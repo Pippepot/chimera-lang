@@ -55,109 +55,8 @@ const reg32 = [_][]const u8{ "eax", "ebx", "r8d", "r9d", "r10d", "r11d", "r12d",
 const eax_i = 0;
 const NUM_REGS = 10;
 
-fn consumeUse(rem_uses: []u32, live: []bool, live_count: *u32, ref: u32) void {
-    std.debug.assert(rem_uses[ref] > 0);
-    rem_uses[ref] -= 1;
-    if (rem_uses[ref] == 0 and live[ref]) {
-        live[ref] = false;
-        live_count.* -= 1;
-    }
-}
-
-fn spillReg(r: usize, reg_to_val: *[NUM_REGS]?u32, slots: []?u32, sidx: *u32, val_to_reg: []?u8, buf: *std.ArrayList(u8), gpa: std.mem.Allocator) !void {
-    const v = reg_to_val[r].?;
-    if (slots[v] == null) {
-        try buf.print(gpa, "    mov [rsp+{d}], {s}\n", .{ sidx.*, reg64[r] });
-        slots[v] = sidx.*;
-        sidx.* += 8;
-    }
-    val_to_reg[v] = null;
-    reg_to_val[r] = null;
-}
-
-fn evict(r: usize, reg_to_val: *[NUM_REGS]?u32, slots: []?u32, sidx: *u32, val_to_reg: []?u8, uc: []const u32, buf: *std.ArrayList(u8), gpa: std.mem.Allocator) !void {
-    if (reg_to_val[r]) |v| {
-        if (uc[v] > 0) try spillReg(r, reg_to_val, slots, sidx, val_to_reg, buf, gpa);
-        val_to_reg[v] = null;
-        reg_to_val[r] = null;
-    }
-}
-
-fn loadIntoReg(val: u32, r: usize, val_to_reg: []?u8, reg_to_val: *[NUM_REGS]?u32, slots: []?u32, sidx: *u32, uc: []const u32, iri: []const Inst, buf: *std.ArrayList(u8), gpa: std.mem.Allocator) !void {
-    if (val_to_reg[val]) |curr| {
-        const creg = @as(usize, curr);
-        if (creg == r) return;
-        try evict(r, reg_to_val, slots, sidx, val_to_reg, uc, buf, gpa);
-        try buf.print(gpa, "    mov {s}, {s}\n", .{ reg32[r], reg32[creg] });
-        val_to_reg[val] = @intCast(r);
-        reg_to_val[creg] = null;
-        reg_to_val[r] = val;
-    } else if (slots[val]) |slot| {
-        try evict(r, reg_to_val, slots, sidx, val_to_reg, uc, buf, gpa);
-        try buf.print(gpa, "    mov {s}, [rsp+{d}]\n", .{ reg32[r], slot });
-        val_to_reg[val] = @intCast(r);
-        reg_to_val[r] = val;
-    } else {
-        const imm = switch (iri[val]) {
-            .iconst => |v| v,
-            else => unreachable,
-        };
-        try evict(r, reg_to_val, slots, sidx, val_to_reg, uc, buf, gpa);
-        try buf.print(gpa, "    mov {s}, {d}\n", .{ reg32[r], imm });
-        val_to_reg[val] = @intCast(r);
-        reg_to_val[r] = val;
-    }
-}
-
-fn ensureAnyReg(val: u32, val_to_reg: []?u8, reg_to_val: *[NUM_REGS]?u32, slots: []?u32, sidx: *u32, uc: []const u32, iri: []const Inst, buf: *std.ArrayList(u8), gpa: std.mem.Allocator) !u8 {
-    if (val_to_reg[val]) |r| return r;
-    var fr: ?u8 = null;
-    for (reg_to_val.*, 0..) |o, ri| {
-        if (o == null and ri != eax_i) {
-            fr = @intCast(ri);
-            break;
-        }
-    }
-    if (fr == null) {
-        for (reg_to_val.*, 0..) |o, ri| {
-            if (o == null) {
-                fr = @intCast(ri);
-                break;
-            }
-        }
-    }
-    if (fr == null) {
-        var victim: u8 = 0;
-        var min_uc: u32 = std.math.maxInt(u32);
-        for (reg_to_val.*, 0..) |o, ri| {
-            if (o) |v| {
-                if (uc[v] < min_uc) {
-                    min_uc = uc[v];
-                    victim = @intCast(ri);
-                }
-            }
-        }
-        try spillReg(victim, reg_to_val, slots, sidx, val_to_reg, buf, gpa);
-        fr = victim;
-    }
-    const r = fr.?;
-    try loadIntoReg(val, @as(usize, r), val_to_reg, reg_to_val, slots, sidx, uc, iri, buf, gpa);
-
-    return r;
-}
-
-fn freeIfDead(val: u32, val_to_reg: []?u8, reg_to_val: *[NUM_REGS]?u32, uc: []const u32) void {
-    if (uc[val] > 0) return;
-    if (val_to_reg[val]) |r| {
-        val_to_reg[val] = null;
-        reg_to_val[@as(usize, r)] = null;
-    }
-}
-
-pub fn emitIr(ir: *const std.ArrayList(Inst), buf: *std.ArrayList(u8), gpa: std.mem.Allocator) error{OutOfMemory}!void {
-    // --- Pass 1: use counts ---
+fn computeUseCounts(ir: *const std.ArrayList(Inst), gpa: std.mem.Allocator) error{OutOfMemory}![]u32 {
     var use_count = try gpa.alloc(u32, ir.items.len);
-    defer gpa.free(use_count);
     @memset(use_count, 0);
     for (ir.items) |inst| {
         switch (inst) {
@@ -169,12 +68,14 @@ pub fn emitIr(ir: *const std.ArrayList(Inst), buf: *std.ArrayList(u8), gpa: std.
             else => {},
         }
     }
+    return use_count;
+}
 
-    // --- Pass 2: peak live values for stack frame ---
-    const rem_uses = try gpa.alloc(u32, ir.items.len);
+fn computeFrameSize(ir: *const std.ArrayList(Inst), use_count: []u32, gpa: std.mem.Allocator) u32 {
+    const rem_uses = gpa.alloc(u32, ir.items.len) catch return 0;
     defer gpa.free(rem_uses);
     @memcpy(rem_uses, use_count);
-    var live = try gpa.alloc(bool, ir.items.len);
+    const live = gpa.alloc(bool, ir.items.len) catch return 0;
     defer gpa.free(live);
     @memset(live, false);
     var live_count: u32 = 0;
@@ -185,164 +86,227 @@ pub fn emitIr(ir: *const std.ArrayList(Inst), buf: *std.ArrayList(u8), gpa: std.
             live_count += 1;
         }
         peak = @max(peak, live_count);
+        const consume = struct {
+            fn c(rem: []u32, lv: []bool, lc: *u32, ref: u32) void {
+                std.debug.assert(rem[ref] > 0);
+                rem[ref] -= 1;
+                if (rem[ref] == 0 and lv[ref]) {
+                    lv[ref] = false;
+                    lc.* -= 1;
+                }
+            }
+        }.c;
         switch (inst) {
             .iadd, .isub, .imul, .idiv => |p| {
-                consumeUse(rem_uses, live, &live_count, p.l);
-                consumeUse(rem_uses, live, &live_count, p.r);
+                consume(rem_uses, live, &live_count, p.l);
+                consume(rem_uses, live, &live_count, p.r);
             },
-            .print, .ret => |v| consumeUse(rem_uses, live, &live_count, v),
+            .print, .ret => |v| consume(rem_uses, live, &live_count, v),
             else => {},
         }
     }
-    const frame_size = if (peak > NUM_REGS) (peak - NUM_REGS) * 8 else @as(u32, 0);
+    return if (peak > NUM_REGS) (peak - NUM_REGS) * 8 else 0;
+}
+
+const Emitter = struct {
+    iri: []const Inst,
+    buf: *std.ArrayList(u8),
+    gpa: std.mem.Allocator,
+    val_to_reg: []?usize,
+    reg_to_val: [NUM_REGS]?u32,
+    spill_slots: []?u32,
+    spill_idx: u32,
+    use_count: []u32,
+
+    fn loadImm(self: *@This(), ref: u32) ?i32 {
+        return switch (self.iri[ref]) {
+            .iconst => |v| v,
+            else => null,
+        };
+    }
+
+    fn spillReg(self: *@This(), r: usize) !void {
+        const v = self.reg_to_val[r].?;
+        if (self.spill_slots[v] == null) {
+            try self.buf.print(self.gpa, "    mov [rsp+{d}], {s}\n", .{ self.spill_idx, reg64[r] });
+            self.spill_slots[v] = self.spill_idx;
+            self.spill_idx += 8;
+        }
+        self.val_to_reg[v] = null;
+        self.reg_to_val[r] = null;
+    }
+
+    fn evict(self: *@This(), r: usize) !void {
+        if (self.reg_to_val[r]) |v| {
+            if (self.use_count[v] > 0) try self.spillReg(r);
+            self.val_to_reg[v] = null;
+            self.reg_to_val[r] = null;
+        }
+    }
+
+    fn findFreeReg(self: *@This()) !usize {
+        var victim: usize = 0;
+        var min_uc: u32 = std.math.maxInt(u32);
+        for (self.reg_to_val, 0..) |o, ri| {
+            if (o) |v| {
+                if (self.use_count[v] < min_uc) {
+                    min_uc = self.use_count[v];
+                    victim = ri;
+                }
+            } else {
+                return ri;
+            }
+        }
+        try self.spillReg(victim);
+        return victim;
+    }
+
+    fn loadIntoReg(self: *@This(), val: u32, r: usize) !void {
+        if (self.val_to_reg[val]) |curr| {
+            if (curr == r) return;
+            try self.evict(r);
+            try self.buf.print(self.gpa, "    mov {s}, {s}\n", .{ reg32[r], reg32[curr] });
+            self.val_to_reg[val] = r;
+            self.reg_to_val[curr] = null;
+            self.reg_to_val[r] = val;
+        } else if (self.spill_slots[val]) |slot| {
+            try self.evict(r);
+            try self.buf.print(self.gpa, "    mov {s}, [rsp+{d}]\n", .{ reg32[r], slot });
+            self.val_to_reg[val] = r;
+            self.reg_to_val[r] = val;
+        } else {
+            const imm = switch (self.iri[val]) {
+                .iconst => |v| v,
+                else => unreachable,
+            };
+            try self.evict(r);
+            try self.buf.print(self.gpa, "    mov {s}, {d}\n", .{ reg32[r], imm });
+            self.val_to_reg[val] = r;
+            self.reg_to_val[r] = val;
+        }
+    }
+
+    fn ensureAnyReg(self: *@This(), val: u32) !usize {
+        if (self.val_to_reg[val]) |r| return r;
+        const r = try self.findFreeReg();
+        try self.loadIntoReg(val, r);
+        return r;
+    }
+
+    fn freeIfDead(self: *@This(), val: u32) void {
+        if (self.use_count[val] > 0) return;
+        if (self.val_to_reg[val]) |r| {
+            self.val_to_reg[val] = null;
+            self.reg_to_val[r] = null;
+        }
+    }
+
+    fn freeOperands(self: *@This(), p: InstPair) void {
+        self.use_count[p.l] -= 1;
+        self.freeIfDead(p.l);
+        self.use_count[p.r] -= 1;
+        self.freeIfDead(p.r);
+    }
+
+    fn emitAddSub(self: *@This(), mnemonic: []const u8, p: InstPair, i: usize) !void {
+        try self.loadIntoReg(p.l, eax_i);
+        if (self.loadImm(p.r)) |imm| try self.buf.print(self.gpa, "    {s} eax, {d}\n", .{ mnemonic, imm })
+        else {
+            const rhs = try self.ensureAnyReg(p.r);
+            try self.buf.print(self.gpa, "    {s} eax, {s}\n", .{ mnemonic, reg32[rhs] });
+        }
+        self.freeOperands(p);
+        self.assignResult(i);
+    }
+
+    fn emitImul(self: *@This(), p: InstPair, i: usize) !void {
+        if (self.loadImm(p.r)) |imm| {
+            if (self.val_to_reg[p.l]) |lhs_r| {
+                try self.buf.print(self.gpa, "    imul eax, {s}, {d}\n", .{ reg32[lhs_r], imm });
+                self.reg_to_val[lhs_r] = null;
+                self.val_to_reg[p.l] = null;
+            } else {
+                try self.evict(eax_i);
+                if (self.loadImm(p.l)) |lhs_val| {
+                    try self.buf.print(self.gpa, "    mov eax, {d}\n    imul eax, {d}\n", .{ lhs_val, imm });
+                } else {
+                    const slot = self.spill_slots[p.l] orelse unreachable;
+                    try self.buf.print(self.gpa, "    imul eax, [rsp+{d}], {d}\n", .{ slot, imm });
+                    self.spill_slots[p.l] = null;
+                }
+            }
+        } else {
+            try self.loadIntoReg(p.l, eax_i);
+            const rhs = try self.ensureAnyReg(p.r);
+            try self.buf.print(self.gpa, "    imul eax, {s}\n", .{reg32[rhs]});
+        }
+        self.freeOperands(p);
+        self.assignResult(i);
+    }
+
+    fn emitIdiv(self: *@This(), p: InstPair, i: usize) !void {
+        try self.loadIntoReg(p.l, eax_i);
+        const rhs = try self.ensureAnyReg(p.r);
+        self.freeOperands(p);
+        try self.buf.appendSlice(self.gpa, "    cdq\n");
+        try self.buf.print(self.gpa, "    idiv {s}\n", .{reg32[rhs]});
+        self.assignResult(i);
+    }
+
+    fn assignResult(self: *@This(), i: usize) void {
+        self.reg_to_val[eax_i] = @intCast(i);
+        self.val_to_reg[i] = eax_i;
+    }
+};
+
+pub fn emitIr(ir: *const std.ArrayList(Inst), buf: *std.ArrayList(u8), gpa: std.mem.Allocator) error{OutOfMemory}!void {
+    const use_count = try computeUseCounts(ir, gpa);
+    defer gpa.free(use_count);
+
+    const frame_size = computeFrameSize(ir, use_count, gpa);
     if (frame_size > 0) try buf.print(gpa, "    sub rsp, {d}\n", .{frame_size});
 
-    // --- Pass 3: register allocation and emission ---
-    var val_to_reg = try gpa.alloc(?u8, ir.items.len);
-    defer gpa.free(val_to_reg);
-    @memset(val_to_reg, null);
-    var reg_to_val: [NUM_REGS]?u32 = [_]?u32{null} ** NUM_REGS;
-    const spill_slots = try gpa.alloc(?u32, ir.items.len);
-    defer gpa.free(spill_slots);
-    @memset(spill_slots, null);
-    var spill_idx: u32 = 0;
+    var self = Emitter{
+        .iri = ir.items,
+        .buf = buf,
+        .gpa = gpa,
+        .val_to_reg = try gpa.alloc(?usize, ir.items.len),
+        .reg_to_val = [_]?u32{null} ** NUM_REGS,
+        .spill_slots = try gpa.alloc(?u32, ir.items.len),
+        .spill_idx = 0,
+        .use_count = use_count,
+    };
+    defer gpa.free(self.val_to_reg);
+    defer gpa.free(self.spill_slots);
+    @memset(self.val_to_reg, null);
+    @memset(self.spill_slots, null);
 
     for (ir.items, 0..) |inst, i| {
         switch (inst) {
             .iconst => {},
-            .iadd => |p| {
-                try loadIntoReg(p.l, eax_i, val_to_reg, &reg_to_val, spill_slots, &spill_idx, use_count, ir.items, buf, gpa);
-                const rhs_imm: ?i32 = switch (ir.items[p.r]) {
-                    .iconst => |v| v,
-                    else => null,
-                };
-                if (rhs_imm) |imm| try buf.print(gpa, "    add eax, {d}\n", .{imm})
-                else {
-                    const rhs = try ensureAnyReg(p.r, val_to_reg, &reg_to_val, spill_slots, &spill_idx, use_count, ir.items, buf, gpa);
-                    try buf.print(gpa, "    add eax, {s}\n", .{reg32[@as(usize, rhs)]});
-                }
-                use_count[p.l] -= 1;
-                freeIfDead(p.l, val_to_reg, &reg_to_val, use_count);
-                use_count[p.r] -= 1;
-                freeIfDead(p.r, val_to_reg, &reg_to_val, use_count);
-                reg_to_val[eax_i] = @intCast(i);
-                val_to_reg[i] = @intCast(eax_i);
-            },
-            .isub => |p| {
-                try loadIntoReg(p.l, eax_i, val_to_reg, &reg_to_val, spill_slots, &spill_idx, use_count, ir.items, buf, gpa);
-                const rhs_imm: ?i32 = switch (ir.items[p.r]) {
-                    .iconst => |v| v,
-                    else => null,
-                };
-                if (rhs_imm) |imm| try buf.print(gpa, "    sub eax, {d}\n", .{imm})
-                else {
-                    const rhs = try ensureAnyReg(p.r, val_to_reg, &reg_to_val, spill_slots, &spill_idx, use_count, ir.items, buf, gpa);
-                    try buf.print(gpa, "    sub eax, {s}\n", .{reg32[@as(usize, rhs)]});
-                }
-                use_count[p.l] -= 1;
-                freeIfDead(p.l, val_to_reg, &reg_to_val, use_count);
-                use_count[p.r] -= 1;
-                freeIfDead(p.r, val_to_reg, &reg_to_val, use_count);
-                reg_to_val[eax_i] = @intCast(i);
-                val_to_reg[i] = @intCast(eax_i);
-            },
-            .imul => |p| {
-                const rhs_imm: ?i32 = switch (ir.items[p.r]) {
-                    .iconst => |v| v,
-                    else => null,
-                };
-                if (rhs_imm) |imm| {
-                    if (val_to_reg[p.l]) |lhs_r| {
-                        const lhs_reg = @as(usize, lhs_r);
-                        try buf.print(gpa, "    imul eax, {s}, {d}\n", .{ reg32[lhs_reg], imm });
-                        reg_to_val[lhs_reg] = null;
-                        val_to_reg[p.l] = null;
-                    } else {
-                        try evict(eax_i, &reg_to_val, spill_slots, &spill_idx, val_to_reg, use_count, buf, gpa);
-                        const lhs_imm: ?i32 = switch (ir.items[p.l]) {
-                            .iconst => |v| v,
-                            else => null,
-                        };
-                        if (lhs_imm) |lhs_val| try buf.print(gpa, "    mov eax, {d}\n    imul eax, {d}\n", .{ lhs_val, imm })
-                        else {
-                            const slot = spill_slots[p.l] orelse unreachable;
-                            try buf.print(gpa, "    imul eax, [rsp+{d}], {d}\n", .{ slot, imm });
-                            spill_slots[p.l] = null;
-                        }
-                    }
-                } else {
-                    try loadIntoReg(p.l, eax_i, val_to_reg, &reg_to_val, spill_slots, &spill_idx, use_count, ir.items, buf, gpa);
-                    const rhs = try ensureAnyReg(p.r, val_to_reg, &reg_to_val, spill_slots, &spill_idx, use_count, ir.items, buf, gpa);
-                    try buf.print(gpa, "    imul eax, {s}\n", .{reg32[@as(usize, rhs)]});
-                }
-                use_count[p.l] -= 1;
-                freeIfDead(p.l, val_to_reg, &reg_to_val, use_count);
-                use_count[p.r] -= 1;
-                freeIfDead(p.r, val_to_reg, &reg_to_val, use_count);
-                reg_to_val[eax_i] = @intCast(i);
-                val_to_reg[i] = @intCast(eax_i);
-            },
-            .idiv => |p| {
-                try loadIntoReg(p.l, eax_i, val_to_reg, &reg_to_val, spill_slots, &spill_idx, use_count, ir.items, buf, gpa);
-                const rhs = try ensureAnyReg(p.r, val_to_reg, &reg_to_val, spill_slots, &spill_idx, use_count, ir.items, buf, gpa);
-                use_count[p.l] -= 1;
-                freeIfDead(p.l, val_to_reg, &reg_to_val, use_count);
-                use_count[p.r] -= 1;
-                freeIfDead(p.r, val_to_reg, &reg_to_val, use_count);
-                try buf.appendSlice(gpa, "    cdq\n");
-                try buf.print(gpa, "    idiv {s}\n", .{reg32[@as(usize, rhs)]});
-                reg_to_val[eax_i] = @intCast(i);
-                val_to_reg[i] = @intCast(eax_i);
-            },
+            .iadd => |p| try self.emitAddSub("add", p, i),
+            .isub => |p| try self.emitAddSub("sub", p, i),
+            .imul => |p| try self.emitImul(p, i),
+            .idiv => |p| try self.emitIdiv(p, i),
             .print => |v| {
-                try loadIntoReg(v, eax_i, val_to_reg, &reg_to_val, spill_slots, &spill_idx, use_count, ir.items, buf, gpa);
-                use_count[v] -= 1;
-                freeIfDead(v, val_to_reg, &reg_to_val, use_count);
+                try self.loadIntoReg(v, eax_i);
+                self.use_count[v] -= 1;
+                self.freeIfDead(v);
                 try buf.appendSlice(gpa, "    call print_int\n");
-                reg_to_val[eax_i] = @intCast(i);
-                val_to_reg[i] = @intCast(eax_i);
+                self.assignResult(i);
             },
             .ret => |v| {
-                try loadIntoReg(v, eax_i, val_to_reg, &reg_to_val, spill_slots, &spill_idx, use_count, ir.items, buf, gpa);
+                try self.loadIntoReg(v, eax_i);
                 try buf.appendSlice(gpa, "    xor edi, edi\n    mov eax, 60\n    syscall\n");
             },
             .iarg => |idx| {
-                try evict(eax_i, &reg_to_val, spill_slots, &spill_idx, val_to_reg, use_count, buf, gpa);
-                var fr: ?u8 = null;
-                for (&reg_to_val, 0..) |o, ri| {
-                    if (o == null and ri != eax_i) {
-                        fr = @intCast(ri);
-                        break;
-                    }
-                }
-                if (fr == null) {
-                    for (&reg_to_val, 0..) |o, ri| {
-                        if (o == null) {
-                            fr = @intCast(ri);
-                            break;
-                        }
-                    }
-                }
-                if (fr == null) {
-                    var victim: u8 = 0;
-                    var min_uc: u32 = std.math.maxInt(u32);
-                    for (&reg_to_val, 0..) |o, ri| {
-                        if (o) |val| {
-                            if (use_count[val] < min_uc) {
-                                min_uc = use_count[val];
-                                victim = @intCast(ri);
-                            }
-                        }
-                    }
-                    try spillReg(victim, &reg_to_val, spill_slots, &spill_idx, val_to_reg, buf, gpa);
-                    fr = victim;
-                }
-                const r = fr.?;
+                try self.evict(eax_i);
+                const r = try self.findFreeReg();
                 try buf.print(gpa, "    mov rdi, [rbp + {d}]\n", .{idx * 8});
                 try buf.appendSlice(gpa, "    call atoi\n");
-                if (@as(usize, r) != eax_i) try buf.print(gpa, "    mov {s}, eax\n", .{reg32[@as(usize, r)]});
-                reg_to_val[@as(usize, r)] = @intCast(i);
-                val_to_reg[i] = r;
+                if (r != eax_i) try buf.print(gpa, "    mov {s}, eax\n", .{reg32[r]});
+                self.reg_to_val[r] = @intCast(i);
+                self.val_to_reg[i] = r;
             },
         }
     }

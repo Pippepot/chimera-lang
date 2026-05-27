@@ -6,25 +6,31 @@
 
 | File | Description |
 |------|-------------|
-| `x86.zig` | AST definition, IR lowering, register allocator, codegen, binary pipeline, main |
+| `x86.zig` | AST types, binary pipeline (`assembleAndLink`, `runProg`, `eval`, `main`) |
+| `codegen.zig` | IR types, AST→IR lowering, register allocator, emission, `compile` |
 | `debug.zig` | Debug helpers: AST dump, IR dump, assembly dump, debug flag parsing |
 | `print.asm` | NASM `print_int` routine (converts int to decimal, writes to stdout via `sys_write`) |
 | `test.zig` | Full-pipeline tests: compile AST → assemble → link → run → capture stdout and verify |
 
-## Public API (`x86.zig`)
+## Public API
 
-- **`AstNode`** — tagged union: `.int(i32)`, `.print(*const AstNode)`, `.add/sub/mul/div(*const [2]AstNode)`, `.arg(u32)`
-- **`Inst`** / **`InstPair`** / **`InstRef`** — SSA IR types (all `pub` for downstream use)
-- **`compile(node, gpa)`** — AST → NASM assembly string (``[]const u8``)
-- **`emitIr(ir, buf, gpa)`** — IR → NASM instructions (3-pass register allocator)
-- **`assembleAndLink(io, asm_source)`** — writes `x86.asm`, runs `nasm`, runs `ld`, produces `prog`
-- **`runProg(io, gpa, args)`** — runs `./prog` with args, returns exit code (``u8``)
-- **`eval(io, node, gpa, args)`** — all-in-one: compile + assemble/link + run, returns exit code
+| Symbol | File | Description |
+|--------|------|-------------|
+| `AstNode` | `x86.zig` | Tagged union AST node |
+| `Inst`, `InstPair`, `InstRef` | `codegen.zig` | SSA IR types |
+| `compile(node, gpa)` | `codegen.zig` | AST → NASM assembly string |
+| `emitIr(ir, buf, gpa)` | `codegen.zig` | IR → NASM instructions |
+| `assembleAndLink(io, asm_source)` | `x86.zig` | writes `x86.asm`, runs `nasm`, runs `ld`, produces `prog` |
+| `runProg(io, gpa, args)` | `x86.zig` | runs `./prog` with args, returns exit code |
+| `eval(io, node, gpa, args)` | `x86.zig` | all-in-one: compile + assemble/link + run, returns exit code |
 
 ## Internal pipeline
 
-1. **`lower`** — AST → SSA IR (``std.ArrayList(Inst)``), appends implicit `ret`. Binary ops use shared `lowerBinop` helper.
-2. **`emitIr`** — three-pass: use-count, peak-live stack-frame, register allocation + emission
+1. **`lower`** (`codegen.zig`) — AST → SSA IR (``std.ArrayList(Inst)``), appends implicit `ret`. Binary ops use shared `lowerBinop` helper, each switch arm is a one-liner.
+2. **`emitIr`** (`codegen.zig`) — three-pass codegen:
+   - `computeUseCounts` — count consumers per IR ref
+   - `computeFrameSize` — forward liveness simulation, computes stack frame (`sub rsp, N`)
+   - `Emitter` struct — groups allocator state (val_to_reg, reg_to_val, spill_slots, spill_idx, use_count), with methods: `emitAddSub`, `emitImul`, `emitIdiv`, `loadIntoReg`, `ensureAnyReg`, `findFreeReg`, `freeOperands`, `assignResult`
 3. **`compile`** = `lower` → `compileIr` (adds prologue, `lea rbp, [rsp+8]`, embeds `print.asm`)
 
 ### IR (`Inst`)
@@ -55,13 +61,14 @@ Pass `--debug=ast,ssa,asm` (comma-separated) on `zig run` to dump intermediate r
 
 - 10 allocatable registers: `rax`, `rbx`, `r8`–`r15` (``eax``/``rXXd`` for 32-bit ops); `reg64`/`reg32` are comptime arrays
 - Three-pass design:
-  1. **Use counts** — count consumers per IR ref
-  2. **Peak liveness** — forward simulation using `rem_uses` + `live` + `consumeUse` helper, computes stack frame size
-  3. **Register allocation + emission** — linear-scan with spilling
+  1. **Use counts** — `computeUseCounts`: count consumers per IR ref
+  2. **Peak liveness** — `computeFrameSize`: forward simulation using `rem_uses` + `live`, computes stack frame size
+  3. **Register allocation + emission** — `Emitter` struct: linear-scan with spilling
 - Data structures: `val_to_reg: []?u8` (value → register), `reg_to_val: [NUM_REGS]?u32` (register → value), `spill_slots: []?u32`
-- `eax` is preferred for instruction results (``imul r, m``, ``idiv``, etc.)
+- `eax` is preferred for instruction results (``imul r, m``, ``idiv``, etc.); `findFreeReg` returns the first free register without special-casing eax
 - Frame is allocated with `sub rsp, N` when peak live > `NUM_REGS`
 - Spill slots are lazily created with `mov [rsp+offset], reg`; tracking variables use tight types (``u8`` for register indices)
+- `emitAddSub(mnemonic, p, i)` factors iadd/isub; `emitImul` uses three-operand `imul eax, reg/lhs, imm` optimization; `emitIdiv` handles `cdq` before `idiv`
 
 ## Notes
 
