@@ -49,40 +49,30 @@ fn testPrintArgs(node: *const AstNode, expected: []const u8, args: []const []con
     try testing.expectEqualStrings(expected, out);
 }
 
-test "int" {
+test "arithmetic" {
     const n = AstNode{ .int = 42 };
     try testPrint(&n, "42\n");
-}
 
-test "add" {
-    const kids = [2]AstNode{ .{ .int = 3 }, .{ .int = 4 } };
-    const n = AstNode{ .add = &kids };
-    try testPrint(&n, "7\n");
-}
+    const add_kids = [2]AstNode{ .{ .int = 3 }, .{ .int = 4 } };
+    const add = AstNode{ .add = &add_kids };
+    try testPrint(&add, "7\n");
 
-test "sub" {
-    const kids = [2]AstNode{ .{ .int = 10 }, .{ .int = 3 } };
-    const n = AstNode{ .sub = &kids };
-    try testPrint(&n, "7\n");
-}
+    const sub_kids = [2]AstNode{ .{ .int = 10 }, .{ .int = 3 } };
+    const sub = AstNode{ .sub = &sub_kids };
+    try testPrint(&sub, "7\n");
 
-test "mul" {
-    const kids = [2]AstNode{ .{ .int = 5 }, .{ .int = 6 } };
-    const n = AstNode{ .mul = &kids };
-    try testPrint(&n, "30\n");
-}
+    const mul_kids = [2]AstNode{ .{ .int = 5 }, .{ .int = 6 } };
+    const mul = AstNode{ .mul = &mul_kids };
+    try testPrint(&mul, "30\n");
 
-test "div" {
-    const kids = [2]AstNode{ .{ .int = 20 }, .{ .int = 4 } };
-    const n = AstNode{ .div = &kids };
-    try testPrint(&n, "5\n");
-}
+    const div_kids = [2]AstNode{ .{ .int = 20 }, .{ .int = 4 } };
+    const div = AstNode{ .div = &div_kids };
+    try testPrint(&div, "5\n");
 
-test "nested" {
     const inner = [2]AstNode{ .{ .int = 6 }, .{ .int = 2 } };
     const outer_kids = [2]AstNode{ .{ .int = 10 }, .{ .mul = &inner } };
-    const n = AstNode{ .sub = &outer_kids };
-    try testPrint(&n, "-2\n");
+    const nested = AstNode{ .sub = &outer_kids };
+    try testPrint(&nested, "-2\n");
 }
 
 test "arg" {

@@ -1,8 +1,9 @@
 const std = @import("std");
 const x86 = @import("x86.zig");
+const ir_mod = @import("ir.zig");
 const codegen = @import("codegen.zig");
 const AstNode = x86.AstNode;
-const Inst = codegen.Inst;
+const Inst = ir_mod.Inst;
 const emitIr = codegen.emitIr;
 
 fn dumpIr(ir: *const std.ArrayList(Inst), writer: *std.Io.Writer) void {

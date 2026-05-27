@@ -80,18 +80,31 @@ pub fn main(init: std.process.Init) !void {
     }
     const prog_args = prog_args_list.items;
 
-    var arg_node: AstNode = undefined;
-    var mkids: [2]AstNode = undefined;
-    var akids: [2]AstNode = undefined;
+    var cond: AstNode = undefined;
+    var cond_kids: [2]AstNode = undefined;
+    var then_expr: AstNode = undefined;
+    var else_expr: AstNode = undefined;
+    var then_print: AstNode = undefined;
+    var else_print: AstNode = undefined;
+    var if_node: IfNode = undefined;
     const root = if (prog_args.len > 0) blk: {
-        arg_node = .{ .arg = 1 };
-        break :blk AstNode{ .print = &arg_node };
+        cond_kids = .{ .{ .arg = 1 }, .{ .int = 0 } };
+        cond = .{ .gt = &cond_kids };
+        then_expr = .{ .int = 111 };
+        else_expr = .{ .int = -111 };
+        then_print = .{ .print = &then_expr };
+        else_print = .{ .print = &else_expr };
+        if_node = .{ .cond = &cond, .then_ = &then_print, .else_ = &else_print };
+        break :blk AstNode{ .if_ = &if_node };
     } else blk: {
-        mkids = .{ .{ .int = 2 }, .{ .int = 5 } };
-        const mul = AstNode{ .mul = &mkids };
-        akids = .{ mul, .{ .int = 3 } };
-        const add = AstNode{ .add = &akids };
-        break :blk AstNode{ .print = &add };
+        cond_kids = .{ .{ .int = 3 }, .{ .int = 4 } };
+        cond = .{ .lt = &cond_kids };
+        then_expr = .{ .int = 10 };
+        else_expr = .{ .int = 20 };
+        then_print = .{ .print = &then_expr };
+        else_print = .{ .print = &else_expr };
+        if_node = .{ .cond = &cond, .then_ = &then_print, .else_ = &else_print };
+        break :blk AstNode{ .if_ = &if_node };
     };
 
     var ir = try codegen.lower(&root, gpa);
