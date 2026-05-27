@@ -12,8 +12,6 @@ pub const AstNode = union(enum) {
     arg: u32,
 };
 
-pub const compile = codegen.compile;
-
 pub fn assembleAndLink(io: std.Io, asm_source: []const u8) void {
     const cwd = std.Io.Dir.cwd();
     cwd.writeFile(io, .{ .sub_path = "x86.asm", .data = asm_source }) catch std.process.exit(1);
@@ -46,7 +44,7 @@ pub fn runProg(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) u8 
 }
 
 pub fn eval(io: std.Io, node: *const AstNode, gpa: std.mem.Allocator, args: []const []const u8) u8 {
-    const asm_source = compile(node, gpa) catch std.process.exit(1);
+    const asm_source = codegen.compile(node, gpa) catch std.process.exit(1);
     defer gpa.free(asm_source);
     assembleAndLink(io, asm_source);
     return runProg(io, gpa, args);

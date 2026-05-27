@@ -1,8 +1,7 @@
 const std = @import("std");
 const testing = std.testing;
 const AstNode = @import("x86.zig").AstNode;
-const codegen = @import("codegen.zig");
-const compile = codegen.compile;
+const compile = @import("codegen.zig").compile;
 const assembleAndLink = @import("x86.zig").assembleAndLink;
 
 fn runTestCapture(node: *const AstNode, args: []const []const u8) ![]u8 {
