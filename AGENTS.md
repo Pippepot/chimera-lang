@@ -2,7 +2,8 @@
 
 ## Code organization
 
-- **Single-file entry point.** `x86.zig` is the only Zig file; run with `zig run x86.zig`. No `build.zig`.
+- **Entry point.** `x86.zig` is the main Zig file; run with `zig run x86.zig`. No `build.zig`.
+- **Debug helpers** in separate `debug.zig` imported by `x86.zig`.
 - **External assembly** goes in `.asm` files, embedded via `@embedFile("file.asm")` in the `compile` function.
 - **Project state** documented in `.agents/project.md`.
 - **AGENTS.md** lives alongside `x86.zig` (project root, not repo root).
@@ -16,12 +17,15 @@
 - **I/O instance** — passed via `init: std.process.Init`, accessible as `init.io`. In tests, create `std.Io.Threaded.init(allocator, .{})`.
 - **`main` signature** — `pub fn main(init: std.process.Init) !void` or return `u8` directly.
 - **`zig test`** — test functions have no `init.io`. Create a Threaded Io manually.
+- **`var` vs `const` on slices** — element mutation does NOT count as variable reassignment. Use `const` for slices where only elements are mutated.
+- **`@intCast(value)`** — takes one argument; destination type is inferred from context. Not `@intCast(T, value)`.
 
 ## AST design
 
 - **Binary ops** use `*const [2]AstNode` (pointer to fixed-size array of two children).
 - **Stack-allocate nodes** when the tree is built and consumed in the same function. No arena/heap needed.
 - **Emit private** — only `compile` is public. Tests use `eval` (full pipeline), not `emit`.
+- **Factor binop lowering** — shared `lowerBinop` function lowers both children, returns `InstPair`. Each binop arm is a one-liner.
 
 ## Assembly generation
 
