@@ -436,6 +436,73 @@ pub fn eval(io: std.Io, node: *const AstNode, gpa: std.mem.Allocator) u8 {
     return runProg(io);
 }
 
+const DebugFlags = struct {
+    ast: bool = false,
+    ssa: bool = false,
+    assembly: bool = false,
+};
+
+fn parseDebugFlags(args: std.process.Args) DebugFlags {
+    var flags = DebugFlags{};
+    var iter = std.process.Args.Iterator.init(args);
+    defer iter.deinit();
+    _ = iter.next();
+    while (iter.next()) |arg| {
+        if (std.mem.startsWith(u8, arg, "--debug=")) {
+            var rest = arg["--debug=".len..];
+            while (rest.len > 0) {
+                const comma = std.mem.indexOfScalar(u8, rest, ',') orelse rest.len;
+                const item = rest[0..comma];
+                if (std.mem.eql(u8, item, "ast")) flags.ast = true;
+                if (std.mem.eql(u8, item, "ssa")) flags.ssa = true;
+                if (std.mem.eql(u8, item, "asm")) flags.assembly = true;
+                if (comma == rest.len) break;
+                rest = rest[comma + 1 ..];
+            }
+        }
+    }
+    return flags;
+}
+
+fn dumpAst(node: *const AstNode, writer: *std.Io.Writer) void {
+    switch (node.*) {
+        .int => |v| writer.print("{d}", .{v}) catch return,
+        .print => |child| {
+            writer.writeAll("(print ") catch return;
+            dumpAst(child, writer);
+            writer.writeAll(")") catch return;
+        },
+        .add => |kids| {
+            writer.writeAll("(+ ") catch return;
+            dumpAst(&kids[0], writer);
+            writer.writeAll(" ") catch return;
+            dumpAst(&kids[1], writer);
+            writer.writeAll(")") catch return;
+        },
+        .sub => |kids| {
+            writer.writeAll("(- ") catch return;
+            dumpAst(&kids[0], writer);
+            writer.writeAll(" ") catch return;
+            dumpAst(&kids[1], writer);
+            writer.writeAll(")") catch return;
+        },
+        .mul => |kids| {
+            writer.writeAll("(* ") catch return;
+            dumpAst(&kids[0], writer);
+            writer.writeAll(" ") catch return;
+            dumpAst(&kids[1], writer);
+            writer.writeAll(")") catch return;
+        },
+        .div => |kids| {
+            writer.writeAll("(/ ") catch return;
+            dumpAst(&kids[0], writer);
+            writer.writeAll(" ") catch return;
+            dumpAst(&kids[1], writer);
+            writer.writeAll(")") catch return;
+        },
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const gpa = init.gpa;
@@ -444,18 +511,40 @@ pub fn main(init: std.process.Init) !void {
     var div = AstNode{ .div = &kids };
     var root = AstNode{ .print = &div };
 
+    const flags = parseDebugFlags(init.minimal.args);
+
+    if (flags.ast) {
+        var wbuf: [1024]u8 = undefined;
+        var w = std.Io.File.stdout().writer(io, &wbuf);
+        try w.interface.writeAll("; AST:\n; ");
+        dumpAst(&root, &w.interface);
+        try w.interface.writeAll("\n\n");
+        try w.interface.flush();
+    }
+
     var ir = try lower(&root, gpa);
     defer ir.deinit(gpa);
 
-    var wbuf: [1024]u8 = undefined;
-    var w = std.Io.File.stdout().writer(io, &wbuf);
-    try w.interface.writeAll("; SSA IR:\n");
-    dumpIr(&ir, &w.interface);
-    try w.interface.writeAll("\n");
-    try w.interface.flush();
+    if (flags.ssa) {
+        var wbuf: [1024]u8 = undefined;
+        var w = std.Io.File.stdout().writer(io, &wbuf);
+        try w.interface.writeAll("; SSA IR:\n");
+        dumpIr(&ir, &w.interface);
+        try w.interface.writeAll("\n");
+        try w.interface.flush();
+    }
 
     const asm_source = try compileIr(&ir, gpa);
     defer gpa.free(asm_source);
+
+    if (flags.assembly) {
+        var wbuf: [4096]u8 = undefined;
+        var w = std.Io.File.stdout().writer(io, &wbuf);
+        try w.interface.writeAll("; --- asm ---\n");
+        try w.interface.writeAll(asm_source);
+        try w.interface.writeAll("; --- end asm ---\n");
+        try w.interface.flush();
+    }
 
     assembleAndLink(io, asm_source);
     _ = runProg(io);
