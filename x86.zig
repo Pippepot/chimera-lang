@@ -2,6 +2,12 @@ const std = @import("std");
 const debug = @import("debug.zig");
 const codegen = @import("codegen.zig");
 
+pub const IfNode = struct {
+    cond: *const AstNode,
+    then_: *const AstNode,
+    else_: ?*const AstNode,
+};
+
 pub const AstNode = union(enum) {
     int: i32,
     print: *const AstNode,
@@ -10,6 +16,13 @@ pub const AstNode = union(enum) {
     mul: *const [2]AstNode,
     div: *const [2]AstNode,
     arg: u32,
+    lt: *const [2]AstNode,
+    gt: *const [2]AstNode,
+    le: *const [2]AstNode,
+    ge: *const [2]AstNode,
+    eq: *const [2]AstNode,
+    ne: *const [2]AstNode,
+    if_: *const IfNode,
 };
 
 pub fn assembleAndLink(io: std.Io, asm_source: []const u8) void {

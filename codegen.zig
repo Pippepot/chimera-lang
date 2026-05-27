@@ -18,26 +18,63 @@ pub const Inst = union(enum) {
     print: InstRef,
     ret: InstRef,
     iarg: u32,
+    ilt: InstPair,
+    igt: InstPair,
+    ile: InstPair,
+    ige: InstPair,
+    ieq: InstPair,
+    ine: InstPair,
+    ijz: struct { cond: InstRef, label: u32 },
+    ijmp: u32,
+    ilabel: u32,
+    itoeax: InstRef,
+    iphi,
 };
 
-fn lowerBinop(arena: *std.ArrayList(Inst), kids: *const [2]AstNode, gpa: std.mem.Allocator) error{OutOfMemory}!InstPair {
-    const l = try lowerAst(arena, &kids[0], gpa);
-    const r = try lowerAst(arena, &kids[1], gpa);
+fn lowerBinop(arena: *std.ArrayList(Inst), kids: *const [2]AstNode, gpa: std.mem.Allocator, label_counter: *u32) error{OutOfMemory}!InstPair {
+    const l = try lowerAst(arena, &kids[0], gpa, label_counter);
+    const r = try lowerAst(arena, &kids[1], gpa, label_counter);
     return .{ .l = l, .r = r };
 }
 
-fn lowerAst(arena: *std.ArrayList(Inst), node: *const AstNode, gpa: std.mem.Allocator) error{OutOfMemory}!InstRef {
+fn lowerAst(arena: *std.ArrayList(Inst), node: *const AstNode, gpa: std.mem.Allocator, label_counter: *u32) error{OutOfMemory}!InstRef {
     switch (node.*) {
         .int => |v| try arena.append(gpa, .{ .iconst = v }),
         .print => |child| {
-            const val = try lowerAst(arena, child, gpa);
+            const val = try lowerAst(arena, child, gpa, label_counter);
             try arena.append(gpa, .{ .print = val });
         },
-        .add => |kids| try arena.append(gpa, .{ .iadd = try lowerBinop(arena, kids, gpa) }),
-        .sub => |kids| try arena.append(gpa, .{ .isub = try lowerBinop(arena, kids, gpa) }),
-        .mul => |kids| try arena.append(gpa, .{ .imul = try lowerBinop(arena, kids, gpa) }),
-        .div => |kids| try arena.append(gpa, .{ .idiv = try lowerBinop(arena, kids, gpa) }),
+        .add => |kids| try arena.append(gpa, .{ .iadd = try lowerBinop(arena, kids, gpa, label_counter) }),
+        .sub => |kids| try arena.append(gpa, .{ .isub = try lowerBinop(arena, kids, gpa, label_counter) }),
+        .mul => |kids| try arena.append(gpa, .{ .imul = try lowerBinop(arena, kids, gpa, label_counter) }),
+        .div => |kids| try arena.append(gpa, .{ .idiv = try lowerBinop(arena, kids, gpa, label_counter) }),
         .arg => |idx| try arena.append(gpa, .{ .iarg = idx }),
+        .lt => |kids| try arena.append(gpa, .{ .ilt = try lowerBinop(arena, kids, gpa, label_counter) }),
+        .gt => |kids| try arena.append(gpa, .{ .igt = try lowerBinop(arena, kids, gpa, label_counter) }),
+        .le => |kids| try arena.append(gpa, .{ .ile = try lowerBinop(arena, kids, gpa, label_counter) }),
+        .ge => |kids| try arena.append(gpa, .{ .ige = try lowerBinop(arena, kids, gpa, label_counter) }),
+        .eq => |kids| try arena.append(gpa, .{ .ieq = try lowerBinop(arena, kids, gpa, label_counter) }),
+        .ne => |kids| try arena.append(gpa, .{ .ine = try lowerBinop(arena, kids, gpa, label_counter) }),
+        .if_ => |data| {
+            const cond_ref = try lowerAst(arena, data.cond, gpa, label_counter);
+            const else_label = label_counter.*;
+            label_counter.* += 1;
+            const end_label = label_counter.*;
+            label_counter.* += 1;
+            try arena.append(gpa, .{ .ijz = .{ .cond = cond_ref, .label = else_label } });
+            const then_ref = try lowerAst(arena, data.then_, gpa, label_counter);
+            try arena.append(gpa, .{ .itoeax = then_ref });
+            try arena.append(gpa, .{ .ijmp = end_label });
+            try arena.append(gpa, .{ .ilabel = else_label });
+            const else_ref = if (data.else_) |else_node| try lowerAst(arena, else_node, gpa, label_counter) else blk: {
+                try arena.append(gpa, .{ .iconst = 0 });
+                break :blk @as(InstRef, @intCast(arena.items.len - 1));
+            };
+            try arena.append(gpa, .{ .itoeax = else_ref });
+            try arena.append(gpa, .{ .ilabel = end_label });
+            try arena.append(gpa, .iphi);
+            return @intCast(arena.items.len - 1);
+        },
     }
     return @intCast(arena.items.len - 1);
 }
@@ -45,7 +82,8 @@ fn lowerAst(arena: *std.ArrayList(Inst), node: *const AstNode, gpa: std.mem.Allo
 pub fn lower(node: *const AstNode, gpa: std.mem.Allocator) error{OutOfMemory}!std.ArrayList(Inst) {
     var ir = try std.ArrayList(Inst).initCapacity(gpa, 16);
     errdefer ir.deinit(gpa);
-    const result = try lowerAst(&ir, node, gpa);
+    var label_counter: u32 = 0;
+    const result = try lowerAst(&ir, node, gpa, &label_counter);
     try ir.append(gpa, .{ .ret = result });
     return ir;
 }
@@ -55,16 +93,25 @@ const reg32 = [_][]const u8{ "eax", "ebx", "r8d", "r9d", "r10d", "r11d", "r12d",
 const eax_i = 0;
 const NUM_REGS = 10;
 
+fn hasValue(inst: Inst) bool {
+    return switch (inst) {
+        .ret, .ijz, .ijmp, .ilabel, .itoeax => false,
+        else => true,
+    };
+}
+
 fn computeUseCounts(ir: *const std.ArrayList(Inst), gpa: std.mem.Allocator) error{OutOfMemory}![]u32 {
     var use_count = try gpa.alloc(u32, ir.items.len);
     @memset(use_count, 0);
     for (ir.items) |inst| {
         switch (inst) {
-            .iadd, .isub, .imul, .idiv => |p| {
+            .iadd, .isub, .imul, .idiv, .ilt, .igt, .ile, .ige, .ieq, .ine => |p| {
                 use_count[p.l] += 1;
                 use_count[p.r] += 1;
             },
             .print, .ret => |v| use_count[v] += 1,
+            .ijz => |j| use_count[j.cond] += 1,
+            .itoeax => |v| use_count[v] += 1,
             else => {},
         }
     }
@@ -81,7 +128,7 @@ fn computeFrameSize(ir: *const std.ArrayList(Inst), use_count: []u32, gpa: std.m
     var live_count: u32 = 0;
     var peak: u32 = 0;
     for (ir.items, 0..) |inst, i| {
-        if (inst != .ret and !live[i]) {
+        if (hasValue(inst) and !live[i]) {
             live[i] = true;
             live_count += 1;
         }
@@ -97,11 +144,13 @@ fn computeFrameSize(ir: *const std.ArrayList(Inst), use_count: []u32, gpa: std.m
             }
         }.c;
         switch (inst) {
-            .iadd, .isub, .imul, .idiv => |p| {
+            .iadd, .isub, .imul, .idiv, .ilt, .igt, .ile, .ige, .ieq, .ine => |p| {
                 consume(rem_uses, live, &live_count, p.l);
                 consume(rem_uses, live, &live_count, p.r);
             },
             .print, .ret => |v| consume(rem_uses, live, &live_count, v),
+            .ijz => |j| consume(rem_uses, live, &live_count, j.cond),
+            .itoeax => |v| consume(rem_uses, live, &live_count, v),
             else => {},
         }
     }
@@ -210,8 +259,7 @@ const Emitter = struct {
 
     fn emitAddSub(self: *@This(), mnemonic: []const u8, p: InstPair, i: usize) !void {
         try self.loadIntoReg(p.l, eax_i);
-        if (self.loadImm(p.r)) |imm| try self.buf.print(self.gpa, "    {s} eax, {d}\n", .{ mnemonic, imm })
-        else {
+        if (self.loadImm(p.r)) |imm| try self.buf.print(self.gpa, "    {s} eax, {d}\n", .{ mnemonic, imm }) else {
             const rhs = try self.ensureAnyReg(p.r);
             try self.buf.print(self.gpa, "    {s} eax, {s}\n", .{ mnemonic, reg32[rhs] });
         }
@@ -222,6 +270,7 @@ const Emitter = struct {
     fn emitImul(self: *@This(), p: InstPair, i: usize) !void {
         if (self.loadImm(p.r)) |imm| {
             if (self.val_to_reg[p.l]) |lhs_r| {
+                // x86 three-operand imul: dest, src, imm — no eax constraint needed
                 try self.buf.print(self.gpa, "    imul eax, {s}, {d}\n", .{ reg32[lhs_r], imm });
                 self.reg_to_val[lhs_r] = null;
                 self.val_to_reg[p.l] = null;
@@ -230,12 +279,14 @@ const Emitter = struct {
                 if (self.loadImm(p.l)) |lhs_val| {
                     try self.buf.print(self.gpa, "    mov eax, {d}\n    imul eax, {d}\n", .{ lhs_val, imm });
                 } else {
+                    // imul can multiply from memory directly: imul eax, [rsp+slot], imm
                     const slot = self.spill_slots[p.l] orelse unreachable;
                     try self.buf.print(self.gpa, "    imul eax, [rsp+{d}], {d}\n", .{ slot, imm });
                     self.spill_slots[p.l] = null;
                 }
             }
         } else {
+            // Register rhs — same two-operand form as add/sub
             try self.loadIntoReg(p.l, eax_i);
             const rhs = try self.ensureAnyReg(p.r);
             try self.buf.print(self.gpa, "    imul eax, {s}\n", .{reg32[rhs]});
@@ -251,6 +302,32 @@ const Emitter = struct {
         try self.buf.appendSlice(self.gpa, "    cdq\n");
         try self.buf.print(self.gpa, "    idiv {s}\n", .{reg32[rhs]});
         self.assignResult(i);
+    }
+
+    fn emitCmp(self: *@This(), setcc: []const u8, p: InstPair, i: usize) !void {
+        try self.loadIntoReg(p.l, eax_i);
+        if (self.loadImm(p.r)) |imm| try self.buf.print(self.gpa, "    cmp eax, {d}\n", .{imm}) else {
+            const rhs = try self.ensureAnyReg(p.r);
+            try self.buf.print(self.gpa, "    cmp eax, {s}\n", .{reg32[rhs]});
+        }
+        self.freeOperands(p);
+        try self.buf.print(self.gpa, "    {s} al\n", .{setcc});
+        try self.buf.appendSlice(self.gpa, "    movzx eax, al\n");
+        self.assignResult(i);
+    }
+
+    fn emitJz(self: *@This(), cond: InstRef, label: u32) !void {
+        const cond_reg = try self.ensureAnyReg(cond);
+        self.use_count[cond] -= 1;
+        try self.buf.print(self.gpa, "    cmp {s}, 0\n", .{reg32[cond_reg]});
+        self.freeIfDead(cond);
+        try self.buf.print(self.gpa, "    je .L{d}\n", .{label});
+    }
+
+    fn emitToEax(self: *@This(), val: InstRef) !void {
+        try self.loadIntoReg(val, eax_i);
+        self.use_count[val] -= 1;
+        self.freeIfDead(val);
     }
 
     fn assignResult(self: *@This(), i: usize) void {
@@ -288,6 +365,12 @@ pub fn emitIr(ir: *const std.ArrayList(Inst), buf: *std.ArrayList(u8), gpa: std.
             .isub => |p| try self.emitAddSub("sub", p, i),
             .imul => |p| try self.emitImul(p, i),
             .idiv => |p| try self.emitIdiv(p, i),
+            .ilt => |p| try self.emitCmp("setl", p, i),
+            .igt => |p| try self.emitCmp("setg", p, i),
+            .ile => |p| try self.emitCmp("setle", p, i),
+            .ige => |p| try self.emitCmp("setge", p, i),
+            .ieq => |p| try self.emitCmp("sete", p, i),
+            .ine => |p| try self.emitCmp("setne", p, i),
             .print => |v| {
                 try self.loadIntoReg(v, eax_i);
                 self.use_count[v] -= 1;
@@ -308,6 +391,11 @@ pub fn emitIr(ir: *const std.ArrayList(Inst), buf: *std.ArrayList(u8), gpa: std.
                 self.reg_to_val[r] = @intCast(i);
                 self.val_to_reg[i] = r;
             },
+            .ijz => |j| try self.emitJz(j.cond, j.label),
+            .ijmp => |label| try buf.print(gpa, "    jmp .L{d}\n", .{label}),
+            .ilabel => |label| try buf.print(gpa, ".L{d}:\n", .{label}),
+            .itoeax => |v| try self.emitToEax(v),
+            .iphi => self.assignResult(i),
         }
     }
 }

@@ -13,9 +13,20 @@ fn dumpIr(ir: *const std.ArrayList(Inst), writer: *std.Io.Writer) void {
             .isub => |p| writer.print("%{d} = isub %{d}, %{d}\n", .{ i, p.l, p.r }) catch return,
             .imul => |p| writer.print("%{d} = imul %{d}, %{d}\n", .{ i, p.l, p.r }) catch return,
             .idiv => |p| writer.print("%{d} = idiv %{d}, %{d}\n", .{ i, p.l, p.r }) catch return,
+            .ilt => |p| writer.print("%{d} = ilt %{d}, %{d}\n", .{ i, p.l, p.r }) catch return,
+            .igt => |p| writer.print("%{d} = igt %{d}, %{d}\n", .{ i, p.l, p.r }) catch return,
+            .ile => |p| writer.print("%{d} = ile %{d}, %{d}\n", .{ i, p.l, p.r }) catch return,
+            .ige => |p| writer.print("%{d} = ige %{d}, %{d}\n", .{ i, p.l, p.r }) catch return,
+            .ieq => |p| writer.print("%{d} = ieq %{d}, %{d}\n", .{ i, p.l, p.r }) catch return,
+            .ine => |p| writer.print("%{d} = ine %{d}, %{d}\n", .{ i, p.l, p.r }) catch return,
             .print => |v| writer.print("%{d} = print %{d}\n", .{ i, v }) catch return,
             .ret => |v| writer.print("%{d} = ret %{d}\n", .{ i, v }) catch return,
             .iarg => |idx| writer.print("%{d} = iarg %{d}\n", .{ i, idx }) catch return,
+            .ijz => |j| writer.print("%{d} = ijz %{d}, L{d}\n", .{ i, j.cond, j.label }) catch return,
+            .ijmp => |label| writer.print("%{d} = ijmp L{d}\n", .{ i, label }) catch return,
+            .ilabel => |label| writer.print("%{d} = ilabel L{d}\n", .{ i, label }) catch return,
+            .itoeax => |v| writer.print("%{d} = itoeax %{d}\n", .{ i, v }) catch return,
+            .iphi => writer.print("%{d} = iphi eax\n", .{i}) catch return,
         }
     }
 }
@@ -85,6 +96,59 @@ fn dumpAst(node: *const AstNode, writer: *std.Io.Writer) void {
             writer.writeAll(")") catch return;
         },
         .arg => |idx| writer.print("arg({d})", .{idx}) catch return,
+        .lt => |kids| {
+            writer.writeAll("(< ") catch return;
+            dumpAst(&kids[0], writer);
+            writer.writeAll(" ") catch return;
+            dumpAst(&kids[1], writer);
+            writer.writeAll(")") catch return;
+        },
+        .gt => |kids| {
+            writer.writeAll("(> ") catch return;
+            dumpAst(&kids[0], writer);
+            writer.writeAll(" ") catch return;
+            dumpAst(&kids[1], writer);
+            writer.writeAll(")") catch return;
+        },
+        .le => |kids| {
+            writer.writeAll("(<= ") catch return;
+            dumpAst(&kids[0], writer);
+            writer.writeAll(" ") catch return;
+            dumpAst(&kids[1], writer);
+            writer.writeAll(")") catch return;
+        },
+        .ge => |kids| {
+            writer.writeAll("(>= ") catch return;
+            dumpAst(&kids[0], writer);
+            writer.writeAll(" ") catch return;
+            dumpAst(&kids[1], writer);
+            writer.writeAll(")") catch return;
+        },
+        .eq => |kids| {
+            writer.writeAll("(== ") catch return;
+            dumpAst(&kids[0], writer);
+            writer.writeAll(" ") catch return;
+            dumpAst(&kids[1], writer);
+            writer.writeAll(")") catch return;
+        },
+        .ne => |kids| {
+            writer.writeAll("(!= ") catch return;
+            dumpAst(&kids[0], writer);
+            writer.writeAll(" ") catch return;
+            dumpAst(&kids[1], writer);
+            writer.writeAll(")") catch return;
+        },
+        .if_ => |data| {
+            writer.writeAll("(if ") catch return;
+            dumpAst(data.cond, writer);
+            writer.writeAll(" ") catch return;
+            dumpAst(data.then_, writer);
+            if (data.else_) |else_node| {
+                writer.writeAll(" ") catch return;
+                dumpAst(else_node, writer);
+            }
+            writer.writeAll(")") catch return;
+        },
     }
 }
 
