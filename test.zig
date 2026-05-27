@@ -11,10 +11,10 @@ fn runTestCapture(node: *const AstNode, args: []const []const u8) ![]u8 {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const asm_source = try compile(node, testing.allocator);
-    defer testing.allocator.free(asm_source);
+    const prog_bytes = try compile(node, testing.allocator);
+    defer testing.allocator.free(prog_bytes);
 
-    assembleAndLink(io, asm_source);
+    assembleAndLink(io, prog_bytes);
     defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
 
     var argv = try std.ArrayList([]const u8).initCapacity(testing.allocator, 1 + args.len);
@@ -33,6 +33,25 @@ fn runTestCapture(node: *const AstNode, args: []const []const u8) ![]u8 {
     }
 
     return result.stdout;
+}
+
+test "compile emits ELF executable bytes" {
+    const n = AstNode{ .int = 0 };
+    const elf = try compile(&n, testing.allocator);
+    defer testing.allocator.free(elf);
+
+    try testing.expect(elf.len >= 64);
+    try testing.expectEqual(@as(u8, 0x7f), elf[0]);
+    try testing.expectEqual(@as(u8, 'E'), elf[1]);
+    try testing.expectEqual(@as(u8, 'L'), elf[2]);
+    try testing.expectEqual(@as(u8, 'F'), elf[3]);
+    try testing.expectEqual(@as(u8, 2), elf[4]);
+    try testing.expectEqual(@as(u8, 1), elf[5]);
+
+    const e_type = std.mem.readInt(u16, elf[16..][0..2], .little);
+    const e_machine = std.mem.readInt(u16, elf[18..][0..2], .little);
+    try testing.expectEqual(@as(u16, 2), e_type);
+    try testing.expectEqual(@as(u16, 62), e_machine);
 }
 
 fn testPrint(node: *const AstNode, expected: []const u8) !void {

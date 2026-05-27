@@ -1,33 +1,51 @@
 const std = @import("std");
 const x86 = @import("x86.zig");
 const ir_mod = @import("ir.zig");
-const codegen = @import("codegen.zig");
 const AstNode = x86.AstNode;
-const Inst = ir_mod.Inst;
-const emitIr = codegen.emitIr;
+const InstPair = ir_mod.InstPair;
+const Program = ir_mod.Program;
 
-fn dumpIr(ir: *const std.ArrayList(Inst), writer: *std.Io.Writer) void {
-    for (ir.items, 0..) |inst, i| {
-        switch (inst) {
-            .iconst => |v| writer.print("%{d} = iconst {d}\n", .{ i, v }) catch return,
-            .iadd => |p| writer.print("%{d} = iadd %{d}, %{d}\n", .{ i, p.l, p.r }) catch return,
-            .isub => |p| writer.print("%{d} = isub %{d}, %{d}\n", .{ i, p.l, p.r }) catch return,
-            .imul => |p| writer.print("%{d} = imul %{d}, %{d}\n", .{ i, p.l, p.r }) catch return,
-            .idiv => |p| writer.print("%{d} = idiv %{d}, %{d}\n", .{ i, p.l, p.r }) catch return,
-            .ilt => |p| writer.print("%{d} = ilt %{d}, %{d}\n", .{ i, p.l, p.r }) catch return,
-            .igt => |p| writer.print("%{d} = igt %{d}, %{d}\n", .{ i, p.l, p.r }) catch return,
-            .ile => |p| writer.print("%{d} = ile %{d}, %{d}\n", .{ i, p.l, p.r }) catch return,
-            .ige => |p| writer.print("%{d} = ige %{d}, %{d}\n", .{ i, p.l, p.r }) catch return,
-            .ieq => |p| writer.print("%{d} = ieq %{d}, %{d}\n", .{ i, p.l, p.r }) catch return,
-            .ine => |p| writer.print("%{d} = ine %{d}, %{d}\n", .{ i, p.l, p.r }) catch return,
-            .print => |v| writer.print("%{d} = print %{d}\n", .{ i, v }) catch return,
-            .ret => |v| writer.print("%{d} = ret %{d}\n", .{ i, v }) catch return,
-            .iarg => |idx| writer.print("%{d} = iarg %{d}\n", .{ i, idx }) catch return,
-            .ijz => |j| writer.print("%{d} = ijz %{d}, L{d}\n", .{ i, j.cond, j.label }) catch return,
-            .ijmp => |label| writer.print("%{d} = ijmp L{d}\n", .{ i, label }) catch return,
-            .ilabel => |label| writer.print("%{d} = ilabel L{d}\n", .{ i, label }) catch return,
-            .itoeax => |v| writer.print("%{d} = itoeax %{d}\n", .{ i, v }) catch return,
-            .iphi => writer.print("%{d} = iphi eax\n", .{i}) catch return,
+fn printBinInst(writer: *std.Io.Writer, id: u32, name: []const u8, p: InstPair) void {
+    writer.print("  %{d} = {s} %{d}, %{d}\n", .{ id, name, p.l, p.r }) catch return;
+}
+
+fn printBranch(writer: *std.Io.Writer, b: ir_mod.Branch) void {
+    if (b.arg) |arg| writer.print("  br L{d}(%{d})\n", .{ b.target, arg }) catch return else writer.print("  br L{d}\n", .{b.target}) catch return;
+}
+
+fn printCbr(writer: *std.Io.Writer, c: @FieldType(ir_mod.Terminator, "cbr")) void {
+    if (c.then_branch.arg) |then_arg| {
+        if (c.else_branch.arg) |else_arg| writer.print("  cbr %{d}, L{d}(%{d}), L{d}(%{d})\n", .{ c.cond, c.then_branch.target, then_arg, c.else_branch.target, else_arg }) catch return else writer.print("  cbr %{d}, L{d}(%{d}), L{d}\n", .{ c.cond, c.then_branch.target, then_arg, c.else_branch.target }) catch return;
+    } else {
+        if (c.else_branch.arg) |else_arg| writer.print("  cbr %{d}, L{d}, L{d}(%{d})\n", .{ c.cond, c.then_branch.target, c.else_branch.target, else_arg }) catch return else writer.print("  cbr %{d}, L{d}, L{d}\n", .{ c.cond, c.then_branch.target, c.else_branch.target }) catch return;
+    }
+}
+
+fn dumpIr(program: *const Program, writer: *std.Io.Writer) void {
+    for (program.blocks.items) |blk| {
+        if (blk.param) |param| writer.print("L{d}(%{d}):\n", .{ blk.id, param }) catch return else writer.print("L{d}:\n", .{blk.id}) catch return;
+        for (blk.insts.items) |vinst| {
+            switch (vinst.op) {
+                .iconst => |v| writer.print("  %{d} = iconst {d}\n", .{ vinst.id, v }) catch return,
+                .iadd => |p| printBinInst(writer, vinst.id, "iadd", p),
+                .isub => |p| printBinInst(writer, vinst.id, "isub", p),
+                .imul => |p| printBinInst(writer, vinst.id, "imul", p),
+                .idiv => |p| printBinInst(writer, vinst.id, "idiv", p),
+                .ilt => |p| printBinInst(writer, vinst.id, "ilt", p),
+                .igt => |p| printBinInst(writer, vinst.id, "igt", p),
+                .ile => |p| printBinInst(writer, vinst.id, "ile", p),
+                .ige => |p| printBinInst(writer, vinst.id, "ige", p),
+                .ieq => |p| printBinInst(writer, vinst.id, "ieq", p),
+                .ine => |p| printBinInst(writer, vinst.id, "ine", p),
+                .print => |v| writer.print("  %{d} = print %{d}\n", .{ vinst.id, v }) catch return,
+                .iarg => |idx| writer.print("  %{d} = iarg %{d}\n", .{ vinst.id, idx }) catch return,
+            }
+        }
+        const terminator = blk.terminator orelse return;
+        switch (terminator) {
+            .ret => |v| writer.print("  ret %{d}\n", .{v}) catch return,
+            .br => |b| printBranch(writer, b),
+            .cbr => |c| printCbr(writer, c),
         }
     }
 }
@@ -44,127 +62,92 @@ pub fn parseDebugFlags(args: std.process.Args) DebugFlags {
     defer iter.deinit();
     _ = iter.next();
     while (iter.next()) |arg| {
-        if (std.mem.startsWith(u8, arg, "--debug=")) {
-            var rest = arg["--debug=".len..];
-            while (rest.len > 0) {
-                const comma = std.mem.indexOfScalar(u8, rest, ',') orelse rest.len;
-                const item = rest[0..comma];
-                if (std.mem.eql(u8, item, "ast")) flags.ast = true;
-                if (std.mem.eql(u8, item, "ssa")) flags.ssa = true;
-                if (std.mem.eql(u8, item, "asm")) flags.assembly = true;
-                if (comma == rest.len) break;
-                rest = rest[comma + 1 ..];
-            }
+        if (!std.mem.startsWith(u8, arg, "--debug=")) continue;
+        var rest = arg["--debug=".len..];
+        while (rest.len > 0) {
+            const comma = std.mem.indexOfScalar(u8, rest, ',') orelse rest.len;
+            const item = rest[0..comma];
+            if (std.mem.eql(u8, item, "ast")) flags.ast = true else if (std.mem.eql(u8, item, "ssa")) flags.ssa = true else if (std.mem.eql(u8, item, "asm")) flags.assembly = true;
+            if (comma == rest.len) break;
+            rest = rest[comma + 1 ..];
         }
     }
     return flags;
 }
 
-fn dumpAst(node: *const AstNode, writer: *std.Io.Writer) void {
+fn appendPrefix(prefix: []const u8, suffix: []const u8, buf: *[256]u8) ?[]const u8 {
+    const need = prefix.len + suffix.len;
+    if (need > buf.len) return null;
+    @memcpy(buf[0..prefix.len], prefix);
+    @memcpy(buf[prefix.len..need], suffix);
+    return buf[0..need];
+}
+
+fn writeAstLabel(writer: *std.Io.Writer, node: *const AstNode) void {
     switch (node.*) {
-        .int => |v| writer.print("{d}", .{v}) catch return,
-        .print => |child| {
-            writer.writeAll("(print ") catch return;
-            dumpAst(child, writer);
-            writer.writeAll(")") catch return;
-        },
-        .add => |kids| {
-            writer.writeAll("(+ ") catch return;
-            dumpAst(&kids[0], writer);
-            writer.writeAll(" ") catch return;
-            dumpAst(&kids[1], writer);
-            writer.writeAll(")") catch return;
-        },
-        .sub => |kids| {
-            writer.writeAll("(- ") catch return;
-            dumpAst(&kids[0], writer);
-            writer.writeAll(" ") catch return;
-            dumpAst(&kids[1], writer);
-            writer.writeAll(")") catch return;
-        },
-        .mul => |kids| {
-            writer.writeAll("(* ") catch return;
-            dumpAst(&kids[0], writer);
-            writer.writeAll(" ") catch return;
-            dumpAst(&kids[1], writer);
-            writer.writeAll(")") catch return;
-        },
-        .div => |kids| {
-            writer.writeAll("(/ ") catch return;
-            dumpAst(&kids[0], writer);
-            writer.writeAll(" ") catch return;
-            dumpAst(&kids[1], writer);
-            writer.writeAll(")") catch return;
-        },
-        .arg => |idx| writer.print("arg({d})", .{idx}) catch return,
-        .lt => |kids| {
-            writer.writeAll("(< ") catch return;
-            dumpAst(&kids[0], writer);
-            writer.writeAll(" ") catch return;
-            dumpAst(&kids[1], writer);
-            writer.writeAll(")") catch return;
-        },
-        .gt => |kids| {
-            writer.writeAll("(> ") catch return;
-            dumpAst(&kids[0], writer);
-            writer.writeAll(" ") catch return;
-            dumpAst(&kids[1], writer);
-            writer.writeAll(")") catch return;
-        },
-        .le => |kids| {
-            writer.writeAll("(<= ") catch return;
-            dumpAst(&kids[0], writer);
-            writer.writeAll(" ") catch return;
-            dumpAst(&kids[1], writer);
-            writer.writeAll(")") catch return;
-        },
-        .ge => |kids| {
-            writer.writeAll("(>= ") catch return;
-            dumpAst(&kids[0], writer);
-            writer.writeAll(" ") catch return;
-            dumpAst(&kids[1], writer);
-            writer.writeAll(")") catch return;
-        },
-        .eq => |kids| {
-            writer.writeAll("(== ") catch return;
-            dumpAst(&kids[0], writer);
-            writer.writeAll(" ") catch return;
-            dumpAst(&kids[1], writer);
-            writer.writeAll(")") catch return;
-        },
-        .ne => |kids| {
-            writer.writeAll("(!= ") catch return;
-            dumpAst(&kids[0], writer);
-            writer.writeAll(" ") catch return;
-            dumpAst(&kids[1], writer);
-            writer.writeAll(")") catch return;
-        },
-        .if_ => |data| {
-            writer.writeAll("(if ") catch return;
-            dumpAst(data.cond, writer);
-            writer.writeAll(" ") catch return;
-            dumpAst(data.then_, writer);
-            if (data.else_) |else_node| {
-                writer.writeAll(" ") catch return;
-                dumpAst(else_node, writer);
-            }
-            writer.writeAll(")") catch return;
-        },
+        .int => |v| writer.print("int {d}", .{v}) catch return,
+        .print => writer.writeAll("print") catch return,
+        .add => writer.writeAll("add") catch return,
+        .sub => writer.writeAll("sub") catch return,
+        .mul => writer.writeAll("mul") catch return,
+        .div => writer.writeAll("div") catch return,
+        .arg => |idx| writer.print("arg {d}", .{idx}) catch return,
+        .lt => writer.writeAll("lt") catch return,
+        .gt => writer.writeAll("gt") catch return,
+        .le => writer.writeAll("le") catch return,
+        .ge => writer.writeAll("ge") catch return,
+        .eq => writer.writeAll("eq") catch return,
+        .ne => writer.writeAll("ne") catch return,
+        .if_ => writer.writeAll("if") catch return,
     }
 }
 
-pub fn dumpDebugInfo(io: std.Io, flags: DebugFlags, root: *const AstNode, ir: ?*const std.ArrayList(Inst), gpa: std.mem.Allocator) !void {
+fn dumpAstNode(node: *const AstNode, writer: *std.Io.Writer, prefix: []const u8, is_last: bool, is_root: bool) void {
+    if (!is_root) writer.print("{s}{s}", .{ prefix, if (is_last) "└─" else "├─" }) catch return;
+    writeAstLabel(writer, node);
+    writer.writeAll("\n") catch return;
+
+    var next_prefix_buf: [256]u8 = undefined;
+    const next_suffix = if (is_root) "" else if (is_last) "  " else "│ ";
+    const next_prefix = appendPrefix(prefix, next_suffix, &next_prefix_buf) orelse return;
+
+    switch (node.*) {
+        .print => |child| dumpAstNode(child, writer, next_prefix, true, false),
+        .add, .sub, .mul, .div, .lt, .gt, .le, .ge, .eq, .ne => |kids| {
+            dumpAstNode(&kids[0], writer, next_prefix, false, false);
+            dumpAstNode(&kids[1], writer, next_prefix, true, false);
+        },
+        .if_ => |data| {
+            if (data.else_ != null) {
+                dumpAstNode(data.cond, writer, next_prefix, false, false);
+                dumpAstNode(data.then_, writer, next_prefix, false, false);
+                dumpAstNode(data.else_.?, writer, next_prefix, true, false);
+            } else {
+                dumpAstNode(data.cond, writer, next_prefix, false, false);
+                dumpAstNode(data.then_, writer, next_prefix, true, false);
+            }
+        },
+        .int, .arg => {},
+    }
+}
+
+fn dumpAstTree(node: *const AstNode, writer: *std.Io.Writer) void {
+    dumpAstNode(node, writer, "", true, true);
+}
+
+pub fn dumpDebugInfo(io: std.Io, flags: DebugFlags, root: *const AstNode, ir: ?*const Program, gpa: std.mem.Allocator) !void {
+    _ = gpa;
     if (flags.ast) {
-        var wbuf: [1024]u8 = undefined;
+        var wbuf: [4096]u8 = undefined;
         var w = std.Io.File.stdout().writer(io, &wbuf);
-        try w.interface.writeAll("; AST:\n; ");
-        dumpAst(root, &w.interface);
-        try w.interface.writeAll("\n\n");
+        try w.interface.writeAll("; AST:\n");
+        dumpAstTree(root, &w.interface);
+        try w.interface.writeAll("\n");
         try w.interface.flush();
     }
     if (ir) |irim| {
         if (flags.ssa) {
-            var wbuf: [1024]u8 = undefined;
+            var wbuf: [4096]u8 = undefined;
             var w = std.Io.File.stdout().writer(io, &wbuf);
             try w.interface.writeAll("; SSA IR:\n");
             dumpIr(irim, &w.interface);
@@ -172,14 +155,10 @@ pub fn dumpDebugInfo(io: std.Io, flags: DebugFlags, root: *const AstNode, ir: ?*
             try w.interface.flush();
         }
         if (flags.assembly) {
-            var asm_buf = try std.ArrayList(u8).initCapacity(gpa, 256);
-            defer asm_buf.deinit(gpa);
-            try asm_buf.appendSlice(gpa, "global _start\n_start:\n");
-            try emitIr(irim, &asm_buf, gpa);
             var wbuf: [4096]u8 = undefined;
             var w = std.Io.File.stdout().writer(io, &wbuf);
             try w.interface.writeAll("; --- asm ---\n");
-            try w.interface.writeAll(asm_buf.items);
+            try w.interface.writeAll("; binary-only backend enabled; text asm emitter removed\n");
             try w.interface.writeAll("; --- end asm ---\n");
             try w.interface.flush();
         }

@@ -50,14 +50,14 @@ pub const Block = struct {
     id: BlockId,
     param: ?ValueRef,
     insts: std.ArrayList(ValueInst),
-    term: ?Terminator,
+    terminator: ?Terminator,
 
     pub fn init(gpa: std.mem.Allocator, id: BlockId, param: ?ValueRef) error{OutOfMemory}!Block {
         return .{
             .id = id,
             .param = param,
             .insts = try std.ArrayList(ValueInst).initCapacity(gpa, 8),
-            .term = null,
+            .terminator = null,
         };
     }
 
@@ -127,14 +127,6 @@ const Lowerer = struct {
         return block_id;
     }
 
-    fn setCurrentBlock(self: *@This(), block_id: BlockId) void {
-        self.current_block_id = block_id;
-    }
-
-    fn setTerminator(self: *@This(), term: Terminator) void {
-        self.currentBlock().term = term;
-    }
-
     fn lowerPairOperands(self: *@This(), kids: *const [2]AstNode) error{OutOfMemory}!InstPair {
         const left = try self.lowerAst(&kids[0]);
         const right = try self.lowerAst(&kids[1]);
@@ -158,23 +150,23 @@ const Lowerer = struct {
         const else_block_id = try self.newBlock(false);
         const merge_block_id = try self.newBlock(true);
 
-        self.setTerminator(.{
+        self.currentBlock().terminator = .{
             .cbr = .{
                 .cond = condition_value,
                 .then_branch = .{ .target = then_block_id },
                 .else_branch = .{ .target = else_block_id },
             },
-        });
+        };
 
-        self.setCurrentBlock(then_block_id);
+        self.current_block_id = then_block_id;
         const then_value = try self.lowerAst(if_node.then_);
-        self.setTerminator(.{ .br = .{ .target = merge_block_id, .arg = then_value } });
+        self.currentBlock().terminator = .{ .br = .{ .target = merge_block_id, .arg = then_value } };
 
-        self.setCurrentBlock(else_block_id);
+        self.current_block_id = else_block_id;
         const else_value = try self.lowerElseValue(if_node.else_);
-        self.setTerminator(.{ .br = .{ .target = merge_block_id, .arg = else_value } });
+        self.currentBlock().terminator = .{ .br = .{ .target = merge_block_id, .arg = else_value } };
 
-        self.setCurrentBlock(merge_block_id);
+        self.current_block_id = merge_block_id;
         return self.currentBlock().param orelse unreachable;
     }
 
@@ -203,7 +195,7 @@ pub fn lower(node: *const AstNode, gpa: std.mem.Allocator) error{OutOfMemory}!Pr
     errdefer lowerer.prog.deinit(gpa);
 
     const result = try lowerer.lowerAst(node);
-    lowerer.setTerminator(.{ .ret = result });
+    lowerer.currentBlock().terminator = .{ .ret = result };
 
     return lowerer.prog;
 }

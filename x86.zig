@@ -70,24 +70,17 @@ fn waitForExitCode(io: std.Io, child: *std.process.Child) u8 {
     }
 }
 
-fn runCommandOrExit(io: std.Io, argv: []const []const u8) void {
-    var child = std.process.spawn(io, .{ .argv = argv, .stderr = .inherit }) catch std.process.exit(1);
-    const code = waitForExitCode(io, &child);
-    if (code != 0) std.process.exit(code);
-}
-
 fn isDebugFlag(arg: []const u8) bool {
     return std.mem.startsWith(u8, arg, "--debug=");
 }
 
-pub fn assembleAndLink(io: std.Io, asm_source: []const u8) void {
+pub fn assembleAndLink(io: std.Io, prog_bytes: []const u8) void {
     const cwd = std.Io.Dir.cwd();
-    cwd.writeFile(io, .{ .sub_path = "x86.asm", .data = asm_source }) catch std.process.exit(1);
-    defer cwd.deleteFile(io, "x86.asm") catch {};
-    defer cwd.deleteFile(io, "x86.o") catch {};
-
-    runCommandOrExit(io, &.{ "nasm", "-f", "elf64", "x86.asm", "-o", "x86.o" });
-    runCommandOrExit(io, &.{ "ld", "x86.o", "-o", "prog" });
+    cwd.writeFile(io, .{
+        .sub_path = "prog",
+        .data = prog_bytes,
+        .flags = .{ .permissions = .executable_file },
+    }) catch std.process.exit(1);
 }
 
 pub fn runProg(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) u8 {
@@ -102,10 +95,10 @@ pub fn runProg(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) u8 
 }
 
 pub fn eval(io: std.Io, node: *const AstNode, gpa: std.mem.Allocator, args: []const []const u8) u8 {
-    const asm_source = codegen.compile(node, gpa) catch std.process.exit(1);
-    defer gpa.free(asm_source);
+    const prog_bytes = codegen.compile(node, gpa) catch std.process.exit(1);
+    defer gpa.free(prog_bytes);
 
-    assembleAndLink(io, asm_source);
+    assembleAndLink(io, prog_bytes);
     return runProg(io, gpa, args);
 }
 
@@ -141,9 +134,9 @@ pub fn main(init: std.process.Init) !void {
 
     try debug.dumpDebugInfo(io, flags, &root, &ir, gpa);
 
-    const asm_source = try codegen.compileIr(&ir, gpa);
-    defer gpa.free(asm_source);
+    const prog_bytes = try codegen.compileProgram(&ir, gpa);
+    defer gpa.free(prog_bytes);
 
-    assembleAndLink(io, asm_source);
+    assembleAndLink(io, prog_bytes);
     _ = runProg(io, gpa, prog_args);
 }
