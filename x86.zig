@@ -395,7 +395,7 @@ fn emitIr(ir: *const std.ArrayList(Inst), buf: *std.ArrayList(u8), gpa: std.mem.
             },
             .ret => |v| {
                 try loadIntoReg(v, eax_i, locs, &reg_owner, spill_slots, &spill_idx, use_count, buf, gpa);
-                try buf.appendSlice(gpa, "    mov edi, eax\n    mov eax, 60\n    syscall\n");
+                try buf.appendSlice(gpa, "    xor edi, edi\n    mov eax, 60\n    syscall\n");
             },
             .iarg => |idx| {
                 try evict(eax_i, &reg_owner, spill_slots, &spill_idx, locs, use_count, buf, gpa);
