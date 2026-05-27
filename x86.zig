@@ -205,7 +205,7 @@ fn emitIr(ir: *const std.ArrayList(Inst), buf: *std.ArrayList(u8), gpa: std.mem.
     }.e;
 
     const loadIntoReg = struct {
-        fn load(val: u32, r: usize, locs_: []?usize, owner: *[NUM_REGS]?u32, slots: []?u32, sidx: *u32, uc: []const u32, buf_: *std.ArrayList(u8), gpa_: std.mem.Allocator) !void {
+        fn load(val: u32, r: usize, locs_: []?usize, owner: *[NUM_REGS]?u32, slots: []?u32, sidx: *u32, uc: []const u32, iri: []const Inst, buf_: *std.ArrayList(u8), gpa_: std.mem.Allocator) !void {
             if (locs_[val]) |curr| {
                 if (curr == r) return;
                 try evict(r, owner, slots, sidx, locs_, uc, buf_, gpa_);
@@ -213,10 +213,18 @@ fn emitIr(ir: *const std.ArrayList(Inst), buf: *std.ArrayList(u8), gpa: std.mem.
                 locs_[val] = r;
                 owner[curr] = null;
                 owner[r] = val;
-            } else {
-                const slot = slots[val] orelse unreachable;
+            } else if (slots[val]) |slot| {
                 try evict(r, owner, slots, sidx, locs_, uc, buf_, gpa_);
                 try buf_.print(gpa_, "    mov {s}, [rsp+{d}]\n", .{ reg32[r], slot });
+                locs_[val] = r;
+                owner[r] = val;
+            } else {
+                const imm = switch (iri[val]) {
+                    .iconst => |v| v,
+                    else => unreachable,
+                };
+                try evict(r, owner, slots, sidx, locs_, uc, buf_, gpa_);
+                try buf_.print(gpa_, "    mov {s}, {d}\n", .{ reg32[r], imm });
                 locs_[val] = r;
                 owner[r] = val;
             }
@@ -224,7 +232,7 @@ fn emitIr(ir: *const std.ArrayList(Inst), buf: *std.ArrayList(u8), gpa: std.mem.
     }.load;
 
     const ensureAnyReg = struct {
-        fn ensure(val: u32, locs_: []?usize, owner: *[NUM_REGS]?u32, slots: []?u32, sidx: *u32, uc: []const u32, buf_: *std.ArrayList(u8), gpa_: std.mem.Allocator) !usize {
+        fn ensure(val: u32, locs_: []?usize, owner: *[NUM_REGS]?u32, slots: []?u32, sidx: *u32, uc: []const u32, iri: []const Inst, buf_: *std.ArrayList(u8), gpa_: std.mem.Allocator) !usize {
             if (locs_[val]) |r| return r;
             var fr: ?usize = null;
             for (owner.*, 0..) |o, ri| {
@@ -256,7 +264,8 @@ fn emitIr(ir: *const std.ArrayList(Inst), buf: *std.ArrayList(u8), gpa: std.mem.
                 fr = victim;
             }
             const r = fr.?;
-            try loadIntoReg(val, r, locs_, owner, slots, sidx, uc, buf_, gpa_);
+            try loadIntoReg(val, r, locs_, owner, slots, sidx, uc, iri, buf_, gpa_);
+
             return r;
         }
     }.ensure;
@@ -273,43 +282,9 @@ fn emitIr(ir: *const std.ArrayList(Inst), buf: *std.ArrayList(u8), gpa: std.mem.
 
     for (ir.items, 0..) |inst, i| {
         switch (inst) {
-            .iconst => |v| {
-                var fr: ?usize = null;
-                for (&reg_owner, 0..) |o, ri| {
-                    if (o == null and ri != eax_i) {
-                        fr = ri;
-                        break;
-                    }
-                }
-                if (fr == null) {
-                    for (&reg_owner, 0..) |o, ri| {
-                        if (o == null) {
-                            fr = ri;
-                            break;
-                        }
-                    }
-                }
-                if (fr == null) {
-                    var victim: usize = 0;
-                    var min_uc: u32 = std.math.maxInt(u32);
-                    for (&reg_owner, 0..) |o, ri| {
-                        if (o) |val| {
-                            if (use_count[val] < min_uc) {
-                                min_uc = use_count[val];
-                                victim = ri;
-                            }
-                        }
-                    }
-                    try spillReg(victim, &reg_owner, spill_slots, &spill_idx, locs, buf, gpa);
-                    fr = victim;
-                }
-                const r = fr.?;
-                reg_owner[r] = @intCast(i);
-                locs[i] = r;
-                try buf.print(gpa, "    mov {s}, {d}\n", .{ reg32[r], v });
-            },
+            .iconst => {},
             .iadd => |p| {
-                try loadIntoReg(p.l, eax_i, locs, &reg_owner, spill_slots, &spill_idx, use_count, buf, gpa);
+                try loadIntoReg(p.l, eax_i, locs, &reg_owner, spill_slots, &spill_idx, use_count, ir.items, buf, gpa);
                 const rhs_imm: ?i32 = switch (ir.items[p.r]) {
                     .iconst => |v| v,
                     else => null,
@@ -317,7 +292,7 @@ fn emitIr(ir: *const std.ArrayList(Inst), buf: *std.ArrayList(u8), gpa: std.mem.
                 if (rhs_imm) |imm| {
                     try buf.print(gpa, "    add eax, {d}\n", .{imm});
                 } else {
-                    const rhs = try ensureAnyReg(p.r, locs, &reg_owner, spill_slots, &spill_idx, use_count, buf, gpa);
+                    const rhs = try ensureAnyReg(p.r, locs, &reg_owner, spill_slots, &spill_idx, use_count, ir.items, buf, gpa);
                     try buf.print(gpa, "    add eax, {s}\n", .{reg32[rhs]});
                 }
                 use_count[p.l] -= 1;
@@ -328,7 +303,7 @@ fn emitIr(ir: *const std.ArrayList(Inst), buf: *std.ArrayList(u8), gpa: std.mem.
                 locs[i] = eax_i;
             },
             .isub => |p| {
-                try loadIntoReg(p.l, eax_i, locs, &reg_owner, spill_slots, &spill_idx, use_count, buf, gpa);
+                try loadIntoReg(p.l, eax_i, locs, &reg_owner, spill_slots, &spill_idx, use_count, ir.items, buf, gpa);
                 const rhs_imm: ?i32 = switch (ir.items[p.r]) {
                     .iconst => |v| v,
                     else => null,
@@ -336,7 +311,7 @@ fn emitIr(ir: *const std.ArrayList(Inst), buf: *std.ArrayList(u8), gpa: std.mem.
                 if (rhs_imm) |imm| {
                     try buf.print(gpa, "    sub eax, {d}\n", .{imm});
                 } else {
-                    const rhs = try ensureAnyReg(p.r, locs, &reg_owner, spill_slots, &spill_idx, use_count, buf, gpa);
+                    const rhs = try ensureAnyReg(p.r, locs, &reg_owner, spill_slots, &spill_idx, use_count, ir.items, buf, gpa);
                     try buf.print(gpa, "    sub eax, {s}\n", .{reg32[rhs]});
                 }
                 use_count[p.l] -= 1;
@@ -357,13 +332,22 @@ fn emitIr(ir: *const std.ArrayList(Inst), buf: *std.ArrayList(u8), gpa: std.mem.
                         reg_owner[lhs_r] = null;
                         locs[p.l] = null;
                     } else {
-                        const slot = spill_slots[p.l] orelse unreachable;
-                        try buf.print(gpa, "    imul eax, [rsp+{d}], {d}\n", .{ slot, imm });
-                        spill_slots[p.l] = null;
+                        try evict(eax_i, &reg_owner, spill_slots, &spill_idx, locs, use_count, buf, gpa);
+                        const lhs_imm: ?i32 = switch (ir.items[p.l]) {
+                            .iconst => |v| v,
+                            else => null,
+                        };
+                        if (lhs_imm) |lhs_val| {
+                            try buf.print(gpa, "    mov eax, {d}\n    imul eax, {d}\n", .{ lhs_val, imm });
+                        } else {
+                            const slot = spill_slots[p.l] orelse unreachable;
+                            try buf.print(gpa, "    imul eax, [rsp+{d}], {d}\n", .{ slot, imm });
+                            spill_slots[p.l] = null;
+                        }
                     }
                 } else {
-                    try loadIntoReg(p.l, eax_i, locs, &reg_owner, spill_slots, &spill_idx, use_count, buf, gpa);
-                    const rhs = try ensureAnyReg(p.r, locs, &reg_owner, spill_slots, &spill_idx, use_count, buf, gpa);
+                    try loadIntoReg(p.l, eax_i, locs, &reg_owner, spill_slots, &spill_idx, use_count, ir.items, buf, gpa);
+                    const rhs = try ensureAnyReg(p.r, locs, &reg_owner, spill_slots, &spill_idx, use_count, ir.items, buf, gpa);
                     try buf.print(gpa, "    imul eax, {s}\n", .{reg32[rhs]});
                 }
                 use_count[p.l] -= 1;
@@ -374,8 +358,8 @@ fn emitIr(ir: *const std.ArrayList(Inst), buf: *std.ArrayList(u8), gpa: std.mem.
                 locs[i] = eax_i;
             },
             .idiv => |p| {
-                try loadIntoReg(p.l, eax_i, locs, &reg_owner, spill_slots, &spill_idx, use_count, buf, gpa);
-                const rhs = try ensureAnyReg(p.r, locs, &reg_owner, spill_slots, &spill_idx, use_count, buf, gpa);
+                try loadIntoReg(p.l, eax_i, locs, &reg_owner, spill_slots, &spill_idx, use_count, ir.items, buf, gpa);
+                const rhs = try ensureAnyReg(p.r, locs, &reg_owner, spill_slots, &spill_idx, use_count, ir.items, buf, gpa);
                 use_count[p.l] -= 1;
                 freeIfDead(p.l, locs, &reg_owner, use_count);
                 use_count[p.r] -= 1;
@@ -386,7 +370,7 @@ fn emitIr(ir: *const std.ArrayList(Inst), buf: *std.ArrayList(u8), gpa: std.mem.
                 locs[i] = eax_i;
             },
             .print => |v| {
-                try loadIntoReg(v, eax_i, locs, &reg_owner, spill_slots, &spill_idx, use_count, buf, gpa);
+                try loadIntoReg(v, eax_i, locs, &reg_owner, spill_slots, &spill_idx, use_count, ir.items, buf, gpa);
                 use_count[v] -= 1;
                 freeIfDead(v, locs, &reg_owner, use_count);
                 try buf.appendSlice(gpa, "    call print_int\n");
@@ -394,7 +378,7 @@ fn emitIr(ir: *const std.ArrayList(Inst), buf: *std.ArrayList(u8), gpa: std.mem.
                 locs[i] = eax_i;
             },
             .ret => |v| {
-                try loadIntoReg(v, eax_i, locs, &reg_owner, spill_slots, &spill_idx, use_count, buf, gpa);
+                try loadIntoReg(v, eax_i, locs, &reg_owner, spill_slots, &spill_idx, use_count, ir.items, buf, gpa);
                 try buf.appendSlice(gpa, "    mov edi, eax\n    mov eax, 60\n    syscall\n");
             },
             .iarg => |idx| {
@@ -604,15 +588,17 @@ pub fn main(init: std.process.Init) !void {
     const prog_args = prog_args_list.items;
 
     var arg_node: AstNode = undefined;
-    var kids: [2]AstNode = undefined;
-    var div: AstNode = undefined;
+    var mkids: [2]AstNode = undefined;
+    var akids: [2]AstNode = undefined;
     const root = if (prog_args.len > 0) blk: {
         arg_node = .{ .arg = 1 };
         break :blk AstNode{ .print = &arg_node };
     } else blk: {
-        kids = .{ .{ .int = 12 }, .{ .int = 3 } };
-        div = .{ .div = &kids };
-        break :blk AstNode{ .print = &div };
+        mkids = .{ .{ .int = 2 }, .{ .int = 5 } };
+        const mul = AstNode{ .mul = &mkids };
+        akids = .{ mul, .{ .int = 3 } };
+        const add = AstNode{ .add = &akids };
+        break :blk AstNode{ .print = &add };
     };
 
     if (flags.ast) {
