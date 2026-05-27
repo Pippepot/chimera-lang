@@ -43,3 +43,30 @@ print_int:
     pop rbx
     pop rax
     ret
+
+atoi:
+    push rcx
+    xor eax, eax
+    xor ecx, ecx
+    cmp byte [rdi], '-'
+    jne .loop
+    mov cl, 1
+    inc rdi
+.loop:
+    movzx edx, byte [rdi]
+    test dl, dl
+    jz .done
+    sub edx, '0'
+    cmp edx, 9
+    ja .done
+    imul eax, 10
+    add eax, edx
+    inc rdi
+    jmp .loop
+.done:
+    test ecx, ecx
+    jz .ret
+    neg eax
+.ret:
+    pop rcx
+    ret

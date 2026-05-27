@@ -7,6 +7,7 @@ pub const AstNode = union(enum) {
     sub: *const [2]AstNode,
     mul: *const [2]AstNode,
     div: *const [2]AstNode,
+    arg: u32,
 };
 
 const InstRef = u32;
@@ -24,6 +25,7 @@ const Inst = union(enum) {
     idiv: InstPair,
     print: InstRef,
     ret: InstRef,
+    iarg: u32,
 };
 
 fn dumpIr(ir: *const std.ArrayList(Inst), writer: *std.Io.Writer) void {
@@ -36,6 +38,7 @@ fn dumpIr(ir: *const std.ArrayList(Inst), writer: *std.Io.Writer) void {
             .idiv => |p| writer.print("%{d} = idiv %{d}, %{d}\n", .{ i, p.l, p.r }) catch return,
             .print => |v| writer.print("%{d} = print %{d}\n", .{ i, v }) catch return,
             .ret => |v| writer.print("%{d} = ret %{d}\n", .{ i, v }) catch return,
+            .iarg => |idx| writer.print("%{d} = iarg %{d}\n", .{ i, idx }) catch return,
         }
     }
 }
@@ -68,6 +71,9 @@ fn lowerAst(arena: *std.ArrayList(Inst), node: *const AstNode, gpa: std.mem.Allo
             const l = try lowerAst(arena, &kids[0], gpa);
             const r = try lowerAst(arena, &kids[1], gpa);
             try arena.append(gpa, .{ .idiv = .{ .l = l, .r = r } });
+        },
+        .arg => |idx| {
+            try arena.append(gpa, .{ .iarg = idx });
         },
     }
     return @intCast(arena.items.len - 1);
@@ -304,46 +310,66 @@ fn emitIr(ir: *const std.ArrayList(Inst), buf: *std.ArrayList(u8), gpa: std.mem.
             },
             .iadd => |p| {
                 try loadIntoReg(p.l, eax_i, locs, &reg_owner, spill_slots, &spill_idx, use_count, buf, gpa);
-                const rhs = try ensureAnyReg(p.r, locs, &reg_owner, spill_slots, &spill_idx, use_count, buf, gpa);
+                const rhs_imm: ?i32 = switch (ir.items[p.r]) {
+                    .iconst => |v| v,
+                    else => null,
+                };
+                if (rhs_imm) |imm| {
+                    try buf.print(gpa, "    add eax, {d}\n", .{imm});
+                } else {
+                    const rhs = try ensureAnyReg(p.r, locs, &reg_owner, spill_slots, &spill_idx, use_count, buf, gpa);
+                    try buf.print(gpa, "    add eax, {s}\n", .{reg32[rhs]});
+                }
                 use_count[p.l] -= 1;
                 freeIfDead(p.l, locs, &reg_owner, use_count);
                 use_count[p.r] -= 1;
                 freeIfDead(p.r, locs, &reg_owner, use_count);
-                if (rhs == 1) {
-                    try buf.appendSlice(gpa, "    add eax, ebx\n");
-                } else {
-                    try buf.print(gpa, "    add eax, {s}\n", .{reg32[rhs]});
-                }
                 reg_owner[eax_i] = @intCast(i);
                 locs[i] = eax_i;
             },
             .isub => |p| {
                 try loadIntoReg(p.l, eax_i, locs, &reg_owner, spill_slots, &spill_idx, use_count, buf, gpa);
-                const rhs = try ensureAnyReg(p.r, locs, &reg_owner, spill_slots, &spill_idx, use_count, buf, gpa);
+                const rhs_imm: ?i32 = switch (ir.items[p.r]) {
+                    .iconst => |v| v,
+                    else => null,
+                };
+                if (rhs_imm) |imm| {
+                    try buf.print(gpa, "    sub eax, {d}\n", .{imm});
+                } else {
+                    const rhs = try ensureAnyReg(p.r, locs, &reg_owner, spill_slots, &spill_idx, use_count, buf, gpa);
+                    try buf.print(gpa, "    sub eax, {s}\n", .{reg32[rhs]});
+                }
                 use_count[p.l] -= 1;
                 freeIfDead(p.l, locs, &reg_owner, use_count);
                 use_count[p.r] -= 1;
                 freeIfDead(p.r, locs, &reg_owner, use_count);
-                if (rhs == 1) {
-                    try buf.appendSlice(gpa, "    sub eax, ebx\n");
-                } else {
-                    try buf.print(gpa, "    sub eax, {s}\n", .{reg32[rhs]});
-                }
                 reg_owner[eax_i] = @intCast(i);
                 locs[i] = eax_i;
             },
             .imul => |p| {
-                try loadIntoReg(p.l, eax_i, locs, &reg_owner, spill_slots, &spill_idx, use_count, buf, gpa);
-                const rhs = try ensureAnyReg(p.r, locs, &reg_owner, spill_slots, &spill_idx, use_count, buf, gpa);
+                const rhs_imm: ?i32 = switch (ir.items[p.r]) {
+                    .iconst => |v| v,
+                    else => null,
+                };
+                if (rhs_imm) |imm| {
+                    if (locs[p.l]) |lhs_r| {
+                        try buf.print(gpa, "    imul eax, {s}, {d}\n", .{ reg32[lhs_r], imm });
+                        reg_owner[lhs_r] = null;
+                        locs[p.l] = null;
+                    } else {
+                        const slot = spill_slots[p.l] orelse unreachable;
+                        try buf.print(gpa, "    imul eax, [rsp+{d}], {d}\n", .{ slot, imm });
+                        spill_slots[p.l] = null;
+                    }
+                } else {
+                    try loadIntoReg(p.l, eax_i, locs, &reg_owner, spill_slots, &spill_idx, use_count, buf, gpa);
+                    const rhs = try ensureAnyReg(p.r, locs, &reg_owner, spill_slots, &spill_idx, use_count, buf, gpa);
+                    try buf.print(gpa, "    imul eax, {s}\n", .{reg32[rhs]});
+                }
                 use_count[p.l] -= 1;
                 freeIfDead(p.l, locs, &reg_owner, use_count);
                 use_count[p.r] -= 1;
                 freeIfDead(p.r, locs, &reg_owner, use_count);
-                if (rhs == 1) {
-                    try buf.appendSlice(gpa, "    imul eax, ebx\n");
-                } else {
-                    try buf.print(gpa, "    imul eax, {s}\n", .{reg32[rhs]});
-                }
                 reg_owner[eax_i] = @intCast(i);
                 locs[i] = eax_i;
             },
@@ -355,11 +381,7 @@ fn emitIr(ir: *const std.ArrayList(Inst), buf: *std.ArrayList(u8), gpa: std.mem.
                 use_count[p.r] -= 1;
                 freeIfDead(p.r, locs, &reg_owner, use_count);
                 try buf.appendSlice(gpa, "    cdq\n");
-                if (rhs == 1) {
-                    try buf.appendSlice(gpa, "    idiv ebx\n");
-                } else {
-                    try buf.print(gpa, "    idiv {s}\n", .{reg32[rhs]});
-                }
+                try buf.print(gpa, "    idiv {s}\n", .{reg32[rhs]});
                 reg_owner[eax_i] = @intCast(i);
                 locs[i] = eax_i;
             },
@@ -374,6 +396,46 @@ fn emitIr(ir: *const std.ArrayList(Inst), buf: *std.ArrayList(u8), gpa: std.mem.
             .ret => |v| {
                 try loadIntoReg(v, eax_i, locs, &reg_owner, spill_slots, &spill_idx, use_count, buf, gpa);
                 try buf.appendSlice(gpa, "    mov edi, eax\n    mov eax, 60\n    syscall\n");
+            },
+            .iarg => |idx| {
+                try evict(eax_i, &reg_owner, spill_slots, &spill_idx, locs, use_count, buf, gpa);
+                var fr: ?usize = null;
+                for (&reg_owner, 0..) |o, ri| {
+                    if (o == null and ri != eax_i) {
+                        fr = ri;
+                        break;
+                    }
+                }
+                if (fr == null) {
+                    for (&reg_owner, 0..) |o, ri| {
+                        if (o == null) {
+                            fr = ri;
+                            break;
+                        }
+                    }
+                }
+                if (fr == null) {
+                    var victim: usize = 0;
+                    var min_uc: u32 = std.math.maxInt(u32);
+                    for (&reg_owner, 0..) |o, ri| {
+                        if (o) |val| {
+                            if (use_count[val] < min_uc) {
+                                min_uc = use_count[val];
+                                victim = ri;
+                            }
+                        }
+                    }
+                    try spillReg(victim, &reg_owner, spill_slots, &spill_idx, locs, buf, gpa);
+                    fr = victim;
+                }
+                const r = fr.?;
+                try buf.print(gpa, "    mov rdi, [rbp + {d}]\n", .{idx * 8});
+                try buf.appendSlice(gpa, "    call atoi\n");
+                if (r != eax_i) {
+                    try buf.print(gpa, "    mov {s}, eax\n", .{reg32[r]});
+                }
+                reg_owner[r] = @intCast(i);
+                locs[i] = r;
             },
         }
     }
@@ -391,6 +453,7 @@ fn compileIr(ir: *const std.ArrayList(Inst), gpa: std.mem.Allocator) error{OutOf
     var buf = try std.ArrayList(u8).initCapacity(gpa, 256);
     errdefer buf.deinit(gpa);
     try buf.appendSlice(gpa, "global _start\n_start:\n");
+    try buf.appendSlice(gpa, "    lea rbp, [rsp+8]\n");
     try emitIr(ir, &buf, gpa);
     try buf.appendSlice(gpa, @embedFile("print.asm"));
     return buf.toOwnedSlice(gpa);
@@ -421,19 +484,23 @@ pub fn assembleAndLink(io: std.Io, asm_source: []const u8) void {
     }
 }
 
-pub fn runProg(io: std.Io) u8 {
-    var child = std.process.spawn(io, .{ .argv = &.{"./prog"}, .stderr = .inherit }) catch std.process.exit(1);
+pub fn runProg(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) u8 {
+    var argv = std.ArrayList([]const u8).initCapacity(gpa, 1 + args.len) catch std.process.exit(1);
+    defer argv.deinit(gpa);
+    argv.appendAssumeCapacity("./prog");
+    for (args) |a| argv.appendAssumeCapacity(a);
+    var child = std.process.spawn(io, .{ .argv = argv.items, .stderr = .inherit }) catch std.process.exit(1);
     switch (child.wait(io) catch std.process.exit(1)) {
         .exited => |code| return code,
         else => std.process.exit(1),
     }
 }
 
-pub fn eval(io: std.Io, node: *const AstNode, gpa: std.mem.Allocator) u8 {
+pub fn eval(io: std.Io, node: *const AstNode, gpa: std.mem.Allocator, args: []const []const u8) u8 {
     const asm_source = compile(node, gpa) catch std.process.exit(1);
     defer gpa.free(asm_source);
     assembleAndLink(io, asm_source);
-    return runProg(io);
+    return runProg(io, gpa, args);
 }
 
 const DebugFlags = struct {
@@ -500,6 +567,7 @@ fn dumpAst(node: *const AstNode, writer: *std.Io.Writer) void {
             dumpAst(&kids[1], writer);
             writer.writeAll(")") catch return;
         },
+        .arg => |idx| writer.print("arg({d})", .{idx}) catch return,
     }
 }
 
@@ -507,11 +575,45 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const gpa = init.gpa;
 
-    var kids = [2]AstNode{ .{ .int = 12 }, .{ .int = 3 } };
-    var div = AstNode{ .div = &kids };
-    var root = AstNode{ .print = &div };
+    var flags = DebugFlags{};
+    var prog_args_list = try std.ArrayList([]const u8).initCapacity(gpa, 4);
+    defer prog_args_list.deinit(gpa);
 
-    const flags = parseDebugFlags(init.minimal.args);
+    {
+        var iter = std.process.Args.Iterator.init(init.minimal.args);
+        defer iter.deinit();
+        _ = iter.next();
+        while (iter.next()) |arg| {
+            if (std.mem.startsWith(u8, arg, "--debug=")) {
+                var rest = arg["--debug=".len..];
+                while (rest.len > 0) {
+                    const comma = std.mem.indexOfScalar(u8, rest, ',') orelse rest.len;
+                    const item = rest[0..comma];
+                    if (std.mem.eql(u8, item, "ast")) flags.ast = true;
+                    if (std.mem.eql(u8, item, "ssa")) flags.ssa = true;
+                    if (std.mem.eql(u8, item, "asm")) flags.assembly = true;
+                    if (comma == rest.len) break;
+                    rest = rest[comma + 1 ..];
+                }
+            } else {
+                try prog_args_list.append(gpa, arg);
+            }
+        }
+    }
+
+    const prog_args = prog_args_list.items;
+
+    var arg_node: AstNode = undefined;
+    var kids: [2]AstNode = undefined;
+    var div: AstNode = undefined;
+    const root = if (prog_args.len > 0) blk: {
+        arg_node = .{ .arg = 1 };
+        break :blk AstNode{ .print = &arg_node };
+    } else blk: {
+        kids = .{ .{ .int = 12 }, .{ .int = 3 } };
+        div = .{ .div = &kids };
+        break :blk AstNode{ .print = &div };
+    };
 
     if (flags.ast) {
         var wbuf: [1024]u8 = undefined;
@@ -538,14 +640,18 @@ pub fn main(init: std.process.Init) !void {
     defer gpa.free(asm_source);
 
     if (flags.assembly) {
+        var asm_buf = try std.ArrayList(u8).initCapacity(gpa, 256);
+        defer asm_buf.deinit(gpa);
+        try asm_buf.appendSlice(gpa, "global _start\n_start:\n");
+        try emitIr(&ir, &asm_buf, gpa);
         var wbuf: [4096]u8 = undefined;
         var w = std.Io.File.stdout().writer(io, &wbuf);
         try w.interface.writeAll("; --- asm ---\n");
-        try w.interface.writeAll(asm_source);
+        try w.interface.writeAll(asm_buf.items);
         try w.interface.writeAll("; --- end asm ---\n");
         try w.interface.flush();
     }
 
     assembleAndLink(io, asm_source);
-    _ = runProg(io);
+    _ = runProg(io, gpa, prog_args);
 }

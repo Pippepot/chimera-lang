@@ -6,7 +6,7 @@ const eval = @import("x86.zig").eval;
 fn runTest(node: *const AstNode) u8 {
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
-    return eval(threaded.io(), node, testing.allocator);
+    return eval(threaded.io(), node, testing.allocator, &.{});
 }
 
 test "int" {
