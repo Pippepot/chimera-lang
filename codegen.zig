@@ -3,329 +3,213 @@ const ir_mod = @import("ir.zig");
 const x86 = @import("x86.zig");
 const AstNode = x86.AstNode;
 
-pub const InstRef = ir_mod.InstRef;
+pub const InstRef = ir_mod.ValueRef;
 pub const InstPair = ir_mod.InstPair;
 pub const Inst = ir_mod.Inst;
+pub const BlockId = ir_mod.BlockId;
+pub const Program = ir_mod.Program;
 pub const lower = ir_mod.lower;
 
-const reg64 = [_][]const u8{ "rax", "rbx", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15" };
-const reg32 = [_][]const u8{ "eax", "ebx", "r8d", "r9d", "r10d", "r11d", "r12d", "r13d", "r14d", "r15d" };
-const eax_i = 0;
-const NUM_REGS = 10;
-
-fn hasValue(inst: Inst) bool {
-    return switch (inst) {
-        .ret, .ijz, .ijmp, .ilabel, .itoeax => false,
-        else => true,
-    };
+fn slotOffset(value_ref: InstRef) u32 {
+    return value_ref * 8;
 }
 
-fn computeUseCounts(ir: *const std.ArrayList(Inst), gpa: std.mem.Allocator) error{OutOfMemory}![]u32 {
-    var use_count = try gpa.alloc(u32, ir.items.len);
-    @memset(use_count, 0);
-    for (ir.items) |inst| {
-        switch (inst) {
-            .iadd, .isub, .imul, .idiv, .ilt, .igt, .ile, .ige, .ieq, .ine => |p| {
-                use_count[p.l] += 1;
-                use_count[p.r] += 1;
-            },
-            .print, .ret => |v| use_count[v] += 1,
-            .ijz => |j| use_count[j.cond] += 1,
-            .itoeax => |v| use_count[v] += 1,
-            else => {},
-        }
-    }
-    return use_count;
-}
-
-fn computeFrameSize(ir: *const std.ArrayList(Inst), use_count: []u32, gpa: std.mem.Allocator) u32 {
-    const rem_uses = gpa.alloc(u32, ir.items.len) catch return 0;
-    defer gpa.free(rem_uses);
-    @memcpy(rem_uses, use_count);
-    const live = gpa.alloc(bool, ir.items.len) catch return 0;
-    defer gpa.free(live);
-    @memset(live, false);
-    var live_count: u32 = 0;
-    var peak: u32 = 0;
-    for (ir.items, 0..) |inst, i| {
-        if (hasValue(inst) and !live[i]) {
-            live[i] = true;
-            live_count += 1;
-        }
-        peak = @max(peak, live_count);
-        const consume = struct {
-            fn c(rem: []u32, lv: []bool, lc: *u32, ref: u32) void {
-                std.debug.assert(rem[ref] > 0);
-                rem[ref] -= 1;
-                if (rem[ref] == 0 and lv[ref]) {
-                    lv[ref] = false;
-                    lc.* -= 1;
-                }
-            }
-        }.c;
-        switch (inst) {
-            .iadd, .isub, .imul, .idiv, .ilt, .igt, .ile, .ige, .ieq, .ine => |p| {
-                consume(rem_uses, live, &live_count, p.l);
-                consume(rem_uses, live, &live_count, p.r);
-            },
-            .print, .ret => |v| consume(rem_uses, live, &live_count, v),
-            .ijz => |j| consume(rem_uses, live, &live_count, j.cond),
-            .itoeax => |v| consume(rem_uses, live, &live_count, v),
-            else => {},
-        }
-    }
-    return if (peak > NUM_REGS) (peak - NUM_REGS) * 8 else 0;
-}
+const BranchCopy = struct {
+    src: InstRef,
+    dst: InstRef,
+};
 
 const Emitter = struct {
-    iri: []const Inst,
     buf: *std.ArrayList(u8),
     gpa: std.mem.Allocator,
-    val_to_reg: []?usize,
-    reg_to_val: [NUM_REGS]?u32,
-    spill_slots: []?u32,
-    spill_idx: u32,
-    use_count: []u32,
+    block_params: []?InstRef,
+    prep_label_counter: u32,
 
-    fn loadImm(self: *@This(), ref: u32) ?i32 {
-        return switch (self.iri[ref]) {
-            .iconst => |v| v,
-            else => null,
+    fn init(prog: *const Program, buf: *std.ArrayList(u8), gpa: std.mem.Allocator) error{OutOfMemory}!@This() {
+        var params = try gpa.alloc(?InstRef, prog.blocks.items.len);
+        @memset(params, null);
+        for (prog.blocks.items) |blk| params[blk.id] = blk.param;
+        return .{
+            .buf = buf,
+            .gpa = gpa,
+            .block_params = params,
+            .prep_label_counter = 0,
         };
     }
 
-    fn spillReg(self: *@This(), r: usize) !void {
-        const v = self.reg_to_val[r].?;
-        if (self.spill_slots[v] == null) {
-            try self.buf.print(self.gpa, "    mov [rsp+{d}], {s}\n", .{ self.spill_idx, reg64[r] });
-            self.spill_slots[v] = self.spill_idx;
-            self.spill_idx += 8;
-        }
-        self.val_to_reg[v] = null;
-        self.reg_to_val[r] = null;
+    fn deinit(self: *@This()) void {
+        self.gpa.free(self.block_params);
     }
 
-    fn evict(self: *@This(), r: usize) !void {
-        if (self.reg_to_val[r]) |v| {
-            if (self.use_count[v] > 0) try self.spillReg(r);
-            self.val_to_reg[v] = null;
-            self.reg_to_val[r] = null;
-        }
+    fn appendLine(self: *@This(), line: []const u8) !void {
+        try self.buf.appendSlice(self.gpa, line);
     }
 
-    fn findFreeReg(self: *@This()) !usize {
-        var victim: usize = 0;
-        var min_uc: u32 = std.math.maxInt(u32);
-        for (self.reg_to_val, 0..) |o, ri| {
-            if (o) |v| {
-                if (self.use_count[v] < min_uc) {
-                    min_uc = self.use_count[v];
-                    victim = ri;
-                }
-            } else {
-                return ri;
-            }
-        }
-        try self.spillReg(victim);
-        return victim;
+    fn loadReg(self: *@This(), reg: []const u8, value_ref: InstRef) !void {
+        try self.buf.print(self.gpa, "    mov {s}, [rsp+{d}]\n", .{ reg, slotOffset(value_ref) });
     }
 
-    fn loadIntoReg(self: *@This(), val: u32, r: usize) !void {
-        if (self.val_to_reg[val]) |curr| {
-            if (curr == r) return;
-            try self.evict(r);
-            try self.buf.print(self.gpa, "    mov {s}, {s}\n", .{ reg32[r], reg32[curr] });
-            self.val_to_reg[val] = r;
-            self.reg_to_val[curr] = null;
-            self.reg_to_val[r] = val;
-        } else if (self.spill_slots[val]) |slot| {
-            try self.evict(r);
-            try self.buf.print(self.gpa, "    mov {s}, [rsp+{d}]\n", .{ reg32[r], slot });
-            self.val_to_reg[val] = r;
-            self.reg_to_val[r] = val;
-        } else {
-            const imm = switch (self.iri[val]) {
-                .iconst => |v| v,
-                else => unreachable,
-            };
-            try self.evict(r);
-            try self.buf.print(self.gpa, "    mov {s}, {d}\n", .{ reg32[r], imm });
-            self.val_to_reg[val] = r;
-            self.reg_to_val[r] = val;
-        }
+    fn storeRax(self: *@This(), value_ref: InstRef) !void {
+        try self.buf.print(self.gpa, "    mov [rsp+{d}], rax\n", .{slotOffset(value_ref)});
     }
 
-    fn ensureAnyReg(self: *@This(), val: u32) !usize {
-        if (self.val_to_reg[val]) |r| return r;
-        const r = try self.findFreeReg();
-        try self.loadIntoReg(val, r);
-        return r;
+    fn copyValue(self: *@This(), src_ref: InstRef, dst_ref: InstRef) !void {
+        try self.buf.print(self.gpa, "    mov rax, [rsp+{d}]\n", .{slotOffset(src_ref)});
+        try self.buf.print(self.gpa, "    mov [rsp+{d}], rax\n", .{slotOffset(dst_ref)});
     }
 
-    fn freeIfDead(self: *@This(), val: u32) void {
-        if (self.use_count[val] > 0) return;
-        if (self.val_to_reg[val]) |r| {
-            self.val_to_reg[val] = null;
-            self.reg_to_val[r] = null;
-        }
+    fn emitBinaryWithSingleOp(self: *@This(), pair: InstPair, op_line: []const u8, out: InstRef) !void {
+        try self.loadReg("eax", pair.l);
+        try self.loadReg("ebx", pair.r);
+        try self.appendLine(op_line);
+        try self.storeRax(out);
     }
 
-    fn freeOperands(self: *@This(), p: InstPair) void {
-        self.use_count[p.l] -= 1;
-        self.freeIfDead(p.l);
-        self.use_count[p.r] -= 1;
-        self.freeIfDead(p.r);
+    fn emitBinaryDiv(self: *@This(), pair: InstPair, out: InstRef) !void {
+        try self.loadReg("eax", pair.l);
+        try self.loadReg("ebx", pair.r);
+        try self.appendLine("    cdq\n");
+        try self.appendLine("    idiv ebx\n");
+        try self.storeRax(out);
     }
 
-    fn emitAddSub(self: *@This(), mnemonic: []const u8, p: InstPair, i: usize) !void {
-        try self.loadIntoReg(p.l, eax_i);
-        if (self.loadImm(p.r)) |imm| try self.buf.print(self.gpa, "    {s} eax, {d}\n", .{ mnemonic, imm }) else {
-            const rhs = try self.ensureAnyReg(p.r);
-            try self.buf.print(self.gpa, "    {s} eax, {s}\n", .{ mnemonic, reg32[rhs] });
-        }
-        self.freeOperands(p);
-        self.assignResult(i);
-    }
-
-    fn emitImul(self: *@This(), p: InstPair, i: usize) !void {
-        if (self.loadImm(p.r)) |imm| {
-            if (self.val_to_reg[p.l]) |lhs_r| {
-                // x86 three-operand imul: dest, src, imm — no eax constraint needed
-                try self.buf.print(self.gpa, "    imul eax, {s}, {d}\n", .{ reg32[lhs_r], imm });
-                self.reg_to_val[lhs_r] = null;
-                self.val_to_reg[p.l] = null;
-            } else {
-                try self.evict(eax_i);
-                if (self.loadImm(p.l)) |lhs_val| {
-                    try self.buf.print(self.gpa, "    mov eax, {d}\n    imul eax, {d}\n", .{ lhs_val, imm });
-                } else {
-                    // imul can multiply from memory directly: imul eax, [rsp+slot], imm
-                    const slot = self.spill_slots[p.l] orelse unreachable;
-                    try self.buf.print(self.gpa, "    imul eax, [rsp+{d}], {d}\n", .{ slot, imm });
-                    self.spill_slots[p.l] = null;
-                }
-            }
-        } else {
-            // Register rhs — same two-operand form as add/sub
-            try self.loadIntoReg(p.l, eax_i);
-            const rhs = try self.ensureAnyReg(p.r);
-            try self.buf.print(self.gpa, "    imul eax, {s}\n", .{reg32[rhs]});
-        }
-        self.freeOperands(p);
-        self.assignResult(i);
-    }
-
-    fn emitIdiv(self: *@This(), p: InstPair, i: usize) !void {
-        try self.loadIntoReg(p.l, eax_i);
-        const rhs = try self.ensureAnyReg(p.r);
-        self.freeOperands(p);
-        try self.buf.appendSlice(self.gpa, "    cdq\n");
-        try self.buf.print(self.gpa, "    idiv {s}\n", .{reg32[rhs]});
-        self.assignResult(i);
-    }
-
-    fn emitCmp(self: *@This(), setcc: []const u8, p: InstPair, i: usize) !void {
-        try self.loadIntoReg(p.l, eax_i);
-        if (self.loadImm(p.r)) |imm| try self.buf.print(self.gpa, "    cmp eax, {d}\n", .{imm}) else {
-            const rhs = try self.ensureAnyReg(p.r);
-            try self.buf.print(self.gpa, "    cmp eax, {s}\n", .{reg32[rhs]});
-        }
-        self.freeOperands(p);
+    fn emitCompare(self: *@This(), setcc: []const u8, pair: InstPair, out: InstRef) !void {
+        try self.loadReg("eax", pair.l);
+        try self.loadReg("ebx", pair.r);
+        try self.appendLine("    cmp eax, ebx\n");
         try self.buf.print(self.gpa, "    {s} al\n", .{setcc});
-        try self.buf.appendSlice(self.gpa, "    movzx eax, al\n");
-        self.assignResult(i);
+        try self.appendLine("    movzx eax, al\n");
+        try self.storeRax(out);
     }
 
-    fn emitJz(self: *@This(), cond: InstRef, label: u32) !void {
-        const cond_reg = try self.ensureAnyReg(cond);
-        self.use_count[cond] -= 1;
-        try self.buf.print(self.gpa, "    cmp {s}, 0\n", .{reg32[cond_reg]});
-        self.freeIfDead(cond);
-        try self.buf.print(self.gpa, "    je .L{d}\n", .{label});
+    fn emitValueInst(self: *@This(), value_inst: ir_mod.ValueInst) !void {
+        switch (value_inst.op) {
+            .iconst => |v| {
+                try self.buf.print(self.gpa, "    mov eax, {d}\n", .{v});
+                try self.storeRax(value_inst.id);
+            },
+            .iadd => |pair| try self.emitBinaryWithSingleOp(pair, "    add eax, ebx\n", value_inst.id),
+            .isub => |pair| try self.emitBinaryWithSingleOp(pair, "    sub eax, ebx\n", value_inst.id),
+            .imul => |pair| try self.emitBinaryWithSingleOp(pair, "    imul eax, ebx\n", value_inst.id),
+            .idiv => |pair| try self.emitBinaryDiv(pair, value_inst.id),
+            .ilt => |pair| try self.emitCompare("setl", pair, value_inst.id),
+            .igt => |pair| try self.emitCompare("setg", pair, value_inst.id),
+            .ile => |pair| try self.emitCompare("setle", pair, value_inst.id),
+            .ige => |pair| try self.emitCompare("setge", pair, value_inst.id),
+            .ieq => |pair| try self.emitCompare("sete", pair, value_inst.id),
+            .ine => |pair| try self.emitCompare("setne", pair, value_inst.id),
+            .print => |v| {
+                try self.loadReg("eax", v);
+                try self.appendLine("    call print_int\n");
+                try self.storeRax(value_inst.id);
+            },
+            .iarg => |idx| {
+                try self.buf.print(self.gpa, "    mov rdi, [rbp + {d}]\n", .{idx * 8});
+                try self.appendLine("    call atoi\n");
+                try self.storeRax(value_inst.id);
+            },
+        }
     }
 
-    fn emitToEax(self: *@This(), val: InstRef) !void {
-        try self.loadIntoReg(val, eax_i);
-        self.use_count[val] -= 1;
-        self.freeIfDead(val);
+    fn branchCopy(self: *@This(), branch: ir_mod.Branch) ?BranchCopy {
+        const dst = self.block_params[branch.target] orelse return null;
+        const src = branch.arg orelse unreachable;
+        if (src == dst) return null;
+        return .{ .src = src, .dst = dst };
     }
 
-    fn assignResult(self: *@This(), i: usize) void {
-        self.reg_to_val[eax_i] = @intCast(i);
-        self.val_to_reg[i] = eax_i;
+    fn emitJump(self: *@This(), target: BlockId) !void {
+        try self.buf.print(self.gpa, "    jmp near .L{d}\n", .{target});
+    }
+
+    fn emitBranch(self: *@This(), branch: ir_mod.Branch) !void {
+        const maybe_copy = self.branchCopy(branch);
+        if (maybe_copy) |copy| try self.copyValue(copy.src, copy.dst);
+        try self.emitJump(branch.target);
+    }
+
+    fn emitConditionalBranch(self: *@This(), cbr: @FieldType(ir_mod.Terminator, "cbr")) !void {
+        try self.loadReg("eax", cbr.cond);
+        try self.appendLine("    cmp eax, 0\n");
+
+        const then_copy = self.branchCopy(cbr.then_branch);
+        const else_copy = self.branchCopy(cbr.else_branch);
+
+        if (then_copy == null and else_copy == null) {
+            try self.buf.print(self.gpa, "    je near .L{d}\n", .{cbr.else_branch.target});
+            try self.emitJump(cbr.then_branch.target);
+            return;
+        }
+
+        if (then_copy != null and else_copy == null) {
+            try self.buf.print(self.gpa, "    je near .L{d}\n", .{cbr.else_branch.target});
+            const copy = then_copy.?;
+            try self.copyValue(copy.src, copy.dst);
+            try self.emitJump(cbr.then_branch.target);
+            return;
+        }
+
+        if (then_copy == null and else_copy != null) {
+            try self.buf.print(self.gpa, "    jne near .L{d}\n", .{cbr.then_branch.target});
+            const copy = else_copy.?;
+            try self.copyValue(copy.src, copy.dst);
+            try self.emitJump(cbr.else_branch.target);
+            return;
+        }
+
+        const prep_label = self.prep_label_counter;
+        self.prep_label_counter += 1;
+        try self.buf.print(self.gpa, "    je near .Lprep{d}\n", .{prep_label});
+        const then_copy_value = then_copy.?;
+        try self.copyValue(then_copy_value.src, then_copy_value.dst);
+        try self.emitJump(cbr.then_branch.target);
+        try self.buf.print(self.gpa, ".Lprep{d}:\n", .{prep_label});
+        const else_copy_value = else_copy.?;
+        try self.copyValue(else_copy_value.src, else_copy_value.dst);
+        try self.emitJump(cbr.else_branch.target);
+    }
+
+    fn emitReturn(self: *@This(), value_ref: InstRef) !void {
+        try self.loadReg("eax", value_ref);
+        try self.appendLine("    xor edi, edi\n");
+        try self.appendLine("    mov eax, 60\n");
+        try self.appendLine("    syscall\n");
+    }
+
+    fn emitTerm(self: *@This(), term: ir_mod.Terminator) !void {
+        switch (term) {
+            .br => |branch| try self.emitBranch(branch),
+            .cbr => |cbr| try self.emitConditionalBranch(cbr),
+            .ret => |result| try self.emitReturn(result),
+        }
+    }
+
+    fn emitBlock(self: *@This(), block: ir_mod.Block) !void {
+        try self.buf.print(self.gpa, ".L{d}:\n", .{block.id});
+        for (block.insts.items) |value_inst| try self.emitValueInst(value_inst);
+        const term = block.term orelse unreachable;
+        try self.emitTerm(term);
     }
 };
 
-pub fn emitIr(ir: *const std.ArrayList(Inst), buf: *std.ArrayList(u8), gpa: std.mem.Allocator) error{OutOfMemory}!void {
-    const use_count = try computeUseCounts(ir, gpa);
-    defer gpa.free(use_count);
-
-    const frame_size = computeFrameSize(ir, use_count, gpa);
+pub fn emitIr(prog: *const Program, buf: *std.ArrayList(u8), gpa: std.mem.Allocator) error{OutOfMemory}!void {
+    const frame_size = prog.next_value * 8;
     if (frame_size > 0) try buf.print(gpa, "    sub rsp, {d}\n", .{frame_size});
 
-    var self = Emitter{
-        .iri = ir.items,
-        .buf = buf,
-        .gpa = gpa,
-        .val_to_reg = try gpa.alloc(?usize, ir.items.len),
-        .reg_to_val = [_]?u32{null} ** NUM_REGS,
-        .spill_slots = try gpa.alloc(?u32, ir.items.len),
-        .spill_idx = 0,
-        .use_count = use_count,
-    };
-    defer gpa.free(self.val_to_reg);
-    defer gpa.free(self.spill_slots);
-    @memset(self.val_to_reg, null);
-    @memset(self.spill_slots, null);
+    var emitter = try Emitter.init(prog, buf, gpa);
+    defer emitter.deinit();
 
-    for (ir.items, 0..) |inst, i| {
-        switch (inst) {
-            .iconst => {},
-            .iadd => |p| try self.emitAddSub("add", p, i),
-            .isub => |p| try self.emitAddSub("sub", p, i),
-            .imul => |p| try self.emitImul(p, i),
-            .idiv => |p| try self.emitIdiv(p, i),
-            .ilt => |p| try self.emitCmp("setl", p, i),
-            .igt => |p| try self.emitCmp("setg", p, i),
-            .ile => |p| try self.emitCmp("setle", p, i),
-            .ige => |p| try self.emitCmp("setge", p, i),
-            .ieq => |p| try self.emitCmp("sete", p, i),
-            .ine => |p| try self.emitCmp("setne", p, i),
-            .print => |v| {
-                try self.loadIntoReg(v, eax_i);
-                self.use_count[v] -= 1;
-                self.freeIfDead(v);
-                try buf.appendSlice(gpa, "    call print_int\n");
-                self.assignResult(i);
-            },
-            .ret => |v| {
-                try self.loadIntoReg(v, eax_i);
-                try buf.appendSlice(gpa, "    xor edi, edi\n    mov eax, 60\n    syscall\n");
-            },
-            .iarg => |idx| {
-                try self.evict(eax_i);
-                const r = try self.findFreeReg();
-                try buf.print(gpa, "    mov rdi, [rbp + {d}]\n", .{idx * 8});
-                try buf.appendSlice(gpa, "    call atoi\n");
-                if (r != eax_i) try buf.print(gpa, "    mov {s}, eax\n", .{reg32[r]});
-                self.reg_to_val[r] = @intCast(i);
-                self.val_to_reg[i] = r;
-            },
-            .ijz => |j| try self.emitJz(j.cond, j.label),
-            .ijmp => |label| try buf.print(gpa, "    jmp .L{d}\n", .{label}),
-            .ilabel => |label| try buf.print(gpa, ".L{d}:\n", .{label}),
-            .itoeax => |v| try self.emitToEax(v),
-            .iphi => self.assignResult(i),
-        }
-    }
+    if (prog.entry != 0) try buf.print(gpa, "    jmp near .L{d}\n", .{prog.entry});
+
+    for (prog.blocks.items) |block| try emitter.emitBlock(block);
 }
 
-pub fn compileIr(ir: *const std.ArrayList(Inst), gpa: std.mem.Allocator) error{OutOfMemory}![]const u8 {
+pub fn compileIr(prog: *const Program, gpa: std.mem.Allocator) error{OutOfMemory}![]const u8 {
     var buf = try std.ArrayList(u8).initCapacity(gpa, 256);
     errdefer buf.deinit(gpa);
     try buf.appendSlice(gpa, "global _start\n_start:\n");
     try buf.appendSlice(gpa, "    lea rbp, [rsp+8]\n");
-    try emitIr(ir, &buf, gpa);
+    try emitIr(prog, &buf, gpa);
     try buf.appendSlice(gpa, @embedFile("print.asm"));
     return buf.toOwnedSlice(gpa);
 }

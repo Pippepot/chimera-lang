@@ -25,40 +25,86 @@ pub const AstNode = union(enum) {
     if_: *const IfNode,
 };
 
-pub fn assembleAndLink(io: std.Io, asm_source: []const u8) void {
-    const cwd = std.Io.Dir.cwd();
-    cwd.writeFile(io, .{ .sub_path = "x86.asm", .data = asm_source }) catch std.process.exit(1);
-    defer cwd.deleteFile(io, "x86.asm") catch {};
-    defer cwd.deleteFile(io, "x86.o") catch {};
+const CmpKind = enum {
+    lt,
+    gt,
+};
 
-    var nasm_child = std.process.spawn(io, .{ .argv = &.{ "nasm", "-f", "elf64", "x86.asm", "-o", "x86.o" }, .stderr = .inherit }) catch std.process.exit(1);
-    switch (nasm_child.wait(io) catch std.process.exit(1)) {
-        .exited => |code| if (code != 0) std.process.exit(code),
-        else => std.process.exit(1),
+const DemoAst = struct {
+    cond_kids: [2]AstNode,
+    cond: AstNode,
+    then_expr: AstNode,
+    else_expr: AstNode,
+    then_print: AstNode,
+    else_print: AstNode,
+    if_node: IfNode,
+    root: AstNode,
+
+    fn init(self: *@This(), comptime cmp: CmpKind, lhs: AstNode, rhs: AstNode, then_value: i32, else_value: i32) void {
+        self.* = DemoAst{
+            .cond_kids = .{ lhs, rhs },
+            .cond = undefined,
+            .then_expr = .{ .int = then_value },
+            .else_expr = .{ .int = else_value },
+            .then_print = undefined,
+            .else_print = undefined,
+            .if_node = undefined,
+            .root = undefined,
+        };
+
+        self.cond = switch (cmp) {
+            .lt => .{ .lt = &self.cond_kids },
+            .gt => .{ .gt = &self.cond_kids },
+        };
+        self.then_print = .{ .print = &self.then_expr };
+        self.else_print = .{ .print = &self.else_expr };
+        self.if_node = .{ .cond = &self.cond, .then_ = &self.then_print, .else_ = &self.else_print };
+        self.root = .{ .if_ = &self.if_node };
     }
+};
 
-    var ld_child = std.process.spawn(io, .{ .argv = &.{ "ld", "x86.o", "-o", "prog" }, .stderr = .inherit }) catch std.process.exit(1);
-    switch (ld_child.wait(io) catch std.process.exit(1)) {
-        .exited => |code| if (code != 0) std.process.exit(code),
-        else => std.process.exit(1),
-    }
-}
-
-pub fn runProg(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) u8 {
-    var argv = std.ArrayList([]const u8).initCapacity(gpa, 1 + args.len) catch std.process.exit(1);
-    defer argv.deinit(gpa);
-    argv.appendAssumeCapacity("./prog");
-    for (args) |a| argv.appendAssumeCapacity(a);
-    var child = std.process.spawn(io, .{ .argv = argv.items, .stderr = .inherit }) catch std.process.exit(1);
+fn waitForExitCode(io: std.Io, child: *std.process.Child) u8 {
     switch (child.wait(io) catch std.process.exit(1)) {
         .exited => |code| return code,
         else => std.process.exit(1),
     }
 }
 
+fn runCommandOrExit(io: std.Io, argv: []const []const u8) void {
+    var child = std.process.spawn(io, .{ .argv = argv, .stderr = .inherit }) catch std.process.exit(1);
+    const code = waitForExitCode(io, &child);
+    if (code != 0) std.process.exit(code);
+}
+
+fn isDebugFlag(arg: []const u8) bool {
+    return std.mem.startsWith(u8, arg, "--debug=");
+}
+
+pub fn assembleAndLink(io: std.Io, asm_source: []const u8) void {
+    const cwd = std.Io.Dir.cwd();
+    cwd.writeFile(io, .{ .sub_path = "x86.asm", .data = asm_source }) catch std.process.exit(1);
+    defer cwd.deleteFile(io, "x86.asm") catch {};
+    defer cwd.deleteFile(io, "x86.o") catch {};
+
+    runCommandOrExit(io, &.{ "nasm", "-f", "elf64", "x86.asm", "-o", "x86.o" });
+    runCommandOrExit(io, &.{ "ld", "x86.o", "-o", "prog" });
+}
+
+pub fn runProg(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) u8 {
+    var argv = std.ArrayList([]const u8).initCapacity(gpa, 1 + args.len) catch std.process.exit(1);
+    defer argv.deinit(gpa);
+
+    argv.appendAssumeCapacity("./prog");
+    for (args) |arg| argv.appendAssumeCapacity(arg);
+
+    var child = std.process.spawn(io, .{ .argv = argv.items, .stderr = .inherit }) catch std.process.exit(1);
+    return waitForExitCode(io, &child);
+}
+
 pub fn eval(io: std.Io, node: *const AstNode, gpa: std.mem.Allocator, args: []const []const u8) u8 {
     const asm_source = codegen.compile(node, gpa) catch std.process.exit(1);
     defer gpa.free(asm_source);
+
     assembleAndLink(io, asm_source);
     return runProg(io, gpa, args);
 }
@@ -67,45 +113,28 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const gpa = init.gpa;
 
+    const flags = debug.parseDebugFlags(init.minimal.args);
+
     var prog_args_list = try std.ArrayList([]const u8).initCapacity(gpa, 4);
     defer prog_args_list.deinit(gpa);
-
-    const flags = debug.parseDebugFlags(init.minimal.args);
 
     var iter = std.process.Args.Iterator.init(init.minimal.args);
     defer iter.deinit();
     _ = iter.next();
     while (iter.next()) |arg| {
-        if (!std.mem.startsWith(u8, arg, "--debug=")) try prog_args_list.append(gpa, arg);
+        if (!isDebugFlag(arg)) try prog_args_list.append(gpa, arg);
     }
-    const prog_args = prog_args_list.items;
 
-    var cond: AstNode = undefined;
-    var cond_kids: [2]AstNode = undefined;
-    var then_expr: AstNode = undefined;
-    var else_expr: AstNode = undefined;
-    var then_print: AstNode = undefined;
-    var else_print: AstNode = undefined;
-    var if_node: IfNode = undefined;
-    const root = if (prog_args.len > 0) blk: {
-        cond_kids = .{ .{ .arg = 1 }, .{ .int = 0 } };
-        cond = .{ .gt = &cond_kids };
-        then_expr = .{ .int = 111 };
-        else_expr = .{ .int = -111 };
-        then_print = .{ .print = &then_expr };
-        else_print = .{ .print = &else_expr };
-        if_node = .{ .cond = &cond, .then_ = &then_print, .else_ = &else_print };
-        break :blk AstNode{ .if_ = &if_node };
-    } else blk: {
-        cond_kids = .{ .{ .int = 3 }, .{ .int = 4 } };
-        cond = .{ .lt = &cond_kids };
-        then_expr = .{ .int = 10 };
-        else_expr = .{ .int = 20 };
-        then_print = .{ .print = &then_expr };
-        else_print = .{ .print = &else_expr };
-        if_node = .{ .cond = &cond, .then_ = &then_print, .else_ = &else_print };
-        break :blk AstNode{ .if_ = &if_node };
-    };
+    const prog_args = prog_args_list.items;
+    const use_cli_condition = prog_args.len > 0;
+
+    var demo_ast: DemoAst = undefined;
+    if (use_cli_condition) {
+        demo_ast.init(.gt, .{ .arg = 1 }, .{ .int = 0 }, 111, -111);
+    } else {
+        demo_ast.init(.lt, .{ .int = 3 }, .{ .int = 4 }, 10, 20);
+    }
+    const root = demo_ast.root;
 
     var ir = try codegen.lower(&root, gpa);
     defer ir.deinit(gpa);
