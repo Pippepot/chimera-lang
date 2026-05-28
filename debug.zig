@@ -1,7 +1,7 @@
 const std = @import("std");
-const x86 = @import("main.zig");
+const ast = @import("ast.zig");
 const ir_mod = @import("ir.zig");
-const AstNode = x86.AstNode;
+const AstNode = ast.AstNode;
 const InstPair = ir_mod.InstPair;
 const Program = ir_mod.Program;
 
@@ -122,6 +122,8 @@ fn writeAstLabel(writer: *std.Io.Writer, node: *const AstNode) void {
         .eq => writer.writeAll("eq") catch return,
         .ne => writer.writeAll("ne") catch return,
         .if_ => writer.writeAll("if") catch return,
+        .bool => |v| writer.print("bool {s}", .{if (v) "true" else "false"}) catch return,
+        .unit => writer.writeAll("unit") catch return,
     }
 }
 
@@ -158,7 +160,7 @@ fn dumpAstNode(node: *const AstNode, writer: *std.Io.Writer, prefix: []const u8,
                 dumpAstNode(data.then_, writer, next_prefix, true, false);
             }
         },
-        .int, .float, .var_ref, .arg => {},
+        .int, .float, .var_ref, .arg, .bool, .unit => {},
     }
 }
 
@@ -166,13 +168,13 @@ fn dumpAstTree(node: *const AstNode, writer: *std.Io.Writer) void {
     dumpAstNode(node, writer, "", true, true);
 }
 
-pub fn dumpDebugInfo(io: std.Io, flags: DebugFlags, root: *const AstNode, ir: ?*const Program, gpa: std.mem.Allocator) !void {
+pub fn dumpDebugInfo(io: std.Io, flags: DebugFlags, root: ?*const AstNode, ir: ?*const Program, gpa: std.mem.Allocator) !void {
     _ = gpa;
-    if (flags.ast) {
+    if (flags.ast and root != null) {
         var wbuf: [4096]u8 = undefined;
         var w = std.Io.File.stdout().writer(io, &wbuf);
         try w.interface.writeAll("; AST:\n");
-        dumpAstTree(root, &w.interface);
+        dumpAstTree(root.?, &w.interface);
         try w.interface.writeAll("\n");
         try w.interface.flush();
     }

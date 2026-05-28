@@ -1,9 +1,11 @@
 const std = @import("std");
+const diagnostics = @import("diagnostics.zig");
 const ir_mod = @import("ir.zig");
 const typecheck = @import("typecheck.zig");
-const x86 = @import("main.zig");
+const ast = @import("ast.zig");
 const helpers = @import("helpers_bin.zig");
-const AstNode = x86.AstNode;
+const db = @import("db.zig");
+const AstNode = ast.AstNode;
 
 const InstRef = ir_mod.ValueRef;
 const InstPair = ir_mod.InstPair;
@@ -599,6 +601,53 @@ fn buildElfExecutable(code: []const u8, entry_code_offset: u64, gpa: std.mem.All
 
     try file_buf.appendSlice(gpa, code);
     return file_buf.toOwnedSlice(gpa);
+}
+
+const ir = @import("ir.zig");
+
+pub const CompileMemo = struct {
+    value: ?[]const u8,
+    diagnostics: std.ArrayList(diagnostics.Diagnostic),
+    deps: std.ArrayList(db.Dependency),
+    verified_at: db.Revision,
+    changed_at: db.Revision,
+    computing: bool,
+
+    pub fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
+        if (self.value) |bytes| gpa.free(bytes);
+        self.diagnostics.deinit(gpa);
+        self.deps.deinit(gpa);
+    }
+};
+
+pub fn computeCompile(lower_memo: *const ir.LowerMemo, gpa: std.mem.Allocator) error{OutOfMemory}!CompileMemo {
+    var diagnostics_list = try std.ArrayList(diagnostics.Diagnostic).initCapacity(gpa, lower_memo.diagnostics.items.len + 1);
+    errdefer diagnostics_list.deinit(gpa);
+    try diagnostics_list.appendSlice(gpa, lower_memo.diagnostics.items);
+
+    var bytes: ?[]const u8 = null;
+    if (lower_memo.value) |*prog| {
+        bytes = compileProgram(prog, gpa) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => blk: {
+                try diagnostics_list.append(gpa, .{
+                    .stage = .compile,
+                    .span = null,
+                    .message = @errorName(err),
+                });
+                break :blk null;
+            },
+        };
+    }
+
+    return .{
+        .value = bytes,
+        .diagnostics = diagnostics_list,
+        .deps = .empty,
+        .verified_at = 0,
+        .changed_at = 0,
+        .computing = false,
+    };
 }
 
 pub fn compileProgram(prog: *const Program, gpa: std.mem.Allocator) ![]const u8 {

@@ -4,12 +4,15 @@
 
 - **Entry point.** `main.zig` is the main Zig file; run with `zig run main.zig -- <source-file> [program-args...]`. No `build.zig`.
 - **Module split:**
-  - `main.zig` owns AST types plus runtime entrypoints (`writeProgram`, `runProg`, `eval`, `main`) and query diagnostics formatting.
-  - `parser.zig` owns lexer + parser (`parseOwned`) from source text to AST.
-  - `typecheck.zig` owns AST type inference/checking (`unit`, `bool`, `int`, `float`).
-  - `query.zig` owns the revisioned incremental query system (`QueryDb`) and stage memos (`parse`, `typecheck`, `lower`, `compile`).
-  - `ir.zig` owns SSA/block IR types and typed AST -> IR lowering.
-  - `codegen.zig` owns IR -> x86 machine code + ELF emission.
+  - `main.zig` owns CLI/runtime entrypoint (`main`) and orchestration of query stages + diagnostics printing.
+  - `ast.zig` owns AST types (`AstNode`, `IfNode`, `ConstNode`).
+  - `runtime.zig` owns runtime helper entrypoints (`writeProgram`, `runProg`, `eval`) plus query diagnostics formatting helper.
+  - `parser.zig` owns lexer + parser (`parseOwned`) from source text to AST, plus `ParseMemo` and `computeParse` for query integration.
+  - `typecheck.zig` owns AST type inference/checking (`unit`, `bool`, `int`, `float`), plus `TypeMemo` and `computeType` for query integration.
+  - `query.zig` owns the revisioned incremental query system (`QueryDb`) and stage orchestration (frame management, dependency tracking, memo verification).
+  - `ir.zig` owns SSA/block IR types and typed AST -> IR lowering, plus `LowerMemo` and `computeLower` for query integration.
+  - `codegen.zig` owns IR -> x86 machine code + ELF emission, plus `CompileMemo` and `computeCompile` for query integration.
+  - `db.zig` owns shared query types (`SourceId`, `Revision`, `Dependency`, `QueryKey`, `QueryStats`, `Stage`, `CompileResult`, `DbError`) and comparison helpers.
   - `debug.zig` owns debug flag parsing and AST/SSA debug dumps.
   - `helpers_bin.zig` owns pre-assembled helper blobs (`print_int`, `print_bool`, `print_float32`, `atoi`).
 - **Project state** is documented in `.agents/project.md`.
@@ -37,6 +40,20 @@
 - **Query ownership:** parse memo values in `QueryDb` own `ParsedAst`; callers borrow `*const AstNode` via `parsedAst`.
 - **Unary minus** is lowered in parser as either negative literal or `0 - expr`.
 
+## Fail semantics (Verse-style)
+
+- **Fallible expressions** — comparisons (`<` `>` `<=` `>=` `==` `!=`) are fallible. They succeed (returning `unit`) or fail.
+- **Fallible contexts** — only `if` conditions. Set `Checker.in_fallible_scope = true` while inferring the condition.
+- **Restriction** — fallible expressions can ONLY appear in fallible contexts. Outside → error `FallibleOutsideFallibleContext`.
+- **`if` condition** — must be a fallible expression. Non-fallible → error `IfConditionNotFallible`.
+- **No bool condition** — `if` no longer requires a `bool` condition. Conditions are fallible expressions, not `bool`.
+- **`if` without else** — no-op on failure. Then-body must be `unit`. Not itself fallible.
+- **Comparisons produce `unit`** — comparisons return `.unit` in the typechecker, not `.bool`. IR types are `.unit` too (instructions still produce 0/1 internally).
+- **`bool` type** — exists for `true`/`false` literals and `printb`. Separate from fallibility.
+- **Equality on bools** — also fallible (`eqb`/`neb` IR, type `.unit`).
+- **`isFallible(node)`** — helper checking node kind against `.lt`, `.gt`, `.le`, `.ge`, `.eq`, `.ne`.
+- **Future scope** — `if const x = <expr> then ...` infrastructure prepared (condition result scoped to then-branch).
+
 ## Query system design
 
 - **`QueryDb` is reusable state.** Keep one DB across revisions to get incremental behavior.
@@ -48,6 +65,7 @@
   - Otherwise re-check dependencies recursively before deciding to recompute.
 - **Compile backdating:** if recomputed compile bytes are identical, preserve old `changed_at`.
 - **Purity boundary:** queries return data only; writing executables and running child processes stay outside query code.
+- **Memo colocation:** each stage defines its own memo type and `computeXxx` function in its module. `query.zig` owns the generic orchestration (frame management, dep tracking, memo caching) and calls stage-specific compute functions.
 
 ## Assembly generation
 

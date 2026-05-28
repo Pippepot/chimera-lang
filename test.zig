@@ -1,10 +1,23 @@
 const std = @import("std");
 const testing = std.testing;
 const query = @import("query.zig");
-const parser = @import("parser.zig");
-const typecheck = @import("typecheck.zig");
-const x86 = @import("main.zig");
-const writeProgram = x86.writeProgram;
+const runtime = @import("runtime.zig");
+const writeProgram = runtime.writeProgram;
+
+fn expectCompileOk(db: *query.QueryDb, source_id: query.SourceId) ![]const u8 {
+    const result = try db.compileResult(source_id);
+    try testing.expectEqual(@as(usize, 0), result.diagnostics.len);
+    try testing.expect(result.bytes != null);
+    return result.bytes.?;
+}
+
+fn expectCompileErrorContains(db: *query.QueryDb, source_id: query.SourceId, text: []const u8) !void {
+    const result = try db.compileResult(source_id);
+    try testing.expect(result.bytes == null);
+    try testing.expect(result.diagnostics.len > 0);
+    try testing.expect(std.mem.indexOf(u8, result.diagnostics[0].message, text) != null);
+    try testing.expect(result.diagnostics[0].span != null);
+}
 
 fn runTestCapture(source: []const u8, args: []const []const u8) ![]u8 {
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
@@ -15,7 +28,7 @@ fn runTestCapture(source: []const u8, args: []const []const u8) ![]u8 {
     defer db.deinit();
 
     try db.setSource(0, source);
-    const prog_bytes = try db.compileBytes(0);
+    const prog_bytes = try expectCompileOk(&db, 0);
 
     writeProgram(io, prog_bytes);
     defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
@@ -55,7 +68,7 @@ test "compile emits ELF executable bytes" {
     defer db.deinit();
 
     try db.setSource(0, "0");
-    const elf = try db.compileBytes(0);
+    const elf = try expectCompileOk(&db, 0);
 
     try testing.expect(elf.len >= 64);
     try testing.expectEqual(@as(u8, 0x7f), elf[0]);
@@ -85,13 +98,13 @@ test "arg" {
 }
 
 test "comparisons" {
-    try testProgram("print(3 < 4)", "true\n");
-    try testProgram("print(4 < 3)", "false\n");
-    try testProgram("print(4 > 3)", "true\n");
-    try testProgram("print(4 <= 4)", "true\n");
-    try testProgram("print(3 >= 4)", "false\n");
-    try testProgram("print(-7 == -7)", "true\n");
-    try testProgram("print(9 != 9)", "false\n");
+    try testProgram("if 3 < 4 then print(42)", "42\n");
+    try testProgram("if 4 < 3 then print(99) else print(11)", "11\n");
+    try testProgram("if 4 > 3 then print(42)", "42\n");
+    try testProgram("if 4 <= 4 then print(42)", "42\n");
+    try testProgram("if 3 >= 4 then print(99) else print(11)", "11\n");
+    try testProgram("if -7 == -7 then print(42)", "42\n");
+    try testProgram("if 9 != 9 then print(99) else print(11)", "11\n");
 }
 
 test "if branches" {
@@ -112,8 +125,8 @@ test "float arithmetic and printing" {
 }
 
 test "float comparisons with NaN semantics" {
-    try testProgram("print((0.0 / 0.0) == 1.0)", "false\n");
-    try testProgram("print((0.0 / 0.0) != 1.0)", "true\n");
+    try testProgram("if (0.0 / 0.0) == 1.0 then print(0) else print(1)", "1\n");
+    try testProgram("if (0.0 / 0.0) != 1.0 then print(1) else print(0)", "1\n");
 }
 
 test "const locals and multi-statement programs" {
@@ -133,6 +146,29 @@ test "const locals and multi-statement programs" {
     , "5\n");
 }
 
+test "bool literals true and false" {
+    try testProgram("print(true)", "true\n");
+    try testProgram("print(false)", "false\n");
+    try testProgram("if true == false then print(0) else print(1)", "1\n");
+    try testProgram("if true != false then print(1) else print(0)", "1\n");
+    try testProgram("if true == true then print(1) else print(0)", "1\n");
+}
+
+test "const binding at end of file (no trailing expression)" {
+    try testProgram(
+        \\const x = 40 + 2
+        \\if x > 2 then print(67)
+        \\print(x)
+        \\const y = false
+        \\print(y)
+    , "67\n42\nfalse\n");
+}
+
+test "bool literal with if" {
+    try testProgram("if 3 == 3 then print(99)", "99\n");
+    try testProgram("if 3 != 3 then print(98) else print(97)", "97\n");
+}
+
 test "if without else requires unit in then branch" {
     try testProgram("if 3 < 4 then print(11)", "11\n");
 }
@@ -142,29 +178,29 @@ test "type errors" {
     defer db.deinit();
 
     try db.setSource(0, "print(1 + 2.0)");
-    try testing.expectError(typecheck.TypeError.ArithmeticOperandMismatch, db.compileBytes(0));
+    try expectCompileErrorContains(&db, 0, "arithmetic operands");
 
     try db.setSource(0, "if 1 then 2 else 3");
-    try testing.expectError(typecheck.TypeError.IfConditionMustBeBool, db.compileBytes(0));
+    try expectCompileErrorContains(&db, 0, "If condition must be a fallible expression");
 
     try db.setSource(0, "if 1 < 2 then 1 else 2.0");
-    try testing.expectError(typecheck.TypeError.IfBranchTypeMismatch, db.compileBytes(0));
+    try expectCompileErrorContains(&db, 0, "if branches");
 
     try db.setSource(0, "if 1 < 2 then 1");
-    try testing.expectError(typecheck.TypeError.IfWithoutElseRequiresUnit, db.compileBytes(0));
+    try expectCompileErrorContains(&db, 0, "without else");
 
     try db.setSource(0, "print(if 1 < 2 then print(1) else print(2))");
-    try testing.expectError(typecheck.TypeError.PrintUnitValue, db.compileBytes(0));
+    try expectCompileErrorContains(&db, 0, "cannot print");
 
     try db.setSource(0, "print(x)");
-    try testing.expectError(typecheck.TypeError.UnknownVariable, db.compileBytes(0));
+    try expectCompileErrorContains(&db, 0, "unknown variable");
 
     try db.setSource(0,
         \\const x = 1
         \\const x = 2
         \\print(x)
     );
-    try testing.expectError(typecheck.TypeError.DuplicateVariable, db.compileBytes(0));
+    try expectCompileErrorContains(&db, 0, "duplicate variable");
 
     try db.setSource(0,
         \\const x = 2
@@ -172,7 +208,29 @@ test "type errors" {
         \\print(y))
         \\print(x)
     );
-    try testing.expectError(parser.ParseError.ExpectedExpression, db.compileBytes(0));
+    try expectCompileErrorContains(&db, 0, "expected expression");
+}
+
+test "fallible expression outside fallible context" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+
+    try db.setSource(0, "print(3 < 4)");
+    try expectCompileErrorContains(&db, 0, "Fallible expression is not allowed outside fallible context");
+
+    try db.setSource(0,
+        \\const x = 3 < 4
+        \\print(x)
+    );
+    try expectCompileErrorContains(&db, 0, "Fallible expression is not allowed outside fallible context");
+}
+
+test "non-fallible expression in if condition" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+
+    try db.setSource(0, "if true then print(99)");
+    try expectCompileErrorContains(&db, 0, "If condition must be a fallible expression");
 }
 
 test "query cache hits within same revision" {
@@ -183,14 +241,14 @@ test "query cache hits within same revision" {
     _ = try db.parsedAst(0);
     _ = try db.typedAst(0);
     _ = try db.loweredProgram(0);
-    _ = try db.compileBytes(0);
+    _ = try expectCompileOk(&db, 0);
 
     db.resetStats();
 
     _ = try db.parsedAst(0);
     _ = try db.typedAst(0);
     _ = try db.loweredProgram(0);
-    _ = try db.compileBytes(0);
+    _ = try expectCompileOk(&db, 0);
 
     const stats = db.statsSnapshot();
     try testing.expectEqual(@as(usize, 1), stats.parse_hits);
@@ -208,13 +266,13 @@ test "source change invalidates parse lower compile" {
     defer db.deinit();
 
     try db.setSource(0, "print(1)");
-    _ = try db.compileBytes(0);
+    _ = try expectCompileOk(&db, 0);
 
     const before = db.statsSnapshot().revision;
     db.resetStats();
 
     try db.setSource(0, "print(2)");
-    _ = try db.compileBytes(0);
+    _ = try expectCompileOk(&db, 0);
 
     const after = db.statsSnapshot();
     try testing.expectEqual(before + 1, after.revision);
@@ -231,15 +289,15 @@ test "source-specific invalidation" {
     defer db.deinit();
 
     try db.setSource(0, "print(10)");
-    _ = try db.compileBytes(0);
+    _ = try expectCompileOk(&db, 0);
 
     try db.setSource(1, "print(20)");
-    _ = try db.compileBytes(1);
+    _ = try expectCompileOk(&db, 1);
 
     db.resetStats();
 
     try db.setSource(0, "print(30)");
-    _ = try db.compileBytes(1);
+    _ = try expectCompileOk(&db, 1);
 
     const stats = db.statsSnapshot();
     try testing.expectEqual(@as(usize, 1), stats.source_sets);
@@ -270,11 +328,11 @@ test "compile changed_at backdates on equal output" {
     defer db.deinit();
 
     try db.setSource(0, "print(5)");
-    _ = try db.compileBytes(0);
+    _ = try expectCompileOk(&db, 0);
     const changed_before = db.changedAt(.compile, 0) orelse return error.TestFailed;
 
     try db.setSource(0, "print( 5 )");
-    _ = try db.compileBytes(0);
+    _ = try expectCompileOk(&db, 0);
     const changed_after = db.changedAt(.compile, 0) orelse return error.TestFailed;
 
     try testing.expectEqual(changed_before, changed_after);
@@ -292,7 +350,7 @@ test "debug query diagnostics format" {
         .compile_recomputes = 1,
         .dependency_checks = 5,
     };
-    try x86.appendQueryDiagnostics(&buf, testing.allocator, stats);
+    try runtime.appendQueryDiagnostics(&buf, testing.allocator, stats);
 
     try testing.expect(std.mem.indexOf(u8, buf.items, "; query diagnostics:") != null);
     try testing.expect(std.mem.indexOf(u8, buf.items, ";   revision: 7") != null);

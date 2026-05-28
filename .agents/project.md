@@ -6,7 +6,9 @@
 
 | File | Description |
 |------|-------------|
-| `main.zig` | AST types, runtime entrypoints (`writeProgram`, `runProg`, `eval`, `main`), and query diagnostics formatting |
+| `main.zig` | CLI entrypoint (`main`) and query pipeline orchestration |
+| `ast.zig` | AST node types (`AstNode`, `IfNode`, `ConstNode`) |
+| `runtime.zig` | Runtime helpers (`writeProgram`, `runProg`, `eval`) and query diagnostics formatting helper |
 | `parser.zig` | Lexer + recursive descent parser (`parseOwned`) from source text to AST |
 | `typecheck.zig` | Type inference/checking over AST (`unit`, `bool`, `int`, `float`) |
 | `query.zig` | Revisioned incremental query database (`QueryDb`) with memoized parse/lower/compile stages |
@@ -21,14 +23,14 @@
 
 | Symbol | File | Description |
 |--------|------|-------------|
-| `AstNode`, `IfNode` | `main.zig` | AST node types |
+| `AstNode`, `IfNode`, `ConstNode` | `ast.zig` | AST node types |
 | `parseOwned(source, gpa)` | `parser.zig` | Parse source string into arena-owned AST |
 | `Program`, `Block`, `Inst`, `Terminator`, `Branch` | `ir.zig` | SSA/block IR model |
 | `lower(node, typed, gpa)` | `ir.zig` | Typed AST -> `Program` |
 | `compileProgram(prog, gpa)` | `codegen.zig` | IR -> ELF file bytes |
 | `QueryDb` (+ `SourceId`, `Revision`, `QueryStats`) | `query.zig` | Incremental query engine over parse/lower/compile |
-| `writeProgram(io, bytes)` | `main.zig` | Writes ELF bytes to `./prog` |
-| `runProg(io, gpa, args)` | `main.zig` | Runs `./prog`, returns process exit code |
+| `writeProgram(io, bytes)` | `runtime.zig` | Writes ELF bytes to `./prog` |
+| `runProg(io, gpa, args)` | `runtime.zig` | Runs `./prog`, returns process exit code |
 | `HelperId`, `HelperDef`, `HelperBlob`, `all_helpers` | `helpers_bin.zig` | Runtime helper registry |
 
 ## Query architecture
@@ -93,12 +95,14 @@ Use `--debug=ast,ssa,timing,query`:
 
 ## Current behavior
 
-- `zig run main.zig -- demo.x86` compiles and runs `demo.x86` (prints `42` with current demo file).
+- `zig run main.zig -- demo.x86` compiles and runs `demo.x86` (prints `67\n42\n` with current demo file).
 - `zig run main.zig --` prints usage and exits with code `1`.
 - First non-debug CLI arg is source file path; remaining args are passed to the generated program.
 - Statements are newline-separated; `;` is not supported as a statement separator.
 - `const` locals are supported, non-mutable, and duplicate names are rejected.
 - Parentheses are expression grouping only and do not create scope boundaries.
+- **Fail semantics:** `if` conditions must be fallible expressions (comparisons). Fallible expressions can only appear inside `if` conditions. Comparisons produce `unit` on success (not `bool`).
+- Implementation plan at `.agents/fail-semantics.md`.
 
 ## Tests
 
@@ -107,18 +111,21 @@ Use `--debug=ast,ssa,timing,query`:
 1. ELF bytes sanity test.
 2. Arithmetic language behavior.
 3. CLI arg behavior (`arg(n)`).
-4. Comparisons.
+4. Comparisons (via `if` conditions — fallible in fallible context).
 5. If branch side effects.
 6. If expression value propagation.
 7. Float arithmetic/printing.
 8. Float comparison NaN semantics.
 9. Const locals + multi-statement programs.
-10. Else-less `if` unit behavior.
-11. Type error coverage.
-12. Query cache hits within same revision.
-13. Source-change invalidation across parse/typecheck/lower/compile.
-14. Source-specific invalidation isolation.
-15. Unchanged source revision stability.
-16. Compile `changed_at` backdating when output bytes are identical.
-17. Query diagnostics formatting.
-18. Helper enum/index mapping.
+10. Bool literal printing and equality comparisons.
+11. Else-less `if` unit behavior.
+12. Type error coverage (including fallible outside fallible context, non-fallible condition).
+13. Fallible expression outside fallible context error.
+14. Non-fallible expression in if condition error.
+15. Query cache hits within same revision.
+16. Source-change invalidation across parse/typecheck/lower/compile.
+17. Source-specific invalidation isolation.
+18. Unchanged source revision stability.
+19. Compile `changed_at` backdating when output bytes are identical.
+20. Query diagnostics formatting.
+21. Helper enum/index mapping.

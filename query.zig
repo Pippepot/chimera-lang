@@ -1,147 +1,51 @@
 const std = @import("std");
+const db = @import("db.zig");
 const parser = @import("parser.zig");
 const typecheck = @import("typecheck.zig");
 const ir_mod = @import("ir.zig");
 const codegen = @import("codegen.zig");
-const x86 = @import("main.zig");
-const AstNode = x86.AstNode;
-const Program = ir_mod.Program;
-const TypedAst = typecheck.TypedAst;
-const TypecheckErrorSet = @typeInfo(@typeInfo(@TypeOf(typecheck.typecheck)).@"fn".return_type.?).error_union.error_set;
-const CompileErrorSet = @typeInfo(@typeInfo(@TypeOf(codegen.compileProgram)).@"fn".return_type.?).error_union.error_set;
+const ast = @import("ast.zig");
+const diagnostics = @import("diagnostics.zig");
 
-pub const SourceId = u32;
-pub const Revision = u64;
+const AstNode = ast.AstNode;
+const Diagnostic = diagnostics.Diagnostic;
 
-pub const QueryError = error{
-    SourceNotFound,
-    QueryCycle,
-};
-
-pub const DbError = QueryError || parser.ParseError || TypecheckErrorSet || std.mem.Allocator.Error || CompileErrorSet;
-
-const QueryKind = enum {
-    parse,
-    typecheck,
-    lower,
-    compile,
-};
-
-const QueryKey = struct {
-    kind: QueryKind,
-    source_id: SourceId,
-};
-
-const Dependency = union(enum) {
-    source: SourceId,
-    query: QueryKey,
-};
+pub const SourceId = db.SourceId;
+pub const QueryStats = db.QueryStats;
+pub const Stage = db.Stage;
+pub const CompileResult = db.CompileResult;
+pub const QueryError = db.QueryError;
 
 const SourceInput = struct {
     text: []u8,
-    changed_at: Revision,
-};
-
-const ParseMemo = struct {
-    value: parser.ParsedAst,
-    deps: std.ArrayList(Dependency),
-    verified_at: Revision,
-    changed_at: Revision,
-    computing: bool,
-
-    fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
-        self.value.deinit();
-        self.deps.deinit(gpa);
-    }
-};
-
-const LowerMemo = struct {
-    value: Program,
-    deps: std.ArrayList(Dependency),
-    verified_at: Revision,
-    changed_at: Revision,
-    computing: bool,
-
-    fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
-        self.value.deinit(gpa);
-        self.deps.deinit(gpa);
-    }
-};
-
-const TypeMemo = struct {
-    value: TypedAst,
-    deps: std.ArrayList(Dependency),
-    verified_at: Revision,
-    changed_at: Revision,
-    computing: bool,
-
-    fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
-        self.value.deinit();
-        self.deps.deinit(gpa);
-    }
-};
-
-const CompileMemo = struct {
-    value: []const u8,
-    deps: std.ArrayList(Dependency),
-    verified_at: Revision,
-    changed_at: Revision,
-    computing: bool,
-
-    fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
-        gpa.free(self.value);
-        self.deps.deinit(gpa);
-    }
+    changed_at: db.Revision,
 };
 
 const ActiveQuery = struct {
-    key: QueryKey,
-    deps: std.ArrayList(Dependency),
-};
-
-pub const QueryStats = struct {
-    revision: Revision = 0,
-    source_sets: usize = 0,
-    source_unchanged: usize = 0,
-    parse_hits: usize = 0,
-    parse_recomputes: usize = 0,
-    type_hits: usize = 0,
-    type_recomputes: usize = 0,
-    lower_hits: usize = 0,
-    lower_recomputes: usize = 0,
-    compile_hits: usize = 0,
-    compile_recomputes: usize = 0,
-    dependency_checks: usize = 0,
-    dependency_invalidations: usize = 0,
-};
-
-pub const Stage = enum {
-    parse,
-    typecheck,
-    lower,
-    compile,
+    key: db.QueryKey,
+    deps: std.ArrayList(db.Dependency),
 };
 
 pub const QueryDb = struct {
     gpa: std.mem.Allocator,
-    revision: Revision,
-    sources: std.AutoHashMap(SourceId, SourceInput),
-    parse_memos: std.AutoHashMap(SourceId, ParseMemo),
-    type_memos: std.AutoHashMap(SourceId, TypeMemo),
-    lower_memos: std.AutoHashMap(SourceId, LowerMemo),
-    compile_memos: std.AutoHashMap(SourceId, CompileMemo),
+    revision: db.Revision,
+    sources: std.AutoHashMap(db.SourceId, SourceInput),
+    parse_memos: std.AutoHashMap(db.SourceId, parser.ParseMemo),
+    type_memos: std.AutoHashMap(db.SourceId, typecheck.TypeMemo),
+    lower_memos: std.AutoHashMap(db.SourceId, ir_mod.LowerMemo),
+    compile_memos: std.AutoHashMap(db.SourceId, codegen.CompileMemo),
     active_stack: std.ArrayList(ActiveQuery),
-    stats: QueryStats,
+    stats: db.QueryStats,
 
     pub fn init(gpa: std.mem.Allocator) QueryDb {
         return .{
             .gpa = gpa,
             .revision = 0,
-            .sources = std.AutoHashMap(SourceId, SourceInput).init(gpa),
-            .parse_memos = std.AutoHashMap(SourceId, ParseMemo).init(gpa),
-            .type_memos = std.AutoHashMap(SourceId, TypeMemo).init(gpa),
-            .lower_memos = std.AutoHashMap(SourceId, LowerMemo).init(gpa),
-            .compile_memos = std.AutoHashMap(SourceId, CompileMemo).init(gpa),
+            .sources = std.AutoHashMap(db.SourceId, SourceInput).init(gpa),
+            .parse_memos = std.AutoHashMap(db.SourceId, parser.ParseMemo).init(gpa),
+            .type_memos = std.AutoHashMap(db.SourceId, typecheck.TypeMemo).init(gpa),
+            .lower_memos = std.AutoHashMap(db.SourceId, ir_mod.LowerMemo).init(gpa),
+            .compile_memos = std.AutoHashMap(db.SourceId, codegen.CompileMemo).init(gpa),
             .active_stack = .empty,
             .stats = .{},
         };
@@ -184,7 +88,7 @@ pub const QueryDb = struct {
         self.active_stack.deinit(self.gpa);
     }
 
-    pub fn setSource(self: *@This(), source_id: SourceId, text: []const u8) !void {
+    pub fn setSource(self: *@This(), source_id: db.SourceId, text: []const u8) !void {
         if (self.sources.getPtr(source_id)) |existing| {
             if (std.mem.eql(u8, existing.text, text)) {
                 self.stats.source_unchanged += 1;
@@ -209,24 +113,40 @@ pub const QueryDb = struct {
         });
     }
 
-    pub fn parsedAst(self: *@This(), source_id: SourceId) DbError!*const AstNode {
+    pub fn sourceText(self: *const @This(), source_id: db.SourceId) ?[]const u8 {
+        if (self.sources.get(source_id)) |input| return input.text;
+        return null;
+    }
+
+    pub fn parsedAst(self: *@This(), source_id: db.SourceId) db.DbError!?*const AstNode {
         const memo = try self.ensureParseMemo(source_id, true);
-        return memo.value.root;
+        if (memo.value) |*parsed| return parsed.root;
+        return null;
     }
 
-    pub fn loweredProgram(self: *@This(), source_id: SourceId) DbError!*const Program {
+    pub fn loweredProgram(self: *@This(), source_id: db.SourceId) db.DbError!?*const ir_mod.Program {
         const memo = try self.ensureLowerMemo(source_id, true);
-        return &memo.value;
+        if (memo.value) |*prog| return prog;
+        return null;
     }
 
-    pub fn typedAst(self: *@This(), source_id: SourceId) DbError!*const TypedAst {
+    pub fn typedAst(self: *@This(), source_id: db.SourceId) db.DbError!?*const typecheck.TypedAst {
         const memo = try self.ensureTypeMemo(source_id, true);
-        return &memo.value;
+        if (memo.value) |*typed| return typed;
+        return null;
     }
 
-    pub fn compileBytes(self: *@This(), source_id: SourceId) DbError![]const u8 {
+    pub fn compileBytes(self: *@This(), source_id: db.SourceId) db.DbError!?[]const u8 {
         const memo = try self.ensureCompileMemo(source_id, true);
         return memo.value;
+    }
+
+    pub fn compileResult(self: *@This(), source_id: db.SourceId) db.DbError!CompileResult {
+        const memo = try self.ensureCompileMemo(source_id, true);
+        return .{
+            .bytes = memo.value,
+            .diagnostics = memo.diagnostics.items,
+        };
     }
 
     pub fn statsSnapshot(self: *const @This()) QueryStats {
@@ -239,7 +159,7 @@ pub const QueryDb = struct {
         self.stats = .{ .revision = self.revision };
     }
 
-    pub fn changedAt(self: *const @This(), stage: Stage, source_id: SourceId) ?Revision {
+    pub fn changedAt(self: *const @This(), stage: Stage, source_id: SourceId) ?db.Revision {
         return switch (stage) {
             .parse => if (self.parse_memos.get(source_id)) |memo| memo.changed_at else null,
             .typecheck => if (self.type_memos.get(source_id)) |memo| memo.changed_at else null,
@@ -252,11 +172,11 @@ pub const QueryDb = struct {
         self.revision += 1;
     }
 
-    fn queryFor(kind: QueryKind, source_id: SourceId) QueryKey {
+    fn queryFor(kind: db.QueryKind, source_id: db.SourceId) db.QueryKey {
         return .{ .kind = kind, .source_id = source_id };
     }
 
-    fn ensureParseMemo(self: *@This(), source_id: SourceId, track_dependency: bool) DbError!*ParseMemo {
+    fn ensureParseMemo(self: *@This(), source_id: db.SourceId, track_dependency: bool) db.DbError!*parser.ParseMemo {
         const query_key = queryFor(.parse, source_id);
         if (track_dependency) try self.noteQueryDependency(query_key);
 
@@ -275,13 +195,37 @@ pub const QueryDb = struct {
             }
 
             self.stats.parse_recomputes += 1;
-            try self.recomputeParseMemo(source_id, memo);
+            memo.computing = true;
+            defer memo.computing = false;
+
+            try self.beginQuery(query_key);
+            errdefer self.abortQuery();
+            const source = try self.getSourceText(source_id);
+            var fresh = try parser.computeParse(source, self.gpa);
+            errdefer fresh.deinit(self.gpa);
+            const frame = self.endQuery();
+
+            if (memo.value) |*parsed| parsed.deinit();
+            memo.diagnostics.deinit(self.gpa);
+            memo.deps.deinit(self.gpa);
+            memo.value = fresh.value;
+            memo.diagnostics = fresh.diagnostics;
+            memo.deps = frame.deps;
+            memo.verified_at = self.revision;
+            memo.changed_at = self.revision;
             return memo;
         }
 
         self.stats.parse_recomputes += 1;
-        var fresh = try self.computeParseMemo(source_id);
+        try self.beginQuery(query_key);
+        errdefer self.abortQuery();
+        const source = try self.getSourceText(source_id);
+        var fresh = try parser.computeParse(source, self.gpa);
         errdefer fresh.deinit(self.gpa);
+        const frame = self.endQuery();
+        fresh.deps = frame.deps;
+        fresh.verified_at = self.revision;
+        fresh.changed_at = self.revision;
 
         const old = try self.parse_memos.fetchPut(source_id, fresh);
         if (old) |kv| {
@@ -291,7 +235,7 @@ pub const QueryDb = struct {
         return self.parse_memos.getPtr(source_id).?;
     }
 
-    fn ensureTypeMemo(self: *@This(), source_id: SourceId, track_dependency: bool) DbError!*TypeMemo {
+    fn ensureTypeMemo(self: *@This(), source_id: db.SourceId, track_dependency: bool) db.DbError!*typecheck.TypeMemo {
         const query_key = queryFor(.typecheck, source_id);
         if (track_dependency) try self.noteQueryDependency(query_key);
 
@@ -310,13 +254,37 @@ pub const QueryDb = struct {
             }
 
             self.stats.type_recomputes += 1;
-            try self.recomputeTypeMemo(source_id, memo);
+            memo.computing = true;
+            defer memo.computing = false;
+
+            try self.beginQuery(query_key);
+            errdefer self.abortQuery();
+            const parse_memo = try self.ensureParseMemo(source_id, true);
+            var fresh = try typecheck.computeType(parse_memo, self.gpa);
+            errdefer fresh.deinit(self.gpa);
+            const frame = self.endQuery();
+
+            if (memo.value) |*typed| typed.deinit();
+            memo.diagnostics.deinit(self.gpa);
+            memo.deps.deinit(self.gpa);
+            memo.value = fresh.value;
+            memo.diagnostics = fresh.diagnostics;
+            memo.deps = frame.deps;
+            memo.verified_at = self.revision;
+            memo.changed_at = self.revision;
             return memo;
         }
 
         self.stats.type_recomputes += 1;
-        var fresh = try self.computeTypeMemo(source_id);
+        try self.beginQuery(query_key);
+        errdefer self.abortQuery();
+        const parse_memo = try self.ensureParseMemo(source_id, true);
+        var fresh = try typecheck.computeType(parse_memo, self.gpa);
         errdefer fresh.deinit(self.gpa);
+        const frame = self.endQuery();
+        fresh.deps = frame.deps;
+        fresh.verified_at = self.revision;
+        fresh.changed_at = self.revision;
 
         const old = try self.type_memos.fetchPut(source_id, fresh);
         if (old) |kv| {
@@ -326,7 +294,7 @@ pub const QueryDb = struct {
         return self.type_memos.getPtr(source_id).?;
     }
 
-    fn ensureLowerMemo(self: *@This(), source_id: SourceId, track_dependency: bool) DbError!*LowerMemo {
+    fn ensureLowerMemo(self: *@This(), source_id: db.SourceId, track_dependency: bool) db.DbError!*ir_mod.LowerMemo {
         const query_key = queryFor(.lower, source_id);
         if (track_dependency) try self.noteQueryDependency(query_key);
 
@@ -345,13 +313,39 @@ pub const QueryDb = struct {
             }
 
             self.stats.lower_recomputes += 1;
-            try self.recomputeLowerMemo(source_id, memo);
+            memo.computing = true;
+            defer memo.computing = false;
+
+            try self.beginQuery(query_key);
+            errdefer self.abortQuery();
+            const type_memo = try self.ensureTypeMemo(source_id, true);
+            const parse_memo = try self.ensureParseMemo(source_id, true);
+            var fresh = try ir_mod.computeLower(type_memo, parse_memo, self.gpa);
+            errdefer fresh.deinit(self.gpa);
+            const frame = self.endQuery();
+
+            if (memo.value) |*program| program.deinit(self.gpa);
+            memo.diagnostics.deinit(self.gpa);
+            memo.deps.deinit(self.gpa);
+            memo.value = fresh.value;
+            memo.diagnostics = fresh.diagnostics;
+            memo.deps = frame.deps;
+            memo.verified_at = self.revision;
+            memo.changed_at = self.revision;
             return memo;
         }
 
         self.stats.lower_recomputes += 1;
-        var fresh = try self.computeLowerMemo(source_id);
+        try self.beginQuery(query_key);
+        errdefer self.abortQuery();
+        const type_memo = try self.ensureTypeMemo(source_id, true);
+        const parse_memo = try self.ensureParseMemo(source_id, true);
+        var fresh = try ir_mod.computeLower(type_memo, parse_memo, self.gpa);
         errdefer fresh.deinit(self.gpa);
+        const frame = self.endQuery();
+        fresh.deps = frame.deps;
+        fresh.verified_at = self.revision;
+        fresh.changed_at = self.revision;
 
         const old = try self.lower_memos.fetchPut(source_id, fresh);
         if (old) |kv| {
@@ -361,7 +355,7 @@ pub const QueryDb = struct {
         return self.lower_memos.getPtr(source_id).?;
     }
 
-    fn ensureCompileMemo(self: *@This(), source_id: SourceId, track_dependency: bool) DbError!*CompileMemo {
+    fn ensureCompileMemo(self: *@This(), source_id: db.SourceId, track_dependency: bool) db.DbError!*codegen.CompileMemo {
         const query_key = queryFor(.compile, source_id);
         if (track_dependency) try self.noteQueryDependency(query_key);
 
@@ -380,13 +374,41 @@ pub const QueryDb = struct {
             }
 
             self.stats.compile_recomputes += 1;
-            try self.recomputeCompileMemo(source_id, memo);
+            memo.computing = true;
+            defer memo.computing = false;
+
+            try self.beginQuery(query_key);
+            errdefer self.abortQuery();
+            const lower_memo = try self.ensureLowerMemo(source_id, true);
+            var fresh = try codegen.computeCompile(lower_memo, self.gpa);
+            errdefer fresh.deinit(self.gpa);
+            const frame = self.endQuery();
+
+            const old_changed_at = memo.changed_at;
+            const same_value = db.valuesEqual(memo.value, fresh.value);
+            const same_diagnostics = db.diagnosticsEqual(memo.diagnostics.items, fresh.diagnostics.items);
+
+            if (memo.value) |bytes| self.gpa.free(bytes);
+            memo.diagnostics.deinit(self.gpa);
+            memo.deps.deinit(self.gpa);
+            memo.value = fresh.value;
+            memo.diagnostics = fresh.diagnostics;
+            memo.deps = frame.deps;
+            memo.verified_at = self.revision;
+            memo.changed_at = if (same_value and same_diagnostics) old_changed_at else self.revision;
             return memo;
         }
 
         self.stats.compile_recomputes += 1;
-        var fresh = try self.computeCompileMemo(source_id);
+        try self.beginQuery(query_key);
+        errdefer self.abortQuery();
+        const lower_memo = try self.ensureLowerMemo(source_id, true);
+        var fresh = try codegen.computeCompile(lower_memo, self.gpa);
         errdefer fresh.deinit(self.gpa);
+        const frame = self.endQuery();
+        fresh.deps = frame.deps;
+        fresh.verified_at = self.revision;
+        fresh.changed_at = self.revision;
 
         const old = try self.compile_memos.fetchPut(source_id, fresh);
         if (old) |kv| {
@@ -396,143 +418,7 @@ pub const QueryDb = struct {
         return self.compile_memos.getPtr(source_id).?;
     }
 
-    fn computeParseMemo(self: *@This(), source_id: SourceId) DbError!ParseMemo {
-        try self.beginQuery(queryFor(.parse, source_id));
-        errdefer self.abortQuery();
-
-        const source = try self.getSourceText(source_id);
-        const value = try parser.parseOwned(source, self.gpa);
-
-        const frame = self.endQuery();
-
-        return .{
-            .value = value,
-            .deps = frame.deps,
-            .verified_at = self.revision,
-            .changed_at = self.revision,
-            .computing = false,
-        };
-    }
-
-    fn recomputeParseMemo(self: *@This(), source_id: SourceId, memo: *ParseMemo) DbError!void {
-        memo.computing = true;
-        defer memo.computing = false;
-
-        var fresh = try self.computeParseMemo(source_id);
-        errdefer fresh.deinit(self.gpa);
-
-        memo.value.deinit();
-        memo.deps.deinit(self.gpa);
-        memo.value = fresh.value;
-        memo.deps = fresh.deps;
-        memo.verified_at = fresh.verified_at;
-        memo.changed_at = self.revision;
-    }
-
-    fn computeLowerMemo(self: *@This(), source_id: SourceId) DbError!LowerMemo {
-        try self.beginQuery(queryFor(.lower, source_id));
-        errdefer self.abortQuery();
-
-        const type_memo = try self.ensureTypeMemo(source_id, true);
-        const parse_memo = try self.ensureParseMemo(source_id, true);
-        const lowered = try ir_mod.lower(parse_memo.value.root, &type_memo.value, self.gpa);
-
-        const frame = self.endQuery();
-
-        return .{
-            .value = lowered,
-            .deps = frame.deps,
-            .verified_at = self.revision,
-            .changed_at = self.revision,
-            .computing = false,
-        };
-    }
-
-    fn recomputeLowerMemo(self: *@This(), source_id: SourceId, memo: *LowerMemo) DbError!void {
-        memo.computing = true;
-        defer memo.computing = false;
-
-        var fresh = try self.computeLowerMemo(source_id);
-        errdefer fresh.deinit(self.gpa);
-
-        memo.value.deinit(self.gpa);
-        memo.deps.deinit(self.gpa);
-        memo.value = fresh.value;
-        memo.deps = fresh.deps;
-        memo.verified_at = fresh.verified_at;
-        memo.changed_at = self.revision;
-    }
-
-    fn computeTypeMemo(self: *@This(), source_id: SourceId) DbError!TypeMemo {
-        try self.beginQuery(queryFor(.typecheck, source_id));
-        errdefer self.abortQuery();
-
-        const parse_memo = try self.ensureParseMemo(source_id, true);
-        const typed = try typecheck.typecheck(parse_memo.value.root, self.gpa);
-
-        const frame = self.endQuery();
-
-        return .{
-            .value = typed,
-            .deps = frame.deps,
-            .verified_at = self.revision,
-            .changed_at = self.revision,
-            .computing = false,
-        };
-    }
-
-    fn recomputeTypeMemo(self: *@This(), source_id: SourceId, memo: *TypeMemo) DbError!void {
-        memo.computing = true;
-        defer memo.computing = false;
-
-        var fresh = try self.computeTypeMemo(source_id);
-        errdefer fresh.deinit(self.gpa);
-
-        memo.value.deinit();
-        memo.deps.deinit(self.gpa);
-        memo.value = fresh.value;
-        memo.deps = fresh.deps;
-        memo.verified_at = fresh.verified_at;
-        memo.changed_at = self.revision;
-    }
-
-    fn computeCompileMemo(self: *@This(), source_id: SourceId) DbError!CompileMemo {
-        try self.beginQuery(queryFor(.compile, source_id));
-        errdefer self.abortQuery();
-
-        const lower_memo = try self.ensureLowerMemo(source_id, true);
-        const bytes = try codegen.compileProgram(&lower_memo.value, self.gpa);
-
-        const frame = self.endQuery();
-
-        return .{
-            .value = bytes,
-            .deps = frame.deps,
-            .verified_at = self.revision,
-            .changed_at = self.revision,
-            .computing = false,
-        };
-    }
-
-    fn recomputeCompileMemo(self: *@This(), source_id: SourceId, memo: *CompileMemo) DbError!void {
-        memo.computing = true;
-        defer memo.computing = false;
-
-        var fresh = try self.computeCompileMemo(source_id);
-        errdefer fresh.deinit(self.gpa);
-
-        const old_changed_at = memo.changed_at;
-        const same_value = std.mem.eql(u8, memo.value, fresh.value);
-
-        self.gpa.free(memo.value);
-        memo.deps.deinit(self.gpa);
-        memo.value = fresh.value;
-        memo.deps = fresh.deps;
-        memo.verified_at = fresh.verified_at;
-        memo.changed_at = if (same_value) old_changed_at else self.revision;
-    }
-
-    fn dependenciesUnchanged(self: *@This(), deps: []const Dependency, verified_at: Revision) DbError!bool {
+    fn dependenciesUnchanged(self: *@This(), deps: []const db.Dependency, verified_at: db.Revision) db.DbError!bool {
         for (deps) |dep| {
             self.stats.dependency_checks += 1;
             switch (dep) {
@@ -554,39 +440,39 @@ pub const QueryDb = struct {
         return true;
     }
 
-    fn queryChangedAfter(self: *@This(), key: QueryKey, revision: Revision) DbError!bool {
+    fn queryChangedAfter(self: *@This(), key: db.QueryKey, revision: db.Revision) db.DbError!bool {
         return switch (key.kind) {
-            .parse => block: {
+            .parse => blk: {
                 const memo = try self.ensureParseMemo(key.source_id, false);
-                break :block memo.changed_at > revision;
+                break :blk memo.changed_at > revision;
             },
-            .typecheck => block: {
+            .typecheck => blk: {
                 const memo = try self.ensureTypeMemo(key.source_id, false);
-                break :block memo.changed_at > revision;
+                break :blk memo.changed_at > revision;
             },
-            .lower => block: {
+            .lower => blk: {
                 const memo = try self.ensureLowerMemo(key.source_id, false);
-                break :block memo.changed_at > revision;
+                break :blk memo.changed_at > revision;
             },
-            .compile => block: {
+            .compile => blk: {
                 const memo = try self.ensureCompileMemo(key.source_id, false);
-                break :block memo.changed_at > revision;
+                break :blk memo.changed_at > revision;
             },
         };
     }
 
-    fn getSourceText(self: *@This(), source_id: SourceId) DbError![]const u8 {
+    fn getSourceText(self: *@This(), source_id: db.SourceId) db.DbError![]const u8 {
         try self.noteSourceDependency(source_id);
         const input = self.sources.get(source_id) orelse return error.SourceNotFound;
         return input.text;
     }
 
-    fn beginQuery(self: *@This(), key: QueryKey) DbError!void {
+    fn beginQuery(self: *@This(), key: db.QueryKey) db.DbError!void {
         for (self.active_stack.items) |active| {
-            if (queryKeyEql(active.key, key)) return error.QueryCycle;
+            if (db.queryKeyEql(active.key, key)) return error.QueryCycle;
         }
 
-        var deps = try std.ArrayList(Dependency).initCapacity(self.gpa, 8);
+        var deps = try std.ArrayList(db.Dependency).initCapacity(self.gpa, 8);
         errdefer deps.deinit(self.gpa);
 
         try self.active_stack.append(self.gpa, .{
@@ -606,39 +492,15 @@ pub const QueryDb = struct {
         frame.deps.deinit(self.gpa);
     }
 
-    fn noteSourceDependency(self: *@This(), source_id: SourceId) std.mem.Allocator.Error!void {
+    fn noteSourceDependency(self: *@This(), source_id: db.SourceId) std.mem.Allocator.Error!void {
         if (self.active_stack.items.len == 0) return;
         const top_idx = self.active_stack.items.len - 1;
-        try appendDependencyUnique(&self.active_stack.items[top_idx].deps, self.gpa, .{ .source = source_id });
+        try db.appendDependencyUnique(&self.active_stack.items[top_idx].deps, self.gpa, .{ .source = source_id });
     }
 
-    fn noteQueryDependency(self: *@This(), key: QueryKey) std.mem.Allocator.Error!void {
+    fn noteQueryDependency(self: *@This(), key: db.QueryKey) std.mem.Allocator.Error!void {
         if (self.active_stack.items.len == 0) return;
         const top_idx = self.active_stack.items.len - 1;
-        try appendDependencyUnique(&self.active_stack.items[top_idx].deps, self.gpa, .{ .query = key });
+        try db.appendDependencyUnique(&self.active_stack.items[top_idx].deps, self.gpa, .{ .query = key });
     }
 };
-
-fn queryKeyEql(a: QueryKey, b: QueryKey) bool {
-    return a.kind == b.kind and a.source_id == b.source_id;
-}
-
-fn dependencyEql(a: Dependency, b: Dependency) bool {
-    return switch (a) {
-        .source => |lhs| switch (b) {
-            .source => |rhs| lhs == rhs,
-            .query => false,
-        },
-        .query => |lhs| switch (b) {
-            .source => false,
-            .query => |rhs| queryKeyEql(lhs, rhs),
-        },
-    };
-}
-
-fn appendDependencyUnique(deps: *std.ArrayList(Dependency), gpa: std.mem.Allocator, dep: Dependency) std.mem.Allocator.Error!void {
-    for (deps.items) |existing| {
-        if (dependencyEql(existing, dep)) return;
-    }
-    try deps.append(gpa, dep);
-}
