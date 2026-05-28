@@ -1,6 +1,7 @@
 const std = @import("std");
 const testing = std.testing;
 const query = @import("query.zig");
+const typecheck = @import("typecheck.zig");
 const x86 = @import("main.zig");
 const writeProgram = x86.writeProgram;
 
@@ -83,13 +84,13 @@ test "arg" {
 }
 
 test "comparisons" {
-    try testProgram("print(3 < 4)", "1\n");
-    try testProgram("print(4 < 3)", "0\n");
-    try testProgram("print(4 > 3)", "1\n");
-    try testProgram("print(4 <= 4)", "1\n");
-    try testProgram("print(3 >= 4)", "0\n");
-    try testProgram("print(-7 == -7)", "1\n");
-    try testProgram("print(9 != 9)", "0\n");
+    try testProgram("print(3 < 4)", "true\n");
+    try testProgram("print(4 < 3)", "false\n");
+    try testProgram("print(4 > 3)", "true\n");
+    try testProgram("print(4 <= 4)", "true\n");
+    try testProgram("print(3 >= 4)", "false\n");
+    try testProgram("print(-7 == -7)", "true\n");
+    try testProgram("print(9 != 9)", "false\n");
 }
 
 test "if branches" {
@@ -103,26 +104,65 @@ test "if expression" {
     try testProgram("print((if 2 == 2 then 5 else 6) + 7)", "12\n");
 }
 
+test "float arithmetic and printing" {
+    try testProgram("print(1.5)", "1.500000\n");
+    try testProgram("print(1.5 + 2.25)", "3.750000\n");
+    try testProgram("print(7.0 / 2.0)", "3.500000\n");
+}
+
+test "float comparisons with NaN semantics" {
+    try testProgram("print((0.0 / 0.0) == 1.0)", "false\n");
+    try testProgram("print((0.0 / 0.0) != 1.0)", "true\n");
+}
+
+test "if without else requires unit in then branch" {
+    try testProgram("if 3 < 4 then print(11)", "11\n");
+}
+
+test "type errors" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+
+    try db.setSource(0, "print(1 + 2.0)");
+    try testing.expectError(typecheck.TypeError.ArithmeticOperandMismatch, db.compileBytes(0));
+
+    try db.setSource(0, "if 1 then 2 else 3");
+    try testing.expectError(typecheck.TypeError.IfConditionMustBeBool, db.compileBytes(0));
+
+    try db.setSource(0, "if 1 < 2 then 1 else 2.0");
+    try testing.expectError(typecheck.TypeError.IfBranchTypeMismatch, db.compileBytes(0));
+
+    try db.setSource(0, "if 1 < 2 then 1");
+    try testing.expectError(typecheck.TypeError.IfWithoutElseRequiresUnit, db.compileBytes(0));
+
+    try db.setSource(0, "print(if 1 < 2 then print(1) else print(2))");
+    try testing.expectError(typecheck.TypeError.PrintUnitValue, db.compileBytes(0));
+}
+
 test "query cache hits within same revision" {
     var db = query.QueryDb.init(testing.allocator);
     defer db.deinit();
 
     try db.setSource(0, "print(1)");
     _ = try db.parsedAst(0);
+    _ = try db.typedAst(0);
     _ = try db.loweredProgram(0);
     _ = try db.compileBytes(0);
 
     db.resetStats();
 
     _ = try db.parsedAst(0);
+    _ = try db.typedAst(0);
     _ = try db.loweredProgram(0);
     _ = try db.compileBytes(0);
 
     const stats = db.statsSnapshot();
     try testing.expectEqual(@as(usize, 1), stats.parse_hits);
+    try testing.expectEqual(@as(usize, 1), stats.type_hits);
     try testing.expectEqual(@as(usize, 1), stats.lower_hits);
     try testing.expectEqual(@as(usize, 1), stats.compile_hits);
     try testing.expectEqual(@as(usize, 0), stats.parse_recomputes);
+    try testing.expectEqual(@as(usize, 0), stats.type_recomputes);
     try testing.expectEqual(@as(usize, 0), stats.lower_recomputes);
     try testing.expectEqual(@as(usize, 0), stats.compile_recomputes);
 }
@@ -144,6 +184,7 @@ test "source change invalidates parse lower compile" {
     try testing.expectEqual(before + 1, after.revision);
     try testing.expectEqual(@as(usize, 1), after.source_sets);
     try testing.expectEqual(@as(usize, 1), after.parse_recomputes);
+    try testing.expectEqual(@as(usize, 1), after.type_recomputes);
     try testing.expectEqual(@as(usize, 1), after.lower_recomputes);
     try testing.expectEqual(@as(usize, 1), after.compile_recomputes);
     try testing.expect(after.dependency_invalidations > 0);
@@ -211,6 +252,7 @@ test "debug query diagnostics format" {
         .revision = 7,
         .source_sets = 2,
         .parse_hits = 3,
+        .type_hits = 4,
         .compile_recomputes = 1,
         .dependency_checks = 5,
     };
@@ -219,6 +261,7 @@ test "debug query diagnostics format" {
     try testing.expect(std.mem.indexOf(u8, buf.items, "; query diagnostics:") != null);
     try testing.expect(std.mem.indexOf(u8, buf.items, ";   revision: 7") != null);
     try testing.expect(std.mem.indexOf(u8, buf.items, ";   parse: hits=3 recomputes=0") != null);
+    try testing.expect(std.mem.indexOf(u8, buf.items, ";   type: hits=4 recomputes=0") != null);
     try testing.expect(std.mem.indexOf(u8, buf.items, ";   compile: hits=0 recomputes=1") != null);
     try testing.expect(std.mem.indexOf(u8, buf.items, ";   dependencies: checks=5 invalidations=0") != null);
 }

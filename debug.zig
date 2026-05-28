@@ -27,18 +27,33 @@ fn dumpIr(program: *const Program, writer: *std.Io.Writer) void {
         for (blk.insts.items) |vinst| {
             switch (vinst.op) {
                 .iconst => |v| writer.print("  %{d} = iconst {d}\n", .{ vinst.id, v }) catch return,
-                .iadd => |p| printBinInst(writer, vinst.id, "iadd", p),
-                .isub => |p| printBinInst(writer, vinst.id, "isub", p),
-                .imul => |p| printBinInst(writer, vinst.id, "imul", p),
-                .idiv => |p| printBinInst(writer, vinst.id, "idiv", p),
-                .ilt => |p| printBinInst(writer, vinst.id, "ilt", p),
-                .igt => |p| printBinInst(writer, vinst.id, "igt", p),
-                .ile => |p| printBinInst(writer, vinst.id, "ile", p),
-                .ige => |p| printBinInst(writer, vinst.id, "ige", p),
-                .ieq => |p| printBinInst(writer, vinst.id, "ieq", p),
-                .ine => |p| printBinInst(writer, vinst.id, "ine", p),
-                .print => |v| writer.print("  %{d} = print %{d}\n", .{ vinst.id, v }) catch return,
-                .iarg => |idx| writer.print("  %{d} = iarg %{d}\n", .{ vinst.id, idx }) catch return,
+                .fconst => |v| writer.print("  %{d} = fconst {d}\n", .{ vinst.id, v }) catch return,
+                .addi => |p| printBinInst(writer, vinst.id, "addi", p),
+                .addf => |p| printBinInst(writer, vinst.id, "addf", p),
+                .subi => |p| printBinInst(writer, vinst.id, "subi", p),
+                .subf => |p| printBinInst(writer, vinst.id, "subf", p),
+                .muli => |p| printBinInst(writer, vinst.id, "muli", p),
+                .mulf => |p| printBinInst(writer, vinst.id, "mulf", p),
+                .divi => |p| printBinInst(writer, vinst.id, "divi", p),
+                .divf => |p| printBinInst(writer, vinst.id, "divf", p),
+                .lti => |p| printBinInst(writer, vinst.id, "lti", p),
+                .ltf => |p| printBinInst(writer, vinst.id, "ltf", p),
+                .gti => |p| printBinInst(writer, vinst.id, "gti", p),
+                .gtf => |p| printBinInst(writer, vinst.id, "gtf", p),
+                .lei => |p| printBinInst(writer, vinst.id, "lei", p),
+                .lef => |p| printBinInst(writer, vinst.id, "lef", p),
+                .gei => |p| printBinInst(writer, vinst.id, "gei", p),
+                .gef => |p| printBinInst(writer, vinst.id, "gef", p),
+                .eqi => |p| printBinInst(writer, vinst.id, "eqi", p),
+                .eqf => |p| printBinInst(writer, vinst.id, "eqf", p),
+                .eqb => |p| printBinInst(writer, vinst.id, "eqb", p),
+                .nei => |p| printBinInst(writer, vinst.id, "nei", p),
+                .nef => |p| printBinInst(writer, vinst.id, "nef", p),
+                .neb => |p| printBinInst(writer, vinst.id, "neb", p),
+                .printi => |v| writer.print("  %{d} = printi %{d}\n", .{ vinst.id, v }) catch return,
+                .printf => |v| writer.print("  %{d} = printf %{d}\n", .{ vinst.id, v }) catch return,
+                .printb => |v| writer.print("  %{d} = printb %{d}\n", .{ vinst.id, v }) catch return,
+                .argi => |idx| writer.print("  %{d} = argi %{d}\n", .{ vinst.id, idx }) catch return,
             }
         }
         const terminator = blk.terminator orelse return;
@@ -53,7 +68,6 @@ fn dumpIr(program: *const Program, writer: *std.Io.Writer) void {
 pub const DebugFlags = struct {
     ast: bool = false,
     ssa: bool = false,
-    assembly: bool = false,
     timing: bool = false,
     query: bool = false,
 };
@@ -69,7 +83,10 @@ pub fn parseDebugFlags(args: std.process.Args) DebugFlags {
         while (rest.len > 0) {
             const comma = std.mem.indexOfScalar(u8, rest, ',') orelse rest.len;
             const item = rest[0..comma];
-            if (std.mem.eql(u8, item, "ast")) flags.ast = true else if (std.mem.eql(u8, item, "ssa")) flags.ssa = true else if (std.mem.eql(u8, item, "asm")) flags.assembly = true else if (std.mem.eql(u8, item, "timing")) flags.timing = true else if (std.mem.eql(u8, item, "query")) flags.query = true;
+            if (std.mem.eql(u8, item, "ast")) flags.ast = true;
+            if (std.mem.eql(u8, item, "ssa")) flags.ssa = true;
+            if (std.mem.eql(u8, item, "timing")) flags.timing = true;
+            if (std.mem.eql(u8, item, "query")) flags.query = true;
             if (comma == rest.len) break;
             rest = rest[comma + 1 ..];
         }
@@ -88,6 +105,7 @@ fn appendPrefix(prefix: []const u8, suffix: []const u8, buf: *[256]u8) ?[]const 
 fn writeAstLabel(writer: *std.Io.Writer, node: *const AstNode) void {
     switch (node.*) {
         .int => |v| writer.print("int {d}", .{v}) catch return,
+        .float => |v| writer.print("float {d}", .{v}) catch return,
         .print => writer.writeAll("print") catch return,
         .add => writer.writeAll("add") catch return,
         .sub => writer.writeAll("sub") catch return,
@@ -129,7 +147,7 @@ fn dumpAstNode(node: *const AstNode, writer: *std.Io.Writer, prefix: []const u8,
                 dumpAstNode(data.then_, writer, next_prefix, true, false);
             }
         },
-        .int, .arg => {},
+        .int, .float, .arg => {},
     }
 }
 
@@ -154,14 +172,6 @@ pub fn dumpDebugInfo(io: std.Io, flags: DebugFlags, root: *const AstNode, ir: ?*
             try w.interface.writeAll("; SSA IR:\n");
             dumpIr(irim, &w.interface);
             try w.interface.writeAll("\n");
-            try w.interface.flush();
-        }
-        if (flags.assembly) {
-            var wbuf: [4096]u8 = undefined;
-            var w = std.Io.File.stdout().writer(io, &wbuf);
-            try w.interface.writeAll("; --- asm ---\n");
-            try w.interface.writeAll("; binary-only backend enabled; text asm emitter removed\n");
-            try w.interface.writeAll("; --- end asm ---\n");
             try w.interface.flush();
         }
     }

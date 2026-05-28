@@ -8,11 +8,12 @@
 |------|-------------|
 | `main.zig` | AST types, runtime entrypoints (`writeProgram`, `runProg`, `eval`, `main`), and query diagnostics formatting |
 | `parser.zig` | Lexer + recursive descent parser (`parseOwned`) from source text to AST |
+| `typecheck.zig` | Type inference/checking over AST (`unit`, `bool`, `int`, `float`) |
 | `query.zig` | Revisioned incremental query database (`QueryDb`) with memoized parse/lower/compile stages |
 | `ir.zig` | Block-based SSA IR definitions and AST -> IR lowering |
 | `codegen.zig` | x86 binary backend: IR -> x86 machine code + ELF executable |
-| `debug.zig` | Debug helpers: AST dump, SSA dump, asm note, debug flag parsing |
-| `helpers_bin.zig` | Pre-assembled helper routines (`print_int`, `atoi`) as byte blobs |
+| `debug.zig` | Debug helpers: AST dump, SSA dump, debug flag parsing |
+| `helpers_bin.zig` | Pre-assembled helper routines (`print_int`, `print_bool`, `print_float32`, `atoi`) as byte blobs |
 | `test.zig` | End-to-end language tests plus incremental query behavior tests |
 
 ## Public API
@@ -22,7 +23,7 @@
 | `AstNode`, `IfNode` | `main.zig` | AST node types |
 | `parseOwned(source, gpa)` | `parser.zig` | Parse source string into arena-owned AST |
 | `Program`, `Block`, `Inst`, `Terminator`, `Branch` | `ir.zig` | SSA/block IR model |
-| `lower(node, gpa)` | `ir.zig` | AST -> `Program` |
+| `lower(node, typed, gpa)` | `ir.zig` | Typed AST -> `Program` |
 | `compileProgram(prog, gpa)` | `codegen.zig` | IR -> ELF file bytes |
 | `QueryDb` (+ `SourceId`, `Revision`, `QueryStats`) | `query.zig` | Incremental query engine over parse/lower/compile |
 | `writeProgram(io, bytes)` | `main.zig` | Writes ELF bytes to `./prog` |
@@ -42,8 +43,9 @@
 ### Stage queries
 
 1. `parse(source_id)` -> `ParsedAst`
-2. `lower(source_id)` -> `Program`
-3. `compile(source_id)` -> `[]const u8` ELF bytes
+2. `typecheck(source_id)` -> typed AST metadata
+3. `lower(source_id)` -> `Program`
+4. `compile(source_id)` -> `[]const u8` ELF bytes
 
 ### Memo metadata
 
@@ -73,17 +75,17 @@ Runtime flow in `main.zig`:
 
 1. `setSource(source_id, demoSource(...))`
 2. `parsedAst(source_id)` (for AST debug)
-3. `loweredProgram(source_id)` (for SSA debug)
-4. `compileBytes(source_id)`
-5. `writeProgram` + `runProg`
+3. `typedAst(source_id)`
+4. `loweredProgram(source_id)` (for SSA debug)
+5. `compileBytes(source_id)`
+6. `writeProgram` + `runProg`
 
 ## Debug flags
 
-Use `--debug=ast,ssa,asm,timing,query`:
+Use `--debug=ast,ssa,timing,query`:
 
 - `ast`: tree-form AST dump.
 - `ssa`: block/terminator SSA listing.
-- `asm`: binary backend note (text asm emitter removed).
 - `timing`: stage timings.
 - `query`: query diagnostics (revision, source set counts, hits/recomputes, dependency checks/invalidations).
 
@@ -102,10 +104,14 @@ Use `--debug=ast,ssa,asm,timing,query`:
 4. Comparisons.
 5. If branch side effects.
 6. If expression value propagation.
-7. Query cache hits within same revision.
-8. Source-change invalidation across parse/lower/compile.
-9. Source-specific invalidation isolation.
-10. Unchanged source revision stability.
-11. Compile `changed_at` backdating when output bytes are identical.
-12. Query diagnostics formatting.
-13. Helper enum/index mapping.
+7. Float arithmetic/printing.
+8. Float comparison NaN semantics.
+9. Else-less `if` unit behavior.
+10. Type error coverage.
+11. Query cache hits within same revision.
+12. Source-change invalidation across parse/typecheck/lower/compile.
+13. Source-specific invalidation isolation.
+14. Unchanged source revision stability.
+15. Compile `changed_at` backdating when output bytes are identical.
+16. Query diagnostics formatting.
+17. Helper enum/index mapping.

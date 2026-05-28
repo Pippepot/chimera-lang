@@ -11,6 +11,7 @@ pub const IfNode = struct {
 
 pub const AstNode = union(enum) {
     int: i32,
+    float: f32,
     print: *const AstNode,
     add: *const [2]AstNode,
     sub: *const [2]AstNode,
@@ -64,6 +65,7 @@ pub fn appendQueryDiagnostics(out: *std.ArrayList(u8), gpa: std.mem.Allocator, s
     try out.print(gpa, ";   source_sets: {d}\n", .{stats.source_sets});
     try out.print(gpa, ";   source_unchanged: {d}\n", .{stats.source_unchanged});
     try out.print(gpa, ";   parse: hits={d} recomputes={d}\n", .{ stats.parse_hits, stats.parse_recomputes });
+    try out.print(gpa, ";   type: hits={d} recomputes={d}\n", .{ stats.type_hits, stats.type_recomputes });
     try out.print(gpa, ";   lower: hits={d} recomputes={d}\n", .{ stats.lower_hits, stats.lower_recomputes });
     try out.print(gpa, ";   compile: hits={d} recomputes={d}\n", .{ stats.compile_hits, stats.compile_recomputes });
     try out.print(gpa, ";   dependencies: checks={d} invalidations={d}\n", .{ stats.dependency_checks, stats.dependency_invalidations });
@@ -140,6 +142,10 @@ pub fn main(init: std.process.Init) !void {
     const root = try qdb.parsedAst(source_id);
     const parse_duration = if (parse_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
 
+    const type_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
+    _ = try qdb.typedAst(source_id);
+    const type_duration = if (type_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
+
     const lower_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
     const ir = try qdb.loweredProgram(source_id);
     const lower_duration = if (lower_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
@@ -169,6 +175,7 @@ pub fn main(init: std.process.Init) !void {
         try printStageTimings(io, &.{
             .{ .label = "set_source", .duration = set_source_duration },
             .{ .label = "parse", .duration = parse_duration },
+            .{ .label = "typecheck", .duration = type_duration },
             .{ .label = "lower", .duration = lower_duration },
             .{ .label = "debug_dump", .duration = debug_duration },
             .{ .label = "compile_query", .duration = compile_duration },

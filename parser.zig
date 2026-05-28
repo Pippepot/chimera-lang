@@ -12,12 +12,14 @@ pub const ParseError = error{
     ExpectedLParen,
     InvalidArgIndex,
     IntegerOverflow,
+    FloatOverflow,
     TrailingInput,
 };
 
 const TokenTag = enum {
     eof,
     int_lit,
+    float_lit,
     kw_if,
     kw_then,
     kw_else,
@@ -40,6 +42,7 @@ const TokenTag = enum {
 const Token = struct {
     tag: TokenTag,
     int_value: u32 = 0,
+    float_value: f32 = 0,
 };
 
 const Lexer = struct {
@@ -56,18 +59,46 @@ const Lexer = struct {
         }
     }
 
-    fn parseNumber(self: *@This()) ParseError!Token {
+    fn parseInt(slice: []const u8) ParseError!u32 {
         var value: u64 = 0;
         const max_signed_plus_one = @as(u64, @intCast(std.math.maxInt(i32))) + 1;
-
-        while (self.index < self.source.len and std.ascii.isDigit(self.source[self.index])) {
-            const digit: u64 = self.source[self.index] - '0';
-            self.index += 1;
+        for (slice) |char| {
+            const digit: u64 = char - '0';
             value = value * 10 + digit;
             if (value > max_signed_plus_one) return error.IntegerOverflow;
         }
+        return @intCast(value);
+    }
 
-        return .{ .tag = .int_lit, .int_value = @intCast(value) };
+    fn parseNumber(self: *@This()) ParseError!Token {
+        const start = self.index;
+        var saw_dot = false;
+
+        if (self.source[self.index] == '.') {
+            saw_dot = true;
+            self.index += 1;
+        }
+
+        while (self.index < self.source.len and std.ascii.isDigit(self.source[self.index])) {
+            self.index += 1;
+        }
+
+        if (self.index < self.source.len and self.source[self.index] == '.') {
+            saw_dot = true;
+            self.index += 1;
+            while (self.index < self.source.len and std.ascii.isDigit(self.source[self.index])) {
+                self.index += 1;
+            }
+        }
+
+        const slice = self.source[start..self.index];
+        if (saw_dot) {
+            const value = std.fmt.parseFloat(f32, slice) catch return error.FloatOverflow;
+            return .{ .tag = .float_lit, .float_value = value };
+        }
+
+        const value = try parseInt(slice);
+        return .{ .tag = .int_lit, .int_value = value };
     }
 
     fn isIdentContinue(char: u8) bool {
@@ -97,7 +128,8 @@ const Lexer = struct {
 
         const char = self.source[self.index];
 
-        if (std.ascii.isDigit(char)) return self.parseNumber();
+        const dot_prefixed_float = char == '.' and self.index + 1 < self.source.len and std.ascii.isDigit(self.source[self.index + 1]);
+        if (std.ascii.isDigit(char) or dot_prefixed_float) return self.parseNumber();
         if (std.ascii.isAlphabetic(char) or char == '_') return self.parseKeywordOrError();
 
         self.index += 1;
@@ -223,6 +255,10 @@ const Parser = struct {
         return -positive;
     }
 
+    fn negatedFloatFromToken(token: Token) f32 {
+        return -token.float_value;
+    }
+
     fn parseProgram(self: *@This()) (ParseError || error{OutOfMemory})!*const AstNode {
         const root = try self.parseExpression();
         if (self.current.tag != .eof) return error.TrailingInput;
@@ -298,6 +334,12 @@ const Parser = struct {
                 return self.allocNode(.{ .int = value });
             }
 
+            if (self.current.tag == .float_lit) {
+                const value = negatedFloatFromToken(self.current);
+                try self.advance();
+                return self.allocNode(.{ .float = value });
+            }
+
             const operand = try self.parseUnary();
             const zero = try self.allocNode(.{ .int = 0 });
             return self.makeBinop(.sub, zero, operand);
@@ -312,6 +354,11 @@ const Parser = struct {
                 const value = try intFromToken(self.current);
                 try self.advance();
                 return self.allocNode(.{ .int = value });
+            },
+            .float_lit => {
+                const value = self.current.float_value;
+                try self.advance();
+                return self.allocNode(.{ .float = value });
             },
             .l_paren => {
                 try self.advance();

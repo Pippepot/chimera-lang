@@ -1,5 +1,6 @@
 const std = @import("std");
 const ir_mod = @import("ir.zig");
+const typecheck = @import("typecheck.zig");
 const x86 = @import("main.zig");
 const helpers = @import("helpers_bin.zig");
 const AstNode = x86.AstNode;
@@ -22,12 +23,18 @@ const BinaryEmitter = struct {
     fixups: std.ArrayList(RelFixup),
 
     const SetccCond = enum(u8) {
+        b  = 0x92,
+        be = 0x96,
+        a  = 0x97,
+        ae = 0x93,
         l  = 0x9C,
         g  = 0x9F,
         le = 0x9E,
         ge = 0x9D,
         e  = 0x94,
         ne = 0x95,
+        p  = 0x9A,
+        np = 0x9B,
     };
 
     const BranchCopy = struct {
@@ -170,11 +177,6 @@ const BinaryEmitter = struct {
         }
     }
 
-    fn finish(self: *@This()) ![]const u8 {
-        try self.resolveFixups();
-        return self.code.toOwnedSlice(self.gpa);
-    }
-
     fn emitLeaRbpRspPlus8(self: *@This()) !void {
         try self.appendBytes(&.{ 0x48, 0x8D, 0x6C, 0x24, 0x08 });
     }
@@ -187,6 +189,11 @@ const BinaryEmitter = struct {
     fn emitMovEaxImm32(self: *@This(), value: i32) !void {
         try self.appendByte(0xB8);
         try self.appendLeU32(@bitCast(value));
+    }
+
+    fn emitMovEaxImmU32(self: *@This(), value: u32) !void {
+        try self.appendByte(0xB8);
+        try self.appendLeU32(value);
     }
 
     fn emitLoadEaxFromSlot(self: *@This(), value_ref: InstRef) !void {
@@ -204,8 +211,23 @@ const BinaryEmitter = struct {
         try self.appendLeU32(slotOffset(value_ref));
     }
 
+    fn emitLoadXmm0FromSlot(self: *@This(), value_ref: InstRef) !void {
+        try self.appendBytes(&.{ 0xF3, 0x0F, 0x10, 0x84, 0x24 });
+        try self.appendLeU32(slotOffset(value_ref));
+    }
+
+    fn emitLoadXmm1FromSlot(self: *@This(), value_ref: InstRef) !void {
+        try self.appendBytes(&.{ 0xF3, 0x0F, 0x10, 0x8C, 0x24 });
+        try self.appendLeU32(slotOffset(value_ref));
+    }
+
     fn emitStoreRaxToSlot(self: *@This(), value_ref: InstRef) !void {
         try self.appendBytes(&.{ 0x48, 0x89, 0x84, 0x24 });
+        try self.appendLeU32(slotOffset(value_ref));
+    }
+
+    fn emitStoreXmm0ToSlot(self: *@This(), value_ref: InstRef) !void {
+        try self.appendBytes(&.{ 0xF3, 0x0F, 0x11, 0x84, 0x24 });
         try self.appendLeU32(slotOffset(value_ref));
     }
 
@@ -247,12 +269,32 @@ const BinaryEmitter = struct {
         try self.appendBytes(&.{ 0x83, 0xF8, 0x00 });
     }
 
+    fn emitUcomissXmm0Xmm1(self: *@This()) !void {
+        try self.appendBytes(&.{ 0x0F, 0x2E, 0xC1 });
+    }
+
+    fn emitFloatBinOp(self: *@This(), opcode: u8) !void {
+        try self.appendBytes(&.{ 0xF3, 0x0F, opcode, 0xC1 });
+    }
+
     fn emitSetcc(self: *@This(), cond: SetccCond) !void {
         try self.appendBytes(&.{ 0x0F, @intFromEnum(cond), 0xC0 });
     }
 
+    fn emitSetccBl(self: *@This(), cond: SetccCond) !void {
+        try self.appendBytes(&.{ 0x0F, @intFromEnum(cond), 0xC3 });
+    }
+
     fn emitMovzxEaxAl(self: *@This()) !void {
         try self.appendBytes(&.{ 0x0F, 0xB6, 0xC0 });
+    }
+
+    fn emitAndAlBl(self: *@This()) !void {
+        try self.appendBytes(&.{ 0x20, 0xD8 });
+    }
+
+    fn emitOrAlBl(self: *@This()) !void {
+        try self.appendBytes(&.{ 0x08, 0xD8 });
     }
 
     fn emitXorEdiEdi(self: *@This()) !void {
@@ -270,7 +312,7 @@ const BinaryEmitter = struct {
         return .{ .src = src, .dst = dst };
     }
 
-    fn emitBinaryArithmetic(self: *@This(), pair: InstPair, opcode: enum { add, sub, imul }, out: InstRef) !void {
+    fn emitBinaryArithmeticInt(self: *@This(), pair: InstPair, opcode: enum { add, sub, imul }, out: InstRef) !void {
         try self.emitLoadEaxFromSlot(pair.l);
         try self.emitLoadEbxFromSlot(pair.r);
         switch (opcode) {
@@ -281,7 +323,14 @@ const BinaryEmitter = struct {
         try self.emitStoreRaxToSlot(out);
     }
 
-    fn emitBinaryDiv(self: *@This(), pair: InstPair, out: InstRef) !void {
+    fn emitBinaryArithmeticFloat(self: *@This(), pair: InstPair, opcode: u8, out: InstRef) !void {
+        try self.emitLoadXmm0FromSlot(pair.l);
+        try self.emitLoadXmm1FromSlot(pair.r);
+        try self.emitFloatBinOp(opcode);
+        try self.emitStoreXmm0ToSlot(out);
+    }
+
+    fn emitBinaryDivInt(self: *@This(), pair: InstPair, out: InstRef) !void {
         try self.emitLoadEaxFromSlot(pair.l);
         try self.emitLoadEbxFromSlot(pair.r);
         try self.emitCdq();
@@ -289,12 +338,46 @@ const BinaryEmitter = struct {
         try self.emitStoreRaxToSlot(out);
     }
 
-    fn emitCompare(self: *@This(), pair: InstPair, cond: SetccCond, out: InstRef) !void {
+    fn emitBinaryDivFloat(self: *@This(), pair: InstPair, out: InstRef) !void {
+        try self.emitLoadXmm0FromSlot(pair.l);
+        try self.emitLoadXmm1FromSlot(pair.r);
+        try self.emitFloatBinOp(0x5E);
+        try self.emitStoreXmm0ToSlot(out);
+    }
+
+    fn emitCompareInt(self: *@This(), pair: InstPair, cond: SetccCond, out: InstRef) !void {
         try self.emitLoadEaxFromSlot(pair.l);
         try self.emitLoadEbxFromSlot(pair.r);
         try self.emitCmpEaxEbx();
         try self.emitSetcc(cond);
         try self.emitMovzxEaxAl();
+        try self.emitStoreRaxToSlot(out);
+    }
+
+    fn emitCompareFloatOrdered(self: *@This(), pair: InstPair, cond: SetccCond, out: InstRef) !void {
+        try self.emitLoadXmm0FromSlot(pair.l);
+        try self.emitLoadXmm1FromSlot(pair.r);
+        try self.emitUcomissXmm0Xmm1();
+        try self.emitSetcc(cond);
+        try self.emitSetccBl(.np);
+        try self.emitAndAlBl();
+        try self.emitMovzxEaxAl();
+        try self.emitStoreRaxToSlot(out);
+    }
+
+    fn emitCompareFloatNotEqual(self: *@This(), pair: InstPair, out: InstRef) !void {
+        try self.emitLoadXmm0FromSlot(pair.l);
+        try self.emitLoadXmm1FromSlot(pair.r);
+        try self.emitUcomissXmm0Xmm1();
+        try self.emitSetcc(.ne);
+        try self.emitSetccBl(.p);
+        try self.emitOrAlBl();
+        try self.emitMovzxEaxAl();
+        try self.emitStoreRaxToSlot(out);
+    }
+
+    fn emitStoreUnitValue(self: *@This(), out: InstRef) !void {
+        try self.emitMovEaxImm32(0);
         try self.emitStoreRaxToSlot(out);
     }
 
@@ -304,21 +387,48 @@ const BinaryEmitter = struct {
                 try self.emitMovEaxImm32(value);
                 try self.emitStoreRaxToSlot(value_inst.id);
             },
-            .iadd => |pair| try self.emitBinaryArithmetic(pair, .add, value_inst.id),
-            .isub => |pair| try self.emitBinaryArithmetic(pair, .sub, value_inst.id),
-            .imul => |pair| try self.emitBinaryArithmetic(pair, .imul, value_inst.id),
-            .idiv => |pair| try self.emitBinaryDiv(pair, value_inst.id),
-            .ilt => |pair| try self.emitCompare(pair, .l, value_inst.id),
-            .igt => |pair| try self.emitCompare(pair, .g, value_inst.id),
-            .ile => |pair| try self.emitCompare(pair, .le, value_inst.id),
-            .ige => |pair| try self.emitCompare(pair, .ge, value_inst.id),
-            .ieq => |pair| try self.emitCompare(pair, .e, value_inst.id),
-            .ine => |pair| try self.emitCompare(pair, .ne, value_inst.id),
-            .print => |value_ref| {
-                try self.emitLoadEaxFromSlot(value_ref);
-                try self.emitCallAndStore(self.helperSymbol(.print_int), value_inst.id);
+            .fconst => |value| {
+                try self.emitMovEaxImmU32(@bitCast(value));
+                try self.emitStoreRaxToSlot(value_inst.id);
             },
-            .iarg => |idx| {
+            .addi => |pair| try self.emitBinaryArithmeticInt(pair, .add, value_inst.id),
+            .addf => |pair| try self.emitBinaryArithmeticFloat(pair, 0x58, value_inst.id),
+            .subi => |pair| try self.emitBinaryArithmeticInt(pair, .sub, value_inst.id),
+            .subf => |pair| try self.emitBinaryArithmeticFloat(pair, 0x5C, value_inst.id),
+            .muli => |pair| try self.emitBinaryArithmeticInt(pair, .imul, value_inst.id),
+            .mulf => |pair| try self.emitBinaryArithmeticFloat(pair, 0x59, value_inst.id),
+            .divi => |pair| try self.emitBinaryDivInt(pair, value_inst.id),
+            .divf => |pair| try self.emitBinaryDivFloat(pair, value_inst.id),
+            .lti => |pair| try self.emitCompareInt(pair, .l, value_inst.id),
+            .ltf => |pair| try self.emitCompareFloatOrdered(pair, .b, value_inst.id),
+            .gti => |pair| try self.emitCompareInt(pair, .g, value_inst.id),
+            .gtf => |pair| try self.emitCompareFloatOrdered(pair, .a, value_inst.id),
+            .lei => |pair| try self.emitCompareInt(pair, .le, value_inst.id),
+            .lef => |pair| try self.emitCompareFloatOrdered(pair, .be, value_inst.id),
+            .gei => |pair| try self.emitCompareInt(pair, .ge, value_inst.id),
+            .gef => |pair| try self.emitCompareFloatOrdered(pair, .ae, value_inst.id),
+            .eqi => |pair| try self.emitCompareInt(pair, .e, value_inst.id),
+            .eqf => |pair| try self.emitCompareFloatOrdered(pair, .e, value_inst.id),
+            .eqb => |pair| try self.emitCompareInt(pair, .e, value_inst.id),
+            .nei => |pair| try self.emitCompareInt(pair, .ne, value_inst.id),
+            .nef => |pair| try self.emitCompareFloatNotEqual(pair, value_inst.id),
+            .neb => |pair| try self.emitCompareInt(pair, .ne, value_inst.id),
+            .printi => |value_ref| {
+                try self.emitLoadEaxFromSlot(value_ref);
+                try self.emitCall(self.helperSymbol(.print_int));
+                try self.emitStoreUnitValue(value_inst.id);
+            },
+            .printf => |value_ref| {
+                try self.emitLoadXmm0FromSlot(value_ref);
+                try self.emitCall(self.helperSymbol(.print_float32));
+                try self.emitStoreUnitValue(value_inst.id);
+            },
+            .printb => |value_ref| {
+                try self.emitLoadEaxFromSlot(value_ref);
+                try self.emitCall(self.helperSymbol(.print_bool));
+                try self.emitStoreUnitValue(value_inst.id);
+            },
+            .argi => |idx| {
                 try self.emitMovRdiFromRbpDisp32(idx * 8);
                 try self.emitCallAndStore(self.helperSymbol(.atoi), value_inst.id);
             },
@@ -408,7 +518,7 @@ const BinaryEmitter = struct {
         }
     }
 
-    fn emitProgram(self: *@This()) !void {
+    fn emitProgram(self: *@This()) ![]const u8 {
         try self.emitLeaRbpRspPlus8();
 
         const frame_size = slotOffset(self.prog.next_value);
@@ -418,6 +528,8 @@ const BinaryEmitter = struct {
 
         for (self.prog.blocks.items) |block| try self.emitBlock(block);
         try self.appendHelpers();
+        try self.resolveFixups();
+        return self.code.toOwnedSlice(self.gpa);
     }
 };
 
@@ -493,15 +605,17 @@ pub fn compileProgram(prog: *const Program, gpa: std.mem.Allocator) ![]const u8 
     var emitter = try BinaryEmitter.init(prog, gpa);
     defer emitter.deinit();
 
-    try emitter.emitProgram();
-    const code = try emitter.finish();
+    const code = try emitter.emitProgram();
     defer gpa.free(code);
 
     return buildElfExecutable(code, 0, gpa);
 }
 
 pub fn compile(node: *const AstNode, gpa: std.mem.Allocator) ![]const u8 {
-    var lowered = try lower(node, gpa);
+    var typed = try typecheck.typecheck(node, gpa);
+    defer typed.deinit();
+
+    var lowered = try lower(node, &typed, gpa);
     defer lowered.deinit(gpa);
     return compileProgram(&lowered, gpa);
 }
