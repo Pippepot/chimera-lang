@@ -1,6 +1,7 @@
 const std = @import("std");
 const testing = std.testing;
 const query = @import("query.zig");
+const parser = @import("parser.zig");
 const typecheck = @import("typecheck.zig");
 const x86 = @import("main.zig");
 const writeProgram = x86.writeProgram;
@@ -115,6 +116,23 @@ test "float comparisons with NaN semantics" {
     try testProgram("print((0.0 / 0.0) != 1.0)", "true\n");
 }
 
+test "const locals and multi-statement programs" {
+    try testProgram(
+        \\const x = 40 + 2
+        \\print(x)
+    , "42\n");
+    try testProgram(
+        \\const x = 2
+        \\const y = x + 3
+        \\print(y)
+    , "5\n");
+    try testProgram(
+        \\const x = 2
+        \\const y = x + 1
+        \\print(x + y)
+    , "5\n");
+}
+
 test "if without else requires unit in then branch" {
     try testProgram("if 3 < 4 then print(11)", "11\n");
 }
@@ -137,6 +155,24 @@ test "type errors" {
 
     try db.setSource(0, "print(if 1 < 2 then print(1) else print(2))");
     try testing.expectError(typecheck.TypeError.PrintUnitValue, db.compileBytes(0));
+
+    try db.setSource(0, "print(x)");
+    try testing.expectError(typecheck.TypeError.UnknownVariable, db.compileBytes(0));
+
+    try db.setSource(0,
+        \\const x = 1
+        \\const x = 2
+        \\print(x)
+    );
+    try testing.expectError(typecheck.TypeError.DuplicateVariable, db.compileBytes(0));
+
+    try db.setSource(0,
+        \\const x = 2
+        \\(const y = 3
+        \\print(y))
+        \\print(x)
+    );
+    try testing.expectError(parser.ParseError.ExpectedExpression, db.compileBytes(0));
 }
 
 test "query cache hits within same revision" {

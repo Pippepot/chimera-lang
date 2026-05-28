@@ -2,11 +2,14 @@ const std = @import("std");
 const x86 = @import("main.zig");
 const AstNode = x86.AstNode;
 const IfNode = x86.IfNode;
+const ConstNode = x86.ConstNode;
 
 pub const ParseError = error{
     UnexpectedCharacter,
     UnexpectedToken,
     ExpectedExpression,
+    ExpectedIdentifier,
+    ExpectedAssign,
     ExpectedThen,
     ExpectedRParen,
     ExpectedLParen,
@@ -21,12 +24,16 @@ const TokenTag = enum {
     int_lit,
     float_lit,
     kw_if,
+    kw_const,
     kw_then,
     kw_else,
     kw_print,
     kw_arg,
+    ident,
     l_paren,
     r_paren,
+    newline,
+    assign,
     plus,
     minus,
     star,
@@ -43,6 +50,7 @@ const Token = struct {
     tag: TokenTag,
     int_value: u32 = 0,
     float_value: f32 = 0,
+    ident: []const u8 = "",
 };
 
 const Lexer = struct {
@@ -53,8 +61,11 @@ const Lexer = struct {
         return .{ .source = source, .index = 0 };
     }
 
-    fn skipWhitespace(self: *@This()) void {
-        while (self.index < self.source.len and std.ascii.isWhitespace(self.source[self.index])) {
+    fn skipInlineWhitespace(self: *@This()) void {
+        while (self.index < self.source.len) {
+            const char = self.source[self.index];
+            if (char == '\n') break;
+            if (!std.ascii.isWhitespace(char)) break;
             self.index += 1;
         }
     }
@@ -105,7 +116,7 @@ const Lexer = struct {
         return std.ascii.isAlphanumeric(char) or char == '_';
     }
 
-    fn parseKeywordOrError(self: *@This()) ParseError!Token {
+    fn parseKeywordOrIdent(self: *@This()) Token {
         const start = self.index;
         self.index += 1;
         while (self.index < self.source.len and isIdentContinue(self.source[self.index])) {
@@ -114,23 +125,27 @@ const Lexer = struct {
 
         const word = self.source[start..self.index];
         if (std.mem.eql(u8, word, "if")) return .{ .tag = .kw_if };
+        if (std.mem.eql(u8, word, "const")) return .{ .tag = .kw_const };
         if (std.mem.eql(u8, word, "then")) return .{ .tag = .kw_then };
         if (std.mem.eql(u8, word, "else")) return .{ .tag = .kw_else };
         if (std.mem.eql(u8, word, "print")) return .{ .tag = .kw_print };
         if (std.mem.eql(u8, word, "arg")) return .{ .tag = .kw_arg };
-
-        return error.UnexpectedCharacter;
+        return .{ .tag = .ident, .ident = word };
     }
 
     fn next(self: *@This()) ParseError!Token {
-        self.skipWhitespace();
+        self.skipInlineWhitespace();
         if (self.index >= self.source.len) return .{ .tag = .eof };
 
         const char = self.source[self.index];
+        if (char == '\n') {
+            self.index += 1;
+            return .{ .tag = .newline };
+        }
 
         const dot_prefixed_float = char == '.' and self.index + 1 < self.source.len and std.ascii.isDigit(self.source[self.index + 1]);
         if (std.ascii.isDigit(char) or dot_prefixed_float) return self.parseNumber();
-        if (std.ascii.isAlphabetic(char) or char == '_') return self.parseKeywordOrError();
+        if (std.ascii.isAlphabetic(char) or char == '_') return self.parseKeywordOrIdent();
 
         self.index += 1;
         return switch (char) {
@@ -151,7 +166,7 @@ const Lexer = struct {
             '=' => if (self.index < self.source.len and self.source[self.index] == '=') tok: {
                 self.index += 1;
                 break :tok .{ .tag = .eq_eq };
-            } else error.UnexpectedCharacter,
+            } else .{ .tag = .assign },
             '!' => if (self.index < self.source.len and self.source[self.index] == '=') tok: {
                 self.index += 1;
                 break :tok .{ .tag = .ne };
@@ -220,6 +235,25 @@ const Parser = struct {
         return kids;
     }
 
+    fn allocName(self: *@This(), name: []const u8) error{OutOfMemory}![]const u8 {
+        return try self.arena.dupe(u8, name);
+    }
+
+    fn makeSeq(self: *@This(), left: *const AstNode, right: *const AstNode) error{OutOfMemory}!*const AstNode {
+        const kids = try self.allocKids(left, right);
+        return self.allocNode(.{ .seq = kids });
+    }
+
+    fn makeConstNode(self: *@This(), name: []const u8, value: *const AstNode, body: *const AstNode) error{OutOfMemory}!*const AstNode {
+        const data = try self.arena.create(ConstNode);
+        data.* = .{
+            .name = try self.allocName(name),
+            .value = value,
+            .body = body,
+        };
+        return self.allocNode(.{ .const_ = data });
+    }
+
     fn makeBinop(self: *@This(), tag: BinTag, left: *const AstNode, right: *const AstNode) error{OutOfMemory}!*const AstNode {
         const kids = try self.allocKids(left, right);
         return switch (tag) {
@@ -260,13 +294,47 @@ const Parser = struct {
     }
 
     fn parseProgram(self: *@This()) (ParseError || error{OutOfMemory})!*const AstNode {
-        const root = try self.parseExpression();
+        const root = try self.parseBlockExpression();
         if (self.current.tag != .eof) return error.TrailingInput;
         return root;
     }
 
+    fn consumeNewlines(self: *@This()) ParseError!void {
+        while (self.current.tag == .newline) {
+            try self.advance();
+        }
+    }
+
+    fn parseBlockExpression(self: *@This()) (ParseError || error{OutOfMemory})!*const AstNode {
+        try self.consumeNewlines();
+        if (self.current.tag == .kw_const) return self.parseConstBinding();
+
+        var first = try self.parseExpression();
+        while (self.current.tag == .newline) {
+            try self.consumeNewlines();
+            if (self.current.tag == .eof or self.current.tag == .r_paren) break;
+            const next = try self.parseBlockExpression();
+            first = try self.makeSeq(first, next);
+            break;
+        }
+        return first;
+    }
+
     fn parseExpression(self: *@This()) (ParseError || error{OutOfMemory})!*const AstNode {
         return self.parseComparison();
+    }
+
+    fn parseConstBinding(self: *@This()) (ParseError || error{OutOfMemory})!*const AstNode {
+        try self.expect(.kw_const, error.UnexpectedToken);
+        if (self.current.tag != .ident) return error.ExpectedIdentifier;
+        const ident = self.current.ident;
+        try self.advance();
+        try self.expect(.assign, error.ExpectedAssign);
+        const value = try self.parseExpression();
+        if (self.current.tag != .newline) return error.UnexpectedToken;
+        try self.consumeNewlines();
+        const body = try self.parseBlockExpression();
+        return self.makeConstNode(ident, value, body);
     }
 
     fn parseComparison(self: *@This()) (ParseError || error{OutOfMemory})!*const AstNode {
@@ -369,6 +437,11 @@ const Parser = struct {
             .kw_print => return self.parsePrint(),
             .kw_arg => return self.parseArg(),
             .kw_if => return self.parseIf(),
+            .ident => {
+                const name = try self.allocName(self.current.ident);
+                try self.advance();
+                return self.allocNode(.{ .var_ref = name });
+            },
             else => return error.ExpectedExpression,
         }
     }

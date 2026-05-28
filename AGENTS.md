@@ -30,6 +30,9 @@
 ## AST + parser design
 
 - **Binary ops** use `*const [2]AstNode` (pointer to fixed-size array of two children).
+- **Statements are newline-separated.** `;` is not a statement separator.
+- **`const` locals are lexical and non-mutable.** Rebinding/shadowing is currently rejected.
+- **Parentheses are grouping only.** `(...)` does not create a new scope.
 - **Parser ownership:** `parser.parseOwned` returns `ParsedAst` with an arena that owns all AST allocations.
 - **Query ownership:** parse memo values in `QueryDb` own `ParsedAst`; callers borrow `*const AstNode` via `parsedAst`.
 - **Unary minus** is lowered in parser as either negative literal or `0 - expr`.

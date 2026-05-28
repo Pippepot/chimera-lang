@@ -106,6 +106,9 @@ fn writeAstLabel(writer: *std.Io.Writer, node: *const AstNode) void {
     switch (node.*) {
         .int => |v| writer.print("int {d}", .{v}) catch return,
         .float => |v| writer.print("float {d}", .{v}) catch return,
+        .var_ref => |name| writer.print("var {s}", .{name}) catch return,
+        .seq => writer.writeAll("seq") catch return,
+        .const_ => |data| writer.print("const {s}", .{data.name}) catch return,
         .print => writer.writeAll("print") catch return,
         .add => writer.writeAll("add") catch return,
         .sub => writer.writeAll("sub") catch return,
@@ -132,6 +135,14 @@ fn dumpAstNode(node: *const AstNode, writer: *std.Io.Writer, prefix: []const u8,
     const next_prefix = appendPrefix(prefix, next_suffix, &next_prefix_buf) orelse return;
 
     switch (node.*) {
+        .seq => |kids| {
+            dumpAstNode(&kids[0], writer, next_prefix, false, false);
+            dumpAstNode(&kids[1], writer, next_prefix, true, false);
+        },
+        .const_ => |data| {
+            dumpAstNode(data.value, writer, next_prefix, false, false);
+            dumpAstNode(data.body, writer, next_prefix, true, false);
+        },
         .print => |child| dumpAstNode(child, writer, next_prefix, true, false),
         .add, .sub, .mul, .div, .lt, .gt, .le, .ge, .eq, .ne => |kids| {
             dumpAstNode(&kids[0], writer, next_prefix, false, false);
@@ -147,7 +158,7 @@ fn dumpAstNode(node: *const AstNode, writer: *std.Io.Writer, prefix: []const u8,
                 dumpAstNode(data.then_, writer, next_prefix, true, false);
             }
         },
-        .int, .float, .arg => {},
+        .int, .float, .var_ref, .arg => {},
     }
 }
 

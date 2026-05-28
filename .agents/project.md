@@ -93,6 +93,9 @@ Use `--debug=ast,ssa,timing,query`:
 
 - `zig run main.zig` prints `10`.
 - `zig run main.zig -- 5` prints `111`.
+- Statements are newline-separated; `;` is not supported as a statement separator.
+- `const` locals are supported, non-mutable, and duplicate names are rejected.
+- Parentheses are expression grouping only and do not create scope boundaries.
 
 ## Tests
 
@@ -106,12 +109,13 @@ Use `--debug=ast,ssa,timing,query`:
 6. If expression value propagation.
 7. Float arithmetic/printing.
 8. Float comparison NaN semantics.
-9. Else-less `if` unit behavior.
-10. Type error coverage.
-11. Query cache hits within same revision.
-12. Source-change invalidation across parse/typecheck/lower/compile.
-13. Source-specific invalidation isolation.
-14. Unchanged source revision stability.
-15. Compile `changed_at` backdating when output bytes are identical.
-16. Query diagnostics formatting.
-17. Helper enum/index mapping.
+9. Const locals + multi-statement programs.
+10. Else-less `if` unit behavior.
+11. Type error coverage.
+12. Query cache hits within same revision.
+13. Source-change invalidation across parse/typecheck/lower/compile.
+14. Source-specific invalidation isolation.
+15. Unchanged source revision stability.
+16. Compile `changed_at` backdating when output bytes are identical.
+17. Query diagnostics formatting.
+18. Helper enum/index mapping.
