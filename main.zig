@@ -1,6 +1,7 @@
 const std = @import("std");
 const debug = @import("debug.zig");
 const codegen = @import("codegen.zig");
+const query = @import("query.zig");
 
 pub const IfNode = struct {
     cond: *const AstNode,
@@ -25,43 +26,10 @@ pub const AstNode = union(enum) {
     if_: *const IfNode,
 };
 
-const CmpKind = enum {
-    lt,
-    gt,
-};
-
-const DemoAst = struct {
-    cond_kids: [2]AstNode,
-    cond: AstNode,
-    then_expr: AstNode,
-    else_expr: AstNode,
-    then_print: AstNode,
-    else_print: AstNode,
-    if_node: IfNode,
-    root: AstNode,
-
-    fn init(self: *@This(), comptime cmp: CmpKind, lhs: AstNode, rhs: AstNode, then_value: i32, else_value: i32) void {
-        self.* = DemoAst{
-            .cond_kids = .{ lhs, rhs },
-            .cond = undefined,
-            .then_expr = .{ .int = then_value },
-            .else_expr = .{ .int = else_value },
-            .then_print = undefined,
-            .else_print = undefined,
-            .if_node = undefined,
-            .root = undefined,
-        };
-
-        self.cond = switch (cmp) {
-            .lt => .{ .lt = &self.cond_kids },
-            .gt => .{ .gt = &self.cond_kids },
-        };
-        self.then_print = .{ .print = &self.then_expr };
-        self.else_print = .{ .print = &self.else_expr };
-        self.if_node = .{ .cond = &self.cond, .then_ = &self.then_print, .else_ = &self.else_print };
-        self.root = .{ .if_ = &self.if_node };
-    }
-};
+fn demoSource(use_cli_condition: bool) []const u8 {
+    if (use_cli_condition) return "if arg(1) > 0 then print(111) else print(-111)";
+    return "if 3 < 4 then print(10) else print(20)";
+}
 
 fn waitForExitCode(io: std.Io, child: *std.process.Child) u8 {
     switch (child.wait(io) catch std.process.exit(1)) {
@@ -87,6 +55,28 @@ fn printStageTimings(io: std.Io, stages: []const StageTiming, total: std.Io.Dura
         try w.interface.print(";   {s}: {d} us\n", .{ stage.label, stage.duration.toMicroseconds() });
     }
     try w.interface.print(";   total: {d} us\n", .{total.toMicroseconds()});
+    try w.interface.flush();
+}
+
+pub fn appendQueryDiagnostics(out: *std.ArrayList(u8), gpa: std.mem.Allocator, stats: query.QueryStats) !void {
+    try out.appendSlice(gpa, "; query diagnostics:\n");
+    try out.print(gpa, ";   revision: {d}\n", .{stats.revision});
+    try out.print(gpa, ";   source_sets: {d}\n", .{stats.source_sets});
+    try out.print(gpa, ";   source_unchanged: {d}\n", .{stats.source_unchanged});
+    try out.print(gpa, ";   parse: hits={d} recomputes={d}\n", .{ stats.parse_hits, stats.parse_recomputes });
+    try out.print(gpa, ";   lower: hits={d} recomputes={d}\n", .{ stats.lower_hits, stats.lower_recomputes });
+    try out.print(gpa, ";   compile: hits={d} recomputes={d}\n", .{ stats.compile_hits, stats.compile_recomputes });
+    try out.print(gpa, ";   dependencies: checks={d} invalidations={d}\n", .{ stats.dependency_checks, stats.dependency_invalidations });
+}
+
+fn printQueryStats(io: std.Io, gpa: std.mem.Allocator, stats: query.QueryStats) !void {
+    var text = try std.ArrayList(u8).initCapacity(gpa, 256);
+    defer text.deinit(gpa);
+    try appendQueryDiagnostics(&text, gpa, stats);
+
+    var wbuf: [2048]u8 = undefined;
+    var w = std.Io.File.stderr().writer(io, &wbuf);
+    try w.interface.writeAll(text.items);
     try w.interface.flush();
 }
 
@@ -123,8 +113,7 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
 
     const flags = debug.parseDebugFlags(init.minimal.args);
-    const timings_enabled = flags.timing;
-    const total_start = if (timings_enabled) std.Io.Clock.awake.now(io) else null;
+    const total_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
 
     var prog_args_list = try std.ArrayList([]const u8).initCapacity(gpa, 4);
     defer prog_args_list.deinit(gpa);
@@ -138,43 +127,51 @@ pub fn main(init: std.process.Init) !void {
 
     const prog_args = prog_args_list.items;
     const use_cli_condition = prog_args.len > 0;
+    const source_id: query.SourceId = 0;
 
-    var demo_ast: DemoAst = undefined;
-    if (use_cli_condition) {
-        demo_ast.init(.gt, .{ .arg = 1 }, .{ .int = 0 }, 111, -111);
-    } else {
-        demo_ast.init(.lt, .{ .int = 3 }, .{ .int = 4 }, 10, 20);
-    }
-    const root = demo_ast.root;
+    var qdb = query.QueryDb.init(gpa);
+    defer qdb.deinit();
 
-    const lower_start = if (timings_enabled) std.Io.Clock.awake.now(io) else null;
-    var ir = try codegen.lower(&root, gpa);
-    defer ir.deinit(gpa);
+    const set_source_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
+    try qdb.setSource(source_id, demoSource(use_cli_condition));
+    const set_source_duration = if (set_source_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
+
+    const parse_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
+    const root = try qdb.parsedAst(source_id);
+    const parse_duration = if (parse_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
+
+    const lower_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
+    const ir = try qdb.loweredProgram(source_id);
     const lower_duration = if (lower_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
 
-    const debug_start = if (timings_enabled) std.Io.Clock.awake.now(io) else null;
-    try debug.dumpDebugInfo(io, flags, &root, &ir, gpa);
+    const debug_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
+    try debug.dumpDebugInfo(io, flags, root, ir, gpa);
     const debug_duration = if (debug_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
 
-    const compile_start = if (timings_enabled) std.Io.Clock.awake.now(io) else null;
-    const prog_bytes = try codegen.compileProgram(&ir, gpa);
-    defer gpa.free(prog_bytes);
+    const compile_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
+    const prog_bytes = try qdb.compileBytes(source_id);
     const compile_duration = if (compile_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
 
-    const write_start = if (timings_enabled) std.Io.Clock.awake.now(io) else null;
+    if (flags.query) {
+        try printQueryStats(io, gpa, qdb.statsSnapshot());
+    }
+
+    const write_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
     writeProgram(io, prog_bytes);
     const write_duration = if (write_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
 
-    const run_start = if (timings_enabled) std.Io.Clock.awake.now(io) else null;
+    const run_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
     _ = runProg(io, gpa, prog_args);
     const run_duration = if (run_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
 
-    if (timings_enabled) {
+    if (flags.timing) {
         const total_duration = total_start.?.untilNow(io, .awake);
         try printStageTimings(io, &.{
+            .{ .label = "set_source", .duration = set_source_duration },
+            .{ .label = "parse", .duration = parse_duration },
             .{ .label = "lower", .duration = lower_duration },
             .{ .label = "debug_dump", .duration = debug_duration },
-            .{ .label = "compile_program", .duration = compile_duration },
+            .{ .label = "compile_query", .duration = compile_duration },
             .{ .label = "write_prog", .duration = write_duration },
             .{ .label = "run_prog", .duration = run_duration },
         }, total_duration);

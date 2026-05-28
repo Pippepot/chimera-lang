@@ -1,4 +1,5 @@
 /prog
+/main
 /x86.asm
 /x86.o
 /.zig-cache/
