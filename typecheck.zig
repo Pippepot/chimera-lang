@@ -27,8 +27,6 @@ pub const TypeError = error{
     MissingNodeType,
 };
 
-pub const TypecheckError = TypeError || std.mem.Allocator.Error;
-
 pub const TypedAst = struct {
     node_types: std.AutoHashMap(usize, Type),
     root_type: Type,
@@ -202,6 +200,12 @@ const Checker = struct {
         return self.remember(node, body_ty);
     }
 
+    fn inferFallible(self: *@This(), node: *const AstNode, kids: *const [2]AstNode, comptime inferFn: fn (*@This(), *const AstNode, *const [2]AstNode) InferError!Type) InferError!Type {
+        const result = try inferFn(self, node, kids);
+        if (!self.in_fallible_scope) return self.fail(node, error.FallibleOutsideFallibleContext);
+        return result;
+    }
+
     fn inferNode(self: *@This(), node: *const AstNode) InferError!Type {
         if (self.typed.node_types.get(nodeKey(node))) |existing| return existing;
         return switch (node.*) {
@@ -224,36 +228,12 @@ const Checker = struct {
             .sub => |kids| self.inferArithmetic(node, kids),
             .mul => |kids| self.inferArithmetic(node, kids),
             .div => |kids| self.inferArithmetic(node, kids),
-            .lt => |kids| block: {
-                const result = try self.inferComparison(node, kids);
-                if (!self.in_fallible_scope) return self.fail(node, error.FallibleOutsideFallibleContext);
-                break :block result;
-            },
-            .gt => |kids| block: {
-                const result = try self.inferComparison(node, kids);
-                if (!self.in_fallible_scope) return self.fail(node, error.FallibleOutsideFallibleContext);
-                break :block result;
-            },
-            .le => |kids| block: {
-                const result = try self.inferComparison(node, kids);
-                if (!self.in_fallible_scope) return self.fail(node, error.FallibleOutsideFallibleContext);
-                break :block result;
-            },
-            .ge => |kids| block: {
-                const result = try self.inferComparison(node, kids);
-                if (!self.in_fallible_scope) return self.fail(node, error.FallibleOutsideFallibleContext);
-                break :block result;
-            },
-            .eq => |kids| block: {
-                const result = try self.inferEquality(node, kids);
-                if (!self.in_fallible_scope) return self.fail(node, error.FallibleOutsideFallibleContext);
-                break :block result;
-            },
-            .ne => |kids| block: {
-                const result = try self.inferEquality(node, kids);
-                if (!self.in_fallible_scope) return self.fail(node, error.FallibleOutsideFallibleContext);
-                break :block result;
-            },
+            .lt => |kids| try self.inferFallible(node, kids, Checker.inferComparison),
+            .gt => |kids| try self.inferFallible(node, kids, Checker.inferComparison),
+            .le => |kids| try self.inferFallible(node, kids, Checker.inferComparison),
+            .ge => |kids| try self.inferFallible(node, kids, Checker.inferComparison),
+            .eq => |kids| try self.inferFallible(node, kids, Checker.inferEquality),
+            .ne => |kids| try self.inferFallible(node, kids, Checker.inferEquality),
             .if_ => |if_node| self.inferIf(node, if_node),
             .bool => self.remember(node, .bool),
             .unit => self.remember(node, .unit),
@@ -268,20 +248,7 @@ fn nodeKey(node: *const AstNode) usize {
 const parser = @import("parser.zig");
 const db = @import("db.zig");
 
-pub const TypeMemo = struct {
-    value: ?TypedAst,
-    diagnostics: std.ArrayList(diagnostics.Diagnostic),
-    deps: std.ArrayList(db.Dependency),
-    verified_at: db.Revision,
-    changed_at: db.Revision,
-    computing: bool,
-
-    pub fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
-        if (self.value) |*typed| typed.deinit();
-        self.diagnostics.deinit(gpa);
-        self.deps.deinit(gpa);
-    }
-};
+pub const TypeMemo = db.Memo(TypedAst);
 
 pub fn computeType(parse_memo: *const parser.ParseMemo, gpa: std.mem.Allocator) error{OutOfMemory}!TypeMemo {
     var diagnostics_list = try std.ArrayList(diagnostics.Diagnostic).initCapacity(gpa, parse_memo.diagnostics.items.len + 1);
@@ -305,19 +272,6 @@ pub fn computeType(parse_memo: *const parser.ParseMemo, gpa: std.mem.Allocator) 
         .changed_at = 0,
         .computing = false,
     };
-}
-
-pub fn typecheck(root: *const AstNode, gpa: std.mem.Allocator) TypecheckError!TypedAst {
-    var checker = Checker.init(gpa);
-    errdefer checker.deinit();
-
-    checker.typed.root_type = checker.inferNode(root) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.TypecheckFailed => return checker.failure.?.kind,
-    };
-
-    checker.bindings.deinit(gpa);
-    return checker.typed;
 }
 
 pub fn typecheckReport(

@@ -5,10 +5,8 @@ const typecheck = @import("typecheck.zig");
 const ir_mod = @import("ir.zig");
 const codegen = @import("codegen.zig");
 const ast = @import("ast.zig");
-const diagnostics = @import("diagnostics.zig");
 
 const AstNode = ast.AstNode;
-const Diagnostic = diagnostics.Diagnostic;
 
 pub const SourceId = db.SourceId;
 pub const QueryStats = db.QueryStats;
@@ -26,14 +24,52 @@ const ActiveQuery = struct {
     deps: std.ArrayList(db.Dependency),
 };
 
+fn freeMemoValue(comptime T: type, value: *?T, gpa: std.mem.Allocator) void {
+    if (value.*) |*v| {
+        if (comptime T == parser.ParsedAst) {
+            v.deinit();
+        } else if (comptime T == typecheck.TypedAst) {
+            v.deinit();
+        } else if (comptime T == ir_mod.Program) {
+            v.deinit(gpa);
+        } else if (comptime T == []const u8) {
+            gpa.free(v.*);
+        }
+    }
+}
+
+fn deinitMemo(comptime T: type, memo: *db.Memo(T), gpa: std.mem.Allocator) void {
+    freeMemoValue(T, &memo.value, gpa);
+    memo.diagnostics.deinit(gpa);
+    memo.deps.deinit(gpa);
+}
+
+fn recordHit(stats: *db.QueryStats, comptime stage: Stage) void {
+    switch (stage) {
+        .parse => stats.parse_hits += 1,
+        .typecheck => stats.type_hits += 1,
+        .lower => stats.lower_hits += 1,
+        .compile => stats.compile_hits += 1,
+    }
+}
+
+fn recordRecompute(stats: *db.QueryStats, comptime stage: Stage) void {
+    switch (stage) {
+        .parse => stats.parse_recomputes += 1,
+        .typecheck => stats.type_recomputes += 1,
+        .lower => stats.lower_recomputes += 1,
+        .compile => stats.compile_recomputes += 1,
+    }
+}
+
 pub const QueryDb = struct {
     gpa: std.mem.Allocator,
     revision: db.Revision,
     sources: std.AutoHashMap(db.SourceId, SourceInput),
-    parse_memos: std.AutoHashMap(db.SourceId, parser.ParseMemo),
-    type_memos: std.AutoHashMap(db.SourceId, typecheck.TypeMemo),
-    lower_memos: std.AutoHashMap(db.SourceId, ir_mod.LowerMemo),
-    compile_memos: std.AutoHashMap(db.SourceId, codegen.CompileMemo),
+    parse_memos: std.AutoHashMap(db.SourceId, db.Memo(parser.ParsedAst)),
+    type_memos: std.AutoHashMap(db.SourceId, db.Memo(typecheck.TypedAst)),
+    lower_memos: std.AutoHashMap(db.SourceId, db.Memo(ir_mod.Program)),
+    compile_memos: std.AutoHashMap(db.SourceId, db.Memo([]const u8)),
     active_stack: std.ArrayList(ActiveQuery),
     stats: db.QueryStats,
 
@@ -42,10 +78,10 @@ pub const QueryDb = struct {
             .gpa = gpa,
             .revision = 0,
             .sources = std.AutoHashMap(db.SourceId, SourceInput).init(gpa),
-            .parse_memos = std.AutoHashMap(db.SourceId, parser.ParseMemo).init(gpa),
-            .type_memos = std.AutoHashMap(db.SourceId, typecheck.TypeMemo).init(gpa),
-            .lower_memos = std.AutoHashMap(db.SourceId, ir_mod.LowerMemo).init(gpa),
-            .compile_memos = std.AutoHashMap(db.SourceId, codegen.CompileMemo).init(gpa),
+            .parse_memos = std.AutoHashMap(db.SourceId, db.Memo(parser.ParsedAst)).init(gpa),
+            .type_memos = std.AutoHashMap(db.SourceId, db.Memo(typecheck.TypedAst)).init(gpa),
+            .lower_memos = std.AutoHashMap(db.SourceId, db.Memo(ir_mod.Program)).init(gpa),
+            .compile_memos = std.AutoHashMap(db.SourceId, db.Memo([]const u8)).init(gpa),
             .active_stack = .empty,
             .stats = .{},
         };
@@ -58,29 +94,26 @@ pub const QueryDb = struct {
         }
         self.sources.deinit();
 
-        var parse_iter = self.parse_memos.iterator();
-        while (parse_iter.next()) |entry| {
-            entry.value_ptr.deinit(self.gpa);
+        {
+            var iter = self.parse_memos.iterator();
+            while (iter.next()) |entry| deinitMemo(parser.ParsedAst, entry.value_ptr, self.gpa);
+            self.parse_memos.deinit();
         }
-        self.parse_memos.deinit();
-
-        var type_iter = self.type_memos.iterator();
-        while (type_iter.next()) |entry| {
-            entry.value_ptr.deinit(self.gpa);
+        {
+            var iter = self.type_memos.iterator();
+            while (iter.next()) |entry| deinitMemo(typecheck.TypedAst, entry.value_ptr, self.gpa);
+            self.type_memos.deinit();
         }
-        self.type_memos.deinit();
-
-        var lower_iter = self.lower_memos.iterator();
-        while (lower_iter.next()) |entry| {
-            entry.value_ptr.deinit(self.gpa);
+        {
+            var iter = self.lower_memos.iterator();
+            while (iter.next()) |entry| deinitMemo(ir_mod.Program, entry.value_ptr, self.gpa);
+            self.lower_memos.deinit();
         }
-        self.lower_memos.deinit();
-
-        var compile_iter = self.compile_memos.iterator();
-        while (compile_iter.next()) |entry| {
-            entry.value_ptr.deinit(self.gpa);
+        {
+            var iter = self.compile_memos.iterator();
+            while (iter.next()) |entry| deinitMemo([]const u8, entry.value_ptr, self.gpa);
+            self.compile_memos.deinit();
         }
-        self.compile_memos.deinit();
 
         for (self.active_stack.items) |*frame| {
             frame.deps.deinit(self.gpa);
@@ -172,250 +205,103 @@ pub const QueryDb = struct {
         self.revision += 1;
     }
 
-    fn queryFor(kind: db.QueryKind, source_id: db.SourceId) db.QueryKey {
+    fn queryFor(kind: db.Stage, source_id: db.SourceId) db.QueryKey {
         return .{ .kind = kind, .source_id = source_id };
     }
 
-    fn ensureParseMemo(self: *@This(), source_id: db.SourceId, track_dependency: bool) db.DbError!*parser.ParseMemo {
-        const query_key = queryFor(.parse, source_id);
+    fn ensureMemo(self: *@This(), source_id: db.SourceId, track_dependency: bool, comptime stage: Stage, comptime T: type, memos: *std.AutoHashMap(db.SourceId, db.Memo(T)), comptime computeFn: fn (*@This(), db.SourceId) (db.DbError || std.mem.Allocator.Error)!db.Memo(T), comptime backdate: bool) (db.DbError || std.mem.Allocator.Error)!*db.Memo(T) {
+        const query_key = queryFor(stage, source_id);
         if (track_dependency) try self.noteQueryDependency(query_key);
 
-        if (self.parse_memos.getPtr(source_id)) |memo| {
+        if (memos.getPtr(source_id)) |memo| {
             if (memo.computing) return error.QueryCycle;
 
             if (memo.verified_at == self.revision) {
-                self.stats.parse_hits += 1;
+                recordHit(&self.stats, stage);
                 return memo;
             }
 
             if (try self.dependenciesUnchanged(memo.deps.items, memo.verified_at)) {
                 memo.verified_at = self.revision;
-                self.stats.parse_hits += 1;
+                recordHit(&self.stats, stage);
                 return memo;
             }
 
-            self.stats.parse_recomputes += 1;
+            recordRecompute(&self.stats, stage);
             memo.computing = true;
             defer memo.computing = false;
 
             try self.beginQuery(query_key);
             errdefer self.abortQuery();
-            const source = try self.getSourceText(source_id);
-            var fresh = try parser.computeParse(source, self.gpa);
-            errdefer fresh.deinit(self.gpa);
-            const frame = self.endQuery();
-
-            if (memo.value) |*parsed| parsed.deinit();
-            memo.diagnostics.deinit(self.gpa);
-            memo.deps.deinit(self.gpa);
-            memo.value = fresh.value;
-            memo.diagnostics = fresh.diagnostics;
-            memo.deps = frame.deps;
-            memo.verified_at = self.revision;
-            memo.changed_at = self.revision;
-            return memo;
-        }
-
-        self.stats.parse_recomputes += 1;
-        try self.beginQuery(query_key);
-        errdefer self.abortQuery();
-        const source = try self.getSourceText(source_id);
-        var fresh = try parser.computeParse(source, self.gpa);
-        errdefer fresh.deinit(self.gpa);
-        const frame = self.endQuery();
-        fresh.deps = frame.deps;
-        fresh.verified_at = self.revision;
-        fresh.changed_at = self.revision;
-
-        const old = try self.parse_memos.fetchPut(source_id, fresh);
-        if (old) |kv| {
-            var old_memo = kv.value;
-            old_memo.deinit(self.gpa);
-        }
-        return self.parse_memos.getPtr(source_id).?;
-    }
-
-    fn ensureTypeMemo(self: *@This(), source_id: db.SourceId, track_dependency: bool) db.DbError!*typecheck.TypeMemo {
-        const query_key = queryFor(.typecheck, source_id);
-        if (track_dependency) try self.noteQueryDependency(query_key);
-
-        if (self.type_memos.getPtr(source_id)) |memo| {
-            if (memo.computing) return error.QueryCycle;
-
-            if (memo.verified_at == self.revision) {
-                self.stats.type_hits += 1;
-                return memo;
-            }
-
-            if (try self.dependenciesUnchanged(memo.deps.items, memo.verified_at)) {
-                memo.verified_at = self.revision;
-                self.stats.type_hits += 1;
-                return memo;
-            }
-
-            self.stats.type_recomputes += 1;
-            memo.computing = true;
-            defer memo.computing = false;
-
-            try self.beginQuery(query_key);
-            errdefer self.abortQuery();
-            const parse_memo = try self.ensureParseMemo(source_id, true);
-            var fresh = try typecheck.computeType(parse_memo, self.gpa);
-            errdefer fresh.deinit(self.gpa);
-            const frame = self.endQuery();
-
-            if (memo.value) |*typed| typed.deinit();
-            memo.diagnostics.deinit(self.gpa);
-            memo.deps.deinit(self.gpa);
-            memo.value = fresh.value;
-            memo.diagnostics = fresh.diagnostics;
-            memo.deps = frame.deps;
-            memo.verified_at = self.revision;
-            memo.changed_at = self.revision;
-            return memo;
-        }
-
-        self.stats.type_recomputes += 1;
-        try self.beginQuery(query_key);
-        errdefer self.abortQuery();
-        const parse_memo = try self.ensureParseMemo(source_id, true);
-        var fresh = try typecheck.computeType(parse_memo, self.gpa);
-        errdefer fresh.deinit(self.gpa);
-        const frame = self.endQuery();
-        fresh.deps = frame.deps;
-        fresh.verified_at = self.revision;
-        fresh.changed_at = self.revision;
-
-        const old = try self.type_memos.fetchPut(source_id, fresh);
-        if (old) |kv| {
-            var old_memo = kv.value;
-            old_memo.deinit(self.gpa);
-        }
-        return self.type_memos.getPtr(source_id).?;
-    }
-
-    fn ensureLowerMemo(self: *@This(), source_id: db.SourceId, track_dependency: bool) db.DbError!*ir_mod.LowerMemo {
-        const query_key = queryFor(.lower, source_id);
-        if (track_dependency) try self.noteQueryDependency(query_key);
-
-        if (self.lower_memos.getPtr(source_id)) |memo| {
-            if (memo.computing) return error.QueryCycle;
-
-            if (memo.verified_at == self.revision) {
-                self.stats.lower_hits += 1;
-                return memo;
-            }
-
-            if (try self.dependenciesUnchanged(memo.deps.items, memo.verified_at)) {
-                memo.verified_at = self.revision;
-                self.stats.lower_hits += 1;
-                return memo;
-            }
-
-            self.stats.lower_recomputes += 1;
-            memo.computing = true;
-            defer memo.computing = false;
-
-            try self.beginQuery(query_key);
-            errdefer self.abortQuery();
-            const type_memo = try self.ensureTypeMemo(source_id, true);
-            const parse_memo = try self.ensureParseMemo(source_id, true);
-            var fresh = try ir_mod.computeLower(type_memo, parse_memo, self.gpa);
-            errdefer fresh.deinit(self.gpa);
-            const frame = self.endQuery();
-
-            if (memo.value) |*program| program.deinit(self.gpa);
-            memo.diagnostics.deinit(self.gpa);
-            memo.deps.deinit(self.gpa);
-            memo.value = fresh.value;
-            memo.diagnostics = fresh.diagnostics;
-            memo.deps = frame.deps;
-            memo.verified_at = self.revision;
-            memo.changed_at = self.revision;
-            return memo;
-        }
-
-        self.stats.lower_recomputes += 1;
-        try self.beginQuery(query_key);
-        errdefer self.abortQuery();
-        const type_memo = try self.ensureTypeMemo(source_id, true);
-        const parse_memo = try self.ensureParseMemo(source_id, true);
-        var fresh = try ir_mod.computeLower(type_memo, parse_memo, self.gpa);
-        errdefer fresh.deinit(self.gpa);
-        const frame = self.endQuery();
-        fresh.deps = frame.deps;
-        fresh.verified_at = self.revision;
-        fresh.changed_at = self.revision;
-
-        const old = try self.lower_memos.fetchPut(source_id, fresh);
-        if (old) |kv| {
-            var old_memo = kv.value;
-            old_memo.deinit(self.gpa);
-        }
-        return self.lower_memos.getPtr(source_id).?;
-    }
-
-    fn ensureCompileMemo(self: *@This(), source_id: db.SourceId, track_dependency: bool) db.DbError!*codegen.CompileMemo {
-        const query_key = queryFor(.compile, source_id);
-        if (track_dependency) try self.noteQueryDependency(query_key);
-
-        if (self.compile_memos.getPtr(source_id)) |memo| {
-            if (memo.computing) return error.QueryCycle;
-
-            if (memo.verified_at == self.revision) {
-                self.stats.compile_hits += 1;
-                return memo;
-            }
-
-            if (try self.dependenciesUnchanged(memo.deps.items, memo.verified_at)) {
-                memo.verified_at = self.revision;
-                self.stats.compile_hits += 1;
-                return memo;
-            }
-
-            self.stats.compile_recomputes += 1;
-            memo.computing = true;
-            defer memo.computing = false;
-
-            try self.beginQuery(query_key);
-            errdefer self.abortQuery();
-            const lower_memo = try self.ensureLowerMemo(source_id, true);
-            var fresh = try codegen.computeCompile(lower_memo, self.gpa);
-            errdefer fresh.deinit(self.gpa);
+            var fresh = try computeFn(self, source_id);
+            errdefer deinitMemo(T, &fresh, self.gpa);
             const frame = self.endQuery();
 
             const old_changed_at = memo.changed_at;
-            const same_value = db.valuesEqual(memo.value, fresh.value);
-            const same_diagnostics = db.diagnosticsEqual(memo.diagnostics.items, fresh.diagnostics.items);
+            const same_value = if (comptime backdate) db.valuesEqual(memo.value, fresh.value) else false;
+            const same_diagnostics = if (comptime backdate) db.diagnosticsEqual(memo.diagnostics.items, fresh.diagnostics.items) else false;
 
-            if (memo.value) |bytes| self.gpa.free(bytes);
-            memo.diagnostics.deinit(self.gpa);
-            memo.deps.deinit(self.gpa);
+            deinitMemo(T, memo, self.gpa);
             memo.value = fresh.value;
             memo.diagnostics = fresh.diagnostics;
             memo.deps = frame.deps;
             memo.verified_at = self.revision;
-            memo.changed_at = if (same_value and same_diagnostics) old_changed_at else self.revision;
+            memo.changed_at = if (backdate and same_value and same_diagnostics) old_changed_at else self.revision;
             return memo;
         }
 
-        self.stats.compile_recomputes += 1;
+        recordRecompute(&self.stats, stage);
         try self.beginQuery(query_key);
         errdefer self.abortQuery();
-        const lower_memo = try self.ensureLowerMemo(source_id, true);
-        var fresh = try codegen.computeCompile(lower_memo, self.gpa);
-        errdefer fresh.deinit(self.gpa);
+        var fresh = try computeFn(self, source_id);
+        errdefer deinitMemo(T, &fresh, self.gpa);
         const frame = self.endQuery();
         fresh.deps = frame.deps;
         fresh.verified_at = self.revision;
         fresh.changed_at = self.revision;
 
-        const old = try self.compile_memos.fetchPut(source_id, fresh);
+        const old = try memos.fetchPut(source_id, fresh);
         if (old) |kv| {
             var old_memo = kv.value;
-            old_memo.deinit(self.gpa);
+            deinitMemo(T, &old_memo, self.gpa);
         }
-        return self.compile_memos.getPtr(source_id).?;
+        return memos.getPtr(source_id).?;
+    }
+
+    fn ensureParseMemo(self: *@This(), source_id: db.SourceId, track_dependency: bool) (db.DbError || std.mem.Allocator.Error)!*db.Memo(parser.ParsedAst) {
+        return self.ensureMemo(source_id, track_dependency, .parse, parser.ParsedAst, &self.parse_memos, struct {
+            fn compute(qdb: *QueryDb, sid: db.SourceId) (db.DbError || std.mem.Allocator.Error)!db.Memo(parser.ParsedAst) {
+                return parser.computeParse(try qdb.getSourceText(sid), qdb.gpa);
+            }
+        }.compute, false);
+    }
+
+    fn ensureTypeMemo(self: *@This(), source_id: db.SourceId, track_dependency: bool) (db.DbError || std.mem.Allocator.Error)!*db.Memo(typecheck.TypedAst) {
+        return self.ensureMemo(source_id, track_dependency, .typecheck, typecheck.TypedAst, &self.type_memos, struct {
+            fn compute(qdb: *QueryDb, sid: db.SourceId) (db.DbError || std.mem.Allocator.Error)!db.Memo(typecheck.TypedAst) {
+                const parse_memo = try qdb.ensureParseMemo(sid, true);
+                return typecheck.computeType(parse_memo, qdb.gpa);
+            }
+        }.compute, false);
+    }
+
+    fn ensureLowerMemo(self: *@This(), source_id: db.SourceId, track_dependency: bool) (db.DbError || std.mem.Allocator.Error)!*db.Memo(ir_mod.Program) {
+        return self.ensureMemo(source_id, track_dependency, .lower, ir_mod.Program, &self.lower_memos, struct {
+            fn compute(qdb: *QueryDb, sid: db.SourceId) (db.DbError || std.mem.Allocator.Error)!db.Memo(ir_mod.Program) {
+                const type_memo = try qdb.ensureTypeMemo(sid, true);
+                const parse_memo = try qdb.ensureParseMemo(sid, true);
+                return ir_mod.computeLower(type_memo, parse_memo, qdb.gpa);
+            }
+        }.compute, false);
+    }
+
+    fn ensureCompileMemo(self: *@This(), source_id: db.SourceId, track_dependency: bool) (db.DbError || std.mem.Allocator.Error)!*db.Memo([]const u8) {
+        return self.ensureMemo(source_id, track_dependency, .compile, []const u8, &self.compile_memos, struct {
+            fn compute(qdb: *QueryDb, sid: db.SourceId) (db.DbError || std.mem.Allocator.Error)!db.Memo([]const u8) {
+                const lower_memo = try qdb.ensureLowerMemo(sid, true);
+                return codegen.computeCompile(lower_memo, qdb.gpa);
+            }
+        }.compute, true);
     }
 
     fn dependenciesUnchanged(self: *@This(), deps: []const db.Dependency, verified_at: db.Revision) db.DbError!bool {

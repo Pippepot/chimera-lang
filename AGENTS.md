@@ -6,12 +6,12 @@
 - **Module split:**
   - `main.zig` owns CLI/runtime entrypoint (`main`) and orchestration of query stages + diagnostics printing.
   - `ast.zig` owns AST types (`AstNode`, `IfNode`, `ConstNode`).
-  - `runtime.zig` owns runtime helper entrypoints (`writeProgram`, `runProg`, `eval`) plus query diagnostics formatting helper.
-  - `parser.zig` owns lexer + parser (`parseOwned`) from source text to AST, plus `ParseMemo` and `computeParse` for query integration.
-  - `typecheck.zig` owns AST type inference/checking (`unit`, `bool`, `int`, `float`), plus `TypeMemo` and `computeType` for query integration.
+  - `runtime.zig` owns runtime helper entrypoints (`writeProgram`, `runProg`) plus query diagnostics formatting helper.
+  - `parser.zig` owns lexer + parser (`parseOwned`) from source text to AST, plus `computeParse` for query integration.
+  - `typecheck.zig` owns AST type inference/checking (`unit`, `bool`, `int`, `float`), plus `computeType` for query integration.
   - `query.zig` owns the revisioned incremental query system (`QueryDb`) and stage orchestration (frame management, dependency tracking, memo verification).
-  - `ir.zig` owns SSA/block IR types and typed AST -> IR lowering, plus `LowerMemo` and `computeLower` for query integration.
-  - `codegen.zig` owns IR -> x86 machine code + ELF emission, plus `CompileMemo` and `computeCompile` for query integration.
+  - `ir.zig` owns SSA/block IR types and typed AST -> IR lowering, plus `computeLower` for query integration.
+  - `codegen.zig` owns IR -> x86 machine code + ELF emission, plus `computeCompile` for query integration.
   - `db.zig` owns shared query types (`SourceId`, `Revision`, `Dependency`, `QueryKey`, `QueryStats`, `Stage`, `CompileResult`, `DbError`) and comparison helpers.
   - `debug.zig` owns debug flag parsing and AST/SSA debug dumps.
   - `helpers_bin.zig` owns pre-assembled helper blobs (`print_int`, `print_bool`, `print_float32`, `atoi`).
@@ -65,7 +65,7 @@
   - Otherwise re-check dependencies recursively before deciding to recompute.
 - **Compile backdating:** if recomputed compile bytes are identical, preserve old `changed_at`.
 - **Purity boundary:** queries return data only; writing executables and running child processes stay outside query code.
-- **Memo colocation:** each stage defines its own memo type and `computeXxx` function in its module. `query.zig` owns the generic orchestration (frame management, dep tracking, memo caching) and calls stage-specific compute functions.
+- **Generic memo type:** `db.Memo(T)` in `db.zig` provides the memo struct for any value type. Each stage's `computeXxx` returns `db.Memo(T)`. `query.zig` owns the generic orchestration (frame management, dep tracking, memo caching) via a single generic `ensureMemo` function and calls stage-specific compute functions.
 
 ## Assembly generation
 

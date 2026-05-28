@@ -4,6 +4,7 @@ const diagnostics = @import("diagnostics.zig");
 
 pub const SourceId = u32;
 pub const Revision = u64;
+pub const Stage = diagnostics.Stage;
 
 pub const QueryError = error{
     SourceNotFound,
@@ -12,15 +13,8 @@ pub const QueryError = error{
 
 pub const DbError = QueryError || std.mem.Allocator.Error;
 
-pub const QueryKind = enum {
-    parse,
-    typecheck,
-    lower,
-    compile,
-};
-
 pub const QueryKey = struct {
-    kind: QueryKind,
+    kind: Stage,
     source_id: SourceId,
 };
 
@@ -45,17 +39,21 @@ pub const QueryStats = struct {
     dependency_invalidations: usize = 0,
 };
 
-pub const Stage = enum {
-    parse,
-    typecheck,
-    lower,
-    compile,
-};
-
 pub const CompileResult = struct {
     bytes: ?[]const u8,
     diagnostics: []const diagnostics.Diagnostic,
 };
+
+pub fn Memo(comptime T: type) type {
+    return struct {
+        value: ?T,
+        diagnostics: std.ArrayList(diagnostics.Diagnostic),
+        deps: std.ArrayList(Dependency),
+        verified_at: Revision = 0,
+        changed_at: Revision = 0,
+        computing: bool = false,
+    };
+}
 
 pub fn queryKeyEql(a: QueryKey, b: QueryKey) bool {
     return a.kind == b.kind and a.source_id == b.source_id;

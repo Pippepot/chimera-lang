@@ -1,9 +1,5 @@
 const std = @import("std");
-const ast = @import("ast.zig");
-const codegen = @import("codegen.zig");
 const query = @import("query.zig");
-
-const AstNode = ast.AstNode;
 
 fn waitForExitCode(io: std.Io, child: *std.process.Child) u8 {
     switch (child.wait(io) catch std.process.exit(1)) {
@@ -44,10 +40,4 @@ pub fn runProg(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) u8 
     return waitForExitCode(io, &child);
 }
 
-pub fn eval(io: std.Io, node: *const AstNode, gpa: std.mem.Allocator, args: []const []const u8) u8 {
-    const prog_bytes = codegen.compile(node, gpa) catch std.process.exit(1);
-    defer gpa.free(prog_bytes);
 
-    writeProgram(io, prog_bytes);
-    return runProg(io, gpa, args);
-}

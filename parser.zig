@@ -578,36 +578,13 @@ pub fn parseErrorMessage(err: anyerror) []const u8 {
 }
 
 pub fn parseOwned(source: []const u8, gpa: std.mem.Allocator) (ParseError || error{OutOfMemory})!ParsedAst {
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    errdefer arena.deinit();
-
-    var parser = try Parser.init(source, arena.allocator(), gpa);
-    errdefer parser.spans.deinit();
-    const root = try parser.parseProgram();
-
-    return .{
-        .arena = arena,
-        .root = root,
-        .spans = parser.spans,
-    };
+    const report = try parseReport(source, gpa);
+    return report.parsed orelse error.ExpectedExpression;
 }
 
 const db = @import("db.zig");
 
-pub const ParseMemo = struct {
-    value: ?ParsedAst,
-    diagnostics: std.ArrayList(diagnostics.Diagnostic),
-    deps: std.ArrayList(db.Dependency),
-    verified_at: db.Revision,
-    changed_at: db.Revision,
-    computing: bool,
-
-    pub fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
-        if (self.value) |*parsed| parsed.deinit();
-        self.diagnostics.deinit(gpa);
-        self.deps.deinit(gpa);
-    }
-};
+pub const ParseMemo = db.Memo(ParsedAst);
 
 pub fn computeParse(source: []const u8, gpa: std.mem.Allocator) error{OutOfMemory}!ParseMemo {
     const report = try parseReport(source, gpa);

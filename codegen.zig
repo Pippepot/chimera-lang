@@ -1,19 +1,14 @@
 const std = @import("std");
 const diagnostics = @import("diagnostics.zig");
 const ir_mod = @import("ir.zig");
-const typecheck = @import("typecheck.zig");
-const ast = @import("ast.zig");
 const helpers = @import("helpers_bin.zig");
 const db = @import("db.zig");
-const AstNode = ast.AstNode;
 
 const InstRef = ir_mod.ValueRef;
 const InstPair = ir_mod.InstPair;
 const Inst = ir_mod.Inst;
 const BlockId = ir_mod.BlockId;
 const Program = ir_mod.Program;
-pub const lower = ir_mod.lower;
-
 const BinaryEmitter = struct {
     prog: *const Program,
     gpa: std.mem.Allocator,
@@ -536,89 +531,85 @@ const BinaryEmitter = struct {
 };
 
 fn buildElfExecutable(code: []const u8, entry_code_offset: u64, gpa: std.mem.Allocator) error{ OutOfMemory, FileTooBig }![]const u8 {
-    const elf_header_size: usize = 64;
-    const program_header_size: usize = 56;
-    const code_file_offset_u64: u64 = 0x1000;
+    const code_file_offset: u64 = 0x1000;
     const image_base: u64 = 0x400000;
 
-    const le = struct {
-        fn write16(bytes: []u8, offset: usize, value: u16) void {
-            std.mem.writeInt(u16, bytes[offset..][0..2], value, .little);
-        }
-        fn write32(bytes: []u8, offset: usize, value: u32) void {
-            std.mem.writeInt(u32, bytes[offset..][0..4], value, .little);
-        }
-        fn write64(bytes: []u8, offset: usize, value: u64) void {
-            std.mem.writeInt(u64, bytes[offset..][0..8], value, .little);
-        }
+    const code_len_u64: u64 = @intCast(code.len);
+    const total_file_size_u64 = code_file_offset + code_len_u64;
+    if (total_file_size_u64 > std.math.maxInt(usize)) return error.FileTooBig;
+    const total_file_size: usize = @intCast(total_file_size_u64);
+
+    const Elf64Header = extern struct {
+        ident: [16]u8,
+        e_type: u16,
+        e_machine: u16,
+        e_version: u32,
+        e_entry: u64,
+        e_phoff: u64,
+        e_shoff: u64,
+        e_flags: u32,
+        e_ehsize: u16,
+        e_phentsize: u16,
+        e_phnum: u16,
+        e_shentsize: u16,
+        e_shnum: u16,
+        e_shstrndx: u16,
     };
 
-    const code_len_u64: u64 = @intCast(code.len);
-    const total_file_size_u64 = code_file_offset_u64 + code_len_u64;
-    if (total_file_size_u64 > std.math.maxInt(usize)) return error.FileTooBig;
+    const Elf64Phdr = extern struct {
+        p_type: u32,
+        p_flags: u32,
+        p_offset: u64,
+        p_vaddr: u64,
+        p_paddr: u64,
+        p_filesz: u64,
+        p_memsz: u64,
+        p_align: u64,
+    };
 
-    const total_file_size: usize = @intCast(total_file_size_u64);
-    const code_file_offset: usize = @intCast(code_file_offset_u64);
+    const elf_header = Elf64Header{
+        .ident = .{ 0x7f, 'E', 'L', 'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+        .e_type = 2,
+        .e_machine = 62,
+        .e_version = 1,
+        .e_entry = image_base + code_file_offset + entry_code_offset,
+        .e_phoff = @sizeOf(Elf64Header),
+        .e_shoff = 0,
+        .e_flags = 0,
+        .e_ehsize = @sizeOf(Elf64Header),
+        .e_phentsize = @sizeOf(Elf64Phdr),
+        .e_phnum = 1,
+        .e_shentsize = 0,
+        .e_shnum = 0,
+        .e_shstrndx = 0,
+    };
+
+    const phdr = Elf64Phdr{
+        .p_type = 1,
+        .p_flags = 5,
+        .p_offset = 0,
+        .p_vaddr = image_base,
+        .p_paddr = image_base,
+        .p_filesz = total_file_size_u64,
+        .p_memsz = total_file_size_u64,
+        .p_align = 0x1000,
+    };
 
     var file_buf = try std.ArrayList(u8).initCapacity(gpa, total_file_size);
     errdefer file_buf.deinit(gpa);
 
-    try file_buf.appendNTimes(gpa, 0, code_file_offset);
-
-    const bytes = file_buf.items;
-    bytes[0] = 0x7f;
-    bytes[1] = 'E';
-    bytes[2] = 'L';
-    bytes[3] = 'F';
-    bytes[4] = 2;
-    bytes[5] = 1;
-    bytes[6] = 1;
-    bytes[7] = 0;
-
-    le.write16(bytes, 16, 2);
-    le.write16(bytes, 18, 62);
-    le.write32(bytes, 20, 1);
-    le.write64(bytes, 24, image_base + code_file_offset_u64 + entry_code_offset);
-    le.write64(bytes, 32, elf_header_size);
-    le.write64(bytes, 40, 0);
-    le.write32(bytes, 48, 0);
-    le.write16(bytes, 52, elf_header_size);
-    le.write16(bytes, 54, program_header_size);
-    le.write16(bytes, 56, 1);
-    le.write16(bytes, 58, 0);
-    le.write16(bytes, 60, 0);
-    le.write16(bytes, 62, 0);
-
-    const phoff = elf_header_size;
-    le.write32(bytes, phoff + 0, 1);
-    le.write32(bytes, phoff + 4, 5);
-    le.write64(bytes, phoff + 8, 0);
-    le.write64(bytes, phoff + 16, image_base);
-    le.write64(bytes, phoff + 24, image_base);
-    le.write64(bytes, phoff + 32, total_file_size_u64);
-    le.write64(bytes, phoff + 40, total_file_size_u64);
-    le.write64(bytes, phoff + 48, 0x1000);
-
+    try file_buf.appendSlice(gpa, std.mem.asBytes(&elf_header));
+    try file_buf.appendSlice(gpa, std.mem.asBytes(&phdr));
+    const remaining = code_file_offset - file_buf.items.len;
+    try file_buf.appendNTimes(gpa, 0, @intCast(remaining));
     try file_buf.appendSlice(gpa, code);
+
     return file_buf.toOwnedSlice(gpa);
 }
 
 const ir = @import("ir.zig");
 
-pub const CompileMemo = struct {
-    value: ?[]const u8,
-    diagnostics: std.ArrayList(diagnostics.Diagnostic),
-    deps: std.ArrayList(db.Dependency),
-    verified_at: db.Revision,
-    changed_at: db.Revision,
-    computing: bool,
-
-    pub fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
-        if (self.value) |bytes| gpa.free(bytes);
-        self.diagnostics.deinit(gpa);
-        self.deps.deinit(gpa);
-    }
-};
+pub const CompileMemo = db.Memo([]const u8);
 
 pub fn computeCompile(lower_memo: *const ir.LowerMemo, gpa: std.mem.Allocator) error{OutOfMemory}!CompileMemo {
     var diagnostics_list = try std.ArrayList(diagnostics.Diagnostic).initCapacity(gpa, lower_memo.diagnostics.items.len + 1);
@@ -660,11 +651,4 @@ pub fn compileProgram(prog: *const Program, gpa: std.mem.Allocator) ![]const u8 
     return buildElfExecutable(code, 0, gpa);
 }
 
-pub fn compile(node: *const AstNode, gpa: std.mem.Allocator) ![]const u8 {
-    var typed = try typecheck.typecheck(node, gpa);
-    defer typed.deinit();
 
-    var lowered = try lower(node, &typed, gpa);
-    defer lowered.deinit(gpa);
-    return compileProgram(&lowered, gpa);
-}

@@ -8,7 +8,7 @@
 |------|-------------|
 | `main.zig` | CLI entrypoint (`main`) and query pipeline orchestration |
 | `ast.zig` | AST node types (`AstNode`, `IfNode`, `ConstNode`) |
-| `runtime.zig` | Runtime helpers (`writeProgram`, `runProg`, `eval`) and query diagnostics formatting helper |
+| `runtime.zig` | Runtime helpers (`writeProgram`, `runProg`) and query diagnostics formatting helper |
 | `parser.zig` | Lexer + recursive descent parser (`parseOwned`) from source text to AST |
 | `typecheck.zig` | Type inference/checking over AST (`unit`, `bool`, `int`, `float`) |
 | `query.zig` | Revisioned incremental query database (`QueryDb`) with memoized parse/lower/compile stages |
@@ -95,7 +95,7 @@ Use `--debug=ast,ssa,timing,query`:
 
 ## Current behavior
 
-- `zig run main.zig -- demo.x86` compiles and runs `demo.x86` (prints `67\n42\n` with current demo file).
+- `zig run main.zig -- demo.x86` compiles and runs `demo.x86` (prints `42` with current demo file).
 - `zig run main.zig --` prints usage and exits with code `1`.
 - First non-debug CLI arg is source file path; remaining args are passed to the generated program.
 - Statements are newline-separated; `;` is not supported as a statement separator.

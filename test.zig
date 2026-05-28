@@ -52,9 +52,7 @@ fn runTestCapture(source: []const u8, args: []const []const u8) ![]u8 {
 }
 
 fn testProgram(source: []const u8, expected: []const u8) !void {
-    const out = try runTestCapture(source, &.{});
-    defer testing.allocator.free(out);
-    try testing.expectEqualStrings(expected, out);
+    try testProgramArgs(source, expected, &.{});
 }
 
 fn testProgramArgs(source: []const u8, expected: []const u8, args: []const []const u8) !void {

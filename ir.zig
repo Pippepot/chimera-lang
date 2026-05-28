@@ -230,6 +230,30 @@ const Lowerer = struct {
         return self.lowerAst(const_node.body);
     }
 
+    fn lowerArithmetic(self: *@This(), node: *const AstNode, kids: *const [2]AstNode, comptime int_tag: std.meta.Tag(Inst), comptime float_tag: std.meta.Tag(Inst)) (error{OutOfMemory} || typecheck.TypeError)!ValueRef {
+        return switch (try self.nodeType(node)) {
+            .int => try self.addPairInst(int_tag, kids, .int),
+            .float => try self.addPairInst(float_tag, kids, .float),
+            else => unreachable,
+        };
+    }
+
+    fn lowerComparison(self: *@This(), kids: *const [2]AstNode, comptime int_tag: std.meta.Tag(Inst), comptime float_tag: std.meta.Tag(Inst)) (error{OutOfMemory} || typecheck.TypeError)!ValueRef {
+        const operand_ty = try self.nodeType(&kids[0]);
+        if (operand_ty == .int) return self.addPairInst(int_tag, kids, .unit);
+        return self.addPairInst(float_tag, kids, .unit);
+    }
+
+    fn lowerEquality(self: *@This(), kids: *const [2]AstNode, comptime int_tag: std.meta.Tag(Inst), comptime float_tag: std.meta.Tag(Inst), comptime bool_tag: std.meta.Tag(Inst)) (error{OutOfMemory} || typecheck.TypeError)!ValueRef {
+        const operand_ty = try self.nodeType(&kids[0]);
+        return switch (operand_ty) {
+            .int => self.addPairInst(int_tag, kids, .unit),
+            .float => self.addPairInst(float_tag, kids, .unit),
+            .bool => self.addPairInst(bool_tag, kids, .unit),
+            .unit => unreachable,
+        };
+    }
+
     fn lowerAst(self: *@This(), node: *const AstNode) (error{OutOfMemory} || typecheck.TypeError)!ValueRef {
         return switch (node.*) {
             .int => |value| try self.addInst(.{ .iconst = value }, .int),
@@ -251,65 +275,17 @@ const Lowerer = struct {
                 };
                 break :block try self.addInst(print_op, .unit);
             },
-            .add => |kids| switch (try self.nodeType(node)) {
-                .int => try self.addPairInst(.addi, kids, .int),
-                .float => try self.addPairInst(.addf, kids, .float),
-                else => unreachable,
-            },
-            .sub => |kids| switch (try self.nodeType(node)) {
-                .int => try self.addPairInst(.subi, kids, .int),
-                .float => try self.addPairInst(.subf, kids, .float),
-                else => unreachable,
-            },
-            .mul => |kids| switch (try self.nodeType(node)) {
-                .int => try self.addPairInst(.muli, kids, .int),
-                .float => try self.addPairInst(.mulf, kids, .float),
-                else => unreachable,
-            },
-            .div => |kids| switch (try self.nodeType(node)) {
-                .int => try self.addPairInst(.divi, kids, .int),
-                .float => try self.addPairInst(.divf, kids, .float),
-                else => unreachable,
-            },
+            .add => |kids| try self.lowerArithmetic(node, kids, .addi, .addf),
+            .sub => |kids| try self.lowerArithmetic(node, kids, .subi, .subf),
+            .mul => |kids| try self.lowerArithmetic(node, kids, .muli, .mulf),
+            .div => |kids| try self.lowerArithmetic(node, kids, .divi, .divf),
             .arg => |idx| try self.addInst(.{ .argi = idx }, .int),
-            .lt => |kids| {
-                const operand_ty = try self.nodeType(&kids[0]);
-                if (operand_ty == .int) return self.addPairInst(.lti, kids, .unit);
-                return self.addPairInst(.ltf, kids, .unit);
-            },
-            .gt => |kids| {
-                const operand_ty = try self.nodeType(&kids[0]);
-                if (operand_ty == .int) return self.addPairInst(.gti, kids, .unit);
-                return self.addPairInst(.gtf, kids, .unit);
-            },
-            .le => |kids| {
-                const operand_ty = try self.nodeType(&kids[0]);
-                if (operand_ty == .int) return self.addPairInst(.lei, kids, .unit);
-                return self.addPairInst(.lef, kids, .unit);
-            },
-            .ge => |kids| {
-                const operand_ty = try self.nodeType(&kids[0]);
-                if (operand_ty == .int) return self.addPairInst(.gei, kids, .unit);
-                return self.addPairInst(.gef, kids, .unit);
-            },
-            .eq => |kids| {
-                const operand_ty = try self.nodeType(&kids[0]);
-                return switch (operand_ty) {
-                    .int => self.addPairInst(.eqi, kids, .unit),
-                    .float => self.addPairInst(.eqf, kids, .unit),
-                    .bool => self.addPairInst(.eqb, kids, .unit),
-                    .unit => unreachable,
-                };
-            },
-            .ne => |kids| {
-                const operand_ty = try self.nodeType(&kids[0]);
-                return switch (operand_ty) {
-                    .int => self.addPairInst(.nei, kids, .unit),
-                    .float => self.addPairInst(.nef, kids, .unit),
-                    .bool => self.addPairInst(.neb, kids, .unit),
-                    .unit => unreachable,
-                };
-            },
+            .lt => |kids| try self.lowerComparison(kids, .lti, .ltf),
+            .gt => |kids| try self.lowerComparison(kids, .gti, .gtf),
+            .le => |kids| try self.lowerComparison(kids, .lei, .lef),
+            .ge => |kids| try self.lowerComparison(kids, .gei, .gef),
+            .eq => |kids| try self.lowerEquality(kids, .eqi, .eqf, .eqb),
+            .ne => |kids| try self.lowerEquality(kids, .nei, .nef, .neb),
             .if_ => |if_node| try self.lowerIf(node, if_node),
             .bool => |value| try self.addInst(.{ .iconst = if (value) @as(i32, 1) else 0 }, .bool),
             .unit => try self.addInst(.{ .iconst = 0 }, .unit),
@@ -320,20 +296,7 @@ const Lowerer = struct {
 const parser = @import("parser.zig");
 const db = @import("db.zig");
 
-pub const LowerMemo = struct {
-    value: ?Program,
-    diagnostics: std.ArrayList(diagnostics.Diagnostic),
-    deps: std.ArrayList(db.Dependency),
-    verified_at: db.Revision,
-    changed_at: db.Revision,
-    computing: bool,
-
-    pub fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
-        if (self.value) |*program| program.deinit(gpa);
-        self.diagnostics.deinit(gpa);
-        self.deps.deinit(gpa);
-    }
-};
+pub const LowerMemo = db.Memo(Program);
 
 pub fn computeLower(type_memo: *const typecheck.TypeMemo, parse_memo: *const parser.ParseMemo, gpa: std.mem.Allocator) error{OutOfMemory}!LowerMemo {
     var diagnostics_list = try std.ArrayList(diagnostics.Diagnostic).initCapacity(gpa, type_memo.diagnostics.items.len + 1);

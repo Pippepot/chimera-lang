@@ -11,10 +11,6 @@ fn printUsage(io: std.Io, exe_name: []const u8) !void {
     try w.interface.flush();
 }
 
-fn isDebugFlag(arg: []const u8) bool {
-    return std.mem.startsWith(u8, arg, "--debug=");
-}
-
 fn readSourceFile(io: std.Io, gpa: std.mem.Allocator, source_path: []const u8) ![]u8 {
     return std.Io.Dir.cwd().readFileAlloc(io, source_path, gpa, .limited(std.math.maxInt(usize)));
 }
@@ -76,7 +72,7 @@ pub fn main(init: std.process.Init) !void {
     defer iter.deinit();
     const exe_name = iter.next() orelse "main";
     while (iter.next()) |arg| {
-        if (!isDebugFlag(arg)) try cli_args_list.append(gpa, arg);
+        if (!std.mem.startsWith(u8, arg, "--debug=")) try cli_args_list.append(gpa, arg);
     }
 
     const cli_args = cli_args_list.items;
