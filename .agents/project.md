@@ -1,4 +1,4 @@
-# x86 AST → Assembly Compiler
+# x86 AST -> Machine Code Compiler
 
 **Location:** `x86/`
 
@@ -6,73 +6,96 @@
 
 | File | Description |
 |------|-------------|
-| `x86.zig` | AST types, binary pipeline (`assembleAndLink`, `runProg`, `eval`, `main`) |
-| `codegen.zig` | IR types, AST→IR lowering, register allocator, emission, `compile` |
-| `debug.zig` | Debug helpers: AST dump, IR dump, assembly dump, debug flag parsing |
-| `print.asm` | NASM `print_int` routine (converts int to decimal, writes to stdout via `sys_write`) |
-| `test.zig` | Full-pipeline tests: compile AST → assemble → link → run → capture stdout and verify |
+| `x86.zig` | AST types, binary pipeline (`writeProgram`, `runProg`, `eval`, `main`) |
+| `ir.zig` | Block-based SSA IR definitions and AST -> IR lowering |
+| `codegen.zig` | x86 binary backend: IR -> x86 machine code + ELF executable |
+| `debug.zig` | Debug helpers: AST tree dump, SSA dump, asm dump, timing, debug flag parsing |
+| `helpers_bin.zig` | Pre-assembled helper routines (`print_int`, `atoi`) as byte blobs |
+| `test.zig` | Full-pipeline tests: compile -> assemble -> link -> run -> assert stdout |
 
 ## Public API
 
 | Symbol | File | Description |
 |--------|------|-------------|
-| `AstNode` | `x86.zig` | Tagged union AST node |
-| `Inst`, `InstPair`, `InstRef` | `codegen.zig` | SSA IR types |
-| `compile(node, gpa)` | `codegen.zig` | AST → NASM assembly string |
-| `emitIr(ir, buf, gpa)` | `codegen.zig` | IR → NASM instructions |
-| `assembleAndLink(io, asm_source)` | `x86.zig` | writes `x86.asm`, runs `nasm`, runs `ld`, produces `prog` |
-| `runProg(io, gpa, args)` | `x86.zig` | runs `./prog` with args, returns exit code |
-| `eval(io, node, gpa, args)` | `x86.zig` | all-in-one: compile + assemble/link + run, returns exit code |
+| `AstNode`, `IfNode` | `x86.zig` | AST node types |
+| `Program`, `Block`, `Inst`, `Terminator`, `Branch` | `ir.zig` | SSA/block IR model |
+| `lower(node, gpa)` | `ir.zig` | AST -> `Program` |
+| `compileProgram(prog, gpa)` | `codegen.zig` | IR -> ELF file bytes |
+| `compile(node, gpa)` | `codegen.zig` | AST -> ELF file bytes (lower + compileProgram) |
+| `writeProgram(io, bytes)` | `x86.zig` | writes ELF bytes to `./prog` |
+| `runProg(io, gpa, args)` | `x86.zig` | runs `./prog`, returns process exit code |
+| `eval(io, node, gpa, args)` | `x86.zig` | compile + write + run |
+| `HelperId`, `HelperDef`, `HelperBlob`, `all_helpers`, `indexOf` | `helpers_bin.zig` | Runtime helper registry |
 
-## Internal pipeline
+## IR Model
 
-1. **`lower`** (`codegen.zig`) — AST → SSA IR (``std.ArrayList(Inst)``), appends implicit `ret`. Binary ops use shared `lowerBinop` helper, each switch arm is a one-liner.
-2. **`emitIr`** (`codegen.zig`) — three-pass codegen:
-   - `computeUseCounts` — count consumers per IR ref
-   - `computeFrameSize` — forward liveness simulation, computes stack frame (`sub rsp, N`)
-   - `Emitter` struct — groups allocator state (val_to_reg, reg_to_val, spill_slots, spill_idx, use_count), with methods: `emitAddSub`, `emitImul`, `emitIdiv`, `loadIntoReg`, `ensureAnyReg`, `findFreeReg`, `freeOperands`, `assignResult`
-3. **`compile`** = `lower` → `compileIr` (adds prologue, `lea rbp, [rsp+8]`, embeds `print.asm`)
+`ir.zig` uses a basic-block SSA design:
 
-### IR (`Inst`)
+- `Program`: `{ entry, blocks, next_value }`
+- `Block`: `{ id, param, insts, term }`
+- `ValueInst`: `{ id, op }`
+- `Terminator`: `br`, `cbr`, `ret`
+- `Branch`: `{ target, arg? }`
 
-| Variant | Meaning |
-|---------|---------|
-| `iconst i32` | Load immediate |
-| `iadd/isub/imul/idiv { l, r }` | Binary op on IR refs |
-| `print ref` | Call `print_int` with value |
-| `ret ref` | Exit with value as code |
-| `iarg u32` | Read argv[index] via `atoi` |
+### Branch-argument style (MLIR-like)
 
-## Debug flags
+`if` merges use block parameters instead of phi nodes:
 
-Pass `--debug=ast,ssa,asm` (comma-separated) on `zig run` to dump intermediate representations:
-- `ast` — S-expression AST dump
-- `ssa` — SSA IR listing (numbered `%0`… refs)
-- `asm` — emitted NASM instructions (before embedding `print.asm`)
+1. Lowering creates `then`, `else`, and `merge` blocks.
+2. `then` and `else` end with `br` to `merge`, passing a value (`arg`).
+3. `merge` declares one `param`, and that param is the `if` expression result.
 
-## Usage
+## Internal Pipeline
 
-- `zig run x86.zig` — compiles and runs the example (`(print (+ (* 2 5) 3))`, prints `13`, exits with `13`)
-- `zig run x86.zig -- 42` — passes `42` as argv to `prog`, which prints and exits with it
-- `zig run x86.zig -- --debug=ast,ssa` — runs with debug dumps to stderr-inherited output
-- `zig test test.zig` — runs 7 tests (int, add, sub, mul, div, nested, arg)
+1. **Lowering** (`ir.lower`) — AST to block-based SSA IR.
+2. **Binary codegen** (`codegen.compileProgram`) — IR to x86 machine code in-memory, then wraps it in a minimal ELF executable (no external assembler or linker).
+3. **Write & run** (`writeProgram` + `runProg`) — write ELF bytes to disk, execute, capture exit code.
 
-## Register allocator
+## Backend Notes
 
-- 10 allocatable registers: `rax`, `rbx`, `r8`–`r15` (``eax``/``rXXd`` for 32-bit ops); `reg64`/`reg32` are comptime arrays
-- Three-pass design:
-  1. **Use counts** — `computeUseCounts`: count consumers per IR ref
-  2. **Peak liveness** — `computeFrameSize`: forward simulation using `rem_uses` + `live`, computes stack frame size
-  3. **Register allocation + emission** — `Emitter` struct: linear-scan with spilling
-- Data structures: `val_to_reg: []?u8` (value → register), `reg_to_val: [NUM_REGS]?u32` (register → value), `spill_slots: []?u32`
-- `eax` is preferred for instruction results (``imul r, m``, ``idiv``, etc.); `findFreeReg` returns the first free register without special-casing eax
-- Frame is allocated with `sub rsp, N` when peak live > `NUM_REGS`
-- Spill slots are lazily created with `mov [rsp+offset], reg`; tracking variables use tight types (``u8`` for register indices)
-- `emitAddSub(mnemonic, p, i)` factors iadd/isub; `emitImul` uses three-operand `imul eax, reg/lhs, imm` optimization; `emitIdiv` handles `cdq` before `idiv`
+### Emitter structure (`BinaryEmitter` in `codegen.zig`)
 
-## Notes
+- **Slot model** — every SSA value gets a stack slot at `[rsp + value_id * 8]`. Frame size is `next_value * 8`. No register allocation.
+- **ALU ops** — load both operands into `eax`/`ebx`, compute, store result to slot. Shared via composite helpers: `emitBinaryArithmetic` (add/sub/imul with internal enum), `emitBinaryDiv`, `emitCompare` (with `SetccCond` typed enum instead of raw opcode bytes).
+- **Control flow** — `br` copies branch arg to target block param slot then jumps. `cbr` uses prep labels for edge-specific copies. Jumps use near encoding with symbol fixups.
+- **Fixup system** — `emitCall`/`emitJmp`/`emitJe`/`emitJne` emit opcode bytes and a placeholder `i32` displacement, recording a `RelFixup`. `resolveFixups` (called by `finish`) walks all fixups, computing RIP-relative offsets from symbol positions bound during emission.
+- **Helper registry** — `print_int` and `atoi` are pre-assembled binary blobs compiled at comptime in `helpers_bin.zig`. Accessed via `helperSymbol(id)` which indexes a `helper_symbols` parallel array. `emitCallAndStore` factors the emitCall + emitStoreRaxToSlot pattern used by both.
+- **Low-level emit** — all appends route through `appendBytes`, including `appendByte` (wraps as `&.{byte}`) and `appendLeI32`/`appendLeU32` (write LE then forward to `appendBytes`).
 
-- `div` uses `cdq` (sign-extend eax→edx) then `idiv reg32`
-- `print` leaves the printed value in `eax` (doesn't push/pop)
-- `iarg` calls `atoi` (no libc — implemented via `syscall` in `print.asm`)
-- No libc, no sysdeps — the emitted binary is statically linked by `ld`
+### ELF construction (`buildElfExecutable`)
+
+Produces a minimal 64-bit ELF binary with one `PT_LOAD` segment. Layout constants: `elf_header_size=64`, `program_header_size=56`, `code_file_offset=0x1000`, `image_base=0x400000`. Little-endian write helpers are scoped as `le.write16/32/64` inside the function body.
+
+### `helpers_bin.zig`
+
+Pre-assembled helper routines generated at comptime via `HelperBuffer`, patched with internal rel32 fixups. Registered via:
+- `HelperId` enum (`print_int`, `atoi`)
+- `all_helpers` array of `HelperDef` (`{ id, blob }`)
+- `indexOf(id)` for stable-index lookup
+- Comptime assertions: blob size limits, coverage of all `HelperId` variants
+
+## Debug Flags
+
+Use `--debug=ast,ssa,asm,timing` (comma-separated) with `zig run`:
+
+- `ast`: tree-form AST dump using box characters (`├─`, `└─`, `│ `).
+- `ssa`: block/terminator SSA listing.
+- `asm`: emitted assembly body dump.
+- `timing`: per-stage timing diagnostics (lower, compile, write, run).
+
+## Main Example Behavior
+
+`x86.zig` demo program uses conditionals:
+
+- `zig run x86.zig` prints `10` from `if (3 < 4) ...`.
+- `zig run x86.zig -- 5` prints `111` from `if (arg1 > 0) ...`.
+
+## Tests
+
+`zig test test.zig` currently runs 5 end-to-end tests:
+
+1. Arithmetic group (`int`, `add`, `sub`, `mul`, `div`, nested)
+2. Argument read (`arg`)
+3. Comparisons
+4. Branch side effects (`if` branches with print in each arm)
+5. `if` expression value propagation (including use inside arithmetic)

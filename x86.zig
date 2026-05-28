@@ -74,7 +74,23 @@ fn isDebugFlag(arg: []const u8) bool {
     return std.mem.startsWith(u8, arg, "--debug=");
 }
 
-pub fn assembleAndLink(io: std.Io, prog_bytes: []const u8) void {
+const StageTiming = struct {
+    label: []const u8,
+    duration: std.Io.Duration,
+};
+
+fn printStageTimings(io: std.Io, stages: []const StageTiming, total: std.Io.Duration) !void {
+    var wbuf: [2048]u8 = undefined;
+    var w = std.Io.File.stderr().writer(io, &wbuf);
+    try w.interface.writeAll("; timing diagnostics:\n");
+    for (stages) |stage| {
+        try w.interface.print(";   {s}: {d} us\n", .{ stage.label, stage.duration.toMicroseconds() });
+    }
+    try w.interface.print(";   total: {d} us\n", .{total.toMicroseconds()});
+    try w.interface.flush();
+}
+
+pub fn writeProgram(io: std.Io, prog_bytes: []const u8) void {
     const cwd = std.Io.Dir.cwd();
     cwd.writeFile(io, .{
         .sub_path = "prog",
@@ -98,7 +114,7 @@ pub fn eval(io: std.Io, node: *const AstNode, gpa: std.mem.Allocator, args: []co
     const prog_bytes = codegen.compile(node, gpa) catch std.process.exit(1);
     defer gpa.free(prog_bytes);
 
-    assembleAndLink(io, prog_bytes);
+    writeProgram(io, prog_bytes);
     return runProg(io, gpa, args);
 }
 
@@ -107,6 +123,8 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
 
     const flags = debug.parseDebugFlags(init.minimal.args);
+    const timings_enabled = flags.timing;
+    const total_start = if (timings_enabled) std.Io.Clock.awake.now(io) else null;
 
     var prog_args_list = try std.ArrayList([]const u8).initCapacity(gpa, 4);
     defer prog_args_list.deinit(gpa);
@@ -129,14 +147,36 @@ pub fn main(init: std.process.Init) !void {
     }
     const root = demo_ast.root;
 
+    const lower_start = if (timings_enabled) std.Io.Clock.awake.now(io) else null;
     var ir = try codegen.lower(&root, gpa);
     defer ir.deinit(gpa);
+    const lower_duration = if (lower_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
 
+    const debug_start = if (timings_enabled) std.Io.Clock.awake.now(io) else null;
     try debug.dumpDebugInfo(io, flags, &root, &ir, gpa);
+    const debug_duration = if (debug_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
 
+    const compile_start = if (timings_enabled) std.Io.Clock.awake.now(io) else null;
     const prog_bytes = try codegen.compileProgram(&ir, gpa);
     defer gpa.free(prog_bytes);
+    const compile_duration = if (compile_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
 
-    assembleAndLink(io, prog_bytes);
+    const write_start = if (timings_enabled) std.Io.Clock.awake.now(io) else null;
+    writeProgram(io, prog_bytes);
+    const write_duration = if (write_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
+
+    const run_start = if (timings_enabled) std.Io.Clock.awake.now(io) else null;
     _ = runProg(io, gpa, prog_args);
+    const run_duration = if (run_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
+
+    if (timings_enabled) {
+        const total_duration = total_start.?.untilNow(io, .awake);
+        try printStageTimings(io, &.{
+            .{ .label = "lower", .duration = lower_duration },
+            .{ .label = "debug_dump", .duration = debug_duration },
+            .{ .label = "compile_program", .duration = compile_duration },
+            .{ .label = "write_prog", .duration = write_duration },
+            .{ .label = "run_prog", .duration = run_duration },
+        }, total_duration);
+    }
 }

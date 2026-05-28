@@ -4,38 +4,12 @@ const x86 = @import("x86.zig");
 const helpers = @import("helpers_bin.zig");
 const AstNode = x86.AstNode;
 
-pub const InstRef = ir_mod.ValueRef;
-pub const InstPair = ir_mod.InstPair;
-pub const Inst = ir_mod.Inst;
-pub const BlockId = ir_mod.BlockId;
-pub const Program = ir_mod.Program;
+const InstRef = ir_mod.ValueRef;
+const InstPair = ir_mod.InstPair;
+const Inst = ir_mod.Inst;
+const BlockId = ir_mod.BlockId;
+const Program = ir_mod.Program;
 pub const lower = ir_mod.lower;
-
-fn slotOffset(value_ref: InstRef) u32 {
-    return value_ref * 8;
-}
-
-fn writeLe16(bytes: []u8, offset: usize, value: u16) void {
-    std.mem.writeInt(u16, bytes[offset..][0..2], value, .little);
-}
-
-fn writeLe32(bytes: []u8, offset: usize, value: u32) void {
-    std.mem.writeInt(u32, bytes[offset..][0..4], value, .little);
-}
-
-fn writeLe64(bytes: []u8, offset: usize, value: u64) void {
-    std.mem.writeInt(u64, bytes[offset..][0..8], value, .little);
-}
-
-const BranchCopy = struct {
-    src: InstRef,
-    dst: InstRef,
-};
-
-const RelFixup = struct {
-    disp_pos: u32,
-    symbol: u32,
-};
 
 const BinaryEmitter = struct {
     prog: *const Program,
@@ -43,10 +17,32 @@ const BinaryEmitter = struct {
     code: std.ArrayList(u8),
     block_params: []?InstRef,
     block_symbols: []u32,
+    helper_symbols: []u32,
     symbols: std.ArrayList(?u32),
     fixups: std.ArrayList(RelFixup),
-    print_int_symbol: u32,
-    atoi_symbol: u32,
+
+    const SetccCond = enum(u8) {
+        l  = 0x9C,
+        g  = 0x9F,
+        le = 0x9E,
+        ge = 0x9D,
+        e  = 0x94,
+        ne = 0x95,
+    };
+
+    const BranchCopy = struct {
+        src: InstRef,
+        dst: InstRef,
+    };
+
+    const RelFixup = struct {
+        disp_pos: u32,
+        symbol: u32,
+    };
+
+    fn slotOffset(value_ref: InstRef) u32 {
+        return value_ref * 8;
+    }
 
     fn init(prog: *const Program, gpa: std.mem.Allocator) !@This() {
         var code = try std.ArrayList(u8).initCapacity(gpa, 1024);
@@ -58,6 +54,9 @@ const BinaryEmitter = struct {
 
         var block_symbols = try gpa.alloc(u32, prog.blocks.items.len);
         errdefer gpa.free(block_symbols);
+
+        var helper_symbols = try gpa.alloc(u32, helpers.all_helpers.len);
+        errdefer gpa.free(helper_symbols);
 
         var symbols = try std.ArrayList(?u32).initCapacity(gpa, prog.blocks.items.len + 16);
         errdefer symbols.deinit(gpa);
@@ -71,11 +70,10 @@ const BinaryEmitter = struct {
             block_symbols[block.id] = @intCast(symbols.items.len - 1);
         }
 
-        try symbols.append(gpa, null);
-        const print_int_symbol: u32 = @intCast(symbols.items.len - 1);
-
-        try symbols.append(gpa, null);
-        const atoi_symbol: u32 = @intCast(symbols.items.len - 1);
+        for (helpers.all_helpers, 0..) |_, idx| {
+            try symbols.append(gpa, null);
+            helper_symbols[idx] = @intCast(symbols.items.len - 1);
+        }
 
         return .{
             .prog = prog,
@@ -83,10 +81,9 @@ const BinaryEmitter = struct {
             .code = code,
             .block_params = block_params,
             .block_symbols = block_symbols,
+            .helper_symbols = helper_symbols,
             .symbols = symbols,
             .fixups = fixups,
-            .print_int_symbol = print_int_symbol,
-            .atoi_symbol = atoi_symbol,
         };
     }
 
@@ -96,10 +93,11 @@ const BinaryEmitter = struct {
         self.fixups.deinit(self.gpa);
         self.gpa.free(self.block_params);
         self.gpa.free(self.block_symbols);
+        self.gpa.free(self.helper_symbols);
     }
 
     fn appendByte(self: *@This(), byte: u8) !void {
-        try self.code.append(self.gpa, byte);
+        try self.appendBytes(&.{byte});
     }
 
     fn appendBytes(self: *@This(), bytes: []const u8) !void {
@@ -109,18 +107,23 @@ const BinaryEmitter = struct {
     fn appendLeI32(self: *@This(), value: i32) !void {
         var bytes: [4]u8 = undefined;
         std.mem.writeInt(i32, &bytes, value, .little);
-        try self.code.appendSlice(self.gpa, &bytes);
+        try self.appendBytes(&bytes);
     }
 
     fn appendLeU32(self: *@This(), value: u32) !void {
         var bytes: [4]u8 = undefined;
         std.mem.writeInt(u32, &bytes, value, .little);
-        try self.code.appendSlice(self.gpa, &bytes);
+        try self.appendBytes(&bytes);
     }
 
     fn createSymbol(self: *@This()) !u32 {
         try self.symbols.append(self.gpa, null);
         return @intCast(self.symbols.items.len - 1);
+    }
+
+    fn helperSymbol(self: *@This(), id: helpers.HelperId) u32 {
+        const helper_idx: usize = @intFromEnum(id);
+        return self.helper_symbols[helper_idx];
     }
 
     fn bindSymbol(self: *@This(), symbol: u32) void {
@@ -244,8 +247,8 @@ const BinaryEmitter = struct {
         try self.appendBytes(&.{ 0x83, 0xF8, 0x00 });
     }
 
-    fn emitSetcc(self: *@This(), opcode: u8) !void {
-        try self.appendBytes(&.{ 0x0F, opcode, 0xC0 });
+    fn emitSetcc(self: *@This(), cond: SetccCond) !void {
+        try self.appendBytes(&.{ 0x0F, @intFromEnum(cond), 0xC0 });
     }
 
     fn emitMovzxEaxAl(self: *@This()) !void {
@@ -286,11 +289,11 @@ const BinaryEmitter = struct {
         try self.emitStoreRaxToSlot(out);
     }
 
-    fn emitCompare(self: *@This(), pair: InstPair, setcc_opcode: u8, out: InstRef) !void {
+    fn emitCompare(self: *@This(), pair: InstPair, cond: SetccCond, out: InstRef) !void {
         try self.emitLoadEaxFromSlot(pair.l);
         try self.emitLoadEbxFromSlot(pair.r);
         try self.emitCmpEaxEbx();
-        try self.emitSetcc(setcc_opcode);
+        try self.emitSetcc(cond);
         try self.emitMovzxEaxAl();
         try self.emitStoreRaxToSlot(out);
     }
@@ -305,23 +308,26 @@ const BinaryEmitter = struct {
             .isub => |pair| try self.emitBinaryArithmetic(pair, .sub, value_inst.id),
             .imul => |pair| try self.emitBinaryArithmetic(pair, .imul, value_inst.id),
             .idiv => |pair| try self.emitBinaryDiv(pair, value_inst.id),
-            .ilt => |pair| try self.emitCompare(pair, 0x9C, value_inst.id),
-            .igt => |pair| try self.emitCompare(pair, 0x9F, value_inst.id),
-            .ile => |pair| try self.emitCompare(pair, 0x9E, value_inst.id),
-            .ige => |pair| try self.emitCompare(pair, 0x9D, value_inst.id),
-            .ieq => |pair| try self.emitCompare(pair, 0x94, value_inst.id),
-            .ine => |pair| try self.emitCompare(pair, 0x95, value_inst.id),
+            .ilt => |pair| try self.emitCompare(pair, .l, value_inst.id),
+            .igt => |pair| try self.emitCompare(pair, .g, value_inst.id),
+            .ile => |pair| try self.emitCompare(pair, .le, value_inst.id),
+            .ige => |pair| try self.emitCompare(pair, .ge, value_inst.id),
+            .ieq => |pair| try self.emitCompare(pair, .e, value_inst.id),
+            .ine => |pair| try self.emitCompare(pair, .ne, value_inst.id),
             .print => |value_ref| {
                 try self.emitLoadEaxFromSlot(value_ref);
-                try self.emitCall(self.print_int_symbol);
-                try self.emitStoreRaxToSlot(value_inst.id);
+                try self.emitCallAndStore(self.helperSymbol(.print_int), value_inst.id);
             },
             .iarg => |idx| {
                 try self.emitMovRdiFromRbpDisp32(idx * 8);
-                try self.emitCall(self.atoi_symbol);
-                try self.emitStoreRaxToSlot(value_inst.id);
+                try self.emitCallAndStore(self.helperSymbol(.atoi), value_inst.id);
             },
         }
+    }
+
+    fn emitCallAndStore(self: *@This(), symbol: u32, out: InstRef) !void {
+        try self.emitCall(symbol);
+        try self.emitStoreRaxToSlot(out);
     }
 
     fn emitReturn(self: *@This(), value_ref: InstRef) !void {
@@ -396,11 +402,10 @@ const BinaryEmitter = struct {
     }
 
     fn appendHelpers(self: *@This()) !void {
-        self.bindSymbol(self.print_int_symbol);
-        try self.appendBytes(helpers.print_int.slice());
-
-        self.bindSymbol(self.atoi_symbol);
-        try self.appendBytes(helpers.atoi.slice());
+        for (helpers.all_helpers, 0..) |helper, idx| {
+            self.bindSymbol(self.helper_symbols[idx]);
+            try self.appendBytes(helper.blob.slice());
+        }
     }
 
     fn emitProgram(self: *@This()) !void {
@@ -421,6 +426,18 @@ fn buildElfExecutable(code: []const u8, entry_code_offset: u64, gpa: std.mem.All
     const program_header_size: usize = 56;
     const code_file_offset_u64: u64 = 0x1000;
     const image_base: u64 = 0x400000;
+
+    const le = struct {
+        fn write16(bytes: []u8, offset: usize, value: u16) void {
+            std.mem.writeInt(u16, bytes[offset..][0..2], value, .little);
+        }
+        fn write32(bytes: []u8, offset: usize, value: u32) void {
+            std.mem.writeInt(u32, bytes[offset..][0..4], value, .little);
+        }
+        fn write64(bytes: []u8, offset: usize, value: u64) void {
+            std.mem.writeInt(u64, bytes[offset..][0..8], value, .little);
+        }
+    };
 
     const code_len_u64: u64 = @intCast(code.len);
     const total_file_size_u64 = code_file_offset_u64 + code_len_u64;
@@ -444,29 +461,29 @@ fn buildElfExecutable(code: []const u8, entry_code_offset: u64, gpa: std.mem.All
     bytes[6] = 1;
     bytes[7] = 0;
 
-    writeLe16(bytes, 16, 2);
-    writeLe16(bytes, 18, 62);
-    writeLe32(bytes, 20, 1);
-    writeLe64(bytes, 24, image_base + code_file_offset_u64 + entry_code_offset);
-    writeLe64(bytes, 32, elf_header_size);
-    writeLe64(bytes, 40, 0);
-    writeLe32(bytes, 48, 0);
-    writeLe16(bytes, 52, elf_header_size);
-    writeLe16(bytes, 54, program_header_size);
-    writeLe16(bytes, 56, 1);
-    writeLe16(bytes, 58, 0);
-    writeLe16(bytes, 60, 0);
-    writeLe16(bytes, 62, 0);
+    le.write16(bytes, 16, 2);
+    le.write16(bytes, 18, 62);
+    le.write32(bytes, 20, 1);
+    le.write64(bytes, 24, image_base + code_file_offset_u64 + entry_code_offset);
+    le.write64(bytes, 32, elf_header_size);
+    le.write64(bytes, 40, 0);
+    le.write32(bytes, 48, 0);
+    le.write16(bytes, 52, elf_header_size);
+    le.write16(bytes, 54, program_header_size);
+    le.write16(bytes, 56, 1);
+    le.write16(bytes, 58, 0);
+    le.write16(bytes, 60, 0);
+    le.write16(bytes, 62, 0);
 
     const phoff = elf_header_size;
-    writeLe32(bytes, phoff + 0, 1);
-    writeLe32(bytes, phoff + 4, 5);
-    writeLe64(bytes, phoff + 8, 0);
-    writeLe64(bytes, phoff + 16, image_base);
-    writeLe64(bytes, phoff + 24, image_base);
-    writeLe64(bytes, phoff + 32, total_file_size_u64);
-    writeLe64(bytes, phoff + 40, total_file_size_u64);
-    writeLe64(bytes, phoff + 48, 0x1000);
+    le.write32(bytes, phoff + 0, 1);
+    le.write32(bytes, phoff + 4, 5);
+    le.write64(bytes, phoff + 8, 0);
+    le.write64(bytes, phoff + 16, image_base);
+    le.write64(bytes, phoff + 24, image_base);
+    le.write64(bytes, phoff + 32, total_file_size_u64);
+    le.write64(bytes, phoff + 40, total_file_size_u64);
+    le.write64(bytes, phoff + 48, 0x1000);
 
     try file_buf.appendSlice(gpa, code);
     return file_buf.toOwnedSlice(gpa);

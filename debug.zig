@@ -54,6 +54,7 @@ pub const DebugFlags = struct {
     ast: bool = false,
     ssa: bool = false,
     assembly: bool = false,
+    timing: bool = false,
 };
 
 pub fn parseDebugFlags(args: std.process.Args) DebugFlags {
@@ -67,7 +68,7 @@ pub fn parseDebugFlags(args: std.process.Args) DebugFlags {
         while (rest.len > 0) {
             const comma = std.mem.indexOfScalar(u8, rest, ',') orelse rest.len;
             const item = rest[0..comma];
-            if (std.mem.eql(u8, item, "ast")) flags.ast = true else if (std.mem.eql(u8, item, "ssa")) flags.ssa = true else if (std.mem.eql(u8, item, "asm")) flags.assembly = true;
+            if (std.mem.eql(u8, item, "ast")) flags.ast = true else if (std.mem.eql(u8, item, "ssa")) flags.ssa = true else if (std.mem.eql(u8, item, "asm")) flags.assembly = true else if (std.mem.eql(u8, item, "timing")) flags.timing = true;
             if (comma == rest.len) break;
             rest = rest[comma + 1 ..];
         }

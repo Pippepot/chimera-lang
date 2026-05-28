@@ -11,6 +11,16 @@ pub const HelperBlob = struct {
     }
 };
 
+pub const HelperId = enum {
+    print_int,
+    atoi,
+};
+
+pub const HelperDef = struct {
+    id: HelperId,
+    blob: HelperBlob,
+};
+
 const HelperBuffer = struct {
     bytes: [max_helper_size]u8 = [_]u8{0} ** max_helper_size,
     len: usize = 0,
@@ -176,3 +186,28 @@ fn buildAtoiBlob() HelperBlob {
 
 pub const print_int = buildPrintIntBlob();
 pub const atoi = buildAtoiBlob();
+
+pub const all_helpers = [_]HelperDef{
+    .{ .id = .print_int, .blob = print_int },
+    .{ .id = .atoi, .blob = atoi },
+};
+
+comptime {
+    _ = print_int;
+    _ = atoi;
+
+    if (print_int.len > max_helper_size) @compileError("print_int helper exceeds max_helper_size");
+    if (atoi.len > max_helper_size) @compileError("atoi helper exceeds max_helper_size");
+
+    const helper_id_count = @typeInfo(HelperId).@"enum".fields.len;
+    if (all_helpers.len != helper_id_count) @compileError("all_helpers must include every HelperId");
+
+    for (all_helpers, 0..) |helper, idx| {
+        if (@intFromEnum(helper.id) != idx) @compileError("all_helpers must follow HelperId enum order");
+    }
+}
+
+test "helper enum values map to registry index" {
+    try std.testing.expectEqual(@as(usize, 0), @intFromEnum(HelperId.print_int));
+    try std.testing.expectEqual(@as(usize, 1), @intFromEnum(HelperId.atoi));
+}
