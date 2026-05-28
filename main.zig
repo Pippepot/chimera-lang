@@ -36,9 +36,11 @@ pub const AstNode = union(enum) {
     if_: *const IfNode,
 };
 
-fn demoSource(use_cli_condition: bool) []const u8 {
-    if (use_cli_condition) return "if arg(1) > 0 then print(111) else print(-111)";
-    return "if 3 < 4 then print(10) else print(20)";
+fn printUsage(io: std.Io) !void {
+    var wbuf: [512]u8 = undefined;
+    var w = std.Io.File.stderr().writer(io, &wbuf);
+    try w.interface.writeAll("usage: zig run main.zig -- [--debug=ast,ssa,timing,query] <source-file> [program-args...]\n");
+    try w.interface.flush();
 }
 
 fn waitForExitCode(io: std.Io, child: *std.process.Child) u8 {
@@ -50,6 +52,10 @@ fn waitForExitCode(io: std.Io, child: *std.process.Child) u8 {
 
 fn isDebugFlag(arg: []const u8) bool {
     return std.mem.startsWith(u8, arg, "--debug=");
+}
+
+fn readSourceFile(io: std.Io, gpa: std.mem.Allocator, source_path: []const u8) ![]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(io, source_path, gpa, .limited(std.math.maxInt(usize)));
 }
 
 const StageTiming = struct {
@@ -126,25 +132,39 @@ pub fn main(init: std.process.Init) !void {
     const flags = debug.parseDebugFlags(init.minimal.args);
     const total_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
 
-    var prog_args_list = try std.ArrayList([]const u8).initCapacity(gpa, 4);
-    defer prog_args_list.deinit(gpa);
+    var cli_args_list = try std.ArrayList([]const u8).initCapacity(gpa, 4);
+    defer cli_args_list.deinit(gpa);
 
     var iter = std.process.Args.Iterator.init(init.minimal.args);
     defer iter.deinit();
     _ = iter.next();
     while (iter.next()) |arg| {
-        if (!isDebugFlag(arg)) try prog_args_list.append(gpa, arg);
+        if (!isDebugFlag(arg)) try cli_args_list.append(gpa, arg);
     }
 
-    const prog_args = prog_args_list.items;
-    const use_cli_condition = prog_args.len > 0;
+    const cli_args = cli_args_list.items;
+    if (cli_args.len == 0) {
+        try printUsage(io);
+        std.process.exit(1);
+    }
+
+    const source_path = cli_args[0];
+    const prog_args = cli_args[1..];
     const source_id: query.SourceId = 0;
 
     var qdb = query.QueryDb.init(gpa);
     defer qdb.deinit();
 
     const set_source_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
-    try qdb.setSource(source_id, demoSource(use_cli_condition));
+    const source_text = readSourceFile(io, gpa, source_path) catch |err| {
+        var wbuf: [512]u8 = undefined;
+        var w = std.Io.File.stderr().writer(io, &wbuf);
+        w.interface.print("error: failed to read source file '{s}': {s}\n", .{ source_path, @errorName(err) }) catch {};
+        w.interface.flush() catch {};
+        std.process.exit(1);
+    };
+    defer gpa.free(source_text);
+    try qdb.setSource(source_id, source_text);
     const set_source_duration = if (set_source_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
 
     const parse_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;

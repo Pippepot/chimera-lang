@@ -15,6 +15,7 @@
 | `debug.zig` | Debug helpers: AST dump, SSA dump, debug flag parsing |
 | `helpers_bin.zig` | Pre-assembled helper routines (`print_int`, `print_bool`, `print_float32`, `atoi`) as byte blobs |
 | `test.zig` | End-to-end language tests plus incremental query behavior tests |
+| `demo.x86` | Small demo source file for quick manual compile/run checks |
 
 ## Public API
 
@@ -73,12 +74,13 @@ Each stage memo stores:
 
 Runtime flow in `main.zig`:
 
-1. `setSource(source_id, demoSource(...))`
-2. `parsedAst(source_id)` (for AST debug)
-3. `typedAst(source_id)`
-4. `loweredProgram(source_id)` (for SSA debug)
-5. `compileBytes(source_id)`
-6. `writeProgram` + `runProg`
+1. Read source text from CLI-provided file path
+2. `setSource(source_id, source_text)`
+3. `parsedAst(source_id)` (for AST debug)
+4. `typedAst(source_id)`
+5. `loweredProgram(source_id)` (for SSA debug)
+6. `compileBytes(source_id)`
+7. `writeProgram` + `runProg`
 
 ## Debug flags
 
@@ -91,8 +93,9 @@ Use `--debug=ast,ssa,timing,query`:
 
 ## Current behavior
 
-- `zig run main.zig` prints `10`.
-- `zig run main.zig -- 5` prints `111`.
+- `zig run main.zig -- demo.x86` compiles and runs `demo.x86` (prints `42` with current demo file).
+- `zig run main.zig --` prints usage and exits with code `1`.
+- First non-debug CLI arg is source file path; remaining args are passed to the generated program.
 - Statements are newline-separated; `;` is not supported as a statement separator.
 - `const` locals are supported, non-mutable, and duplicate names are rejected.
 - Parentheses are expression grouping only and do not create scope boundaries.

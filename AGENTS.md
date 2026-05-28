@@ -2,7 +2,7 @@
 
 ## Code organization
 
-- **Entry point.** `main.zig` is the main Zig file; run with `zig run main.zig`. No `build.zig`.
+- **Entry point.** `main.zig` is the main Zig file; run with `zig run main.zig -- <source-file> [program-args...]`. No `build.zig`.
 - **Module split:**
   - `main.zig` owns AST types plus runtime entrypoints (`writeProgram`, `runProg`, `eval`, `main`) and query diagnostics formatting.
   - `parser.zig` owns lexer + parser (`parseOwned`) from source text to AST.
@@ -60,6 +60,11 @@
 
 - Use `--debug=ast,ssa,timing,query` (comma-separated) with `zig run main.zig -- ...`.
 - `query` prints query diagnostics (revision, source updates, stage hits/recomputes, dependency checks/invalidations).
+
+## CLI behavior
+
+- The first non-debug CLI argument is treated as the source file path to compile.
+- Remaining non-debug CLI arguments are passed through to the generated `./prog` (visible to `arg(n)`).
 
 ## Testing
 
