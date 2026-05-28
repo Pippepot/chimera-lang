@@ -1,4 +1,4 @@
-# x86 AST -> Machine Code Compiler
+# x86 Source -> Query -> Machine Code Compiler
 
 **Location:** `x86/`
 
@@ -6,97 +6,106 @@
 
 | File | Description |
 |------|-------------|
-| `main.zig` | AST types, binary pipeline (`writeProgram`, `runProg`, `eval`, `main`) |
-|------|-------------|
+| `main.zig` | AST types, runtime entrypoints (`writeProgram`, `runProg`, `eval`, `main`), and query diagnostics formatting |
+| `parser.zig` | Lexer + recursive descent parser (`parseOwned`) from source text to AST |
+| `query.zig` | Revisioned incremental query database (`QueryDb`) with memoized parse/lower/compile stages |
 | `ir.zig` | Block-based SSA IR definitions and AST -> IR lowering |
 | `codegen.zig` | x86 binary backend: IR -> x86 machine code + ELF executable |
-| `debug.zig` | Debug helpers: AST tree dump, SSA dump, asm dump, timing, debug flag parsing |
+| `debug.zig` | Debug helpers: AST dump, SSA dump, asm note, debug flag parsing |
 | `helpers_bin.zig` | Pre-assembled helper routines (`print_int`, `atoi`) as byte blobs |
-| `test.zig` | Full-pipeline tests: compile -> assemble -> link -> run -> assert stdout |
+| `test.zig` | End-to-end language tests plus incremental query behavior tests |
 
 ## Public API
 
 | Symbol | File | Description |
 |--------|------|-------------|
 | `AstNode`, `IfNode` | `main.zig` | AST node types |
+| `parseOwned(source, gpa)` | `parser.zig` | Parse source string into arena-owned AST |
 | `Program`, `Block`, `Inst`, `Terminator`, `Branch` | `ir.zig` | SSA/block IR model |
 | `lower(node, gpa)` | `ir.zig` | AST -> `Program` |
 | `compileProgram(prog, gpa)` | `codegen.zig` | IR -> ELF file bytes |
-| `compile(node, gpa)` | `codegen.zig` | AST -> ELF file bytes (lower + compileProgram) |
-| `writeProgram(io, bytes)` | `main.zig` | writes ELF bytes to `./prog` |
-| `runProg(io, gpa, args)` | `main.zig` | runs `./prog`, returns process exit code |
-| `eval(io, node, gpa, args)` | `main.zig` | compile + write + run |
-| `HelperId`, `HelperDef`, `HelperBlob`, `all_helpers`, `indexOf` | `helpers_bin.zig` | Runtime helper registry |
+| `QueryDb` (+ `SourceId`, `Revision`, `QueryStats`) | `query.zig` | Incremental query engine over parse/lower/compile |
+| `writeProgram(io, bytes)` | `main.zig` | Writes ELF bytes to `./prog` |
+| `runProg(io, gpa, args)` | `main.zig` | Runs `./prog`, returns process exit code |
+| `HelperId`, `HelperDef`, `HelperBlob`, `all_helpers` | `helpers_bin.zig` | Runtime helper registry |
 
-## IR Model
+## Query architecture
 
-`ir.zig` uses a basic-block SSA design:
+`query.zig` uses a reusable DB with revisioned inputs and per-stage memo tables.
 
-- `Program`: `{ entry, blocks, next_value }`
-- `Block`: `{ id, param, insts, term }`
-- `ValueInst`: `{ id, op }`
-- `Terminator`: `br`, `cbr`, `ret`
-- `Branch`: `{ target, arg? }`
+### Inputs
 
-### Branch-argument style (MLIR-like)
+- `setSource(source_id, text)` stores source text keyed by `SourceId`.
+- Revision increments only when text actually changes.
+- Input metadata tracks `changed_at` revision.
 
-`if` merges use block parameters instead of phi nodes:
+### Stage queries
 
-1. Lowering creates `then`, `else`, and `merge` blocks.
-2. `then` and `else` end with `br` to `merge`, passing a value (`arg`).
-3. `merge` declares one `param`, and that param is the `if` expression result.
+1. `parse(source_id)` -> `ParsedAst`
+2. `lower(source_id)` -> `Program`
+3. `compile(source_id)` -> `[]const u8` ELF bytes
 
-## Internal Pipeline
+### Memo metadata
 
-1. **Lowering** (`ir.lower`) — AST to block-based SSA IR.
-2. **Binary codegen** (`codegen.compileProgram`) — IR to x86 machine code in-memory, then wraps it in a minimal ELF executable (no external assembler or linker).
-3. **Write & run** (`writeProgram` + `runProg`) — write ELF bytes to disk, execute, capture exit code.
+Each stage memo stores:
+- `value`
+- `deps` (source deps and query deps)
+- `verified_at`
+- `changed_at`
+- `computing` (cycle guard)
 
-## Backend Notes
+### Red/green verification
 
-### Emitter structure (`BinaryEmitter` in `codegen.zig`)
+- If `verified_at == current_revision`: cache hit.
+- Otherwise, recursively verify dependencies and reuse memo if unchanged.
+- Recompute only on dependency invalidation.
+- Compile memo supports backdating: if recomputed bytes equal old bytes, preserve old `changed_at`.
 
-- **Slot model** — every SSA value gets a stack slot at `[rsp + value_id * 8]`. Frame size is `next_value * 8`. No register allocation.
-- **ALU ops** — load both operands into `eax`/`ebx`, compute, store result to slot. Shared via composite helpers: `emitBinaryArithmetic` (add/sub/imul with internal enum), `emitBinaryDiv`, `emitCompare` (with `SetccCond` typed enum instead of raw opcode bytes).
-- **Control flow** — `br` copies branch arg to target block param slot then jumps. `cbr` uses prep labels for edge-specific copies. Jumps use near encoding with symbol fixups.
-- **Fixup system** — `emitCall`/`emitJmp`/`emitJe`/`emitJne` emit opcode bytes and a placeholder `i32` displacement, recording a `RelFixup`. `resolveFixups` (called by `finish`) walks all fixups, computing RIP-relative offsets from symbol positions bound during emission.
-- **Helper registry** — `print_int` and `atoi` are pre-assembled binary blobs compiled at comptime in `helpers_bin.zig`. Accessed via `helperSymbol(id)` which indexes a `helper_symbols` parallel array. `emitCallAndStore` factors the emitCall + emitStoreRaxToSlot pattern used by both.
-- **Low-level emit** — all appends route through `appendBytes`, including `appendByte` (wraps as `&.{byte}`) and `appendLeI32`/`appendLeU32` (write LE then forward to `appendBytes`).
+### Ownership/lifetime
 
-### ELF construction (`buildElfExecutable`)
+- `QueryDb` owns all memoized values and source text.
+- Replacing a memo deinitializes/frees the old value.
+- Returned pointers/slices are borrowed and valid until that memo is invalidated or DB is deinitialized.
 
-Produces a minimal 64-bit ELF binary with one `PT_LOAD` segment. Layout constants: `elf_header_size=64`, `program_header_size=56`, `code_file_offset=0x1000`, `image_base=0x400000`. Little-endian write helpers are scoped as `le.write16/32/64` inside the function body.
+## Internal pipeline
 
-### `helpers_bin.zig`
+Runtime flow in `main.zig`:
 
-Pre-assembled helper routines generated at comptime via `HelperBuffer`, patched with internal rel32 fixups. Registered via:
-- `HelperId` enum (`print_int`, `atoi`)
-- `all_helpers` array of `HelperDef` (`{ id, blob }`)
-- `indexOf(id)` for stable-index lookup
-- Comptime assertions: blob size limits, coverage of all `HelperId` variants
+1. `setSource(source_id, demoSource(...))`
+2. `parsedAst(source_id)` (for AST debug)
+3. `loweredProgram(source_id)` (for SSA debug)
+4. `compileBytes(source_id)`
+5. `writeProgram` + `runProg`
 
-## Debug Flags
+## Debug flags
 
-Use `--debug=ast,ssa,asm,timing` (comma-separated) with `zig run`:
+Use `--debug=ast,ssa,asm,timing,query`:
 
-- `ast`: tree-form AST dump using box characters (`├─`, `└─`, `│ `).
+- `ast`: tree-form AST dump.
 - `ssa`: block/terminator SSA listing.
-- `asm`: emitted assembly body dump.
-- `timing`: per-stage timing diagnostics (lower, compile, write, run).
+- `asm`: binary backend note (text asm emitter removed).
+- `timing`: stage timings.
+- `query`: query diagnostics (revision, source set counts, hits/recomputes, dependency checks/invalidations).
 
-## Main Example Behavior
+## Current behavior
 
-`main.zig` demo program uses conditionals:
-
-- `zig run main.zig` prints `10` from `if (3 < 4) ...`.
-- `zig run main.zig -- 5` prints `111` from `if (arg1 > 0) ...`.
+- `zig run main.zig` prints `10`.
+- `zig run main.zig -- 5` prints `111`.
 
 ## Tests
 
-`zig test test.zig` currently runs 5 end-to-end tests:
+`zig test test.zig` currently includes:
 
-1. Arithmetic group (`int`, `add`, `sub`, `mul`, `div`, nested)
-2. Argument read (`arg`)
-3. Comparisons
-4. Branch side effects (`if` branches with print in each arm)
-5. `if` expression value propagation (including use inside arithmetic)
+1. ELF bytes sanity test.
+2. Arithmetic language behavior.
+3. CLI arg behavior (`arg(n)`).
+4. Comparisons.
+5. If branch side effects.
+6. If expression value propagation.
+7. Query cache hits within same revision.
+8. Source-change invalidation across parse/lower/compile.
+9. Source-specific invalidation isolation.
+10. Unchanged source revision stability.
+11. Compile `changed_at` backdating when output bytes are identical.
+12. Query diagnostics formatting.
+13. Helper enum/index mapping.

@@ -3,9 +3,15 @@
 ## Code organization
 
 - **Entry point.** `main.zig` is the main Zig file; run with `zig run main.zig`. No `build.zig`.
-- **Module split:** `main.zig` owns AST types + binary pipeline (`writeProgram`, `runProg`, `eval`, `main`). `codegen.zig` owns IR types, lowering, and binary emission. `debug.zig` owns debug helpers.
-- **External assembly** goes in `.asm` files, embedded via `@embedFile("file.asm")` in the `compile` function.
-- **Project state** documented in `.agents/project.md`.
+- **Module split:**
+  - `main.zig` owns AST types plus runtime entrypoints (`writeProgram`, `runProg`, `eval`, `main`) and query diagnostics formatting.
+  - `parser.zig` owns lexer + parser (`parseOwned`) from source text to AST.
+  - `query.zig` owns the revisioned incremental query system (`QueryDb`) and stage memos (`parse`, `lower`, `compile`).
+  - `ir.zig` owns SSA/block IR types and AST -> IR lowering.
+  - `codegen.zig` owns IR -> x86 machine code + ELF emission.
+  - `debug.zig` owns debug flag parsing and AST/SSA debug dumps.
+  - `helpers_bin.zig` owns pre-assembled helper blobs (`print_int`, `atoi`).
+- **Project state** is documented in `.agents/project.md`.
 - **AGENTS.md** lives alongside `main.zig` (project root, not repo root).
 
 ## Zig 0.16 standard library
@@ -20,13 +26,24 @@
 - **`var` vs `const` on slices** — element mutation does NOT count as variable reassignment. Use `const` for slices where only elements are mutated.
 - **`@intCast(value)`** — takes one argument; destination type is inferred from context. Not `@intCast(T, value)`.
 
-## AST design
+## AST + parser design
 
 - **Binary ops** use `*const [2]AstNode` (pointer to fixed-size array of two children).
-- **Stack-allocate nodes** when the tree is built and consumed in the same function. No arena/heap needed.
-- **Emit private** — only `compile` is public. Tests use `eval` (full pipeline), not `emit`.
-- **Factor binop lowering** — shared `lowerBinop` function lowers both children, returns `InstPair`. Each binop arm is a one-liner.
-- **Factor codegen binops** — iadd/isub share `emitAddSub(mnemonic, p, i)` differing only by the mnemonic string. imul/idiv get their own helpers (`emitImul`, `emitIdiv`) due to x86 instruction quirks (three-operand `imul`, `cdq` before `idiv`). All four share the `freeOperands` + `assignResult` tail.
+- **Parser ownership:** `parser.parseOwned` returns `ParsedAst` with an arena that owns all AST allocations.
+- **Query ownership:** parse memo values in `QueryDb` own `ParsedAst`; callers borrow `*const AstNode` via `parsedAst`.
+- **Unary minus** is lowered in parser as either negative literal or `0 - expr`.
+
+## Query system design
+
+- **`QueryDb` is reusable state.** Keep one DB across revisions to get incremental behavior.
+- **Inputs are virtual source IDs.** `setSource(source_id, text)` updates source text and revision tracking.
+- **Stage queries:** `parse(source_id)` -> `lower(source_id)` -> `compile(source_id)`.
+- **Memo metadata:** each memo tracks `deps`, `verified_at`, `changed_at`, and `computing`.
+- **Red/green verification:**
+  - If `verified_at == current_revision`, it is an immediate hit.
+  - Otherwise re-check dependencies recursively before deciding to recompute.
+- **Compile backdating:** if recomputed compile bytes are identical, preserve old `changed_at`.
+- **Purity boundary:** queries return data only; writing executables and running child processes stay outside query code.
 
 ## Assembly generation
 
@@ -34,26 +51,27 @@
 - **32-bit ops are fine** in 64-bit mode: `add eax, ebx`, `sub eax, ebx`, `imul eax, ebx`, `idiv ebx`.
 - **Signed division** requires `cdq` before `idiv` (sign-extends `eax` into `edx`).
 - **Exit syscall** — `mov edi, eax` (exit code), `mov eax, 60` (syscall number), `syscall`.
-- **NASM doesn't read from stdin.** Always write source to a temp file. Use defer to clean up.
+
+## Debug flags
+
+- Use `--debug=ast,ssa,asm,timing,query` (comma-separated) with `zig run main.zig -- ...`.
+- `query` prints query diagnostics (revision, source updates, stage hits/recomputes, dependency checks/invalidations).
 
 ## Testing
 
-- **Tests compile and run the full binary** and check the exit code, not assembly strings.
-- **Test every AST node** (int, add, sub, mul, div, nested). Cover edge cases like negative results.
-- Use `testing.expectEqual(expected: u8, actual: u8)` for exit code assertions.
+- **Behavioral tests** compile and run full binaries from source strings via `QueryDb`.
+- **Incremental tests** verify query cache hits, invalidation on source changes, per-source isolation, unchanged-source no revision bump, and compile `changed_at` backdating.
+- **Debug formatting test** verifies stable query diagnostics text output.
 
 ## Git
 
-- `.gitignore` generated files: `prog`, `x86.asm`, `x86.o`, `.zig-cache/`.
-- Commit all source files including `.asm` and test files.
+- `.gitignore` generated files: `prog`, `main`, `x86.asm`, `x86.o`, `.zig-cache/`.
+- Commit all source files including parser/query modules and tests.
 
 ## Style
 
 - **No scoped blocks** for variable reuse. Use descriptive names instead (`asm_child`, `ld_child`).
 - **Concrete types** not `anytype` for function parameters where the type is known.
-- **Factor repeated patterns** into shared functions. For codegen: `emitAddSub` with mnemonic param, `emitImul`/`emitIdiv` for x86-specific quirks, `freeOperands` + `assignResult` as shared tail.
-- **Separate compile stages** into distinct public functions: `compile` → `assembleAndLink` → `runProg`, then compose as `eval`.
-- **Emitter struct for stateful codegen** — when codegen helpers share mutable state (registers, spill slots, use counts), group state into a struct with `*@This()` methods. Zig's anonymous structs (`const foo = struct { fn _() ... }._`) cannot capture mutable variables across the namespace boundary, so the Emitter struct is the idiomatic alternative to threading 8+ parameters.
-- **Caller-provided output buffer** — functions like `emitIr` take a `*std.ArrayList(u8)` buffer parameter instead of returning one. The caller controls allocation, enabling reuse (e.g., `compileIr` adds prologue/epilogue around the buffer, `debug.zig` uses a separate buffer for display).
-- **Hoist `try` from format args** — don't inline `try foo()` inside a `buf.print(...)` format argument. Assign the result to a variable first. Error union types don't coerce to format arguments.
-- **Single pass over multi-concern loops** — when a loop body has multiple concerns (find free reg, track spill victim), handle all in a single pass with simple branches. Don't split into sequential passes unless each has a genuinely different structure.
+- **Factor repeated patterns** into shared functions.
+- **Hoist `try` from format args** — don't inline `try foo()` inside `buf.print(...)` format args.
+- **Single pass over multi-concern loops** where practical.
