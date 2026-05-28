@@ -2,11 +2,11 @@
 
 ## Code organization
 
-- **Entry point.** `x86.zig` is the main Zig file; run with `zig run x86.zig`. No `build.zig`.
-- **Module split:** `x86.zig` owns AST types + binary pipeline (`assembleAndLink`, `runProg`, `eval`, `main`). `codegen.zig` owns IR types, lowering, register allocator, and emission. `debug.zig` owns debug helpers.
+- **Entry point.** `main.zig` is the main Zig file; run with `zig run main.zig`. No `build.zig`.
+- **Module split:** `main.zig` owns AST types + binary pipeline (`writeProgram`, `runProg`, `eval`, `main`). `codegen.zig` owns IR types, lowering, and binary emission. `debug.zig` owns debug helpers.
 - **External assembly** goes in `.asm` files, embedded via `@embedFile("file.asm")` in the `compile` function.
 - **Project state** documented in `.agents/project.md`.
-- **AGENTS.md** lives alongside `x86.zig` (project root, not repo root).
+- **AGENTS.md** lives alongside `main.zig` (project root, not repo root).
 
 ## Zig 0.16 standard library
 

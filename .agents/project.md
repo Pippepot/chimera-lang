@@ -6,7 +6,8 @@
 
 | File | Description |
 |------|-------------|
-| `x86.zig` | AST types, binary pipeline (`writeProgram`, `runProg`, `eval`, `main`) |
+| `main.zig` | AST types, binary pipeline (`writeProgram`, `runProg`, `eval`, `main`) |
+|------|-------------|
 | `ir.zig` | Block-based SSA IR definitions and AST -> IR lowering |
 | `codegen.zig` | x86 binary backend: IR -> x86 machine code + ELF executable |
 | `debug.zig` | Debug helpers: AST tree dump, SSA dump, asm dump, timing, debug flag parsing |
@@ -17,14 +18,14 @@
 
 | Symbol | File | Description |
 |--------|------|-------------|
-| `AstNode`, `IfNode` | `x86.zig` | AST node types |
+| `AstNode`, `IfNode` | `main.zig` | AST node types |
 | `Program`, `Block`, `Inst`, `Terminator`, `Branch` | `ir.zig` | SSA/block IR model |
 | `lower(node, gpa)` | `ir.zig` | AST -> `Program` |
 | `compileProgram(prog, gpa)` | `codegen.zig` | IR -> ELF file bytes |
 | `compile(node, gpa)` | `codegen.zig` | AST -> ELF file bytes (lower + compileProgram) |
-| `writeProgram(io, bytes)` | `x86.zig` | writes ELF bytes to `./prog` |
-| `runProg(io, gpa, args)` | `x86.zig` | runs `./prog`, returns process exit code |
-| `eval(io, node, gpa, args)` | `x86.zig` | compile + write + run |
+| `writeProgram(io, bytes)` | `main.zig` | writes ELF bytes to `./prog` |
+| `runProg(io, gpa, args)` | `main.zig` | runs `./prog`, returns process exit code |
+| `eval(io, node, gpa, args)` | `main.zig` | compile + write + run |
 | `HelperId`, `HelperDef`, `HelperBlob`, `all_helpers`, `indexOf` | `helpers_bin.zig` | Runtime helper registry |
 
 ## IR Model
@@ -85,10 +86,10 @@ Use `--debug=ast,ssa,asm,timing` (comma-separated) with `zig run`:
 
 ## Main Example Behavior
 
-`x86.zig` demo program uses conditionals:
+`main.zig` demo program uses conditionals:
 
-- `zig run x86.zig` prints `10` from `if (3 < 4) ...`.
-- `zig run x86.zig -- 5` prints `111` from `if (arg1 > 0) ...`.
+- `zig run main.zig` prints `10` from `if (3 < 4) ...`.
+- `zig run main.zig -- 5` prints `111` from `if (arg1 > 0) ...`.
 
 ## Tests
 

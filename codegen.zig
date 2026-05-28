@@ -1,6 +1,6 @@
 const std = @import("std");
 const ir_mod = @import("ir.zig");
-const x86 = @import("x86.zig");
+const x86 = @import("main.zig");
 const helpers = @import("helpers_bin.zig");
 const AstNode = x86.AstNode;
 

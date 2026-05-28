@@ -1,10 +1,10 @@
 const std = @import("std");
 const testing = std.testing;
-const x86 = @import("x86.zig");
+const x86 = @import("main.zig");
 const AstNode = x86.AstNode;
 const IfNode = x86.IfNode;
 const compile = @import("codegen.zig").compile;
-const assembleAndLink = @import("x86.zig").assembleAndLink;
+const writeProgram = @import("main.zig").writeProgram;
 
 fn runTestCapture(node: *const AstNode, args: []const []const u8) ![]u8 {
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
@@ -14,7 +14,7 @@ fn runTestCapture(node: *const AstNode, args: []const []const u8) ![]u8 {
     const prog_bytes = try compile(node, testing.allocator);
     defer testing.allocator.free(prog_bytes);
 
-    assembleAndLink(io, prog_bytes);
+    writeProgram(io, prog_bytes);
     defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
 
     var argv = try std.ArrayList([]const u8).initCapacity(testing.allocator, 1 + args.len);

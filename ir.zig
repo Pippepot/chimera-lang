@@ -1,5 +1,5 @@
 const std = @import("std");
-const x86 = @import("x86.zig");
+const x86 = @import("main.zig");
 const AstNode = x86.AstNode;
 
 pub const ValueRef = u32;

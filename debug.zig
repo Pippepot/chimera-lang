@@ -1,5 +1,5 @@
 const std = @import("std");
-const x86 = @import("x86.zig");
+const x86 = @import("main.zig");
 const ir_mod = @import("ir.zig");
 const AstNode = x86.AstNode;
 const InstPair = ir_mod.InstPair;
