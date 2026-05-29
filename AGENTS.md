@@ -47,7 +47,21 @@
 - **Query ownership:** parse memo values in `QueryDb` own `ParsedAst`; callers borrow `*const AstNode` via `parsedAst`.
 - **Unary minus** is lowered in parser as either negative literal or `0 - expr`.
 
-## Var (mutable variables)
+## Type syntax
+
+- **Primitive types:** `unit`, `bool`, `int`, `float`.
+- **Function types:** `func(ParamType1, ParamType2, ...) ReturnType` — usable in parameter annotations (`f: func(int) int`), return type annotations, and `const`/`var` binding annotations.
+- **Named struct types:** referenced by their declared name (e.g. `Foo`) — usable in `const`/`var` binding annotations.
+
+## Struct types and initialization
+
+- **Struct declaration:** `comptime Name = struct` followed by newline and indented field lines (`field: type`).
+- **Struct init:** `TypeName{field1 = expr, field2 = expr, ...}`. Must provide all fields in order; field count and names are checked by the typechecker.
+- **Field access:** `expr.fieldName`. The expression must be of a named struct type.
+- **IR lowering:**
+  - `var`/`const` with a `struct_init` value allocates N consecutive stack slots (one per field) and emits `store` for each field value.
+  - Field access for index 0 returns the base slot directly. For higher indices it emits `field_load(base, field_index)` which loads from slot `base + field_index`.
+- **Structs in function args/returns** are not yet supported.
 
 - **`var` locals** are mutable and use the same syntax as `const`: `var name = expr`.
 - **Reassignment:** `name = expr` produces unit (can be used as an expression).

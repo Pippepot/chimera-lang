@@ -533,6 +533,10 @@ const BinaryEmitter = struct {
                 try self.emitStoreRaxToSlot(pair.r);
                 try self.emitStoreUnitValue(value_inst.id);
             },
+            .field_load => |fl| {
+                try self.emitLoadRaxFromSlot(fl.base + fl.field_index);
+                try self.emitStoreRaxToSlot(value_inst.id);
+            },
         }
         _ = fn_layout;
     }

@@ -72,6 +72,21 @@ pub const CallNode = struct {
     args: []const *const AstNode,
 };
 
+pub const FieldInit = struct {
+    name: []const u8,
+    value: *const AstNode,
+};
+
+pub const StructInitNode = struct {
+    struct_name: []const u8,
+    fields: []const FieldInit,
+};
+
+pub const FieldAccessNode = struct {
+    target: *const AstNode,
+    field: []const u8,
+};
+
 pub const BlockNode = struct {
     items: []const *const AstNode,
 };
@@ -86,6 +101,8 @@ pub const AstNode = union(enum) {
     const_: *const ConstNode,
     return_: *const ReturnNode,
     call: *const CallNode,
+    struct_init: *const StructInitNode,
+    field_access: *const FieldAccessNode,
     print: *const AstNode,
     add: *const [2]AstNode,
     sub: *const [2]AstNode,

@@ -348,6 +348,79 @@ test "const and var optional type annotations" {
     , "42\n");
 }
 
+test "struct init single field var and field access" {
+    try testProgram(
+        \\comptime Foo = struct
+        \\  x: int
+        \\var foo = Foo{x = 10}
+        \\print(foo.x)
+    , "10\n");
+}
+
+test "struct init multi-field var and field access" {
+    try testProgram(
+        \\comptime Point = struct
+        \\  x: int
+        \\  y: int
+        \\var p = Point{x = 3, y = 4}
+        \\print(p.x)
+        \\print(p.y)
+    , "3\n4\n");
+}
+
+test "struct init const and field access" {
+    try testProgram(
+        \\comptime Foo = struct
+        \\  x: int
+        \\const f = Foo{x = 42}
+        \\print(f.x)
+    , "42\n");
+}
+
+test "struct init unknown field error" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+    try db.setSource(0,
+        \\comptime Foo = struct
+        \\  x: int
+        \\var f = Foo{y = 10}
+    );
+    try expectCompileErrorContains(&db, 0, "struct init field name mismatch");
+}
+
+test "struct init field count mismatch error" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+    try db.setSource(0,
+        \\comptime Foo = struct
+        \\  x: int
+        \\  y: int
+        \\var f = Foo{x = 1}
+    );
+    try expectCompileErrorContains(&db, 0, "struct init field count mismatch");
+}
+
+test "field access on non-struct error" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+    try db.setSource(0,
+        \\const x = 5
+        \\print(x.nonexistent)
+    );
+    try expectCompileErrorContains(&db, 0, "field access on non-struct type");
+}
+
+test "struct field type mismatch error" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+    try db.setSource(0,
+        \\comptime Foo = struct
+        \\  x: int
+        \\var f = Foo{x = 1.0}
+    );
+    try expectCompileErrorContains(&db, 0, "binding type annotation mismatch");
+}
+
 test "binding type annotation mismatch errors" {
     var db = query.QueryDb.init(testing.allocator);
     defer db.deinit();

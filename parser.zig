@@ -17,6 +17,9 @@ const ParamNode = ast.ParamNode;
 const FieldNode = ast.FieldNode;
 const TypeNode = ast.TypeNode;
 const FuncTypeNode = ast.FuncTypeNode;
+const FieldInit = ast.FieldInit;
+const StructInitNode = ast.StructInitNode;
+const FieldAccessNode = ast.FieldAccessNode;
 
 pub const ParseError = error{
     UnexpectedCharacter,
@@ -73,6 +76,9 @@ const TokenTag = enum {
     ge,
     eq_eq,
     ne,
+    l_brace,
+    r_brace,
+    dot,
 };
 
 const Token = struct {
@@ -255,8 +261,11 @@ const Lexer = struct {
         return switch (char) {
             '(' => .{ .tag = .l_paren, .start = start, .end = self.index },
             ')' => .{ .tag = .r_paren, .start = start, .end = self.index },
+            '{' => .{ .tag = .l_brace, .start = start, .end = self.index },
+            '}' => .{ .tag = .r_brace, .start = start, .end = self.index },
             ':' => .{ .tag = .colon, .start = start, .end = self.index },
             ',' => .{ .tag = .comma, .start = start, .end = self.index },
+            '.' => .{ .tag = .dot, .start = start, .end = self.index },
             '+' => .{ .tag = .plus, .start = start, .end = self.index },
             '-' => if (self.index < self.source.len and self.source[self.index] == '>') arrow: {
                 self.index += 1;
@@ -448,6 +457,23 @@ const Parser = struct {
         const call = try self.arena.create(CallNode);
         call.* = .{ .callee = callee, .args = owned_args };
         return self.allocNode(.{ .call = call }, span);
+    }
+
+    fn makeStructInitNode(self: *@This(), struct_name: []const u8, fields: []const FieldInit, span: ast.Span) error{OutOfMemory}!*const AstNode {
+        const owned_name = try self.allocName(struct_name);
+        const owned_fields = try self.arena.alloc(FieldInit, fields.len);
+        for (fields, 0..) |f, i| {
+            owned_fields[i] = .{ .name = try self.allocName(f.name), .value = f.value };
+        }
+        const data = try self.arena.create(StructInitNode);
+        data.* = .{ .struct_name = owned_name, .fields = owned_fields };
+        return self.allocNode(.{ .struct_init = data }, span);
+    }
+
+    fn makeFieldAccessNode(self: *@This(), target: *const AstNode, field: []const u8, span: ast.Span) error{OutOfMemory}!*const AstNode {
+        const data = try self.arena.create(FieldAccessNode);
+        data.* = .{ .target = target, .field = try self.allocName(field) };
+        return self.allocNode(.{ .field_access = data }, span);
     }
 
     fn makeBinop(self: *@This(), tag: BinTag, left: *const AstNode, right: *const AstNode) error{OutOfMemory}!*const AstNode {
@@ -891,33 +917,79 @@ const Parser = struct {
             return self.makeBinop(.sub, zero, operand);
         }
 
-        return self.parseCall();
+        return self.parsePostfix();
     }
 
-    fn parseCall(self: *@This()) (ParseError || error{OutOfMemory})!*const AstNode {
-        var callee = try self.parsePrimary();
+    fn parsePostfix(self: *@This()) (ParseError || error{OutOfMemory})!*const AstNode {
+        var expr = try self.parsePrimary();
 
-        while (self.current.tag == .l_paren) {
-            const callee_span = self.spanOfNode(callee);
-            try self.advance();
+        while (true) {
+            if (self.current.tag == .l_paren) {
+                const callee_span = self.spanOfNode(expr);
+                try self.advance();
 
-            var args = std.ArrayList(*const AstNode).empty;
-            while (self.current.tag != .r_paren) {
-                const arg = try self.parseExpression();
-                try args.append(self.arena, arg);
-                if (self.current.tag == .comma) {
-                    try self.advance();
-                } else if (self.current.tag != .r_paren) {
-                    return error.ExpectedComma;
+                var args = std.ArrayList(*const AstNode).empty;
+                while (self.current.tag != .r_paren) {
+                    const arg = try self.parseExpression();
+                    try args.append(self.arena, arg);
+                    if (self.current.tag == .comma) {
+                        try self.advance();
+                    } else if (self.current.tag != .r_paren) {
+                        return error.ExpectedComma;
+                    }
                 }
-            }
 
-            const end_span = tokenSpan(self.current);
-            try self.expect(.r_paren, error.ExpectedRParen);
-            callee = try self.makeCallNode(callee, args.items, coverSpans(callee_span, end_span));
+                const end_span = tokenSpan(self.current);
+                try self.expect(.r_paren, error.ExpectedRParen);
+                expr = try self.makeCallNode(expr, args.items, coverSpans(callee_span, end_span));
+            } else if (self.current.tag == .l_brace) {
+                if (expr.* != .var_ref) return error.ExpectedIdentifier;
+                const struct_name = expr.var_ref;
+                expr = try self.parseStructInit(struct_name);
+            } else if (self.current.tag == .dot) {
+                expr = try self.parseFieldAccess(expr);
+            } else {
+                break;
+            }
         }
 
-        return callee;
+        return expr;
+    }
+
+    fn parseStructInit(self: *@This(), struct_name: []const u8) (ParseError || error{OutOfMemory})!*const AstNode {
+        const lbrace_span = tokenSpan(self.current);
+        try self.expect(.l_brace, error.UnexpectedToken);
+
+        var fields = std.ArrayList(FieldInit).empty;
+        while (self.current.tag != .r_brace) {
+            if (self.current.tag != .ident) return error.ExpectedIdentifier;
+            const field_name = self.current.ident;
+            try self.advance();
+            try self.expect(.assign, error.ExpectedAssign);
+            const value = try self.parseExpression();
+            try fields.append(self.arena, .{ .name = field_name, .value = value });
+
+            if (self.current.tag == .comma) {
+                try self.advance();
+            } else if (self.current.tag != .r_brace) {
+                return error.ExpectedComma;
+            }
+        }
+
+        const end_span = tokenSpan(self.current);
+        try self.expect(.r_brace, error.UnexpectedToken);
+        const span = coverSpans(lbrace_span, end_span);
+        return self.makeStructInitNode(struct_name, fields.items, span);
+    }
+
+    fn parseFieldAccess(self: *@This(), target: *const AstNode) (ParseError || error{OutOfMemory})!*const AstNode {
+        const dot_span = tokenSpan(self.current);
+        try self.expect(.dot, error.UnexpectedToken);
+        if (self.current.tag != .ident) return error.ExpectedIdentifier;
+        const field_name = self.current.ident;
+        try self.advance();
+        const end_span = tokenSpan(self.current);
+        return self.makeFieldAccessNode(target, field_name, coverSpans(dot_span, end_span));
     }
 
     fn parsePrimary(self: *@This()) (ParseError || error{OutOfMemory})!*const AstNode {

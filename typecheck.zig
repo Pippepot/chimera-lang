@@ -70,6 +70,10 @@ pub const TypeError = error{
     ReturnTypeMismatch,
     FunctionBodyTypeMismatch,
     MissingNodeType,
+    UnknownField,
+    FieldAccessOnNonStruct,
+    StructInitFieldCountMismatch,
+    StructInitFieldNameMismatch,
 };
 
 pub const TypedAst = struct {
@@ -134,6 +138,10 @@ pub fn typeErrorMessage(kind: TypeError) []const u8 {
         error.ReturnTypeMismatch => "return type mismatch",
         error.FunctionBodyTypeMismatch => "function body type does not match declared return type",
         error.MissingNodeType => "internal type table mismatch",
+        error.UnknownField => "unknown field",
+        error.FieldAccessOnNonStruct => "field access on non-struct type",
+        error.StructInitFieldCountMismatch => "struct init field count mismatch",
+        error.StructInitFieldNameMismatch => "struct init field name mismatch",
     };
 }
 
@@ -438,6 +446,37 @@ const Checker = struct {
         return self.remember(node, self.current_return);
     }
 
+    fn findStructDeclFor(self: *const @This(), name: []const u8) ?*const ast.StructDecl {
+        return findStructDecl(self.resolved, name);
+    }
+
+    fn inferStructInit(self: *@This(), node: *const AstNode, si_node: *const ast.StructInitNode) InferError!Type {
+        const struct_decl = self.findStructDeclFor(si_node.struct_name) orelse return self.failAtNode(node, error.UnknownType);
+        if (si_node.fields.len != struct_decl.fields.len) return self.failAtNode(node, error.StructInitFieldCountMismatch);
+        for (si_node.fields, struct_decl.fields) |given, decl_field| {
+            if (!std.mem.eql(u8, given.name, decl_field.name)) return self.failAtNode(node, error.StructInitFieldNameMismatch);
+            const field_ty = try self.resolveTypeNode(decl_field.ty);
+            const value_ty = try self.inferNode(given.value);
+            if (!typeEql(value_ty, field_ty)) return self.failAtNode(node, error.BindingTypeMismatch);
+        }
+        return self.remember(node, .{ .named = si_node.struct_name });
+    }
+
+    fn inferFieldAccess(self: *@This(), node: *const AstNode, fa_node: *const ast.FieldAccessNode) InferError!Type {
+        const target_ty = try self.inferNode(fa_node.target);
+        const struct_name = switch (target_ty) {
+            .named => |name| name,
+            else => return self.failAtNode(node, error.FieldAccessOnNonStruct),
+        };
+        const struct_decl = self.findStructDeclFor(struct_name) orelse return self.failAtNode(node, error.UnknownType);
+        for (struct_decl.fields) |field| {
+            if (std.mem.eql(u8, field.name, fa_node.field)) {
+                return self.remember(node, try self.resolveTypeNode(field.ty));
+            }
+        }
+        return self.failAtNode(node, error.UnknownField);
+    }
+
     fn inferBlock(self: *@This(), node: *const AstNode, block_node: *const ast.BlockNode) InferError!Type {
         const mark = self.bindings.mark();
         defer self.bindings.restore(mark);
@@ -495,6 +534,8 @@ const Checker = struct {
             .eq => |kids| try self.inferFallible(node, kids, Checker.inferEquality),
             .ne => |kids| try self.inferFallible(node, kids, Checker.inferEquality),
             .if_ => |if_node| self.inferIf(node, if_node),
+            .struct_init => |si| self.inferStructInit(node, si),
+            .field_access => |fa| self.inferFieldAccess(node, fa),
         };
     }
 
@@ -544,6 +585,16 @@ fn hasTopLevelEntry(node: *const AstNode) bool {
 
 fn isSyntheticTopLevelEntry(decl: *const ast.FuncDecl) bool {
     return std.mem.eql(u8, decl.name, "__top_level_entry__");
+}
+
+fn findStructDecl(resolved: *const resolver.ResolvedAst, name: []const u8) ?*const ast.StructDecl {
+    for (resolved.module.decls) |decl| {
+        if (decl.* == .comptime_struct) {
+            const st = decl.comptime_struct;
+            if (std.mem.eql(u8, st.name, name)) return st;
+        }
+    }
+    return null;
 }
 
 fn nodeKey(node: *const AstNode) usize {

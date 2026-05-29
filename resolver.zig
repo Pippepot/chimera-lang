@@ -200,6 +200,12 @@ const Resolver = struct {
                     try self.resolveNode(else_node);
                 }
             },
+            .struct_init => |si| {
+                for (si.fields) |field| try self.resolveNode(field.value);
+            },
+            .field_access => |fa| {
+                try self.resolveNode(fa.target);
+            },
         }
     }
 };

@@ -25,6 +25,11 @@ pub const CallInst = struct {
     args: [MaxCallArgs]ValueRef,
 };
 
+pub const FieldLoad = struct {
+    base: ValueRef,
+    field_index: u32,
+};
+
 pub const Inst = union(enum) {
     iconst: i32,
     fconst: f32,
@@ -43,6 +48,7 @@ pub const Inst = union(enum) {
     printb: ValueRef,
     argi: u32,
     store: InstPair,
+    field_load: FieldLoad,
 };
 
 pub const PredicateOp = enum {
@@ -443,6 +449,26 @@ const FunctionLowerer = struct {
     }
 
     fn lowerVar(self: *@This(), var_node: *const ast.VarNode) (error{OutOfMemory} || LowerError || typecheck.TypeError)!ValueRef {
+        if (var_node.value.* == .struct_init) {
+            const si = var_node.value.struct_init;
+            const struct_decl = self.findStructDecl(si.struct_name) orelse unreachable;
+            const field_count: u32 = @intCast(struct_decl.fields.len);
+            const var_base = try self.allocValue(try self.nodeType(var_node.value));
+            if (field_count > 1) {
+                self.function.next_value += field_count - 1;
+                var i: u32 = 0;
+                while (i < field_count - 1) : (i += 1) {
+                    try self.function.value_types.append(self.parent.gpa, try self.nodeType(var_node.value));
+                }
+            }
+            for (si.fields, 0..) |field, idx| {
+                const field_value = try self.lowerAst(field.value);
+                const dst_slot: ValueRef = var_base + @as(ValueRef, @intCast(idx));
+                _ = try self.addInst(.{ .store = .{ .l = field_value, .r = dst_slot } }, .unit);
+            }
+            try self.pushBinding(var_node.name, var_base);
+            return self.lowerUnitValue();
+        }
         const value_ref = try self.lowerAst(var_node.value);
         const var_slot = try self.allocValue(try self.nodeType(var_node.value));
         _ = try self.addInst(.{ .store = .{ .l = value_ref, .r = var_slot } }, .unit);
@@ -451,6 +477,26 @@ const FunctionLowerer = struct {
     }
 
     fn lowerConst(self: *@This(), const_node: *const ast.ConstNode) (error{OutOfMemory} || LowerError || typecheck.TypeError)!ValueRef {
+        if (const_node.value.* == .struct_init) {
+            const si = const_node.value.struct_init;
+            const struct_decl = self.findStructDecl(si.struct_name) orelse unreachable;
+            const field_count: u32 = @intCast(struct_decl.fields.len);
+            const const_base = try self.allocValue(try self.nodeType(const_node.value));
+            if (field_count > 1) {
+                self.function.next_value += field_count - 1;
+                var i: u32 = 0;
+                while (i < field_count - 1) : (i += 1) {
+                    try self.function.value_types.append(self.parent.gpa, try self.nodeType(const_node.value));
+                }
+            }
+            for (si.fields, 0..) |field, idx| {
+                const field_value = try self.lowerAst(field.value);
+                const dst_slot: ValueRef = const_base + @as(ValueRef, @intCast(idx));
+                _ = try self.addInst(.{ .store = .{ .l = field_value, .r = dst_slot } }, .unit);
+            }
+            try self.pushBinding(const_node.name, const_base);
+            return self.lowerUnitValue();
+        }
         const value_ref = try self.lowerAst(const_node.value);
         try self.pushBinding(const_node.name, value_ref);
         return self.lowerUnitValue();
@@ -467,6 +513,55 @@ const FunctionLowerer = struct {
         const value_ref = try self.lowerAst(return_node.value);
         self.currentBlock().terminator = .{ .ret = value_ref };
         return value_ref;
+    }
+
+    fn findStructDecl(self: *const @This(), name: []const u8) ?*const ast.StructDecl {
+        for (self.parent.mono.module.decls) |decl| {
+            if (decl.* == .comptime_struct) {
+                const st = decl.comptime_struct;
+                if (std.mem.eql(u8, st.name, name)) return st;
+            }
+        }
+        return null;
+    }
+
+    fn fieldIndex(self: *const @This(), struct_name: []const u8, field_name: []const u8) ?u32 {
+        const st = self.findStructDecl(struct_name) orelse return null;
+        for (st.fields, 0..) |f, idx| {
+            if (std.mem.eql(u8, f.name, field_name)) return @intCast(idx);
+        }
+        return null;
+    }
+
+    fn lowerStructInit(self: *@This(), node: *const AstNode, si: *const ast.StructInitNode) (error{OutOfMemory} || LowerError || typecheck.TypeError)!ValueRef {
+        const field_count: u32 = @intCast(si.fields.len);
+        const struct_type = try self.nodeType(node);
+        const base = try self.allocValue(struct_type);
+        if (field_count > 1) {
+            self.function.next_value += field_count - 1;
+            var i: u32 = 0;
+            while (i < field_count - 1) : (i += 1) {
+                try self.function.value_types.append(self.parent.gpa, struct_type);
+            }
+        }
+        for (si.fields, 0..) |field, idx| {
+            const field_value = try self.lowerAst(field.value);
+            const dst_slot: ValueRef = base + @as(ValueRef, @intCast(idx));
+            _ = try self.addInst(.{ .store = .{ .l = field_value, .r = dst_slot } }, .unit);
+        }
+        return base;
+    }
+
+    fn lowerFieldAccess(self: *@This(), node: *const AstNode, fa: *const ast.FieldAccessNode) (error{OutOfMemory} || LowerError || typecheck.TypeError)!ValueRef {
+        const base = try self.lowerAst(fa.target);
+        const target_type = try self.nodeType(fa.target);
+        const struct_name = switch (target_type) {
+            .named => |name| name,
+            else => unreachable,
+        };
+        const f_idx = self.fieldIndex(struct_name, fa.field) orelse unreachable;
+        if (f_idx == 0) return base;
+        return self.addInst(.{ .field_load = .{ .base = base, .field_index = f_idx } }, try self.nodeType(node));
     }
 
     fn lowerVarRef(self: *@This(), name: []const u8) (error{OutOfMemory} || LowerError || typecheck.TypeError)!ValueRef {
@@ -506,6 +601,8 @@ const FunctionLowerer = struct {
             .arg => |idx| try self.addInst(.{ .argi = idx }, .int),
             .lt, .gt, .le, .ge, .eq, .ne => error.IfConditionNotFallible,
             .if_ => |if_node| try self.lowerIf(node, if_node),
+            .struct_init => |si| try self.lowerStructInit(node, si),
+            .field_access => |fa| try self.lowerFieldAccess(node, fa),
         };
     }
 

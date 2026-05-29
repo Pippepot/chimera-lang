@@ -59,6 +59,10 @@ This compiler now supports a declaration-first language with optional top-level 
   - `const x: int = 1`
   - `var y: float = 1.0`
   - Annotation is optional when RHS inference is sufficient.
+- **Struct types** declared with `comptime Name = struct` and indented field lines.
+- **Struct init** uses `TypeName{field1 = val1, field2 = val2, ...}` syntax.
+- **Field access** uses `expr.fieldName` syntax.
+  - Multi-field structs allocate consecutive stack slots and use `field_load` IR for non-zero field indices.
 
 ## Current behavior
 
@@ -80,4 +84,4 @@ This compiler now supports a declaration-first language with optional top-level 
   - per-stage cache hits/recomputes
   - source invalidation behavior
   - compile `changed_at` backdating
-- Current suite: `zig test test.zig` (21 tests).
+- Current suite: `zig test test.zig` (28 tests).
