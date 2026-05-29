@@ -12,6 +12,7 @@
   - `typecheck.zig` owns type inference/checking (`unit`, `bool`, `int`, `float`, function types), plus `computeType` for query integration.
   - `monomorphize.zig` owns the monomorphization stage artifact (`computeMonomorphize`).
   - `query.zig` owns the revisioned incremental query system (`QueryDb`) and stage orchestration (frame management, dependency tracking, memo verification).
+  - `query_cache.zig` owns cross-run persistent query cache encoding/decoding, atomic save/load, and stale-cache cleanup.
   - `ir.zig` owns multi-function IR types and typed AST -> IR lowering, plus `computeLower` for query integration.
   - `codegen.zig` owns IR -> x86 machine code + ELF emission, plus `computeCompile` for query integration.
   - `db.zig` owns shared query types (`SourceId`, `Revision`, `Dependency`, `QueryKey`, `QueryStats`, `Stage`, `CompileResult`, `DbError`) and comparison helpers.
@@ -115,12 +116,16 @@
 
 - **`QueryDb` is reusable state.** Keep one DB across revisions to get incremental behavior.
 - **Inputs are virtual source IDs.** `setSource(source_id, text)` updates source text and revision tracking.
+- **Path-backed inputs:** `setSourceFile(source_id, source_path, text)` enables persistent cache load/save for that source.
+- **Initialization options:** `initWithOptions(gpa, QueryDbOptions)` controls persistent cache enablement, optional cache dir override, and `io` handle. `init(gpa)` remains a default wrapper.
 - **Stage queries:** `parse(source_id)` -> `resolve(source_id)` -> `typecheck(source_id)` -> `monomorphize(source_id)` -> `lower(source_id)` -> `compile(source_id)`.
 - **Memo metadata:** each memo tracks `deps`, `verified_at`, `changed_at`, and `computing`.
 - **Red/green verification:**
   - If `verified_at == current_revision`, it is an immediate hit.
   - Otherwise re-check dependencies recursively before deciding to recompute.
 - **Compile backdating:** if recomputed compile bytes are identical, preserve old `changed_at`.
+- **Persistent cache keying:** strict validation includes cache schema version, compiler fingerprint, and source hash.
+- **Persistent cache cleanup:** cache loader performs eager sweep for stale source entries (cache file exists but source file no longer exists).
 - **Purity boundary:** queries return data only; writing executables and running child processes stay outside query code.
 - **Generic memo type:** `db.Memo(T)` in `db.zig` provides the memo struct for any value type. Each stage's `computeXxx` returns `db.Memo(T)`. `query.zig` owns the generic orchestration (frame management, dep tracking, memo caching) via a single generic `ensureMemo` function and calls stage-specific compute functions.
 
@@ -140,17 +145,19 @@
 
 - The first non-debug CLI argument is treated as the source file path to compile.
 - Remaining non-debug CLI arguments are passed through to the generated `./prog` (visible to `arg(n)`).
+- Query cache is enabled by default for CLI runs; use `--no-query-cache` to disable it.
 
 ## Testing
 
 - **Behavioral tests** compile and run full binaries from source strings via `QueryDb`.
 - **Type tests** cover numeric/boolean typing, strict no-coercion behavior, and type errors.
 - **Incremental tests** verify query cache hits, invalidation on source changes, per-source isolation, unchanged-source no revision bump, and compile `changed_at` backdating.
+- **Persistent cache tests** verify cross-`QueryDb` reuse, disable flag behavior, failure caching, corrupted cache recovery, and stale cache deletion.
 - **Debug formatting test** verifies stable query diagnostics text output.
 
 ## Git
 
-- `.gitignore` generated files: `prog`, `main`, `x86.asm`, `x86.o`, `.zig-cache/`.
+- `.gitignore` generated files: `prog`, `main`, `x86.asm`, `x86.o`, `.zig-cache/`, `*.qcache`.
 - Commit all source files including parser/query modules and tests.
 
 ## Style

@@ -26,6 +26,7 @@ This compiler now supports a declaration-first language with optional top-level 
 | `ir.zig` | Multi-function IR and lowering |
 | `codegen.zig` | x86/ELF backend for multi-function programs |
 | `query.zig` | Incremental revisioned query DB |
+| `query_cache.zig` | Persistent query cache serialization, loading, saving, and stale-cache sweep |
 | `db.zig` | Shared query types/stats/deps/memo helpers |
 | `debug.zig` | AST/IR debug dump helpers + flags |
 | `runtime.zig` | Runtime helpers (`writeProgram`, `runProg`) |
@@ -49,6 +50,7 @@ This compiler now supports a declaration-first language with optional top-level 
 - Memos track `deps`, `verified_at`, `changed_at`, `computing`.
 - Unchanged dependencies yield cache hits without recomputation.
 - Compile stage supports `changed_at` backdating when bytes/diagnostics are unchanged.
+- Cross-run persistent cache stores compile outputs + per-stage diagnostics metadata keyed by strict fingerprints.
 
 ## Language notes
 
@@ -71,6 +73,7 @@ This compiler now supports a declaration-first language with optional top-level 
 - First non-debug CLI argument is source file path.
 - Remaining CLI args are passed to generated `./prog` and accessible via `arg(n)`.
 - Debug flags: `--debug=ast,ssa,timing,query`.
+- Query cache is enabled by default for CLI path-backed sources (`setSourceFile`); disable with `--no-query-cache`.
 
 ## Tests
 
@@ -85,4 +88,5 @@ This compiler now supports a declaration-first language with optional top-level 
   - per-stage cache hits/recomputes
   - source invalidation behavior
   - compile `changed_at` backdating
-- Current suite: `zig test test.zig` (38 tests).
+  - persistent cache reuse/disable/failure/corruption/stale cleanup behavior
+- Current suite: `zig test test.zig` (43 tests).

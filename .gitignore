@@ -3,4 +3,6 @@
 /x86.asm
 /x86.o
 /.zig-cache/
+.qcache
+*.qcache
 .agents/main

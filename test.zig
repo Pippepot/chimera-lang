@@ -3,6 +3,7 @@ const testing = std.testing;
 const parser = @import("parser.zig");
 const query = @import("query.zig");
 const runtime = @import("runtime.zig");
+const query_cache = @import("query_cache.zig");
 const writeProgram = runtime.writeProgram;
 
 fn expectCompileOk(db: *query.QueryDb, source_id: query.SourceId) ![]const u8 {
@@ -59,6 +60,23 @@ fn testProgramArgs(source: []const u8, expected: []const u8, args: []const []con
     const out = try runTestCapture(source, args);
     defer testing.allocator.free(out);
     try testing.expectEqualStrings(expected, out);
+}
+
+fn makeTmpSourcePath(gpa: std.mem.Allocator, tmp: *const testing.TmpDir, file_name: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa, ".zig-cache{c}tmp{c}{s}{c}{s}", .{
+        std.fs.path.sep,
+        std.fs.path.sep,
+        tmp.sub_path,
+        std.fs.path.sep,
+        file_name,
+    });
+}
+
+fn initCacheDb(cache_enabled: bool) query.QueryDb {
+    return query.QueryDb.initWithOptions(testing.allocator, .{
+        .persistent_cache_enabled = cache_enabled,
+        .io = testing.io,
+    });
 }
 
 test "parser builds declaration-root module" {
@@ -495,4 +513,199 @@ test "empty string literal" {
     try testProgram(
         \\print("")
     , "\n");
+}
+
+test "persistent cache reuses compile result across db instances" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const source_text = "print(42)\n";
+    const source_path = try makeTmpSourcePath(testing.allocator, &tmp, "persist_ok.x86");
+    defer testing.allocator.free(source_path);
+    const cache_path = try std.fmt.allocPrint(testing.allocator, "{s}.qcache", .{source_path});
+    defer testing.allocator.free(cache_path);
+
+    try std.Io.Dir.cwd().writeFile(testing.io, .{
+        .sub_path = source_path,
+        .data = source_text,
+    });
+    defer std.Io.Dir.cwd().deleteFile(testing.io, source_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(testing.io, cache_path) catch {};
+
+    {
+        var db = initCacheDb(true);
+        defer db.deinit();
+        try db.setSourceFile(0, source_path, source_text);
+        _ = try expectCompileOk(&db, 0);
+    }
+
+    {
+        var db = initCacheDb(true);
+        defer db.deinit();
+        try db.setSourceFile(0, source_path, source_text);
+        db.resetStats();
+        _ = try expectCompileOk(&db, 0);
+        const stats = db.statsSnapshot();
+        try testing.expect(stats.compile_hits >= 1);
+        try testing.expectEqual(@as(usize, 0), stats.compile_recomputes);
+    }
+}
+
+test "persistent cache disable option bypasses disk cache" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const source_text = "print(7)\n";
+    const source_path = try makeTmpSourcePath(testing.allocator, &tmp, "persist_disabled.x86");
+    defer testing.allocator.free(source_path);
+    const cache_path = try std.fmt.allocPrint(testing.allocator, "{s}.qcache", .{source_path});
+    defer testing.allocator.free(cache_path);
+
+    try std.Io.Dir.cwd().writeFile(testing.io, .{
+        .sub_path = source_path,
+        .data = source_text,
+    });
+    defer std.Io.Dir.cwd().deleteFile(testing.io, source_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(testing.io, cache_path) catch {};
+
+    {
+        var db = initCacheDb(true);
+        defer db.deinit();
+        try db.setSourceFile(0, source_path, source_text);
+        _ = try expectCompileOk(&db, 0);
+    }
+
+    {
+        var db = initCacheDb(false);
+        defer db.deinit();
+        try db.setSourceFile(0, source_path, source_text);
+        db.resetStats();
+        _ = try expectCompileOk(&db, 0);
+        const stats = db.statsSnapshot();
+        try testing.expectEqual(@as(usize, 0), stats.compile_hits);
+        try testing.expectEqual(@as(usize, 1), stats.compile_recomputes);
+    }
+}
+
+test "persistent cache stores compile failures and diagnostics" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const source_text = "print(missing_name)\n";
+    const source_path = try makeTmpSourcePath(testing.allocator, &tmp, "persist_fail.x86");
+    defer testing.allocator.free(source_path);
+    const cache_path = try std.fmt.allocPrint(testing.allocator, "{s}.qcache", .{source_path});
+    defer testing.allocator.free(cache_path);
+
+    try std.Io.Dir.cwd().writeFile(testing.io, .{
+        .sub_path = source_path,
+        .data = source_text,
+    });
+    defer std.Io.Dir.cwd().deleteFile(testing.io, source_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(testing.io, cache_path) catch {};
+
+    {
+        var db = initCacheDb(true);
+        defer db.deinit();
+        try db.setSourceFile(0, source_path, source_text);
+        try expectCompileErrorContains(&db, 0, "unknown symbol");
+    }
+
+    {
+        var db = initCacheDb(true);
+        defer db.deinit();
+        try db.setSourceFile(0, source_path, source_text);
+        db.resetStats();
+        try expectCompileErrorContains(&db, 0, "unknown symbol");
+        const stats = db.statsSnapshot();
+        try testing.expect(stats.compile_hits >= 1);
+    }
+}
+
+test "corrupted persistent cache is ignored and rebuilt" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const source_text = "print(5)\n";
+    const source_path = try makeTmpSourcePath(testing.allocator, &tmp, "persist_corrupt.x86");
+    defer testing.allocator.free(source_path);
+    const cache_path = try std.fmt.allocPrint(testing.allocator, "{s}.qcache", .{source_path});
+    defer testing.allocator.free(cache_path);
+
+    try std.Io.Dir.cwd().writeFile(testing.io, .{
+        .sub_path = source_path,
+        .data = source_text,
+    });
+    defer std.Io.Dir.cwd().deleteFile(testing.io, source_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(testing.io, cache_path) catch {};
+
+    {
+        var db = initCacheDb(true);
+        defer db.deinit();
+        try db.setSourceFile(0, source_path, source_text);
+        _ = try expectCompileOk(&db, 0);
+    }
+
+    try std.Io.Dir.cwd().writeFile(testing.io, .{
+        .sub_path = cache_path,
+        .data = "not-a-valid-cache",
+    });
+
+    {
+        var db = initCacheDb(true);
+        defer db.deinit();
+        try db.setSourceFile(0, source_path, source_text);
+        db.resetStats();
+        _ = try expectCompileOk(&db, 0);
+        const stats = db.statsSnapshot();
+        try testing.expectEqual(@as(usize, 1), stats.compile_recomputes);
+    }
+}
+
+test "stale cache files are removed by eager sweep" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const source_text = "print(9)\n";
+    const live_source = try makeTmpSourcePath(testing.allocator, &tmp, "persist_live.x86");
+    defer testing.allocator.free(live_source);
+    const stale_source = try makeTmpSourcePath(testing.allocator, &tmp, "persist_stale.x86");
+    defer testing.allocator.free(stale_source);
+    const stale_cache = try std.fmt.allocPrint(testing.allocator, "{s}.qcache", .{stale_source});
+    defer testing.allocator.free(stale_cache);
+    const live_cache = try std.fmt.allocPrint(testing.allocator, "{s}.qcache", .{live_source});
+    defer testing.allocator.free(live_cache);
+
+    try std.Io.Dir.cwd().writeFile(testing.io, .{
+        .sub_path = live_source,
+        .data = source_text,
+    });
+    defer std.Io.Dir.cwd().deleteFile(testing.io, live_source) catch {};
+    defer std.Io.Dir.cwd().deleteFile(testing.io, live_cache) catch {};
+    defer std.Io.Dir.cwd().deleteFile(testing.io, stale_cache) catch {};
+
+    try query_cache.save(testing.io, testing.allocator, .{}, .{
+        .source_path = stale_source,
+        .source_text = source_text,
+        .parse = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{} },
+        .resolve = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{} },
+        .typecheck = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{} },
+        .monomorphize = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{} },
+        .lower = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{} },
+        .compile = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
+    });
+
+    {
+        var db = initCacheDb(true);
+        defer db.deinit();
+        try db.setSourceFile(0, live_source, source_text);
+        _ = try expectCompileOk(&db, 0);
+    }
+
+    std.Io.Dir.cwd().access(testing.io, stale_cache, .{}) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+
+    return error.TestFailed;
 }

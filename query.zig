@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const db = @import("db.zig");
 const parser = @import("parser.zig");
 const resolver = @import("resolver.zig");
@@ -7,12 +8,19 @@ const monomorphize = @import("monomorphize.zig");
 const ir_mod = @import("ir.zig");
 const codegen = @import("codegen.zig");
 const ast = @import("ast.zig");
+const query_cache = @import("query_cache.zig");
 
 pub const SourceId = db.SourceId;
 pub const QueryStats = db.QueryStats;
 pub const Stage = db.Stage;
 pub const CompileResult = db.CompileResult;
 pub const QueryError = db.QueryError;
+
+pub const QueryDbOptions = struct {
+    persistent_cache_enabled: bool = true,
+    cache_dir_override: ?[]const u8 = null,
+    io: ?std.Io = null,
+};
 
 pub fn appendQueryDiagnostics(out: *std.ArrayList(u8), gpa: std.mem.Allocator, stats: QueryStats) !void {
     try out.appendSlice(gpa, "; query diagnostics:\n");
@@ -31,6 +39,7 @@ pub fn appendQueryDiagnostics(out: *std.ArrayList(u8), gpa: std.mem.Allocator, s
 const SourceInput = struct {
     text: []u8,
     changed_at: db.Revision,
+    source_path: ?[]u8 = null,
 };
 
 const ActiveQuery = struct {
@@ -86,6 +95,10 @@ fn recordRecompute(stats: *db.QueryStats, comptime stage: Stage) void {
 
 pub const QueryDb = struct {
     gpa: std.mem.Allocator,
+    io: ?std.Io,
+    persistent_cache_enabled: bool,
+    cache_dir_override: ?[]u8,
+    cache_backings: std.ArrayList([]u8),
     revision: db.Revision,
     sources: std.AutoHashMap(db.SourceId, SourceInput),
     parse_memos: std.AutoHashMap(db.SourceId, db.Memo(parser.ParsedAst)),
@@ -98,8 +111,19 @@ pub const QueryDb = struct {
     stats: db.QueryStats,
 
     pub fn init(gpa: std.mem.Allocator) QueryDb {
+        return initWithOptions(gpa, .{
+            .io = if (builtin.is_test) std.testing.io else null,
+        });
+    }
+
+    pub fn initWithOptions(gpa: std.mem.Allocator, options: QueryDbOptions) QueryDb {
+        const override_copy = if (options.cache_dir_override) |dir| gpa.dupe(u8, dir) catch null else null;
         return .{
             .gpa = gpa,
+            .io = options.io,
+            .persistent_cache_enabled = options.persistent_cache_enabled,
+            .cache_dir_override = override_copy,
+            .cache_backings = .empty,
             .revision = 0,
             .sources = std.AutoHashMap(db.SourceId, SourceInput).init(gpa),
             .parse_memos = std.AutoHashMap(db.SourceId, db.Memo(parser.ParsedAst)).init(gpa),
@@ -114,9 +138,14 @@ pub const QueryDb = struct {
     }
 
     pub fn deinit(self: *@This()) void {
+        if (self.io) |io| {
+            self.flushPersistentCaches(io) catch {};
+        }
+
         var source_iter = self.sources.iterator();
         while (source_iter.next()) |entry| {
             self.gpa.free(entry.value_ptr.text);
+            if (entry.value_ptr.source_path) |path| self.gpa.free(path);
         }
         self.sources.deinit();
 
@@ -155,9 +184,22 @@ pub const QueryDb = struct {
             frame.deps.deinit(self.gpa);
         }
         self.active_stack.deinit(self.gpa);
+
+        for (self.cache_backings.items) |backing| self.gpa.free(backing);
+        self.cache_backings.deinit(self.gpa);
+
+        if (self.cache_dir_override) |dir| self.gpa.free(dir);
     }
 
     pub fn setSource(self: *@This(), source_id: db.SourceId, text: []const u8) !void {
+        try self.setSourceImpl(source_id, null, text);
+    }
+
+    pub fn setSourceFile(self: *@This(), source_id: db.SourceId, source_path: []const u8, text: []const u8) !void {
+        try self.setSourceImpl(source_id, source_path, text);
+    }
+
+    fn setSourceImpl(self: *@This(), source_id: db.SourceId, source_path: ?[]const u8, text: []const u8) !void {
         if (self.sources.getPtr(source_id)) |existing| {
             if (std.mem.eql(u8, existing.text, text)) {
                 self.stats.source_unchanged += 1;
@@ -167,19 +209,29 @@ pub const QueryDb = struct {
             const new_text = try self.gpa.dupe(u8, text);
             self.gpa.free(existing.text);
             existing.text = new_text;
+            if (source_path) |path| {
+                if (existing.source_path) |old_path| self.gpa.free(old_path);
+                existing.source_path = try self.gpa.dupe(u8, path);
+            }
             self.bumpRevision();
             existing.changed_at = self.revision;
             self.stats.source_sets += 1;
+            try self.tryLoadPersistentCache(source_id, existing);
             return;
         }
 
         const owned_text = try self.gpa.dupe(u8, text);
+        const owned_path = if (source_path) |path| try self.gpa.dupe(u8, path) else null;
         self.bumpRevision();
         self.stats.source_sets += 1;
         try self.sources.put(source_id, .{
             .text = owned_text,
             .changed_at = self.revision,
+            .source_path = owned_path,
         });
+
+        const input = self.sources.getPtr(source_id).?;
+        try self.tryLoadPersistentCache(source_id, input);
     }
 
     pub fn sourceText(self: *const @This(), source_id: db.SourceId) ?[]const u8 {
@@ -249,6 +301,114 @@ pub const QueryDb = struct {
             .lower => if (self.lower_memos.get(source_id)) |memo| memo.changed_at else null,
             .compile => if (self.compile_memos.get(source_id)) |memo| memo.changed_at else null,
         };
+    }
+
+    fn cacheOptions(self: *const @This()) query_cache.CacheOptions {
+        return .{ .cache_dir_override = self.cache_dir_override };
+    }
+
+    fn tryLoadPersistentCache(self: *@This(), source_id: db.SourceId, input: *SourceInput) !void {
+        if (!self.persistent_cache_enabled) return;
+        if (self.io == null) return;
+        const source_path = input.source_path orelse return;
+        const io = self.io.?;
+
+        query_cache.sweepStaleCaches(io, self.gpa, self.cacheOptions(), source_path) catch {};
+        var loaded = (try query_cache.load(io, self.gpa, self.cacheOptions(), source_path, input.text)) orelse return;
+        errdefer loaded.deinit(self.gpa);
+
+        const compile_bytes = if (loaded.compile.bytes) |bytes| try self.gpa.dupe(u8, bytes) else null;
+
+        var deps = try std.ArrayList(db.Dependency).initCapacity(self.gpa, 1);
+        errdefer deps.deinit(self.gpa);
+        try deps.append(self.gpa, .{ .query = queryFor(.lower, source_id) });
+
+        var memo = db.makeMemo([]const u8, compile_bytes, loaded.compile.diagnostics);
+        memo.deps = deps;
+        memo.verified_at = self.revision;
+        memo.changed_at = self.revision;
+
+        loaded.parse.diagnostics.deinit(self.gpa);
+        loaded.resolve.diagnostics.deinit(self.gpa);
+        loaded.typecheck.diagnostics.deinit(self.gpa);
+        loaded.monomorphize.diagnostics.deinit(self.gpa);
+        loaded.lower.diagnostics.deinit(self.gpa);
+
+        try self.cache_backings.append(self.gpa, loaded.backing);
+        loaded.backing = loaded.backing[0..0];
+        loaded.compile.diagnostics = .empty;
+
+        if (try self.compile_memos.fetchPut(source_id, memo)) |kv| {
+            var old = kv.value;
+            deinitMemo([]const u8, &old, self.gpa);
+        }
+
+        // Rehydrate stage values that were present when the cache file was written.
+        // This keeps APIs like parsedAst()/loweredProgram() behaviorally consistent.
+        if (loaded.parse.has_value) _ = try self.parsedAst(source_id);
+        if (loaded.resolve.has_value) _ = try self.resolvedAst(source_id);
+        if (loaded.typecheck.has_value) _ = try self.typedAst(source_id);
+        if (loaded.monomorphize.has_value) _ = try self.monomorphizedProgram(source_id);
+        if (loaded.lower.has_value) _ = try self.loweredProgram(source_id);
+    }
+
+    fn snapshotStage(self: *const @This(), source_id: db.SourceId, stage: Stage) query_cache.StageSnapshot {
+        return switch (stage) {
+            .parse => if (self.parse_memos.get(source_id)) |memo| .{
+                .changed_at = memo.changed_at,
+                .has_value = memo.value != null,
+                .diagnostics = memo.diagnostics.items,
+            } else .{ .changed_at = 0, .has_value = false, .diagnostics = &.{} },
+            .resolve => if (self.resolve_memos.get(source_id)) |memo| .{
+                .changed_at = memo.changed_at,
+                .has_value = memo.value != null,
+                .diagnostics = memo.diagnostics.items,
+            } else .{ .changed_at = 0, .has_value = false, .diagnostics = &.{} },
+            .typecheck => if (self.type_memos.get(source_id)) |memo| .{
+                .changed_at = memo.changed_at,
+                .has_value = memo.value != null,
+                .diagnostics = memo.diagnostics.items,
+            } else .{ .changed_at = 0, .has_value = false, .diagnostics = &.{} },
+            .monomorphize => if (self.mono_memos.get(source_id)) |memo| .{
+                .changed_at = memo.changed_at,
+                .has_value = memo.value != null,
+                .diagnostics = memo.diagnostics.items,
+            } else .{ .changed_at = 0, .has_value = false, .diagnostics = &.{} },
+            .lower => if (self.lower_memos.get(source_id)) |memo| .{
+                .changed_at = memo.changed_at,
+                .has_value = memo.value != null,
+                .diagnostics = memo.diagnostics.items,
+            } else .{ .changed_at = 0, .has_value = false, .diagnostics = &.{} },
+            .compile => unreachable,
+        };
+    }
+
+    fn flushPersistentCaches(self: *@This(), io: std.Io) !void {
+        if (!self.persistent_cache_enabled) return;
+
+        var iter = self.sources.iterator();
+        while (iter.next()) |entry| {
+            const source_id = entry.key_ptr.*;
+            const source = entry.value_ptr.*;
+            const source_path = source.source_path orelse continue;
+            const compile_memo = self.compile_memos.get(source_id) orelse continue;
+
+            try query_cache.save(io, self.gpa, self.cacheOptions(), .{
+                .source_path = source_path,
+                .source_text = source.text,
+                .parse = self.snapshotStage(source_id, .parse),
+                .resolve = self.snapshotStage(source_id, .resolve),
+                .typecheck = self.snapshotStage(source_id, .typecheck),
+                .monomorphize = self.snapshotStage(source_id, .monomorphize),
+                .lower = self.snapshotStage(source_id, .lower),
+                .compile = .{
+                    .changed_at = compile_memo.changed_at,
+                    .has_value = compile_memo.value != null,
+                    .diagnostics = compile_memo.diagnostics.items,
+                    .bytes = compile_memo.value,
+                },
+            });
+        }
     }
 
     fn bumpRevision(self: *@This()) void {

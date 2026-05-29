@@ -7,7 +7,7 @@ const runtime = @import("runtime.zig");
 fn printUsage(io: std.Io, exe_name: []const u8) !void {
     var wbuf: [512]u8 = undefined;
     var w = std.Io.File.stderr().writer(io, &wbuf);
-    try w.interface.print("usage: {s} [--debug=ast,ssa,timing,query] <source-file> [program-args...]\n", .{exe_name});
+    try w.interface.print("usage: {s} [--debug=ast,ssa,timing,query] [--no-query-cache] <source-file> [program-args...]\n", .{exe_name});
     try w.interface.flush();
 }
 
@@ -63,6 +63,7 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
 
     const flags = debug.parseDebugFlags(init.minimal.args);
+    var persistent_cache_enabled = true;
 
     var cli_args_list = try std.ArrayList([]const u8).initCapacity(gpa, 4);
     defer cli_args_list.deinit(gpa);
@@ -71,7 +72,12 @@ pub fn main(init: std.process.Init) !void {
     defer iter.deinit();
     const exe_name = iter.next() orelse "main";
     while (iter.next()) |arg| {
-        if (!std.mem.startsWith(u8, arg, "--debug=")) try cli_args_list.append(gpa, arg);
+        if (std.mem.startsWith(u8, arg, "--debug=")) continue;
+        if (std.mem.eql(u8, arg, "--no-query-cache")) {
+            persistent_cache_enabled = false;
+            continue;
+        }
+        try cli_args_list.append(gpa, arg);
     }
 
     const cli_args = cli_args_list.items;
@@ -84,7 +90,10 @@ pub fn main(init: std.process.Init) !void {
     const prog_args = cli_args[1..];
     const source_id: query.SourceId = 0;
 
-    var qdb = query.QueryDb.init(gpa);
+    var qdb = query.QueryDb.initWithOptions(gpa, .{
+        .persistent_cache_enabled = persistent_cache_enabled,
+        .io = io,
+    });
     defer qdb.deinit();
 
     const set_source_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
@@ -96,32 +105,44 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
     defer gpa.free(source_text);
-    try qdb.setSource(source_id, source_text);
+    try qdb.setSourceFile(source_id, source_path, source_text);
     const set_source_duration = if (set_source_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
 
-    const parse_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
-    const module = try qdb.parsedAst(source_id);
-    const parse_duration = if (parse_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
+    const need_stage_debug = flags.ast or flags.ssa;
+    const need_stage_pipeline = flags.timing or need_stage_debug;
 
-    const resolve_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
-    _ = try qdb.resolvedAst(source_id);
-    const resolve_duration = if (resolve_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
+    var parse_duration = std.Io.Duration.zero;
+    var resolve_duration = std.Io.Duration.zero;
+    var type_duration = std.Io.Duration.zero;
+    var mono_duration = std.Io.Duration.zero;
+    var lower_duration = std.Io.Duration.zero;
+    var debug_duration = std.Io.Duration.zero;
 
-    const type_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
-    _ = try qdb.typedAst(source_id);
-    const type_duration = if (type_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
+    if (need_stage_pipeline) {
+        const parse_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
+        const module = try qdb.parsedAst(source_id);
+        parse_duration = if (parse_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
 
-    const mono_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
-    _ = try qdb.monomorphizedProgram(source_id);
-    const mono_duration = if (mono_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
+        const resolve_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
+        _ = try qdb.resolvedAst(source_id);
+        resolve_duration = if (resolve_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
 
-    const lower_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
-    const ir = try qdb.loweredProgram(source_id);
-    const lower_duration = if (lower_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
+        const type_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
+        _ = try qdb.typedAst(source_id);
+        type_duration = if (type_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
 
-    const debug_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
-    try debug.dumpDebugInfo(io, flags, module, ir, gpa);
-    const debug_duration = if (debug_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
+        const mono_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
+        _ = try qdb.monomorphizedProgram(source_id);
+        mono_duration = if (mono_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
+
+        const lower_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
+        const ir = try qdb.loweredProgram(source_id);
+        lower_duration = if (lower_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
+
+        const debug_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
+        try debug.dumpDebugInfo(io, flags, module, ir, gpa);
+        debug_duration = if (debug_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
+    }
 
     const compile_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
     const compile_result = try qdb.compileResult(source_id);
