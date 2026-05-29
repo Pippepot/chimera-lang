@@ -17,7 +17,7 @@
   - `db.zig` owns shared query types (`SourceId`, `Revision`, `Dependency`, `QueryKey`, `QueryStats`, `Stage`, `CompileResult`, `DbError`) and comparison helpers.
   - `scope.zig` owns a shared lexical scope stack utility (`ScopeStack`) reused by typechecker and lowering.
   - `debug.zig` owns debug flag parsing and AST/SSA debug dumps.
-  - `helpers_bin.zig` owns pre-assembled helper blobs (`print_int`, `print_bool`, `print_float32`, `atoi`).
+  - `helpers_bin.zig` owns pre-assembled helper blobs (`print_int`, `print_bool`, `print_float32`, `print_string`, `atoi`).
 - **Project state** is documented in `.agents/project.md`.
 - **AGENTS.md** lives alongside `main.zig` (project root, not repo root).
 
@@ -46,10 +46,11 @@
 - **Parser ownership:** `parser.parseOwned` returns `ParsedAst` with an arena that owns all AST allocations.
 - **Query ownership:** parse memo values in `QueryDb` own `ParsedAst`; callers borrow `*const AstNode` via `parsedAst`.
 - **Unary minus** is lowered in parser as either negative literal or `0 - expr`.
+- **String parsing:** the lexer's `next()` does `self.index += 1` before dispatching `"` to `parseString()`, so `parseString` must NOT also increment — use `const start = self.index - 1` instead of `self.index += 1`.
 
 ## Type syntax
 
-- **Primitive types:** `unit`, `bool`, `int`, `float`.
+- **Primitive types:** `unit`, `bool`, `int`, `float`, `string`.
 - **Function types:** `func(ParamType1, ParamType2, ...) ReturnType` — usable in parameter annotations (`f: func(int) int`), return type annotations, and `const`/`var` binding annotations.
 - **Named struct types:** referenced by their declared name (e.g. `Foo`) — usable in `const`/`var` binding annotations.
 
@@ -98,6 +99,17 @@
 - **Equality on bools** — also fallible (predicate branch `eqb`/`neb`, type `.unit`).
 - **`isFallible(node)`** — helper checking node kind against `.lt`, `.gt`, `.le`, `.ge`, `.eq`, `.ne`.
 - **Scope isolation:** each block and each `if` branch restores bindings after inference/lowering; branch-local `const` names do not leak.
+
+## String literals
+
+- **Lexer:** `parseString()` slices content between `"` and `"` from `source[content_start..index]`.
+- **Parser:** two-pass processing — first pass counts final length (handling `\\` escapes), second pass copies with escape expansion. Result allocated in arena as `[]const u8`.
+- **Type system:** `string` is a primitive type (`Type.string`). `print` on string type emits `prints` IR.
+- **IR lowering:** `string_lit(id)` instruction holds a table index; `Lowerer.addString` dupe-owns the bytes.
+- **Codegen:** `string_lit` emits `lea rax, [rip + symbol]`, `prints` calls `print_string` helper.
+- **Runtime representation:** 8-byte pointer to a `{len: u64, data: [len]u8}` structure in the `.rodata` segment.
+- **Deduplication:** not yet implemented.
+- **Helper (`print_string`):** two-syscall write: first `write(syscall, 1, data_ptr, len)`, second `write(syscall, 1, newline_ptr, 1)`. Newline byte stored in the red zone.
 
 ## Query system design
 

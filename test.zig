@@ -431,3 +431,68 @@ test "binding type annotation mismatch errors" {
     try db.setSource(0, "var y: float = 1");
     try expectCompileErrorContains(&db, 0, "binding type annotation mismatch");
 }
+
+test "string literal print" {
+    try testProgram(
+        \\print("hello, world")
+    , "hello, world\n");
+}
+
+test "string literal with escape sequences" {
+    try testProgram(
+        \\print("line1\nline2")
+    , "line1\nline2\n");
+}
+
+test "string literal with tab" {
+    try testProgram(
+        \\print("a\tb")
+    , "a\tb\n");
+}
+
+test "string literal with quote" {
+    try testProgram(
+        \\print("say \"hi\"")
+    , "say \"hi\"\n");
+}
+
+test "string literal with backslash" {
+    try testProgram(
+        \\print("path\\to\\file")
+    , "path\\to\\file\n");
+}
+
+test "string literal in const binding" {
+    try testProgram(
+        \\const s = "hello"
+        \\print(s)
+    , "hello\n");
+}
+
+test "string type annotation" {
+    try testProgram(
+        \\const s: string = "hi"
+        \\print(s)
+    , "hi\n");
+}
+
+test "string literal multiple prints" {
+    try testProgram(
+        \\print("abc")
+        \\print("def")
+    , "abc\ndef\n");
+}
+
+test "string in arithmetic errors" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+
+    try db.setSource(0, "const s: string = \"x\"\nprint(s + 1)");
+    try expectCompileErrorContains(&db, 0, "arithmetic requires int or float operands");
+}
+
+test "empty string literal" {
+    try testProgram(
+        \\print("")
+    , "\n");
+}

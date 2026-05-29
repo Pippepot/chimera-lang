@@ -118,4 +118,5 @@ pub const AstNode = union(enum) {
     if_: *const IfNode,
     bool: bool,
     unit: void,
+    string: []const u8,
 };

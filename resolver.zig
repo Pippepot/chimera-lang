@@ -145,7 +145,7 @@ const Resolver = struct {
                     try self.resolveNode(item);
                 }
             },
-            .int, .float, .arg, .bool, .unit => {},
+            .int, .float, .arg, .bool, .unit, .string => {},
             .var_ref => |name| {
                 if (self.locals.lookup(name) != null) {
                     try self.resolved.node_refs.put(@intFromPtr(node), .local);

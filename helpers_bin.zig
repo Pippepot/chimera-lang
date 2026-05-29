@@ -16,6 +16,7 @@ pub const HelperId = enum {
     print_bool,
     print_float32,
     atoi,
+    print_string,
 };
 
 pub const HelperDef = struct {
@@ -217,16 +218,48 @@ fn buildPrintFloat32Blob() HelperBlob {
     return .{ .bytes = buf.bytes, .len = buf.len };
 }
 
+fn buildPrintStringBlob() HelperBlob {
+    var buf = HelperBuffer{};
+    buf.appendSlice(&.{
+        0x53, // push rbx
+        0x51, // push rcx
+        0x52, // push rdx
+        0x56, // push rsi
+        0x57, // push rdi
+        0x48, 0x89, 0xC6, // mov rsi, rax  ; rsi = base pointer
+        0x48, 0x83, 0xC6, 0x08, // add rsi, 8  ; rsi = data pointer
+        0x48, 0x8B, 0x10, // mov rdx, [rax] ; rdx = length
+        0xBF, 0x01, 0x00, 0x00, 0x00, // mov edi, 1  ; stdout
+        0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1  ; SYS_write
+        0x0F, 0x05, // syscall - write string data
+        0xC6, 0x44, 0x24, 0x07, 0x0A, // mov byte [rsp+7], 0x0A ; store newline in unused push area
+        0x48, 0x8D, 0x74, 0x24, 0x07, // lea rsi, [rsp+7] ; rsi = pointer to newline
+        0xBA, 0x01, 0x00, 0x00, 0x00, // mov edx, 1 ; length = 1
+        0xBF, 0x01, 0x00, 0x00, 0x00, // mov edi, 1 ; stdout
+        0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1 ; SYS_write
+        0x0F, 0x05, // syscall - write newline
+        0x5F, // pop rdi
+        0x5E, // pop rsi
+        0x5A, // pop rdx
+        0x59, // pop rcx
+        0x5B, // pop rbx
+        0xC3, // ret
+    });
+    return .{ .bytes = buf.bytes, .len = buf.len };
+}
+
 pub const print_int = buildPrintIntBlob();
 pub const print_bool = buildPrintBoolBlob();
 pub const print_float32 = buildPrintFloat32Blob();
 pub const atoi = buildAtoiBlob();
+pub const print_string = buildPrintStringBlob();
 
 pub const all_helpers = [_]HelperDef{
     .{ .id = .print_int, .blob = print_int },
     .{ .id = .print_bool, .blob = print_bool },
     .{ .id = .print_float32, .blob = print_float32 },
     .{ .id = .atoi, .blob = atoi },
+    .{ .id = .print_string, .blob = print_string },
 };
 
 comptime {
@@ -234,11 +267,13 @@ comptime {
     _ = print_bool;
     _ = print_float32;
     _ = atoi;
+    _ = print_string;
 
     if (print_int.len > max_helper_size) @compileError("print_int helper exceeds max_helper_size");
     if (print_bool.len > max_helper_size) @compileError("print_bool helper exceeds max_helper_size");
     if (print_float32.len > max_helper_size) @compileError("print_float32 helper exceeds max_helper_size");
     if (atoi.len > max_helper_size) @compileError("atoi helper exceeds max_helper_size");
+    if (print_string.len > max_helper_size) @compileError("print_string helper exceeds max_helper_size");
 
     const helper_id_count = @typeInfo(HelperId).@"enum".fields.len;
     if (all_helpers.len != helper_id_count) @compileError("all_helpers must include every HelperId");
@@ -253,4 +288,5 @@ test "helper enum values map to registry index" {
     try std.testing.expectEqual(@as(usize, 1), @intFromEnum(HelperId.print_bool));
     try std.testing.expectEqual(@as(usize, 2), @intFromEnum(HelperId.print_float32));
     try std.testing.expectEqual(@as(usize, 3), @intFromEnum(HelperId.atoi));
+    try std.testing.expectEqual(@as(usize, 4), @intFromEnum(HelperId.print_string));
 }

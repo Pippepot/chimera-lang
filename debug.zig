@@ -78,6 +78,8 @@ fn dumpIr(program: *const Program, writer: *std.Io.Writer) void {
                     .argi => |idx| writer.print("  %{d} = argi %{d}\n", .{ vinst.id, idx }) catch return,
                     .store => |p| printBinInst(writer, vinst.id, "store", p),
                     .field_load => |fl| writer.print("  %{d} = field_load %{d}, {d}\n", .{ vinst.id, fl.base, fl.field_index }) catch return,
+                    .string_lit => |id| writer.print("  %{d} = string_lit ${d}\n", .{ vinst.id, id }) catch return,
+                    .prints => |v| writer.print("  %{d} = prints %{d}\n", .{ vinst.id, v }) catch return,
                 }
             }
             const terminator = blk.terminator orelse return;
@@ -156,6 +158,7 @@ fn writeAstLabel(writer: *std.Io.Writer, node: *const AstNode) void {
         .field_access => writer.writeAll("field_access") catch return,
         .bool => |v| writer.print("bool {s}", .{if (v) "true" else "false"}) catch return,
         .unit => writer.writeAll("unit") catch return,
+        .string => |s| writer.print("string \"{s}\"", .{s}) catch return,
     }
 }
 
@@ -209,7 +212,7 @@ fn dumpAstNode(node: *const AstNode, writer: *std.Io.Writer, prefix: []const u8,
         .struct_init => |si| {
             _ = si;
         },
-        .int, .float, .var_ref, .arg, .bool, .unit => {},
+        .int, .float, .var_ref, .arg, .bool, .unit, .string => {},
     }
 }
 

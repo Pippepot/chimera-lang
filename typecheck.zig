@@ -18,6 +18,7 @@ pub const Type = union(enum) {
     bool,
     int,
     float,
+    string,
     named: []const u8,
     func: *const FuncType,
 };
@@ -25,7 +26,7 @@ pub const Type = union(enum) {
 pub fn typeEql(a: Type, b: Type) bool {
     if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
     return switch (a) {
-        .unit, .bool, .int, .float => true,
+        .unit, .bool, .int, .float, .string => true,
         .named => |lhs| std.mem.eql(u8, lhs, b.named),
         .func => |lhs| funcTypeEql(lhs, b.func),
     };
@@ -124,7 +125,7 @@ pub fn typeErrorMessage(kind: TypeError) []const u8 {
         error.ComparisonOperandMismatch => "comparison operands must have the same type",
         error.ComparisonRequiresNumeric => "comparison requires int or float operands",
         error.EqualityOperandMismatch => "equality operands must have the same type",
-        error.EqualityUnsupportedType => "equality is not supported for unit values",
+        error.EqualityUnsupportedType => "equality is not supported for this type",
         error.IfConditionNotFallible => "If condition must be a fallible expression",
         error.FallibleOutsideFallibleContext => "Fallible expression is not allowed outside fallible context",
         error.IfBranchTypeMismatch => "if branches must return the same type",
@@ -243,6 +244,7 @@ const Checker = struct {
                 if (std.mem.eql(u8, name, "bool")) break :blk .bool;
                 if (std.mem.eql(u8, name, "int")) break :blk .int;
                 if (std.mem.eql(u8, name, "float")) break :blk .float;
+                if (std.mem.eql(u8, name, "string")) break :blk .string;
                 if (self.resolved.struct_names.contains(name)) break :blk .{ .named = name };
                 return self.failAtType(type_node, error.UnknownType);
             },
@@ -350,7 +352,7 @@ const Checker = struct {
         if (!typeEql(pair[0], pair[1])) return self.failAtNode(node, error.EqualityOperandMismatch);
         switch (pair[0]) {
             .bool, .int, .float => {},
-            .unit, .named, .func => return self.failAtNode(node, error.EqualityUnsupportedType),
+            .unit, .string, .named, .func => return self.failAtNode(node, error.EqualityUnsupportedType),
         }
         return self.remember(node, .unit);
     }
@@ -507,6 +509,7 @@ const Checker = struct {
             .float => self.remember(node, .float),
             .bool => self.remember(node, .bool),
             .unit => self.remember(node, .unit),
+            .string => self.remember(node, .string),
             .var_ref => |name| self.inferVarRef(node, name),
             .var_ => |vn| self.inferVar(node, vn),
             .assign => |an| self.inferAssign(node, an),
@@ -517,7 +520,7 @@ const Checker = struct {
             .print => |child| blk: {
                 const child_ty = try self.inferNode(child);
                 switch (child_ty) {
-                    .int, .float, .bool => {},
+                    .int, .float, .bool, .string => {},
                     .unit => return self.failAtNode(child, error.PrintUnitValue),
                     .named, .func => return self.failAtNode(child, error.PrintUnsupportedType),
                 }

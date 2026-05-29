@@ -49,6 +49,8 @@ pub const Inst = union(enum) {
     argi: u32,
     store: InstPair,
     field_load: FieldLoad,
+    string_lit: u32,
+    prints: ValueRef,
 };
 
 pub const PredicateOp = enum {
@@ -134,10 +136,13 @@ pub const Function = struct {
 pub const Program = struct {
     entry: FuncId,
     functions: std.ArrayList(Function),
+    strings: std.ArrayList([]const u8),
 
     pub fn deinit(self: *Program, gpa: std.mem.Allocator) void {
         for (self.functions.items) |*func| func.deinit(gpa);
         self.functions.deinit(gpa);
+        for (self.strings.items) |s| gpa.free(s);
+        self.strings.deinit(gpa);
     }
 };
 
@@ -152,6 +157,7 @@ const Lowerer = struct {
     typed: *const typecheck.TypedAst,
     mono: *const monomorphize.MonoProgram,
     function_ids: std.StringHashMap(FuncId),
+    strings: std.ArrayList([]const u8),
 
     fn init(gpa: std.mem.Allocator, typed: *const typecheck.TypedAst, mono: *const monomorphize.MonoProgram) !Lowerer {
         var function_ids = std.StringHashMap(FuncId).init(gpa);
@@ -166,11 +172,20 @@ const Lowerer = struct {
             .typed = typed,
             .mono = mono,
             .function_ids = function_ids,
+            .strings = .empty,
         };
     }
 
     fn deinit(self: *@This()) void {
         self.function_ids.deinit();
+        for (self.strings.items) |s| self.gpa.free(s);
+        self.strings.deinit(self.gpa);
+    }
+
+    fn addString(self: *@This(), s: []const u8) !u32 {
+        const owned = try self.gpa.dupe(u8, s);
+        try self.strings.append(self.gpa, owned);
+        return @intCast(self.strings.items.len - 1);
     }
 
     fn allocFunction(self: *@This(), id: FuncId, name: []const u8, ret_type: Type) !Function {
@@ -215,10 +230,13 @@ const Lowerer = struct {
             try functions.append(self.gpa, lowered);
         }
 
-        return .{
+        const result = Program{
             .entry = self.mono.entry_function,
             .functions = functions,
+            .strings = self.strings,
         };
+        self.strings = .empty;
+        return result;
     }
 };
 
@@ -349,7 +367,7 @@ const FunctionLowerer = struct {
                 .int => int_op,
                 .float => float_op,
                 .bool => bool_op,
-                .unit, .named, .func => unreachable,
+                .unit, .named, .func, .string => unreachable,
             },
             .pair = pair,
         };
@@ -577,6 +595,10 @@ const FunctionLowerer = struct {
             .float => |value| try self.addInst(.{ .fconst = value }, .float),
             .bool => |value| try self.addInst(.{ .iconst = if (value) @as(i32, 1) else 0 }, .bool),
             .unit => try self.lowerUnitValue(),
+            .string => |s| blk: {
+                const id = try self.parent.addString(s);
+                break :blk try self.addInst(.{ .string_lit = id }, .string);
+            },
             .var_ref => |name| try self.lowerVarRef(name),
             .var_ => |vn| try self.lowerVar(vn),
             .const_ => |cn| try self.lowerConst(cn),
@@ -590,6 +612,7 @@ const FunctionLowerer = struct {
                     .int => .{ .printi = child_ref },
                     .float => .{ .printf = child_ref },
                     .bool => .{ .printb = child_ref },
+                    .string => .{ .prints = child_ref },
                     else => unreachable,
                 };
                 break :blk try self.addInst(print_op, .unit);

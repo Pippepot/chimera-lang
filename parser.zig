@@ -38,6 +38,8 @@ pub const ParseError = error{
     IntegerOverflow,
     FloatOverflow,
     TrailingInput,
+    UnterminatedString,
+    InvalidEscape,
 };
 
 const TokenTag = enum {
@@ -79,6 +81,7 @@ const TokenTag = enum {
     l_brace,
     r_brace,
     dot,
+    string_lit,
 };
 
 const Token = struct {
@@ -160,6 +163,23 @@ const Lexer = struct {
 
         const value = try parseInt(slice);
         return .{ .tag = .int_lit, .start = start, .end = self.index, .int_value = value };
+    }
+
+    fn parseString(self: *@This()) ParseError!Token {
+        const start = self.index - 1;
+        const content_start = self.index;
+        while (self.index < self.source.len and self.source[self.index] != '"') {
+            if (self.source[self.index] == '\\') {
+                self.index += 1;
+                if (self.index >= self.source.len) return error.UnterminatedString;
+            }
+            self.index += 1;
+        }
+        if (self.index >= self.source.len) return error.UnterminatedString;
+        const ident = self.source[content_start..self.index];
+        const end = self.index + 1;
+        self.index += 1;
+        return .{ .tag = .string_lit, .start = start, .end = end, .ident = ident };
     }
 
     fn isIdentContinue(char: u8) bool {
@@ -266,6 +286,7 @@ const Lexer = struct {
             ':' => .{ .tag = .colon, .start = start, .end = self.index },
             ',' => .{ .tag = .comma, .start = start, .end = self.index },
             '.' => .{ .tag = .dot, .start = start, .end = self.index },
+            '"' => return self.parseString(),
             '+' => .{ .tag = .plus, .start = start, .end = self.index },
             '-' => if (self.index < self.source.len and self.source[self.index] == '>') arrow: {
                 self.index += 1;
@@ -1025,6 +1046,40 @@ const Parser = struct {
                 try self.advance();
                 return self.allocNode(.{ .bool = false }, span);
             },
+            .string_lit => {
+                const span = tokenSpan(self.current);
+                const raw = self.current.ident;
+                var final_len: usize = 0;
+                var i: usize = 0;
+                while (i < raw.len) : (i += 1) {
+                    if (raw[i] == '\\') {
+                        i += 1;
+                        if (i >= raw.len) return error.UnterminatedString;
+                    }
+                    final_len += 1;
+                }
+                const final_str = try self.arena.alloc(u8, final_len);
+                var j: usize = 0;
+                i = 0;
+                while (i < raw.len) : (i += 1) {
+                    if (raw[i] == '\\') {
+                        i += 1;
+                        final_str[j] = switch (raw[i]) {
+                            'n' => '\n',
+                            't' => '\t',
+                            '\\' => '\\',
+                            '"' => '"',
+                            '0' => 0,
+                            else => return error.InvalidEscape,
+                        };
+                    } else {
+                        final_str[j] = raw[i];
+                    }
+                    j += 1;
+                }
+                try self.advance();
+                return self.allocNode(.{ .string = final_str }, span);
+            },
             .ident => {
                 const ident_span = tokenSpan(self.current);
                 const name = try self.allocName(self.current.ident);
@@ -1134,6 +1189,8 @@ pub fn parseErrorMessage(err: anyerror) []const u8 {
         error.IntegerOverflow => "integer literal out of range",
         error.FloatOverflow => "float literal out of range",
         error.TrailingInput => "trailing input after program",
+        error.UnterminatedString => "unterminated string literal",
+        error.InvalidEscape => "invalid escape sequence in string",
         error.OutOfMemory => "out of memory while parsing",
         else => "parse error",
     };

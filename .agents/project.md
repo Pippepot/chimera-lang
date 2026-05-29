@@ -59,6 +59,7 @@ This compiler now supports a declaration-first language with optional top-level 
   - `const x: int = 1`
   - `var y: float = 1.0`
   - Annotation is optional when RHS inference is sufficient.
+- **`string` type** — primitive type supporting string literals with escape sequences (`\n`, `\t`, `\\`, `\"`, `\0`). `print` on strings calls `print_string` helper.
 - **Struct types** declared with `comptime Name = struct` and indented field lines.
 - **Struct init** uses `TypeName{field1 = val1, field2 = val2, ...}` syntax.
 - **Field access** uses `expr.fieldName` syntax.
@@ -84,4 +85,4 @@ This compiler now supports a declaration-first language with optional top-level 
   - per-stage cache hits/recomputes
   - source invalidation behavior
   - compile `changed_at` backdating
-- Current suite: `zig test test.zig` (28 tests).
+- Current suite: `zig test test.zig` (38 tests).
