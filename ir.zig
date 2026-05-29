@@ -2,6 +2,7 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const diagnostics = @import("diagnostics.zig");
 const typecheck = @import("typecheck.zig");
+const scope_mod = @import("scope.zig");
 const AstNode = ast.AstNode;
 const Type = typecheck.Type;
 
@@ -28,20 +29,28 @@ pub const Inst = union(enum) {
     printf: ValueRef,
     printb: ValueRef,
     argi: u32,
-    lti: InstPair,
-    ltf: InstPair,
-    gti: InstPair,
-    gtf: InstPair,
-    lei: InstPair,
-    lef: InstPair,
-    gei: InstPair,
-    gef: InstPair,
-    eqi: InstPair,
-    eqf: InstPair,
-    eqb: InstPair,
-    nei: InstPair,
-    nef: InstPair,
-    neb: InstPair,
+};
+
+pub const PredicateOp = enum {
+    lti,
+    ltf,
+    gti,
+    gtf,
+    lei,
+    lef,
+    gei,
+    gef,
+    eqi,
+    eqf,
+    eqb,
+    nei,
+    nef,
+    neb,
+};
+
+pub const Predicate = struct {
+    op: PredicateOp,
+    pair: InstPair,
 };
 
 pub const ValueInst = struct {
@@ -56,8 +65,8 @@ pub const Branch = struct {
 
 pub const Terminator = union(enum) {
     br: Branch,
-    cbr: struct {
-        cond: ValueRef,
+    pbr: struct {
+        pred: Predicate,
         then_branch: Branch,
         else_branch: Branch,
     },
@@ -100,14 +109,9 @@ pub const Program = struct {
 const Lowerer = struct {
     gpa: std.mem.Allocator,
     typed: *const typecheck.TypedAst,
-    bindings: std.ArrayList(Binding),
+    bindings: scope_mod.ScopeStack(ValueRef),
     prog: Program,
     current_block_id: BlockId,
-
-    const Binding = struct {
-        name: []const u8,
-        value_ref: ValueRef,
-    };
 
     fn init(gpa: std.mem.Allocator, typed: *const typecheck.TypedAst) error{OutOfMemory}!Lowerer {
         var blocks = try std.ArrayList(Block).initCapacity(gpa, 8);
@@ -123,7 +127,7 @@ const Lowerer = struct {
         return .{
             .gpa = gpa,
             .typed = typed,
-            .bindings = .empty,
+            .bindings = scope_mod.ScopeStack(ValueRef).init(),
             .prog = .{
                 .entry = 0,
                 .blocks = blocks,
@@ -139,18 +143,14 @@ const Lowerer = struct {
     }
 
     fn pushBinding(self: *@This(), name: []const u8, value_ref: ValueRef) (std.mem.Allocator.Error || typecheck.TypeError)!void {
-        if (self.lookupBinding(name) != null) return error.DuplicateVariable;
-        try self.bindings.append(self.gpa, .{ .name = name, .value_ref = value_ref });
+        self.bindings.push(self.gpa, name, value_ref) catch |err| switch (err) {
+            error.DuplicateVariable => return error.DuplicateVariable,
+            error.OutOfMemory => return error.OutOfMemory,
+        };
     }
 
     fn lookupBinding(self: *const @This(), name: []const u8) ?ValueRef {
-        var idx = self.bindings.items.len;
-        while (idx > 0) {
-            idx -= 1;
-            const binding = self.bindings.items[idx];
-            if (std.mem.eql(u8, binding.name, name)) return binding.value_ref;
-        }
-        return null;
+        return self.bindings.lookup(name);
     }
 
     fn allocValue(self: *@This(), ty: Type) error{OutOfMemory}!ValueRef {
@@ -186,17 +186,71 @@ const Lowerer = struct {
         return self.addInst(@unionInit(Inst, @tagName(tag), operands), result_type);
     }
 
-    fn lowerElseValue(self: *@This(), else_node: ?*const AstNode) (error{OutOfMemory} || typecheck.TypeError)!ValueRef {
-        if (else_node) |node| return self.lowerAst(node);
+    fn lowerUnitValue(self: *@This()) error{OutOfMemory}!ValueRef {
         return self.addInst(.{ .iconst = 0 }, .unit);
+    }
+
+    fn lowerElseValue(self: *@This(), else_node: ?*const AstNode) (error{OutOfMemory} || typecheck.TypeError)!ValueRef {
+        if (else_node) |node| {
+            const mark = self.bindings.mark();
+            defer self.bindings.restore(mark);
+            return self.lowerAst(node);
+        }
+        return self.lowerUnitValue();
     }
 
     fn nodeType(self: *const @This(), node: *const AstNode) typecheck.TypeError!Type {
         return self.typed.typeOf(node);
     }
 
+    fn lowerComparisonPredicate(
+        self: *@This(),
+        kids: *const [2]AstNode,
+        int_op: PredicateOp,
+        float_op: PredicateOp,
+    ) (error{OutOfMemory} || typecheck.TypeError)!Predicate {
+        const pair = try self.lowerPairOperands(kids);
+        const operand_ty = try self.nodeType(&kids[0]);
+        return .{
+            .op = if (operand_ty == .int) int_op else float_op,
+            .pair = pair,
+        };
+    }
+
+    fn lowerEqualityPredicate(
+        self: *@This(),
+        kids: *const [2]AstNode,
+        int_op: PredicateOp,
+        float_op: PredicateOp,
+        bool_op: PredicateOp,
+    ) (error{OutOfMemory} || typecheck.TypeError)!Predicate {
+        const pair = try self.lowerPairOperands(kids);
+        const operand_ty = try self.nodeType(&kids[0]);
+        return .{
+            .op = switch (operand_ty) {
+                .int => int_op,
+                .float => float_op,
+                .bool => bool_op,
+                .unit => unreachable,
+            },
+            .pair = pair,
+        };
+    }
+
+    fn lowerConditionPredicate(self: *@This(), cond: *const AstNode) (error{OutOfMemory} || typecheck.TypeError)!Predicate {
+        return switch (cond.*) {
+            .lt => |kids| self.lowerComparisonPredicate(kids, .lti, .ltf),
+            .gt => |kids| self.lowerComparisonPredicate(kids, .gti, .gtf),
+            .le => |kids| self.lowerComparisonPredicate(kids, .lei, .lef),
+            .ge => |kids| self.lowerComparisonPredicate(kids, .gei, .gef),
+            .eq => |kids| self.lowerEqualityPredicate(kids, .eqi, .eqf, .eqb),
+            .ne => |kids| self.lowerEqualityPredicate(kids, .nei, .nef, .neb),
+            else => error.IfConditionNotFallible,
+        };
+    }
+
     fn lowerIf(self: *@This(), node: *const AstNode, if_node: *const ast.IfNode) (error{OutOfMemory} || typecheck.TypeError)!ValueRef {
-        const condition_value = try self.lowerAst(if_node.cond);
+        const predicate = try self.lowerConditionPredicate(if_node.cond);
         const if_ty = try self.nodeType(node);
 
         const then_block_id = try self.newBlock(null);
@@ -204,15 +258,19 @@ const Lowerer = struct {
         const merge_block_id = try self.newBlock(if_ty);
 
         self.currentBlock().terminator = .{
-            .cbr = .{
-                .cond = condition_value,
+            .pbr = .{
+                .pred = predicate,
                 .then_branch = .{ .target = then_block_id },
                 .else_branch = .{ .target = else_block_id },
             },
         };
 
         self.current_block_id = then_block_id;
-        const then_value = try self.lowerAst(if_node.then_);
+        const then_value = then_blk: {
+            const mark = self.bindings.mark();
+            defer self.bindings.restore(mark);
+            break :then_blk try self.lowerAst(if_node.then_);
+        };
         self.currentBlock().terminator = .{ .br = .{ .target = merge_block_id, .arg = then_value } };
 
         self.current_block_id = else_block_id;
@@ -223,11 +281,22 @@ const Lowerer = struct {
         return self.currentBlock().param orelse unreachable;
     }
 
-    fn lowerConst(self: *@This(), node: *const AstNode, const_node: *const ast.ConstNode) (error{OutOfMemory} || typecheck.TypeError)!ValueRef {
-        _ = node;
+    fn lowerConst(self: *@This(), const_node: *const ast.ConstNode) (error{OutOfMemory} || typecheck.TypeError)!ValueRef {
         const value_ref = try self.lowerAst(const_node.value);
         try self.pushBinding(const_node.name, value_ref);
-        return self.lowerAst(const_node.body);
+        return self.lowerUnitValue();
+    }
+
+    fn lowerBlock(self: *@This(), block_node: *const ast.BlockNode) (error{OutOfMemory} || typecheck.TypeError)!ValueRef {
+        const mark = self.bindings.mark();
+        defer self.bindings.restore(mark);
+
+        var result: ?ValueRef = null;
+        for (block_node.items) |item| {
+            result = try self.lowerAst(item);
+        }
+        if (result) |value| return value;
+        return self.lowerUnitValue();
     }
 
     fn lowerArithmetic(self: *@This(), node: *const AstNode, kids: *const [2]AstNode, comptime int_tag: std.meta.Tag(Inst), comptime float_tag: std.meta.Tag(Inst)) (error{OutOfMemory} || typecheck.TypeError)!ValueRef {
@@ -238,32 +307,13 @@ const Lowerer = struct {
         };
     }
 
-    fn lowerComparison(self: *@This(), kids: *const [2]AstNode, comptime int_tag: std.meta.Tag(Inst), comptime float_tag: std.meta.Tag(Inst)) (error{OutOfMemory} || typecheck.TypeError)!ValueRef {
-        const operand_ty = try self.nodeType(&kids[0]);
-        if (operand_ty == .int) return self.addPairInst(int_tag, kids, .unit);
-        return self.addPairInst(float_tag, kids, .unit);
-    }
-
-    fn lowerEquality(self: *@This(), kids: *const [2]AstNode, comptime int_tag: std.meta.Tag(Inst), comptime float_tag: std.meta.Tag(Inst), comptime bool_tag: std.meta.Tag(Inst)) (error{OutOfMemory} || typecheck.TypeError)!ValueRef {
-        const operand_ty = try self.nodeType(&kids[0]);
-        return switch (operand_ty) {
-            .int => self.addPairInst(int_tag, kids, .unit),
-            .float => self.addPairInst(float_tag, kids, .unit),
-            .bool => self.addPairInst(bool_tag, kids, .unit),
-            .unit => unreachable,
-        };
-    }
-
     fn lowerAst(self: *@This(), node: *const AstNode) (error{OutOfMemory} || typecheck.TypeError)!ValueRef {
         return switch (node.*) {
+            .block => |block_node| try self.lowerBlock(block_node),
             .int => |value| try self.addInst(.{ .iconst = value }, .int),
             .float => |value| try self.addInst(.{ .fconst = value }, .float),
             .var_ref => |name| self.lookupBinding(name) orelse return error.UnknownVariable,
-            .seq => |kids| block: {
-                _ = try self.lowerAst(&kids[0]);
-                break :block try self.lowerAst(&kids[1]);
-            },
-            .const_ => |const_node| try self.lowerConst(node, const_node),
+            .const_ => |const_node| try self.lowerConst(const_node),
             .print => |child| block: {
                 const child_ref = try self.lowerAst(child);
                 const child_ty = try self.nodeType(child);
@@ -280,15 +330,10 @@ const Lowerer = struct {
             .mul => |kids| try self.lowerArithmetic(node, kids, .muli, .mulf),
             .div => |kids| try self.lowerArithmetic(node, kids, .divi, .divf),
             .arg => |idx| try self.addInst(.{ .argi = idx }, .int),
-            .lt => |kids| try self.lowerComparison(kids, .lti, .ltf),
-            .gt => |kids| try self.lowerComparison(kids, .gti, .gtf),
-            .le => |kids| try self.lowerComparison(kids, .lei, .lef),
-            .ge => |kids| try self.lowerComparison(kids, .gei, .gef),
-            .eq => |kids| try self.lowerEquality(kids, .eqi, .eqf, .eqb),
-            .ne => |kids| try self.lowerEquality(kids, .nei, .nef, .neb),
+            .lt, .gt, .le, .ge, .eq, .ne => error.IfConditionNotFallible,
             .if_ => |if_node| try self.lowerIf(node, if_node),
             .bool => |value| try self.addInst(.{ .iconst = if (value) @as(i32, 1) else 0 }, .bool),
-            .unit => try self.addInst(.{ .iconst = 0 }, .unit),
+            .unit => try self.lowerUnitValue(),
         };
     }
 };
@@ -299,34 +344,22 @@ const db = @import("db.zig");
 pub const LowerMemo = db.Memo(Program);
 
 pub fn computeLower(type_memo: *const typecheck.TypeMemo, parse_memo: *const parser.ParseMemo, gpa: std.mem.Allocator) error{OutOfMemory}!LowerMemo {
-    var diagnostics_list = try std.ArrayList(diagnostics.Diagnostic).initCapacity(gpa, type_memo.diagnostics.items.len + 1);
+    var diagnostics_list = try db.initDiagnosticList(gpa, type_memo.diagnostics.items, 1);
     errdefer diagnostics_list.deinit(gpa);
-    try diagnostics_list.appendSlice(gpa, type_memo.diagnostics.items);
 
     var lowered_value: ?Program = null;
     if (type_memo.value != null and parse_memo.value != null) {
         const lowered = lower(parse_memo.value.?.root, &type_memo.value.?, gpa) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => blk: {
-                try diagnostics_list.append(gpa, .{
-                    .stage = .lower,
-                    .span = null,
-                    .message = @errorName(err),
-                });
+                try db.appendStageError(&diagnostics_list, gpa, .lower, @errorName(err));
                 break :blk null;
             },
         };
         lowered_value = lowered;
     }
 
-    return .{
-        .value = lowered_value,
-        .diagnostics = diagnostics_list,
-        .deps = .empty,
-        .verified_at = 0,
-        .changed_at = 0,
-        .computing = false,
-    };
+    return db.makeMemo(Program, lowered_value, diagnostics_list);
 }
 
 pub fn lower(node: *const AstNode, typed: *const typecheck.TypedAst, gpa: std.mem.Allocator) (error{OutOfMemory} || typecheck.TypeError)!Program {

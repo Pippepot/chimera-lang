@@ -100,3 +100,38 @@ pub fn appendDependencyUnique(deps: *std.ArrayList(Dependency), gpa: std.mem.All
     }
     try deps.append(gpa, dep);
 }
+
+pub fn initDiagnosticList(
+    gpa: std.mem.Allocator,
+    inherited: []const diagnostics.Diagnostic,
+    extra_capacity: usize,
+) std.mem.Allocator.Error!std.ArrayList(diagnostics.Diagnostic) {
+    var list = try std.ArrayList(diagnostics.Diagnostic).initCapacity(gpa, inherited.len + extra_capacity);
+    errdefer list.deinit(gpa);
+    try list.appendSlice(gpa, inherited);
+    return list;
+}
+
+pub fn appendStageError(
+    list: *std.ArrayList(diagnostics.Diagnostic),
+    gpa: std.mem.Allocator,
+    stage: Stage,
+    message: []const u8,
+) std.mem.Allocator.Error!void {
+    try list.append(gpa, .{
+        .stage = stage,
+        .span = null,
+        .message = message,
+    });
+}
+
+pub fn makeMemo(comptime T: type, value: ?T, diagnostics_list: std.ArrayList(diagnostics.Diagnostic)) Memo(T) {
+    return .{
+        .value = value,
+        .diagnostics = diagnostics_list,
+        .deps = .empty,
+        .verified_at = 0,
+        .changed_at = 0,
+        .computing = false,
+    };
+}

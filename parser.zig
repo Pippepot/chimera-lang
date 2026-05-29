@@ -4,6 +4,7 @@ const diagnostics = @import("diagnostics.zig");
 const AstNode = ast.AstNode;
 const IfNode = ast.IfNode;
 const ConstNode = ast.ConstNode;
+const BlockNode = ast.BlockNode;
 
 pub const ParseError = error{
     UnexpectedCharacter,
@@ -11,7 +12,6 @@ pub const ParseError = error{
     ExpectedExpression,
     ExpectedIdentifier,
     ExpectedAssign,
-    ExpectedThen,
     ExpectedRParen,
     ExpectedLParen,
     InvalidArgIndex,
@@ -26,7 +26,6 @@ const TokenTag = enum {
     float_lit,
     kw_if,
     kw_const,
-    kw_then,
     kw_else,
     kw_print,
     kw_arg,
@@ -36,6 +35,9 @@ const TokenTag = enum {
     l_paren,
     r_paren,
     newline,
+    arrow,
+    indent,
+    dedent,
     assign,
     plus,
     minus,
@@ -61,9 +63,22 @@ const Token = struct {
 const Lexer = struct {
     source: []const u8,
     index: usize,
+    indent_levels: [32]usize,
+    indent_len: usize,
+    pending_dedent: usize,
+    at_line_start: bool,
 
     fn init(source: []const u8) Lexer {
-        return .{ .source = source, .index = 0 };
+        var levels: [32]usize = undefined;
+        levels[0] = 0;
+        return .{
+            .source = source,
+            .index = 0,
+            .indent_levels = levels,
+            .indent_len = 1,
+            .pending_dedent = 0,
+            .at_line_start = true,
+        };
     }
 
     fn skipInlineWhitespace(self: *@This()) void {
@@ -131,7 +146,6 @@ const Lexer = struct {
         const word = self.source[start..self.index];
         if (std.mem.eql(u8, word, "if")) return .{ .tag = .kw_if, .start = start, .end = self.index };
         if (std.mem.eql(u8, word, "const")) return .{ .tag = .kw_const, .start = start, .end = self.index };
-        if (std.mem.eql(u8, word, "then")) return .{ .tag = .kw_then, .start = start, .end = self.index };
         if (std.mem.eql(u8, word, "else")) return .{ .tag = .kw_else, .start = start, .end = self.index };
         if (std.mem.eql(u8, word, "print")) return .{ .tag = .kw_print, .start = start, .end = self.index };
         if (std.mem.eql(u8, word, "arg")) return .{ .tag = .kw_arg, .start = start, .end = self.index };
@@ -141,8 +155,57 @@ const Lexer = struct {
     }
 
     fn next(self: *@This()) ParseError!Token {
+        if (self.pending_dedent > 0) {
+            self.pending_dedent -= 1;
+            return .{ .tag = .dedent, .start = self.index, .end = self.index };
+        }
+
+        if (self.at_line_start) {
+            self.at_line_start = false;
+            const start = self.index;
+            while (self.index < self.source.len and self.source[self.index] == ' ') {
+                self.index += 1;
+            }
+            const indent = self.index - start;
+
+            if (self.index >= self.source.len) {
+                if (self.indent_len > 1) {
+                    self.indent_len -= 1;
+                    self.pending_dedent = self.indent_len - 1;
+                    return .{ .tag = .dedent, .start = self.source.len, .end = self.source.len };
+                }
+                return .{ .tag = .eof, .start = self.source.len, .end = self.source.len };
+            }
+
+            if (self.source[self.index] == '\n') {
+                self.index += 1;
+                self.at_line_start = true;
+                return self.next();
+            }
+
+            const top = self.indent_levels[self.indent_len - 1];
+            if (indent > top) {
+                self.indent_levels[self.indent_len] = indent;
+                self.indent_len += 1;
+                return .{ .tag = .indent, .start = start, .end = self.index };
+            }
+            if (indent < top) {
+                while (self.indent_len > 1 and indent < self.indent_levels[self.indent_len - 1]) {
+                    self.indent_len -= 1;
+                    self.pending_dedent += 1;
+                }
+                self.pending_dedent -= 1;
+                return .{ .tag = .dedent, .start = start, .end = self.index };
+            }
+        }
+
         self.skipInlineWhitespace();
         if (self.index >= self.source.len) {
+            if (self.indent_len > 1) {
+                self.indent_len -= 1;
+                self.pending_dedent = self.indent_len - 1;
+                return .{ .tag = .dedent, .start = self.source.len, .end = self.source.len };
+            }
             return .{ .tag = .eof, .start = self.source.len, .end = self.source.len };
         }
 
@@ -150,6 +213,7 @@ const Lexer = struct {
         if (char == '\n') {
             const start = self.index;
             self.index += 1;
+            self.at_line_start = true;
             return .{ .tag = .newline, .start = start, .end = self.index };
         }
 
@@ -163,7 +227,10 @@ const Lexer = struct {
             '(' => .{ .tag = .l_paren, .start = start, .end = self.index },
             ')' => .{ .tag = .r_paren, .start = start, .end = self.index },
             '+' => .{ .tag = .plus, .start = start, .end = self.index },
-            '-' => .{ .tag = .minus, .start = start, .end = self.index },
+            '-' => if (self.index < self.source.len and self.source[self.index] == '>') arrow: {
+                self.index += 1;
+                break :arrow .{ .tag = .arrow, .start = start, .end = self.index };
+            } else .{ .tag = .minus, .start = start, .end = self.index },
             '*' => .{ .tag = .star, .start = start, .end = self.index },
             '/' => .{ .tag = .slash, .start = start, .end = self.index },
             '<' => if (self.index < self.source.len and self.source[self.index] == '=') tok: {
@@ -274,20 +341,26 @@ const Parser = struct {
         return try self.arena.dupe(u8, name);
     }
 
-    fn makeSeq(self: *@This(), left: *const AstNode, right: *const AstNode) error{OutOfMemory}!*const AstNode {
-        const kids = try self.allocKids(left, right);
-        const span = coverSpans(self.spanOfNode(left), self.spanOfNode(right));
-        return self.allocNode(.{ .seq = kids }, span);
-    }
-
-    fn makeConstNode(self: *@This(), name: []const u8, value: *const AstNode, body: *const AstNode, span: ast.Span) error{OutOfMemory}!*const AstNode {
+    fn makeConstNode(self: *@This(), name: []const u8, value: *const AstNode, span: ast.Span) error{OutOfMemory}!*const AstNode {
         const data = try self.arena.create(ConstNode);
         data.* = .{
             .name = try self.allocName(name),
             .value = value,
-            .body = body,
         };
         return self.allocNode(.{ .const_ = data }, span);
+    }
+
+    fn makeBlockNode(self: *@This(), items: []const *const AstNode) error{OutOfMemory}!*const AstNode {
+        const block = try self.arena.create(BlockNode);
+        const owned_items = try self.arena.alloc(*const AstNode, items.len);
+        @memcpy(owned_items, items);
+        block.* = .{ .items = owned_items };
+
+        const span = if (items.len == 0)
+            ast.Span{ .start = self.lexer.index, .end = self.lexer.index }
+        else
+            coverSpans(self.spanOfNode(items[0]), self.spanOfNode(items[items.len - 1]));
+        return self.allocNode(.{ .block = block }, span);
     }
 
     fn makeBinop(self: *@This(), tag: BinTag, left: *const AstNode, right: *const AstNode) error{OutOfMemory}!*const AstNode {
@@ -331,7 +404,7 @@ const Parser = struct {
     }
 
     fn parseProgram(self: *@This()) (ParseError || error{OutOfMemory})!*const AstNode {
-        const root = try self.parseBlockExpression();
+        const root = try self.parseBlockUntil();
         if (self.current.tag != .eof) return error.TrailingInput;
         return root;
     }
@@ -342,20 +415,59 @@ const Parser = struct {
         }
     }
 
-    fn parseBlockExpression(self: *@This()) (ParseError || error{OutOfMemory})!*const AstNode {
-        try self.consumeNewlines();
+    fn parseStatement(self: *@This()) (ParseError || error{OutOfMemory})!*const AstNode {
         if (self.current.tag == .kw_const) return self.parseConstBinding();
-        if (self.current.tag == .eof) return self.allocNode(.{ .unit = {} }, .{ .start = self.lexer.index, .end = self.lexer.index });
+        return self.parseExpression();
+    }
 
-        var first = try self.parseExpression();
-        while (self.current.tag == .newline) {
-            try self.consumeNewlines();
-            if (self.current.tag == .eof or self.current.tag == .r_paren) break;
-            const next = try self.parseBlockExpression();
-            first = try self.makeSeq(first, next);
-            break;
+    fn parseBlockUntil(self: *@This()) (ParseError || error{OutOfMemory})!*const AstNode {
+        try self.consumeNewlines();
+        var items = std.ArrayList(*const AstNode).empty;
+
+        while (self.current.tag != .eof and self.current.tag != .r_paren and self.current.tag != .dedent) {
+            if (self.current.tag == .kw_else) {
+                if (items.items.len == 0) return error.ExpectedExpression;
+                const last_idx = items.items.len - 1;
+                if (findIfWithoutElse(items.items[last_idx])) |if_node| {
+                    try self.advance();
+                    try self.consumeNewlines();
+                    if (self.current.tag == .indent) {
+                        try self.advance();
+                        if_node.else_ = try self.parseBlockUntil();
+                        try self.consumeNewlines();
+                        try self.expect(.dedent, error.ExpectedExpression);
+                    } else {
+                        if_node.else_ = try self.parseExpression();
+                    }
+                    if (self.current.tag == .newline) {
+                        try self.consumeNewlines();
+                    }
+                    continue;
+                }
+                return error.ExpectedExpression;
+            }
+
+            const statement = try self.parseStatement();
+            try items.append(self.arena, statement);
+
+            if (self.current.tag == .newline) {
+                try self.consumeNewlines();
+                continue;
+            }
+            if (self.current.tag == .eof or self.current.tag == .r_paren or self.current.tag == .dedent) break;
+            if (self.current.tag == .kw_else) continue;
+            const stmt_span = self.spanOfNode(statement);
+            const cursor_start = if (self.current.start > self.lexer.source.len) self.lexer.source.len else self.current.start;
+            if (cursor_start > stmt_span.end and std.mem.indexOfScalar(u8, self.lexer.source[stmt_span.end..cursor_start], '\n') != null) {
+                continue;
+            }
+            return error.UnexpectedToken;
         }
-        return first;
+
+        if (items.items.len == 0) {
+            return self.allocNode(.{ .unit = {} }, .{ .start = self.lexer.index, .end = self.lexer.index });
+        }
+        return self.makeBlockNode(items.items);
     }
 
     fn parseExpression(self: *@This()) (ParseError || error{OutOfMemory})!*const AstNode {
@@ -370,11 +482,19 @@ const Parser = struct {
         try self.advance();
         try self.expect(.assign, error.ExpectedAssign);
         const value = try self.parseExpression();
-        if (self.current.tag != .newline) return error.UnexpectedToken;
-        try self.consumeNewlines();
-        const body = try self.parseBlockExpression();
-        const const_node_span = coverSpans(const_span, self.spanOfNode(body));
-        return self.makeConstNode(ident, value, body, const_node_span);
+        const value_span = self.spanOfNode(value);
+        switch (self.current.tag) {
+            .newline, .eof, .dedent, .r_paren, .kw_else => {},
+            else => {
+                const cursor_start = if (self.current.start > self.lexer.source.len) self.lexer.source.len else self.current.start;
+                if (cursor_start <= value_span.end) return error.UnexpectedToken;
+                if (std.mem.indexOfScalar(u8, self.lexer.source[value_span.end..cursor_start], '\n') == null) {
+                    return error.UnexpectedToken;
+                }
+            },
+        }
+        const const_node_span = coverSpans(const_span, value_span);
+        return self.makeConstNode(ident, value, const_node_span);
     }
 
     fn parseComparison(self: *@This()) (ParseError || error{OutOfMemory})!*const AstNode {
@@ -528,18 +648,43 @@ const Parser = struct {
         return self.allocNode(.{ .arg = idx }, coverSpans(arg_span, end_span));
     }
 
+    fn findIfWithoutElse(node: *const AstNode) ?*ast.IfNode {
+        return switch (node.*) {
+            .if_ => |if_node| if (if_node.else_ == null) @constCast(if_node) else null,
+            else => null,
+        };
+    }
+
     fn parseIf(self: *@This()) (ParseError || error{OutOfMemory})!*const AstNode {
         const if_span = tokenSpan(self.current);
         try self.expect(.kw_if, error.UnexpectedToken);
 
         const cond = try self.parseExpression();
-        try self.expect(.kw_then, error.ExpectedThen);
-        const then_expr = try self.parseExpression();
+
+        const then_expr = if (self.current.tag == .arrow) then_body: {
+            try self.advance();
+            break :then_body try self.parseExpression();
+        } else then_body: {
+            try self.consumeNewlines();
+            try self.expect(.indent, error.ExpectedExpression);
+            const body = try self.parseBlockUntil();
+            try self.consumeNewlines();
+            try self.expect(.dedent, error.ExpectedExpression);
+            break :then_body body;
+        };
 
         var else_expr: ?*const AstNode = null;
         if (self.current.tag == .kw_else) {
             try self.advance();
-            else_expr = try self.parseExpression();
+            try self.consumeNewlines();
+            if (self.current.tag == .indent) {
+                try self.advance();
+                else_expr = try self.parseBlockUntil();
+                try self.consumeNewlines();
+                try self.expect(.dedent, error.ExpectedExpression);
+            } else {
+                else_expr = try self.parseExpression();
+            }
         }
 
         const if_data = try self.arena.create(IfNode);
@@ -565,7 +710,6 @@ pub fn parseErrorMessage(err: anyerror) []const u8 {
         error.ExpectedExpression => "expected expression",
         error.ExpectedIdentifier => "expected identifier",
         error.ExpectedAssign => "expected '=' in const binding",
-        error.ExpectedThen => "expected 'then' in if expression",
         error.ExpectedRParen => "expected ')'",
         error.ExpectedLParen => "expected '('",
         error.InvalidArgIndex => "invalid arg() index",
@@ -589,20 +733,13 @@ pub const ParseMemo = db.Memo(ParsedAst);
 pub fn computeParse(source: []const u8, gpa: std.mem.Allocator) error{OutOfMemory}!ParseMemo {
     const report = try parseReport(source, gpa);
 
-    var diagnostics_list = try std.ArrayList(diagnostics.Diagnostic).initCapacity(gpa, 1);
+    var diagnostics_list = try db.initDiagnosticList(gpa, &.{}, 1);
     errdefer diagnostics_list.deinit(gpa);
     if (report.diagnostic) |diag| {
         try diagnostics_list.append(gpa, diag);
     }
 
-    return .{
-        .value = report.parsed,
-        .diagnostics = diagnostics_list,
-        .deps = .empty,
-        .verified_at = 0,
-        .changed_at = 0,
-        .computing = false,
-    };
+    return db.makeMemo(ParsedAst, report.parsed, diagnostics_list);
 }
 
 pub fn parseReport(source: []const u8, gpa: std.mem.Allocator) error{OutOfMemory}!ParseReport {

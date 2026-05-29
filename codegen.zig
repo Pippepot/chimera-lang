@@ -20,17 +20,17 @@ const BinaryEmitter = struct {
     fixups: std.ArrayList(RelFixup),
 
     const SetccCond = enum(u8) {
-        b  = 0x92,
+        b = 0x92,
         be = 0x96,
-        a  = 0x97,
+        a = 0x97,
         ae = 0x93,
-        l  = 0x9C,
-        g  = 0x9F,
+        l = 0x9C,
+        g = 0x9F,
         le = 0x9E,
         ge = 0x9D,
-        e  = 0x94,
+        e = 0x94,
         ne = 0x95,
-        p  = 0x9A,
+        p = 0x9A,
         np = 0x9B,
     };
 
@@ -294,8 +294,8 @@ const BinaryEmitter = struct {
         try self.appendBytes(&.{ 0x08, 0xD8 });
     }
 
-    fn emitXorEdiEdi(self: *@This()) !void {
-        try self.appendBytes(&.{ 0x31, 0xFF });
+    fn emitMovEdiEax(self: *@This()) !void {
+        try self.appendBytes(&.{ 0x89, 0xC7 });
     }
 
     fn emitSyscall(self: *@This()) !void {
@@ -342,16 +342,15 @@ const BinaryEmitter = struct {
         try self.emitStoreXmm0ToSlot(out);
     }
 
-    fn emitCompareInt(self: *@This(), pair: InstPair, cond: SetccCond, out: InstRef) !void {
+    fn emitCompareIntToEax(self: *@This(), pair: InstPair, cond: SetccCond) !void {
         try self.emitLoadEaxFromSlot(pair.l);
         try self.emitLoadEbxFromSlot(pair.r);
         try self.emitCmpEaxEbx();
         try self.emitSetcc(cond);
         try self.emitMovzxEaxAl();
-        try self.emitStoreRaxToSlot(out);
     }
 
-    fn emitCompareFloatOrdered(self: *@This(), pair: InstPair, cond: SetccCond, out: InstRef) !void {
+    fn emitCompareFloatOrderedToEax(self: *@This(), pair: InstPair, cond: SetccCond) !void {
         try self.emitLoadXmm0FromSlot(pair.l);
         try self.emitLoadXmm1FromSlot(pair.r);
         try self.emitUcomissXmm0Xmm1();
@@ -359,10 +358,9 @@ const BinaryEmitter = struct {
         try self.emitSetccBl(.np);
         try self.emitAndAlBl();
         try self.emitMovzxEaxAl();
-        try self.emitStoreRaxToSlot(out);
     }
 
-    fn emitCompareFloatNotEqual(self: *@This(), pair: InstPair, out: InstRef) !void {
+    fn emitCompareFloatNotEqualToEax(self: *@This(), pair: InstPair) !void {
         try self.emitLoadXmm0FromSlot(pair.l);
         try self.emitLoadXmm1FromSlot(pair.r);
         try self.emitUcomissXmm0Xmm1();
@@ -370,7 +368,6 @@ const BinaryEmitter = struct {
         try self.emitSetccBl(.p);
         try self.emitOrAlBl();
         try self.emitMovzxEaxAl();
-        try self.emitStoreRaxToSlot(out);
     }
 
     fn emitStoreUnitValue(self: *@This(), out: InstRef) !void {
@@ -396,20 +393,6 @@ const BinaryEmitter = struct {
             .mulf => |pair| try self.emitBinaryArithmeticFloat(pair, 0x59, value_inst.id),
             .divi => |pair| try self.emitBinaryDivInt(pair, value_inst.id),
             .divf => |pair| try self.emitBinaryDivFloat(pair, value_inst.id),
-            .lti => |pair| try self.emitCompareInt(pair, .l, value_inst.id),
-            .ltf => |pair| try self.emitCompareFloatOrdered(pair, .b, value_inst.id),
-            .gti => |pair| try self.emitCompareInt(pair, .g, value_inst.id),
-            .gtf => |pair| try self.emitCompareFloatOrdered(pair, .a, value_inst.id),
-            .lei => |pair| try self.emitCompareInt(pair, .le, value_inst.id),
-            .lef => |pair| try self.emitCompareFloatOrdered(pair, .be, value_inst.id),
-            .gei => |pair| try self.emitCompareInt(pair, .ge, value_inst.id),
-            .gef => |pair| try self.emitCompareFloatOrdered(pair, .ae, value_inst.id),
-            .eqi => |pair| try self.emitCompareInt(pair, .e, value_inst.id),
-            .eqf => |pair| try self.emitCompareFloatOrdered(pair, .e, value_inst.id),
-            .eqb => |pair| try self.emitCompareInt(pair, .e, value_inst.id),
-            .nei => |pair| try self.emitCompareInt(pair, .ne, value_inst.id),
-            .nef => |pair| try self.emitCompareFloatNotEqual(pair, value_inst.id),
-            .neb => |pair| try self.emitCompareInt(pair, .ne, value_inst.id),
             .printi => |value_ref| {
                 try self.emitLoadEaxFromSlot(value_ref);
                 try self.emitCall(self.helperSymbol(.print_int));
@@ -439,7 +422,7 @@ const BinaryEmitter = struct {
 
     fn emitReturn(self: *@This(), value_ref: InstRef) !void {
         try self.emitLoadEaxFromSlot(value_ref);
-        try self.emitXorEdiEdi();
+        try self.emitMovEdiEax();
         try self.emitMovEaxImm32(60);
         try self.emitSyscall();
     }
@@ -450,14 +433,32 @@ const BinaryEmitter = struct {
         try self.emitJmp(self.block_symbols[branch.target]);
     }
 
-    fn emitConditionalBranch(self: *@This(), cbr: @FieldType(ir_mod.Terminator, "cbr")) !void {
-        try self.emitLoadEaxFromSlot(cbr.cond);
+    fn emitPredicateValueToEax(self: *@This(), pred: ir_mod.Predicate) !void {
+        switch (pred.op) {
+            .lti => try self.emitCompareIntToEax(pred.pair, .l),
+            .ltf => try self.emitCompareFloatOrderedToEax(pred.pair, .b),
+            .gti => try self.emitCompareIntToEax(pred.pair, .g),
+            .gtf => try self.emitCompareFloatOrderedToEax(pred.pair, .a),
+            .lei => try self.emitCompareIntToEax(pred.pair, .le),
+            .lef => try self.emitCompareFloatOrderedToEax(pred.pair, .be),
+            .gei => try self.emitCompareIntToEax(pred.pair, .ge),
+            .gef => try self.emitCompareFloatOrderedToEax(pred.pair, .ae),
+            .eqi => try self.emitCompareIntToEax(pred.pair, .e),
+            .eqf => try self.emitCompareFloatOrderedToEax(pred.pair, .e),
+            .eqb => try self.emitCompareIntToEax(pred.pair, .e),
+            .nei => try self.emitCompareIntToEax(pred.pair, .ne),
+            .nef => try self.emitCompareFloatNotEqualToEax(pred.pair),
+            .neb => try self.emitCompareIntToEax(pred.pair, .ne),
+        }
+    }
+
+    fn emitBranchOnEaxNonZero(self: *@This(), then_branch: ir_mod.Branch, else_branch: ir_mod.Branch) !void {
         try self.emitCmpEaxZero();
 
-        const then_copy = self.branchCopy(cbr.then_branch);
-        const else_copy = self.branchCopy(cbr.else_branch);
-        const then_symbol = self.block_symbols[cbr.then_branch.target];
-        const else_symbol = self.block_symbols[cbr.else_branch.target];
+        const then_copy = self.branchCopy(then_branch);
+        const else_copy = self.branchCopy(else_branch);
+        const then_symbol = self.block_symbols[then_branch.target];
+        const else_symbol = self.block_symbols[else_branch.target];
 
         if (then_copy == null and else_copy == null) {
             try self.emitJe(else_symbol);
@@ -493,10 +494,15 @@ const BinaryEmitter = struct {
         try self.emitJmp(else_symbol);
     }
 
+    fn emitPredicateBranch(self: *@This(), pbr: @FieldType(ir_mod.Terminator, "pbr")) !void {
+        try self.emitPredicateValueToEax(pbr.pred);
+        try self.emitBranchOnEaxNonZero(pbr.then_branch, pbr.else_branch);
+    }
+
     fn emitTerm(self: *@This(), term: ir_mod.Terminator) !void {
         switch (term) {
             .br => |branch| try self.emitBranch(branch),
-            .cbr => |cbr| try self.emitConditionalBranch(cbr),
+            .pbr => |pbr| try self.emitPredicateBranch(pbr),
             .ret => |value_ref| try self.emitReturn(value_ref),
         }
     }
@@ -612,33 +618,21 @@ const ir = @import("ir.zig");
 pub const CompileMemo = db.Memo([]const u8);
 
 pub fn computeCompile(lower_memo: *const ir.LowerMemo, gpa: std.mem.Allocator) error{OutOfMemory}!CompileMemo {
-    var diagnostics_list = try std.ArrayList(diagnostics.Diagnostic).initCapacity(gpa, lower_memo.diagnostics.items.len + 1);
+    var diagnostics_list = try db.initDiagnosticList(gpa, lower_memo.diagnostics.items, 1);
     errdefer diagnostics_list.deinit(gpa);
-    try diagnostics_list.appendSlice(gpa, lower_memo.diagnostics.items);
 
     var bytes: ?[]const u8 = null;
     if (lower_memo.value) |*prog| {
         bytes = compileProgram(prog, gpa) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => blk: {
-                try diagnostics_list.append(gpa, .{
-                    .stage = .compile,
-                    .span = null,
-                    .message = @errorName(err),
-                });
+                try db.appendStageError(&diagnostics_list, gpa, .compile, @errorName(err));
                 break :blk null;
             },
         };
     }
 
-    return .{
-        .value = bytes,
-        .diagnostics = diagnostics_list,
-        .deps = .empty,
-        .verified_at = 0,
-        .changed_at = 0,
-        .computing = false,
-    };
+    return db.makeMemo([]const u8, bytes, diagnostics_list);
 }
 
 pub fn compileProgram(prog: *const Program, gpa: std.mem.Allocator) ![]const u8 {
@@ -650,5 +644,3 @@ pub fn compileProgram(prog: *const Program, gpa: std.mem.Allocator) ![]const u8 
 
     return buildElfExecutable(code, 0, gpa);
 }
-
-

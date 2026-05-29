@@ -1,6 +1,7 @@
 const std = @import("std");
 const ast = @import("ast.zig");
 const diagnostics = @import("diagnostics.zig");
+const scope_mod = @import("scope.zig");
 const AstNode = ast.AstNode;
 
 pub const Type = enum {
@@ -74,14 +75,9 @@ pub fn typeErrorMessage(kind: TypeError) []const u8 {
 const Checker = struct {
     gpa: std.mem.Allocator,
     typed: TypedAst,
-    bindings: std.ArrayList(Binding),
+    bindings: scope_mod.ScopeStack(Type),
     failure: ?Failure,
     in_fallible_scope: bool,
-
-    const Binding = struct {
-        name: []const u8,
-        ty: Type,
-    };
 
     const Failure = struct {
         node: *const AstNode,
@@ -94,7 +90,7 @@ const Checker = struct {
         return .{
             .gpa = gpa,
             .typed = TypedAst.init(gpa),
-            .bindings = .empty,
+            .bindings = scope_mod.ScopeStack(Type).init(),
             .failure = null,
             .in_fallible_scope = false,
         };
@@ -118,18 +114,14 @@ const Checker = struct {
     }
 
     fn pushBinding(self: *@This(), node: *const AstNode, name: []const u8, ty: Type) InferError!void {
-        if (self.lookupBinding(name) != null) return self.fail(node, error.DuplicateVariable);
-        try self.bindings.append(self.gpa, .{ .name = name, .ty = ty });
+        self.bindings.push(self.gpa, name, ty) catch |err| switch (err) {
+            error.DuplicateVariable => return self.fail(node, error.DuplicateVariable),
+            error.OutOfMemory => return error.OutOfMemory,
+        };
     }
 
     fn lookupBinding(self: *const @This(), name: []const u8) ?Type {
-        var idx = self.bindings.items.len;
-        while (idx > 0) {
-            idx -= 1;
-            const binding = self.bindings.items[idx];
-            if (std.mem.eql(u8, binding.name, name)) return binding.ty;
-        }
-        return null;
+        return self.bindings.lookup(name);
     }
 
     fn inferPair(self: *@This(), kids: *const [2]AstNode) InferError![2]Type {
@@ -176,15 +168,24 @@ const Checker = struct {
     }
 
     fn inferIf(self: *@This(), node: *const AstNode, if_node: *const ast.IfNode) InferError!Type {
+        const prev_fallible = self.in_fallible_scope;
         self.in_fallible_scope = true;
+        defer self.in_fallible_scope = prev_fallible;
         _ = try self.inferNode(if_node.cond);
-        self.in_fallible_scope = false;
 
         if (!isFallible(if_node.cond)) return self.fail(if_node.cond, error.IfConditionNotFallible);
 
-        const then_ty = try self.inferNode(if_node.then_);
+        const then_ty = then_blk: {
+            const mark = self.bindings.mark();
+            defer self.bindings.restore(mark);
+            break :then_blk try self.inferNode(if_node.then_);
+        };
         if (if_node.else_) |else_node| {
-            const else_ty = try self.inferNode(else_node);
+            const else_ty = else_blk: {
+                const mark = self.bindings.mark();
+                defer self.bindings.restore(mark);
+                break :else_blk try self.inferNode(else_node);
+            };
             if (then_ty != else_ty) return self.fail(node, error.IfBranchTypeMismatch);
             return self.remember(node, then_ty);
         }
@@ -196,8 +197,18 @@ const Checker = struct {
     fn inferConst(self: *@This(), node: *const AstNode, const_node: *const ast.ConstNode) InferError!Type {
         const value_ty = try self.inferNode(const_node.value);
         try self.pushBinding(node, const_node.name, value_ty);
-        const body_ty = try self.inferNode(const_node.body);
-        return self.remember(node, body_ty);
+        return self.remember(node, .unit);
+    }
+
+    fn inferBlock(self: *@This(), node: *const AstNode, block_node: *const ast.BlockNode) InferError!Type {
+        const mark = self.bindings.mark();
+        defer self.bindings.restore(mark);
+
+        var result_ty: Type = .unit;
+        for (block_node.items) |item| {
+            result_ty = try self.inferNode(item);
+        }
+        return self.remember(node, result_ty);
     }
 
     fn inferFallible(self: *@This(), node: *const AstNode, kids: *const [2]AstNode, comptime inferFn: fn (*@This(), *const AstNode, *const [2]AstNode) InferError!Type) InferError!Type {
@@ -209,14 +220,10 @@ const Checker = struct {
     fn inferNode(self: *@This(), node: *const AstNode) InferError!Type {
         if (self.typed.node_types.get(nodeKey(node))) |existing| return existing;
         return switch (node.*) {
+            .block => |block_node| self.inferBlock(node, block_node),
             .int => self.remember(node, .int),
             .float => self.remember(node, .float),
             .var_ref => |name| self.remember(node, self.lookupBinding(name) orelse return self.fail(node, error.UnknownVariable)),
-            .seq => |kids| block: {
-                _ = try self.inferNode(&kids[0]);
-                const rhs = try self.inferNode(&kids[1]);
-                break :block try self.remember(node, rhs);
-            },
             .const_ => |const_node| self.inferConst(node, const_node),
             .arg => self.remember(node, .int),
             .print => |child| block: {
@@ -251,9 +258,8 @@ const db = @import("db.zig");
 pub const TypeMemo = db.Memo(TypedAst);
 
 pub fn computeType(parse_memo: *const parser.ParseMemo, gpa: std.mem.Allocator) error{OutOfMemory}!TypeMemo {
-    var diagnostics_list = try std.ArrayList(diagnostics.Diagnostic).initCapacity(gpa, parse_memo.diagnostics.items.len + 1);
+    var diagnostics_list = try db.initDiagnosticList(gpa, parse_memo.diagnostics.items, 1);
     errdefer diagnostics_list.deinit(gpa);
-    try diagnostics_list.appendSlice(gpa, parse_memo.diagnostics.items);
 
     var typed_value: ?TypedAst = null;
     if (parse_memo.value) |*parsed| {
@@ -264,14 +270,7 @@ pub fn computeType(parse_memo: *const parser.ParseMemo, gpa: std.mem.Allocator) 
         typed_value = report.typed;
     }
 
-    return .{
-        .value = typed_value,
-        .diagnostics = diagnostics_list,
-        .deps = .empty,
-        .verified_at = 0,
-        .changed_at = 0,
-        .computing = false,
-    };
+    return db.makeMemo(TypedAst, typed_value, diagnostics_list);
 }
 
 pub fn typecheckReport(

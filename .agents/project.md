@@ -7,13 +7,14 @@
 | File | Description |
 |------|-------------|
 | `main.zig` | CLI entrypoint (`main`) and query pipeline orchestration |
-| `ast.zig` | AST node types (`AstNode`, `IfNode`, `ConstNode`) |
-| `runtime.zig` | Runtime helpers (`writeProgram`, `runProg`) and query diagnostics formatting helper |
+| `ast.zig` | AST node types (`AstNode`, `IfNode`, `ConstNode`, `BlockNode`) |
+| `runtime.zig` | Runtime helpers (`writeProgram`, `runProg`) |
 | `parser.zig` | Lexer + recursive descent parser (`parseOwned`) from source text to AST |
 | `typecheck.zig` | Type inference/checking over AST (`unit`, `bool`, `int`, `float`) |
 | `query.zig` | Revisioned incremental query database (`QueryDb`) with memoized parse/lower/compile stages |
 | `ir.zig` | Block-based SSA IR definitions and AST -> IR lowering |
 | `codegen.zig` | x86 binary backend: IR -> x86 machine code + ELF executable |
+| `scope.zig` | Shared lexical scope stack utility used by typecheck/lowering |
 | `debug.zig` | Debug helpers: AST dump, SSA dump, debug flag parsing |
 | `helpers_bin.zig` | Pre-assembled helper routines (`print_int`, `print_bool`, `print_float32`, `atoi`) as byte blobs |
 | `test.zig` | End-to-end language tests plus incremental query behavior tests |
@@ -23,9 +24,9 @@
 
 | Symbol | File | Description |
 |--------|------|-------------|
-| `AstNode`, `IfNode`, `ConstNode` | `ast.zig` | AST node types |
+| `AstNode`, `IfNode`, `ConstNode`, `BlockNode` | `ast.zig` | AST node types |
 | `parseOwned(source, gpa)` | `parser.zig` | Parse source string into arena-owned AST |
-| `Program`, `Block`, `Inst`, `Terminator`, `Branch` | `ir.zig` | SSA/block IR model |
+| `Program`, `Block`, `Inst`, `Predicate`, `Terminator`, `Branch` | `ir.zig` | SSA/block IR model |
 | `lower(node, typed, gpa)` | `ir.zig` | Typed AST -> `Program` |
 | `compileProgram(prog, gpa)` | `codegen.zig` | IR -> ELF file bytes |
 | `QueryDb` (+ `SourceId`, `Revision`, `QueryStats`) | `query.zig` | Incremental query engine over parse/lower/compile |
@@ -81,7 +82,7 @@ Runtime flow in `main.zig`:
 3. `parsedAst(source_id)` (for AST debug)
 4. `typedAst(source_id)`
 5. `loweredProgram(source_id)` (for SSA debug)
-6. `compileBytes(source_id)`
+6. `compileResult(source_id)`
 7. `writeProgram` + `runProg`
 
 ## Debug flags
@@ -91,17 +92,21 @@ Use `--debug=ast,ssa,timing,query`:
 - `ast`: tree-form AST dump.
 - `ssa`: block/terminator SSA listing.
 - `timing`: stage timings.
-- `query`: query diagnostics (revision, source set counts, hits/recomputes, dependency checks/invalidations).
+- `query`: query diagnostics (revision, source set counts, hits/recomputes, dependency checks/invalidations) via `query.appendQueryDiagnostics`.
 
 ## Current behavior
 
-- `zig run main.zig -- demo.x86` compiles and runs `demo.x86` (prints `42` with current demo file).
+- `zig run main.zig -- demo.x86` compiles and runs `demo.x86` (current demo prints `645` and `42`).
 - `zig run main.zig --` prints usage and exits with code `1`.
 - First non-debug CLI arg is source file path; remaining args are passed to the generated program.
+- `if`/`else` uses indentation-based blocks (no `then` keyword). Use `->` for inline body, or newline + indent for block body.
+- `else` does not require `->` for inline body; just `else <expr>`.
 - Statements are newline-separated; `;` is not supported as a statement separator.
 - `const` locals are supported, non-mutable, and duplicate names are rejected.
+- Multi-statement programs are represented as explicit `AstNode.block`.
 - Parentheses are expression grouping only and do not create scope boundaries.
 - **Fail semantics:** `if` conditions must be fallible expressions (comparisons). Fallible expressions can only appear inside `if` conditions. Comparisons produce `unit` on success (not `bool`).
+- Block/branch lexical scope is isolated: branch-local `const` names do not leak into sibling branches or following statements.
 - Implementation plan at `.agents/fail-semantics.md`.
 
 ## Tests
@@ -118,14 +123,21 @@ Use `--debug=ast,ssa,timing,query`:
 8. Float comparison NaN semantics.
 9. Const locals + multi-statement programs.
 10. Bool literal printing and equality comparisons.
-11. Else-less `if` unit behavior.
-12. Type error coverage (including fallible outside fallible context, non-fallible condition).
-13. Fallible expression outside fallible context error.
-14. Non-fallible expression in if condition error.
-15. Query cache hits within same revision.
-16. Source-change invalidation across parse/typecheck/lower/compile.
-17. Source-specific invalidation isolation.
-18. Unchanged source revision stability.
-19. Compile `changed_at` backdating when output bytes are identical.
-20. Query diagnostics formatting.
-21. Helper enum/index mapping.
+ 11. Else-less `if` unit behavior.
+ 12. Indentation-based `if`/`else` blocks.
+ 13. `else if` chaining with mixed inline/block bodies.
+14. Nested `if` with proper indentation-based binding.
+15. Statement after indented `if` block parsing.
+16. Branch-local `const` visibility/isolation behavior.
+17. Same-name `const` declarations across opposite `if` branches.
+18. Type error coverage (including fallible outside fallible context, non-fallible condition).
+19. Fallible expression outside fallible context error.
+20. Non-fallible expression in if condition error.
+21. Query cache hits within same revision.
+22. Source-change invalidation across parse/typecheck/lower/compile.
+23. Source-specific invalidation isolation.
+24. Unchanged source revision stability.
+25. Compile `changed_at` backdating when output bytes are identical.
+26. Query diagnostics formatting.
+27. Program exit code follows top-level expression value.
+28. Helper enum/index mapping.

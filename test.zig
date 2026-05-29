@@ -96,24 +96,24 @@ test "arg" {
 }
 
 test "comparisons" {
-    try testProgram("if 3 < 4 then print(42)", "42\n");
-    try testProgram("if 4 < 3 then print(99) else print(11)", "11\n");
-    try testProgram("if 4 > 3 then print(42)", "42\n");
-    try testProgram("if 4 <= 4 then print(42)", "42\n");
-    try testProgram("if 3 >= 4 then print(99) else print(11)", "11\n");
-    try testProgram("if -7 == -7 then print(42)", "42\n");
-    try testProgram("if 9 != 9 then print(99) else print(11)", "11\n");
+    try testProgram("if 3 < 4 -> print(42)", "42\n");
+    try testProgram("if 4 < 3 -> print(99) else print(11)", "11\n");
+    try testProgram("if 4 > 3 -> print(42)", "42\n");
+    try testProgram("if 4 <= 4 -> print(42)", "42\n");
+    try testProgram("if 3 >= 4 -> print(99) else print(11)", "11\n");
+    try testProgram("if -7 == -7 -> print(42)", "42\n");
+    try testProgram("if 9 != 9 -> print(99) else print(11)", "11\n");
 }
 
 test "if branches" {
-    try testProgram("if 3 < 4 then print(11) else print(22)", "11\n");
-    try testProgram("if 3 > 4 then print(33) else print(44)", "44\n");
+    try testProgram("if 3 < 4 -> print(11) else print(22)", "11\n");
+    try testProgram("if 3 > 4 -> print(33) else print(44)", "44\n");
 }
 
 test "if expression" {
-    try testProgram("print(if 8 > 2 then 55 else 66)", "55\n");
-    try testProgram("print(if 8 < 2 then 77 else 88)", "88\n");
-    try testProgram("print((if 2 == 2 then 5 else 6) + 7)", "12\n");
+    try testProgram("print(if 8 > 2 -> 55 else 66)", "55\n");
+    try testProgram("print(if 8 < 2 -> 77 else 88)", "88\n");
+    try testProgram("print((if 2 == 2 -> 5 else 6) + 7)", "12\n");
 }
 
 test "float arithmetic and printing" {
@@ -123,8 +123,8 @@ test "float arithmetic and printing" {
 }
 
 test "float comparisons with NaN semantics" {
-    try testProgram("if (0.0 / 0.0) == 1.0 then print(0) else print(1)", "1\n");
-    try testProgram("if (0.0 / 0.0) != 1.0 then print(1) else print(0)", "1\n");
+    try testProgram("if (0.0 / 0.0) == 1.0 -> print(0) else print(1)", "1\n");
+    try testProgram("if (0.0 / 0.0) != 1.0 -> print(1) else print(0)", "1\n");
 }
 
 test "const locals and multi-statement programs" {
@@ -147,28 +147,123 @@ test "const locals and multi-statement programs" {
 test "bool literals true and false" {
     try testProgram("print(true)", "true\n");
     try testProgram("print(false)", "false\n");
-    try testProgram("if true == false then print(0) else print(1)", "1\n");
-    try testProgram("if true != false then print(1) else print(0)", "1\n");
-    try testProgram("if true == true then print(1) else print(0)", "1\n");
+    try testProgram("if true == false -> print(0) else print(1)", "1\n");
+    try testProgram("if true != false -> print(1) else print(0)", "1\n");
+    try testProgram("if true == true -> print(1) else print(0)", "1\n");
 }
 
 test "const binding at end of file (no trailing expression)" {
     try testProgram(
         \\const x = 40 + 2
-        \\if x > 2 then print(67)
+        \\if x > 2 -> print(67)
         \\print(x)
         \\const y = false
         \\print(y)
     , "67\n42\nfalse\n");
 }
 
-test "bool literal with if" {
-    try testProgram("if 3 == 3 then print(99)", "99\n");
-    try testProgram("if 3 != 3 then print(98) else print(97)", "97\n");
+test "const binding accepts multiline if expression" {
+    try testProgram(
+        \\const x = if 1 < 2
+        \\  1
+        \\else
+        \\  2
+        \\print(x)
+    , "1\n");
 }
 
-test "if without else requires unit in then branch" {
-    try testProgram("if 3 < 4 then print(11)", "11\n");
+test "bool literal with if" {
+    try testProgram("if 3 == 3 -> print(99)", "99\n");
+    try testProgram("if 3 != 3 -> print(98) else print(97)", "97\n");
+}
+
+test "if without else requires unit then-branch" {
+    try testProgram("if 3 < 4 -> print(11)", "11\n");
+}
+
+test "if block body with indentation" {
+    try testProgram(
+        \\if 3 < 4
+        \\  print(42)
+    , "42\n");
+    try testProgram(
+        \\if 4 < 3
+        \\  print(99)
+        \\else
+        \\  print(11)
+    , "11\n");
+}
+
+test "if else if chaining" {
+    try testProgram(
+        \\if 4 < 3 -> print(99)
+        \\else if 3 > 2
+        \\  print(42)
+        \\else print(11)
+    , "42\n");
+}
+
+test "if indented else block" {
+    try testProgram(
+        \\if 4 < 3 -> print(99)
+        \\else
+        \\  print(42)
+    , "42\n");
+}
+
+test "nested if with indentation" {
+    try testProgram(
+        \\if 3 < 4
+        \\  if 5 > 2
+        \\    print(42)
+        \\else print(99)
+    , "42\n");
+}
+
+test "statement after indented if block" {
+    try testProgram(
+        \\if 1 < 2
+        \\  print(1)
+        \\print(2)
+    , "1\n2\n");
+}
+
+test "branch-local const is inaccessible in other branch" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+
+    try db.setSource(0,
+        \\if 2 < 1
+        \\  const x = 1
+        \\  print(x)
+        \\else
+        \\  print(x)
+    );
+    try expectCompileErrorContains(&db, 0, "unknown variable");
+}
+
+test "branch-local const does not leak after if" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+
+    try db.setSource(0,
+        \\if 1 < 2
+        \\  const x = 1
+        \\  print(0)
+        \\print(x)
+    );
+    try expectCompileErrorContains(&db, 0, "unknown variable");
+}
+
+test "same const name allowed across if branches" {
+    try testProgram(
+        \\if 1 < 2
+        \\  const x = 1
+        \\  print(x)
+        \\else
+        \\  const x = 2
+        \\  print(x)
+    , "1\n");
 }
 
 test "type errors" {
@@ -178,16 +273,16 @@ test "type errors" {
     try db.setSource(0, "print(1 + 2.0)");
     try expectCompileErrorContains(&db, 0, "arithmetic operands");
 
-    try db.setSource(0, "if 1 then 2 else 3");
+    try db.setSource(0, "if 1 -> 2 else 3");
     try expectCompileErrorContains(&db, 0, "If condition must be a fallible expression");
 
-    try db.setSource(0, "if 1 < 2 then 1 else 2.0");
+    try db.setSource(0, "if 1 < 2 -> 1 else 2.0");
     try expectCompileErrorContains(&db, 0, "if branches");
 
-    try db.setSource(0, "if 1 < 2 then 1");
+    try db.setSource(0, "if 1 < 2 -> 1");
     try expectCompileErrorContains(&db, 0, "without else");
 
-    try db.setSource(0, "print(if 1 < 2 then print(1) else print(2))");
+    try db.setSource(0, "print(if 1 < 2 -> print(1) else print(2))");
     try expectCompileErrorContains(&db, 0, "cannot print");
 
     try db.setSource(0, "print(x)");
@@ -227,7 +322,7 @@ test "non-fallible expression in if condition" {
     var db = query.QueryDb.init(testing.allocator);
     defer db.deinit();
 
-    try db.setSource(0, "if true then print(99)");
+    try db.setSource(0, "if true -> print(99)");
     try expectCompileErrorContains(&db, 0, "If condition must be a fallible expression");
 }
 
@@ -348,7 +443,7 @@ test "debug query diagnostics format" {
         .compile_recomputes = 1,
         .dependency_checks = 5,
     };
-    try runtime.appendQueryDiagnostics(&buf, testing.allocator, stats);
+    try query.appendQueryDiagnostics(&buf, testing.allocator, stats);
 
     try testing.expect(std.mem.indexOf(u8, buf.items, "; query diagnostics:") != null);
     try testing.expect(std.mem.indexOf(u8, buf.items, ";   revision: 7") != null);
@@ -356,4 +451,29 @@ test "debug query diagnostics format" {
     try testing.expect(std.mem.indexOf(u8, buf.items, ";   type: hits=4 recomputes=0") != null);
     try testing.expect(std.mem.indexOf(u8, buf.items, ";   compile: hits=0 recomputes=1") != null);
     try testing.expect(std.mem.indexOf(u8, buf.items, ";   dependencies: checks=5 invalidations=0") != null);
+}
+
+test "program exit code follows top-level expression value" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+
+    try db.setSource(0, "42");
+    const prog_bytes = try expectCompileOk(&db, 0);
+    writeProgram(io, prog_bytes);
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+
+    const result = try std.process.run(testing.allocator, io, .{
+        .argv = &.{"./prog"},
+    });
+    defer testing.allocator.free(result.stdout);
+    defer testing.allocator.free(result.stderr);
+
+    switch (result.term) {
+        .exited => |code| try testing.expectEqual(@as(u8, 42), code),
+        else => return error.TestFailed,
+    }
 }

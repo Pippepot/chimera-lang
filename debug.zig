@@ -13,11 +13,32 @@ fn printBranch(writer: *std.Io.Writer, b: ir_mod.Branch) void {
     if (b.arg) |arg| writer.print("  br L{d}(%{d})\n", .{ b.target, arg }) catch return else writer.print("  br L{d}\n", .{b.target}) catch return;
 }
 
-fn printCbr(writer: *std.Io.Writer, c: @FieldType(ir_mod.Terminator, "cbr")) void {
-    if (c.then_branch.arg) |then_arg| {
-        if (c.else_branch.arg) |else_arg| writer.print("  cbr %{d}, L{d}(%{d}), L{d}(%{d})\n", .{ c.cond, c.then_branch.target, then_arg, c.else_branch.target, else_arg }) catch return else writer.print("  cbr %{d}, L{d}(%{d}), L{d}\n", .{ c.cond, c.then_branch.target, then_arg, c.else_branch.target }) catch return;
+fn printPbr(writer: *std.Io.Writer, p: @FieldType(ir_mod.Terminator, "pbr")) void {
+    const op_name = @tagName(p.pred.op);
+    if (p.then_branch.arg) |then_arg| {
+        if (p.else_branch.arg) |else_arg| {
+            writer.print(
+                "  pbr {s} %{d}, %{d}, L{d}(%{d}), L{d}(%{d})\n",
+                .{ op_name, p.pred.pair.l, p.pred.pair.r, p.then_branch.target, then_arg, p.else_branch.target, else_arg },
+            ) catch return;
+        } else {
+            writer.print(
+                "  pbr {s} %{d}, %{d}, L{d}(%{d}), L{d}\n",
+                .{ op_name, p.pred.pair.l, p.pred.pair.r, p.then_branch.target, then_arg, p.else_branch.target },
+            ) catch return;
+        }
     } else {
-        if (c.else_branch.arg) |else_arg| writer.print("  cbr %{d}, L{d}, L{d}(%{d})\n", .{ c.cond, c.then_branch.target, c.else_branch.target, else_arg }) catch return else writer.print("  cbr %{d}, L{d}, L{d}\n", .{ c.cond, c.then_branch.target, c.else_branch.target }) catch return;
+        if (p.else_branch.arg) |else_arg| {
+            writer.print(
+                "  pbr {s} %{d}, %{d}, L{d}, L{d}(%{d})\n",
+                .{ op_name, p.pred.pair.l, p.pred.pair.r, p.then_branch.target, p.else_branch.target, else_arg },
+            ) catch return;
+        } else {
+            writer.print(
+                "  pbr {s} %{d}, %{d}, L{d}, L{d}\n",
+                .{ op_name, p.pred.pair.l, p.pred.pair.r, p.then_branch.target, p.else_branch.target },
+            ) catch return;
+        }
     }
 }
 
@@ -36,20 +57,6 @@ fn dumpIr(program: *const Program, writer: *std.Io.Writer) void {
                 .mulf => |p| printBinInst(writer, vinst.id, "mulf", p),
                 .divi => |p| printBinInst(writer, vinst.id, "divi", p),
                 .divf => |p| printBinInst(writer, vinst.id, "divf", p),
-                .lti => |p| printBinInst(writer, vinst.id, "lti", p),
-                .ltf => |p| printBinInst(writer, vinst.id, "ltf", p),
-                .gti => |p| printBinInst(writer, vinst.id, "gti", p),
-                .gtf => |p| printBinInst(writer, vinst.id, "gtf", p),
-                .lei => |p| printBinInst(writer, vinst.id, "lei", p),
-                .lef => |p| printBinInst(writer, vinst.id, "lef", p),
-                .gei => |p| printBinInst(writer, vinst.id, "gei", p),
-                .gef => |p| printBinInst(writer, vinst.id, "gef", p),
-                .eqi => |p| printBinInst(writer, vinst.id, "eqi", p),
-                .eqf => |p| printBinInst(writer, vinst.id, "eqf", p),
-                .eqb => |p| printBinInst(writer, vinst.id, "eqb", p),
-                .nei => |p| printBinInst(writer, vinst.id, "nei", p),
-                .nef => |p| printBinInst(writer, vinst.id, "nef", p),
-                .neb => |p| printBinInst(writer, vinst.id, "neb", p),
                 .printi => |v| writer.print("  %{d} = printi %{d}\n", .{ vinst.id, v }) catch return,
                 .printf => |v| writer.print("  %{d} = printf %{d}\n", .{ vinst.id, v }) catch return,
                 .printb => |v| writer.print("  %{d} = printb %{d}\n", .{ vinst.id, v }) catch return,
@@ -60,7 +67,7 @@ fn dumpIr(program: *const Program, writer: *std.Io.Writer) void {
         switch (terminator) {
             .ret => |v| writer.print("  ret %{d}\n", .{v}) catch return,
             .br => |b| printBranch(writer, b),
-            .cbr => |c| printCbr(writer, c),
+            .pbr => |p| printPbr(writer, p),
         }
     }
 }
@@ -107,7 +114,7 @@ fn writeAstLabel(writer: *std.Io.Writer, node: *const AstNode) void {
         .int => |v| writer.print("int {d}", .{v}) catch return,
         .float => |v| writer.print("float {d}", .{v}) catch return,
         .var_ref => |name| writer.print("var {s}", .{name}) catch return,
-        .seq => writer.writeAll("seq") catch return,
+        .block => writer.writeAll("block") catch return,
         .const_ => |data| writer.print("const {s}", .{data.name}) catch return,
         .print => writer.writeAll("print") catch return,
         .add => writer.writeAll("add") catch return,
@@ -137,13 +144,13 @@ fn dumpAstNode(node: *const AstNode, writer: *std.Io.Writer, prefix: []const u8,
     const next_prefix = appendPrefix(prefix, next_suffix, &next_prefix_buf) orelse return;
 
     switch (node.*) {
-        .seq => |kids| {
-            dumpAstNode(&kids[0], writer, next_prefix, false, false);
-            dumpAstNode(&kids[1], writer, next_prefix, true, false);
+        .block => |block| {
+            for (block.items, 0..) |item, idx| {
+                dumpAstNode(item, writer, next_prefix, idx + 1 == block.items.len, false);
+            }
         },
         .const_ => |data| {
-            dumpAstNode(data.value, writer, next_prefix, false, false);
-            dumpAstNode(data.body, writer, next_prefix, true, false);
+            dumpAstNode(data.value, writer, next_prefix, true, false);
         },
         .print => |child| dumpAstNode(child, writer, next_prefix, true, false),
         .add, .sub, .mul, .div, .lt, .gt, .le, .ge, .eq, .ne => |kids| {

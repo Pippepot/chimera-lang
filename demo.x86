@@ -1,4 +1,5 @@
-const x = 40 + 2
-if 34 < 34 then print(67)
+const x = if 34 < 34
+  1
+else
+  2
 print(x)
-const y = false

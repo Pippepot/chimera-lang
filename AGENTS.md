@@ -5,14 +5,15 @@
 - **Entry point.** `main.zig` is the main Zig file; run with `zig run main.zig -- <source-file> [program-args...]`. No `build.zig`.
 - **Module split:**
   - `main.zig` owns CLI/runtime entrypoint (`main`) and orchestration of query stages + diagnostics printing.
-  - `ast.zig` owns AST types (`AstNode`, `IfNode`, `ConstNode`).
-  - `runtime.zig` owns runtime helper entrypoints (`writeProgram`, `runProg`) plus query diagnostics formatting helper.
+  - `ast.zig` owns AST types (`AstNode`, `IfNode`, `ConstNode`, `BlockNode`).
+  - `runtime.zig` owns runtime helper entrypoints (`writeProgram`, `runProg`).
   - `parser.zig` owns lexer + parser (`parseOwned`) from source text to AST, plus `computeParse` for query integration.
   - `typecheck.zig` owns AST type inference/checking (`unit`, `bool`, `int`, `float`), plus `computeType` for query integration.
   - `query.zig` owns the revisioned incremental query system (`QueryDb`) and stage orchestration (frame management, dependency tracking, memo verification).
   - `ir.zig` owns SSA/block IR types and typed AST -> IR lowering, plus `computeLower` for query integration.
   - `codegen.zig` owns IR -> x86 machine code + ELF emission, plus `computeCompile` for query integration.
   - `db.zig` owns shared query types (`SourceId`, `Revision`, `Dependency`, `QueryKey`, `QueryStats`, `Stage`, `CompileResult`, `DbError`) and comparison helpers.
+  - `scope.zig` owns a shared lexical scope stack utility (`ScopeStack`) reused by typechecker and lowering.
   - `debug.zig` owns debug flag parsing and AST/SSA debug dumps.
   - `helpers_bin.zig` owns pre-assembled helper blobs (`print_int`, `print_bool`, `print_float32`, `atoi`).
 - **Project state** is documented in `.agents/project.md`.
@@ -32,13 +33,29 @@
 
 ## AST + parser design
 
+- **Program bodies use explicit block nodes.** Multi-statement bodies parse to `AstNode.block` containing ordered statement pointers.
 - **Binary ops** use `*const [2]AstNode` (pointer to fixed-size array of two children).
 - **Statements are newline-separated.** `;` is not a statement separator.
 - **`const` locals are lexical and non-mutable.** Rebinding/shadowing is currently rejected.
+- **`const` is statement-scoped.** `const name = expr` binds in the surrounding block scope; it no longer owns a nested `body` expression.
 - **Parentheses are grouping only.** `(...)` does not create a new scope.
 - **Parser ownership:** `parser.parseOwned` returns `ParsedAst` with an arena that owns all AST allocations.
 - **Query ownership:** parse memo values in `QueryDb` own `ParsedAst`; callers borrow `*const AstNode` via `parsedAst`.
 - **Unary minus** is lowered in parser as either negative literal or `0 - expr`.
+
+## If/else syntax (indentation-based)
+
+- **No `then` keyword.** `if` expects either `->` (inline) or a newline + indented block.
+- **Inline then-body:** `if <cond> -> <expr>` — `->` is required for inline body.
+- **Block then-body:** `if <cond>` followed by newline and indented body.
+- **Inline else-body:** `else <expr>` — no `->` needed, body is the next expression.
+- **Block else-body:** `else` followed by newline and indented body.
+- **`else if` chaining:** `else if <cond>` — the else body is an `if` expression, works naturally.
+- **Indentation tracking:** Lexer emits `indent`/`dedent` tokens using a stack of column levels. Blank lines are ignored. Multiple dedents are
+  emitted as needed (one per call via `pending_dedent`).
+- **Cross-line else binding:** `parseBlockUntil` handles `else` on a new line after an `if` without `else` via `findIfWithoutElse`.
+  Finds the rightmost unbound `if` in the preceding expression and attaches the `else` to it.
+- **`parseBlockUntil`** stops on `eof`, `r_paren`, and `dedent` (but not `kw_else` — cross-line else is handled during sequencing).
 
 ## Fail semantics (Verse-style)
 
@@ -48,11 +65,11 @@
 - **`if` condition** — must be a fallible expression. Non-fallible → error `IfConditionNotFallible`.
 - **No bool condition** — `if` no longer requires a `bool` condition. Conditions are fallible expressions, not `bool`.
 - **`if` without else** — no-op on failure. Then-body must be `unit`. Not itself fallible.
-- **Comparisons produce `unit`** — comparisons return `.unit` in the typechecker, not `.bool`. IR types are `.unit` too (instructions still produce 0/1 internally).
+- **Comparisons produce `unit`** — comparisons return `.unit` in the typechecker, not `.bool`.
 - **`bool` type** — exists for `true`/`false` literals and `printb`. Separate from fallibility.
-- **Equality on bools** — also fallible (`eqb`/`neb` IR, type `.unit`).
+- **Equality on bools** — also fallible (predicate branch `eqb`/`neb`, type `.unit`).
 - **`isFallible(node)`** — helper checking node kind against `.lt`, `.gt`, `.le`, `.ge`, `.eq`, `.ne`.
-- **Future scope** — `if const x = <expr> then ...` infrastructure prepared (condition result scoped to then-branch).
+- **Scope isolation:** each block and each `if` branch restores bindings after inference/lowering; branch-local `const` names do not leak.
 
 ## Query system design
 
@@ -72,7 +89,7 @@
 - **Use 64-bit registers** for push/pop: `push rax`, `pop rax`. `push eax` is invalid in 64-bit mode.
 - **32-bit ops are fine** in 64-bit mode: `add eax, ebx`, `sub eax, ebx`, `imul eax, ebx`, `idiv ebx`.
 - **Signed division** requires `cdq` before `idiv` (sign-extends `eax` into `edx`).
-- **Exit syscall** — `mov edi, eax` (exit code), `mov eax, 60` (syscall number), `syscall`.
+- **Exit syscall** — preserve return value as exit code via `mov edi, eax`, then set `mov eax, 60`, then `syscall`.
 
 ## Debug flags
 

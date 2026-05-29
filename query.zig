@@ -14,6 +14,18 @@ pub const Stage = db.Stage;
 pub const CompileResult = db.CompileResult;
 pub const QueryError = db.QueryError;
 
+pub fn appendQueryDiagnostics(out: *std.ArrayList(u8), gpa: std.mem.Allocator, stats: QueryStats) !void {
+    try out.appendSlice(gpa, "; query diagnostics:\n");
+    try out.print(gpa, ";   revision: {d}\n", .{stats.revision});
+    try out.print(gpa, ";   source_sets: {d}\n", .{stats.source_sets});
+    try out.print(gpa, ";   source_unchanged: {d}\n", .{stats.source_unchanged});
+    try out.print(gpa, ";   parse: hits={d} recomputes={d}\n", .{ stats.parse_hits, stats.parse_recomputes });
+    try out.print(gpa, ";   type: hits={d} recomputes={d}\n", .{ stats.type_hits, stats.type_recomputes });
+    try out.print(gpa, ";   lower: hits={d} recomputes={d}\n", .{ stats.lower_hits, stats.lower_recomputes });
+    try out.print(gpa, ";   compile: hits={d} recomputes={d}\n", .{ stats.compile_hits, stats.compile_recomputes });
+    try out.print(gpa, ";   dependencies: checks={d} invalidations={d}\n", .{ stats.dependency_checks, stats.dependency_invalidations });
+}
+
 const SourceInput = struct {
     text: []u8,
     changed_at: db.Revision,

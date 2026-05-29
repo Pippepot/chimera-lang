@@ -12,14 +12,17 @@ pub const IfNode = struct {
 pub const ConstNode = struct {
     name: []const u8,
     value: *const AstNode,
-    body: *const AstNode,
+};
+
+pub const BlockNode = struct {
+    items: []const *const AstNode,
 };
 
 pub const AstNode = union(enum) {
+    block: *const BlockNode,
     int: i32,
     float: f32,
     var_ref: []const u8,
-    seq: *const [2]AstNode,
     const_: *const ConstNode,
     print: *const AstNode,
     add: *const [2]AstNode,
