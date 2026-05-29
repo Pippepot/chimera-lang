@@ -29,6 +29,7 @@ pub const Inst = union(enum) {
     printf: ValueRef,
     printb: ValueRef,
     argi: u32,
+    store: InstPair,
 };
 
 pub const PredicateOp = enum {
@@ -287,6 +288,21 @@ const Lowerer = struct {
         return self.lowerUnitValue();
     }
 
+    fn lowerVar(self: *@This(), var_node: *const ast.VarNode) (error{OutOfMemory} || typecheck.TypeError)!ValueRef {
+        const value_ref = try self.lowerAst(var_node.value);
+        const var_slot = try self.allocValue(try self.nodeType(var_node.value));
+        _ = try self.addInst(.{ .store = .{ .l = value_ref, .r = var_slot } }, .unit);
+        try self.pushBinding(var_node.name, var_slot);
+        return self.lowerUnitValue();
+    }
+
+    fn lowerAssign(self: *@This(), assign_node: *const ast.VarNode) (error{OutOfMemory} || typecheck.TypeError)!ValueRef {
+        const value_ref = try self.lowerAst(assign_node.value);
+        const var_slot = self.lookupBinding(assign_node.name) orelse return error.UnknownVariable;
+        _ = try self.addInst(.{ .store = .{ .l = value_ref, .r = var_slot } }, .unit);
+        return self.lowerUnitValue();
+    }
+
     fn lowerBlock(self: *@This(), block_node: *const ast.BlockNode) (error{OutOfMemory} || typecheck.TypeError)!ValueRef {
         const mark = self.bindings.mark();
         defer self.bindings.restore(mark);
@@ -313,6 +329,8 @@ const Lowerer = struct {
             .int => |value| try self.addInst(.{ .iconst = value }, .int),
             .float => |value| try self.addInst(.{ .fconst = value }, .float),
             .var_ref => |name| self.lookupBinding(name) orelse return error.UnknownVariable,
+            .var_ => |var_node| try self.lowerVar(var_node),
+            .assign => |assign_node| try self.lowerAssign(assign_node),
             .const_ => |const_node| try self.lowerConst(const_node),
             .print => |child| block: {
                 const child_ref = try self.lowerAst(child);

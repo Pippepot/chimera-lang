@@ -3,6 +3,7 @@ const ast = @import("ast.zig");
 const diagnostics = @import("diagnostics.zig");
 const AstNode = ast.AstNode;
 const IfNode = ast.IfNode;
+const VarNode = ast.VarNode;
 const ConstNode = ast.ConstNode;
 const BlockNode = ast.BlockNode;
 
@@ -26,6 +27,7 @@ const TokenTag = enum {
     float_lit,
     kw_if,
     kw_const,
+    kw_var,
     kw_else,
     kw_print,
     kw_arg,
@@ -146,6 +148,7 @@ const Lexer = struct {
         const word = self.source[start..self.index];
         if (std.mem.eql(u8, word, "if")) return .{ .tag = .kw_if, .start = start, .end = self.index };
         if (std.mem.eql(u8, word, "const")) return .{ .tag = .kw_const, .start = start, .end = self.index };
+        if (std.mem.eql(u8, word, "var")) return .{ .tag = .kw_var, .start = start, .end = self.index };
         if (std.mem.eql(u8, word, "else")) return .{ .tag = .kw_else, .start = start, .end = self.index };
         if (std.mem.eql(u8, word, "print")) return .{ .tag = .kw_print, .start = start, .end = self.index };
         if (std.mem.eql(u8, word, "arg")) return .{ .tag = .kw_arg, .start = start, .end = self.index };
@@ -350,6 +353,24 @@ const Parser = struct {
         return self.allocNode(.{ .const_ = data }, span);
     }
 
+    fn makeVarNode(self: *@This(), name: []const u8, value: *const AstNode, span: ast.Span) error{OutOfMemory}!*const AstNode {
+        const data = try self.arena.create(VarNode);
+        data.* = .{
+            .name = try self.allocName(name),
+            .value = value,
+        };
+        return self.allocNode(.{ .var_ = data }, span);
+    }
+
+    fn makeAssignNode(self: *@This(), name: []const u8, value: *const AstNode, span: ast.Span) error{OutOfMemory}!*const AstNode {
+        const data = try self.arena.create(VarNode);
+        data.* = .{
+            .name = name,
+            .value = value,
+        };
+        return self.allocNode(.{ .assign = data }, span);
+    }
+
     fn makeBlockNode(self: *@This(), items: []const *const AstNode) error{OutOfMemory}!*const AstNode {
         const block = try self.arena.create(BlockNode);
         const owned_items = try self.arena.alloc(*const AstNode, items.len);
@@ -417,6 +438,7 @@ const Parser = struct {
 
     fn parseStatement(self: *@This()) (ParseError || error{OutOfMemory})!*const AstNode {
         if (self.current.tag == .kw_const) return self.parseConstBinding();
+        if (self.current.tag == .kw_var) return self.parseVarBinding();
         return self.parseExpression();
     }
 
@@ -471,7 +493,16 @@ const Parser = struct {
     }
 
     fn parseExpression(self: *@This()) (ParseError || error{OutOfMemory})!*const AstNode {
-        return self.parseComparison();
+        const node = try self.parseComparison();
+        if (self.current.tag == .assign) {
+            if (node.* != .var_ref) return error.UnexpectedToken;
+            const name = node.var_ref;
+            try self.advance();
+            const value = try self.parseExpression();
+            const span = coverSpans(self.spanOfNode(node), self.spanOfNode(value));
+            return self.makeAssignNode(name, value, span);
+        }
+        return node;
     }
 
     fn parseConstBinding(self: *@This()) (ParseError || error{OutOfMemory})!*const AstNode {
@@ -495,6 +526,29 @@ const Parser = struct {
         }
         const const_node_span = coverSpans(const_span, value_span);
         return self.makeConstNode(ident, value, const_node_span);
+    }
+
+    fn parseVarBinding(self: *@This()) (ParseError || error{OutOfMemory})!*const AstNode {
+        const var_span = tokenSpan(self.current);
+        try self.expect(.kw_var, error.UnexpectedToken);
+        if (self.current.tag != .ident) return error.ExpectedIdentifier;
+        const ident = self.current.ident;
+        try self.advance();
+        try self.expect(.assign, error.ExpectedAssign);
+        const value = try self.parseExpression();
+        const value_span = self.spanOfNode(value);
+        switch (self.current.tag) {
+            .newline, .eof, .dedent, .r_paren, .kw_else => {},
+            else => {
+                const cursor_start = if (self.current.start > self.lexer.source.len) self.lexer.source.len else self.current.start;
+                if (cursor_start <= value_span.end) return error.UnexpectedToken;
+                if (std.mem.indexOfScalar(u8, self.lexer.source[value_span.end..cursor_start], '\n') == null) {
+                    return error.UnexpectedToken;
+                }
+            },
+        }
+        const var_node_span = coverSpans(var_span, value_span);
+        return self.makeVarNode(ident, value, var_node_span);
     }
 
     fn parseComparison(self: *@This()) (ParseError || error{OutOfMemory})!*const AstNode {
@@ -709,7 +763,7 @@ pub fn parseErrorMessage(err: anyerror) []const u8 {
         error.UnexpectedToken => "unexpected token",
         error.ExpectedExpression => "expected expression",
         error.ExpectedIdentifier => "expected identifier",
-        error.ExpectedAssign => "expected '=' in const binding",
+        error.ExpectedAssign => "expected '=' in binding",
         error.ExpectedRParen => "expected ')'",
         error.ExpectedLParen => "expected '('",
         error.InvalidArgIndex => "invalid arg() index",

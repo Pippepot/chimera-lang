@@ -412,6 +412,11 @@ const BinaryEmitter = struct {
                 try self.emitMovRdiFromRbpDisp32(idx * 8);
                 try self.emitCallAndStore(self.helperSymbol(.atoi), value_inst.id);
             },
+            .store => |pair| {
+                try self.emitLoadRaxFromSlot(pair.l);
+                try self.emitStoreRaxToSlot(pair.r);
+                try self.emitStoreUnitValue(value_inst.id);
+            },
         }
     }
 

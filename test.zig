@@ -453,6 +453,93 @@ test "debug query diagnostics format" {
     try testing.expect(std.mem.indexOf(u8, buf.items, ";   dependencies: checks=5 invalidations=0") != null);
 }
 
+test "var declaration and read" {
+    try testProgram(
+        \\var x = 5
+        \\print(x)
+    , "5\n");
+    try testProgram(
+        \\var x = 40 + 2
+        \\print(x)
+    , "42\n");
+}
+
+test "var reassignment" {
+    try testProgram(
+        \\var x = 5
+        \\x = 10
+        \\print(x)
+    , "10\n");
+    try testProgram(
+        \\var x = 1
+        \\x = x + 2
+        \\print(x)
+    , "3\n");
+    try testProgram(
+        \\var x = 1
+        \\x = x + 1
+        \\print(x)
+    , "2\n");
+}
+
+test "var with const" {
+    try testProgram(
+        \\var x = 2
+        \\const y = x + 3
+        \\print(y)
+    , "5\n");
+}
+
+test "var reassignment type mismatch" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+    try db.setSource(0,
+        \\var x = 5
+        \\x = 3.0
+    );
+    try expectCompileErrorContains(&db, 0, "assignment type mismatch");
+}
+
+test "assign to const is error" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+    try db.setSource(0,
+        \\const x = 5
+        \\x = 10
+    );
+    try expectCompileErrorContains(&db, 0, "cannot assign to const");
+}
+
+test "assign to unknown variable is error" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+    try db.setSource(0, "x = 10");
+    try expectCompileErrorContains(&db, 0, "unknown variable");
+}
+
+test "var duplicate name is error" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+    try db.setSource(0,
+        \\var x = 1
+        \\var x = 2
+    );
+    try expectCompileErrorContains(&db, 0, "duplicate variable");
+}
+
+test "var branch-local scope isolation" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+    try db.setSource(0,
+        \\if 1 < 2
+        \\  var x = 1
+        \\  print(x)
+        \\else
+        \\  print(x)
+    );
+    try expectCompileErrorContains(&db, 0, "unknown variable");
+}
+
 test "program exit code follows top-level expression value" {
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();

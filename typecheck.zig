@@ -25,6 +25,8 @@ pub const TypeError = error{
     FallibleOutsideFallibleContext,
     IfBranchTypeMismatch,
     IfWithoutElseRequiresUnit,
+    AssignToConst,
+    AssignmentTypeMismatch,
     MissingNodeType,
 };
 
@@ -68,14 +70,21 @@ pub fn typeErrorMessage(kind: TypeError) []const u8 {
         error.FallibleOutsideFallibleContext => "Fallible expression is not allowed outside fallible context",
         error.IfBranchTypeMismatch => "if branches must return the same type",
         error.IfWithoutElseRequiresUnit => "if without else must have unit then-branch",
+        error.AssignToConst => "cannot assign to const variable",
+        error.AssignmentTypeMismatch => "assignment type mismatch",
         error.MissingNodeType => "internal type table mismatch",
     };
 }
 
+const Binding = struct {
+    ty: Type,
+    mutable: bool,
+};
+
 const Checker = struct {
     gpa: std.mem.Allocator,
     typed: TypedAst,
-    bindings: scope_mod.ScopeStack(Type),
+    bindings: scope_mod.ScopeStack(Binding),
     failure: ?Failure,
     in_fallible_scope: bool,
 
@@ -90,7 +99,7 @@ const Checker = struct {
         return .{
             .gpa = gpa,
             .typed = TypedAst.init(gpa),
-            .bindings = scope_mod.ScopeStack(Type).init(),
+            .bindings = scope_mod.ScopeStack(Binding).init(),
             .failure = null,
             .in_fallible_scope = false,
         };
@@ -113,14 +122,14 @@ const Checker = struct {
         return error.TypecheckFailed;
     }
 
-    fn pushBinding(self: *@This(), node: *const AstNode, name: []const u8, ty: Type) InferError!void {
-        self.bindings.push(self.gpa, name, ty) catch |err| switch (err) {
+    fn pushBinding(self: *@This(), node: *const AstNode, name: []const u8, binding: Binding) InferError!void {
+        self.bindings.push(self.gpa, name, binding) catch |err| switch (err) {
             error.DuplicateVariable => return self.fail(node, error.DuplicateVariable),
             error.OutOfMemory => return error.OutOfMemory,
         };
     }
 
-    fn lookupBinding(self: *const @This(), name: []const u8) ?Type {
+    fn lookupBinding(self: *const @This(), name: []const u8) ?Binding {
         return self.bindings.lookup(name);
     }
 
@@ -196,7 +205,21 @@ const Checker = struct {
 
     fn inferConst(self: *@This(), node: *const AstNode, const_node: *const ast.ConstNode) InferError!Type {
         const value_ty = try self.inferNode(const_node.value);
-        try self.pushBinding(node, const_node.name, value_ty);
+        try self.pushBinding(node, const_node.name, .{ .ty = value_ty, .mutable = false });
+        return self.remember(node, .unit);
+    }
+
+    fn inferVar(self: *@This(), node: *const AstNode, var_node: *const ast.VarNode) InferError!Type {
+        const value_ty = try self.inferNode(var_node.value);
+        try self.pushBinding(node, var_node.name, .{ .ty = value_ty, .mutable = true });
+        return self.remember(node, .unit);
+    }
+
+    fn inferAssign(self: *@This(), node: *const AstNode, assign_node: *const ast.VarNode) InferError!Type {
+        const value_ty = try self.inferNode(assign_node.value);
+        const binding = self.lookupBinding(assign_node.name) orelse return self.fail(node, error.UnknownVariable);
+        if (!binding.mutable) return self.fail(node, error.AssignToConst);
+        if (binding.ty != value_ty) return self.fail(node, error.AssignmentTypeMismatch);
         return self.remember(node, .unit);
     }
 
@@ -223,7 +246,9 @@ const Checker = struct {
             .block => |block_node| self.inferBlock(node, block_node),
             .int => self.remember(node, .int),
             .float => self.remember(node, .float),
-            .var_ref => |name| self.remember(node, self.lookupBinding(name) orelse return self.fail(node, error.UnknownVariable)),
+            .var_ref => |name| self.remember(node, (self.lookupBinding(name) orelse return self.fail(node, error.UnknownVariable)).ty),
+            .var_ => |var_node| self.inferVar(node, var_node),
+            .assign => |assign_node| self.inferAssign(node, assign_node),
             .const_ => |const_node| self.inferConst(node, const_node),
             .arg => self.remember(node, .int),
             .print => |child| block: {

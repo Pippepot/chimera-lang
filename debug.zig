@@ -61,6 +61,7 @@ fn dumpIr(program: *const Program, writer: *std.Io.Writer) void {
                 .printf => |v| writer.print("  %{d} = printf %{d}\n", .{ vinst.id, v }) catch return,
                 .printb => |v| writer.print("  %{d} = printb %{d}\n", .{ vinst.id, v }) catch return,
                 .argi => |idx| writer.print("  %{d} = argi %{d}\n", .{ vinst.id, idx }) catch return,
+                .store => |p| printBinInst(writer, vinst.id, "store", p),
             }
         }
         const terminator = blk.terminator orelse return;
@@ -116,6 +117,8 @@ fn writeAstLabel(writer: *std.Io.Writer, node: *const AstNode) void {
         .var_ref => |name| writer.print("var {s}", .{name}) catch return,
         .block => writer.writeAll("block") catch return,
         .const_ => |data| writer.print("const {s}", .{data.name}) catch return,
+        .var_ => |data| writer.print("var {s}", .{data.name}) catch return,
+        .assign => |data| writer.print("assign {s}", .{data.name}) catch return,
         .print => writer.writeAll("print") catch return,
         .add => writer.writeAll("add") catch return,
         .sub => writer.writeAll("sub") catch return,
@@ -150,6 +153,12 @@ fn dumpAstNode(node: *const AstNode, writer: *std.Io.Writer, prefix: []const u8,
             }
         },
         .const_ => |data| {
+            dumpAstNode(data.value, writer, next_prefix, true, false);
+        },
+        .var_ => |data| {
+            dumpAstNode(data.value, writer, next_prefix, true, false);
+        },
+        .assign => |data| {
             dumpAstNode(data.value, writer, next_prefix, true, false);
         },
         .print => |child| dumpAstNode(child, writer, next_prefix, true, false),

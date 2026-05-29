@@ -9,6 +9,11 @@ pub const IfNode = struct {
     else_: ?*const AstNode,
 };
 
+pub const VarNode = struct {
+    name: []const u8,
+    value: *const AstNode,
+};
+
 pub const ConstNode = struct {
     name: []const u8,
     value: *const AstNode,
@@ -23,6 +28,8 @@ pub const AstNode = union(enum) {
     int: i32,
     float: f32,
     var_ref: []const u8,
+    var_: *const VarNode,
+    assign: *const VarNode,
     const_: *const ConstNode,
     print: *const AstNode,
     add: *const [2]AstNode,

@@ -7,7 +7,7 @@
 | File | Description |
 |------|-------------|
 | `main.zig` | CLI entrypoint (`main`) and query pipeline orchestration |
-| `ast.zig` | AST node types (`AstNode`, `IfNode`, `ConstNode`, `BlockNode`) |
+| `ast.zig` | AST node types (`AstNode`, `IfNode`, `VarNode`, `ConstNode`, `BlockNode`) |
 | `runtime.zig` | Runtime helpers (`writeProgram`, `runProg`) |
 | `parser.zig` | Lexer + recursive descent parser (`parseOwned`) from source text to AST |
 | `typecheck.zig` | Type inference/checking over AST (`unit`, `bool`, `int`, `float`) |
@@ -24,7 +24,7 @@
 
 | Symbol | File | Description |
 |--------|------|-------------|
-| `AstNode`, `IfNode`, `ConstNode`, `BlockNode` | `ast.zig` | AST node types |
+| `AstNode`, `IfNode`, `VarNode`, `ConstNode`, `BlockNode` | `ast.zig` | AST node types |
 | `parseOwned(source, gpa)` | `parser.zig` | Parse source string into arena-owned AST |
 | `Program`, `Block`, `Inst`, `Predicate`, `Terminator`, `Branch` | `ir.zig` | SSA/block IR model |
 | `lower(node, typed, gpa)` | `ir.zig` | Typed AST -> `Program` |
@@ -102,11 +102,12 @@ Use `--debug=ast,ssa,timing,query`:
 - `if`/`else` uses indentation-based blocks (no `then` keyword). Use `->` for inline body, or newline + indent for block body.
 - `else` does not require `->` for inline body; just `else <expr>`.
 - Statements are newline-separated; `;` is not supported as a statement separator.
-- `const` locals are supported, non-mutable, and duplicate names are rejected.
+- `const` locals are non-mutable, `var` locals are mutable, and duplicate names are rejected for both.
+- Reassignment (`name = expr`) produces unit and validates mutability and type match.
 - Multi-statement programs are represented as explicit `AstNode.block`.
 - Parentheses are expression grouping only and do not create scope boundaries.
 - **Fail semantics:** `if` conditions must be fallible expressions (comparisons). Fallible expressions can only appear inside `if` conditions. Comparisons produce `unit` on success (not `bool`).
-- Block/branch lexical scope is isolated: branch-local `const` names do not leak into sibling branches or following statements.
+- Block/branch lexical scope is isolated: branch-local `const` and `var` names do not leak into sibling branches or following statements.
 - Implementation plan at `.agents/fail-semantics.md`.
 
 ## Tests
@@ -141,3 +142,6 @@ Use `--debug=ast,ssa,timing,query`:
 26. Query diagnostics formatting.
 27. Program exit code follows top-level expression value.
 28. Helper enum/index mapping.
+29. `var` declaration and read.
+30. `var` reassignment.
+31. `var` type mismatch error, assign-to-const error, unknown variable error, duplicate var error, branch-local `var` scope isolation.

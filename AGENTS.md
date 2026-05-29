@@ -5,7 +5,7 @@
 - **Entry point.** `main.zig` is the main Zig file; run with `zig run main.zig -- <source-file> [program-args...]`. No `build.zig`.
 - **Module split:**
   - `main.zig` owns CLI/runtime entrypoint (`main`) and orchestration of query stages + diagnostics printing.
-  - `ast.zig` owns AST types (`AstNode`, `IfNode`, `ConstNode`, `BlockNode`).
+  - `ast.zig` owns AST types (`AstNode`, `IfNode`, `VarNode`, `ConstNode`, `BlockNode`).
   - `runtime.zig` owns runtime helper entrypoints (`writeProgram`, `runProg`).
   - `parser.zig` owns lexer + parser (`parseOwned`) from source text to AST, plus `computeParse` for query integration.
   - `typecheck.zig` owns AST type inference/checking (`unit`, `bool`, `int`, `float`), plus `computeType` for query integration.
@@ -36,12 +36,22 @@
 - **Program bodies use explicit block nodes.** Multi-statement bodies parse to `AstNode.block` containing ordered statement pointers.
 - **Binary ops** use `*const [2]AstNode` (pointer to fixed-size array of two children).
 - **Statements are newline-separated.** `;` is not a statement separator.
-- **`const` locals are lexical and non-mutable.** Rebinding/shadowing is currently rejected.
+- **`const` locals are lexical and non-mutable.** `var` locals are lexical and mutable. Rebinding/shadowing is currently rejected for both.
 - **`const` is statement-scoped.** `const name = expr` binds in the surrounding block scope; it no longer owns a nested `body` expression.
 - **Parentheses are grouping only.** `(...)` does not create a new scope.
 - **Parser ownership:** `parser.parseOwned` returns `ParsedAst` with an arena that owns all AST allocations.
 - **Query ownership:** parse memo values in `QueryDb` own `ParsedAst`; callers borrow `*const AstNode` via `parsedAst`.
 - **Unary minus** is lowered in parser as either negative literal or `0 - expr`.
+
+## Var (mutable variables)
+
+- **`var` locals** are mutable and use the same syntax as `const`: `var name = expr`.
+- **Reassignment:** `name = expr` produces unit (can be used as an expression).
+- **Type system:** Checker tracks `Binding { ty, mutable }` via `ScopeStack(Binding)`. Assignment validates mutability and type match.
+- **IR lowering:** `var` evaluates the initializer, allocates a dedicated value slot via `allocValue`, emits a `store` IR instruction copying the initial value into the var slot, and binds the name to the slot. `assign` looks up the slot and emits another `store`. Reads (`var_ref`) load from the slot.
+- **`store` IR instruction:** `InstPair { l = src_value, r = dst_slot }`, emits `mov rax, [rsp+src]; mov [rsp+dst], rax` in codegen.
+- **Scope isolation:** `var` bindings use the same scope stack as `const`; branch-local vars are automatically isolated by existing mark/restore pattern.
+- **Restrictions:** duplicate names rejected, reassigning to `const` errors, type mismatch on assignment errors.
 
 ## If/else syntax (indentation-based)
 
