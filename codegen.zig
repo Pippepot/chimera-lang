@@ -8,16 +8,24 @@ const InstRef = ir_mod.ValueRef;
 const InstPair = ir_mod.InstPair;
 const Inst = ir_mod.Inst;
 const BlockId = ir_mod.BlockId;
+const FuncId = ir_mod.FuncId;
 const Program = ir_mod.Program;
+const Function = ir_mod.Function;
+
+const FunctionLayout = struct {
+    symbol: u32,
+    block_symbols: []u32,
+};
+
 const BinaryEmitter = struct {
     prog: *const Program,
     gpa: std.mem.Allocator,
     code: std.ArrayList(u8),
-    block_params: []?InstRef,
-    block_symbols: []u32,
-    helper_symbols: []u32,
     symbols: std.ArrayList(?u32),
     fixups: std.ArrayList(RelFixup),
+    start_symbol: u32,
+    function_layouts: []FunctionLayout,
+    helper_symbols: []u32,
 
     const SetccCond = enum(u8) {
         b = 0x92,
@@ -48,56 +56,105 @@ const BinaryEmitter = struct {
         return value_ref * 8;
     }
 
+    fn frameSize(next_value: InstRef) u32 {
+        const raw = slotOffset(next_value);
+        return std.mem.alignForward(u32, raw, 16);
+    }
+
     fn init(prog: *const Program, gpa: std.mem.Allocator) !@This() {
-        var code = try std.ArrayList(u8).initCapacity(gpa, 1024);
+        var code = try std.ArrayList(u8).initCapacity(gpa, 2048);
         errdefer code.deinit(gpa);
 
-        var block_params = try gpa.alloc(?InstRef, prog.blocks.items.len);
-        errdefer gpa.free(block_params);
-        @memset(block_params, null);
+        var symbols = try std.ArrayList(?u32).initCapacity(gpa, 256);
+        errdefer symbols.deinit(gpa);
 
-        var block_symbols = try gpa.alloc(u32, prog.blocks.items.len);
-        errdefer gpa.free(block_symbols);
+        var fixups = try std.ArrayList(RelFixup).initCapacity(gpa, 256);
+        errdefer fixups.deinit(gpa);
+
+        var function_layouts = try gpa.alloc(FunctionLayout, prog.functions.items.len);
+        errdefer gpa.free(function_layouts);
 
         var helper_symbols = try gpa.alloc(u32, helpers.all_helpers.len);
         errdefer gpa.free(helper_symbols);
 
-        var symbols = try std.ArrayList(?u32).initCapacity(gpa, prog.blocks.items.len + 16);
-        errdefer symbols.deinit(gpa);
+        const start_symbol = try createSymbol(&symbols, gpa);
 
-        var fixups = try std.ArrayList(RelFixup).initCapacity(gpa, 128);
-        errdefer fixups.deinit(gpa);
-
-        for (prog.blocks.items) |block| {
-            block_params[block.id] = block.param;
-            try symbols.append(gpa, null);
-            block_symbols[block.id] = @intCast(symbols.items.len - 1);
+        for (prog.functions.items, 0..) |func, fn_idx| {
+            const fn_symbol = try createSymbol(&symbols, gpa);
+            const block_symbols = try gpa.alloc(u32, func.blocks.items.len);
+            errdefer gpa.free(block_symbols);
+            for (func.blocks.items, 0..) |_, block_idx| {
+                block_symbols[block_idx] = try createSymbol(&symbols, gpa);
+            }
+            function_layouts[fn_idx] = .{
+                .symbol = fn_symbol,
+                .block_symbols = block_symbols,
+            };
         }
 
         for (helpers.all_helpers, 0..) |_, idx| {
-            try symbols.append(gpa, null);
-            helper_symbols[idx] = @intCast(symbols.items.len - 1);
+            helper_symbols[idx] = try createSymbol(&symbols, gpa);
         }
 
         return .{
             .prog = prog,
             .gpa = gpa,
             .code = code,
-            .block_params = block_params,
-            .block_symbols = block_symbols,
-            .helper_symbols = helper_symbols,
             .symbols = symbols,
             .fixups = fixups,
+            .start_symbol = start_symbol,
+            .function_layouts = function_layouts,
+            .helper_symbols = helper_symbols,
         };
     }
 
+    fn createSymbol(symbols: *std.ArrayList(?u32), gpa: std.mem.Allocator) !u32 {
+        try symbols.append(gpa, null);
+        return @intCast(symbols.items.len - 1);
+    }
+
     fn deinit(self: *@This()) void {
+        for (self.function_layouts) |layout| {
+            self.gpa.free(layout.block_symbols);
+        }
+        self.gpa.free(self.function_layouts);
+        self.gpa.free(self.helper_symbols);
         self.code.deinit(self.gpa);
         self.symbols.deinit(self.gpa);
         self.fixups.deinit(self.gpa);
-        self.gpa.free(self.block_params);
-        self.gpa.free(self.block_symbols);
-        self.gpa.free(self.helper_symbols);
+    }
+
+    fn layoutFor(self: *const @This(), fn_id: FuncId) *const FunctionLayout {
+        return &self.function_layouts[fn_id];
+    }
+
+    fn helperSymbol(self: *const @This(), id: helpers.HelperId) u32 {
+        const helper_idx: usize = @intFromEnum(id);
+        return self.helper_symbols[helper_idx];
+    }
+
+    fn bindSymbol(self: *@This(), symbol: u32) void {
+        std.debug.assert(self.symbols.items[symbol] == null);
+        self.symbols.items[symbol] = @intCast(self.code.items.len);
+    }
+
+    fn addRel32Fixup(self: *@This(), symbol: u32) !void {
+        const disp_pos: u32 = @intCast(self.code.items.len);
+        try self.appendLeI32(0);
+        try self.fixups.append(self.gpa, .{ .disp_pos = disp_pos, .symbol = symbol });
+    }
+
+    fn resolveFixups(self: *@This()) !void {
+        for (self.fixups.items) |fixup| {
+            const target = self.symbols.items[fixup.symbol] orelse return error.MissingSymbol;
+            const target_i64: i64 = @intCast(target);
+            const next_ip_i64 = @as(i64, fixup.disp_pos) + 4;
+            const rel_i64 = target_i64 - next_ip_i64;
+            if (rel_i64 < std.math.minInt(i32) or rel_i64 > std.math.maxInt(i32)) return error.BranchOutOfRange;
+            const rel_i32: i32 = @intCast(rel_i64);
+            const disp_pos: usize = @intCast(fixup.disp_pos);
+            std.mem.writeInt(i32, self.code.items[disp_pos..][0..4], rel_i32, .little);
+        }
     }
 
     fn appendByte(self: *@This(), byte: u8) !void {
@@ -120,30 +177,13 @@ const BinaryEmitter = struct {
         try self.appendBytes(&bytes);
     }
 
-    fn createSymbol(self: *@This()) !u32 {
-        try self.symbols.append(self.gpa, null);
-        return @intCast(self.symbols.items.len - 1);
-    }
-
-    fn helperSymbol(self: *@This(), id: helpers.HelperId) u32 {
-        const helper_idx: usize = @intFromEnum(id);
-        return self.helper_symbols[helper_idx];
-    }
-
-    fn bindSymbol(self: *@This(), symbol: u32) void {
-        std.debug.assert(self.symbols.items[symbol] == null);
-        self.symbols.items[symbol] = @intCast(self.code.items.len);
-    }
-
-    fn addRel32Fixup(self: *@This(), symbol: u32) !void {
-        const disp_pos: u32 = @intCast(self.code.items.len);
-        try self.appendLeI32(0);
-        try self.fixups.append(self.gpa, .{ .disp_pos = disp_pos, .symbol = symbol });
-    }
-
-    fn emitCall(self: *@This(), symbol: u32) !void {
+    fn emitCallRel(self: *@This(), symbol: u32) !void {
         try self.appendByte(0xE8);
         try self.addRel32Fixup(symbol);
+    }
+
+    fn emitCallRax(self: *@This()) !void {
+        try self.appendBytes(&.{ 0xFF, 0xD0 });
     }
 
     fn emitJmp(self: *@This(), symbol: u32) !void {
@@ -161,21 +201,28 @@ const BinaryEmitter = struct {
         try self.addRel32Fixup(symbol);
     }
 
-    fn resolveFixups(self: *@This()) !void {
-        for (self.fixups.items) |fixup| {
-            const target = self.symbols.items[fixup.symbol] orelse return error.MissingSymbol;
-            const target_i64: i64 = @intCast(target);
-            const next_ip_i64 = @as(i64, fixup.disp_pos) + 4;
-            const rel_i64 = target_i64 - next_ip_i64;
-            if (rel_i64 < std.math.minInt(i32) or rel_i64 > std.math.maxInt(i32)) return error.BranchOutOfRange;
-            const rel_i32: i32 = @intCast(rel_i64);
-            const disp_pos: usize = @intCast(fixup.disp_pos);
-            std.mem.writeInt(i32, self.code.items[disp_pos..][0..4], rel_i32, .little);
-        }
+    fn emitPushRbp(self: *@This()) !void {
+        try self.appendByte(0x55);
     }
 
-    fn emitLeaRbpRspPlus8(self: *@This()) !void {
-        try self.appendBytes(&.{ 0x48, 0x8D, 0x6C, 0x24, 0x08 });
+    fn emitMovRbpRsp(self: *@This()) !void {
+        try self.appendBytes(&.{ 0x48, 0x89, 0xE5 });
+    }
+
+    fn emitMovRspRbp(self: *@This()) !void {
+        try self.appendBytes(&.{ 0x48, 0x89, 0xEC });
+    }
+
+    fn emitPopRbp(self: *@This()) !void {
+        try self.appendByte(0x5D);
+    }
+
+    fn emitRet(self: *@This()) !void {
+        try self.appendByte(0xC3);
+    }
+
+    fn emitLeaR15RspPlus8(self: *@This()) !void {
+        try self.appendBytes(&.{ 0x4C, 0x8D, 0x7C, 0x24, 0x08 });
     }
 
     fn emitSubRspImm32(self: *@This(), value: u32) !void {
@@ -208,6 +255,32 @@ const BinaryEmitter = struct {
         try self.appendLeU32(slotOffset(value_ref));
     }
 
+    fn emitLoadRegFromSlot(self: *@This(), reg_index: usize, value_ref: InstRef) !void {
+        switch (reg_index) {
+            0 => try self.appendBytes(&.{ 0x48, 0x8B, 0xBC, 0x24 }), // rdi
+            1 => try self.appendBytes(&.{ 0x48, 0x8B, 0xB4, 0x24 }), // rsi
+            2 => try self.appendBytes(&.{ 0x48, 0x8B, 0x94, 0x24 }), // rdx
+            3 => try self.appendBytes(&.{ 0x48, 0x8B, 0x8C, 0x24 }), // rcx
+            4 => try self.appendBytes(&.{ 0x4C, 0x8B, 0x84, 0x24 }), // r8
+            5 => try self.appendBytes(&.{ 0x4C, 0x8B, 0x8C, 0x24 }), // r9
+            else => return error.UnsupportedRegister,
+        }
+        try self.appendLeU32(slotOffset(value_ref));
+    }
+
+    fn emitStoreRegToSlot(self: *@This(), reg_index: usize, value_ref: InstRef) !void {
+        switch (reg_index) {
+            0 => try self.appendBytes(&.{ 0x48, 0x89, 0xBC, 0x24 }), // rdi
+            1 => try self.appendBytes(&.{ 0x48, 0x89, 0xB4, 0x24 }), // rsi
+            2 => try self.appendBytes(&.{ 0x48, 0x89, 0x94, 0x24 }), // rdx
+            3 => try self.appendBytes(&.{ 0x48, 0x89, 0x8C, 0x24 }), // rcx
+            4 => try self.appendBytes(&.{ 0x4C, 0x89, 0x84, 0x24 }), // r8
+            5 => try self.appendBytes(&.{ 0x4C, 0x89, 0x8C, 0x24 }), // r9
+            else => return error.UnsupportedRegister,
+        }
+        try self.appendLeU32(slotOffset(value_ref));
+    }
+
     fn emitLoadXmm0FromSlot(self: *@This(), value_ref: InstRef) !void {
         try self.appendBytes(&.{ 0xF3, 0x0F, 0x10, 0x84, 0x24 });
         try self.appendLeU32(slotOffset(value_ref));
@@ -233,8 +306,8 @@ const BinaryEmitter = struct {
         try self.emitStoreRaxToSlot(dst_ref);
     }
 
-    fn emitMovRdiFromRbpDisp32(self: *@This(), disp: u32) !void {
-        try self.appendBytes(&.{ 0x48, 0x8B, 0xBD });
+    fn emitMovRdiFromArgv(self: *@This(), disp: u32) !void {
+        try self.appendBytes(&.{ 0x49, 0x8B, 0xBF });
         try self.appendLeU32(disp);
     }
 
@@ -302,8 +375,13 @@ const BinaryEmitter = struct {
         try self.appendBytes(&.{ 0x0F, 0x05 });
     }
 
-    fn branchCopy(self: *@This(), branch: ir_mod.Branch) ?BranchCopy {
-        const dst = self.block_params[branch.target] orelse return null;
+    fn emitLeaRaxSymbol(self: *@This(), symbol: u32) !void {
+        try self.appendBytes(&.{ 0x48, 0x8D, 0x05 });
+        try self.addRel32Fixup(symbol);
+    }
+
+    fn branchCopy(branch: ir_mod.Branch, block_params: []const ?InstRef) ?BranchCopy {
+        const dst = block_params[branch.target] orelse return null;
         const src = branch.arg orelse unreachable;
         if (src == dst) return null;
         return .{ .src = src, .dst = dst };
@@ -375,7 +453,31 @@ const BinaryEmitter = struct {
         try self.emitStoreRaxToSlot(out);
     }
 
-    fn emitValueInst(self: *@This(), value_inst: ir_mod.ValueInst) !void {
+    fn emitCallAndStore(self: *@This(), symbol: u32, out: InstRef) !void {
+        try self.emitCallRel(symbol);
+        try self.emitStoreRaxToSlot(out);
+    }
+
+    fn emitFunctionPrologue(self: *@This(), func: *const Function) !void {
+        try self.emitPushRbp();
+        try self.emitMovRbpRsp();
+
+        const size = frameSize(func.next_value);
+        if (size > 0) try self.emitSubRspImm32(size);
+
+        for (func.param_values.items, 0..) |slot, idx| {
+            try self.emitStoreRegToSlot(idx, slot);
+        }
+    }
+
+    fn emitFunctionReturn(self: *@This(), value_ref: InstRef) !void {
+        try self.emitLoadRaxFromSlot(value_ref);
+        try self.emitMovRspRbp();
+        try self.emitPopRbp();
+        try self.emitRet();
+    }
+
+    fn emitValueInst(self: *@This(), value_inst: ir_mod.ValueInst, fn_layout: *const FunctionLayout) !void {
         switch (value_inst.op) {
             .iconst => |value| {
                 try self.emitMovEaxImm32(value);
@@ -383,6 +485,20 @@ const BinaryEmitter = struct {
             },
             .fconst => |value| {
                 try self.emitMovEaxImmU32(@bitCast(value));
+                try self.emitStoreRaxToSlot(value_inst.id);
+            },
+            .fn_addr => |fn_id| {
+                const symbol = self.layoutFor(fn_id).symbol;
+                try self.emitLeaRaxSymbol(symbol);
+                try self.emitStoreRaxToSlot(value_inst.id);
+            },
+            .call => |call_info| {
+                var idx: usize = 0;
+                while (idx < call_info.argc) : (idx += 1) {
+                    try self.emitLoadRegFromSlot(idx, call_info.args[idx]);
+                }
+                try self.emitLoadRaxFromSlot(call_info.callee);
+                try self.emitCallRax();
                 try self.emitStoreRaxToSlot(value_inst.id);
             },
             .addi => |pair| try self.emitBinaryArithmeticInt(pair, .add, value_inst.id),
@@ -395,21 +511,21 @@ const BinaryEmitter = struct {
             .divf => |pair| try self.emitBinaryDivFloat(pair, value_inst.id),
             .printi => |value_ref| {
                 try self.emitLoadEaxFromSlot(value_ref);
-                try self.emitCall(self.helperSymbol(.print_int));
+                try self.emitCallRel(self.helperSymbol(.print_int));
                 try self.emitStoreUnitValue(value_inst.id);
             },
             .printf => |value_ref| {
                 try self.emitLoadXmm0FromSlot(value_ref);
-                try self.emitCall(self.helperSymbol(.print_float32));
+                try self.emitCallRel(self.helperSymbol(.print_float32));
                 try self.emitStoreUnitValue(value_inst.id);
             },
             .printb => |value_ref| {
                 try self.emitLoadEaxFromSlot(value_ref);
-                try self.emitCall(self.helperSymbol(.print_bool));
+                try self.emitCallRel(self.helperSymbol(.print_bool));
                 try self.emitStoreUnitValue(value_inst.id);
             },
             .argi => |idx| {
-                try self.emitMovRdiFromRbpDisp32(idx * 8);
+                try self.emitMovRdiFromArgv(idx * 8);
                 try self.emitCallAndStore(self.helperSymbol(.atoi), value_inst.id);
             },
             .store => |pair| {
@@ -418,24 +534,13 @@ const BinaryEmitter = struct {
                 try self.emitStoreUnitValue(value_inst.id);
             },
         }
+        _ = fn_layout;
     }
 
-    fn emitCallAndStore(self: *@This(), symbol: u32, out: InstRef) !void {
-        try self.emitCall(symbol);
-        try self.emitStoreRaxToSlot(out);
-    }
-
-    fn emitReturn(self: *@This(), value_ref: InstRef) !void {
-        try self.emitLoadEaxFromSlot(value_ref);
-        try self.emitMovEdiEax();
-        try self.emitMovEaxImm32(60);
-        try self.emitSyscall();
-    }
-
-    fn emitBranch(self: *@This(), branch: ir_mod.Branch) !void {
-        const maybe_copy = self.branchCopy(branch);
+    fn emitBranch(self: *@This(), branch: ir_mod.Branch, block_symbols: []const u32, block_params: []const ?InstRef) !void {
+        const maybe_copy = branchCopy(branch, block_params);
         if (maybe_copy) |copy| try self.emitCopySlot(copy.src, copy.dst);
-        try self.emitJmp(self.block_symbols[branch.target]);
+        try self.emitJmp(block_symbols[branch.target]);
     }
 
     fn emitPredicateValueToEax(self: *@This(), pred: ir_mod.Predicate) !void {
@@ -457,13 +562,19 @@ const BinaryEmitter = struct {
         }
     }
 
-    fn emitBranchOnEaxNonZero(self: *@This(), then_branch: ir_mod.Branch, else_branch: ir_mod.Branch) !void {
+    fn emitBranchOnEaxNonZero(
+        self: *@This(),
+        then_branch: ir_mod.Branch,
+        else_branch: ir_mod.Branch,
+        block_symbols: []const u32,
+        block_params: []const ?InstRef,
+    ) !void {
         try self.emitCmpEaxZero();
 
-        const then_copy = self.branchCopy(then_branch);
-        const else_copy = self.branchCopy(else_branch);
-        const then_symbol = self.block_symbols[then_branch.target];
-        const else_symbol = self.block_symbols[else_branch.target];
+        const then_copy = branchCopy(then_branch, block_params);
+        const else_copy = branchCopy(else_branch, block_params);
+        const then_symbol = block_symbols[then_branch.target];
+        const else_symbol = block_symbols[else_branch.target];
 
         if (then_copy == null and else_copy == null) {
             try self.emitJe(else_symbol);
@@ -487,7 +598,7 @@ const BinaryEmitter = struct {
             return;
         }
 
-        const prep_symbol = try self.createSymbol();
+        const prep_symbol = try createSymbol(&self.symbols, self.gpa);
         try self.emitJe(prep_symbol);
         const then_copy_value = then_copy.?;
         try self.emitCopySlot(then_copy_value.src, then_copy_value.dst);
@@ -499,24 +610,71 @@ const BinaryEmitter = struct {
         try self.emitJmp(else_symbol);
     }
 
-    fn emitPredicateBranch(self: *@This(), pbr: @FieldType(ir_mod.Terminator, "pbr")) !void {
+    fn emitPredicateBranch(
+        self: *@This(),
+        pbr: @FieldType(ir_mod.Terminator, "pbr"),
+        block_symbols: []const u32,
+        block_params: []const ?InstRef,
+    ) !void {
         try self.emitPredicateValueToEax(pbr.pred);
-        try self.emitBranchOnEaxNonZero(pbr.then_branch, pbr.else_branch);
+        try self.emitBranchOnEaxNonZero(pbr.then_branch, pbr.else_branch, block_symbols, block_params);
     }
 
-    fn emitTerm(self: *@This(), term: ir_mod.Terminator) !void {
+    fn emitTerm(
+        self: *@This(),
+        term: ir_mod.Terminator,
+        block_symbols: []const u32,
+        block_params: []const ?InstRef,
+    ) !void {
         switch (term) {
-            .br => |branch| try self.emitBranch(branch),
-            .pbr => |pbr| try self.emitPredicateBranch(pbr),
-            .ret => |value_ref| try self.emitReturn(value_ref),
+            .br => |branch| try self.emitBranch(branch, block_symbols, block_params),
+            .pbr => |pbr| try self.emitPredicateBranch(pbr, block_symbols, block_params),
+            .ret => |value_ref| try self.emitFunctionReturn(value_ref),
         }
     }
 
-    fn emitBlock(self: *@This(), block: ir_mod.Block) !void {
-        self.bindSymbol(self.block_symbols[block.id]);
-        for (block.insts.items) |value_inst| try self.emitValueInst(value_inst);
+    fn emitBlock(
+        self: *@This(),
+        block: ir_mod.Block,
+        symbol: u32,
+        block_symbols: []const u32,
+        block_params: []const ?InstRef,
+        fn_layout: *const FunctionLayout,
+    ) !void {
+        self.bindSymbol(symbol);
+        for (block.insts.items) |value_inst| try self.emitValueInst(value_inst, fn_layout);
         const terminator = block.terminator orelse unreachable;
-        try self.emitTerm(terminator);
+        try self.emitTerm(terminator, block_symbols, block_params);
+    }
+
+    fn emitFunction(self: *@This(), func: *const Function) !void {
+        const layout = self.layoutFor(func.id);
+        self.bindSymbol(layout.symbol);
+        try self.emitFunctionPrologue(func);
+
+        if (func.entry != 0) {
+            try self.emitJmp(layout.block_symbols[func.entry]);
+        }
+
+        var block_params = try self.gpa.alloc(?InstRef, func.blocks.items.len);
+        defer self.gpa.free(block_params);
+        for (func.blocks.items) |block| {
+            block_params[block.id] = block.param;
+        }
+
+        for (func.blocks.items, 0..) |block, block_idx| {
+            try self.emitBlock(block, layout.block_symbols[block_idx], layout.block_symbols, block_params, layout);
+        }
+    }
+
+    fn emitStart(self: *@This()) !void {
+        self.bindSymbol(self.start_symbol);
+        try self.emitLeaR15RspPlus8();
+        const entry_layout = self.layoutFor(self.prog.entry);
+        try self.emitCallRel(entry_layout.symbol);
+        try self.emitMovEdiEax();
+        try self.emitMovEaxImm32(60);
+        try self.emitSyscall();
     }
 
     fn appendHelpers(self: *@This()) !void {
@@ -527,14 +685,10 @@ const BinaryEmitter = struct {
     }
 
     fn emitProgram(self: *@This()) ![]const u8 {
-        try self.emitLeaRbpRspPlus8();
-
-        const frame_size = slotOffset(self.prog.next_value);
-        if (frame_size > 0) try self.emitSubRspImm32(frame_size);
-
-        if (self.prog.entry != 0) try self.emitJmp(self.block_symbols[self.prog.entry]);
-
-        for (self.prog.blocks.items) |block| try self.emitBlock(block);
+        try self.emitStart();
+        for (self.prog.functions.items) |*func| {
+            try self.emitFunction(func);
+        }
         try self.appendHelpers();
         try self.resolveFixups();
         return self.code.toOwnedSlice(self.gpa);

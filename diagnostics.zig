@@ -3,7 +3,9 @@ const ast = @import("ast.zig");
 
 pub const Stage = enum {
     parse,
+    resolve,
     typecheck,
+    monomorphize,
     lower,
     compile,
 };

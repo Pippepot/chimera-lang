@@ -2,21 +2,34 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const diagnostics = @import("diagnostics.zig");
 const typecheck = @import("typecheck.zig");
+const monomorphize = @import("monomorphize.zig");
 const scope_mod = @import("scope.zig");
+const db = @import("db.zig");
+
 const AstNode = ast.AstNode;
 const Type = typecheck.Type;
 
 pub const ValueRef = u32;
 pub const BlockId = u32;
+pub const FuncId = u32;
+pub const MaxCallArgs: usize = 6;
 
 pub const InstPair = struct {
     l: ValueRef,
     r: ValueRef,
 };
 
+pub const CallInst = struct {
+    callee: ValueRef,
+    argc: u8,
+    args: [MaxCallArgs]ValueRef,
+};
+
 pub const Inst = union(enum) {
     iconst: i32,
     fconst: f32,
+    fn_addr: FuncId,
+    call: CallInst,
     addi: InstPair,
     addf: InstPair,
     subi: InstPair,
@@ -94,58 +107,170 @@ pub const Block = struct {
     }
 };
 
-pub const Program = struct {
+pub const Function = struct {
+    id: FuncId,
+    name: []const u8,
     entry: BlockId,
     blocks: std.ArrayList(Block),
     value_types: std.ArrayList(Type),
     next_value: ValueRef,
+    param_values: std.ArrayList(ValueRef),
+    ret_type: Type,
 
-    pub fn deinit(self: *Program, gpa: std.mem.Allocator) void {
+    pub fn deinit(self: *Function, gpa: std.mem.Allocator) void {
         for (self.blocks.items) |*block| block.deinit(gpa);
         self.blocks.deinit(gpa);
         self.value_types.deinit(gpa);
+        self.param_values.deinit(gpa);
     }
+};
+
+pub const Program = struct {
+    entry: FuncId,
+    functions: std.ArrayList(Function),
+
+    pub fn deinit(self: *Program, gpa: std.mem.Allocator) void {
+        for (self.functions.items) |*func| func.deinit(gpa);
+        self.functions.deinit(gpa);
+    }
+};
+
+const LowerError = error{
+    UnknownSymbol,
+    UnknownFunction,
+    TooManyCallArgs,
 };
 
 const Lowerer = struct {
     gpa: std.mem.Allocator,
     typed: *const typecheck.TypedAst,
-    bindings: scope_mod.ScopeStack(ValueRef),
-    prog: Program,
-    current_block_id: BlockId,
+    mono: *const monomorphize.MonoProgram,
+    function_ids: std.StringHashMap(FuncId),
 
-    fn init(gpa: std.mem.Allocator, typed: *const typecheck.TypedAst) error{OutOfMemory}!Lowerer {
-        var blocks = try std.ArrayList(Block).initCapacity(gpa, 8);
-        errdefer blocks.deinit(gpa);
-        var value_types = try std.ArrayList(Type).initCapacity(gpa, 32);
-        errdefer value_types.deinit(gpa);
+    fn init(gpa: std.mem.Allocator, typed: *const typecheck.TypedAst, mono: *const monomorphize.MonoProgram) !Lowerer {
+        var function_ids = std.StringHashMap(FuncId).init(gpa);
+        errdefer function_ids.deinit();
 
-        const entry_param: ?ValueRef = null;
-        var entry_block = try Block.init(gpa, 0, entry_param);
-        errdefer entry_block.deinit(gpa);
-        try blocks.append(gpa, entry_block);
+        for (mono.functions.items, 0..) |mono_fn, idx| {
+            try function_ids.put(mono_fn.decl.name, @intCast(idx));
+        }
 
         return .{
             .gpa = gpa,
             .typed = typed,
-            .bindings = scope_mod.ScopeStack(ValueRef).init(),
-            .prog = .{
-                .entry = 0,
-                .blocks = blocks,
-                .value_types = value_types,
-                .next_value = 0,
-            },
-            .current_block_id = 0,
+            .mono = mono,
+            .function_ids = function_ids,
         };
     }
 
-    fn currentBlock(self: *@This()) *Block {
-        return &self.prog.blocks.items[self.current_block_id];
+    fn deinit(self: *@This()) void {
+        self.function_ids.deinit();
     }
 
-    fn pushBinding(self: *@This(), name: []const u8, value_ref: ValueRef) (std.mem.Allocator.Error || typecheck.TypeError)!void {
-        self.bindings.push(self.gpa, name, value_ref) catch |err| switch (err) {
-            error.DuplicateVariable => return error.DuplicateVariable,
+    fn allocFunction(self: *@This(), id: FuncId, name: []const u8, ret_type: Type) !Function {
+        var blocks = try std.ArrayList(Block).initCapacity(self.gpa, 8);
+        errdefer blocks.deinit(self.gpa);
+
+        var value_types = try std.ArrayList(Type).initCapacity(self.gpa, 32);
+        errdefer value_types.deinit(self.gpa);
+
+        var params = try std.ArrayList(ValueRef).initCapacity(self.gpa, 8);
+        errdefer params.deinit(self.gpa);
+
+        var entry_block = try Block.init(self.gpa, 0, null);
+        errdefer entry_block.deinit(self.gpa);
+        try blocks.append(self.gpa, entry_block);
+
+        return .{
+            .id = id,
+            .name = name,
+            .entry = 0,
+            .blocks = blocks,
+            .value_types = value_types,
+            .next_value = 0,
+            .param_values = params,
+            .ret_type = ret_type,
+        };
+    }
+
+    fn lowerProgram(self: *@This()) !Program {
+        var functions = try std.ArrayList(Function).initCapacity(self.gpa, self.mono.functions.items.len);
+        errdefer {
+            for (functions.items) |*func| func.deinit(self.gpa);
+            functions.deinit(self.gpa);
+        }
+
+        for (self.mono.functions.items, 0..) |mono_fn, idx| {
+            var fn_lower = try FunctionLowerer.init(self, @intCast(idx), mono_fn);
+            errdefer fn_lower.deinit();
+
+            var lowered = try fn_lower.run();
+            errdefer lowered.deinit(self.gpa);
+            try functions.append(self.gpa, lowered);
+        }
+
+        return .{
+            .entry = self.mono.entry_function,
+            .functions = functions,
+        };
+    }
+};
+
+const FunctionLowerer = struct {
+    parent: *Lowerer,
+    function: Function,
+    bindings: scope_mod.ScopeStack(ValueRef),
+    current_block_id: BlockId,
+    mono_fn: monomorphize.MonoFunction,
+
+    fn init(parent: *Lowerer, fn_id: FuncId, mono_fn: monomorphize.MonoFunction) !FunctionLowerer {
+        const ret_type = mono_fn.ty.ret;
+        var function = try parent.allocFunction(fn_id, mono_fn.decl.name, ret_type);
+        errdefer function.deinit(parent.gpa);
+
+        return .{
+            .parent = parent,
+            .function = function,
+            .bindings = scope_mod.ScopeStack(ValueRef).init(),
+            .current_block_id = 0,
+            .mono_fn = mono_fn,
+        };
+    }
+
+    fn deinit(self: *@This()) void {
+        self.bindings.deinit(self.parent.gpa);
+        self.function.deinit(self.parent.gpa);
+    }
+
+    fn currentBlock(self: *@This()) *Block {
+        return &self.function.blocks.items[self.current_block_id];
+    }
+
+    fn allocValue(self: *@This(), ty: Type) error{OutOfMemory}!ValueRef {
+        const value_id = self.function.next_value;
+        self.function.next_value += 1;
+        try self.function.value_types.append(self.parent.gpa, ty);
+        return value_id;
+    }
+
+    fn addInst(self: *@This(), op: Inst, ty: Type) error{OutOfMemory}!ValueRef {
+        const value_id = try self.allocValue(ty);
+        try self.currentBlock().insts.append(self.parent.gpa, .{ .id = value_id, .op = op });
+        return value_id;
+    }
+
+    fn newBlock(self: *@This(), param_type: ?Type) error{OutOfMemory}!BlockId {
+        const block_id: BlockId = @intCast(self.function.blocks.items.len);
+        const block_param = if (param_type) |ty| try self.allocValue(ty) else null;
+        var block = try Block.init(self.parent.gpa, block_id, block_param);
+        errdefer block.deinit(self.parent.gpa);
+        try self.function.blocks.append(self.parent.gpa, block);
+        return block_id;
+    }
+
+    fn pushBinding(self: *@This(), name: []const u8, value_ref: ValueRef) !void {
+        self.bindings.push(self.parent.gpa, name, value_ref) catch |err| switch (err) {
+            error.DuplicateVariable => return error.UnknownSymbol,
             error.OutOfMemory => return error.OutOfMemory,
         };
     }
@@ -154,35 +279,22 @@ const Lowerer = struct {
         return self.bindings.lookup(name);
     }
 
-    fn allocValue(self: *@This(), ty: Type) error{OutOfMemory}!ValueRef {
-        const value_id = self.prog.next_value;
-        self.prog.next_value += 1;
-        try self.prog.value_types.append(self.gpa, ty);
-        return value_id;
+    fn nodeType(self: *const @This(), node: *const AstNode) typecheck.TypeError!Type {
+        return self.parent.typed.typeOf(node);
     }
 
-    fn addInst(self: *@This(), op: Inst, ty: Type) error{OutOfMemory}!ValueRef {
-        const value_id = try self.allocValue(ty);
-        try self.currentBlock().insts.append(self.gpa, .{ .id = value_id, .op = op });
-        return value_id;
-    }
-
-    fn newBlock(self: *@This(), param_type: ?Type) error{OutOfMemory}!BlockId {
-        const block_id: BlockId = @intCast(self.prog.blocks.items.len);
-        const block_param = if (param_type) |ty| try self.allocValue(ty) else null;
-        var block = try Block.init(self.gpa, block_id, block_param);
-        errdefer block.deinit(self.gpa);
-        try self.prog.blocks.append(self.gpa, block);
-        return block_id;
-    }
-
-    fn lowerPairOperands(self: *@This(), kids: *const [2]AstNode) (error{OutOfMemory} || typecheck.TypeError)!InstPair {
+    fn lowerPairOperands(self: *@This(), kids: *const [2]AstNode) (error{OutOfMemory} || LowerError || typecheck.TypeError)!InstPair {
         const left = try self.lowerAst(&kids[0]);
         const right = try self.lowerAst(&kids[1]);
         return .{ .l = left, .r = right };
     }
 
-    fn addPairInst(self: *@This(), comptime tag: std.meta.Tag(Inst), kids: *const [2]AstNode, result_type: Type) (error{OutOfMemory} || typecheck.TypeError)!ValueRef {
+    fn addPairInst(
+        self: *@This(),
+        comptime tag: std.meta.Tag(Inst),
+        kids: *const [2]AstNode,
+        result_type: Type,
+    ) (error{OutOfMemory} || LowerError || typecheck.TypeError)!ValueRef {
         const operands = try self.lowerPairOperands(kids);
         return self.addInst(@unionInit(Inst, @tagName(tag), operands), result_type);
     }
@@ -191,17 +303,16 @@ const Lowerer = struct {
         return self.addInst(.{ .iconst = 0 }, .unit);
     }
 
-    fn lowerElseValue(self: *@This(), else_node: ?*const AstNode) (error{OutOfMemory} || typecheck.TypeError)!ValueRef {
-        if (else_node) |node| {
-            const mark = self.bindings.mark();
-            defer self.bindings.restore(mark);
-            return self.lowerAst(node);
-        }
-        return self.lowerUnitValue();
-    }
-
-    fn nodeType(self: *const @This(), node: *const AstNode) typecheck.TypeError!Type {
-        return self.typed.typeOf(node);
+    fn lowerConditionPredicate(self: *@This(), cond: *const AstNode) (error{OutOfMemory} || LowerError || typecheck.TypeError)!Predicate {
+        return switch (cond.*) {
+            .lt => |kids| self.lowerComparisonPredicate(kids, .lti, .ltf),
+            .gt => |kids| self.lowerComparisonPredicate(kids, .gti, .gtf),
+            .le => |kids| self.lowerComparisonPredicate(kids, .lei, .lef),
+            .ge => |kids| self.lowerComparisonPredicate(kids, .gei, .gef),
+            .eq => |kids| self.lowerEqualityPredicate(kids, .eqi, .eqf, .eqb),
+            .ne => |kids| self.lowerEqualityPredicate(kids, .nei, .nef, .neb),
+            else => error.IfConditionNotFallible,
+        };
     }
 
     fn lowerComparisonPredicate(
@@ -209,7 +320,7 @@ const Lowerer = struct {
         kids: *const [2]AstNode,
         int_op: PredicateOp,
         float_op: PredicateOp,
-    ) (error{OutOfMemory} || typecheck.TypeError)!Predicate {
+    ) (error{OutOfMemory} || LowerError || typecheck.TypeError)!Predicate {
         const pair = try self.lowerPairOperands(kids);
         const operand_ty = try self.nodeType(&kids[0]);
         return .{
@@ -224,7 +335,7 @@ const Lowerer = struct {
         int_op: PredicateOp,
         float_op: PredicateOp,
         bool_op: PredicateOp,
-    ) (error{OutOfMemory} || typecheck.TypeError)!Predicate {
+    ) (error{OutOfMemory} || LowerError || typecheck.TypeError)!Predicate {
         const pair = try self.lowerPairOperands(kids);
         const operand_ty = try self.nodeType(&kids[0]);
         return .{
@@ -232,25 +343,43 @@ const Lowerer = struct {
                 .int => int_op,
                 .float => float_op,
                 .bool => bool_op,
-                .unit => unreachable,
+                .unit, .named, .func => unreachable,
             },
             .pair = pair,
         };
     }
 
-    fn lowerConditionPredicate(self: *@This(), cond: *const AstNode) (error{OutOfMemory} || typecheck.TypeError)!Predicate {
-        return switch (cond.*) {
-            .lt => |kids| self.lowerComparisonPredicate(kids, .lti, .ltf),
-            .gt => |kids| self.lowerComparisonPredicate(kids, .gti, .gtf),
-            .le => |kids| self.lowerComparisonPredicate(kids, .lei, .lef),
-            .ge => |kids| self.lowerComparisonPredicate(kids, .gei, .gef),
-            .eq => |kids| self.lowerEqualityPredicate(kids, .eqi, .eqf, .eqb),
-            .ne => |kids| self.lowerEqualityPredicate(kids, .nei, .nef, .neb),
-            else => error.IfConditionNotFallible,
+    fn lowerArithmetic(
+        self: *@This(),
+        node: *const AstNode,
+        kids: *const [2]AstNode,
+        comptime int_tag: std.meta.Tag(Inst),
+        comptime float_tag: std.meta.Tag(Inst),
+    ) (error{OutOfMemory} || LowerError || typecheck.TypeError)!ValueRef {
+        return switch (try self.nodeType(node)) {
+            .int => try self.addPairInst(int_tag, kids, .int),
+            .float => try self.addPairInst(float_tag, kids, .float),
+            else => unreachable,
         };
     }
 
-    fn lowerIf(self: *@This(), node: *const AstNode, if_node: *const ast.IfNode) (error{OutOfMemory} || typecheck.TypeError)!ValueRef {
+    fn lowerCall(self: *@This(), node: *const AstNode, call_node: *const ast.CallNode) (error{OutOfMemory} || LowerError || typecheck.TypeError)!ValueRef {
+        if (call_node.args.len > MaxCallArgs) return error.TooManyCallArgs;
+
+        var args: [MaxCallArgs]ValueRef = [_]ValueRef{0} ** MaxCallArgs;
+        for (call_node.args, 0..) |arg_node, idx| {
+            args[idx] = try self.lowerAst(arg_node);
+        }
+
+        const callee = try self.lowerAst(call_node.callee);
+        return self.addInst(.{ .call = .{
+            .callee = callee,
+            .argc = @intCast(call_node.args.len),
+            .args = args,
+        } }, try self.nodeType(node));
+    }
+
+    fn lowerIf(self: *@This(), node: *const AstNode, if_node: *const ast.IfNode) (error{OutOfMemory} || LowerError || typecheck.TypeError)!ValueRef {
         const predicate = try self.lowerConditionPredicate(if_node.cond);
         const if_ty = try self.nodeType(node);
 
@@ -266,29 +395,54 @@ const Lowerer = struct {
             },
         };
 
+        var then_fallthrough = false;
         self.current_block_id = then_block_id;
         const then_value = then_blk: {
             const mark = self.bindings.mark();
             defer self.bindings.restore(mark);
             break :then_blk try self.lowerAst(if_node.then_);
         };
-        self.currentBlock().terminator = .{ .br = .{ .target = merge_block_id, .arg = then_value } };
+        if (self.currentBlock().terminator == null) {
+            self.currentBlock().terminator = .{ .br = .{ .target = merge_block_id, .arg = then_value } };
+            then_fallthrough = true;
+        }
 
+        var else_fallthrough = false;
         self.current_block_id = else_block_id;
-        const else_value = try self.lowerElseValue(if_node.else_);
-        self.currentBlock().terminator = .{ .br = .{ .target = merge_block_id, .arg = else_value } };
+        const else_value = else_blk: {
+            const mark = self.bindings.mark();
+            defer self.bindings.restore(mark);
+            if (if_node.else_) |else_node| {
+                break :else_blk try self.lowerAst(else_node);
+            }
+            break :else_blk try self.lowerUnitValue();
+        };
+        if (self.currentBlock().terminator == null) {
+            self.currentBlock().terminator = .{ .br = .{ .target = merge_block_id, .arg = else_value } };
+            else_fallthrough = true;
+        }
 
         self.current_block_id = merge_block_id;
-        return self.currentBlock().param orelse unreachable;
-    }
-
-    fn lowerConst(self: *@This(), const_node: *const ast.ConstNode) (error{OutOfMemory} || typecheck.TypeError)!ValueRef {
-        const value_ref = try self.lowerAst(const_node.value);
-        try self.pushBinding(const_node.name, value_ref);
+        if (then_fallthrough or else_fallthrough) {
+            return self.currentBlock().param orelse unreachable;
+        }
         return self.lowerUnitValue();
     }
 
-    fn lowerVar(self: *@This(), var_node: *const ast.VarNode) (error{OutOfMemory} || typecheck.TypeError)!ValueRef {
+    fn lowerBlock(self: *@This(), block_node: *const ast.BlockNode) (error{OutOfMemory} || LowerError || typecheck.TypeError)!ValueRef {
+        const mark = self.bindings.mark();
+        defer self.bindings.restore(mark);
+
+        var result: ?ValueRef = null;
+        for (block_node.items) |item| {
+            if (self.currentBlock().terminator != null) break;
+            result = try self.lowerAst(item);
+        }
+        if (result) |value| return value;
+        return self.lowerUnitValue();
+    }
+
+    fn lowerVar(self: *@This(), var_node: *const ast.VarNode) (error{OutOfMemory} || LowerError || typecheck.TypeError)!ValueRef {
         const value_ref = try self.lowerAst(var_node.value);
         const var_slot = try self.allocValue(try self.nodeType(var_node.value));
         _ = try self.addInst(.{ .store = .{ .l = value_ref, .r = var_slot } }, .unit);
@@ -296,52 +450,54 @@ const Lowerer = struct {
         return self.lowerUnitValue();
     }
 
-    fn lowerAssign(self: *@This(), assign_node: *const ast.VarNode) (error{OutOfMemory} || typecheck.TypeError)!ValueRef {
+    fn lowerConst(self: *@This(), const_node: *const ast.ConstNode) (error{OutOfMemory} || LowerError || typecheck.TypeError)!ValueRef {
+        const value_ref = try self.lowerAst(const_node.value);
+        try self.pushBinding(const_node.name, value_ref);
+        return self.lowerUnitValue();
+    }
+
+    fn lowerAssign(self: *@This(), assign_node: *const ast.VarNode) (error{OutOfMemory} || LowerError || typecheck.TypeError)!ValueRef {
         const value_ref = try self.lowerAst(assign_node.value);
-        const var_slot = self.lookupBinding(assign_node.name) orelse return error.UnknownVariable;
-        _ = try self.addInst(.{ .store = .{ .l = value_ref, .r = var_slot } }, .unit);
+        const dst = self.lookupBinding(assign_node.name) orelse return error.UnknownSymbol;
+        _ = try self.addInst(.{ .store = .{ .l = value_ref, .r = dst } }, .unit);
         return self.lowerUnitValue();
     }
 
-    fn lowerBlock(self: *@This(), block_node: *const ast.BlockNode) (error{OutOfMemory} || typecheck.TypeError)!ValueRef {
-        const mark = self.bindings.mark();
-        defer self.bindings.restore(mark);
-
-        var result: ?ValueRef = null;
-        for (block_node.items) |item| {
-            result = try self.lowerAst(item);
-        }
-        if (result) |value| return value;
-        return self.lowerUnitValue();
+    fn lowerReturn(self: *@This(), return_node: *const ast.ReturnNode) (error{OutOfMemory} || LowerError || typecheck.TypeError)!ValueRef {
+        const value_ref = try self.lowerAst(return_node.value);
+        self.currentBlock().terminator = .{ .ret = value_ref };
+        return value_ref;
     }
 
-    fn lowerArithmetic(self: *@This(), node: *const AstNode, kids: *const [2]AstNode, comptime int_tag: std.meta.Tag(Inst), comptime float_tag: std.meta.Tag(Inst)) (error{OutOfMemory} || typecheck.TypeError)!ValueRef {
-        return switch (try self.nodeType(node)) {
-            .int => try self.addPairInst(int_tag, kids, .int),
-            .float => try self.addPairInst(float_tag, kids, .float),
-            else => unreachable,
-        };
+    fn lowerVarRef(self: *@This(), name: []const u8) (error{OutOfMemory} || LowerError || typecheck.TypeError)!ValueRef {
+        if (self.lookupBinding(name)) |value| return value;
+        const fn_id = self.parent.function_ids.get(name) orelse return error.UnknownFunction;
+        return self.addInst(.{ .fn_addr = fn_id }, .{ .func = self.parent.typed.functionType(fn_id) });
     }
 
-    fn lowerAst(self: *@This(), node: *const AstNode) (error{OutOfMemory} || typecheck.TypeError)!ValueRef {
+    fn lowerAst(self: *@This(), node: *const AstNode) (error{OutOfMemory} || LowerError || typecheck.TypeError)!ValueRef {
         return switch (node.*) {
-            .block => |block_node| try self.lowerBlock(block_node),
+            .block => |blk| try self.lowerBlock(blk),
             .int => |value| try self.addInst(.{ .iconst = value }, .int),
             .float => |value| try self.addInst(.{ .fconst = value }, .float),
-            .var_ref => |name| self.lookupBinding(name) orelse return error.UnknownVariable,
-            .var_ => |var_node| try self.lowerVar(var_node),
-            .assign => |assign_node| try self.lowerAssign(assign_node),
-            .const_ => |const_node| try self.lowerConst(const_node),
-            .print => |child| block: {
+            .bool => |value| try self.addInst(.{ .iconst = if (value) @as(i32, 1) else 0 }, .bool),
+            .unit => try self.lowerUnitValue(),
+            .var_ref => |name| try self.lowerVarRef(name),
+            .var_ => |vn| try self.lowerVar(vn),
+            .const_ => |cn| try self.lowerConst(cn),
+            .assign => |an| try self.lowerAssign(an),
+            .return_ => |rn| try self.lowerReturn(rn),
+            .call => |call_node| try self.lowerCall(node, call_node),
+            .print => |child| blk: {
                 const child_ref = try self.lowerAst(child);
                 const child_ty = try self.nodeType(child);
                 const print_op: Inst = switch (child_ty) {
                     .int => .{ .printi = child_ref },
                     .float => .{ .printf = child_ref },
                     .bool => .{ .printb = child_ref },
-                    .unit => unreachable,
+                    else => unreachable,
                 };
-                break :block try self.addInst(print_op, .unit);
+                break :blk try self.addInst(print_op, .unit);
             },
             .add => |kids| try self.lowerArithmetic(node, kids, .addi, .addf),
             .sub => |kids| try self.lowerArithmetic(node, kids, .subi, .subf),
@@ -350,24 +506,43 @@ const Lowerer = struct {
             .arg => |idx| try self.addInst(.{ .argi = idx }, .int),
             .lt, .gt, .le, .ge, .eq, .ne => error.IfConditionNotFallible,
             .if_ => |if_node| try self.lowerIf(node, if_node),
-            .bool => |value| try self.addInst(.{ .iconst = if (value) @as(i32, 1) else 0 }, .bool),
-            .unit => try self.lowerUnitValue(),
         };
+    }
+
+    fn setupParams(self: *@This()) !void {
+        for (self.mono_fn.decl.params, self.mono_fn.ty.params) |param, param_ty| {
+            const slot = try self.allocValue(param_ty);
+            try self.function.param_values.append(self.parent.gpa, slot);
+            try self.pushBinding(param.name, slot);
+        }
+    }
+
+    fn run(self: *@This()) !Function {
+        try self.setupParams();
+
+        const result = try self.lowerAst(self.mono_fn.decl.body);
+        if (self.currentBlock().terminator == null) {
+            self.currentBlock().terminator = .{ .ret = result };
+        }
+
+        self.bindings.deinit(self.parent.gpa);
+        return self.function;
     }
 };
 
-const parser = @import("parser.zig");
-const db = @import("db.zig");
-
 pub const LowerMemo = db.Memo(Program);
 
-pub fn computeLower(type_memo: *const typecheck.TypeMemo, parse_memo: *const parser.ParseMemo, gpa: std.mem.Allocator) error{OutOfMemory}!LowerMemo {
-    var diagnostics_list = try db.initDiagnosticList(gpa, type_memo.diagnostics.items, 1);
+pub fn computeLower(
+    mono_memo: *const monomorphize.MonomorphizeMemo,
+    type_memo: *const typecheck.TypeMemo,
+    gpa: std.mem.Allocator,
+) error{OutOfMemory}!LowerMemo {
+    var diagnostics_list = try db.initDiagnosticList(gpa, mono_memo.diagnostics.items, 1);
     errdefer diagnostics_list.deinit(gpa);
 
     var lowered_value: ?Program = null;
-    if (type_memo.value != null and parse_memo.value != null) {
-        const lowered = lower(parse_memo.value.?.root, &type_memo.value.?, gpa) catch |err| switch (err) {
+    if (mono_memo.value != null and type_memo.value != null) {
+        const lowered = lower(&mono_memo.value.?, &type_memo.value.?, gpa) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => blk: {
                 try db.appendStageError(&diagnostics_list, gpa, .lower, @errorName(err));
@@ -380,13 +555,9 @@ pub fn computeLower(type_memo: *const typecheck.TypeMemo, parse_memo: *const par
     return db.makeMemo(Program, lowered_value, diagnostics_list);
 }
 
-pub fn lower(node: *const AstNode, typed: *const typecheck.TypedAst, gpa: std.mem.Allocator) (error{OutOfMemory} || typecheck.TypeError)!Program {
-    var lowerer = try Lowerer.init(gpa, typed);
-    errdefer lowerer.prog.deinit(gpa);
-    defer lowerer.bindings.deinit(gpa);
+pub fn lower(mono: *const monomorphize.MonoProgram, typed: *const typecheck.TypedAst, gpa: std.mem.Allocator) !Program {
+    var lowerer = try Lowerer.init(gpa, typed, mono);
+    defer lowerer.deinit();
 
-    const result = try lowerer.lowerAst(node);
-    lowerer.currentBlock().terminator = .{ .ret = result };
-
-    return lowerer.prog;
+    return lowerer.lowerProgram();
 }

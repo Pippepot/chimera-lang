@@ -5,12 +5,14 @@
 - **Entry point.** `main.zig` is the main Zig file; run with `zig run main.zig -- <source-file> [program-args...]`. No `build.zig`.
 - **Module split:**
   - `main.zig` owns CLI/runtime entrypoint (`main`) and orchestration of query stages + diagnostics printing.
-  - `ast.zig` owns AST types (`AstNode`, `IfNode`, `VarNode`, `ConstNode`, `BlockNode`).
+  - `ast.zig` owns AST module/declaration/type nodes and expression nodes (`AstNode`, `IfNode`, `VarNode`, `ConstNode`, `BlockNode`).
   - `runtime.zig` owns runtime helper entrypoints (`writeProgram`, `runProg`).
-  - `parser.zig` owns lexer + parser (`parseOwned`) from source text to AST, plus `computeParse` for query integration.
-  - `typecheck.zig` owns AST type inference/checking (`unit`, `bool`, `int`, `float`), plus `computeType` for query integration.
+  - `parser.zig` owns lexer + parser (`parseOwned`) from source text to module AST, plus `computeParse` for query integration.
+  - `resolver.zig` owns pre-typecheck symbol resolution (`computeResolve`) and symbol diagnostics.
+  - `typecheck.zig` owns type inference/checking (`unit`, `bool`, `int`, `float`, function types), plus `computeType` for query integration.
+  - `monomorphize.zig` owns the monomorphization stage artifact (`computeMonomorphize`).
   - `query.zig` owns the revisioned incremental query system (`QueryDb`) and stage orchestration (frame management, dependency tracking, memo verification).
-  - `ir.zig` owns SSA/block IR types and typed AST -> IR lowering, plus `computeLower` for query integration.
+  - `ir.zig` owns multi-function IR types and typed AST -> IR lowering, plus `computeLower` for query integration.
   - `codegen.zig` owns IR -> x86 machine code + ELF emission, plus `computeCompile` for query integration.
   - `db.zig` owns shared query types (`SourceId`, `Revision`, `Dependency`, `QueryKey`, `QueryStats`, `Stage`, `CompileResult`, `DbError`) and comparison helpers.
   - `scope.zig` owns a shared lexical scope stack utility (`ScopeStack`) reused by typechecker and lowering.
@@ -33,10 +35,12 @@
 
 ## AST + parser design
 
+- **Program root is module + optional top-level entry block.** Parse produces declarations and an executable top-level entry node (`Module.entry`), and top-level statements are valid.
 - **Program bodies use explicit block nodes.** Multi-statement bodies parse to `AstNode.block` containing ordered statement pointers.
 - **Binary ops** use `*const [2]AstNode` (pointer to fixed-size array of two children).
 - **Statements are newline-separated.** `;` is not a statement separator.
 - **`const` locals are lexical and non-mutable.** `var` locals are lexical and mutable. Rebinding/shadowing is currently rejected for both.
+- **Binding annotations are optional.** `const`/`var` support `name: Type = expr`; annotation must match inferred RHS type.
 - **`const` is statement-scoped.** `const name = expr` binds in the surrounding block scope; it no longer owns a nested `body` expression.
 - **Parentheses are grouping only.** `(...)` does not create a new scope.
 - **Parser ownership:** `parser.parseOwned` returns `ParsedAst` with an arena that owns all AST allocations.
@@ -85,7 +89,7 @@
 
 - **`QueryDb` is reusable state.** Keep one DB across revisions to get incremental behavior.
 - **Inputs are virtual source IDs.** `setSource(source_id, text)` updates source text and revision tracking.
-- **Stage queries:** `parse(source_id)` -> `typecheck(source_id)` -> `lower(source_id)` -> `compile(source_id)`.
+- **Stage queries:** `parse(source_id)` -> `resolve(source_id)` -> `typecheck(source_id)` -> `monomorphize(source_id)` -> `lower(source_id)` -> `compile(source_id)`.
 - **Memo metadata:** each memo tracks `deps`, `verified_at`, `changed_at`, and `computing`.
 - **Red/green verification:**
   - If `verified_at == current_revision`, it is an immediate hit.

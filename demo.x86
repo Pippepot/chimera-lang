@@ -1,5 +1,4 @@
-const x = if 34 < 34
-  1
-else
-  2
-print(x)
+comptime Foo = struct
+  x: int
+var foo = Foo{x = 10}
+print(foo.x)

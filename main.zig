@@ -20,10 +20,10 @@ const StageTiming = struct {
     duration: std.Io.Duration,
 };
 
-fn printStageTimings(io: std.Io, stages: []const StageTiming, total: std.Io.Duration) !void {
+fn printStageTimings(io: std.Io, header: []const u8, stages: []const StageTiming, total: std.Io.Duration) !void {
     var wbuf: [2048]u8 = undefined;
     var w = std.Io.File.stderr().writer(io, &wbuf);
-    try w.interface.writeAll("; timing diagnostics:\n");
+    try w.interface.print("; {s}:\n", .{header});
     for (stages) |stage| {
         try w.interface.print(";   {s}: {d} us\n", .{ stage.label, stage.duration.toMicroseconds() });
     }
@@ -63,7 +63,6 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
 
     const flags = debug.parseDebugFlags(init.minimal.args);
-    const total_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
 
     var cli_args_list = try std.ArrayList([]const u8).initCapacity(gpa, 4);
     defer cli_args_list.deinit(gpa);
@@ -101,24 +100,48 @@ pub fn main(init: std.process.Init) !void {
     const set_source_duration = if (set_source_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
 
     const parse_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
-    const root = try qdb.parsedAst(source_id);
+    const module = try qdb.parsedAst(source_id);
     const parse_duration = if (parse_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
+
+    const resolve_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
+    _ = try qdb.resolvedAst(source_id);
+    const resolve_duration = if (resolve_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
 
     const type_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
     _ = try qdb.typedAst(source_id);
     const type_duration = if (type_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
+
+    const mono_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
+    _ = try qdb.monomorphizedProgram(source_id);
+    const mono_duration = if (mono_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
 
     const lower_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
     const ir = try qdb.loweredProgram(source_id);
     const lower_duration = if (lower_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
 
     const debug_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
-    try debug.dumpDebugInfo(io, flags, root, ir, gpa);
+    try debug.dumpDebugInfo(io, flags, module, ir, gpa);
     const debug_duration = if (debug_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
 
     const compile_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
     const compile_result = try qdb.compileResult(source_id);
     const compile_duration = if (compile_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
+
+    if (flags.timing) {
+        const compile_total = std.Io.Duration{
+            .nanoseconds = set_source_duration.nanoseconds + parse_duration.nanoseconds + resolve_duration.nanoseconds + type_duration.nanoseconds + mono_duration.nanoseconds + lower_duration.nanoseconds + debug_duration.nanoseconds + compile_duration.nanoseconds,
+        };
+        try printStageTimings(io, "compilation timing diagnostics", &.{
+            .{ .label = "set_source", .duration = set_source_duration },
+            .{ .label = "parse", .duration = parse_duration },
+            .{ .label = "resolve", .duration = resolve_duration },
+            .{ .label = "typecheck", .duration = type_duration },
+            .{ .label = "monomorphize", .duration = mono_duration },
+            .{ .label = "lower", .duration = lower_duration },
+            .{ .label = "debug_dump", .duration = debug_duration },
+            .{ .label = "compile_query", .duration = compile_duration },
+        }, compile_total);
+    }
 
     if (compile_result.diagnostics.len > 0 or compile_result.bytes == null) {
         try printCompileDiagnostics(io, gpa, source_path, source_text, compile_result.diagnostics);
@@ -141,16 +164,12 @@ pub fn main(init: std.process.Init) !void {
     const run_duration = if (run_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
 
     if (flags.timing) {
-        const total_duration = total_start.?.untilNow(io, .awake);
-        try printStageTimings(io, &.{
-            .{ .label = "set_source", .duration = set_source_duration },
-            .{ .label = "parse", .duration = parse_duration },
-            .{ .label = "typecheck", .duration = type_duration },
-            .{ .label = "lower", .duration = lower_duration },
-            .{ .label = "debug_dump", .duration = debug_duration },
-            .{ .label = "compile_query", .duration = compile_duration },
+        const run_total = std.Io.Duration{
+            .nanoseconds = write_duration.nanoseconds + run_duration.nanoseconds,
+        };
+        try printStageTimings(io, "runtime timing diagnostics", &.{
             .{ .label = "write_prog", .duration = write_duration },
             .{ .label = "run_prog", .duration = run_duration },
-        }, total_duration);
+        }, run_total);
     }
 }

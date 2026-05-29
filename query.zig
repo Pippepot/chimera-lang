@@ -1,12 +1,12 @@
 const std = @import("std");
 const db = @import("db.zig");
 const parser = @import("parser.zig");
+const resolver = @import("resolver.zig");
 const typecheck = @import("typecheck.zig");
+const monomorphize = @import("monomorphize.zig");
 const ir_mod = @import("ir.zig");
 const codegen = @import("codegen.zig");
 const ast = @import("ast.zig");
-
-const AstNode = ast.AstNode;
 
 pub const SourceId = db.SourceId;
 pub const QueryStats = db.QueryStats;
@@ -20,7 +20,9 @@ pub fn appendQueryDiagnostics(out: *std.ArrayList(u8), gpa: std.mem.Allocator, s
     try out.print(gpa, ";   source_sets: {d}\n", .{stats.source_sets});
     try out.print(gpa, ";   source_unchanged: {d}\n", .{stats.source_unchanged});
     try out.print(gpa, ";   parse: hits={d} recomputes={d}\n", .{ stats.parse_hits, stats.parse_recomputes });
+    try out.print(gpa, ";   resolve: hits={d} recomputes={d}\n", .{ stats.resolve_hits, stats.resolve_recomputes });
     try out.print(gpa, ";   type: hits={d} recomputes={d}\n", .{ stats.type_hits, stats.type_recomputes });
+    try out.print(gpa, ";   monomorphize: hits={d} recomputes={d}\n", .{ stats.mono_hits, stats.mono_recomputes });
     try out.print(gpa, ";   lower: hits={d} recomputes={d}\n", .{ stats.lower_hits, stats.lower_recomputes });
     try out.print(gpa, ";   compile: hits={d} recomputes={d}\n", .{ stats.compile_hits, stats.compile_recomputes });
     try out.print(gpa, ";   dependencies: checks={d} invalidations={d}\n", .{ stats.dependency_checks, stats.dependency_invalidations });
@@ -40,8 +42,12 @@ fn freeMemoValue(comptime T: type, value: *?T, gpa: std.mem.Allocator) void {
     if (value.*) |*v| {
         if (comptime T == parser.ParsedAst) {
             v.deinit();
+        } else if (comptime T == resolver.ResolvedAst) {
+            v.deinit(gpa);
         } else if (comptime T == typecheck.TypedAst) {
             v.deinit();
+        } else if (comptime T == monomorphize.MonoProgram) {
+            v.deinit(gpa);
         } else if (comptime T == ir_mod.Program) {
             v.deinit(gpa);
         } else if (comptime T == []const u8) {
@@ -59,7 +65,9 @@ fn deinitMemo(comptime T: type, memo: *db.Memo(T), gpa: std.mem.Allocator) void 
 fn recordHit(stats: *db.QueryStats, comptime stage: Stage) void {
     switch (stage) {
         .parse => stats.parse_hits += 1,
+        .resolve => stats.resolve_hits += 1,
         .typecheck => stats.type_hits += 1,
+        .monomorphize => stats.mono_hits += 1,
         .lower => stats.lower_hits += 1,
         .compile => stats.compile_hits += 1,
     }
@@ -68,7 +76,9 @@ fn recordHit(stats: *db.QueryStats, comptime stage: Stage) void {
 fn recordRecompute(stats: *db.QueryStats, comptime stage: Stage) void {
     switch (stage) {
         .parse => stats.parse_recomputes += 1,
+        .resolve => stats.resolve_recomputes += 1,
         .typecheck => stats.type_recomputes += 1,
+        .monomorphize => stats.mono_recomputes += 1,
         .lower => stats.lower_recomputes += 1,
         .compile => stats.compile_recomputes += 1,
     }
@@ -79,7 +89,9 @@ pub const QueryDb = struct {
     revision: db.Revision,
     sources: std.AutoHashMap(db.SourceId, SourceInput),
     parse_memos: std.AutoHashMap(db.SourceId, db.Memo(parser.ParsedAst)),
+    resolve_memos: std.AutoHashMap(db.SourceId, db.Memo(resolver.ResolvedAst)),
     type_memos: std.AutoHashMap(db.SourceId, db.Memo(typecheck.TypedAst)),
+    mono_memos: std.AutoHashMap(db.SourceId, db.Memo(monomorphize.MonoProgram)),
     lower_memos: std.AutoHashMap(db.SourceId, db.Memo(ir_mod.Program)),
     compile_memos: std.AutoHashMap(db.SourceId, db.Memo([]const u8)),
     active_stack: std.ArrayList(ActiveQuery),
@@ -91,7 +103,9 @@ pub const QueryDb = struct {
             .revision = 0,
             .sources = std.AutoHashMap(db.SourceId, SourceInput).init(gpa),
             .parse_memos = std.AutoHashMap(db.SourceId, db.Memo(parser.ParsedAst)).init(gpa),
+            .resolve_memos = std.AutoHashMap(db.SourceId, db.Memo(resolver.ResolvedAst)).init(gpa),
             .type_memos = std.AutoHashMap(db.SourceId, db.Memo(typecheck.TypedAst)).init(gpa),
+            .mono_memos = std.AutoHashMap(db.SourceId, db.Memo(monomorphize.MonoProgram)).init(gpa),
             .lower_memos = std.AutoHashMap(db.SourceId, db.Memo(ir_mod.Program)).init(gpa),
             .compile_memos = std.AutoHashMap(db.SourceId, db.Memo([]const u8)).init(gpa),
             .active_stack = .empty,
@@ -112,9 +126,19 @@ pub const QueryDb = struct {
             self.parse_memos.deinit();
         }
         {
+            var iter = self.resolve_memos.iterator();
+            while (iter.next()) |entry| deinitMemo(resolver.ResolvedAst, entry.value_ptr, self.gpa);
+            self.resolve_memos.deinit();
+        }
+        {
             var iter = self.type_memos.iterator();
             while (iter.next()) |entry| deinitMemo(typecheck.TypedAst, entry.value_ptr, self.gpa);
             self.type_memos.deinit();
+        }
+        {
+            var iter = self.mono_memos.iterator();
+            while (iter.next()) |entry| deinitMemo(monomorphize.MonoProgram, entry.value_ptr, self.gpa);
+            self.mono_memos.deinit();
         }
         {
             var iter = self.lower_memos.iterator();
@@ -163,21 +187,33 @@ pub const QueryDb = struct {
         return null;
     }
 
-    pub fn parsedAst(self: *@This(), source_id: db.SourceId) db.DbError!?*const AstNode {
+    pub fn parsedAst(self: *@This(), source_id: db.SourceId) db.DbError!?*const ast.Module {
         const memo = try self.ensureParseMemo(source_id, true);
         if (memo.value) |*parsed| return parsed.root;
         return null;
     }
 
-    pub fn loweredProgram(self: *@This(), source_id: db.SourceId) db.DbError!?*const ir_mod.Program {
-        const memo = try self.ensureLowerMemo(source_id, true);
-        if (memo.value) |*prog| return prog;
+    pub fn resolvedAst(self: *@This(), source_id: db.SourceId) db.DbError!?*const resolver.ResolvedAst {
+        const memo = try self.ensureResolveMemo(source_id, true);
+        if (memo.value) |*resolved| return resolved;
         return null;
     }
 
     pub fn typedAst(self: *@This(), source_id: db.SourceId) db.DbError!?*const typecheck.TypedAst {
         const memo = try self.ensureTypeMemo(source_id, true);
         if (memo.value) |*typed| return typed;
+        return null;
+    }
+
+    pub fn monomorphizedProgram(self: *@This(), source_id: db.SourceId) db.DbError!?*const monomorphize.MonoProgram {
+        const memo = try self.ensureMonomorphizeMemo(source_id, true);
+        if (memo.value) |*mono| return mono;
+        return null;
+    }
+
+    pub fn loweredProgram(self: *@This(), source_id: db.SourceId) db.DbError!?*const ir_mod.Program {
+        const memo = try self.ensureLowerMemo(source_id, true);
+        if (memo.value) |*prog| return prog;
         return null;
     }
 
@@ -207,7 +243,9 @@ pub const QueryDb = struct {
     pub fn changedAt(self: *const @This(), stage: Stage, source_id: SourceId) ?db.Revision {
         return switch (stage) {
             .parse => if (self.parse_memos.get(source_id)) |memo| memo.changed_at else null,
+            .resolve => if (self.resolve_memos.get(source_id)) |memo| memo.changed_at else null,
             .typecheck => if (self.type_memos.get(source_id)) |memo| memo.changed_at else null,
+            .monomorphize => if (self.mono_memos.get(source_id)) |memo| memo.changed_at else null,
             .lower => if (self.lower_memos.get(source_id)) |memo| memo.changed_at else null,
             .compile => if (self.compile_memos.get(source_id)) |memo| memo.changed_at else null,
         };
@@ -221,7 +259,16 @@ pub const QueryDb = struct {
         return .{ .kind = kind, .source_id = source_id };
     }
 
-    fn ensureMemo(self: *@This(), source_id: db.SourceId, track_dependency: bool, comptime stage: Stage, comptime T: type, memos: *std.AutoHashMap(db.SourceId, db.Memo(T)), comptime computeFn: fn (*@This(), db.SourceId) (db.DbError || std.mem.Allocator.Error)!db.Memo(T), comptime backdate: bool) (db.DbError || std.mem.Allocator.Error)!*db.Memo(T) {
+    fn ensureMemo(
+        self: *@This(),
+        source_id: db.SourceId,
+        track_dependency: bool,
+        comptime stage: Stage,
+        comptime T: type,
+        memos: *std.AutoHashMap(db.SourceId, db.Memo(T)),
+        comptime computeFn: fn (*@This(), db.SourceId) (db.DbError || std.mem.Allocator.Error)!db.Memo(T),
+        comptime backdate: bool,
+    ) (db.DbError || std.mem.Allocator.Error)!*db.Memo(T) {
         const query_key = queryFor(stage, source_id);
         if (track_dependency) try self.noteQueryDependency(query_key);
 
@@ -288,11 +335,30 @@ pub const QueryDb = struct {
         }.compute, false);
     }
 
+    fn ensureResolveMemo(self: *@This(), source_id: db.SourceId, track_dependency: bool) (db.DbError || std.mem.Allocator.Error)!*db.Memo(resolver.ResolvedAst) {
+        return self.ensureMemo(source_id, track_dependency, .resolve, resolver.ResolvedAst, &self.resolve_memos, struct {
+            fn compute(qdb: *QueryDb, sid: db.SourceId) (db.DbError || std.mem.Allocator.Error)!db.Memo(resolver.ResolvedAst) {
+                const parse_memo = try qdb.ensureParseMemo(sid, true);
+                return resolver.computeResolve(parse_memo, qdb.gpa);
+            }
+        }.compute, false);
+    }
+
     fn ensureTypeMemo(self: *@This(), source_id: db.SourceId, track_dependency: bool) (db.DbError || std.mem.Allocator.Error)!*db.Memo(typecheck.TypedAst) {
         return self.ensureMemo(source_id, track_dependency, .typecheck, typecheck.TypedAst, &self.type_memos, struct {
             fn compute(qdb: *QueryDb, sid: db.SourceId) (db.DbError || std.mem.Allocator.Error)!db.Memo(typecheck.TypedAst) {
+                const resolve_memo = try qdb.ensureResolveMemo(sid, true);
                 const parse_memo = try qdb.ensureParseMemo(sid, true);
-                return typecheck.computeType(parse_memo, qdb.gpa);
+                return typecheck.computeType(resolve_memo, parse_memo, qdb.gpa);
+            }
+        }.compute, false);
+    }
+
+    fn ensureMonomorphizeMemo(self: *@This(), source_id: db.SourceId, track_dependency: bool) (db.DbError || std.mem.Allocator.Error)!*db.Memo(monomorphize.MonoProgram) {
+        return self.ensureMemo(source_id, track_dependency, .monomorphize, monomorphize.MonoProgram, &self.mono_memos, struct {
+            fn compute(qdb: *QueryDb, sid: db.SourceId) (db.DbError || std.mem.Allocator.Error)!db.Memo(monomorphize.MonoProgram) {
+                const type_memo = try qdb.ensureTypeMemo(sid, true);
+                return monomorphize.computeMonomorphize(type_memo, qdb.gpa);
             }
         }.compute, false);
     }
@@ -300,9 +366,9 @@ pub const QueryDb = struct {
     fn ensureLowerMemo(self: *@This(), source_id: db.SourceId, track_dependency: bool) (db.DbError || std.mem.Allocator.Error)!*db.Memo(ir_mod.Program) {
         return self.ensureMemo(source_id, track_dependency, .lower, ir_mod.Program, &self.lower_memos, struct {
             fn compute(qdb: *QueryDb, sid: db.SourceId) (db.DbError || std.mem.Allocator.Error)!db.Memo(ir_mod.Program) {
+                const mono_memo = try qdb.ensureMonomorphizeMemo(sid, true);
                 const type_memo = try qdb.ensureTypeMemo(sid, true);
-                const parse_memo = try qdb.ensureParseMemo(sid, true);
-                return ir_mod.computeLower(type_memo, parse_memo, qdb.gpa);
+                return ir_mod.computeLower(mono_memo, type_memo, qdb.gpa);
             }
         }.compute, false);
     }
@@ -344,8 +410,16 @@ pub const QueryDb = struct {
                 const memo = try self.ensureParseMemo(key.source_id, false);
                 break :blk memo.changed_at > revision;
             },
+            .resolve => blk: {
+                const memo = try self.ensureResolveMemo(key.source_id, false);
+                break :blk memo.changed_at > revision;
+            },
             .typecheck => blk: {
                 const memo = try self.ensureTypeMemo(key.source_id, false);
+                break :blk memo.changed_at > revision;
+            },
+            .monomorphize => blk: {
+                const memo = try self.ensureMonomorphizeMemo(key.source_id, false);
                 break :blk memo.changed_at > revision;
             },
             .lower => blk: {

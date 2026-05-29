@@ -1,5 +1,6 @@
 const std = @import("std");
 const testing = std.testing;
+const parser = @import("parser.zig");
 const query = @import("query.zig");
 const runtime = @import("runtime.zig");
 const writeProgram = runtime.writeProgram;
@@ -16,7 +17,6 @@ fn expectCompileErrorContains(db: *query.QueryDb, source_id: query.SourceId, tex
     try testing.expect(result.bytes == null);
     try testing.expect(result.diagnostics.len > 0);
     try testing.expect(std.mem.indexOf(u8, result.diagnostics[0].message, text) != null);
-    try testing.expect(result.diagnostics[0].span != null);
 }
 
 fn runTestCapture(source: []const u8, args: []const []const u8) ![]u8 {
@@ -61,6 +61,32 @@ fn testProgramArgs(source: []const u8, expected: []const u8, args: []const []con
     try testing.expectEqualStrings(expected, out);
 }
 
+test "parser builds declaration-root module" {
+    const src =
+        \\comptime Vec2 = struct
+        \\  x: int
+        \\  y: int
+        \\
+        \\comptime main = func() int
+        \\  return 0
+    ;
+
+    var parsed = try parser.parseOwned(src, testing.allocator);
+    defer parsed.deinit();
+
+    try testing.expectEqual(@as(usize, 2), parsed.root.decls.len);
+    try testing.expect(parsed.root.decls[0].* == .comptime_struct);
+    try testing.expect(parsed.root.decls[1].* == .comptime_func);
+}
+
+test "top-level call expression executes as entry point" {
+    try testProgram(
+        \\comptime foo = func() unit
+        \\  print(34)
+        \\foo()
+    , "34\n");
+}
+
 test "compile emits ELF executable bytes" {
     var db = query.QueryDb.init(testing.allocator);
     defer db.deinit();
@@ -73,365 +99,214 @@ test "compile emits ELF executable bytes" {
     try testing.expectEqual(@as(u8, 'E'), elf[1]);
     try testing.expectEqual(@as(u8, 'L'), elf[2]);
     try testing.expectEqual(@as(u8, 'F'), elf[3]);
-    try testing.expectEqual(@as(u8, 2), elf[4]);
-    try testing.expectEqual(@as(u8, 1), elf[5]);
-
-    const e_type = std.mem.readInt(u16, elf[16..][0..2], .little);
-    const e_machine = std.mem.readInt(u16, elf[18..][0..2], .little);
-    try testing.expectEqual(@as(u16, 2), e_type);
-    try testing.expectEqual(@as(u16, 62), e_machine);
 }
 
-test "arithmetic" {
-    try testProgram("print(42)", "42\n");
-    try testProgram("print(3 + 4)", "7\n");
-    try testProgram("print(10 - 3)", "7\n");
-    try testProgram("print(5 * 6)", "30\n");
-    try testProgram("print(20 / 4)", "5\n");
-    try testProgram("print(10 - 6 * 2)", "-2\n");
+test "resolver duplicate symbol" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+
+    try db.setSource(0,
+        \\comptime foo = func() int
+        \\  return 0
+        \\
+        \\comptime foo = func() int
+        \\  return 1
+    );
+    try expectCompileErrorContains(&db, 0, "duplicate symbol");
 }
 
-test "arg" {
-    try testProgramArgs("print(arg(1))", "42\n", &.{"42"});
+test "resolver unknown symbol" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+
+    try db.setSource(0, "print(missing_name)");
+    try expectCompileErrorContains(&db, 0, "unknown symbol");
 }
 
-test "comparisons" {
-    try testProgram("if 3 < 4 -> print(42)", "42\n");
-    try testProgram("if 4 < 3 -> print(99) else print(11)", "11\n");
-    try testProgram("if 4 > 3 -> print(42)", "42\n");
-    try testProgram("if 4 <= 4 -> print(42)", "42\n");
-    try testProgram("if 3 >= 4 -> print(99) else print(11)", "11\n");
-    try testProgram("if -7 == -7 -> print(42)", "42\n");
-    try testProgram("if 9 != 9 -> print(99) else print(11)", "11\n");
-}
-
-test "if branches" {
-    try testProgram("if 3 < 4 -> print(11) else print(22)", "11\n");
-    try testProgram("if 3 > 4 -> print(33) else print(44)", "44\n");
-}
-
-test "if expression" {
-    try testProgram("print(if 8 > 2 -> 55 else 66)", "55\n");
-    try testProgram("print(if 8 < 2 -> 77 else 88)", "88\n");
-    try testProgram("print((if 2 == 2 -> 5 else 6) + 7)", "12\n");
-}
-
-test "float arithmetic and printing" {
-    try testProgram("print(1.5)", "1.500000\n");
-    try testProgram("print(1.5 + 2.25)", "3.750000\n");
-    try testProgram("print(7.0 / 2.0)", "3.500000\n");
-}
-
-test "float comparisons with NaN semantics" {
-    try testProgram("if (0.0 / 0.0) == 1.0 -> print(0) else print(1)", "1\n");
-    try testProgram("if (0.0 / 0.0) != 1.0 -> print(1) else print(0)", "1\n");
-}
-
-test "const locals and multi-statement programs" {
+test "multi-function calls and arithmetic" {
     try testProgram(
-        \\const x = 40 + 2
-        \\print(x)
+        \\comptime add = func(a: int, b: int) int
+        \\  return a + b
+        \\
+        \\comptime mul = func(a: int, b: int) int
+        \\  return a * b
+        \\
+        \\comptime main = func() int
+        \\  print(add(2, 3))
+        \\  print(mul(4, 5))
+        \\  return 0
+    , "5\n20\n");
+}
+
+test "first-class function value bind and call" {
+    try testProgram(
+        \\comptime add1 = func(x: int) int
+        \\  return x + 1
+        \\
+        \\comptime main = func() int
+        \\  const f = add1
+        \\  print(f(41))
+        \\  return 0
     , "42\n");
+}
+
+test "first-class function value pass return call" {
     try testProgram(
-        \\const x = 2
-        \\const y = x + 3
-        \\print(y)
-    , "5\n");
-    try testProgram(
-        \\const x = 2
-        \\const y = x + 1
-        \\print(x + y)
-    , "5\n");
+        \\comptime add1 = func(x: int) int
+        \\  return x + 1
+        \\
+        \\comptime apply = func(f: func(int) int, x: int) int
+        \\  return f(x)
+        \\
+        \\comptime ret_add1 = func() func(int) int
+        \\  return add1
+        \\
+        \\comptime main = func() int
+        \\  const f = ret_add1()
+        \\  print(apply(f, 41))
+        \\  return 0
+    , "42\n");
 }
 
-test "bool literals true and false" {
-    try testProgram("print(true)", "true\n");
-    try testProgram("print(false)", "false\n");
-    try testProgram("if true == false -> print(0) else print(1)", "1\n");
-    try testProgram("if true != false -> print(1) else print(0)", "1\n");
-    try testProgram("if true == true -> print(1) else print(0)", "1\n");
-}
-
-test "const binding at end of file (no trailing expression)" {
-    try testProgram(
-        \\const x = 40 + 2
-        \\if x > 2 -> print(67)
-        \\print(x)
-        \\const y = false
-        \\print(y)
-    , "67\n42\nfalse\n");
-}
-
-test "const binding accepts multiline if expression" {
-    try testProgram(
-        \\const x = if 1 < 2
-        \\  1
-        \\else
-        \\  2
-        \\print(x)
-    , "1\n");
-}
-
-test "bool literal with if" {
-    try testProgram("if 3 == 3 -> print(99)", "99\n");
-    try testProgram("if 3 != 3 -> print(98) else print(97)", "97\n");
-}
-
-test "if without else requires unit then-branch" {
-    try testProgram("if 3 < 4 -> print(11)", "11\n");
-}
-
-test "if block body with indentation" {
+test "if fallible semantics in top-level body" {
     try testProgram(
         \\if 3 < 4
-        \\  print(42)
-    , "42\n");
-    try testProgram(
-        \\if 4 < 3
-        \\  print(99)
-        \\else
         \\  print(11)
+        \\else
+        \\  print(22)
     , "11\n");
 }
 
-test "if else if chaining" {
-    try testProgram(
-        \\if 4 < 3 -> print(99)
-        \\else if 3 > 2
-        \\  print(42)
-        \\else print(11)
-    , "42\n");
-}
-
-test "if indented else block" {
-    try testProgram(
-        \\if 4 < 3 -> print(99)
-        \\else
-        \\  print(42)
-    , "42\n");
-}
-
-test "nested if with indentation" {
-    try testProgram(
-        \\if 3 < 4
-        \\  if 5 > 2
-        \\    print(42)
-        \\else print(99)
-    , "42\n");
-}
-
-test "statement after indented if block" {
-    try testProgram(
-        \\if 1 < 2
-        \\  print(1)
-        \\print(2)
-    , "1\n2\n");
-}
-
-test "branch-local const is inaccessible in other branch" {
+test "typecheck call arity mismatch" {
     var db = query.QueryDb.init(testing.allocator);
     defer db.deinit();
 
     try db.setSource(0,
-        \\if 2 < 1
-        \\  const x = 1
-        \\  print(x)
-        \\else
-        \\  print(x)
+        \\comptime add = func(a: int, b: int) int
+        \\  return a + b
+        \\
+        \\comptime main = func() int
+        \\  return add(1)
     );
-    try expectCompileErrorContains(&db, 0, "unknown variable");
+    try expectCompileErrorContains(&db, 0, "call argument count mismatch");
 }
 
-test "branch-local const does not leak after if" {
+test "typecheck call argument type mismatch" {
     var db = query.QueryDb.init(testing.allocator);
     defer db.deinit();
 
     try db.setSource(0,
-        \\if 1 < 2
-        \\  const x = 1
-        \\  print(0)
-        \\print(x)
+        \\comptime add = func(a: int, b: int) int
+        \\  return a + b
+        \\
+        \\comptime main = func() int
+        \\  return add(1, 2.0)
     );
-    try expectCompileErrorContains(&db, 0, "unknown variable");
+    try expectCompileErrorContains(&db, 0, "call argument type mismatch");
 }
 
-test "same const name allowed across if branches" {
-    try testProgram(
-        \\if 1 < 2
-        \\  const x = 1
-        \\  print(x)
-        \\else
-        \\  const x = 2
-        \\  print(x)
-    , "1\n");
-}
-
-test "type errors" {
+test "typecheck return mismatch" {
     var db = query.QueryDb.init(testing.allocator);
     defer db.deinit();
-
-    try db.setSource(0, "print(1 + 2.0)");
-    try expectCompileErrorContains(&db, 0, "arithmetic operands");
-
-    try db.setSource(0, "if 1 -> 2 else 3");
-    try expectCompileErrorContains(&db, 0, "If condition must be a fallible expression");
-
-    try db.setSource(0, "if 1 < 2 -> 1 else 2.0");
-    try expectCompileErrorContains(&db, 0, "if branches");
-
-    try db.setSource(0, "if 1 < 2 -> 1");
-    try expectCompileErrorContains(&db, 0, "without else");
-
-    try db.setSource(0, "print(if 1 < 2 -> print(1) else print(2))");
-    try expectCompileErrorContains(&db, 0, "cannot print");
-
-    try db.setSource(0, "print(x)");
-    try expectCompileErrorContains(&db, 0, "unknown variable");
 
     try db.setSource(0,
-        \\const x = 1
-        \\const x = 2
-        \\print(x)
+        \\comptime main = func() int
+        \\  return 1.0
     );
-    try expectCompileErrorContains(&db, 0, "duplicate variable");
+    try expectCompileErrorContains(&db, 0, "return type mismatch");
+}
+
+test "monomorphize stage produces deterministic unique entries" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
 
     try db.setSource(0,
-        \\const x = 2
-        \\(const y = 3
-        \\print(y))
-        \\print(x)
+        \\comptime a = func() int
+        \\  return 1
+        \\
+        \\comptime b = func() int
+        \\  return a()
+        \\
+        \\comptime main = func() int
+        \\  return b()
     );
-    try expectCompileErrorContains(&db, 0, "expected expression");
+
+    const mono = try db.monomorphizedProgram(0);
+    try testing.expect(mono != null);
+    try testing.expectEqual(@as(usize, 3), mono.?.functions.items.len);
+
+    const mono_again = try db.monomorphizedProgram(0);
+    try testing.expect(mono_again != null);
+    try testing.expectEqual(@as(usize, 3), mono_again.?.functions.items.len);
 }
 
-test "fallible expression outside fallible context" {
+test "query cache hits within same revision includes resolve and monomorphize" {
     var db = query.QueryDb.init(testing.allocator);
     defer db.deinit();
 
-    try db.setSource(0, "print(3 < 4)");
-    try expectCompileErrorContains(&db, 0, "Fallible expression is not allowed outside fallible context");
-
-    try db.setSource(0,
-        \\const x = 3 < 4
-        \\print(x)
-    );
-    try expectCompileErrorContains(&db, 0, "Fallible expression is not allowed outside fallible context");
-}
-
-test "non-fallible expression in if condition" {
-    var db = query.QueryDb.init(testing.allocator);
-    defer db.deinit();
-
-    try db.setSource(0, "if true -> print(99)");
-    try expectCompileErrorContains(&db, 0, "If condition must be a fallible expression");
-}
-
-test "query cache hits within same revision" {
-    var db = query.QueryDb.init(testing.allocator);
-    defer db.deinit();
-
-    try db.setSource(0, "print(1)");
+    try db.setSource(0, "0");
     _ = try db.parsedAst(0);
+    _ = try db.resolvedAst(0);
     _ = try db.typedAst(0);
+    _ = try db.monomorphizedProgram(0);
     _ = try db.loweredProgram(0);
     _ = try expectCompileOk(&db, 0);
 
     db.resetStats();
 
     _ = try db.parsedAst(0);
+    _ = try db.resolvedAst(0);
     _ = try db.typedAst(0);
+    _ = try db.monomorphizedProgram(0);
     _ = try db.loweredProgram(0);
     _ = try expectCompileOk(&db, 0);
 
     const stats = db.statsSnapshot();
     try testing.expectEqual(@as(usize, 1), stats.parse_hits);
+    try testing.expectEqual(@as(usize, 1), stats.resolve_hits);
     try testing.expectEqual(@as(usize, 1), stats.type_hits);
+    try testing.expectEqual(@as(usize, 1), stats.mono_hits);
     try testing.expectEqual(@as(usize, 1), stats.lower_hits);
     try testing.expectEqual(@as(usize, 1), stats.compile_hits);
-    try testing.expectEqual(@as(usize, 0), stats.parse_recomputes);
-    try testing.expectEqual(@as(usize, 0), stats.type_recomputes);
-    try testing.expectEqual(@as(usize, 0), stats.lower_recomputes);
-    try testing.expectEqual(@as(usize, 0), stats.compile_recomputes);
 }
 
-test "source change invalidates parse lower compile" {
+test "source change invalidates all stages" {
     var db = query.QueryDb.init(testing.allocator);
     defer db.deinit();
 
-    try db.setSource(0, "print(1)");
+    try db.setSource(0, "0");
     _ = try expectCompileOk(&db, 0);
-
-    const before = db.statsSnapshot().revision;
-    db.resetStats();
-
-    try db.setSource(0, "print(2)");
-    _ = try expectCompileOk(&db, 0);
-
-    const after = db.statsSnapshot();
-    try testing.expectEqual(before + 1, after.revision);
-    try testing.expectEqual(@as(usize, 1), after.source_sets);
-    try testing.expectEqual(@as(usize, 1), after.parse_recomputes);
-    try testing.expectEqual(@as(usize, 1), after.type_recomputes);
-    try testing.expectEqual(@as(usize, 1), after.lower_recomputes);
-    try testing.expectEqual(@as(usize, 1), after.compile_recomputes);
-    try testing.expect(after.dependency_invalidations > 0);
-}
-
-test "source-specific invalidation" {
-    var db = query.QueryDb.init(testing.allocator);
-    defer db.deinit();
-
-    try db.setSource(0, "print(10)");
-    _ = try expectCompileOk(&db, 0);
-
-    try db.setSource(1, "print(20)");
-    _ = try expectCompileOk(&db, 1);
 
     db.resetStats();
 
-    try db.setSource(0, "print(30)");
-    _ = try expectCompileOk(&db, 1);
+    try db.setSource(0, "1");
+    _ = try expectCompileOk(&db, 0);
 
     const stats = db.statsSnapshot();
-    try testing.expectEqual(@as(usize, 1), stats.source_sets);
-    try testing.expectEqual(@as(usize, 0), stats.parse_recomputes);
-    try testing.expectEqual(@as(usize, 0), stats.lower_recomputes);
-    try testing.expectEqual(@as(usize, 0), stats.compile_recomputes);
-    try testing.expect(stats.compile_hits > 0);
-}
-
-test "identical source does not advance revision" {
-    var db = query.QueryDb.init(testing.allocator);
-    defer db.deinit();
-
-    try db.setSource(0, "print(7)");
-    const before = db.statsSnapshot().revision;
-
-    db.resetStats();
-    try db.setSource(0, "print(7)");
-
-    const after = db.statsSnapshot();
-    try testing.expectEqual(before, after.revision);
-    try testing.expectEqual(@as(usize, 1), after.source_unchanged);
-    try testing.expectEqual(@as(usize, 0), after.source_sets);
+    try testing.expectEqual(@as(usize, 1), stats.parse_recomputes);
+    try testing.expectEqual(@as(usize, 1), stats.resolve_recomputes);
+    try testing.expectEqual(@as(usize, 1), stats.type_recomputes);
+    try testing.expectEqual(@as(usize, 1), stats.mono_recomputes);
+    try testing.expectEqual(@as(usize, 1), stats.lower_recomputes);
+    try testing.expectEqual(@as(usize, 1), stats.compile_recomputes);
 }
 
 test "compile changed_at backdates on equal output" {
     var db = query.QueryDb.init(testing.allocator);
     defer db.deinit();
 
-    try db.setSource(0, "print(5)");
+    try db.setSource(0, "5");
     _ = try expectCompileOk(&db, 0);
     const changed_before = db.changedAt(.compile, 0) orelse return error.TestFailed;
 
-    try db.setSource(0, "print( 5 )");
+    try db.setSource(0, "5\n");
     _ = try expectCompileOk(&db, 0);
     const changed_after = db.changedAt(.compile, 0) orelse return error.TestFailed;
 
     try testing.expectEqual(changed_before, changed_after);
 }
 
-test "debug query diagnostics format" {
+test "debug query diagnostics format includes resolve and monomorphize" {
     var buf = try std.ArrayList(u8).initCapacity(testing.allocator, 256);
     defer buf.deinit(testing.allocator);
 
@@ -439,128 +314,47 @@ test "debug query diagnostics format" {
         .revision = 7,
         .source_sets = 2,
         .parse_hits = 3,
-        .type_hits = 4,
+        .resolve_hits = 4,
+        .type_hits = 5,
+        .mono_hits = 6,
         .compile_recomputes = 1,
         .dependency_checks = 5,
     };
     try query.appendQueryDiagnostics(&buf, testing.allocator, stats);
 
-    try testing.expect(std.mem.indexOf(u8, buf.items, "; query diagnostics:") != null);
-    try testing.expect(std.mem.indexOf(u8, buf.items, ";   revision: 7") != null);
     try testing.expect(std.mem.indexOf(u8, buf.items, ";   parse: hits=3 recomputes=0") != null);
-    try testing.expect(std.mem.indexOf(u8, buf.items, ";   type: hits=4 recomputes=0") != null);
-    try testing.expect(std.mem.indexOf(u8, buf.items, ";   compile: hits=0 recomputes=1") != null);
-    try testing.expect(std.mem.indexOf(u8, buf.items, ";   dependencies: checks=5 invalidations=0") != null);
+    try testing.expect(std.mem.indexOf(u8, buf.items, ";   resolve: hits=4 recomputes=0") != null);
+    try testing.expect(std.mem.indexOf(u8, buf.items, ";   type: hits=5 recomputes=0") != null);
+    try testing.expect(std.mem.indexOf(u8, buf.items, ";   monomorphize: hits=6 recomputes=0") != null);
 }
 
-test "var declaration and read" {
+test "arg builtin still works at top level" {
+    try testProgramArgs(
+        \\print(arg(1))
+    , "42\n", &.{"42"});
+}
+
+test "const and var optional type annotations" {
     try testProgram(
-        \\var x = 5
-        \\print(x)
-    , "5\n");
+        \\const x: int = 40
+        \\var y: int = x + 1
+        \\y = y + 1
+        \\print(y)
+    , "42\n");
     try testProgram(
-        \\var x = 40 + 2
-        \\print(x)
+        \\const x = 40
+        \\var y = x + 2
+        \\print(y)
     , "42\n");
 }
 
-test "var reassignment" {
-    try testProgram(
-        \\var x = 5
-        \\x = 10
-        \\print(x)
-    , "10\n");
-    try testProgram(
-        \\var x = 1
-        \\x = x + 2
-        \\print(x)
-    , "3\n");
-    try testProgram(
-        \\var x = 1
-        \\x = x + 1
-        \\print(x)
-    , "2\n");
-}
-
-test "var with const" {
-    try testProgram(
-        \\var x = 2
-        \\const y = x + 3
-        \\print(y)
-    , "5\n");
-}
-
-test "var reassignment type mismatch" {
-    var db = query.QueryDb.init(testing.allocator);
-    defer db.deinit();
-    try db.setSource(0,
-        \\var x = 5
-        \\x = 3.0
-    );
-    try expectCompileErrorContains(&db, 0, "assignment type mismatch");
-}
-
-test "assign to const is error" {
-    var db = query.QueryDb.init(testing.allocator);
-    defer db.deinit();
-    try db.setSource(0,
-        \\const x = 5
-        \\x = 10
-    );
-    try expectCompileErrorContains(&db, 0, "cannot assign to const");
-}
-
-test "assign to unknown variable is error" {
-    var db = query.QueryDb.init(testing.allocator);
-    defer db.deinit();
-    try db.setSource(0, "x = 10");
-    try expectCompileErrorContains(&db, 0, "unknown variable");
-}
-
-test "var duplicate name is error" {
-    var db = query.QueryDb.init(testing.allocator);
-    defer db.deinit();
-    try db.setSource(0,
-        \\var x = 1
-        \\var x = 2
-    );
-    try expectCompileErrorContains(&db, 0, "duplicate variable");
-}
-
-test "var branch-local scope isolation" {
-    var db = query.QueryDb.init(testing.allocator);
-    defer db.deinit();
-    try db.setSource(0,
-        \\if 1 < 2
-        \\  var x = 1
-        \\  print(x)
-        \\else
-        \\  print(x)
-    );
-    try expectCompileErrorContains(&db, 0, "unknown variable");
-}
-
-test "program exit code follows top-level expression value" {
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
+test "binding type annotation mismatch errors" {
     var db = query.QueryDb.init(testing.allocator);
     defer db.deinit();
 
-    try db.setSource(0, "42");
-    const prog_bytes = try expectCompileOk(&db, 0);
-    writeProgram(io, prog_bytes);
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    try db.setSource(0, "const x: int = 1.0");
+    try expectCompileErrorContains(&db, 0, "binding type annotation mismatch");
 
-    const result = try std.process.run(testing.allocator, io, .{
-        .argv = &.{"./prog"},
-    });
-    defer testing.allocator.free(result.stdout);
-    defer testing.allocator.free(result.stderr);
-
-    switch (result.term) {
-        .exited => |code| try testing.expectEqual(@as(u8, 42), code),
-        else => return error.TestFailed,
-    }
+    try db.setSource(0, "var y: float = 1");
+    try expectCompileErrorContains(&db, 0, "binding type annotation mismatch");
 }

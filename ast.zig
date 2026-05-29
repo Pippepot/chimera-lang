@@ -3,6 +3,48 @@ pub const Span = struct {
     end: usize,
 };
 
+pub const TypeNode = union(enum) {
+    name: []const u8,
+    func: *const FuncTypeNode,
+};
+
+pub const FuncTypeNode = struct {
+    params: []const *const TypeNode,
+    ret: *const TypeNode,
+};
+
+pub const ParamNode = struct {
+    name: []const u8,
+    ty: *const TypeNode,
+};
+
+pub const FieldNode = struct {
+    name: []const u8,
+    ty: *const TypeNode,
+};
+
+pub const FuncDecl = struct {
+    name: []const u8,
+    params: []const ParamNode,
+    ret_type: *const TypeNode,
+    body: *const AstNode,
+};
+
+pub const StructDecl = struct {
+    name: []const u8,
+    fields: []const FieldNode,
+};
+
+pub const Decl = union(enum) {
+    comptime_func: *const FuncDecl,
+    comptime_struct: *const StructDecl,
+};
+
+pub const Module = struct {
+    decls: []const *const Decl,
+    entry: *const AstNode,
+};
+
 pub const IfNode = struct {
     cond: *const AstNode,
     then_: *const AstNode,
@@ -11,12 +53,23 @@ pub const IfNode = struct {
 
 pub const VarNode = struct {
     name: []const u8,
+    ty: ?*const TypeNode,
     value: *const AstNode,
 };
 
 pub const ConstNode = struct {
     name: []const u8,
+    ty: ?*const TypeNode,
     value: *const AstNode,
+};
+
+pub const ReturnNode = struct {
+    value: *const AstNode,
+};
+
+pub const CallNode = struct {
+    callee: *const AstNode,
+    args: []const *const AstNode,
 };
 
 pub const BlockNode = struct {
@@ -31,6 +84,8 @@ pub const AstNode = union(enum) {
     var_: *const VarNode,
     assign: *const VarNode,
     const_: *const ConstNode,
+    return_: *const ReturnNode,
+    call: *const CallNode,
     print: *const AstNode,
     add: *const [2]AstNode,
     sub: *const [2]AstNode,
