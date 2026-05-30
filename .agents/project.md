@@ -1,6 +1,6 @@
-# x86 Source -> Query -> Machine Code Compiler
+# Chimera — Source -> Query -> Machine Code Compiler
 
-**Location:** `x86/`
+**Location:** `chimera/`
 
 ## Overview
 
@@ -18,21 +18,21 @@ This compiler now supports a declaration-first language with optional top-level 
 | File | Description |
 |------|-------------|
 | `main.zig` | CLI entrypoint and query pipeline orchestration |
-| `ast.zig` | AST/module/declaration/types and expression nodes |
-| `parser.zig` | Lexer + parser (`parseOwned`) to module AST |
-| `resolver.zig` | Symbol resolution stage (top-level + locals) |
-| `typecheck.zig` | Type inference/checking including function types/calls/returns |
-| `monomorphize.zig` | Monomorphization stage artifact (`MonoProgram`) |
-| `ir.zig` | Multi-function IR and lowering |
-| `codegen.zig` | x86/ELF backend for multi-function programs |
-| `query.zig` | Incremental revisioned query DB |
-| `query_cache.zig` | Persistent query cache serialization, loading, saving, and stale-cache sweep |
+| `ast.zig` | **Flat index-based AST** — `Node` (extern struct, 12 bytes), `Ast` container with single `backing: []u8`, buffer-copy `serialize`/`deserialize` |
+| `parser.zig` | **Rewritten** — builds flat arrays via `AstBuilder`, returns `NodeIdx` not `*const AstNode`, `AstBuilder.seal()` packs contiguous backing buffer |
+| `resolver.zig` | **Rewritten** — `NodeIdx` keys, flat AST accessors, no `*const AstNode`/`*const ast.Module` |
+| `typecheck.zig` | **Rewritten** — `NodeIdx`/`TypeIdx` keys, flat AST accessors, `TypedAst.ast` reference |
+| `monomorphize.zig` | **Rewritten** — `MonoFunction.decl` is `NodeIdx`, `ty` is owned `FuncType`, no `module` field |
+| `ir.zig` | ⏳ **Pending rewrite** — needs flat AST dispatch (currently uses `*const AstNode` patterns) |
+| `codegen.zig` | Unchanged — IR types not yet flat (still ArrayList-based `Program`) |
+| `query.zig` | ⏳ **Pending fixes** — `parsedAst` return type, `v.deinit()` arg, load/save all 6 stages |
+| `query_cache.zig` | ⏳ **Pending rewrite** — replace per-field ser/des with buffer-copy for each stage |
 | `db.zig` | Shared query types/stats/deps/memo helpers |
-| `debug.zig` | AST/IR debug dump helpers + flags |
-| `runtime.zig` | Runtime helpers (`writeProgram`, `runProg`) |
-| `scope.zig` | Reusable lexical scope stack utility |
-| `helpers_bin.zig` | Embedded helper machine-code blobs |
-| `test.zig` | End-to-end behavioral + incremental tests |
+| `debug.zig` | ⏳ **Pending rewrite** — needs flat AST dispatch |
+| `runtime.zig` | Runtime helpers (`writeProgram`, `runProg`) — unchanged |
+| `scope.zig` | Reusable lexical scope stack utility — unchanged |
+| `helpers_bin.zig` | Embedded helper machine-code blobs — unchanged |
+| `test.zig` | ⏳ **Needs updating** — tests use old API |
 
 ## Query architecture
 
@@ -52,28 +52,58 @@ This compiler now supports a declaration-first language with optional top-level 
 - Compile stage supports `changed_at` backdating when bytes/diagnostics are unchanged.
 - Cross-run persistent cache stores compile outputs + per-stage diagnostics metadata keyed by strict fingerprints.
 
+## Flat AST design (in progress)
+
+The old pointer-based AST (`*const AstNode`, `*const ast.Module`, `*const ast.FuncDecl`) is being replaced with a flat index-based design:
+
+- **`ast.Node`**: 12-byte `extern struct { tag: Tag, _pad: [3]u8, data0: u32, data1: u32 }`
+- **`ast.Ast`**: Single `backing: []u8` containing all arrays (nodes, extra, string_bytes, string_offsets, spans, decls). Buffer-copy `serialize`/`deserialize`.
+- **Node overflow**: Nodes needing >2 values use `data1` as extra index.
+- **Accessor functions**: `ast.blockItems(idx)`, `ast.varDeclValue(idx)`, `ast.ifData(idx)`, `ast.callArgs(idx)`, `ast.fnParams(idx)`, `ast.fnBody(idx)`, `ast.structFields(idx)`, `ast.structInitFields(idx)`, `ast.stringOf(idx)`, etc.
+- **String interning**: `AstBuilder.internString()` copies to `string_bytes`, records offset, uses `std.StringHashMap` during building (freed after seal).
+- **Replace map types**: `std.AutoHashMap(usize, T)` → `std.AutoHashMap(ast.NodeIdx, T)`. Full sorted-array serialization is deferred.
+
+### Serialization plan
+
+All 6 stages must be cached with `hits=1 recomputes=0` when cache is present. The flat AST makes parse output inherently serializable (memcpy of `backing`). Stages 2-6 will get flat buffer containers for inherent serializability too. `query_cache.zig` will use buffer-copy for each stage instead of per-field writers/readers.
+
+## Current status (May 2026)
+
+- **ast.zig** ✅ — Flat AST with `serialize`/`deserialize` (buffer-copy), `verifyAt`/`entry`
+- **parser.zig** ✅ — `AstBuilder`, `NodeIdx` returns, `verifyAt`/`entry` support
+- **resolver.zig** ✅ — Flat AST, `NodeIdx` keys, deps: parse
+- **typecheck.zig** ✅ — Flat AST, `NodeIdx`/`TypeIdx` keys, deps: resolve, parse
+- **monomorphize.zig** ✅ — `NodeIdx` decl, owned types, deps: typecheck
+- **ir.zig** ✅ — Flat AST dispatch via `ast.nodes[idx].tag` and accessors, deps: monomorphize, typecheck
+- **debug.zig** ✅ — Flat AST dispatch
+- **codegen.zig** ✅ — IR->x86 + ELF, backdate support, deps: lower
+- **query.zig** ✅ — Generic `ensureMemo`, 6-stage pipeline, persistent cache load/save
+- **query_cache.zig** ✅ — Buffer-copy ser/des for all 6 stages, persistent cache with schema v3
+- **main.zig** ✅ — Updated for `?*const ast.Ast`, persistent cache CLI
+- **test.zig** ✅ — All 35 tests pass using flat API
+- **runtime.zig** — Unchanged
+- **scope.zig** — Unchanged
+- **helpers_bin.zig** — Unchanged
+
 ## Language notes
 
 - Statements are newline-separated.
 - `if`/`else` uses indentation-based blocks with inline `->` form supported.
 - Fallible comparisons (`<`, `>`, `<=`, `>=`, `==`, `!=`) are only legal in `if` conditions.
-- `const` and `var` bindings support optional type annotations:
-  - `const x: int = 1`
-  - `var y: float = 1.0`
-  - Annotation is optional when RHS inference is sufficient.
-- **`string` type** — primitive type supporting string literals with escape sequences (`\n`, `\t`, `\\`, `\"`, `\0`). `print` on strings calls `print_string` helper.
-- **Struct types** declared with `comptime Name = struct` and indented field lines.
-- **Struct init** uses `TypeName{field1 = val1, field2 = val2, ...}` syntax.
-- **Field access** uses `expr.fieldName` syntax.
-  - Multi-field structs allocate consecutive stack slots and use `field_load` IR for non-zero field indices.
+- `const` and `var` bindings support optional type annotations.
+- **`string` type** — primitive type with escape sequences.
+- **Struct types** — `comptime Name = struct` with indented field lines.
+- **Struct init** — `TypeName{field1 = val1, field2 = val2, ...}`.
+- **Field access** — `expr.fieldName`, multi-field structs use consecutive stack slots + `field_load` IR.
 
 ## Current behavior
 
-- `zig run main.zig -- demo.x86` compiles and runs the demo.
+- `zig run main.zig -- demo.chi` compiles and runs the demo.
 - First non-debug CLI argument is source file path.
 - Remaining CLI args are passed to generated `./prog` and accessible via `arg(n)`.
 - Debug flags: `--debug=ast,ssa,timing,query`.
 - Query cache is enabled by default for CLI path-backed sources (`setSourceFile`); disable with `--no-query-cache`.
+- ⚠️ Code currently does not compile — mid-rewrite (see current status above).
 
 ## Tests
 
@@ -89,4 +119,5 @@ This compiler now supports a declaration-first language with optional top-level 
   - source invalidation behavior
   - compile `changed_at` backdating
   - persistent cache reuse/disable/failure/corruption/stale cleanup behavior
-- Current suite: `zig test test.zig` (43 tests).
+- Zero-recompute test: `compileResult` twice with no source change → 0 recomputes, 1 compile hit (compile is the only stage accessed on the second call; all others are implicitly cached).
+- Current suite: `zig test test.zig` (35 tests).

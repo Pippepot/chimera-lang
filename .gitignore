@@ -1,7 +1,7 @@
 /prog
 /main
-/x86.asm
-/x86.o
+/chimera.asm
+/chimera.o
 /.zig-cache/
 .qcache
 *.qcache

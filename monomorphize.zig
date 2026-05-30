@@ -5,26 +5,27 @@ const db = @import("db.zig");
 
 pub const MonoFunction = struct {
     source_id: u32,
-    decl: *const ast.FuncDecl,
-    ty: *const typecheck.FuncType,
+    decl: ast.NodeIdx,
+    ty: typecheck.FuncType,
     has_explicit_return: bool,
 };
 
 pub const MonoProgram = struct {
-    module: *const ast.Module,
     functions: std.ArrayList(MonoFunction),
     entry_function: u32,
+    arena: std.heap.ArenaAllocator,
 
-    pub fn init(gpa: std.mem.Allocator, module: *const ast.Module, entry_function: u32) !MonoProgram {
+    pub fn init(gpa: std.mem.Allocator, entry_function: u32) !MonoProgram {
         return .{
-            .module = module,
             .functions = try std.ArrayList(MonoFunction).initCapacity(gpa, 8),
             .entry_function = entry_function,
+            .arena = std.heap.ArenaAllocator.init(gpa),
         };
     }
 
     pub fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
         self.functions.deinit(gpa);
+        self.arena.deinit();
     }
 };
 
@@ -36,16 +37,20 @@ pub fn computeMonomorphize(type_memo: *const typecheck.TypeMemo, gpa: std.mem.Al
 
     var mono_value: ?MonoProgram = null;
     if (type_memo.value) |*typed| {
-        var mono = try MonoProgram.init(gpa, typed.module, typed.entry_function);
+        var mono = try MonoProgram.init(gpa, typed.entry_function);
         errdefer mono.deinit(gpa);
 
         var fn_id: u32 = 0;
         while (fn_id < typed.functions.len) : (fn_id += 1) {
             const info = typed.functions[fn_id];
+            const owned_params = try mono.arena.allocator().dupe(typecheck.Type, info.ty.params);
             try mono.functions.append(gpa, .{
                 .source_id = fn_id,
                 .decl = info.decl,
-                .ty = info.ty,
+                .ty = .{
+                    .params = owned_params,
+                    .ret = info.ty.ret,
+                },
                 .has_explicit_return = info.has_explicit_return,
             });
         }

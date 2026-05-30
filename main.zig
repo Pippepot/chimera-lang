@@ -1,3 +1,4 @@
+// Chimera — Source → Query → Machine Code Compiler
 const std = @import("std");
 const debug = @import("debug.zig");
 const diagnostics = @import("diagnostics.zig");
@@ -120,7 +121,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (need_stage_pipeline) {
         const parse_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
-        const module = try qdb.parsedAst(source_id);
+        const module_or_null = try qdb.parsedAst(source_id);
         parse_duration = if (parse_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
 
         const resolve_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
@@ -140,7 +141,7 @@ pub fn main(init: std.process.Init) !void {
         lower_duration = if (lower_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
 
         const debug_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
-        try debug.dumpDebugInfo(io, flags, module, ir, gpa);
+        try debug.dumpDebugInfo(io, flags, module_or_null, ir, gpa);
         debug_duration = if (debug_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
     }
 

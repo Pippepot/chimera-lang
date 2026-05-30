@@ -157,8 +157,18 @@
 
 ## Git
 
-- `.gitignore` generated files: `prog`, `main`, `x86.asm`, `x86.o`, `.zig-cache/`, `*.qcache`.
+- `.gitignore` generated files: `prog`, `main`, `chimera.asm`, `chimera.o`, `.zig-cache/`, `*.qcache`.
 - Commit all source files including parser/query modules and tests.
+
+## Persistent cache
+
+- **`Ast.serialize`/`deserialize` layout must match exactly.** Use `computedSize` to get offsets and total size. `deserialize` must NOT add `@sizeOf(Header)` to `layout.total` — `layout.total` already includes the header. The data slice passed to `deserialize` is the full serialized output (header + payload), and `data[0..layout.total]` is the correct view.
+- **Span struct uses `usize` fields** (not `u32`), so `@sizeOf(Span)=16` and `@alignOf(Span)=8` on x86-64. This matters for alignment padding in the serialization format.
+
+## Query system
+
+- **Moving a local `ArrayList` into a memo field transfers ownership.** Do NOT `defer list.deinit(gpa)` on a list that was assigned to `memo.deps` — the memo owns the memory and `deinitMemo` will free it. Using `defer` causes a double-free when `deinitMemo` later frees the same allocation.
+- **Zero-recompute test pattern:** call `compileResult` twice with no `setSource`/`setSourceFile` between calls. The second call returns an immediate hit because `memo.verified_at == self.revision` (set during first computation). All 6 recompute counters remain at 0.
 
 ## Style
 

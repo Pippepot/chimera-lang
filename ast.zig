@@ -1,122 +1,329 @@
+const std = @import("std");
+
+pub const NodeIdx = u32;
+pub const StringIdx = u32;
+pub const ExtraIdx = u32;
+
 pub const Span = struct {
     start: usize,
     end: usize,
 };
 
-pub const TypeNode = union(enum) {
-    name: []const u8,
-    func: *const FuncTypeNode,
+pub const Tag = enum(u8) {
+    block,
+    int_lit,
+    float_lit,
+    var_ref,
+    var_decl,
+    assign,
+    const_decl,
+    return_stmt,
+    call,
+    struct_init,
+    field_access,
+    print_stmt,
+    add,
+    sub,
+    mul,
+    div,
+    arg,
+    lt,
+    gt,
+    le,
+    ge,
+    eq,
+    ne,
+    if_stmt,
+    bool_lit,
+    unit_lit,
+    type_name,
+    type_func,
+    comptime_fn,
+    comptime_struct,
 };
 
-pub const FuncTypeNode = struct {
-    params: []const *const TypeNode,
-    ret: *const TypeNode,
+pub const Node = extern struct {
+    tag: Tag,
+    _pad: [3]u8,
+    data0: u32,
+    data1: u32,
 };
 
-pub const ParamNode = struct {
-    name: []const u8,
-    ty: *const TypeNode,
+pub const Ast = struct {
+    backing: []u8,
+
+    nodes: []Node,
+    extra: []u32,
+    string_bytes: []u8,
+    string_offsets: []u32,
+    spans: []Span,
+    decls: []NodeIdx,
+    entry: NodeIdx,
+    name_map: std.StringHashMap(NodeIdx),
+
+    pub fn deinit(ast: *Ast, gpa: std.mem.Allocator) void {
+        gpa.free(ast.backing);
+        ast.name_map.deinit();
+    }
+
+    pub fn spanOf(ast: *const Ast, idx: NodeIdx) ?Span {
+        if (idx < ast.spans.len) return ast.spans[idx];
+        return null;
+    }
+
+    pub fn stringOf(ast: *const Ast, idx: StringIdx) []const u8 {
+        const start = ast.string_offsets[idx];
+        const end = if (idx + 1 < ast.string_offsets.len)
+            ast.string_offsets[idx + 1]
+        else
+            @as(u32, @intCast(ast.string_bytes.len));
+        return ast.string_bytes[start..end];
+    }
+
+    pub fn blockItems(ast: *const Ast, idx: NodeIdx) []const NodeIdx {
+        const start = ast.nodes[idx].data0;
+        const count = ast.nodes[idx].data1;
+        return ast.extra[start..][0..count];
+    }
+
+    pub fn varDeclHasType(ast: *const Ast, idx: NodeIdx) bool {
+        return ast.nodes[idx].data1 & 0x80000000 != 0;
+    }
+
+    pub fn varDeclType(ast: *const Ast, idx: NodeIdx) ?TypeIdx {
+        if (!varDeclHasType(ast, idx)) return null;
+        const extra_idx = ast.nodes[idx].data1 & ~@as(u32, 0x80000000);
+        return ast.extra[extra_idx];
+    }
+
+    pub fn varDeclValue(ast: *const Ast, idx: NodeIdx) NodeIdx {
+        if (!varDeclHasType(ast, idx)) return ast.nodes[idx].data1;
+        const extra_idx = ast.nodes[idx].data1 & ~@as(u32, 0x80000000);
+        return ast.extra[extra_idx + 1];
+    }
+
+    pub fn callArgs(ast: *const Ast, idx: NodeIdx) []const NodeIdx {
+        const extra_idx = ast.nodes[idx].data1;
+        const count = ast.extra[extra_idx];
+        return ast.extra[extra_idx + 1 ..][0..count];
+    }
+
+    pub fn ifData(ast: *const Ast, idx: NodeIdx) struct { cond: NodeIdx, then_: NodeIdx, else_: NodeIdx } {
+        const extra_idx = ast.nodes[idx].data1;
+        return .{
+            .cond = ast.nodes[idx].data0,
+            .then_ = ast.extra[extra_idx],
+            .else_ = ast.extra[extra_idx + 1],
+        };
+    }
+
+    pub fn structInitFields(ast: *const Ast, idx: NodeIdx) []const FieldPair {
+        const extra_idx = ast.nodes[idx].data1;
+        const count = ast.extra[extra_idx];
+        const pairs = @as([*]const FieldPair, @ptrCast(&ast.extra[extra_idx + 1]));
+        return pairs[0..count];
+    }
+
+    pub fn structInitName(ast: *const Ast, idx: NodeIdx) StringIdx {
+        return ast.nodes[idx].data0;
+    }
+
+    pub fn fnParams(ast: *const Ast, idx: NodeIdx) []const ParamPair {
+        const extra_idx = ast.nodes[idx].data1;
+        const count = ast.extra[extra_idx];
+        const pairs = @as([*]const ParamPair, @ptrCast(&ast.extra[extra_idx + 1]));
+        return pairs[0..count];
+    }
+
+    pub fn fnRetType(ast: *const Ast, idx: NodeIdx) TypeIdx {
+        const extra_idx = ast.nodes[idx].data1;
+        const count = ast.extra[extra_idx];
+        return ast.extra[extra_idx + 1 + count * 2];
+    }
+
+    pub fn fnBody(ast: *const Ast, idx: NodeIdx) NodeIdx {
+        const extra_idx = ast.nodes[idx].data1;
+        const count = ast.extra[extra_idx];
+        return ast.extra[extra_idx + 1 + count * 2 + 1];
+    }
+
+    pub fn structFields(ast: *const Ast, idx: NodeIdx) []const ParamPair {
+        const extra_idx = ast.nodes[idx].data1;
+        const count = ast.extra[extra_idx];
+        const pairs = @as([*]const ParamPair, @ptrCast(&ast.extra[extra_idx + 1]));
+        return pairs[0..count];
+    }
+
+    pub fn funcTypeParams(ast: *const Ast, idx: NodeIdx) []const TypeIdx {
+        const extra_idx = ast.nodes[idx].data0;
+        const count = ast.nodes[idx].data1;
+        return ast.extra[extra_idx..][0..count];
+    }
+
+    pub fn funcTypeRet(ast: *const Ast, idx: NodeIdx) TypeIdx {
+        const extra_idx = ast.nodes[idx].data0;
+        const count = ast.nodes[idx].data1;
+        return ast.extra[extra_idx + count];
+    }
+
+    fn alignForward(addr: usize, alignment: usize) usize {
+        return (addr + (alignment - 1)) & ~(@as(usize, alignment) - 1);
+    }
+
+    pub fn serialize(ast: *const Ast, gpa: std.mem.Allocator) ![]u8 {
+        var len: usize = @sizeOf(Header);
+        len += ast.nodes.len * @sizeOf(Node);
+        len += ast.extra.len * 4;
+        len += ast.string_bytes.len;
+        len = alignForward(len, 4);
+        len += ast.string_offsets.len * 4;
+        len = alignForward(len, @alignOf(Span));
+        len += ast.spans.len * @sizeOf(Span);
+        len += ast.decls.len * 4;
+
+        var buf = try std.ArrayList(u8).initCapacity(gpa, len);
+        errdefer buf.deinit(gpa);
+
+        var int_buf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &int_buf, @intCast(ast.nodes.len), .little);
+        try buf.appendSlice(gpa, &int_buf);
+        std.mem.writeInt(u32, &int_buf, @intCast(ast.extra.len), .little);
+        try buf.appendSlice(gpa, &int_buf);
+        std.mem.writeInt(u32, &int_buf, @intCast(ast.string_bytes.len), .little);
+        try buf.appendSlice(gpa, &int_buf);
+        std.mem.writeInt(u32, &int_buf, @intCast(ast.string_offsets.len), .little);
+        try buf.appendSlice(gpa, &int_buf);
+        std.mem.writeInt(u32, &int_buf, @intCast(ast.spans.len), .little);
+        try buf.appendSlice(gpa, &int_buf);
+        std.mem.writeInt(u32, &int_buf, @intCast(ast.decls.len), .little);
+        try buf.appendSlice(gpa, &int_buf);
+        std.mem.writeInt(u32, &int_buf, ast.entry, .little);
+        try buf.appendSlice(gpa, &int_buf);
+
+        try buf.appendSlice(gpa, std.mem.sliceAsBytes(ast.nodes));
+        try buf.appendSlice(gpa, std.mem.sliceAsBytes(ast.extra));
+        try buf.appendSlice(gpa, ast.string_bytes);
+        try buf.appendNTimes(gpa, 0, alignForward(0, 4));
+        const before_offs = buf.items.len;
+        const offs_align = alignForward(before_offs, 4) - before_offs;
+        try buf.appendNTimes(gpa, 0, offs_align);
+        try buf.appendSlice(gpa, std.mem.sliceAsBytes(ast.string_offsets));
+        try buf.appendNTimes(gpa, 0, alignForward(0, @alignOf(Span)));
+        const before_spans = buf.items.len;
+        const spans_align = alignForward(before_spans, @alignOf(Span)) - before_spans;
+        try buf.appendNTimes(gpa, 0, spans_align);
+        try buf.appendSlice(gpa, std.mem.sliceAsBytes(ast.spans));
+        try buf.appendSlice(gpa, std.mem.sliceAsBytes(ast.decls));
+
+        return buf.toOwnedSlice(gpa);
+    }
+
+    fn computedSize(
+        nodes_len: u32,
+        extra_len: u32,
+        str_bytes_len: u32,
+        str_offs_len: u32,
+        spans_len: u32,
+        decls_len: u32,
+    ) struct {
+        total: usize,
+        nodes_off: usize,
+        extra_off: usize,
+        str_bytes_off: usize,
+        str_offs_off: usize,
+        spans_off: usize,
+        decls_off: usize,
+    } {
+        const header_size = @sizeOf(Header);
+        const nodes_off = header_size;
+        const nodes_bytes: usize = @intCast(nodes_len * @sizeOf(Node));
+        const extra_off = nodes_off + nodes_bytes;
+        const extra_bytes: usize = @intCast(extra_len * 4);
+        const str_bytes_off = extra_off + extra_bytes;
+        const str_bytes_bytes: usize = @intCast(str_bytes_len);
+        const str_offs_off = alignForward(str_bytes_off + str_bytes_bytes, 4);
+        const str_offs_bytes: usize = @intCast(str_offs_len * 4);
+        const spans_off = alignForward(str_offs_off + str_offs_bytes, @alignOf(Span));
+        const spans_bytes: usize = @intCast(spans_len * @sizeOf(Span));
+        const decls_off = spans_off + spans_bytes;
+        const decls_bytes: usize = @intCast(decls_len * 4);
+        const total = decls_off + decls_bytes;
+        return .{
+            .total = total,
+            .nodes_off = nodes_off,
+            .extra_off = extra_off,
+            .str_bytes_off = str_bytes_off,
+            .str_offs_off = str_offs_off,
+            .spans_off = spans_off,
+            .decls_off = decls_off,
+        };
+    }
+
+    pub fn deserialize(gpa: std.mem.Allocator, data: []const u8) !Ast {
+        if (data.len < @sizeOf(Header)) return error.UnexpectedEndOfStream;
+        const header_bytes = data[0..@sizeOf(Header)];
+        const header = std.mem.bytesAsValue(Header, header_bytes);
+        const layout = computedSize(header.nodes_len, header.extra_len, header.str_bytes_len, header.str_offs_len, header.spans_len, header.decls_len);
+
+        if (data.len < layout.total) return error.UnexpectedEndOfStream;
+        const payload = data[0..layout.total];
+
+        const backing = try gpa.alloc(u8, layout.total);
+        errdefer gpa.free(backing);
+        @memcpy(backing, payload);
+
+        const nodes = @as([*]Node, @ptrCast(@alignCast(backing.ptr + layout.nodes_off)))[0..header.nodes_len];
+        const extra = @as([*]u32, @ptrCast(@alignCast(backing.ptr + layout.extra_off)))[0..header.extra_len];
+        const string_bytes = backing[layout.str_bytes_off..][0..header.str_bytes_len];
+        const string_offsets = @as([*]u32, @ptrCast(@alignCast(backing.ptr + layout.str_offs_off)))[0..header.str_offs_len];
+        const spans = @as([*]Span, @ptrCast(@alignCast(backing.ptr + layout.spans_off)))[0..header.spans_len];
+        const decls = @as([*]NodeIdx, @ptrCast(@alignCast(backing.ptr + layout.decls_off)))[0..header.decls_len];
+
+        var ast_result = Ast{
+            .backing = backing,
+            .nodes = nodes,
+            .extra = extra,
+            .string_bytes = string_bytes,
+            .string_offsets = string_offsets,
+            .spans = spans,
+            .decls = decls,
+            .entry = header.entry,
+            .name_map = std.StringHashMap(NodeIdx).init(gpa),
+        };
+
+        for (decls) |decl_idx| {
+            const name_idx = ast_result.nodes[decl_idx].data0;
+            const name = ast_result.stringOf(name_idx);
+            try ast_result.name_map.put(name, decl_idx);
+        }
+
+        return ast_result;
+    }
+
+    pub const Header = extern struct {
+        nodes_len: u32,
+        extra_len: u32,
+        str_bytes_len: u32,
+        str_offs_len: u32,
+        spans_len: u32,
+        decls_len: u32,
+        entry: u32,
+    };
 };
 
-pub const FieldNode = struct {
-    name: []const u8,
-    ty: *const TypeNode,
-};
+pub const TypeIdx = u32;
 
-pub const FuncDecl = struct {
-    name: []const u8,
-    params: []const ParamNode,
-    ret_type: *const TypeNode,
-    body: *const AstNode,
-};
+pub fn typeName(ast: *const Ast, idx: TypeIdx) []const u8 {
+    return ast.stringOf(ast.nodes[idx].data0);
+}
 
-pub const StructDecl = struct {
-    name: []const u8,
-    fields: []const FieldNode,
-};
+pub fn typeFuncParams(ast: *const Ast, idx: TypeIdx) []const TypeIdx {
+    return ast.funcTypeParams(idx);
+}
 
-pub const Decl = union(enum) {
-    comptime_func: *const FuncDecl,
-    comptime_struct: *const StructDecl,
-};
+pub fn typeFuncRet(ast: *const Ast, idx: TypeIdx) TypeIdx {
+    return ast.funcTypeRet(idx);
+}
 
-pub const Module = struct {
-    decls: []const *const Decl,
-    entry: *const AstNode,
-};
-
-pub const IfNode = struct {
-    cond: *const AstNode,
-    then_: *const AstNode,
-    else_: ?*const AstNode,
-};
-
-pub const VarNode = struct {
-    name: []const u8,
-    ty: ?*const TypeNode,
-    value: *const AstNode,
-};
-
-pub const ConstNode = struct {
-    name: []const u8,
-    ty: ?*const TypeNode,
-    value: *const AstNode,
-};
-
-pub const ReturnNode = struct {
-    value: *const AstNode,
-};
-
-pub const CallNode = struct {
-    callee: *const AstNode,
-    args: []const *const AstNode,
-};
-
-pub const FieldInit = struct {
-    name: []const u8,
-    value: *const AstNode,
-};
-
-pub const StructInitNode = struct {
-    struct_name: []const u8,
-    fields: []const FieldInit,
-};
-
-pub const FieldAccessNode = struct {
-    target: *const AstNode,
-    field: []const u8,
-};
-
-pub const BlockNode = struct {
-    items: []const *const AstNode,
-};
-
-pub const AstNode = union(enum) {
-    block: *const BlockNode,
-    int: i32,
-    float: f32,
-    var_ref: []const u8,
-    var_: *const VarNode,
-    assign: *const VarNode,
-    const_: *const ConstNode,
-    return_: *const ReturnNode,
-    call: *const CallNode,
-    struct_init: *const StructInitNode,
-    field_access: *const FieldAccessNode,
-    print: *const AstNode,
-    add: *const [2]AstNode,
-    sub: *const [2]AstNode,
-    mul: *const [2]AstNode,
-    div: *const [2]AstNode,
-    arg: u32,
-    lt: *const [2]AstNode,
-    gt: *const [2]AstNode,
-    le: *const [2]AstNode,
-    ge: *const [2]AstNode,
-    eq: *const [2]AstNode,
-    ne: *const [2]AstNode,
-    if_: *const IfNode,
-    bool: bool,
-    unit: void,
-    string: []const u8,
-};
+pub const FieldPair = struct { name: StringIdx, value: NodeIdx };
+pub const ParamPair = struct { name: StringIdx, ty: TypeIdx };

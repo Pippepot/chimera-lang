@@ -50,7 +50,7 @@ const ActiveQuery = struct {
 fn freeMemoValue(comptime T: type, value: *?T, gpa: std.mem.Allocator) void {
     if (value.*) |*v| {
         if (comptime T == parser.ParsedAst) {
-            v.deinit();
+            v.deinit(gpa);
         } else if (comptime T == resolver.ResolvedAst) {
             v.deinit(gpa);
         } else if (comptime T == typecheck.TypedAst) {
@@ -216,7 +216,7 @@ pub const QueryDb = struct {
             self.bumpRevision();
             existing.changed_at = self.revision;
             self.stats.source_sets += 1;
-            try self.tryLoadPersistentCache(source_id, existing);
+            self.tryLoadPersistentCache(source_id, existing);
             return;
         }
 
@@ -231,7 +231,7 @@ pub const QueryDb = struct {
         });
 
         const input = self.sources.getPtr(source_id).?;
-        try self.tryLoadPersistentCache(source_id, input);
+        self.tryLoadPersistentCache(source_id, input);
     }
 
     pub fn sourceText(self: *const @This(), source_id: db.SourceId) ?[]const u8 {
@@ -239,9 +239,9 @@ pub const QueryDb = struct {
         return null;
     }
 
-    pub fn parsedAst(self: *@This(), source_id: db.SourceId) db.DbError!?*const ast.Module {
+    pub fn parsedAst(self: *@This(), source_id: db.SourceId) db.DbError!?*const ast.Ast {
         const memo = try self.ensureParseMemo(source_id, true);
-        if (memo.value) |*parsed| return parsed.root;
+        if (memo.value) |*parsed| return &parsed.ast;
         return null;
     }
 
@@ -307,107 +307,204 @@ pub const QueryDb = struct {
         return .{ .cache_dir_override = self.cache_dir_override };
     }
 
-    fn tryLoadPersistentCache(self: *@This(), source_id: db.SourceId, input: *SourceInput) !void {
+    fn tryLoadPersistentCache(self: *@This(), source_id: db.SourceId, input: *SourceInput) void {
         if (!self.persistent_cache_enabled) return;
         if (self.io == null) return;
         const source_path = input.source_path orelse return;
         const io = self.io.?;
 
-        query_cache.sweepStaleCaches(io, self.gpa, self.cacheOptions(), source_path) catch {};
-        var loaded = (try query_cache.load(io, self.gpa, self.cacheOptions(), source_path, input.text)) orelse return;
+        var loaded = query_cache.load(io, self.gpa, self.cacheOptions(), source_path, input.text) catch return orelse return;
         errdefer loaded.deinit(self.gpa);
 
-        const compile_bytes = if (loaded.compile.bytes) |bytes| try self.gpa.dupe(u8, bytes) else null;
-
-        var deps = try std.ArrayList(db.Dependency).initCapacity(self.gpa, 1);
-        errdefer deps.deinit(self.gpa);
-        try deps.append(self.gpa, .{ .query = queryFor(.lower, source_id) });
-
-        var memo = db.makeMemo([]const u8, compile_bytes, loaded.compile.diagnostics);
-        memo.deps = deps;
-        memo.verified_at = self.revision;
-        memo.changed_at = self.revision;
-
-        loaded.parse.diagnostics.deinit(self.gpa);
-        loaded.resolve.diagnostics.deinit(self.gpa);
-        loaded.typecheck.diagnostics.deinit(self.gpa);
-        loaded.monomorphize.diagnostics.deinit(self.gpa);
-        loaded.lower.diagnostics.deinit(self.gpa);
-
-        try self.cache_backings.append(self.gpa, loaded.backing);
-        loaded.backing = loaded.backing[0..0];
-        loaded.compile.diagnostics = .empty;
-
-        if (try self.compile_memos.fetchPut(source_id, memo)) |kv| {
-            var old = kv.value;
-            deinitMemo([]const u8, &old, self.gpa);
+        // ── 1. Parse memo ──
+        const parse_value = if (loaded.parse.has_value and loaded.parse.bytes != null)
+            query_cache.deserializeParsed(self.gpa, loaded.parse.bytes.?) catch return
+        else
+            null;
+        var parse_memo = db.makeMemo(parser.ParsedAst, parse_value, loaded.parse.diagnostics);
+        loaded.parse.diagnostics = .empty;
+        {
+            var pd = std.ArrayList(db.Dependency).initCapacity(self.gpa, 1) catch return;
+            pd.append(self.gpa, .{ .source = source_id }) catch return;
+            parse_memo.deps = pd;
         }
+        parse_memo.verified_at = self.revision;
+        parse_memo.changed_at = self.revision;
 
-        // Rehydrate stage values that were present when the cache file was written.
-        // This keeps APIs like parsedAst()/loweredProgram() behaviorally consistent.
-        if (loaded.parse.has_value) _ = try self.parsedAst(source_id);
-        if (loaded.resolve.has_value) _ = try self.resolvedAst(source_id);
-        if (loaded.typecheck.has_value) _ = try self.typedAst(source_id);
-        if (loaded.monomorphize.has_value) _ = try self.monomorphizedProgram(source_id);
-        if (loaded.lower.has_value) _ = try self.loweredProgram(source_id);
+        // ── 2. Resolve memo ──
+        const resolve_value = if (loaded.resolve.has_value and loaded.resolve.bytes != null)
+            query_cache.deserializeResolved(self.gpa, loaded.resolve.bytes.?) catch return
+        else
+            null;
+        var resolve_memo = db.makeMemo(resolver.ResolvedAst, resolve_value, loaded.resolve.diagnostics);
+        loaded.resolve.diagnostics = .empty;
+        {
+            var rd = std.ArrayList(db.Dependency).initCapacity(self.gpa, 1) catch return;
+            rd.append(self.gpa, .{ .query = queryFor(.parse, source_id) }) catch return;
+            resolve_memo.deps = rd;
+        }
+        resolve_memo.verified_at = self.revision;
+        resolve_memo.changed_at = self.revision;
+
+        // ── 3. Typecheck memo (needs parse_ast from deserialized parse memo) ──
+        const parse_ast = if (parse_memo.value) |*p| &p.ast else null;
+        const type_value = if (loaded.typecheck.has_value and loaded.typecheck.bytes != null and parse_ast != null)
+            query_cache.deserializeTyped(self.gpa, loaded.typecheck.bytes.?, parse_ast.?) catch return
+        else
+            null;
+        var type_memo = db.makeMemo(typecheck.TypedAst, type_value, loaded.typecheck.diagnostics);
+        loaded.typecheck.diagnostics = .empty;
+        {
+            var td = std.ArrayList(db.Dependency).initCapacity(self.gpa, 1) catch return;
+            td.append(self.gpa, .{ .query = queryFor(.resolve, source_id) }) catch return;
+            type_memo.deps = td;
+        }
+        type_memo.verified_at = self.revision;
+        type_memo.changed_at = self.revision;
+
+        // ── 4. Monomorphize memo ──
+        const mono_value = if (loaded.monomorphize.has_value and loaded.monomorphize.bytes != null)
+            query_cache.deserializeMono(self.gpa, loaded.monomorphize.bytes.?) catch return
+        else
+            null;
+        var mono_memo = db.makeMemo(monomorphize.MonoProgram, mono_value, loaded.monomorphize.diagnostics);
+        loaded.monomorphize.diagnostics = .empty;
+        {
+            var md = std.ArrayList(db.Dependency).initCapacity(self.gpa, 1) catch return;
+            md.append(self.gpa, .{ .query = queryFor(.typecheck, source_id) }) catch return;
+            mono_memo.deps = md;
+        }
+        mono_memo.verified_at = self.revision;
+        mono_memo.changed_at = self.revision;
+
+        // ── 5. Lower memo ──
+        const lower_value = if (loaded.lower.has_value and loaded.lower.bytes != null)
+            query_cache.deserializeProgram(self.gpa, loaded.lower.bytes.?) catch return
+        else
+            null;
+        var lower_memo = db.makeMemo(ir_mod.Program, lower_value, loaded.lower.diagnostics);
+        loaded.lower.diagnostics = .empty;
+        {
+            var ld = std.ArrayList(db.Dependency).initCapacity(self.gpa, 1) catch return;
+            ld.append(self.gpa, .{ .query = queryFor(.monomorphize, source_id) }) catch return;
+            lower_memo.deps = ld;
+        }
+        lower_memo.verified_at = self.revision;
+        lower_memo.changed_at = self.revision;
+
+        // ── 6. Compile memo ──
+        const compile_bytes = if (loaded.compile.bytes) |bytes| self.gpa.dupe(u8, bytes) catch return else null;
+        var compile_memo = db.makeMemo([]const u8, compile_bytes, loaded.compile.diagnostics);
+        loaded.compile.diagnostics = .empty;
+        {
+            var cd = std.ArrayList(db.Dependency).initCapacity(self.gpa, 1) catch return;
+            cd.append(self.gpa, .{ .query = queryFor(.lower, source_id) }) catch return;
+            compile_memo.deps = cd;
+        }
+        compile_memo.verified_at = self.revision;
+        compile_memo.changed_at = self.revision;
+
+        // ── Retain backing (diagnostics were moved out) ──
+        self.cache_backings.append(self.gpa, loaded.backing) catch return;
+        loaded.backing = loaded.backing[0..0];
+
+        // ── Insert all memos ──
+        _ = self.parse_memos.fetchPut(source_id, parse_memo) catch return;
+        _ = self.resolve_memos.fetchPut(source_id, resolve_memo) catch return;
+        _ = self.type_memos.fetchPut(source_id, type_memo) catch return;
+        _ = self.mono_memos.fetchPut(source_id, mono_memo) catch return;
+        _ = self.lower_memos.fetchPut(source_id, lower_memo) catch return;
+        _ = self.compile_memos.fetchPut(source_id, compile_memo) catch return;
     }
 
-    fn snapshotStage(self: *const @This(), source_id: db.SourceId, stage: Stage) query_cache.StageSnapshot {
+    fn snapshotStage(self: *const @This(), source_id: db.SourceId, stage: Stage, gpa: std.mem.Allocator) (error{OutOfMemory}!query_cache.StageSnapshot) {
         return switch (stage) {
             .parse => if (self.parse_memos.get(source_id)) |memo| .{
                 .changed_at = memo.changed_at,
                 .has_value = memo.value != null,
                 .diagnostics = memo.diagnostics.items,
-            } else .{ .changed_at = 0, .has_value = false, .diagnostics = &.{} },
+                .bytes = if (memo.value) |*v| try query_cache.serializeParsed(gpa, v) else null,
+            } else .{ .changed_at = 0, .has_value = false, .diagnostics = &.{}, .bytes = null },
             .resolve => if (self.resolve_memos.get(source_id)) |memo| .{
                 .changed_at = memo.changed_at,
                 .has_value = memo.value != null,
                 .diagnostics = memo.diagnostics.items,
-            } else .{ .changed_at = 0, .has_value = false, .diagnostics = &.{} },
+                .bytes = if (memo.value) |*v| try query_cache.serializeResolved(gpa, v) else null,
+            } else .{ .changed_at = 0, .has_value = false, .diagnostics = &.{}, .bytes = null },
             .typecheck => if (self.type_memos.get(source_id)) |memo| .{
                 .changed_at = memo.changed_at,
                 .has_value = memo.value != null,
                 .diagnostics = memo.diagnostics.items,
-            } else .{ .changed_at = 0, .has_value = false, .diagnostics = &.{} },
+                .bytes = if (memo.value) |*v| try query_cache.serializeTyped(gpa, v) else null,
+            } else .{ .changed_at = 0, .has_value = false, .diagnostics = &.{}, .bytes = null },
             .monomorphize => if (self.mono_memos.get(source_id)) |memo| .{
                 .changed_at = memo.changed_at,
                 .has_value = memo.value != null,
                 .diagnostics = memo.diagnostics.items,
-            } else .{ .changed_at = 0, .has_value = false, .diagnostics = &.{} },
+                .bytes = if (memo.value) |*v| try query_cache.serializeMono(gpa, v) else null,
+            } else .{ .changed_at = 0, .has_value = false, .diagnostics = &.{}, .bytes = null },
             .lower => if (self.lower_memos.get(source_id)) |memo| .{
                 .changed_at = memo.changed_at,
                 .has_value = memo.value != null,
                 .diagnostics = memo.diagnostics.items,
-            } else .{ .changed_at = 0, .has_value = false, .diagnostics = &.{} },
-            .compile => unreachable,
+                .bytes = if (memo.value) |*v| try query_cache.serializeProgram(gpa, v) else null,
+            } else .{ .changed_at = 0, .has_value = false, .diagnostics = &.{}, .bytes = null },
+            .compile => if (self.compile_memos.get(source_id)) |memo| .{
+                .changed_at = memo.changed_at,
+                .has_value = memo.value != null,
+                .diagnostics = memo.diagnostics.items,
+                .bytes = memo.value,
+            } else .{ .changed_at = 0, .has_value = false, .diagnostics = &.{}, .bytes = null },
         };
     }
 
     fn flushPersistentCaches(self: *@This(), io: std.Io) !void {
         if (!self.persistent_cache_enabled) return;
 
+        {
+            var iter = self.sources.iterator();
+            if (iter.next()) |entry| {
+                const source = entry.value_ptr.*;
+                if (source.source_path) |path|
+                    query_cache.sweepStaleCaches(io, self.gpa, self.cacheOptions(), path) catch {};
+            }
+        }
+
         var iter = self.sources.iterator();
         while (iter.next()) |entry| {
             const source_id = entry.key_ptr.*;
             const source = entry.value_ptr.*;
             const source_path = source.source_path orelse continue;
-            const compile_memo = self.compile_memos.get(source_id) orelse continue;
+            if (self.compile_memos.get(source_id) == null) continue;
+
+            const parse_snap = try self.snapshotStage(source_id, .parse, self.gpa);
+            errdefer if (parse_snap.bytes) |b| self.gpa.free(b);
+            const resolve_snap = try self.snapshotStage(source_id, .resolve, self.gpa);
+            errdefer if (resolve_snap.bytes) |b| self.gpa.free(b);
+            const type_snap = try self.snapshotStage(source_id, .typecheck, self.gpa);
+            errdefer if (type_snap.bytes) |b| self.gpa.free(b);
+            const mono_snap = try self.snapshotStage(source_id, .monomorphize, self.gpa);
+            errdefer if (mono_snap.bytes) |b| self.gpa.free(b);
+            const lower_snap = try self.snapshotStage(source_id, .lower, self.gpa);
+            errdefer if (lower_snap.bytes) |b| self.gpa.free(b);
+            const compile_snap = try self.snapshotStage(source_id, .compile, self.gpa);
 
             try query_cache.save(io, self.gpa, self.cacheOptions(), .{
                 .source_path = source_path,
                 .source_text = source.text,
-                .parse = self.snapshotStage(source_id, .parse),
-                .resolve = self.snapshotStage(source_id, .resolve),
-                .typecheck = self.snapshotStage(source_id, .typecheck),
-                .monomorphize = self.snapshotStage(source_id, .monomorphize),
-                .lower = self.snapshotStage(source_id, .lower),
-                .compile = .{
-                    .changed_at = compile_memo.changed_at,
-                    .has_value = compile_memo.value != null,
-                    .diagnostics = compile_memo.diagnostics.items,
-                    .bytes = compile_memo.value,
-                },
+                .parse = parse_snap,
+                .resolve = resolve_snap,
+                .typecheck = type_snap,
+                .monomorphize = mono_snap,
+                .lower = lower_snap,
+                .compile = compile_snap,
             });
+
+            if (parse_snap.bytes) |b| self.gpa.free(b);
+            if (resolve_snap.bytes) |b| self.gpa.free(b);
+            if (type_snap.bytes) |b| self.gpa.free(b);
+            if (mono_snap.bytes) |b| self.gpa.free(b);
+            if (lower_snap.bytes) |b| self.gpa.free(b);
         }
     }
 

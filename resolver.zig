@@ -5,8 +5,6 @@ const diagnostics = @import("diagnostics.zig");
 const scope_mod = @import("scope.zig");
 const db = @import("db.zig");
 
-const AstNode = ast.AstNode;
-
 pub const ResolveError = error{
     DuplicateSymbol,
     UnknownSymbol,
@@ -18,19 +16,19 @@ pub const ResolvedRef = union(enum) {
 };
 
 pub const ResolvedAst = struct {
-    module: *const ast.Module,
-    functions: std.ArrayList(*const ast.FuncDecl),
+    functions: std.ArrayList(ast.NodeIdx),
     function_names: std.StringHashMap(u32),
     struct_names: std.StringHashMap(void),
-    node_refs: std.AutoHashMap(usize, ResolvedRef),
+    node_refs: std.AutoHashMap(ast.NodeIdx, ResolvedRef),
+    key_arena: std.heap.ArenaAllocator,
 
-    pub fn init(gpa: std.mem.Allocator, module: *const ast.Module) !ResolvedAst {
+    pub fn init(gpa: std.mem.Allocator) !ResolvedAst {
         return .{
-            .module = module,
-            .functions = try std.ArrayList(*const ast.FuncDecl).initCapacity(gpa, 8),
+            .functions = try std.ArrayList(ast.NodeIdx).initCapacity(gpa, 8),
             .function_names = std.StringHashMap(u32).init(gpa),
             .struct_names = std.StringHashMap(void).init(gpa),
-            .node_refs = std.AutoHashMap(usize, ResolvedRef).init(gpa),
+            .node_refs = std.AutoHashMap(ast.NodeIdx, ResolvedRef).init(gpa),
+            .key_arena = std.heap.ArenaAllocator.init(gpa),
         };
     }
 
@@ -39,6 +37,7 @@ pub const ResolvedAst = struct {
         self.function_names.deinit();
         self.struct_names.deinit();
         self.node_refs.deinit();
+        self.key_arena.deinit();
     }
 };
 
@@ -63,7 +62,7 @@ const Resolver = struct {
         return .{
             .gpa = gpa,
             .parsed = parsed,
-            .resolved = try ResolvedAst.init(gpa, parsed.root),
+            .resolved = try ResolvedAst.init(gpa),
             .locals = scope_mod.ScopeStack(void).init(),
             .failure = null,
         };
@@ -74,138 +73,136 @@ const Resolver = struct {
         self.resolved.deinit(self.gpa);
     }
 
-    fn spanOfDecl(self: *const @This(), decl: *const ast.Decl) ?ast.Span {
-        return self.parsed.spanOfAny(@intFromPtr(decl));
-    }
-
-    fn spanOfNode(self: *const @This(), node: *const AstNode) ?ast.Span {
-        return self.parsed.spanOfNode(node);
-    }
-
     fn fail(self: *@This(), span: ?ast.Span, kind: ResolveError) error{ResolveFailed} {
         if (self.failure == null) self.failure = .{ .span = span, .kind = kind };
         return error.ResolveFailed;
     }
 
-    fn addTopLevelSymbol(self: *@This(), name: []const u8, decl: *const ast.Decl) !void {
+    fn addTopLevelSymbol(self: *@This(), name: []const u8, decl_idx: ast.NodeIdx) !void {
         if (self.resolved.function_names.contains(name) or self.resolved.struct_names.contains(name)) {
-            return self.fail(self.spanOfDecl(decl), error.DuplicateSymbol);
+            return self.fail(self.parsed.ast.spanOf(decl_idx), error.DuplicateSymbol);
         }
 
-        switch (decl.*) {
-            .comptime_func => |func_decl| {
+        switch (self.parsed.ast.nodes[decl_idx].tag) {
+            .comptime_fn => {
                 const fn_id: u32 = @intCast(self.resolved.functions.items.len);
-                try self.resolved.functions.append(self.gpa, func_decl);
+                try self.resolved.functions.append(self.gpa, decl_idx);
                 try self.resolved.function_names.put(name, fn_id);
             },
             .comptime_struct => {
                 try self.resolved.struct_names.put(name, {});
             },
+            else => {},
         }
     }
 
     fn resolveTopLevel(self: *@This()) !void {
-        for (self.resolved.module.decls) |decl| {
-            const name = switch (decl.*) {
-                .comptime_func => |func_decl| func_decl.name,
-                .comptime_struct => |struct_decl| struct_decl.name,
-            };
-            try self.addTopLevelSymbol(name, decl);
+        for (self.parsed.ast.decls) |decl_idx| {
+            const name = self.parsed.ast.stringOf(self.parsed.ast.nodes[decl_idx].data0);
+            try self.addTopLevelSymbol(name, decl_idx);
         }
     }
 
     fn resolve(self: *@This()) !void {
         try self.resolveTopLevel();
-        for (self.resolved.functions.items) |func_decl| {
-            try self.resolveFunction(func_decl);
+        for (self.resolved.functions.items) |func_decl_idx| {
+            try self.resolveFunction(func_decl_idx);
         }
-        try self.resolveNode(self.resolved.module.entry);
+        try self.resolveNode(self.parsed.ast.entry);
     }
 
-    fn resolveFunction(self: *@This(), func_decl: *const ast.FuncDecl) !void {
+    fn resolveFunction(self: *@This(), func_decl_idx: ast.NodeIdx) !void {
         const mark = self.locals.mark();
         defer self.locals.restore(mark);
 
-        for (func_decl.params) |param| {
-            self.locals.push(self.gpa, param.name, {}) catch |err| switch (err) {
-                error.DuplicateVariable => return self.fail(self.spanOfNode(func_decl.body), error.DuplicateSymbol),
+        for (self.parsed.ast.fnParams(func_decl_idx)) |param| {
+            const name = self.parsed.ast.stringOf(param.name);
+            self.locals.push(self.gpa, name, {}) catch |err| switch (err) {
+                error.DuplicateVariable => return self.fail(self.parsed.ast.spanOf(func_decl_idx), error.DuplicateSymbol),
                 error.OutOfMemory => return error.OutOfMemory,
             };
         }
 
-        try self.resolveNode(func_decl.body);
+        try self.resolveNode(self.parsed.ast.fnBody(func_decl_idx));
     }
 
-    fn resolveNode(self: *@This(), node: *const AstNode) !void {
-        switch (node.*) {
-            .block => |blk| {
+    fn resolveNode(self: *@This(), idx: ast.NodeIdx) !void {
+        const ast_ = self.parsed.ast;
+        switch (ast_.nodes[idx].tag) {
+            .block => {
                 const mark = self.locals.mark();
                 defer self.locals.restore(mark);
-                for (blk.items) |item| {
+                for (ast_.blockItems(idx)) |item| {
                     try self.resolveNode(item);
                 }
             },
-            .int, .float, .arg, .bool, .unit, .string => {},
-            .var_ref => |name| {
+            .int_lit, .float_lit, .arg, .bool_lit, .unit_lit => {},
+            .var_ref => {
+                const name = ast_.stringOf(ast_.nodes[idx].data0);
                 if (self.locals.lookup(name) != null) {
-                    try self.resolved.node_refs.put(@intFromPtr(node), .local);
+                    try self.resolved.node_refs.put(idx, .local);
                     return;
                 }
                 if (self.resolved.function_names.get(name)) |fn_id| {
-                    try self.resolved.node_refs.put(@intFromPtr(node), .{ .function = fn_id });
+                    try self.resolved.node_refs.put(idx, .{ .function = fn_id });
                     return;
                 }
-                return self.fail(self.spanOfNode(node), error.UnknownSymbol);
+                return self.fail(ast_.spanOf(idx), error.UnknownSymbol);
             },
-            .const_ => |cn| {
-                try self.resolveNode(cn.value);
-                self.locals.push(self.gpa, cn.name, {}) catch |err| switch (err) {
-                    error.DuplicateVariable => return self.fail(self.spanOfNode(node), error.DuplicateSymbol),
+            .const_decl => {
+                const name = ast_.stringOf(ast_.nodes[idx].data0);
+                try self.resolveNode(ast_.varDeclValue(idx));
+                self.locals.push(self.gpa, name, {}) catch |err| switch (err) {
+                    error.DuplicateVariable => return self.fail(ast_.spanOf(idx), error.DuplicateSymbol),
                     error.OutOfMemory => return error.OutOfMemory,
                 };
             },
-            .var_ => |vn| {
-                try self.resolveNode(vn.value);
-                self.locals.push(self.gpa, vn.name, {}) catch |err| switch (err) {
-                    error.DuplicateVariable => return self.fail(self.spanOfNode(node), error.DuplicateSymbol),
+            .var_decl => {
+                const name = ast_.stringOf(ast_.nodes[idx].data0);
+                try self.resolveNode(ast_.varDeclValue(idx));
+                self.locals.push(self.gpa, name, {}) catch |err| switch (err) {
+                    error.DuplicateVariable => return self.fail(ast_.spanOf(idx), error.DuplicateSymbol),
                     error.OutOfMemory => return error.OutOfMemory,
                 };
             },
-            .assign => |an| {
-                if (self.locals.lookup(an.name) == null) {
-                    return self.fail(self.spanOfNode(node), error.UnknownSymbol);
+            .assign => {
+                const name = ast_.stringOf(ast_.nodes[idx].data0);
+                if (self.locals.lookup(name) == null) {
+                    return self.fail(ast_.spanOf(idx), error.UnknownSymbol);
                 }
-                try self.resolveNode(an.value);
+                try self.resolveNode(ast_.nodes[idx].data1);
             },
-            .return_ => |ret| try self.resolveNode(ret.value),
-            .call => |call_node| {
-                try self.resolveNode(call_node.callee);
-                for (call_node.args) |arg| try self.resolveNode(arg);
+            .return_stmt => try self.resolveNode(ast_.nodes[idx].data0),
+            .call => {
+                try self.resolveNode(ast_.nodes[idx].data0);
+                for (ast_.callArgs(idx)) |arg| try self.resolveNode(arg);
             },
-            .print => |child| try self.resolveNode(child),
-            .add, .sub, .mul, .div, .lt, .gt, .le, .ge, .eq, .ne => |kids| {
-                try self.resolveNode(&kids[0]);
-                try self.resolveNode(&kids[1]);
+            .print_stmt => try self.resolveNode(ast_.nodes[idx].data0),
+            .add, .sub, .mul, .div, .lt, .gt, .le, .ge, .eq, .ne => {
+                try self.resolveNode(ast_.nodes[idx].data0);
+                try self.resolveNode(ast_.nodes[idx].data1);
             },
-            .if_ => |if_node| {
-                try self.resolveNode(if_node.cond);
+            .if_stmt => {
+                const data = ast_.ifData(idx);
+                try self.resolveNode(data.cond);
                 {
                     const mark = self.locals.mark();
                     defer self.locals.restore(mark);
-                    try self.resolveNode(if_node.then_);
+                    try self.resolveNode(data.then_);
                 }
-                if (if_node.else_) |else_node| {
+                if (data.else_ != std.math.maxInt(ast.NodeIdx)) {
                     const mark = self.locals.mark();
                     defer self.locals.restore(mark);
-                    try self.resolveNode(else_node);
+                    try self.resolveNode(data.else_);
                 }
             },
-            .struct_init => |si| {
-                for (si.fields) |field| try self.resolveNode(field.value);
+            .struct_init => {
+                for (ast_.structInitFields(idx)) |field| try self.resolveNode(field.value);
             },
-            .field_access => |fa| {
-                try self.resolveNode(fa.target);
+            .field_access => {
+                try self.resolveNode(ast_.nodes[idx].data0);
             },
+            .type_name, .type_func, .comptime_fn, .comptime_struct => {},
         }
     }
 };

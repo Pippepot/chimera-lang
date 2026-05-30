@@ -6,8 +6,6 @@ const resolver = @import("resolver.zig");
 const scope_mod = @import("scope.zig");
 const db = @import("db.zig");
 
-const AstNode = ast.AstNode;
-
 pub const FuncType = struct {
     params: []const Type,
     ret: Type,
@@ -18,7 +16,6 @@ pub const Type = union(enum) {
     bool,
     int,
     float,
-    string,
     named: []const u8,
     func: *const FuncType,
 };
@@ -26,7 +23,7 @@ pub const Type = union(enum) {
 pub fn typeEql(a: Type, b: Type) bool {
     if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
     return switch (a) {
-        .unit, .bool, .int, .float, .string => true,
+        .unit, .bool, .int, .float => true,
         .named => |lhs| std.mem.eql(u8, lhs, b.named),
         .func => |lhs| funcTypeEql(lhs, b.func),
     };
@@ -41,7 +38,7 @@ fn funcTypeEql(a: *const FuncType, b: *const FuncType) bool {
 }
 
 pub const FunctionInfo = struct {
-    decl: *const ast.FuncDecl,
+    decl: ast.NodeIdx,
     ty: *const FuncType,
     has_explicit_return: bool,
 };
@@ -79,16 +76,16 @@ pub const TypeError = error{
 
 pub const TypedAst = struct {
     arena: std.heap.ArenaAllocator,
-    module: *const ast.Module,
-    node_types: std.AutoHashMap(usize, Type),
+    ast: *const ast.Ast,
+    node_types: std.AutoHashMap(ast.NodeIdx, Type),
     functions: []FunctionInfo,
     entry_function: u32,
 
-    pub fn init(gpa: std.mem.Allocator, module: *const ast.Module) TypedAst {
+    pub fn init(gpa: std.mem.Allocator, parsed_ast: *const ast.Ast) TypedAst {
         return .{
             .arena = std.heap.ArenaAllocator.init(gpa),
-            .module = module,
-            .node_types = std.AutoHashMap(usize, Type).init(gpa),
+            .ast = parsed_ast,
+            .node_types = std.AutoHashMap(ast.NodeIdx, Type).init(gpa),
             .functions = &.{},
             .entry_function = 0,
         };
@@ -99,8 +96,8 @@ pub const TypedAst = struct {
         self.arena.deinit();
     }
 
-    pub fn typeOf(self: *const @This(), node: *const AstNode) TypeError!Type {
-        return self.node_types.get(nodeKey(node)) orelse error.MissingNodeType;
+    pub fn typeOf(self: *const @This(), idx: ast.NodeIdx) TypeError!Type {
+        return self.node_types.get(idx) orelse error.MissingNodeType;
     }
 
     pub fn functionType(self: *const @This(), fn_id: u32) *const FuncType {
@@ -174,7 +171,7 @@ const Checker = struct {
             .gpa = gpa,
             .parsed = parsed,
             .resolved = resolved,
-            .typed = TypedAst.init(gpa, resolved.module),
+            .typed = TypedAst.init(gpa, &parsed.ast),
             .bindings = scope_mod.ScopeStack(Binding).init(),
             .failure = null,
             .in_fallible_scope = false,
@@ -188,16 +185,16 @@ const Checker = struct {
         self.bindings.deinit(self.gpa);
     }
 
-    fn spanOfNode(self: *const @This(), node: *const AstNode) ?ast.Span {
-        return self.parsed.spanOfNode(node);
+    fn spanOfNode(self: *const @This(), idx: ast.NodeIdx) ?ast.Span {
+        return self.parsed.ast.spanOf(idx);
     }
 
-    fn spanOfTypeNode(self: *const @This(), type_node: *const ast.TypeNode) ?ast.Span {
-        return self.parsed.spanOfAny(@intFromPtr(type_node));
+    fn spanOfTypeNode(self: *const @This(), type_idx: ast.TypeIdx) ?ast.Span {
+        return self.parsed.ast.spanOf(type_idx);
     }
 
-    fn remember(self: *@This(), node: *const AstNode, ty: Type) std.mem.Allocator.Error!Type {
-        try self.typed.node_types.put(nodeKey(node), ty);
+    fn remember(self: *@This(), idx: ast.NodeIdx, ty: Type) std.mem.Allocator.Error!Type {
+        try self.typed.node_types.put(idx, ty);
         return ty;
     }
 
@@ -206,17 +203,17 @@ const Checker = struct {
         return error.TypecheckFailed;
     }
 
-    fn failAtNode(self: *@This(), node: *const AstNode, kind: TypeError) error{TypecheckFailed} {
-        return self.fail(self.spanOfNode(node), kind);
+    fn failAtNode(self: *@This(), idx: ast.NodeIdx, kind: TypeError) error{TypecheckFailed} {
+        return self.fail(self.spanOfNode(idx), kind);
     }
 
-    fn failAtType(self: *@This(), type_node: *const ast.TypeNode, kind: TypeError) error{TypecheckFailed} {
-        return self.fail(self.spanOfTypeNode(type_node), kind);
+    fn failAtType(self: *@This(), type_idx: ast.TypeIdx, kind: TypeError) error{TypecheckFailed} {
+        return self.fail(self.spanOfTypeNode(type_idx), kind);
     }
 
-    fn pushBinding(self: *@This(), node: *const AstNode, name: []const u8, binding: Binding) InferError!void {
+    fn pushBinding(self: *@This(), idx: ast.NodeIdx, name: []const u8, binding: Binding) InferError!void {
         self.bindings.push(self.gpa, name, binding) catch |err| switch (err) {
-            error.DuplicateVariable => return self.failAtNode(node, error.DuplicateSymbol),
+            error.DuplicateVariable => return self.failAtNode(idx, error.DuplicateSymbol),
             error.OutOfMemory => return error.OutOfMemory,
         };
     }
@@ -237,64 +234,59 @@ const Checker = struct {
         return fn_ty;
     }
 
-    fn resolveTypeNode(self: *@This(), type_node: *const ast.TypeNode) InferError!Type {
-        return switch (type_node.*) {
-            .name => |name| blk: {
-                if (std.mem.eql(u8, name, "unit")) break :blk .unit;
-                if (std.mem.eql(u8, name, "bool")) break :blk .bool;
-                if (std.mem.eql(u8, name, "int")) break :blk .int;
-                if (std.mem.eql(u8, name, "float")) break :blk .float;
-                if (std.mem.eql(u8, name, "string")) break :blk .string;
-                if (self.resolved.struct_names.contains(name)) break :blk .{ .named = name };
-                return self.failAtType(type_node, error.UnknownType);
+    fn resolveTypeNode(self: *@This(), type_idx: ast.TypeIdx) InferError!Type {
+        const a = self.parsed.ast;
+        switch (a.nodes[type_idx].tag) {
+            .type_name => {
+                const name = a.stringOf(a.nodes[type_idx].data0);
+                if (std.mem.eql(u8, name, "unit")) return .unit;
+                if (std.mem.eql(u8, name, "bool")) return .bool;
+                if (std.mem.eql(u8, name, "int")) return .int;
+                if (std.mem.eql(u8, name, "float")) return .float;
+                if (self.resolved.struct_names.contains(name)) return .{ .named = name };
+                return self.failAtType(type_idx, error.UnknownType);
             },
-            .func => |fn_node| blk: {
-                var params = try std.ArrayList(Type).initCapacity(self.gpa, fn_node.params.len);
+            .type_func => {
+                const param_indices = a.funcTypeParams(type_idx);
+                var params = try std.ArrayList(Type).initCapacity(self.gpa, param_indices.len);
                 defer params.deinit(self.gpa);
-                for (fn_node.params) |param_type_node| {
-                    try params.append(self.gpa, try self.resolveTypeNode(param_type_node));
+                for (param_indices) |p| {
+                    try params.append(self.gpa, try self.resolveTypeNode(p));
                 }
-                const ret_ty = try self.resolveTypeNode(fn_node.ret);
+                const ret_ty = try self.resolveTypeNode(a.funcTypeRet(type_idx));
                 const fn_ty = try self.allocFuncType(params.items, ret_ty);
-                break :blk .{ .func = fn_ty };
+                return .{ .func = fn_ty };
             },
-        };
+            else => return self.failAtType(type_idx, error.UnknownType),
+        }
     }
 
     fn setupFunctionSignatures(self: *@This()) InferError!void {
         const arena_alloc = self.typed.arena.allocator();
         const fn_count = self.resolved.functions.items.len;
-        const reserve_extra: usize = if (hasTopLevelEntry(self.typed.module.entry)) 1 else 0;
+        const reserve_extra: usize = if (hasTopLevelEntry(self.parsed.ast, self.parsed.ast.entry)) 1 else 0;
         const infos = try arena_alloc.alloc(FunctionInfo, fn_count + reserve_extra);
 
-        for (self.resolved.functions.items, 0..) |func_decl, idx| {
-            var param_types = try std.ArrayList(Type).initCapacity(self.gpa, func_decl.params.len);
+        const a = self.parsed.ast;
+        for (self.resolved.functions.items, 0..) |func_decl_idx, idx| {
+            var param_types = try std.ArrayList(Type).initCapacity(self.gpa, a.fnParams(func_decl_idx).len);
             defer param_types.deinit(self.gpa);
-            for (func_decl.params) |param| {
+            for (a.fnParams(func_decl_idx)) |param| {
                 try param_types.append(self.gpa, try self.resolveTypeNode(param.ty));
             }
-            const ret_ty = try self.resolveTypeNode(func_decl.ret_type);
+            const ret_ty = try self.resolveTypeNode(a.fnRetType(func_decl_idx));
             const fn_ty = try self.allocFuncType(param_types.items, ret_ty);
             infos[idx] = .{
-                .decl = func_decl,
+                .decl = func_decl_idx,
                 .ty = fn_ty,
                 .has_explicit_return = false,
             };
         }
 
         if (reserve_extra == 1) {
-            const fake_ret_type = try arena_alloc.create(ast.TypeNode);
-            fake_ret_type.* = .{ .name = "unit" };
-            const fake_decl = try arena_alloc.create(ast.FuncDecl);
-            fake_decl.* = .{
-                .name = "__top_level_entry__",
-                .params = &.{},
-                .ret_type = fake_ret_type,
-                .body = self.typed.module.entry,
-            };
             const top_fn_ty = try self.allocFuncType(&.{}, .unit);
             infos[fn_count] = .{
-                .decl = fake_decl,
+                .decl = std.math.maxInt(ast.NodeIdx),
                 .ty = top_fn_ty,
                 .has_explicit_return = false,
             };
@@ -318,227 +310,266 @@ const Checker = struct {
         };
     }
 
-    fn isFallible(node: *const AstNode) bool {
-        return switch (node.*) {
+    fn isFallibleNode(a: ast.Ast, idx: ast.NodeIdx) bool {
+        return switch (a.nodes[idx].tag) {
             .lt, .gt, .le, .ge, .eq, .ne => true,
             else => false,
         };
     }
 
-    fn inferPair(self: *@This(), kids: *const [2]AstNode) InferError![2]Type {
-        const lhs = try self.inferNode(&kids[0]);
-        const rhs = try self.inferNode(&kids[1]);
-        return .{ lhs, rhs };
+    fn inferPair(self: *@This(), lhs: ast.NodeIdx, rhs: ast.NodeIdx) InferError![2]Type {
+        const l = try self.inferNode(lhs);
+        const r = try self.inferNode(rhs);
+        return .{ l, r };
     }
 
-    fn inferArithmetic(self: *@This(), node: *const AstNode, kids: *const [2]AstNode) InferError!Type {
-        const pair = try self.inferPair(kids);
-        if (!isNumeric(pair[0])) return self.failAtNode(&kids[0], error.ArithmeticRequiresNumeric);
-        if (!isNumeric(pair[1])) return self.failAtNode(&kids[1], error.ArithmeticRequiresNumeric);
-        if (!typeEql(pair[0], pair[1])) return self.failAtNode(node, error.ArithmeticOperandMismatch);
-        return self.remember(node, pair[0]);
+    fn inferArithmetic(self: *@This(), idx: ast.NodeIdx, lhs: ast.NodeIdx, rhs: ast.NodeIdx) InferError!Type {
+        const pair = try self.inferPair(lhs, rhs);
+        if (!isNumeric(pair[0])) return self.failAtNode(lhs, error.ArithmeticRequiresNumeric);
+        if (!isNumeric(pair[1])) return self.failAtNode(rhs, error.ArithmeticRequiresNumeric);
+        if (!typeEql(pair[0], pair[1])) return self.failAtNode(idx, error.ArithmeticOperandMismatch);
+        return self.remember(idx, pair[0]);
     }
 
-    fn inferComparison(self: *@This(), node: *const AstNode, kids: *const [2]AstNode) InferError!Type {
-        const pair = try self.inferPair(kids);
-        if (!isNumeric(pair[0])) return self.failAtNode(&kids[0], error.ComparisonRequiresNumeric);
-        if (!isNumeric(pair[1])) return self.failAtNode(&kids[1], error.ComparisonRequiresNumeric);
-        if (!typeEql(pair[0], pair[1])) return self.failAtNode(node, error.ComparisonOperandMismatch);
-        return self.remember(node, .unit);
+    fn inferComparison(self: *@This(), idx: ast.NodeIdx, lhs: ast.NodeIdx, rhs: ast.NodeIdx) InferError!Type {
+        const pair = try self.inferPair(lhs, rhs);
+        if (!isNumeric(pair[0])) return self.failAtNode(lhs, error.ComparisonRequiresNumeric);
+        if (!isNumeric(pair[1])) return self.failAtNode(rhs, error.ComparisonRequiresNumeric);
+        if (!typeEql(pair[0], pair[1])) return self.failAtNode(idx, error.ComparisonOperandMismatch);
+        return self.remember(idx, .unit);
     }
 
-    fn inferEquality(self: *@This(), node: *const AstNode, kids: *const [2]AstNode) InferError!Type {
-        const pair = try self.inferPair(kids);
-        if (!typeEql(pair[0], pair[1])) return self.failAtNode(node, error.EqualityOperandMismatch);
+    fn inferEquality(self: *@This(), idx: ast.NodeIdx, lhs: ast.NodeIdx, rhs: ast.NodeIdx) InferError!Type {
+        const pair = try self.inferPair(lhs, rhs);
+        if (!typeEql(pair[0], pair[1])) return self.failAtNode(idx, error.EqualityOperandMismatch);
         switch (pair[0]) {
             .bool, .int, .float => {},
-            .unit, .string, .named, .func => return self.failAtNode(node, error.EqualityUnsupportedType),
+            .unit, .named, .func => return self.failAtNode(idx, error.EqualityUnsupportedType),
         }
-        return self.remember(node, .unit);
+        return self.remember(idx, .unit);
     }
 
     fn inferFallible(
         self: *@This(),
-        node: *const AstNode,
-        kids: *const [2]AstNode,
-        comptime inferFn: fn (*@This(), *const AstNode, *const [2]AstNode) InferError!Type,
+        idx: ast.NodeIdx,
+        lhs: ast.NodeIdx,
+        rhs: ast.NodeIdx,
+        comptime inferFn: fn (*@This(), ast.NodeIdx, ast.NodeIdx, ast.NodeIdx) InferError!Type,
     ) InferError!Type {
-        const result = try inferFn(self, node, kids);
-        if (!self.in_fallible_scope) return self.failAtNode(node, error.FallibleOutsideFallibleContext);
+        const result = try inferFn(self, idx, lhs, rhs);
+        if (!self.in_fallible_scope) return self.failAtNode(idx, error.FallibleOutsideFallibleContext);
         return result;
     }
 
-    fn inferIf(self: *@This(), node: *const AstNode, if_node: *const ast.IfNode) InferError!Type {
+    fn inferIf(self: *@This(), idx: ast.NodeIdx) InferError!Type {
         const prev_fallible = self.in_fallible_scope;
         self.in_fallible_scope = true;
         defer self.in_fallible_scope = prev_fallible;
 
-        _ = try self.inferNode(if_node.cond);
-        if (!isFallible(if_node.cond)) return self.failAtNode(if_node.cond, error.IfConditionNotFallible);
+        const a = self.parsed.ast;
+        const data = a.ifData(idx);
+
+        _ = try self.inferNode(data.cond);
+        if (!isFallibleNode(a, data.cond)) return self.failAtNode(data.cond, error.IfConditionNotFallible);
 
         const then_ty = then_blk: {
             const mark = self.bindings.mark();
             defer self.bindings.restore(mark);
-            break :then_blk try self.inferNode(if_node.then_);
+            break :then_blk try self.inferNode(data.then_);
         };
 
-        if (if_node.else_) |else_node| {
+        if (data.else_ != std.math.maxInt(ast.NodeIdx)) {
             const else_ty = else_blk: {
                 const mark = self.bindings.mark();
                 defer self.bindings.restore(mark);
-                break :else_blk try self.inferNode(else_node);
+                break :else_blk try self.inferNode(data.else_);
             };
-            if (!typeEql(then_ty, else_ty)) return self.failAtNode(node, error.IfBranchTypeMismatch);
-            return self.remember(node, then_ty);
+            if (!typeEql(then_ty, else_ty)) return self.failAtNode(idx, error.IfBranchTypeMismatch);
+            return self.remember(idx, then_ty);
         }
 
-        if (!typeEql(then_ty, .unit)) return self.failAtNode(if_node.then_, error.IfWithoutElseRequiresUnit);
-        return self.remember(node, .unit);
+        if (!typeEql(then_ty, .unit)) return self.failAtNode(data.then_, error.IfWithoutElseRequiresUnit);
+        return self.remember(idx, .unit);
     }
 
-    fn inferConst(self: *@This(), node: *const AstNode, const_node: *const ast.ConstNode) InferError!Type {
-        const value_ty = try self.inferNode(const_node.value);
-        if (const_node.ty) |annot| {
-            const annot_ty = try self.resolveTypeNode(annot);
-            if (!typeEql(value_ty, annot_ty)) return self.failAtNode(node, error.BindingTypeMismatch);
+    fn inferConst(self: *@This(), idx: ast.NodeIdx) InferError!Type {
+        const a = self.parsed.ast;
+        const name = a.stringOf(a.nodes[idx].data0);
+        const value = a.varDeclValue(idx);
+        const value_ty = try self.inferNode(value);
+        if (a.varDeclHasType(idx)) {
+            const annot_ty = try self.resolveTypeNode(a.varDeclType(idx).?);
+            if (!typeEql(value_ty, annot_ty)) return self.failAtNode(idx, error.BindingTypeMismatch);
         }
-        try self.pushBinding(node, const_node.name, .{ .ty = value_ty, .mutable = false });
-        return self.remember(node, .unit);
+        try self.pushBinding(idx, name, .{ .ty = value_ty, .mutable = false });
+        return self.remember(idx, .unit);
     }
 
-    fn inferVar(self: *@This(), node: *const AstNode, var_node: *const ast.VarNode) InferError!Type {
-        const value_ty = try self.inferNode(var_node.value);
-        if (var_node.ty) |annot| {
-            const annot_ty = try self.resolveTypeNode(annot);
-            if (!typeEql(value_ty, annot_ty)) return self.failAtNode(node, error.BindingTypeMismatch);
+    fn inferVar(self: *@This(), idx: ast.NodeIdx) InferError!Type {
+        const a = self.parsed.ast;
+        const name = a.stringOf(a.nodes[idx].data0);
+        const value = a.varDeclValue(idx);
+        const value_ty = try self.inferNode(value);
+        if (a.varDeclHasType(idx)) {
+            const annot_ty = try self.resolveTypeNode(a.varDeclType(idx).?);
+            if (!typeEql(value_ty, annot_ty)) return self.failAtNode(idx, error.BindingTypeMismatch);
         }
-        try self.pushBinding(node, var_node.name, .{ .ty = value_ty, .mutable = true });
-        return self.remember(node, .unit);
+        try self.pushBinding(idx, name, .{ .ty = value_ty, .mutable = true });
+        return self.remember(idx, .unit);
     }
 
-    fn inferAssign(self: *@This(), node: *const AstNode, assign_node: *const ast.VarNode) InferError!Type {
-        const value_ty = try self.inferNode(assign_node.value);
-        const binding = self.lookupBinding(assign_node.name) orelse return self.failAtNode(node, error.UnknownSymbol);
-        if (!binding.mutable) return self.failAtNode(node, error.AssignToConst);
-        if (!typeEql(binding.ty, value_ty)) return self.failAtNode(node, error.AssignmentTypeMismatch);
-        return self.remember(node, .unit);
+    fn inferAssign(self: *@This(), idx: ast.NodeIdx) InferError!Type {
+        const a = self.parsed.ast;
+        const name = a.stringOf(a.nodes[idx].data0);
+        const value = a.nodes[idx].data1;
+        const value_ty = try self.inferNode(value);
+        const binding = self.lookupBinding(name) orelse return self.failAtNode(idx, error.UnknownSymbol);
+        if (!binding.mutable) return self.failAtNode(idx, error.AssignToConst);
+        if (!typeEql(binding.ty, value_ty)) return self.failAtNode(idx, error.AssignmentTypeMismatch);
+        return self.remember(idx, .unit);
     }
 
-    fn inferCall(self: *@This(), node: *const AstNode, call_node: *const ast.CallNode) InferError!Type {
-        const callee_ty = try self.inferNode(call_node.callee);
+    fn inferCall(self: *@This(), idx: ast.NodeIdx) InferError!Type {
+        const a = self.parsed.ast;
+        const callee = a.nodes[idx].data0;
+        const callee_ty = try self.inferNode(callee);
         const fn_ty = switch (callee_ty) {
             .func => |sig| sig,
-            else => return self.failAtNode(call_node.callee, error.CallTargetNotFunction),
+            else => return self.failAtNode(callee, error.CallTargetNotFunction),
         };
 
-        if (call_node.args.len != fn_ty.params.len) return self.failAtNode(node, error.CallArityMismatch);
+        const args = a.callArgs(idx);
+        if (args.len != fn_ty.params.len) return self.failAtNode(idx, error.CallArityMismatch);
 
-        for (call_node.args, 0..) |arg_node, idx| {
+        for (args, 0..) |arg_node, arg_idx| {
             const arg_ty = try self.inferNode(arg_node);
-            if (!typeEql(arg_ty, fn_ty.params[idx])) return self.failAtNode(arg_node, error.CallArgumentMismatch);
+            if (!typeEql(arg_ty, fn_ty.params[arg_idx])) return self.failAtNode(arg_node, error.CallArgumentMismatch);
         }
 
-        return self.remember(node, fn_ty.ret);
+        return self.remember(idx, fn_ty.ret);
     }
 
-    fn inferReturn(self: *@This(), node: *const AstNode, ret_node: *const ast.ReturnNode) InferError!Type {
-        const ret_ty = try self.inferNode(ret_node.value);
-        if (!typeEql(ret_ty, self.current_return)) return self.failAtNode(node, error.ReturnTypeMismatch);
+    fn inferReturn(self: *@This(), idx: ast.NodeIdx) InferError!Type {
+        const a = self.parsed.ast;
+        const ret_val = a.nodes[idx].data0;
+        const ret_ty = try self.inferNode(ret_val);
+        if (!typeEql(ret_ty, self.current_return)) return self.failAtNode(idx, error.ReturnTypeMismatch);
         self.current_saw_return = true;
-        return self.remember(node, self.current_return);
+        return self.remember(idx, self.current_return);
     }
 
-    fn findStructDeclFor(self: *const @This(), name: []const u8) ?*const ast.StructDecl {
-        return findStructDecl(self.resolved, name);
-    }
-
-    fn inferStructInit(self: *@This(), node: *const AstNode, si_node: *const ast.StructInitNode) InferError!Type {
-        const struct_decl = self.findStructDeclFor(si_node.struct_name) orelse return self.failAtNode(node, error.UnknownType);
-        if (si_node.fields.len != struct_decl.fields.len) return self.failAtNode(node, error.StructInitFieldCountMismatch);
-        for (si_node.fields, struct_decl.fields) |given, decl_field| {
-            if (!std.mem.eql(u8, given.name, decl_field.name)) return self.failAtNode(node, error.StructInitFieldNameMismatch);
-            const field_ty = try self.resolveTypeNode(decl_field.ty);
-            const value_ty = try self.inferNode(given.value);
-            if (!typeEql(value_ty, field_ty)) return self.failAtNode(node, error.BindingTypeMismatch);
-        }
-        return self.remember(node, .{ .named = si_node.struct_name });
-    }
-
-    fn inferFieldAccess(self: *@This(), node: *const AstNode, fa_node: *const ast.FieldAccessNode) InferError!Type {
-        const target_ty = try self.inferNode(fa_node.target);
-        const struct_name = switch (target_ty) {
-            .named => |name| name,
-            else => return self.failAtNode(node, error.FieldAccessOnNonStruct),
-        };
-        const struct_decl = self.findStructDeclFor(struct_name) orelse return self.failAtNode(node, error.UnknownType);
-        for (struct_decl.fields) |field| {
-            if (std.mem.eql(u8, field.name, fa_node.field)) {
-                return self.remember(node, try self.resolveTypeNode(field.ty));
+    fn findStructDecl(self: *const @This(), name: []const u8) ?ast.NodeIdx {
+        for (self.parsed.ast.decls) |decl_idx| {
+            if (self.parsed.ast.nodes[decl_idx].tag == .comptime_struct) {
+                const st_name = self.parsed.ast.stringOf(self.parsed.ast.nodes[decl_idx].data0);
+                if (std.mem.eql(u8, st_name, name)) return decl_idx;
             }
         }
-        return self.failAtNode(node, error.UnknownField);
+        return null;
     }
 
-    fn inferBlock(self: *@This(), node: *const AstNode, block_node: *const ast.BlockNode) InferError!Type {
+    fn inferStructInit(self: *@This(), idx: ast.NodeIdx) InferError!Type {
+        const a = self.parsed.ast;
+        const si_name_idx = a.structInitName(idx);
+        const si_name = a.stringOf(si_name_idx);
+        const struct_decl = self.findStructDecl(si_name) orelse return self.failAtNode(idx, error.UnknownType);
+
+        const fields = a.structInitFields(idx);
+        const decl_fields = a.structFields(struct_decl);
+        if (fields.len != decl_fields.len) return self.failAtNode(idx, error.StructInitFieldCountMismatch);
+        for (fields, decl_fields) |given, decl_field| {
+            const given_name = a.stringOf(given.name);
+            const decl_field_name = a.stringOf(decl_field.name);
+            if (!std.mem.eql(u8, given_name, decl_field_name)) return self.failAtNode(idx, error.StructInitFieldNameMismatch);
+            const field_ty = try self.resolveTypeNode(decl_field.ty);
+            const value_ty = try self.inferNode(given.value);
+            if (!typeEql(value_ty, field_ty)) return self.failAtNode(idx, error.BindingTypeMismatch);
+        }
+        return self.remember(idx, .{ .named = si_name });
+    }
+
+    fn inferFieldAccess(self: *@This(), idx: ast.NodeIdx) InferError!Type {
+        const a = self.parsed.ast;
+        const target = a.nodes[idx].data0;
+        const field_name = a.stringOf(a.nodes[idx].data1);
+        const target_ty = try self.inferNode(target);
+        const struct_name = switch (target_ty) {
+            .named => |name| name,
+            else => return self.failAtNode(idx, error.FieldAccessOnNonStruct),
+        };
+        const struct_decl = self.findStructDecl(struct_name) orelse return self.failAtNode(idx, error.UnknownType);
+        for (a.structFields(struct_decl)) |f| {
+            const f_name = a.stringOf(f.name);
+            if (std.mem.eql(u8, f_name, field_name)) {
+                return self.remember(idx, try self.resolveTypeNode(f.ty));
+            }
+        }
+        return self.failAtNode(idx, error.UnknownField);
+    }
+
+    fn inferBlock(self: *@This(), idx: ast.NodeIdx) InferError!Type {
         const mark = self.bindings.mark();
         defer self.bindings.restore(mark);
 
         var result_ty: Type = .unit;
-        for (block_node.items) |item| {
+        for (self.parsed.ast.blockItems(idx)) |item| {
             result_ty = try self.inferNode(item);
         }
-        return self.remember(node, result_ty);
+        return self.remember(idx, result_ty);
     }
 
-    fn inferVarRef(self: *@This(), node: *const AstNode, name: []const u8) InferError!Type {
-        if (self.lookupBinding(name)) |binding| return self.remember(node, binding.ty);
+    fn inferVarRef(self: *@This(), idx: ast.NodeIdx) InferError!Type {
+        const name = self.parsed.ast.stringOf(self.parsed.ast.nodes[idx].data0);
+        if (self.lookupBinding(name)) |binding| return self.remember(idx, binding.ty);
 
-        const resolved_ref = self.resolved.node_refs.get(nodeKey(node)) orelse return self.failAtNode(node, error.UnknownSymbol);
+        const resolved_ref = self.resolved.node_refs.get(idx) orelse return self.failAtNode(idx, error.UnknownSymbol);
         switch (resolved_ref) {
-            .local => return self.failAtNode(node, error.UnknownSymbol),
-            .function => |fn_id| return self.remember(node, .{ .func = self.typed.functionType(fn_id) }),
+            .local => return self.failAtNode(idx, error.UnknownSymbol),
+            .function => |fn_id| return self.remember(idx, .{ .func = self.typed.functionType(fn_id) }),
         }
     }
 
-    fn inferNode(self: *@This(), node: *const AstNode) InferError!Type {
-        if (self.typed.node_types.get(nodeKey(node))) |existing| return existing;
+    fn inferNode(self: *@This(), idx: ast.NodeIdx) InferError!Type {
+        if (self.typed.node_types.get(idx)) |existing| return existing;
 
-        return switch (node.*) {
-            .block => |blk| self.inferBlock(node, blk),
-            .int => self.remember(node, .int),
-            .float => self.remember(node, .float),
-            .bool => self.remember(node, .bool),
-            .unit => self.remember(node, .unit),
-            .string => self.remember(node, .string),
-            .var_ref => |name| self.inferVarRef(node, name),
-            .var_ => |vn| self.inferVar(node, vn),
-            .assign => |an| self.inferAssign(node, an),
-            .const_ => |cn| self.inferConst(node, cn),
-            .return_ => |rn| self.inferReturn(node, rn),
-            .call => |cn| self.inferCall(node, cn),
-            .arg => self.remember(node, .int),
-            .print => |child| blk: {
+        const a = self.parsed.ast;
+        return switch (a.nodes[idx].tag) {
+            .block => self.inferBlock(idx),
+            .int_lit => self.remember(idx, .int),
+            .float_lit => self.remember(idx, .float),
+            .bool_lit => self.remember(idx, .bool),
+            .unit_lit => self.remember(idx, .unit),
+            .var_ref => self.inferVarRef(idx),
+            .var_decl => self.inferVar(idx),
+            .assign => self.inferAssign(idx),
+            .const_decl => self.inferConst(idx),
+            .return_stmt => self.inferReturn(idx),
+            .call => self.inferCall(idx),
+            .arg => self.remember(idx, .int),
+            .print_stmt => blk: {
+                const child = a.nodes[idx].data0;
                 const child_ty = try self.inferNode(child);
                 switch (child_ty) {
-                    .int, .float, .bool, .string => {},
+                    .int, .float, .bool => {},
                     .unit => return self.failAtNode(child, error.PrintUnitValue),
                     .named, .func => return self.failAtNode(child, error.PrintUnsupportedType),
                 }
-                break :blk try self.remember(node, .unit);
+                break :blk try self.remember(idx, .unit);
             },
-            .add => |kids| self.inferArithmetic(node, kids),
-            .sub => |kids| self.inferArithmetic(node, kids),
-            .mul => |kids| self.inferArithmetic(node, kids),
-            .div => |kids| self.inferArithmetic(node, kids),
-            .lt => |kids| try self.inferFallible(node, kids, Checker.inferComparison),
-            .gt => |kids| try self.inferFallible(node, kids, Checker.inferComparison),
-            .le => |kids| try self.inferFallible(node, kids, Checker.inferComparison),
-            .ge => |kids| try self.inferFallible(node, kids, Checker.inferComparison),
-            .eq => |kids| try self.inferFallible(node, kids, Checker.inferEquality),
-            .ne => |kids| try self.inferFallible(node, kids, Checker.inferEquality),
-            .if_ => |if_node| self.inferIf(node, if_node),
-            .struct_init => |si| self.inferStructInit(node, si),
-            .field_access => |fa| self.inferFieldAccess(node, fa),
+            .add => self.inferArithmetic(idx, a.nodes[idx].data0, a.nodes[idx].data1),
+            .sub => self.inferArithmetic(idx, a.nodes[idx].data0, a.nodes[idx].data1),
+            .mul => self.inferArithmetic(idx, a.nodes[idx].data0, a.nodes[idx].data1),
+            .div => self.inferArithmetic(idx, a.nodes[idx].data0, a.nodes[idx].data1),
+            .lt => try self.inferFallible(idx, a.nodes[idx].data0, a.nodes[idx].data1, Checker.inferComparison),
+            .gt => try self.inferFallible(idx, a.nodes[idx].data0, a.nodes[idx].data1, Checker.inferComparison),
+            .le => try self.inferFallible(idx, a.nodes[idx].data0, a.nodes[idx].data1, Checker.inferComparison),
+            .ge => try self.inferFallible(idx, a.nodes[idx].data0, a.nodes[idx].data1, Checker.inferComparison),
+            .eq => try self.inferFallible(idx, a.nodes[idx].data0, a.nodes[idx].data1, Checker.inferEquality),
+            .ne => try self.inferFallible(idx, a.nodes[idx].data0, a.nodes[idx].data1, Checker.inferEquality),
+            .if_stmt => self.inferIf(idx),
+            .struct_init => self.inferStructInit(idx),
+            .field_access => self.inferFieldAccess(idx),
+            .type_name, .type_func, .comptime_fn, .comptime_struct => unreachable,
         };
     }
 
@@ -550,20 +581,26 @@ const Checker = struct {
         self.current_return = info.ty.ret;
         self.current_saw_return = false;
 
-        for (info.decl.params, info.ty.params) |param, param_ty| {
-            self.bindings.push(self.gpa, param.name, .{ .ty = param_ty, .mutable = false }) catch |err| switch (err) {
-                error.DuplicateVariable => return self.failAtNode(info.decl.body, error.DuplicateSymbol),
-                error.OutOfMemory => return error.OutOfMemory,
-            };
+        const is_top_level = info.decl == std.math.maxInt(ast.NodeIdx);
+        if (!is_top_level) {
+            const a = self.parsed.ast;
+            for (a.fnParams(info.decl), info.ty.params) |param, param_ty| {
+                const pname = a.stringOf(param.name);
+                self.bindings.push(self.gpa, pname, .{ .ty = param_ty, .mutable = false }) catch |err| switch (err) {
+                    error.DuplicateVariable => return self.failAtNode(info.decl, error.DuplicateSymbol),
+                    error.OutOfMemory => return error.OutOfMemory,
+                };
+            }
         }
 
-        const body_ty = try self.inferNode(info.decl.body);
+        const body = if (is_top_level) self.parsed.ast.entry else self.parsed.ast.fnBody(info.decl);
+        const body_ty = try self.inferNode(body);
         if (!self.current_saw_return and !typeEql(body_ty, info.ty.ret)) {
-            if (isSyntheticTopLevelEntry(info.decl)) {
+            if (is_top_level) {
                 const mutable_sig = @constCast(info.ty);
                 mutable_sig.ret = body_ty;
             } else {
-                return self.failAtNode(info.decl.body, error.FunctionBodyTypeMismatch);
+                return self.failAtNode(body, error.FunctionBodyTypeMismatch);
             }
         }
         info.has_explicit_return = self.current_saw_return;
@@ -579,29 +616,10 @@ const Checker = struct {
     }
 };
 
-fn hasTopLevelEntry(node: *const AstNode) bool {
-    return switch (node.*) {
-        .unit => false,
-        else => true,
-    };
-}
-
-fn isSyntheticTopLevelEntry(decl: *const ast.FuncDecl) bool {
-    return std.mem.eql(u8, decl.name, "__top_level_entry__");
-}
-
-fn findStructDecl(resolved: *const resolver.ResolvedAst, name: []const u8) ?*const ast.StructDecl {
-    for (resolved.module.decls) |decl| {
-        if (decl.* == .comptime_struct) {
-            const st = decl.comptime_struct;
-            if (std.mem.eql(u8, st.name, name)) return st;
-        }
-    }
-    return null;
-}
-
-fn nodeKey(node: *const AstNode) usize {
-    return @intFromPtr(node);
+fn hasTopLevelEntry(a: ast.Ast, entry: ast.NodeIdx) bool {
+    if (a.nodes[entry].tag == .block) return a.blockItems(entry).len > 0;
+    if (a.nodes[entry].tag == .unit_lit) return false;
+    return true;
 }
 
 pub const TypeMemo = db.Memo(TypedAst);
@@ -616,8 +634,8 @@ pub fn computeType(
 
     var typed_value: ?TypedAst = null;
     if (resolve_memo.value) |*resolved| {
-        const parsed = parse_memo.value orelse return db.makeMemo(TypedAst, null, diagnostics_list);
-        const report = try typecheckReport(&parsed, resolved, gpa);
+        const parsed = if (parse_memo.value) |*p| p else return db.makeMemo(TypedAst, null, diagnostics_list);
+        const report = try typecheckReport(parsed, resolved, gpa);
         if (report.diagnostic) |diag| {
             try diagnostics_list.append(gpa, diag);
         }

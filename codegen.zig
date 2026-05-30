@@ -26,7 +26,6 @@ const BinaryEmitter = struct {
     start_symbol: u32,
     function_layouts: []FunctionLayout,
     helper_symbols: []u32,
-    string_symbols: []u32,
 
     const SetccCond = enum(u8) {
         b = 0x92,
@@ -78,9 +77,6 @@ const BinaryEmitter = struct {
         var helper_symbols = try gpa.alloc(u32, helpers.all_helpers.len);
         errdefer gpa.free(helper_symbols);
 
-        var string_symbols = try gpa.alloc(u32, prog.strings.items.len);
-        errdefer gpa.free(string_symbols);
-
         const start_symbol = try createSymbol(&symbols, gpa);
 
         for (prog.functions.items, 0..) |func, fn_idx| {
@@ -100,10 +96,6 @@ const BinaryEmitter = struct {
             helper_symbols[idx] = try createSymbol(&symbols, gpa);
         }
 
-        for (prog.strings.items, 0..) |_, idx| {
-            string_symbols[idx] = try createSymbol(&symbols, gpa);
-        }
-
         return .{
             .prog = prog,
             .gpa = gpa,
@@ -113,7 +105,6 @@ const BinaryEmitter = struct {
             .start_symbol = start_symbol,
             .function_layouts = function_layouts,
             .helper_symbols = helper_symbols,
-            .string_symbols = string_symbols,
         };
     }
 
@@ -128,7 +119,6 @@ const BinaryEmitter = struct {
         }
         self.gpa.free(self.function_layouts);
         self.gpa.free(self.helper_symbols);
-        self.gpa.free(self.string_symbols);
         self.code.deinit(self.gpa);
         self.symbols.deinit(self.gpa);
         self.fixups.deinit(self.gpa);
@@ -553,16 +543,6 @@ const BinaryEmitter = struct {
                 try self.emitLoadRaxFromSlot(fl.base + fl.field_index);
                 try self.emitStoreRaxToSlot(value_inst.id);
             },
-            .string_lit => |str_id| {
-                const symbol = self.string_symbols[str_id];
-                try self.emitLeaRaxSymbol(symbol);
-                try self.emitStoreRaxToSlot(value_inst.id);
-            },
-            .prints => |value_ref| {
-                try self.emitLoadRaxFromSlot(value_ref);
-                try self.emitCallRel(self.helperSymbol(.print_string));
-                try self.emitStoreUnitValue(value_inst.id);
-            },
         }
         _ = fn_layout;
     }
@@ -714,21 +694,12 @@ const BinaryEmitter = struct {
         }
     }
 
-    fn appendStringData(self: *@This()) !void {
-        for (self.prog.strings.items, 0..) |str, idx| {
-            self.bindSymbol(self.string_symbols[idx]);
-            try self.appendLeU64(@intCast(str.len));
-            try self.appendBytes(str);
-        }
-    }
-
     fn emitProgram(self: *@This()) ![]const u8 {
         try self.emitStart();
         for (self.prog.functions.items) |*func| {
             try self.emitFunction(func);
         }
         try self.appendHelpers();
-        try self.appendStringData();
         try self.resolveFixups();
         return self.code.toOwnedSlice(self.gpa);
     }

@@ -1,5 +1,0 @@
-comptime Foo = struct
-  x: int
-var foo = Foo{x = 10}
-print(foo.x)
-print("hello")

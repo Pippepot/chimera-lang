@@ -2,10 +2,16 @@ const std = @import("std");
 const builtin = @import("builtin");
 const db = @import("db.zig");
 const diagnostics = @import("diagnostics.zig");
+const ir_mod = @import("ir.zig");
+const ast = @import("ast.zig");
+const parser = @import("parser.zig");
+const resolver = @import("resolver.zig");
+const typecheck = @import("typecheck.zig");
+const monomorphize = @import("monomorphize.zig");
 
 const CacheExt = ".qcache";
 const Magic: [8]u8 = .{ 'X', '8', '6', 'Q', 'C', 'A', 'C', 'H' };
-const SchemaVersion: u32 = 1;
+const SchemaVersion: u32 = 3;
 const CompilerAbiVersion: u32 = 1;
 
 pub const CacheOptions = struct {
@@ -13,12 +19,6 @@ pub const CacheOptions = struct {
 };
 
 pub const StageSnapshot = struct {
-    changed_at: db.Revision,
-    has_value: bool,
-    diagnostics: []const diagnostics.Diagnostic,
-};
-
-pub const CompileStageSnapshot = struct {
     changed_at: db.Revision,
     has_value: bool,
     diagnostics: []const diagnostics.Diagnostic,
@@ -33,16 +33,10 @@ pub const SavePayload = struct {
     typecheck: StageSnapshot,
     monomorphize: StageSnapshot,
     lower: StageSnapshot,
-    compile: CompileStageSnapshot,
+    compile: StageSnapshot,
 };
 
 pub const LoadedStage = struct {
-    changed_at: db.Revision,
-    has_value: bool,
-    diagnostics: std.ArrayList(diagnostics.Diagnostic),
-};
-
-pub const LoadedCompile = struct {
     changed_at: db.Revision,
     has_value: bool,
     diagnostics: std.ArrayList(diagnostics.Diagnostic),
@@ -56,7 +50,7 @@ pub const LoadPayload = struct {
     typecheck: LoadedStage,
     monomorphize: LoadedStage,
     lower: LoadedStage,
-    compile: LoadedCompile,
+    compile: LoadedStage,
 
     pub fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
         self.parse.diagnostics.deinit(gpa);
@@ -167,14 +161,6 @@ fn appendStage(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, snapshot: StageS
     for (snapshot.diagnostics) |diag| {
         try appendDiagnostic(buf, gpa, diag);
     }
-}
-
-fn appendCompileStage(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, snapshot: CompileStageSnapshot) !void {
-    try appendStage(buf, gpa, .{
-        .changed_at = snapshot.changed_at,
-        .has_value = snapshot.has_value,
-        .diagnostics = snapshot.diagnostics,
-    });
     if (snapshot.bytes) |bytes| {
         try appendU8(buf, gpa, 1);
         try appendBytes(buf, gpa, bytes);
@@ -198,7 +184,7 @@ fn serialize(gpa: std.mem.Allocator, payload: SavePayload) ![]u8 {
     try appendStage(&buf, gpa, payload.typecheck);
     try appendStage(&buf, gpa, payload.monomorphize);
     try appendStage(&buf, gpa, payload.lower);
-    try appendCompileStage(&buf, gpa, payload.compile);
+    try appendStage(&buf, gpa, payload.compile);
 
     return buf.toOwnedSlice(gpa);
 }
@@ -270,25 +256,580 @@ fn readStage(r: *Reader, gpa: std.mem.Allocator) LoadError!LoadedStage {
     const has_value_byte = try r.readU8();
     if (has_value_byte != 0 and has_value_byte != 1) return error.InvalidData;
 
-    return .{
-        .changed_at = changed,
-        .has_value = has_value_byte == 1,
-        .diagnostics = try readDiagnosticsList(r, gpa),
-    };
-}
-
-fn readCompileStage(r: *Reader, gpa: std.mem.Allocator) LoadError!LoadedCompile {
-    var stage = try readStage(r, gpa);
-    errdefer stage.diagnostics.deinit(gpa);
+    var diags = try readDiagnosticsList(r, gpa);
+    errdefer diags.deinit(gpa);
 
     const has_bytes = try r.readU8();
     if (has_bytes != 0 and has_bytes != 1) return error.InvalidData;
 
     return .{
-        .changed_at = stage.changed_at,
-        .has_value = stage.has_value,
-        .diagnostics = stage.diagnostics,
+        .changed_at = changed,
+        .has_value = has_value_byte == 1,
+        .diagnostics = diags,
         .bytes = if (has_bytes == 1) try r.readBytes() else null,
+    };
+}
+
+fn writeType(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, ty: ir_mod.Type) !void {
+    const tag = std.meta.activeTag(ty);
+    try appendU8(buf, gpa, @intFromEnum(tag));
+    switch (ty) {
+        .unit, .bool, .int, .float => {},
+        .named => |id| try appendU32(buf, gpa, id),
+        .func => |id| try appendU32(buf, gpa, id),
+    }
+}
+
+fn readType(r: *Reader) LoadError!ir_mod.Type {
+    const tag = try r.readU8();
+    return switch (tag) {
+        0 => .unit,
+        1 => .bool,
+        2 => .int,
+        3 => .float,
+        4 => .{ .named = try r.readU32() },
+        5 => .{ .func = try r.readU32() },
+        else => error.InvalidData,
+    };
+}
+
+fn writeTerminator(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, term: ir_mod.Terminator) !void {
+    const tag = std.meta.activeTag(term);
+    try appendU8(buf, gpa, @intFromEnum(tag));
+    switch (term) {
+        .br => |b| {
+            try appendU32(buf, gpa, b.target);
+            try appendU8(buf, gpa, if (b.arg != null) 1 else 0);
+            if (b.arg) |arg| try appendU32(buf, gpa, arg);
+        },
+        .pbr => |p| {
+            try appendU8(buf, gpa, @intFromEnum(p.pred.op));
+            try appendU32(buf, gpa, p.pred.pair.l);
+            try appendU32(buf, gpa, p.pred.pair.r);
+            try appendU32(buf, gpa, p.then_branch.target);
+            try appendU8(buf, gpa, if (p.then_branch.arg != null) 1 else 0);
+            if (p.then_branch.arg) |arg| try appendU32(buf, gpa, arg);
+            try appendU32(buf, gpa, p.else_branch.target);
+            try appendU8(buf, gpa, if (p.else_branch.arg != null) 1 else 0);
+            if (p.else_branch.arg) |arg| try appendU32(buf, gpa, arg);
+        },
+        .ret => |v| try appendU32(buf, gpa, v),
+    }
+}
+
+fn readTerminator(r: *Reader) LoadError!ir_mod.Terminator {
+    const tag = try r.readU8();
+    return switch (tag) {
+        0 => .{ .br = .{
+            .target = try r.readU32(),
+            .arg = if ((try r.readU8()) == 1) try r.readU32() else null,
+        } },
+        1 => .{ .pbr = .{
+            .pred = .{
+                .op = @enumFromInt(try r.readU8()),
+                .pair = .{ .l = try r.readU32(), .r = try r.readU32() },
+            },
+            .then_branch = .{
+                .target = try r.readU32(),
+                .arg = if ((try r.readU8()) == 1) try r.readU32() else null,
+            },
+            .else_branch = .{
+                .target = try r.readU32(),
+                .arg = if ((try r.readU8()) == 1) try r.readU32() else null,
+            },
+        } },
+        2 => .{ .ret = try r.readU32() },
+        else => error.InvalidData,
+    };
+}
+
+fn writeInst(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, inst: ir_mod.Inst) !void {
+    const tag = std.meta.activeTag(inst);
+    try appendU8(buf, gpa, @intFromEnum(tag));
+    switch (inst) {
+        .iconst => |v| try buf.appendSlice(gpa, std.mem.asBytes(&v)),
+        .fconst => |v| try buf.appendSlice(gpa, std.mem.asBytes(&v)),
+        .fn_addr => |id| try appendU32(buf, gpa, id),
+        .call => |c| {
+            try appendU32(buf, gpa, c.callee);
+            try appendU8(buf, gpa, c.argc);
+            for (&c.args) |a| try appendU32(buf, gpa, a);
+        },
+        .addi, .addf, .subi, .subf, .muli, .mulf, .divi, .divf, .store => |p| {
+            try appendU32(buf, gpa, p.l);
+            try appendU32(buf, gpa, p.r);
+        },
+        .printi, .printf, .printb => |v| try appendU32(buf, gpa, v),
+        .field_load => |fl| {
+            try appendU32(buf, gpa, fl.base);
+            try appendU32(buf, gpa, fl.field_index);
+        },
+        .argi => |idx| try appendU32(buf, gpa, idx),
+    }
+}
+
+fn readInst(r: *Reader) LoadError!ir_mod.Inst {
+    const tag = try r.readU8();
+    return switch (tag) {
+        0 => .{ .iconst = @as(i32, @bitCast(try r.readU32())) },
+        1 => .{ .fconst = @as(f32, @bitCast(try r.readU32())) },
+        2 => .{ .fn_addr = try r.readU32() },
+        3 => .{ .call = .{
+            .callee = try r.readU32(),
+            .argc = try r.readU8(),
+            .args = blk: {
+                var args: [ir_mod.MaxCallArgs]ir_mod.ValueRef = undefined;
+                for (&args) |*a| a.* = try r.readU32();
+                break :blk args;
+            },
+        } },
+        4 => .{ .addi = .{ .l = try r.readU32(), .r = try r.readU32() } },
+        5 => .{ .addf = .{ .l = try r.readU32(), .r = try r.readU32() } },
+        6 => .{ .subi = .{ .l = try r.readU32(), .r = try r.readU32() } },
+        7 => .{ .subf = .{ .l = try r.readU32(), .r = try r.readU32() } },
+        8 => .{ .muli = .{ .l = try r.readU32(), .r = try r.readU32() } },
+        9 => .{ .mulf = .{ .l = try r.readU32(), .r = try r.readU32() } },
+        10 => .{ .divi = .{ .l = try r.readU32(), .r = try r.readU32() } },
+        11 => .{ .divf = .{ .l = try r.readU32(), .r = try r.readU32() } },
+        12 => .{ .printi = try r.readU32() },
+        13 => .{ .printf = try r.readU32() },
+        14 => .{ .printb = try r.readU32() },
+        15 => .{ .argi = try r.readU32() },
+        16 => .{ .store = .{ .l = try r.readU32(), .r = try r.readU32() } },
+        17 => .{ .field_load = .{ .base = try r.readU32(), .field_index = try r.readU32() } },
+        else => error.InvalidData,
+    };
+}
+
+fn writeBlock(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, block: ir_mod.Block) !void {
+    try appendU32(buf, gpa, block.id);
+    try appendU8(buf, gpa, if (block.param != null) 1 else 0);
+    if (block.param) |p| try appendU32(buf, gpa, p);
+    try appendU32(buf, gpa, @intCast(block.insts.items.len));
+    for (block.insts.items) |vinst| {
+        try appendU32(buf, gpa, vinst.id);
+        try writeInst(buf, gpa, vinst.op);
+    }
+    if (block.terminator) |term| {
+        try appendU8(buf, gpa, 1);
+        try writeTerminator(buf, gpa, term);
+    } else {
+        try appendU8(buf, gpa, 0);
+    }
+}
+
+fn readBlock(r: *Reader, gpa: std.mem.Allocator) LoadError!ir_mod.Block {
+    const id = try r.readU32();
+    const param: ?ir_mod.ValueRef = if ((try r.readU8()) == 1) try r.readU32() else null;
+    const inst_count = try r.readU32();
+    var insts = try std.ArrayList(ir_mod.ValueInst).initCapacity(gpa, inst_count);
+    errdefer insts.deinit(gpa);
+    var i: u32 = 0;
+    while (i < inst_count) : (i += 1) {
+        const vinst_id = try r.readU32();
+        const op = try readInst(r);
+        try insts.append(gpa, .{ .id = vinst_id, .op = op });
+    }
+    const has_term = try r.readU8();
+    return .{
+        .id = id,
+        .param = param,
+        .insts = insts,
+        .terminator = if (has_term == 1) try readTerminator(r) else null,
+    };
+}
+
+fn writeFunction(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, func: ir_mod.Function) !void {
+    try appendU32(buf, gpa, func.id);
+    try appendU32(buf, gpa, func.name);
+    try appendU32(buf, gpa, func.entry);
+    try writeType(buf, gpa, func.ret_type);
+    try appendU32(buf, gpa, func.next_value);
+    try appendU32(buf, gpa, @intCast(func.value_types.items.len));
+    for (func.value_types.items) |vt| try writeType(buf, gpa, vt);
+    try appendU32(buf, gpa, @intCast(func.param_values.items.len));
+    for (func.param_values.items) |pv| try appendU32(buf, gpa, pv);
+    try appendU32(buf, gpa, @intCast(func.blocks.items.len));
+    for (func.blocks.items) |*blk| try writeBlock(buf, gpa, blk.*);
+}
+
+fn readFunction(r: *Reader, gpa: std.mem.Allocator) LoadError!ir_mod.Function {
+    const id = try r.readU32();
+    const name = try r.readU32();
+    const entry = try r.readU32();
+    const ret_type = try readType(r);
+    const next_value = try r.readU32();
+    const vt_count = try r.readU32();
+    var value_types = try std.ArrayList(ir_mod.Type).initCapacity(gpa, vt_count);
+    errdefer value_types.deinit(gpa);
+    var vi: u32 = 0;
+    while (vi < vt_count) : (vi += 1) {
+        try value_types.append(gpa, try readType(r));
+    }
+    const pv_count = try r.readU32();
+    var param_values = try std.ArrayList(ir_mod.ValueRef).initCapacity(gpa, pv_count);
+    errdefer param_values.deinit(gpa);
+    var pvi: u32 = 0;
+    while (pvi < pv_count) : (pvi += 1) {
+        try param_values.append(gpa, try r.readU32());
+    }
+    const block_count = try r.readU32();
+    var blocks = try std.ArrayList(ir_mod.Block).initCapacity(gpa, block_count);
+    errdefer {
+        for (blocks.items) |*blk| blk.deinit(gpa);
+        blocks.deinit(gpa);
+    }
+    var bi: u32 = 0;
+    while (bi < block_count) : (bi += 1) {
+        try blocks.append(gpa, try readBlock(r, gpa));
+    }
+    return .{
+        .id = id,
+        .name = name,
+        .entry = entry,
+        .blocks = blocks,
+        .value_types = value_types,
+        .next_value = next_value,
+        .param_values = param_values,
+        .ret_type = ret_type,
+    };
+}
+
+pub fn serializeProgram(gpa: std.mem.Allocator, prog: *const ir_mod.Program) ![]u8 {
+    var buf = try std.ArrayList(u8).initCapacity(gpa, 4096);
+    errdefer buf.deinit(gpa);
+
+    try appendU32(&buf, gpa, @intCast(prog.strings.items.len));
+    for (prog.strings.items) |s| {
+        try appendBytes(&buf, gpa, s);
+    }
+
+    try appendU32(&buf, gpa, @intCast(prog.func_types.items.len));
+    for (prog.func_types.items) |ft| {
+        try appendU32(&buf, gpa, @intCast(ft.params.len));
+        for (ft.params) |p| try writeType(&buf, gpa, p);
+        try writeType(&buf, gpa, ft.ret);
+    }
+
+    try appendU32(&buf, gpa, @intCast(prog.functions.items.len));
+    for (prog.functions.items) |*func| try writeFunction(&buf, gpa, func.*);
+
+    try appendU32(&buf, gpa, prog.entry);
+
+    return buf.toOwnedSlice(gpa);
+}
+
+pub fn deserializeProgram(gpa: std.mem.Allocator, data: []const u8) !ir_mod.Program {
+    var r = Reader{ .data = data };
+
+    const string_count = try r.readU32();
+    var strings = try std.ArrayList([]const u8).initCapacity(gpa, string_count);
+    errdefer {
+        for (strings.items) |s| gpa.free(s);
+        strings.deinit(gpa);
+    }
+    var si: u32 = 0;
+    while (si < string_count) : (si += 1) {
+        const raw = try r.readBytes();
+        const owned = try gpa.dupe(u8, raw);
+        try strings.append(gpa, owned);
+    }
+
+    const ft_count = try r.readU32();
+    var func_types = try std.ArrayList(ir_mod.IrFuncType).initCapacity(gpa, ft_count);
+    errdefer {
+        for (func_types.items) |ft| gpa.free(ft.params);
+        func_types.deinit(gpa);
+    }
+    var fti: u32 = 0;
+    while (fti < ft_count) : (fti += 1) {
+        const param_count = try r.readU32();
+        const params = try gpa.alloc(ir_mod.Type, param_count);
+        errdefer gpa.free(params);
+        var pi: u32 = 0;
+        while (pi < param_count) : (pi += 1) {
+            params[pi] = try readType(&r);
+        }
+        const ret = try readType(&r);
+        try func_types.append(gpa, .{ .params = params, .ret = ret });
+    }
+
+    const fn_count = try r.readU32();
+    var functions = try std.ArrayList(ir_mod.Function).initCapacity(gpa, fn_count);
+    errdefer {
+        for (functions.items) |*f| f.deinit(gpa);
+        functions.deinit(gpa);
+    }
+    var fi: u32 = 0;
+    while (fi < fn_count) : (fi += 1) {
+        try functions.append(gpa, try readFunction(&r, gpa));
+    }
+
+    const entry = try r.readU32();
+
+    if (r.idx != r.data.len) return error.InvalidData;
+
+    return .{
+        .entry = entry,
+        .functions = functions,
+        .strings = strings,
+        .func_types = func_types,
+    };
+}
+
+// ── Typecheck Type/FuncType serialization ──
+
+fn writeTcType(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, ty: typecheck.Type) (error{OutOfMemory}!void) {
+    const tag = std.meta.activeTag(ty);
+    try appendU8(buf, gpa, @intFromEnum(tag));
+    switch (ty) {
+        .unit, .bool, .int, .float => {},
+        .named => |s| try appendBytes(buf, gpa, s),
+        .func => |ft| try writeTcFuncType(buf, gpa, ft.*),
+    }
+}
+
+fn readTcType(r: *Reader, allocator: std.mem.Allocator) LoadError!typecheck.Type {
+    const tag = try r.readU8();
+    return switch (tag) {
+        0 => .unit,
+        1 => .bool,
+        2 => .int,
+        3 => .float,
+        4 => .{ .named = try allocator.dupe(u8, try r.readBytes()) },
+        5 => blk: {
+            const ft = try allocator.create(typecheck.FuncType);
+            ft.* = try readTcFuncType(r, allocator);
+            break :blk .{ .func = ft };
+        },
+        else => error.InvalidData,
+    };
+}
+
+fn writeTcFuncType(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, ft: typecheck.FuncType) (error{OutOfMemory}!void) {
+    try appendU32(buf, gpa, @intCast(ft.params.len));
+    for (ft.params) |p| try writeTcType(buf, gpa, p);
+    try writeTcType(buf, gpa, ft.ret);
+}
+
+fn readTcFuncType(r: *Reader, allocator: std.mem.Allocator) LoadError!typecheck.FuncType {
+    const param_count = try r.readU32();
+    var params = try std.ArrayList(typecheck.Type).initCapacity(allocator, param_count);
+    errdefer params.deinit(allocator);
+    var i: u32 = 0;
+    while (i < param_count) : (i += 1) {
+        try params.append(allocator, try readTcType(r, allocator));
+    }
+    const ret = try readTcType(r, allocator);
+    return .{
+        .params = try params.toOwnedSlice(allocator),
+        .ret = ret,
+    };
+}
+
+// ── ResolvedAst serialization ──
+
+pub fn serializeResolved(gpa: std.mem.Allocator, ra: *const resolver.ResolvedAst) ![]u8 {
+    var buf = try std.ArrayList(u8).initCapacity(gpa, 1024);
+    errdefer buf.deinit(gpa);
+
+    try appendU32(&buf, gpa, @intCast(ra.functions.items.len));
+    for (ra.functions.items) |fn_idx| try appendU32(&buf, gpa, fn_idx);
+
+    try appendU32(&buf, gpa, @intCast(ra.function_names.count()));
+    var fn_iter = ra.function_names.iterator();
+    while (fn_iter.next()) |entry| {
+        try appendBytes(&buf, gpa, entry.key_ptr.*);
+        try appendU32(&buf, gpa, entry.value_ptr.*);
+    }
+
+    try appendU32(&buf, gpa, @intCast(ra.struct_names.count()));
+    var sn_iter = ra.struct_names.iterator();
+    while (sn_iter.next()) |entry| {
+        try appendBytes(&buf, gpa, entry.key_ptr.*);
+    }
+
+    try appendU32(&buf, gpa, @intCast(ra.node_refs.count()));
+    var nr_iter = ra.node_refs.iterator();
+    while (nr_iter.next()) |entry| {
+        try appendU32(&buf, gpa, entry.key_ptr.*);
+        const ref_tag = std.meta.activeTag(entry.value_ptr.*);
+        try appendU8(&buf, gpa, @intFromEnum(ref_tag));
+        switch (entry.value_ptr.*) {
+            .local => {},
+            .function => |id| try appendU32(&buf, gpa, id),
+        }
+    }
+
+    return buf.toOwnedSlice(gpa);
+}
+
+pub fn deserializeResolved(gpa: std.mem.Allocator, data: []const u8) LoadError!resolver.ResolvedAst {
+    var r = Reader{ .data = data };
+    var ra = try resolver.ResolvedAst.init(gpa);
+    errdefer ra.deinit(gpa);
+
+    const fn_count = try r.readU32();
+    try ra.functions.ensureTotalCapacity(gpa, fn_count);
+    var fi: u32 = 0;
+    while (fi < fn_count) : (fi += 1) {
+        ra.functions.appendAssumeCapacity(try r.readU32());
+    }
+
+    const fn_name_count = try r.readU32();
+    var fni: u32 = 0;
+    while (fni < fn_name_count) : (fni += 1) {
+        const raw_key = try r.readBytes();
+        const owned_key = try ra.key_arena.allocator().dupe(u8, raw_key);
+        const value = try r.readU32();
+        try ra.function_names.put(owned_key, value);
+    }
+
+    const sn_count = try r.readU32();
+    var sni: u32 = 0;
+    while (sni < sn_count) : (sni += 1) {
+        const raw_key = try r.readBytes();
+        const owned_key = try ra.key_arena.allocator().dupe(u8, raw_key);
+        try ra.struct_names.put(owned_key, {});
+    }
+
+    const nr_count = try r.readU32();
+    try ra.node_refs.ensureUnusedCapacity(nr_count);
+    var nri: u32 = 0;
+    while (nri < nr_count) : (nri += 1) {
+        const node_idx = try r.readU32();
+        const ref_tag = try r.readU8();
+        switch (ref_tag) {
+            0 => ra.node_refs.putAssumeCapacity(node_idx, .local),
+            1 => ra.node_refs.putAssumeCapacity(node_idx, .{ .function = try r.readU32() }),
+            else => return error.InvalidData,
+        }
+    }
+
+    if (r.idx != r.data.len) return error.InvalidData;
+    return ra;
+}
+
+// ── TypedAst serialization ──
+
+pub fn serializeTyped(gpa: std.mem.Allocator, ta: *const typecheck.TypedAst) ![]u8 {
+    var buf = try std.ArrayList(u8).initCapacity(gpa, 2048);
+    errdefer buf.deinit(gpa);
+
+    try appendU32(&buf, gpa, @intCast(ta.node_types.count()));
+    var nt_iter = ta.node_types.iterator();
+    while (nt_iter.next()) |entry| {
+        try appendU32(&buf, gpa, entry.key_ptr.*);
+        try writeTcType(&buf, gpa, entry.value_ptr.*);
+    }
+
+    try appendU32(&buf, gpa, @intCast(ta.functions.len));
+    for (ta.functions) |fi| {
+        try appendU32(&buf, gpa, fi.decl);
+        try writeTcFuncType(&buf, gpa, fi.ty.*);
+        try appendU8(&buf, gpa, if (fi.has_explicit_return) 1 else 0);
+    }
+
+    try appendU32(&buf, gpa, ta.entry_function);
+    return buf.toOwnedSlice(gpa);
+}
+
+pub fn deserializeTyped(gpa: std.mem.Allocator, data: []const u8, parse_ast: *const ast.Ast) LoadError!typecheck.TypedAst {
+    var r = Reader{ .data = data };
+    var ta = typecheck.TypedAst.init(gpa, parse_ast);
+    errdefer ta.deinit();
+    const arena_alloc = ta.arena.allocator();
+
+    const nt_count = try r.readU32();
+    try ta.node_types.ensureUnusedCapacity(nt_count);
+    var nti: u32 = 0;
+    while (nti < nt_count) : (nti += 1) {
+        const node_idx = try r.readU32();
+        const ty = try readTcType(&r, arena_alloc);
+        ta.node_types.putAssumeCapacity(node_idx, ty);
+    }
+
+    const fn_count = try r.readU32();
+    var functions = try std.ArrayList(typecheck.FunctionInfo).initCapacity(arena_alloc, fn_count);
+    errdefer functions.deinit(arena_alloc);
+    var fni: u32 = 0;
+    while (fni < fn_count) : (fni += 1) {
+        const decl = try r.readU32();
+        const ft_ptr = try arena_alloc.create(typecheck.FuncType);
+        ft_ptr.* = try readTcFuncType(&r, arena_alloc);
+        const has_ret = (try r.readU8()) == 1;
+        try functions.append(arena_alloc, .{
+            .decl = decl,
+            .ty = ft_ptr,
+            .has_explicit_return = has_ret,
+        });
+    }
+    ta.functions = try functions.toOwnedSlice(arena_alloc);
+
+    ta.entry_function = try r.readU32();
+
+    if (r.idx != r.data.len) return error.InvalidData;
+    return ta;
+}
+
+// ── MonoProgram serialization ──
+
+pub fn serializeMono(gpa: std.mem.Allocator, mp: *const monomorphize.MonoProgram) ![]u8 {
+    var buf = try std.ArrayList(u8).initCapacity(gpa, 1024);
+    errdefer buf.deinit(gpa);
+
+    try appendU32(&buf, gpa, @intCast(mp.functions.items.len));
+    for (mp.functions.items) |mf| {
+        try appendU32(&buf, gpa, mf.source_id);
+        try appendU32(&buf, gpa, mf.decl);
+        try writeTcFuncType(&buf, gpa, mf.ty);
+        try appendU8(&buf, gpa, if (mf.has_explicit_return) 1 else 0);
+    }
+
+    try appendU32(&buf, gpa, mp.entry_function);
+    return buf.toOwnedSlice(gpa);
+}
+
+pub fn deserializeMono(gpa: std.mem.Allocator, data: []const u8) LoadError!monomorphize.MonoProgram {
+    var r = Reader{ .data = data };
+
+    const fn_count = try r.readU32();
+    var mp = try monomorphize.MonoProgram.init(gpa, 0);
+    errdefer mp.deinit(gpa);
+    const arena_alloc = mp.arena.allocator();
+
+    try mp.functions.ensureTotalCapacity(gpa, fn_count);
+    var fi: u32 = 0;
+    while (fi < fn_count) : (fi += 1) {
+        const source_id = try r.readU32();
+        const decl = try r.readU32();
+        const ft = try readTcFuncType(&r, arena_alloc);
+        const has_ret = (try r.readU8()) == 1;
+        mp.functions.appendAssumeCapacity(.{
+            .source_id = source_id,
+            .decl = decl,
+            .ty = ft,
+            .has_explicit_return = has_ret,
+        });
+    }
+
+    mp.entry_function = try r.readU32();
+
+    if (r.idx != r.data.len) return error.InvalidData;
+    return mp;
+}
+
+// ── ParsedAst serialization ──
+
+pub fn serializeParsed(gpa: std.mem.Allocator, pa: *const parser.ParsedAst) ![]u8 {
+    return pa.ast.serialize(gpa);
+}
+
+pub fn deserializeParsed(gpa: std.mem.Allocator, data: []const u8) !parser.ParsedAst {
+    const ast_value = try ast.Ast.deserialize(gpa, data);
+    return .{
+        .arena = std.heap.ArenaAllocator.init(gpa),
+        .ast = ast_value,
     };
 }
 
@@ -319,7 +860,7 @@ fn deserialize(gpa: std.mem.Allocator, file_data: []u8, expected_source_hash: u6
     errdefer mono_stage.diagnostics.deinit(gpa);
     var lower_stage = try readStage(&r, gpa);
     errdefer lower_stage.diagnostics.deinit(gpa);
-    var compile_stage = try readCompileStage(&r, gpa);
+    var compile_stage = try readStage(&r, gpa);
     errdefer compile_stage.diagnostics.deinit(gpa);
 
     if (r.idx != r.data.len) return error.InvalidData;
@@ -378,10 +919,13 @@ pub fn load(io: std.Io, gpa: std.mem.Allocator, options: CacheOptions, source_pa
     };
 
     const expected_hash = sourceHash(source_text);
-    return deserialize(gpa, data, expected_hash) catch {
+    const result = deserialize(gpa, data, expected_hash) catch {
         gpa.free(data);
         return null;
     };
+    if (result) |payload| return payload;
+    gpa.free(data);
+    return null;
 }
 
 fn sweepCacheDir(io: std.Io, gpa: std.mem.Allocator, dir_path: []const u8) !void {

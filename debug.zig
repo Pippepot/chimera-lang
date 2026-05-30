@@ -2,7 +2,6 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const ir_mod = @import("ir.zig");
 
-const AstNode = ast.AstNode;
 const Program = ir_mod.Program;
 const InstPair = ir_mod.InstPair;
 
@@ -55,7 +54,7 @@ fn printPbr(writer: *std.Io.Writer, p: @FieldType(ir_mod.Terminator, "pbr")) voi
 
 fn dumpIr(program: *const Program, writer: *std.Io.Writer) void {
     for (program.functions.items) |func| {
-        writer.print("fn {s} (id={d})\n", .{ func.name, func.id }) catch return;
+        writer.print("fn {s} (id={d})\n", .{ program.strings.items[func.name], func.id }) catch return;
         for (func.blocks.items) |blk| {
             if (blk.param) |param| writer.print("L{d}(%{d}):\n", .{ blk.id, param }) catch return else writer.print("L{d}:\n", .{blk.id}) catch return;
             for (blk.insts.items) |vinst| {
@@ -75,11 +74,9 @@ fn dumpIr(program: *const Program, writer: *std.Io.Writer) void {
                     .printi => |v| writer.print("  %{d} = printi %{d}\n", .{ vinst.id, v }) catch return,
                     .printf => |v| writer.print("  %{d} = printf %{d}\n", .{ vinst.id, v }) catch return,
                     .printb => |v| writer.print("  %{d} = printb %{d}\n", .{ vinst.id, v }) catch return,
-                    .argi => |idx| writer.print("  %{d} = argi %{d}\n", .{ vinst.id, idx }) catch return,
+                    .argi => |idx_val| writer.print("  %{d} = argi %{d}\n", .{ vinst.id, idx_val }) catch return,
                     .store => |p| printBinInst(writer, vinst.id, "store", p),
                     .field_load => |fl| writer.print("  %{d} = field_load %{d}, {d}\n", .{ vinst.id, fl.base, fl.field_index }) catch return,
-                    .string_lit => |id| writer.print("  %{d} = string_lit ${d}\n", .{ vinst.id, id }) catch return,
-                    .prints => |v| writer.print("  %{d} = prints %{d}\n", .{ vinst.id, v }) catch return,
                 }
             }
             const terminator = blk.terminator orelse return;
@@ -130,138 +127,156 @@ fn appendPrefix(prefix: []const u8, suffix: []const u8, buf: *[256]u8) ?[]const 
     return buf[0..need];
 }
 
-fn writeAstLabel(writer: *std.Io.Writer, node: *const AstNode) void {
-    switch (node.*) {
-        .int => |v| writer.print("int {d}", .{v}) catch return,
-        .float => |v| writer.print("float {d}", .{v}) catch return,
-        .var_ref => |name| writer.print("var {s}", .{name}) catch return,
+fn writeAstLabel(writer: *std.Io.Writer, a: *const ast.Ast, idx: ast.NodeIdx) void {
+    switch (a.nodes[idx].tag) {
+        .int_lit => writer.print("int {d}", .{@as(i32, @bitCast(a.nodes[idx].data0))}) catch return,
+        .float_lit => writer.print("float {d}", .{@as(f32, @bitCast(a.nodes[idx].data0))}) catch return,
+        .var_ref => writer.print("var {s}", .{a.stringOf(a.nodes[idx].data0)}) catch return,
         .block => writer.writeAll("block") catch return,
-        .const_ => |data| writer.print("const {s}", .{data.name}) catch return,
-        .var_ => |data| writer.print("var {s}", .{data.name}) catch return,
-        .assign => |data| writer.print("assign {s}", .{data.name}) catch return,
-        .return_ => writer.writeAll("return") catch return,
+        .const_decl => writer.print("const {s}", .{a.stringOf(a.nodes[idx].data0)}) catch return,
+        .var_decl => writer.print("var {s}", .{a.stringOf(a.nodes[idx].data0)}) catch return,
+        .assign => writer.print("assign {s}", .{a.stringOf(a.nodes[idx].data0)}) catch return,
+        .return_stmt => writer.writeAll("return") catch return,
         .call => writer.writeAll("call") catch return,
-        .print => writer.writeAll("print") catch return,
+        .print_stmt => writer.writeAll("print") catch return,
         .add => writer.writeAll("add") catch return,
         .sub => writer.writeAll("sub") catch return,
         .mul => writer.writeAll("mul") catch return,
         .div => writer.writeAll("div") catch return,
-        .arg => |idx| writer.print("arg {d}", .{idx}) catch return,
+        .arg => writer.print("arg {d}", .{a.nodes[idx].data0}) catch return,
         .lt => writer.writeAll("lt") catch return,
         .gt => writer.writeAll("gt") catch return,
         .le => writer.writeAll("le") catch return,
         .ge => writer.writeAll("ge") catch return,
         .eq => writer.writeAll("eq") catch return,
         .ne => writer.writeAll("ne") catch return,
-        .if_ => writer.writeAll("if") catch return,
+        .if_stmt => writer.writeAll("if") catch return,
         .struct_init => writer.writeAll("struct_init") catch return,
         .field_access => writer.writeAll("field_access") catch return,
-        .bool => |v| writer.print("bool {s}", .{if (v) "true" else "false"}) catch return,
-        .unit => writer.writeAll("unit") catch return,
-        .string => |s| writer.print("string \"{s}\"", .{s}) catch return,
+        .bool_lit => writer.print("bool {s}", .{if (a.nodes[idx].data0 != 0) "true" else "false"}) catch return,
+        .unit_lit => writer.writeAll("unit") catch return,
+        .type_name, .type_func, .comptime_fn, .comptime_struct => {},
     }
 }
 
-fn dumpAstNode(node: *const AstNode, writer: *std.Io.Writer, prefix: []const u8, is_last: bool, is_root: bool) void {
+fn dumpAstNode(a: *const ast.Ast, idx: ast.NodeIdx, writer: *std.Io.Writer, prefix: []const u8, is_last: bool, is_root: bool) void {
     if (!is_root) writer.print("{s}{s}", .{ prefix, if (is_last) "└─" else "├─" }) catch return;
-    writeAstLabel(writer, node);
+    writeAstLabel(writer, a, idx);
     writer.writeAll("\n") catch return;
 
     var next_prefix_buf: [256]u8 = undefined;
     const next_suffix = if (is_root) "" else if (is_last) "  " else "│ ";
     const next_prefix = appendPrefix(prefix, next_suffix, &next_prefix_buf) orelse return;
 
-    switch (node.*) {
-        .block => |block| {
-            for (block.items, 0..) |item, idx| {
-                dumpAstNode(item, writer, next_prefix, idx + 1 == block.items.len, false);
+    switch (a.nodes[idx].tag) {
+        .block => {
+            const items = a.blockItems(idx);
+            for (items, 0..) |item, i| {
+                dumpAstNode(a, item, writer, next_prefix, i + 1 == items.len, false);
             }
         },
-        .const_ => |data| dumpAstNode(data.value, writer, next_prefix, true, false),
-        .var_ => |data| dumpAstNode(data.value, writer, next_prefix, true, false),
-        .assign => |data| dumpAstNode(data.value, writer, next_prefix, true, false),
-        .return_ => |data| dumpAstNode(data.value, writer, next_prefix, true, false),
-        .call => |call_node| {
-            if (call_node.args.len == 0) {
-                dumpAstNode(call_node.callee, writer, next_prefix, true, false);
+        .const_decl => dumpAstNode(a, a.varDeclValue(idx), writer, next_prefix, true, false),
+        .var_decl => dumpAstNode(a, a.varDeclValue(idx), writer, next_prefix, true, false),
+        .assign => dumpAstNode(a, a.nodes[idx].data1, writer, next_prefix, true, false),
+        .return_stmt => dumpAstNode(a, a.nodes[idx].data0, writer, next_prefix, true, false),
+        .call => {
+            const callee = a.nodes[idx].data0;
+            const args = a.callArgs(idx);
+            if (args.len == 0) {
+                dumpAstNode(a, callee, writer, next_prefix, true, false);
             } else {
-                dumpAstNode(call_node.callee, writer, next_prefix, false, false);
-                for (call_node.args, 0..) |arg, idx| {
-                    dumpAstNode(arg, writer, next_prefix, idx + 1 == call_node.args.len, false);
+                dumpAstNode(a, callee, writer, next_prefix, false, false);
+                for (args, 0..) |arg, i| {
+                    dumpAstNode(a, arg, writer, next_prefix, i + 1 == args.len, false);
                 }
             }
         },
-        .print => |child| dumpAstNode(child, writer, next_prefix, true, false),
-        .add, .sub, .mul, .div, .lt, .gt, .le, .ge, .eq, .ne => |kids| {
-            dumpAstNode(&kids[0], writer, next_prefix, false, false);
-            dumpAstNode(&kids[1], writer, next_prefix, true, false);
+        .print_stmt => dumpAstNode(a, a.nodes[idx].data0, writer, next_prefix, true, false),
+        .add, .sub, .mul, .div, .lt, .gt, .le, .ge, .eq, .ne => {
+            dumpAstNode(a, a.nodes[idx].data0, writer, next_prefix, false, false);
+            dumpAstNode(a, a.nodes[idx].data1, writer, next_prefix, true, false);
         },
-        .if_ => |data| {
-            if (data.else_ != null) {
-                dumpAstNode(data.cond, writer, next_prefix, false, false);
-                dumpAstNode(data.then_, writer, next_prefix, false, false);
-                dumpAstNode(data.else_.?, writer, next_prefix, true, false);
+        .if_stmt => {
+            const id = a.ifData(idx);
+            if (id.else_ != std.math.maxInt(ast.NodeIdx)) {
+                dumpAstNode(a, id.cond, writer, next_prefix, false, false);
+                dumpAstNode(a, id.then_, writer, next_prefix, false, false);
+                dumpAstNode(a, id.else_, writer, next_prefix, true, false);
             } else {
-                dumpAstNode(data.cond, writer, next_prefix, false, false);
-                dumpAstNode(data.then_, writer, next_prefix, true, false);
+                dumpAstNode(a, id.cond, writer, next_prefix, false, false);
+                dumpAstNode(a, id.then_, writer, next_prefix, true, false);
             }
         },
-        .field_access => |fa| {
-            dumpAstNode(fa.target, writer, next_prefix, true, false);
+        .field_access => dumpAstNode(a, a.nodes[idx].data0, writer, next_prefix, true, false),
+        .struct_init => {
+            const fields = a.structInitFields(idx);
+            for (fields, 0..) |field, i| {
+                writer.print("{s}{s}", .{ next_prefix, if (i + 1 == fields.len) "└─" else "├─" }) catch return;
+                writer.print("{s}: ", .{a.stringOf(field.name)}) catch return;
+                dumpAstNode(a, field.value, writer, next_prefix, i + 1 == fields.len, true);
+            }
         },
-        .struct_init => |si| {
-            _ = si;
-        },
-        .int, .float, .var_ref, .arg, .bool, .unit, .string => {},
+        .int_lit, .float_lit, .var_ref, .arg, .bool_lit, .unit_lit => {},
+        .type_name, .type_func, .comptime_fn, .comptime_struct => {},
     }
 }
 
-fn dumpTypeNode(ty: *const ast.TypeNode, writer: *std.Io.Writer) void {
-    switch (ty.*) {
-        .name => |name| writer.print("{s}", .{name}) catch return,
-        .func => |func_ty| {
+fn dumpTypeNode(a: *const ast.Ast, type_idx: ast.TypeIdx, writer: *std.Io.Writer) void {
+    switch (a.nodes[type_idx].tag) {
+        .type_name => writer.print("{s}", .{a.stringOf(a.nodes[type_idx].data0)}) catch return,
+        .type_func => {
             writer.writeAll("func(") catch return;
-            for (func_ty.params, 0..) |param, idx| {
-                if (idx > 0) writer.writeAll(", ") catch return;
-                dumpTypeNode(param, writer);
+            const params = a.funcTypeParams(type_idx);
+            for (params, 0..) |param, i| {
+                if (i > 0) writer.writeAll(", ") catch return;
+                dumpTypeNode(a, param, writer);
             }
             writer.writeAll(") ") catch return;
-            dumpTypeNode(func_ty.ret, writer);
+            dumpTypeNode(a, a.funcTypeRet(type_idx), writer);
         },
+        .int_lit, .float_lit, .var_ref, .block, .const_decl, .var_decl, .assign,
+        .return_stmt, .call, .print_stmt, .add, .sub, .mul, .div, .arg, .lt, .gt,
+        .le, .ge, .eq, .ne, .if_stmt, .struct_init, .field_access, .bool_lit,
+        .unit_lit, .comptime_fn, .comptime_struct => {},
     }
 }
 
-fn dumpModule(module: *const ast.Module, writer: *std.Io.Writer) void {
-    for (module.decls) |decl| {
-        switch (decl.*) {
-            .comptime_func => |func_decl| {
-                writer.print("comptime {s} = func(", .{func_decl.name}) catch return;
-                for (func_decl.params, 0..) |param, idx| {
-                    if (idx > 0) writer.writeAll(", ") catch return;
-                    writer.print("{s}: ", .{param.name}) catch return;
-                    dumpTypeNode(param.ty, writer);
+fn dumpProgram(a: *const ast.Ast, writer: *std.Io.Writer) void {
+    for (a.decls) |decl_idx| {
+        switch (a.nodes[decl_idx].tag) {
+            .comptime_fn => {
+                const name = a.stringOf(a.nodes[decl_idx].data0);
+                writer.print("comptime {s} = func(", .{name}) catch return;
+                const params = a.fnParams(decl_idx);
+                for (params, 0..) |param, i| {
+                    if (i > 0) writer.writeAll(", ") catch return;
+                    writer.print("{s}: ", .{a.stringOf(param.name)}) catch return;
+                    dumpTypeNode(a, param.ty, writer);
                 }
                 writer.writeAll(") ") catch return;
-                dumpTypeNode(func_decl.ret_type, writer);
+                dumpTypeNode(a, a.fnRetType(decl_idx), writer);
                 writer.writeAll("\n") catch return;
-                dumpAstNode(func_decl.body, writer, "  ", true, true);
+                dumpAstNode(a, a.fnBody(decl_idx), writer, "  ", true, true);
                 writer.writeAll("\n") catch return;
             },
-            .comptime_struct => |struct_decl| {
-                writer.print("comptime {s} = struct\n", .{struct_decl.name}) catch return;
-                for (struct_decl.fields) |field| {
-                    writer.print("  {s}: ", .{field.name}) catch return;
-                    dumpTypeNode(field.ty, writer);
+            .comptime_struct => {
+                const name = a.stringOf(a.nodes[decl_idx].data0);
+                writer.print("comptime {s} = struct\n", .{name}) catch return;
+                const fields = a.structFields(decl_idx);
+                for (fields) |field| {
+                    writer.print("  {s}: ", .{a.stringOf(field.name)}) catch return;
+                    dumpTypeNode(a, field.ty, writer);
                     writer.writeAll("\n") catch return;
                 }
                 writer.writeAll("\n") catch return;
             },
+            else => {},
         }
     }
 
-    if (module.entry.* != .unit) {
+    if (a.entry != std.math.maxInt(ast.NodeIdx)) {
         writer.writeAll("entry\n") catch return;
-        dumpAstNode(module.entry, writer, "  ", true, true);
+        dumpAstNode(a, a.entry, writer, "  ", true, true);
         writer.writeAll("\n") catch return;
     }
 }
@@ -269,16 +284,16 @@ fn dumpModule(module: *const ast.Module, writer: *std.Io.Writer) void {
 pub fn dumpDebugInfo(
     io: std.Io,
     flags: DebugFlags,
-    module: ?*const ast.Module,
+    ast_ast: ?*const ast.Ast,
     ir: ?*const Program,
     gpa: std.mem.Allocator,
 ) !void {
     _ = gpa;
-    if (flags.ast and module != null) {
+    if (flags.ast and ast_ast != null) {
         var wbuf: [4096]u8 = undefined;
         var w = std.Io.File.stdout().writer(io, &wbuf);
         try w.interface.writeAll("; AST:\n");
-        dumpModule(module.?, &w.interface);
+        dumpProgram(ast_ast.?, &w.interface);
         try w.interface.writeAll("\n");
         try w.interface.flush();
     }

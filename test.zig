@@ -90,11 +90,11 @@ test "parser builds declaration-root module" {
     ;
 
     var parsed = try parser.parseOwned(src, testing.allocator);
-    defer parsed.deinit();
+    defer parsed.deinit(testing.allocator);
 
-    try testing.expectEqual(@as(usize, 2), parsed.root.decls.len);
-    try testing.expect(parsed.root.decls[0].* == .comptime_struct);
-    try testing.expect(parsed.root.decls[1].* == .comptime_func);
+    try testing.expectEqual(@as(usize, 2), parsed.ast.decls.len);
+    try testing.expect(parsed.ast.nodes[parsed.ast.decls[0]].tag == .comptime_struct);
+    try testing.expect(parsed.ast.nodes[parsed.ast.decls[1]].tag == .comptime_fn);
 }
 
 test "top-level call expression executes as entry point" {
@@ -450,77 +450,12 @@ test "binding type annotation mismatch errors" {
     try expectCompileErrorContains(&db, 0, "binding type annotation mismatch");
 }
 
-test "string literal print" {
-    try testProgram(
-        \\print("hello, world")
-    , "hello, world\n");
-}
-
-test "string literal with escape sequences" {
-    try testProgram(
-        \\print("line1\nline2")
-    , "line1\nline2\n");
-}
-
-test "string literal with tab" {
-    try testProgram(
-        \\print("a\tb")
-    , "a\tb\n");
-}
-
-test "string literal with quote" {
-    try testProgram(
-        \\print("say \"hi\"")
-    , "say \"hi\"\n");
-}
-
-test "string literal with backslash" {
-    try testProgram(
-        \\print("path\\to\\file")
-    , "path\\to\\file\n");
-}
-
-test "string literal in const binding" {
-    try testProgram(
-        \\const s = "hello"
-        \\print(s)
-    , "hello\n");
-}
-
-test "string type annotation" {
-    try testProgram(
-        \\const s: string = "hi"
-        \\print(s)
-    , "hi\n");
-}
-
-test "string literal multiple prints" {
-    try testProgram(
-        \\print("abc")
-        \\print("def")
-    , "abc\ndef\n");
-}
-
-test "string in arithmetic errors" {
-    var db = query.QueryDb.init(testing.allocator);
-    defer db.deinit();
-
-    try db.setSource(0, "const s: string = \"x\"\nprint(s + 1)");
-    try expectCompileErrorContains(&db, 0, "arithmetic requires int or float operands");
-}
-
-test "empty string literal" {
-    try testProgram(
-        \\print("")
-    , "\n");
-}
-
 test "persistent cache reuses compile result across db instances" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const source_text = "print(42)\n";
-    const source_path = try makeTmpSourcePath(testing.allocator, &tmp, "persist_ok.x86");
+    const source_path = try makeTmpSourcePath(testing.allocator, &tmp, "persist_ok.chi");
     defer testing.allocator.free(source_path);
     const cache_path = try std.fmt.allocPrint(testing.allocator, "{s}.qcache", .{source_path});
     defer testing.allocator.free(cache_path);
@@ -556,7 +491,7 @@ test "persistent cache disable option bypasses disk cache" {
     defer tmp.cleanup();
 
     const source_text = "print(7)\n";
-    const source_path = try makeTmpSourcePath(testing.allocator, &tmp, "persist_disabled.x86");
+    const source_path = try makeTmpSourcePath(testing.allocator, &tmp, "persist_disabled.chi");
     defer testing.allocator.free(source_path);
     const cache_path = try std.fmt.allocPrint(testing.allocator, "{s}.qcache", .{source_path});
     defer testing.allocator.free(cache_path);
@@ -592,7 +527,7 @@ test "persistent cache stores compile failures and diagnostics" {
     defer tmp.cleanup();
 
     const source_text = "print(missing_name)\n";
-    const source_path = try makeTmpSourcePath(testing.allocator, &tmp, "persist_fail.x86");
+    const source_path = try makeTmpSourcePath(testing.allocator, &tmp, "persist_fail.chi");
     defer testing.allocator.free(source_path);
     const cache_path = try std.fmt.allocPrint(testing.allocator, "{s}.qcache", .{source_path});
     defer testing.allocator.free(cache_path);
@@ -627,7 +562,7 @@ test "corrupted persistent cache is ignored and rebuilt" {
     defer tmp.cleanup();
 
     const source_text = "print(5)\n";
-    const source_path = try makeTmpSourcePath(testing.allocator, &tmp, "persist_corrupt.x86");
+    const source_path = try makeTmpSourcePath(testing.allocator, &tmp, "persist_corrupt.chi");
     defer testing.allocator.free(source_path);
     const cache_path = try std.fmt.allocPrint(testing.allocator, "{s}.qcache", .{source_path});
     defer testing.allocator.free(cache_path);
@@ -662,14 +597,47 @@ test "corrupted persistent cache is ignored and rebuilt" {
     }
 }
 
+test "persistent cache load frees data on hash mismatch (regression)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const source_text = "print(42)\n";
+    const different_text = "print(99)\n";
+    const source_path = try makeTmpSourcePath(testing.allocator, &tmp, "persist_hash_mismatch.chi");
+    defer testing.allocator.free(source_path);
+    const cache_path = try std.fmt.allocPrint(testing.allocator, "{s}.qcache", .{source_path});
+    defer testing.allocator.free(cache_path);
+
+    try std.Io.Dir.cwd().writeFile(testing.io, .{
+        .sub_path = source_path,
+        .data = source_text,
+    });
+    defer std.Io.Dir.cwd().deleteFile(testing.io, source_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(testing.io, cache_path) catch {};
+
+    try query_cache.save(testing.io, testing.allocator, .{}, .{
+        .source_path = source_path,
+        .source_text = source_text,
+        .parse = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
+        .resolve = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
+        .typecheck = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
+        .monomorphize = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
+        .lower = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
+        .compile = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
+    });
+
+    const result = try query_cache.load(testing.io, testing.allocator, .{}, source_path, different_text);
+    try testing.expect(result == null);
+}
+
 test "stale cache files are removed by eager sweep" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const source_text = "print(9)\n";
-    const live_source = try makeTmpSourcePath(testing.allocator, &tmp, "persist_live.x86");
+    const live_source = try makeTmpSourcePath(testing.allocator, &tmp, "persist_live.chi");
     defer testing.allocator.free(live_source);
-    const stale_source = try makeTmpSourcePath(testing.allocator, &tmp, "persist_stale.x86");
+    const stale_source = try makeTmpSourcePath(testing.allocator, &tmp, "persist_stale.chi");
     defer testing.allocator.free(stale_source);
     const stale_cache = try std.fmt.allocPrint(testing.allocator, "{s}.qcache", .{stale_source});
     defer testing.allocator.free(stale_cache);
@@ -687,11 +655,11 @@ test "stale cache files are removed by eager sweep" {
     try query_cache.save(testing.io, testing.allocator, .{}, .{
         .source_path = stale_source,
         .source_text = source_text,
-        .parse = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{} },
-        .resolve = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{} },
-        .typecheck = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{} },
-        .monomorphize = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{} },
-        .lower = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{} },
+        .parse = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
+        .resolve = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
+        .typecheck = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
+        .monomorphize = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
+        .lower = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
         .compile = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
     });
 
@@ -708,4 +676,30 @@ test "stale cache files are removed by eager sweep" {
     };
 
     return error.TestFailed;
+}
+
+test "second compile with no changes has zero recomputes" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+
+    try db.setSource(0, "0");
+    _ = try expectCompileOk(&db, 0);
+
+    db.resetStats();
+
+    _ = try expectCompileOk(&db, 0);
+
+    const stats = db.statsSnapshot();
+    try testing.expectEqual(@as(usize, 0), stats.parse_recomputes);
+    try testing.expectEqual(@as(usize, 0), stats.resolve_recomputes);
+    try testing.expectEqual(@as(usize, 0), stats.type_recomputes);
+    try testing.expectEqual(@as(usize, 0), stats.mono_recomputes);
+    try testing.expectEqual(@as(usize, 0), stats.lower_recomputes);
+    try testing.expectEqual(@as(usize, 0), stats.compile_recomputes);
+    try testing.expectEqual(@as(usize, 0), stats.parse_hits);
+    try testing.expectEqual(@as(usize, 0), stats.resolve_hits);
+    try testing.expectEqual(@as(usize, 0), stats.type_hits);
+    try testing.expectEqual(@as(usize, 0), stats.mono_hits);
+    try testing.expectEqual(@as(usize, 0), stats.lower_hits);
+    try testing.expectEqual(@as(usize, 1), stats.compile_hits);
 }
