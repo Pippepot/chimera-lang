@@ -13,11 +13,14 @@ pub const ResolveError = error{
 pub const ResolvedRef = union(enum) {
     local,
     function: u32,
+    comptime_value: ast.NodeIdx,
+    struct_decl: ast.NodeIdx,
 };
 
 pub const ResolvedAst = struct {
     functions: std.ArrayList(ast.NodeIdx),
     function_names: std.StringHashMap(u32),
+    comptime_value_names: std.StringHashMap(ast.NodeIdx),
     struct_names: std.StringHashMap(void),
     node_refs: std.AutoHashMap(ast.NodeIdx, ResolvedRef),
     key_arena: std.heap.ArenaAllocator,
@@ -26,6 +29,7 @@ pub const ResolvedAst = struct {
         return .{
             .functions = try std.ArrayList(ast.NodeIdx).initCapacity(gpa, 8),
             .function_names = std.StringHashMap(u32).init(gpa),
+            .comptime_value_names = std.StringHashMap(ast.NodeIdx).init(gpa),
             .struct_names = std.StringHashMap(void).init(gpa),
             .node_refs = std.AutoHashMap(ast.NodeIdx, ResolvedRef).init(gpa),
             .key_arena = std.heap.ArenaAllocator.init(gpa),
@@ -35,6 +39,7 @@ pub const ResolvedAst = struct {
     pub fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
         self.functions.deinit(gpa);
         self.function_names.deinit();
+        self.comptime_value_names.deinit();
         self.struct_names.deinit();
         self.node_refs.deinit();
         self.key_arena.deinit();
@@ -79,7 +84,10 @@ const Resolver = struct {
     }
 
     fn addTopLevelSymbol(self: *@This(), name: []const u8, decl_idx: ast.NodeIdx) !void {
-        if (self.resolved.function_names.contains(name) or self.resolved.struct_names.contains(name)) {
+        if (self.resolved.function_names.contains(name) or
+            self.resolved.comptime_value_names.contains(name) or
+            self.resolved.struct_names.contains(name))
+        {
             return self.fail(self.parsed.ast.spanOf(decl_idx), error.DuplicateSymbol);
         }
 
@@ -92,13 +100,16 @@ const Resolver = struct {
             .comptime_struct => {
                 try self.resolved.struct_names.put(name, {});
             },
+            .comptime_value_decl => {
+                try self.resolved.comptime_value_names.put(name, decl_idx);
+            },
             else => {},
         }
     }
 
     fn resolveTopLevel(self: *@This()) !void {
         for (self.parsed.ast.decls) |decl_idx| {
-            const name = self.parsed.ast.stringOf(self.parsed.ast.nodes[decl_idx].data0);
+            const name = self.parsed.ast.identOf(self.parsed.ast.nodes[decl_idx].data0);
             try self.addTopLevelSymbol(name, decl_idx);
         }
     }
@@ -116,7 +127,7 @@ const Resolver = struct {
         defer self.locals.restore(mark);
 
         for (self.parsed.ast.fnParams(func_decl_idx)) |param| {
-            const name = self.parsed.ast.stringOf(param.name);
+            const name = self.parsed.ast.identOf(param.name);
             self.locals.push(self.gpa, name, {}) catch |err| switch (err) {
                 error.DuplicateVariable => return self.fail(self.parsed.ast.spanOf(func_decl_idx), error.DuplicateSymbol),
                 error.OutOfMemory => return error.OutOfMemory,
@@ -138,7 +149,7 @@ const Resolver = struct {
             },
             .int_lit, .float_lit, .arg, .bool_lit, .unit_lit => {},
             .var_ref => {
-                const name = ast_.stringOf(ast_.nodes[idx].data0);
+                const name = ast_.identOf(ast_.nodes[idx].data0);
                 if (self.locals.lookup(name) != null) {
                     try self.resolved.node_refs.put(idx, .local);
                     return;
@@ -147,10 +158,20 @@ const Resolver = struct {
                     try self.resolved.node_refs.put(idx, .{ .function = fn_id });
                     return;
                 }
+                if (self.resolved.comptime_value_names.get(name)) |decl_idx| {
+                    try self.resolved.node_refs.put(idx, .{ .comptime_value = decl_idx });
+                    return;
+                }
+                if (self.parsed.ast.name_map.get(name)) |decl_idx| {
+                    if (self.parsed.ast.nodes[decl_idx].tag == .comptime_struct) {
+                        try self.resolved.node_refs.put(idx, .{ .struct_decl = decl_idx });
+                        return;
+                    }
+                }
                 return self.fail(ast_.spanOf(idx), error.UnknownSymbol);
             },
             .const_decl => {
-                const name = ast_.stringOf(ast_.nodes[idx].data0);
+                const name = ast_.identOf(ast_.nodes[idx].data0);
                 try self.resolveNode(ast_.varDeclValue(idx));
                 self.locals.push(self.gpa, name, {}) catch |err| switch (err) {
                     error.DuplicateVariable => return self.fail(ast_.spanOf(idx), error.DuplicateSymbol),
@@ -158,7 +179,7 @@ const Resolver = struct {
                 };
             },
             .var_decl => {
-                const name = ast_.stringOf(ast_.nodes[idx].data0);
+                const name = ast_.identOf(ast_.nodes[idx].data0);
                 try self.resolveNode(ast_.varDeclValue(idx));
                 self.locals.push(self.gpa, name, {}) catch |err| switch (err) {
                     error.DuplicateVariable => return self.fail(ast_.spanOf(idx), error.DuplicateSymbol),
@@ -166,7 +187,7 @@ const Resolver = struct {
                 };
             },
             .assign => {
-                const name = ast_.stringOf(ast_.nodes[idx].data0);
+                const name = ast_.identOf(ast_.nodes[idx].data0);
                 if (self.locals.lookup(name) == null) {
                     return self.fail(ast_.spanOf(idx), error.UnknownSymbol);
                 }
@@ -202,6 +223,8 @@ const Resolver = struct {
             .field_access => {
                 try self.resolveNode(ast_.nodes[idx].data0);
             },
+            .comptime_expr => try self.resolveNode(ast_.comptimeExprBody(idx)),
+            .comptime_value_decl => try self.resolveNode(ast_.nodes[idx].data1),
             .type_name, .type_func, .comptime_fn, .comptime_struct => {},
         }
     }

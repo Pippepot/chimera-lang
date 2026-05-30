@@ -55,10 +55,10 @@ This compiler now supports a declaration-first language with optional top-level 
 The old pointer-based AST (`*const AstNode`, `*const ast.Module`, `*const ast.FuncDecl`) is being replaced with a flat index-based design:
 
 - **`ast.Node`**: 12-byte `extern struct { tag: Tag, _pad: [3]u8, data0: u32, data1: u32 }`
-- **`ast.Ast`**: Single `backing: []u8` containing all arrays (nodes, extra, string_bytes, string_offsets, spans, decls). Buffer-copy `serialize`/`deserialize`.
+- **`ast.Ast`**: Single `backing: []u8` containing all arrays (nodes, extra, ident_bytes, ident_offsets, spans, decls). Buffer-copy `serialize`/`deserialize`.
 - **Node overflow**: Nodes needing >2 values use `data1` as extra index.
-- **Accessor functions**: `ast.blockItems(idx)`, `ast.varDeclValue(idx)`, `ast.ifData(idx)`, `ast.callArgs(idx)`, `ast.fnParams(idx)`, `ast.fnBody(idx)`, `ast.structFields(idx)`, `ast.structInitFields(idx)`, `ast.stringOf(idx)`, etc.
-- **String interning**: `AstBuilder.internString()` copies to `string_bytes`, records offset, uses `std.StringHashMap` during building (freed after seal).
+- **Accessor functions**: `ast.blockItems(idx)`, `ast.varDeclValue(idx)`, `ast.ifData(idx)`, `ast.callArgs(idx)`, `ast.fnParams(idx)`, `ast.fnBody(idx)`, `ast.structFields(idx)`, `ast.structInitFields(idx)`, `ast.identOf(idx)`, etc.
+- **Identifier interning**: `AstBuilder.internIdent()` copies to `ident_bytes`, records offset, uses `std.StringHashMap` during building (freed after seal).
 - **Replace map types**: `std.AutoHashMap(usize, T)` → `std.AutoHashMap(ast.NodeIdx, T)`. Full sorted-array serialization is deferred.
 
 ### Serialization plan
@@ -76,7 +76,7 @@ All 5 stages must be cached with `hits=1 recomputes=0` when cache is present. Th
 - **query.zig** ✅ — Generic `ensureMemo`, 5-stage pipeline, persistent cache load/save
 - **query_cache.zig** ✅ — Buffer-copy ser/des for all 5 stages, persistent cache with schema v4
 - **main.zig** ✅ — Updated for `?*const ast.Ast`, persistent cache CLI
-- **test.zig** ✅ — All 34 tests pass using flat API
+- **test.zig** ✅ — All 43 tests pass using flat API
 - **runtime.zig** — Unchanged
 - **scope.zig** — Unchanged
 - **helpers_bin.zig** — Unchanged
@@ -87,7 +87,7 @@ All 5 stages must be cached with `hits=1 recomputes=0` when cache is present. Th
 - `if`/`else` uses indentation-based blocks with inline `->` form supported.
 - Fallible comparisons (`<`, `>`, `<=`, `>=`, `==`, `!=`) are only legal in `if` conditions.
 - `const` and `var` bindings support optional type annotations.
-- **`string` type** — primitive type with escape sequences.
+- **No language string values** — string literals and `string` type annotations are rejected.
 - **Struct types** — `comptime Name = struct` with indented field lines.
 - **Struct init** — `TypeName{field1 = val1, field2 = val2, ...}`.
 - **Field access** — `expr.fieldName`, multi-field structs use consecutive stack slots + `field_load` IR.
@@ -115,4 +115,4 @@ All 5 stages must be cached with `hits=1 recomputes=0` when cache is present. Th
   - compile `changed_at` backdating
   - persistent cache reuse/disable/failure/corruption/stale cleanup behavior
 - Zero-recompute test: `compileResult` twice with no source change → 0 recomputes, 1 compile hit (compile is the only stage accessed on the second call; all others are implicitly cached).
-- Current suite: `zig test test.zig` (34 tests).
+- Current suite: `zig test test.zig` (43 tests).

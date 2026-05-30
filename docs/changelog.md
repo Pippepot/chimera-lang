@@ -1,5 +1,26 @@
 # Changelog
 
+## 2026-05-30 — String-language removal and naming cleanup
+
+### Language surface
+
+- Removed language-level string support:
+  - string literals are rejected by the lexer/parser.
+  - `string` type annotations are rejected as unknown type.
+- Added regression tests to lock this behavior.
+
+### Naming clarity
+
+- Renamed AST identifier intern storage terminology:
+  - `StringIdx` -> `IdentIdx`
+  - `stringOf` -> `identOf`
+  - `internString` -> `internIdent`
+  - `string_bytes`/`string_offsets`/`string_map` -> `ident_bytes`/`ident_offsets`/`ident_map`
+- Renamed IR symbol table terminology:
+  - `StringId` -> `SymbolId`
+  - `Program.strings` -> `Program.symbols`
+  - `Program.stringFor` -> `Program.symbolFor`
+
 ## 2026-05-30 — Error reporting & grammar fixes
 
 ### Error reporting (parser.zig)

@@ -222,6 +222,76 @@ test "if fallible semantics in top-level body" {
     , "11\n");
 }
 
+test "inline if arrow supports return in function bodies" {
+    try testProgram(
+        \\comptime fib = func(n: int) int
+        \\  if n == 1 -> return 1
+        \\  if n == 0 -> return 0
+        \\  return fib(n - 1) + fib(n - 2)
+        \\
+        \\print(fib(10))
+    , "55\n");
+}
+
+test "inline comptime expression computes value at compile time" {
+    try testProgram(
+        \\const x = comptime -> 40 + 2
+        \\print(x)
+    , "42\n");
+}
+
+test "block comptime expression computes value at compile time" {
+    try testProgram(
+        \\const x = comptime
+        \\  const a = 40
+        \\  a + 2
+        \\print(x)
+    , "42\n");
+}
+
+test "comptime value declaration resolves dependencies regardless of order" {
+    try testProgram(
+        \\comptime y = x + 1
+        \\comptime x = 41
+        \\print(y)
+    , "42\n");
+}
+
+test "comptime declaration cycle reports diagnostic" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+
+    try db.setSource(0,
+        \\comptime a = b + 1
+        \\comptime b = a + 1
+        \\print(a)
+    );
+    try expectCompileErrorContains(&db, 0, "comptime dependency cycle");
+}
+
+test "comptime expressions are pure in v1" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+
+    try db.setSource(0,
+        \\const x = comptime -> print(1)
+        \\print(x)
+    );
+    try expectCompileErrorContains(&db, 0, "operation is not allowed in pure comptime execution");
+}
+
+test "comptime expressions cannot capture runtime locals" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+
+    try db.setSource(0,
+        \\const a = 41
+        \\const b = comptime -> a + 1
+        \\print(b)
+    );
+    try expectCompileErrorContains(&db, 0, "comptime can only reference comptime symbols");
+}
+
 test "typecheck call arity mismatch" {
     var db = query.QueryDb.init(testing.allocator);
     defer db.deinit();
@@ -269,6 +339,7 @@ test "query cache hits within same revision includes resolve" {
     try db.setSource(0, "0");
     _ = try db.parsedAst(0);
     _ = try db.resolvedAst(0);
+    _ = try db.astgenIr(0);
     _ = try db.typedAst(0);
     _ = try db.loweredProgram(0);
     _ = try expectCompileOk(&db, 0);
@@ -277,6 +348,7 @@ test "query cache hits within same revision includes resolve" {
 
     _ = try db.parsedAst(0);
     _ = try db.resolvedAst(0);
+    _ = try db.astgenIr(0);
     _ = try db.typedAst(0);
     _ = try db.loweredProgram(0);
     _ = try expectCompileOk(&db, 0);
@@ -284,6 +356,7 @@ test "query cache hits within same revision includes resolve" {
     const stats = db.statsSnapshot();
     try testing.expectEqual(@as(usize, 1), stats.parse_hits);
     try testing.expectEqual(@as(usize, 1), stats.resolve_hits);
+    try testing.expectEqual(@as(usize, 1), stats.astgen_hits);
     try testing.expectEqual(@as(usize, 1), stats.type_hits);
     try testing.expectEqual(@as(usize, 1), stats.lower_hits);
     try testing.expectEqual(@as(usize, 1), stats.compile_hits);
@@ -304,6 +377,7 @@ test "source change invalidates all stages" {
     const stats = db.statsSnapshot();
     try testing.expectEqual(@as(usize, 1), stats.parse_recomputes);
     try testing.expectEqual(@as(usize, 1), stats.resolve_recomputes);
+    try testing.expectEqual(@as(usize, 1), stats.astgen_recomputes);
     try testing.expectEqual(@as(usize, 1), stats.type_recomputes);
     try testing.expectEqual(@as(usize, 1), stats.lower_recomputes);
     try testing.expectEqual(@as(usize, 1), stats.compile_recomputes);
@@ -333,6 +407,7 @@ test "debug query diagnostics format includes resolve" {
         .source_sets = 2,
         .parse_hits = 3,
         .resolve_hits = 4,
+        .astgen_hits = 2,
         .type_hits = 5,
         .compile_recomputes = 1,
         .dependency_checks = 5,
@@ -341,6 +416,7 @@ test "debug query diagnostics format includes resolve" {
 
     try testing.expect(std.mem.indexOf(u8, buf.items, ";   parse: hits=3 recomputes=0") != null);
     try testing.expect(std.mem.indexOf(u8, buf.items, ";   resolve: hits=4 recomputes=0") != null);
+    try testing.expect(std.mem.indexOf(u8, buf.items, ";   astgen: hits=2 recomputes=0") != null);
     try testing.expect(std.mem.indexOf(u8, buf.items, ";   type: hits=5 recomputes=0") != null);
 }
 
@@ -446,6 +522,22 @@ test "binding type annotation mismatch errors" {
 
     try db.setSource(0, "var y: float = 1");
     try expectCompileErrorContains(&db, 0, "binding type annotation mismatch");
+}
+
+test "string type annotation is rejected" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+
+    try db.setSource(0, "const s: string = 1");
+    try expectCompileErrorContains(&db, 0, "unknown type");
+}
+
+test "string literal syntax is rejected" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+
+    try db.setSource(0, "print(\"hello\")");
+    try expectCompileErrorContains(&db, 0, "unexpected character");
 }
 
 test "persistent cache reuses compile result across db instances" {
@@ -558,6 +650,7 @@ test "persistent cache load frees data on hash mismatch (regression)" {
         .source_text = source_text,
         .parse = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
         .resolve = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
+        .astgen = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
         .typecheck = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
         .lower = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
         .compile = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
@@ -594,6 +687,7 @@ test "stale cache files are removed by eager sweep" {
         .source_text = source_text,
         .parse = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
         .resolve = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
+        .astgen = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
         .typecheck = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
         .lower = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
         .compile = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
@@ -628,10 +722,12 @@ test "second compile with no changes has zero recomputes" {
     const stats = db.statsSnapshot();
     try testing.expectEqual(@as(usize, 0), stats.parse_recomputes);
     try testing.expectEqual(@as(usize, 0), stats.resolve_recomputes);
+    try testing.expectEqual(@as(usize, 0), stats.astgen_recomputes);
     try testing.expectEqual(@as(usize, 0), stats.type_recomputes);
     try testing.expectEqual(@as(usize, 0), stats.lower_recomputes);
     try testing.expectEqual(@as(usize, 0), stats.parse_hits);
     try testing.expectEqual(@as(usize, 0), stats.resolve_hits);
+    try testing.expectEqual(@as(usize, 0), stats.astgen_hits);
     try testing.expectEqual(@as(usize, 0), stats.type_hits);
     try testing.expectEqual(@as(usize, 0), stats.lower_hits);
     try testing.expectEqual(@as(usize, 1), stats.compile_hits);

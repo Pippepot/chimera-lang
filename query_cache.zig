@@ -3,16 +3,17 @@ const builtin = @import("builtin");
 const db = @import("db.zig");
 const diagnostics = @import("diagnostics.zig");
 const ir_mod = @import("ir.zig");
+const astgen = @import("astgen.zig");
 const ast = @import("ast.zig");
 const parser = @import("parser.zig");
 const resolver = @import("resolver.zig");
-const typecheck = @import("typecheck.zig");
+const analyze = @import("analyze.zig");
 
 
 const CacheExt = ".qcache";
 const Magic: [8]u8 = .{ 'X', '8', '6', 'Q', 'C', 'A', 'C', 'H' };
-const SchemaVersion: u32 = 4;
-const CompilerAbiVersion: u32 = 2;
+const SchemaVersion: u32 = 5;
+const CompilerAbiVersion: u32 = 3;
 
 pub const CacheOptions = struct {
     cache_dir_override: ?[]const u8 = null,
@@ -30,6 +31,7 @@ pub const SavePayload = struct {
     source_text: []const u8,
     parse: StageSnapshot,
     resolve: StageSnapshot,
+    astgen: StageSnapshot,
     typecheck: StageSnapshot,
     lower: StageSnapshot,
     compile: StageSnapshot,
@@ -46,6 +48,7 @@ pub const LoadPayload = struct {
     backing: []u8,
     parse: LoadedStage,
     resolve: LoadedStage,
+    astgen: LoadedStage,
     typecheck: LoadedStage,
     lower: LoadedStage,
     compile: LoadedStage,
@@ -53,6 +56,7 @@ pub const LoadPayload = struct {
     pub fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
         self.parse.diagnostics.deinit(gpa);
         self.resolve.diagnostics.deinit(gpa);
+        self.astgen.diagnostics.deinit(gpa);
         self.typecheck.diagnostics.deinit(gpa);
         self.lower.diagnostics.deinit(gpa);
         self.compile.diagnostics.deinit(gpa);
@@ -110,6 +114,7 @@ fn stageFromByte(byte: u8) !diagnostics.Stage {
     return switch (byte) {
         stageTagByte(.parse) => .parse,
         stageTagByte(.resolve) => .resolve,
+        stageTagByte(.astgen) => .astgen,
         stageTagByte(.typecheck) => .typecheck,
         stageTagByte(.lower) => .lower,
         stageTagByte(.compile) => .compile,
@@ -177,6 +182,7 @@ fn serialize(gpa: std.mem.Allocator, payload: SavePayload) ![]u8 {
 
     try appendStage(&buf, gpa, payload.parse);
     try appendStage(&buf, gpa, payload.resolve);
+    try appendStage(&buf, gpa, payload.astgen);
     try appendStage(&buf, gpa, payload.typecheck);
     try appendStage(&buf, gpa, payload.lower);
     try appendStage(&buf, gpa, payload.compile);
@@ -484,8 +490,8 @@ pub fn serializeProgram(gpa: std.mem.Allocator, prog: *const ir_mod.Program) ![]
     var buf = try std.ArrayList(u8).initCapacity(gpa, 4096);
     errdefer buf.deinit(gpa);
 
-    try appendU32(&buf, gpa, @intCast(prog.strings.items.len));
-    for (prog.strings.items) |s| {
+    try appendU32(&buf, gpa, @intCast(prog.symbols.items.len));
+    for (prog.symbols.items) |s| {
         try appendBytes(&buf, gpa, s);
     }
 
@@ -508,16 +514,16 @@ pub fn deserializeProgram(gpa: std.mem.Allocator, data: []const u8) !ir_mod.Prog
     var r = Reader{ .data = data };
 
     const string_count = try r.readU32();
-    var strings = try std.ArrayList([]const u8).initCapacity(gpa, string_count);
+    var symbols = try std.ArrayList([]const u8).initCapacity(gpa, string_count);
     errdefer {
-        for (strings.items) |s| gpa.free(s);
-        strings.deinit(gpa);
+        for (symbols.items) |s| gpa.free(s);
+        symbols.deinit(gpa);
     }
     var si: u32 = 0;
     while (si < string_count) : (si += 1) {
         const raw = try r.readBytes();
         const owned = try gpa.dupe(u8, raw);
-        try strings.append(gpa, owned);
+        try symbols.append(gpa, owned);
     }
 
     const ft_count = try r.readU32();
@@ -557,14 +563,14 @@ pub fn deserializeProgram(gpa: std.mem.Allocator, data: []const u8) !ir_mod.Prog
     return .{
         .entry = entry,
         .functions = functions,
-        .strings = strings,
+        .symbols = symbols,
         .func_types = func_types,
     };
 }
 
 // ── Typecheck Type/FuncType serialization ──
 
-fn writeTcType(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, ty: typecheck.Type) (error{OutOfMemory}!void) {
+fn writeTcType(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, ty: analyze.Type) (error{OutOfMemory}!void) {
     const tag = std.meta.activeTag(ty);
     try appendU8(buf, gpa, @intFromEnum(tag));
     switch (ty) {
@@ -574,7 +580,7 @@ fn writeTcType(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, ty: typecheck.Ty
     }
 }
 
-fn readTcType(r: *Reader, allocator: std.mem.Allocator) LoadError!typecheck.Type {
+fn readTcType(r: *Reader, allocator: std.mem.Allocator) LoadError!analyze.Type {
     const tag = try r.readU8();
     return switch (tag) {
         0 => .unit,
@@ -583,7 +589,7 @@ fn readTcType(r: *Reader, allocator: std.mem.Allocator) LoadError!typecheck.Type
         3 => .float,
         4 => .{ .named = try allocator.dupe(u8, try r.readBytes()) },
         5 => blk: {
-            const ft = try allocator.create(typecheck.FuncType);
+            const ft = try allocator.create(analyze.FuncType);
             ft.* = try readTcFuncType(r, allocator);
             break :blk .{ .func = ft };
         },
@@ -591,15 +597,15 @@ fn readTcType(r: *Reader, allocator: std.mem.Allocator) LoadError!typecheck.Type
     };
 }
 
-fn writeTcFuncType(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, ft: typecheck.FuncType) (error{OutOfMemory}!void) {
+fn writeTcFuncType(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, ft: analyze.FuncType) (error{OutOfMemory}!void) {
     try appendU32(buf, gpa, @intCast(ft.params.len));
     for (ft.params) |p| try writeTcType(buf, gpa, p);
     try writeTcType(buf, gpa, ft.ret);
 }
 
-fn readTcFuncType(r: *Reader, allocator: std.mem.Allocator) LoadError!typecheck.FuncType {
+fn readTcFuncType(r: *Reader, allocator: std.mem.Allocator) LoadError!analyze.FuncType {
     const param_count = try r.readU32();
-    var params = try std.ArrayList(typecheck.Type).initCapacity(allocator, param_count);
+    var params = try std.ArrayList(analyze.Type).initCapacity(allocator, param_count);
     errdefer params.deinit(allocator);
     var i: u32 = 0;
     while (i < param_count) : (i += 1) {
@@ -628,6 +634,13 @@ pub fn serializeResolved(gpa: std.mem.Allocator, ra: *const resolver.ResolvedAst
         try appendU32(&buf, gpa, entry.value_ptr.*);
     }
 
+    try appendU32(&buf, gpa, @intCast(ra.comptime_value_names.count()));
+    var cv_iter = ra.comptime_value_names.iterator();
+    while (cv_iter.next()) |entry| {
+        try appendBytes(&buf, gpa, entry.key_ptr.*);
+        try appendU32(&buf, gpa, entry.value_ptr.*);
+    }
+
     try appendU32(&buf, gpa, @intCast(ra.struct_names.count()));
     var sn_iter = ra.struct_names.iterator();
     while (sn_iter.next()) |entry| {
@@ -643,6 +656,8 @@ pub fn serializeResolved(gpa: std.mem.Allocator, ra: *const resolver.ResolvedAst
         switch (entry.value_ptr.*) {
             .local => {},
             .function => |id| try appendU32(&buf, gpa, id),
+            .comptime_value => |decl| try appendU32(&buf, gpa, decl),
+            .struct_decl => |decl| try appendU32(&buf, gpa, decl),
         }
     }
 
@@ -670,6 +685,15 @@ pub fn deserializeResolved(gpa: std.mem.Allocator, data: []const u8) LoadError!r
         try ra.function_names.put(owned_key, value);
     }
 
+    const cv_count = try r.readU32();
+    var cvi: u32 = 0;
+    while (cvi < cv_count) : (cvi += 1) {
+        const raw_key = try r.readBytes();
+        const owned_key = try ra.key_arena.allocator().dupe(u8, raw_key);
+        const value = try r.readU32();
+        try ra.comptime_value_names.put(owned_key, value);
+    }
+
     const sn_count = try r.readU32();
     var sni: u32 = 0;
     while (sni < sn_count) : (sni += 1) {
@@ -687,6 +711,8 @@ pub fn deserializeResolved(gpa: std.mem.Allocator, data: []const u8) LoadError!r
         switch (ref_tag) {
             0 => ra.node_refs.putAssumeCapacity(node_idx, .local),
             1 => ra.node_refs.putAssumeCapacity(node_idx, .{ .function = try r.readU32() }),
+            2 => ra.node_refs.putAssumeCapacity(node_idx, .{ .comptime_value = try r.readU32() }),
+            3 => ra.node_refs.putAssumeCapacity(node_idx, .{ .struct_decl = try r.readU32() }),
             else => return error.InvalidData,
         }
     }
@@ -695,9 +721,50 @@ pub fn deserializeResolved(gpa: std.mem.Allocator, data: []const u8) LoadError!r
     return ra;
 }
 
-// ── TypedAst serialization ──
+fn writeComptimeValue(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, value: analyze.ComptimeValue) !void {
+    const tag = std.meta.activeTag(value);
+    try appendU8(buf, gpa, @intFromEnum(tag));
+    switch (value) {
+        .unit => {},
+        .bool => |v| try appendU8(buf, gpa, if (v) 1 else 0),
+        .int => |v| try appendU32(buf, gpa, @bitCast(v)),
+        .float => |v| try appendU32(buf, gpa, @bitCast(v)),
+        .func => |fn_id| try appendU32(buf, gpa, fn_id),
+        .struct_type => |decl| try appendU32(buf, gpa, decl),
+        .struct_value => |sv| {
+            try appendU32(buf, gpa, sv.decl);
+            try appendU32(buf, gpa, @intCast(sv.fields.len));
+            for (sv.fields) |field| try writeComptimeValue(buf, gpa, field);
+        },
+    }
+}
 
-pub fn serializeTyped(gpa: std.mem.Allocator, ta: *const typecheck.TypedAst) ![]u8 {
+fn readComptimeValue(r: *Reader, allocator: std.mem.Allocator) LoadError!analyze.ComptimeValue {
+    const tag = try r.readU8();
+    return switch (tag) {
+        0 => .unit,
+        1 => .{ .bool = (try r.readU8()) == 1 },
+        2 => .{ .int = @bitCast(try r.readU32()) },
+        3 => .{ .float = @bitCast(try r.readU32()) },
+        4 => .{ .func = try r.readU32() },
+        5 => .{ .struct_type = try r.readU32() },
+        6 => blk: {
+            const decl = try r.readU32();
+            const field_count = try r.readU32();
+            const fields = try allocator.alloc(analyze.ComptimeValue, field_count);
+            var i: u32 = 0;
+            while (i < field_count) : (i += 1) {
+                fields[i] = try readComptimeValue(r, allocator);
+            }
+            break :blk .{ .struct_value = .{ .decl = decl, .fields = fields } };
+        },
+        else => error.InvalidData,
+    };
+}
+
+// ── Analyze serialization ──
+
+pub fn serializeTyped(gpa: std.mem.Allocator, ta: *const analyze.AnalyzedAst) ![]u8 {
     var buf = try std.ArrayList(u8).initCapacity(gpa, 2048);
     errdefer buf.deinit(gpa);
 
@@ -706,6 +773,20 @@ pub fn serializeTyped(gpa: std.mem.Allocator, ta: *const typecheck.TypedAst) ![]
     while (nt_iter.next()) |entry| {
         try appendU32(&buf, gpa, entry.key_ptr.*);
         try writeTcType(&buf, gpa, entry.value_ptr.*);
+    }
+
+    try appendU32(&buf, gpa, @intCast(ta.comptime_node_values.count()));
+    var cn_iter = ta.comptime_node_values.iterator();
+    while (cn_iter.next()) |entry| {
+        try appendU32(&buf, gpa, entry.key_ptr.*);
+        try writeComptimeValue(&buf, gpa, entry.value_ptr.*);
+    }
+
+    try appendU32(&buf, gpa, @intCast(ta.comptime_values.count()));
+    var cv_iter2 = ta.comptime_values.iterator();
+    while (cv_iter2.next()) |entry| {
+        try appendBytes(&buf, gpa, entry.key_ptr.*);
+        try writeComptimeValue(&buf, gpa, entry.value_ptr.*);
     }
 
     try appendU32(&buf, gpa, @intCast(ta.functions.len));
@@ -719,9 +800,9 @@ pub fn serializeTyped(gpa: std.mem.Allocator, ta: *const typecheck.TypedAst) ![]
     return buf.toOwnedSlice(gpa);
 }
 
-pub fn deserializeTyped(gpa: std.mem.Allocator, data: []const u8, parse_ast: *const ast.Ast) LoadError!typecheck.TypedAst {
+pub fn deserializeTyped(gpa: std.mem.Allocator, data: []const u8, parse_ast: *const ast.Ast) LoadError!analyze.AnalyzedAst {
     var r = Reader{ .data = data };
-    var ta = typecheck.TypedAst.init(gpa, parse_ast);
+    var ta = analyze.AnalyzedAst.init(gpa, parse_ast);
     errdefer ta.deinit();
     const arena_alloc = ta.arena.allocator();
 
@@ -734,13 +815,30 @@ pub fn deserializeTyped(gpa: std.mem.Allocator, data: []const u8, parse_ast: *co
         ta.node_types.putAssumeCapacity(node_idx, ty);
     }
 
+    const cn_count = try r.readU32();
+    try ta.comptime_node_values.ensureUnusedCapacity(cn_count);
+    var cni: u32 = 0;
+    while (cni < cn_count) : (cni += 1) {
+        const node_idx = try r.readU32();
+        const value = try readComptimeValue(&r, arena_alloc);
+        ta.comptime_node_values.putAssumeCapacity(node_idx, value);
+    }
+
+    const cv_count = try r.readU32();
+    var cvi: u32 = 0;
+    while (cvi < cv_count) : (cvi += 1) {
+        const name = try arena_alloc.dupe(u8, try r.readBytes());
+        const value = try readComptimeValue(&r, arena_alloc);
+        try ta.comptime_values.put(name, value);
+    }
+
     const fn_count = try r.readU32();
-    var functions = try std.ArrayList(typecheck.FunctionInfo).initCapacity(arena_alloc, fn_count);
+    var functions = try std.ArrayList(analyze.FunctionInfo).initCapacity(arena_alloc, fn_count);
     errdefer functions.deinit(arena_alloc);
     var fni: u32 = 0;
     while (fni < fn_count) : (fni += 1) {
         const decl = try r.readU32();
-        const ft_ptr = try arena_alloc.create(typecheck.FuncType);
+        const ft_ptr = try arena_alloc.create(analyze.FuncType);
         ft_ptr.* = try readTcFuncType(&r, arena_alloc);
         const has_ret = (try r.readU8()) == 1;
         try functions.append(arena_alloc, .{
@@ -755,6 +853,63 @@ pub fn deserializeTyped(gpa: std.mem.Allocator, data: []const u8, parse_ast: *co
 
     if (r.idx != r.data.len) return error.InvalidData;
     return ta;
+}
+
+// ── Astgen serialization ──
+
+pub fn serializeAstgen(gpa: std.mem.Allocator, ir: *const astgen.AstgenIr) ![]u8 {
+    var buf = try std.ArrayList(u8).initCapacity(gpa, 1024);
+    errdefer buf.deinit(gpa);
+
+    try appendU32(&buf, gpa, @intCast(ir.insts.items.len));
+    for (ir.insts.items) |inst| {
+        try appendU32(&buf, gpa, inst.idx);
+        try appendU8(&buf, gpa, @intFromEnum(inst.tag));
+        try appendU32(&buf, gpa, inst.data0);
+        try appendU32(&buf, gpa, inst.data1);
+    }
+
+    try appendU32(&buf, gpa, @intCast(ir.symbols.items.len));
+    for (ir.symbols.items) |sym| {
+        try appendU32(&buf, gpa, sym.name);
+        try appendU32(&buf, gpa, sym.decl);
+    }
+
+    return buf.toOwnedSlice(gpa);
+}
+
+pub fn deserializeAstgen(gpa: std.mem.Allocator, data: []const u8) LoadError!astgen.AstgenIr {
+    var r = Reader{ .data = data };
+    var ir = try astgen.AstgenIr.init(gpa);
+    errdefer ir.deinit(gpa);
+
+    const inst_count = try r.readU32();
+    try ir.insts.ensureUnusedCapacity(gpa, inst_count);
+    var ii: u32 = 0;
+    while (ii < inst_count) : (ii += 1) {
+        const idx = try r.readU32();
+        const tag: ast.Tag = @enumFromInt(try r.readU8());
+        const data0 = try r.readU32();
+        const data1 = try r.readU32();
+        ir.insts.appendAssumeCapacity(.{
+            .idx = idx,
+            .tag = tag,
+            .data0 = data0,
+            .data1 = data1,
+        });
+    }
+
+    const sym_count = try r.readU32();
+    try ir.symbols.ensureUnusedCapacity(gpa, sym_count);
+    var si: u32 = 0;
+    while (si < sym_count) : (si += 1) {
+        const name = try r.readU32();
+        const decl = try r.readU32();
+        ir.symbols.appendAssumeCapacity(.{ .name = name, .decl = decl });
+    }
+
+    if (r.idx != r.data.len) return error.InvalidData;
+    return ir;
 }
 
 // ── ParsedAst serialization ──
@@ -792,6 +947,8 @@ fn deserialize(gpa: std.mem.Allocator, file_data: []u8, expected_source_hash: u6
     errdefer parse_stage.diagnostics.deinit(gpa);
     var resolve_stage = try readStage(&r, gpa);
     errdefer resolve_stage.diagnostics.deinit(gpa);
+    var astgen_stage = try readStage(&r, gpa);
+    errdefer astgen_stage.diagnostics.deinit(gpa);
     var type_stage = try readStage(&r, gpa);
     errdefer type_stage.diagnostics.deinit(gpa);
     var lower_stage = try readStage(&r, gpa);
@@ -805,6 +962,7 @@ fn deserialize(gpa: std.mem.Allocator, file_data: []u8, expected_source_hash: u6
         .backing = file_data,
         .parse = parse_stage,
         .resolve = resolve_stage,
+        .astgen = astgen_stage,
         .typecheck = type_stage,
         .lower = lower_stage,
         .compile = compile_stage,

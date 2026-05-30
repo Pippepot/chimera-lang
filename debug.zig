@@ -54,7 +54,7 @@ fn printPbr(writer: *std.Io.Writer, p: @FieldType(ir_mod.Terminator, "pbr")) voi
 
 fn dumpIr(program: *const Program, writer: *std.Io.Writer) void {
     for (program.functions.items) |func| {
-        writer.print("fn {s} (id={d})\n", .{ program.strings.items[func.name], func.id }) catch return;
+        writer.print("fn {s} (id={d})\n", .{ program.symbolFor(func.name), func.id }) catch return;
         for (func.blocks.items) |blk| {
             if (blk.param) |param| writer.print("L{d}(%{d}):\n", .{ blk.id, param }) catch return else writer.print("L{d}:\n", .{blk.id}) catch return;
             for (blk.insts.items) |vinst| {
@@ -131,11 +131,11 @@ fn writeAstLabel(writer: *std.Io.Writer, a: *const ast.Ast, idx: ast.NodeIdx) vo
     switch (a.nodes[idx].tag) {
         .int_lit => writer.print("int {d}", .{@as(i32, @bitCast(a.nodes[idx].data0))}) catch return,
         .float_lit => writer.print("float {d}", .{@as(f32, @bitCast(a.nodes[idx].data0))}) catch return,
-        .var_ref => writer.print("var {s}", .{a.stringOf(a.nodes[idx].data0)}) catch return,
+        .var_ref => writer.print("var {s}", .{a.identOf(a.nodes[idx].data0)}) catch return,
         .block => writer.writeAll("block") catch return,
-        .const_decl => writer.print("const {s}", .{a.stringOf(a.nodes[idx].data0)}) catch return,
-        .var_decl => writer.print("var {s}", .{a.stringOf(a.nodes[idx].data0)}) catch return,
-        .assign => writer.print("assign {s}", .{a.stringOf(a.nodes[idx].data0)}) catch return,
+        .const_decl => writer.print("const {s}", .{a.identOf(a.nodes[idx].data0)}) catch return,
+        .var_decl => writer.print("var {s}", .{a.identOf(a.nodes[idx].data0)}) catch return,
+        .assign => writer.print("assign {s}", .{a.identOf(a.nodes[idx].data0)}) catch return,
         .return_stmt => writer.writeAll("return") catch return,
         .call => writer.writeAll("call") catch return,
         .print_stmt => writer.writeAll("print") catch return,
@@ -153,6 +153,8 @@ fn writeAstLabel(writer: *std.Io.Writer, a: *const ast.Ast, idx: ast.NodeIdx) vo
         .if_stmt => writer.writeAll("if") catch return,
         .struct_init => writer.writeAll("struct_init") catch return,
         .field_access => writer.writeAll("field_access") catch return,
+        .comptime_expr => writer.writeAll("comptime_expr") catch return,
+        .comptime_value_decl => writer.print("comptime_decl {s}", .{a.identOf(a.nodes[idx].data0)}) catch return,
         .bool_lit => writer.print("bool {s}", .{if (a.nodes[idx].data0 != 0) "true" else "false"}) catch return,
         .unit_lit => writer.writeAll("unit") catch return,
         .type_name, .type_func, .comptime_fn, .comptime_struct => {},
@@ -208,11 +210,13 @@ fn dumpAstNode(a: *const ast.Ast, idx: ast.NodeIdx, writer: *std.Io.Writer, pref
             }
         },
         .field_access => dumpAstNode(a, a.nodes[idx].data0, writer, next_prefix, true, false),
+        .comptime_expr => dumpAstNode(a, a.comptimeExprBody(idx), writer, next_prefix, true, false),
+        .comptime_value_decl => dumpAstNode(a, a.nodes[idx].data1, writer, next_prefix, true, false),
         .struct_init => {
             const fields = a.structInitFields(idx);
             for (fields, 0..) |field, i| {
                 writer.print("{s}{s}", .{ next_prefix, if (i + 1 == fields.len) "└─" else "├─" }) catch return;
-                writer.print("{s}: ", .{a.stringOf(field.name)}) catch return;
+                writer.print("{s}: ", .{a.identOf(field.name)}) catch return;
                 dumpAstNode(a, field.value, writer, next_prefix, i + 1 == fields.len, true);
             }
         },
@@ -223,7 +227,7 @@ fn dumpAstNode(a: *const ast.Ast, idx: ast.NodeIdx, writer: *std.Io.Writer, pref
 
 fn dumpTypeNode(a: *const ast.Ast, type_idx: ast.TypeIdx, writer: *std.Io.Writer) void {
     switch (a.nodes[type_idx].tag) {
-        .type_name => writer.print("{s}", .{a.stringOf(a.nodes[type_idx].data0)}) catch return,
+        .type_name => writer.print("{s}", .{a.identOf(a.nodes[type_idx].data0)}) catch return,
         .type_func => {
             writer.writeAll("func(") catch return;
             const params = a.funcTypeParams(type_idx);
@@ -237,7 +241,7 @@ fn dumpTypeNode(a: *const ast.Ast, type_idx: ast.TypeIdx, writer: *std.Io.Writer
         .int_lit, .float_lit, .var_ref, .block, .const_decl, .var_decl, .assign,
         .return_stmt, .call, .print_stmt, .add, .sub, .mul, .div, .arg, .lt, .gt,
         .le, .ge, .eq, .ne, .if_stmt, .struct_init, .field_access, .bool_lit,
-        .unit_lit, .comptime_fn, .comptime_struct => {},
+        .unit_lit, .comptime_expr, .comptime_value_decl, .comptime_fn, .comptime_struct => {},
     }
 }
 
@@ -245,12 +249,12 @@ fn dumpProgram(a: *const ast.Ast, writer: *std.Io.Writer) void {
     for (a.decls) |decl_idx| {
         switch (a.nodes[decl_idx].tag) {
             .comptime_fn => {
-                const name = a.stringOf(a.nodes[decl_idx].data0);
+                const name = a.identOf(a.nodes[decl_idx].data0);
                 writer.print("comptime {s} = func(", .{name}) catch return;
                 const params = a.fnParams(decl_idx);
                 for (params, 0..) |param, i| {
                     if (i > 0) writer.writeAll(", ") catch return;
-                    writer.print("{s}: ", .{a.stringOf(param.name)}) catch return;
+                    writer.print("{s}: ", .{a.identOf(param.name)}) catch return;
                     dumpTypeNode(a, param.ty, writer);
                 }
                 writer.writeAll(") ") catch return;
@@ -260,15 +264,19 @@ fn dumpProgram(a: *const ast.Ast, writer: *std.Io.Writer) void {
                 writer.writeAll("\n") catch return;
             },
             .comptime_struct => {
-                const name = a.stringOf(a.nodes[decl_idx].data0);
+                const name = a.identOf(a.nodes[decl_idx].data0);
                 writer.print("comptime {s} = struct\n", .{name}) catch return;
                 const fields = a.structFields(decl_idx);
                 for (fields) |field| {
-                    writer.print("  {s}: ", .{a.stringOf(field.name)}) catch return;
+                    writer.print("  {s}: ", .{a.identOf(field.name)}) catch return;
                     dumpTypeNode(a, field.ty, writer);
                     writer.writeAll("\n") catch return;
                 }
                 writer.writeAll("\n") catch return;
+            },
+            .comptime_value_decl => {
+                const name = a.identOf(a.nodes[decl_idx].data0);
+                writer.print("comptime {s} = ...\n\n", .{name}) catch return;
             },
             else => {},
         }

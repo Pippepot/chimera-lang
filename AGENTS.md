@@ -18,7 +18,7 @@
   - `db.zig` owns shared query types (`SourceId`, `Revision`, `Dependency`, `QueryKey`, `QueryStats`, `Stage`, `CompileResult`, `DbError`) and comparison helpers.
   - `scope.zig` owns a shared lexical scope stack utility (`ScopeStack`) reused by typechecker and lowering.
   - `debug.zig` owns debug flag parsing and AST/SSA debug dumps.
-  - `helpers_bin.zig` owns pre-assembled helper blobs (`print_int`, `print_bool`, `print_float32`, `print_string`, `atoi`).
+  - `helpers_bin.zig` owns pre-assembled helper blobs (`print_int`, `print_bool`, `print_float32`, `atoi`).
 - **Project state** is documented in `.agents/project.md`.
 - **AGENTS.md** lives alongside `main.zig` (project root, not repo root).
 
@@ -47,11 +47,9 @@
 - **Parser ownership:** `parser.parseOwned` returns `ParsedAst` with an arena that owns all AST allocations.
 - **Query ownership:** parse memo values in `QueryDb` own `ParsedAst`; callers borrow `*const AstNode` via `parsedAst`.
 - **Unary minus** is lowered in parser as either negative literal or `0 - expr`.
-- **String parsing:** the lexer's `next()` does `self.index += 1` before dispatching `"` to `parseString()`, so `parseString` must NOT also increment — use `const start = self.index - 1` instead of `self.index += 1`.
-
 ## Type syntax
 
-- **Primitive types:** `unit`, `bool`, `int`, `float`, `string`.
+- **Primitive types:** `unit`, `bool`, `int`, `float`.
 - **Function types:** `func(ParamType1, ParamType2, ...) ReturnType` — usable in parameter annotations (`f: func(int) int`), return type annotations, and `const`/`var` binding annotations.
 - **Named struct types:** referenced by their declared name (e.g. `Foo`) — usable in `const`/`var` binding annotations.
 
@@ -139,7 +137,7 @@
 
 ## Testing
 
-- **Behavioral tests** compile and run full binaries from source strings via `QueryDb`.
+- **Behavioral tests** compile and run full binaries from source snippets via `QueryDb`.
 - **Type tests** cover numeric/boolean typing, strict no-coercion behavior, and type errors.
 - **Incremental tests** verify query cache hits, invalidation on source changes, per-source isolation, unchanged-source no revision bump, and compile `changed_at` backdating.
 - **Persistent cache tests** verify cross-`QueryDb` reuse, disable flag behavior, failure caching, corrupted cache recovery, and stale cache deletion.

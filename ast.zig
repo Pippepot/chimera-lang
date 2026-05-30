@@ -1,7 +1,7 @@
 const std = @import("std");
 
 pub const NodeIdx = u32;
-pub const StringIdx = u32;
+pub const IdentIdx = u32;
 pub const ExtraIdx = u32;
 
 pub const Span = struct {
@@ -38,6 +38,8 @@ pub const Tag = enum(u8) {
     unit_lit,
     type_name,
     type_func,
+    comptime_expr,
+    comptime_value_decl,
     comptime_fn,
     comptime_struct,
 };
@@ -54,8 +56,8 @@ pub const Ast = struct {
 
     nodes: []Node,
     extra: []u32,
-    string_bytes: []u8,
-    string_offsets: []u32,
+    ident_bytes: []u8,
+    ident_offsets: []u32,
     spans: []Span,
     decls: []NodeIdx,
     entry: NodeIdx,
@@ -71,13 +73,13 @@ pub const Ast = struct {
         return null;
     }
 
-    pub fn stringOf(ast: *const Ast, idx: StringIdx) []const u8 {
-        const start = ast.string_offsets[idx];
-        const end = if (idx + 1 < ast.string_offsets.len)
-            ast.string_offsets[idx + 1]
+    pub fn identOf(ast: *const Ast, idx: IdentIdx) []const u8 {
+        const start = ast.ident_offsets[idx];
+        const end = if (idx + 1 < ast.ident_offsets.len)
+            ast.ident_offsets[idx + 1]
         else
-            @as(u32, @intCast(ast.string_bytes.len));
-        return ast.string_bytes[start..end];
+            @as(u32, @intCast(ast.ident_bytes.len));
+        return ast.ident_bytes[start..end];
     }
 
     pub fn blockItems(ast: *const Ast, idx: NodeIdx) []const NodeIdx {
@@ -124,7 +126,7 @@ pub const Ast = struct {
         return pairs[0..count];
     }
 
-    pub fn structInitName(ast: *const Ast, idx: NodeIdx) StringIdx {
+    pub fn structInitName(ast: *const Ast, idx: NodeIdx) IdentIdx {
         return ast.nodes[idx].data0;
     }
 
@@ -166,6 +168,10 @@ pub const Ast = struct {
         return ast.extra[extra_idx + count];
     }
 
+    pub fn comptimeExprBody(ast: *const Ast, idx: NodeIdx) NodeIdx {
+        return ast.nodes[idx].data0;
+    }
+
     fn alignForward(addr: usize, alignment: usize) usize {
         return (addr + (alignment - 1)) & ~(@as(usize, alignment) - 1);
     }
@@ -174,9 +180,9 @@ pub const Ast = struct {
         var len: usize = @sizeOf(Header);
         len += ast.nodes.len * @sizeOf(Node);
         len += ast.extra.len * 4;
-        len += ast.string_bytes.len;
+        len += ast.ident_bytes.len;
         len = alignForward(len, 4);
-        len += ast.string_offsets.len * 4;
+        len += ast.ident_offsets.len * 4;
         len = alignForward(len, @alignOf(Span));
         len += ast.spans.len * @sizeOf(Span);
         len += ast.decls.len * 4;
@@ -189,9 +195,9 @@ pub const Ast = struct {
         try buf.appendSlice(gpa, &int_buf);
         std.mem.writeInt(u32, &int_buf, @intCast(ast.extra.len), .little);
         try buf.appendSlice(gpa, &int_buf);
-        std.mem.writeInt(u32, &int_buf, @intCast(ast.string_bytes.len), .little);
+        std.mem.writeInt(u32, &int_buf, @intCast(ast.ident_bytes.len), .little);
         try buf.appendSlice(gpa, &int_buf);
-        std.mem.writeInt(u32, &int_buf, @intCast(ast.string_offsets.len), .little);
+        std.mem.writeInt(u32, &int_buf, @intCast(ast.ident_offsets.len), .little);
         try buf.appendSlice(gpa, &int_buf);
         std.mem.writeInt(u32, &int_buf, @intCast(ast.spans.len), .little);
         try buf.appendSlice(gpa, &int_buf);
@@ -202,12 +208,12 @@ pub const Ast = struct {
 
         try buf.appendSlice(gpa, std.mem.sliceAsBytes(ast.nodes));
         try buf.appendSlice(gpa, std.mem.sliceAsBytes(ast.extra));
-        try buf.appendSlice(gpa, ast.string_bytes);
+        try buf.appendSlice(gpa, ast.ident_bytes);
         try buf.appendNTimes(gpa, 0, alignForward(0, 4));
         const before_offs = buf.items.len;
         const offs_align = alignForward(before_offs, 4) - before_offs;
         try buf.appendNTimes(gpa, 0, offs_align);
-        try buf.appendSlice(gpa, std.mem.sliceAsBytes(ast.string_offsets));
+        try buf.appendSlice(gpa, std.mem.sliceAsBytes(ast.ident_offsets));
         try buf.appendNTimes(gpa, 0, alignForward(0, @alignOf(Span)));
         const before_spans = buf.items.len;
         const spans_align = alignForward(before_spans, @alignOf(Span)) - before_spans;
@@ -274,8 +280,8 @@ pub const Ast = struct {
 
         const nodes = @as([*]Node, @ptrCast(@alignCast(backing.ptr + layout.nodes_off)))[0..header.nodes_len];
         const extra = @as([*]u32, @ptrCast(@alignCast(backing.ptr + layout.extra_off)))[0..header.extra_len];
-        const string_bytes = backing[layout.str_bytes_off..][0..header.str_bytes_len];
-        const string_offsets = @as([*]u32, @ptrCast(@alignCast(backing.ptr + layout.str_offs_off)))[0..header.str_offs_len];
+        const ident_bytes = backing[layout.str_bytes_off..][0..header.str_bytes_len];
+        const ident_offsets = @as([*]u32, @ptrCast(@alignCast(backing.ptr + layout.str_offs_off)))[0..header.str_offs_len];
         const spans = @as([*]Span, @ptrCast(@alignCast(backing.ptr + layout.spans_off)))[0..header.spans_len];
         const decls = @as([*]NodeIdx, @ptrCast(@alignCast(backing.ptr + layout.decls_off)))[0..header.decls_len];
 
@@ -283,8 +289,8 @@ pub const Ast = struct {
             .backing = backing,
             .nodes = nodes,
             .extra = extra,
-            .string_bytes = string_bytes,
-            .string_offsets = string_offsets,
+            .ident_bytes = ident_bytes,
+            .ident_offsets = ident_offsets,
             .spans = spans,
             .decls = decls,
             .entry = header.entry,
@@ -293,7 +299,7 @@ pub const Ast = struct {
 
         for (decls) |decl_idx| {
             const name_idx = ast_result.nodes[decl_idx].data0;
-            const name = ast_result.stringOf(name_idx);
+            const name = ast_result.identOf(name_idx);
             try ast_result.name_map.put(name, decl_idx);
         }
 
@@ -314,7 +320,7 @@ pub const Ast = struct {
 pub const TypeIdx = u32;
 
 pub fn typeName(ast: *const Ast, idx: TypeIdx) []const u8 {
-    return ast.stringOf(ast.nodes[idx].data0);
+    return ast.identOf(ast.nodes[idx].data0);
 }
 
 pub fn typeFuncParams(ast: *const Ast, idx: TypeIdx) []const TypeIdx {
@@ -325,5 +331,5 @@ pub fn typeFuncRet(ast: *const Ast, idx: TypeIdx) TypeIdx {
     return ast.funcTypeRet(idx);
 }
 
-pub const FieldPair = struct { name: StringIdx, value: NodeIdx };
-pub const ParamPair = struct { name: StringIdx, ty: TypeIdx };
+pub const FieldPair = struct { name: IdentIdx, value: NodeIdx };
+pub const ParamPair = struct { name: IdentIdx, ty: TypeIdx };

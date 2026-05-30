@@ -1,5 +1,6 @@
 const std = @import("std");
 const ast = @import("ast.zig");
+const astgen = @import("astgen.zig");
 const diagnostics = @import("diagnostics.zig");
 const parser = @import("parser.zig");
 const resolver = @import("resolver.zig");
@@ -43,6 +44,21 @@ pub const FunctionInfo = struct {
     has_explicit_return: bool,
 };
 
+pub const StructValue = struct {
+    decl: ast.NodeIdx,
+    fields: []const ComptimeValue,
+};
+
+pub const ComptimeValue = union(enum) {
+    unit,
+    bool: bool,
+    int: i32,
+    float: f32,
+    func: u32,
+    struct_type: ast.NodeIdx,
+    struct_value: StructValue,
+};
+
 pub const TypeError = error{
     UnknownSymbol,
     UnknownType,
@@ -72,22 +88,30 @@ pub const TypeError = error{
     FieldAccessOnNonStruct,
     StructInitFieldCountMismatch,
     StructInitFieldNameMismatch,
+    ComptimeCycle,
+    ComptimeCaptureNotAllowed,
+    ComptimePureOperationNotAllowed,
+    ComptimeValueNotAvailable,
 };
 
-pub const TypedAst = struct {
+pub const AnalyzedAst = struct {
     arena: std.heap.ArenaAllocator,
     ast: *const ast.Ast,
     node_types: std.AutoHashMap(ast.NodeIdx, Type),
     field_index: std.AutoHashMap(ast.NodeIdx, u32),
+    comptime_node_values: std.AutoHashMap(ast.NodeIdx, ComptimeValue),
+    comptime_values: std.StringHashMap(ComptimeValue),
     functions: []FunctionInfo,
     entry_function: u32,
 
-    pub fn init(gpa: std.mem.Allocator, parsed_ast: *const ast.Ast) TypedAst {
+    pub fn init(gpa: std.mem.Allocator, parsed_ast: *const ast.Ast) AnalyzedAst {
         return .{
             .arena = std.heap.ArenaAllocator.init(gpa),
             .ast = parsed_ast,
             .node_types = std.AutoHashMap(ast.NodeIdx, Type).init(gpa),
             .field_index = std.AutoHashMap(ast.NodeIdx, u32).init(gpa),
+            .comptime_node_values = std.AutoHashMap(ast.NodeIdx, ComptimeValue).init(gpa),
+            .comptime_values = std.StringHashMap(ComptimeValue).init(gpa),
             .functions = &.{},
             .entry_function = 0,
         };
@@ -96,6 +120,8 @@ pub const TypedAst = struct {
     pub fn deinit(self: *@This()) void {
         self.node_types.deinit();
         self.field_index.deinit();
+        self.comptime_node_values.deinit();
+        self.comptime_values.deinit();
         self.arena.deinit();
     }
 
@@ -109,7 +135,7 @@ pub const TypedAst = struct {
 };
 
 pub const TypecheckReport = struct {
-    typed: ?TypedAst,
+    typed: ?AnalyzedAst,
     diagnostic: ?diagnostics.Diagnostic,
 };
 
@@ -143,22 +169,29 @@ pub fn typeErrorMessage(kind: TypeError) []const u8 {
         error.FieldAccessOnNonStruct => "field access on non-struct type",
         error.StructInitFieldCountMismatch => "struct init field count mismatch",
         error.StructInitFieldNameMismatch => "struct init field name mismatch",
+        error.ComptimeCycle => "comptime dependency cycle",
+        error.ComptimeCaptureNotAllowed => "comptime can only reference comptime symbols and comptime locals",
+        error.ComptimePureOperationNotAllowed => "operation is not allowed in pure comptime execution",
+        error.ComptimeValueNotAvailable => "comptime value is not available",
     };
 }
 
 const Binding = struct {
     ty: Type,
     mutable: bool,
+    comptime_visible: bool,
 };
 
 const Checker = struct {
     gpa: std.mem.Allocator,
     parsed: *const parser.ParsedAst,
     resolved: *const resolver.ResolvedAst,
-    typed: TypedAst,
+    typed: AnalyzedAst,
     bindings: scope_mod.ScopeStack(Binding),
+    comptime_decl_state: std.AutoHashMap(ast.NodeIdx, DeclState),
     failure: ?Failure,
     in_fallible_scope: bool,
+    in_comptime_context: bool,
     current_return: Type,
     current_saw_return: bool,
 
@@ -169,15 +202,40 @@ const Checker = struct {
 
     const InferError = std.mem.Allocator.Error || error{TypecheckFailed};
 
+    const DeclPhase = enum {
+        pending,
+        running,
+        done,
+    };
+
+    const DeclState = struct {
+        ty_phase: DeclPhase = .pending,
+        val_phase: DeclPhase = .pending,
+        ty: ?Type = null,
+        value: ?ComptimeValue = null,
+    };
+
+    const EvalBinding = struct {
+        value: ComptimeValue,
+        mutable: bool,
+    };
+
+    const EvalStep = struct {
+        value: ComptimeValue,
+        returned: bool,
+    };
+
     fn init(parsed: *const parser.ParsedAst, resolved: *const resolver.ResolvedAst, gpa: std.mem.Allocator) Checker {
         return .{
             .gpa = gpa,
             .parsed = parsed,
             .resolved = resolved,
-            .typed = TypedAst.init(gpa, &parsed.ast),
+            .typed = AnalyzedAst.init(gpa, &parsed.ast),
             .bindings = scope_mod.ScopeStack(Binding).init(),
+            .comptime_decl_state = std.AutoHashMap(ast.NodeIdx, DeclState).init(gpa),
             .failure = null,
             .in_fallible_scope = false,
+            .in_comptime_context = false,
             .current_return = .unit,
             .current_saw_return = false,
         };
@@ -186,6 +244,7 @@ const Checker = struct {
     fn deinit(self: *@This()) void {
         self.typed.deinit();
         self.bindings.deinit(self.gpa);
+        self.comptime_decl_state.deinit();
     }
 
     fn spanOfNode(self: *const @This(), idx: ast.NodeIdx) ?ast.Span {
@@ -404,7 +463,11 @@ const Checker = struct {
             const annot_ty = try self.resolveTypeNode(a.varDeclType(idx).?);
             if (!typeEql(value_ty, annot_ty)) return self.failAtNode(idx, error.BindingTypeMismatch);
         }
-        try self.pushBinding(idx, name, .{ .ty = value_ty, .mutable = false });
+        try self.pushBinding(idx, name, .{
+            .ty = value_ty,
+            .mutable = false,
+            .comptime_visible = self.in_comptime_context,
+        });
         return self.remember(idx, .unit);
     }
 
@@ -417,7 +480,11 @@ const Checker = struct {
             const annot_ty = try self.resolveTypeNode(a.varDeclType(idx).?);
             if (!typeEql(value_ty, annot_ty)) return self.failAtNode(idx, error.BindingTypeMismatch);
         }
-        try self.pushBinding(idx, name, .{ .ty = value_ty, .mutable = true });
+        try self.pushBinding(idx, name, .{
+            .ty = value_ty,
+            .mutable = true,
+            .comptime_visible = self.in_comptime_context,
+        });
         return self.remember(idx, .unit);
     }
 
@@ -467,6 +534,21 @@ const Checker = struct {
                 const st_name = self.parsed.ast.identOf(self.parsed.ast.nodes[decl_idx].data0);
                 if (std.mem.eql(u8, st_name, name)) return decl_idx;
             }
+        }
+        return null;
+    }
+
+    fn comptimeDeclStatePtr(self: *@This(), decl_idx: ast.NodeIdx) InferError!*DeclState {
+        if (self.comptime_decl_state.getPtr(decl_idx)) |state| return state;
+        try self.comptime_decl_state.put(decl_idx, .{});
+        return self.comptime_decl_state.getPtr(decl_idx).?;
+    }
+
+    fn evalBindingIndex(bindings: *scope_mod.ScopeStack(EvalBinding), name: []const u8) ?usize {
+        var idx = bindings.entries.items.len;
+        while (idx > 0) {
+            idx -= 1;
+            if (std.mem.eql(u8, bindings.entries.items[idx].name, name)) return idx;
         }
         return null;
     }
@@ -522,15 +604,360 @@ const Checker = struct {
         return self.remember(idx, result_ty);
     }
 
+    fn inferComptimeDeclType(self: *@This(), decl_idx: ast.NodeIdx) InferError!Type {
+        const decl = self.parsed.ast.nodes[decl_idx];
+        return switch (decl.tag) {
+            .comptime_fn => blk: {
+                const name = self.parsed.ast.identOf(decl.data0);
+                const fn_id = self.resolved.function_names.get(name) orelse return self.failAtNode(decl_idx, error.UnknownSymbol);
+                break :blk .{ .func = self.typed.functionType(fn_id) };
+            },
+            .comptime_struct => .{ .named = self.parsed.ast.identOf(decl.data0) },
+            .comptime_value_decl => blk: {
+                const state = try self.comptimeDeclStatePtr(decl_idx);
+                switch (state.ty_phase) {
+                    .done => break :blk state.ty.?,
+                    .running => return self.failAtNode(decl_idx, error.ComptimeCycle),
+                    .pending => {},
+                }
+
+                state.ty_phase = .running;
+                const prev = self.in_comptime_context;
+                self.in_comptime_context = true;
+                const value_ty = self.inferNode(decl.data1) catch |err| {
+                    self.in_comptime_context = prev;
+                    state.ty_phase = .pending;
+                    return err;
+                };
+                self.in_comptime_context = prev;
+                state.ty = value_ty;
+                state.ty_phase = .done;
+                break :blk value_ty;
+            },
+            else => return self.failAtNode(decl_idx, error.UnknownSymbol),
+        };
+    }
+
+    fn cloneCtValue(self: *@This(), value: ComptimeValue) std.mem.Allocator.Error!ComptimeValue {
+        return switch (value) {
+            .struct_value => |sv| blk: {
+                const arena_alloc = self.typed.arena.allocator();
+                const copied_fields = try arena_alloc.alloc(ComptimeValue, sv.fields.len);
+                for (sv.fields, 0..) |f, i| copied_fields[i] = try self.cloneCtValue(f);
+                break :blk .{ .struct_value = .{
+                    .decl = sv.decl,
+                    .fields = copied_fields,
+                } };
+            },
+            else => value,
+        };
+    }
+
+    fn evalPredicate(self: *@This(), idx: ast.NodeIdx, locals: *scope_mod.ScopeStack(EvalBinding)) InferError!bool {
+        const a = self.parsed.ast;
+        const lhs_v = (try self.evalNodeStep(a.nodes[idx].data0, locals)).value;
+        const rhs_v = (try self.evalNodeStep(a.nodes[idx].data1, locals)).value;
+        return switch (a.nodes[idx].tag) {
+            .lt => switch (lhs_v) {
+                .int => |lv| lv < rhs_v.int,
+                .float => |lv| lv < rhs_v.float,
+                else => false,
+            },
+            .gt => switch (lhs_v) {
+                .int => |lv| lv > rhs_v.int,
+                .float => |lv| lv > rhs_v.float,
+                else => false,
+            },
+            .le => switch (lhs_v) {
+                .int => |lv| lv <= rhs_v.int,
+                .float => |lv| lv <= rhs_v.float,
+                else => false,
+            },
+            .ge => switch (lhs_v) {
+                .int => |lv| lv >= rhs_v.int,
+                .float => |lv| lv >= rhs_v.float,
+                else => false,
+            },
+            .eq => switch (lhs_v) {
+                .bool => |lv| lv == rhs_v.bool,
+                .int => |lv| lv == rhs_v.int,
+                .float => |lv| lv == rhs_v.float,
+                else => false,
+            },
+            .ne => switch (lhs_v) {
+                .bool => |lv| lv != rhs_v.bool,
+                .int => |lv| lv != rhs_v.int,
+                .float => |lv| lv != rhs_v.float,
+                else => false,
+            },
+            else => false,
+        };
+    }
+
+    fn evalComptimeDeclValue(self: *@This(), decl_idx: ast.NodeIdx, locals: *scope_mod.ScopeStack(EvalBinding)) InferError!ComptimeValue {
+        const decl = self.parsed.ast.nodes[decl_idx];
+        switch (decl.tag) {
+            .comptime_fn => {
+                const name = self.parsed.ast.identOf(decl.data0);
+                const v: ComptimeValue = .{ .func = self.resolved.function_names.get(name).? };
+                try self.typed.comptime_values.put(name, v);
+                return v;
+            },
+            .comptime_struct => {
+                const name = self.parsed.ast.identOf(decl.data0);
+                const v: ComptimeValue = .{ .struct_type = decl_idx };
+                try self.typed.comptime_values.put(name, v);
+                return v;
+            },
+            .comptime_value_decl => {
+                const state = try self.comptimeDeclStatePtr(decl_idx);
+                switch (state.val_phase) {
+                    .done => return state.value.?,
+                    .running => return self.failAtNode(decl_idx, error.ComptimeCycle),
+                    .pending => {},
+                }
+
+                state.val_phase = .running;
+                const prev = self.in_comptime_context;
+                self.in_comptime_context = true;
+                const eval_result = self.evalNodeStep(decl.data1, locals) catch |err| {
+                    self.in_comptime_context = prev;
+                    state.val_phase = .pending;
+                    return err;
+                };
+                self.in_comptime_context = prev;
+                state.value = eval_result.value;
+                state.val_phase = .done;
+                try self.typed.comptime_values.put(self.parsed.ast.identOf(decl.data0), eval_result.value);
+                return eval_result.value;
+            },
+            else => return self.failAtNode(decl_idx, error.ComptimeValueNotAvailable),
+        }
+    }
+
+    fn evalFunction(self: *@This(), fn_id: u32, args: []const ComptimeValue) InferError!ComptimeValue {
+        const info = self.typed.functions[fn_id];
+        if (info.decl == std.math.maxInt(ast.NodeIdx)) return .unit;
+
+        var locals = scope_mod.ScopeStack(EvalBinding).init();
+        defer locals.deinit(self.gpa);
+
+        const fn_params = self.parsed.ast.fnParams(info.decl);
+        for (fn_params, args) |param, arg_value| {
+            const pname = self.parsed.ast.identOf(param.name);
+            const copied = try self.cloneCtValue(arg_value);
+            locals.push(self.gpa, pname, .{
+                .value = copied,
+                .mutable = false,
+            }) catch |err| switch (err) {
+                error.DuplicateVariable => return self.failAtNode(info.decl, error.DuplicateSymbol),
+                error.OutOfMemory => return error.OutOfMemory,
+            };
+        }
+
+        const step = try self.evalNodeStep(self.parsed.ast.fnBody(info.decl), &locals);
+        return step.value;
+    }
+
+    fn evalNodeStep(self: *@This(), idx: ast.NodeIdx, locals: *scope_mod.ScopeStack(EvalBinding)) InferError!EvalStep {
+        const a = self.parsed.ast;
+        return switch (a.nodes[idx].tag) {
+            .block => blk: {
+                const mark = locals.mark();
+                defer locals.restore(mark);
+                var last: ComptimeValue = .unit;
+                for (a.blockItems(idx)) |item| {
+                    const step = try self.evalNodeStep(item, locals);
+                    last = step.value;
+                    if (step.returned) break :blk .{ .value = step.value, .returned = true };
+                }
+                break :blk .{ .value = last, .returned = false };
+            },
+            .int_lit => .{ .value = .{ .int = @bitCast(a.nodes[idx].data0) }, .returned = false },
+            .float_lit => .{ .value = .{ .float = @bitCast(a.nodes[idx].data0) }, .returned = false },
+            .bool_lit => .{ .value = .{ .bool = a.nodes[idx].data0 != 0 }, .returned = false },
+            .unit_lit => .{ .value = .unit, .returned = false },
+            .var_ref => blk: {
+                const name = a.identOf(a.nodes[idx].data0);
+                if (evalBindingIndex(locals, name)) |binding_idx| {
+                    break :blk .{ .value = locals.entries.items[binding_idx].value.value, .returned = false };
+                }
+                const resolved_ref = self.resolved.node_refs.get(idx) orelse return self.failAtNode(idx, error.UnknownSymbol);
+                switch (resolved_ref) {
+                    .function => |fn_id| break :blk .{ .value = .{ .func = fn_id }, .returned = false },
+                    .struct_decl => |decl_idx| break :blk .{ .value = .{ .struct_type = decl_idx }, .returned = false },
+                    .comptime_value => |decl_idx| break :blk .{ .value = try self.evalComptimeDeclValue(decl_idx, locals), .returned = false },
+                    .local => return self.failAtNode(idx, error.ComptimeCaptureNotAllowed),
+                }
+            },
+            .const_decl => blk: {
+                const name = a.identOf(a.nodes[idx].data0);
+                const value = (try self.evalNodeStep(a.varDeclValue(idx), locals)).value;
+                locals.push(self.gpa, name, .{
+                    .value = try self.cloneCtValue(value),
+                    .mutable = false,
+                }) catch |err| switch (err) {
+                    error.DuplicateVariable => return self.failAtNode(idx, error.DuplicateSymbol),
+                    error.OutOfMemory => return error.OutOfMemory,
+                };
+                break :blk .{ .value = .unit, .returned = false };
+            },
+            .var_decl => blk: {
+                const name = a.identOf(a.nodes[idx].data0);
+                const value = (try self.evalNodeStep(a.varDeclValue(idx), locals)).value;
+                locals.push(self.gpa, name, .{
+                    .value = try self.cloneCtValue(value),
+                    .mutable = true,
+                }) catch |err| switch (err) {
+                    error.DuplicateVariable => return self.failAtNode(idx, error.DuplicateSymbol),
+                    error.OutOfMemory => return error.OutOfMemory,
+                };
+                break :blk .{ .value = .unit, .returned = false };
+            },
+            .assign => blk: {
+                const name = a.identOf(a.nodes[idx].data0);
+                const value = (try self.evalNodeStep(a.nodes[idx].data1, locals)).value;
+                const binding_idx = evalBindingIndex(locals, name) orelse return self.failAtNode(idx, error.ComptimeCaptureNotAllowed);
+                if (!locals.entries.items[binding_idx].value.mutable) return self.failAtNode(idx, error.AssignToConst);
+                locals.entries.items[binding_idx].value.value = try self.cloneCtValue(value);
+                break :blk .{ .value = .unit, .returned = false };
+            },
+            .return_stmt => blk: {
+                const value = (try self.evalNodeStep(a.nodes[idx].data0, locals)).value;
+                break :blk .{ .value = value, .returned = true };
+            },
+            .call => blk: {
+                const callee = (try self.evalNodeStep(a.nodes[idx].data0, locals)).value;
+                const fn_id = switch (callee) {
+                    .func => |id| id,
+                    else => return self.failAtNode(idx, error.CallTargetNotFunction),
+                };
+
+                const arg_nodes = a.callArgs(idx);
+                var arg_values = try std.ArrayList(ComptimeValue).initCapacity(self.gpa, arg_nodes.len);
+                defer arg_values.deinit(self.gpa);
+                for (arg_nodes) |arg_node| {
+                    const arg_value = (try self.evalNodeStep(arg_node, locals)).value;
+                    try arg_values.append(self.gpa, try self.cloneCtValue(arg_value));
+                }
+                break :blk .{ .value = try self.evalFunction(fn_id, arg_values.items), .returned = false };
+            },
+            .print_stmt, .arg => self.failAtNode(idx, error.ComptimePureOperationNotAllowed),
+            .add => blk: {
+                const l = (try self.evalNodeStep(a.nodes[idx].data0, locals)).value;
+                const r = (try self.evalNodeStep(a.nodes[idx].data1, locals)).value;
+                break :blk .{ .value = switch (l) {
+                    .int => |lv| .{ .int = lv + r.int },
+                    .float => |lv| .{ .float = lv + r.float },
+                    else => return self.failAtNode(idx, error.ArithmeticRequiresNumeric),
+                }, .returned = false };
+            },
+            .sub => blk: {
+                const l = (try self.evalNodeStep(a.nodes[idx].data0, locals)).value;
+                const r = (try self.evalNodeStep(a.nodes[idx].data1, locals)).value;
+                break :blk .{ .value = switch (l) {
+                    .int => |lv| .{ .int = lv - r.int },
+                    .float => |lv| .{ .float = lv - r.float },
+                    else => return self.failAtNode(idx, error.ArithmeticRequiresNumeric),
+                }, .returned = false };
+            },
+            .mul => blk: {
+                const l = (try self.evalNodeStep(a.nodes[idx].data0, locals)).value;
+                const r = (try self.evalNodeStep(a.nodes[idx].data1, locals)).value;
+                break :blk .{ .value = switch (l) {
+                    .int => |lv| .{ .int = lv * r.int },
+                    .float => |lv| .{ .float = lv * r.float },
+                    else => return self.failAtNode(idx, error.ArithmeticRequiresNumeric),
+                }, .returned = false };
+            },
+            .div => blk: {
+                const l = (try self.evalNodeStep(a.nodes[idx].data0, locals)).value;
+                const r = (try self.evalNodeStep(a.nodes[idx].data1, locals)).value;
+                break :blk .{ .value = switch (l) {
+                    .int => |lv| .{ .int = @divTrunc(lv, r.int) },
+                    .float => |lv| .{ .float = lv / r.float },
+                    else => return self.failAtNode(idx, error.ArithmeticRequiresNumeric),
+                }, .returned = false };
+            },
+            .lt, .gt, .le, .ge, .eq, .ne => .{ .value = .unit, .returned = false },
+            .if_stmt => blk: {
+                const data = a.ifData(idx);
+                const pred = try self.evalPredicate(data.cond, locals);
+                if (pred) break :blk try self.evalNodeStep(data.then_, locals);
+                if (data.else_ != std.math.maxInt(ast.NodeIdx)) break :blk try self.evalNodeStep(data.else_, locals);
+                break :blk .{ .value = .unit, .returned = false };
+            },
+            .struct_init => blk: {
+                const si_name = a.identOf(a.structInitName(idx));
+                const decl = self.findStructDecl(si_name) orelse return self.failAtNode(idx, error.UnknownType);
+                const fields = a.structInitFields(idx);
+                const arena_alloc = self.typed.arena.allocator();
+                const values = try arena_alloc.alloc(ComptimeValue, fields.len);
+                for (fields, 0..) |field, i| {
+                    values[i] = (try self.evalNodeStep(field.value, locals)).value;
+                }
+                break :blk .{ .value = .{ .struct_value = .{
+                    .decl = decl,
+                    .fields = values,
+                } }, .returned = false };
+            },
+            .field_access => blk: {
+                const target = (try self.evalNodeStep(a.nodes[idx].data0, locals)).value;
+                const field_idx = self.typed.field_index.get(idx) orelse return self.failAtNode(idx, error.UnknownField);
+                const sv = switch (target) {
+                    .struct_value => |v| v,
+                    else => return self.failAtNode(idx, error.FieldAccessOnNonStruct),
+                };
+                break :blk .{ .value = sv.fields[field_idx], .returned = false };
+            },
+            .comptime_expr => self.evalNodeStep(a.comptimeExprBody(idx), locals),
+            .comptime_value_decl => .{ .value = .unit, .returned = false },
+            .comptime_fn, .comptime_struct => .{ .value = .unit, .returned = false },
+            .type_name, .type_func => return self.failAtNode(idx, error.ComptimeValueNotAvailable),
+        };
+    }
+
+    fn inferComptimeExpr(self: *@This(), idx: ast.NodeIdx) InferError!Type {
+        const body = self.parsed.ast.comptimeExprBody(idx);
+        const prev = self.in_comptime_context;
+        self.in_comptime_context = true;
+        const ty = self.inferNode(body) catch |err| {
+            self.in_comptime_context = prev;
+            return err;
+        };
+        self.in_comptime_context = prev;
+
+        var locals = scope_mod.ScopeStack(EvalBinding).init();
+        defer locals.deinit(self.gpa);
+        const value = (try self.evalNodeStep(body, &locals)).value;
+        try self.typed.comptime_node_values.put(idx, value);
+        return self.remember(idx, ty);
+    }
+
     fn inferVarRef(self: *@This(), idx: ast.NodeIdx) InferError!Type {
         const name = self.parsed.ast.identOf(self.parsed.ast.nodes[idx].data0);
-        if (self.lookupBinding(name)) |binding| return self.remember(idx, binding.ty);
+        if (self.lookupBinding(name)) |binding| {
+            if (self.in_comptime_context and !binding.comptime_visible) {
+                return self.failAtNode(idx, error.ComptimeCaptureNotAllowed);
+            }
+            return self.remember(idx, binding.ty);
+        }
 
         const resolved_ref = self.resolved.node_refs.get(idx) orelse return self.failAtNode(idx, error.UnknownSymbol);
-        switch (resolved_ref) {
-            .local => return self.failAtNode(idx, error.UnknownSymbol),
+        return switch (resolved_ref) {
+            .local => return self.failAtNode(idx, if (self.in_comptime_context) error.ComptimeCaptureNotAllowed else error.UnknownSymbol),
             .function => |fn_id| return self.remember(idx, .{ .func = self.typed.functionType(fn_id) }),
-        }
+            .comptime_value => |decl_idx| blk: {
+                const ty = try self.inferComptimeDeclType(decl_idx);
+                if (!self.in_comptime_context) {
+                    var locals = scope_mod.ScopeStack(EvalBinding).init();
+                    defer locals.deinit(self.gpa);
+                    _ = try self.evalComptimeDeclValue(decl_idx, &locals);
+                }
+                break :blk try self.remember(idx, ty);
+            },
+            .struct_decl => |decl_idx| return self.remember(idx, .{ .named = self.parsed.ast.identOf(self.parsed.ast.nodes[decl_idx].data0) }),
+        };
     }
 
     fn inferNode(self: *@This(), idx: ast.NodeIdx) InferError!Type {
@@ -549,8 +976,9 @@ const Checker = struct {
             .const_decl => self.inferConst(idx),
             .return_stmt => self.inferReturn(idx),
             .call => self.inferCall(idx),
-            .arg => self.remember(idx, .int),
+            .arg => if (self.in_comptime_context) self.failAtNode(idx, error.ComptimePureOperationNotAllowed) else self.remember(idx, .int),
             .print_stmt => blk: {
+                if (self.in_comptime_context) return self.failAtNode(idx, error.ComptimePureOperationNotAllowed);
                 const child = a.nodes[idx].data0;
                 const child_ty = try self.inferNode(child);
                 switch (child_ty) {
@@ -573,6 +1001,8 @@ const Checker = struct {
             .if_stmt => self.inferIf(idx),
             .struct_init => self.inferStructInit(idx),
             .field_access => self.inferFieldAccess(idx),
+            .comptime_expr => self.inferComptimeExpr(idx),
+            .comptime_value_decl => try self.remember(idx, .unit),
             .comptime_fn, .comptime_struct => try self.remember(idx, .unit),
             .type_name, .type_func => unreachable,
         };
@@ -591,7 +1021,7 @@ const Checker = struct {
             const a = self.parsed.ast;
             for (a.fnParams(info.decl), info.ty.params) |param, param_ty| {
                 const pname = a.identOf(param.name);
-                self.bindings.push(self.gpa, pname, .{ .ty = param_ty, .mutable = false }) catch |err| switch (err) {
+                self.bindings.push(self.gpa, pname, .{ .ty = param_ty, .mutable = false, .comptime_visible = false }) catch |err| switch (err) {
                     error.DuplicateVariable => return self.failAtNode(info.decl, error.DuplicateSymbol),
                     error.OutOfMemory => return error.OutOfMemory,
                 };
@@ -622,32 +1052,43 @@ const Checker = struct {
 };
 
 fn hasTopLevelEntry(a: ast.Ast, entry: ast.NodeIdx) bool {
-    if (a.nodes[entry].tag == .block) return a.blockItems(entry).len > 0;
+    if (a.nodes[entry].tag == .block) {
+        for (a.blockItems(entry)) |item| {
+            switch (a.nodes[item].tag) {
+                .comptime_fn, .comptime_struct, .comptime_value_decl => continue,
+                else => return true,
+            }
+        }
+        return false;
+    }
     if (a.nodes[entry].tag == .unit_lit) return false;
     return true;
 }
 
-pub const TypeMemo = db.Memo(TypedAst);
+pub const AnalyzeMemo = db.Memo(AnalyzedAst);
 
-pub fn computeType(
+pub fn computeAnalyze(
     resolve_memo: *const resolver.ResolveMemo,
+    astgen_memo: *const astgen.AstgenMemo,
     parse_memo: *const parser.ParseMemo,
     gpa: std.mem.Allocator,
-) error{OutOfMemory}!TypeMemo {
+) error{OutOfMemory}!AnalyzeMemo {
     var diagnostics_list = try db.initDiagnosticList(gpa, resolve_memo.diagnostics.items, 1);
     errdefer diagnostics_list.deinit(gpa);
 
-    var typed_value: ?TypedAst = null;
-    if (resolve_memo.value) |*resolved| {
-        const parsed = if (parse_memo.value) |*p| p else return db.makeMemo(TypedAst, null, diagnostics_list);
-        const report = try typecheckReport(parsed, resolved, gpa);
-        if (report.diagnostic) |diag| {
-            try diagnostics_list.append(gpa, diag);
+    var typed_value: ?AnalyzedAst = null;
+    if (astgen_memo.value != null) {
+        if (resolve_memo.value) |*resolved| {
+            const parsed = if (parse_memo.value) |*p| p else return db.makeMemo(AnalyzedAst, null, diagnostics_list);
+            const report = try typecheckReport(parsed, resolved, gpa);
+            if (report.diagnostic) |diag| {
+                try diagnostics_list.append(gpa, diag);
+            }
+            typed_value = report.typed;
         }
-        typed_value = report.typed;
     }
 
-    return db.makeMemo(TypedAst, typed_value, diagnostics_list);
+    return db.makeMemo(AnalyzedAst, typed_value, diagnostics_list);
 }
 
 pub fn typecheckReport(
@@ -675,6 +1116,7 @@ pub fn typecheckReport(
     };
 
     checker.bindings.deinit(gpa);
+    checker.comptime_decl_state.deinit();
     return .{
         .typed = checker.typed,
         .diagnostic = null,

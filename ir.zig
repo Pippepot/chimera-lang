@@ -1,11 +1,11 @@
 const std = @import("std");
 const ast = @import("ast.zig");
 const diagnostics = @import("diagnostics.zig");
-const typecheck = @import("typecheck.zig");
+const analyze = @import("analyze.zig");
 const scope_mod = @import("scope.zig");
 const db = @import("db.zig");
 
-pub const StringId = u32;
+pub const SymbolId = u32;
 pub const FuncTypeId = u32;
 pub const ValueRef = u32;
 pub const BlockId = u32;
@@ -17,7 +17,7 @@ pub const Type = union(enum) {
     bool,
     int,
     float,
-    named: StringId,
+    named: SymbolId,
     func: FuncTypeId,
 };
 
@@ -136,7 +136,7 @@ pub const Block = struct {
 
 pub const Function = struct {
     id: FuncId,
-    name: StringId,
+    name: SymbolId,
     entry: BlockId,
     blocks: std.ArrayList(Block),
     next_value: ValueRef,
@@ -153,18 +153,18 @@ pub const Function = struct {
 pub const Program = struct {
     entry: FuncId,
     functions: std.ArrayList(Function),
-    strings: std.ArrayList([]const u8),
+    symbols: std.ArrayList([]const u8),
     func_types: std.ArrayList(IrFuncType),
 
-    pub fn stringFor(self: *const Program, id: StringId) []const u8 {
-        return self.strings.items[id];
+    pub fn symbolFor(self: *const Program, id: SymbolId) []const u8 {
+        return self.symbols.items[id];
     }
 
     pub fn deinit(self: *Program, gpa: std.mem.Allocator) void {
         for (self.functions.items) |*func| func.deinit(gpa);
         self.functions.deinit(gpa);
-        for (self.strings.items) |s| gpa.free(s);
-        self.strings.deinit(gpa);
+        for (self.symbols.items) |s| gpa.free(s);
+        self.symbols.deinit(gpa);
         for (self.func_types.items) |ft| gpa.free(ft.params);
         self.func_types.deinit(gpa);
     }
@@ -174,27 +174,29 @@ const LowerError = error{
     UnknownSymbol,
     UnknownFunction,
     TooManyCallArgs,
+    MissingComptimeValue,
+    UnsupportedComptimeValue,
 };
 
-const LowerResult = error{OutOfMemory} || LowerError || typecheck.TypeError;
+const LowerResult = error{OutOfMemory} || LowerError || analyze.TypeError;
 
 const Lowerer = struct {
     gpa: std.mem.Allocator,
-    typed: *const typecheck.TypedAst,
+    typed: *const analyze.AnalyzedAst,
     function_ids: std.StringHashMap(FuncId),
-    strings: std.ArrayList([]const u8),
-    string_map: std.StringHashMap(StringId),
+    symbols: std.ArrayList([]const u8),
+    ident_map: std.StringHashMap(SymbolId),
     func_types: std.ArrayList(IrFuncType),
     func_type_map: std.AutoHashMap(usize, FuncTypeId),
 
-    fn init(gpa: std.mem.Allocator, typed: *const typecheck.TypedAst) !Lowerer {
+    fn init(gpa: std.mem.Allocator, typed: *const analyze.AnalyzedAst) !Lowerer {
         var function_ids = std.StringHashMap(FuncId).init(gpa);
         errdefer function_ids.deinit();
 
         const a = typed.ast;
         for (typed.functions, 0..) |info, idx| {
             if (info.decl == std.math.maxInt(ast.NodeIdx)) continue;
-            const name = a.stringOf(a.nodes[info.decl].data0);
+            const name = a.identOf(a.nodes[info.decl].data0);
             try function_ids.put(name, @intCast(idx));
         }
 
@@ -202,8 +204,8 @@ const Lowerer = struct {
             .gpa = gpa,
             .typed = typed,
             .function_ids = function_ids,
-            .strings = .empty,
-            .string_map = .init(gpa),
+            .symbols = .empty,
+            .ident_map = .init(gpa),
             .func_types = .empty,
             .func_type_map = .init(gpa),
         };
@@ -211,36 +213,36 @@ const Lowerer = struct {
 
     fn deinit(self: *@This()) void {
         self.function_ids.deinit();
-        self.string_map.deinit();
+        self.ident_map.deinit();
         self.func_type_map.deinit();
-        for (self.strings.items) |s| self.gpa.free(s);
-        self.strings.deinit(self.gpa);
+        for (self.symbols.items) |s| self.gpa.free(s);
+        self.symbols.deinit(self.gpa);
         for (self.func_types.items) |ft| self.gpa.free(ft.params);
         self.func_types.deinit(self.gpa);
     }
 
-    fn internString(self: *@This(), s: []const u8) !StringId {
-        if (self.string_map.get(s)) |id| return id;
+    fn internIdent(self: *@This(), s: []const u8) !SymbolId {
+        if (self.ident_map.get(s)) |id| return id;
         const owned = try self.gpa.dupe(u8, s);
         errdefer self.gpa.free(owned);
-        const id: StringId = @intCast(self.strings.items.len);
-        try self.strings.append(self.gpa, owned);
-        try self.string_map.put(owned, id);
+        const id: SymbolId = @intCast(self.symbols.items.len);
+        try self.symbols.append(self.gpa, owned);
+        try self.ident_map.put(owned, id);
         return id;
     }
 
-    fn internType(self: *@This(), tc_ty: typecheck.Type) error{OutOfMemory}!Type {
+    fn internType(self: *@This(), tc_ty: analyze.Type) error{OutOfMemory}!Type {
         return switch (tc_ty) {
             .unit => .unit,
             .bool => .bool,
             .int => .int,
             .float => .float,
-            .named => |name| .{ .named = try self.internString(name) },
+            .named => |name| .{ .named = try self.internIdent(name) },
             .func => |ft| .{ .func = try self.internFuncType(ft) },
         };
     }
 
-    fn internFuncType(self: *@This(), ft: *const typecheck.FuncType) !FuncTypeId {
+    fn internFuncType(self: *@This(), ft: *const analyze.FuncType) !FuncTypeId {
         const ptr_key = @intFromPtr(ft);
         if (self.func_type_map.get(ptr_key)) |id| return id;
 
@@ -260,12 +262,8 @@ const Lowerer = struct {
         return id;
     }
 
-    fn stringFor(self: *const @This(), id: StringId) []const u8 {
-        return self.strings.items[id];
-    }
-
     fn allocFunction(self: *@This(), id: FuncId, name: []const u8, ret_type: Type) !Function {
-        const name_id = try self.internString(name);
+        const name_id = try self.internIdent(name);
         var blocks = try std.ArrayList(Block).initCapacity(self.gpa, 8);
         errdefer blocks.deinit(self.gpa);
 
@@ -306,10 +304,10 @@ const Lowerer = struct {
         const result = Program{
             .entry = self.typed.entry_function,
             .functions = functions,
-            .strings = self.strings,
+            .symbols = self.symbols,
             .func_types = self.func_types,
         };
-        self.strings = .empty;
+        self.symbols = .empty;
         self.func_types = .empty;
         return result;
     }
@@ -320,14 +318,14 @@ const FunctionLowerer = struct {
     function: Function,
     bindings: scope_mod.ScopeStack(ValueRef),
     current_block_id: BlockId,
-    info: typecheck.FunctionInfo,
+    info: analyze.FunctionInfo,
 
-    fn init(parent: *Lowerer, fn_id: FuncId, info: typecheck.FunctionInfo) !FunctionLowerer {
+    fn init(parent: *Lowerer, fn_id: FuncId, info: analyze.FunctionInfo) !FunctionLowerer {
         const a = parent.typed.ast;
         const fn_name = if (info.decl == std.math.maxInt(ast.NodeIdx))
             ""
         else
-            a.stringOf(a.nodes[info.decl].data0);
+            a.identOf(a.nodes[info.decl].data0);
         const ret_type = try parent.internType(info.ty.ret);
         var function = try parent.allocFunction(fn_id, fn_name, ret_type);
         errdefer function.deinit(parent.gpa);
@@ -382,7 +380,7 @@ const FunctionLowerer = struct {
         return self.bindings.lookup(name);
     }
 
-    fn nodeType(self: *const @This(), idx: ast.NodeIdx) (std.mem.Allocator.Error || typecheck.TypeError)!Type {
+    fn nodeType(self: *const @This(), idx: ast.NodeIdx) (std.mem.Allocator.Error || analyze.TypeError)!Type {
         return self.parent.internType(try self.parent.typed.typeOf(idx));
     }
 
@@ -573,7 +571,7 @@ const FunctionLowerer = struct {
     fn lowerVar(self: *@This(), idx: ast.NodeIdx) LowerResult!ValueRef {
         const a = self.parent.typed.ast;
         const value = a.varDeclValue(idx);
-        const name = a.stringOf(a.nodes[idx].data0);
+        const name = a.identOf(a.nodes[idx].data0);
         if (a.nodes[value].tag == .struct_init) {
             const base = try self.lowerStructIntoSlots(value);
             try self.pushBinding(name, base);
@@ -589,7 +587,7 @@ const FunctionLowerer = struct {
     fn lowerConst(self: *@This(), idx: ast.NodeIdx) LowerResult!ValueRef {
         const a = self.parent.typed.ast;
         const value = a.varDeclValue(idx);
-        const name = a.stringOf(a.nodes[idx].data0);
+        const name = a.identOf(a.nodes[idx].data0);
         if (a.nodes[value].tag == .struct_init) {
             const base = try self.lowerStructIntoSlots(value);
             try self.pushBinding(name, base);
@@ -602,7 +600,7 @@ const FunctionLowerer = struct {
 
     fn lowerAssign(self: *@This(), idx: ast.NodeIdx) LowerResult!ValueRef {
         const a = self.parent.typed.ast;
-        const name = a.stringOf(a.nodes[idx].data0);
+        const name = a.identOf(a.nodes[idx].data0);
         const value_ref = try self.lowerAst(a.nodes[idx].data1);
         const dst = self.lookupBinding(name) orelse return error.UnknownSymbol;
         _ = try self.addInst(.{ .store = .{ .l = value_ref, .r = dst } });
@@ -628,8 +626,33 @@ const FunctionLowerer = struct {
         return self.addInst(.{ .field_load = .{ .base = base, .field_index = f_idx } });
     }
 
+    fn lowerComptimeValue(self: *@This(), value: analyze.ComptimeValue) LowerResult!ValueRef {
+        return switch (value) {
+            .unit => self.lowerUnitValue(),
+            .bool => |v| self.addInst(.{ .iconst = if (v) @as(i32, 1) else 0 }),
+            .int => |v| self.addInst(.{ .iconst = v }),
+            .float => |v| self.addInst(.{ .fconst = v }),
+            .func => |fn_id| self.addInst(.{ .fn_addr = fn_id }),
+            .struct_type => error.UnsupportedComptimeValue,
+            .struct_value => |sv| blk: {
+                const field_count: u32 = @intCast(sv.fields.len);
+                const base = try self.allocValue();
+                if (field_count > 1) self.function.next_value += field_count - 1;
+                for (sv.fields, 0..) |field_value, field_idx| {
+                    const src = try self.lowerComptimeValue(field_value);
+                    const dst = base + @as(ValueRef, @intCast(field_idx));
+                    _ = try self.addInst(.{ .store = .{ .l = src, .r = dst } });
+                }
+                break :blk base;
+            },
+        };
+    }
+
     fn lowerVarRef(self: *@This(), name: []const u8) LowerResult!ValueRef {
         if (self.lookupBinding(name)) |value| return value;
+        if (self.parent.typed.comptime_values.get(name)) |cv| {
+            return self.lowerComptimeValue(cv);
+        }
         const fn_id = self.parent.function_ids.get(name) orelse return error.UnknownFunction;
         return self.addInst(.{ .fn_addr = fn_id });
     }
@@ -652,7 +675,7 @@ const FunctionLowerer = struct {
             },
             .unit_lit => try self.lowerUnitValue(),
             .var_ref => blk: {
-                const name = a.stringOf(a.nodes[idx].data0);
+                const name = a.identOf(a.nodes[idx].data0);
                 break :blk try self.lowerVarRef(name);
             },
             .var_decl => try self.lowerVar(idx),
@@ -684,6 +707,11 @@ const FunctionLowerer = struct {
             .if_stmt => try self.lowerIf(idx),
             .struct_init => try self.lowerStructInit(idx),
             .field_access => try self.lowerFieldAccess(idx),
+            .comptime_expr => blk: {
+                const value = self.parent.typed.comptime_node_values.get(idx) orelse return error.MissingComptimeValue;
+                break :blk try self.lowerComptimeValue(value);
+            },
+            .comptime_value_decl => try self.lowerUnitValue(),
             .comptime_fn, .comptime_struct => try self.lowerUnitValue(),
             .type_name, .type_func => unreachable,
         };
@@ -694,7 +722,7 @@ const FunctionLowerer = struct {
         const a = self.parent.typed.ast;
         const params = a.fnParams(self.info.decl);
         for (params, self.info.ty.params) |param, _| {
-            const pname = a.stringOf(param.name);
+            const pname = a.identOf(param.name);
             const slot = try self.allocValue();
             try self.function.param_values.append(self.parent.gpa, slot);
             try self.pushBinding(pname, slot);
@@ -722,7 +750,7 @@ const FunctionLowerer = struct {
 pub const LowerMemo = db.Memo(Program);
 
 pub fn computeLower(
-    type_memo: *const typecheck.TypeMemo,
+    type_memo: *const analyze.AnalyzeMemo,
     gpa: std.mem.Allocator,
 ) error{OutOfMemory}!LowerMemo {
     var diagnostics_list = try db.initDiagnosticList(gpa, type_memo.diagnostics.items, 1);
@@ -743,7 +771,7 @@ pub fn computeLower(
     return db.makeMemo(Program, lowered_value, diagnostics_list);
 }
 
-pub fn lower(typed: *const typecheck.TypedAst, gpa: std.mem.Allocator) !Program {
+pub fn lower(typed: *const analyze.AnalyzedAst, gpa: std.mem.Allocator) !Program {
     var lowerer = try Lowerer.init(gpa, typed);
     defer lowerer.deinit();
 

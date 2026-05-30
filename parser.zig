@@ -5,7 +5,7 @@ const diagnostics = @import("diagnostics.zig");
 const AstNode = ast.Node;
 const Tag = ast.Tag;
 const NodeIdx = ast.NodeIdx;
-const StringIdx = ast.StringIdx;
+const IdentIdx = ast.IdentIdx;
 const Span = ast.Span;
 
 pub const ParseError = error{
@@ -288,9 +288,9 @@ pub const AstBuilder = struct {
 
     nodes: std.ArrayList(ast.Node),
     extra: std.ArrayList(u32),
-    string_bytes: std.ArrayList(u8),
-    string_offsets: std.ArrayList(u32),
-    string_map: std.StringHashMap(StringIdx),
+    ident_bytes: std.ArrayList(u8),
+    ident_offsets: std.ArrayList(u32),
+    ident_map: std.StringHashMap(IdentIdx),
     spans: std.ArrayList(ast.Span),
     decls: std.ArrayList(NodeIdx),
 
@@ -300,9 +300,9 @@ pub const AstBuilder = struct {
             .temp_arena = std.heap.ArenaAllocator.init(gpa),
             .nodes = .empty,
             .extra = .empty,
-            .string_bytes = .empty,
-            .string_offsets = .empty,
-            .string_map = std.StringHashMap(StringIdx).init(gpa),
+            .ident_bytes = .empty,
+            .ident_offsets = .empty,
+            .ident_map = std.StringHashMap(IdentIdx).init(gpa),
             .spans = .empty,
             .decls = .empty,
         };
@@ -311,21 +311,21 @@ pub const AstBuilder = struct {
     pub fn deinit(self: *AstBuilder) void {
         self.nodes.deinit(self.gpa);
         self.extra.deinit(self.gpa);
-        self.string_bytes.deinit(self.gpa);
-        self.string_offsets.deinit(self.gpa);
-        self.string_map.deinit();
+        self.ident_bytes.deinit(self.gpa);
+        self.ident_offsets.deinit(self.gpa);
+        self.ident_map.deinit();
         self.spans.deinit(self.gpa);
         self.decls.deinit(self.gpa);
         self.temp_arena.deinit();
     }
 
-    pub fn internString(self: *AstBuilder, s: []const u8) !StringIdx {
-        if (self.string_map.get(s)) |idx| return idx;
-        const idx: StringIdx = @intCast(self.string_offsets.items.len);
-        try self.string_offsets.append(self.gpa, @intCast(self.string_bytes.items.len));
-        try self.string_bytes.appendSlice(self.gpa, s);
+    pub fn internIdent(self: *AstBuilder, s: []const u8) !IdentIdx {
+        if (self.ident_map.get(s)) |idx| return idx;
+        const idx: IdentIdx = @intCast(self.ident_offsets.items.len);
+        try self.ident_offsets.append(self.gpa, @intCast(self.ident_bytes.items.len));
+        try self.ident_bytes.appendSlice(self.gpa, s);
         const owned = try self.temp_arena.allocator().dupe(u8, s);
-        try self.string_map.put(owned, idx);
+        try self.ident_map.put(owned, idx);
         return idx;
     }
 
@@ -336,13 +336,13 @@ pub const AstBuilder = struct {
         return idx;
     }
 
-    pub fn stringOf(self: *const AstBuilder, idx: StringIdx) []const u8 {
-        const start = self.string_offsets.items[idx];
-        const end = if (idx + 1 < self.string_offsets.items.len)
-            self.string_offsets.items[idx + 1]
+    pub fn identOf(self: *const AstBuilder, idx: IdentIdx) []const u8 {
+        const start = self.ident_offsets.items[idx];
+        const end = if (idx + 1 < self.ident_offsets.items.len)
+            self.ident_offsets.items[idx + 1]
         else
-            @as(u32, @intCast(self.string_bytes.items.len));
-        return self.string_bytes.items[start..end];
+            @as(u32, @intCast(self.ident_bytes.items.len));
+        return self.ident_bytes.items[start..end];
     }
 
     pub fn allocExtraSingle(self: *AstBuilder, value: u32) !u32 {
@@ -375,17 +375,17 @@ pub const AstBuilder = struct {
         defer self.gpa.free(nodes);
         const extra = try self.extra.toOwnedSlice(self.gpa);
         defer self.gpa.free(extra);
-        const string_bytes = try self.string_bytes.toOwnedSlice(self.gpa);
-        defer self.gpa.free(string_bytes);
-        const string_offsets = try self.string_offsets.toOwnedSlice(self.gpa);
-        defer self.gpa.free(string_offsets);
+        const ident_bytes = try self.ident_bytes.toOwnedSlice(self.gpa);
+        defer self.gpa.free(ident_bytes);
+        const ident_offsets = try self.ident_offsets.toOwnedSlice(self.gpa);
+        defer self.gpa.free(ident_offsets);
         const spans = try self.spans.toOwnedSlice(self.gpa);
         defer self.gpa.free(spans);
 
         const nodes_len = nodes.len;
         const extra_len = extra.len;
-        const str_bytes_len = string_bytes.len;
-        const str_offs_len = string_offsets.len;
+        const str_bytes_len = ident_bytes.len;
+        const str_offs_len = ident_offsets.len;
         const spans_len = spans.len;
         const decls_len = decls_slice.len;
 
@@ -420,8 +420,8 @@ pub const AstBuilder = struct {
 
         @memcpy(backing[nodes_off..][0..nodes_bytes], std.mem.sliceAsBytes(nodes));
         @memcpy(backing[extra_off..][0..extra_bytes], std.mem.sliceAsBytes(extra));
-        @memcpy(backing[str_bytes_off..][0..str_bytes_bytes], string_bytes);
-        @memcpy(backing[str_offs_off..][0..str_offs_bytes], std.mem.sliceAsBytes(string_offsets));
+        @memcpy(backing[str_bytes_off..][0..str_bytes_bytes], ident_bytes);
+        @memcpy(backing[str_offs_off..][0..str_offs_bytes], std.mem.sliceAsBytes(ident_offsets));
         @memcpy(backing[spans_off..][0..spans_bytes], std.mem.sliceAsBytes(spans));
         @memcpy(backing[decls_off..][0..decls_bytes], std.mem.sliceAsBytes(decls_slice));
 
@@ -444,8 +444,8 @@ pub const AstBuilder = struct {
             .backing = backing,
             .nodes = @as([*]ast.Node, @ptrCast(@alignCast(backing.ptr + nodes_off)))[0..nodes_len],
             .extra = @as([*]u32, @ptrCast(@alignCast(backing.ptr + extra_off)))[0..extra_len],
-            .string_bytes = backing[str_bytes_off..][0..str_bytes_len],
-            .string_offsets = @as([*]u32, @ptrCast(@alignCast(backing.ptr + str_offs_off)))[0..str_offs_len],
+            .ident_bytes = backing[str_bytes_off..][0..str_bytes_len],
+            .ident_offsets = @as([*]u32, @ptrCast(@alignCast(backing.ptr + str_offs_off)))[0..str_offs_len],
             .spans = @as([*]ast.Span, @ptrCast(@alignCast(backing.ptr + spans_off)))[0..spans_len],
             .decls = @as([*]ast.NodeIdx, @ptrCast(@alignCast(backing.ptr + decls_off)))[0..decls_len],
             .entry = entry,
@@ -528,7 +528,7 @@ const Parser = struct {
     }
 
     fn internName(self: *@This(), name: []const u8) !u32 {
-        return self.builder.internString(name);
+        return self.builder.internIdent(name);
     }
 
     fn makeBlockNode(self: *@This(), items: []const NodeIdx) !NodeIdx {
@@ -664,7 +664,7 @@ const Parser = struct {
             try self.expect(.dedent, error.ExpectedExpression);
             return body;
         }
-        return self.parseExpression();
+        return self.parseStatement();
     }
 
     fn expectStatementTerminated(self: *@This(), stmt_end: usize) ParseError!void {
@@ -682,20 +682,9 @@ const Parser = struct {
 
     fn parseProgram(self: *@This()) ParseError!NodeIdx {
         try self.consumeNewlines();
-
-        var decls = std.ArrayList(NodeIdx).empty;
-        while (self.current.tag == .kw_comptime) {
-            const decl = try self.parseDeclaration();
-            try decls.append(self.scratch_arena.allocator(), decl);
-        }
         const entry = try self.parseBlockUntil();
         try self.consumeNewlines();
         if (self.current.tag != .eof) return error.TrailingInput;
-
-        const owned_decls = try self.scratch_arena.allocator().alloc(NodeIdx, decls.items.len);
-        @memcpy(owned_decls, decls.items);
-        for (owned_decls) |d| try self.builder.decls.append(self.builder.gpa, d);
-
         return entry;
     }
 
@@ -716,7 +705,53 @@ const Parser = struct {
         if (self.current.tag == .kw_struct) {
             return self.parseComptimeStruct(name, decl_start);
         }
-        return error.ExpectedDeclaration;
+        return self.parseComptimeValueDecl(name, decl_start);
+    }
+
+    fn parseComptimeValueDecl(self: *@This(), name: []const u8, decl_start: ast.Span) ParseError!NodeIdx {
+        const name_idx = try self.internName(name);
+        const value = try self.parseExpression();
+        const span = coverSpans(decl_start, try self.spanOf(value));
+        return self.allocNode(.comptime_value_decl, name_idx, value, span);
+    }
+
+    fn parseComptimeExprAfterKeyword(self: *@This(), start_span: ast.Span) ParseError!NodeIdx {
+        const body = if (self.current.tag == .arrow) body: {
+            try self.advance();
+            break :body try self.parseExpression();
+        } else try self.parseIndentedBlock(error.ExpectedExpression);
+
+        const span = coverSpans(start_span, try self.spanOf(body));
+        return self.allocNode(.comptime_expr, body, 0, span);
+    }
+
+    fn parseComptimeStatement(self: *@This()) ParseError!NodeIdx {
+        if (self.current.tag != .kw_comptime) return error.UnexpectedToken;
+        const kw_span = tokenSpan(self.current);
+        try self.advance();
+
+        if (self.current.tag == .ident) {
+            const name = self.current.ident;
+            try self.advance();
+            try self.expect(.assign, error.ExpectedAssign);
+
+            if (self.current.tag == .kw_func) {
+                const decl = try self.parseComptimeFunc(name, kw_span);
+                try self.builder.decls.append(self.builder.gpa, decl);
+                return decl;
+            }
+            if (self.current.tag == .kw_struct) {
+                const decl = try self.parseComptimeStruct(name, kw_span);
+                try self.builder.decls.append(self.builder.gpa, decl);
+                return decl;
+            }
+
+            const decl = try self.parseComptimeValueDecl(name, kw_span);
+            try self.builder.decls.append(self.builder.gpa, decl);
+            return decl;
+        }
+
+        return self.parseComptimeExprAfterKeyword(kw_span);
     }
 
     fn parseComptimeFunc(self: *@This(), name: []const u8, decl_start: ast.Span) ParseError!NodeIdx {
@@ -854,11 +889,7 @@ const Parser = struct {
         if (self.current.tag == .kw_const) return self.parseBinding(.const_kind);
         if (self.current.tag == .kw_var) return self.parseBinding(.var_kind);
         if (self.current.tag == .kw_return) return self.parseReturn();
-        if (self.current.tag == .kw_comptime) {
-            const decl = try self.parseDeclaration();
-            try self.builder.decls.append(self.builder.gpa, decl);
-            return decl;
-        }
+        if (self.current.tag == .kw_comptime) return self.parseComptimeStatement();
         return self.parseExpression();
     }
 
@@ -913,7 +944,7 @@ const Parser = struct {
             const node_tag = self.builder.nodes.items[node].tag;
             if (node_tag != .var_ref) return error.UnexpectedToken;
             const name_idx = self.builder.nodes.items[node].data0;
-            const name = self.builder.stringOf(name_idx);
+            const name = self.builder.identOf(name_idx);
             try self.advance();
             const value = try self.parseExpression();
             const span = coverSpans(try self.spanOf(node), try self.spanOf(value));
@@ -1036,7 +1067,7 @@ const Parser = struct {
                 expr = try self.makeCallNode(expr, args.items, coverSpans(callee_span, end_span));
             } else if (self.current.tag == .l_brace) {
                 if (self.builder.nodes.items[expr].tag != .var_ref) return error.ExpectedIdentifier;
-                const struct_name = self.builder.stringOf(self.builder.nodes.items[expr].data0);
+                const struct_name = self.builder.identOf(self.builder.nodes.items[expr].data0);
                 expr = try self.parseStructInit(struct_name);
             } else if (self.current.tag == .dot) {
                 expr = try self.parseFieldAccess(expr);
@@ -1107,6 +1138,11 @@ const Parser = struct {
             .kw_print => return self.parsePrint(),
             .kw_arg => return self.parseArg(),
             .kw_if => return self.parseIf(),
+            .kw_comptime => {
+                const kw_span = tokenSpan(self.current);
+                try self.advance();
+                return self.parseComptimeExprAfterKeyword(kw_span);
+            },
             .kw_true => {
                 const span = tokenSpan(self.current);
                 try self.advance();
@@ -1176,7 +1212,7 @@ const Parser = struct {
 
         const then_expr = if (self.current.tag == .arrow) then_body: {
             try self.advance();
-            break :then_body try self.parseExpression();
+            break :then_body try self.parseStatement();
         } else try self.parseIndentedBlock(error.ExpectedExpression);
 
         var else_expr: ?NodeIdx = null;
@@ -1296,5 +1332,3 @@ pub fn parseReport(source: []const u8, gpa: std.mem.Allocator) error{OutOfMemory
         .diagnostic = null,
     };
 }
-
-
