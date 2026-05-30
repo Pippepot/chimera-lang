@@ -139,7 +139,6 @@ pub const Function = struct {
     name: StringId,
     entry: BlockId,
     blocks: std.ArrayList(Block),
-    value_types: std.ArrayList(Type),
     next_value: ValueRef,
     param_values: std.ArrayList(ValueRef),
     ret_type: Type,
@@ -147,7 +146,6 @@ pub const Function = struct {
     pub fn deinit(self: *Function, gpa: std.mem.Allocator) void {
         for (self.blocks.items) |*block| block.deinit(gpa);
         self.blocks.deinit(gpa);
-        self.value_types.deinit(gpa);
         self.param_values.deinit(gpa);
     }
 };
@@ -177,6 +175,8 @@ const LowerError = error{
     UnknownFunction,
     TooManyCallArgs,
 };
+
+const LowerResult = error{OutOfMemory} || LowerError || typecheck.TypeError;
 
 const Lowerer = struct {
     gpa: std.mem.Allocator,
@@ -269,9 +269,6 @@ const Lowerer = struct {
         var blocks = try std.ArrayList(Block).initCapacity(self.gpa, 8);
         errdefer blocks.deinit(self.gpa);
 
-        var value_types = try std.ArrayList(Type).initCapacity(self.gpa, 32);
-        errdefer value_types.deinit(self.gpa);
-
         var params = try std.ArrayList(ValueRef).initCapacity(self.gpa, 8);
         errdefer params.deinit(self.gpa);
 
@@ -284,7 +281,6 @@ const Lowerer = struct {
             .name = name_id,
             .entry = 0,
             .blocks = blocks,
-            .value_types = value_types,
             .next_value = 0,
             .param_values = params,
             .ret_type = ret_type,
@@ -354,22 +350,21 @@ const FunctionLowerer = struct {
         return &self.function.blocks.items[self.current_block_id];
     }
 
-    fn allocValue(self: *@This(), ty: Type) error{OutOfMemory}!ValueRef {
+    fn allocValue(self: *@This()) error{OutOfMemory}!ValueRef {
         const value_id = self.function.next_value;
         self.function.next_value += 1;
-        try self.function.value_types.append(self.parent.gpa, ty);
         return value_id;
     }
 
-    fn addInst(self: *@This(), op: Inst, ty: Type) error{OutOfMemory}!ValueRef {
-        const value_id = try self.allocValue(ty);
+    fn addInst(self: *@This(), op: Inst) error{OutOfMemory}!ValueRef {
+        const value_id = try self.allocValue();
         try self.currentBlock().insts.append(self.parent.gpa, .{ .id = value_id, .op = op });
         return value_id;
     }
 
     fn newBlock(self: *@This(), param_type: ?Type) error{OutOfMemory}!BlockId {
         const block_id: BlockId = @intCast(self.function.blocks.items.len);
-        const block_param = if (param_type) |ty| try self.allocValue(ty) else null;
+        const block_param = if (param_type) |_| try self.allocValue() else null;
         var block = try Block.init(self.parent.gpa, block_id, block_param);
         errdefer block.deinit(self.parent.gpa);
         try self.function.blocks.append(self.parent.gpa, block);
@@ -391,7 +386,7 @@ const FunctionLowerer = struct {
         return self.parent.internType(try self.parent.typed.typeOf(idx));
     }
 
-    fn lowerPairOperands(self: *@This(), lhs: ast.NodeIdx, rhs: ast.NodeIdx) (error{OutOfMemory} || LowerError || typecheck.TypeError)!InstPair {
+    fn lowerPairOperands(self: *@This(), lhs: ast.NodeIdx, rhs: ast.NodeIdx) LowerResult!InstPair {
         const left = try self.lowerAst(lhs);
         const right = try self.lowerAst(rhs);
         return .{ .l = left, .r = right };
@@ -402,17 +397,16 @@ const FunctionLowerer = struct {
         comptime tag: std.meta.Tag(Inst),
         lhs: ast.NodeIdx,
         rhs: ast.NodeIdx,
-        result_type: Type,
-    ) (error{OutOfMemory} || LowerError || typecheck.TypeError)!ValueRef {
+    ) LowerResult!ValueRef {
         const operands = try self.lowerPairOperands(lhs, rhs);
-        return self.addInst(@unionInit(Inst, @tagName(tag), operands), result_type);
+        return self.addInst(@unionInit(Inst, @tagName(tag), operands));
     }
 
     fn lowerUnitValue(self: *@This()) error{OutOfMemory}!ValueRef {
-        return self.addInst(.{ .iconst = 0 }, .unit);
+        return self.addInst(.{ .iconst = 0 });
     }
 
-    fn lowerConditionPredicate(self: *@This(), cond: ast.NodeIdx) (error{OutOfMemory} || LowerError || typecheck.TypeError)!Predicate {
+    fn lowerConditionPredicate(self: *@This(), cond: ast.NodeIdx) LowerResult!Predicate {
         const a = self.parent.typed.ast;
         return switch (a.nodes[cond].tag) {
             .lt => self.lowerComparisonPredicate(a.nodes[cond].data0, a.nodes[cond].data1, .lti, .ltf),
@@ -431,7 +425,7 @@ const FunctionLowerer = struct {
         rhs: ast.NodeIdx,
         int_op: PredicateOp,
         float_op: PredicateOp,
-    ) (error{OutOfMemory} || LowerError || typecheck.TypeError)!Predicate {
+    ) LowerResult!Predicate {
         const pair = try self.lowerPairOperands(lhs, rhs);
         const operand_ty = try self.nodeType(lhs);
         return .{
@@ -447,7 +441,7 @@ const FunctionLowerer = struct {
         int_op: PredicateOp,
         float_op: PredicateOp,
         bool_op: PredicateOp,
-    ) (error{OutOfMemory} || LowerError || typecheck.TypeError)!Predicate {
+    ) LowerResult!Predicate {
         const pair = try self.lowerPairOperands(lhs, rhs);
         const operand_ty = try self.nodeType(lhs);
         return .{
@@ -468,15 +462,15 @@ const FunctionLowerer = struct {
         rhs: ast.NodeIdx,
         comptime int_tag: std.meta.Tag(Inst),
         comptime float_tag: std.meta.Tag(Inst),
-    ) (error{OutOfMemory} || LowerError || typecheck.TypeError)!ValueRef {
+    ) LowerResult!ValueRef {
         return switch (try self.nodeType(idx)) {
-            .int => try self.addPairInst(int_tag, lhs, rhs, .int),
-            .float => try self.addPairInst(float_tag, lhs, rhs, .float),
+            .int => try self.addPairInst(int_tag, lhs, rhs),
+            .float => try self.addPairInst(float_tag, lhs, rhs),
             else => unreachable,
         };
     }
 
-    fn lowerCall(self: *@This(), idx: ast.NodeIdx) (error{OutOfMemory} || LowerError || typecheck.TypeError)!ValueRef {
+    fn lowerCall(self: *@This(), idx: ast.NodeIdx) LowerResult!ValueRef {
         const a = self.parent.typed.ast;
         const call_args = a.callArgs(idx);
         if (call_args.len > MaxCallArgs) return error.TooManyCallArgs;
@@ -491,10 +485,10 @@ const FunctionLowerer = struct {
             .callee = callee,
             .argc = @intCast(call_args.len),
             .args = args,
-        } }, try self.nodeType(idx));
+        } });
     }
 
-    fn lowerIf(self: *@This(), idx: ast.NodeIdx) (error{OutOfMemory} || LowerError || typecheck.TypeError)!ValueRef {
+    fn lowerIf(self: *@This(), idx: ast.NodeIdx) LowerResult!ValueRef {
         const a = self.parent.typed.ast;
         const data = a.ifData(idx);
         const predicate = try self.lowerConditionPredicate(data.cond);
@@ -546,7 +540,7 @@ const FunctionLowerer = struct {
         return self.lowerUnitValue();
     }
 
-    fn lowerBlock(self: *@This(), idx: ast.NodeIdx) (error{OutOfMemory} || LowerError || typecheck.TypeError)!ValueRef {
+    fn lowerBlock(self: *@This(), idx: ast.NodeIdx) LowerResult!ValueRef {
         const a = self.parent.typed.ast;
         const mark = self.bindings.mark();
         defer self.bindings.restore(mark);
@@ -560,63 +554,45 @@ const FunctionLowerer = struct {
         return self.lowerUnitValue();
     }
 
-    fn lowerVar(self: *@This(), idx: ast.NodeIdx) (error{OutOfMemory} || LowerError || typecheck.TypeError)!ValueRef {
+    fn lowerStructIntoSlots(self: *@This(), init_idx: ast.NodeIdx) LowerResult!ValueRef {
+        const a = self.parent.typed.ast;
+        const fields = a.structInitFields(init_idx);
+        const field_count: u32 = @intCast(fields.len);
+        const base = try self.allocValue();
+        if (field_count > 1) {
+            self.function.next_value += field_count - 1;
+        }
+        for (fields, 0..) |field, field_idx| {
+            const field_value = try self.lowerAst(field.value);
+            const dst_slot: ValueRef = base + @as(ValueRef, @intCast(field_idx));
+            _ = try self.addInst(.{ .store = .{ .l = field_value, .r = dst_slot } });
+        }
+        return base;
+    }
+
+    fn lowerVar(self: *@This(), idx: ast.NodeIdx) LowerResult!ValueRef {
         const a = self.parent.typed.ast;
         const value = a.varDeclValue(idx);
         const name = a.stringOf(a.nodes[idx].data0);
         if (a.nodes[value].tag == .struct_init) {
-            const si_name = a.stringOf(a.structInitName(value));
-            const struct_decl = self.findStructDecl(si_name) orelse unreachable;
-            const st_fields = a.structFields(struct_decl);
-            const field_count: u32 = @intCast(st_fields.len);
-            const var_base = try self.allocValue(try self.nodeType(value));
-            if (field_count > 1) {
-                self.function.next_value += field_count - 1;
-                var i: u32 = 0;
-                while (i < field_count - 1) : (i += 1) {
-                    try self.function.value_types.append(self.parent.gpa, try self.nodeType(value));
-                }
-            }
-            const init_fields = a.structInitFields(value);
-            for (init_fields, 0..) |field, field_idx| {
-                const field_value = try self.lowerAst(field.value);
-                const dst_slot: ValueRef = var_base + @as(ValueRef, @intCast(field_idx));
-                _ = try self.addInst(.{ .store = .{ .l = field_value, .r = dst_slot } }, .unit);
-            }
-            try self.pushBinding(name, var_base);
+            const base = try self.lowerStructIntoSlots(value);
+            try self.pushBinding(name, base);
             return self.lowerUnitValue();
         }
         const value_ref = try self.lowerAst(value);
-        const var_slot = try self.allocValue(try self.nodeType(value));
-        _ = try self.addInst(.{ .store = .{ .l = value_ref, .r = var_slot } }, .unit);
+        const var_slot = try self.allocValue();
+        _ = try self.addInst(.{ .store = .{ .l = value_ref, .r = var_slot } });
         try self.pushBinding(name, var_slot);
         return self.lowerUnitValue();
     }
 
-    fn lowerConst(self: *@This(), idx: ast.NodeIdx) (error{OutOfMemory} || LowerError || typecheck.TypeError)!ValueRef {
+    fn lowerConst(self: *@This(), idx: ast.NodeIdx) LowerResult!ValueRef {
         const a = self.parent.typed.ast;
         const value = a.varDeclValue(idx);
         const name = a.stringOf(a.nodes[idx].data0);
         if (a.nodes[value].tag == .struct_init) {
-            const si_name = a.stringOf(a.structInitName(value));
-            const struct_decl = self.findStructDecl(si_name) orelse unreachable;
-            const st_fields = a.structFields(struct_decl);
-            const field_count: u32 = @intCast(st_fields.len);
-            const const_base = try self.allocValue(try self.nodeType(value));
-            if (field_count > 1) {
-                self.function.next_value += field_count - 1;
-                var i: u32 = 0;
-                while (i < field_count - 1) : (i += 1) {
-                    try self.function.value_types.append(self.parent.gpa, try self.nodeType(value));
-                }
-            }
-            const init_fields = a.structInitFields(value);
-            for (init_fields, 0..) |field, field_idx| {
-                const field_value = try self.lowerAst(field.value);
-                const dst_slot: ValueRef = const_base + @as(ValueRef, @intCast(field_idx));
-                _ = try self.addInst(.{ .store = .{ .l = field_value, .r = dst_slot } }, .unit);
-            }
-            try self.pushBinding(name, const_base);
+            const base = try self.lowerStructIntoSlots(value);
+            try self.pushBinding(name, base);
             return self.lowerUnitValue();
         }
         const value_ref = try self.lowerAst(value);
@@ -624,102 +600,55 @@ const FunctionLowerer = struct {
         return self.lowerUnitValue();
     }
 
-    fn lowerAssign(self: *@This(), idx: ast.NodeIdx) (error{OutOfMemory} || LowerError || typecheck.TypeError)!ValueRef {
+    fn lowerAssign(self: *@This(), idx: ast.NodeIdx) LowerResult!ValueRef {
         const a = self.parent.typed.ast;
         const name = a.stringOf(a.nodes[idx].data0);
         const value_ref = try self.lowerAst(a.nodes[idx].data1);
         const dst = self.lookupBinding(name) orelse return error.UnknownSymbol;
-        _ = try self.addInst(.{ .store = .{ .l = value_ref, .r = dst } }, .unit);
+        _ = try self.addInst(.{ .store = .{ .l = value_ref, .r = dst } });
         return self.lowerUnitValue();
     }
 
-    fn lowerReturn(self: *@This(), idx: ast.NodeIdx) (error{OutOfMemory} || LowerError || typecheck.TypeError)!ValueRef {
+    fn lowerReturn(self: *@This(), idx: ast.NodeIdx) LowerResult!ValueRef {
         const a = self.parent.typed.ast;
         const value_ref = try self.lowerAst(a.nodes[idx].data0);
         self.currentBlock().terminator = .{ .ret = value_ref };
         return value_ref;
     }
 
-    fn findStructDecl(self: *const @This(), name: []const u8) ?ast.NodeIdx {
-        const a = self.parent.typed.ast;
-        for (a.decls) |decl_idx| {
-            if (a.nodes[decl_idx].tag == .comptime_struct) {
-                const st_name = a.stringOf(a.nodes[decl_idx].data0);
-                if (std.mem.eql(u8, st_name, name)) return decl_idx;
-            }
-        }
-        return null;
+    fn lowerStructInit(self: *@This(), idx: ast.NodeIdx) LowerResult!ValueRef {
+        return self.lowerStructIntoSlots(idx);
     }
 
-    fn fieldIndex(self: *const @This(), struct_name: []const u8, field_name: []const u8) ?u32 {
-        const a = self.parent.typed.ast;
-        const decl_idx = self.findStructDecl(struct_name) orelse return null;
-        const fields = a.structFields(decl_idx);
-        for (fields, 0..) |f, i| {
-            const f_name = a.stringOf(f.name);
-            if (std.mem.eql(u8, f_name, field_name)) return @intCast(i);
-        }
-        return null;
-    }
-
-    fn lowerStructInit(self: *@This(), idx: ast.NodeIdx) (error{OutOfMemory} || LowerError || typecheck.TypeError)!ValueRef {
-        const a = self.parent.typed.ast;
-        const fields = a.structInitFields(idx);
-        const field_count: u32 = @intCast(fields.len);
-        const struct_type = try self.nodeType(idx);
-        const base = try self.allocValue(struct_type);
-        if (field_count > 1) {
-            self.function.next_value += field_count - 1;
-            var i: u32 = 0;
-            while (i < field_count - 1) : (i += 1) {
-                try self.function.value_types.append(self.parent.gpa, struct_type);
-            }
-        }
-        for (fields, 0..) |field, field_idx| {
-            const field_value = try self.lowerAst(field.value);
-            const dst_slot: ValueRef = base + @as(ValueRef, @intCast(field_idx));
-            _ = try self.addInst(.{ .store = .{ .l = field_value, .r = dst_slot } }, .unit);
-        }
-        return base;
-    }
-
-    fn lowerFieldAccess(self: *@This(), idx: ast.NodeIdx) (error{OutOfMemory} || LowerError || typecheck.TypeError)!ValueRef {
-        const a = self.parent.typed.ast;
-        const target = a.nodes[idx].data0;
-        const field_name = a.stringOf(a.nodes[idx].data1);
+    fn lowerFieldAccess(self: *@This(), idx: ast.NodeIdx) LowerResult!ValueRef {
+        const target = self.parent.typed.ast.nodes[idx].data0;
         const base = try self.lowerAst(target);
-        const target_type = try self.nodeType(target);
-        const struct_name = switch (target_type) {
-            .named => |name_id| self.parent.stringFor(name_id),
-            else => unreachable,
-        };
-        const f_idx = self.fieldIndex(struct_name, field_name) orelse unreachable;
+        const f_idx = self.parent.typed.field_index.get(idx).?;
         if (f_idx == 0) return base;
-        return self.addInst(.{ .field_load = .{ .base = base, .field_index = f_idx } }, try self.nodeType(idx));
+        return self.addInst(.{ .field_load = .{ .base = base, .field_index = f_idx } });
     }
 
-    fn lowerVarRef(self: *@This(), name: []const u8) (error{OutOfMemory} || LowerError || typecheck.TypeError)!ValueRef {
+    fn lowerVarRef(self: *@This(), name: []const u8) LowerResult!ValueRef {
         if (self.lookupBinding(name)) |value| return value;
         const fn_id = self.parent.function_ids.get(name) orelse return error.UnknownFunction;
-        const ft = self.parent.typed.functionType(fn_id);
-        return self.addInst(.{ .fn_addr = fn_id }, .{ .func = try self.parent.internFuncType(ft) });
+        return self.addInst(.{ .fn_addr = fn_id });
     }
 
-    fn lowerAst(self: *@This(), idx: ast.NodeIdx) (error{OutOfMemory} || LowerError || typecheck.TypeError)!ValueRef {
+    fn lowerAst(self: *@This(), idx: ast.NodeIdx) LowerResult!ValueRef {
         const a = self.parent.typed.ast;
         return switch (a.nodes[idx].tag) {
             .block => try self.lowerBlock(idx),
             .int_lit => blk: {
                 const value: i32 = @bitCast(a.nodes[idx].data0);
-                break :blk try self.addInst(.{ .iconst = value }, .int);
+                break :blk try self.addInst(.{ .iconst = value });
             },
             .float_lit => blk: {
                 const value: f32 = @bitCast(a.nodes[idx].data0);
-                break :blk try self.addInst(.{ .fconst = value }, .float);
+                break :blk try self.addInst(.{ .fconst = value });
             },
             .bool_lit => blk: {
                 const value = a.nodes[idx].data0 != 0;
-                break :blk try self.addInst(.{ .iconst = if (value) @as(i32, 1) else 0 }, .bool);
+                break :blk try self.addInst(.{ .iconst = if (value) @as(i32, 1) else 0 });
             },
             .unit_lit => try self.lowerUnitValue(),
             .var_ref => blk: {
@@ -741,7 +670,7 @@ const FunctionLowerer = struct {
                     .bool => .{ .printb = child_ref },
                     else => unreachable,
                 };
-                break :blk try self.addInst(print_op, .unit);
+                break :blk try self.addInst(print_op);
             },
             .add => try self.lowerArithmetic(idx, a.nodes[idx].data0, a.nodes[idx].data1, .addi, .addf),
             .sub => try self.lowerArithmetic(idx, a.nodes[idx].data0, a.nodes[idx].data1, .subi, .subf),
@@ -749,13 +678,14 @@ const FunctionLowerer = struct {
             .div => try self.lowerArithmetic(idx, a.nodes[idx].data0, a.nodes[idx].data1, .divi, .divf),
             .arg => blk: {
                 const arg_idx = a.nodes[idx].data0;
-                break :blk try self.addInst(.{ .argi = arg_idx }, .int);
+                break :blk try self.addInst(.{ .argi = arg_idx });
             },
             .lt, .gt, .le, .ge, .eq, .ne => error.IfConditionNotFallible,
             .if_stmt => try self.lowerIf(idx),
             .struct_init => try self.lowerStructInit(idx),
             .field_access => try self.lowerFieldAccess(idx),
-            .type_name, .type_func, .comptime_fn, .comptime_struct => unreachable,
+            .comptime_fn, .comptime_struct => try self.lowerUnitValue(),
+            .type_name, .type_func => unreachable,
         };
     }
 
@@ -763,9 +693,9 @@ const FunctionLowerer = struct {
         if (self.info.decl == std.math.maxInt(ast.NodeIdx)) return;
         const a = self.parent.typed.ast;
         const params = a.fnParams(self.info.decl);
-        for (params, self.info.ty.params) |param, param_ty| {
+        for (params, self.info.ty.params) |param, _| {
             const pname = a.stringOf(param.name);
-            const slot = try self.allocValue(try self.parent.internType(param_ty));
+            const slot = try self.allocValue();
             try self.function.param_values.append(self.parent.gpa, slot);
             try self.pushBinding(pname, slot);
         }

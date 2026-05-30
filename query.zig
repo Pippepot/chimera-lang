@@ -58,16 +58,12 @@ fn stageValueType(comptime stage: Stage) type {
 
 fn freeMemoValue(comptime T: type, value: *?T, gpa: std.mem.Allocator) void {
     if (value.*) |*v| {
-        if (comptime T == parser.ParsedAst) {
-            v.deinit(gpa);
-        } else if (comptime T == resolver.ResolvedAst) {
-            v.deinit(gpa);
+        if (comptime T == []const u8) {
+            gpa.free(v.*);
         } else if (comptime T == typecheck.TypedAst) {
             v.deinit();
-        } else if (comptime T == ir_mod.Program) {
+        } else {
             v.deinit(gpa);
-        } else if (comptime T == []const u8) {
-            gpa.free(v.*);
         }
     }
 }
@@ -163,30 +159,11 @@ pub const QueryDb = struct {
         }
         self.sources.deinit();
 
-        {
-            var iter = self.parse_memos.iterator();
-            while (iter.next()) |entry| deinitMemo(parser.ParsedAst, entry.value_ptr, self.gpa);
-            self.parse_memos.deinit();
-        }
-        {
-            var iter = self.resolve_memos.iterator();
-            while (iter.next()) |entry| deinitMemo(resolver.ResolvedAst, entry.value_ptr, self.gpa);
-            self.resolve_memos.deinit();
-        }
-        {
-            var iter = self.type_memos.iterator();
-            while (iter.next()) |entry| deinitMemo(typecheck.TypedAst, entry.value_ptr, self.gpa);
-            self.type_memos.deinit();
-        }
-        {
-            var iter = self.lower_memos.iterator();
-            while (iter.next()) |entry| deinitMemo(ir_mod.Program, entry.value_ptr, self.gpa);
-            self.lower_memos.deinit();
-        }
-        {
-            var iter = self.compile_memos.iterator();
-            while (iter.next()) |entry| deinitMemo([]const u8, entry.value_ptr, self.gpa);
-            self.compile_memos.deinit();
+        inline for (.{ .parse, .resolve, .typecheck, .lower, .compile }) |s| {
+            const T = stageValueType(s);
+            var iter = self.memosFor(s).iterator();
+            while (iter.next()) |entry| deinitMemo(T, entry.value_ptr, self.gpa);
+            self.memosFor(s).deinit();
         }
 
         for (self.active_stack.items) |*frame| {
@@ -249,36 +226,36 @@ pub const QueryDb = struct {
     }
 
     pub fn parsedAst(self: *@This(), source_id: db.SourceId) db.DbError!?*const ast.Ast {
-        const memo = try self.ensureParseMemo(source_id, true);
+        const memo = try self.ensureStageMemo(source_id, true, .parse);
         if (memo.value) |*parsed| return &parsed.ast;
         return null;
     }
 
     pub fn resolvedAst(self: *@This(), source_id: db.SourceId) db.DbError!?*const resolver.ResolvedAst {
-        const memo = try self.ensureResolveMemo(source_id, true);
+        const memo = try self.ensureStageMemo(source_id, true, .resolve);
         if (memo.value) |*resolved| return resolved;
         return null;
     }
 
     pub fn typedAst(self: *@This(), source_id: db.SourceId) db.DbError!?*const typecheck.TypedAst {
-        const memo = try self.ensureTypeMemo(source_id, true);
+        const memo = try self.ensureStageMemo(source_id, true, .typecheck);
         if (memo.value) |*typed| return typed;
         return null;
     }
 
     pub fn loweredProgram(self: *@This(), source_id: db.SourceId) db.DbError!?*const ir_mod.Program {
-        const memo = try self.ensureLowerMemo(source_id, true);
+        const memo = try self.ensureStageMemo(source_id, true, .lower);
         if (memo.value) |*prog| return prog;
         return null;
     }
 
     pub fn compileBytes(self: *@This(), source_id: db.SourceId) db.DbError!?[]const u8 {
-        const memo = try self.ensureCompileMemo(source_id, true);
+        const memo = try self.ensureStageMemo(source_id, true, .compile);
         return memo.value;
     }
 
     pub fn compileResult(self: *@This(), source_id: db.SourceId) db.DbError!CompileResult {
-        const memo = try self.ensureCompileMemo(source_id, true);
+        const memo = try self.ensureStageMemo(source_id, true, .compile);
         return .{
             .bytes = memo.value,
             .diagnostics = memo.diagnostics.items,
@@ -406,10 +383,7 @@ pub const QueryDb = struct {
         _ = self.compile_memos.fetchPut(source_id, compile_memo) catch return;
     }
 
-    /// Serialises one stage's memo value (and diagnostics) for persistent cache storage.
-    /// Each stage delegates to its dedicated `query_cache.serializeXxx` function.
     fn snapshotStage(self: *@This(), source_id: db.SourceId, comptime stage: Stage, gpa: std.mem.Allocator) (error{OutOfMemory}!query_cache.StageSnapshot) {
-        _ = stageValueType(stage);
         return if (self.memosFor(stage).get(source_id)) |memo| .{
             .changed_at = memo.changed_at,
             .has_value = memo.value != null,
@@ -449,30 +423,25 @@ pub const QueryDb = struct {
             const source_path = source.source_path orelse continue;
             if (self.compile_memos.get(source_id) == null) continue;
 
-            const parse_snap = try self.snapshotStage(source_id, .parse, self.gpa);
-            errdefer if (parse_snap.bytes) |b| self.gpa.free(b);
-            const resolve_snap = try self.snapshotStage(source_id, .resolve, self.gpa);
-            errdefer if (resolve_snap.bytes) |b| self.gpa.free(b);
-            const type_snap = try self.snapshotStage(source_id, .typecheck, self.gpa);
-            errdefer if (type_snap.bytes) |b| self.gpa.free(b);
-            const lower_snap = try self.snapshotStage(source_id, .lower, self.gpa);
-            errdefer if (lower_snap.bytes) |b| self.gpa.free(b);
-            const compile_snap = try self.snapshotStage(source_id, .compile, self.gpa);
+            var snaps: [5]query_cache.StageSnapshot = undefined;
+            var snap_count: usize = 0;
+            errdefer for (snaps[0..snap_count]) |s| if (s.bytes) |b| self.gpa.free(b);
+            inline for (.{ .parse, .resolve, .typecheck, .lower, .compile }, &snaps, 0..) |s, *dest, i| {
+                dest.* = try self.snapshotStage(source_id, s, self.gpa);
+                snap_count = i + 1;
+            }
 
             try query_cache.save(io, self.gpa, self.cacheOptions(), .{
                 .source_path = source_path,
                 .source_text = source.text,
-                .parse = parse_snap,
-                .resolve = resolve_snap,
-                .typecheck = type_snap,
-                .lower = lower_snap,
-                .compile = compile_snap,
+                .parse = snaps[0],
+                .resolve = snaps[1],
+                .typecheck = snaps[2],
+                .lower = snaps[3],
+                .compile = snaps[4],
             });
 
-            if (parse_snap.bytes) |b| self.gpa.free(b);
-            if (resolve_snap.bytes) |b| self.gpa.free(b);
-            if (type_snap.bytes) |b| self.gpa.free(b);
-            if (lower_snap.bytes) |b| self.gpa.free(b);
+            for (snaps[0..4]) |s| if (s.bytes) |b| self.gpa.free(b);
         }
     }
 
@@ -555,47 +524,25 @@ pub const QueryDb = struct {
         return memos.getPtr(source_id).?;
     }
 
-    fn ensureParseMemo(self: *@This(), source_id: db.SourceId, track_dependency: bool) (db.DbError || std.mem.Allocator.Error)!*db.Memo(parser.ParsedAst) {
-        return self.ensureMemo(source_id, track_dependency, .parse, struct {
-            fn compute(qdb: *QueryDb, sid: db.SourceId) (db.DbError || std.mem.Allocator.Error)!db.Memo(parser.ParsedAst) {
-                return parser.computeParse(try qdb.getSourceText(sid), qdb.gpa);
-            }
-        }.compute);
-    }
-
-    fn ensureResolveMemo(self: *@This(), source_id: db.SourceId, track_dependency: bool) (db.DbError || std.mem.Allocator.Error)!*db.Memo(resolver.ResolvedAst) {
-        return self.ensureMemo(source_id, track_dependency, .resolve, struct {
-            fn compute(qdb: *QueryDb, sid: db.SourceId) (db.DbError || std.mem.Allocator.Error)!db.Memo(resolver.ResolvedAst) {
-                const parse_memo = try qdb.ensureParseMemo(sid, true);
-                return resolver.computeResolve(parse_memo, qdb.gpa);
-            }
-        }.compute);
-    }
-
-    fn ensureTypeMemo(self: *@This(), source_id: db.SourceId, track_dependency: bool) (db.DbError || std.mem.Allocator.Error)!*db.Memo(typecheck.TypedAst) {
-        return self.ensureMemo(source_id, track_dependency, .typecheck, struct {
-            fn compute(qdb: *QueryDb, sid: db.SourceId) (db.DbError || std.mem.Allocator.Error)!db.Memo(typecheck.TypedAst) {
-                const resolve_memo = try qdb.ensureResolveMemo(sid, true);
-                const parse_memo = try qdb.ensureParseMemo(sid, true);
-                return typecheck.computeType(resolve_memo, parse_memo, qdb.gpa);
-            }
-        }.compute);
-    }
-
-    fn ensureLowerMemo(self: *@This(), source_id: db.SourceId, track_dependency: bool) (db.DbError || std.mem.Allocator.Error)!*db.Memo(ir_mod.Program) {
-        return self.ensureMemo(source_id, track_dependency, .lower, struct {
-            fn compute(qdb: *QueryDb, sid: db.SourceId) (db.DbError || std.mem.Allocator.Error)!db.Memo(ir_mod.Program) {
-                const type_memo = try qdb.ensureTypeMemo(sid, true);
-                return ir_mod.computeLower(type_memo, qdb.gpa);
-            }
-        }.compute);
-    }
-
-    fn ensureCompileMemo(self: *@This(), source_id: db.SourceId, track_dependency: bool) (db.DbError || std.mem.Allocator.Error)!*db.Memo([]const u8) {
-        return self.ensureMemo(source_id, track_dependency, .compile, struct {
-            fn compute(qdb: *QueryDb, sid: db.SourceId) (db.DbError || std.mem.Allocator.Error)!db.Memo([]const u8) {
-                const lower_memo = try qdb.ensureLowerMemo(sid, true);
-                return codegen.computeCompile(lower_memo, qdb.gpa);
+    fn ensureStageMemo(self: *@This(), source_id: db.SourceId, track_dependency: bool, comptime stage: Stage) (db.DbError || std.mem.Allocator.Error)!*db.Memo(stageValueType(stage)) {
+        return self.ensureMemo(source_id, track_dependency, stage, struct {
+            fn compute(qdb: *QueryDb, sid: db.SourceId) (db.DbError || std.mem.Allocator.Error)!db.Memo(stageValueType(stage)) {
+                if (comptime stage == .parse) {
+                    return try parser.computeParse(try qdb.getSourceText(sid), qdb.gpa);
+                }
+                if (comptime stage == .resolve) {
+                    return try resolver.computeResolve(try qdb.ensureStageMemo(sid, true, .parse), qdb.gpa);
+                }
+                if (comptime stage == .typecheck) {
+                    return try typecheck.computeType(try qdb.ensureStageMemo(sid, true, .resolve), try qdb.ensureStageMemo(sid, true, .parse), qdb.gpa);
+                }
+                if (comptime stage == .lower) {
+                    return try ir_mod.computeLower(try qdb.ensureStageMemo(sid, true, .typecheck), qdb.gpa);
+                }
+                if (comptime stage == .compile) {
+                    return try codegen.computeCompile(try qdb.ensureStageMemo(sid, true, .lower), qdb.gpa);
+                }
+                unreachable;
             }
         }.compute);
     }
@@ -624,26 +571,11 @@ pub const QueryDb = struct {
 
     fn queryChangedAfter(self: *@This(), key: db.QueryKey, revision: db.Revision) db.DbError!bool {
         return switch (key.kind) {
-            .parse => blk: {
-                const memo = try self.ensureParseMemo(key.source_id, false);
-                break :blk memo.changed_at > revision;
-            },
-            .resolve => blk: {
-                const memo = try self.ensureResolveMemo(key.source_id, false);
-                break :blk memo.changed_at > revision;
-            },
-            .typecheck => blk: {
-                const memo = try self.ensureTypeMemo(key.source_id, false);
-                break :blk memo.changed_at > revision;
-            },
-            .lower => blk: {
-                const memo = try self.ensureLowerMemo(key.source_id, false);
-                break :blk memo.changed_at > revision;
-            },
-            .compile => blk: {
-                const memo = try self.ensureCompileMemo(key.source_id, false);
-                break :blk memo.changed_at > revision;
-            },
+            .parse => (try self.ensureStageMemo(key.source_id, false, .parse)).changed_at > revision,
+            .resolve => (try self.ensureStageMemo(key.source_id, false, .resolve)).changed_at > revision,
+            .typecheck => (try self.ensureStageMemo(key.source_id, false, .typecheck)).changed_at > revision,
+            .lower => (try self.ensureStageMemo(key.source_id, false, .lower)).changed_at > revision,
+            .compile => (try self.ensureStageMemo(key.source_id, false, .compile)).changed_at > revision,
         };
     }
 

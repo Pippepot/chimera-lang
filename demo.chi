@@ -1,0 +1,8 @@
+comptime Foo = struct
+  x: int
+var foo = Foo{x = 10}
+print(foo.x)
+print(foo.x)
+comptime bar = func(x: int) int
+  return x + x
+print(bar(23))

@@ -79,6 +79,33 @@ fn initCacheDb(cache_enabled: bool) query.QueryDb {
     });
 }
 
+const PersistTest = struct {
+    tmp: testing.TmpDir,
+    source_path: []u8,
+    cache_path: []u8,
+
+    fn init(name: []const u8, text: []const u8) !@This() {
+        var tmp = testing.tmpDir(.{});
+        const source_path = try makeTmpSourcePath(testing.allocator, &tmp, name);
+        errdefer testing.allocator.free(source_path);
+        const cache_path = try std.fmt.allocPrint(testing.allocator, "{s}.qcache", .{source_path});
+        errdefer testing.allocator.free(cache_path);
+        try std.Io.Dir.cwd().writeFile(testing.io, .{
+            .sub_path = source_path,
+            .data = text,
+        });
+        return .{ .tmp = tmp, .source_path = source_path, .cache_path = cache_path };
+    }
+
+    fn deinit(self: *@This()) void {
+        std.Io.Dir.cwd().deleteFile(testing.io, self.source_path) catch {};
+        std.Io.Dir.cwd().deleteFile(testing.io, self.cache_path) catch {};
+        testing.allocator.free(self.cache_path);
+        testing.allocator.free(self.source_path);
+        self.tmp.cleanup();
+    }
+};
+
 test "parser builds declaration-root module" {
     const src =
         \\comptime Vec2 = struct
@@ -422,33 +449,21 @@ test "binding type annotation mismatch errors" {
 }
 
 test "persistent cache reuses compile result across db instances" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-
     const source_text = "print(42)\n";
-    const source_path = try makeTmpSourcePath(testing.allocator, &tmp, "persist_ok.chi");
-    defer testing.allocator.free(source_path);
-    const cache_path = try std.fmt.allocPrint(testing.allocator, "{s}.qcache", .{source_path});
-    defer testing.allocator.free(cache_path);
-
-    try std.Io.Dir.cwd().writeFile(testing.io, .{
-        .sub_path = source_path,
-        .data = source_text,
-    });
-    defer std.Io.Dir.cwd().deleteFile(testing.io, source_path) catch {};
-    defer std.Io.Dir.cwd().deleteFile(testing.io, cache_path) catch {};
+    var pt = try PersistTest.init("persist_ok.chi", source_text);
+    defer pt.deinit();
 
     {
         var db = initCacheDb(true);
         defer db.deinit();
-        try db.setSourceFile(0, source_path, source_text);
+        try db.setSourceFile(0, pt.source_path, source_text);
         _ = try expectCompileOk(&db, 0);
     }
 
     {
         var db = initCacheDb(true);
         defer db.deinit();
-        try db.setSourceFile(0, source_path, source_text);
+        try db.setSourceFile(0, pt.source_path, source_text);
         db.resetStats();
         _ = try expectCompileOk(&db, 0);
         const stats = db.statsSnapshot();
@@ -458,33 +473,21 @@ test "persistent cache reuses compile result across db instances" {
 }
 
 test "persistent cache disable option bypasses disk cache" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-
     const source_text = "print(7)\n";
-    const source_path = try makeTmpSourcePath(testing.allocator, &tmp, "persist_disabled.chi");
-    defer testing.allocator.free(source_path);
-    const cache_path = try std.fmt.allocPrint(testing.allocator, "{s}.qcache", .{source_path});
-    defer testing.allocator.free(cache_path);
-
-    try std.Io.Dir.cwd().writeFile(testing.io, .{
-        .sub_path = source_path,
-        .data = source_text,
-    });
-    defer std.Io.Dir.cwd().deleteFile(testing.io, source_path) catch {};
-    defer std.Io.Dir.cwd().deleteFile(testing.io, cache_path) catch {};
+    var pt = try PersistTest.init("persist_disabled.chi", source_text);
+    defer pt.deinit();
 
     {
         var db = initCacheDb(true);
         defer db.deinit();
-        try db.setSourceFile(0, source_path, source_text);
+        try db.setSourceFile(0, pt.source_path, source_text);
         _ = try expectCompileOk(&db, 0);
     }
 
     {
         var db = initCacheDb(false);
         defer db.deinit();
-        try db.setSourceFile(0, source_path, source_text);
+        try db.setSourceFile(0, pt.source_path, source_text);
         db.resetStats();
         _ = try expectCompileOk(&db, 0);
         const stats = db.statsSnapshot();
@@ -494,33 +497,21 @@ test "persistent cache disable option bypasses disk cache" {
 }
 
 test "persistent cache stores compile failures and diagnostics" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-
     const source_text = "print(missing_name)\n";
-    const source_path = try makeTmpSourcePath(testing.allocator, &tmp, "persist_fail.chi");
-    defer testing.allocator.free(source_path);
-    const cache_path = try std.fmt.allocPrint(testing.allocator, "{s}.qcache", .{source_path});
-    defer testing.allocator.free(cache_path);
-
-    try std.Io.Dir.cwd().writeFile(testing.io, .{
-        .sub_path = source_path,
-        .data = source_text,
-    });
-    defer std.Io.Dir.cwd().deleteFile(testing.io, source_path) catch {};
-    defer std.Io.Dir.cwd().deleteFile(testing.io, cache_path) catch {};
+    var pt = try PersistTest.init("persist_fail.chi", source_text);
+    defer pt.deinit();
 
     {
         var db = initCacheDb(true);
         defer db.deinit();
-        try db.setSourceFile(0, source_path, source_text);
+        try db.setSourceFile(0, pt.source_path, source_text);
         try expectCompileErrorContains(&db, 0, "unknown symbol");
     }
 
     {
         var db = initCacheDb(true);
         defer db.deinit();
-        try db.setSourceFile(0, source_path, source_text);
+        try db.setSourceFile(0, pt.source_path, source_text);
         db.resetStats();
         try expectCompileErrorContains(&db, 0, "unknown symbol");
         const stats = db.statsSnapshot();
@@ -529,38 +520,26 @@ test "persistent cache stores compile failures and diagnostics" {
 }
 
 test "corrupted persistent cache is ignored and rebuilt" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-
     const source_text = "print(5)\n";
-    const source_path = try makeTmpSourcePath(testing.allocator, &tmp, "persist_corrupt.chi");
-    defer testing.allocator.free(source_path);
-    const cache_path = try std.fmt.allocPrint(testing.allocator, "{s}.qcache", .{source_path});
-    defer testing.allocator.free(cache_path);
-
-    try std.Io.Dir.cwd().writeFile(testing.io, .{
-        .sub_path = source_path,
-        .data = source_text,
-    });
-    defer std.Io.Dir.cwd().deleteFile(testing.io, source_path) catch {};
-    defer std.Io.Dir.cwd().deleteFile(testing.io, cache_path) catch {};
+    var pt = try PersistTest.init("persist_corrupt.chi", source_text);
+    defer pt.deinit();
 
     {
         var db = initCacheDb(true);
         defer db.deinit();
-        try db.setSourceFile(0, source_path, source_text);
+        try db.setSourceFile(0, pt.source_path, source_text);
         _ = try expectCompileOk(&db, 0);
     }
 
     try std.Io.Dir.cwd().writeFile(testing.io, .{
-        .sub_path = cache_path,
+        .sub_path = pt.cache_path,
         .data = "not-a-valid-cache",
     });
 
     {
         var db = initCacheDb(true);
         defer db.deinit();
-        try db.setSourceFile(0, source_path, source_text);
+        try db.setSourceFile(0, pt.source_path, source_text);
         db.resetStats();
         _ = try expectCompileOk(&db, 0);
         const stats = db.statsSnapshot();
@@ -569,25 +548,13 @@ test "corrupted persistent cache is ignored and rebuilt" {
 }
 
 test "persistent cache load frees data on hash mismatch (regression)" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-
     const source_text = "print(42)\n";
     const different_text = "print(99)\n";
-    const source_path = try makeTmpSourcePath(testing.allocator, &tmp, "persist_hash_mismatch.chi");
-    defer testing.allocator.free(source_path);
-    const cache_path = try std.fmt.allocPrint(testing.allocator, "{s}.qcache", .{source_path});
-    defer testing.allocator.free(cache_path);
-
-    try std.Io.Dir.cwd().writeFile(testing.io, .{
-        .sub_path = source_path,
-        .data = source_text,
-    });
-    defer std.Io.Dir.cwd().deleteFile(testing.io, source_path) catch {};
-    defer std.Io.Dir.cwd().deleteFile(testing.io, cache_path) catch {};
+    var pt = try PersistTest.init("persist_hash_mismatch.chi", source_text);
+    defer pt.deinit();
 
     try query_cache.save(testing.io, testing.allocator, .{}, .{
-        .source_path = source_path,
+        .source_path = pt.source_path,
         .source_text = source_text,
         .parse = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
         .resolve = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
@@ -596,7 +563,7 @@ test "persistent cache load frees data on hash mismatch (regression)" {
         .compile = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
     });
 
-    const result = try query_cache.load(testing.io, testing.allocator, .{}, source_path, different_text);
+    const result = try query_cache.load(testing.io, testing.allocator, .{}, pt.source_path, different_text);
     try testing.expect(result == null);
 }
 

@@ -550,10 +550,6 @@ const Parser = struct {
         return ast.Span{ .start = 0, .end = 0 };
     }
 
-    fn spanOfToken(_: *const @This(), token: Token) ast.Span {
-        return tokenSpan(token);
-    }
-
     fn makeConstNode(self: *@This(), name: []const u8, ty: ?NodeIdx, value: NodeIdx, span: ast.Span) !NodeIdx {
         const name_idx = try self.internName(name);
         if (ty) |type_idx| {
@@ -650,6 +646,40 @@ const Parser = struct {
         }
     }
 
+    fn parseIndentedBlock(self: *@This(), err: ParseError) ParseError!NodeIdx {
+        try self.consumeNewlines();
+        try self.expect(.indent, err);
+        const body = try self.parseBlockUntil();
+        try self.consumeNewlines();
+        try self.expect(.dedent, err);
+        return body;
+    }
+
+    fn parseOptionalIndentedBlock(self: *@This()) ParseError!NodeIdx {
+        try self.consumeNewlines();
+        if (self.current.tag == .indent) {
+            try self.advance();
+            const body = try self.parseBlockUntil();
+            try self.consumeNewlines();
+            try self.expect(.dedent, error.ExpectedExpression);
+            return body;
+        }
+        return self.parseExpression();
+    }
+
+    fn expectStatementTerminated(self: *@This(), stmt_end: usize) ParseError!void {
+        switch (self.current.tag) {
+            .newline, .eof, .dedent, .r_paren, .kw_else => {},
+            else => {
+                const cursor_start = if (self.current.start > self.lexer.source.len) self.lexer.source.len else self.current.start;
+                if (cursor_start <= stmt_end) return error.UnexpectedToken;
+                if (std.mem.indexOfScalar(u8, self.lexer.source[stmt_end..cursor_start], '\n') == null) {
+                    return error.UnexpectedToken;
+                }
+            },
+        }
+    }
+
     fn parseProgram(self: *@This()) ParseError!NodeIdx {
         try self.consumeNewlines();
 
@@ -716,12 +746,7 @@ const Parser = struct {
         try self.expect(.r_paren, error.ExpectedRParen);
         const ret_ty = try self.parseType();
 
-        try self.consumeNewlines();
-        if (self.current.tag != .indent) return error.ExpectedIndent;
-        try self.advance();
-        const body = try self.parseBlockUntil();
-        try self.consumeNewlines();
-        try self.expect(.dedent, error.ExpectedIndent);
+        const body = try self.parseIndentedBlock(error.ExpectedIndent);
 
         const param_count: u32 = @intCast(param_names.items.len);
         try self.builder.extra.append(self.builder.gpa, param_count);
@@ -823,11 +848,36 @@ const Parser = struct {
         }
     }
 
+    const BindingKind = enum { const_kind, var_kind };
+
     fn parseStatement(self: *@This()) ParseError!NodeIdx {
-        if (self.current.tag == .kw_const) return self.parseConstBinding();
-        if (self.current.tag == .kw_var) return self.parseVarBinding();
+        if (self.current.tag == .kw_const) return self.parseBinding(.const_kind);
+        if (self.current.tag == .kw_var) return self.parseBinding(.var_kind);
         if (self.current.tag == .kw_return) return self.parseReturn();
+        if (self.current.tag == .kw_comptime) {
+            const decl = try self.parseDeclaration();
+            try self.builder.decls.append(self.builder.gpa, decl);
+            return decl;
+        }
         return self.parseExpression();
+    }
+
+    fn bindCrossLineElse(self: *@This(), items: *const std.ArrayList(NodeIdx)) ParseError!void {
+        if (items.items.len == 0) return error.ExpectedExpression;
+        const last_idx = items.items.len - 1;
+        const if_node_data = findIfWithoutElse(self.builder, items.items[last_idx]) orelse return error.ExpectedExpression;
+        try self.advance();
+        const else_expr = try self.parseOptionalIndentedBlock();
+
+        const ei = self.builder.extra.items.len;
+        try self.builder.extra.append(self.builder.gpa, if_node_data.then_);
+        try self.builder.extra.append(self.builder.gpa, else_expr);
+        const node = &self.builder.nodes.items[if_node_data.if_idx];
+        node.data1 = @intCast(ei);
+
+        if (self.current.tag == .newline) {
+            try self.consumeNewlines();
+        }
     }
 
     fn parseBlockUntil(self: *@This()) ParseError!NodeIdx {
@@ -836,31 +886,8 @@ const Parser = struct {
 
         while (self.current.tag != .eof and self.current.tag != .r_paren and self.current.tag != .dedent) {
             if (self.current.tag == .kw_else) {
-                if (items.items.len == 0) return error.ExpectedExpression;
-                const last_idx = items.items.len - 1;
-                if (findIfWithoutElse(self.builder, items.items[last_idx])) |if_node_data| {
-                    try self.advance();
-                    try self.consumeNewlines();
-                    const else_expr = if (self.current.tag == .indent) blk: {
-                        try self.advance();
-                        const body = try self.parseBlockUntil();
-                        try self.consumeNewlines();
-                        try self.expect(.dedent, error.ExpectedExpression);
-                        break :blk body;
-                    } else try self.parseExpression();
-
-                    const ei = self.builder.extra.items.len;
-                    try self.builder.extra.append(self.builder.gpa, if_node_data.then_);
-                    try self.builder.extra.append(self.builder.gpa, else_expr);
-                    const node = &self.builder.nodes.items[if_node_data.if_idx];
-                    node.data1 = @intCast(ei);
-
-                    if (self.current.tag == .newline) {
-                        try self.consumeNewlines();
-                    }
-                    continue;
-                }
-                return error.ExpectedExpression;
+                try self.bindCrossLineElse(&items);
+                continue;
             }
 
             const statement = try self.parseStatement();
@@ -873,12 +900,8 @@ const Parser = struct {
             if (self.current.tag == .eof or self.current.tag == .r_paren or self.current.tag == .dedent) break;
             if (self.current.tag == .kw_else) continue;
 
-            const stmt_span = try self.spanOf(statement);
-            const cursor_start = if (self.current.start > self.lexer.source.len) self.lexer.source.len else self.current.start;
-            if (cursor_start > stmt_span.end and std.mem.indexOfScalar(u8, self.lexer.source[stmt_span.end..cursor_start], '\n') != null) {
-                continue;
-            }
-            return error.UnexpectedToken;
+            try self.expectStatementTerminated((try self.spanOf(statement)).end);
+            continue;
         }
 
         return self.makeBlockNode(items.items);
@@ -899,18 +922,6 @@ const Parser = struct {
         return node;
     }
 
-    fn stringOf(self: *@This(), idx: u32) []const u8 {
-        const start = if (idx < self.builder.string_offsets.items.len)
-            self.builder.string_offsets.items[idx]
-        else
-            0;
-        const end = if (idx + 1 < self.builder.string_offsets.items.len)
-            self.builder.string_offsets.items[idx + 1]
-        else
-            @as(u32, @intCast(self.builder.string_bytes.items.len));
-        return self.builder.string_bytes.items[start..end];
-    }
-
     fn parseReturn(self: *@This()) ParseError!NodeIdx {
         const ret_span = tokenSpan(self.current);
         try self.expect(.kw_return, error.UnexpectedToken);
@@ -919,9 +930,13 @@ const Parser = struct {
         return self.makeReturnNode(value, span);
     }
 
-    fn parseConstBinding(self: *@This()) ParseError!NodeIdx {
-        const const_span = tokenSpan(self.current);
-        try self.expect(.kw_const, error.UnexpectedToken);
+    fn parseBinding(self: *@This(), kind: BindingKind) ParseError!NodeIdx {
+        const keyword_span = tokenSpan(self.current);
+        const keyword_tag: TokenTag = switch (kind) {
+            .const_kind => .kw_const,
+            .var_kind => .kw_var,
+        };
+        try self.expect(keyword_tag, error.UnexpectedToken);
         if (self.current.tag != .ident) return error.ExpectedIdentifier;
         const ident = self.current.ident;
         try self.advance();
@@ -933,103 +948,41 @@ const Parser = struct {
         try self.expect(.assign, error.ExpectedAssign);
         const value = try self.parseExpression();
         const value_span = try self.spanOf(value);
-        switch (self.current.tag) {
-            .newline, .eof, .dedent, .r_paren, .kw_else => {},
-            else => {
-                const cursor_start = if (self.current.start > self.lexer.source.len) self.lexer.source.len else self.current.start;
-                if (cursor_start <= value_span.end) return error.UnexpectedToken;
-                if (std.mem.indexOfScalar(u8, self.lexer.source[value_span.end..cursor_start], '\n') == null) {
-                    return error.UnexpectedToken;
-                }
-            },
-        }
+        try self.expectStatementTerminated(value_span.end);
         const end_span = if (binding_ty) |ty| coverSpans(try self.spanOf(ty), value_span) else value_span;
-        const const_node_span = coverSpans(const_span, end_span);
-        return self.makeConstNode(ident, binding_ty, value, const_node_span);
+        const node_span = coverSpans(keyword_span, end_span);
+        return switch (kind) {
+            .const_kind => self.makeConstNode(ident, binding_ty, value, node_span),
+            .var_kind => self.makeVarNode(ident, binding_ty, value, node_span),
+        };
     }
 
-    fn parseVarBinding(self: *@This()) ParseError!NodeIdx {
-        const var_span = tokenSpan(self.current);
-        try self.expect(.kw_var, error.UnexpectedToken);
-        if (self.current.tag != .ident) return error.ExpectedIdentifier;
-        const ident = self.current.ident;
-        try self.advance();
-        var binding_ty: ?u32 = null;
-        if (self.current.tag == .colon) {
+    const BinOpEntry = struct { token: TokenTag, tag: BinTag };
+
+    fn parseBinary(self: *@This(), ops: []const BinOpEntry, next: *const fn (*Parser) ParseError!NodeIdx) ParseError!NodeIdx {
+        var lhs = try next(self);
+        while (true) {
+            const found = for (ops) |op| {
+                if (self.current.tag == op.token) break op.tag;
+            } else null;
+            const bin_tag = found orelse break;
             try self.advance();
-            binding_ty = try self.parseType();
+            const rhs = try next(self);
+            lhs = try self.makeBinop(bin_tag, lhs, rhs);
         }
-        try self.expect(.assign, error.ExpectedAssign);
-        const value = try self.parseExpression();
-        const value_span = try self.spanOf(value);
-        switch (self.current.tag) {
-            .newline, .eof, .dedent, .r_paren, .kw_else => {},
-            else => {
-                const cursor_start = if (self.current.start > self.lexer.source.len) self.lexer.source.len else self.current.start;
-                if (cursor_start <= value_span.end) return error.UnexpectedToken;
-                if (std.mem.indexOfScalar(u8, self.lexer.source[value_span.end..cursor_start], '\n') == null) {
-                    return error.UnexpectedToken;
-                }
-            },
-        }
-        const end_span = if (binding_ty) |ty| coverSpans(try self.spanOf(ty), value_span) else value_span;
-        const var_node_span = coverSpans(var_span, end_span);
-        return self.makeVarNode(ident, binding_ty, value, var_node_span);
+        return lhs;
     }
 
     fn parseComparison(self: *@This()) ParseError!NodeIdx {
-        var lhs = try self.parseAdditive();
-
-        while (true) {
-            const bin_tag = switch (self.current.tag) {
-                .lt => BinTag.lt,
-                .gt => BinTag.gt,
-                .le => BinTag.le,
-                .ge => BinTag.ge,
-                .eq_eq => BinTag.eq,
-                .ne => BinTag.ne,
-                else => break,
-            };
-            try self.advance();
-            const rhs = try self.parseAdditive();
-            lhs = try self.makeBinop(bin_tag, lhs, rhs);
-        }
-
-        return lhs;
+        return self.parseBinary(&.{ .{ .token = .lt, .tag = .lt }, .{ .token = .gt, .tag = .gt }, .{ .token = .le, .tag = .le }, .{ .token = .ge, .tag = .ge }, .{ .token = .eq_eq, .tag = .eq }, .{ .token = .ne, .tag = .ne } }, &Parser.parseAdditive);
     }
 
     fn parseAdditive(self: *@This()) ParseError!NodeIdx {
-        var lhs = try self.parseMultiplicative();
-
-        while (true) {
-            const bin_tag = switch (self.current.tag) {
-                .plus => BinTag.add,
-                .minus => BinTag.sub,
-                else => break,
-            };
-            try self.advance();
-            const rhs = try self.parseMultiplicative();
-            lhs = try self.makeBinop(bin_tag, lhs, rhs);
-        }
-
-        return lhs;
+        return self.parseBinary(&.{ .{ .token = .plus, .tag = .add }, .{ .token = .minus, .tag = .sub } }, &Parser.parseMultiplicative);
     }
 
     fn parseMultiplicative(self: *@This()) ParseError!NodeIdx {
-        var lhs = try self.parseUnary();
-
-        while (true) {
-            const bin_tag = switch (self.current.tag) {
-                .star => BinTag.mul,
-                .slash => BinTag.div,
-                else => break,
-            };
-            try self.advance();
-            const rhs = try self.parseUnary();
-            lhs = try self.makeBinop(bin_tag, lhs, rhs);
-        }
-
-        return lhs;
+        return self.parseBinary(&.{ .{ .token = .star, .tag = .mul }, .{ .token = .slash, .tag = .div } }, &Parser.parseUnary);
     }
 
     fn parseUnary(self: *@This()) ParseError!NodeIdx {
@@ -1224,27 +1177,12 @@ const Parser = struct {
         const then_expr = if (self.current.tag == .arrow) then_body: {
             try self.advance();
             break :then_body try self.parseExpression();
-        } else then_body: {
-            try self.consumeNewlines();
-            try self.expect(.indent, error.ExpectedExpression);
-            const body = try self.parseBlockUntil();
-            try self.consumeNewlines();
-            try self.expect(.dedent, error.ExpectedExpression);
-            break :then_body body;
-        };
+        } else try self.parseIndentedBlock(error.ExpectedExpression);
 
         var else_expr: ?NodeIdx = null;
         if (self.current.tag == .kw_else) {
             try self.advance();
-            try self.consumeNewlines();
-            if (self.current.tag == .indent) {
-                try self.advance();
-                else_expr = try self.parseBlockUntil();
-                try self.consumeNewlines();
-                try self.expect(.dedent, error.ExpectedExpression);
-            } else {
-                else_expr = try self.parseExpression();
-            }
+            else_expr = try self.parseOptionalIndentedBlock();
         }
 
         const end_span = if (else_expr) |e| try self.spanOf(e) else try self.spanOf(then_expr);
@@ -1312,7 +1250,7 @@ pub fn parseReport(source: []const u8, gpa: std.mem.Allocator) error{OutOfMemory
     var builder = AstBuilder.init(gpa);
     errdefer builder.deinit();
 
-    const entry = parseSource(&builder, source) catch |err| {
+    var parser = Parser.init(source, &builder) catch |err| {
         builder.deinit();
         const end = if (source.len > 0) @as(usize, 1) else 0;
         return .{
@@ -1324,6 +1262,21 @@ pub fn parseReport(source: []const u8, gpa: std.mem.Allocator) error{OutOfMemory
             },
         };
     };
+
+    const entry = parser.parseProgram() catch |err| {
+        const error_span = ast.Span{ .start = parser.current.start, .end = parser.current.end };
+        parser.deinit();
+        builder.deinit();
+        return .{
+            .parsed = null,
+            .diagnostic = .{
+                .stage = .parse,
+                .span = error_span,
+                .message = parseErrorMessage(err),
+            },
+        };
+    };
+    parser.deinit();
 
     var scratch_arena = std.heap.ArenaAllocator.init(gpa);
     errdefer scratch_arena.deinit();
@@ -1344,10 +1297,4 @@ pub fn parseReport(source: []const u8, gpa: std.mem.Allocator) error{OutOfMemory
     };
 }
 
-fn parseSource(builder: *AstBuilder, source: []const u8) (ParseError || error{OutOfMemory})!NodeIdx {
-    var parser = try Parser.init(source, builder);
-    defer parser.deinit();
 
-    const entry = try parser.parseProgram();
-    return entry;
-}

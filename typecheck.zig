@@ -78,6 +78,7 @@ pub const TypedAst = struct {
     arena: std.heap.ArenaAllocator,
     ast: *const ast.Ast,
     node_types: std.AutoHashMap(ast.NodeIdx, Type),
+    field_index: std.AutoHashMap(ast.NodeIdx, u32),
     functions: []FunctionInfo,
     entry_function: u32,
 
@@ -86,6 +87,7 @@ pub const TypedAst = struct {
             .arena = std.heap.ArenaAllocator.init(gpa),
             .ast = parsed_ast,
             .node_types = std.AutoHashMap(ast.NodeIdx, Type).init(gpa),
+            .field_index = std.AutoHashMap(ast.NodeIdx, u32).init(gpa),
             .functions = &.{},
             .entry_function = 0,
         };
@@ -93,6 +95,7 @@ pub const TypedAst = struct {
 
     pub fn deinit(self: *@This()) void {
         self.node_types.deinit();
+        self.field_index.deinit();
         self.arena.deinit();
     }
 
@@ -498,9 +501,10 @@ const Checker = struct {
             else => return self.failAtNode(idx, error.FieldAccessOnNonStruct),
         };
         const struct_decl = self.findStructDecl(struct_name) orelse return self.failAtNode(idx, error.UnknownType);
-        for (a.structFields(struct_decl)) |f| {
+        for (a.structFields(struct_decl), 0..) |f, i| {
             const f_name = a.stringOf(f.name);
             if (std.mem.eql(u8, f_name, field_name)) {
+                try self.typed.field_index.put(idx, @intCast(i));
                 return self.remember(idx, try self.resolveTypeNode(f.ty));
             }
         }
@@ -569,7 +573,8 @@ const Checker = struct {
             .if_stmt => self.inferIf(idx),
             .struct_init => self.inferStructInit(idx),
             .field_access => self.inferFieldAccess(idx),
-            .type_name, .type_func, .comptime_fn, .comptime_struct => unreachable,
+            .comptime_fn, .comptime_struct => try self.remember(idx, .unit),
+            .type_name, .type_func => unreachable,
         };
     }
 

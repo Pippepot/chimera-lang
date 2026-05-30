@@ -12,7 +12,7 @@ const typecheck = @import("typecheck.zig");
 const CacheExt = ".qcache";
 const Magic: [8]u8 = .{ 'X', '8', '6', 'Q', 'C', 'A', 'C', 'H' };
 const SchemaVersion: u32 = 4;
-const CompilerAbiVersion: u32 = 1;
+const CompilerAbiVersion: u32 = 2;
 
 pub const CacheOptions = struct {
     cache_dir_override: ?[]const u8 = null,
@@ -440,8 +440,6 @@ fn writeFunction(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, func: ir_mod.F
     try appendU32(buf, gpa, func.entry);
     try writeType(buf, gpa, func.ret_type);
     try appendU32(buf, gpa, func.next_value);
-    try appendU32(buf, gpa, @intCast(func.value_types.items.len));
-    for (func.value_types.items) |vt| try writeType(buf, gpa, vt);
     try appendU32(buf, gpa, @intCast(func.param_values.items.len));
     for (func.param_values.items) |pv| try appendU32(buf, gpa, pv);
     try appendU32(buf, gpa, @intCast(func.blocks.items.len));
@@ -454,13 +452,6 @@ fn readFunction(r: *Reader, gpa: std.mem.Allocator) LoadError!ir_mod.Function {
     const entry = try r.readU32();
     const ret_type = try readType(r);
     const next_value = try r.readU32();
-    const vt_count = try r.readU32();
-    var value_types = try std.ArrayList(ir_mod.Type).initCapacity(gpa, vt_count);
-    errdefer value_types.deinit(gpa);
-    var vi: u32 = 0;
-    while (vi < vt_count) : (vi += 1) {
-        try value_types.append(gpa, try readType(r));
-    }
     const pv_count = try r.readU32();
     var param_values = try std.ArrayList(ir_mod.ValueRef).initCapacity(gpa, pv_count);
     errdefer param_values.deinit(gpa);
@@ -483,7 +474,6 @@ fn readFunction(r: *Reader, gpa: std.mem.Allocator) LoadError!ir_mod.Function {
         .name = name,
         .entry = entry,
         .blocks = blocks,
-        .value_types = value_types,
         .next_value = next_value,
         .param_values = param_values,
         .ret_type = ret_type,
