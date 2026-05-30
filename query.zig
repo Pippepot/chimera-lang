@@ -4,7 +4,6 @@ const db = @import("db.zig");
 const parser = @import("parser.zig");
 const resolver = @import("resolver.zig");
 const typecheck = @import("typecheck.zig");
-const monomorphize = @import("monomorphize.zig");
 const ir_mod = @import("ir.zig");
 const codegen = @import("codegen.zig");
 const ast = @import("ast.zig");
@@ -30,7 +29,6 @@ pub fn appendQueryDiagnostics(out: *std.ArrayList(u8), gpa: std.mem.Allocator, s
     try out.print(gpa, ";   parse: hits={d} recomputes={d}\n", .{ stats.parse_hits, stats.parse_recomputes });
     try out.print(gpa, ";   resolve: hits={d} recomputes={d}\n", .{ stats.resolve_hits, stats.resolve_recomputes });
     try out.print(gpa, ";   type: hits={d} recomputes={d}\n", .{ stats.type_hits, stats.type_recomputes });
-    try out.print(gpa, ";   monomorphize: hits={d} recomputes={d}\n", .{ stats.mono_hits, stats.mono_recomputes });
     try out.print(gpa, ";   lower: hits={d} recomputes={d}\n", .{ stats.lower_hits, stats.lower_recomputes });
     try out.print(gpa, ";   compile: hits={d} recomputes={d}\n", .{ stats.compile_hits, stats.compile_recomputes });
     try out.print(gpa, ";   dependencies: checks={d} invalidations={d}\n", .{ stats.dependency_checks, stats.dependency_invalidations });
@@ -47,6 +45,17 @@ const ActiveQuery = struct {
     deps: std.ArrayList(db.Dependency),
 };
 
+/// Maps Stage enum to the Zig type stored in the memo's `.value` field.
+fn stageValueType(comptime stage: Stage) type {
+    return switch (stage) {
+        .parse => parser.ParsedAst,
+        .resolve => resolver.ResolvedAst,
+        .typecheck => typecheck.TypedAst,
+        .lower => ir_mod.Program,
+        .compile => []const u8,
+    };
+}
+
 fn freeMemoValue(comptime T: type, value: *?T, gpa: std.mem.Allocator) void {
     if (value.*) |*v| {
         if (comptime T == parser.ParsedAst) {
@@ -55,8 +64,6 @@ fn freeMemoValue(comptime T: type, value: *?T, gpa: std.mem.Allocator) void {
             v.deinit(gpa);
         } else if (comptime T == typecheck.TypedAst) {
             v.deinit();
-        } else if (comptime T == monomorphize.MonoProgram) {
-            v.deinit(gpa);
         } else if (comptime T == ir_mod.Program) {
             v.deinit(gpa);
         } else if (comptime T == []const u8) {
@@ -76,7 +83,6 @@ fn recordHit(stats: *db.QueryStats, comptime stage: Stage) void {
         .parse => stats.parse_hits += 1,
         .resolve => stats.resolve_hits += 1,
         .typecheck => stats.type_hits += 1,
-        .monomorphize => stats.mono_hits += 1,
         .lower => stats.lower_hits += 1,
         .compile => stats.compile_hits += 1,
     }
@@ -87,7 +93,6 @@ fn recordRecompute(stats: *db.QueryStats, comptime stage: Stage) void {
         .parse => stats.parse_recomputes += 1,
         .resolve => stats.resolve_recomputes += 1,
         .typecheck => stats.type_recomputes += 1,
-        .monomorphize => stats.mono_recomputes += 1,
         .lower => stats.lower_recomputes += 1,
         .compile => stats.compile_recomputes += 1,
     }
@@ -104,7 +109,6 @@ pub const QueryDb = struct {
     parse_memos: std.AutoHashMap(db.SourceId, db.Memo(parser.ParsedAst)),
     resolve_memos: std.AutoHashMap(db.SourceId, db.Memo(resolver.ResolvedAst)),
     type_memos: std.AutoHashMap(db.SourceId, db.Memo(typecheck.TypedAst)),
-    mono_memos: std.AutoHashMap(db.SourceId, db.Memo(monomorphize.MonoProgram)),
     lower_memos: std.AutoHashMap(db.SourceId, db.Memo(ir_mod.Program)),
     compile_memos: std.AutoHashMap(db.SourceId, db.Memo([]const u8)),
     active_stack: std.ArrayList(ActiveQuery),
@@ -129,11 +133,21 @@ pub const QueryDb = struct {
             .parse_memos = std.AutoHashMap(db.SourceId, db.Memo(parser.ParsedAst)).init(gpa),
             .resolve_memos = std.AutoHashMap(db.SourceId, db.Memo(resolver.ResolvedAst)).init(gpa),
             .type_memos = std.AutoHashMap(db.SourceId, db.Memo(typecheck.TypedAst)).init(gpa),
-            .mono_memos = std.AutoHashMap(db.SourceId, db.Memo(monomorphize.MonoProgram)).init(gpa),
             .lower_memos = std.AutoHashMap(db.SourceId, db.Memo(ir_mod.Program)).init(gpa),
             .compile_memos = std.AutoHashMap(db.SourceId, db.Memo([]const u8)).init(gpa),
             .active_stack = .empty,
             .stats = .{},
+        };
+    }
+
+    /// Returns the memo HashMap for a given stage. Used by ensureMemoImpl and deinit.
+    fn memosFor(self: *@This(), comptime stage: Stage) *std.AutoHashMap(db.SourceId, db.Memo(stageValueType(stage))) {
+        return switch (stage) {
+            .parse => &self.parse_memos,
+            .resolve => &self.resolve_memos,
+            .typecheck => &self.type_memos,
+            .lower => &self.lower_memos,
+            .compile => &self.compile_memos,
         };
     }
 
@@ -163,11 +177,6 @@ pub const QueryDb = struct {
             var iter = self.type_memos.iterator();
             while (iter.next()) |entry| deinitMemo(typecheck.TypedAst, entry.value_ptr, self.gpa);
             self.type_memos.deinit();
-        }
-        {
-            var iter = self.mono_memos.iterator();
-            while (iter.next()) |entry| deinitMemo(monomorphize.MonoProgram, entry.value_ptr, self.gpa);
-            self.mono_memos.deinit();
         }
         {
             var iter = self.lower_memos.iterator();
@@ -257,12 +266,6 @@ pub const QueryDb = struct {
         return null;
     }
 
-    pub fn monomorphizedProgram(self: *@This(), source_id: db.SourceId) db.DbError!?*const monomorphize.MonoProgram {
-        const memo = try self.ensureMonomorphizeMemo(source_id, true);
-        if (memo.value) |*mono| return mono;
-        return null;
-    }
-
     pub fn loweredProgram(self: *@This(), source_id: db.SourceId) db.DbError!?*const ir_mod.Program {
         const memo = try self.ensureLowerMemo(source_id, true);
         if (memo.value) |*prog| return prog;
@@ -297,7 +300,6 @@ pub const QueryDb = struct {
             .parse => if (self.parse_memos.get(source_id)) |memo| memo.changed_at else null,
             .resolve => if (self.resolve_memos.get(source_id)) |memo| memo.changed_at else null,
             .typecheck => if (self.type_memos.get(source_id)) |memo| memo.changed_at else null,
-            .monomorphize => if (self.mono_memos.get(source_id)) |memo| memo.changed_at else null,
             .lower => if (self.lower_memos.get(source_id)) |memo| memo.changed_at else null,
             .compile => if (self.compile_memos.get(source_id)) |memo| memo.changed_at else null,
         };
@@ -307,6 +309,10 @@ pub const QueryDb = struct {
         return .{ .cache_dir_override = self.cache_dir_override };
     }
 
+    /// Load pre-computed stage values from the on-disk persistent cache.
+    /// Each block follows the same pattern: deserialize → makeMemo → take diagnostics →
+    /// create deps → set timestamps → register.  The typecheck stage is the only one
+    /// that additionally needs the parsed AST (from the parse memo) during deserialization.
     fn tryLoadPersistentCache(self: *@This(), source_id: db.SourceId, input: *SourceInput) void {
         if (!self.persistent_cache_enabled) return;
         if (self.io == null) return;
@@ -362,22 +368,7 @@ pub const QueryDb = struct {
         type_memo.verified_at = self.revision;
         type_memo.changed_at = self.revision;
 
-        // ── 4. Monomorphize memo ──
-        const mono_value = if (loaded.monomorphize.has_value and loaded.monomorphize.bytes != null)
-            query_cache.deserializeMono(self.gpa, loaded.monomorphize.bytes.?) catch return
-        else
-            null;
-        var mono_memo = db.makeMemo(monomorphize.MonoProgram, mono_value, loaded.monomorphize.diagnostics);
-        loaded.monomorphize.diagnostics = .empty;
-        {
-            var md = std.ArrayList(db.Dependency).initCapacity(self.gpa, 1) catch return;
-            md.append(self.gpa, .{ .query = queryFor(.typecheck, source_id) }) catch return;
-            mono_memo.deps = md;
-        }
-        mono_memo.verified_at = self.revision;
-        mono_memo.changed_at = self.revision;
-
-        // ── 5. Lower memo ──
+        // ── 4. Lower memo ──
         const lower_value = if (loaded.lower.has_value and loaded.lower.bytes != null)
             query_cache.deserializeProgram(self.gpa, loaded.lower.bytes.?) catch return
         else
@@ -386,13 +377,13 @@ pub const QueryDb = struct {
         loaded.lower.diagnostics = .empty;
         {
             var ld = std.ArrayList(db.Dependency).initCapacity(self.gpa, 1) catch return;
-            ld.append(self.gpa, .{ .query = queryFor(.monomorphize, source_id) }) catch return;
+            ld.append(self.gpa, .{ .query = queryFor(.typecheck, source_id) }) catch return;
             lower_memo.deps = ld;
         }
         lower_memo.verified_at = self.revision;
         lower_memo.changed_at = self.revision;
 
-        // ── 6. Compile memo ──
+        // ── 5. Compile memo ──
         const compile_bytes = if (loaded.compile.bytes) |bytes| self.gpa.dupe(u8, bytes) catch return else null;
         var compile_memo = db.makeMemo([]const u8, compile_bytes, loaded.compile.diagnostics);
         loaded.compile.diagnostics = .empty;
@@ -408,54 +399,35 @@ pub const QueryDb = struct {
         self.cache_backings.append(self.gpa, loaded.backing) catch return;
         loaded.backing = loaded.backing[0..0];
 
-        // ── Insert all memos ──
         _ = self.parse_memos.fetchPut(source_id, parse_memo) catch return;
         _ = self.resolve_memos.fetchPut(source_id, resolve_memo) catch return;
         _ = self.type_memos.fetchPut(source_id, type_memo) catch return;
-        _ = self.mono_memos.fetchPut(source_id, mono_memo) catch return;
         _ = self.lower_memos.fetchPut(source_id, lower_memo) catch return;
         _ = self.compile_memos.fetchPut(source_id, compile_memo) catch return;
     }
 
-    fn snapshotStage(self: *const @This(), source_id: db.SourceId, stage: Stage, gpa: std.mem.Allocator) (error{OutOfMemory}!query_cache.StageSnapshot) {
-        return switch (stage) {
-            .parse => if (self.parse_memos.get(source_id)) |memo| .{
-                .changed_at = memo.changed_at,
-                .has_value = memo.value != null,
-                .diagnostics = memo.diagnostics.items,
-                .bytes = if (memo.value) |*v| try query_cache.serializeParsed(gpa, v) else null,
-            } else .{ .changed_at = 0, .has_value = false, .diagnostics = &.{}, .bytes = null },
-            .resolve => if (self.resolve_memos.get(source_id)) |memo| .{
-                .changed_at = memo.changed_at,
-                .has_value = memo.value != null,
-                .diagnostics = memo.diagnostics.items,
-                .bytes = if (memo.value) |*v| try query_cache.serializeResolved(gpa, v) else null,
-            } else .{ .changed_at = 0, .has_value = false, .diagnostics = &.{}, .bytes = null },
-            .typecheck => if (self.type_memos.get(source_id)) |memo| .{
-                .changed_at = memo.changed_at,
-                .has_value = memo.value != null,
-                .diagnostics = memo.diagnostics.items,
-                .bytes = if (memo.value) |*v| try query_cache.serializeTyped(gpa, v) else null,
-            } else .{ .changed_at = 0, .has_value = false, .diagnostics = &.{}, .bytes = null },
-            .monomorphize => if (self.mono_memos.get(source_id)) |memo| .{
-                .changed_at = memo.changed_at,
-                .has_value = memo.value != null,
-                .diagnostics = memo.diagnostics.items,
-                .bytes = if (memo.value) |*v| try query_cache.serializeMono(gpa, v) else null,
-            } else .{ .changed_at = 0, .has_value = false, .diagnostics = &.{}, .bytes = null },
-            .lower => if (self.lower_memos.get(source_id)) |memo| .{
-                .changed_at = memo.changed_at,
-                .has_value = memo.value != null,
-                .diagnostics = memo.diagnostics.items,
-                .bytes = if (memo.value) |*v| try query_cache.serializeProgram(gpa, v) else null,
-            } else .{ .changed_at = 0, .has_value = false, .diagnostics = &.{}, .bytes = null },
-            .compile => if (self.compile_memos.get(source_id)) |memo| .{
-                .changed_at = memo.changed_at,
-                .has_value = memo.value != null,
-                .diagnostics = memo.diagnostics.items,
-                .bytes = memo.value,
-            } else .{ .changed_at = 0, .has_value = false, .diagnostics = &.{}, .bytes = null },
-        };
+    /// Serialises one stage's memo value (and diagnostics) for persistent cache storage.
+    /// Each stage delegates to its dedicated `query_cache.serializeXxx` function.
+    fn snapshotStage(self: *@This(), source_id: db.SourceId, comptime stage: Stage, gpa: std.mem.Allocator) (error{OutOfMemory}!query_cache.StageSnapshot) {
+        _ = stageValueType(stage);
+        return if (self.memosFor(stage).get(source_id)) |memo| .{
+            .changed_at = memo.changed_at,
+            .has_value = memo.value != null,
+            .diagnostics = memo.diagnostics.items,
+            .bytes = if (memo.value) |*v|
+                if (comptime stage == .compile)
+                    v.*
+                else if (comptime stage == .parse)
+                    try query_cache.serializeParsed(gpa, @as(*const parser.ParsedAst, @ptrCast(v)))
+                else if (comptime stage == .resolve)
+                    try query_cache.serializeResolved(gpa, @as(*const resolver.ResolvedAst, @ptrCast(v)))
+                else if (comptime stage == .typecheck)
+                    try query_cache.serializeTyped(gpa, @as(*const typecheck.TypedAst, @ptrCast(v)))
+                else
+                    try query_cache.serializeProgram(gpa, @as(*const ir_mod.Program, @ptrCast(v)))
+            else
+                null,
+        } else .{ .changed_at = 0, .has_value = false, .diagnostics = &.{}, .bytes = null };
     }
 
     fn flushPersistentCaches(self: *@This(), io: std.Io) !void {
@@ -483,8 +455,6 @@ pub const QueryDb = struct {
             errdefer if (resolve_snap.bytes) |b| self.gpa.free(b);
             const type_snap = try self.snapshotStage(source_id, .typecheck, self.gpa);
             errdefer if (type_snap.bytes) |b| self.gpa.free(b);
-            const mono_snap = try self.snapshotStage(source_id, .monomorphize, self.gpa);
-            errdefer if (mono_snap.bytes) |b| self.gpa.free(b);
             const lower_snap = try self.snapshotStage(source_id, .lower, self.gpa);
             errdefer if (lower_snap.bytes) |b| self.gpa.free(b);
             const compile_snap = try self.snapshotStage(source_id, .compile, self.gpa);
@@ -495,7 +465,6 @@ pub const QueryDb = struct {
                 .parse = parse_snap,
                 .resolve = resolve_snap,
                 .typecheck = type_snap,
-                .monomorphize = mono_snap,
                 .lower = lower_snap,
                 .compile = compile_snap,
             });
@@ -503,7 +472,6 @@ pub const QueryDb = struct {
             if (parse_snap.bytes) |b| self.gpa.free(b);
             if (resolve_snap.bytes) |b| self.gpa.free(b);
             if (type_snap.bytes) |b| self.gpa.free(b);
-            if (mono_snap.bytes) |b| self.gpa.free(b);
             if (lower_snap.bytes) |b| self.gpa.free(b);
         }
     }
@@ -516,16 +484,19 @@ pub const QueryDb = struct {
         return .{ .kind = kind, .source_id = source_id };
     }
 
+    /// Generic memo ensure logic.  `stage` determines the value type, the memo
+    /// HashMap, and the backdate flag (true only for .compile).  `computeFn` is
+    /// the stage-specific function that produces a fresh memo.
     fn ensureMemo(
         self: *@This(),
         source_id: db.SourceId,
         track_dependency: bool,
         comptime stage: Stage,
-        comptime T: type,
-        memos: *std.AutoHashMap(db.SourceId, db.Memo(T)),
-        comptime computeFn: fn (*@This(), db.SourceId) (db.DbError || std.mem.Allocator.Error)!db.Memo(T),
-        comptime backdate: bool,
-    ) (db.DbError || std.mem.Allocator.Error)!*db.Memo(T) {
+        comptime computeFn: fn (*@This(), db.SourceId) (db.DbError || std.mem.Allocator.Error)!db.Memo(stageValueType(stage)),
+    ) (db.DbError || std.mem.Allocator.Error)!*db.Memo(stageValueType(stage)) {
+        const T = stageValueType(stage);
+        const memos = self.memosFor(stage);
+        const backdate = comptime stage == .compile;
         const query_key = queryFor(stage, source_id);
         if (track_dependency) try self.noteQueryDependency(query_key);
 
@@ -554,8 +525,8 @@ pub const QueryDb = struct {
             const frame = self.endQuery();
 
             const old_changed_at = memo.changed_at;
-            const same_value = if (comptime backdate) db.valuesEqual(memo.value, fresh.value) else false;
-            const same_diagnostics = if (comptime backdate) db.diagnosticsEqual(memo.diagnostics.items, fresh.diagnostics.items) else false;
+            const same_value = if (backdate) db.valuesEqual(memo.value, fresh.value) else false;
+            const same_diagnostics = if (backdate) db.diagnosticsEqual(memo.diagnostics.items, fresh.diagnostics.items) else false;
 
             deinitMemo(T, memo, self.gpa);
             memo.value = fresh.value;
@@ -585,58 +556,48 @@ pub const QueryDb = struct {
     }
 
     fn ensureParseMemo(self: *@This(), source_id: db.SourceId, track_dependency: bool) (db.DbError || std.mem.Allocator.Error)!*db.Memo(parser.ParsedAst) {
-        return self.ensureMemo(source_id, track_dependency, .parse, parser.ParsedAst, &self.parse_memos, struct {
+        return self.ensureMemo(source_id, track_dependency, .parse, struct {
             fn compute(qdb: *QueryDb, sid: db.SourceId) (db.DbError || std.mem.Allocator.Error)!db.Memo(parser.ParsedAst) {
                 return parser.computeParse(try qdb.getSourceText(sid), qdb.gpa);
             }
-        }.compute, false);
+        }.compute);
     }
 
     fn ensureResolveMemo(self: *@This(), source_id: db.SourceId, track_dependency: bool) (db.DbError || std.mem.Allocator.Error)!*db.Memo(resolver.ResolvedAst) {
-        return self.ensureMemo(source_id, track_dependency, .resolve, resolver.ResolvedAst, &self.resolve_memos, struct {
+        return self.ensureMemo(source_id, track_dependency, .resolve, struct {
             fn compute(qdb: *QueryDb, sid: db.SourceId) (db.DbError || std.mem.Allocator.Error)!db.Memo(resolver.ResolvedAst) {
                 const parse_memo = try qdb.ensureParseMemo(sid, true);
                 return resolver.computeResolve(parse_memo, qdb.gpa);
             }
-        }.compute, false);
+        }.compute);
     }
 
     fn ensureTypeMemo(self: *@This(), source_id: db.SourceId, track_dependency: bool) (db.DbError || std.mem.Allocator.Error)!*db.Memo(typecheck.TypedAst) {
-        return self.ensureMemo(source_id, track_dependency, .typecheck, typecheck.TypedAst, &self.type_memos, struct {
+        return self.ensureMemo(source_id, track_dependency, .typecheck, struct {
             fn compute(qdb: *QueryDb, sid: db.SourceId) (db.DbError || std.mem.Allocator.Error)!db.Memo(typecheck.TypedAst) {
                 const resolve_memo = try qdb.ensureResolveMemo(sid, true);
                 const parse_memo = try qdb.ensureParseMemo(sid, true);
                 return typecheck.computeType(resolve_memo, parse_memo, qdb.gpa);
             }
-        }.compute, false);
-    }
-
-    fn ensureMonomorphizeMemo(self: *@This(), source_id: db.SourceId, track_dependency: bool) (db.DbError || std.mem.Allocator.Error)!*db.Memo(monomorphize.MonoProgram) {
-        return self.ensureMemo(source_id, track_dependency, .monomorphize, monomorphize.MonoProgram, &self.mono_memos, struct {
-            fn compute(qdb: *QueryDb, sid: db.SourceId) (db.DbError || std.mem.Allocator.Error)!db.Memo(monomorphize.MonoProgram) {
-                const type_memo = try qdb.ensureTypeMemo(sid, true);
-                return monomorphize.computeMonomorphize(type_memo, qdb.gpa);
-            }
-        }.compute, false);
+        }.compute);
     }
 
     fn ensureLowerMemo(self: *@This(), source_id: db.SourceId, track_dependency: bool) (db.DbError || std.mem.Allocator.Error)!*db.Memo(ir_mod.Program) {
-        return self.ensureMemo(source_id, track_dependency, .lower, ir_mod.Program, &self.lower_memos, struct {
+        return self.ensureMemo(source_id, track_dependency, .lower, struct {
             fn compute(qdb: *QueryDb, sid: db.SourceId) (db.DbError || std.mem.Allocator.Error)!db.Memo(ir_mod.Program) {
-                const mono_memo = try qdb.ensureMonomorphizeMemo(sid, true);
                 const type_memo = try qdb.ensureTypeMemo(sid, true);
-                return ir_mod.computeLower(mono_memo, type_memo, qdb.gpa);
+                return ir_mod.computeLower(type_memo, qdb.gpa);
             }
-        }.compute, false);
+        }.compute);
     }
 
     fn ensureCompileMemo(self: *@This(), source_id: db.SourceId, track_dependency: bool) (db.DbError || std.mem.Allocator.Error)!*db.Memo([]const u8) {
-        return self.ensureMemo(source_id, track_dependency, .compile, []const u8, &self.compile_memos, struct {
+        return self.ensureMemo(source_id, track_dependency, .compile, struct {
             fn compute(qdb: *QueryDb, sid: db.SourceId) (db.DbError || std.mem.Allocator.Error)!db.Memo([]const u8) {
                 const lower_memo = try qdb.ensureLowerMemo(sid, true);
                 return codegen.computeCompile(lower_memo, qdb.gpa);
             }
-        }.compute, true);
+        }.compute);
     }
 
     fn dependenciesUnchanged(self: *@This(), deps: []const db.Dependency, verified_at: db.Revision) db.DbError!bool {
@@ -673,10 +634,6 @@ pub const QueryDb = struct {
             },
             .typecheck => blk: {
                 const memo = try self.ensureTypeMemo(key.source_id, false);
-                break :blk memo.changed_at > revision;
-            },
-            .monomorphize => blk: {
-                const memo = try self.ensureMonomorphizeMemo(key.source_id, false);
                 break :blk memo.changed_at > revision;
             },
             .lower => blk: {

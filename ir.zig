@@ -2,7 +2,6 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const diagnostics = @import("diagnostics.zig");
 const typecheck = @import("typecheck.zig");
-const monomorphize = @import("monomorphize.zig");
 const scope_mod = @import("scope.zig");
 const db = @import("db.zig");
 
@@ -182,28 +181,26 @@ const LowerError = error{
 const Lowerer = struct {
     gpa: std.mem.Allocator,
     typed: *const typecheck.TypedAst,
-    mono: *const monomorphize.MonoProgram,
     function_ids: std.StringHashMap(FuncId),
     strings: std.ArrayList([]const u8),
     string_map: std.StringHashMap(StringId),
     func_types: std.ArrayList(IrFuncType),
     func_type_map: std.AutoHashMap(usize, FuncTypeId),
 
-    fn init(gpa: std.mem.Allocator, typed: *const typecheck.TypedAst, mono: *const monomorphize.MonoProgram) !Lowerer {
+    fn init(gpa: std.mem.Allocator, typed: *const typecheck.TypedAst) !Lowerer {
         var function_ids = std.StringHashMap(FuncId).init(gpa);
         errdefer function_ids.deinit();
 
         const a = typed.ast;
-        for (mono.functions.items, 0..) |mono_fn, idx| {
-            if (mono_fn.decl == std.math.maxInt(ast.NodeIdx)) continue;
-            const name = a.stringOf(a.nodes[mono_fn.decl].data0);
+        for (typed.functions, 0..) |info, idx| {
+            if (info.decl == std.math.maxInt(ast.NodeIdx)) continue;
+            const name = a.stringOf(a.nodes[info.decl].data0);
             try function_ids.put(name, @intCast(idx));
         }
 
         return .{
             .gpa = gpa,
             .typed = typed,
-            .mono = mono,
             .function_ids = function_ids,
             .strings = .empty,
             .string_map = .init(gpa),
@@ -295,14 +292,14 @@ const Lowerer = struct {
     }
 
     fn lowerProgram(self: *@This()) !Program {
-        var functions = try std.ArrayList(Function).initCapacity(self.gpa, self.mono.functions.items.len);
+        var functions = try std.ArrayList(Function).initCapacity(self.gpa, self.typed.functions.len);
         errdefer {
             for (functions.items) |*func| func.deinit(self.gpa);
             functions.deinit(self.gpa);
         }
 
-        for (self.mono.functions.items, 0..) |mono_fn, idx| {
-            var fn_lower = try FunctionLowerer.init(self, @intCast(idx), mono_fn);
+        for (self.typed.functions, 0..) |info, idx| {
+            var fn_lower = try FunctionLowerer.init(self, @intCast(idx), info);
             errdefer fn_lower.deinit();
 
             var lowered = try fn_lower.run();
@@ -311,7 +308,7 @@ const Lowerer = struct {
         }
 
         const result = Program{
-            .entry = self.mono.entry_function,
+            .entry = self.typed.entry_function,
             .functions = functions,
             .strings = self.strings,
             .func_types = self.func_types,
@@ -327,15 +324,15 @@ const FunctionLowerer = struct {
     function: Function,
     bindings: scope_mod.ScopeStack(ValueRef),
     current_block_id: BlockId,
-    mono_fn: monomorphize.MonoFunction,
+    info: typecheck.FunctionInfo,
 
-    fn init(parent: *Lowerer, fn_id: FuncId, mono_fn: monomorphize.MonoFunction) !FunctionLowerer {
+    fn init(parent: *Lowerer, fn_id: FuncId, info: typecheck.FunctionInfo) !FunctionLowerer {
         const a = parent.typed.ast;
-        const fn_name = if (mono_fn.decl == std.math.maxInt(ast.NodeIdx))
+        const fn_name = if (info.decl == std.math.maxInt(ast.NodeIdx))
             ""
         else
-            a.stringOf(a.nodes[mono_fn.decl].data0);
-        const ret_type = try parent.internType(mono_fn.ty.ret);
+            a.stringOf(a.nodes[info.decl].data0);
+        const ret_type = try parent.internType(info.ty.ret);
         var function = try parent.allocFunction(fn_id, fn_name, ret_type);
         errdefer function.deinit(parent.gpa);
 
@@ -344,7 +341,7 @@ const FunctionLowerer = struct {
             .function = function,
             .bindings = scope_mod.ScopeStack(ValueRef).init(),
             .current_block_id = 0,
-            .mono_fn = mono_fn,
+            .info = info,
         };
     }
 
@@ -763,10 +760,10 @@ const FunctionLowerer = struct {
     }
 
     fn setupParams(self: *@This()) !void {
-        if (self.mono_fn.decl == std.math.maxInt(ast.NodeIdx)) return;
+        if (self.info.decl == std.math.maxInt(ast.NodeIdx)) return;
         const a = self.parent.typed.ast;
-        const params = a.fnParams(self.mono_fn.decl);
-        for (params, self.mono_fn.ty.params) |param, param_ty| {
+        const params = a.fnParams(self.info.decl);
+        for (params, self.info.ty.params) |param, param_ty| {
             const pname = a.stringOf(param.name);
             const slot = try self.allocValue(try self.parent.internType(param_ty));
             try self.function.param_values.append(self.parent.gpa, slot);
@@ -778,10 +775,10 @@ const FunctionLowerer = struct {
         try self.setupParams();
 
         const a = self.parent.typed.ast;
-        const body = if (self.mono_fn.decl == std.math.maxInt(ast.NodeIdx))
+        const body = if (self.info.decl == std.math.maxInt(ast.NodeIdx))
             a.entry
         else
-            a.fnBody(self.mono_fn.decl);
+            a.fnBody(self.info.decl);
         const result = try self.lowerAst(body);
         if (self.currentBlock().terminator == null) {
             self.currentBlock().terminator = .{ .ret = result };
@@ -795,32 +792,29 @@ const FunctionLowerer = struct {
 pub const LowerMemo = db.Memo(Program);
 
 pub fn computeLower(
-    mono_memo: *const monomorphize.MonomorphizeMemo,
     type_memo: *const typecheck.TypeMemo,
     gpa: std.mem.Allocator,
 ) error{OutOfMemory}!LowerMemo {
-    var diagnostics_list = try db.initDiagnosticList(gpa, mono_memo.diagnostics.items, 1);
+    var diagnostics_list = try db.initDiagnosticList(gpa, type_memo.diagnostics.items, 1);
     errdefer diagnostics_list.deinit(gpa);
 
     var lowered_value: ?Program = null;
-    if (mono_memo.value) |*mono_val| {
-        if (type_memo.value) |*type_val| {
-            const lowered = lower(mono_val, type_val, gpa) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => blk: {
-                    try db.appendStageError(&diagnostics_list, gpa, .lower, @errorName(err));
-                    break :blk null;
-                },
-            };
-            lowered_value = lowered;
-        }
+    if (type_memo.value) |*type_val| {
+        const lowered = lower(type_val, gpa) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => blk: {
+                try db.appendStageError(&diagnostics_list, gpa, .lower, @errorName(err));
+                break :blk null;
+            },
+        };
+        lowered_value = lowered;
     }
 
     return db.makeMemo(Program, lowered_value, diagnostics_list);
 }
 
-pub fn lower(mono: *const monomorphize.MonoProgram, typed: *const typecheck.TypedAst, gpa: std.mem.Allocator) !Program {
-    var lowerer = try Lowerer.init(gpa, typed, mono);
+pub fn lower(typed: *const typecheck.TypedAst, gpa: std.mem.Allocator) !Program {
+    var lowerer = try Lowerer.init(gpa, typed);
     defer lowerer.deinit();
 
     return lowerer.lowerProgram();

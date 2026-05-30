@@ -115,10 +115,8 @@ pub fn main(init: std.process.Init) !void {
     var parse_duration = std.Io.Duration.zero;
     var resolve_duration = std.Io.Duration.zero;
     var type_duration = std.Io.Duration.zero;
-    var mono_duration = std.Io.Duration.zero;
     var lower_duration = std.Io.Duration.zero;
     var debug_duration = std.Io.Duration.zero;
-
     if (need_stage_pipeline) {
         const parse_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
         const module_or_null = try qdb.parsedAst(source_id);
@@ -131,10 +129,6 @@ pub fn main(init: std.process.Init) !void {
         const type_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
         _ = try qdb.typedAst(source_id);
         type_duration = if (type_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
-
-        const mono_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
-        _ = try qdb.monomorphizedProgram(source_id);
-        mono_duration = if (mono_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
 
         const lower_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
         const ir = try qdb.loweredProgram(source_id);
@@ -151,14 +145,13 @@ pub fn main(init: std.process.Init) !void {
 
     if (flags.timing) {
         const compile_total = std.Io.Duration{
-            .nanoseconds = set_source_duration.nanoseconds + parse_duration.nanoseconds + resolve_duration.nanoseconds + type_duration.nanoseconds + mono_duration.nanoseconds + lower_duration.nanoseconds + debug_duration.nanoseconds + compile_duration.nanoseconds,
+            .nanoseconds = set_source_duration.nanoseconds + parse_duration.nanoseconds + resolve_duration.nanoseconds + type_duration.nanoseconds + lower_duration.nanoseconds + debug_duration.nanoseconds + compile_duration.nanoseconds,
         };
         try printStageTimings(io, "compilation timing diagnostics", &.{
             .{ .label = "set_source", .duration = set_source_duration },
             .{ .label = "parse", .duration = parse_duration },
             .{ .label = "resolve", .duration = resolve_duration },
             .{ .label = "typecheck", .duration = type_duration },
-            .{ .label = "monomorphize", .duration = mono_duration },
             .{ .label = "lower", .duration = lower_duration },
             .{ .label = "debug_dump", .duration = debug_duration },
             .{ .label = "compile_query", .duration = compile_duration },

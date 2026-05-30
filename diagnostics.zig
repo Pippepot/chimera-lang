@@ -5,7 +5,6 @@ pub const Stage = enum {
     parse,
     resolve,
     typecheck,
-    monomorphize,
     lower,
     compile,
 };

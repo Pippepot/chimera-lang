@@ -234,31 +234,8 @@ test "typecheck return mismatch" {
     try expectCompileErrorContains(&db, 0, "return type mismatch");
 }
 
-test "monomorphize stage produces deterministic unique entries" {
-    var db = query.QueryDb.init(testing.allocator);
-    defer db.deinit();
 
-    try db.setSource(0,
-        \\comptime a = func() int
-        \\  return 1
-        \\
-        \\comptime b = func() int
-        \\  return a()
-        \\
-        \\comptime main = func() int
-        \\  return b()
-    );
-
-    const mono = try db.monomorphizedProgram(0);
-    try testing.expect(mono != null);
-    try testing.expectEqual(@as(usize, 3), mono.?.functions.items.len);
-
-    const mono_again = try db.monomorphizedProgram(0);
-    try testing.expect(mono_again != null);
-    try testing.expectEqual(@as(usize, 3), mono_again.?.functions.items.len);
-}
-
-test "query cache hits within same revision includes resolve and monomorphize" {
+test "query cache hits within same revision includes resolve" {
     var db = query.QueryDb.init(testing.allocator);
     defer db.deinit();
 
@@ -266,7 +243,6 @@ test "query cache hits within same revision includes resolve and monomorphize" {
     _ = try db.parsedAst(0);
     _ = try db.resolvedAst(0);
     _ = try db.typedAst(0);
-    _ = try db.monomorphizedProgram(0);
     _ = try db.loweredProgram(0);
     _ = try expectCompileOk(&db, 0);
 
@@ -275,7 +251,6 @@ test "query cache hits within same revision includes resolve and monomorphize" {
     _ = try db.parsedAst(0);
     _ = try db.resolvedAst(0);
     _ = try db.typedAst(0);
-    _ = try db.monomorphizedProgram(0);
     _ = try db.loweredProgram(0);
     _ = try expectCompileOk(&db, 0);
 
@@ -283,7 +258,6 @@ test "query cache hits within same revision includes resolve and monomorphize" {
     try testing.expectEqual(@as(usize, 1), stats.parse_hits);
     try testing.expectEqual(@as(usize, 1), stats.resolve_hits);
     try testing.expectEqual(@as(usize, 1), stats.type_hits);
-    try testing.expectEqual(@as(usize, 1), stats.mono_hits);
     try testing.expectEqual(@as(usize, 1), stats.lower_hits);
     try testing.expectEqual(@as(usize, 1), stats.compile_hits);
 }
@@ -304,7 +278,6 @@ test "source change invalidates all stages" {
     try testing.expectEqual(@as(usize, 1), stats.parse_recomputes);
     try testing.expectEqual(@as(usize, 1), stats.resolve_recomputes);
     try testing.expectEqual(@as(usize, 1), stats.type_recomputes);
-    try testing.expectEqual(@as(usize, 1), stats.mono_recomputes);
     try testing.expectEqual(@as(usize, 1), stats.lower_recomputes);
     try testing.expectEqual(@as(usize, 1), stats.compile_recomputes);
 }
@@ -324,7 +297,7 @@ test "compile changed_at backdates on equal output" {
     try testing.expectEqual(changed_before, changed_after);
 }
 
-test "debug query diagnostics format includes resolve and monomorphize" {
+test "debug query diagnostics format includes resolve" {
     var buf = try std.ArrayList(u8).initCapacity(testing.allocator, 256);
     defer buf.deinit(testing.allocator);
 
@@ -334,7 +307,6 @@ test "debug query diagnostics format includes resolve and monomorphize" {
         .parse_hits = 3,
         .resolve_hits = 4,
         .type_hits = 5,
-        .mono_hits = 6,
         .compile_recomputes = 1,
         .dependency_checks = 5,
     };
@@ -343,7 +315,6 @@ test "debug query diagnostics format includes resolve and monomorphize" {
     try testing.expect(std.mem.indexOf(u8, buf.items, ";   parse: hits=3 recomputes=0") != null);
     try testing.expect(std.mem.indexOf(u8, buf.items, ";   resolve: hits=4 recomputes=0") != null);
     try testing.expect(std.mem.indexOf(u8, buf.items, ";   type: hits=5 recomputes=0") != null);
-    try testing.expect(std.mem.indexOf(u8, buf.items, ";   monomorphize: hits=6 recomputes=0") != null);
 }
 
 test "arg builtin still works at top level" {
@@ -621,7 +592,6 @@ test "persistent cache load frees data on hash mismatch (regression)" {
         .parse = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
         .resolve = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
         .typecheck = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
-        .monomorphize = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
         .lower = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
         .compile = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
     });
@@ -658,7 +628,6 @@ test "stale cache files are removed by eager sweep" {
         .parse = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
         .resolve = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
         .typecheck = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
-        .monomorphize = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
         .lower = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
         .compile = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
     });
@@ -693,13 +662,10 @@ test "second compile with no changes has zero recomputes" {
     try testing.expectEqual(@as(usize, 0), stats.parse_recomputes);
     try testing.expectEqual(@as(usize, 0), stats.resolve_recomputes);
     try testing.expectEqual(@as(usize, 0), stats.type_recomputes);
-    try testing.expectEqual(@as(usize, 0), stats.mono_recomputes);
     try testing.expectEqual(@as(usize, 0), stats.lower_recomputes);
-    try testing.expectEqual(@as(usize, 0), stats.compile_recomputes);
     try testing.expectEqual(@as(usize, 0), stats.parse_hits);
     try testing.expectEqual(@as(usize, 0), stats.resolve_hits);
     try testing.expectEqual(@as(usize, 0), stats.type_hits);
-    try testing.expectEqual(@as(usize, 0), stats.mono_hits);
     try testing.expectEqual(@as(usize, 0), stats.lower_hits);
     try testing.expectEqual(@as(usize, 1), stats.compile_hits);
 }

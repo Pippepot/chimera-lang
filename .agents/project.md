@@ -22,17 +22,16 @@ This compiler now supports a declaration-first language with optional top-level 
 | `parser.zig` | **Rewritten** — builds flat arrays via `AstBuilder`, returns `NodeIdx` not `*const AstNode`, `AstBuilder.seal()` packs contiguous backing buffer |
 | `resolver.zig` | **Rewritten** — `NodeIdx` keys, flat AST accessors, no `*const AstNode`/`*const ast.Module` |
 | `typecheck.zig` | **Rewritten** — `NodeIdx`/`TypeIdx` keys, flat AST accessors, `TypedAst.ast` reference |
-| `monomorphize.zig` | **Rewritten** — `MonoFunction.decl` is `NodeIdx`, `ty` is owned `FuncType`, no `module` field |
-| `ir.zig` | ⏳ **Pending rewrite** — needs flat AST dispatch (currently uses `*const AstNode` patterns) |
-| `codegen.zig` | Unchanged — IR types not yet flat (still ArrayList-based `Program`) |
-| `query.zig` | ⏳ **Pending fixes** — `parsedAst` return type, `v.deinit()` arg, load/save all 6 stages |
-| `query_cache.zig` | ⏳ **Pending rewrite** — replace per-field ser/des with buffer-copy for each stage |
+| `ir.zig` | Flat AST dispatch via `ast.nodes[idx].tag` and accessors |
+| `codegen.zig` | IR->x86 + ELF, backdate support |
+| `query.zig` | Generic `ensureMemo`, 5-stage pipeline, persistent cache load/save |
+| `query_cache.zig` | Buffer-copy ser/des for all 5 stages, persistent cache with schema v4 |
 | `db.zig` | Shared query types/stats/deps/memo helpers |
-| `debug.zig` | ⏳ **Pending rewrite** — needs flat AST dispatch |
+| `debug.zig` | Flat AST dispatch |
 | `runtime.zig` | Runtime helpers (`writeProgram`, `runProg`) — unchanged |
 | `scope.zig` | Reusable lexical scope stack utility — unchanged |
 | `helpers_bin.zig` | Embedded helper machine-code blobs — unchanged |
-| `test.zig` | ⏳ **Needs updating** — tests use old API |
+| `test.zig` | All 34 tests pass using flat API |
 
 ## Query architecture
 
@@ -41,9 +40,8 @@ This compiler now supports a declaration-first language with optional top-level 
 1. `parse(source_id)` -> `ParsedAst`
 2. `resolve(source_id)` -> `ResolvedAst`
 3. `typecheck(source_id)` -> `TypedAst`
-4. `monomorphize(source_id)` -> `MonoProgram`
-5. `lower(source_id)` -> `Program`
-6. `compile(source_id)` -> `[]const u8`
+4. `lower(source_id)` -> `Program`
+5. `compile(source_id)` -> `[]const u8`
 
 ### Red/green behavior
 
@@ -65,7 +63,7 @@ The old pointer-based AST (`*const AstNode`, `*const ast.Module`, `*const ast.Fu
 
 ### Serialization plan
 
-All 6 stages must be cached with `hits=1 recomputes=0` when cache is present. The flat AST makes parse output inherently serializable (memcpy of `backing`). Stages 2-6 will get flat buffer containers for inherent serializability too. `query_cache.zig` will use buffer-copy for each stage instead of per-field writers/readers.
+All 5 stages must be cached with `hits=1 recomputes=0` when cache is present. The flat AST makes parse output inherently serializable (memcpy of `backing`). Stages 2-5 use buffer-copy serialization in `query_cache.zig`.
 
 ## Current status (May 2026)
 
@@ -73,14 +71,12 @@ All 6 stages must be cached with `hits=1 recomputes=0` when cache is present. Th
 - **parser.zig** ✅ — `AstBuilder`, `NodeIdx` returns, `verifyAt`/`entry` support
 - **resolver.zig** ✅ — Flat AST, `NodeIdx` keys, deps: parse
 - **typecheck.zig** ✅ — Flat AST, `NodeIdx`/`TypeIdx` keys, deps: resolve, parse
-- **monomorphize.zig** ✅ — `NodeIdx` decl, owned types, deps: typecheck
-- **ir.zig** ✅ — Flat AST dispatch via `ast.nodes[idx].tag` and accessors, deps: monomorphize, typecheck
-- **debug.zig** ✅ — Flat AST dispatch
+- **ir.zig** ✅ — Flat AST dispatch via `ast.nodes[idx].tag` and accessors, deps: typecheck
 - **codegen.zig** ✅ — IR->x86 + ELF, backdate support, deps: lower
-- **query.zig** ✅ — Generic `ensureMemo`, 6-stage pipeline, persistent cache load/save
-- **query_cache.zig** ✅ — Buffer-copy ser/des for all 6 stages, persistent cache with schema v3
+- **query.zig** ✅ — Generic `ensureMemo`, 5-stage pipeline, persistent cache load/save
+- **query_cache.zig** ✅ — Buffer-copy ser/des for all 5 stages, persistent cache with schema v4
 - **main.zig** ✅ — Updated for `?*const ast.Ast`, persistent cache CLI
-- **test.zig** ✅ — All 35 tests pass using flat API
+- **test.zig** ✅ — All 34 tests pass using flat API
 - **runtime.zig** — Unchanged
 - **scope.zig** — Unchanged
 - **helpers_bin.zig** — Unchanged
@@ -103,7 +99,6 @@ All 6 stages must be cached with `hits=1 recomputes=0` when cache is present. Th
 - Remaining CLI args are passed to generated `./prog` and accessible via `arg(n)`.
 - Debug flags: `--debug=ast,ssa,timing,query`.
 - Query cache is enabled by default for CLI path-backed sources (`setSourceFile`); disable with `--no-query-cache`.
-- ⚠️ Code currently does not compile — mid-rewrite (see current status above).
 
 ## Tests
 
@@ -120,4 +115,4 @@ All 6 stages must be cached with `hits=1 recomputes=0` when cache is present. Th
   - compile `changed_at` backdating
   - persistent cache reuse/disable/failure/corruption/stale cleanup behavior
 - Zero-recompute test: `compileResult` twice with no source change → 0 recomputes, 1 compile hit (compile is the only stage accessed on the second call; all others are implicitly cached).
-- Current suite: `zig test test.zig` (35 tests).
+- Current suite: `zig test test.zig` (34 tests).

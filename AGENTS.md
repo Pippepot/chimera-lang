@@ -101,16 +101,6 @@
 - **`isFallible(node)`** — helper checking node kind against `.lt`, `.gt`, `.le`, `.ge`, `.eq`, `.ne`.
 - **Scope isolation:** each block and each `if` branch restores bindings after inference/lowering; branch-local `const` names do not leak.
 
-## String literals
-
-- **Lexer:** `parseString()` slices content between `"` and `"` from `source[content_start..index]`.
-- **Parser:** two-pass processing — first pass counts final length (handling `\\` escapes), second pass copies with escape expansion. Result allocated in arena as `[]const u8`.
-- **Type system:** `string` is a primitive type (`Type.string`). `print` on string type emits `prints` IR.
-- **IR lowering:** `string_lit(id)` instruction holds a table index; `Lowerer.addString` dupe-owns the bytes.
-- **Codegen:** `string_lit` emits `lea rax, [rip + symbol]`, `prints` calls `print_string` helper.
-- **Runtime representation:** 8-byte pointer to a `{len: u64, data: [len]u8}` structure in the `.rodata` segment.
-- **Deduplication:** not yet implemented.
-- **Helper (`print_string`):** two-syscall write: first `write(syscall, 1, data_ptr, len)`, second `write(syscall, 1, newline_ptr, 1)`. Newline byte stored in the red zone.
 
 ## Query system design
 

@@ -7,11 +7,11 @@ const ast = @import("ast.zig");
 const parser = @import("parser.zig");
 const resolver = @import("resolver.zig");
 const typecheck = @import("typecheck.zig");
-const monomorphize = @import("monomorphize.zig");
+
 
 const CacheExt = ".qcache";
 const Magic: [8]u8 = .{ 'X', '8', '6', 'Q', 'C', 'A', 'C', 'H' };
-const SchemaVersion: u32 = 3;
+const SchemaVersion: u32 = 4;
 const CompilerAbiVersion: u32 = 1;
 
 pub const CacheOptions = struct {
@@ -31,7 +31,6 @@ pub const SavePayload = struct {
     parse: StageSnapshot,
     resolve: StageSnapshot,
     typecheck: StageSnapshot,
-    monomorphize: StageSnapshot,
     lower: StageSnapshot,
     compile: StageSnapshot,
 };
@@ -48,7 +47,6 @@ pub const LoadPayload = struct {
     parse: LoadedStage,
     resolve: LoadedStage,
     typecheck: LoadedStage,
-    monomorphize: LoadedStage,
     lower: LoadedStage,
     compile: LoadedStage,
 
@@ -56,7 +54,6 @@ pub const LoadPayload = struct {
         self.parse.diagnostics.deinit(gpa);
         self.resolve.diagnostics.deinit(gpa);
         self.typecheck.diagnostics.deinit(gpa);
-        self.monomorphize.diagnostics.deinit(gpa);
         self.lower.diagnostics.deinit(gpa);
         self.compile.diagnostics.deinit(gpa);
         gpa.free(self.backing);
@@ -114,7 +111,6 @@ fn stageFromByte(byte: u8) !diagnostics.Stage {
         stageTagByte(.parse) => .parse,
         stageTagByte(.resolve) => .resolve,
         stageTagByte(.typecheck) => .typecheck,
-        stageTagByte(.monomorphize) => .monomorphize,
         stageTagByte(.lower) => .lower,
         stageTagByte(.compile) => .compile,
         else => error.InvalidData,
@@ -182,7 +178,6 @@ fn serialize(gpa: std.mem.Allocator, payload: SavePayload) ![]u8 {
     try appendStage(&buf, gpa, payload.parse);
     try appendStage(&buf, gpa, payload.resolve);
     try appendStage(&buf, gpa, payload.typecheck);
-    try appendStage(&buf, gpa, payload.monomorphize);
     try appendStage(&buf, gpa, payload.lower);
     try appendStage(&buf, gpa, payload.compile);
 
@@ -772,53 +767,6 @@ pub fn deserializeTyped(gpa: std.mem.Allocator, data: []const u8, parse_ast: *co
     return ta;
 }
 
-// ── MonoProgram serialization ──
-
-pub fn serializeMono(gpa: std.mem.Allocator, mp: *const monomorphize.MonoProgram) ![]u8 {
-    var buf = try std.ArrayList(u8).initCapacity(gpa, 1024);
-    errdefer buf.deinit(gpa);
-
-    try appendU32(&buf, gpa, @intCast(mp.functions.items.len));
-    for (mp.functions.items) |mf| {
-        try appendU32(&buf, gpa, mf.source_id);
-        try appendU32(&buf, gpa, mf.decl);
-        try writeTcFuncType(&buf, gpa, mf.ty);
-        try appendU8(&buf, gpa, if (mf.has_explicit_return) 1 else 0);
-    }
-
-    try appendU32(&buf, gpa, mp.entry_function);
-    return buf.toOwnedSlice(gpa);
-}
-
-pub fn deserializeMono(gpa: std.mem.Allocator, data: []const u8) LoadError!monomorphize.MonoProgram {
-    var r = Reader{ .data = data };
-
-    const fn_count = try r.readU32();
-    var mp = try monomorphize.MonoProgram.init(gpa, 0);
-    errdefer mp.deinit(gpa);
-    const arena_alloc = mp.arena.allocator();
-
-    try mp.functions.ensureTotalCapacity(gpa, fn_count);
-    var fi: u32 = 0;
-    while (fi < fn_count) : (fi += 1) {
-        const source_id = try r.readU32();
-        const decl = try r.readU32();
-        const ft = try readTcFuncType(&r, arena_alloc);
-        const has_ret = (try r.readU8()) == 1;
-        mp.functions.appendAssumeCapacity(.{
-            .source_id = source_id,
-            .decl = decl,
-            .ty = ft,
-            .has_explicit_return = has_ret,
-        });
-    }
-
-    mp.entry_function = try r.readU32();
-
-    if (r.idx != r.data.len) return error.InvalidData;
-    return mp;
-}
-
 // ── ParsedAst serialization ──
 
 pub fn serializeParsed(gpa: std.mem.Allocator, pa: *const parser.ParsedAst) ![]u8 {
@@ -856,8 +804,6 @@ fn deserialize(gpa: std.mem.Allocator, file_data: []u8, expected_source_hash: u6
     errdefer resolve_stage.diagnostics.deinit(gpa);
     var type_stage = try readStage(&r, gpa);
     errdefer type_stage.diagnostics.deinit(gpa);
-    var mono_stage = try readStage(&r, gpa);
-    errdefer mono_stage.diagnostics.deinit(gpa);
     var lower_stage = try readStage(&r, gpa);
     errdefer lower_stage.diagnostics.deinit(gpa);
     var compile_stage = try readStage(&r, gpa);
@@ -870,7 +816,6 @@ fn deserialize(gpa: std.mem.Allocator, file_data: []u8, expected_source_hash: u6
         .parse = parse_stage,
         .resolve = resolve_stage,
         .typecheck = type_stage,
-        .monomorphize = mono_stage,
         .lower = lower_stage,
         .compile = compile_stage,
     };
