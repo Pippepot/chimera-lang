@@ -21,11 +21,13 @@ This compiler now supports a declaration-first language with optional top-level 
 | `ast.zig` | **Flat index-based AST** — `Node` (extern struct, 12 bytes), `Ast` container with single `backing: []u8`, buffer-copy `serialize`/`deserialize` |
 | `parser.zig` | **Rewritten** — builds flat arrays via `AstBuilder`, returns `NodeIdx` not `*const AstNode`, `AstBuilder.seal()` packs contiguous backing buffer |
 | `resolver.zig` | **Rewritten** — `NodeIdx` keys, flat AST accessors, no `*const AstNode`/`*const ast.Module` |
-| `typecheck.zig` | **Rewritten** — `NodeIdx`/`TypeIdx` keys, flat AST accessors, `TypedAst.ast` reference |
+| `astgen.zig` | AST-to-analyze lowering (`AstgenIr`) between resolve and analyze |
+| `analyze.zig` | Active semantic analysis/type inference/comptime stage (`AnalyzedAst`) |
+| `typecheck.zig` | Legacy typechecker retained for reference (not in active query pipeline) |
 | `ir.zig` | Flat AST dispatch via `ast.nodes[idx].tag` and accessors |
 | `codegen.zig` | IR->x86 + ELF, backdate support |
-| `query.zig` | Generic `ensureMemo`, 5-stage pipeline, persistent cache load/save |
-| `query_cache.zig` | Buffer-copy ser/des for all 5 stages, persistent cache with schema v4 |
+| `query.zig` | Generic `ensureMemo`, 6-stage pipeline (`astgen` included), persistent cache load/save |
+| `query_cache.zig` | Buffer-copy ser/des for all active stages, persistent cache |
 | `db.zig` | Shared query types/stats/deps/memo helpers |
 | `debug.zig` | Flat AST dispatch |
 | `runtime.zig` | Runtime helpers (`writeProgram`, `runProg`) — unchanged |
@@ -39,9 +41,10 @@ This compiler now supports a declaration-first language with optional top-level 
 
 1. `parse(source_id)` -> `ParsedAst`
 2. `resolve(source_id)` -> `ResolvedAst`
-3. `typecheck(source_id)` -> `TypedAst`
-4. `lower(source_id)` -> `Program`
-5. `compile(source_id)` -> `[]const u8`
+3. `astgen(source_id)` -> `AstgenIr`
+4. `typecheck(source_id)` -> `AnalyzedAst`
+5. `lower(source_id)` -> `Program`
+6. `compile(source_id)` -> `[]const u8`
 
 ### Red/green behavior
 

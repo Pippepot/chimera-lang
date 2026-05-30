@@ -3,7 +3,8 @@ const builtin = @import("builtin");
 const db = @import("db.zig");
 const parser = @import("parser.zig");
 const resolver = @import("resolver.zig");
-const typecheck = @import("typecheck.zig");
+const astgen = @import("astgen.zig");
+const analyze = @import("analyze.zig");
 const ir_mod = @import("ir.zig");
 const codegen = @import("codegen.zig");
 const ast = @import("ast.zig");
@@ -28,6 +29,7 @@ pub fn appendQueryDiagnostics(out: *std.ArrayList(u8), gpa: std.mem.Allocator, s
     try out.print(gpa, ";   source_unchanged: {d}\n", .{stats.source_unchanged});
     try out.print(gpa, ";   parse: hits={d} recomputes={d}\n", .{ stats.parse_hits, stats.parse_recomputes });
     try out.print(gpa, ";   resolve: hits={d} recomputes={d}\n", .{ stats.resolve_hits, stats.resolve_recomputes });
+    try out.print(gpa, ";   astgen: hits={d} recomputes={d}\n", .{ stats.astgen_hits, stats.astgen_recomputes });
     try out.print(gpa, ";   type: hits={d} recomputes={d}\n", .{ stats.type_hits, stats.type_recomputes });
     try out.print(gpa, ";   lower: hits={d} recomputes={d}\n", .{ stats.lower_hits, stats.lower_recomputes });
     try out.print(gpa, ";   compile: hits={d} recomputes={d}\n", .{ stats.compile_hits, stats.compile_recomputes });
@@ -50,7 +52,8 @@ fn stageValueType(comptime stage: Stage) type {
     return switch (stage) {
         .parse => parser.ParsedAst,
         .resolve => resolver.ResolvedAst,
-        .typecheck => typecheck.TypedAst,
+        .astgen => astgen.AstgenIr,
+        .typecheck => analyze.AnalyzedAst,
         .lower => ir_mod.Program,
         .compile => []const u8,
     };
@@ -60,7 +63,7 @@ fn freeMemoValue(comptime T: type, value: *?T, gpa: std.mem.Allocator) void {
     if (value.*) |*v| {
         if (comptime T == []const u8) {
             gpa.free(v.*);
-        } else if (comptime T == typecheck.TypedAst) {
+        } else if (comptime T == analyze.AnalyzedAst) {
             v.deinit();
         } else {
             v.deinit(gpa);
@@ -78,6 +81,7 @@ fn recordHit(stats: *db.QueryStats, comptime stage: Stage) void {
     switch (stage) {
         .parse => stats.parse_hits += 1,
         .resolve => stats.resolve_hits += 1,
+        .astgen => stats.astgen_hits += 1,
         .typecheck => stats.type_hits += 1,
         .lower => stats.lower_hits += 1,
         .compile => stats.compile_hits += 1,
@@ -88,6 +92,7 @@ fn recordRecompute(stats: *db.QueryStats, comptime stage: Stage) void {
     switch (stage) {
         .parse => stats.parse_recomputes += 1,
         .resolve => stats.resolve_recomputes += 1,
+        .astgen => stats.astgen_recomputes += 1,
         .typecheck => stats.type_recomputes += 1,
         .lower => stats.lower_recomputes += 1,
         .compile => stats.compile_recomputes += 1,
@@ -104,7 +109,8 @@ pub const QueryDb = struct {
     sources: std.AutoHashMap(db.SourceId, SourceInput),
     parse_memos: std.AutoHashMap(db.SourceId, db.Memo(parser.ParsedAst)),
     resolve_memos: std.AutoHashMap(db.SourceId, db.Memo(resolver.ResolvedAst)),
-    type_memos: std.AutoHashMap(db.SourceId, db.Memo(typecheck.TypedAst)),
+    astgen_memos: std.AutoHashMap(db.SourceId, db.Memo(astgen.AstgenIr)),
+    type_memos: std.AutoHashMap(db.SourceId, db.Memo(analyze.AnalyzedAst)),
     lower_memos: std.AutoHashMap(db.SourceId, db.Memo(ir_mod.Program)),
     compile_memos: std.AutoHashMap(db.SourceId, db.Memo([]const u8)),
     active_stack: std.ArrayList(ActiveQuery),
@@ -128,7 +134,8 @@ pub const QueryDb = struct {
             .sources = std.AutoHashMap(db.SourceId, SourceInput).init(gpa),
             .parse_memos = std.AutoHashMap(db.SourceId, db.Memo(parser.ParsedAst)).init(gpa),
             .resolve_memos = std.AutoHashMap(db.SourceId, db.Memo(resolver.ResolvedAst)).init(gpa),
-            .type_memos = std.AutoHashMap(db.SourceId, db.Memo(typecheck.TypedAst)).init(gpa),
+            .astgen_memos = std.AutoHashMap(db.SourceId, db.Memo(astgen.AstgenIr)).init(gpa),
+            .type_memos = std.AutoHashMap(db.SourceId, db.Memo(analyze.AnalyzedAst)).init(gpa),
             .lower_memos = std.AutoHashMap(db.SourceId, db.Memo(ir_mod.Program)).init(gpa),
             .compile_memos = std.AutoHashMap(db.SourceId, db.Memo([]const u8)).init(gpa),
             .active_stack = .empty,
@@ -141,6 +148,7 @@ pub const QueryDb = struct {
         return switch (stage) {
             .parse => &self.parse_memos,
             .resolve => &self.resolve_memos,
+            .astgen => &self.astgen_memos,
             .typecheck => &self.type_memos,
             .lower => &self.lower_memos,
             .compile => &self.compile_memos,
@@ -159,7 +167,7 @@ pub const QueryDb = struct {
         }
         self.sources.deinit();
 
-        inline for (.{ .parse, .resolve, .typecheck, .lower, .compile }) |s| {
+        inline for (.{ .parse, .resolve, .astgen, .typecheck, .lower, .compile }) |s| {
             const T = stageValueType(s);
             var iter = self.memosFor(s).iterator();
             while (iter.next()) |entry| deinitMemo(T, entry.value_ptr, self.gpa);
@@ -237,7 +245,13 @@ pub const QueryDb = struct {
         return null;
     }
 
-    pub fn typedAst(self: *@This(), source_id: db.SourceId) db.DbError!?*const typecheck.TypedAst {
+    pub fn astgenIr(self: *@This(), source_id: db.SourceId) db.DbError!?*const astgen.AstgenIr {
+        const memo = try self.ensureStageMemo(source_id, true, .astgen);
+        if (memo.value) |*ir| return ir;
+        return null;
+    }
+
+    pub fn typedAst(self: *@This(), source_id: db.SourceId) db.DbError!?*const analyze.AnalyzedAst {
         const memo = try self.ensureStageMemo(source_id, true, .typecheck);
         if (memo.value) |*typed| return typed;
         return null;
@@ -276,6 +290,7 @@ pub const QueryDb = struct {
         return switch (stage) {
             .parse => if (self.parse_memos.get(source_id)) |memo| memo.changed_at else null,
             .resolve => if (self.resolve_memos.get(source_id)) |memo| memo.changed_at else null,
+            .astgen => if (self.astgen_memos.get(source_id)) |memo| memo.changed_at else null,
             .typecheck => if (self.type_memos.get(source_id)) |memo| memo.changed_at else null,
             .lower => if (self.lower_memos.get(source_id)) |memo| memo.changed_at else null,
             .compile => if (self.compile_memos.get(source_id)) |memo| memo.changed_at else null,
@@ -288,8 +303,7 @@ pub const QueryDb = struct {
 
     /// Load pre-computed stage values from the on-disk persistent cache.
     /// Each block follows the same pattern: deserialize → makeMemo → take diagnostics →
-    /// create deps → set timestamps → register.  The typecheck stage is the only one
-    /// that additionally needs the parsed AST (from the parse memo) during deserialization.
+    /// create deps → set timestamps → register.
     fn tryLoadPersistentCache(self: *@This(), source_id: db.SourceId, input: *SourceInput) void {
         if (!self.persistent_cache_enabled) return;
         if (self.io == null) return;
@@ -329,23 +343,38 @@ pub const QueryDb = struct {
         resolve_memo.verified_at = self.revision;
         resolve_memo.changed_at = self.revision;
 
-        // ── 3. Typecheck memo (needs parse_ast from deserialized parse memo) ──
+        // ── 3. Astgen memo ──
+        const astgen_value = if (loaded.astgen.has_value and loaded.astgen.bytes != null)
+            query_cache.deserializeAstgen(self.gpa, loaded.astgen.bytes.?) catch return
+        else
+            null;
+        var astgen_memo = db.makeMemo(astgen.AstgenIr, astgen_value, loaded.astgen.diagnostics);
+        loaded.astgen.diagnostics = .empty;
+        {
+            var ad = std.ArrayList(db.Dependency).initCapacity(self.gpa, 1) catch return;
+            ad.append(self.gpa, .{ .query = queryFor(.resolve, source_id) }) catch return;
+            astgen_memo.deps = ad;
+        }
+        astgen_memo.verified_at = self.revision;
+        astgen_memo.changed_at = self.revision;
+
+        // ── 4. Analyze memo (needs parse_ast from deserialized parse memo) ──
         const parse_ast = if (parse_memo.value) |*p| &p.ast else null;
         const type_value = if (loaded.typecheck.has_value and loaded.typecheck.bytes != null and parse_ast != null)
             query_cache.deserializeTyped(self.gpa, loaded.typecheck.bytes.?, parse_ast.?) catch return
         else
             null;
-        var type_memo = db.makeMemo(typecheck.TypedAst, type_value, loaded.typecheck.diagnostics);
+        var type_memo = db.makeMemo(analyze.AnalyzedAst, type_value, loaded.typecheck.diagnostics);
         loaded.typecheck.diagnostics = .empty;
         {
             var td = std.ArrayList(db.Dependency).initCapacity(self.gpa, 1) catch return;
-            td.append(self.gpa, .{ .query = queryFor(.resolve, source_id) }) catch return;
+            td.append(self.gpa, .{ .query = queryFor(.astgen, source_id) }) catch return;
             type_memo.deps = td;
         }
         type_memo.verified_at = self.revision;
         type_memo.changed_at = self.revision;
 
-        // ── 4. Lower memo ──
+        // ── 5. Lower memo ──
         const lower_value = if (loaded.lower.has_value and loaded.lower.bytes != null)
             query_cache.deserializeProgram(self.gpa, loaded.lower.bytes.?) catch return
         else
@@ -360,7 +389,7 @@ pub const QueryDb = struct {
         lower_memo.verified_at = self.revision;
         lower_memo.changed_at = self.revision;
 
-        // ── 5. Compile memo ──
+        // ── 6. Compile memo ──
         const compile_bytes = if (loaded.compile.bytes) |bytes| self.gpa.dupe(u8, bytes) catch return else null;
         var compile_memo = db.makeMemo([]const u8, compile_bytes, loaded.compile.diagnostics);
         loaded.compile.diagnostics = .empty;
@@ -378,6 +407,7 @@ pub const QueryDb = struct {
 
         _ = self.parse_memos.fetchPut(source_id, parse_memo) catch return;
         _ = self.resolve_memos.fetchPut(source_id, resolve_memo) catch return;
+        _ = self.astgen_memos.fetchPut(source_id, astgen_memo) catch return;
         _ = self.type_memos.fetchPut(source_id, type_memo) catch return;
         _ = self.lower_memos.fetchPut(source_id, lower_memo) catch return;
         _ = self.compile_memos.fetchPut(source_id, compile_memo) catch return;
@@ -390,13 +420,15 @@ pub const QueryDb = struct {
             .diagnostics = memo.diagnostics.items,
             .bytes = if (memo.value) |*v|
                 if (comptime stage == .compile)
-                    v.*
+                    try gpa.dupe(u8, v.*)
                 else if (comptime stage == .parse)
                     try query_cache.serializeParsed(gpa, @as(*const parser.ParsedAst, @ptrCast(v)))
                 else if (comptime stage == .resolve)
                     try query_cache.serializeResolved(gpa, @as(*const resolver.ResolvedAst, @ptrCast(v)))
+                else if (comptime stage == .astgen)
+                    try query_cache.serializeAstgen(gpa, @as(*const astgen.AstgenIr, @ptrCast(v)))
                 else if (comptime stage == .typecheck)
-                    try query_cache.serializeTyped(gpa, @as(*const typecheck.TypedAst, @ptrCast(v)))
+                    try query_cache.serializeTyped(gpa, @as(*const analyze.AnalyzedAst, @ptrCast(v)))
                 else
                     try query_cache.serializeProgram(gpa, @as(*const ir_mod.Program, @ptrCast(v)))
             else
@@ -423,10 +455,10 @@ pub const QueryDb = struct {
             const source_path = source.source_path orelse continue;
             if (self.compile_memos.get(source_id) == null) continue;
 
-            var snaps: [5]query_cache.StageSnapshot = undefined;
+            var snaps: [6]query_cache.StageSnapshot = undefined;
             var snap_count: usize = 0;
             errdefer for (snaps[0..snap_count]) |s| if (s.bytes) |b| self.gpa.free(b);
-            inline for (.{ .parse, .resolve, .typecheck, .lower, .compile }, &snaps, 0..) |s, *dest, i| {
+            inline for (.{ .parse, .resolve, .astgen, .typecheck, .lower, .compile }, &snaps, 0..) |s, *dest, i| {
                 dest.* = try self.snapshotStage(source_id, s, self.gpa);
                 snap_count = i + 1;
             }
@@ -436,12 +468,13 @@ pub const QueryDb = struct {
                 .source_text = source.text,
                 .parse = snaps[0],
                 .resolve = snaps[1],
-                .typecheck = snaps[2],
-                .lower = snaps[3],
-                .compile = snaps[4],
+                .astgen = snaps[2],
+                .typecheck = snaps[3],
+                .lower = snaps[4],
+                .compile = snaps[5],
             });
 
-            for (snaps[0..4]) |s| if (s.bytes) |b| self.gpa.free(b);
+            for (snaps[0..6]) |s| if (s.bytes) |b| self.gpa.free(b);
         }
     }
 
@@ -533,8 +566,20 @@ pub const QueryDb = struct {
                 if (comptime stage == .resolve) {
                     return try resolver.computeResolve(try qdb.ensureStageMemo(sid, true, .parse), qdb.gpa);
                 }
+                if (comptime stage == .astgen) {
+                    return try astgen.computeAstgen(
+                        try qdb.ensureStageMemo(sid, true, .resolve),
+                        try qdb.ensureStageMemo(sid, true, .parse),
+                        qdb.gpa,
+                    );
+                }
                 if (comptime stage == .typecheck) {
-                    return try typecheck.computeType(try qdb.ensureStageMemo(sid, true, .resolve), try qdb.ensureStageMemo(sid, true, .parse), qdb.gpa);
+                    return try analyze.computeAnalyze(
+                        try qdb.ensureStageMemo(sid, true, .resolve),
+                        try qdb.ensureStageMemo(sid, true, .astgen),
+                        try qdb.ensureStageMemo(sid, true, .parse),
+                        qdb.gpa,
+                    );
                 }
                 if (comptime stage == .lower) {
                     return try ir_mod.computeLower(try qdb.ensureStageMemo(sid, true, .typecheck), qdb.gpa);
@@ -573,6 +618,7 @@ pub const QueryDb = struct {
         return switch (key.kind) {
             .parse => (try self.ensureStageMemo(key.source_id, false, .parse)).changed_at > revision,
             .resolve => (try self.ensureStageMemo(key.source_id, false, .resolve)).changed_at > revision,
+            .astgen => (try self.ensureStageMemo(key.source_id, false, .astgen)).changed_at > revision,
             .typecheck => (try self.ensureStageMemo(key.source_id, false, .typecheck)).changed_at > revision,
             .lower => (try self.ensureStageMemo(key.source_id, false, .lower)).changed_at > revision,
             .compile => (try self.ensureStageMemo(key.source_id, false, .compile)).changed_at > revision,

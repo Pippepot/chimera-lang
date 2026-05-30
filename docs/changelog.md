@@ -21,6 +21,14 @@
   - `Program.strings` -> `Program.symbols`
   - `Program.stringFor` -> `Program.symbolFor`
 
+## 2026-05-30 — Query pipeline adds explicit astgen stage
+
+- Added `astgen` stage metrics and diagnostics output.
+- `QueryDb` now stores/verifies/persists an `astgen` memo between resolve and type analysis.
+- Active type analysis in the query pipeline is wired through `analyze.zig`.
+- CLI timing output now includes `astgen`.
+- Demo source (`demo.chi`) updated to Fibonacci example.
+
 ## 2026-05-30 — Error reporting & grammar fixes
 
 ### Error reporting (parser.zig)

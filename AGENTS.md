@@ -9,8 +9,9 @@
   - `runtime.zig` owns runtime helper entrypoints (`writeProgram`, `runProg`).
   - `parser.zig` owns lexer + parser (`parseOwned`) from source text to module AST, plus `computeParse` for query integration.
   - `resolver.zig` owns pre-typecheck symbol resolution (`computeResolve`) and symbol diagnostics.
-  - `typecheck.zig` owns type inference/checking (`unit`, `bool`, `int`, `float`, function types), plus `computeType` for query integration.
-  - `monomorphize.zig` owns the monomorphization stage artifact (`computeMonomorphize`).
+  - `astgen.zig` owns AST-to-analyze lowering (`computeAstgen`) used between resolve and analyze.
+  - `analyze.zig` owns type inference/checking (`unit`, `bool`, `int`, `float`, function types), comptime evaluation, and `computeAnalyze` for query integration.
+  - `typecheck.zig` is legacy typechecking implementation retained in-tree but not used by the active query pipeline.
   - `query.zig` owns the revisioned incremental query system (`QueryDb`) and stage orchestration (frame management, dependency tracking, memo verification).
   - `query_cache.zig` owns cross-run persistent query cache encoding/decoding, atomic save/load, and stale-cache cleanup.
   - `ir.zig` owns multi-function IR types and typed AST -> IR lowering, plus `computeLower` for query integration.
@@ -106,7 +107,7 @@
 - **Inputs are virtual source IDs.** `setSource(source_id, text)` updates source text and revision tracking.
 - **Path-backed inputs:** `setSourceFile(source_id, source_path, text)` enables persistent cache load/save for that source.
 - **Initialization options:** `initWithOptions(gpa, QueryDbOptions)` controls persistent cache enablement, optional cache dir override, and `io` handle. `init(gpa)` remains a default wrapper.
-- **Stage queries:** `parse(source_id)` -> `resolve(source_id)` -> `typecheck(source_id)` -> `monomorphize(source_id)` -> `lower(source_id)` -> `compile(source_id)`.
+- **Stage queries:** `parse(source_id)` -> `resolve(source_id)` -> `astgen(source_id)` -> `typecheck(source_id)` -> `lower(source_id)` -> `compile(source_id)`.
 - **Memo metadata:** each memo tracks `deps`, `verified_at`, `changed_at`, and `computing`.
 - **Red/green verification:**
   - If `verified_at == current_revision`, it is an immediate hit.
