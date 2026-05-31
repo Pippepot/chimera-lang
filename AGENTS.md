@@ -66,6 +66,15 @@
   - Field access for index 0 returns the base slot directly. For higher indices it emits `field_load(base, field_index)` which loads from slot `base + field_index`.
 - **Structs in function args/returns** are not yet supported.
 
+## Monomorphization of comptime functions with runtime params
+
+- **Comptime functions with runtime params** — `comptime foo = func(comptime T: type, x: T)` monomorphizes per unique call. `foo(int, 10)` creates `foo$int` with `x: int`; `foo(float, 1.23)` creates `foo$float` with `x: float`.
+- **Comptime type in scope** — The comptime type parameter `T` is available for subsequent param type annotations (`x: T`), the function body, and return type annotations.
+- **Per-function typechecking** — Each monomorphized instance gets its own `FunctionInfo` entry with concrete param types. The body shares the same AST but is typechecked independently per instance via `checkFunction`. `node_types` are cleared before each monomorphized body check to avoid stale cached types.
+- **IR binding-based type lookup** — The IR lowerer resolves `var_ref` types from local bindings rather than the shared `node_types` map, correctly handling shared AST nodes across monomorphized instances.
+- **`call_monomorph_targets`** — Maps call nodes to monomorphized function IDs so the IR/codegen emit calls to the correct concrete function (not the generic template).
+- **Caching** — Monomorphized functions are cached by `(function_name, $, type_name)` key so repeated calls with the same comptime args reuse the same instantiation.
+
 - **`var` locals** are mutable and use the same syntax as `const`: `var name = expr`.
 - **Reassignment:** `name = expr` produces unit (can be used as an expression).
 - **Type system:** Checker tracks `Binding { ty, mutable }` via `ScopeStack(Binding)`. Assignment validates mutability and type match.

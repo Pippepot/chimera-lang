@@ -199,8 +199,9 @@ const Lowerer = struct {
         errdefer function_ids.deinit();
 
         const a = typed.ast;
-        for (typed.functions, 0..) |info, idx| {
+        for (typed.functions.items, 0..) |info, idx| {
             if (info.decl == std.math.maxInt(ast.NodeIdx)) continue;
+            if (info.is_monomorphized) continue;
             const name = a.identOf(a.nodes[info.decl].data0);
             try function_ids.put(name, @intCast(idx));
         }
@@ -319,13 +320,13 @@ const Lowerer = struct {
     }
 
     fn lowerProgram(self: *@This()) !Program {
-        var functions = try std.ArrayList(Function).initCapacity(self.gpa, self.typed.functions.len);
+        var functions = try std.ArrayList(Function).initCapacity(self.gpa, self.typed.functions.items.len);
         errdefer {
             for (functions.items) |*func| func.deinit(self.gpa);
             functions.deinit(self.gpa);
         }
 
-        for (self.typed.functions, 0..) |info, idx| {
+        for (self.typed.functions.items, 0..) |info, idx| {
             var fn_lower = try FunctionLowerer.init(self, @intCast(idx), info);
             errdefer fn_lower.deinit();
 
@@ -423,7 +424,12 @@ const FunctionLowerer = struct {
         return self.bindings.lookup(name);
     }
 
-    fn nodeType(self: *const @This(), idx: ast.NodeIdx) (std.mem.Allocator.Error || analyze.TypeError)!analyze.Type {
+    fn nodeType(self: *const @This(), idx: ast.NodeIdx) analyze.TypeError!analyze.Type {
+        const a = self.parent.typed.ast;
+        if (a.nodes[idx].tag == .var_ref) {
+            const name = a.identOf(a.nodes[idx].data0);
+            if (self.lookupBinding(name)) |binding| return binding.ty;
+        }
         return self.parent.typed.typeOf(idx);
     }
 
@@ -700,6 +706,11 @@ const FunctionLowerer = struct {
 
     fn lowerCall(self: *@This(), idx: ast.NodeIdx) LowerResult!ValueRef {
         const a = self.parent.typed.ast;
+
+        if (self.parent.typed.call_monomorph_targets.get(idx)) |target_fn_id| {
+            return self.lowerMonomorphizedCall(idx, target_fn_id);
+        }
+
         const call_args = a.callArgs(idx);
         const callee = a.nodes[idx].data0;
         const callee_ty = try self.nodeType(callee);
@@ -727,6 +738,48 @@ const FunctionLowerer = struct {
         }
 
         const callee_ref = try self.lowerAst(callee);
+        return self.addInst(.{ .call = .{
+            .callee = callee_ref,
+            .argc = @intCast(arg_word_count),
+            .args = args,
+        } });
+    }
+
+    fn lowerMonomorphizedCall(self: *@This(), idx: ast.NodeIdx, target_fn_id: FuncId) LowerResult!ValueRef {
+        const a = self.parent.typed.ast;
+        const target_info = self.parent.typed.functions.items[target_fn_id];
+        const call_args = a.callArgs(idx);
+        const mono_params = target_info.ty.params;
+
+        const ret_slots = try self.typeSlotCount(target_info.ty.ret);
+        if (ret_slots != 1) return error.UnsupportedMultiSlotFunctionSignature;
+
+        var args: [MaxCallArgs]ValueRef = [_]ValueRef{0} ** MaxCallArgs;
+        var arg_word_count: usize = 0;
+
+        // Find the comptime mask to skip comptime args
+        const mask = if (target_info.decl != std.math.maxInt(ast.NodeIdx))
+            a.fnComptimeMask(target_info.decl)
+        else
+            0;
+
+        var runtime_idx: usize = 0;
+        for (call_args, 0..) |arg_node, arg_idx| {
+            if (mask & (@as(u32, 1) << @intCast(arg_idx)) != 0) continue;
+            const param_ty = mono_params[runtime_idx];
+            const arg_base = try self.lowerValueAsType(arg_node, param_ty);
+            const arg_width = try self.typeSlotCount(param_ty);
+            if (arg_word_count + arg_width > MaxCallArgs) return error.TooManyCallArgs;
+
+            var slot_offset: u32 = 0;
+            while (slot_offset < arg_width) : (slot_offset += 1) {
+                args[arg_word_count] = arg_base + slot_offset;
+                arg_word_count += 1;
+            }
+            runtime_idx += 1;
+        }
+
+        const callee_ref = try self.addInst(.{ .fn_addr = target_fn_id });
         return self.addInst(.{ .call = .{
             .callee = callee_ref,
             .argc = @intCast(arg_word_count),
@@ -978,7 +1031,12 @@ const FunctionLowerer = struct {
         if (self.info.decl == std.math.maxInt(ast.NodeIdx)) return;
         const a = self.parent.typed.ast;
         const params = a.fnParams(self.info.decl);
-        for (params, self.info.ty.params) |param, param_ty| {
+        const mask = a.fnComptimeMask(self.info.decl);
+        var runtime_idx: usize = 0;
+        for (params, 0..) |param, param_idx| {
+            if (mask & (@as(u32, 1) << @intCast(param_idx)) != 0) continue;
+            if (runtime_idx >= self.info.ty.params.len) return error.UnknownFunction;
+            const param_ty = self.info.ty.params[runtime_idx];
             const pname = a.identOf(param.name);
             const slot_count = try self.typeSlotCount(param_ty);
             if (self.function.param_values.items.len + slot_count > MaxCallArgs) return error.TooManyCallArgs;
@@ -992,18 +1050,20 @@ const FunctionLowerer = struct {
                 .ty = param_ty,
                 .slot_count = slot_count,
             });
+            runtime_idx += 1;
         }
     }
 
-    fn isComptimeOnlyFunction(self: *const @This()) bool {
+    fn isGenericFunction(self: *const @This()) bool {
         if (self.info.decl == std.math.maxInt(ast.NodeIdx)) return false;
+        if (self.info.is_monomorphized) return false;
         const comptime_mask = self.parent.typed.ast.fnComptimeMask(self.info.decl);
-        return comptime_mask != 0 and self.info.ty.ret == .type_type;
+        return comptime_mask != 0;
     }
 
     fn run(self: *@This()) !Function {
         try self.setupParams();
-        if (self.isComptimeOnlyFunction()) {
+        if (self.isGenericFunction()) {
             const stub_ret = try self.lowerUnitValue();
             self.currentBlock().terminator = .{ .ret = stub_ret };
             self.bindings.deinit(self.parent.gpa);

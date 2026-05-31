@@ -760,6 +760,77 @@ test "comptime function inline struct init" {
     , "3.000000\n");
 }
 
+test "monomorphized function with comptime type param and runtime param" {
+
+    try testProgram(
+        \\comptime foo = func(comptime T: type, x: T)
+        \\  print(x)
+        \\foo(int, 10)
+    , "10\n");
+}
+
+test "monomorphized function multiple type instantiations" {
+
+    try testProgram(
+        \\comptime foo = func(comptime T: type, x: T)
+        \\  print(x)
+        \\foo(int, 10)
+        \\foo(float, 1.23)
+    , "10\n1.230000\n");
+}
+
+test "monomorphized function int parameter used as field type" {
+
+    try testProgram(
+        \\comptime wrap = func(comptime T: type, x: T)
+        \\  print(x)
+        \\wrap(int, 42)
+        \\wrap(float, 3.14)
+    , "42\n3.140000\n");
+}
+
+test "monomorphized function arg type mismatch errors" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+
+    try db.setSource(0,
+        \\comptime foo = func(comptime T: type, x: T)
+        \\  print(x)
+        \\foo(int, 1.0)
+    );
+    try expectCompileErrorContains(&db, 0, "call argument type mismatch");
+}
+
+test "monomorphized function comptime arg type mismatch errors" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+
+    try db.setSource(0,
+        \\comptime foo = func(comptime T: type, x: T)
+        \\  print(x)
+        \\foo(42, 10)
+    );
+    try expectCompileErrorContains(&db, 0, "call argument type mismatch");
+}
+
+test "monomorphized function caching across same revision" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+
+    try db.setSource(0,
+        \\comptime foo = func(comptime T: type, x: T)
+        \\  print(x)
+        \\foo(int, 10)
+        \\foo(int, 20)
+    );
+    _ = try expectCompileOk(&db, 0);
+    db.resetStats();
+    _ = try expectCompileOk(&db, 0);
+    const stats = db.statsSnapshot();
+    try testing.expect(stats.compile_hits >= 1);
+    try testing.expectEqual(@as(usize, 0), stats.compile_recomputes);
+}
+
 test "binding type annotation mismatch errors" {
     var db = query.QueryDb.init(testing.allocator);
     defer db.deinit();

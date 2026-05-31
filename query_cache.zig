@@ -831,8 +831,8 @@ pub fn serializeTyped(gpa: std.mem.Allocator, ta: *const analyze.AnalyzedAst) ![
         try writeComptimeValue(&buf, gpa, entry.value_ptr.*);
     }
 
-    try appendU32(&buf, gpa, @intCast(ta.functions.len));
-    for (ta.functions) |fi| {
+    try appendU32(&buf, gpa, @intCast(ta.functions.items.len));
+    for (ta.functions.items) |fi| {
         try appendU32(&buf, gpa, fi.decl);
         try writeTcFuncType(&buf, gpa, fi.ty.*);
         try appendU8(&buf, gpa, if (fi.has_explicit_return) 1 else 0);
@@ -907,21 +907,19 @@ pub fn deserializeTyped(gpa: std.mem.Allocator, data: []const u8, parse_ast: *co
     }
 
     const fn_count = try r.readU32();
-    var functions = try std.ArrayList(analyze.FunctionInfo).initCapacity(arena_alloc, fn_count);
-    errdefer functions.deinit(arena_alloc);
+    try ta.functions.ensureTotalCapacity(gpa, fn_count);
     var fni: u32 = 0;
     while (fni < fn_count) : (fni += 1) {
         const decl = try r.readU32();
         const ft_ptr = try arena_alloc.create(analyze.FuncType);
         ft_ptr.* = try readTcFuncType(&r, arena_alloc);
         const has_ret = (try r.readU8()) == 1;
-        try functions.append(arena_alloc, .{
+        ta.functions.appendAssumeCapacity(.{
             .decl = decl,
             .ty = ft_ptr,
             .has_explicit_return = has_ret,
         });
     }
-    ta.functions = try functions.toOwnedSlice(arena_alloc);
 
     ta.entry_function = try r.readU32();
 

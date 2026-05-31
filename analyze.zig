@@ -55,6 +55,7 @@ pub const FunctionInfo = struct {
     decl: ast.NodeIdx,
     ty: *const FuncType,
     has_explicit_return: bool,
+    is_monomorphized: bool = false,
 };
 
 pub const StructValue = struct {
@@ -123,6 +124,7 @@ pub const ResolvedField = struct {
 
 pub const AnalyzedAst = struct {
     arena: std.heap.ArenaAllocator,
+    gpa: std.mem.Allocator,
     ast: *const ast.Ast,
     node_types: std.AutoHashMap(ast.NodeIdx, Type),
     field_index: std.AutoHashMap(ast.NodeIdx, u32),
@@ -132,12 +134,14 @@ pub const AnalyzedAst = struct {
     comptime_values: std.StringHashMap(ComptimeValue),
     comptime_struct_fields: std.StringHashMap([]const ResolvedField),
     struct_expr_fields: std.AutoHashMap(ast.NodeIdx, []const ResolvedField),
-    functions: []FunctionInfo,
+    functions: std.ArrayList(FunctionInfo),
     entry_function: u32,
+    call_monomorph_targets: std.AutoHashMap(ast.NodeIdx, u32),
 
     pub fn init(gpa: std.mem.Allocator, parsed_ast: *const ast.Ast) AnalyzedAst {
         return .{
             .arena = std.heap.ArenaAllocator.init(gpa),
+            .gpa = gpa,
             .ast = parsed_ast,
             .node_types = std.AutoHashMap(ast.NodeIdx, Type).init(gpa),
             .field_index = std.AutoHashMap(ast.NodeIdx, u32).init(gpa),
@@ -147,8 +151,9 @@ pub const AnalyzedAst = struct {
             .comptime_values = std.StringHashMap(ComptimeValue).init(gpa),
             .comptime_struct_fields = std.StringHashMap([]const ResolvedField).init(gpa),
             .struct_expr_fields = std.AutoHashMap(ast.NodeIdx, []const ResolvedField).init(gpa),
-            .functions = &.{},
+            .functions = std.ArrayList(FunctionInfo).empty,
             .entry_function = 0,
+            .call_monomorph_targets = std.AutoHashMap(ast.NodeIdx, u32).init(gpa),
         };
     }
 
@@ -161,6 +166,8 @@ pub const AnalyzedAst = struct {
         self.comptime_values.deinit();
         self.comptime_struct_fields.deinit();
         self.struct_expr_fields.deinit();
+        self.functions.deinit(self.gpa);
+        self.call_monomorph_targets.deinit();
         self.arena.deinit();
     }
 
@@ -169,7 +176,7 @@ pub const AnalyzedAst = struct {
     }
 
     pub fn functionType(self: *const @This(), fn_id: u32) *const FuncType {
-        return self.functions[fn_id].ty;
+        return self.functions.items[fn_id].ty;
     }
 };
 
@@ -251,19 +258,20 @@ const Binding = struct {
     comptime_visible: bool,
 };
 
-const Checker = struct {
-    gpa: std.mem.Allocator,
-    parsed: *const parser.ParsedAst,
-    resolved: *const resolver.ResolvedAst,
-    typed: AnalyzedAst,
-    bindings: scope_mod.ScopeStack(Binding),
-    comptime_decl_state: std.AutoHashMap(ast.NodeIdx, DeclState),
-    failure: ?Failure,
-    in_fallible_scope: bool,
-    in_comptime_context: bool,
-    current_return: Type,
-    current_saw_return: bool,
-    anon_counter: u32,
+    const Checker = struct {
+        gpa: std.mem.Allocator,
+        parsed: *const parser.ParsedAst,
+        resolved: *const resolver.ResolvedAst,
+        typed: AnalyzedAst,
+        bindings: scope_mod.ScopeStack(Binding),
+        comptime_decl_state: std.AutoHashMap(ast.NodeIdx, DeclState),
+        monomorph_cache: std.StringHashMap(u32),
+        failure: ?Failure,
+        in_fallible_scope: bool,
+        in_comptime_context: bool,
+        current_return: Type,
+        current_saw_return: bool,
+        anon_counter: u32,
 
     const Failure = struct {
         span: ?ast.Span,
@@ -305,6 +313,7 @@ const Checker = struct {
             .typed = AnalyzedAst.init(gpa, &parsed.ast),
             .bindings = scope_mod.ScopeStack(Binding).init(),
             .comptime_decl_state = std.AutoHashMap(ast.NodeIdx, DeclState).init(gpa),
+            .monomorph_cache = std.StringHashMap(u32).init(gpa),
             .failure = null,
             .in_fallible_scope = false,
             .in_comptime_context = false,
@@ -318,6 +327,7 @@ const Checker = struct {
         self.typed.deinit();
         self.bindings.deinit(self.gpa);
         self.comptime_decl_state.deinit();
+        self.monomorph_cache.deinit();
     }
 
     fn failAtNode(self: *@This(), idx: ast.NodeIdx, kind: TypeError) error{TypecheckFailed} {
@@ -417,6 +427,13 @@ const Checker = struct {
                         else => return self.failAtType(type_idx, error.ComptimeValueNotAType),
                     }
                 }
+                if (self.typed.comptime_values.get(name)) |cv| {
+                    switch (cv) {
+                        .type_value => |ty| return ty,
+                        .struct_type => return .{ .named = name },
+                        else => return self.failAtType(type_idx, error.ComptimeValueNotAType),
+                    }
+                }
                 return self.failAtType(type_idx, error.UnknownType);
             },
             .type_func => {
@@ -448,20 +465,40 @@ const Checker = struct {
         }
     }
 
+    fn paramTypeReferencesComptimeParam(self: *const @This(), func_decl_idx: ast.NodeIdx, param_ty_idx: ast.TypeIdx) bool {
+        const a = self.parsed.ast;
+        if (a.nodes[param_ty_idx].tag != .type_name) return false;
+        const tname = a.identOf(a.nodes[param_ty_idx].data0);
+        const mask = a.fnComptimeMask(func_decl_idx);
+        for (a.fnParams(func_decl_idx), 0..) |other_param, other_idx| {
+            if (other_idx >= 32) break;
+            if (mask & (@as(u32, 1) << @intCast(other_idx)) != 0) {
+                const other_name = a.identOf(other_param.name);
+                if (std.mem.eql(u8, tname, other_name)) return true;
+            }
+        }
+        return false;
+    }
+
     fn setupFunctionSignatures(self: *@This()) InferError!void {
-        const arena_alloc = self.typed.arena.allocator();
+        const a = self.parsed.ast;
         const fn_count = self.resolved.functions.items.len;
         const has_top_level_entry = hasTopLevelEntry(self.parsed.ast, self.parsed.ast.entry);
         const main_fn_id = self.resolved.function_names.get("main");
         const reserve_extra: usize = if (has_top_level_entry or (fn_count == 0 and main_fn_id == null)) 1 else 0;
-        const infos = try arena_alloc.alloc(FunctionInfo, fn_count + reserve_extra);
 
-        const a = self.parsed.ast;
+        try self.typed.functions.ensureTotalCapacity(self.gpa, fn_count + reserve_extra);
+
         for (self.resolved.functions.items, 0..) |func_decl_idx, idx| {
+            _ = idx;
             var param_types = try std.ArrayList(Type).initCapacity(self.gpa, a.fnParams(func_decl_idx).len);
             defer param_types.deinit(self.gpa);
             for (a.fnParams(func_decl_idx)) |param| {
-                try param_types.append(self.gpa, try self.resolveTypeNode(param.ty));
+                if (self.paramTypeReferencesComptimeParam(func_decl_idx, param.ty)) {
+                    try param_types.append(self.gpa, .type_type);
+                } else {
+                    try param_types.append(self.gpa, try self.resolveTypeNode(param.ty));
+                }
             }
             const ret_ty = try self.resolveTypeNode(a.fnRetType(func_decl_idx));
             const fn_ty = try self.allocFuncType(param_types.items, ret_ty);
@@ -469,26 +506,22 @@ const Checker = struct {
                 const annot_ty = try self.resolveTypeNode(annot);
                 if (!typeEql(.{ .func = fn_ty }, annot_ty)) return self.failAtNodeWithTypes(func_decl_idx, error.BindingTypeMismatch, annot_ty, .{ .func = fn_ty });
             }
-            infos[idx] = .{
+            try self.typed.functions.append(self.gpa, .{
                 .decl = func_decl_idx,
                 .ty = fn_ty,
                 .has_explicit_return = false,
-            };
+            });
         }
 
         if (reserve_extra == 1) {
+            const top_fn_id = @as(u32, @intCast(self.typed.functions.items.len));
             const top_fn_ty = try self.allocFuncType(&.{}, .unit);
-            infos[fn_count] = .{
+            try self.typed.functions.append(self.gpa, .{
                 .decl = std.math.maxInt(ast.NodeIdx),
                 .ty = top_fn_ty,
                 .has_explicit_return = false,
-            };
-        }
-
-        self.typed.functions = infos;
-
-        if (reserve_extra == 1) {
-            self.typed.entry_function = @intCast(fn_count);
+            });
+            self.typed.entry_function = top_fn_id;
         } else if (main_fn_id) |main_id| {
             self.typed.entry_function = main_id;
         } else {
@@ -720,6 +753,29 @@ const Checker = struct {
         const a = self.parsed.ast;
         const callee = a.nodes[idx].data0;
         const callee_ty = try self.inferNode(callee);
+
+        // Check if this is a call to a generic function (with comptime params)
+        if (callee_ty == .func) {
+            const resolved_ref = self.resolved.node_refs.get(callee);
+            if (resolved_ref) |ref| {
+                if (ref == .function) {
+                    const generic_fn_id = ref.function;
+                    if (generic_fn_id < self.typed.functions.items.len) {
+                        const gen_info = self.typed.functions.items[generic_fn_id];
+                        const mask = if (gen_info.decl != std.math.maxInt(ast.NodeIdx))
+                            a.fnComptimeMask(gen_info.decl)
+                        else
+                            0;
+                        // Only monomorphize if the function has runtime params
+                        // (comptime-only functions returning type use normal comptime eval)
+                        if (mask != 0 and gen_info.ty.ret != .type_type) {
+                            return self.inferMonomorphizedCall(idx, generic_fn_id, mask);
+                        }
+                    }
+                }
+            }
+        }
+
         const fn_ty = switch (callee_ty) {
             .func => |sig| sig,
             else => return self.failAtNode(callee, error.CallTargetNotFunction),
@@ -734,6 +790,167 @@ const Checker = struct {
         }
 
         return self.remember(idx, fn_ty.ret);
+    }
+
+    fn inferMonomorphizedCall(self: *@This(), call_idx: ast.NodeIdx, generic_fn_id: u32, comptime_mask: u32) InferError!Type {
+        const a = self.parsed.ast;
+        const generic_info = self.typed.functions.items[generic_fn_id];
+        const func_decl = generic_info.decl;
+        const args = a.callArgs(call_idx);
+        const params = a.fnParams(func_decl);
+
+        // Collect comptime args (evaluate them)
+        var comptime_types = try std.ArrayList(Type).initCapacity(self.gpa, 4);
+        defer comptime_types.deinit(self.gpa);
+        var comptime_values = try std.ArrayList(ComptimeValue).initCapacity(self.gpa, 4);
+        defer comptime_values.deinit(self.gpa);
+        var runtime_arg_nodes = try std.ArrayList(ast.NodeIdx).initCapacity(self.gpa, args.len);
+        defer runtime_arg_nodes.deinit(self.gpa);
+
+        for (args, 0..) |arg_node, arg_idx| {
+            if (comptime_mask & (@as(u32, 1) << @intCast(arg_idx)) != 0) {
+                const prev = self.in_comptime_context;
+                self.in_comptime_context = true;
+                var eval_locals = scope_mod.ScopeStack(EvalBinding).init();
+                defer eval_locals.deinit(self.gpa);
+                const eval_result = self.evalNodeStep(arg_node, &eval_locals) catch |err| {
+                    self.in_comptime_context = prev;
+                    return err;
+                };
+                self.in_comptime_context = prev;
+                if (eval_result.value == .type_value) {
+                    try comptime_types.append(self.gpa, eval_result.value.type_value);
+                } else {
+                    try comptime_types.append(self.gpa, .type_type);
+                }
+                // Verify comptime arg type matches declared parameter type
+                const declared_param_ty = try self.resolveTypeNode(params[arg_idx].ty);
+                const arg_ct_ty = comptimeValueCtype(eval_result.value);
+                if (!typeEql(declared_param_ty, arg_ct_ty)) {
+                    return self.failAtNodeWithTypes(arg_node, error.CallArgumentMismatch, declared_param_ty, arg_ct_ty);
+                }
+                try comptime_values.append(self.gpa, try self.cloneCtValue(eval_result.value));
+            } else {
+                try runtime_arg_nodes.append(self.gpa, arg_node);
+            }
+        }
+
+        // Build cache key
+        const fn_name = a.identOf(a.nodes[func_decl].data0);
+        var key_buf = try std.ArrayList(u8).initCapacity(self.gpa, 64);
+        defer key_buf.deinit(self.gpa);
+        try key_buf.appendSlice(self.gpa, fn_name);
+        for (comptime_types.items) |ct| {
+            try key_buf.append(self.gpa, '$');
+            try key_buf.appendSlice(self.gpa, typeName(ct));
+        }
+        const key = key_buf.items;
+
+        // Check cache
+        if (self.monomorph_cache.get(key)) |existing_fn_id| {
+            const mono_info = self.typed.functions.items[existing_fn_id];
+            const mono_params = mono_info.ty.params;
+            if (runtime_arg_nodes.items.len != mono_params.len) return self.failAtNode(call_idx, error.CallArityMismatch);
+            for (runtime_arg_nodes.items, mono_params) |arg_node, param_ty| {
+                const arg_ty = try self.inferNode(arg_node);
+                if (!isAssignableTo(param_ty, arg_ty)) return self.failAtNodeWithTypes(arg_node, error.CallArgumentMismatch, param_ty, arg_ty);
+            }
+            try self.typed.call_monomorph_targets.put(call_idx, existing_fn_id);
+            return self.remember(call_idx, mono_info.ty.ret);
+        }
+
+        // Bind comptime param values first so they're available when resolving runtime param types
+        var comptime_idx: usize = 0;
+        for (params, 0..) |param, param_idx| {
+            if (comptime_mask & (@as(u32, 1) << @intCast(param_idx)) != 0) {
+                const pname = a.identOf(param.name);
+                const ct_value = comptime_values.items[comptime_idx];
+                try self.typed.comptime_values.put(pname, try self.cloneCtValue(ct_value));
+                comptime_idx += 1;
+            }
+        }
+
+        // Build monomorphized param types (comptime params are now bound)
+        var mono_param_types = try std.ArrayList(Type).initCapacity(self.gpa, params.len);
+        defer mono_param_types.deinit(self.gpa);
+        for (params, 0..) |param, param_idx| {
+            if (comptime_mask & (@as(u32, 1) << @intCast(param_idx)) != 0) continue;
+            const resolved_ty = try self.resolveTypeNode(param.ty);
+            try mono_param_types.append(self.gpa, resolved_ty);
+        }
+
+        const ret_ty = try self.resolveTypeNode(a.fnRetType(func_decl));
+        const mono_fn_ty = try self.allocFuncType(mono_param_types.items, ret_ty);
+
+        // Check binding annotation if present
+        if (a.comptimeFnAnnotation(func_decl)) |annot| {
+            const annot_ty = try self.resolveTypeNode(annot);
+            if (!typeEql(.{ .func = mono_fn_ty }, annot_ty)) return self.failAtNodeWithTypes(func_decl, error.BindingTypeMismatch, annot_ty, .{ .func = mono_fn_ty });
+        }
+
+        // Create monomorphized function entry (body will be typechecked by checkFunction later)
+        const new_fn_id: u32 = @intCast(self.typed.functions.items.len);
+        try self.typed.functions.append(self.gpa, .{
+            .decl = func_decl,
+            .ty = mono_fn_ty,
+            .has_explicit_return = false,
+            .is_monomorphized = true,
+        });
+
+        // Cache
+        const owned_key = try self.typed.arena.allocator().dupe(u8, key);
+        try self.monomorph_cache.put(owned_key, new_fn_id);
+
+        // Record this call node -> monomorphized function mapping
+        try self.typed.call_monomorph_targets.put(call_idx, new_fn_id);
+
+        // Check runtime args against monomorphized params
+        const mono_params = mono_fn_ty.params;
+        if (runtime_arg_nodes.items.len != mono_params.len) return self.failAtNode(call_idx, error.CallArityMismatch);
+        for (runtime_arg_nodes.items, mono_params) |arg_node, param_ty| {
+            const arg_ty = try self.inferNode(arg_node);
+            if (!isAssignableTo(param_ty, arg_ty)) return self.failAtNodeWithTypes(arg_node, error.CallArgumentMismatch, param_ty, arg_ty);
+        }
+
+        return self.remember(call_idx, mono_fn_ty.ret);
+    }
+
+    fn clearNodeTypesInSubtree(self: *@This(), idx: ast.NodeIdx) void {
+        _ = self.typed.node_types.remove(idx);
+        const a = self.parsed.ast;
+        switch (a.nodes[idx].tag) {
+            .block => {
+                for (a.blockItems(idx)) |item| self.clearNodeTypesInSubtree(item);
+            },
+            .var_ref, .int_lit, .float_lit, .bool_lit, .unit_lit => {},
+            .const_decl, .var_decl => {
+                self.clearNodeTypesInSubtree(a.varDeclValue(idx));
+            },
+            .assign => self.clearNodeTypesInSubtree(a.nodes[idx].data1),
+            .return_stmt => self.clearNodeTypesInSubtree(a.nodes[idx].data0),
+            .call => {
+                self.clearNodeTypesInSubtree(a.nodes[idx].data0);
+                for (a.callArgs(idx)) |arg| self.clearNodeTypesInSubtree(arg);
+            },
+            .print_stmt => self.clearNodeTypesInSubtree(a.nodes[idx].data0),
+            .add, .sub, .mul, .div, .lt, .gt, .le, .ge, .eq, .ne, .@"and", .@"or" => {
+                self.clearNodeTypesInSubtree(a.nodes[idx].data0);
+                self.clearNodeTypesInSubtree(a.nodes[idx].data1);
+            },
+            .if_stmt => {
+                const data = a.ifData(idx);
+                self.clearNodeTypesInSubtree(data.cond);
+                self.clearNodeTypesInSubtree(data.then_);
+                if (data.else_ != std.math.maxInt(ast.NodeIdx)) self.clearNodeTypesInSubtree(data.else_);
+            },
+            .struct_init => {
+                for (a.structInitFields(idx)) |field| self.clearNodeTypesInSubtree(field.value);
+            },
+            .field_access => self.clearNodeTypesInSubtree(a.nodes[idx].data0),
+            .comptime_expr => self.clearNodeTypesInSubtree(a.comptimeExprBody(idx)),
+            .comptime_value_decl => self.clearNodeTypesInSubtree(a.comptimeValueDeclValue(idx)),
+            else => {},
+        }
     }
 
     fn inferReturn(self: *@This(), idx: ast.NodeIdx) InferError!Type {
@@ -1026,6 +1243,16 @@ const Checker = struct {
         };
     }
 
+    fn comptimeValueCtype(value: ComptimeValue) Type {
+        return switch (value) {
+            .unit => .unit,
+            .bool => .bool,
+            .int => .int,
+            .float => .float,
+            .func, .struct_type, .struct_value, .type_value => .type_type,
+        };
+    }
+
     fn runtimeTypeOfComptimeValue(self: *@This(), source_idx: ast.NodeIdx, value: ComptimeValue) InferError!Type {
         return switch (value) {
             .unit => .unit,
@@ -1177,7 +1404,7 @@ const Checker = struct {
     }
 
     fn evalFunction(self: *@This(), fn_id: u32, args: []const ComptimeValue) InferError!ComptimeValue {
-        const info = self.typed.functions[fn_id];
+        const info = self.typed.functions.items[fn_id];
         if (info.decl == std.math.maxInt(ast.NodeIdx)) return .unit;
 
         var locals = scope_mod.ScopeStack(EvalBinding).init();
@@ -1501,8 +1728,9 @@ const Checker = struct {
     }
 
     fn checkFunction(self: *@This(), fn_id: u32) InferError!void {
-        const info = &self.typed.functions[fn_id];
-        if (self.hasComptimeParams(info.*) and info.ty.ret == .type_type) return;
+        if (fn_id >= self.typed.functions.items.len) return;
+        const info = self.typed.functions.items[fn_id];
+        if (self.hasComptimeParams(info) and !info.is_monomorphized) return;
 
         const mark = self.bindings.mark();
         defer self.bindings.restore(mark);
@@ -1513,9 +1741,26 @@ const Checker = struct {
         const is_top_level = info.decl == std.math.maxInt(ast.NodeIdx);
         if (!is_top_level) {
             const a = self.parsed.ast;
-            for (a.fnParams(info.decl), info.ty.params) |param, param_ty| {
-                const pname = a.identOf(param.name);
-                try self.pushBinding(info.decl, pname, .{ .ty = param_ty, .mutable = false, .comptime_visible = false });
+            if (info.is_monomorphized) {
+                // For monomorphized functions, only bind runtime params (skip comptime ones)
+                const mask = a.fnComptimeMask(info.decl);
+                var runtime_idx: u32 = 0;
+                for (a.fnParams(info.decl), 0..) |param, param_idx| {
+                    if (mask & (@as(u32, 1) << @intCast(param_idx)) != 0) continue;
+                    if (runtime_idx >= info.ty.params.len) return;
+                    const param_ty = info.ty.params[runtime_idx];
+                    const pname = a.identOf(param.name);
+                    try self.pushBinding(info.decl, pname, .{ .ty = param_ty, .mutable = false, .comptime_visible = false });
+                    runtime_idx += 1;
+                }
+                // Clear cached node_types for body since shared AST nodes may have stale types
+                const body = a.fnBody(info.decl);
+                self.clearNodeTypesInSubtree(body);
+            } else {
+                for (a.fnParams(info.decl), info.ty.params) |param, param_ty| {
+                    const pname = a.identOf(param.name);
+                    try self.pushBinding(info.decl, pname, .{ .ty = param_ty, .mutable = false, .comptime_visible = false });
+                }
             }
         }
 
@@ -1523,13 +1768,13 @@ const Checker = struct {
         const body_ty = try self.inferNode(body);
         if (!self.current_saw_return and !isAssignableTo(info.ty.ret, body_ty)) {
             if (is_top_level) {
-                const mutable_sig = @constCast(info.ty);
+                const mutable_sig = @constCast(self.typed.functions.items[fn_id].ty);
                 mutable_sig.ret = body_ty;
             } else {
                 return self.failAtNodeWithTypes(body, error.FunctionBodyTypeMismatch, info.ty.ret, body_ty);
             }
         }
-        info.has_explicit_return = self.current_saw_return;
+        self.typed.functions.items[fn_id].has_explicit_return = self.current_saw_return;
     }
 
     fn run(self: *@This()) InferError!void {
@@ -1537,7 +1782,7 @@ const Checker = struct {
         try self.validateTopLevelComptimeDecls();
 
         var idx: u32 = 0;
-        while (idx < self.typed.functions.len) : (idx += 1) {
+        while (idx < self.typed.functions.items.len) : (idx += 1) {
             try self.checkFunction(idx);
         }
     }
@@ -1619,6 +1864,7 @@ pub fn typecheckReport(
 
     checker.bindings.deinit(gpa);
     checker.comptime_decl_state.deinit();
+    checker.monomorph_cache.deinit();
     return .{
         .typed = checker.typed,
         .diagnostic = null,
