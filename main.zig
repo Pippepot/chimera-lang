@@ -4,11 +4,12 @@ const debug = @import("debug.zig");
 const diagnostics = @import("diagnostics.zig");
 const query = @import("query.zig");
 const runtime = @import("runtime.zig");
+const disasm = @import("disasm.zig");
 
 fn printUsage(io: std.Io, exe_name: []const u8) !void {
     var wbuf: [512]u8 = undefined;
     var w = std.Io.File.stderr().writer(io, &wbuf);
-    try w.interface.print("usage: {s} [--debug=ast,ssa,timing,query] [--no-query-cache] <source-file> [program-args...]\n", .{exe_name});
+    try w.interface.print("usage: {s} [--debug=ast,ssa,timing,query,asm] [--no-query-cache] <source-file> [program-args...]\n", .{exe_name});
     try w.interface.flush();
 }
 
@@ -140,13 +141,21 @@ pub fn main(init: std.process.Init) !void {
         lower_duration = if (lower_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
 
         const debug_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
-        try debug.dumpDebugInfo(io, flags, module_or_null, ir, gpa);
+        try debug.dumpDebugInfo(io, flags, module_or_null, ir, null, gpa);
         debug_duration = if (debug_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
     }
 
     const compile_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
     const compile_result = try qdb.compileResult(source_id);
     const compile_duration = if (compile_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
+
+    if (flags.x86 and compile_result.bytes != null) {
+        const program_code_len = std.mem.readInt(u32, compile_result.bytes.?[120..124], .little);
+        const raw_code = compile_result.bytes.?[0x1000..];
+        const asm_text = try disasm.disassemble(raw_code[0..@intCast(program_code_len)], gpa);
+        defer gpa.free(asm_text);
+        try debug.dumpDebugInfo(io, flags, null, null, asm_text, gpa);
+    }
 
     if (flags.timing) {
         const compile_total = std.Io.Duration{

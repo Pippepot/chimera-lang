@@ -15,10 +15,11 @@
   - `query.zig` owns the revisioned incremental query system (`QueryDb`) and stage orchestration (frame management, dependency tracking, memo verification).
   - `query_cache.zig` owns cross-run persistent query cache encoding/decoding, atomic save/load, and stale-cache cleanup.
   - `ir.zig` owns multi-function IR types and typed AST -> IR lowering, plus `computeLower` for query integration.
-  - `codegen.zig` owns IR -> x86 machine code + ELF emission, plus `computeCompile` for query integration.
+  - `codegen.zig` owns IR -> x86 machine code + ELF emission, plus `computeCompile` for query integration. Records `program_code_len` (offset before helpers) in the ELF padding.
+  - `disasm.zig` owns a pattern-based x86 disassembler that reads raw machine code and produces human-readable assembly text (used by `--debug=asm`). No emitter dependencies — operates purely on bytes + a 75-entry pattern table.
   - `db.zig` owns shared query types (`SourceId`, `Revision`, `Dependency`, `QueryKey`, `QueryStats`, `Stage`, `CompileResult`, `DbError`) and comparison helpers.
   - `scope.zig` owns a shared lexical scope stack utility (`ScopeStack`) reused by typechecker and lowering.
-  - `debug.zig` owns debug flag parsing and AST/SSA debug dumps.
+  - `debug.zig` owns debug flag parsing and AST/SSA/x86 debug dumps.
   - `helpers_bin.zig` owns pre-assembled helper blobs (`print_int`, `print_bool`, `print_float32`, `atoi`).
 - **Project state** is documented in `.agents/project.md`.
 - **AGENTS.md** lives alongside `main.zig` (project root, not repo root).
@@ -127,8 +128,9 @@
 
 ## Debug flags
 
-- Use `--debug=ast,ssa,timing,query` (comma-separated) with `zig run main.zig -- ...`.
+- Use `--debug=ast,ssa,timing,query,asm` (comma-separated) with `zig run main.zig -- ...`.
 - `query` prints query diagnostics (revision, source updates, stage hits/recomputes, dependency checks/invalidations).
+- `asm` prints x86 assembly disassembly of the emitted machine code (helpers excluded). The disassembler operates on raw bytes via a pattern table; it does not call into the emitter or IR.
 
 ## CLI behavior
 

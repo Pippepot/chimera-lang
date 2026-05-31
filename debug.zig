@@ -95,6 +95,7 @@ pub const DebugFlags = struct {
     ssa: bool = false,
     timing: bool = false,
     query: bool = false,
+    x86: bool = false,
 };
 
 pub fn parseDebugFlags(args: std.process.Args) DebugFlags {
@@ -112,6 +113,7 @@ pub fn parseDebugFlags(args: std.process.Args) DebugFlags {
             if (std.mem.eql(u8, item, "ssa")) flags.ssa = true;
             if (std.mem.eql(u8, item, "timing")) flags.timing = true;
             if (std.mem.eql(u8, item, "query")) flags.query = true;
+            if (std.mem.eql(u8, item, "asm")) flags.x86 = true;
             if (comma == rest.len) break;
             rest = rest[comma + 1 ..];
         }
@@ -181,8 +183,28 @@ fn dumpAstNode(a: *const ast.Ast, idx: ast.NodeIdx, writer: *std.Io.Writer, pref
     switch (a.nodes[idx].tag) {
         .block => {
             const items = a.blockItems(idx);
+            var has_visible = false;
+            for (items) |item| {
+                if (a.nodes[item].tag != .comptime_fn and a.nodes[item].tag != .comptime_struct) {
+                    has_visible = true;
+                    break;
+                }
+            }
+            if (!has_visible) return;
+
+            const last_visible = last_visible: {
+                var last: u32 = 0;
+                var i: u32 = 0;
+                while (i < items.len) : (i += 1) {
+                    if (a.nodes[items[i]].tag != .comptime_fn and a.nodes[items[i]].tag != .comptime_struct) {
+                        last = i;
+                    }
+                }
+                break :last_visible last;
+            };
             for (items, 0..) |item, i| {
-                dumpAstNode(a, item, writer, next_prefix, i + 1 == items.len, false);
+                if (a.nodes[item].tag == .comptime_fn or a.nodes[item].tag == .comptime_struct) continue;
+                dumpAstNode(a, item, writer, next_prefix, i == last_visible, false);
             }
         },
         .const_decl => dumpAstNode(a, a.varDeclValue(idx), writer, next_prefix, true, false),
@@ -259,10 +281,7 @@ fn dumpTypeNode(a: *const ast.Ast, type_idx: ast.TypeIdx, writer: *std.Io.Writer
             writer.writeAll(") ") catch return;
             dumpTypeNode(a, a.funcTypeRet(type_idx), writer);
         },
-        .int_lit, .float_lit, .var_ref, .block, .const_decl, .var_decl, .assign,
-        .return_stmt, .call, .print_stmt, .add, .sub, .mul, .div, .arg, .lt, .gt,
-        .le, .ge, .eq, .ne, .if_stmt, .struct_init, .field_access, .bool_lit,
-        .unit_lit, .comptime_expr, .comptime_value_decl, .comptime_fn, .comptime_struct, .struct_expr => {},
+        .int_lit, .float_lit, .var_ref, .block, .const_decl, .var_decl, .assign, .return_stmt, .call, .print_stmt, .add, .sub, .mul, .div, .arg, .lt, .gt, .le, .ge, .eq, .ne, .if_stmt, .struct_init, .field_access, .bool_lit, .unit_lit, .comptime_expr, .comptime_value_decl, .comptime_fn, .comptime_struct, .struct_expr => {},
     }
 }
 
@@ -275,6 +294,9 @@ fn dumpProgram(a: *const ast.Ast, writer: *std.Io.Writer) void {
                 const params = a.fnParams(decl_idx);
                 for (params, 0..) |param, i| {
                     if (i > 0) writer.writeAll(", ") catch return;
+                    if (a.fnParamIsComptime(decl_idx, @intCast(i))) {
+                        writer.writeAll("comptime ") catch return;
+                    }
                     writer.print("{s}: ", .{a.identOf(param.name)}) catch return;
                     dumpTypeNode(a, param.ty, writer);
                 }
@@ -304,7 +326,7 @@ fn dumpProgram(a: *const ast.Ast, writer: *std.Io.Writer) void {
     }
 
     if (a.entry != std.math.maxInt(ast.NodeIdx)) {
-        writer.writeAll("entry\n") catch return;
+        writer.writeAll("program entry\n") catch return;
         dumpAstNode(a, a.entry, writer, "  ", true, true);
         writer.writeAll("\n") catch return;
     }
@@ -315,6 +337,7 @@ pub fn dumpDebugInfo(
     flags: DebugFlags,
     ast_ast: ?*const ast.Ast,
     ir: ?*const Program,
+    asm_text: ?[]const u8,
     gpa: std.mem.Allocator,
 ) !void {
     _ = gpa;
@@ -335,5 +358,13 @@ pub fn dumpDebugInfo(
             try w.interface.writeAll("\n");
             try w.interface.flush();
         }
+    }
+    if (flags.x86 and asm_text != null) {
+        var wbuf: [4096]u8 = undefined;
+        var w = std.Io.File.stdout().writer(io, &wbuf);
+        try w.interface.writeAll("; x86 assembly:\n");
+        try w.interface.writeAll(asm_text.?);
+        try w.interface.writeAll("\n");
+        try w.interface.flush();
     }
 }

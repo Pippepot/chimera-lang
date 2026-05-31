@@ -25,11 +25,12 @@ This compiler now supports a declaration-first language with optional top-level 
 | `analyze.zig` | Active semantic analysis/type inference/comptime stage (`AnalyzedAst`) |
 | `typecheck.zig` | Legacy typechecker retained for reference (not in active query pipeline) |
 | `ir.zig` | Flat AST dispatch via `ast.nodes[idx].tag` and accessors |
-| `codegen.zig` | IR->x86 + ELF, backdate support |
+| `codegen.zig` | IR->x86 + ELF, backdate support, records `program_code_len` in ELF padding |
+| `disasm.zig` | Pattern-based x86 disassembler (75-entry table), two-pass label collection, used by `--debug=asm` |
 | `query.zig` | Generic `ensureMemo`, 6-stage pipeline (`astgen` included), persistent cache load/save |
 | `query_cache.zig` | Buffer-copy ser/des for all active stages, persistent cache |
 | `db.zig` | Shared query types/stats/deps/memo helpers |
-| `debug.zig` | Flat AST dispatch |
+| `debug.zig` | Flat AST dispatch, debug flag parsing (ast/ssa/asm/timing/query) |
 | `runtime.zig` | Runtime helpers (`writeProgram`, `runProg`) — unchanged |
 | `scope.zig` | Reusable lexical scope stack utility — unchanged |
 | `helpers_bin.zig` | Embedded helper machine-code blobs — unchanged |
@@ -75,7 +76,8 @@ All 5 stages must be cached with `hits=1 recomputes=0` when cache is present. Th
 - **resolver.zig** ✅ — Flat AST, `NodeIdx` keys, builtin type name resolution, deps: parse
 - **analyze.zig** ✅ — Flat AST, `Type.type_type`, `ComptimeValue.type_value`, monomorphized struct type creation/lookup, comptime evaluator supports type_name/struct_expr
 - **ir.zig** ✅ — Flat AST dispatch, `Type.type_type`, deps: analyze
-- **codegen.zig** ✅ — IR->x86 + ELF, backdate support, deps: lower
+- **codegen.zig** ✅ — IR->x86 + ELF, backdate support, `program_code_len` in ELF padding, deps: lower
+- **disasm.zig** ✅ — Pattern-based x86 disassembler, 75-entry table, two-pass label resolution
 - **query.zig** ✅ — Generic `ensureMemo`, 6-stage pipeline, persistent cache load/save
 - **query_cache.zig** ✅ — Buffer-copy ser/des for all stages, `type_type` and `type_value` serialization
 - **main.zig** ✅ — CLI, persistent cache
@@ -100,7 +102,7 @@ All 5 stages must be cached with `hits=1 recomputes=0` when cache is present. Th
 - `zig run main.zig -- demo.chi` compiles and runs the demo.
 - First non-debug CLI argument is source file path.
 - Remaining CLI args are passed to generated `./prog` and accessible via `arg(n)`.
-- Debug flags: `--debug=ast,ssa,timing,query`.
+- Debug flags: `--debug=ast,ssa,timing,query,asm`.
 - Query cache is enabled by default for CLI path-backed sources (`setSourceFile`); disable with `--no-query-cache`.
 
 ## Tests

@@ -26,6 +26,7 @@ const BinaryEmitter = struct {
     start_symbol: u32,
     function_layouts: []FunctionLayout,
     helper_symbols: []u32,
+    program_code_len: u32 = 0,
 
     const SetccCond = enum(u8) {
         b = 0x92,
@@ -699,13 +700,14 @@ const BinaryEmitter = struct {
         for (self.prog.functions.items) |*func| {
             try self.emitFunction(func);
         }
+        self.program_code_len = @intCast(self.code.items.len);
         try self.appendHelpers();
         try self.resolveFixups();
         return self.code.toOwnedSlice(self.gpa);
     }
 };
 
-fn buildElfExecutable(code: []const u8, entry_code_offset: u64, gpa: std.mem.Allocator) error{ OutOfMemory, FileTooBig }![]const u8 {
+fn buildElfExecutable(code: []const u8, entry_code_offset: u64, program_code_len: u32, gpa: std.mem.Allocator) error{ OutOfMemory, FileTooBig }![]const u8 {
     const code_file_offset: u64 = 0x1000;
     const image_base: u64 = 0x400000;
 
@@ -775,6 +777,9 @@ fn buildElfExecutable(code: []const u8, entry_code_offset: u64, gpa: std.mem.All
 
     try file_buf.appendSlice(gpa, std.mem.asBytes(&elf_header));
     try file_buf.appendSlice(gpa, std.mem.asBytes(&phdr));
+    var plen_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &plen_bytes, program_code_len, .little);
+    try file_buf.appendSlice(gpa, &plen_bytes);
     const remaining = code_file_offset - file_buf.items.len;
     try file_buf.appendNTimes(gpa, 0, @intCast(remaining));
     try file_buf.appendSlice(gpa, code);
@@ -811,5 +816,5 @@ pub fn compileProgram(prog: *const Program, gpa: std.mem.Allocator) ![]const u8 
     const code = try emitter.emitProgram();
     defer gpa.free(code);
 
-    return buildElfExecutable(code, 0, gpa);
+    return buildElfExecutable(code, 0, emitter.program_code_len, gpa);
 }
