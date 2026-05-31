@@ -26,13 +26,13 @@ This compiler now supports a declaration-first language with optional top-level 
 | `ir.zig` | Flat AST dispatch via `ast.nodes[idx].tag` and accessors |
 | `codegen.zig` | IR->x86 + ELF, backdate support, records `program_code_len` in ELF padding |
 | `disasm.zig` | Pattern-based x86 disassembler (75-entry table), two-pass label collection, used by `--debug=asm` |
-| `query.zig` | Generic `ensureMemo`, 6-stage pipeline (`astgen` included), persistent cache load/save |
+| `query.zig` | Generic `ensureMemo`, 5-stage pipeline, persistent cache load/save |
 | `query_cache.zig` | Buffer-copy ser/des for all active stages, persistent cache |
 | `debug.zig` | Flat AST dispatch, debug flag parsing (ast/ssa/asm/timing/query) |
 | `runtime.zig` | Runtime helpers (`writeProgram`, `runProg`) — unchanged |
 | `scope.zig` | Reusable lexical scope stack utility — unchanged |
 | `helpers_bin.zig` | Embedded helper machine-code blobs — unchanged |
-| `test.zig` | All 54 tests pass using flat API |
+| `test.zig` | All tests pass using flat API |
 
 ## Query architecture
 
@@ -78,13 +78,17 @@ All 5 stages must be cached with `hits=1 recomputes=0` when cache is present. Th
 - **query.zig** ✅ — Generic `ensureMemo`, 5-stage pipeline, persistent cache load/save
 - **query_cache.zig** ✅ — Buffer-copy ser/des for all active stages, `type_type` and `type_value` serialization
 - **main.zig** ✅ — CLI, persistent cache
-- **test.zig** ✅ — All 54 tests pass including monomorphization and caching tests
+- **test.zig** ✅ — All 70 tests pass including monomorphization, variant `is`/`as`, and caching tests
 
 ## Language notes
 
 - Statements are newline-separated.
 - `if`/`else` uses indentation-based blocks with inline `->` form supported.
 - Fallible comparisons (`<`, `>`, `<=`, `>=`, `==`, `!=`) are only legal in `if` conditions.
+- **Variant types** — compiletime type unions use `|` (e.g. `comptime T = int | float | Foo`).
+- **`is` predicate** — fallible runtime variant tag check (`if x is int`).
+- **`as` cast** — fallible runtime variant cast (`if const i = x as int`).
+- **Condition binding scope** — names introduced by `if const/var name = ... as Type` are visible only in the success (`then`) branch.
 - `const` and `var` bindings support optional type annotations.
 - **No language string values** — string literals and `string` type annotations are rejected.
 - **Struct types** — `comptime Name = struct` with indented field lines.
@@ -117,4 +121,4 @@ All 5 stages must be cached with `hits=1 recomputes=0` when cache is present. Th
   - compile `changed_at` backdating
   - persistent cache reuse/disable/failure/corruption/stale cleanup behavior
 - Zero-recompute test: `compileResult` twice with no source change → 0 recomputes, 1 compile hit (compile is the only stage accessed on the second call; all others are implicitly cached).
-- Current suite: `zig test test.zig` (53 tests).
+- Current suite: `zig test test.zig` (70 tests).

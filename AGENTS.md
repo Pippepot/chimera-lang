@@ -54,6 +54,7 @@
 - **Primitive types:** `unit`, `bool`, `int`, `float`.
 - **Function types:** `func(ParamType1, ParamType2, ...) ReturnType` — usable in parameter annotations (`f: func(int) int`), return type annotations, and `const`/`var` binding annotations.
 - **Named struct types:** referenced by their declared name (e.g. `Foo`) — usable in `const`/`var` binding annotations.
+- **Variant types:** compiletime type unions written with `|` (e.g. `comptime Sum = int | float | Foo`) and usable in annotations.
 
 ## Struct types and initialization
 
@@ -78,6 +79,7 @@
 - **No `then` keyword.** `if` expects either `->` (inline) or a newline + indented block.
 - **Inline then-body:** `if <cond> -> <expr>` — `->` is required for inline body.
 - **Block then-body:** `if <cond>` followed by newline and indented body.
+- **Condition binding form:** `if const name = <fallible-expr>` / `if var name = <fallible-expr>` binds `name` only in the success (`then`) branch.
 - **Inline else-body:** `else <expr>` — no `->` needed, body is the next expression.
 - **Block else-body:** `else` followed by newline and indented body.
 - **`else if` chaining:** `else if <cond>` — the else body is an `if` expression, works naturally.
@@ -89,7 +91,7 @@
 
 ## Fail semantics (Verse-style)
 
-- **Fallible expressions** — comparisons (`<` `>` `<=` `>=` `==` `!=`) are fallible. They succeed (returning `unit`) or fail.
+- **Fallible expressions** — comparisons (`<` `>` `<=` `>=` `==` `!=`), variant `is` checks, and variant `as` casts are fallible.
 - **Fallible contexts** — only `if` conditions. Set `Checker.in_fallible_scope = true` while inferring the condition.
 - **Restriction** — fallible expressions can ONLY appear in fallible contexts. Outside → error `FallibleOutsideFallibleContext`.
 - **`if` condition** — must be a fallible expression. Non-fallible → error `IfConditionNotFallible`.
@@ -98,7 +100,9 @@
 - **Comparisons produce `unit`** — comparisons return `.unit` in the typechecker, not `.bool`.
 - **`bool` type** — exists for `true`/`false` literals and `printb`. Separate from fallibility.
 - **Equality on bools** — also fallible (predicate branch `eqb`/`neb`, type `.unit`).
-- **`isFallible(node)`** — helper checking node kind against `.lt`, `.gt`, `.le`, `.ge`, `.eq`, `.ne`.
+- **`is`** — checks a variant's runtime tag against a RHS type (or RHS type-union alias).
+- **`as`** — checks a variant's runtime tag and on success yields payload typed as RHS member type.
+- **`isFallible(node)`** — helper checking node kind against `.lt`, `.gt`, `.le`, `.ge`, `.eq`, `.ne`, `.is`, `.as`, `.and`, `.or`.
 - **Scope isolation:** each block and each `if` branch restores bindings after inference/lowering; branch-local `const` names do not leak.
 
 
@@ -108,7 +112,7 @@
 - **Inputs are virtual source IDs.** `setSource(source_id, text)` updates source text and revision tracking.
 - **Path-backed inputs:** `setSourceFile(source_id, source_path, text)` enables persistent cache load/save for that source.
 - **Initialization options:** `initWithOptions(gpa, QueryDbOptions)` controls persistent cache enablement, optional cache dir override, and `io` handle. `init(gpa)` remains a default wrapper.
-- **Stage queries:** `parse(source_id)` -> `resolve(source_id)` -> `astgen(source_id)` -> `typecheck(source_id)` -> `lower(source_id)` -> `compile(source_id)`.
+- **Stage queries:** `parse(source_id)` -> `resolve(source_id)` -> `typecheck(source_id)` -> `lower(source_id)` -> `compile(source_id)`.
 - **Memo metadata:** each memo tracks `deps`, `verified_at`, `changed_at`, and `computing`.
 - **Red/green verification:**
   - If `verified_at == current_revision`, it is an immediate hit.

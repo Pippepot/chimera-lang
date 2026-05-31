@@ -45,6 +45,7 @@ const TokenTag = enum {
     kw_func,
     kw_struct,
     kw_is,
+    kw_as,
     kw_and,
     kw_or,
     ident,
@@ -179,6 +180,7 @@ const Lexer = struct {
         if (std.mem.eql(u8, word, "func")) return .{ .tag = .kw_func, .start = start, .end = self.index };
         if (std.mem.eql(u8, word, "struct")) return .{ .tag = .kw_struct, .start = start, .end = self.index };
         if (std.mem.eql(u8, word, "is")) return .{ .tag = .kw_is, .start = start, .end = self.index };
+        if (std.mem.eql(u8, word, "as")) return .{ .tag = .kw_as, .start = start, .end = self.index };
         if (std.mem.eql(u8, word, "and")) return .{ .tag = .kw_and, .start = start, .end = self.index };
         if (std.mem.eql(u8, word, "or")) return .{ .tag = .kw_or, .start = start, .end = self.index };
         return .{ .tag = .ident, .start = start, .end = self.index, .ident = word };
@@ -608,6 +610,11 @@ const Parser = struct {
     fn makeIsNode(self: *@This(), lhs: NodeIdx, rhs_type: ast.TypeIdx) !NodeIdx {
         const span = coverSpans(try self.spanOf(lhs), try self.spanOf(rhs_type));
         return self.allocNode(.is, lhs, rhs_type, span);
+    }
+
+    fn makeAsNode(self: *@This(), lhs: NodeIdx, rhs_type: ast.TypeIdx) !NodeIdx {
+        const span = coverSpans(try self.spanOf(lhs), try self.spanOf(rhs_type));
+        return self.allocNode(.as, lhs, rhs_type, span);
     }
 
     fn makeBinop(self: *@This(), tag: BinTag, left: NodeIdx, right: NodeIdx) !NodeIdx {
@@ -1127,6 +1134,11 @@ const Parser = struct {
                     const rhs_type = try self.parseType();
                     lhs = try self.makeIsNode(lhs, rhs_type);
                 },
+                .kw_as => {
+                    try self.advance();
+                    const rhs_type = try self.parseType();
+                    lhs = try self.makeAsNode(lhs, rhs_type);
+                },
                 else => break,
             }
         }
@@ -1367,7 +1379,7 @@ const Parser = struct {
         const if_span = tokenSpan(self.current);
         try self.expect(.kw_if, error.UnexpectedToken);
 
-        const cond = try self.parseExpression();
+        const cond = try self.parseIfCondition();
 
         const then_expr = if (self.current.tag == .arrow) then_body: {
             try self.advance();
@@ -1389,6 +1401,43 @@ const Parser = struct {
         }
         const extra_idx = try self.builder.allocExtraPair(then_expr, std.math.maxInt(u32));
         return self.allocNode(.if_stmt, cond, extra_idx, span);
+    }
+
+    fn parseIfCondition(self: *@This()) ParseError!NodeIdx {
+        return switch (self.current.tag) {
+            .kw_const => self.parseIfBindingCondition(.const_kind),
+            .kw_var => self.parseIfBindingCondition(.var_kind),
+            else => self.parseExpression(),
+        };
+    }
+
+    fn parseIfBindingCondition(self: *@This(), kind: BindingKind) ParseError!NodeIdx {
+        const keyword_span = tokenSpan(self.current);
+        const keyword_tag: TokenTag = switch (kind) {
+            .const_kind => .kw_const,
+            .var_kind => .kw_var,
+        };
+        try self.expect(keyword_tag, error.UnexpectedToken);
+
+        if (self.current.tag != .ident) return error.ExpectedIdentifier;
+        const ident = self.current.ident;
+        try self.advance();
+
+        var binding_ty: ?u32 = null;
+        if (self.current.tag == .colon) {
+            try self.advance();
+            binding_ty = try self.parseType();
+        }
+
+        try self.expect(.assign, error.ExpectedAssign);
+        const value = try self.parseExpression();
+        const value_span = try self.spanOf(value);
+        const end_span = if (binding_ty) |ty| coverSpans(try self.spanOf(ty), value_span) else value_span;
+        const node_span = coverSpans(keyword_span, end_span);
+        return switch (kind) {
+            .const_kind => self.makeConstNode(ident, binding_ty, value, node_span),
+            .var_kind => self.makeVarNode(ident, binding_ty, value, node_span),
+        };
     }
 };
 

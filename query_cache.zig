@@ -11,7 +11,7 @@ const analyze = @import("analyze.zig");
 const CacheExt = ".qcache";
 const Magic: [8]u8 = .{ 'X', '8', '6', 'Q', 'C', 'A', 'C', 'H' };
 const SchemaVersion: u32 = 7;
-const CompilerAbiVersion: u32 = 4;
+const CompilerAbiVersion: u32 = 6;
 
 pub const CacheOptions = struct {
     cache_dir_override: ?[]const u8 = null,

@@ -536,6 +536,78 @@ const FunctionLowerer = struct {
         }
     }
 
+    fn lowerVariantAsCondition(
+        self: *@This(),
+        start_block_id: BlockId,
+        as_node: ast.NodeIdx,
+        success_binding_slot: ?ValueRef,
+        success_binding_width: u32,
+        then_target: BlockId,
+        else_target: BlockId,
+    ) LowerResult!void {
+        const a = self.parent.typed.ast;
+        const lhs = a.asLhs(as_node);
+        const lhs_base = try self.lowerAst(lhs);
+        const lhs_ty = try self.nodeType(lhs);
+        const lhs_variant = switch (lhs_ty) {
+            .variant => |variant_ty| variant_ty,
+            else => return error.IfConditionNotFallible,
+        };
+        const rhs_ty = try self.nodeType(as_node);
+        const member_tag = variantMemberIndex(lhs_variant, rhs_ty) orelse return error.IfConditionNotFallible;
+
+        self.current_block_id = start_block_id;
+        const tag_const = try self.addInst(.{ .iconst = @intCast(member_tag) });
+
+        const success_target = if (success_binding_slot == null) then_target else try self.newBlock(null);
+        self.currentBlock().terminator = .{
+            .pbr = .{
+                .pred = .{
+                    .op = .eqi,
+                    .pair = .{ .l = lhs_base, .r = tag_const },
+                },
+                .then_branch = .{ .target = success_target },
+                .else_branch = .{ .target = else_target },
+            },
+        };
+
+        if (success_binding_slot) |binding_slot| {
+            self.current_block_id = success_target;
+            try self.emitCopySlots(lhs_base + 1, binding_slot, success_binding_width);
+            self.currentBlock().terminator = .{ .br = .{ .target = then_target } };
+        }
+    }
+
+    const IfCondBinding = struct {
+        name: []const u8,
+        mutable: bool,
+        ty: analyze.Type,
+        slot: ValueRef,
+        slot_count: u32,
+        as_node: ast.NodeIdx,
+    };
+
+    fn setupIfCondBinding(self: *@This(), cond: ast.NodeIdx) LowerResult!?IfCondBinding {
+        const a = self.parent.typed.ast;
+        const cond_tag = a.nodes[cond].tag;
+        if (cond_tag != .const_decl and cond_tag != .var_decl) return null;
+
+        const value_node = a.varDeclValue(cond);
+        if (a.nodes[value_node].tag != .as) return error.IfConditionNotFallible;
+
+        const binding_ty = self.parent.typed.decl_binding_types.get(cond) orelse try self.nodeType(value_node);
+        const slot_count = try self.typeSlotCount(binding_ty);
+        const slot = try self.allocSlotRange(slot_count);
+        return .{
+            .name = a.identOf(a.nodes[cond].data0),
+            .mutable = cond_tag == .var_decl,
+            .ty = binding_ty,
+            .slot = slot,
+            .slot_count = slot_count,
+            .as_node = value_node,
+        };
+    }
+
     fn lowerConditionToBranches(
         self: *@This(),
         start_block_id: BlockId,
@@ -558,6 +630,9 @@ const FunctionLowerer = struct {
             },
             .is => {
                 try self.lowerVariantIsCondition(start_block_id, cond, then_target, else_target);
+            },
+            .as => {
+                try self.lowerVariantAsCondition(start_block_id, cond, null, 0, then_target, else_target);
             },
             else => {
                 const predicate = try self.lowerConditionPredicate(cond);
@@ -626,17 +701,35 @@ const FunctionLowerer = struct {
     fn lowerCall(self: *@This(), idx: ast.NodeIdx) LowerResult!ValueRef {
         const a = self.parent.typed.ast;
         const call_args = a.callArgs(idx);
-        if (call_args.len > MaxCallArgs) return error.TooManyCallArgs;
+        const callee = a.nodes[idx].data0;
+        const callee_ty = try self.nodeType(callee);
+        const fn_ty = switch (callee_ty) {
+            .func => |sig| sig,
+            else => return error.UnknownFunction,
+        };
+        if (call_args.len != fn_ty.params.len) return error.UnknownFunction;
+
+        const ret_slots = try self.typeSlotCount(fn_ty.ret);
+        if (ret_slots != 1) return error.UnsupportedMultiSlotFunctionSignature;
 
         var args: [MaxCallArgs]ValueRef = [_]ValueRef{0} ** MaxCallArgs;
-        for (call_args, 0..) |arg_node, i| {
-            args[i] = try self.lowerAst(arg_node);
+        var arg_word_count: usize = 0;
+        for (call_args, fn_ty.params) |arg_node, param_ty| {
+            const arg_base = try self.lowerValueAsType(arg_node, param_ty);
+            const arg_width = try self.typeSlotCount(param_ty);
+            if (arg_word_count + arg_width > MaxCallArgs) return error.TooManyCallArgs;
+
+            var slot_offset: u32 = 0;
+            while (slot_offset < arg_width) : (slot_offset += 1) {
+                args[arg_word_count] = arg_base + slot_offset;
+                arg_word_count += 1;
+            }
         }
 
-        const callee = try self.lowerAst(a.nodes[idx].data0);
+        const callee_ref = try self.lowerAst(callee);
         return self.addInst(.{ .call = .{
-            .callee = callee,
-            .argc = @intCast(call_args.len),
+            .callee = callee_ref,
+            .argc = @intCast(arg_word_count),
             .args = args,
         } });
     }
@@ -645,18 +738,30 @@ const FunctionLowerer = struct {
         const a = self.parent.typed.ast;
         const data = a.ifData(idx);
         const if_ty = try self.nodeType(idx);
+        const cond_binding = try self.setupIfCondBinding(data.cond);
 
         const then_block_id = try self.newBlock(null);
         const else_block_id = try self.newBlock(null);
         const merge_block_id = try self.newBlock(if_ty);
         const condition_entry_block = self.current_block_id;
-        try self.lowerConditionToBranches(condition_entry_block, data.cond, then_block_id, else_block_id);
+        if (cond_binding) |binding| {
+            try self.lowerVariantAsCondition(condition_entry_block, binding.as_node, binding.slot, binding.slot_count, then_block_id, else_block_id);
+        } else {
+            try self.lowerConditionToBranches(condition_entry_block, data.cond, then_block_id, else_block_id);
+        }
 
         var then_fallthrough = false;
         self.current_block_id = then_block_id;
         const then_value = then_blk: {
             const mark = self.bindings.mark();
             defer self.bindings.restore(mark);
+            if (cond_binding) |binding| {
+                try self.pushBinding(binding.name, .{
+                    .slot = binding.slot,
+                    .ty = binding.ty,
+                    .slot_count = binding.slot_count,
+                });
+            }
             break :then_blk try self.lowerAst(data.then_);
         };
         if (self.currentBlock().terminator == null) {
@@ -854,7 +959,7 @@ const FunctionLowerer = struct {
                 const arg_idx = a.nodes[idx].data0;
                 break :blk try self.addInst(.{ .argi = arg_idx });
             },
-            .lt, .gt, .le, .ge, .eq, .ne, .is, .@"and", .@"or" => error.IfConditionNotFallible,
+            .lt, .gt, .le, .ge, .eq, .ne, .is, .as, .@"and", .@"or" => error.IfConditionNotFallible,
             .if_stmt => try self.lowerIf(idx),
             .struct_init => try self.lowerStructInit(idx),
             .field_access => try self.lowerFieldAccess(idx),
@@ -876,9 +981,12 @@ const FunctionLowerer = struct {
         for (params, self.info.ty.params) |param, param_ty| {
             const pname = a.identOf(param.name);
             const slot_count = try self.typeSlotCount(param_ty);
-            if (slot_count != 1) return error.UnsupportedMultiSlotFunctionSignature;
+            if (self.function.param_values.items.len + slot_count > MaxCallArgs) return error.TooManyCallArgs;
             const slot = try self.allocSlotRange(slot_count);
-            try self.function.param_values.append(self.parent.gpa, slot);
+            var slot_offset: u32 = 0;
+            while (slot_offset < slot_count) : (slot_offset += 1) {
+                try self.function.param_values.append(self.parent.gpa, slot + slot_offset);
+            }
             try self.pushBinding(pname, .{
                 .slot = slot,
                 .ty = param_ty,

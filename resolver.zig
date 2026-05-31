@@ -220,18 +220,41 @@ const Resolver = struct {
             .is => {
                 try self.resolveNode(ast_.isLhs(idx));
             },
+            .as => {
+                try self.resolveNode(ast_.asLhs(idx));
+            },
             .if_stmt => {
                 const data = ast_.ifData(idx);
-                try self.resolveNode(data.cond);
-                {
-                    const mark = self.locals.mark();
-                    defer self.locals.restore(mark);
-                    try self.resolveNode(data.then_);
-                }
-                if (data.else_ != std.math.maxInt(ast.NodeIdx)) {
-                    const mark = self.locals.mark();
-                    defer self.locals.restore(mark);
-                    try self.resolveNode(data.else_);
+                const cond_tag = ast_.nodes[data.cond].tag;
+                if (cond_tag == .const_decl or cond_tag == .var_decl) {
+                    const cond_name = ast_.identOf(ast_.nodes[data.cond].data0);
+                    try self.resolveNode(ast_.varDeclValue(data.cond));
+                    {
+                        const mark = self.locals.mark();
+                        defer self.locals.restore(mark);
+                        self.locals.push(self.gpa, cond_name, {}) catch |err| switch (err) {
+                            error.DuplicateVariable => return self.fail(ast_.spanOf(data.cond), error.DuplicateSymbol),
+                            error.OutOfMemory => return error.OutOfMemory,
+                        };
+                        try self.resolveNode(data.then_);
+                    }
+                    if (data.else_ != std.math.maxInt(ast.NodeIdx)) {
+                        const mark = self.locals.mark();
+                        defer self.locals.restore(mark);
+                        try self.resolveNode(data.else_);
+                    }
+                } else {
+                    try self.resolveNode(data.cond);
+                    {
+                        const mark = self.locals.mark();
+                        defer self.locals.restore(mark);
+                        try self.resolveNode(data.then_);
+                    }
+                    if (data.else_ != std.math.maxInt(ast.NodeIdx)) {
+                        const mark = self.locals.mark();
+                        defer self.locals.restore(mark);
+                        try self.resolveNode(data.else_);
+                    }
                 }
             },
             .struct_init => {

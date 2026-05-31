@@ -1,5 +1,39 @@
 # Changelog
 
+## 2026-05-31 — Variant `as` casts and `if` condition bindings
+
+### Language surface
+
+- Added **`as`** as a fallible variant cast: `value as Type`.
+  - Succeeds when the variant tag matches `Type`.
+  - Fails otherwise (usable only in fallible contexts, like `if` conditions).
+- Added `if` condition binding form:
+  - `if const x = value as Type`
+  - `if var x = value as Type`
+- Condition bindings are scoped to the **success branch only** (do not leak to `else` or outer scope).
+
+### Compiler implementation
+
+- Parser/AST:
+  - Added `kw_as` token and `.as` AST node.
+  - `parseIf` now accepts binding conditions (`if const/var ... = ...`).
+- Resolver:
+  - Resolves `as` LHS expressions.
+  - Resolves bound name only within the `then` branch for condition bindings.
+- Type analysis:
+  - Added `inferAs` with diagnostics for non-variant LHS and non-member RHS.
+  - Added condition-binding analysis that records binding type and enforces fallible RHS.
+- Lowering:
+  - Added runtime tag-check lowering for `as`.
+  - For `if const/var name = v as T`, emits payload copy into a branch-local binding slot on success.
+
+### Cache + tests
+
+- Persistent cache compiler ABI version bumped to **6**.
+- Added regression tests for:
+  - `if const i = b as int` / `if const f = b as float` execution
+  - success-branch-only scope of condition-bound names
+
 ## 2026-05-31 — Remove astgen stage, fold diagnostics into db.zig
 
 ### Pipeline simplification

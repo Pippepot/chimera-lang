@@ -34,6 +34,7 @@ pub const Tag = enum(u8) {
     eq,
     ne,
     is,
+    as,
     @"and",
     @"or",
     if_stmt,
@@ -149,6 +150,14 @@ pub const Ast = struct {
     }
 
     pub fn isRhsType(ast: *const Ast, idx: NodeIdx) TypeIdx {
+        return ast.nodes[idx].data1;
+    }
+
+    pub fn asLhs(ast: *const Ast, idx: NodeIdx) NodeIdx {
+        return ast.nodes[idx].data0;
+    }
+
+    pub fn asRhsType(ast: *const Ast, idx: NodeIdx) TypeIdx {
         return ast.nodes[idx].data1;
     }
 

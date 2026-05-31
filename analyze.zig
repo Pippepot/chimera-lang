@@ -112,6 +112,8 @@ pub const TypeError = error{
     DuplicateVariantMember,
     IsOperandNotVariant,
     IsTypeNotInVariant,
+    AsOperandNotVariant,
+    AsTypeNotInVariant,
 };
 
 pub const ResolvedField = struct {
@@ -229,6 +231,8 @@ pub fn typeErrorMessage(kind: TypeError) []const u8 {
         error.DuplicateVariantMember => "duplicate variant member type",
         error.IsOperandNotVariant => "left side of 'is' must be a variant type",
         error.IsTypeNotInVariant => "right side of 'is' is not a member of the variant type",
+        error.AsOperandNotVariant => "left side of 'as' must be a variant type",
+        error.AsTypeNotInVariant => "right side of 'as' is not a member of the variant type",
     };
 }
 
@@ -508,7 +512,7 @@ const Checker = struct {
 
     fn isFallibleNode(a: ast.Ast, idx: ast.NodeIdx) bool {
         return switch (a.nodes[idx].tag) {
-            .lt, .gt, .le, .ge, .eq, .ne, .is, .@"and", .@"or" => true,
+            .lt, .gt, .le, .ge, .eq, .ne, .is, .as, .@"and", .@"or" => true,
             else => false,
         };
     }
@@ -595,6 +599,55 @@ const Checker = struct {
         return self.remember(idx, .unit);
     }
 
+    fn inferAs(self: *@This(), idx: ast.NodeIdx, lhs: ast.NodeIdx, rhs_type_idx: ast.TypeIdx) InferError!Type {
+        if (!self.in_fallible_scope) return self.failAtNode(idx, error.FallibleOutsideFallibleContext);
+        const lhs_ty = try self.inferNode(lhs);
+        const lhs_variant = switch (lhs_ty) {
+            .variant => |variant_ty| variant_ty,
+            else => return self.failAtNode(lhs, error.AsOperandNotVariant),
+        };
+
+        const rhs_ty = try self.resolveTypeNode(rhs_type_idx);
+        switch (rhs_ty) {
+            .variant => return self.failAtType(rhs_type_idx, error.AsTypeNotInVariant),
+            else => {
+                _ = variantMemberIndex(lhs_variant, rhs_ty) orelse return self.failAtType(rhs_type_idx, error.AsTypeNotInVariant);
+                return self.remember(idx, rhs_ty);
+            },
+        }
+    }
+
+    const IfCondBinding = struct {
+        name: []const u8,
+        ty: Type,
+        mutable: bool,
+    };
+
+    fn inferIfCondBinding(self: *@This(), cond: ast.NodeIdx) InferError!?IfCondBinding {
+        const a = self.parsed.ast;
+        const cond_tag = a.nodes[cond].tag;
+        if (cond_tag != .const_decl and cond_tag != .var_decl) return null;
+
+        const value_node = a.varDeclValue(cond);
+        const value_ty = try self.inferNode(value_node);
+        if (!isFallibleNode(a, value_node)) return self.failAtNode(value_node, error.IfConditionNotFallible);
+        if (value_ty == .type_type) return self.failAtNode(cond, error.RuntimeTypeValue);
+
+        var binding_ty = value_ty;
+        if (a.varDeclHasType(cond)) {
+            const annot_ty = try self.resolveTypeNode(a.varDeclType(cond).?);
+            if (!typeEql(annot_ty, value_ty)) return self.failAtNodeWithTypes(cond, error.BindingTypeMismatch, annot_ty, value_ty);
+            binding_ty = annot_ty;
+        }
+        try self.typed.decl_binding_types.put(cond, binding_ty);
+        _ = try self.remember(cond, .unit);
+        return .{
+            .name = a.identOf(a.nodes[cond].data0),
+            .ty = binding_ty,
+            .mutable = cond_tag == .var_decl,
+        };
+    }
+
     fn inferIf(self: *@This(), idx: ast.NodeIdx) InferError!Type {
         const prev_fallible = self.in_fallible_scope;
         self.in_fallible_scope = true;
@@ -603,12 +656,22 @@ const Checker = struct {
         const a = self.parsed.ast;
         const data = a.ifData(idx);
 
-        _ = try self.inferNode(data.cond);
-        if (!isFallibleNode(a, data.cond)) return self.failAtNode(data.cond, error.IfConditionNotFallible);
+        const cond_binding = try self.inferIfCondBinding(data.cond);
+        if (cond_binding == null) {
+            _ = try self.inferNode(data.cond);
+            if (!isFallibleNode(a, data.cond)) return self.failAtNode(data.cond, error.IfConditionNotFallible);
+        }
 
         const then_ty = then_blk: {
             const mark = self.bindings.mark();
             defer self.bindings.restore(mark);
+            if (cond_binding) |binding| {
+                try self.pushBinding(data.cond, binding.name, .{
+                    .ty = binding.ty,
+                    .mutable = binding.mutable,
+                    .comptime_visible = self.in_comptime_context,
+                });
+            }
             break :then_blk try self.inferNode(data.then_);
         };
 
@@ -1033,6 +1096,31 @@ const Checker = struct {
                     else => typeEql(lhs_ty, rhs_ty),
                 };
             },
+            .as => blk: {
+                const lhs_node = a.asLhs(idx);
+                const lhs_value = (try self.evalNodeStep(lhs_node, locals)).value;
+                const lhs_ty = try self.runtimeTypeOfComptimeValue(lhs_node, lhs_value);
+                const rhs_ty = try self.resolveTypeNode(a.asRhsType(idx));
+                if (rhs_ty == .variant) break :blk false;
+                break :blk typeEql(lhs_ty, rhs_ty);
+            },
+            .const_decl, .var_decl => blk: {
+                const value_node = a.varDeclValue(idx);
+                if (a.nodes[value_node].tag != .as) break :blk false;
+
+                const lhs_node = a.asLhs(value_node);
+                const lhs_value = (try self.evalNodeStep(lhs_node, locals)).value;
+                const lhs_ty = try self.runtimeTypeOfComptimeValue(lhs_node, lhs_value);
+                const rhs_ty = try self.resolveTypeNode(a.asRhsType(value_node));
+                if (rhs_ty == .variant or !typeEql(lhs_ty, rhs_ty)) break :blk false;
+
+                const name = a.identOf(a.nodes[idx].data0);
+                try self.pushLocal(locals, idx, name, .{
+                    .value = try self.cloneCtValue(lhs_value),
+                    .mutable = a.nodes[idx].tag == .var_decl,
+                });
+                break :blk true;
+            },
             else => false,
         };
     }
@@ -1208,7 +1296,7 @@ const Checker = struct {
             },
             .print_stmt, .arg => self.failAtNode(idx, error.ComptimePureOperationNotAllowed),
             .add, .sub, .mul, .div => try self.evalArithmetic(idx, locals),
-            .lt, .gt, .le, .ge, .eq, .ne, .is, .@"and", .@"or" => .{ .value = .unit, .returned = false },
+            .lt, .gt, .le, .ge, .eq, .ne, .is, .as, .@"and", .@"or" => .{ .value = .unit, .returned = false },
             .if_stmt => blk: {
                 const data = a.ifData(idx);
                 const pred = try self.evalPredicate(data.cond, locals);
@@ -1392,6 +1480,7 @@ const Checker = struct {
             .lt, .gt, .le, .ge => try self.inferComparison(idx, a.nodes[idx].data0, a.nodes[idx].data1),
             .eq, .ne => try self.inferEquality(idx, a.nodes[idx].data0, a.nodes[idx].data1),
             .is => try self.inferIs(idx, a.isLhs(idx), a.isRhsType(idx)),
+            .as => try self.inferAs(idx, a.asLhs(idx), a.asRhsType(idx)),
             .@"and", .@"or" => try self.inferLogical(idx, a.nodes[idx].data0, a.nodes[idx].data1),
             .if_stmt => self.inferIf(idx),
             .struct_init => self.inferStructInit(idx),

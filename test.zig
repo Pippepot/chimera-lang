@@ -495,6 +495,41 @@ test "variant type alias supports runtime is checks and assignment" {
     , "11\n22\n33\n");
 }
 
+test "variant function parameter supports runtime is checks" {
+    try testProgram(
+        \\comptime foo = func(x: int | float)
+        \\  if x is int -> print(1)
+        \\  if x is float -> print(2)
+        \\
+        \\foo(1)
+        \\foo(1.0)
+    , "1\n2\n");
+}
+
+test "if condition binding with as unwraps variant payload" {
+    try testProgram(
+        \\var b: int | float = 1
+        \\b = 2
+        \\if const i = b as int
+        \\  print(i)
+        \\b = 3.54
+        \\if const f = b as float -> print(f)
+    , "2\n3.540000\n");
+}
+
+test "if condition binding with as is scoped to success branch" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+
+    try db.setSource(0,
+        \\var b: int | float = 1
+        \\if const i = b as int
+        \\  print(i)
+        \\print(i)
+    );
+    try expectCompileErrorContains(&db, 0, "unknown symbol");
+}
+
 test "is requires a variant lhs" {
     var db = query.QueryDb.init(testing.allocator);
     defer db.deinit();
