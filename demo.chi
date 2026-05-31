@@ -2,4 +2,4 @@ comptime foo = func(comptime T: type, x:T)
   print(x)
 
 foo(int, 10)
-foo(float 1.23)
+foo(float, 1.23)
