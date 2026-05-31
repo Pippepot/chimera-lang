@@ -48,6 +48,7 @@ const TokenTag = enum {
     kw_as,
     kw_and,
     kw_or,
+    kw_not,
     ident,
     l_paren,
     r_paren,
@@ -183,6 +184,7 @@ const Lexer = struct {
         if (std.mem.eql(u8, word, "as")) return .{ .tag = .kw_as, .start = start, .end = self.index };
         if (std.mem.eql(u8, word, "and")) return .{ .tag = .kw_and, .start = start, .end = self.index };
         if (std.mem.eql(u8, word, "or")) return .{ .tag = .kw_or, .start = start, .end = self.index };
+        if (std.mem.eql(u8, word, "not")) return .{ .tag = .kw_not, .start = start, .end = self.index };
         return .{ .tag = .ident, .start = start, .end = self.index, .ident = word };
     }
 
@@ -1146,11 +1148,22 @@ const Parser = struct {
     }
 
     fn parseAnd(self: *@This()) ParseError!NodeIdx {
-        return self.parseBinary(&.{.{ .token = .kw_and, .tag = .@"and" }}, &Parser.parseComparison);
+        return self.parseBinary(&.{.{ .token = .kw_and, .tag = .@"and" }}, &Parser.parseNot);
     }
 
     fn parseOr(self: *@This()) ParseError!NodeIdx {
         return self.parseBinary(&.{.{ .token = .kw_or, .tag = .@"or" }}, &Parser.parseAnd);
+    }
+
+    fn parseNot(self: *@This()) ParseError!NodeIdx {
+        if (self.current.tag == .kw_not) {
+            const not_span = tokenSpan(self.current);
+            try self.advance();
+            const inner = try self.parseComparison();
+            const span = coverSpans(not_span, try self.spanOf(inner));
+            return self.allocNode(.@"not", inner, 0, span);
+        }
+        return self.parseComparison();
     }
 
     fn parseAdditive(self: *@This()) ParseError!NodeIdx {
@@ -1331,6 +1344,8 @@ const Parser = struct {
                 const name_idx = try self.internName(name);
                 return self.allocNode(.var_ref, name_idx, 0, ident_span);
             },
+            .kw_const => return self.parseBinding(.const_kind),
+            .kw_var => return self.parseBinding(.var_kind),
             else => return error.ExpectedExpression,
         }
     }

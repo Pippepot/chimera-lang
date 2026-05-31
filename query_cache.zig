@@ -10,7 +10,7 @@ const analyze = @import("analyze.zig");
 
 const CacheExt = ".qcache";
 const Magic: [8]u8 = .{ 'X', '8', '6', 'Q', 'C', 'A', 'C', 'H' };
-const SchemaVersion: u32 = 7;
+const SchemaVersion: u32 = 9;
 const CompilerAbiVersion: u32 = 6;
 
 pub const CacheOptions = struct {
@@ -350,6 +350,7 @@ fn writeInst(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, inst: ir_mod.Inst)
         .call => |c| {
             try appendU32(buf, gpa, c.callee);
             try appendU8(buf, gpa, c.argc);
+            try appendU8(buf, gpa, c.ret_slots);
             for (&c.args) |a| try appendU32(buf, gpa, a);
         },
         .addi, .addf, .subi, .subf, .muli, .mulf, .divi, .divf, .store => |p| {
@@ -374,6 +375,7 @@ fn readInst(r: *Reader) LoadError!ir_mod.Inst {
         3 => .{ .call = .{
             .callee = try r.readU32(),
             .argc = try r.readU8(),
+            .ret_slots = try r.readU8(),
             .args = blk: {
                 var args: [ir_mod.MaxCallArgs]ir_mod.ValueRef = undefined;
                 for (&args) |*a| a.* = try r.readU32();

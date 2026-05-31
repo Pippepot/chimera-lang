@@ -213,6 +213,9 @@ const Resolver = struct {
                 for (ast_.callArgs(idx)) |arg| try self.resolveNode(arg);
             },
             .print_stmt => try self.resolveNode(ast_.nodes[idx].data0),
+            .@"not" => {
+                try self.resolveNode(ast_.nodes[idx].data0);
+            },
             .add, .sub, .mul, .div, .lt, .gt, .le, .ge, .eq, .ne, .@"and", .@"or" => {
                 try self.resolveNode(ast_.nodes[idx].data0);
                 try self.resolveNode(ast_.nodes[idx].data1);

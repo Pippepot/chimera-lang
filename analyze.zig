@@ -545,7 +545,7 @@ const Binding = struct {
 
     fn isFallibleNode(a: ast.Ast, idx: ast.NodeIdx) bool {
         return switch (a.nodes[idx].tag) {
-            .lt, .gt, .le, .ge, .eq, .ne, .is, .as, .@"and", .@"or" => true,
+            .lt, .gt, .le, .ge, .eq, .ne, .is, .as, .@"and", .@"or", .@"not" => true,
             else => false,
         };
     }
@@ -590,6 +590,14 @@ const Binding = struct {
         if (!isFallibleNode(self.parsed.ast, lhs)) return self.failAtNode(lhs, error.LogicalOperandNotFallible);
         _ = try self.inferNode(rhs);
         if (!isFallibleNode(self.parsed.ast, rhs)) return self.failAtNode(rhs, error.LogicalOperandNotFallible);
+        return self.remember(idx, .unit);
+    }
+
+    fn inferNot(self: *@This(), idx: ast.NodeIdx) InferError!Type {
+        if (!self.in_fallible_scope) return self.failAtNode(idx, error.FallibleOutsideFallibleContext);
+        const inner = self.parsed.ast.nodes[idx].data0;
+        _ = try self.inferNode(inner);
+        if (!isFallibleNode(self.parsed.ast, inner)) return self.failAtNode(inner, error.LogicalOperandNotFallible);
         return self.remember(idx, .unit);
     }
 
@@ -690,6 +698,7 @@ const Binding = struct {
         const data = a.ifData(idx);
 
         const cond_binding = try self.inferIfCondBinding(data.cond);
+        const cond_mark = self.bindings.mark();
         if (cond_binding == null) {
             _ = try self.inferNode(data.cond);
             if (!isFallibleNode(a, data.cond)) return self.failAtNode(data.cond, error.IfConditionNotFallible);
@@ -708,13 +717,47 @@ const Binding = struct {
             break :then_blk try self.inferNode(data.then_);
         };
 
+        self.bindings.restore(cond_mark);
+
         if (data.else_ != std.math.maxInt(ast.NodeIdx)) {
             const else_ty = else_blk: {
                 const mark = self.bindings.mark();
                 defer self.bindings.restore(mark);
                 break :else_blk try self.inferNode(data.else_);
             };
-            if (!typeEql(then_ty, else_ty)) return self.failAtNodeWithTypes(idx, error.IfBranchTypeMismatch, then_ty, else_ty);
+            if (!typeEql(then_ty, else_ty)) {
+                var all_members = try std.ArrayList(Type).initCapacity(self.gpa, 4);
+                defer all_members.deinit(self.gpa);
+                const branch_types = [_]Type{ then_ty, else_ty };
+                for (branch_types) |ty| {
+                    switch (ty) {
+                        .variant => |vt| {
+                            for (vt.members) |m| {
+                                var found = false;
+                                for (all_members.items) |existing| {
+                                    if (typeEql(existing, m)) {
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                                if (!found) try all_members.append(self.gpa, m);
+                            }
+                        },
+                        else => {
+                            var found = false;
+                            for (all_members.items) |existing| {
+                                if (typeEql(existing, ty)) {
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if (!found) try all_members.append(self.gpa, ty);
+                        },
+                    }
+                }
+                const variant_ty = try self.allocVariantType(all_members.items);
+                return self.remember(idx, .{ .variant = variant_ty });
+            }
             return self.remember(idx, then_ty);
         }
 
@@ -735,7 +778,7 @@ const Binding = struct {
         }
         try self.pushBinding(idx, name, .{ .ty = binding_ty, .mutable = mutable, .comptime_visible = self.in_comptime_context });
         try self.typed.decl_binding_types.put(idx, binding_ty);
-        return self.remember(idx, .unit);
+        return self.remember(idx, binding_ty);
     }
 
     fn inferAssign(self: *@This(), idx: ast.NodeIdx) InferError!Type {
@@ -933,6 +976,9 @@ const Binding = struct {
                 for (a.callArgs(idx)) |arg| self.clearNodeTypesInSubtree(arg);
             },
             .print_stmt => self.clearNodeTypesInSubtree(a.nodes[idx].data0),
+            .@"not" => {
+                self.clearNodeTypesInSubtree(a.nodes[idx].data0);
+            },
             .add, .sub, .mul, .div, .lt, .gt, .le, .ge, .eq, .ne, .@"and", .@"or" => {
                 self.clearNodeTypesInSubtree(a.nodes[idx].data0);
                 self.clearNodeTypesInSubtree(a.nodes[idx].data1);
@@ -1283,6 +1329,9 @@ const Binding = struct {
                 if (try self.evalPredicate(a.nodes[idx].data0, locals)) return true;
                 return self.evalPredicate(a.nodes[idx].data1, locals);
             },
+            .@"not" => {
+                return !try self.evalPredicate(a.nodes[idx].data0, locals);
+            },
             .lt, .gt, .le, .ge, .eq, .ne => blk: {
                 const lhs_v = (try self.evalNodeStep(a.nodes[idx].data0, locals)).value;
                 const rhs_v = (try self.evalNodeStep(a.nodes[idx].data1, locals)).value;
@@ -1430,9 +1479,9 @@ const Binding = struct {
     fn evalDecl(self: *@This(), idx: ast.NodeIdx, mutable: bool, locals: *scope_mod.ScopeStack(EvalBinding)) InferError!EvalStep {
         const a = self.parsed.ast;
         const name = a.identOf(a.nodes[idx].data0);
-        const value = (try self.evalNodeStep(a.varDeclValue(idx), locals)).value;
-        try self.pushLocal(locals, idx, name, .{ .value = try self.cloneCtValue(value), .mutable = mutable });
-        return .{ .value = .unit, .returned = false };
+        const step = try self.evalNodeStep(a.varDeclValue(idx), locals);
+        try self.pushLocal(locals, idx, name, .{ .value = try self.cloneCtValue(step.value), .mutable = mutable });
+        return step;
     }
 
     fn evalArithmetic(self: *@This(), idx: ast.NodeIdx, locals: *scope_mod.ScopeStack(EvalBinding)) InferError!EvalStep {
@@ -1523,7 +1572,17 @@ const Binding = struct {
             },
             .print_stmt, .arg => self.failAtNode(idx, error.ComptimePureOperationNotAllowed),
             .add, .sub, .mul, .div => try self.evalArithmetic(idx, locals),
-            .lt, .gt, .le, .ge, .eq, .ne, .is, .as, .@"and", .@"or" => .{ .value = .unit, .returned = false },
+            .lt, .gt, .le, .ge, .eq, .ne, .is, .@"and", .@"or", .@"not" => .{ .value = .unit, .returned = false },
+            .as => blk: {
+                const lhs_node = a.asLhs(idx);
+                const lhs_step = try self.evalNodeStep(lhs_node, locals);
+                const lhs_ty = try self.runtimeTypeOfComptimeValue(lhs_node, lhs_step.value);
+                const rhs_ty = try self.resolveTypeNode(a.asRhsType(idx));
+                if (typeEql(lhs_ty, rhs_ty)) {
+                    break :blk .{ .value = try self.cloneCtValue(lhs_step.value), .returned = false };
+                }
+                break :blk .{ .value = .unit, .returned = false };
+            },
             .if_stmt => blk: {
                 const data = a.ifData(idx);
                 const pred = try self.evalPredicate(data.cond, locals);
@@ -1709,6 +1768,7 @@ const Binding = struct {
             .is => try self.inferIs(idx, a.isLhs(idx), a.isRhsType(idx)),
             .as => try self.inferAs(idx, a.asLhs(idx), a.asRhsType(idx)),
             .@"and", .@"or" => try self.inferLogical(idx, a.nodes[idx].data0, a.nodes[idx].data1),
+            .@"not" => try self.inferNot(idx),
             .if_stmt => self.inferIf(idx),
             .struct_init => self.inferStructInit(idx),
             .field_access => self.inferFieldAccess(idx),

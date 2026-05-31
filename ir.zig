@@ -46,6 +46,7 @@ pub const CallInst = struct {
     callee: ValueRef,
     argc: u8,
     args: [MaxCallArgs]ValueRef,
+    ret_slots: u8,
 };
 
 pub const FieldLoad = struct {
@@ -180,7 +181,6 @@ const LowerError = error{
     TooManyCallArgs,
     MissingComptimeValue,
     UnsupportedComptimeValue,
-    UnsupportedMultiSlotFunctionSignature,
 };
 
 const LowerResult = error{OutOfMemory} || LowerError || analyze.TypeError;
@@ -366,8 +366,6 @@ const FunctionLowerer = struct {
             ""
         else
             a.identOf(a.nodes[info.decl].data0);
-        const ret_slots = try parent.typeSlotCount(info.ty.ret);
-        if (ret_slots != 1) return error.UnsupportedMultiSlotFunctionSignature;
         const ret_type = try parent.internType(info.ty.ret);
         var function = try parent.allocFunction(fn_id, fn_name, ret_type);
         errdefer function.deinit(parent.gpa);
@@ -459,16 +457,14 @@ const FunctionLowerer = struct {
         return base;
     }
 
-    fn lowerValueAsType(self: *@This(), value_node: ast.NodeIdx, target_ty: analyze.Type) LowerResult!ValueRef {
-        const source_ty = try self.parent.typed.typeOf(value_node);
-        if (analyze.typeEql(target_ty, source_ty)) return self.lowerAst(value_node);
+    fn wrapValueRefToType(self: *@This(), source_ref: ValueRef, source_ty: analyze.Type, target_ty: analyze.Type) LowerResult!ValueRef {
+        if (analyze.typeEql(source_ty, target_ty)) return source_ref;
 
         const target_variant = switch (target_ty) {
             .variant => |variant_ty| variant_ty,
             else => unreachable,
         };
         const member_tag = variantMemberIndex(target_variant, source_ty) orelse unreachable;
-        const source_ref = try self.lowerAst(value_node);
         const source_slots = try self.typeSlotCount(source_ty);
         const variant_slots = try self.typeSlotCount(target_ty);
         const variant_base = try self.allocSlotRange(variant_slots);
@@ -476,6 +472,12 @@ const FunctionLowerer = struct {
         _ = try self.addInst(.{ .store = .{ .l = tag_const, .r = variant_base } });
         try self.emitCopySlots(source_ref, variant_base + 1, source_slots);
         return variant_base;
+    }
+
+    fn lowerValueAsType(self: *@This(), value_node: ast.NodeIdx, target_ty: analyze.Type) LowerResult!ValueRef {
+        const source_ty = try self.parent.typed.typeOf(value_node);
+        const source_ref = try self.lowerAst(value_node);
+        return self.wrapValueRefToType(source_ref, source_ty, target_ty);
     }
 
     fn lowerPairOperands(self: *@This(), lhs: ast.NodeIdx, rhs: ast.NodeIdx) LowerResult!InstPair {
@@ -634,6 +636,9 @@ const FunctionLowerer = struct {
                 try self.lowerConditionToBranches(start_block_id, a.nodes[cond].data0, then_target, rhs_block_id);
                 try self.lowerConditionToBranches(rhs_block_id, a.nodes[cond].data1, then_target, else_target);
             },
+            .@"not" => {
+                try self.lowerConditionToBranches(start_block_id, a.nodes[cond].data0, else_target, then_target);
+            },
             .is => {
                 try self.lowerVariantIsCondition(start_block_id, cond, then_target, else_target);
             },
@@ -721,7 +726,6 @@ const FunctionLowerer = struct {
         if (call_args.len != fn_ty.params.len) return error.UnknownFunction;
 
         const ret_slots = try self.typeSlotCount(fn_ty.ret);
-        if (ret_slots != 1) return error.UnsupportedMultiSlotFunctionSignature;
 
         var args: [MaxCallArgs]ValueRef = [_]ValueRef{0} ** MaxCallArgs;
         var arg_word_count: usize = 0;
@@ -738,11 +742,16 @@ const FunctionLowerer = struct {
         }
 
         const callee_ref = try self.lowerAst(callee);
-        return self.addInst(.{ .call = .{
+        const call_value = try self.addInst(.{ .call = .{
             .callee = callee_ref,
             .argc = @intCast(arg_word_count),
             .args = args,
+            .ret_slots = @intCast(ret_slots),
         } });
+        if (ret_slots > 1) {
+            self.function.next_value += ret_slots - 1;
+        }
+        return call_value;
     }
 
     fn lowerMonomorphizedCall(self: *@This(), idx: ast.NodeIdx, target_fn_id: FuncId) LowerResult!ValueRef {
@@ -752,7 +761,6 @@ const FunctionLowerer = struct {
         const mono_params = target_info.ty.params;
 
         const ret_slots = try self.typeSlotCount(target_info.ty.ret);
-        if (ret_slots != 1) return error.UnsupportedMultiSlotFunctionSignature;
 
         var args: [MaxCallArgs]ValueRef = [_]ValueRef{0} ** MaxCallArgs;
         var arg_word_count: usize = 0;
@@ -780,11 +788,16 @@ const FunctionLowerer = struct {
         }
 
         const callee_ref = try self.addInst(.{ .fn_addr = target_fn_id });
-        return self.addInst(.{ .call = .{
+        const call_value = try self.addInst(.{ .call = .{
             .callee = callee_ref,
             .argc = @intCast(arg_word_count),
             .args = args,
+            .ret_slots = @intCast(ret_slots),
         } });
+        if (ret_slots > 1) {
+            self.function.next_value += ret_slots - 1;
+        }
+        return call_value;
     }
 
     fn lowerIf(self: *@This(), idx: ast.NodeIdx) LowerResult!ValueRef {
@@ -797,6 +810,7 @@ const FunctionLowerer = struct {
         const else_block_id = try self.newBlock(null);
         const merge_block_id = try self.newBlock(if_ty);
         const condition_entry_block = self.current_block_id;
+        const cond_mark = self.bindings.mark();
         if (cond_binding) |binding| {
             try self.lowerVariantAsCondition(condition_entry_block, binding.as_node, binding.slot, binding.slot_count, then_block_id, else_block_id);
         } else {
@@ -818,9 +832,15 @@ const FunctionLowerer = struct {
             break :then_blk try self.lowerAst(data.then_);
         };
         if (self.currentBlock().terminator == null) {
-            self.currentBlock().terminator = .{ .br = .{ .target = merge_block_id, .arg = then_value } };
+            const then_arg = if (if_ty == .variant) then_arg_blk: {
+                const then_ty = try self.parent.typed.typeOf(data.then_);
+                break :then_arg_blk try self.wrapValueRefToType(then_value, then_ty, if_ty);
+            } else then_value;
+            self.currentBlock().terminator = .{ .br = .{ .target = merge_block_id, .arg = then_arg } };
             then_fallthrough = true;
         }
+
+        self.bindings.restore(cond_mark);
 
         var else_fallthrough = false;
         self.current_block_id = else_block_id;
@@ -833,7 +853,14 @@ const FunctionLowerer = struct {
             break :else_blk try self.lowerUnitValue();
         };
         if (self.currentBlock().terminator == null) {
-            self.currentBlock().terminator = .{ .br = .{ .target = merge_block_id, .arg = else_value } };
+            const else_arg = if (if_ty == .variant) else_arg_blk: {
+                const else_ty = if (data.else_ != std.math.maxInt(ast.NodeIdx))
+                    try self.parent.typed.typeOf(data.else_)
+                else
+                    analyze.Type.unit;
+                break :else_arg_blk try self.wrapValueRefToType(else_value, else_ty, if_ty);
+            } else else_value;
+            self.currentBlock().terminator = .{ .br = .{ .target = merge_block_id, .arg = else_arg } };
             else_fallthrough = true;
         }
 
@@ -888,7 +915,7 @@ const FunctionLowerer = struct {
             .ty = binding_ty,
             .slot_count = slot_count,
         });
-        return self.lowerUnitValue();
+        return var_slot;
     }
 
     fn lowerConst(self: *@This(), idx: ast.NodeIdx) LowerResult!ValueRef {
@@ -903,7 +930,7 @@ const FunctionLowerer = struct {
             .ty = binding_ty,
             .slot_count = slot_count,
         });
-        return self.lowerUnitValue();
+        return value_ref;
     }
 
     fn lowerAssign(self: *@This(), idx: ast.NodeIdx) LowerResult!ValueRef {
@@ -966,6 +993,26 @@ const FunctionLowerer = struct {
         return self.addInst(.{ .fn_addr = fn_id });
     }
 
+    fn lowerAsValue(self: *@This(), idx: ast.NodeIdx) LowerResult!ValueRef {
+        const a = self.parent.typed.ast;
+        const lhs = a.asLhs(idx);
+        const lhs_base = try self.lowerAst(lhs);
+        const lhs_ty = try self.nodeType(lhs);
+        const lhs_variant = switch (lhs_ty) {
+            .variant => |variant_ty| variant_ty,
+            else => return error.IfConditionNotFallible,
+        };
+        const rhs_ty = try self.nodeType(idx);
+        const member_tag = variantMemberIndex(lhs_variant, rhs_ty) orelse return error.IfConditionNotFallible;
+        const payload_slots = try self.typeSlotCount(rhs_ty);
+        const result_base = try self.allocSlotRange(payload_slots);
+        const tag_const = try self.addInst(.{ .iconst = @intCast(member_tag) });
+        const check_eq = try self.addInst(.{ .subi = .{ .l = lhs_base, .r = tag_const } });
+        _ = check_eq;
+        try self.emitCopySlots(lhs_base + 1, result_base, payload_slots);
+        return result_base;
+    }
+
     fn lowerAst(self: *@This(), idx: ast.NodeIdx) LowerResult!ValueRef {
         const a = self.parent.typed.ast;
         return switch (a.nodes[idx].tag) {
@@ -1012,7 +1059,8 @@ const FunctionLowerer = struct {
                 const arg_idx = a.nodes[idx].data0;
                 break :blk try self.addInst(.{ .argi = arg_idx });
             },
-            .lt, .gt, .le, .ge, .eq, .ne, .is, .as, .@"and", .@"or" => error.IfConditionNotFallible,
+            .lt, .gt, .le, .ge, .eq, .ne, .is, .@"and", .@"or", .@"not" => error.IfConditionNotFallible,
+            .as => try self.lowerAsValue(idx),
             .if_stmt => try self.lowerIf(idx),
             .struct_init => try self.lowerStructInit(idx),
             .field_access => try self.lowerFieldAccess(idx),
@@ -1077,7 +1125,9 @@ const FunctionLowerer = struct {
             a.fnBody(self.info.decl);
         const result = try self.lowerAst(body);
         if (self.currentBlock().terminator == null) {
-            self.currentBlock().terminator = .{ .ret = result };
+            const body_ty = try self.parent.typed.typeOf(body);
+            const wrapped = try self.wrapValueRefToType(result, body_ty, self.info.ty.ret);
+            self.currentBlock().terminator = .{ .ret = wrapped };
         }
 
         self.bindings.deinit(self.parent.gpa);

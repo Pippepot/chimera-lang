@@ -570,6 +570,80 @@ test "comptime-only program with variant alias compiles" {
     , "");
 }
 
+test "function returning variant unwraps correctly on success" {
+    try testProgram(
+        \\comptime foo = func(b: bool) int | unit
+        \\  if b == true -> return 10
+        \\
+        \\if const i = foo(true) as int
+        \\  print(i)
+    , "10\n");
+}
+
+test "function returning variant as fails when tag does not match" {
+    try testProgram(
+        \\comptime foo = func(b: bool) int | unit
+        \\  if b == true -> return 10
+        \\
+        \\if const i = foo(false) as int
+        \\  print(i)
+        \\else
+        \\  print(99)
+    , "99\n");
+}
+
+test "const/var are expressions returning their bound value" {
+    try testProgram(
+        \\comptime foo = func(b: bool) int | unit
+        \\  if b == true -> return 42
+        \\
+        \\if (const i = foo(true) as int) == 42
+        \\  print(i)
+    , "42\n");
+}
+
+test "not inverts fallible expression success/failure" {
+    try testProgram(
+        \\if not (1 == 2) -> print(10)
+        \\if not (1 == 1)
+        \\  print(20)
+        \\else
+        \\  print(30)
+    , "10\n30\n");
+}
+
+test "comptime const/var as expression and as in comptime eval" {
+    try testProgram(
+        \\comptime foo = func(b: bool) int | unit
+        \\  if b == true -> return 10
+        \\
+        \\comptime b = if (const i = foo(true) as int)==10 -> i else 2
+        \\print(b)
+    , "10\n");
+}
+
+test "const in if condition scoped to then-branch only" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+
+    try db.setSource(0,
+        \\if (const i = 10) == 10
+        \\  print(1)
+        \\else
+        \\  print(i)
+    );
+    try expectCompileErrorContains(&db, 0, "unknown symbol");
+}
+
+test "if with mismatched branch types returns variant" {
+    try testProgram(
+        \\var x = if 1 == 1 -> 42 else true
+        \\var y = if 1 == 2 -> 99 else 3.14
+        \\if const v = x as int -> print(v)
+        \\if const v = y as float -> print(v)
+    , "42\n3.140000\n");
+}
+
 test "struct init single field var and field access" {
     try testProgram(
         \\comptime Foo = struct

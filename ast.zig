@@ -37,6 +37,7 @@ pub const Tag = enum(u8) {
     as,
     @"and",
     @"or",
+    @"not",
     if_stmt,
     bool_lit,
     unit_lit,

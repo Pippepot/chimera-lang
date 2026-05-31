@@ -78,7 +78,7 @@ All 5 stages must be cached with `hits=1 recomputes=0` when cache is present. Th
 - **query.zig** ✅ — Generic `ensureMemo`, 5-stage pipeline, persistent cache load/save
 - **query_cache.zig** ✅ — Buffer-copy ser/des for all active stages, `type_type` and `type_value` serialization
 - **main.zig** ✅ — CLI, persistent cache
-- **test.zig** ✅ — All 70 tests pass including monomorphization, variant `is`/`as`, and caching tests
+- **test.zig** ✅ — All 83 tests pass including monomorphization, variant `is`/`as`, caching tests, persistent cache, and const/var-expression / not-keyword / variant-if-branch tests
 
 ## Language notes
 
@@ -98,6 +98,11 @@ All 5 stages must be cached with `hits=1 recomputes=0` when cache is present. Th
 - **Comptime functions with runtime params referencing comptime types** — `comptime foo = func(comptime T: type, x: T) body` monomorphizes per unique call, generating separate runtime functions (e.g., `foo$int`, `foo$float`). The comptime type param is in scope for subsequent param type annotations. Monomorphized entries are added to `AnalyzedAst.functions` dynamically (ArrayList), typechecked independently, and the IR lowerer resolves `var_ref` types from local bindings to handle shared AST nodes. See `inferMonomorphizedCall`, `call_monomorph_targets`, `FunctionInfo.is_monomorphized`.
 - **Struct expressions** — `struct` followed by indented field lines creates a struct type in expression position (e.g., `return struct\n  x: T` inside a comptime function).
 - **`type` metatype** — usable as parameter and return type annotations for comptime functions. Builtin type names (`int`, `float`, `bool`, `unit`, `type`) can be passed as comptime arguments.
+- **Multi-slot function returns** — functions can return variant types (e.g. `func(b: bool) int | unit`). Return values are wrapped with a variant tag and copied via a hidden r10 return buffer pointer. IR `CallInst.ret_slots` tracks the slot count; the codegen sets up r10 before calls and copies from it on function return.
+- **`const`/`var` as expressions** — bindings evaluate to their bound value (not `unit`), usable inside parentheses in expression context. The parser accepts `kw_const`/`kw_var` in `parsePrimary` for expression-position binding.
+- **`const`/`var` scoping in if conditions** — bindings created inside a fallible if condition (even via `(const i = ...) == x`) are scoped to the then-branch only. Condition bindings are restored after the then-branch via `bindings.restore(cond_mark)` before the else-branch executes.
+- **`not` keyword** — unary fallible operator that inverts success/failure of a fallible expression. `not (x == 5)` succeeds when the comparison fails, returns `unit`. Implemented in `lowerConditionToBranches` by swapping `then_target`/`else_target`.
+- **Variant if branches** — when if/else branches return different types, the if expression's type is the variant union of both branch types instead of erroring. Unique members are collected from both branches (flattening nested variants) and used to allocate a `VariantType`. The IR lowerer wraps each branch value into the variant layout at the merge point.
 
 ## Current behavior
 
@@ -122,4 +127,4 @@ All 5 stages must be cached with `hits=1 recomputes=0` when cache is present. Th
   - compile `changed_at` backdating
   - persistent cache reuse/disable/failure/corruption/stale cleanup behavior
 - Zero-recompute test: `compileResult` twice with no source change → 0 recomputes, 1 compile hit (compile is the only stage accessed on the second call; all others are implicitly cached).
-- Current suite: `zig test test.zig` (70 tests).
+- Current suite: `zig test test.zig` (83 tests).
