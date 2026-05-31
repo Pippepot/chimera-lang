@@ -9,9 +9,9 @@
   - `runtime.zig` owns runtime helper entrypoints (`writeProgram`, `runProg`).
   - `parser.zig` owns lexer + parser (`parseOwned`) from source text to module AST, plus `computeParse` for query integration.
   - `resolver.zig` owns pre-typecheck symbol resolution (`computeResolve`) and symbol diagnostics.
-  - `astgen.zig` owns AST-to-analyze lowering (`computeAstgen`) used between resolve and analyze.
+  - `astgen.zig` was removed — type analysis depends directly on resolve.
   - `analyze.zig` owns type inference/checking (`unit`, `bool`, `int`, `float`, function types), comptime evaluation, and `computeAnalyze` for query integration.
-  - `typecheck.zig` is legacy typechecking implementation retained in-tree but not used by the active query pipeline.
+  - `typecheck.zig` was legacy; now deleted from tree.
   - `query.zig` owns the revisioned incremental query system (`QueryDb`) and stage orchestration (frame management, dependency tracking, memo verification).
   - `query_cache.zig` owns cross-run persistent query cache encoding/decoding, atomic save/load, and stale-cache cleanup.
   - `ir.zig` owns multi-function IR types and typed AST -> IR lowering, plus `computeLower` for query integration.

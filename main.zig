@@ -1,7 +1,7 @@
 // Chimera — Source → Query → Machine Code Compiler
 const std = @import("std");
 const debug = @import("debug.zig");
-const diagnostics = @import("diagnostics.zig");
+const db = @import("db.zig");
 const query = @import("query.zig");
 const runtime = @import("runtime.zig");
 const disasm = @import("disasm.zig");
@@ -48,11 +48,11 @@ fn printCompileDiagnostics(
     gpa: std.mem.Allocator,
     source_path: []const u8,
     source: []const u8,
-    diags: []const diagnostics.Diagnostic,
+    diags: []const db.Diagnostic,
 ) !void {
     var text = try std.ArrayList(u8).initCapacity(gpa, 512);
     defer text.deinit(gpa);
-    try diagnostics.appendDiagnostics(&text, gpa, source_path, source, diags);
+    try db.appendDiagnostics(&text, gpa, source_path, source, diags);
 
     var wbuf: [4096]u8 = undefined;
     var w = std.Io.File.stderr().writer(io, &wbuf);
@@ -115,7 +115,6 @@ pub fn main(init: std.process.Init) !void {
 
     var parse_duration = std.Io.Duration.zero;
     var resolve_duration = std.Io.Duration.zero;
-    var astgen_duration = std.Io.Duration.zero;
     var type_duration = std.Io.Duration.zero;
     var lower_duration = std.Io.Duration.zero;
     var debug_duration = std.Io.Duration.zero;
@@ -127,10 +126,6 @@ pub fn main(init: std.process.Init) !void {
         const resolve_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
         _ = try qdb.resolvedAst(source_id);
         resolve_duration = if (resolve_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
-
-        const astgen_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
-        _ = try qdb.astgenIr(source_id);
-        astgen_duration = if (astgen_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
 
         const type_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
         _ = try qdb.typedAst(source_id);
@@ -159,13 +154,12 @@ pub fn main(init: std.process.Init) !void {
 
     if (flags.timing) {
         const compile_total = std.Io.Duration{
-            .nanoseconds = set_source_duration.nanoseconds + parse_duration.nanoseconds + resolve_duration.nanoseconds + astgen_duration.nanoseconds + type_duration.nanoseconds + lower_duration.nanoseconds + debug_duration.nanoseconds + compile_duration.nanoseconds,
+            .nanoseconds = set_source_duration.nanoseconds + parse_duration.nanoseconds + resolve_duration.nanoseconds + type_duration.nanoseconds + lower_duration.nanoseconds + debug_duration.nanoseconds + compile_duration.nanoseconds,
         };
         try printStageTimings(io, "compilation timing diagnostics", &.{
             .{ .label = "set_source", .duration = set_source_duration },
             .{ .label = "parse", .duration = parse_duration },
             .{ .label = "resolve", .duration = resolve_duration },
-            .{ .label = "astgen", .duration = astgen_duration },
             .{ .label = "typecheck", .duration = type_duration },
             .{ .label = "lower", .duration = lower_duration },
             .{ .label = "debug_dump", .duration = debug_duration },

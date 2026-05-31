@@ -1,5 +1,22 @@
 # Changelog
 
+## 2026-05-31 — Remove astgen stage, fold diagnostics into db.zig
+
+### Pipeline simplification
+
+- **Removed `astgen` stage entirely** from the query pipeline. The `astgen.zig` module (AstgenIr, computeAstgen, serializeAstgen/deserializeAstgen) is deleted. Type analysis (`computeAnalyze`) now depends directly on `resolve` instead of `astgen`.
+- **Reduced pipeline from 6 to 5 stages:** `parse → resolve → typecheck → lower → compile`. All stage enums, memos, stats, diagnostics printing, timing, and persistent cache serialization updated accordingly.
+- **Removed legacy `typecheck.zig`** (retained but unused) and `diagnostics.zig`. Diagnostics types (`Stage`, `Diagnostic`) and formatting (`appendDiagnostic`, `appendDiagnostics`, `lineInfoForOffset`, `highlightLen`) moved into `db.zig`.
+- **Persistent cache schema version bumped** from 5 to 6 (astgen stage data removed from serialization format).
+
+### Code quality
+
+- **AST serialization:** `Ast.serialize` and `AstBuilder.seal` now use `Ast.computedSize` layout struct instead of manual offset arithmetic. `computedSize` made `pub`.
+- **Codegen:** `emitLoadRegFromSlot`/`emitStoreRegToSlot` replaced switch-on-register with prefix lookup tables.
+- **Debug:** `writeAstLabel` groups multi-tag cases into single pattern arms.
+- **Parser:** `parseStructFields` extracted as shared helper used by both `parseComptimeStruct` and `parseStructExpr`. Local `alignForward` removed in favor of `computedSize`.
+- **QueryDb:** Inlined memo/dep setup in `tryLoadPersistentCache` replaced with `loadMemo`, `depForSource`, `depForStage` helpers. `snapshotStage` refactored with `serializeStageValue` dispatch. Comments removed per convention.
+
 ## 2026-05-30 — String-language removal and naming cleanup
 
 ### Language surface

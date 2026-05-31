@@ -1,7 +1,5 @@
 const std = @import("std");
 const ast = @import("ast.zig");
-const astgen = @import("astgen.zig");
-const diagnostics = @import("diagnostics.zig");
 const parser = @import("parser.zig");
 const resolver = @import("resolver.zig");
 const scope_mod = @import("scope.zig");
@@ -149,7 +147,7 @@ pub const AnalyzedAst = struct {
 
 pub const TypecheckReport = struct {
     typed: ?AnalyzedAst,
-    diagnostic: ?diagnostics.Diagnostic,
+    diagnostic: ?db.Diagnostic,
 };
 
 pub fn typeName(ty: Type) []const u8 {
@@ -1222,7 +1220,6 @@ pub const AnalyzeMemo = db.Memo(AnalyzedAst);
 
 pub fn computeAnalyze(
     resolve_memo: *const resolver.ResolveMemo,
-    astgen_memo: *const astgen.AstgenMemo,
     parse_memo: *const parser.ParseMemo,
     gpa: std.mem.Allocator,
 ) error{OutOfMemory}!AnalyzeMemo {
@@ -1230,15 +1227,13 @@ pub fn computeAnalyze(
     errdefer diagnostics_list.deinit(gpa);
 
     var typed_value: ?AnalyzedAst = null;
-    if (astgen_memo.value != null) {
-        if (resolve_memo.value) |*resolved| {
-            const parsed = if (parse_memo.value) |*p| p else return db.makeMemo(AnalyzedAst, null, diagnostics_list);
-            const report = try typecheckReport(parsed, resolved, gpa);
-            if (report.diagnostic) |diag| {
-                try diagnostics_list.append(gpa, diag);
-            }
-            typed_value = report.typed;
+    if (resolve_memo.value) |*resolved| {
+        const parsed = if (parse_memo.value) |*p| p else return db.makeMemo(AnalyzedAst, null, diagnostics_list);
+        const report = try typecheckReport(parsed, resolved, gpa);
+        if (report.diagnostic) |diag| {
+            try diagnostics_list.append(gpa, diag);
         }
+        typed_value = report.typed;
     }
 
     return db.makeMemo(AnalyzedAst, typed_value, diagnostics_list);

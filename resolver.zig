@@ -1,7 +1,6 @@
 const std = @import("std");
 const ast = @import("ast.zig");
 const parser = @import("parser.zig");
-const diagnostics = @import("diagnostics.zig");
 const scope_mod = @import("scope.zig");
 const db = @import("db.zig");
 
@@ -49,7 +48,7 @@ pub const ResolvedAst = struct {
 
 pub const ResolveReport = struct {
     resolved: ?ResolvedAst,
-    diagnostic: ?diagnostics.Diagnostic,
+    diagnostic: ?db.Diagnostic,
 };
 
 const Resolver = struct {

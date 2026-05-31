@@ -1,10 +1,23 @@
 const std = @import("std");
 const ast = @import("ast.zig");
-const diagnostics = @import("diagnostics.zig");
 
 pub const SourceId = u32;
 pub const Revision = u64;
-pub const Stage = diagnostics.Stage;
+
+pub const Stage = enum {
+    parse,
+    resolve,
+    typecheck,
+    lower,
+    compile,
+};
+
+pub const Diagnostic = struct {
+    stage: Stage,
+    span: ?ast.Span,
+    message: []const u8,
+    message_allocated: bool = false,
+};
 
 pub const QueryError = error{
     SourceNotFound,
@@ -31,8 +44,6 @@ pub const QueryStats = struct {
     parse_recomputes: usize = 0,
     resolve_hits: usize = 0,
     resolve_recomputes: usize = 0,
-    astgen_hits: usize = 0,
-    astgen_recomputes: usize = 0,
     type_hits: usize = 0,
     type_recomputes: usize = 0,
     lower_hits: usize = 0,
@@ -45,13 +56,13 @@ pub const QueryStats = struct {
 
 pub const CompileResult = struct {
     bytes: ?[]const u8,
-    diagnostics: []const diagnostics.Diagnostic,
+    diagnostics: []const Diagnostic,
 };
 
 pub fn Memo(comptime T: type) type {
     return struct {
         value: ?T,
-        diagnostics: std.ArrayList(diagnostics.Diagnostic),
+        diagnostics: std.ArrayList(Diagnostic),
         deps: std.ArrayList(Dependency),
         verified_at: Revision = 0,
         changed_at: Revision = 0,
@@ -69,7 +80,7 @@ pub fn spanEql(a: ?ast.Span, b: ?ast.Span) bool {
     return a.?.start == b.?.start and a.?.end == b.?.end;
 }
 
-pub fn diagnosticsEqual(a: []const diagnostics.Diagnostic, b: []const diagnostics.Diagnostic) bool {
+pub fn diagnosticsEqual(a: []const Diagnostic, b: []const Diagnostic) bool {
     if (a.len != b.len) return false;
     for (a, b) |left, right| {
         if (left.stage != right.stage) return false;
@@ -101,10 +112,10 @@ pub fn appendDependencyUnique(deps: *std.ArrayList(Dependency), gpa: std.mem.All
 
 pub fn initDiagnosticList(
     gpa: std.mem.Allocator,
-    inherited: []const diagnostics.Diagnostic,
+    inherited: []const Diagnostic,
     extra_capacity: usize,
-) std.mem.Allocator.Error!std.ArrayList(diagnostics.Diagnostic) {
-    var list = try std.ArrayList(diagnostics.Diagnostic).initCapacity(gpa, inherited.len + extra_capacity);
+) std.mem.Allocator.Error!std.ArrayList(Diagnostic) {
+    var list = try std.ArrayList(Diagnostic).initCapacity(gpa, inherited.len + extra_capacity);
     errdefer list.deinit(gpa);
     for (inherited) |diag| {
         try list.append(gpa, .{
@@ -117,7 +128,7 @@ pub fn initDiagnosticList(
 }
 
 pub fn appendStageError(
-    list: *std.ArrayList(diagnostics.Diagnostic),
+    list: *std.ArrayList(Diagnostic),
     gpa: std.mem.Allocator,
     stage: Stage,
     message: []const u8,
@@ -129,7 +140,7 @@ pub fn appendStageError(
     });
 }
 
-pub fn makeMemo(comptime T: type, value: ?T, diagnostics_list: std.ArrayList(diagnostics.Diagnostic)) Memo(T) {
+pub fn makeMemo(comptime T: type, value: ?T, diagnostics_list: std.ArrayList(Diagnostic)) Memo(T) {
     return .{
         .value = value,
         .diagnostics = diagnostics_list,
@@ -138,4 +149,94 @@ pub fn makeMemo(comptime T: type, value: ?T, diagnostics_list: std.ArrayList(dia
         .changed_at = 0,
         .computing = false,
     };
+}
+
+// ── Source-line diagnostics formatting ──
+
+const LineInfo = struct {
+    line: usize,
+    column: usize,
+    line_start: usize,
+    line_end: usize,
+};
+
+fn lineInfoForOffset(source: []const u8, offset: usize) LineInfo {
+    var line: usize = 1;
+    var column: usize = 1;
+    var line_start: usize = 0;
+
+    var idx: usize = 0;
+    const safe_offset = if (offset > source.len) source.len else offset;
+    while (idx < safe_offset) : (idx += 1) {
+        if (source[idx] == '\n') {
+            line += 1;
+            column = 1;
+            line_start = idx + 1;
+        } else {
+            column += 1;
+        }
+    }
+
+    var line_end = source.len;
+    idx = line_start;
+    while (idx < source.len) : (idx += 1) {
+        if (source[idx] == '\n') {
+            line_end = idx;
+            break;
+        }
+    }
+
+    return .{
+        .line = line,
+        .column = column,
+        .line_start = line_start,
+        .line_end = line_end,
+    };
+}
+
+fn highlightLen(span: ast.Span, line_start: usize, line_end: usize) usize {
+    const start = if (span.start < line_start) line_start else span.start;
+    const capped_end = if (span.end > line_end) line_end else span.end;
+    if (capped_end <= start) return 1;
+    return capped_end - start;
+}
+
+pub fn appendDiagnostic(
+    out: *std.ArrayList(u8),
+    gpa: std.mem.Allocator,
+    source_path: []const u8,
+    source: []const u8,
+    diag: Diagnostic,
+) !void {
+    if (diag.span) |span| {
+        const info = lineInfoForOffset(source, span.start);
+        try out.print(gpa, "error: {s}:{d}:{d}: {s}\n", .{ source_path, info.line, info.column, diag.message });
+
+        const line_text = source[info.line_start..info.line_end];
+        try out.appendSlice(gpa, line_text);
+        try out.appendSlice(gpa, "\n");
+
+        const caret_indent = if (info.column > 0) info.column - 1 else 0;
+        try out.appendNTimes(gpa, ' ', caret_indent);
+        try out.append(gpa, '^');
+
+        const extra = highlightLen(span, info.line_start, info.line_end);
+        if (extra > 1) try out.appendNTimes(gpa, '~', extra - 1);
+        try out.appendSlice(gpa, "\n");
+        return;
+    }
+
+    try out.print(gpa, "error: {s}: {s}\n", .{ source_path, diag.message });
+}
+
+pub fn appendDiagnostics(
+    out: *std.ArrayList(u8),
+    gpa: std.mem.Allocator,
+    source_path: []const u8,
+    source: []const u8,
+    diags: []const Diagnostic,
+) !void {
+    for (diags) |diag| {
+        try appendDiagnostic(out, gpa, source_path, source, diag);
+    }
 }

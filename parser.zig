@@ -1,6 +1,6 @@
 const std = @import("std");
 const ast = @import("ast.zig");
-const diagnostics = @import("diagnostics.zig");
+const db = @import("db.zig");
 
 const AstNode = ast.Node;
 const Tag = ast.Tag;
@@ -374,10 +374,6 @@ pub const AstBuilder = struct {
         return idx;
     }
 
-    fn alignForward(addr: usize, alignment: usize) usize {
-        return (addr + (alignment - 1)) & ~(@as(usize, alignment) - 1);
-    }
-
     pub fn seal(self: *AstBuilder, entry: NodeIdx) !ast.Ast {
         const decls_slice = try self.decls.toOwnedSlice(self.gpa);
         defer self.gpa.free(decls_slice);
@@ -392,72 +388,56 @@ pub const AstBuilder = struct {
         const spans = try self.spans.toOwnedSlice(self.gpa);
         defer self.gpa.free(spans);
 
-        const nodes_len = nodes.len;
-        const extra_len = extra.len;
-        const str_bytes_len = ident_bytes.len;
-        const str_offs_len = ident_offsets.len;
-        const spans_len = spans.len;
-        const decls_len = decls_slice.len;
+        const layout = ast.Ast.computedSize(
+            @intCast(nodes.len), @intCast(extra.len),
+            @intCast(ident_bytes.len), @intCast(ident_offsets.len),
+            @intCast(spans.len), @intCast(decls_slice.len),
+        );
 
-        const header_size = @sizeOf(ast.Ast.Header);
-        const nodes_off = header_size;
-        const nodes_bytes = nodes_len * @sizeOf(ast.Node);
-        const extra_off = nodes_off + nodes_bytes;
-        const extra_bytes = extra_len * 4;
-        const str_bytes_off = extra_off + extra_bytes;
-        const str_bytes_bytes = str_bytes_len;
-        const str_offs_off = alignForward(str_bytes_off + str_bytes_bytes, 4);
-        const str_offs_bytes = str_offs_len * 4;
-        const spans_off = alignForward(str_offs_off + str_offs_bytes, @alignOf(ast.Span));
-        const spans_bytes = spans_len * @sizeOf(ast.Span);
-        const decls_off = spans_off + spans_bytes;
-        const decls_bytes = decls_len * 4;
-        const total_size = decls_off + decls_bytes;
-
-        const backing = try self.gpa.alloc(u8, total_size);
+        const backing = try self.gpa.alloc(u8, layout.total);
         errdefer self.gpa.free(backing);
         @memset(backing, 0);
         const hdr: *ast.Ast.Header = @ptrCast(@alignCast(backing.ptr));
         hdr.* = .{
-            .nodes_len = @intCast(nodes_len),
-            .extra_len = @intCast(extra_len),
-            .str_bytes_len = @intCast(str_bytes_len),
-            .str_offs_len = @intCast(str_offs_len),
-            .spans_len = @intCast(spans_len),
-            .decls_len = @intCast(decls_len),
+            .nodes_len = @intCast(nodes.len),
+            .extra_len = @intCast(extra.len),
+            .str_bytes_len = @intCast(ident_bytes.len),
+            .str_offs_len = @intCast(ident_offsets.len),
+            .spans_len = @intCast(spans.len),
+            .decls_len = @intCast(decls_slice.len),
             .entry = entry,
         };
 
-        @memcpy(backing[nodes_off..][0..nodes_bytes], std.mem.sliceAsBytes(nodes));
-        @memcpy(backing[extra_off..][0..extra_bytes], std.mem.sliceAsBytes(extra));
-        @memcpy(backing[str_bytes_off..][0..str_bytes_bytes], ident_bytes);
-        @memcpy(backing[str_offs_off..][0..str_offs_bytes], std.mem.sliceAsBytes(ident_offsets));
-        @memcpy(backing[spans_off..][0..spans_bytes], std.mem.sliceAsBytes(spans));
-        @memcpy(backing[decls_off..][0..decls_bytes], std.mem.sliceAsBytes(decls_slice));
+        @memcpy(backing[layout.nodes_off..][0..nodes.len * @sizeOf(ast.Node)], std.mem.sliceAsBytes(nodes));
+        @memcpy(backing[layout.extra_off..][0..extra.len * 4], std.mem.sliceAsBytes(extra));
+        @memcpy(backing[layout.str_bytes_off..][0..ident_bytes.len], ident_bytes);
+        @memcpy(backing[layout.str_offs_off..][0..ident_offsets.len * 4], std.mem.sliceAsBytes(ident_offsets));
+        @memcpy(backing[layout.spans_off..][0..spans.len * @sizeOf(ast.Span)], std.mem.sliceAsBytes(spans));
+        @memcpy(backing[layout.decls_off..][0..decls_slice.len * 4], std.mem.sliceAsBytes(decls_slice));
 
         var name_map = std.StringHashMap(ast.NodeIdx).init(self.gpa);
         errdefer name_map.deinit();
         {
-            const ast_nodes = @as([*]ast.Node, @ptrCast(@alignCast(backing.ptr + nodes_off)))[0..nodes_len];
-            const str_offs = @as([*]u32, @ptrCast(@alignCast(backing.ptr + str_offs_off)))[0..str_offs_len];
-            const decls = @as([*]ast.NodeIdx, @ptrCast(@alignCast(backing.ptr + decls_off)))[0..decls_len];
+            const ast_nodes = @as([*]ast.Node, @ptrCast(@alignCast(backing.ptr + layout.nodes_off)))[0..nodes.len];
+            const str_offs = @as([*]u32, @ptrCast(@alignCast(backing.ptr + layout.str_offs_off)))[0..ident_offsets.len];
+            const decls = @as([*]ast.NodeIdx, @ptrCast(@alignCast(backing.ptr + layout.decls_off)))[0..decls_slice.len];
             for (decls) |decl_idx| {
                 const name_idx = ast_nodes[decl_idx].data0;
                 const start = str_offs[name_idx];
-                const end = if (name_idx + 1 < str_offs_len) str_offs[name_idx + 1] else @as(u32, @intCast(str_bytes_len));
-                const name = backing[str_bytes_off..][start..end];
+                const end = if (name_idx + 1 < ident_offsets.len) str_offs[name_idx + 1] else @as(u32, @intCast(ident_bytes.len));
+                const name = backing[layout.str_bytes_off..][start..end];
                 try name_map.put(name, decl_idx);
             }
         }
 
         return ast.Ast{
             .backing = backing,
-            .nodes = @as([*]ast.Node, @ptrCast(@alignCast(backing.ptr + nodes_off)))[0..nodes_len],
-            .extra = @as([*]u32, @ptrCast(@alignCast(backing.ptr + extra_off)))[0..extra_len],
-            .ident_bytes = backing[str_bytes_off..][0..str_bytes_len],
-            .ident_offsets = @as([*]u32, @ptrCast(@alignCast(backing.ptr + str_offs_off)))[0..str_offs_len],
-            .spans = @as([*]ast.Span, @ptrCast(@alignCast(backing.ptr + spans_off)))[0..spans_len],
-            .decls = @as([*]ast.NodeIdx, @ptrCast(@alignCast(backing.ptr + decls_off)))[0..decls_len],
+            .nodes = @as([*]ast.Node, @ptrCast(@alignCast(backing.ptr + layout.nodes_off)))[0..nodes.len],
+            .extra = @as([*]u32, @ptrCast(@alignCast(backing.ptr + layout.extra_off)))[0..extra.len],
+            .ident_bytes = backing[layout.str_bytes_off..][0..ident_bytes.len],
+            .ident_offsets = @as([*]u32, @ptrCast(@alignCast(backing.ptr + layout.str_offs_off)))[0..ident_offsets.len],
+            .spans = @as([*]ast.Span, @ptrCast(@alignCast(backing.ptr + layout.spans_off)))[0..spans.len],
+            .decls = @as([*]ast.NodeIdx, @ptrCast(@alignCast(backing.ptr + layout.decls_off)))[0..decls_slice.len],
             .entry = entry,
             .name_map = name_map,
         };
@@ -475,10 +455,6 @@ pub const ParsedAst = struct {
 
     pub fn spanOfNode(self: *const @This(), idx: NodeIdx) ?ast.Span {
         return self.ast.spanOf(idx);
-    }
-
-    pub fn spanOfAny(_: *const @This(), _: usize) ?ast.Span {
-        return null;
     }
 };
 
@@ -852,40 +828,43 @@ const Parser = struct {
         return self.allocNode(.comptime_fn, name_idx, data1, span);
     }
 
-    fn parseComptimeStruct(self: *@This(), name: []const u8, binding_ty: ?NodeIdx, decl_start: ast.Span) ParseError!NodeIdx {
-        try self.expect(.kw_struct, error.UnexpectedToken);
+    const StructFields = struct { names: std.ArrayList(u32), types: std.ArrayList(u32) };
 
-        const name_idx = try self.internName(name);
-
+    fn parseStructFields(self: *@This()) ParseError!StructFields {
         try self.consumeNewlines();
         if (self.current.tag != .indent) return error.ExpectedIndent;
         try self.advance();
 
-        var field_names = std.ArrayList(u32).empty;
-        var field_types = std.ArrayList(u32).empty;
+        var names = std.ArrayList(u32).empty;
+        var types = std.ArrayList(u32).empty;
         while (self.current.tag != .dedent and self.current.tag != .eof) {
             if (self.current.tag != .ident) return error.ExpectedIdentifier;
-            const field_name = try self.internName(self.current.ident);
+            const fname = try self.internName(self.current.ident);
             try self.advance();
             try self.expect(.colon, error.ExpectedColon);
-            const field_ty = try self.parseType();
-            try field_names.append(self.scratch_arena.allocator(), field_name);
-            try field_types.append(self.scratch_arena.allocator(), field_ty);
+            const fty = try self.parseType();
+            try names.append(self.scratch_arena.allocator(), fname);
+            try types.append(self.scratch_arena.allocator(), fty);
             if (self.current.tag == .newline) {
                 try self.consumeNewlines();
             } else if (self.current.tag != .dedent) {
                 return error.UnexpectedToken;
             }
         }
-
         try self.expect(.dedent, error.ExpectedIndent);
+        return .{ .names = names, .types = types };
+    }
 
-        const field_count: u32 = @intCast(field_names.items.len);
+    fn parseComptimeStruct(self: *@This(), name: []const u8, binding_ty: ?NodeIdx, decl_start: ast.Span) ParseError!NodeIdx {
+        try self.expect(.kw_struct, error.UnexpectedToken);
+        const name_idx = try self.internName(name);
+        const fields = try self.parseStructFields();
+
+        const field_count: u32 = @intCast(fields.names.items.len);
         try self.builder.extra.append(self.builder.gpa, field_count);
-        var i: u32 = 0;
-        while (i < field_count) : (i += 1) {
-            try self.builder.extra.append(self.builder.gpa, field_names.items[i]);
-            try self.builder.extra.append(self.builder.gpa, field_types.items[i]);
+        for (0..@intCast(field_count)) |i| {
+            try self.builder.extra.append(self.builder.gpa, fields.names.items[i]);
+            try self.builder.extra.append(self.builder.gpa, fields.types.items[i]);
         }
         if (binding_ty) |annot| {
             try self.builder.extra.append(self.builder.gpa, annot);
@@ -896,9 +875,8 @@ const Parser = struct {
             @intCast(self.builder.extra.items.len - 1 - field_count * 2);
 
         const data1 = if (binding_ty != null) extra_idx | 0x80000000 else extra_idx;
-
         const span = if (field_count > 0)
-            coverSpans(decl_start, try self.spanOf(field_types.items[field_count - 1]))
+            coverSpans(decl_start, try self.spanOf(fields.types.items[field_count - 1]))
         else
             decl_start;
         return self.allocNode(.comptime_struct, name_idx, data1, span);
@@ -1186,38 +1164,16 @@ const Parser = struct {
     }
 
     fn parseStructExpr(self: *@This(), start_span: ast.Span) ParseError!NodeIdx {
-        try self.consumeNewlines();
-        if (self.current.tag != .indent) return error.ExpectedIndent;
-        try self.advance();
+        const fields = try self.parseStructFields();
 
-        var field_names = std.ArrayList(u32).empty;
-        var field_types = std.ArrayList(u32).empty;
-        while (self.current.tag != .dedent and self.current.tag != .eof) {
-            if (self.current.tag != .ident) return error.ExpectedIdentifier;
-            const field_name = try self.internName(self.current.ident);
-            try self.advance();
-            try self.expect(.colon, error.ExpectedColon);
-            const field_ty = try self.parseType();
-            try field_names.append(self.scratch_arena.allocator(), field_name);
-            try field_types.append(self.scratch_arena.allocator(), field_ty);
-            if (self.current.tag == .newline) {
-                try self.consumeNewlines();
-            } else if (self.current.tag != .dedent) {
-                return error.UnexpectedToken;
-            }
-        }
-
-        try self.expect(.dedent, error.ExpectedIndent);
-
-        const field_count: u32 = @intCast(field_names.items.len);
+        const field_count: u32 = @intCast(fields.names.items.len);
         const extra_idx = try self.builder.allocExtraSingle(field_count);
-        var i: u32 = 0;
-        while (i < field_count) : (i += 1) {
-            try self.builder.extra.append(self.builder.gpa, field_names.items[i]);
-            try self.builder.extra.append(self.builder.gpa, field_types.items[i]);
+        for (0..@intCast(field_count)) |i| {
+            try self.builder.extra.append(self.builder.gpa, fields.names.items[i]);
+            try self.builder.extra.append(self.builder.gpa, fields.types.items[i]);
         }
         const span = if (field_count > 0)
-            coverSpans(start_span, try self.spanOf(field_types.items[field_count - 1]))
+            coverSpans(start_span, try self.spanOf(fields.types.items[field_count - 1]))
         else
             start_span;
         return self.allocNode(.struct_expr, extra_idx, field_count, span);
@@ -1348,7 +1304,7 @@ const Parser = struct {
 
 pub const ParseReport = struct {
     parsed: ?ParsedAst,
-    diagnostic: ?diagnostics.Diagnostic,
+    diagnostic: ?db.Diagnostic,
 };
 
 pub fn parseErrorMessage(err: anyerror) []const u8 {
@@ -1379,7 +1335,6 @@ pub fn parseOwned(source: []const u8, gpa: std.mem.Allocator) (ParseError || err
     return report.parsed orelse error.ExpectedExpression;
 }
 
-const db = @import("db.zig");
 
 pub const ParseMemo = db.Memo(ParsedAst);
 

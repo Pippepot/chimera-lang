@@ -339,7 +339,6 @@ test "query cache hits within same revision includes resolve" {
     try db.setSource(0, "0");
     _ = try db.parsedAst(0);
     _ = try db.resolvedAst(0);
-    _ = try db.astgenIr(0);
     _ = try db.typedAst(0);
     _ = try db.loweredProgram(0);
     _ = try expectCompileOk(&db, 0);
@@ -348,7 +347,6 @@ test "query cache hits within same revision includes resolve" {
 
     _ = try db.parsedAst(0);
     _ = try db.resolvedAst(0);
-    _ = try db.astgenIr(0);
     _ = try db.typedAst(0);
     _ = try db.loweredProgram(0);
     _ = try expectCompileOk(&db, 0);
@@ -356,7 +354,6 @@ test "query cache hits within same revision includes resolve" {
     const stats = db.statsSnapshot();
     try testing.expectEqual(@as(usize, 1), stats.parse_hits);
     try testing.expectEqual(@as(usize, 1), stats.resolve_hits);
-    try testing.expectEqual(@as(usize, 1), stats.astgen_hits);
     try testing.expectEqual(@as(usize, 1), stats.type_hits);
     try testing.expectEqual(@as(usize, 1), stats.lower_hits);
     try testing.expectEqual(@as(usize, 1), stats.compile_hits);
@@ -377,7 +374,6 @@ test "source change invalidates all stages" {
     const stats = db.statsSnapshot();
     try testing.expectEqual(@as(usize, 1), stats.parse_recomputes);
     try testing.expectEqual(@as(usize, 1), stats.resolve_recomputes);
-    try testing.expectEqual(@as(usize, 1), stats.astgen_recomputes);
     try testing.expectEqual(@as(usize, 1), stats.type_recomputes);
     try testing.expectEqual(@as(usize, 1), stats.lower_recomputes);
     try testing.expectEqual(@as(usize, 1), stats.compile_recomputes);
@@ -407,7 +403,6 @@ test "debug query diagnostics format includes resolve" {
         .source_sets = 2,
         .parse_hits = 3,
         .resolve_hits = 4,
-        .astgen_hits = 2,
         .type_hits = 5,
         .compile_recomputes = 1,
         .dependency_checks = 5,
@@ -416,7 +411,6 @@ test "debug query diagnostics format includes resolve" {
 
     try testing.expect(std.mem.indexOf(u8, buf.items, ";   parse: hits=3 recomputes=0") != null);
     try testing.expect(std.mem.indexOf(u8, buf.items, ";   resolve: hits=4 recomputes=0") != null);
-    try testing.expect(std.mem.indexOf(u8, buf.items, ";   astgen: hits=2 recomputes=0") != null);
     try testing.expect(std.mem.indexOf(u8, buf.items, ";   type: hits=5 recomputes=0") != null);
 }
 
@@ -765,7 +759,6 @@ test "persistent cache load frees data on hash mismatch (regression)" {
         .source_text = source_text,
         .parse = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
         .resolve = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
-        .astgen = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
         .typecheck = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
         .lower = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
         .compile = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
@@ -802,7 +795,6 @@ test "stale cache files are removed by eager sweep" {
         .source_text = source_text,
         .parse = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
         .resolve = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
-        .astgen = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
         .typecheck = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
         .lower = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
         .compile = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
@@ -849,12 +841,10 @@ test "second compile with no changes has zero recomputes" {
     const stats = db.statsSnapshot();
     try testing.expectEqual(@as(usize, 0), stats.parse_recomputes);
     try testing.expectEqual(@as(usize, 0), stats.resolve_recomputes);
-    try testing.expectEqual(@as(usize, 0), stats.astgen_recomputes);
     try testing.expectEqual(@as(usize, 0), stats.type_recomputes);
     try testing.expectEqual(@as(usize, 0), stats.lower_recomputes);
     try testing.expectEqual(@as(usize, 0), stats.parse_hits);
     try testing.expectEqual(@as(usize, 0), stats.resolve_hits);
-    try testing.expectEqual(@as(usize, 0), stats.astgen_hits);
     try testing.expectEqual(@as(usize, 0), stats.type_hits);
     try testing.expectEqual(@as(usize, 0), stats.lower_hits);
     try testing.expectEqual(@as(usize, 1), stats.compile_hits);

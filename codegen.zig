@@ -1,5 +1,4 @@
 const std = @import("std");
-const diagnostics = @import("diagnostics.zig");
 const ir_mod = @import("ir.zig");
 const helpers = @import("helpers_bin.zig");
 const db = @import("db.zig");
@@ -263,28 +262,30 @@ const BinaryEmitter = struct {
     }
 
     fn emitLoadRegFromSlot(self: *@This(), reg_index: usize, value_ref: InstRef) !void {
-        switch (reg_index) {
-            0 => try self.appendBytes(&.{ 0x48, 0x8B, 0xBC, 0x24 }), // rdi
-            1 => try self.appendBytes(&.{ 0x48, 0x8B, 0xB4, 0x24 }), // rsi
-            2 => try self.appendBytes(&.{ 0x48, 0x8B, 0x94, 0x24 }), // rdx
-            3 => try self.appendBytes(&.{ 0x48, 0x8B, 0x8C, 0x24 }), // rcx
-            4 => try self.appendBytes(&.{ 0x4C, 0x8B, 0x84, 0x24 }), // r8
-            5 => try self.appendBytes(&.{ 0x4C, 0x8B, 0x8C, 0x24 }), // r9
-            else => return error.UnsupportedRegister,
-        }
+        const prefixes = [_][]const u8{
+            &.{ 0x48, 0x8B, 0xBC, 0x24 },
+            &.{ 0x48, 0x8B, 0xB4, 0x24 },
+            &.{ 0x48, 0x8B, 0x94, 0x24 },
+            &.{ 0x48, 0x8B, 0x8C, 0x24 },
+            &.{ 0x4C, 0x8B, 0x84, 0x24 },
+            &.{ 0x4C, 0x8B, 0x8C, 0x24 },
+        };
+        if (reg_index >= prefixes.len) return error.UnsupportedRegister;
+        try self.appendBytes(prefixes[reg_index]);
         try self.appendLeU32(slotOffset(value_ref));
     }
 
     fn emitStoreRegToSlot(self: *@This(), reg_index: usize, value_ref: InstRef) !void {
-        switch (reg_index) {
-            0 => try self.appendBytes(&.{ 0x48, 0x89, 0xBC, 0x24 }), // rdi
-            1 => try self.appendBytes(&.{ 0x48, 0x89, 0xB4, 0x24 }), // rsi
-            2 => try self.appendBytes(&.{ 0x48, 0x89, 0x94, 0x24 }), // rdx
-            3 => try self.appendBytes(&.{ 0x48, 0x89, 0x8C, 0x24 }), // rcx
-            4 => try self.appendBytes(&.{ 0x4C, 0x89, 0x84, 0x24 }), // r8
-            5 => try self.appendBytes(&.{ 0x4C, 0x89, 0x8C, 0x24 }), // r9
-            else => return error.UnsupportedRegister,
-        }
+        const prefixes = [_][]const u8{
+            &.{ 0x48, 0x89, 0xBC, 0x24 },
+            &.{ 0x48, 0x89, 0xB4, 0x24 },
+            &.{ 0x48, 0x89, 0x94, 0x24 },
+            &.{ 0x48, 0x89, 0x8C, 0x24 },
+            &.{ 0x4C, 0x89, 0x84, 0x24 },
+            &.{ 0x4C, 0x89, 0x8C, 0x24 },
+        };
+        if (reg_index >= prefixes.len) return error.UnsupportedRegister;
+        try self.appendBytes(prefixes[reg_index]);
         try self.appendLeU32(slotOffset(value_ref));
     }
 
@@ -787,11 +788,9 @@ fn buildElfExecutable(code: []const u8, entry_code_offset: u64, program_code_len
     return file_buf.toOwnedSlice(gpa);
 }
 
-const ir = @import("ir.zig");
-
 pub const CompileMemo = db.Memo([]const u8);
 
-pub fn computeCompile(lower_memo: *const ir.LowerMemo, gpa: std.mem.Allocator) error{OutOfMemory}!CompileMemo {
+pub fn computeCompile(lower_memo: *const ir_mod.LowerMemo, gpa: std.mem.Allocator) error{OutOfMemory}!CompileMemo {
     var diagnostics_list = try db.initDiagnosticList(gpa, lower_memo.diagnostics.items, 1);
     errdefer diagnostics_list.deinit(gpa);
 

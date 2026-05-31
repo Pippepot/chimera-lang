@@ -1,6 +1,5 @@
 const std = @import("std");
 const ast = @import("ast.zig");
-const diagnostics = @import("diagnostics.zig");
 const analyze = @import("analyze.zig");
 const scope_mod = @import("scope.zig");
 const db = @import("db.zig");
@@ -775,7 +774,7 @@ pub fn computeLower(
     return db.makeMemo(Program, lowered_value, diagnostics_list);
 }
 
-pub fn lower(typed: *const analyze.AnalyzedAst, gpa: std.mem.Allocator) !Program {
+fn lower(typed: *const analyze.AnalyzedAst, gpa: std.mem.Allocator) !Program {
     var lowerer = try Lowerer.init(gpa, typed);
     defer lowerer.deinit();
 

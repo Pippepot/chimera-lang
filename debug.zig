@@ -130,29 +130,15 @@ fn appendPrefix(prefix: []const u8, suffix: []const u8, buf: *[256]u8) ?[]const 
 }
 
 fn writeAstLabel(writer: *std.Io.Writer, a: *const ast.Ast, idx: ast.NodeIdx) void {
-    switch (a.nodes[idx].tag) {
-        .int_lit => writer.print("int {d}", .{@as(i32, @bitCast(a.nodes[idx].data0))}) catch return,
-        .float_lit => writer.print("float {d}", .{@as(f32, @bitCast(a.nodes[idx].data0))}) catch return,
-        .var_ref => writer.print("var {s}", .{a.identOf(a.nodes[idx].data0)}) catch return,
-        .block => writer.writeAll("block") catch return,
-        .const_decl => writer.print("const {s}", .{a.identOf(a.nodes[idx].data0)}) catch return,
-        .var_decl => writer.print("var {s}", .{a.identOf(a.nodes[idx].data0)}) catch return,
-        .assign => writer.print("assign {s}", .{a.identOf(a.nodes[idx].data0)}) catch return,
-        .return_stmt => writer.writeAll("return") catch return,
-        .call => writer.writeAll("call") catch return,
-        .print_stmt => writer.writeAll("print") catch return,
-        .add => writer.writeAll("add") catch return,
-        .sub => writer.writeAll("sub") catch return,
-        .mul => writer.writeAll("mul") catch return,
-        .div => writer.writeAll("div") catch return,
-        .arg => writer.print("arg {d}", .{a.nodes[idx].data0}) catch return,
-        .lt => writer.writeAll("lt") catch return,
-        .gt => writer.writeAll("gt") catch return,
-        .le => writer.writeAll("le") catch return,
-        .ge => writer.writeAll("ge") catch return,
-        .eq => writer.writeAll("eq") catch return,
-        .ne => writer.writeAll("ne") catch return,
-        .if_stmt => writer.writeAll("if") catch return,
+    const node = a.nodes[idx];
+    switch (node.tag) {
+        .int_lit => writer.print("int {d}", .{@as(i32, @bitCast(node.data0))}) catch return,
+        .float_lit => writer.print("float {d}", .{@as(f32, @bitCast(node.data0))}) catch return,
+        .var_ref => writer.print("var {s}", .{a.identOf(node.data0)}) catch return,
+        .const_decl, .var_decl => writer.print("{s} {s}", .{ @tagName(node.tag), a.identOf(node.data0) }) catch return,
+        .assign => writer.print("assign {s}", .{a.identOf(node.data0)}) catch return,
+        .call, .return_stmt, .print_stmt, .add, .sub, .mul, .div, .lt, .gt, .le, .ge, .eq, .ne, .if_stmt, .block, .field_access, .comptime_expr, .struct_expr, .unit_lit => writer.print("{s}", .{@tagName(node.tag)}) catch return,
+        .arg => writer.print("arg {d}", .{node.data0}) catch return,
         .struct_init => {
             const type_expr = a.structInitTypeExpr(idx);
             if (a.nodes[type_expr].tag == .var_ref) {
@@ -161,12 +147,8 @@ fn writeAstLabel(writer: *std.Io.Writer, a: *const ast.Ast, idx: ast.NodeIdx) vo
                 writer.writeAll("struct_init") catch return;
             }
         },
-        .field_access => writer.writeAll("field_access") catch return,
-        .comptime_expr => writer.writeAll("comptime_expr") catch return,
-        .comptime_value_decl => writer.print("comptime_decl {s}", .{a.identOf(a.nodes[idx].data0)}) catch return,
-        .bool_lit => writer.print("bool {s}", .{if (a.nodes[idx].data0 != 0) "true" else "false"}) catch return,
-        .unit_lit => writer.writeAll("unit") catch return,
-        .struct_expr => writer.writeAll("struct_expr") catch return,
+        .bool_lit => writer.print("bool {s}", .{if (node.data0 != 0) "true" else "false"}) catch return,
+        .comptime_value_decl => writer.print("comptime_decl {s}", .{a.identOf(node.data0)}) catch return,
         .type_name, .type_func, .comptime_fn, .comptime_struct => {},
     }
 }
@@ -281,7 +263,7 @@ fn dumpTypeNode(a: *const ast.Ast, type_idx: ast.TypeIdx, writer: *std.Io.Writer
             writer.writeAll(") ") catch return;
             dumpTypeNode(a, a.funcTypeRet(type_idx), writer);
         },
-        .int_lit, .float_lit, .var_ref, .block, .const_decl, .var_decl, .assign, .return_stmt, .call, .print_stmt, .add, .sub, .mul, .div, .arg, .lt, .gt, .le, .ge, .eq, .ne, .if_stmt, .struct_init, .field_access, .bool_lit, .unit_lit, .comptime_expr, .comptime_value_decl, .comptime_fn, .comptime_struct, .struct_expr => {},
+        else => {},
     }
 }
 

@@ -241,54 +241,33 @@ pub const Ast = struct {
     }
 
     pub fn serialize(ast: *const Ast, gpa: std.mem.Allocator) ![]u8 {
-        var len: usize = @sizeOf(Header);
-        len += ast.nodes.len * @sizeOf(Node);
-        len += ast.extra.len * 4;
-        len += ast.ident_bytes.len;
-        len = alignForward(len, 4);
-        len += ast.ident_offsets.len * 4;
-        len = alignForward(len, @alignOf(Span));
-        len += ast.spans.len * @sizeOf(Span);
-        len += ast.decls.len * 4;
-
-        var buf = try std.ArrayList(u8).initCapacity(gpa, len);
+        const layout = computedSize(
+            @intCast(ast.nodes.len), @intCast(ast.extra.len),
+            @intCast(ast.ident_bytes.len), @intCast(ast.ident_offsets.len),
+            @intCast(ast.spans.len), @intCast(ast.decls.len),
+        );
+        var buf = try std.ArrayList(u8).initCapacity(gpa, layout.total);
         errdefer buf.deinit(gpa);
 
-        var int_buf: [4]u8 = undefined;
-        std.mem.writeInt(u32, &int_buf, @intCast(ast.nodes.len), .little);
-        try buf.appendSlice(gpa, &int_buf);
-        std.mem.writeInt(u32, &int_buf, @intCast(ast.extra.len), .little);
-        try buf.appendSlice(gpa, &int_buf);
-        std.mem.writeInt(u32, &int_buf, @intCast(ast.ident_bytes.len), .little);
-        try buf.appendSlice(gpa, &int_buf);
-        std.mem.writeInt(u32, &int_buf, @intCast(ast.ident_offsets.len), .little);
-        try buf.appendSlice(gpa, &int_buf);
-        std.mem.writeInt(u32, &int_buf, @intCast(ast.spans.len), .little);
-        try buf.appendSlice(gpa, &int_buf);
-        std.mem.writeInt(u32, &int_buf, @intCast(ast.decls.len), .little);
-        try buf.appendSlice(gpa, &int_buf);
-        std.mem.writeInt(u32, &int_buf, ast.entry, .little);
-        try buf.appendSlice(gpa, &int_buf);
+        var w: [4]u8 = undefined;
+        inline for (.{ @as(u32, @intCast(ast.nodes.len)), @as(u32, @intCast(ast.extra.len)), @as(u32, @intCast(ast.ident_bytes.len)), @as(u32, @intCast(ast.ident_offsets.len)), @as(u32, @intCast(ast.spans.len)), @as(u32, @intCast(ast.decls.len)), ast.entry }) |v| {
+            std.mem.writeInt(u32, &w, v, .little);
+            try buf.appendSlice(gpa, &w);
+        }
 
         try buf.appendSlice(gpa, std.mem.sliceAsBytes(ast.nodes));
         try buf.appendSlice(gpa, std.mem.sliceAsBytes(ast.extra));
         try buf.appendSlice(gpa, ast.ident_bytes);
-        try buf.appendNTimes(gpa, 0, alignForward(0, 4));
-        const before_offs = buf.items.len;
-        const offs_align = alignForward(before_offs, 4) - before_offs;
-        try buf.appendNTimes(gpa, 0, offs_align);
+        try buf.appendNTimes(gpa, 0, layout.str_offs_off - buf.items.len);
         try buf.appendSlice(gpa, std.mem.sliceAsBytes(ast.ident_offsets));
-        try buf.appendNTimes(gpa, 0, alignForward(0, @alignOf(Span)));
-        const before_spans = buf.items.len;
-        const spans_align = alignForward(before_spans, @alignOf(Span)) - before_spans;
-        try buf.appendNTimes(gpa, 0, spans_align);
+        try buf.appendNTimes(gpa, 0, layout.spans_off - buf.items.len);
         try buf.appendSlice(gpa, std.mem.sliceAsBytes(ast.spans));
         try buf.appendSlice(gpa, std.mem.sliceAsBytes(ast.decls));
 
         return buf.toOwnedSlice(gpa);
     }
 
-    fn computedSize(
+    pub fn computedSize(
         nodes_len: u32,
         extra_len: u32,
         str_bytes_len: u32,
