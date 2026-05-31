@@ -1,5 +1,6 @@
 const std = @import("std");
 const testing = std.testing;
+const ast = @import("ast.zig");
 const parser = @import("parser.zig");
 const query = @import("query.zig");
 const runtime = @import("runtime.zig");
@@ -1136,6 +1137,224 @@ test "stale cache files are removed by eager sweep" {
     };
 
     return error.TestFailed;
+}
+
+test "parser ownership syntax and parameter modes" {
+    const src =
+        \\comptime S = struct
+        \\  move = none
+        \\  copy = none
+        \\  drop = explicit
+        \\  x: int
+        \\
+        \\comptime f = func(read a: int, mut b: int, var c: int, deinit d: int, e: int) unit
+        \\  0
+    ;
+    var parsed = try parser.parseOwned(src, testing.allocator);
+    defer parsed.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 2), parsed.ast.decls.len);
+    const struct_decl = parsed.ast.decls[0];
+    const fn_decl = parsed.ast.decls[1];
+
+    try testing.expect(parsed.ast.nodes[struct_decl].tag == .comptime_struct);
+    try testing.expect(parsed.ast.structMoveKind(struct_decl) == ast.StructMoveKind.none);
+    try testing.expect(parsed.ast.structCopyKind(struct_decl) == ast.StructCopyKind.none);
+    try testing.expect(parsed.ast.structDropKind(struct_decl) == ast.StructDropKind.explicit);
+    try testing.expect(parsed.ast.structMoveExplicit(struct_decl));
+    try testing.expect(parsed.ast.structCopyExplicit(struct_decl));
+    try testing.expect(parsed.ast.structDropExplicit(struct_decl));
+
+    try testing.expect(parsed.ast.nodes[fn_decl].tag == .comptime_fn);
+    try testing.expect(parsed.ast.fnParamAccessMode(fn_decl, 0) == ast.ParamAccessMode.read);
+    try testing.expect(parsed.ast.fnParamAccessMode(fn_decl, 1) == ast.ParamAccessMode.mut);
+    try testing.expect(parsed.ast.fnParamAccessMode(fn_decl, 2) == ast.ParamAccessMode.var_mode);
+    try testing.expect(parsed.ast.fnParamAccessMode(fn_decl, 3) == ast.ParamAccessMode.deinit);
+    try testing.expect(parsed.ast.fnParamAccessMode(fn_decl, 4) == ast.ParamAccessMode.read);
+}
+
+test "struct ownership keys are reserved and cannot be field names" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+
+    try db.setSource(0,
+        \\comptime S = struct
+        \\  move: int
+    );
+    try expectCompileErrorContains(&db, 0, "unexpected token");
+}
+
+test "ownership copy none rejects implicit struct copy" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+
+    try db.setSource(0,
+        \\comptime A = struct
+        \\  x: int
+        \\const a = A{x = 1}
+        \\const b = a
+        \\print(b.x)
+    );
+    try expectCompileErrorContains(&db, 0, "copy is not allowed");
+}
+
+test "inline one-line copy hook is invoked on implicit copy" {
+    try testProgram(
+        \\comptime Box = struct
+        \\  x: int
+        \\  copy = func(read self: Box) Box -> Box{x = self.x + 1}
+        \\const a = Box{x = 5}
+        \\const b = a
+        \\print(b.x)
+    , "6\n");
+}
+
+test "inline one-line move hook is invoked on move sigil" {
+    try testProgram(
+        \\comptime Box = struct
+        \\  x: int
+        \\  move = func(var self: Box) Box -> Box{x = self.x + 10}
+        \\const a = Box{x = 2}
+        \\const b = a^
+        \\print(b.x)
+    , "12\n");
+}
+
+test "var parameter consume supports both x and x^ call forms" {
+    try testProgram(
+        \\comptime A = struct
+        \\  x: int
+        \\comptime take = func(var a: A) unit
+        \\  print(a.x)
+        \\const a = A{x = 1}
+        \\take(a)
+        \\const b = A{x = 2}
+        \\take(b^)
+    , "1\n2\n");
+}
+
+test "use after move is diagnosed" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+
+    try db.setSource(0,
+        \\comptime A = struct
+        \\  x: int
+        \\comptime take = func(var a: A) unit
+        \\  print(a.x)
+        \\const a = A{x = 1}
+        \\take(a)
+        \\print(a.x)
+    );
+    try expectCompileErrorContains(&db, 0, "use after move");
+}
+
+test "read parameter borrows and does not require copy" {
+    try testProgram(
+        \\comptime A = struct
+        \\  x: int
+        \\comptime show = func(read a: A) unit
+        \\  print(a.x)
+        \\const a = A{x = 9}
+        \\show(a)
+    , "9\n");
+}
+
+test "mut parameter writes back to caller value" {
+    try testProgram(
+        \\comptime bump = func(mut x: int) unit
+        \\  x = x + 1
+        \\var n = 41
+        \\bump(n)
+        \\print(n)
+    , "42\n");
+}
+
+test "move none values cannot be transferred" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+
+    try db.setSource(0,
+        \\comptime Id = struct
+        \\  move = none
+        \\  x: int
+        \\comptime take = func(var v: Id) unit
+        \\  print(v.x)
+        \\const a = Id{x = 3}
+        \\take(a)
+    );
+    try expectCompileErrorContains(&db, 0, "stable-identity value cannot be transferred");
+}
+
+test "move none forces copy none compatibility" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+
+    try db.setSource(0,
+        \\comptime Id = struct
+        \\  move = none
+        \\  copy = trivial
+        \\  x: int
+    );
+    try expectCompileErrorContains(&db, 0, "struct ownership policy is incompatible");
+}
+
+test "drop explicit requires deinit path before scope exit" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+
+    try db.setSource(0,
+        \\comptime D = struct
+        \\  drop = explicit
+        \\  x: int
+        \\const d = D{x = 1}
+    );
+    try expectCompileErrorContains(&db, 0, "deinit ownership must be consumed");
+}
+
+test "drop explicit is satisfied by deinit parameter call" {
+    try testProgram(
+        \\comptime D = struct
+        \\  drop = explicit
+        \\  x: int
+        \\comptime consume = func(deinit d: D) unit
+        \\  print(d.x)
+        \\const d = D{x = 7}
+        \\consume(d)
+    , "7\n");
+}
+
+test "deinit parameter ownership cannot be transferred again" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+
+    try db.setSource(0,
+        \\comptime D = struct
+        \\  drop = explicit
+        \\  x: int
+        \\comptime consume = func(deinit d: D) unit
+        \\  print(d.x)
+        \\comptime bad = func(deinit d: D) unit
+        \\  consume(d)
+        \\const d = D{x = 1}
+        \\bad(d)
+    );
+    try expectCompileErrorContains(&db, 0, "deinit-owned value cannot be transferred");
+}
+
+test "ownership hook signature mismatch is diagnosed" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+
+    try db.setSource(0,
+        \\comptime S = struct
+        \\  x: int
+        \\  copy = func(var self: S) S
+        \\    return S{x = self.x}
+        \\const s = S{x = 1}
+        \\print(s.x)
+    );
+    try expectCompileErrorContains(&db, 0, "ownership hook function signature mismatch");
 }
 
 test "comments are ignored by parser" {

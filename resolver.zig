@@ -264,6 +264,9 @@ const Resolver = struct {
                 try self.resolveNode(ast_.structInitTypeExpr(idx));
                 for (ast_.structInitFields(idx)) |field| try self.resolveNode(field.value);
             },
+            .move_expr => {
+                try self.resolveNode(ast_.nodes[idx].data0);
+            },
             .struct_expr => {},
             .type_union => {
                 for (ast_.typeUnionMembers(idx)) |member| try self.resolveNode(member);

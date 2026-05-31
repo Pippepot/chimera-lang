@@ -54,6 +54,17 @@ pub const FieldLoad = struct {
     field_index: u32,
 };
 
+pub const PtrLoad = struct {
+    ptr: ValueRef,
+    offset_slots: u32,
+};
+
+pub const PtrStore = struct {
+    ptr: ValueRef,
+    src: ValueRef,
+    offset_slots: u32,
+};
+
 pub const Inst = union(enum) {
     iconst: i32,
     fconst: f32,
@@ -73,6 +84,9 @@ pub const Inst = union(enum) {
     argi: u32,
     store: InstPair,
     field_load: FieldLoad,
+    slot_addr: ValueRef,
+    load_ptr: PtrLoad,
+    store_ptr: PtrStore,
 };
 
 pub const PredicateOp = enum {
@@ -348,8 +362,13 @@ const Lowerer = struct {
 };
 
 const FunctionLowerer = struct {
+    const BindingStorage = union(enum) {
+        local_slot: ValueRef,
+        borrowed_ptr: ValueRef,
+    };
+
     const LowerBinding = struct {
-        slot: ValueRef,
+        storage: BindingStorage,
         ty: analyze.Type,
         slot_count: u32,
     };
@@ -422,6 +441,63 @@ const FunctionLowerer = struct {
         return self.bindings.lookup(name);
     }
 
+    fn callParamModes(self: *const @This(), call_idx: ast.NodeIdx, callee: ast.NodeIdx) []const ast.ParamAccessMode {
+        if (self.parent.typed.call_monomorph_targets.get(call_idx)) |target_fn_id| {
+            if (target_fn_id < self.parent.typed.functions.items.len) return self.parent.typed.functions.items[target_fn_id].param_modes;
+        }
+        if (self.parent.typed.ast.nodes[callee].tag == .var_ref) {
+            const cname = self.parent.typed.ast.identOf(self.parent.typed.ast.nodes[callee].data0);
+            if (self.parent.function_ids.get(cname)) |fn_id| {
+                if (fn_id < self.parent.typed.functions.items.len) {
+                    return self.parent.typed.functions.items[fn_id].param_modes;
+                }
+            }
+        }
+        return &.{};
+    }
+
+    fn lowerBindingPointer(self: *@This(), binding: LowerBinding) LowerResult!ValueRef {
+        return switch (binding.storage) {
+            .local_slot => |slot| self.addInst(.{ .slot_addr = slot }),
+            .borrowed_ptr => |ptr_slot| ptr_slot,
+        };
+    }
+
+    fn lowerBindingValue(self: *@This(), binding: LowerBinding) LowerResult!ValueRef {
+        return switch (binding.storage) {
+            .local_slot => |slot| slot,
+            .borrowed_ptr => |ptr_slot| blk: {
+                const base = try self.allocSlotRange(binding.slot_count);
+                var offset: u32 = 0;
+                while (offset < binding.slot_count) : (offset += 1) {
+                    const loaded = try self.addInst(.{ .load_ptr = .{ .ptr = ptr_slot, .offset_slots = offset } });
+                    _ = try self.addInst(.{ .store = .{ .l = loaded, .r = base + offset } });
+                }
+                break :blk base;
+            },
+        };
+    }
+
+    fn lowerReadArgPointer(self: *@This(), arg_node: ast.NodeIdx, param_ty: analyze.Type) LowerResult!ValueRef {
+        const a = self.parent.typed.ast;
+        if (a.nodes[arg_node].tag == .var_ref) {
+            const name = a.identOf(a.nodes[arg_node].data0);
+            if (self.lookupBinding(name)) |binding| {
+                return self.lowerBindingPointer(binding);
+            }
+        }
+        const arg_value = try self.lowerValueAsType(arg_node, param_ty);
+        return self.addInst(.{ .slot_addr = arg_value });
+    }
+
+    fn lowerMutArgPointer(self: *@This(), arg_node: ast.NodeIdx) LowerResult!ValueRef {
+        const a = self.parent.typed.ast;
+        if (a.nodes[arg_node].tag != .var_ref) return error.UnknownSymbol;
+        const name = a.identOf(a.nodes[arg_node].data0);
+        const binding = self.lookupBinding(name) orelse return error.UnknownSymbol;
+        return self.lowerBindingPointer(binding);
+    }
+
     fn nodeType(self: *const @This(), idx: ast.NodeIdx) analyze.TypeError!analyze.Type {
         const a = self.parent.typed.ast;
         if (a.nodes[idx].tag == .var_ref) {
@@ -433,6 +509,56 @@ const FunctionLowerer = struct {
 
     fn typeSlotCount(self: *const @This(), ty: analyze.Type) LowerResult!u32 {
         return self.parent.typeSlotCount(ty);
+    }
+
+    fn ownershipSpecForType(self: *const @This(), ty: analyze.Type) ?analyze.OwnershipSpec {
+        return switch (ty) {
+            .named => |name| self.parent.typed.ownership_specs.get(name),
+            else => null,
+        };
+    }
+
+    fn emitCallWithArgs(self: *@This(), callee_ref: ValueRef, arg_values: []const ValueRef, ret_ty: analyze.Type) LowerResult!ValueRef {
+        if (arg_values.len > MaxCallArgs) return error.TooManyCallArgs;
+        const ret_slots = try self.typeSlotCount(ret_ty);
+        var args: [MaxCallArgs]ValueRef = [_]ValueRef{0} ** MaxCallArgs;
+        for (arg_values, 0..) |arg, idx| args[idx] = arg;
+        const call_value = try self.addInst(.{ .call = .{
+            .callee = callee_ref,
+            .argc = @intCast(arg_values.len),
+            .args = args,
+            .ret_slots = @intCast(ret_slots),
+        } });
+        if (ret_slots > 1) self.function.next_value += ret_slots - 1;
+        return call_value;
+    }
+
+    fn emitCopyHook(self: *@This(), hook_fn_id: FuncId, source_base: ValueRef, ty: analyze.Type) LowerResult!ValueRef {
+        const source_ptr = try self.addInst(.{ .slot_addr = source_base });
+        const callee_ref = try self.addInst(.{ .fn_addr = hook_fn_id });
+        return self.emitCallWithArgs(callee_ref, &.{source_ptr}, ty);
+    }
+
+    fn emitMoveHook(self: *@This(), hook_fn_id: FuncId, source_base: ValueRef, ty: analyze.Type) LowerResult!ValueRef {
+        const width = try self.typeSlotCount(ty);
+        if (width > MaxCallArgs) return error.TooManyCallArgs;
+        var args_buf: [MaxCallArgs]ValueRef = [_]ValueRef{0} ** MaxCallArgs;
+        var i: u32 = 0;
+        while (i < width) : (i += 1) {
+            args_buf[i] = source_base + i;
+        }
+        const callee_ref = try self.addInst(.{ .fn_addr = hook_fn_id });
+        return self.emitCallWithArgs(callee_ref, args_buf[0..width], ty);
+    }
+
+    fn applyImplicitCopy(self: *@This(), value_node: ast.NodeIdx, value_ref: ValueRef, ty: analyze.Type) LowerResult!ValueRef {
+        const value_tag = self.parent.typed.ast.nodes[value_node].tag;
+        if (value_tag == .move_expr) return value_ref;
+        if (value_tag != .var_ref and value_tag != .field_access) return value_ref;
+        const spec = self.ownershipSpecForType(ty) orelse return value_ref;
+        if (spec.copy.kind != .func) return value_ref;
+        const hook_fn = spec.copy.hook_fn orelse return value_ref;
+        return self.emitCopyHook(hook_fn, value_ref, ty);
     }
 
     fn variantMemberIndex(variant_ty: *const analyze.VariantType, member_ty: analyze.Type) ?u32 {
@@ -726,18 +852,34 @@ const FunctionLowerer = struct {
         if (call_args.len != fn_ty.params.len) return error.UnknownFunction;
 
         const ret_slots = try self.typeSlotCount(fn_ty.ret);
+        const param_modes = self.callParamModes(idx, callee);
 
         var args: [MaxCallArgs]ValueRef = [_]ValueRef{0} ** MaxCallArgs;
         var arg_word_count: usize = 0;
-        for (call_args, fn_ty.params) |arg_node, param_ty| {
-            const arg_base = try self.lowerValueAsType(arg_node, param_ty);
-            const arg_width = try self.typeSlotCount(param_ty);
-            if (arg_word_count + arg_width > MaxCallArgs) return error.TooManyCallArgs;
+        for (call_args, fn_ty.params, 0..) |arg_node, param_ty, arg_idx| {
+            const mode = if (arg_idx < param_modes.len) param_modes[arg_idx] else ast.ParamAccessMode.read;
+            switch (mode) {
+                .read => {
+                    if (arg_word_count + 1 > MaxCallArgs) return error.TooManyCallArgs;
+                    args[arg_word_count] = try self.lowerReadArgPointer(arg_node, param_ty);
+                    arg_word_count += 1;
+                },
+                .mut => {
+                    if (arg_word_count + 1 > MaxCallArgs) return error.TooManyCallArgs;
+                    args[arg_word_count] = try self.lowerMutArgPointer(arg_node);
+                    arg_word_count += 1;
+                },
+                .var_mode, .deinit => {
+                    const arg_base = try self.lowerValueAsType(arg_node, param_ty);
+                    const arg_width = try self.typeSlotCount(param_ty);
+                    if (arg_word_count + arg_width > MaxCallArgs) return error.TooManyCallArgs;
 
-            var slot_offset: u32 = 0;
-            while (slot_offset < arg_width) : (slot_offset += 1) {
-                args[arg_word_count] = arg_base + slot_offset;
-                arg_word_count += 1;
+                    var slot_offset: u32 = 0;
+                    while (slot_offset < arg_width) : (slot_offset += 1) {
+                        args[arg_word_count] = arg_base + slot_offset;
+                        arg_word_count += 1;
+                    }
+                },
             }
         }
 
@@ -759,6 +901,7 @@ const FunctionLowerer = struct {
         const target_info = self.parent.typed.functions.items[target_fn_id];
         const call_args = a.callArgs(idx);
         const mono_params = target_info.ty.params;
+        const param_modes = target_info.param_modes;
 
         const ret_slots = try self.typeSlotCount(target_info.ty.ret);
 
@@ -775,14 +918,29 @@ const FunctionLowerer = struct {
         for (call_args, 0..) |arg_node, arg_idx| {
             if (mask & (@as(u32, 1) << @intCast(arg_idx)) != 0) continue;
             const param_ty = mono_params[runtime_idx];
-            const arg_base = try self.lowerValueAsType(arg_node, param_ty);
-            const arg_width = try self.typeSlotCount(param_ty);
-            if (arg_word_count + arg_width > MaxCallArgs) return error.TooManyCallArgs;
+            const mode = if (runtime_idx < param_modes.len) param_modes[runtime_idx] else ast.ParamAccessMode.read;
+            switch (mode) {
+                .read => {
+                    if (arg_word_count + 1 > MaxCallArgs) return error.TooManyCallArgs;
+                    args[arg_word_count] = try self.lowerReadArgPointer(arg_node, param_ty);
+                    arg_word_count += 1;
+                },
+                .mut => {
+                    if (arg_word_count + 1 > MaxCallArgs) return error.TooManyCallArgs;
+                    args[arg_word_count] = try self.lowerMutArgPointer(arg_node);
+                    arg_word_count += 1;
+                },
+                .var_mode, .deinit => {
+                    const arg_base = try self.lowerValueAsType(arg_node, param_ty);
+                    const arg_width = try self.typeSlotCount(param_ty);
+                    if (arg_word_count + arg_width > MaxCallArgs) return error.TooManyCallArgs;
 
-            var slot_offset: u32 = 0;
-            while (slot_offset < arg_width) : (slot_offset += 1) {
-                args[arg_word_count] = arg_base + slot_offset;
-                arg_word_count += 1;
+                    var slot_offset: u32 = 0;
+                    while (slot_offset < arg_width) : (slot_offset += 1) {
+                        args[arg_word_count] = arg_base + slot_offset;
+                        arg_word_count += 1;
+                    }
+                },
             }
             runtime_idx += 1;
         }
@@ -824,7 +982,7 @@ const FunctionLowerer = struct {
             defer self.bindings.restore(mark);
             if (cond_binding) |binding| {
                 try self.pushBinding(binding.name, .{
-                    .slot = binding.slot,
+                    .storage = .{ .local_slot = binding.slot },
                     .ty = binding.ty,
                     .slot_count = binding.slot_count,
                 });
@@ -906,12 +1064,13 @@ const FunctionLowerer = struct {
         const value = a.varDeclValue(idx);
         const name = a.identOf(a.nodes[idx].data0);
         const binding_ty = self.parent.typed.decl_binding_types.get(idx) orelse try self.parent.typed.typeOf(value);
-        const value_ref = try self.lowerValueAsType(value, binding_ty);
+        const raw_value_ref = try self.lowerValueAsType(value, binding_ty);
+        const value_ref = try self.applyImplicitCopy(value, raw_value_ref, binding_ty);
         const slot_count = try self.typeSlotCount(binding_ty);
         const var_slot = try self.allocSlotRange(slot_count);
         try self.emitCopySlots(value_ref, var_slot, slot_count);
         try self.pushBinding(name, .{
-            .slot = var_slot,
+            .storage = .{ .local_slot = var_slot },
             .ty = binding_ty,
             .slot_count = slot_count,
         });
@@ -923,22 +1082,40 @@ const FunctionLowerer = struct {
         const value = a.varDeclValue(idx);
         const name = a.identOf(a.nodes[idx].data0);
         const binding_ty = self.parent.typed.decl_binding_types.get(idx) orelse try self.parent.typed.typeOf(value);
-        const value_ref = try self.lowerValueAsType(value, binding_ty);
+        const raw_value_ref = try self.lowerValueAsType(value, binding_ty);
+        const value_ref = try self.applyImplicitCopy(value, raw_value_ref, binding_ty);
         const slot_count = try self.typeSlotCount(binding_ty);
+        const const_slot = try self.allocSlotRange(slot_count);
+        try self.emitCopySlots(value_ref, const_slot, slot_count);
         try self.pushBinding(name, .{
-            .slot = value_ref,
+            .storage = .{ .local_slot = const_slot },
             .ty = binding_ty,
             .slot_count = slot_count,
         });
-        return value_ref;
+        return const_slot;
     }
 
     fn lowerAssign(self: *@This(), idx: ast.NodeIdx) LowerResult!ValueRef {
         const a = self.parent.typed.ast;
         const name = a.identOf(a.nodes[idx].data0);
         const binding = self.lookupBinding(name) orelse return error.UnknownSymbol;
-        const value_ref = try self.lowerValueAsType(a.nodes[idx].data1, binding.ty);
-        try self.emitCopySlots(value_ref, binding.slot, binding.slot_count);
+        const raw_value_ref = try self.lowerValueAsType(a.nodes[idx].data1, binding.ty);
+        const value_ref = try self.applyImplicitCopy(a.nodes[idx].data1, raw_value_ref, binding.ty);
+        switch (binding.storage) {
+            .local_slot => |slot| try self.emitCopySlots(value_ref, slot, binding.slot_count),
+            .borrowed_ptr => |ptr_slot| {
+                var offset: u32 = 0;
+                while (offset < binding.slot_count) : (offset += 1) {
+                    _ = try self.addInst(.{
+                        .store_ptr = .{
+                            .ptr = ptr_slot,
+                            .src = value_ref + offset,
+                            .offset_slots = offset,
+                        },
+                    });
+                }
+            },
+        }
         return self.lowerUnitValue();
     }
 
@@ -985,7 +1162,7 @@ const FunctionLowerer = struct {
     }
 
     fn lowerVarRef(self: *@This(), name: []const u8) LowerResult!ValueRef {
-        if (self.lookupBinding(name)) |binding| return binding.slot;
+        if (self.lookupBinding(name)) |binding| return self.lowerBindingValue(binding);
         if (self.parent.typed.comptime_values.get(name)) |cv| {
             return self.lowerComptimeValue(cv);
         }
@@ -1063,6 +1240,15 @@ const FunctionLowerer = struct {
             .as => try self.lowerAsValue(idx),
             .if_stmt => try self.lowerIf(idx),
             .struct_init => try self.lowerStructInit(idx),
+            .move_expr => blk: {
+                const source = a.nodes[idx].data0;
+                const source_ty = try self.nodeType(source);
+                const source_ref = try self.lowerAst(source);
+                const spec = self.ownershipSpecForType(source_ty) orelse break :blk source_ref;
+                if (spec.move.kind != .func) break :blk source_ref;
+                const hook_fn = spec.move.hook_fn orelse break :blk source_ref;
+                break :blk try self.emitMoveHook(hook_fn, source_ref, source_ty);
+            },
             .field_access => try self.lowerFieldAccess(idx),
             .comptime_expr => blk: {
                 const value = self.parent.typed.comptime_node_values.get(idx) orelse return error.MissingComptimeValue;
@@ -1085,19 +1271,34 @@ const FunctionLowerer = struct {
             if (mask & (@as(u32, 1) << @intCast(param_idx)) != 0) continue;
             if (runtime_idx >= self.info.ty.params.len) return error.UnknownFunction;
             const param_ty = self.info.ty.params[runtime_idx];
+            const mode = if (runtime_idx < self.info.param_modes.len) self.info.param_modes[runtime_idx] else ast.ParamAccessMode.read;
             const pname = a.identOf(param.name);
             const slot_count = try self.typeSlotCount(param_ty);
-            if (self.function.param_values.items.len + slot_count > MaxCallArgs) return error.TooManyCallArgs;
-            const slot = try self.allocSlotRange(slot_count);
-            var slot_offset: u32 = 0;
-            while (slot_offset < slot_count) : (slot_offset += 1) {
-                try self.function.param_values.append(self.parent.gpa, slot + slot_offset);
+            switch (mode) {
+                .read, .mut => {
+                    if (self.function.param_values.items.len + 1 > MaxCallArgs) return error.TooManyCallArgs;
+                    const ptr_slot = try self.allocValue();
+                    try self.function.param_values.append(self.parent.gpa, ptr_slot);
+                    try self.pushBinding(pname, .{
+                        .storage = .{ .borrowed_ptr = ptr_slot },
+                        .ty = param_ty,
+                        .slot_count = slot_count,
+                    });
+                },
+                .var_mode, .deinit => {
+                    if (self.function.param_values.items.len + slot_count > MaxCallArgs) return error.TooManyCallArgs;
+                    const slot = try self.allocSlotRange(slot_count);
+                    var slot_offset: u32 = 0;
+                    while (slot_offset < slot_count) : (slot_offset += 1) {
+                        try self.function.param_values.append(self.parent.gpa, slot + slot_offset);
+                    }
+                    try self.pushBinding(pname, .{
+                        .storage = .{ .local_slot = slot },
+                        .ty = param_ty,
+                        .slot_count = slot_count,
+                    });
+                },
             }
-            try self.pushBinding(pname, .{
-                .slot = slot,
-                .ty = param_ty,
-                .slot_count = slot_count,
-            });
             runtime_idx += 1;
         }
     }

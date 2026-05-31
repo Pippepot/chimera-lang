@@ -1,2 +1,17 @@
-const b = if 1 > 2 -> 1 else 2.3
-if const i = b as int -> print(i)
+comptime Bar = struct
+  x: int
+  
+  copy = func(self: Bar) Bar
+    print(1234)
+    return Bar{x = self.x}
+
+const a = Bar{x = 1}
+const aa = a
+print(aa.x)
+
+comptime foo = func(var x: int) int
+  x = x + 1
+  return x
+const b = 1
+const c = foo(b)
+print(c)

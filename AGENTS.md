@@ -7,16 +7,16 @@
   - `main.zig` owns CLI/runtime entrypoint (`main`) and orchestration of query stages + diagnostics printing.
   - `ast.zig` owns AST module/declaration/type nodes and expression nodes (`AstNode`, `IfNode`, `VarNode`, `ConstNode`, `BlockNode`).
   - `runtime.zig` owns runtime helper entrypoints (`writeProgram`, `runProg`).
-  - `parser.zig` owns lexer + parser (`parseOwned`) from source text to module AST, plus `computeParse` for query integration.
+  - `parser.zig` owns lexer + parser (`parseOwned`) from source text to module AST, plus `computeParse` for query integration. Includes ownership syntax (`move/copy/drop` struct properties, param access modes, postfix move `^`).
   - `resolver.zig` owns pre-typecheck symbol resolution (`computeResolve`) and symbol diagnostics.
   - `astgen.zig` was removed — type analysis depends directly on resolve.
-  - `analyze.zig` owns type inference/checking (`unit`, `bool`, `int`, `float`, function types), comptime evaluation, and `computeAnalyze` for query integration.
+  - `analyze.zig` owns type inference/checking (`unit`, `bool`, `int`, `float`, function types), comptime evaluation, ownership policy computation/validation, ownership-flow analysis, and `computeAnalyze` for query integration.
   - `typecheck.zig` was legacy; now deleted from tree.
   - `query.zig` owns the revisioned incremental query system (`QueryDb`) and stage orchestration (frame management, dependency tracking, memo verification).
   - `query_cache.zig` owns cross-run persistent query cache encoding/decoding, atomic save/load, and stale-cache cleanup.
-  - `ir.zig` owns multi-function IR types and typed AST -> IR lowering, plus `computeLower` for query integration.
+  - `ir.zig` owns multi-function IR types and typed AST -> IR lowering, plus `computeLower` for query integration. Includes ownership-aware lowering (borrow-pointer path for `read/mut`, ownership transfer for `var/deinit`, hook-call lowering for copy/move func policies).
   - `codegen.zig` owns IR -> x86 machine code + ELF emission, plus `computeCompile` for query integration. Records `program_code_len` (offset before helpers) in the ELF padding.
-  - `disasm.zig` owns a pattern-based x86 disassembler that reads raw machine code and produces human-readable assembly text (used by `--debug=asm`). No emitter dependencies — operates purely on bytes + a 75-entry pattern table.
+  - `disasm.zig` owns a pattern-based x86 disassembler that reads raw machine code and produces human-readable assembly text (used by `--debug=asm`). No emitter dependencies — operates purely on bytes + an 80-entry pattern table, with resilient unknown-byte fallback.
   - `db.zig` owns shared query types (`SourceId`, `Revision`, `Dependency`, `QueryKey`, `QueryStats`, `Stage`, `CompileResult`, `DbError`) and comparison helpers.
   - `scope.zig` owns a shared lexical scope stack utility (`ScopeStack`) reused by typechecker and lowering.
   - `debug.zig` owns debug flag parsing and AST/SSA/x86 debug dumps.
@@ -49,6 +49,7 @@
 - **Parser ownership:** `parser.parseOwned` returns `ParsedAst` with an arena that owns all AST allocations.
 - **Query ownership:** parse memo values in `QueryDb` own `ParsedAst`; callers borrow `*const AstNode` via `parsedAst`.
 - **Unary minus** is lowered in parser as either negative literal or `0 - expr`.
+- **Postfix move operator:** `expr^` parses to `Ast.Tag.move_expr` and has postfix precedence.
 ## Type syntax
 
 - **Primitive types:** `unit`, `bool`, `int`, `float`.
@@ -59,12 +60,43 @@
 ## Struct types and initialization
 
 - **Struct declaration:** `comptime Name = struct` followed by newline and indented field lines (`field: type`).
+- **Struct ownership properties:** struct bodies may include `move = ...`, `copy = ...`, `drop = ...` lines in addition to fields. Reserved keys `move/copy/drop` are not valid field names.
+- **Policy RHS forms:** `trivial`, `fieldwise`, `none` (`move/copy`), `explicit` (`drop`), named hook functions, and inline `func` hooks (`->` one-line or indented body).
 - **Struct init:** `TypeName{field1 = expr, field2 = expr, ...}`. Must provide all fields in order; field count and names are checked by the typechecker.
 - **Field access:** `expr.fieldName`. The expression must be of a named struct type.
 - **IR lowering:**
   - `var`/`const` with a `struct_init` value allocates N consecutive stack slots (one per field) and emits `store` for each field value.
   - Field access for index 0 returns the base slot directly. For higher indices it emits `field_load(base, field_index)` which loads from slot `base + field_index`.
-- **Structs in function args/returns** are not yet supported.
+- **Structs in function args/returns** are supported and participate in ownership-mode lowering.
+
+## Ownership MVP
+
+- **Struct policies:** `move/copy/drop` policies are computed per struct with defaults:
+  - move defaults to `fieldwise`
+  - copy defaults to `none`
+  - drop defaults to `trivial`, upgrades to `fieldwise` if needed, and to `explicit` if any field requires explicit drop
+- **Policy validation:** `trivial` requires trivial support on all fields; `fieldwise` requires support on all fields; `move=none` forces `copy=none`.
+- **Hook signatures are strict:**
+  - `copy`: `func(read self: Self) Self`
+  - `move`: `func(var self: Self) Self`
+  - `drop`: `func(deinit self: Self) unit`
+- **Parameter access modes:**
+  - `read` (default): immutable borrow
+  - `mut`: mutable borrow
+  - `var`: ownership transfer into callee
+  - `deinit`: ownership transfer that must not remain alive at function end
+- **Transfer syntax:**
+  - explicit move with postfix `^`
+  - `var` call arguments consume ownership with either `f(x)` or `f(x^)`
+- **Static ownership checks:**
+  - use-after-move / use-after-deinit diagnostics
+  - stable-identity transfer restrictions (`move=none`)
+  - explicit-drop obligations (`drop=explicit` must be satisfied via `deinit` transfer)
+  - deinit-owned values cannot be transferred again
+- **Lowering/codegen ownership path:**
+  - `read`/`mut` parameters are passed by pointer and loaded/stored through pointer ops
+  - `var`/`deinit` parameters use ownership-transfer value passing
+  - copy/move hook calls are lowered when policies are `func`
 
 ## Monomorphization of comptime functions with runtime params
 
@@ -149,12 +181,13 @@
 
 - The first non-debug CLI argument is treated as the source file path to compile.
 - Remaining non-debug CLI arguments are passed through to the generated `./prog` (visible to `arg(n)`).
-- Query cache is enabled by default for CLI runs; use `--no-query-cache` to disable it.
+- Query cache is enabled by default for CLI runs; use `--nocache` to disable it.
 
 ## Testing
 
 - **Behavioral tests** compile and run full binaries from source snippets via `QueryDb`.
 - **Type tests** cover numeric/boolean typing, strict no-coercion behavior, and type errors.
+- **Ownership tests** cover parser/property syntax, policy validation, hook signatures, copy/move/deinit diagnostics, `mut` writeback, and hook invocation behavior.
 - **Incremental tests** verify query cache hits, invalidation on source changes, per-source isolation, unchanged-source no revision bump, and compile `changed_at` backdating.
 - **Persistent cache tests** verify cross-`QueryDb` reuse, disable flag behavior, failure caching, corrupted cache recovery, and stale cache deletion.
 - **Debug formatting test** verifies stable query diagnostics text output.

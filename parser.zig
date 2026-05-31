@@ -36,6 +36,9 @@ const TokenTag = enum {
     kw_else,
     kw_const,
     kw_var,
+    kw_read,
+    kw_mut,
+    kw_deinit,
     kw_return,
     kw_print,
     kw_arg,
@@ -73,6 +76,7 @@ const TokenTag = enum {
     r_brace,
     dot,
     pipe,
+    caret,
 };
 
 const Token = struct {
@@ -172,6 +176,9 @@ const Lexer = struct {
         if (std.mem.eql(u8, word, "else")) return .{ .tag = .kw_else, .start = start, .end = self.index };
         if (std.mem.eql(u8, word, "const")) return .{ .tag = .kw_const, .start = start, .end = self.index };
         if (std.mem.eql(u8, word, "var")) return .{ .tag = .kw_var, .start = start, .end = self.index };
+        if (std.mem.eql(u8, word, "read")) return .{ .tag = .kw_read, .start = start, .end = self.index };
+        if (std.mem.eql(u8, word, "mut")) return .{ .tag = .kw_mut, .start = start, .end = self.index };
+        if (std.mem.eql(u8, word, "deinit")) return .{ .tag = .kw_deinit, .start = start, .end = self.index };
         if (std.mem.eql(u8, word, "return")) return .{ .tag = .kw_return, .start = start, .end = self.index };
         if (std.mem.eql(u8, word, "print")) return .{ .tag = .kw_print, .start = start, .end = self.index };
         if (std.mem.eql(u8, word, "arg")) return .{ .tag = .kw_arg, .start = start, .end = self.index };
@@ -266,6 +273,7 @@ const Lexer = struct {
             ',' => .{ .tag = .comma, .start = start, .end = self.index },
             '.' => .{ .tag = .dot, .start = start, .end = self.index },
             '|' => .{ .tag = .pipe, .start = start, .end = self.index },
+            '^' => .{ .tag = .caret, .start = start, .end = self.index },
             '#' => {
                 while (self.index < self.source.len and self.source[self.index] != '\n') {
                     self.index += 1;
@@ -475,6 +483,7 @@ const Parser = struct {
     lexer: Lexer,
     current: Token,
     scratch_arena: std.heap.ArenaAllocator,
+    inline_hook_counter: u32,
 
     const BinTag = enum {
         add,
@@ -499,6 +508,7 @@ const Parser = struct {
             .lexer = lexer,
             .current = current,
             .scratch_arena = std.heap.ArenaAllocator.init(builder.gpa),
+            .inline_hook_counter = 0,
         };
     }
 
@@ -800,6 +810,55 @@ const Parser = struct {
         return self.parseComptimeExprAfterKeyword(kw_span);
     }
 
+    const ParsedFnParam = struct {
+        name: u32,
+        ty: u32,
+        is_comptime: bool,
+        access_mode: ast.ParamAccessMode,
+    };
+
+    fn parseFnParam(self: *@This()) ParseError!ParsedFnParam {
+        var is_comptime = false;
+        if (self.current.tag == .kw_comptime) {
+            is_comptime = true;
+            try self.advance();
+        }
+
+        var access_mode: ast.ParamAccessMode = .read;
+        switch (self.current.tag) {
+            .kw_read => {
+                access_mode = .read;
+                try self.advance();
+            },
+            .kw_mut => {
+                access_mode = .mut;
+                try self.advance();
+            },
+            .kw_var => {
+                access_mode = .var_mode;
+                try self.advance();
+            },
+            .kw_deinit => {
+                access_mode = .deinit;
+                try self.advance();
+            },
+            else => {},
+        }
+
+        if (is_comptime and access_mode != .read) return error.UnexpectedToken;
+        if (self.current.tag != .ident) return error.ExpectedIdentifier;
+        const param_name = try self.internName(self.current.ident);
+        try self.advance();
+        try self.expect(.colon, error.ExpectedColon);
+        const ty = try self.parseType();
+        return .{
+            .name = param_name,
+            .ty = ty,
+            .is_comptime = is_comptime,
+            .access_mode = access_mode,
+        };
+    }
+
     fn parseComptimeFunc(self: *@This(), name: []const u8, binding_ty: ?NodeIdx, decl_start: ast.Span) ParseError!NodeIdx {
         try self.expect(.kw_func, error.UnexpectedToken);
         try self.expect(.l_paren, error.ExpectedLParen);
@@ -809,21 +868,21 @@ const Parser = struct {
         var param_names = std.ArrayList(u32).empty;
         var param_types = std.ArrayList(u32).empty;
         var comptime_mask: u32 = 0;
+        var mut_mask: u32 = 0;
+        var var_mask: u32 = 0;
+        var deinit_mask: u32 = 0;
         var param_index: u32 = 0;
         while (self.current.tag != .r_paren) {
-            var is_comptime = false;
-            if (self.current.tag == .kw_comptime) {
-                is_comptime = true;
-                try self.advance();
+            const param = try self.parseFnParam();
+            try param_names.append(self.scratch_arena.allocator(), param.name);
+            try param_types.append(self.scratch_arena.allocator(), param.ty);
+            if (param.is_comptime) comptime_mask |= @as(u32, 1) << @intCast(param_index);
+            switch (param.access_mode) {
+                .read => {},
+                .mut => mut_mask |= @as(u32, 1) << @intCast(param_index),
+                .var_mode => var_mask |= @as(u32, 1) << @intCast(param_index),
+                .deinit => deinit_mask |= @as(u32, 1) << @intCast(param_index),
             }
-            if (self.current.tag != .ident) return error.ExpectedIdentifier;
-            const param_name = try self.internName(self.current.ident);
-            try self.advance();
-            try self.expect(.colon, error.ExpectedColon);
-            const ty = try self.parseType();
-            try param_names.append(self.scratch_arena.allocator(), param_name);
-            try param_types.append(self.scratch_arena.allocator(), ty);
-            if (is_comptime) comptime_mask |= @as(u32, 1) << @intCast(param_index);
             param_index += 1;
 
             if (self.current.tag == .comma) {
@@ -840,11 +899,17 @@ const Parser = struct {
         else
             try self.makeUnitTypeNode(rp_span);
 
-        const body = try self.parseIndentedBlock(error.ExpectedIndent);
+        const body = if (self.current.tag == .arrow) body: {
+            try self.advance();
+            break :body try self.parseStatement();
+        } else try self.parseIndentedBlock(error.ExpectedIndent);
 
         const param_count: u32 = @intCast(param_names.items.len);
         try self.builder.extra.append(self.builder.gpa, param_count);
         try self.builder.extra.append(self.builder.gpa, comptime_mask);
+        try self.builder.extra.append(self.builder.gpa, mut_mask);
+        try self.builder.extra.append(self.builder.gpa, var_mask);
+        try self.builder.extra.append(self.builder.gpa, deinit_mask);
         var i: u32 = 0;
         while (i < param_count) : (i += 1) {
             try self.builder.extra.append(self.builder.gpa, param_names.items[i]);
@@ -856,9 +921,9 @@ const Parser = struct {
             try self.builder.extra.append(self.builder.gpa, annot);
         }
         const extra_idx: u32 = if (binding_ty != null)
-            @intCast(self.builder.extra.items.len - 5 - param_count * 2)
+            @intCast(self.builder.extra.items.len - 8 - param_count * 2)
         else
-            @intCast(self.builder.extra.items.len - 4 - param_count * 2);
+            @intCast(self.builder.extra.items.len - 7 - param_count * 2);
 
         const data1 = if (binding_ty != null) extra_idx | 0x80000000 else extra_idx;
         const body_span = try self.spanOf(body);
@@ -867,6 +932,17 @@ const Parser = struct {
     }
 
     const StructFields = struct { names: std.ArrayList(u32), types: std.ArrayList(u32) };
+
+    const ParsedStructBody = struct {
+        fields: StructFields,
+        move_kind: ast.StructMoveKind,
+        move_hook: ?u32,
+        copy_kind: ast.StructCopyKind,
+        copy_hook: ?u32,
+        drop_kind: ast.StructDropKind,
+        drop_hook: ?u32,
+        explicit_mask: u32,
+    };
 
     fn parseStructFields(self: *@This()) ParseError!StructFields {
         try self.consumeNewlines();
@@ -893,28 +969,195 @@ const Parser = struct {
         return .{ .names = names, .types = types };
     }
 
+    fn makeInlineHookName(self: *@This(), struct_name: []const u8, property_name: []const u8) ParseError![]const u8 {
+        const n = self.inline_hook_counter;
+        self.inline_hook_counter += 1;
+        return std.fmt.allocPrint(self.scratch_arena.allocator(), "$hook_{s}_{s}_{d}", .{ struct_name, property_name, n }) catch return error.OutOfMemory;
+    }
+
+    fn parseOwnershipHookRef(self: *@This(), struct_name: []const u8, property_name: []const u8, line_start: ast.Span) ParseError!u32 {
+        if (self.current.tag == .kw_func) {
+            const generated_name = try self.makeInlineHookName(struct_name, property_name);
+            const decl = try self.parseComptimeFunc(generated_name, null, line_start);
+            try self.builder.decls.append(self.builder.gpa, decl);
+            return self.internName(generated_name);
+        }
+        if (self.current.tag != .ident) return error.UnexpectedToken;
+        const hook_name = self.current.ident;
+        try self.advance();
+        return self.internName(hook_name);
+    }
+
+    fn parseMovePolicy(self: *@This(), body: *ParsedStructBody, struct_name: []const u8, line_start: ast.Span) ParseError!void {
+        if (self.current.tag == .ident) {
+            const rhs = self.current.ident;
+            if (std.mem.eql(u8, rhs, "trivial")) {
+                body.move_kind = .trivial;
+                body.move_hook = null;
+                try self.advance();
+                return;
+            }
+            if (std.mem.eql(u8, rhs, "fieldwise")) {
+                body.move_kind = .fieldwise;
+                body.move_hook = null;
+                try self.advance();
+                return;
+            }
+            if (std.mem.eql(u8, rhs, "none")) {
+                body.move_kind = .none;
+                body.move_hook = null;
+                try self.advance();
+                return;
+            }
+        }
+        body.move_kind = .func;
+        body.move_hook = try self.parseOwnershipHookRef(struct_name, "move", line_start);
+    }
+
+    fn parseCopyPolicy(self: *@This(), body: *ParsedStructBody, struct_name: []const u8, line_start: ast.Span) ParseError!void {
+        if (self.current.tag == .ident) {
+            const rhs = self.current.ident;
+            if (std.mem.eql(u8, rhs, "trivial")) {
+                body.copy_kind = .trivial;
+                body.copy_hook = null;
+                try self.advance();
+                return;
+            }
+            if (std.mem.eql(u8, rhs, "fieldwise")) {
+                body.copy_kind = .fieldwise;
+                body.copy_hook = null;
+                try self.advance();
+                return;
+            }
+            if (std.mem.eql(u8, rhs, "none")) {
+                body.copy_kind = .none;
+                body.copy_hook = null;
+                try self.advance();
+                return;
+            }
+        }
+        body.copy_kind = .func;
+        body.copy_hook = try self.parseOwnershipHookRef(struct_name, "copy", line_start);
+    }
+
+    fn parseDropPolicy(self: *@This(), body: *ParsedStructBody, struct_name: []const u8, line_start: ast.Span) ParseError!void {
+        if (self.current.tag == .ident) {
+            const rhs = self.current.ident;
+            if (std.mem.eql(u8, rhs, "trivial")) {
+                body.drop_kind = .trivial;
+                body.drop_hook = null;
+                try self.advance();
+                return;
+            }
+            if (std.mem.eql(u8, rhs, "fieldwise")) {
+                body.drop_kind = .fieldwise;
+                body.drop_hook = null;
+                try self.advance();
+                return;
+            }
+            if (std.mem.eql(u8, rhs, "explicit")) {
+                body.drop_kind = .explicit;
+                body.drop_hook = null;
+                try self.advance();
+                return;
+            }
+        }
+        body.drop_kind = .func;
+        body.drop_hook = try self.parseOwnershipHookRef(struct_name, "drop", line_start);
+    }
+
+    fn parseComptimeStructBody(self: *@This(), struct_name: []const u8) ParseError!ParsedStructBody {
+        try self.consumeNewlines();
+        if (self.current.tag != .indent) return error.ExpectedIndent;
+        try self.advance();
+
+        const names = std.ArrayList(u32).empty;
+        const types = std.ArrayList(u32).empty;
+        var body = ParsedStructBody{
+            .fields = .{ .names = names, .types = types },
+            .move_kind = .fieldwise,
+            .move_hook = null,
+            .copy_kind = .none,
+            .copy_hook = null,
+            .drop_kind = .trivial,
+            .drop_hook = null,
+            .explicit_mask = 0,
+        };
+        var saw_move = false;
+        var saw_copy = false;
+        var saw_drop = false;
+        while (self.current.tag != .dedent and self.current.tag != .eof) {
+            if (self.current.tag != .ident) return error.ExpectedIdentifier;
+            const key = self.current.ident;
+            const key_span = tokenSpan(self.current);
+            try self.advance();
+
+            if (std.mem.eql(u8, key, "move") or std.mem.eql(u8, key, "copy") or std.mem.eql(u8, key, "drop")) {
+                if (self.current.tag != .assign) return error.UnexpectedToken;
+                try self.advance();
+                if (std.mem.eql(u8, key, "move")) {
+                    if (saw_move) return error.UnexpectedToken;
+                    saw_move = true;
+                    body.explicit_mask |= 0b001;
+                    try self.parseMovePolicy(&body, struct_name, key_span);
+                } else if (std.mem.eql(u8, key, "copy")) {
+                    if (saw_copy) return error.UnexpectedToken;
+                    saw_copy = true;
+                    body.explicit_mask |= 0b010;
+                    try self.parseCopyPolicy(&body, struct_name, key_span);
+                } else {
+                    if (saw_drop) return error.UnexpectedToken;
+                    saw_drop = true;
+                    body.explicit_mask |= 0b100;
+                    try self.parseDropPolicy(&body, struct_name, key_span);
+                }
+            } else {
+                const fname = try self.internName(key);
+                try self.expect(.colon, error.ExpectedColon);
+                const fty = try self.parseType();
+                try body.fields.names.append(self.scratch_arena.allocator(), fname);
+                try body.fields.types.append(self.scratch_arena.allocator(), fty);
+            }
+
+            if (self.current.tag == .newline) {
+                try self.consumeNewlines();
+            } else if (self.current.tag != .dedent) {
+                return error.UnexpectedToken;
+            }
+        }
+        try self.expect(.dedent, error.ExpectedIndent);
+        return body;
+    }
+
     fn parseComptimeStruct(self: *@This(), name: []const u8, binding_ty: ?NodeIdx, decl_start: ast.Span) ParseError!NodeIdx {
         try self.expect(.kw_struct, error.UnexpectedToken);
         const name_idx = try self.internName(name);
-        const fields = try self.parseStructFields();
+        const body = try self.parseComptimeStructBody(name);
 
-        const field_count: u32 = @intCast(fields.names.items.len);
+        const field_count: u32 = @intCast(body.fields.names.items.len);
         try self.builder.extra.append(self.builder.gpa, field_count);
+        try self.builder.extra.append(self.builder.gpa, @intFromEnum(body.move_kind));
+        try self.builder.extra.append(self.builder.gpa, body.move_hook orelse ast.no_hook_ident);
+        try self.builder.extra.append(self.builder.gpa, @intFromEnum(body.copy_kind));
+        try self.builder.extra.append(self.builder.gpa, body.copy_hook orelse ast.no_hook_ident);
+        try self.builder.extra.append(self.builder.gpa, @intFromEnum(body.drop_kind));
+        try self.builder.extra.append(self.builder.gpa, body.drop_hook orelse ast.no_hook_ident);
+        try self.builder.extra.append(self.builder.gpa, body.explicit_mask);
         for (0..@intCast(field_count)) |i| {
-            try self.builder.extra.append(self.builder.gpa, fields.names.items[i]);
-            try self.builder.extra.append(self.builder.gpa, fields.types.items[i]);
+            try self.builder.extra.append(self.builder.gpa, body.fields.names.items[i]);
+            try self.builder.extra.append(self.builder.gpa, body.fields.types.items[i]);
         }
         if (binding_ty) |annot| {
             try self.builder.extra.append(self.builder.gpa, annot);
         }
         const extra_idx: u32 = if (binding_ty != null)
-            @intCast(self.builder.extra.items.len - 2 - field_count * 2)
+            @intCast(self.builder.extra.items.len - 9 - field_count * 2)
         else
-            @intCast(self.builder.extra.items.len - 1 - field_count * 2);
+            @intCast(self.builder.extra.items.len - 8 - field_count * 2);
 
         const data1 = if (binding_ty != null) extra_idx | 0x80000000 else extra_idx;
         const span = if (field_count > 0)
-            coverSpans(decl_start, try self.spanOf(fields.types.items[field_count - 1]))
+            coverSpans(decl_start, try self.spanOf(body.fields.types.items[field_count - 1]))
         else
             decl_start;
         return self.allocNode(.comptime_struct, name_idx, data1, span);
@@ -1227,6 +1470,11 @@ const Parser = struct {
                 expr = try self.parseStructInitWithExpr(expr);
             } else if (self.current.tag == .dot) {
                 expr = try self.parseFieldAccess(expr);
+            } else if (self.current.tag == .caret) {
+                const caret_span = tokenSpan(self.current);
+                try self.advance();
+                const expr_span = try self.spanOf(expr);
+                expr = try self.allocNode(.move_expr, expr, 0, coverSpans(expr_span, caret_span));
             } else {
                 break;
             }

@@ -54,8 +54,30 @@ fn variantTypeEql(a: *const VariantType, b: *const VariantType) bool {
 pub const FunctionInfo = struct {
     decl: ast.NodeIdx,
     ty: *const FuncType,
+    param_modes: []const ast.ParamAccessMode,
     has_explicit_return: bool,
     is_monomorphized: bool = false,
+};
+
+pub const MovePolicy = struct {
+    kind: ast.StructMoveKind,
+    hook_fn: ?u32 = null,
+};
+
+pub const CopyPolicy = struct {
+    kind: ast.StructCopyKind,
+    hook_fn: ?u32 = null,
+};
+
+pub const DropPolicy = struct {
+    kind: ast.StructDropKind,
+    hook_fn: ?u32 = null,
+};
+
+pub const OwnershipSpec = struct {
+    move: MovePolicy,
+    copy: CopyPolicy,
+    drop: DropPolicy,
 };
 
 pub const StructValue = struct {
@@ -115,6 +137,16 @@ pub const TypeError = error{
     IsTypeNotInVariant,
     AsOperandNotVariant,
     AsTypeNotInVariant,
+    OwnershipCopyNotAllowed,
+    OwnershipMoveNotAllowed,
+    UseAfterMove,
+    UseAfterDeinit,
+    StableIdentityTransfer,
+    DeinitNotSatisfied,
+    HookSignatureMismatch,
+    StructPolicyIncompatible,
+    InvalidBorrowArgument,
+    InvalidDeinitTransfer,
 };
 
 pub const ResolvedField = struct {
@@ -134,6 +166,7 @@ pub const AnalyzedAst = struct {
     comptime_values: std.StringHashMap(ComptimeValue),
     comptime_struct_fields: std.StringHashMap([]const ResolvedField),
     struct_expr_fields: std.AutoHashMap(ast.NodeIdx, []const ResolvedField),
+    ownership_specs: std.StringHashMap(OwnershipSpec),
     functions: std.ArrayList(FunctionInfo),
     entry_function: u32,
     call_monomorph_targets: std.AutoHashMap(ast.NodeIdx, u32),
@@ -151,6 +184,7 @@ pub const AnalyzedAst = struct {
             .comptime_values = std.StringHashMap(ComptimeValue).init(gpa),
             .comptime_struct_fields = std.StringHashMap([]const ResolvedField).init(gpa),
             .struct_expr_fields = std.AutoHashMap(ast.NodeIdx, []const ResolvedField).init(gpa),
+            .ownership_specs = std.StringHashMap(OwnershipSpec).init(gpa),
             .functions = std.ArrayList(FunctionInfo).empty,
             .entry_function = 0,
             .call_monomorph_targets = std.AutoHashMap(ast.NodeIdx, u32).init(gpa),
@@ -166,6 +200,7 @@ pub const AnalyzedAst = struct {
         self.comptime_values.deinit();
         self.comptime_struct_fields.deinit();
         self.struct_expr_fields.deinit();
+        self.ownership_specs.deinit();
         self.functions.deinit(self.gpa);
         self.call_monomorph_targets.deinit();
         self.arena.deinit();
@@ -240,6 +275,16 @@ pub fn typeErrorMessage(kind: TypeError) []const u8 {
         error.IsTypeNotInVariant => "right side of 'is' is not a member of the variant type",
         error.AsOperandNotVariant => "left side of 'as' must be a variant type",
         error.AsTypeNotInVariant => "right side of 'as' is not a member of the variant type",
+        error.OwnershipCopyNotAllowed => "copy is not allowed for this type",
+        error.OwnershipMoveNotAllowed => "move is not allowed for this type",
+        error.UseAfterMove => "use after move",
+        error.UseAfterDeinit => "use after deinit",
+        error.StableIdentityTransfer => "stable-identity value cannot be transferred",
+        error.DeinitNotSatisfied => "deinit ownership must be consumed before function return",
+        error.HookSignatureMismatch => "ownership hook function signature mismatch",
+        error.StructPolicyIncompatible => "struct ownership policy is incompatible with field policies",
+        error.InvalidBorrowArgument => "borrow argument must be a variable reference",
+        error.InvalidDeinitTransfer => "deinit-owned value cannot be transferred except to deinit parameter",
     };
 }
 
@@ -266,6 +311,7 @@ const Binding = struct {
         bindings: scope_mod.ScopeStack(Binding),
         comptime_decl_state: std.AutoHashMap(ast.NodeIdx, DeclState),
         monomorph_cache: std.StringHashMap(u32),
+        ownership_in_progress: std.StringHashMap(void),
         failure: ?Failure,
         in_fallible_scope: bool,
         in_comptime_context: bool,
@@ -314,6 +360,7 @@ const Binding = struct {
             .bindings = scope_mod.ScopeStack(Binding).init(),
             .comptime_decl_state = std.AutoHashMap(ast.NodeIdx, DeclState).init(gpa),
             .monomorph_cache = std.StringHashMap(u32).init(gpa),
+            .ownership_in_progress = std.StringHashMap(void).init(gpa),
             .failure = null,
             .in_fallible_scope = false,
             .in_comptime_context = false,
@@ -328,6 +375,7 @@ const Binding = struct {
         self.bindings.deinit(self.gpa);
         self.comptime_decl_state.deinit();
         self.monomorph_cache.deinit();
+        self.ownership_in_progress.deinit();
     }
 
     fn failAtNode(self: *@This(), idx: ast.NodeIdx, kind: TypeError) error{TypecheckFailed} {
@@ -502,6 +550,7 @@ const Binding = struct {
             }
             const ret_ty = try self.resolveTypeNode(a.fnRetType(func_decl_idx));
             const fn_ty = try self.allocFuncType(param_types.items, ret_ty);
+            const param_modes = try self.runtimeParamModes(func_decl_idx);
             if (a.comptimeFnAnnotation(func_decl_idx)) |annot| {
                 const annot_ty = try self.resolveTypeNode(annot);
                 if (!typeEql(.{ .func = fn_ty }, annot_ty)) return self.failAtNodeWithTypes(func_decl_idx, error.BindingTypeMismatch, annot_ty, .{ .func = fn_ty });
@@ -509,6 +558,7 @@ const Binding = struct {
             try self.typed.functions.append(self.gpa, .{
                 .decl = func_decl_idx,
                 .ty = fn_ty,
+                .param_modes = param_modes,
                 .has_explicit_return = false,
             });
         }
@@ -519,6 +569,7 @@ const Binding = struct {
             try self.typed.functions.append(self.gpa, .{
                 .decl = std.math.maxInt(ast.NodeIdx),
                 .ty = top_fn_ty,
+                .param_modes = &.{},
                 .has_explicit_return = false,
             });
             self.typed.entry_function = top_fn_id;
@@ -526,6 +577,624 @@ const Binding = struct {
             self.typed.entry_function = main_id;
         } else {
             self.typed.entry_function = 0;
+        }
+    }
+
+    fn runtimeParamModes(self: *@This(), func_decl_idx: ast.NodeIdx) InferError![]const ast.ParamAccessMode {
+        const a = self.parsed.ast;
+        var modes = try std.ArrayList(ast.ParamAccessMode).initCapacity(self.gpa, a.fnParams(func_decl_idx).len);
+        defer modes.deinit(self.gpa);
+        for (a.fnParams(func_decl_idx), 0..) |_, param_idx| {
+            if (a.fnParamIsComptime(func_decl_idx, @intCast(param_idx))) continue;
+            try modes.append(self.gpa, a.fnParamAccessMode(func_decl_idx, @intCast(param_idx)));
+        }
+        return self.typed.arena.allocator().dupe(ast.ParamAccessMode, modes.items) catch return error.OutOfMemory;
+    }
+
+    const TypeCaps = struct {
+        move_supported: bool = true,
+        move_trivial: bool = true,
+        copy_supported: bool = true,
+        copy_trivial: bool = true,
+        drop_fieldwise_supported: bool = true,
+        drop_trivial: bool = true,
+        has_explicit_drop: bool = false,
+    };
+
+    fn hookSignatureExpectedMode(kind: ast.StructMoveKind) ast.ParamAccessMode {
+        return switch (kind) {
+            .func => .var_mode,
+            else => .read,
+        };
+    }
+
+    fn findStructDeclByName(self: *const @This(), name: []const u8) ?ast.NodeIdx {
+        for (self.parsed.ast.decls) |decl_idx| {
+            if (self.parsed.ast.nodes[decl_idx].tag != .comptime_struct) continue;
+            const decl_name = self.parsed.ast.identOf(self.parsed.ast.nodes[decl_idx].data0);
+            if (std.mem.eql(u8, decl_name, name)) return decl_idx;
+        }
+        return null;
+    }
+
+    fn typeCaps(self: *@This(), ty: Type) InferError!TypeCaps {
+        switch (ty) {
+            .unit, .bool, .int, .float, .type_type, .func => return .{},
+            .variant => |variant_ty| {
+                var caps = TypeCaps{};
+                for (variant_ty.members) |member_ty| {
+                    const mc = try self.typeCaps(member_ty);
+                    caps.move_supported = caps.move_supported and mc.move_supported;
+                    caps.move_trivial = caps.move_trivial and mc.move_trivial;
+                    caps.copy_supported = caps.copy_supported and mc.copy_supported;
+                    caps.copy_trivial = caps.copy_trivial and mc.copy_trivial;
+                    caps.drop_fieldwise_supported = caps.drop_fieldwise_supported and mc.drop_fieldwise_supported;
+                    caps.drop_trivial = caps.drop_trivial and mc.drop_trivial;
+                    caps.has_explicit_drop = caps.has_explicit_drop or mc.has_explicit_drop;
+                }
+                return caps;
+            },
+            .named => |name| {
+                const spec = try self.computeOwnershipForNamed(name);
+                return .{
+                    .move_supported = spec.move.kind != .none,
+                    .move_trivial = spec.move.kind == .trivial,
+                    .copy_supported = spec.copy.kind != .none,
+                    .copy_trivial = spec.copy.kind == .trivial,
+                    .drop_fieldwise_supported = spec.drop.kind != .explicit,
+                    .drop_trivial = spec.drop.kind == .trivial,
+                    .has_explicit_drop = spec.drop.kind == .explicit,
+                };
+            },
+        }
+    }
+
+    fn validateHookSignature(
+        self: *@This(),
+        fn_id: u32,
+        owner_name: []const u8,
+        expected_mode: ast.ParamAccessMode,
+        expected_ret: Type,
+        decl_idx: ast.NodeIdx,
+    ) InferError!void {
+        if (fn_id >= self.typed.functions.items.len) return self.failAtNode(decl_idx, error.HookSignatureMismatch);
+        const info = self.typed.functions.items[fn_id];
+        if (info.param_modes.len != 1 or info.ty.params.len != 1) return self.failAtNode(decl_idx, error.HookSignatureMismatch);
+        if (info.param_modes[0] != expected_mode) return self.failAtNode(decl_idx, error.HookSignatureMismatch);
+        const expected_self: Type = .{ .named = owner_name };
+        if (!typeEql(info.ty.params[0], expected_self)) return self.failAtNode(decl_idx, error.HookSignatureMismatch);
+        if (!typeEql(info.ty.ret, expected_ret)) return self.failAtNode(decl_idx, error.HookSignatureMismatch);
+    }
+
+    fn resolveHookFnId(self: *@This(), hook_ident: ?ast.IdentIdx, decl_idx: ast.NodeIdx) InferError!?u32 {
+        const hid = hook_ident orelse return null;
+        const hook_name = self.parsed.ast.identOf(hid);
+        return self.resolved.function_names.get(hook_name) orelse return self.failAtNode(decl_idx, error.HookSignatureMismatch);
+    }
+
+    fn computeOwnershipDefaultFromFields(self: *@This(), field_types: []const Type, decl_idx: ast.NodeIdx) InferError!OwnershipSpec {
+        var all_move_supported = true;
+        var all_drop_fieldwise = true;
+        var all_drop_trivial = true;
+        var any_explicit_drop = false;
+        for (field_types) |field_ty| {
+            const caps = try self.typeCaps(field_ty);
+            all_move_supported = all_move_supported and caps.move_supported;
+            all_drop_fieldwise = all_drop_fieldwise and caps.drop_fieldwise_supported;
+            all_drop_trivial = all_drop_trivial and caps.drop_trivial;
+            any_explicit_drop = any_explicit_drop or caps.has_explicit_drop;
+        }
+        if (!all_move_supported or !all_drop_fieldwise) return self.failAtNode(decl_idx, error.StructPolicyIncompatible);
+
+        const drop_kind: ast.StructDropKind = if (any_explicit_drop) .explicit else if (all_drop_trivial) .trivial else .fieldwise;
+        return .{
+            .move = .{ .kind = .fieldwise, .hook_fn = null },
+            .copy = .{ .kind = .none, .hook_fn = null },
+            .drop = .{ .kind = drop_kind, .hook_fn = null },
+        };
+    }
+
+    fn computeOwnershipForDecl(self: *@This(), decl_idx: ast.NodeIdx, name: []const u8) InferError!OwnershipSpec {
+        const a = self.parsed.ast;
+        const fields = a.structFields(decl_idx);
+        var field_types = try std.ArrayList(Type).initCapacity(self.gpa, fields.len);
+        defer field_types.deinit(self.gpa);
+        for (fields) |field| {
+            try field_types.append(self.gpa, try self.resolveTypeNode(field.ty));
+        }
+
+        var all_move_supported = true;
+        var all_copy_supported = true;
+        var all_drop_fieldwise = true;
+        var all_move_trivial = true;
+        var all_copy_trivial = true;
+        var all_drop_trivial = true;
+        var any_explicit_drop = false;
+        for (field_types.items) |field_ty| {
+            const caps = try self.typeCaps(field_ty);
+            all_move_supported = all_move_supported and caps.move_supported;
+            all_copy_supported = all_copy_supported and caps.copy_supported;
+            all_drop_fieldwise = all_drop_fieldwise and caps.drop_fieldwise_supported;
+            all_move_trivial = all_move_trivial and caps.move_trivial;
+            all_copy_trivial = all_copy_trivial and caps.copy_trivial;
+            all_drop_trivial = all_drop_trivial and caps.drop_trivial;
+            any_explicit_drop = any_explicit_drop or caps.has_explicit_drop;
+        }
+
+        var move_policy = MovePolicy{
+            .kind = a.structMoveKind(decl_idx),
+            .hook_fn = null,
+        };
+        switch (move_policy.kind) {
+            .trivial => if (!all_move_trivial) return self.failAtNode(decl_idx, error.StructPolicyIncompatible),
+            .fieldwise => if (!all_move_supported) return self.failAtNode(decl_idx, error.StructPolicyIncompatible),
+            .none => {},
+            .func => {
+                const hook_fn = (try self.resolveHookFnId(a.structMoveHook(decl_idx), decl_idx)) orelse return self.failAtNode(decl_idx, error.HookSignatureMismatch);
+                try self.validateHookSignature(hook_fn, name, .var_mode, .{ .named = name }, decl_idx);
+                move_policy.hook_fn = hook_fn;
+            },
+        }
+
+        var copy_policy = CopyPolicy{
+            .kind = a.structCopyKind(decl_idx),
+            .hook_fn = null,
+        };
+        switch (copy_policy.kind) {
+            .none => {},
+            .trivial => if (!all_copy_trivial) return self.failAtNode(decl_idx, error.StructPolicyIncompatible),
+            .fieldwise => if (!all_copy_supported) return self.failAtNode(decl_idx, error.StructPolicyIncompatible),
+            .func => {
+                const hook_fn = (try self.resolveHookFnId(a.structCopyHook(decl_idx), decl_idx)) orelse return self.failAtNode(decl_idx, error.HookSignatureMismatch);
+                try self.validateHookSignature(hook_fn, name, .read, .{ .named = name }, decl_idx);
+                copy_policy.hook_fn = hook_fn;
+            },
+        }
+
+        var effective_drop_kind = a.structDropKind(decl_idx);
+        if (!a.structDropExplicit(decl_idx)) {
+            effective_drop_kind = if (any_explicit_drop) .explicit else if (all_drop_trivial) .trivial else .fieldwise;
+        }
+
+        var drop_policy = DropPolicy{
+            .kind = effective_drop_kind,
+            .hook_fn = null,
+        };
+        switch (drop_policy.kind) {
+            .trivial => if (!all_drop_trivial) return self.failAtNode(decl_idx, error.StructPolicyIncompatible),
+            .fieldwise => if (!all_drop_fieldwise) return self.failAtNode(decl_idx, error.StructPolicyIncompatible),
+            .explicit => {},
+            .func => {
+                const hook_fn = (try self.resolveHookFnId(a.structDropHook(decl_idx), decl_idx)) orelse return self.failAtNode(decl_idx, error.HookSignatureMismatch);
+                try self.validateHookSignature(hook_fn, name, .deinit, .unit, decl_idx);
+                drop_policy.hook_fn = hook_fn;
+            },
+        }
+
+        if (move_policy.kind == .none and copy_policy.kind != .none) return self.failAtNode(decl_idx, error.StructPolicyIncompatible);
+
+        return .{
+            .move = move_policy,
+            .copy = copy_policy,
+            .drop = drop_policy,
+        };
+    }
+
+    fn computeOwnershipForNamed(self: *@This(), name: []const u8) InferError!OwnershipSpec {
+        if (self.typed.ownership_specs.get(name)) |spec| return spec;
+        if (self.ownership_in_progress.contains(name)) return self.failAtNode(self.parsed.ast.entry, error.StructPolicyIncompatible);
+        try self.ownership_in_progress.put(name, {});
+        defer _ = self.ownership_in_progress.remove(name);
+
+        const spec = if (self.findStructDeclByName(name)) |decl_idx| blk: {
+            break :blk try self.computeOwnershipForDecl(decl_idx, name);
+        } else if (self.typed.comptime_struct_fields.get(name)) |fields| blk: {
+            var field_types = try std.ArrayList(Type).initCapacity(self.gpa, fields.len);
+            defer field_types.deinit(self.gpa);
+            for (fields) |field| try field_types.append(self.gpa, field.ty);
+            break :blk try self.computeOwnershipDefaultFromFields(field_types.items, self.parsed.ast.entry);
+        } else {
+            return self.failAtNode(self.parsed.ast.entry, error.UnknownType);
+        };
+
+        try self.typed.ownership_specs.put(name, spec);
+        return spec;
+    }
+
+    fn computeOwnershipSpecs(self: *@This()) InferError!void {
+        for (self.parsed.ast.decls) |decl_idx| {
+            if (self.parsed.ast.nodes[decl_idx].tag != .comptime_struct) continue;
+            const name = self.parsed.ast.identOf(self.parsed.ast.nodes[decl_idx].data0);
+            _ = try self.computeOwnershipForNamed(name);
+        }
+    }
+
+    const OwnershipState = enum {
+        alive,
+        moved,
+        deinited,
+    };
+
+    const OwnershipBinding = struct {
+        ty: Type,
+        mutable: bool,
+        owned: bool,
+        param_mode: ast.ParamAccessMode,
+        state: OwnershipState,
+    };
+
+    const OwnershipUse = enum {
+        read,
+        copy,
+        move,
+        borrow_read,
+        borrow_mut,
+        deinit_transfer,
+    };
+
+    fn ownershipLookupIndex(stack: *scope_mod.ScopeStack(OwnershipBinding), name: []const u8) ?usize {
+        var idx = stack.entries.items.len;
+        while (idx > 0) {
+            idx -= 1;
+            if (std.mem.eql(u8, stack.entries.items[idx].name, name)) return idx;
+        }
+        return null;
+    }
+
+    fn copyAllowed(self: *@This(), ty: Type) InferError!bool {
+        return switch (ty) {
+            .unit, .bool, .int, .float, .type_type, .func => true,
+            .named => |name| (try self.computeOwnershipForNamed(name)).copy.kind != .none,
+            .variant => |variant_ty| blk: {
+                for (variant_ty.members) |member_ty| {
+                    if (!try self.copyAllowed(member_ty)) break :blk false;
+                }
+                break :blk true;
+            },
+        };
+    }
+
+    fn moveAllowed(self: *@This(), ty: Type) InferError!bool {
+        return switch (ty) {
+            .unit, .bool, .int, .float, .type_type, .func => true,
+            .named => |name| (try self.computeOwnershipForNamed(name)).move.kind != .none,
+            .variant => |variant_ty| blk: {
+                for (variant_ty.members) |member_ty| {
+                    if (!try self.moveAllowed(member_ty)) break :blk false;
+                }
+                break :blk true;
+            },
+        };
+    }
+
+    fn dropExplicit(self: *@This(), ty: Type) InferError!bool {
+        return switch (ty) {
+            .unit, .bool, .int, .float, .type_type, .func => false,
+            .named => |name| (try self.computeOwnershipForNamed(name)).drop.kind == .explicit,
+            .variant => |variant_ty| blk: {
+                for (variant_ty.members) |member_ty| {
+                    if (try self.dropExplicit(member_ty)) break :blk true;
+                }
+                break :blk false;
+            },
+        };
+    }
+
+    fn stableIdentity(self: *@This(), ty: Type) InferError!bool {
+        return switch (ty) {
+            .named => |name| (try self.computeOwnershipForNamed(name)).move.kind == .none,
+            else => false,
+        };
+    }
+
+    fn checkScopeExitExplicitDrops(self: *@This(), stack: *scope_mod.ScopeStack(OwnershipBinding), mark: usize, span_node: ast.NodeIdx) InferError!void {
+        var idx = mark;
+        while (idx < stack.entries.items.len) : (idx += 1) {
+            const binding = stack.entries.items[idx].value;
+            if (!binding.owned) continue;
+            if (binding.state != .alive) continue;
+            if (binding.param_mode == .deinit) continue;
+            if (try self.dropExplicit(binding.ty)) return self.failAtNode(span_node, error.DeinitNotSatisfied);
+        }
+    }
+
+    fn applyOwnershipUseOnBinding(self: *@This(), node_idx: ast.NodeIdx, binding: *OwnershipBinding, use: OwnershipUse) InferError!void {
+        if (binding.state == .moved) return self.failAtNode(node_idx, error.UseAfterMove);
+        if (binding.state == .deinited) return self.failAtNode(node_idx, error.UseAfterDeinit);
+
+        switch (use) {
+            .read => {
+                // Non-consuming read/borrow.
+            },
+            .copy => {
+                if (binding.param_mode == .deinit) return self.failAtNode(node_idx, error.InvalidDeinitTransfer);
+                if (!try self.copyAllowed(binding.ty)) return self.failAtNode(node_idx, error.OwnershipCopyNotAllowed);
+            },
+            .move => {
+                if (!binding.owned) return self.failAtNode(node_idx, error.OwnershipMoveNotAllowed);
+                if (binding.param_mode == .deinit) return self.failAtNode(node_idx, error.InvalidDeinitTransfer);
+                if (!try self.moveAllowed(binding.ty)) {
+                    if (try self.stableIdentity(binding.ty)) return self.failAtNode(node_idx, error.StableIdentityTransfer);
+                    return self.failAtNode(node_idx, error.OwnershipMoveNotAllowed);
+                }
+                binding.state = .moved;
+            },
+            .borrow_read => {},
+            .borrow_mut => {
+                if (!binding.mutable) return self.failAtNode(node_idx, error.AssignToConst);
+            },
+            .deinit_transfer => {
+                if (!binding.owned) return self.failAtNode(node_idx, error.InvalidDeinitTransfer);
+                if (binding.param_mode == .deinit) return self.failAtNode(node_idx, error.InvalidDeinitTransfer);
+                binding.state = .deinited;
+            },
+        }
+    }
+
+    fn callParamModes(self: *@This(), call_idx: ast.NodeIdx, callee: ast.NodeIdx) []const ast.ParamAccessMode {
+        if (self.typed.call_monomorph_targets.get(call_idx)) |fn_id| {
+            if (fn_id < self.typed.functions.items.len) return self.typed.functions.items[fn_id].param_modes;
+        }
+        if (self.resolved.node_refs.get(callee)) |ref| {
+            if (ref == .function) {
+                const fn_id = ref.function;
+                if (fn_id < self.typed.functions.items.len) return self.typed.functions.items[fn_id].param_modes;
+            }
+        }
+        return &.{};
+    }
+
+    fn ownershipUseExpr(self: *@This(), idx: ast.NodeIdx, stack: *scope_mod.ScopeStack(OwnershipBinding), use: OwnershipUse, current_ret: Type) InferError!void {
+        const a = self.parsed.ast;
+        switch (a.nodes[idx].tag) {
+            .int_lit, .float_lit, .bool_lit, .unit_lit, .arg, .type_name, .type_func, .type_variant, .type_union, .struct_expr, .comptime_expr, .comptime_fn, .comptime_struct, .comptime_value_decl => {},
+            .var_ref => {
+                const name = a.identOf(a.nodes[idx].data0);
+                if (ownershipLookupIndex(stack, name)) |binding_idx| {
+                    const binding = &stack.entries.items[binding_idx].value;
+                    try self.applyOwnershipUseOnBinding(idx, binding, use);
+                }
+            },
+            .move_expr => {
+                try self.ownershipUseExpr(a.nodes[idx].data0, stack, .move, current_ret);
+            },
+            .field_access => {
+                const borrow_use: OwnershipUse = switch (use) {
+                    .borrow_mut => .borrow_mut,
+                    else => .borrow_read,
+                };
+                try self.ownershipUseExpr(a.nodes[idx].data0, stack, borrow_use, current_ret);
+            },
+            .struct_init => {
+                for (a.structInitFields(idx)) |field| {
+                    try self.ownershipUseExpr(field.value, stack, .copy, current_ret);
+                }
+            },
+            .call => {
+                const callee = a.nodes[idx].data0;
+                try self.ownershipUseExpr(callee, stack, .read, current_ret);
+                const param_modes = self.callParamModes(idx, callee);
+                const args = a.callArgs(idx);
+                for (args, 0..) |arg, arg_idx| {
+                    const mode = if (arg_idx < param_modes.len) param_modes[arg_idx] else ast.ParamAccessMode.read;
+                    switch (mode) {
+                        .read => try self.ownershipUseExpr(arg, stack, .read, current_ret),
+                        .mut => {
+                            if (a.nodes[arg].tag != .var_ref) return self.failAtNode(arg, error.InvalidBorrowArgument);
+                            try self.ownershipUseExpr(arg, stack, .borrow_mut, current_ret);
+                        },
+                        .var_mode => {
+                            if (a.nodes[arg].tag == .move_expr) {
+                                try self.ownershipUseExpr(arg, stack, .read, current_ret);
+                            } else {
+                                try self.ownershipUseExpr(arg, stack, .move, current_ret);
+                            }
+                        },
+                        .deinit => {
+                            const target_arg = if (a.nodes[arg].tag == .move_expr) a.nodes[arg].data0 else arg;
+                            try self.ownershipUseExpr(target_arg, stack, .deinit_transfer, current_ret);
+                        },
+                    }
+                }
+            },
+            .print_stmt => try self.ownershipUseExpr(a.nodes[idx].data0, stack, .read, current_ret),
+            .add, .sub, .mul, .div, .lt, .gt, .le, .ge, .eq, .ne, .@"and", .@"or" => {
+                try self.ownershipUseExpr(a.nodes[idx].data0, stack, .read, current_ret);
+                try self.ownershipUseExpr(a.nodes[idx].data1, stack, .read, current_ret);
+            },
+            .is => try self.ownershipUseExpr(a.isLhs(idx), stack, .read, current_ret),
+            .as => try self.ownershipUseExpr(a.asLhs(idx), stack, .read, current_ret),
+            .@"not" => try self.ownershipUseExpr(a.nodes[idx].data0, stack, .read, current_ret),
+            .if_stmt => try self.ownershipVisitIf(idx, stack, current_ret),
+            .const_decl => try self.ownershipVisitDecl(idx, stack, false, current_ret),
+            .var_decl => try self.ownershipVisitDecl(idx, stack, true, current_ret),
+            .assign => try self.ownershipVisitAssign(idx, stack, current_ret),
+            .return_stmt => {
+                try self.ownershipUseExpr(a.nodes[idx].data0, stack, .move, current_ret);
+            },
+            .block => try self.ownershipVisitBlock(idx, stack, current_ret),
+        }
+    }
+
+    fn ownershipVisitDecl(self: *@This(), idx: ast.NodeIdx, stack: *scope_mod.ScopeStack(OwnershipBinding), mutable: bool, current_ret: Type) InferError!void {
+        const a = self.parsed.ast;
+        const value_node = a.varDeclValue(idx);
+        try self.ownershipUseExpr(value_node, stack, .copy, current_ret);
+        const binding_ty = self.typed.decl_binding_types.get(idx) orelse (self.typed.typeOf(value_node) catch return self.failAtNode(value_node, error.MissingNodeType));
+        const name = a.identOf(a.nodes[idx].data0);
+        stack.push(self.gpa, name, .{
+            .ty = binding_ty,
+            .mutable = mutable,
+            .owned = true,
+            .param_mode = .read,
+            .state = .alive,
+        }) catch |err| switch (err) {
+            error.DuplicateVariable => return self.failAtNode(idx, error.DuplicateSymbol),
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+    }
+
+    fn ownershipVisitAssign(self: *@This(), idx: ast.NodeIdx, stack: *scope_mod.ScopeStack(OwnershipBinding), current_ret: Type) InferError!void {
+        const a = self.parsed.ast;
+        const name = a.identOf(a.nodes[idx].data0);
+        if (ownershipLookupIndex(stack, name)) |binding_idx| {
+            const binding = &stack.entries.items[binding_idx].value;
+            if (binding.state == .alive and try self.dropExplicit(binding.ty)) return self.failAtNode(idx, error.DeinitNotSatisfied);
+            try self.ownershipUseExpr(a.nodes[idx].data1, stack, .copy, current_ret);
+            binding.state = .alive;
+            return;
+        }
+        try self.ownershipUseExpr(a.nodes[idx].data1, stack, .copy, current_ret);
+    }
+
+    fn snapshotOwnershipStates(self: *@This(), stack: *scope_mod.ScopeStack(OwnershipBinding), count: usize) InferError![]OwnershipState {
+        const states = try self.gpa.alloc(OwnershipState, count);
+        for (0..count) |i| states[i] = stack.entries.items[i].value.state;
+        return states;
+    }
+
+    fn restoreOwnershipStates(stack: *scope_mod.ScopeStack(OwnershipBinding), states: []const OwnershipState) void {
+        for (states, 0..) |state, idx| {
+            stack.entries.items[idx].value.state = state;
+        }
+    }
+
+    fn mergeOwnershipStates(then_state: OwnershipState, else_state: OwnershipState) OwnershipState {
+        if (then_state == else_state) return then_state;
+        if (then_state == .deinited or else_state == .deinited) return .deinited;
+        return .moved;
+    }
+
+    fn ownershipVisitIf(self: *@This(), idx: ast.NodeIdx, stack: *scope_mod.ScopeStack(OwnershipBinding), current_ret: Type) InferError!void {
+        const a = self.parsed.ast;
+        const data = a.ifData(idx);
+        const baseline_count = stack.entries.items.len;
+
+        var cond_binding_name: ?[]const u8 = null;
+        var cond_binding_ty: ?Type = null;
+        var cond_binding_mutable = false;
+        const cond_tag = a.nodes[data.cond].tag;
+        if (cond_tag == .const_decl or cond_tag == .var_decl) {
+            const value_node = a.varDeclValue(data.cond);
+            try self.ownershipUseExpr(value_node, stack, .copy, current_ret);
+            cond_binding_name = a.identOf(a.nodes[data.cond].data0);
+            cond_binding_ty = self.typed.decl_binding_types.get(data.cond) orelse (self.typed.typeOf(value_node) catch return self.failAtNode(value_node, error.MissingNodeType));
+            cond_binding_mutable = cond_tag == .var_decl;
+        } else {
+            try self.ownershipUseExpr(data.cond, stack, .read, current_ret);
+        }
+
+        const baseline = try self.snapshotOwnershipStates(stack, baseline_count);
+        defer self.gpa.free(baseline);
+
+        {
+            const mark = stack.mark();
+            if (cond_binding_name) |name| {
+                stack.push(self.gpa, name, .{
+                    .ty = cond_binding_ty.?,
+                    .mutable = cond_binding_mutable,
+                    .owned = true,
+                    .param_mode = .read,
+                    .state = .alive,
+                }) catch |err| switch (err) {
+                    error.DuplicateVariable => return self.failAtNode(data.cond, error.DuplicateSymbol),
+                    error.OutOfMemory => return error.OutOfMemory,
+                };
+            }
+            try self.ownershipUseExpr(data.then_, stack, .read, current_ret);
+            try self.checkScopeExitExplicitDrops(stack, mark, data.then_);
+            stack.restore(mark);
+        }
+
+        const then_states = try self.snapshotOwnershipStates(stack, baseline_count);
+        defer self.gpa.free(then_states);
+
+        restoreOwnershipStates(stack, baseline);
+        if (data.else_ != std.math.maxInt(ast.NodeIdx)) {
+            const mark = stack.mark();
+            try self.ownershipUseExpr(data.else_, stack, .read, current_ret);
+            try self.checkScopeExitExplicitDrops(stack, mark, data.else_);
+            stack.restore(mark);
+        }
+        const else_states = try self.snapshotOwnershipStates(stack, baseline_count);
+        defer self.gpa.free(else_states);
+
+        for (0..baseline_count) |i| {
+            stack.entries.items[i].value.state = mergeOwnershipStates(then_states[i], else_states[i]);
+        }
+    }
+
+    fn ownershipVisitBlock(self: *@This(), idx: ast.NodeIdx, stack: *scope_mod.ScopeStack(OwnershipBinding), current_ret: Type) InferError!void {
+        const a = self.parsed.ast;
+        const mark = stack.mark();
+        for (a.blockItems(idx)) |item| {
+            switch (a.nodes[item].tag) {
+                .const_decl => try self.ownershipVisitDecl(item, stack, false, current_ret),
+                .var_decl => try self.ownershipVisitDecl(item, stack, true, current_ret),
+                .assign => try self.ownershipVisitAssign(item, stack, current_ret),
+                .return_stmt => try self.ownershipUseExpr(item, stack, .read, current_ret),
+                else => try self.ownershipUseExpr(item, stack, .read, current_ret),
+            }
+        }
+        try self.checkScopeExitExplicitDrops(stack, mark, idx);
+        stack.restore(mark);
+    }
+
+    fn ownershipCheckFunction(self: *@This(), fn_id: u32) InferError!void {
+        if (fn_id >= self.typed.functions.items.len) return;
+        const info = self.typed.functions.items[fn_id];
+        if (self.hasComptimeParams(info) and !info.is_monomorphized) return;
+
+        var stack = scope_mod.ScopeStack(OwnershipBinding).init();
+        defer stack.deinit(self.gpa);
+
+        const is_top_level = info.decl == std.math.maxInt(ast.NodeIdx);
+        if (!is_top_level) {
+            const a = self.parsed.ast;
+            const mask = a.fnComptimeMask(info.decl);
+            var runtime_idx: usize = 0;
+            for (a.fnParams(info.decl), 0..) |param, param_idx| {
+                if (mask & (@as(u32, 1) << @intCast(param_idx)) != 0) continue;
+                if (runtime_idx >= info.ty.params.len or runtime_idx >= info.param_modes.len) break;
+                const pname = a.identOf(param.name);
+                const mode = info.param_modes[runtime_idx];
+                const mutable = switch (mode) {
+                    .read => false,
+                    .mut, .var_mode, .deinit => true,
+                };
+                const owned = switch (mode) {
+                    .read, .mut => false,
+                    .var_mode, .deinit => true,
+                };
+                stack.push(self.gpa, pname, .{
+                    .ty = info.ty.params[runtime_idx],
+                    .mutable = mutable,
+                    .owned = owned,
+                    .param_mode = mode,
+                    .state = .alive,
+                }) catch |err| switch (err) {
+                    error.DuplicateVariable => return self.failAtNode(info.decl, error.DuplicateSymbol),
+                    error.OutOfMemory => return error.OutOfMemory,
+                };
+                runtime_idx += 1;
+            }
+        }
+
+        const body = if (is_top_level) self.parsed.ast.entry else self.parsed.ast.fnBody(info.decl);
+        try self.ownershipUseExpr(body, &stack, .read, info.ty.ret);
+
+        for (stack.entries.items) |entry| {
+            if (!entry.value.owned) continue;
+            if (entry.value.state != .alive) continue;
+            if (entry.value.param_mode == .deinit) continue;
+            if (try self.dropExplicit(entry.value.ty)) return self.failAtNode(body, error.DeinitNotSatisfied);
+        }
+    }
+
+    fn runOwnershipChecks(self: *@This()) InferError!void {
+        var fn_id: u32 = 0;
+        while (fn_id < self.typed.functions.items.len) : (fn_id += 1) {
+            try self.ownershipCheckFunction(fn_id);
         }
     }
 
@@ -936,6 +1605,7 @@ const Binding = struct {
         try self.typed.functions.append(self.gpa, .{
             .decl = func_decl,
             .ty = mono_fn_ty,
+            .param_modes = try self.runtimeParamModes(func_decl),
             .has_explicit_return = false,
             .is_monomorphized = true,
         });
@@ -992,6 +1662,7 @@ const Binding = struct {
             .struct_init => {
                 for (a.structInitFields(idx)) |field| self.clearNodeTypesInSubtree(field.value);
             },
+            .move_expr => self.clearNodeTypesInSubtree(a.nodes[idx].data0),
             .field_access => self.clearNodeTypesInSubtree(a.nodes[idx].data0),
             .comptime_expr => self.clearNodeTypesInSubtree(a.comptimeExprBody(idx)),
             .comptime_value_decl => self.clearNodeTypesInSubtree(a.comptimeValueDeclValue(idx)),
@@ -1622,6 +2293,7 @@ const Binding = struct {
                     .fields = values,
                 } }, .returned = false };
             },
+            .move_expr => self.evalNodeStep(a.nodes[idx].data0, locals),
             .field_access => blk: {
                 const target = (try self.evalNodeStep(a.nodes[idx].data0, locals)).value;
                 const field_idx = self.typed.field_index.get(idx) orelse return self.failAtNode(idx, error.UnknownField);
@@ -1771,6 +2443,7 @@ const Binding = struct {
             .@"not" => try self.inferNot(idx),
             .if_stmt => self.inferIf(idx),
             .struct_init => self.inferStructInit(idx),
+            .move_expr => try self.remember(idx, try self.inferNode(a.nodes[idx].data0)),
             .field_access => self.inferFieldAccess(idx),
             .comptime_expr => self.inferComptimeExpr(idx),
             .comptime_value_decl => try self.remember(idx, .unit),
@@ -1809,17 +2482,26 @@ const Binding = struct {
                     if (mask & (@as(u32, 1) << @intCast(param_idx)) != 0) continue;
                     if (runtime_idx >= info.ty.params.len) return;
                     const param_ty = info.ty.params[runtime_idx];
+                    const access_mode = info.param_modes[runtime_idx];
                     const pname = a.identOf(param.name);
-                    try self.pushBinding(info.decl, pname, .{ .ty = param_ty, .mutable = false, .comptime_visible = false });
+                    const mutable = switch (access_mode) {
+                        .read => false,
+                        .mut, .var_mode, .deinit => true,
+                    };
+                    try self.pushBinding(info.decl, pname, .{ .ty = param_ty, .mutable = mutable, .comptime_visible = false });
                     runtime_idx += 1;
                 }
                 // Clear cached node_types for body since shared AST nodes may have stale types
                 const body = a.fnBody(info.decl);
                 self.clearNodeTypesInSubtree(body);
             } else {
-                for (a.fnParams(info.decl), info.ty.params) |param, param_ty| {
+                for (a.fnParams(info.decl), info.ty.params, info.param_modes) |param, param_ty, access_mode| {
                     const pname = a.identOf(param.name);
-                    try self.pushBinding(info.decl, pname, .{ .ty = param_ty, .mutable = false, .comptime_visible = false });
+                    const mutable = switch (access_mode) {
+                        .read => false,
+                        .mut, .var_mode, .deinit => true,
+                    };
+                    try self.pushBinding(info.decl, pname, .{ .ty = param_ty, .mutable = mutable, .comptime_visible = false });
                 }
             }
         }
@@ -1839,12 +2521,14 @@ const Binding = struct {
 
     fn run(self: *@This()) InferError!void {
         try self.setupFunctionSignatures();
+        try self.computeOwnershipSpecs();
         try self.validateTopLevelComptimeDecls();
 
         var idx: u32 = 0;
         while (idx < self.typed.functions.items.len) : (idx += 1) {
             try self.checkFunction(idx);
         }
+        try self.runOwnershipChecks();
     }
 };
 
@@ -1925,6 +2609,7 @@ pub fn typecheckReport(
     checker.bindings.deinit(gpa);
     checker.comptime_decl_state.deinit();
     checker.monomorph_cache.deinit();
+    checker.ownership_in_progress.deinit();
     return .{
         .typed = checker.typed,
         .diagnostic = null,

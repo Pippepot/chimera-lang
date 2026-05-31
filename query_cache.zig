@@ -10,8 +10,8 @@ const analyze = @import("analyze.zig");
 
 const CacheExt = ".qcache";
 const Magic: [8]u8 = .{ 'X', '8', '6', 'Q', 'C', 'A', 'C', 'H' };
-const SchemaVersion: u32 = 9;
-const CompilerAbiVersion: u32 = 6;
+const SchemaVersion: u32 = 11;
+const CompilerAbiVersion: u32 = 8;
 
 pub const CacheOptions = struct {
     cache_dir_override: ?[]const u8 = null,
@@ -362,6 +362,16 @@ fn writeInst(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, inst: ir_mod.Inst)
             try appendU32(buf, gpa, fl.base);
             try appendU32(buf, gpa, fl.field_index);
         },
+        .slot_addr => |slot| try appendU32(buf, gpa, slot),
+        .load_ptr => |ptr_load| {
+            try appendU32(buf, gpa, ptr_load.ptr);
+            try appendU32(buf, gpa, ptr_load.offset_slots);
+        },
+        .store_ptr => |store_ptr| {
+            try appendU32(buf, gpa, store_ptr.ptr);
+            try appendU32(buf, gpa, store_ptr.src);
+            try appendU32(buf, gpa, store_ptr.offset_slots);
+        },
         .argi => |idx| try appendU32(buf, gpa, idx),
     }
 }
@@ -396,6 +406,13 @@ fn readInst(r: *Reader) LoadError!ir_mod.Inst {
         15 => .{ .argi = try r.readU32() },
         16 => .{ .store = .{ .l = try r.readU32(), .r = try r.readU32() } },
         17 => .{ .field_load = .{ .base = try r.readU32(), .field_index = try r.readU32() } },
+        18 => .{ .slot_addr = try r.readU32() },
+        19 => .{ .load_ptr = .{ .ptr = try r.readU32(), .offset_slots = try r.readU32() } },
+        20 => .{ .store_ptr = .{
+            .ptr = try r.readU32(),
+            .src = try r.readU32(),
+            .offset_slots = try r.readU32(),
+        } },
         else => error.InvalidData,
     };
 }
@@ -837,6 +854,10 @@ pub fn serializeTyped(gpa: std.mem.Allocator, ta: *const analyze.AnalyzedAst) ![
     for (ta.functions.items) |fi| {
         try appendU32(&buf, gpa, fi.decl);
         try writeTcFuncType(&buf, gpa, fi.ty.*);
+        try appendU32(&buf, gpa, @intCast(fi.param_modes.len));
+        for (fi.param_modes) |mode| {
+            try appendU8(&buf, gpa, @intCast(@intFromEnum(mode)));
+        }
         try appendU8(&buf, gpa, if (fi.has_explicit_return) 1 else 0);
     }
 
@@ -915,10 +936,18 @@ pub fn deserializeTyped(gpa: std.mem.Allocator, data: []const u8, parse_ast: *co
         const decl = try r.readU32();
         const ft_ptr = try arena_alloc.create(analyze.FuncType);
         ft_ptr.* = try readTcFuncType(&r, arena_alloc);
+        const param_mode_count = try r.readU32();
+        const param_modes = try arena_alloc.alloc(ast.ParamAccessMode, param_mode_count);
+        var pmi: u32 = 0;
+        while (pmi < param_mode_count) : (pmi += 1) {
+            const mode_value = try r.readU8();
+            param_modes[pmi] = @enumFromInt(mode_value);
+        }
         const has_ret = (try r.readU8()) == 1;
         ta.functions.appendAssumeCapacity(.{
             .decl = decl,
             .ty = ft_ptr,
+            .param_modes = param_modes,
             .has_explicit_return = has_ret,
         });
     }

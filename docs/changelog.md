@@ -1,5 +1,67 @@
 # Changelog
 
+## 2026-05-31 — Ownership MVP foundations (struct policies + borrows + deinit)
+
+### Language surface
+
+- Added struct ownership policy lines inside `comptime Name = struct`:
+  - `move = ...`
+  - `copy = ...`
+  - `drop = ...`
+- Policy RHS now supports keywords and hook functions:
+  - `move`: `trivial | fieldwise | none | func`
+  - `copy`: `trivial | fieldwise | none | func`
+  - `drop`: `trivial | fieldwise | explicit | func`
+- Added parameter access modifiers:
+  - `read` (default)
+  - `mut`
+  - `var`
+  - `deinit`
+- Added postfix move operator `^` (`expr^`).
+- Inline hook declarations support both indented bodies and one-line `->` form.
+
+### Semantics and analysis
+
+- Added ownership policy model in type analysis with defaults/compatibility checks.
+- Added strict hook signature validation:
+  - `copy`: `func(read self: Self) Self`
+  - `move`: `func(var self: Self) Self`
+  - `drop`: `func(deinit self: Self) unit`
+- Added ownership-flow pass enforcing:
+  - use-after-move / use-after-deinit
+  - copy/move legality
+  - stable-identity transfer restrictions (`move=none`)
+  - `drop=explicit` obligations and `deinit` transfer constraints
+
+### Lowering and codegen
+
+- Added ownership-aware call lowering:
+  - `read`/`mut` params pass by reference (pointer path)
+  - `var`/`deinit` params keep value-transfer path
+- Added IR pointer instructions for borrow path (`slot_addr`, `load_ptr`, `store_ptr`) and x86 emission for them.
+- Added lowering paths for `copy=func` implicit copy hooks and `move=func` move hooks.
+
+### Tooling and cache
+
+- Updated debug AST/IR printing for ownership nodes/instructions.
+- Extended persistent cache serialization for new function metadata and IR instructions.
+- Bumped persistent cache versions:
+  - schema: `11`
+  - compiler ABI: `8`
+- Updated disassembler patterns and fallback behavior to tolerate unknown bytes.
+
+### Tests
+
+- Added ownership parser, semantic, and behavioral regression tests:
+  - policy parsing + reserved keys
+  - copy/move hook behavior
+  - `var` consume forms (`x` and `x^`)
+  - `read` borrow and `mut` writeback behavior
+  - `move=none` restrictions
+  - `drop=explicit` + `deinit` enforcement
+  - hook signature mismatch diagnostics
+- Suite now passes at **98 tests**.
+
 ## 2026-05-31 — Variant `as` casts and `if` condition bindings
 
 ### Language surface

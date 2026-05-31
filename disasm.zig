@@ -112,6 +112,13 @@ fn patterns() [patternCount()]Pattern {
         // xmm slot store
         .{ .prefix = &.{ 0xF3, 0x0F, 0x11, 0x84, 0x24 }, .total_len = 9, .operand = .u32, .asm_prefix = "movss [rsp+", .asm_suffix = "], xmm0" },
 
+        // pointer/memory helpers
+        .{ .prefix = &.{ 0x48, 0x8D, 0x84, 0x24 }, .total_len = 8, .operand = .u32, .asm_prefix = "lea rax, [rsp+", .asm_suffix = "]" },
+        .{ .prefix = &.{ 0x4C, 0x8D, 0x94, 0x24 }, .total_len = 8, .operand = .u32, .asm_prefix = "lea r10, [rsp+", .asm_suffix = "]" },
+        .{ .prefix = &.{ 0x48, 0x8B, 0x80 }, .total_len = 7, .operand = .u32, .asm_prefix = "mov rax, [rax+", .asm_suffix = "]" },
+        .{ .prefix = &.{ 0x49, 0x89, 0x82 }, .total_len = 7, .operand = .u32, .asm_prefix = "mov [r10+", .asm_suffix = "], rax" },
+        .{ .prefix = &.{ 0x48, 0x89, 0x82 }, .total_len = 7, .operand = .u32, .asm_prefix = "mov [rdx+", .asm_suffix = "], rax" },
+
         // immediate (signed)
         .{ .prefix = &.{0xB8}, .total_len = 5, .operand = .i32, .asm_prefix = "mov eax, ", .asm_suffix = "" },
 
@@ -131,7 +138,7 @@ fn patterns() [patternCount()]Pattern {
 }
 
 fn patternCount() comptime_int {
-    return 75;
+    return 80;
 }
 
 fn matchPattern(code: []const u8) ?Pattern {
@@ -152,7 +159,10 @@ fn collectTargets(code: []const u8, gpa: std.mem.Allocator) !std.AutoHashMap(usi
     var cursor: usize = 0;
 
     while (cursor < code.len) {
-        const pat = matchPattern(code[cursor..]) orelse break;
+        const pat = matchPattern(code[cursor..]) orelse {
+            cursor += 1;
+            continue;
+        };
         if (pat.operand == .rel) {
             const rel = std.mem.readInt(i32, code[cursor + pat.prefix.len ..][0..4], .little);
             const target: usize = @intCast(@as(i64, @intCast(cursor)) + @as(i64, @intCast(pat.total_len)) + @as(i64, rel));
@@ -182,8 +192,9 @@ pub fn disassemble(code: []const u8, gpa: std.mem.Allocator) ![]const u8 {
         }
 
         const pat = matchPattern(code[cursor..]) orelse {
-            if (cursor >= 64) break;
-            return error.UnknownInstruction;
+            try out.print(gpa, "  db 0x{x:0>2}\n", .{code[cursor]});
+            cursor += 1;
+            continue;
         };
 
         switch (pat.operand) {
@@ -201,8 +212,11 @@ pub fn disassemble(code: []const u8, gpa: std.mem.Allocator) ![]const u8 {
             .rel => {
                 const rel = std.mem.readInt(i32, code[cursor + pat.prefix.len ..][0..4], .little);
                 const target: usize = @intCast(@as(i64, @intCast(cursor)) + @as(i64, @intCast(pat.total_len)) + @as(i64, rel));
-                const label_idx = targets.get(target) orelse unreachable;
-                try out.print(gpa, "  {s}L{d}{s}\n", .{ pat.asm_prefix, label_idx, pat.asm_suffix });
+                if (targets.get(target)) |label_idx| {
+                    try out.print(gpa, "  {s}L{d}{s}\n", .{ pat.asm_prefix, label_idx, pat.asm_suffix });
+                } else {
+                    try out.print(gpa, "  {s}{d}{s}\n", .{ pat.asm_prefix, target, pat.asm_suffix });
+                }
             },
         }
 

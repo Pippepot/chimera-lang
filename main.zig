@@ -9,7 +9,7 @@ const disasm = @import("disasm.zig");
 fn printUsage(io: std.Io, exe_name: []const u8) !void {
     var wbuf: [512]u8 = undefined;
     var w = std.Io.File.stderr().writer(io, &wbuf);
-    try w.interface.print("usage: {s} [--debug=ast,ssa,timing,query,asm] [--no-query-cache] <source-file> [program-args...]\n", .{exe_name});
+    try w.interface.print("usage: {s} [--debug=ast,ssa,timing,query,asm] [--nocache] <source-file> [program-args...]\n", .{exe_name});
     try w.interface.flush();
 }
 
@@ -75,7 +75,7 @@ pub fn main(init: std.process.Init) !void {
     const exe_name = iter.next() orelse "main";
     while (iter.next()) |arg| {
         if (std.mem.startsWith(u8, arg, "--debug=")) continue;
-        if (std.mem.eql(u8, arg, "--no-query-cache")) {
+        if (std.mem.eql(u8, arg, "--nocache")) {
             persistent_cache_enabled = false;
             continue;
         }

@@ -262,6 +262,16 @@ const BinaryEmitter = struct {
         try self.appendLeU32(slotOffset(value_ref));
     }
 
+    fn emitLoadRaxFromRaxOffset32(self: *@This(), offset: u32) !void {
+        try self.appendBytes(&.{ 0x48, 0x8B, 0x80 });
+        try self.appendLeU32(offset);
+    }
+
+    fn emitStoreRaxToRdxOffset32(self: *@This(), offset: u32) !void {
+        try self.appendBytes(&.{ 0x48, 0x89, 0x82 });
+        try self.appendLeU32(offset);
+    }
+
     fn emitLoadRegFromSlot(self: *@This(), reg_index: usize, value_ref: InstRef) !void {
         const prefixes = [_][]const u8{
             &.{ 0x48, 0x8B, 0xBC, 0x24 },
@@ -307,6 +317,11 @@ const BinaryEmitter = struct {
 
     fn emitStoreRaxToR10Offset32(self: *@This(), offset: u32) !void {
         try self.appendBytes(&.{ 0x49, 0x89, 0x82 });
+        try self.appendLeU32(offset);
+    }
+
+    fn emitLeaRaxRspOffset(self: *@This(), offset: u32) !void {
+        try self.appendBytes(&.{ 0x48, 0x8D, 0x84, 0x24 });
         try self.appendLeU32(offset);
     }
 
@@ -581,6 +596,21 @@ const BinaryEmitter = struct {
             .field_load => |fl| {
                 try self.emitLoadRaxFromSlot(fl.base + fl.field_index);
                 try self.emitStoreRaxToSlot(value_inst.id);
+            },
+            .slot_addr => |slot| {
+                try self.emitLeaRaxRspOffset(slotOffset(slot));
+                try self.emitStoreRaxToSlot(value_inst.id);
+            },
+            .load_ptr => |load| {
+                try self.emitLoadRaxFromSlot(load.ptr);
+                try self.emitLoadRaxFromRaxOffset32(load.offset_slots * 8);
+                try self.emitStoreRaxToSlot(value_inst.id);
+            },
+            .store_ptr => |st| {
+                try self.emitLoadRaxFromSlot(st.src);
+                try self.emitLoadRegFromSlot(2, st.ptr);
+                try self.emitStoreRaxToRdxOffset32(st.offset_slots * 8);
+                try self.emitStoreUnitValue(value_inst.id);
             },
         }
     }
