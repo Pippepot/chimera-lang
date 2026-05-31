@@ -222,6 +222,44 @@ test "if fallible semantics in top-level body" {
     , "11\n");
 }
 
+test "fallible and short-circuits on lhs failure" {
+    try testProgram(
+        \\if 2 < 1 and 1 / 0 < 1
+        \\  print(11)
+        \\else
+        \\  print(22)
+    , "22\n");
+}
+
+test "fallible or short-circuits on lhs success" {
+    try testProgram(
+        \\if 1 < 2 or 1 / 0 < 1
+        \\  print(11)
+        \\else
+        \\  print(22)
+    , "11\n");
+}
+
+test "fallible and binds tighter than or" {
+    try testProgram(
+        \\if 1 < 2 or 3 < 2 and 4 < 3
+        \\  print(11)
+        \\else
+        \\  print(22)
+    , "11\n");
+}
+
+test "logical operands must be fallible" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+
+    try db.setSource(0,
+        \\if true and 1 < 2
+        \\  print(11)
+    );
+    try expectCompileErrorContains(&db, 0, "logical operands must be fallible expressions");
+}
+
 test "inline if arrow supports return in function bodies" {
     try testProgram(
         \\comptime fib = func(n: int) int
@@ -569,6 +607,48 @@ test "comptime function error passing non-type as type param" {
         \\const r = Wrapper(42)
     );
     try expectCompileErrorContains(&db, 0, "call argument type mismatch");
+}
+
+test "runtime type value in const decl errors" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+
+    try db.setSource(0,
+        \\comptime Wrapper = func(comptime T: type) type
+        \\  return struct
+        \\    x: T
+        \\const i3: type = Wrapper(int)
+    );
+    try expectCompileErrorContains(&db, 0, "type value cannot be used at runtime");
+}
+
+test "runtime type value in var decl errors" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+
+    try db.setSource(0,
+        \\var t: type = int
+    );
+    try expectCompileErrorContains(&db, 0, "type value cannot be used at runtime");
+}
+
+test "comptime value used as type annotation in const decl" {
+    try testProgram(
+        \\comptime i: type = int
+        \\const b: i = 233
+        \\print(b)
+    , "233\n");
+}
+
+test "comptime value not a type in annotation errors" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+
+    try db.setSource(0,
+        \\comptime x = 42
+        \\const y: x = 1
+    );
+    try expectCompileErrorContains(&db, 0, "comptime value is not a type");
 }
 
 test "comptime function inline struct init" {

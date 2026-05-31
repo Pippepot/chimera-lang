@@ -1,6 +1,3 @@
-comptime Wrapper = func(comptime T: type) type
-  return struct
-    x: T
-
-const i2 = Wrapper(int){x = 3}.x * 344 / 2
-print(i2+2)
+comptime i:type = int
+const b:i = 233
+print(b)

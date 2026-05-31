@@ -71,6 +71,7 @@ pub const TypeError = error{
     ComparisonRequiresNumeric,
     EqualityOperandMismatch,
     EqualityUnsupportedType,
+    LogicalOperandNotFallible,
     IfConditionNotFallible,
     FallibleOutsideFallibleContext,
     IfBranchTypeMismatch,
@@ -92,6 +93,8 @@ pub const TypeError = error{
     ComptimeCaptureNotAllowed,
     ComptimePureOperationNotAllowed,
     ComptimeValueNotAvailable,
+    RuntimeTypeValue,
+    ComptimeValueNotAType,
 };
 
 pub const ResolvedField = struct {
@@ -175,6 +178,7 @@ pub fn typeErrorMessage(kind: TypeError) []const u8 {
         error.ComparisonRequiresNumeric => "comparison requires int or float operands",
         error.EqualityOperandMismatch => "equality operands must have the same type",
         error.EqualityUnsupportedType => "equality is not supported for this type",
+        error.LogicalOperandNotFallible => "logical operands must be fallible expressions",
         error.IfConditionNotFallible => "If condition must be a fallible expression",
         error.FallibleOutsideFallibleContext => "Fallible expression is not allowed outside fallible context",
         error.IfBranchTypeMismatch => "if branches must return the same type",
@@ -196,6 +200,8 @@ pub fn typeErrorMessage(kind: TypeError) []const u8 {
         error.ComptimeCaptureNotAllowed => "comptime can only reference comptime symbols and comptime locals",
         error.ComptimePureOperationNotAllowed => "operation is not allowed in pure comptime execution",
         error.ComptimeValueNotAvailable => "comptime value is not available",
+        error.RuntimeTypeValue => "type value cannot be used at runtime, use 'comptime' instead of 'const' or 'var'",
+        error.ComptimeValueNotAType => "comptime value is not a type",
     };
 }
 
@@ -344,6 +350,15 @@ const Checker = struct {
                 if (std.mem.eql(u8, name, "float")) return .float;
                 if (std.mem.eql(u8, name, "type")) return .type_type;
                 if (self.resolved.struct_names.contains(name)) return .{ .named = name };
+                if (self.resolved.comptime_value_names.get(name)) |decl_idx| {
+                    var locals = scope_mod.ScopeStack(EvalBinding).init();
+                    defer locals.deinit(self.gpa);
+                    const cv = try self.evalComptimeDeclValue(decl_idx, &locals);
+                    switch (cv) {
+                        .type_value => |ty| return ty,
+                        else => return self.failAtType(type_idx, error.ComptimeValueNotAType),
+                    }
+                }
                 return self.failAtType(type_idx, error.UnknownType);
             },
             .type_func => {
@@ -416,7 +431,7 @@ const Checker = struct {
 
     fn isFallibleNode(a: ast.Ast, idx: ast.NodeIdx) bool {
         return switch (a.nodes[idx].tag) {
-            .lt, .gt, .le, .ge, .eq, .ne => true,
+            .lt, .gt, .le, .ge, .eq, .ne, .@"and", .@"or" => true,
             else => false,
         };
     }
@@ -450,8 +465,17 @@ const Checker = struct {
         if (!typeEql(pair[0], pair[1])) return self.failAtNode(idx, error.EqualityOperandMismatch);
         switch (pair[0]) {
             .bool, .int, .float => {},
-            .unit, .named, .func, .type_type => return self.failAtNode(idx, error.EqualityUnsupportedType),
+            .unit, .named, .func, .type_type => return self.failAtNodeWithTypes(idx, error.EqualityUnsupportedType, pair[0], pair[0]),
         }
+        return self.remember(idx, .unit);
+    }
+
+    fn inferLogical(self: *@This(), idx: ast.NodeIdx, lhs: ast.NodeIdx, rhs: ast.NodeIdx) InferError!Type {
+        if (!self.in_fallible_scope) return self.failAtNode(idx, error.FallibleOutsideFallibleContext);
+        _ = try self.inferNode(lhs);
+        if (!isFallibleNode(self.parsed.ast, lhs)) return self.failAtNode(lhs, error.LogicalOperandNotFallible);
+        _ = try self.inferNode(rhs);
+        if (!isFallibleNode(self.parsed.ast, rhs)) return self.failAtNode(rhs, error.LogicalOperandNotFallible);
         return self.remember(idx, .unit);
     }
 
@@ -490,6 +514,7 @@ const Checker = struct {
         const a = self.parsed.ast;
         const name = a.identOf(a.nodes[idx].data0);
         const value_ty = try self.inferNode(a.varDeclValue(idx));
+        if (value_ty == .type_type) return self.failAtNode(idx, error.RuntimeTypeValue);
         if (a.varDeclHasType(idx)) {
             const annot_ty = try self.resolveTypeNode(a.varDeclType(idx).?);
             if (!typeEql(value_ty, annot_ty)) return self.failAtNodeWithTypes(idx, error.BindingTypeMismatch, annot_ty, value_ty);
@@ -771,35 +796,45 @@ const Checker = struct {
 
     fn evalPredicate(self: *@This(), idx: ast.NodeIdx, locals: *scope_mod.ScopeStack(EvalBinding)) InferError!bool {
         const a = self.parsed.ast;
-        const lhs_v = (try self.evalNodeStep(a.nodes[idx].data0, locals)).value;
-        const rhs_v = (try self.evalNodeStep(a.nodes[idx].data1, locals)).value;
         const tag = a.nodes[idx].tag;
         return switch (tag) {
-            .lt, .gt, .le, .ge, .eq, .ne => switch (lhs_v) {
-                .int => |lv| switch (tag) {
-                    .lt => lv < rhs_v.int,
-                    .gt => lv > rhs_v.int,
-                    .le => lv <= rhs_v.int,
-                    .ge => lv >= rhs_v.int,
-                    .eq => lv == rhs_v.int,
-                    .ne => lv != rhs_v.int,
-                    else => unreachable,
-                },
-                .float => |lv| switch (tag) {
-                    .lt => lv < rhs_v.float,
-                    .gt => lv > rhs_v.float,
-                    .le => lv <= rhs_v.float,
-                    .ge => lv >= rhs_v.float,
-                    .eq => lv == rhs_v.float,
-                    .ne => lv != rhs_v.float,
-                    else => unreachable,
-                },
-                .bool => |lv| switch (tag) {
-                    .eq => lv == rhs_v.bool,
-                    .ne => lv != rhs_v.bool,
+            .@"and" => {
+                if (!try self.evalPredicate(a.nodes[idx].data0, locals)) return false;
+                return self.evalPredicate(a.nodes[idx].data1, locals);
+            },
+            .@"or" => {
+                if (try self.evalPredicate(a.nodes[idx].data0, locals)) return true;
+                return self.evalPredicate(a.nodes[idx].data1, locals);
+            },
+            .lt, .gt, .le, .ge, .eq, .ne => blk: {
+                const lhs_v = (try self.evalNodeStep(a.nodes[idx].data0, locals)).value;
+                const rhs_v = (try self.evalNodeStep(a.nodes[idx].data1, locals)).value;
+                break :blk switch (lhs_v) {
+                    .int => |lv| switch (tag) {
+                        .lt => lv < rhs_v.int,
+                        .gt => lv > rhs_v.int,
+                        .le => lv <= rhs_v.int,
+                        .ge => lv >= rhs_v.int,
+                        .eq => lv == rhs_v.int,
+                        .ne => lv != rhs_v.int,
+                        else => unreachable,
+                    },
+                    .float => |lv| switch (tag) {
+                        .lt => lv < rhs_v.float,
+                        .gt => lv > rhs_v.float,
+                        .le => lv <= rhs_v.float,
+                        .ge => lv >= rhs_v.float,
+                        .eq => lv == rhs_v.float,
+                        .ne => lv != rhs_v.float,
+                        else => unreachable,
+                    },
+                    .bool => |lv| switch (tag) {
+                        .eq => lv == rhs_v.bool,
+                        .ne => lv != rhs_v.bool,
+                        else => false,
+                    },
                     else => false,
-                },
-                else => false,
+                };
             },
             else => false,
         };
@@ -976,7 +1011,7 @@ const Checker = struct {
             },
             .print_stmt, .arg => self.failAtNode(idx, error.ComptimePureOperationNotAllowed),
             .add, .sub, .mul, .div => try self.evalArithmetic(idx, locals),
-            .lt, .gt, .le, .ge, .eq, .ne => .{ .value = .unit, .returned = false },
+            .lt, .gt, .le, .ge, .eq, .ne, .@"and", .@"or" => .{ .value = .unit, .returned = false },
             .if_stmt => blk: {
                 const data = a.ifData(idx);
                 const pred = try self.evalPredicate(data.cond, locals);
@@ -1143,6 +1178,7 @@ const Checker = struct {
             .div => self.inferArithmetic(idx, a.nodes[idx].data0, a.nodes[idx].data1),
             .lt, .gt, .le, .ge => try self.inferComparison(idx, a.nodes[idx].data0, a.nodes[idx].data1),
             .eq, .ne => try self.inferEquality(idx, a.nodes[idx].data0, a.nodes[idx].data1),
+            .@"and", .@"or" => try self.inferLogical(idx, a.nodes[idx].data0, a.nodes[idx].data1),
             .if_stmt => self.inferIf(idx),
             .struct_init => self.inferStructInit(idx),
             .field_access => self.inferFieldAccess(idx),
@@ -1258,6 +1294,9 @@ pub fn typecheckReport(
                 const actual_str = typeName(failure.actual_type.?);
                 if (failure.kind == error.IfBranchTypeMismatch) {
                     break :msg try std.fmt.allocPrint(gpa, "{s}: '{s}' vs '{s}'", .{ base, expected_str, actual_str });
+                }
+                if (failure.kind == error.EqualityUnsupportedType) {
+                    break :msg try std.fmt.allocPrint(gpa, "{s}: '{s}'", .{ base, expected_str });
                 }
                 break :msg try std.fmt.allocPrint(gpa, "{s}: expected '{s}', got '{s}'", .{ base, expected_str, actual_str });
             } else typeErrorMessage(failure.kind);

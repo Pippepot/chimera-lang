@@ -418,6 +418,39 @@ const FunctionLowerer = struct {
         };
     }
 
+    fn lowerConditionToBranches(
+        self: *@This(),
+        start_block_id: BlockId,
+        cond: ast.NodeIdx,
+        then_target: BlockId,
+        else_target: BlockId,
+    ) LowerResult!void {
+        const a = self.parent.typed.ast;
+        self.current_block_id = start_block_id;
+        switch (a.nodes[cond].tag) {
+            .@"and" => {
+                const rhs_block_id = try self.newBlock(null);
+                try self.lowerConditionToBranches(start_block_id, a.nodes[cond].data0, rhs_block_id, else_target);
+                try self.lowerConditionToBranches(rhs_block_id, a.nodes[cond].data1, then_target, else_target);
+            },
+            .@"or" => {
+                const rhs_block_id = try self.newBlock(null);
+                try self.lowerConditionToBranches(start_block_id, a.nodes[cond].data0, then_target, rhs_block_id);
+                try self.lowerConditionToBranches(rhs_block_id, a.nodes[cond].data1, then_target, else_target);
+            },
+            else => {
+                const predicate = try self.lowerConditionPredicate(cond);
+                self.currentBlock().terminator = .{
+                    .pbr = .{
+                        .pred = predicate,
+                        .then_branch = .{ .target = then_target },
+                        .else_branch = .{ .target = else_target },
+                    },
+                };
+            },
+        }
+    }
+
     fn lowerComparisonPredicate(
         self: *@This(),
         lhs: ast.NodeIdx,
@@ -490,20 +523,13 @@ const FunctionLowerer = struct {
     fn lowerIf(self: *@This(), idx: ast.NodeIdx) LowerResult!ValueRef {
         const a = self.parent.typed.ast;
         const data = a.ifData(idx);
-        const predicate = try self.lowerConditionPredicate(data.cond);
         const if_ty = try self.nodeType(idx);
 
         const then_block_id = try self.newBlock(null);
         const else_block_id = try self.newBlock(null);
         const merge_block_id = try self.newBlock(if_ty);
-
-        self.currentBlock().terminator = .{
-            .pbr = .{
-                .pred = predicate,
-                .then_branch = .{ .target = then_block_id },
-                .else_branch = .{ .target = else_block_id },
-            },
-        };
+        const condition_entry_block = self.current_block_id;
+        try self.lowerConditionToBranches(condition_entry_block, data.cond, then_block_id, else_block_id);
 
         var then_fallthrough = false;
         self.current_block_id = then_block_id;
@@ -705,7 +731,7 @@ const FunctionLowerer = struct {
                 const arg_idx = a.nodes[idx].data0;
                 break :blk try self.addInst(.{ .argi = arg_idx });
             },
-            .lt, .gt, .le, .ge, .eq, .ne => error.IfConditionNotFallible,
+            .lt, .gt, .le, .ge, .eq, .ne, .@"and", .@"or" => error.IfConditionNotFallible,
             .if_stmt => try self.lowerIf(idx),
             .struct_init => try self.lowerStructInit(idx),
             .field_access => try self.lowerFieldAccess(idx),

@@ -44,6 +44,8 @@ const TokenTag = enum {
     kw_comptime,
     kw_func,
     kw_struct,
+    kw_and,
+    kw_or,
     ident,
     l_paren,
     r_paren,
@@ -174,6 +176,8 @@ const Lexer = struct {
         if (std.mem.eql(u8, word, "comptime")) return .{ .tag = .kw_comptime, .start = start, .end = self.index };
         if (std.mem.eql(u8, word, "func")) return .{ .tag = .kw_func, .start = start, .end = self.index };
         if (std.mem.eql(u8, word, "struct")) return .{ .tag = .kw_struct, .start = start, .end = self.index };
+        if (std.mem.eql(u8, word, "and")) return .{ .tag = .kw_and, .start = start, .end = self.index };
+        if (std.mem.eql(u8, word, "or")) return .{ .tag = .kw_or, .start = start, .end = self.index };
         return .{ .tag = .ident, .start = start, .end = self.index, .ident = word };
     }
 
@@ -475,6 +479,8 @@ const Parser = struct {
         ge,
         eq,
         ne,
+        @"and",
+        @"or",
     };
 
     fn init(source: []const u8, builder: *AstBuilder) ParseError!Parser {
@@ -607,6 +613,8 @@ const Parser = struct {
             .ge => .ge,
             .eq => .eq,
             .ne => .ne,
+            .@"and" => .@"and",
+            .@"or" => .@"or",
         };
         const span = coverSpans(try self.spanOf(left), try self.spanOf(right));
         return self.allocNode(node_tag, left, right, span);
@@ -982,7 +990,7 @@ const Parser = struct {
     }
 
     fn parseExpression(self: *@This()) ParseError!NodeIdx {
-        const node = try self.parseComparison();
+        const node = try self.parseOr();
         if (self.current.tag == .assign) {
             const node_tag = self.builder.nodes.items[node].tag;
             if (node_tag != .var_ref) return error.UnexpectedToken;
@@ -1049,6 +1057,14 @@ const Parser = struct {
 
     fn parseComparison(self: *@This()) ParseError!NodeIdx {
         return self.parseBinary(&.{ .{ .token = .lt, .tag = .lt }, .{ .token = .gt, .tag = .gt }, .{ .token = .le, .tag = .le }, .{ .token = .ge, .tag = .ge }, .{ .token = .eq_eq, .tag = .eq }, .{ .token = .ne, .tag = .ne } }, &Parser.parseAdditive);
+    }
+
+    fn parseAnd(self: *@This()) ParseError!NodeIdx {
+        return self.parseBinary(&.{.{ .token = .kw_and, .tag = .@"and" }}, &Parser.parseComparison);
+    }
+
+    fn parseOr(self: *@This()) ParseError!NodeIdx {
+        return self.parseBinary(&.{.{ .token = .kw_or, .tag = .@"or" }}, &Parser.parseAnd);
     }
 
     fn parseAdditive(self: *@This()) ParseError!NodeIdx {

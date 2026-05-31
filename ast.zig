@@ -33,6 +33,8 @@ pub const Tag = enum(u8) {
     ge,
     eq,
     ne,
+    @"and",
+    @"or",
     if_stmt,
     bool_lit,
     unit_lit,

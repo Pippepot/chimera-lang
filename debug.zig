@@ -137,7 +137,7 @@ fn writeAstLabel(writer: *std.Io.Writer, a: *const ast.Ast, idx: ast.NodeIdx) vo
         .var_ref => writer.print("var {s}", .{a.identOf(node.data0)}) catch return,
         .const_decl, .var_decl => writer.print("{s} {s}", .{ @tagName(node.tag), a.identOf(node.data0) }) catch return,
         .assign => writer.print("assign {s}", .{a.identOf(node.data0)}) catch return,
-        .call, .return_stmt, .print_stmt, .add, .sub, .mul, .div, .lt, .gt, .le, .ge, .eq, .ne, .if_stmt, .block, .field_access, .comptime_expr, .struct_expr, .unit_lit => writer.print("{s}", .{@tagName(node.tag)}) catch return,
+        .call, .return_stmt, .print_stmt, .add, .sub, .mul, .div, .lt, .gt, .le, .ge, .eq, .ne, .@"and", .@"or", .if_stmt, .block, .field_access, .comptime_expr, .struct_expr, .unit_lit => writer.print("{s}", .{@tagName(node.tag)}) catch return,
         .arg => writer.print("arg {d}", .{node.data0}) catch return,
         .struct_init => {
             const type_expr = a.structInitTypeExpr(idx);
@@ -206,7 +206,7 @@ fn dumpAstNode(a: *const ast.Ast, idx: ast.NodeIdx, writer: *std.Io.Writer, pref
             }
         },
         .print_stmt => dumpAstNode(a, a.nodes[idx].data0, writer, next_prefix, true, false),
-        .add, .sub, .mul, .div, .lt, .gt, .le, .ge, .eq, .ne => {
+        .add, .sub, .mul, .div, .lt, .gt, .le, .ge, .eq, .ne, .@"and", .@"or" => {
             dumpAstNode(a, a.nodes[idx].data0, writer, next_prefix, false, false);
             dumpAstNode(a, a.nodes[idx].data1, writer, next_prefix, true, false);
         },
