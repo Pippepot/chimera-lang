@@ -15,6 +15,7 @@ pub const ResolvedRef = union(enum) {
     function: u32,
     comptime_value: ast.NodeIdx,
     struct_decl: ast.NodeIdx,
+    builtin_type,
 };
 
 pub const ResolvedAst = struct {
@@ -168,6 +169,13 @@ const Resolver = struct {
                         return;
                     }
                 }
+                if (std.mem.eql(u8, name, "int") or std.mem.eql(u8, name, "float") or
+                    std.mem.eql(u8, name, "bool") or std.mem.eql(u8, name, "unit") or
+                    std.mem.eql(u8, name, "type"))
+                {
+                    try self.resolved.node_refs.put(idx, .builtin_type);
+                    return;
+                }
                 return self.fail(ast_.spanOf(idx), error.UnknownSymbol);
             },
             .const_decl => {
@@ -189,7 +197,14 @@ const Resolver = struct {
             .assign => {
                 const name = ast_.identOf(ast_.nodes[idx].data0);
                 if (self.locals.lookup(name) == null) {
-                    return self.fail(ast_.spanOf(idx), error.UnknownSymbol);
+                if (std.mem.eql(u8, name, "int") or std.mem.eql(u8, name, "float") or
+                    std.mem.eql(u8, name, "bool") or std.mem.eql(u8, name, "unit") or
+                    std.mem.eql(u8, name, "type"))
+                {
+                    try self.resolved.node_refs.put(idx, .builtin_type);
+                    return;
+                }
+                return self.fail(ast_.spanOf(idx), error.UnknownSymbol);
                 }
                 try self.resolveNode(ast_.nodes[idx].data1);
             },
@@ -218,8 +233,10 @@ const Resolver = struct {
                 }
             },
             .struct_init => {
+                try self.resolveNode(ast_.structInitTypeExpr(idx));
                 for (ast_.structInitFields(idx)) |field| try self.resolveNode(field.value);
             },
+            .struct_expr => {},
             .field_access => {
                 try self.resolveNode(ast_.nodes[idx].data0);
             },

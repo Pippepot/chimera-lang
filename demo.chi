@@ -1,2 +1,6 @@
-# This is a comment
-print(42)
+comptime Wrapper = func(comptime T: type) type
+  return struct
+    x: T
+
+const i2 = Wrapper(float){x = 3}
+print(i2.x)

@@ -157,6 +157,7 @@ fn writeAstLabel(writer: *std.Io.Writer, a: *const ast.Ast, idx: ast.NodeIdx) vo
         .comptime_value_decl => writer.print("comptime_decl {s}", .{a.identOf(a.nodes[idx].data0)}) catch return,
         .bool_lit => writer.print("bool {s}", .{if (a.nodes[idx].data0 != 0) "true" else "false"}) catch return,
         .unit_lit => writer.writeAll("unit") catch return,
+        .struct_expr => writer.writeAll("struct_expr") catch return,
         .type_name, .type_func, .comptime_fn, .comptime_struct => {},
     }
 }
@@ -220,6 +221,15 @@ fn dumpAstNode(a: *const ast.Ast, idx: ast.NodeIdx, writer: *std.Io.Writer, pref
                 dumpAstNode(a, field.value, writer, next_prefix, i + 1 == fields.len, true);
             }
         },
+        .struct_expr => {
+            const fields = a.structExprFields(idx);
+            for (fields, 0..) |field, i| {
+                writer.print("{s}{s}", .{ next_prefix, if (i + 1 == fields.len) "└─" else "├─" }) catch return;
+                writer.print("{s}: ", .{a.identOf(field.name)}) catch return;
+                dumpTypeNode(a, field.ty, writer);
+                writer.writeAll("\n") catch return;
+            }
+        },
         .int_lit, .float_lit, .var_ref, .arg, .bool_lit, .unit_lit => {},
         .type_name, .type_func, .comptime_fn, .comptime_struct => {},
     }
@@ -241,7 +251,7 @@ fn dumpTypeNode(a: *const ast.Ast, type_idx: ast.TypeIdx, writer: *std.Io.Writer
         .int_lit, .float_lit, .var_ref, .block, .const_decl, .var_decl, .assign,
         .return_stmt, .call, .print_stmt, .add, .sub, .mul, .div, .arg, .lt, .gt,
         .le, .ge, .eq, .ne, .if_stmt, .struct_init, .field_access, .bool_lit,
-        .unit_lit, .comptime_expr, .comptime_value_decl, .comptime_fn, .comptime_struct => {},
+        .unit_lit, .comptime_expr, .comptime_value_decl, .comptime_fn, .comptime_struct, .struct_expr => {},
     }
 }
 

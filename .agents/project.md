@@ -33,7 +33,7 @@ This compiler now supports a declaration-first language with optional top-level 
 | `runtime.zig` | Runtime helpers (`writeProgram`, `runProg`) — unchanged |
 | `scope.zig` | Reusable lexical scope stack utility — unchanged |
 | `helpers_bin.zig` | Embedded helper machine-code blobs — unchanged |
-| `test.zig` | All 34 tests pass using flat API |
+| `test.zig` | All 54 tests pass using flat API |
 
 ## Query architecture
 
@@ -68,21 +68,18 @@ The old pointer-based AST (`*const AstNode`, `*const ast.Module`, `*const ast.Fu
 
 All 5 stages must be cached with `hits=1 recomputes=0` when cache is present. The flat AST makes parse output inherently serializable (memcpy of `backing`). Stages 2-5 use buffer-copy serialization in `query_cache.zig`.
 
-## Current status (May 2026)
+## Current status (June 2026)
 
-- **ast.zig** ✅ — Flat AST with `serialize`/`deserialize` (buffer-copy), `verifyAt`/`entry`
-- **parser.zig** ✅ — `AstBuilder`, `NodeIdx` returns, `verifyAt`/`entry` support
-- **resolver.zig** ✅ — Flat AST, `NodeIdx` keys, deps: parse
-- **typecheck.zig** ✅ — Flat AST, `NodeIdx`/`TypeIdx` keys, deps: resolve, parse
-- **ir.zig** ✅ — Flat AST dispatch via `ast.nodes[idx].tag` and accessors, deps: typecheck
+- **ast.zig** ✅ — Flat AST with `serialize`/`deserialize` (buffer-copy), `struct_expr` tag, comptime mask in fn extra data
+- **parser.zig** ✅ — `AstBuilder`, `NodeIdx` returns, comptime params, struct expressions, inline call struct init
+- **resolver.zig** ✅ — Flat AST, `NodeIdx` keys, builtin type name resolution, deps: parse
+- **analyze.zig** ✅ — Flat AST, `Type.type_type`, `ComptimeValue.type_value`, monomorphized struct type creation/lookup, comptime evaluator supports type_name/struct_expr
+- **ir.zig** ✅ — Flat AST dispatch, `Type.type_type`, deps: analyze
 - **codegen.zig** ✅ — IR->x86 + ELF, backdate support, deps: lower
-- **query.zig** ✅ — Generic `ensureMemo`, 5-stage pipeline, persistent cache load/save
-- **query_cache.zig** ✅ — Buffer-copy ser/des for all 5 stages, persistent cache with schema v4
-- **main.zig** ✅ — Updated for `?*const ast.Ast`, persistent cache CLI
-- **test.zig** ✅ — All 43 tests pass using flat API
-- **runtime.zig** — Unchanged
-- **scope.zig** — Unchanged
-- **helpers_bin.zig** — Unchanged
+- **query.zig** ✅ — Generic `ensureMemo`, 6-stage pipeline, persistent cache load/save
+- **query_cache.zig** ✅ — Buffer-copy ser/des for all stages, `type_type` and `type_value` serialization
+- **main.zig** ✅ — CLI, persistent cache
+- **test.zig** ✅ — All 54 tests pass including monomorphization and caching tests
 
 ## Language notes
 
@@ -92,8 +89,11 @@ All 5 stages must be cached with `hits=1 recomputes=0` when cache is present. Th
 - `const` and `var` bindings support optional type annotations.
 - **No language string values** — string literals and `string` type annotations are rejected.
 - **Struct types** — `comptime Name = struct` with indented field lines.
-- **Struct init** — `TypeName{field1 = val1, field2 = val2, ...}`.
+- **Struct init** — `TypeName{field1 = val1, field2 = val2, ...}`. Supports inline call-based init: `Wrapper(float){x = 3.0}`.
 - **Field access** — `expr.fieldName`, multi-field structs use consecutive stack slots + `field_load` IR.
+- **Comptime functions with type params** — `comptime Name = func(comptime T: type) type` with indented body. Comptime params support `type`, `int`, `float`, `bool` types. Functions with comptime params returning `type` are monomorphized: each unique call is independently evaluated at comptime, producing a concrete struct type.
+- **Struct expressions** — `struct` followed by indented field lines creates a struct type in expression position (e.g., `return struct\n  x: T` inside a comptime function).
+- **`type` metatype** — usable as parameter and return type annotations for comptime functions. Builtin type names (`int`, `float`, `bool`, `unit`, `type`) can be passed as comptime arguments.
 
 ## Current behavior
 
@@ -118,4 +118,4 @@ All 5 stages must be cached with `hits=1 recomputes=0` when cache is present. Th
   - compile `changed_at` backdating
   - persistent cache reuse/disable/failure/corruption/stale cleanup behavior
 - Zero-recompute test: `compileResult` twice with no source change → 0 recomputes, 1 compile hit (compile is the only stage accessed on the second call; all others are implicitly cached).
-- Current suite: `zig test test.zig` (43 tests).
+- Current suite: `zig test test.zig` (54 tests).

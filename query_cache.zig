@@ -275,7 +275,7 @@ fn writeType(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, ty: ir_mod.Type) !
     const tag = std.meta.activeTag(ty);
     try appendU8(buf, gpa, @intFromEnum(tag));
     switch (ty) {
-        .unit, .bool, .int, .float => {},
+        .unit, .bool, .int, .float, .type_type => {},
         .named => |id| try appendU32(buf, gpa, id),
         .func => |id| try appendU32(buf, gpa, id),
     }
@@ -288,8 +288,9 @@ fn readType(r: *Reader) LoadError!ir_mod.Type {
         1 => .bool,
         2 => .int,
         3 => .float,
-        4 => .{ .named = try r.readU32() },
-        5 => .{ .func = try r.readU32() },
+        4 => .type_type,
+        5 => .{ .named = try r.readU32() },
+        6 => .{ .func = try r.readU32() },
         else => error.InvalidData,
     };
 }
@@ -574,7 +575,7 @@ fn writeTcType(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, ty: analyze.Type
     const tag = std.meta.activeTag(ty);
     try appendU8(buf, gpa, @intFromEnum(tag));
     switch (ty) {
-        .unit, .bool, .int, .float => {},
+        .unit, .bool, .int, .float, .type_type => {},
         .named => |s| try appendBytes(buf, gpa, s),
         .func => |ft| try writeTcFuncType(buf, gpa, ft.*),
     }
@@ -587,8 +588,9 @@ fn readTcType(r: *Reader, allocator: std.mem.Allocator) LoadError!analyze.Type {
         1 => .bool,
         2 => .int,
         3 => .float,
-        4 => .{ .named = try allocator.dupe(u8, try r.readBytes()) },
-        5 => blk: {
+        4 => .type_type,
+        5 => .{ .named = try allocator.dupe(u8, try r.readBytes()) },
+        6 => blk: {
             const ft = try allocator.create(analyze.FuncType);
             ft.* = try readTcFuncType(r, allocator);
             break :blk .{ .func = ft };
@@ -654,7 +656,7 @@ pub fn serializeResolved(gpa: std.mem.Allocator, ra: *const resolver.ResolvedAst
         const ref_tag = std.meta.activeTag(entry.value_ptr.*);
         try appendU8(&buf, gpa, @intFromEnum(ref_tag));
         switch (entry.value_ptr.*) {
-            .local => {},
+            .local, .builtin_type => {},
             .function => |id| try appendU32(&buf, gpa, id),
             .comptime_value => |decl| try appendU32(&buf, gpa, decl),
             .struct_decl => |decl| try appendU32(&buf, gpa, decl),
@@ -713,6 +715,7 @@ pub fn deserializeResolved(gpa: std.mem.Allocator, data: []const u8) LoadError!r
             1 => ra.node_refs.putAssumeCapacity(node_idx, .{ .function = try r.readU32() }),
             2 => ra.node_refs.putAssumeCapacity(node_idx, .{ .comptime_value = try r.readU32() }),
             3 => ra.node_refs.putAssumeCapacity(node_idx, .{ .struct_decl = try r.readU32() }),
+            4 => ra.node_refs.putAssumeCapacity(node_idx, .builtin_type),
             else => return error.InvalidData,
         }
     }
@@ -736,6 +739,7 @@ fn writeComptimeValue(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, value: an
             try appendU32(buf, gpa, @intCast(sv.fields.len));
             for (sv.fields) |field| try writeComptimeValue(buf, gpa, field);
         },
+        .type_value => |ty| try writeTcType(buf, gpa, ty),
     }
 }
 
@@ -758,6 +762,7 @@ fn readComptimeValue(r: *Reader, allocator: std.mem.Allocator) LoadError!analyze
             }
             break :blk .{ .struct_value = .{ .decl = decl, .fields = fields } };
         },
+        7 => .{ .type_value = try readTcType(r, allocator) },
         else => error.InvalidData,
     };
 }

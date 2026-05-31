@@ -573,7 +573,7 @@ const Checker = struct {
             .if_stmt => self.inferIf(idx),
             .struct_init => self.inferStructInit(idx),
             .field_access => self.inferFieldAccess(idx),
-            .comptime_fn, .comptime_struct => try self.remember(idx, .unit),
+            .comptime_fn, .comptime_struct, .struct_expr => try self.remember(idx, .unit),
             .type_name, .type_func => unreachable,
         };
     }

@@ -17,6 +17,7 @@ pub const Type = union(enum) {
     bool,
     int,
     float,
+    type_type,
     named: []const u8,
     func: *const FuncType,
 };
@@ -24,7 +25,7 @@ pub const Type = union(enum) {
 pub fn typeEql(a: Type, b: Type) bool {
     if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
     return switch (a) {
-        .unit, .bool, .int, .float => true,
+        .unit, .bool, .int, .float, .type_type => true,
         .named => |lhs| std.mem.eql(u8, lhs, b.named),
         .func => |lhs| funcTypeEql(lhs, b.func),
     };
@@ -57,6 +58,7 @@ pub const ComptimeValue = union(enum) {
     func: u32,
     struct_type: ast.NodeIdx,
     struct_value: StructValue,
+    type_value: Type,
 };
 
 pub const TypeError = error{
@@ -94,6 +96,11 @@ pub const TypeError = error{
     ComptimeValueNotAvailable,
 };
 
+pub const ResolvedField = struct {
+    name: []const u8,
+    ty: Type,
+};
+
 pub const AnalyzedAst = struct {
     arena: std.heap.ArenaAllocator,
     ast: *const ast.Ast,
@@ -101,6 +108,8 @@ pub const AnalyzedAst = struct {
     field_index: std.AutoHashMap(ast.NodeIdx, u32),
     comptime_node_values: std.AutoHashMap(ast.NodeIdx, ComptimeValue),
     comptime_values: std.StringHashMap(ComptimeValue),
+    comptime_struct_fields: std.StringHashMap([]const ResolvedField),
+    struct_expr_fields: std.AutoHashMap(ast.NodeIdx, []const ResolvedField),
     functions: []FunctionInfo,
     entry_function: u32,
 
@@ -112,6 +121,8 @@ pub const AnalyzedAst = struct {
             .field_index = std.AutoHashMap(ast.NodeIdx, u32).init(gpa),
             .comptime_node_values = std.AutoHashMap(ast.NodeIdx, ComptimeValue).init(gpa),
             .comptime_values = std.StringHashMap(ComptimeValue).init(gpa),
+            .comptime_struct_fields = std.StringHashMap([]const ResolvedField).init(gpa),
+            .struct_expr_fields = std.AutoHashMap(ast.NodeIdx, []const ResolvedField).init(gpa),
             .functions = &.{},
             .entry_function = 0,
         };
@@ -122,6 +133,8 @@ pub const AnalyzedAst = struct {
         self.field_index.deinit();
         self.comptime_node_values.deinit();
         self.comptime_values.deinit();
+        self.comptime_struct_fields.deinit();
+        self.struct_expr_fields.deinit();
         self.arena.deinit();
     }
 
@@ -145,6 +158,7 @@ pub fn typeName(ty: Type) []const u8 {
         .bool => "bool",
         .int => "int",
         .float => "float",
+        .type_type => "type",
         .named => |name| name,
         .func => "function",
     };
@@ -187,6 +201,15 @@ pub fn typeErrorMessage(kind: TypeError) []const u8 {
     };
 }
 
+fn builtinType(name: []const u8) Type {
+    if (std.mem.eql(u8, name, "unit")) return .unit;
+    if (std.mem.eql(u8, name, "bool")) return .bool;
+    if (std.mem.eql(u8, name, "int")) return .int;
+    if (std.mem.eql(u8, name, "float")) return .float;
+    if (std.mem.eql(u8, name, "type")) return .type_type;
+    return .unit;
+}
+
 const Binding = struct {
     ty: Type,
     mutable: bool,
@@ -205,6 +228,7 @@ const Checker = struct {
     in_comptime_context: bool,
     current_return: Type,
     current_saw_return: bool,
+    anon_counter: u32,
 
     const Failure = struct {
         span: ?ast.Span,
@@ -251,6 +275,7 @@ const Checker = struct {
             .in_comptime_context = false,
             .current_return = .unit,
             .current_saw_return = false,
+            .anon_counter = 0,
         };
     }
 
@@ -319,6 +344,7 @@ const Checker = struct {
                 if (std.mem.eql(u8, name, "bool")) return .bool;
                 if (std.mem.eql(u8, name, "int")) return .int;
                 if (std.mem.eql(u8, name, "float")) return .float;
+                if (std.mem.eql(u8, name, "type")) return .type_type;
                 if (self.resolved.struct_names.contains(name)) return .{ .named = name };
                 return self.failAtType(type_idx, error.UnknownType);
             },
@@ -426,7 +452,7 @@ const Checker = struct {
         if (!typeEql(pair[0], pair[1])) return self.failAtNode(idx, error.EqualityOperandMismatch);
         switch (pair[0]) {
             .bool, .int, .float => {},
-            .unit, .named, .func => return self.failAtNode(idx, error.EqualityUnsupportedType),
+            .unit, .named, .func, .type_type => return self.failAtNode(idx, error.EqualityUnsupportedType),
         }
         return self.remember(idx, .unit);
     }
@@ -521,7 +547,31 @@ const Checker = struct {
                 if (std.mem.eql(u8, st_name, name)) return decl_idx;
             }
         }
+        if (self.typed.comptime_struct_fields.contains(name)) return 0;
         return null;
+    }
+
+    fn ensureComptimeStructFields(self: *@This(), name: []const u8) InferError!void {
+        if (self.typed.comptime_struct_fields.contains(name)) return;
+        if (self.typed.comptime_values.contains(name)) return;
+        if (self.resolved.comptime_value_names.get(name)) |decl_idx| {
+            if (self.parsed.ast.nodes[decl_idx].tag == .comptime_value_decl) {
+                // Check for cycles: if this decl is already running, skip
+                const state = try self.comptimeDeclStatePtr(decl_idx);
+                if (state.val_phase == .running) return;
+                var eval_locals = scope_mod.ScopeStack(EvalBinding).init();
+                defer eval_locals.deinit(self.gpa);
+                const value = try self.evalComptimeDeclValue(decl_idx, &eval_locals);
+                switch (value) {
+                    .struct_type => |struct_node| {
+                        if (self.typed.struct_expr_fields.get(struct_node)) |resolved| {
+                            try self.typed.comptime_struct_fields.put(name, resolved);
+                        }
+                    },
+                    else => {},
+                }
+            }
+        }
     }
 
     fn comptimeDeclStatePtr(self: *@This(), decl_idx: ast.NodeIdx) InferError!*DeclState {
@@ -541,22 +591,68 @@ const Checker = struct {
 
     fn inferStructInit(self: *@This(), idx: ast.NodeIdx) InferError!Type {
         const a = self.parsed.ast;
-        const si_name_idx = a.structInitName(idx);
-        const si_name = a.identOf(si_name_idx);
-        const struct_decl = self.findStructDecl(si_name) orelse return self.failAtNode(idx, error.UnknownType);
+        const type_expr = a.structInitTypeExpr(idx);
 
-        const fields = a.structInitFields(idx);
-        const decl_fields = a.structFields(struct_decl);
-        if (fields.len != decl_fields.len) return self.failAtNode(idx, error.StructInitFieldCountMismatch);
-        for (fields, decl_fields) |given, decl_field| {
-            const given_name = a.identOf(given.name);
-            const decl_field_name = a.identOf(decl_field.name);
-            if (!std.mem.eql(u8, given_name, decl_field_name)) return self.failAtNode(idx, error.StructInitFieldNameMismatch);
-            const field_ty = try self.resolveTypeNode(decl_field.ty);
-            const value_ty = try self.inferNode(given.value);
-            if (!typeEql(value_ty, field_ty)) return self.failAtNodeWithTypes(idx, error.BindingTypeMismatch, field_ty, value_ty);
+        if (a.nodes[type_expr].tag == .call) {
+            var eval_locals = scope_mod.ScopeStack(EvalBinding).init();
+            defer eval_locals.deinit(self.gpa);
+            const eval_result = try self.evalNodeStep(type_expr, &eval_locals);
+            const struct_node = switch (eval_result.value) {
+                .struct_type => |n| n,
+                else => return self.failAtNode(idx, error.UnknownType),
+            };
+            if (self.typed.struct_expr_fields.get(struct_node)) |resolved_fields| {
+                const fields = a.structInitFields(idx);
+                if (fields.len != resolved_fields.len) return self.failAtNode(idx, error.StructInitFieldCountMismatch);
+                for (fields, resolved_fields) |given, resolved| {
+                    const given_name = a.identOf(given.name);
+                    if (!std.mem.eql(u8, given_name, resolved.name)) return self.failAtNode(idx, error.StructInitFieldNameMismatch);
+                    const value_ty = try self.inferNode(given.value);
+                    if (!typeEql(value_ty, resolved.ty)) return self.failAtNodeWithTypes(idx, error.BindingTypeMismatch, resolved.ty, value_ty);
+                }
+                const anon_name = try std.fmt.allocPrint(self.typed.arena.allocator(), "$anon{}", .{self.anon_counter});
+                self.anon_counter += 1;
+                try self.typed.comptime_struct_fields.put(anon_name, resolved_fields);
+                return self.remember(idx, .{ .named = anon_name });
+            }
+            return self.failAtNode(idx, error.UnknownType);
         }
-        return self.remember(idx, .{ .named = si_name });
+
+        const si_name_idx = a.structInitName(idx);
+        if (si_name_idx == std.math.maxInt(ast.IdentIdx)) return self.failAtNode(idx, error.UnknownType);
+        const si_name = a.identOf(si_name_idx);
+
+        if (self.findStructDecl(si_name)) |struct_decl| {
+            if (struct_decl != 0) {
+                const fields = a.structInitFields(idx);
+                const decl_fields = a.structFields(struct_decl);
+                if (fields.len != decl_fields.len) return self.failAtNode(idx, error.StructInitFieldCountMismatch);
+                for (fields, decl_fields) |given, decl_field| {
+                    const given_name = a.identOf(given.name);
+                    const decl_field_name = a.identOf(decl_field.name);
+                    if (!std.mem.eql(u8, given_name, decl_field_name)) return self.failAtNode(idx, error.StructInitFieldNameMismatch);
+                    const field_ty = try self.resolveTypeNode(decl_field.ty);
+                    const value_ty = try self.inferNode(given.value);
+                    if (!typeEql(value_ty, field_ty)) return self.failAtNodeWithTypes(idx, error.BindingTypeMismatch, field_ty, value_ty);
+                }
+                return self.remember(idx, .{ .named = si_name });
+            }
+        }
+
+        try self.ensureComptimeStructFields(si_name);
+        if (self.typed.comptime_struct_fields.get(si_name)) |resolved_fields| {
+            const fields = a.structInitFields(idx);
+            if (fields.len != resolved_fields.len) return self.failAtNode(idx, error.StructInitFieldCountMismatch);
+            for (fields, resolved_fields) |given, resolved| {
+                const given_name = a.identOf(given.name);
+                if (!std.mem.eql(u8, given_name, resolved.name)) return self.failAtNode(idx, error.StructInitFieldNameMismatch);
+                const value_ty = try self.inferNode(given.value);
+                if (!typeEql(value_ty, resolved.ty)) return self.failAtNodeWithTypes(idx, error.BindingTypeMismatch, resolved.ty, value_ty);
+            }
+            return self.remember(idx, .{ .named = si_name });
+        }
+
+        return self.failAtNode(idx, error.UnknownType);
     }
 
     fn inferFieldAccess(self: *@This(), idx: ast.NodeIdx) InferError!Type {
@@ -568,14 +664,29 @@ const Checker = struct {
             .named => |name| name,
             else => return self.failAtNode(idx, error.FieldAccessOnNonStruct),
         };
-        const struct_decl = self.findStructDecl(struct_name) orelse return self.failAtNode(idx, error.UnknownType);
-        for (a.structFields(struct_decl), 0..) |f, i| {
-            const f_name = a.identOf(f.name);
-            if (std.mem.eql(u8, f_name, field_name)) {
-                try self.typed.field_index.put(idx, @intCast(i));
-                return self.remember(idx, try self.resolveTypeNode(f.ty));
+
+        if (self.findStructDecl(struct_name)) |struct_decl| {
+            if (struct_decl != 0) {
+                for (a.structFields(struct_decl), 0..) |f, i| {
+                    const f_name = a.identOf(f.name);
+                    if (std.mem.eql(u8, f_name, field_name)) {
+                        try self.typed.field_index.put(idx, @intCast(i));
+                        return self.remember(idx, try self.resolveTypeNode(f.ty));
+                    }
+                }
+                return self.failAtNode(idx, error.UnknownField);
             }
         }
+
+        if (self.typed.comptime_struct_fields.get(struct_name)) |resolved_fields| {
+            for (resolved_fields, 0..) |f, i| {
+                if (std.mem.eql(u8, f.name, field_name)) {
+                    try self.typed.field_index.put(idx, @intCast(i));
+                    return self.remember(idx, f.ty);
+                }
+            }
+        }
+
         return self.failAtNode(idx, error.UnknownField);
     }
 
@@ -655,6 +766,7 @@ const Checker = struct {
                     .fields = copied_fields,
                 } };
             },
+            .type_value => |ty| .{ .type_value = ty },
             else => value,
         };
     }
@@ -730,7 +842,16 @@ const Checker = struct {
                 self.in_comptime_context = prev;
                 state.value = eval_result.value;
                 state.val_phase = .done;
-                try self.typed.comptime_values.put(a.identOf(decl.data0), eval_result.value);
+                const decl_name = a.identOf(decl.data0);
+                try self.typed.comptime_values.put(decl_name, eval_result.value);
+                switch (eval_result.value) {
+                    .struct_type => |struct_node| {
+                        if (self.typed.struct_expr_fields.get(struct_node)) |resolved| {
+                            try self.typed.comptime_struct_fields.put(decl_name, resolved);
+                        }
+                    },
+                    else => {},
+                }
                 return eval_result.value;
             },
             else => return self.failAtNode(decl_idx, error.ComptimeValueNotAvailable),
@@ -821,6 +942,7 @@ const Checker = struct {
                     .function => |fn_id| break :blk .{ .value = .{ .func = fn_id }, .returned = false },
                     .struct_decl => |decl_idx| break :blk .{ .value = .{ .struct_type = decl_idx }, .returned = false },
                     .comptime_value => |decl_idx| break :blk .{ .value = try self.evalComptimeDeclValue(decl_idx, locals), .returned = false },
+                    .builtin_type => break :blk .{ .value = .{ .type_value = builtinType(name) }, .returned = false },
                     .local => return self.failAtNode(idx, error.ComptimeCaptureNotAllowed),
                 }
             },
@@ -865,6 +987,24 @@ const Checker = struct {
                 break :blk .{ .value = .unit, .returned = false };
             },
             .struct_init => blk: {
+                const type_expr = a.structInitTypeExpr(idx);
+                if (a.nodes[type_expr].tag == .call) {
+                    const eval_result = try self.evalNodeStep(type_expr, locals);
+                    const struct_node = switch (eval_result.value) {
+                        .struct_type => |n| n,
+                        else => return self.failAtNode(idx, error.UnknownType),
+                    };
+                    const fields = a.structInitFields(idx);
+                    const arena_alloc = self.typed.arena.allocator();
+                    const values = try arena_alloc.alloc(ComptimeValue, fields.len);
+                    for (fields, 0..) |field, i| {
+                        values[i] = (try self.evalNodeStep(field.value, locals)).value;
+                    }
+                    break :blk .{ .value = .{ .struct_value = .{
+                        .decl = struct_node,
+                        .fields = values,
+                    } }, .returned = false };
+                }
                 const si_name = a.identOf(a.structInitName(idx));
                 const decl = self.findStructDecl(si_name) orelse return self.failAtNode(idx, error.UnknownType);
                 const fields = a.structInitFields(idx);
@@ -890,7 +1030,37 @@ const Checker = struct {
             .comptime_expr => self.evalNodeStep(a.comptimeExprBody(idx), locals),
             .comptime_value_decl => .{ .value = .unit, .returned = false },
             .comptime_fn, .comptime_struct => .{ .value = .unit, .returned = false },
-            .type_name, .type_func => return self.failAtNode(idx, error.ComptimeValueNotAvailable),
+            .type_name => blk: {
+                const name = a.identOf(a.nodes[idx].data0);
+                if (evalBindingIndex(locals, name)) |binding_idx| {
+                    break :blk .{ .value = locals.entries.items[binding_idx].value.value, .returned = false };
+                }
+                const ty = builtinType(name);
+                break :blk .{ .value = .{ .type_value = ty }, .returned = false };
+            },
+            .type_func => blk: {
+                const ty = try self.resolveTypeNode(idx);
+                break :blk .{ .value = .{ .type_value = ty }, .returned = false };
+            },
+            .struct_expr => blk: {
+                const fields = a.structExprFields(idx);
+                const arena_alloc = self.typed.arena.allocator();
+                const resolved = try arena_alloc.alloc(ResolvedField, fields.len);
+                for (fields, 0..) |field, i| {
+                    const ty_value = (try self.evalNodeStep(field.ty, locals)).value;
+                    const field_ty: Type = switch (ty_value) {
+                        .type_value => |ty| ty,
+                        .struct_type => .{ .named = self.parsed.ast.identOf(self.parsed.ast.nodes[ty_value.struct_type].data0) },
+                        else => return self.failAtNode(idx, error.ComptimeValueNotAvailable),
+                    };
+                    resolved[i] = .{
+                        .name = a.identOf(field.name),
+                        .ty = field_ty,
+                    };
+                }
+                try self.typed.struct_expr_fields.put(idx, resolved);
+                break :blk .{ .value = .{ .struct_type = idx }, .returned = false };
+            },
         };
     }
 
@@ -936,6 +1106,7 @@ const Checker = struct {
                 }
                 break :blk try self.remember(idx, ty);
             },
+            .builtin_type => self.remember(idx, .type_type),
             .struct_decl => |decl_idx| self.remember(idx, .{ .named = self.parsed.ast.identOf(self.parsed.ast.nodes[decl_idx].data0) }),
         };
     }
@@ -964,7 +1135,7 @@ const Checker = struct {
                 switch (child_ty) {
                     .int, .float, .bool => {},
                     .unit => return self.failAtNode(child, error.PrintUnitValue),
-                    .named, .func => return self.failAtNode(child, error.PrintUnsupportedType),
+                    .named, .func, .type_type => return self.failAtNode(child, error.PrintUnsupportedType),
                 }
                 break :blk try self.remember(idx, .unit);
             },
@@ -980,12 +1151,21 @@ const Checker = struct {
             .comptime_expr => self.inferComptimeExpr(idx),
             .comptime_value_decl => try self.remember(idx, .unit),
             .comptime_fn, .comptime_struct => try self.remember(idx, .unit),
+            .struct_expr => self.remember(idx, .type_type),
             .type_name, .type_func => unreachable,
         };
     }
 
+    fn hasComptimeParams(self: *const @This(), info: FunctionInfo) bool {
+        if (info.decl == std.math.maxInt(ast.NodeIdx)) return false;
+        const mask = self.parsed.ast.fnComptimeMask(info.decl);
+        return mask != 0;
+    }
+
     fn checkFunction(self: *@This(), fn_id: u32) InferError!void {
         const info = &self.typed.functions[fn_id];
+        if (self.hasComptimeParams(info.*) and info.ty.ret == .type_type) return;
+
         const mark = self.bindings.mark();
         defer self.bindings.restore(mark);
 

@@ -513,6 +513,81 @@ test "struct field type mismatch error" {
     try expectCompileErrorContains(&db, 0, "binding type annotation mismatch");
 }
 
+test "comptime function returns monomorphized struct type" {
+
+    try testProgram(
+        \\comptime Wrapper = func(comptime T: type) type
+        \\  return struct
+        \\    x: T
+        \\comptime IntWrapper = Wrapper(int)
+        \\const instance = IntWrapper{x = 42}
+        \\print(instance.x)
+    , "42\n");
+}
+
+test "comptime function with dual monomorphized parameter" {
+
+    try testProgram(
+        \\comptime Pair = func(comptime A: type, comptime B: type) type
+        \\  return struct
+        \\    first: A
+        \\    second: B
+        \\comptime IP = Pair(int, float)
+        \\const p = IP{first = 10, second = 2.5}
+        \\print(p.first)
+        \\print(p.second)
+    , "10\n2.500000\n");
+}
+
+test "comptime function monomorphization caching" {
+
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+
+    try db.setSource(0,
+        \\comptime Wrapper = func(comptime T: type) type
+        \\  return struct
+        \\    x: T
+        \\comptime IntWrapper = Wrapper(int)
+        \\const a = IntWrapper{x = 1}
+        \\comptime FloatWrapper = Wrapper(float)
+        \\const b = FloatWrapper{x = 2.5}
+        \\print(a.x)
+        \\print(b.x)
+    );
+    _ = try expectCompileOk(&db, 0);
+    db.resetStats();
+    _ = try expectCompileOk(&db, 0);
+    const stats = db.statsSnapshot();
+    try testing.expect(stats.compile_hits >= 1);
+    try testing.expectEqual(@as(usize, 0), stats.compile_recomputes);
+
+}
+
+test "comptime function error passing non-type as type param" {
+
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+
+    try db.setSource(0,
+        \\comptime Wrapper = func(comptime T: type) type
+        \\  return T
+        \\const r = Wrapper(42)
+    );
+    try expectCompileErrorContains(&db, 0, "call argument type mismatch");
+}
+
+test "comptime function inline struct init" {
+
+    try testProgram(
+        \\comptime Wrapper = func(comptime T: type) type
+        \\  return struct
+        \\    x: T
+        \\const val = Wrapper(float){x = 3.0}
+        \\print(val.x)
+    , "3.000000\n");
+}
+
 test "binding type annotation mismatch errors" {
     var db = query.QueryDb.init(testing.allocator);
     defer db.deinit();

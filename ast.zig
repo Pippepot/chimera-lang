@@ -42,6 +42,7 @@ pub const Tag = enum(u8) {
     comptime_value_decl,
     comptime_fn,
     comptime_struct,
+    struct_expr,
 };
 
 pub const Node = extern struct {
@@ -127,6 +128,14 @@ pub const Ast = struct {
     }
 
     pub fn structInitName(ast: *const Ast, idx: NodeIdx) IdentIdx {
+        const type_expr = ast.nodes[idx].data0;
+        if (ast.nodes[type_expr].tag == .var_ref) {
+            return ast.nodes[type_expr].data0;
+        }
+        return std.math.maxInt(IdentIdx);
+    }
+
+    pub fn structInitTypeExpr(ast: *const Ast, idx: NodeIdx) NodeIdx {
         return ast.nodes[idx].data0;
     }
 
@@ -139,30 +148,46 @@ pub const Ast = struct {
         annotation: ?TypeIdx,
     };
 
+    pub fn fnComptimeMask(ast: *const Ast, idx: NodeIdx) u32 {
+        const ei = extraIdx(ast.nodes[idx].data1);
+        return ast.extra[ei + 1]; // second u32 after count
+    }
+
+    pub fn fnParamIsComptime(ast: *const Ast, idx: NodeIdx, param_index: u32) bool {
+        return fnComptimeMask(ast, idx) & (@as(u32, 1) << @intCast(param_index)) != 0;
+    }
+
     pub fn fnParams(ast: *const Ast, idx: NodeIdx) []const ParamPair {
         const ei = extraIdx(ast.nodes[idx].data1);
         const count = ast.extra[ei];
-        const pairs = @as([*]const ParamPair, @ptrCast(&ast.extra[ei + 1]));
+        const pairs = @as([*]const ParamPair, @ptrCast(&ast.extra[ei + 2])); // skip count + comptime_mask
         return pairs[0..count];
     }
 
     pub fn fnRetType(ast: *const Ast, idx: NodeIdx) TypeIdx {
         const ei = extraIdx(ast.nodes[idx].data1);
         const count = ast.extra[ei];
-        return ast.extra[ei + 1 + count * 2];
+        return ast.extra[ei + 2 + count * 2];
     }
 
     pub fn fnBody(ast: *const Ast, idx: NodeIdx) NodeIdx {
         const ei = extraIdx(ast.nodes[idx].data1);
         const count = ast.extra[ei];
-        return ast.extra[ei + 1 + count * 2 + 1];
+        return ast.extra[ei + 2 + count * 2 + 1];
     }
 
     pub fn comptimeFnAnnotation(ast: *const Ast, idx: NodeIdx) ?TypeIdx {
         if (ast.nodes[idx].data1 & 0x80000000 == 0) return null;
         const ei = extraIdx(ast.nodes[idx].data1);
         const count = ast.extra[ei];
-        return ast.extra[ei + 3 + count * 2];
+        return ast.extra[ei + 4 + count * 2];
+    }
+
+    pub fn structExprFields(ast: *const Ast, idx: NodeIdx) []const ParamPair {
+        const ei = ast.nodes[idx].data0;
+        const count = ast.nodes[idx].data1;
+        const pairs = @as([*]const ParamPair, @ptrCast(&ast.extra[ei + 1]));
+        return pairs[0..count];
     }
 
     pub fn structFields(ast: *const Ast, idx: NodeIdx) []const ParamPair {

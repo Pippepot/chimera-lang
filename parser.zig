@@ -794,7 +794,14 @@ const Parser = struct {
 
         var param_names = std.ArrayList(u32).empty;
         var param_types = std.ArrayList(u32).empty;
+        var comptime_mask: u32 = 0;
+        var param_index: u32 = 0;
         while (self.current.tag != .r_paren) {
+            var is_comptime = false;
+            if (self.current.tag == .kw_comptime) {
+                is_comptime = true;
+                try self.advance();
+            }
             if (self.current.tag != .ident) return error.ExpectedIdentifier;
             const param_name = try self.internName(self.current.ident);
             try self.advance();
@@ -802,6 +809,8 @@ const Parser = struct {
             const ty = try self.parseType();
             try param_names.append(self.scratch_arena.allocator(), param_name);
             try param_types.append(self.scratch_arena.allocator(), ty);
+            if (is_comptime) comptime_mask |= @as(u32, 1) << @intCast(param_index);
+            param_index += 1;
 
             if (self.current.tag == .comma) {
                 try self.advance();
@@ -821,6 +830,7 @@ const Parser = struct {
 
         const param_count: u32 = @intCast(param_names.items.len);
         try self.builder.extra.append(self.builder.gpa, param_count);
+        try self.builder.extra.append(self.builder.gpa, comptime_mask);
         var i: u32 = 0;
         while (i < param_count) : (i += 1) {
             try self.builder.extra.append(self.builder.gpa, param_names.items[i]);
@@ -832,9 +842,9 @@ const Parser = struct {
             try self.builder.extra.append(self.builder.gpa, annot);
         }
         const extra_idx: u32 = if (binding_ty != null)
-            @intCast(self.builder.extra.items.len - 4 - param_count * 2)
+            @intCast(self.builder.extra.items.len - 5 - param_count * 2)
         else
-            @intCast(self.builder.extra.items.len - 3 - param_count * 2);
+            @intCast(self.builder.extra.items.len - 4 - param_count * 2);
 
         const data1 = if (binding_ty != null) extra_idx | 0x80000000 else extra_idx;
         const body_span = try self.spanOf(body);
@@ -1121,9 +1131,7 @@ const Parser = struct {
                 try self.expect(.r_paren, error.ExpectedRParen);
                 expr = try self.makeCallNode(expr, args.items, coverSpans(callee_span, end_span));
             } else if (self.current.tag == .l_brace) {
-                if (self.builder.nodes.items[expr].tag != .var_ref) return error.ExpectedIdentifier;
-                const struct_name = self.builder.identOf(self.builder.nodes.items[expr].data0);
-                expr = try self.parseStructInit(struct_name);
+                expr = try self.parseStructInitWithExpr(expr);
             } else if (self.current.tag == .dot) {
                 expr = try self.parseFieldAccess(expr);
             } else {
@@ -1134,7 +1142,7 @@ const Parser = struct {
         return expr;
     }
 
-    fn parseStructInit(self: *@This(), struct_name: []const u8) ParseError!NodeIdx {
+    fn parseStructInitWithExpr(self: *@This(), callee_expr: NodeIdx) ParseError!NodeIdx {
         const lbrace_span = tokenSpan(self.current);
         try self.expect(.l_brace, error.UnexpectedToken);
 
@@ -1157,7 +1165,14 @@ const Parser = struct {
         const end_span = tokenSpan(self.current);
         try self.expect(.r_brace, error.UnexpectedToken);
         const span = coverSpans(lbrace_span, end_span);
-        return self.makeStructInitNode(struct_name, fields.items, span);
+        const count: u32 = @intCast(fields.items.len);
+        try self.builder.extra.append(self.builder.gpa, count);
+        for (fields.items) |f| {
+            try self.builder.extra.append(self.builder.gpa, try self.internName(f.name));
+            try self.builder.extra.append(self.builder.gpa, f.value);
+        }
+        const extra_idx: u32 = @intCast(self.builder.extra.items.len - 1 - count * 2);
+        return self.allocNode(.struct_init, callee_expr, extra_idx, span);
     }
 
     fn parseFieldAccess(self: *@This(), target: NodeIdx) ParseError!NodeIdx {
@@ -1168,6 +1183,44 @@ const Parser = struct {
         try self.advance();
         const end_span = tokenSpan(self.current);
         return self.makeFieldAccessNode(target, field_name, coverSpans(dot_span, end_span));
+    }
+
+    fn parseStructExpr(self: *@This(), start_span: ast.Span) ParseError!NodeIdx {
+        try self.consumeNewlines();
+        if (self.current.tag != .indent) return error.ExpectedIndent;
+        try self.advance();
+
+        var field_names = std.ArrayList(u32).empty;
+        var field_types = std.ArrayList(u32).empty;
+        while (self.current.tag != .dedent and self.current.tag != .eof) {
+            if (self.current.tag != .ident) return error.ExpectedIdentifier;
+            const field_name = try self.internName(self.current.ident);
+            try self.advance();
+            try self.expect(.colon, error.ExpectedColon);
+            const field_ty = try self.parseType();
+            try field_names.append(self.scratch_arena.allocator(), field_name);
+            try field_types.append(self.scratch_arena.allocator(), field_ty);
+            if (self.current.tag == .newline) {
+                try self.consumeNewlines();
+            } else if (self.current.tag != .dedent) {
+                return error.UnexpectedToken;
+            }
+        }
+
+        try self.expect(.dedent, error.ExpectedIndent);
+
+        const field_count: u32 = @intCast(field_names.items.len);
+        const extra_idx = try self.builder.allocExtraSingle(field_count);
+        var i: u32 = 0;
+        while (i < field_count) : (i += 1) {
+            try self.builder.extra.append(self.builder.gpa, field_names.items[i]);
+            try self.builder.extra.append(self.builder.gpa, field_types.items[i]);
+        }
+        const span = if (field_count > 0)
+            coverSpans(start_span, try self.spanOf(field_types.items[field_count - 1]))
+        else
+            start_span;
+        return self.allocNode(.struct_expr, extra_idx, field_count, span);
     }
 
     fn parsePrimary(self: *@This()) ParseError!NodeIdx {
@@ -1207,6 +1260,11 @@ const Parser = struct {
                 const span = tokenSpan(self.current);
                 try self.advance();
                 return self.allocNode(.bool_lit, 0, 0, span);
+            },
+            .kw_struct => {
+                const s_span = tokenSpan(self.current);
+                try self.advance();
+                return self.parseStructExpr(s_span);
             },
             .ident => {
                 const ident_span = tokenSpan(self.current);

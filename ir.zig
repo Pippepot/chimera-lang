@@ -17,23 +17,24 @@ pub const Type = union(enum) {
     bool,
     int,
     float,
+    type_type,
     named: SymbolId,
     func: FuncTypeId,
-};
-
-pub const IrFuncType = struct {
-    params: []const Type,
-    ret: Type,
 };
 
 pub fn typeEql(a: Type, b: Type) bool {
     if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
     return switch (a) {
-        .unit, .bool, .int, .float => true,
+        .unit, .bool, .int, .float, .type_type => true,
         .named => |lhs| lhs == b.named,
         .func => |lhs| lhs == b.func,
     };
 }
+
+pub const IrFuncType = struct {
+    params: []const Type,
+    ret: Type,
+};
 
 pub const InstPair = struct {
     l: ValueRef,
@@ -237,6 +238,7 @@ const Lowerer = struct {
             .bool => .bool,
             .int => .int,
             .float => .float,
+            .type_type => .type_type,
             .named => |name| .{ .named = try self.internIdent(name) },
             .func => |ft| .{ .func = try self.internFuncType(ft) },
         };
@@ -447,7 +449,7 @@ const FunctionLowerer = struct {
                 .int => int_op,
                 .float => float_op,
                 .bool => bool_op,
-                .unit, .named, .func => unreachable,
+                .unit, .named, .func, .type_type => unreachable,
             },
             .pair = pair,
         };
@@ -633,6 +635,7 @@ const FunctionLowerer = struct {
             .int => |v| self.addInst(.{ .iconst = v }),
             .float => |v| self.addInst(.{ .fconst = v }),
             .func => |fn_id| self.addInst(.{ .fn_addr = fn_id }),
+            .type_value => error.UnsupportedComptimeValue,
             .struct_type => error.UnsupportedComptimeValue,
             .struct_value => |sv| blk: {
                 const field_count: u32 = @intCast(sv.fields.len);
@@ -713,6 +716,7 @@ const FunctionLowerer = struct {
             },
             .comptime_value_decl => try self.lowerUnitValue(),
             .comptime_fn, .comptime_struct => try self.lowerUnitValue(),
+            .struct_expr => try self.lowerUnitValue(),
             .type_name, .type_func => unreachable,
         };
     }
