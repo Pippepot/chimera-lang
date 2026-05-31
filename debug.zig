@@ -151,7 +151,14 @@ fn writeAstLabel(writer: *std.Io.Writer, a: *const ast.Ast, idx: ast.NodeIdx) vo
         .eq => writer.writeAll("eq") catch return,
         .ne => writer.writeAll("ne") catch return,
         .if_stmt => writer.writeAll("if") catch return,
-        .struct_init => writer.writeAll("struct_init") catch return,
+        .struct_init => {
+            const type_expr = a.structInitTypeExpr(idx);
+            if (a.nodes[type_expr].tag == .var_ref) {
+                writer.print("struct_init {s}", .{a.identOf(a.nodes[type_expr].data0)}) catch return;
+            } else {
+                writer.writeAll("struct_init") catch return;
+            }
+        },
         .field_access => writer.writeAll("field_access") catch return,
         .comptime_expr => writer.writeAll("comptime_expr") catch return,
         .comptime_value_decl => writer.print("comptime_decl {s}", .{a.identOf(a.nodes[idx].data0)}) catch return,
@@ -214,9 +221,13 @@ fn dumpAstNode(a: *const ast.Ast, idx: ast.NodeIdx, writer: *std.Io.Writer, pref
         .comptime_expr => dumpAstNode(a, a.comptimeExprBody(idx), writer, next_prefix, true, false),
         .comptime_value_decl => dumpAstNode(a, a.comptimeValueDeclValue(idx), writer, next_prefix, true, false),
         .struct_init => {
+            const type_expr = a.structInitTypeExpr(idx);
+            if (a.nodes[type_expr].tag != .var_ref) {
+                dumpAstNode(a, type_expr, writer, next_prefix, false, false);
+            }
             const fields = a.structInitFields(idx);
             for (fields, 0..) |field, i| {
-                writer.print("{s}{s}", .{ next_prefix, if (i + 1 == fields.len) "└─" else "├─" }) catch return;
+                writer.print("{s}{s}", .{ next_prefix, if (i + 1 == fields.len and a.nodes[type_expr].tag == .var_ref) "└─" else "├─" }) catch return;
                 writer.print("{s}: ", .{a.identOf(field.name)}) catch return;
                 dumpAstNode(a, field.value, writer, next_prefix, i + 1 == fields.len, true);
             }
