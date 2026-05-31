@@ -161,6 +161,7 @@ pub const Function = struct {
     next_value: ValueRef,
     param_values: std.ArrayList(ValueRef),
     ret_type: Type,
+    ret_slots: u32,
 
     pub fn deinit(self: *Function, gpa: std.mem.Allocator) void {
         for (self.blocks.items) |*block| block.deinit(gpa);
@@ -310,7 +311,7 @@ const Lowerer = struct {
         return id;
     }
 
-    fn allocFunction(self: *@This(), id: FuncId, name: []const u8, ret_type: Type) !Function {
+    fn allocFunction(self: *@This(), id: FuncId, name: []const u8, ret_type: Type, ret_slots: u32) !Function {
         const name_id = try self.internIdent(name);
         var blocks = try std.ArrayList(Block).initCapacity(self.gpa, 8);
         errdefer blocks.deinit(self.gpa);
@@ -330,6 +331,7 @@ const Lowerer = struct {
             .next_value = 0,
             .param_values = params,
             .ret_type = ret_type,
+            .ret_slots = ret_slots,
         };
     }
 
@@ -386,7 +388,8 @@ const FunctionLowerer = struct {
         else
             a.identOf(a.nodes[info.decl].data0);
         const ret_type = try parent.internType(info.ty.ret);
-        var function = try parent.allocFunction(fn_id, fn_name, ret_type);
+        const ret_slots = try parent.typeSlotCount(info.ty.ret);
+        var function = try parent.allocFunction(fn_id, fn_name, ret_type, ret_slots);
         errdefer function.deinit(parent.gpa);
 
         return .{
@@ -727,7 +730,7 @@ const FunctionLowerer = struct {
         if (cond_tag != .const_decl and cond_tag != .var_decl) return null;
 
         const value_node = a.varDeclValue(cond);
-        if (a.nodes[value_node].tag != .as) return error.IfConditionNotFallible;
+        if (a.nodes[value_node].tag != .as) return null;
 
         const binding_ty = self.parent.typed.decl_binding_types.get(cond) orelse try self.nodeType(value_node);
         const slot_count = try self.typeSlotCount(binding_ty);
@@ -962,6 +965,9 @@ const FunctionLowerer = struct {
         const a = self.parent.typed.ast;
         const data = a.ifData(idx);
         const if_ty = try self.nodeType(idx);
+
+        const cond_tag = a.nodes[data.cond].tag;
+        const is_if_binding = cond_tag == .const_decl or cond_tag == .var_decl;
         const cond_binding = try self.setupIfCondBinding(data.cond);
 
         const then_block_id = try self.newBlock(null);
@@ -972,7 +978,11 @@ const FunctionLowerer = struct {
         if (cond_binding) |binding| {
             try self.lowerVariantAsCondition(condition_entry_block, binding.as_node, binding.slot, binding.slot_count, then_block_id, else_block_id);
         } else {
-            try self.lowerConditionToBranches(condition_entry_block, data.cond, then_block_id, else_block_id);
+            const cond_node = if (is_if_binding)
+                a.varDeclValue(data.cond)
+            else
+                data.cond;
+            try self.lowerConditionToBranches(condition_entry_block, cond_node, then_block_id, else_block_id);
         }
 
         var then_fallthrough = false;
@@ -985,6 +995,17 @@ const FunctionLowerer = struct {
                     .storage = .{ .local_slot = binding.slot },
                     .ty = binding.ty,
                     .slot_count = binding.slot_count,
+                });
+            } else if (is_if_binding) {
+                const binding_ty = self.parent.typed.decl_binding_types.get(data.cond) orelse .unit;
+                const slot_count = try self.typeSlotCount(binding_ty);
+                const slot = try self.allocSlotRange(slot_count);
+                const unit_val = try self.lowerUnitValue();
+                try self.emitCopySlots(unit_val, slot, slot_count);
+                try self.pushBinding(a.identOf(a.nodes[data.cond].data0), .{
+                    .storage = .{ .local_slot = slot },
+                    .ty = binding_ty,
+                    .slot_count = slot_count,
                 });
             }
             break :then_blk try self.lowerAst(data.then_);
@@ -1119,6 +1140,51 @@ const FunctionLowerer = struct {
         return self.lowerUnitValue();
     }
 
+    fn resolveFieldChainRoot(self: *@This(), node: ast.NodeIdx) struct { root: ast.NodeIdx, field_sum: u32 } {
+        const a = self.parent.typed.ast;
+        var current = node;
+        var field_sum: u32 = 0;
+        while (a.nodes[current].tag == .field_access) {
+            const f_idx = self.parent.typed.field_index.get(current) orelse break;
+            field_sum += f_idx;
+            current = a.nodes[current].data0;
+        }
+        return .{ .root = current, .field_sum = field_sum };
+    }
+
+    fn lowerFieldAssign(self: *@This(), idx: ast.NodeIdx) LowerResult!ValueRef {
+        const a = self.parent.typed.ast;
+        const field_node = a.nodes[idx].data0;
+        const value_node = a.nodes[idx].data1;
+        const field_ty = try self.parent.typed.typeOf(field_node);
+        const value_ref = try self.lowerValueAsType(value_node, field_ty);
+        const chain = self.resolveFieldChainRoot(field_node);
+        if (a.nodes[chain.root].tag == .var_ref) {
+            const name = a.identOf(a.nodes[chain.root].data0);
+            if (self.lookupBinding(name)) |binding| {
+                switch (binding.storage) {
+                    .local_slot => |slot| {
+                        _ = try self.addInst(.{ .store = .{ .l = value_ref, .r = slot + chain.field_sum } });
+                    },
+                    .borrowed_ptr => |ptr_slot| {
+                        _ = try self.addInst(.{
+                            .store_ptr = .{
+                                .ptr = ptr_slot,
+                                .src = value_ref,
+                                .offset_slots = chain.field_sum,
+                            },
+                        });
+                    },
+                }
+                return self.lowerUnitValue();
+            }
+        }
+        const base_ref = try self.lowerAst(chain.root);
+        const dst_slot = base_ref + chain.field_sum;
+        _ = try self.addInst(.{ .store = .{ .l = value_ref, .r = dst_slot } });
+        return self.lowerUnitValue();
+    }
+
     fn lowerReturn(self: *@This(), idx: ast.NodeIdx) LowerResult!ValueRef {
         const a = self.parent.typed.ast;
         const value_ref = try self.lowerValueAsType(a.nodes[idx].data0, self.info.ty.ret);
@@ -1214,6 +1280,7 @@ const FunctionLowerer = struct {
             .var_decl => try self.lowerVar(idx),
             .const_decl => try self.lowerConst(idx),
             .assign => try self.lowerAssign(idx),
+            .field_assign => try self.lowerFieldAssign(idx),
             .return_stmt => try self.lowerReturn(idx),
             .call => try self.lowerCall(idx),
             .print_stmt => blk: {

@@ -1087,6 +1087,8 @@ const Parser = struct {
         var saw_copy = false;
         var saw_drop = false;
         while (self.current.tag != .dedent and self.current.tag != .eof) {
+            try self.consumeNewlines();
+            if (self.current.tag == .dedent or self.current.tag == .eof) break;
             if (self.current.tag != .ident) return error.ExpectedIdentifier;
             const key = self.current.ident;
             const key_span = tokenSpan(self.current);
@@ -1119,10 +1121,8 @@ const Parser = struct {
                 try body.fields.types.append(self.scratch_arena.allocator(), fty);
             }
 
-            if (self.current.tag == .newline) {
+            if (self.current.tag == .newline or self.current.tag == .ident or self.current.tag == .kw_comptime) {
                 try self.consumeNewlines();
-            } else if (self.current.tag != .dedent) {
-                return error.UnexpectedToken;
             }
         }
         try self.expect(.dedent, error.ExpectedIndent);
@@ -1280,13 +1280,21 @@ const Parser = struct {
         const node = try self.parseTypeUnionExpr();
         if (self.current.tag == .assign) {
             const node_tag = self.builder.nodes.items[node].tag;
-            if (node_tag != .var_ref) return error.UnexpectedToken;
-            const name_idx = self.builder.nodes.items[node].data0;
-            const name = self.builder.identOf(name_idx);
-            try self.advance();
-            const value = try self.parseExpression();
-            const span = coverSpans(try self.spanOf(node), try self.spanOf(value));
-            return self.makeAssignNode(name, value, span);
+            if (node_tag == .var_ref) {
+                const name_idx = self.builder.nodes.items[node].data0;
+                const name = self.builder.identOf(name_idx);
+                try self.advance();
+                const value = try self.parseExpression();
+                const span = coverSpans(try self.spanOf(node), try self.spanOf(value));
+                return self.makeAssignNode(name, value, span);
+            }
+            if (node_tag == .field_access) {
+                try self.advance();
+                const value = try self.parseExpression();
+                const span = coverSpans(try self.spanOf(node), try self.spanOf(value));
+                return self.allocNode(.field_assign, node, value, span);
+            }
+            return error.UnexpectedToken;
         }
         return node;
     }
@@ -1520,10 +1528,10 @@ const Parser = struct {
         const dot_span = tokenSpan(self.current);
         try self.expect(.dot, error.UnexpectedToken);
         if (self.current.tag != .ident) return error.ExpectedIdentifier;
+        const field_name_span = tokenSpan(self.current);
         const field_name = self.current.ident;
         try self.advance();
-        const end_span = tokenSpan(self.current);
-        return self.makeFieldAccessNode(target, field_name, coverSpans(dot_span, end_span));
+        return self.makeFieldAccessNode(target, field_name, coverSpans(dot_span, field_name_span));
     }
 
     fn parseStructExpr(self: *@This(), start_span: ast.Span) ParseError!NodeIdx {

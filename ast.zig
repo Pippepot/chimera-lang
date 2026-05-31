@@ -16,6 +16,7 @@ pub const Tag = enum(u8) {
     var_ref,
     var_decl,
     assign,
+    field_assign,
     const_decl,
     return_stmt,
     call,

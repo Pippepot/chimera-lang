@@ -463,6 +463,7 @@ fn writeFunction(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, func: ir_mod.F
     try appendU32(buf, gpa, func.name);
     try appendU32(buf, gpa, func.entry);
     try writeType(buf, gpa, func.ret_type);
+    try appendU32(buf, gpa, func.ret_slots);
     try appendU32(buf, gpa, func.next_value);
     try appendU32(buf, gpa, @intCast(func.param_values.items.len));
     for (func.param_values.items) |pv| try appendU32(buf, gpa, pv);
@@ -475,6 +476,7 @@ fn readFunction(r: *Reader, gpa: std.mem.Allocator) LoadError!ir_mod.Function {
     const name = try r.readU32();
     const entry = try r.readU32();
     const ret_type = try readType(r);
+    const ret_slots = try r.readU32();
     const next_value = try r.readU32();
     const pv_count = try r.readU32();
     var param_values = try std.ArrayList(ir_mod.ValueRef).initCapacity(gpa, pv_count);
@@ -501,6 +503,7 @@ fn readFunction(r: *Reader, gpa: std.mem.Allocator) LoadError!ir_mod.Function {
         .next_value = next_value,
         .param_values = param_values,
         .ret_type = ret_type,
+        .ret_slots = ret_slots,
     };
 }
 

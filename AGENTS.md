@@ -64,10 +64,15 @@
 - **Policy RHS forms:** `trivial`, `fieldwise`, `none` (`move/copy`), `explicit` (`drop`), named hook functions, and inline `func` hooks (`->` one-line or indented body).
 - **Struct init:** `TypeName{field1 = expr, field2 = expr, ...}`. Must provide all fields in order; field count and names are checked by the typechecker.
 - **Field access:** `expr.fieldName`. The expression must be of a named struct type.
+- **Field assignment:** `p.x = expr` is supported for `var` variables and `mut` parameters. Uses `store` for local slots and `store_ptr` with offset for borrowed pointers. Chained field access (`a.b.c = val`) resolves the full slot offset through the chain.
+- **IR fields added:**
+  - `field_assign` AST tag in `ast.zig` stores `data0 = field_access_node, data1 = value_expr`.
+  - `Function.ret_slots: u32` in `ir.zig` stores the return value slot count explicitly (not inferred from IR `Type`, which loses struct field count).
 - **IR lowering:**
   - `var`/`const` with a `struct_init` value allocates N consecutive stack slots (one per field) and emits `store` for each field value.
   - Field access for index 0 returns the base slot directly. For higher indices it emits `field_load(base, field_index)` which loads from slot `base + field_index`.
-- **Structs in function args/returns** are supported and participate in ownership-mode lowering.
+  - Field assignment uses `store_ptr` for `borrowed_ptr` bindings and `store` for `local_slot` bindings.
+- **Structs in function args/returns** are supported and participate in ownership-mode lowering. Multi-slot struct return uses R10 hidden pointer convention (caller sets R10 to return slot area before call, callee stores through R10-relative offsets).
 
 ## Ownership MVP
 

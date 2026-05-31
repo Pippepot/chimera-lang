@@ -1324,7 +1324,21 @@ test "drop explicit is satisfied by deinit parameter call" {
     , "7\n");
 }
 
-test "deinit parameter ownership cannot be transferred again" {
+test "deinit-to-deinit transfer is allowed" {
+    try testProgram(
+        \\comptime D = struct
+        \\  drop = explicit
+        \\  x: int
+        \\comptime consume = func(deinit d: D) unit
+        \\  print(d.x)
+        \\comptime bad = func(deinit d: D) unit
+        \\  consume(d)
+        \\const d = D{x = 5}
+        \\bad(d)
+    , "5\n");
+}
+
+test "deinit-owned value cannot be transferred to var parameter" {
     var db = query.QueryDb.init(testing.allocator);
     defer db.deinit();
 
@@ -1334,8 +1348,10 @@ test "deinit parameter ownership cannot be transferred again" {
         \\  x: int
         \\comptime consume = func(deinit d: D) unit
         \\  print(d.x)
-        \\comptime bad = func(deinit d: D) unit
+        \\comptime take = func(var d: D) unit
         \\  consume(d)
+        \\comptime bad = func(deinit d: D) unit
+        \\  take(d)
         \\const d = D{x = 1}
         \\bad(d)
     );
@@ -1355,6 +1371,404 @@ test "ownership hook signature mismatch is diagnosed" {
         \\print(s.x)
     );
     try expectCompileErrorContains(&db, 0, "ownership hook function signature mismatch");
+}
+
+test "regression: multi-field struct return from function works" {
+    try testProgram(
+        \\comptime Point = struct
+        \\  x: int
+        \\  y: int
+        \\comptime make = func(x: int, y: int) Point
+        \\  return Point{x = x, y = y}
+        \\const pt = make(3, 4)
+        \\print(pt.x)
+        \\print(pt.y)
+    , "3\n4\n");
+    try testProgram(
+        \\comptime Tri = struct
+        \\  a: int
+        \\  b: int
+        \\  c: int
+        \\comptime make = func(a: int, b: int, c: int) Tri
+        \\  return Tri{a = a, b = b, c = c}
+        \\const t = make(10, 20, 30)
+        \\print(t.a)
+        \\print(t.b)
+        \\print(t.c)
+    , "10\n20\n30\n");
+}
+
+test "regression: drop func indented body followed by field parses" {
+    try testProgram(
+        \\comptime D = struct
+        \\  drop = func(deinit self: D) unit -> print(77)
+        \\  x: int
+        \\comptime consume = func(deinit d: D) unit
+        \\  print(d.x)
+        \\const d = D{x = 5}
+        \\consume(d)
+    , "5\n");
+    try testProgram(
+        \\comptime D = struct
+        \\  x: int
+        \\  drop = func(deinit self: D) unit
+        \\    print(99)
+        \\comptime consume = func(deinit d: D) unit
+        \\  print(d.x)
+        \\const d = D{x = 3}
+        \\consume(d)
+    , "3\n");
+}
+
+test "regression: field assignment p.x = expr works" {
+    try testProgram(
+        \\comptime Point = struct
+        \\  x: int
+        \\  y: int
+        \\comptime set_x = func(mut p: Point, val: int) unit
+        \\  p.x = val
+        \\var pt = Point{x = 1, y = 2}
+        \\set_x(pt, 99)
+        \\print(pt.x)
+    , "99\n");
+}
+
+test "regression: nested field assignment a.b.c = expr works" {
+    try testProgram(
+        \\comptime Inner = struct
+        \\  v: int
+        \\comptime Outer = struct
+        \\  inner: Inner
+        \\  tag: int
+        \\comptime set = func(mut o: Outer, val: int) unit
+        \\  o.inner.v = val
+        \\var o = Outer{inner = Inner{v = 1}, tag = 2}
+        \\set(o, 99)
+        \\print(o.inner.v)
+    , "99\n");
+}
+
+test "regression: field_access as last statement in function body" {
+    try testProgram(
+        \\comptime A = struct
+        \\  x: int
+        \\comptime f = func(a: A) int
+        \\  a.x
+        \\print(42)
+    , "42\n");
+    try testProgram(
+        \\comptime A = struct
+        \\  x: int
+        \\comptime f = func(a: A) int
+        \\  return a.x
+        \\comptime g = func(a: A) int
+        \\  return a.x
+        \\print(99)
+    , "99\n");
+}
+
+test "regression: if-const with comparison works" {
+    try testProgram(
+        \\if const p = 1 < 2
+        \\  print(11)
+        \\else
+        \\  print(22)
+    , "11\n");
+    try testProgram(
+        \\if const p = 1 == 2
+        \\  print(11)
+        \\else
+        \\  print(22)
+    , "22\n");
+}
+
+test "regression: monomorphized function with comptime type param in return type" {
+    try testProgram(
+        \\comptime wrap = func(comptime T: type, var x: T) T
+        \\  return x
+        \\const w = wrap(int, 42)
+        \\print(w)
+    , "42\n");
+    try testProgram(
+        \\comptime wrap = func(comptime T: type, var x: T) T
+        \\  return x
+        \\comptime W = struct
+        \\  v: int
+        \\const w = wrap(W, W{v = 99})
+        \\print(w.v)
+    , "99\n");
+}
+
+test "regression: deinit-to-deinit chain works" {
+    try testProgram(
+        \\comptime D = struct
+        \\  drop = explicit
+        \\  x: int
+        \\comptime inner = func(deinit d: D) unit
+        \\  print(d.x)
+        \\comptime outer = func(deinit d: D) unit
+        \\  inner(d)
+        \\const d = D{x = 7}
+        \\outer(d)
+    , "7\n");
+}
+
+test "regression: mut writeback with multi-field struct" {
+    try testProgram(
+        \\comptime Point = struct
+        \\  x: int
+        \\  y: int
+        \\comptime set_both = func(mut p: Point) unit
+        \\  p = Point{x = 10, y = 20}
+        \\var pt = Point{x = 1, y = 2}
+        \\set_both(pt)
+        \\print(pt.x)
+        \\print(pt.y)
+    , "10\n20\n");
+}
+
+test "regression: swap via mut params and field assignment" {
+    try testProgram(
+        \\comptime Pair = struct
+        \\  first: int
+        \\  second: int
+        \\comptime swap = func(mut p: Pair) unit
+        \\  const tmp = p.first
+        \\  p.first = p.second
+        \\  p.second = tmp
+        \\var p = Pair{first = 10, second = 20}
+        \\swap(p)
+        \\print(p.first)
+        \\print(p.second)
+    , "20\n10\n");
+}
+
+test "error: arithmetic operands must have the same type" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+    try db.setSource(0, "print(1 + 2.0)");
+    try expectCompileErrorContains(&db, 0, "arithmetic operands must have the same type");
+}
+
+test "error: arithmetic requires int or float operands" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+    try db.setSource(0, "print(true + 1)");
+    try expectCompileErrorContains(&db, 0, "arithmetic requires int or float operands");
+}
+
+test "error: as operand not variant" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+    try db.setSource(0,
+        \\const x = 1
+        \\if x as float
+        \\  print(1)
+    );
+    try expectCompileErrorContains(&db, 0, "left side of 'as' must be a variant type");
+}
+
+test "error: as type not in variant" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+    try db.setSource(0,
+        \\comptime V = int | float
+        \\var v: V = 1.0
+        \\if v as bool
+        \\  print(1)
+    );
+    try expectCompileErrorContains(&db, 0, "right side of 'as' is not a member of the variant type");
+}
+
+test "error: assign to const symbol" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+    try db.setSource(0,
+        \\const x = 1
+        \\x = 2
+    );
+    try expectCompileErrorContains(&db, 0, "cannot assign to const symbol");
+}
+
+test "error: assignment type mismatch" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+    try db.setSource(0,
+        \\var x: int = 1
+        \\x = 2.0
+    );
+    try expectCompileErrorContains(&db, 0, "assignment type mismatch");
+}
+
+test "error: call target not function" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+    try db.setSource(0,
+        \\const x = 1
+        \\x(2)
+    );
+    try expectCompileErrorContains(&db, 0, "call target is not a function value");
+}
+
+test "error: comparison operands must have the same type" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+    try db.setSource(0, "if 1 < 2.0\n  print(1)");
+    try expectCompileErrorContains(&db, 0, "comparison operands must have the same type");
+}
+
+test "error: comparison requires numeric" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+    try db.setSource(0, "if true < false\n  print(1)");
+    try expectCompileErrorContains(&db, 0, "comparison requires int or float operands");
+}
+
+test "if branches variant type (no error — if returns variant)" {
+    try testProgram(
+        \\if 1 < 2
+        \\  1
+        \\else
+        \\  2.0
+        \\print(42)
+    , "42\n");
+}
+
+test "error: equality operands must have the same type" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+    try db.setSource(0, "if 1 == 2.0\n  print(1)");
+    try expectCompileErrorContains(&db, 0, "equality operands must have the same type");
+}
+
+test "error: equality unsupported type" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+    try db.setSource(0,
+        \\comptime A = struct
+        \\  x: int
+        \\const a = A{x = 1}
+        \\if a == a
+        \\  print(1)
+    );
+    try expectCompileErrorContains(&db, 0, "equality is not supported for this type");
+}
+
+test "error: fallible outside fallible context" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+    try db.setSource(0, "print(1 < 2)");
+    try expectCompileErrorContains(&db, 0, "Fallible expression is not allowed outside fallible context");
+}
+
+test "error: function body type mismatch" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+    try db.setSource(0,
+        \\comptime f = func() int
+        \\  1.0
+    );
+    try expectCompileErrorContains(&db, 0, "function body type does not match declared return type");
+}
+
+
+test "error: if without else must have unit then-branch" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+    try db.setSource(0,
+        \\if 1 < 2
+        \\  1
+    );
+    try expectCompileErrorContains(&db, 0, "if without else must have unit then-branch");
+}
+
+test "error: invalid borrow argument" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+    try db.setSource(0,
+        \\comptime f = func(mut x: int) unit
+        \\  x = x + 1
+        \\f(1 + 2)
+    );
+    try expectCompileErrorContains(&db, 0, "borrow argument must be a variable reference");
+}
+
+test "error: move borrowed value" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+    try db.setSource(0,
+        \\comptime f = func(x: int) int
+        \\  return x
+    );
+    try expectCompileErrorContains(&db, 0, "cannot move a borrowed value");
+}
+
+test "error: mutate const" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+    try db.setSource(0,
+        \\comptime f = func(mut x: int) unit
+        \\  x = x + 1
+        \\const n = 1
+        \\f(n)
+    );
+    try expectCompileErrorContains(&db, 0, "cannot mutate a const variable");
+}
+
+test "error: move not allowed for type" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+    try db.setSource(0,
+        \\comptime Id = struct
+        \\  move = none
+        \\  copy = none
+        \\  x: int
+        \\comptime V = int | Id
+        \\var v: V = 1
+        \\var w = v^
+    );
+    try expectCompileErrorContains(&db, 0, "move is not allowed for this type");
+}
+
+test "error: print unit value" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+    try db.setSource(0,
+        \\const x = if 1 < 2
+        \\  print(0)
+        \\else
+        \\  print(0)
+        \\print(x)
+    );
+    try expectCompileErrorContains(&db, 0, "cannot print a unit value");
+}
+
+test "error: recursive struct types" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+    try db.setSource(0,
+        \\comptime S = struct
+        \\  w: W
+        \\comptime W = struct
+        \\  s: S
+    );
+    try expectCompileErrorContains(&db, 0, "recursive struct types are not supported");
+}
+
+test "error: use after deinit" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+    try db.setSource(0,
+        \\comptime D = struct
+        \\  drop = explicit
+        \\  x: int
+        \\comptime consume = func(deinit d: D) unit
+        \\  print(d.x)
+        \\const d = D{x = 1}
+        \\consume(d)
+        \\print(d.x)
+    );
+    try expectCompileErrorContains(&db, 0, "use after deinit");
 }
 
 test "comments are ignored by parser" {

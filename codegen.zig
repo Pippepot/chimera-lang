@@ -513,14 +513,10 @@ const BinaryEmitter = struct {
         }
     }
 
-    fn emitFunctionReturn(self: *@This(), value_ref: InstRef, ret_type: ir_mod.Type) !void {
-        const slot_count = switch (ret_type) {
-            .variant => |slots| slots,
-            else => 1,
-        };
-        if (slot_count > 1) {
+    fn emitFunctionReturn(self: *@This(), value_ref: InstRef, ret_slots: u32) !void {
+        if (ret_slots > 1) {
             var i: u32 = 0;
-            while (i < slot_count) : (i += 1) {
+            while (i < ret_slots) : (i += 1) {
                 try self.emitLoadRaxFromSlot(value_ref + i);
                 try self.emitStoreRaxToR10Offset32(i * 8);
             }
@@ -712,12 +708,12 @@ const BinaryEmitter = struct {
         block_symbols: []const u32,
         block_params: []const ?InstRef,
         block_param_widths: []const u32,
-        ret_type: ir_mod.Type,
+        ret_slots: u32,
     ) !void {
         switch (term) {
             .br => |branch| try self.emitBranch(branch, block_symbols, block_params, block_param_widths),
             .pbr => |pbr| try self.emitPredicateBranch(pbr, block_symbols, block_params, block_param_widths),
-            .ret => |value_ref| try self.emitFunctionReturn(value_ref, ret_type),
+            .ret => |value_ref| try self.emitFunctionReturn(value_ref, ret_slots),
         }
     }
 
@@ -728,12 +724,12 @@ const BinaryEmitter = struct {
         block_symbols: []const u32,
         block_params: []const ?InstRef,
         block_param_widths: []const u32,
-        ret_type: ir_mod.Type,
+        ret_slots: u32,
     ) !void {
         self.bindSymbol(symbol);
         for (block.insts.items) |value_inst| try self.emitValueInst(value_inst);
         const terminator = block.terminator orelse unreachable;
-        try self.emitTerm(terminator, block_symbols, block_params, block_param_widths, ret_type);
+        try self.emitTerm(terminator, block_symbols, block_params, block_param_widths, ret_slots);
     }
 
     fn emitFunction(self: *@This(), func: *const Function) !void {
@@ -755,7 +751,7 @@ const BinaryEmitter = struct {
         }
 
         for (func.blocks.items, 0..) |block, block_idx| {
-            try self.emitBlock(block, layout.block_symbols[block_idx], layout.block_symbols, block_params, block_param_widths, func.ret_type);
+            try self.emitBlock(block, layout.block_symbols[block_idx], layout.block_symbols, block_params, block_param_widths, func.ret_slots);
         }
     }
 
@@ -765,10 +761,7 @@ const BinaryEmitter = struct {
         try self.emitLeaR15RspPlus8();
 
         const entry_fn = &self.prog.functions.items[self.prog.entry];
-        const ret_slot_count: u32 = switch (entry_fn.ret_type) {
-            .variant => |slots| slots,
-            else => 1,
-        };
+        const ret_slot_count: u32 = entry_fn.ret_slots;
         if (ret_slot_count > 1) {
             try self.emitSubRspImm32(ret_slot_count * 8);
             try self.emitLeaR10RspOffset(0);

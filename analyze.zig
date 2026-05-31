@@ -139,14 +139,17 @@ pub const TypeError = error{
     AsTypeNotInVariant,
     OwnershipCopyNotAllowed,
     OwnershipMoveNotAllowed,
+    MoveBorrowedValue,
     UseAfterMove,
     UseAfterDeinit,
     StableIdentityTransfer,
     DeinitNotSatisfied,
     HookSignatureMismatch,
     StructPolicyIncompatible,
+    RecursiveStruct,
     InvalidBorrowArgument,
     InvalidDeinitTransfer,
+    MutateConst,
 };
 
 pub const ResolvedField = struct {
@@ -277,14 +280,17 @@ pub fn typeErrorMessage(kind: TypeError) []const u8 {
         error.AsTypeNotInVariant => "right side of 'as' is not a member of the variant type",
         error.OwnershipCopyNotAllowed => "copy is not allowed for this type",
         error.OwnershipMoveNotAllowed => "move is not allowed for this type",
+        error.MoveBorrowedValue => "cannot move a borrowed value; the value is not owned",
         error.UseAfterMove => "use after move",
         error.UseAfterDeinit => "use after deinit",
         error.StableIdentityTransfer => "stable-identity value cannot be transferred",
         error.DeinitNotSatisfied => "deinit ownership must be consumed before function return",
         error.HookSignatureMismatch => "ownership hook function signature mismatch",
         error.StructPolicyIncompatible => "struct ownership policy is incompatible with field policies",
+        error.RecursiveStruct => "recursive struct types are not supported",
         error.InvalidBorrowArgument => "borrow argument must be a variable reference",
         error.InvalidDeinitTransfer => "deinit-owned value cannot be transferred except to deinit parameter",
+        error.MutateConst => "cannot mutate a const variable; 'mut' parameter requires a mutable variable",
     };
 }
 
@@ -475,13 +481,16 @@ const Binding = struct {
                         else => return self.failAtType(type_idx, error.ComptimeValueNotAType),
                     }
                 }
-                if (self.typed.comptime_values.get(name)) |cv| {
-                    switch (cv) {
-                        .type_value => |ty| return ty,
-                        .struct_type => return .{ .named = name },
-                        else => return self.failAtType(type_idx, error.ComptimeValueNotAType),
-                    }
+            if (self.typed.comptime_values.get(name)) |cv| {
+                switch (cv) {
+                    .type_value => |ty| return ty,
+                    .struct_type => |decl_idx| {
+                        const struct_name = self.parsed.ast.identOf(self.parsed.ast.nodes[decl_idx].data0);
+                        return .{ .named = struct_name };
+                    },
+                    else => return self.failAtType(type_idx, error.ComptimeValueNotAType),
                 }
+            }
                 return self.failAtType(type_idx, error.UnknownType);
             },
             .type_func => {
@@ -528,6 +537,22 @@ const Binding = struct {
         return false;
     }
 
+    fn retTypeReferencesComptimeParam(self: *const @This(), func_decl_idx: ast.NodeIdx) bool {
+        const a = self.parsed.ast;
+        const ret_ty = a.fnRetType(func_decl_idx);
+        if (a.nodes[ret_ty].tag != .type_name) return false;
+        const tname = a.identOf(a.nodes[ret_ty].data0);
+        const mask = a.fnComptimeMask(func_decl_idx);
+        for (a.fnParams(func_decl_idx), 0..) |other_param, other_idx| {
+            if (other_idx >= 32) break;
+            if (mask & (@as(u32, 1) << @intCast(other_idx)) != 0) {
+                const other_name = a.identOf(other_param.name);
+                if (std.mem.eql(u8, tname, other_name)) return true;
+            }
+        }
+        return false;
+    }
+
     fn setupFunctionSignatures(self: *@This()) InferError!void {
         const a = self.parsed.ast;
         const fn_count = self.resolved.functions.items.len;
@@ -548,7 +573,10 @@ const Binding = struct {
                     try param_types.append(self.gpa, try self.resolveTypeNode(param.ty));
                 }
             }
-            const ret_ty = try self.resolveTypeNode(a.fnRetType(func_decl_idx));
+            const ret_ty = if (self.retTypeReferencesComptimeParam(func_decl_idx))
+                .type_type
+            else
+                try self.resolveTypeNode(a.fnRetType(func_decl_idx));
             const fn_ty = try self.allocFuncType(param_types.items, ret_ty);
             const param_modes = try self.runtimeParamModes(func_decl_idx);
             if (a.comptimeFnAnnotation(func_decl_idx)) |annot| {
@@ -782,7 +810,10 @@ const Binding = struct {
 
     fn computeOwnershipForNamed(self: *@This(), name: []const u8) InferError!OwnershipSpec {
         if (self.typed.ownership_specs.get(name)) |spec| return spec;
-        if (self.ownership_in_progress.contains(name)) return self.failAtNode(self.parsed.ast.entry, error.StructPolicyIncompatible);
+        if (self.ownership_in_progress.contains(name)) {
+            const decl = self.findStructDeclByName(name) orelse self.parsed.ast.entry;
+            return self.failAtNode(decl, error.RecursiveStruct);
+        }
         try self.ownership_in_progress.put(name, {});
         defer _ = self.ownership_in_progress.remove(name);
 
@@ -911,7 +942,7 @@ const Binding = struct {
                 if (!try self.copyAllowed(binding.ty)) return self.failAtNode(node_idx, error.OwnershipCopyNotAllowed);
             },
             .move => {
-                if (!binding.owned) return self.failAtNode(node_idx, error.OwnershipMoveNotAllowed);
+                if (!binding.owned) return self.failAtNode(node_idx, error.MoveBorrowedValue);
                 if (binding.param_mode == .deinit) return self.failAtNode(node_idx, error.InvalidDeinitTransfer);
                 if (!try self.moveAllowed(binding.ty)) {
                     if (try self.stableIdentity(binding.ty)) return self.failAtNode(node_idx, error.StableIdentityTransfer);
@@ -921,11 +952,10 @@ const Binding = struct {
             },
             .borrow_read => {},
             .borrow_mut => {
-                if (!binding.mutable) return self.failAtNode(node_idx, error.AssignToConst);
+                if (!binding.mutable) return self.failAtNode(node_idx, error.MutateConst);
             },
             .deinit_transfer => {
                 if (!binding.owned) return self.failAtNode(node_idx, error.InvalidDeinitTransfer);
-                if (binding.param_mode == .deinit) return self.failAtNode(node_idx, error.InvalidDeinitTransfer);
                 binding.state = .deinited;
             },
         }
@@ -1009,6 +1039,10 @@ const Binding = struct {
             .const_decl => try self.ownershipVisitDecl(idx, stack, false, current_ret),
             .var_decl => try self.ownershipVisitDecl(idx, stack, true, current_ret),
             .assign => try self.ownershipVisitAssign(idx, stack, current_ret),
+            .field_assign => {
+                try self.ownershipUseExpr(a.nodes[idx].data1, stack, .copy, current_ret);
+                try self.ownershipUseExpr(a.nodes[idx].data0, stack, .borrow_mut, current_ret);
+            },
             .return_stmt => {
                 try self.ownershipUseExpr(a.nodes[idx].data0, stack, .move, current_ret);
             },
@@ -1132,6 +1166,7 @@ const Binding = struct {
                 .const_decl => try self.ownershipVisitDecl(item, stack, false, current_ret),
                 .var_decl => try self.ownershipVisitDecl(item, stack, true, current_ret),
                 .assign => try self.ownershipVisitAssign(item, stack, current_ret),
+                .field_assign => try self.ownershipUseExpr(item, stack, .read, current_ret),
                 .return_stmt => try self.ownershipUseExpr(item, stack, .read, current_ret),
                 else => try self.ownershipUseExpr(item, stack, .read, current_ret),
             }
@@ -1461,6 +1496,23 @@ const Binding = struct {
         return self.remember(idx, .unit);
     }
 
+    fn inferFieldAssign(self: *@This(), idx: ast.NodeIdx) InferError!Type {
+        const a = self.parsed.ast;
+        const field_node = a.nodes[idx].data0;
+        const value_node = a.nodes[idx].data1;
+        _ = try self.inferFieldAccess(field_node);
+        const field_ty = self.typed.typeOf(field_node) catch return self.failAtNode(idx, error.MissingNodeType);
+        const target = a.nodes[field_node].data0;
+        if (a.nodes[target].tag == .var_ref) {
+            const name = a.identOf(a.nodes[target].data0);
+            const binding = self.lookupBinding(name) orelse return self.failAtNode(idx, error.UnknownSymbol);
+            if (!binding.mutable) return self.failAtNode(idx, error.MutateConst);
+        }
+        const value_ty = try self.inferNode(value_node);
+        if (!isAssignableTo(field_ty, value_ty)) return self.failAtNodeWithTypes(idx, error.AssignmentTypeMismatch, field_ty, value_ty);
+        return self.remember(idx, .unit);
+    }
+
     fn inferCall(self: *@This(), idx: ast.NodeIdx) InferError!Type {
         const a = self.parsed.ast;
         const callee = a.nodes[idx].data0;
@@ -1480,7 +1532,9 @@ const Binding = struct {
                             0;
                         // Only monomorphize if the function has runtime params
                         // (comptime-only functions returning type use normal comptime eval)
-                        if (mask != 0 and gen_info.ty.ret != .type_type) {
+                        const has_runtime_params = gen_info.decl != std.math.maxInt(ast.NodeIdx) and
+                            a.fnParams(gen_info.decl).len > @popCount(mask);
+                        if (mask != 0 and has_runtime_params) {
                             return self.inferMonomorphizedCall(idx, generic_fn_id, mask);
                         }
                     }
@@ -1664,6 +1718,10 @@ const Binding = struct {
             },
             .move_expr => self.clearNodeTypesInSubtree(a.nodes[idx].data0),
             .field_access => self.clearNodeTypesInSubtree(a.nodes[idx].data0),
+            .field_assign => {
+                self.clearNodeTypesInSubtree(a.nodes[idx].data0);
+                self.clearNodeTypesInSubtree(a.nodes[idx].data1);
+            },
             .comptime_expr => self.clearNodeTypesInSubtree(a.comptimeExprBody(idx)),
             .comptime_value_decl => self.clearNodeTypesInSubtree(a.comptimeValueDeclValue(idx)),
             else => {},
@@ -1839,6 +1897,27 @@ const Binding = struct {
                 if (!typeEql(value_ty, resolved.ty)) return self.failAtNodeWithTypes(idx, error.BindingTypeMismatch, resolved.ty, value_ty);
             }
             return self.remember(idx, .{ .named = si_name });
+        }
+
+        if (a.nodes[type_expr].tag == .var_ref) {
+            const tv_name = a.identOf(a.nodes[type_expr].data0);
+            if (self.typed.comptime_values.get(tv_name)) |cv| {
+                if (cv == .struct_type) {
+                    const struct_decl = cv.struct_type;
+                    const fields = a.structInitFields(idx);
+                    const decl_fields = a.structFields(struct_decl);
+                    if (fields.len != decl_fields.len) return self.failAtNode(idx, error.StructInitFieldCountMismatch);
+                    for (fields, decl_fields) |given, decl_field| {
+                        const given_name = a.identOf(given.name);
+                        const decl_field_name = a.identOf(decl_field.name);
+                        if (!std.mem.eql(u8, given_name, decl_field_name)) return self.failAtNode(idx, error.StructInitFieldNameMismatch);
+                        const field_ty = try self.resolveTypeNode(decl_field.ty);
+                        const value_ty = try self.inferNode(given.value);
+                        if (!typeEql(value_ty, field_ty)) return self.failAtNodeWithTypes(idx, error.BindingTypeMismatch, field_ty, value_ty);
+                    }
+                    return self.remember(idx, .{ .named = a.identOf(a.nodes[struct_decl].data0) });
+                }
+            }
         }
 
         return self.failAtNode(idx, error.UnknownType);
@@ -2225,6 +2304,11 @@ const Binding = struct {
                 const value = (try self.evalNodeStep(a.nodes[idx].data0, locals)).value;
                 break :blk .{ .value = value, .returned = true };
             },
+            .field_assign => blk: {
+                _ = try self.evalNodeStep(a.nodes[idx].data0, locals);
+                _ = try self.evalNodeStep(a.nodes[idx].data1, locals);
+                break :blk .{ .value = .unit, .returned = false };
+            },
             .call => blk: {
                 const callee = (try self.evalNodeStep(a.nodes[idx].data0, locals)).value;
                 const fn_id = switch (callee) {
@@ -2416,6 +2500,7 @@ const Binding = struct {
             .var_ref => self.inferVarRef(idx),
             .var_decl => self.inferDecl(idx, true),
             .assign => self.inferAssign(idx),
+            .field_assign => self.inferFieldAssign(idx),
             .const_decl => self.inferDecl(idx, false),
             .return_stmt => self.inferReturn(idx),
             .call => self.inferCall(idx),

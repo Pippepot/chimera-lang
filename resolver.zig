@@ -207,6 +207,10 @@ const Resolver = struct {
                 }
                 try self.resolveNode(ast_.nodes[idx].data1);
             },
+            .field_assign => {
+                try self.resolveNode(ast_.nodes[idx].data0);
+                try self.resolveNode(ast_.nodes[idx].data1);
+            },
             .return_stmt => try self.resolveNode(ast_.nodes[idx].data0),
             .call => {
                 try self.resolveNode(ast_.nodes[idx].data0);
