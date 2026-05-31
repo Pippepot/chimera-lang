@@ -10,8 +10,8 @@ const analyze = @import("analyze.zig");
 
 const CacheExt = ".qcache";
 const Magic: [8]u8 = .{ 'X', '8', '6', 'Q', 'C', 'A', 'C', 'H' };
-const SchemaVersion: u32 = 6;
-const CompilerAbiVersion: u32 = 3;
+const SchemaVersion: u32 = 7;
+const CompilerAbiVersion: u32 = 4;
 
 pub const CacheOptions = struct {
     cache_dir_override: ?[]const u8 = null,
@@ -271,6 +271,7 @@ fn writeType(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, ty: ir_mod.Type) !
         .unit, .bool, .int, .float, .type_type => {},
         .named => |id| try appendU32(buf, gpa, id),
         .func => |id| try appendU32(buf, gpa, id),
+        .variant => |slot_count| try appendU32(buf, gpa, slot_count),
     }
 }
 
@@ -284,6 +285,7 @@ fn readType(r: *Reader) LoadError!ir_mod.Type {
         4 => .type_type,
         5 => .{ .named = try r.readU32() },
         6 => .{ .func = try r.readU32() },
+        7 => .{ .variant = try r.readU32() },
         else => error.InvalidData,
     };
 }
@@ -400,6 +402,7 @@ fn writeBlock(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, block: ir_mod.Blo
     try appendU32(buf, gpa, block.id);
     try appendU8(buf, gpa, if (block.param != null) 1 else 0);
     if (block.param) |p| try appendU32(buf, gpa, p);
+    try appendU32(buf, gpa, block.param_width);
     try appendU32(buf, gpa, @intCast(block.insts.items.len));
     for (block.insts.items) |vinst| {
         try appendU32(buf, gpa, vinst.id);
@@ -416,6 +419,7 @@ fn writeBlock(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, block: ir_mod.Blo
 fn readBlock(r: *Reader, gpa: std.mem.Allocator) LoadError!ir_mod.Block {
     const id = try r.readU32();
     const param: ?ir_mod.ValueRef = if ((try r.readU8()) == 1) try r.readU32() else null;
+    const param_width = try r.readU32();
     const inst_count = try r.readU32();
     var insts = try std.ArrayList(ir_mod.ValueInst).initCapacity(gpa, inst_count);
     errdefer insts.deinit(gpa);
@@ -429,6 +433,7 @@ fn readBlock(r: *Reader, gpa: std.mem.Allocator) LoadError!ir_mod.Block {
     return .{
         .id = id,
         .param = param,
+        .param_width = param_width,
         .insts = insts,
         .terminator = if (has_term == 1) try readTerminator(r) else null,
     };
@@ -571,6 +576,10 @@ fn writeTcType(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, ty: analyze.Type
         .unit, .bool, .int, .float, .type_type => {},
         .named => |s| try appendBytes(buf, gpa, s),
         .func => |ft| try writeTcFuncType(buf, gpa, ft.*),
+        .variant => |variant_ty| {
+            try appendU32(buf, gpa, @intCast(variant_ty.members.len));
+            for (variant_ty.members) |member_ty| try writeTcType(buf, gpa, member_ty);
+        },
     }
 }
 
@@ -587,6 +596,17 @@ fn readTcType(r: *Reader, allocator: std.mem.Allocator) LoadError!analyze.Type {
             const ft = try allocator.create(analyze.FuncType);
             ft.* = try readTcFuncType(r, allocator);
             break :blk .{ .func = ft };
+        },
+        7 => blk: {
+            const member_count = try r.readU32();
+            const members = try allocator.alloc(analyze.Type, member_count);
+            var member_index: u32 = 0;
+            while (member_index < member_count) : (member_index += 1) {
+                members[member_index] = try readTcType(r, allocator);
+            }
+            const variant_ptr = try allocator.create(analyze.VariantType);
+            variant_ptr.* = .{ .members = members };
+            break :blk .{ .variant = variant_ptr };
         },
         else => error.InvalidData,
     };
@@ -773,6 +793,30 @@ pub fn serializeTyped(gpa: std.mem.Allocator, ta: *const analyze.AnalyzedAst) ![
         try writeTcType(&buf, gpa, entry.value_ptr.*);
     }
 
+    try appendU32(&buf, gpa, @intCast(ta.field_index.count()));
+    var fi_iter = ta.field_index.iterator();
+    while (fi_iter.next()) |entry| {
+        try appendU32(&buf, gpa, entry.key_ptr.*);
+        try appendU32(&buf, gpa, entry.value_ptr.*);
+    }
+
+    try appendU32(&buf, gpa, @intCast(ta.decl_binding_types.count()));
+    var db_iter = ta.decl_binding_types.iterator();
+    while (db_iter.next()) |entry| {
+        try appendU32(&buf, gpa, entry.key_ptr.*);
+        try writeTcType(&buf, gpa, entry.value_ptr.*);
+    }
+
+    try appendU32(&buf, gpa, @intCast(ta.is_variant_tags.count()));
+    var iv_iter = ta.is_variant_tags.iterator();
+    while (iv_iter.next()) |entry| {
+        try appendU32(&buf, gpa, entry.key_ptr.*);
+        try appendU32(&buf, gpa, @intCast(entry.value_ptr.*.len));
+        for (entry.value_ptr.*) |tag_value| {
+            try appendU32(&buf, gpa, tag_value);
+        }
+    }
+
     try appendU32(&buf, gpa, @intCast(ta.comptime_node_values.count()));
     var cn_iter = ta.comptime_node_values.iterator();
     while (cn_iter.next()) |entry| {
@@ -811,6 +855,38 @@ pub fn deserializeTyped(gpa: std.mem.Allocator, data: []const u8, parse_ast: *co
         const node_idx = try r.readU32();
         const ty = try readTcType(&r, arena_alloc);
         ta.node_types.putAssumeCapacity(node_idx, ty);
+    }
+
+    const fi_count = try r.readU32();
+    try ta.field_index.ensureUnusedCapacity(fi_count);
+    var fii: u32 = 0;
+    while (fii < fi_count) : (fii += 1) {
+        const node_idx = try r.readU32();
+        const field_idx = try r.readU32();
+        ta.field_index.putAssumeCapacity(node_idx, field_idx);
+    }
+
+    const db_count = try r.readU32();
+    try ta.decl_binding_types.ensureUnusedCapacity(db_count);
+    var dbi: u32 = 0;
+    while (dbi < db_count) : (dbi += 1) {
+        const node_idx = try r.readU32();
+        const ty = try readTcType(&r, arena_alloc);
+        ta.decl_binding_types.putAssumeCapacity(node_idx, ty);
+    }
+
+    const iv_count = try r.readU32();
+    try ta.is_variant_tags.ensureUnusedCapacity(iv_count);
+    var ivi: u32 = 0;
+    while (ivi < iv_count) : (ivi += 1) {
+        const node_idx = try r.readU32();
+        const tag_count = try r.readU32();
+        const tags = try arena_alloc.alloc(u32, tag_count);
+        var ti: u32 = 0;
+        while (ti < tag_count) : (ti += 1) {
+            tags[ti] = try r.readU32();
+        }
+        ta.is_variant_tags.putAssumeCapacity(node_idx, tags);
     }
 
     const cn_count = try r.readU32();

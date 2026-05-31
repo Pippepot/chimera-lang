@@ -44,6 +44,7 @@ const TokenTag = enum {
     kw_comptime,
     kw_func,
     kw_struct,
+    kw_is,
     kw_and,
     kw_or,
     ident,
@@ -69,6 +70,7 @@ const TokenTag = enum {
     l_brace,
     r_brace,
     dot,
+    pipe,
 };
 
 const Token = struct {
@@ -176,6 +178,7 @@ const Lexer = struct {
         if (std.mem.eql(u8, word, "comptime")) return .{ .tag = .kw_comptime, .start = start, .end = self.index };
         if (std.mem.eql(u8, word, "func")) return .{ .tag = .kw_func, .start = start, .end = self.index };
         if (std.mem.eql(u8, word, "struct")) return .{ .tag = .kw_struct, .start = start, .end = self.index };
+        if (std.mem.eql(u8, word, "is")) return .{ .tag = .kw_is, .start = start, .end = self.index };
         if (std.mem.eql(u8, word, "and")) return .{ .tag = .kw_and, .start = start, .end = self.index };
         if (std.mem.eql(u8, word, "or")) return .{ .tag = .kw_or, .start = start, .end = self.index };
         return .{ .tag = .ident, .start = start, .end = self.index, .ident = word };
@@ -258,6 +261,7 @@ const Lexer = struct {
             ':' => .{ .tag = .colon, .start = start, .end = self.index },
             ',' => .{ .tag = .comma, .start = start, .end = self.index },
             '.' => .{ .tag = .dot, .start = start, .end = self.index },
+            '|' => .{ .tag = .pipe, .start = start, .end = self.index },
             '#' => {
                 while (self.index < self.source.len and self.source[self.index] != '\n') {
                     self.index += 1;
@@ -601,6 +605,11 @@ const Parser = struct {
         return self.allocNode(.field_access, target, field_idx, span);
     }
 
+    fn makeIsNode(self: *@This(), lhs: NodeIdx, rhs_type: ast.TypeIdx) !NodeIdx {
+        const span = coverSpans(try self.spanOf(lhs), try self.spanOf(rhs_type));
+        return self.allocNode(.is, lhs, rhs_type, span);
+    }
+
     fn makeBinop(self: *@This(), tag: BinTag, left: NodeIdx, right: NodeIdx) !NodeIdx {
         const node_tag: Tag = switch (tag) {
             .add => .add,
@@ -618,6 +627,18 @@ const Parser = struct {
         };
         const span = coverSpans(try self.spanOf(left), try self.spanOf(right));
         return self.allocNode(node_tag, left, right, span);
+    }
+
+    fn makeVariantTypeNode(self: *@This(), members: []const ast.TypeIdx) !NodeIdx {
+        const extra_idx = try self.builder.allocExtraSlice(members);
+        const span = coverSpans(try self.spanOf(members[0]), try self.spanOf(members[members.len - 1]));
+        return self.allocNode(.type_variant, extra_idx, @intCast(members.len), span);
+    }
+
+    fn makeTypeUnionNode(self: *@This(), members: []const NodeIdx) !NodeIdx {
+        const extra_idx = try self.builder.allocExtraSlice(members);
+        const span = coverSpans(try self.spanOf(members[0]), try self.spanOf(members[members.len - 1]));
+        return self.allocNode(.type_union, extra_idx, @intCast(members.len), span);
     }
 
     fn maxI32PlusOne() u32 {
@@ -890,7 +911,7 @@ const Parser = struct {
         return self.allocNode(.comptime_struct, name_idx, data1, span);
     }
 
-    fn parseType(self: *@This()) ParseError!u32 {
+    fn parseTypePrimary(self: *@This()) ParseError!u32 {
         switch (self.current.tag) {
             .ident => {
                 const span = tokenSpan(self.current);
@@ -932,6 +953,20 @@ const Parser = struct {
             },
             else => return error.ExpectedType,
         }
+    }
+
+    fn parseType(self: *@This()) ParseError!u32 {
+        const first = try self.parseTypePrimary();
+        if (self.current.tag != .pipe) return first;
+
+        var members = std.ArrayList(u32).empty;
+        try members.append(self.scratch_arena.allocator(), first);
+        while (self.current.tag == .pipe) {
+            try self.advance();
+            const next_member = try self.parseTypePrimary();
+            try members.append(self.scratch_arena.allocator(), next_member);
+        }
+        return self.makeVariantTypeNode(members.items);
     }
 
     const BindingKind = enum { const_kind, var_kind };
@@ -990,7 +1025,7 @@ const Parser = struct {
     }
 
     fn parseExpression(self: *@This()) ParseError!NodeIdx {
-        const node = try self.parseOr();
+        const node = try self.parseTypeUnionExpr();
         if (self.current.tag == .assign) {
             const node_tag = self.builder.nodes.items[node].tag;
             if (node_tag != .var_ref) return error.UnexpectedToken;
@@ -1002,6 +1037,20 @@ const Parser = struct {
             return self.makeAssignNode(name, value, span);
         }
         return node;
+    }
+
+    fn parseTypeUnionExpr(self: *@This()) ParseError!NodeIdx {
+        const first = try self.parseOr();
+        if (self.current.tag != .pipe) return first;
+
+        var members = std.ArrayList(NodeIdx).empty;
+        try members.append(self.scratch_arena.allocator(), first);
+        while (self.current.tag == .pipe) {
+            try self.advance();
+            const next_member = try self.parseOr();
+            try members.append(self.scratch_arena.allocator(), next_member);
+        }
+        return self.makeTypeUnionNode(members.items);
     }
 
     fn parseReturn(self: *@This()) ParseError!NodeIdx {
@@ -1056,7 +1105,32 @@ const Parser = struct {
     }
 
     fn parseComparison(self: *@This()) ParseError!NodeIdx {
-        return self.parseBinary(&.{ .{ .token = .lt, .tag = .lt }, .{ .token = .gt, .tag = .gt }, .{ .token = .le, .tag = .le }, .{ .token = .ge, .tag = .ge }, .{ .token = .eq_eq, .tag = .eq }, .{ .token = .ne, .tag = .ne } }, &Parser.parseAdditive);
+        var lhs = try self.parseAdditive();
+        while (true) {
+            switch (self.current.tag) {
+                .lt, .gt, .le, .ge, .eq_eq, .ne => {
+                    const op_tag: BinTag = switch (self.current.tag) {
+                        .lt => .lt,
+                        .gt => .gt,
+                        .le => .le,
+                        .ge => .ge,
+                        .eq_eq => .eq,
+                        .ne => .ne,
+                        else => unreachable,
+                    };
+                    try self.advance();
+                    const rhs = try self.parseAdditive();
+                    lhs = try self.makeBinop(op_tag, lhs, rhs);
+                },
+                .kw_is => {
+                    try self.advance();
+                    const rhs_type = try self.parseType();
+                    lhs = try self.makeIsNode(lhs, rhs_type);
+                },
+                else => break,
+            }
+        }
+        return lhs;
     }
 
     fn parseAnd(self: *@This()) ParseError!NodeIdx {

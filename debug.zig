@@ -137,7 +137,7 @@ fn writeAstLabel(writer: *std.Io.Writer, a: *const ast.Ast, idx: ast.NodeIdx) vo
         .var_ref => writer.print("var {s}", .{a.identOf(node.data0)}) catch return,
         .const_decl, .var_decl => writer.print("{s} {s}", .{ @tagName(node.tag), a.identOf(node.data0) }) catch return,
         .assign => writer.print("assign {s}", .{a.identOf(node.data0)}) catch return,
-        .call, .return_stmt, .print_stmt, .add, .sub, .mul, .div, .lt, .gt, .le, .ge, .eq, .ne, .@"and", .@"or", .if_stmt, .block, .field_access, .comptime_expr, .struct_expr, .unit_lit => writer.print("{s}", .{@tagName(node.tag)}) catch return,
+        .call, .return_stmt, .print_stmt, .add, .sub, .mul, .div, .lt, .gt, .le, .ge, .eq, .ne, .is, .@"and", .@"or", .if_stmt, .block, .field_access, .comptime_expr, .struct_expr, .type_union, .unit_lit => writer.print("{s}", .{@tagName(node.tag)}) catch return,
         .arg => writer.print("arg {d}", .{node.data0}) catch return,
         .struct_init => {
             const type_expr = a.structInitTypeExpr(idx);
@@ -149,7 +149,7 @@ fn writeAstLabel(writer: *std.Io.Writer, a: *const ast.Ast, idx: ast.NodeIdx) vo
         },
         .bool_lit => writer.print("bool {s}", .{if (node.data0 != 0) "true" else "false"}) catch return,
         .comptime_value_decl => writer.print("comptime_decl {s}", .{a.identOf(node.data0)}) catch return,
-        .type_name, .type_func, .comptime_fn, .comptime_struct => {},
+        .type_name, .type_func, .type_variant, .comptime_fn, .comptime_struct => {},
     }
 }
 
@@ -210,6 +210,12 @@ fn dumpAstNode(a: *const ast.Ast, idx: ast.NodeIdx, writer: *std.Io.Writer, pref
             dumpAstNode(a, a.nodes[idx].data0, writer, next_prefix, false, false);
             dumpAstNode(a, a.nodes[idx].data1, writer, next_prefix, true, false);
         },
+        .is => {
+            dumpAstNode(a, a.isLhs(idx), writer, next_prefix, false, false);
+            writer.print("{s}└─type ", .{next_prefix}) catch return;
+            dumpTypeNode(a, a.isRhsType(idx), writer);
+            writer.writeAll("\n") catch return;
+        },
         .if_stmt => {
             const id = a.ifData(idx);
             if (id.else_ != std.math.maxInt(ast.NodeIdx)) {
@@ -245,8 +251,14 @@ fn dumpAstNode(a: *const ast.Ast, idx: ast.NodeIdx, writer: *std.Io.Writer, pref
                 writer.writeAll("\n") catch return;
             }
         },
+        .type_union => {
+            const members = a.typeUnionMembers(idx);
+            for (members, 0..) |member, i| {
+                dumpAstNode(a, member, writer, next_prefix, i + 1 == members.len, false);
+            }
+        },
         .int_lit, .float_lit, .var_ref, .arg, .bool_lit, .unit_lit => {},
-        .type_name, .type_func, .comptime_fn, .comptime_struct => {},
+        .type_name, .type_func, .type_variant, .comptime_fn, .comptime_struct => {},
     }
 }
 
@@ -262,6 +274,13 @@ fn dumpTypeNode(a: *const ast.Ast, type_idx: ast.TypeIdx, writer: *std.Io.Writer
             }
             writer.writeAll(") ") catch return;
             dumpTypeNode(a, a.funcTypeRet(type_idx), writer);
+        },
+        .type_variant => {
+            const members = a.variantTypeMembers(type_idx);
+            for (members, 0..) |member, i| {
+                if (i > 0) writer.writeAll(" | ") catch return;
+                dumpTypeNode(a, member, writer);
+            }
         },
         else => {},
     }

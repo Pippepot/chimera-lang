@@ -33,6 +33,7 @@ pub const Tag = enum(u8) {
     ge,
     eq,
     ne,
+    is,
     @"and",
     @"or",
     if_stmt,
@@ -40,6 +41,8 @@ pub const Tag = enum(u8) {
     unit_lit,
     type_name,
     type_func,
+    type_variant,
+    type_union,
     comptime_expr,
     comptime_value_decl,
     comptime_fn,
@@ -141,6 +144,14 @@ pub const Ast = struct {
         return ast.nodes[idx].data0;
     }
 
+    pub fn isLhs(ast: *const Ast, idx: NodeIdx) NodeIdx {
+        return ast.nodes[idx].data0;
+    }
+
+    pub fn isRhsType(ast: *const Ast, idx: NodeIdx) TypeIdx {
+        return ast.nodes[idx].data1;
+    }
+
     fn extraIdx(data1: u32) u32 {
         return data1 & ~@as(u32, 0x80000000);
     }
@@ -216,6 +227,18 @@ pub const Ast = struct {
         const extra_idx = ast.nodes[idx].data0;
         const count = ast.nodes[idx].data1;
         return ast.extra[extra_idx + count];
+    }
+
+    pub fn variantTypeMembers(ast: *const Ast, idx: NodeIdx) []const TypeIdx {
+        const extra_idx = ast.nodes[idx].data0;
+        const count = ast.nodes[idx].data1;
+        return ast.extra[extra_idx..][0..count];
+    }
+
+    pub fn typeUnionMembers(ast: *const Ast, idx: NodeIdx) []const NodeIdx {
+        const extra_idx = ast.nodes[idx].data0;
+        const count = ast.nodes[idx].data1;
+        return ast.extra[extra_idx..][0..count];
     }
 
     pub fn comptimeValueDeclHasType(ast: *const Ast, idx: NodeIdx) bool {
@@ -374,6 +397,10 @@ pub fn typeFuncParams(ast: *const Ast, idx: TypeIdx) []const TypeIdx {
 
 pub fn typeFuncRet(ast: *const Ast, idx: TypeIdx) TypeIdx {
     return ast.funcTypeRet(idx);
+}
+
+pub fn typeVariantMembers(ast: *const Ast, idx: TypeIdx) []const TypeIdx {
+    return ast.variantTypeMembers(idx);
 }
 
 pub const FieldPair = struct { name: IdentIdx, value: NodeIdx };

@@ -19,6 +19,7 @@ pub const Type = union(enum) {
     type_type,
     named: SymbolId,
     func: FuncTypeId,
+    variant: u32,
 };
 
 pub fn typeEql(a: Type, b: Type) bool {
@@ -27,6 +28,7 @@ pub fn typeEql(a: Type, b: Type) bool {
         .unit, .bool, .int, .float, .type_type => true,
         .named => |lhs| lhs == b.named,
         .func => |lhs| lhs == b.func,
+        .variant => |lhs| lhs == b.variant,
     };
 }
 
@@ -117,13 +119,15 @@ pub const Terminator = union(enum) {
 pub const Block = struct {
     id: BlockId,
     param: ?ValueRef,
+    param_width: u32,
     insts: std.ArrayList(ValueInst),
     terminator: ?Terminator,
 
-    pub fn init(gpa: std.mem.Allocator, id: BlockId, param: ?ValueRef) error{OutOfMemory}!Block {
+    pub fn init(gpa: std.mem.Allocator, id: BlockId, param: ?ValueRef, param_width: u32) error{OutOfMemory}!Block {
         return .{
             .id = id,
             .param = param,
+            .param_width = param_width,
             .insts = try std.ArrayList(ValueInst).initCapacity(gpa, 8),
             .terminator = null,
         };
@@ -176,6 +180,7 @@ const LowerError = error{
     TooManyCallArgs,
     MissingComptimeValue,
     UnsupportedComptimeValue,
+    UnsupportedMultiSlotFunctionSignature,
 };
 
 const LowerResult = error{OutOfMemory} || LowerError || analyze.TypeError;
@@ -240,6 +245,33 @@ const Lowerer = struct {
             .type_type => .type_type,
             .named => |name| .{ .named = try self.internIdent(name) },
             .func => |ft| .{ .func = try self.internFuncType(ft) },
+            .variant => .{ .variant = try self.typeSlotCount(tc_ty) },
+        };
+    }
+
+    fn namedTypeFieldCount(self: *const @This(), name: []const u8) u32 {
+        const a = self.typed.ast;
+        for (a.decls) |decl_idx| {
+            if (a.nodes[decl_idx].tag != .comptime_struct) continue;
+            const decl_name = a.identOf(a.nodes[decl_idx].data0);
+            if (std.mem.eql(u8, decl_name, name)) return @intCast(a.structFields(decl_idx).len);
+        }
+        if (self.typed.comptime_struct_fields.get(name)) |fields| return @intCast(fields.len);
+        return 1;
+    }
+
+    fn typeSlotCount(self: *const @This(), ty: analyze.Type) error{OutOfMemory}!u32 {
+        return switch (ty) {
+            .unit, .bool, .int, .float, .type_type, .func => 1,
+            .named => |name| self.namedTypeFieldCount(name),
+            .variant => |variant_ty| blk: {
+                var max_member_slots: u32 = 1;
+                for (variant_ty.members) |member_ty| {
+                    const member_slots = try self.typeSlotCount(member_ty);
+                    if (member_slots > max_member_slots) max_member_slots = member_slots;
+                }
+                break :blk max_member_slots + 1;
+            },
         };
     }
 
@@ -271,7 +303,7 @@ const Lowerer = struct {
         var params = try std.ArrayList(ValueRef).initCapacity(self.gpa, 8);
         errdefer params.deinit(self.gpa);
 
-        var entry_block = try Block.init(self.gpa, 0, null);
+        var entry_block = try Block.init(self.gpa, 0, null, 0);
         errdefer entry_block.deinit(self.gpa);
         try blocks.append(self.gpa, entry_block);
 
@@ -315,9 +347,15 @@ const Lowerer = struct {
 };
 
 const FunctionLowerer = struct {
+    const LowerBinding = struct {
+        slot: ValueRef,
+        ty: analyze.Type,
+        slot_count: u32,
+    };
+
     parent: *Lowerer,
     function: Function,
-    bindings: scope_mod.ScopeStack(ValueRef),
+    bindings: scope_mod.ScopeStack(LowerBinding),
     current_block_id: BlockId,
     info: analyze.FunctionInfo,
 
@@ -327,6 +365,8 @@ const FunctionLowerer = struct {
             ""
         else
             a.identOf(a.nodes[info.decl].data0);
+        const ret_slots = try parent.typeSlotCount(info.ty.ret);
+        if (ret_slots != 1) return error.UnsupportedMultiSlotFunctionSignature;
         const ret_type = try parent.internType(info.ty.ret);
         var function = try parent.allocFunction(fn_id, fn_name, ret_type);
         errdefer function.deinit(parent.gpa);
@@ -334,7 +374,7 @@ const FunctionLowerer = struct {
         return .{
             .parent = parent,
             .function = function,
-            .bindings = scope_mod.ScopeStack(ValueRef).init(),
+            .bindings = scope_mod.ScopeStack(LowerBinding).init(),
             .current_block_id = 0,
             .info = info,
         };
@@ -361,28 +401,75 @@ const FunctionLowerer = struct {
         return value_id;
     }
 
-    fn newBlock(self: *@This(), param_type: ?Type) error{OutOfMemory}!BlockId {
+    fn newBlock(self: *@This(), param_type: ?analyze.Type) LowerResult!BlockId {
         const block_id: BlockId = @intCast(self.function.blocks.items.len);
-        const block_param = if (param_type) |_| try self.allocValue() else null;
-        var block = try Block.init(self.parent.gpa, block_id, block_param);
+        const param_width = if (param_type) |ty| try self.typeSlotCount(ty) else 0;
+        const block_param = if (param_width > 0) try self.allocValue() else null;
+        if (param_width > 1) self.function.next_value += param_width - 1;
+        var block = try Block.init(self.parent.gpa, block_id, block_param, param_width);
         errdefer block.deinit(self.parent.gpa);
         try self.function.blocks.append(self.parent.gpa, block);
         return block_id;
     }
 
-    fn pushBinding(self: *@This(), name: []const u8, value_ref: ValueRef) !void {
-        self.bindings.push(self.parent.gpa, name, value_ref) catch |err| switch (err) {
+    fn pushBinding(self: *@This(), name: []const u8, binding: LowerBinding) !void {
+        self.bindings.push(self.parent.gpa, name, binding) catch |err| switch (err) {
             error.DuplicateVariable => return error.UnknownSymbol,
             error.OutOfMemory => return error.OutOfMemory,
         };
     }
 
-    fn lookupBinding(self: *const @This(), name: []const u8) ?ValueRef {
+    fn lookupBinding(self: *const @This(), name: []const u8) ?LowerBinding {
         return self.bindings.lookup(name);
     }
 
-    fn nodeType(self: *const @This(), idx: ast.NodeIdx) (std.mem.Allocator.Error || analyze.TypeError)!Type {
-        return self.parent.internType(try self.parent.typed.typeOf(idx));
+    fn nodeType(self: *const @This(), idx: ast.NodeIdx) (std.mem.Allocator.Error || analyze.TypeError)!analyze.Type {
+        return self.parent.typed.typeOf(idx);
+    }
+
+    fn typeSlotCount(self: *const @This(), ty: analyze.Type) LowerResult!u32 {
+        return self.parent.typeSlotCount(ty);
+    }
+
+    fn variantMemberIndex(variant_ty: *const analyze.VariantType, member_ty: analyze.Type) ?u32 {
+        for (variant_ty.members, 0..) |candidate, index| {
+            if (analyze.typeEql(candidate, member_ty)) return @intCast(index);
+        }
+        return null;
+    }
+
+    fn emitCopySlots(self: *@This(), src_base: ValueRef, dst_base: ValueRef, slot_count: u32) LowerResult!void {
+        var slot_index: u32 = 0;
+        while (slot_index < slot_count) : (slot_index += 1) {
+            const src = src_base + slot_index;
+            const dst = dst_base + slot_index;
+            _ = try self.addInst(.{ .store = .{ .l = src, .r = dst } });
+        }
+    }
+
+    fn allocSlotRange(self: *@This(), slot_count: u32) LowerResult!ValueRef {
+        const base = try self.allocValue();
+        if (slot_count > 1) self.function.next_value += slot_count - 1;
+        return base;
+    }
+
+    fn lowerValueAsType(self: *@This(), value_node: ast.NodeIdx, target_ty: analyze.Type) LowerResult!ValueRef {
+        const source_ty = try self.parent.typed.typeOf(value_node);
+        if (analyze.typeEql(target_ty, source_ty)) return self.lowerAst(value_node);
+
+        const target_variant = switch (target_ty) {
+            .variant => |variant_ty| variant_ty,
+            else => unreachable,
+        };
+        const member_tag = variantMemberIndex(target_variant, source_ty) orelse unreachable;
+        const source_ref = try self.lowerAst(value_node);
+        const source_slots = try self.typeSlotCount(source_ty);
+        const variant_slots = try self.typeSlotCount(target_ty);
+        const variant_base = try self.allocSlotRange(variant_slots);
+        const tag_const = try self.addInst(.{ .iconst = @intCast(member_tag) });
+        _ = try self.addInst(.{ .store = .{ .l = tag_const, .r = variant_base } });
+        try self.emitCopySlots(source_ref, variant_base + 1, source_slots);
+        return variant_base;
     }
 
     fn lowerPairOperands(self: *@This(), lhs: ast.NodeIdx, rhs: ast.NodeIdx) LowerResult!InstPair {
@@ -418,6 +505,37 @@ const FunctionLowerer = struct {
         };
     }
 
+    fn lowerVariantIsCondition(
+        self: *@This(),
+        start_block_id: BlockId,
+        cond: ast.NodeIdx,
+        then_target: BlockId,
+        else_target: BlockId,
+    ) LowerResult!void {
+        const a = self.parent.typed.ast;
+        const lhs = a.isLhs(cond);
+        const lhs_base = try self.lowerAst(lhs);
+        const tag_values = self.parent.typed.is_variant_tags.get(cond) orelse return error.IfConditionNotFallible;
+
+        var current_block_id = start_block_id;
+        for (tag_values, 0..) |tag_value, tag_index| {
+            self.current_block_id = current_block_id;
+            const tag_const = try self.addInst(.{ .iconst = @intCast(tag_value) });
+            const next_fail_block = if (tag_index + 1 == tag_values.len) else_target else try self.newBlock(null);
+            self.currentBlock().terminator = .{
+                .pbr = .{
+                    .pred = .{
+                        .op = .eqi,
+                        .pair = .{ .l = lhs_base, .r = tag_const },
+                    },
+                    .then_branch = .{ .target = then_target },
+                    .else_branch = .{ .target = next_fail_block },
+                },
+            };
+            current_block_id = next_fail_block;
+        }
+    }
+
     fn lowerConditionToBranches(
         self: *@This(),
         start_block_id: BlockId,
@@ -437,6 +555,9 @@ const FunctionLowerer = struct {
                 const rhs_block_id = try self.newBlock(null);
                 try self.lowerConditionToBranches(start_block_id, a.nodes[cond].data0, then_target, rhs_block_id);
                 try self.lowerConditionToBranches(rhs_block_id, a.nodes[cond].data1, then_target, else_target);
+            },
+            .is => {
+                try self.lowerVariantIsCondition(start_block_id, cond, then_target, else_target);
             },
             else => {
                 const predicate = try self.lowerConditionPredicate(cond);
@@ -481,7 +602,7 @@ const FunctionLowerer = struct {
                 .int => int_op,
                 .float => float_op,
                 .bool => bool_op,
-                .unit, .named, .func, .type_type => unreachable,
+                .unit, .named, .func, .type_type, .variant => unreachable,
             },
             .pair = pair,
         };
@@ -599,15 +720,16 @@ const FunctionLowerer = struct {
         const a = self.parent.typed.ast;
         const value = a.varDeclValue(idx);
         const name = a.identOf(a.nodes[idx].data0);
-        if (a.nodes[value].tag == .struct_init) {
-            const base = try self.lowerStructIntoSlots(value);
-            try self.pushBinding(name, base);
-            return self.lowerUnitValue();
-        }
-        const value_ref = try self.lowerAst(value);
-        const var_slot = try self.allocValue();
-        _ = try self.addInst(.{ .store = .{ .l = value_ref, .r = var_slot } });
-        try self.pushBinding(name, var_slot);
+        const binding_ty = self.parent.typed.decl_binding_types.get(idx) orelse try self.parent.typed.typeOf(value);
+        const value_ref = try self.lowerValueAsType(value, binding_ty);
+        const slot_count = try self.typeSlotCount(binding_ty);
+        const var_slot = try self.allocSlotRange(slot_count);
+        try self.emitCopySlots(value_ref, var_slot, slot_count);
+        try self.pushBinding(name, .{
+            .slot = var_slot,
+            .ty = binding_ty,
+            .slot_count = slot_count,
+        });
         return self.lowerUnitValue();
     }
 
@@ -615,28 +737,29 @@ const FunctionLowerer = struct {
         const a = self.parent.typed.ast;
         const value = a.varDeclValue(idx);
         const name = a.identOf(a.nodes[idx].data0);
-        if (a.nodes[value].tag == .struct_init) {
-            const base = try self.lowerStructIntoSlots(value);
-            try self.pushBinding(name, base);
-            return self.lowerUnitValue();
-        }
-        const value_ref = try self.lowerAst(value);
-        try self.pushBinding(name, value_ref);
+        const binding_ty = self.parent.typed.decl_binding_types.get(idx) orelse try self.parent.typed.typeOf(value);
+        const value_ref = try self.lowerValueAsType(value, binding_ty);
+        const slot_count = try self.typeSlotCount(binding_ty);
+        try self.pushBinding(name, .{
+            .slot = value_ref,
+            .ty = binding_ty,
+            .slot_count = slot_count,
+        });
         return self.lowerUnitValue();
     }
 
     fn lowerAssign(self: *@This(), idx: ast.NodeIdx) LowerResult!ValueRef {
         const a = self.parent.typed.ast;
         const name = a.identOf(a.nodes[idx].data0);
-        const value_ref = try self.lowerAst(a.nodes[idx].data1);
-        const dst = self.lookupBinding(name) orelse return error.UnknownSymbol;
-        _ = try self.addInst(.{ .store = .{ .l = value_ref, .r = dst } });
+        const binding = self.lookupBinding(name) orelse return error.UnknownSymbol;
+        const value_ref = try self.lowerValueAsType(a.nodes[idx].data1, binding.ty);
+        try self.emitCopySlots(value_ref, binding.slot, binding.slot_count);
         return self.lowerUnitValue();
     }
 
     fn lowerReturn(self: *@This(), idx: ast.NodeIdx) LowerResult!ValueRef {
         const a = self.parent.typed.ast;
-        const value_ref = try self.lowerAst(a.nodes[idx].data0);
+        const value_ref = try self.lowerValueAsType(a.nodes[idx].data0, self.info.ty.ret);
         self.currentBlock().terminator = .{ .ret = value_ref };
         return value_ref;
     }
@@ -677,7 +800,7 @@ const FunctionLowerer = struct {
     }
 
     fn lowerVarRef(self: *@This(), name: []const u8) LowerResult!ValueRef {
-        if (self.lookupBinding(name)) |value| return value;
+        if (self.lookupBinding(name)) |binding| return binding.slot;
         if (self.parent.typed.comptime_values.get(name)) |cv| {
             return self.lowerComptimeValue(cv);
         }
@@ -731,7 +854,7 @@ const FunctionLowerer = struct {
                 const arg_idx = a.nodes[idx].data0;
                 break :blk try self.addInst(.{ .argi = arg_idx });
             },
-            .lt, .gt, .le, .ge, .eq, .ne, .@"and", .@"or" => error.IfConditionNotFallible,
+            .lt, .gt, .le, .ge, .eq, .ne, .is, .@"and", .@"or" => error.IfConditionNotFallible,
             .if_stmt => try self.lowerIf(idx),
             .struct_init => try self.lowerStructInit(idx),
             .field_access => try self.lowerFieldAccess(idx),
@@ -742,7 +865,7 @@ const FunctionLowerer = struct {
             .comptime_value_decl => try self.lowerUnitValue(),
             .comptime_fn, .comptime_struct => try self.lowerUnitValue(),
             .struct_expr => try self.lowerUnitValue(),
-            .type_name, .type_func => unreachable,
+            .type_name, .type_func, .type_variant, .type_union => unreachable,
         };
     }
 
@@ -750,16 +873,34 @@ const FunctionLowerer = struct {
         if (self.info.decl == std.math.maxInt(ast.NodeIdx)) return;
         const a = self.parent.typed.ast;
         const params = a.fnParams(self.info.decl);
-        for (params, self.info.ty.params) |param, _| {
+        for (params, self.info.ty.params) |param, param_ty| {
             const pname = a.identOf(param.name);
-            const slot = try self.allocValue();
+            const slot_count = try self.typeSlotCount(param_ty);
+            if (slot_count != 1) return error.UnsupportedMultiSlotFunctionSignature;
+            const slot = try self.allocSlotRange(slot_count);
             try self.function.param_values.append(self.parent.gpa, slot);
-            try self.pushBinding(pname, slot);
+            try self.pushBinding(pname, .{
+                .slot = slot,
+                .ty = param_ty,
+                .slot_count = slot_count,
+            });
         }
+    }
+
+    fn isComptimeOnlyFunction(self: *const @This()) bool {
+        if (self.info.decl == std.math.maxInt(ast.NodeIdx)) return false;
+        const comptime_mask = self.parent.typed.ast.fnComptimeMask(self.info.decl);
+        return comptime_mask != 0 and self.info.ty.ret == .type_type;
     }
 
     fn run(self: *@This()) !Function {
         try self.setupParams();
+        if (self.isComptimeOnlyFunction()) {
+            const stub_ret = try self.lowerUnitValue();
+            self.currentBlock().terminator = .{ .ret = stub_ret };
+            self.bindings.deinit(self.parent.gpa);
+            return self.function;
+        }
 
         const a = self.parent.typed.ast;
         const body = if (self.info.decl == std.math.maxInt(ast.NodeIdx))

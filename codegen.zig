@@ -45,6 +45,7 @@ const BinaryEmitter = struct {
     const BranchCopy = struct {
         src: InstRef,
         dst: InstRef,
+        width: u32,
     };
 
     const RelFixup = struct {
@@ -388,11 +389,20 @@ const BinaryEmitter = struct {
         try self.addRel32Fixup(symbol);
     }
 
-    fn branchCopy(branch: ir_mod.Branch, block_params: []const ?InstRef) ?BranchCopy {
+    fn branchCopy(branch: ir_mod.Branch, block_params: []const ?InstRef, block_param_widths: []const u32) ?BranchCopy {
         const dst = block_params[branch.target] orelse return null;
+        const width = block_param_widths[branch.target];
+        if (width == 0) return null;
         const src = branch.arg orelse unreachable;
         if (src == dst) return null;
-        return .{ .src = src, .dst = dst };
+        return .{ .src = src, .dst = dst, .width = width };
+    }
+
+    fn emitCopySlots(self: *@This(), src: InstRef, dst: InstRef, width: u32) !void {
+        var slot_index: u32 = 0;
+        while (slot_index < width) : (slot_index += 1) {
+            try self.emitCopySlot(src + slot_index, dst + slot_index);
+        }
     }
 
     fn emitBinaryArithmeticInt(self: *@This(), pair: InstPair, opcode: enum { add, sub, imul }, out: InstRef) !void {
@@ -549,9 +559,15 @@ const BinaryEmitter = struct {
         _ = fn_layout;
     }
 
-    fn emitBranch(self: *@This(), branch: ir_mod.Branch, block_symbols: []const u32, block_params: []const ?InstRef) !void {
-        const maybe_copy = branchCopy(branch, block_params);
-        if (maybe_copy) |copy| try self.emitCopySlot(copy.src, copy.dst);
+    fn emitBranch(
+        self: *@This(),
+        branch: ir_mod.Branch,
+        block_symbols: []const u32,
+        block_params: []const ?InstRef,
+        block_param_widths: []const u32,
+    ) !void {
+        const maybe_copy = branchCopy(branch, block_params, block_param_widths);
+        if (maybe_copy) |copy| try self.emitCopySlots(copy.src, copy.dst, copy.width);
         try self.emitJmp(block_symbols[branch.target]);
     }
 
@@ -580,11 +596,12 @@ const BinaryEmitter = struct {
         else_branch: ir_mod.Branch,
         block_symbols: []const u32,
         block_params: []const ?InstRef,
+        block_param_widths: []const u32,
     ) !void {
         try self.emitCmpEaxZero();
 
-        const then_copy = branchCopy(then_branch, block_params);
-        const else_copy = branchCopy(else_branch, block_params);
+        const then_copy = branchCopy(then_branch, block_params, block_param_widths);
+        const else_copy = branchCopy(else_branch, block_params, block_param_widths);
         const then_symbol = block_symbols[then_branch.target];
         const else_symbol = block_symbols[else_branch.target];
 
@@ -597,7 +614,7 @@ const BinaryEmitter = struct {
         if (then_copy != null and else_copy == null) {
             try self.emitJe(else_symbol);
             const copy = then_copy.?;
-            try self.emitCopySlot(copy.src, copy.dst);
+            try self.emitCopySlots(copy.src, copy.dst, copy.width);
             try self.emitJmp(then_symbol);
             return;
         }
@@ -605,7 +622,7 @@ const BinaryEmitter = struct {
         if (then_copy == null and else_copy != null) {
             try self.emitJne(then_symbol);
             const copy = else_copy.?;
-            try self.emitCopySlot(copy.src, copy.dst);
+            try self.emitCopySlots(copy.src, copy.dst, copy.width);
             try self.emitJmp(else_symbol);
             return;
         }
@@ -613,12 +630,12 @@ const BinaryEmitter = struct {
         const prep_symbol = try createSymbol(&self.symbols, self.gpa);
         try self.emitJe(prep_symbol);
         const then_copy_value = then_copy.?;
-        try self.emitCopySlot(then_copy_value.src, then_copy_value.dst);
+        try self.emitCopySlots(then_copy_value.src, then_copy_value.dst, then_copy_value.width);
         try self.emitJmp(then_symbol);
 
         self.bindSymbol(prep_symbol);
         const else_copy_value = else_copy.?;
-        try self.emitCopySlot(else_copy_value.src, else_copy_value.dst);
+        try self.emitCopySlots(else_copy_value.src, else_copy_value.dst, else_copy_value.width);
         try self.emitJmp(else_symbol);
     }
 
@@ -627,9 +644,10 @@ const BinaryEmitter = struct {
         pbr: @FieldType(ir_mod.Terminator, "pbr"),
         block_symbols: []const u32,
         block_params: []const ?InstRef,
+        block_param_widths: []const u32,
     ) !void {
         try self.emitPredicateValueToEax(pbr.pred);
-        try self.emitBranchOnEaxNonZero(pbr.then_branch, pbr.else_branch, block_symbols, block_params);
+        try self.emitBranchOnEaxNonZero(pbr.then_branch, pbr.else_branch, block_symbols, block_params, block_param_widths);
     }
 
     fn emitTerm(
@@ -637,10 +655,11 @@ const BinaryEmitter = struct {
         term: ir_mod.Terminator,
         block_symbols: []const u32,
         block_params: []const ?InstRef,
+        block_param_widths: []const u32,
     ) !void {
         switch (term) {
-            .br => |branch| try self.emitBranch(branch, block_symbols, block_params),
-            .pbr => |pbr| try self.emitPredicateBranch(pbr, block_symbols, block_params),
+            .br => |branch| try self.emitBranch(branch, block_symbols, block_params, block_param_widths),
+            .pbr => |pbr| try self.emitPredicateBranch(pbr, block_symbols, block_params, block_param_widths),
             .ret => |value_ref| try self.emitFunctionReturn(value_ref),
         }
     }
@@ -651,12 +670,13 @@ const BinaryEmitter = struct {
         symbol: u32,
         block_symbols: []const u32,
         block_params: []const ?InstRef,
+        block_param_widths: []const u32,
         fn_layout: *const FunctionLayout,
     ) !void {
         self.bindSymbol(symbol);
         for (block.insts.items) |value_inst| try self.emitValueInst(value_inst, fn_layout);
         const terminator = block.terminator orelse unreachable;
-        try self.emitTerm(terminator, block_symbols, block_params);
+        try self.emitTerm(terminator, block_symbols, block_params, block_param_widths);
     }
 
     fn emitFunction(self: *@This(), func: *const Function) !void {
@@ -670,16 +690,20 @@ const BinaryEmitter = struct {
 
         var block_params = try self.gpa.alloc(?InstRef, func.blocks.items.len);
         defer self.gpa.free(block_params);
+        var block_param_widths = try self.gpa.alloc(u32, func.blocks.items.len);
+        defer self.gpa.free(block_param_widths);
         for (func.blocks.items) |block| {
             block_params[block.id] = block.param;
+            block_param_widths[block.id] = block.param_width;
         }
 
         for (func.blocks.items, 0..) |block, block_idx| {
-            try self.emitBlock(block, layout.block_symbols[block_idx], layout.block_symbols, block_params, layout);
+            try self.emitBlock(block, layout.block_symbols[block_idx], layout.block_symbols, block_params, block_param_widths, layout);
         }
     }
 
     fn emitStart(self: *@This()) !void {
+        if (self.prog.entry >= self.function_layouts.len) return error.InvalidEntryFunction;
         self.bindSymbol(self.start_symbol);
         try self.emitLeaR15RspPlus8();
         const entry_layout = self.layoutFor(self.prog.entry);

@@ -217,6 +217,9 @@ const Resolver = struct {
                 try self.resolveNode(ast_.nodes[idx].data0);
                 try self.resolveNode(ast_.nodes[idx].data1);
             },
+            .is => {
+                try self.resolveNode(ast_.isLhs(idx));
+            },
             .if_stmt => {
                 const data = ast_.ifData(idx);
                 try self.resolveNode(data.cond);
@@ -236,12 +239,15 @@ const Resolver = struct {
                 for (ast_.structInitFields(idx)) |field| try self.resolveNode(field.value);
             },
             .struct_expr => {},
+            .type_union => {
+                for (ast_.typeUnionMembers(idx)) |member| try self.resolveNode(member);
+            },
             .field_access => {
                 try self.resolveNode(ast_.nodes[idx].data0);
             },
             .comptime_expr => try self.resolveNode(ast_.comptimeExprBody(idx)),
             .comptime_value_decl => try self.resolveNode(ast_.comptimeValueDeclValue(idx)),
-            .type_name, .type_func, .comptime_fn, .comptime_struct => {},
+            .type_name, .type_func, .type_variant, .comptime_fn, .comptime_struct => {},
         }
     }
 };

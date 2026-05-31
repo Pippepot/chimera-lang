@@ -472,6 +472,69 @@ test "const and var optional type annotations" {
     , "42\n");
 }
 
+test "variant type alias supports runtime is checks and assignment" {
+    try testProgram(
+        \\comptime A = struct
+        \\  f1: int
+        \\  f2: float
+        \\comptime sumtype = int | float | A
+        \\var x: sumtype = 3
+        \\if x is int
+        \\  print(11)
+        \\else
+        \\  print(0)
+        \\x = A{f1 = 2, f2 = 4.5}
+        \\if x is int
+        \\  print(0)
+        \\else
+        \\  print(22)
+        \\if x is int | A
+        \\  print(33)
+        \\else
+        \\  print(0)
+    , "11\n22\n33\n");
+}
+
+test "is requires a variant lhs" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+
+    try db.setSource(0,
+        \\if 1 is int
+        \\  print(1)
+    );
+    try expectCompileErrorContains(&db, 0, "left side of 'is' must be a variant type");
+}
+
+test "is rhs must be a variant member type" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+
+    try db.setSource(0,
+        \\comptime T = int | float
+        \\var x: T = 1
+        \\if x is bool
+        \\  print(1)
+    );
+    try expectCompileErrorContains(&db, 0, "right side of 'is' is not a member of the variant type");
+}
+
+test "variant type rejects duplicate members" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+
+    try db.setSource(0,
+        \\comptime T = int | int
+    );
+    try expectCompileErrorContains(&db, 0, "duplicate variant member type");
+}
+
+test "comptime-only program with variant alias compiles" {
+    try testProgram(
+        \\comptime T = int | float
+    , "");
+}
+
 test "struct init single field var and field access" {
     try testProgram(
         \\comptime Foo = struct
