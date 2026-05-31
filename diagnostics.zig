@@ -14,6 +14,7 @@ pub const Diagnostic = struct {
     stage: Stage,
     span: ?ast.Span,
     message: []const u8,
+    message_allocated: bool = false,
 };
 
 const LineInfo = struct {

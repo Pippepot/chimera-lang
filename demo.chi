@@ -1,7 +1,2 @@
-comptime fib = func(n: int) int
-  if n == 1 -> return 1
-  if n == 0 -> return 0
-  return fib(n-1) + fib(n-2)
-
-comptime n = 40
-print(fib(n))
+# This is a comment
+print(42)

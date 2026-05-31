@@ -130,30 +130,53 @@ pub const Ast = struct {
         return ast.nodes[idx].data0;
     }
 
+    fn extraIdx(data1: u32) u32 {
+        return data1 & ~@as(u32, 0x80000000);
+    }
+
+    pub const FnAnnotationInfo = struct {
+        has_annotation: bool,
+        annotation: ?TypeIdx,
+    };
+
     pub fn fnParams(ast: *const Ast, idx: NodeIdx) []const ParamPair {
-        const extra_idx = ast.nodes[idx].data1;
-        const count = ast.extra[extra_idx];
-        const pairs = @as([*]const ParamPair, @ptrCast(&ast.extra[extra_idx + 1]));
+        const ei = extraIdx(ast.nodes[idx].data1);
+        const count = ast.extra[ei];
+        const pairs = @as([*]const ParamPair, @ptrCast(&ast.extra[ei + 1]));
         return pairs[0..count];
     }
 
     pub fn fnRetType(ast: *const Ast, idx: NodeIdx) TypeIdx {
-        const extra_idx = ast.nodes[idx].data1;
-        const count = ast.extra[extra_idx];
-        return ast.extra[extra_idx + 1 + count * 2];
+        const ei = extraIdx(ast.nodes[idx].data1);
+        const count = ast.extra[ei];
+        return ast.extra[ei + 1 + count * 2];
     }
 
     pub fn fnBody(ast: *const Ast, idx: NodeIdx) NodeIdx {
-        const extra_idx = ast.nodes[idx].data1;
-        const count = ast.extra[extra_idx];
-        return ast.extra[extra_idx + 1 + count * 2 + 1];
+        const ei = extraIdx(ast.nodes[idx].data1);
+        const count = ast.extra[ei];
+        return ast.extra[ei + 1 + count * 2 + 1];
+    }
+
+    pub fn comptimeFnAnnotation(ast: *const Ast, idx: NodeIdx) ?TypeIdx {
+        if (ast.nodes[idx].data1 & 0x80000000 == 0) return null;
+        const ei = extraIdx(ast.nodes[idx].data1);
+        const count = ast.extra[ei];
+        return ast.extra[ei + 3 + count * 2];
     }
 
     pub fn structFields(ast: *const Ast, idx: NodeIdx) []const ParamPair {
-        const extra_idx = ast.nodes[idx].data1;
-        const count = ast.extra[extra_idx];
-        const pairs = @as([*]const ParamPair, @ptrCast(&ast.extra[extra_idx + 1]));
+        const ei = extraIdx(ast.nodes[idx].data1);
+        const count = ast.extra[ei];
+        const pairs = @as([*]const ParamPair, @ptrCast(&ast.extra[ei + 1]));
         return pairs[0..count];
+    }
+
+    pub fn comptimeStructAnnotation(ast: *const Ast, idx: NodeIdx) ?TypeIdx {
+        if (ast.nodes[idx].data1 & 0x80000000 == 0) return null;
+        const ei = extraIdx(ast.nodes[idx].data1);
+        const count = ast.extra[ei];
+        return ast.extra[ei + 1 + count * 2];
     }
 
     pub fn funcTypeParams(ast: *const Ast, idx: NodeIdx) []const TypeIdx {
@@ -166,6 +189,22 @@ pub const Ast = struct {
         const extra_idx = ast.nodes[idx].data0;
         const count = ast.nodes[idx].data1;
         return ast.extra[extra_idx + count];
+    }
+
+    pub fn comptimeValueDeclHasType(ast: *const Ast, idx: NodeIdx) bool {
+        return ast.nodes[idx].data1 & 0x80000000 != 0;
+    }
+
+    pub fn comptimeValueDeclType(ast: *const Ast, idx: NodeIdx) ?TypeIdx {
+        if (!comptimeValueDeclHasType(ast, idx)) return null;
+        const extra_idx = ast.nodes[idx].data1 & ~@as(u32, 0x80000000);
+        return ast.extra[extra_idx];
+    }
+
+    pub fn comptimeValueDeclValue(ast: *const Ast, idx: NodeIdx) NodeIdx {
+        if (!comptimeValueDeclHasType(ast, idx)) return ast.nodes[idx].data1;
+        const extra_idx = ast.nodes[idx].data1 & ~@as(u32, 0x80000000);
+        return ast.extra[extra_idx + 1];
     }
 
     pub fn comptimeExprBody(ast: *const Ast, idx: NodeIdx) NodeIdx {

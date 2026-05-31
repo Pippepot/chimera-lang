@@ -5,5 +5,5 @@ fn fib(n: i32) i32 {
 }
 
 pub fn main() !void {
-    _ = fib(40);
+    _ = fib(10);
 }

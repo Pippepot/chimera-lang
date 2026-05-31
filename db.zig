@@ -87,14 +87,8 @@ pub fn valuesEqual(a: ?[]const u8, b: ?[]const u8) bool {
 
 pub fn dependencyEql(a: Dependency, b: Dependency) bool {
     return switch (a) {
-        .source => |lhs| switch (b) {
-            .source => |rhs| lhs == rhs,
-            .query => false,
-        },
-        .query => |lhs| switch (b) {
-            .source => false,
-            .query => |rhs| queryKeyEql(lhs, rhs),
-        },
+        .source => |lhs| b == .source and lhs == b.source,
+        .query => |lhs| b == .query and queryKeyEql(lhs, b.query),
     };
 }
 
@@ -112,7 +106,13 @@ pub fn initDiagnosticList(
 ) std.mem.Allocator.Error!std.ArrayList(diagnostics.Diagnostic) {
     var list = try std.ArrayList(diagnostics.Diagnostic).initCapacity(gpa, inherited.len + extra_capacity);
     errdefer list.deinit(gpa);
-    try list.appendSlice(gpa, inherited);
+    for (inherited) |diag| {
+        try list.append(gpa, .{
+            .stage = diag.stage,
+            .span = diag.span,
+            .message = diag.message,
+        });
+    }
     return list;
 }
 

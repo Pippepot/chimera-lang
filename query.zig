@@ -73,6 +73,9 @@ fn freeMemoValue(comptime T: type, value: *?T, gpa: std.mem.Allocator) void {
 
 fn deinitMemo(comptime T: type, memo: *db.Memo(T), gpa: std.mem.Allocator) void {
     freeMemoValue(T, &memo.value, gpa);
+    for (memo.diagnostics.items) |diag| {
+        if (diag.message_allocated) gpa.free(diag.message);
+    }
     memo.diagnostics.deinit(gpa);
     memo.deps.deinit(gpa);
 }

@@ -254,6 +254,16 @@ const Lexer = struct {
             ':' => .{ .tag = .colon, .start = start, .end = self.index },
             ',' => .{ .tag = .comma, .start = start, .end = self.index },
             '.' => .{ .tag = .dot, .start = start, .end = self.index },
+            '#' => {
+                while (self.index < self.source.len and self.source[self.index] != '\n') {
+                    self.index += 1;
+                }
+                if (self.index < self.source.len) {
+                    self.index += 1;
+                    self.at_line_start = true;
+                }
+                return self.next();
+            },
             '+' => .{ .tag = .plus, .start = start, .end = self.index },
             '-' => if (self.index < self.source.len and self.source[self.index] == '>') arrow: {
                 self.index += 1;
@@ -545,6 +555,11 @@ const Parser = struct {
         return self.allocNode(.block, extra_idx, count, span);
     }
 
+    fn makeUnitTypeNode(self: *@This(), span: ast.Span) !NodeIdx {
+        const unit_name = try self.internName("unit");
+        return self.allocNode(.type_name, unit_name, 0, span);
+    }
+
     fn spanOf(self: *const @This(), idx: NodeIdx) !ast.Span {
         if (idx < self.builder.spans.items.len) return self.builder.spans.items[idx];
         return ast.Span{ .start = 0, .end = 0 };
@@ -697,21 +712,31 @@ const Parser = struct {
         const name = self.current.ident;
         try self.advance();
 
+        var binding_ty: ?NodeIdx = null;
+        if (self.current.tag == .colon) {
+            try self.advance();
+            binding_ty = try self.parseType();
+        }
+
         try self.expect(.assign, error.ExpectedAssign);
 
         if (self.current.tag == .kw_func) {
-            return self.parseComptimeFunc(name, decl_start);
+            return self.parseComptimeFunc(name, binding_ty, decl_start);
         }
         if (self.current.tag == .kw_struct) {
-            return self.parseComptimeStruct(name, decl_start);
+            return self.parseComptimeStruct(name, binding_ty, decl_start);
         }
-        return self.parseComptimeValueDecl(name, decl_start);
+        return self.parseComptimeValueDecl(name, binding_ty, decl_start);
     }
 
-    fn parseComptimeValueDecl(self: *@This(), name: []const u8, decl_start: ast.Span) ParseError!NodeIdx {
+    fn parseComptimeValueDecl(self: *@This(), name: []const u8, binding_ty: ?NodeIdx, decl_start: ast.Span) ParseError!NodeIdx {
         const name_idx = try self.internName(name);
         const value = try self.parseExpression();
         const span = coverSpans(decl_start, try self.spanOf(value));
+        if (binding_ty) |ty| {
+            const extra_idx = try self.builder.allocExtraPair(ty, value);
+            return self.allocNode(.comptime_value_decl, name_idx, extra_idx | 0x80000000, span);
+        }
         return self.allocNode(.comptime_value_decl, name_idx, value, span);
     }
 
@@ -733,20 +758,27 @@ const Parser = struct {
         if (self.current.tag == .ident) {
             const name = self.current.ident;
             try self.advance();
+
+            var binding_ty: ?NodeIdx = null;
+            if (self.current.tag == .colon) {
+                try self.advance();
+                binding_ty = try self.parseType();
+            }
+
             try self.expect(.assign, error.ExpectedAssign);
 
             if (self.current.tag == .kw_func) {
-                const decl = try self.parseComptimeFunc(name, kw_span);
+                const decl = try self.parseComptimeFunc(name, binding_ty, kw_span);
                 try self.builder.decls.append(self.builder.gpa, decl);
                 return decl;
             }
             if (self.current.tag == .kw_struct) {
-                const decl = try self.parseComptimeStruct(name, kw_span);
+                const decl = try self.parseComptimeStruct(name, binding_ty, kw_span);
                 try self.builder.decls.append(self.builder.gpa, decl);
                 return decl;
             }
 
-            const decl = try self.parseComptimeValueDecl(name, kw_span);
+            const decl = try self.parseComptimeValueDecl(name, binding_ty, kw_span);
             try self.builder.decls.append(self.builder.gpa, decl);
             return decl;
         }
@@ -754,7 +786,7 @@ const Parser = struct {
         return self.parseComptimeExprAfterKeyword(kw_span);
     }
 
-    fn parseComptimeFunc(self: *@This(), name: []const u8, decl_start: ast.Span) ParseError!NodeIdx {
+    fn parseComptimeFunc(self: *@This(), name: []const u8, binding_ty: ?NodeIdx, decl_start: ast.Span) ParseError!NodeIdx {
         try self.expect(.kw_func, error.UnexpectedToken);
         try self.expect(.l_paren, error.ExpectedLParen);
 
@@ -778,8 +810,12 @@ const Parser = struct {
             }
         }
 
+        const rp_span = tokenSpan(self.current);
         try self.expect(.r_paren, error.ExpectedRParen);
-        const ret_ty = try self.parseType();
+        const ret_ty = if (self.current.tag == .ident or self.current.tag == .kw_func)
+            try self.parseType()
+        else
+            try self.makeUnitTypeNode(rp_span);
 
         const body = try self.parseIndentedBlock(error.ExpectedIndent);
 
@@ -792,14 +828,21 @@ const Parser = struct {
         }
         try self.builder.extra.append(self.builder.gpa, ret_ty);
         try self.builder.extra.append(self.builder.gpa, body);
-        const extra_idx: u32 = @intCast(self.builder.extra.items.len - 3 - param_count * 2);
+        if (binding_ty) |annot| {
+            try self.builder.extra.append(self.builder.gpa, annot);
+        }
+        const extra_idx: u32 = if (binding_ty != null)
+            @intCast(self.builder.extra.items.len - 4 - param_count * 2)
+        else
+            @intCast(self.builder.extra.items.len - 3 - param_count * 2);
 
+        const data1 = if (binding_ty != null) extra_idx | 0x80000000 else extra_idx;
         const body_span = try self.spanOf(body);
         const span = coverSpans(decl_start, body_span);
-        return self.allocNode(.comptime_fn, name_idx, extra_idx, span);
+        return self.allocNode(.comptime_fn, name_idx, data1, span);
     }
 
-    fn parseComptimeStruct(self: *@This(), name: []const u8, decl_start: ast.Span) ParseError!NodeIdx {
+    fn parseComptimeStruct(self: *@This(), name: []const u8, binding_ty: ?NodeIdx, decl_start: ast.Span) ParseError!NodeIdx {
         try self.expect(.kw_struct, error.UnexpectedToken);
 
         const name_idx = try self.internName(name);
@@ -834,13 +877,21 @@ const Parser = struct {
             try self.builder.extra.append(self.builder.gpa, field_names.items[i]);
             try self.builder.extra.append(self.builder.gpa, field_types.items[i]);
         }
-        const extra_idx: u32 = @intCast(self.builder.extra.items.len - 1 - field_count * 2);
+        if (binding_ty) |annot| {
+            try self.builder.extra.append(self.builder.gpa, annot);
+        }
+        const extra_idx: u32 = if (binding_ty != null)
+            @intCast(self.builder.extra.items.len - 2 - field_count * 2)
+        else
+            @intCast(self.builder.extra.items.len - 1 - field_count * 2);
+
+        const data1 = if (binding_ty != null) extra_idx | 0x80000000 else extra_idx;
 
         const span = if (field_count > 0)
             coverSpans(decl_start, try self.spanOf(field_types.items[field_count - 1]))
         else
             decl_start;
-        return self.allocNode(.comptime_struct, name_idx, extra_idx, span);
+        return self.allocNode(.comptime_struct, name_idx, data1, span);
     }
 
     fn parseType(self: *@This()) ParseError!u32 {
@@ -867,9 +918,13 @@ const Parser = struct {
                         return error.ExpectedComma;
                     }
                 }
+                const rp_span = tokenSpan(self.current);
                 try self.expect(.r_paren, error.ExpectedRParen);
 
-                const ret_ty = try self.parseType();
+                const ret_ty = if (self.current.tag == .ident or self.current.tag == .kw_func)
+                    try self.parseType()
+                else
+                    try self.makeUnitTypeNode(rp_span);
 
                 const param_count: u32 = @intCast(params.items.len);
                 const extra_idx = try self.builder.allocExtraSlice(params.items);

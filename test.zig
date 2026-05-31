@@ -524,6 +524,46 @@ test "binding type annotation mismatch errors" {
     try expectCompileErrorContains(&db, 0, "binding type annotation mismatch");
 }
 
+test "comptime value decl with int type annotation" {
+    try testProgram(
+        \\comptime x: int = 42
+        \\print(x)
+    , "42\n");
+}
+
+test "comptime value decl with float type annotation" {
+    try testProgram(
+        \\comptime x: float = 1.5
+        \\print(x)
+    , "1.500000\n");
+}
+
+test "comptime value decl type annotation mismatch" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+
+    try db.setSource(0,
+        \\comptime x: int = 1.0
+        \\print(x)
+    );
+    try expectCompileErrorContains(&db, 0, "binding type annotation mismatch");
+}
+
+test "comptime function value decl with type annotation" {
+    try testProgram(
+        \\comptime f: func(int) int = func(n: int) int
+        \\  return n + 1
+        \\print(f(41))
+    , "42\n");
+}
+
+test "comptime value decl with bool type annotation" {
+    try testProgram(
+        \\comptime flag: bool = true
+        \\print(flag)
+    , "true\n");
+}
+
 test "string type annotation is rejected" {
     var db = query.QueryDb.init(testing.allocator);
     defer db.deinit();
@@ -706,6 +746,18 @@ test "stale cache files are removed by eager sweep" {
     };
 
     return error.TestFailed;
+}
+
+test "comments are ignored by parser" {
+    try testProgram(
+        \\# this is a comment
+        \\print(42)
+    , "42\n");
+    try testProgram(
+        \\print(1) # inline comment
+        \\# another comment
+        \\print(2)
+    , "1\n2\n");
 }
 
 test "second compile with no changes has zero recomputes" {

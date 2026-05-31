@@ -139,6 +139,17 @@ pub const TypecheckReport = struct {
     diagnostic: ?diagnostics.Diagnostic,
 };
 
+pub fn typeName(ty: Type) []const u8 {
+    return switch (ty) {
+        .unit => "unit",
+        .bool => "bool",
+        .int => "int",
+        .float => "float",
+        .named => |name| name,
+        .func => "function",
+    };
+}
+
 pub fn typeErrorMessage(kind: TypeError) []const u8 {
     return switch (kind) {
         error.UnknownSymbol => "unknown symbol",
@@ -198,6 +209,8 @@ const Checker = struct {
     const Failure = struct {
         span: ?ast.Span,
         kind: TypeError,
+        expected_type: ?Type = null,
+        actual_type: ?Type = null,
     };
 
     const InferError = std.mem.Allocator.Error || error{TypecheckFailed};
@@ -247,12 +260,21 @@ const Checker = struct {
         self.comptime_decl_state.deinit();
     }
 
-    fn spanOfNode(self: *const @This(), idx: ast.NodeIdx) ?ast.Span {
-        return self.parsed.ast.spanOf(idx);
+    fn failAtNode(self: *@This(), idx: ast.NodeIdx, kind: TypeError) error{TypecheckFailed} {
+        return self.fail(self.parsed.ast.spanOf(idx), kind);
     }
 
-    fn spanOfTypeNode(self: *const @This(), type_idx: ast.TypeIdx) ?ast.Span {
-        return self.parsed.ast.spanOf(type_idx);
+    fn failAtType(self: *@This(), type_idx: ast.TypeIdx, kind: TypeError) error{TypecheckFailed} {
+        return self.fail(self.parsed.ast.spanOf(type_idx), kind);
+    }
+
+    fn failWithTypes(self: *@This(), span: ?ast.Span, kind: TypeError, expected: Type, actual: Type) error{TypecheckFailed} {
+        if (self.failure == null) self.failure = .{ .span = span, .kind = kind, .expected_type = expected, .actual_type = actual };
+        return error.TypecheckFailed;
+    }
+
+    fn failAtNodeWithTypes(self: *@This(), idx: ast.NodeIdx, kind: TypeError, expected: Type, actual: Type) error{TypecheckFailed} {
+        return self.failWithTypes(self.parsed.ast.spanOf(idx), kind, expected, actual);
     }
 
     fn remember(self: *@This(), idx: ast.NodeIdx, ty: Type) std.mem.Allocator.Error!Type {
@@ -263,14 +285,6 @@ const Checker = struct {
     fn fail(self: *@This(), span: ?ast.Span, kind: TypeError) error{TypecheckFailed} {
         if (self.failure == null) self.failure = .{ .span = span, .kind = kind };
         return error.TypecheckFailed;
-    }
-
-    fn failAtNode(self: *@This(), idx: ast.NodeIdx, kind: TypeError) error{TypecheckFailed} {
-        return self.fail(self.spanOfNode(idx), kind);
-    }
-
-    fn failAtType(self: *@This(), type_idx: ast.TypeIdx, kind: TypeError) error{TypecheckFailed} {
-        return self.fail(self.spanOfTypeNode(type_idx), kind);
     }
 
     fn pushBinding(self: *@This(), idx: ast.NodeIdx, name: []const u8, binding: Binding) InferError!void {
@@ -338,6 +352,10 @@ const Checker = struct {
             }
             const ret_ty = try self.resolveTypeNode(a.fnRetType(func_decl_idx));
             const fn_ty = try self.allocFuncType(param_types.items, ret_ty);
+            if (a.comptimeFnAnnotation(func_decl_idx)) |annot| {
+                const annot_ty = try self.resolveTypeNode(annot);
+                if (!typeEql(.{ .func = fn_ty }, annot_ty)) return self.failAtNodeWithTypes(func_decl_idx, error.BindingTypeMismatch, annot_ty, .{ .func = fn_ty });
+            }
             infos[idx] = .{
                 .decl = func_decl_idx,
                 .ty = fn_ty,
@@ -361,7 +379,7 @@ const Checker = struct {
         } else if (self.resolved.function_names.get("main")) |main_id| {
             self.typed.entry_function = main_id;
         } else {
-            self.typed.entry_function = if (fn_count > 0) 0 else 0;
+            self.typed.entry_function = 0;
         }
     }
 
@@ -394,6 +412,7 @@ const Checker = struct {
     }
 
     fn inferComparison(self: *@This(), idx: ast.NodeIdx, lhs: ast.NodeIdx, rhs: ast.NodeIdx) InferError!Type {
+        if (!self.in_fallible_scope) return self.failAtNode(idx, error.FallibleOutsideFallibleContext);
         const pair = try self.inferPair(lhs, rhs);
         if (!isNumeric(pair[0])) return self.failAtNode(lhs, error.ComparisonRequiresNumeric);
         if (!isNumeric(pair[1])) return self.failAtNode(rhs, error.ComparisonRequiresNumeric);
@@ -402,6 +421,7 @@ const Checker = struct {
     }
 
     fn inferEquality(self: *@This(), idx: ast.NodeIdx, lhs: ast.NodeIdx, rhs: ast.NodeIdx) InferError!Type {
+        if (!self.in_fallible_scope) return self.failAtNode(idx, error.FallibleOutsideFallibleContext);
         const pair = try self.inferPair(lhs, rhs);
         if (!typeEql(pair[0], pair[1])) return self.failAtNode(idx, error.EqualityOperandMismatch);
         switch (pair[0]) {
@@ -409,18 +429,6 @@ const Checker = struct {
             .unit, .named, .func => return self.failAtNode(idx, error.EqualityUnsupportedType),
         }
         return self.remember(idx, .unit);
-    }
-
-    fn inferFallible(
-        self: *@This(),
-        idx: ast.NodeIdx,
-        lhs: ast.NodeIdx,
-        rhs: ast.NodeIdx,
-        comptime inferFn: fn (*@This(), ast.NodeIdx, ast.NodeIdx, ast.NodeIdx) InferError!Type,
-    ) InferError!Type {
-        const result = try inferFn(self, idx, lhs, rhs);
-        if (!self.in_fallible_scope) return self.failAtNode(idx, error.FallibleOutsideFallibleContext);
-        return result;
     }
 
     fn inferIf(self: *@This(), idx: ast.NodeIdx) InferError!Type {
@@ -446,7 +454,7 @@ const Checker = struct {
                 defer self.bindings.restore(mark);
                 break :else_blk try self.inferNode(data.else_);
             };
-            if (!typeEql(then_ty, else_ty)) return self.failAtNode(idx, error.IfBranchTypeMismatch);
+            if (!typeEql(then_ty, else_ty)) return self.failAtNodeWithTypes(idx, error.IfBranchTypeMismatch, then_ty, else_ty);
             return self.remember(idx, then_ty);
         }
 
@@ -454,37 +462,15 @@ const Checker = struct {
         return self.remember(idx, .unit);
     }
 
-    fn inferConst(self: *@This(), idx: ast.NodeIdx) InferError!Type {
+    fn inferDecl(self: *@This(), idx: ast.NodeIdx, mutable: bool) InferError!Type {
         const a = self.parsed.ast;
         const name = a.identOf(a.nodes[idx].data0);
-        const value = a.varDeclValue(idx);
-        const value_ty = try self.inferNode(value);
+        const value_ty = try self.inferNode(a.varDeclValue(idx));
         if (a.varDeclHasType(idx)) {
             const annot_ty = try self.resolveTypeNode(a.varDeclType(idx).?);
-            if (!typeEql(value_ty, annot_ty)) return self.failAtNode(idx, error.BindingTypeMismatch);
+            if (!typeEql(value_ty, annot_ty)) return self.failAtNodeWithTypes(idx, error.BindingTypeMismatch, annot_ty, value_ty);
         }
-        try self.pushBinding(idx, name, .{
-            .ty = value_ty,
-            .mutable = false,
-            .comptime_visible = self.in_comptime_context,
-        });
-        return self.remember(idx, .unit);
-    }
-
-    fn inferVar(self: *@This(), idx: ast.NodeIdx) InferError!Type {
-        const a = self.parsed.ast;
-        const name = a.identOf(a.nodes[idx].data0);
-        const value = a.varDeclValue(idx);
-        const value_ty = try self.inferNode(value);
-        if (a.varDeclHasType(idx)) {
-            const annot_ty = try self.resolveTypeNode(a.varDeclType(idx).?);
-            if (!typeEql(value_ty, annot_ty)) return self.failAtNode(idx, error.BindingTypeMismatch);
-        }
-        try self.pushBinding(idx, name, .{
-            .ty = value_ty,
-            .mutable = true,
-            .comptime_visible = self.in_comptime_context,
-        });
+        try self.pushBinding(idx, name, .{ .ty = value_ty, .mutable = mutable, .comptime_visible = self.in_comptime_context });
         return self.remember(idx, .unit);
     }
 
@@ -495,7 +481,7 @@ const Checker = struct {
         const value_ty = try self.inferNode(value);
         const binding = self.lookupBinding(name) orelse return self.failAtNode(idx, error.UnknownSymbol);
         if (!binding.mutable) return self.failAtNode(idx, error.AssignToConst);
-        if (!typeEql(binding.ty, value_ty)) return self.failAtNode(idx, error.AssignmentTypeMismatch);
+        if (!typeEql(binding.ty, value_ty)) return self.failAtNodeWithTypes(idx, error.AssignmentTypeMismatch, binding.ty, value_ty);
         return self.remember(idx, .unit);
     }
 
@@ -513,7 +499,7 @@ const Checker = struct {
 
         for (args, 0..) |arg_node, arg_idx| {
             const arg_ty = try self.inferNode(arg_node);
-            if (!typeEql(arg_ty, fn_ty.params[arg_idx])) return self.failAtNode(arg_node, error.CallArgumentMismatch);
+            if (!typeEql(arg_ty, fn_ty.params[arg_idx])) return self.failAtNodeWithTypes(arg_node, error.CallArgumentMismatch, fn_ty.params[arg_idx], arg_ty);
         }
 
         return self.remember(idx, fn_ty.ret);
@@ -523,7 +509,7 @@ const Checker = struct {
         const a = self.parsed.ast;
         const ret_val = a.nodes[idx].data0;
         const ret_ty = try self.inferNode(ret_val);
-        if (!typeEql(ret_ty, self.current_return)) return self.failAtNode(idx, error.ReturnTypeMismatch);
+        if (!typeEql(ret_ty, self.current_return)) return self.failAtNodeWithTypes(idx, error.ReturnTypeMismatch, self.current_return, ret_ty);
         self.current_saw_return = true;
         return self.remember(idx, .unit);
     }
@@ -568,7 +554,7 @@ const Checker = struct {
             if (!std.mem.eql(u8, given_name, decl_field_name)) return self.failAtNode(idx, error.StructInitFieldNameMismatch);
             const field_ty = try self.resolveTypeNode(decl_field.ty);
             const value_ty = try self.inferNode(given.value);
-            if (!typeEql(value_ty, field_ty)) return self.failAtNode(idx, error.BindingTypeMismatch);
+            if (!typeEql(value_ty, field_ty)) return self.failAtNodeWithTypes(idx, error.BindingTypeMismatch, field_ty, value_ty);
         }
         return self.remember(idx, .{ .named = si_name });
     }
@@ -608,12 +594,28 @@ const Checker = struct {
         const decl = self.parsed.ast.nodes[decl_idx];
         return switch (decl.tag) {
             .comptime_fn => blk: {
-                const name = self.parsed.ast.identOf(decl.data0);
+                const a = self.parsed.ast;
+                const name = a.identOf(decl.data0);
                 const fn_id = self.resolved.function_names.get(name) orelse return self.failAtNode(decl_idx, error.UnknownSymbol);
-                break :blk .{ .func = self.typed.functionType(fn_id) };
+                const fn_ty: Type = .{ .func = self.typed.functionType(fn_id) };
+                if (a.comptimeFnAnnotation(decl_idx)) |annot| {
+                    const annot_ty = try self.resolveTypeNode(annot);
+                    if (!typeEql(fn_ty, annot_ty)) return self.failAtNodeWithTypes(decl_idx, error.BindingTypeMismatch, annot_ty, fn_ty);
+                }
+                break :blk fn_ty;
             },
-            .comptime_struct => .{ .named = self.parsed.ast.identOf(decl.data0) },
+            .comptime_struct => blk: {
+                const a = self.parsed.ast;
+                const name = a.identOf(decl.data0);
+                const struct_ty: Type = .{ .named = name };
+                if (a.comptimeStructAnnotation(decl_idx)) |annot| {
+                    const annot_ty = try self.resolveTypeNode(annot);
+                    if (!typeEql(struct_ty, annot_ty)) return self.failAtNodeWithTypes(decl_idx, error.BindingTypeMismatch, annot_ty, struct_ty);
+                }
+                break :blk struct_ty;
+            },
             .comptime_value_decl => blk: {
+                const a = self.parsed.ast;
                 const state = try self.comptimeDeclStatePtr(decl_idx);
                 switch (state.ty_phase) {
                     .done => break :blk state.ty.?,
@@ -624,12 +626,16 @@ const Checker = struct {
                 state.ty_phase = .running;
                 const prev = self.in_comptime_context;
                 self.in_comptime_context = true;
-                const value_ty = self.inferNode(decl.data1) catch |err| {
+                const value_ty = self.inferNode(a.comptimeValueDeclValue(decl_idx)) catch |err| {
                     self.in_comptime_context = prev;
                     state.ty_phase = .pending;
                     return err;
                 };
                 self.in_comptime_context = prev;
+                if (a.comptimeValueDeclHasType(decl_idx)) {
+                    const annot_ty = try self.resolveTypeNode(a.comptimeValueDeclType(decl_idx).?);
+                    if (!typeEql(value_ty, annot_ty)) return self.failAtNodeWithTypes(decl_idx, error.BindingTypeMismatch, annot_ty, value_ty);
+                }
                 state.ty = value_ty;
                 state.ty_phase = .done;
                 break :blk value_ty;
@@ -657,37 +663,32 @@ const Checker = struct {
         const a = self.parsed.ast;
         const lhs_v = (try self.evalNodeStep(a.nodes[idx].data0, locals)).value;
         const rhs_v = (try self.evalNodeStep(a.nodes[idx].data1, locals)).value;
-        return switch (a.nodes[idx].tag) {
-            .lt => switch (lhs_v) {
-                .int => |lv| lv < rhs_v.int,
-                .float => |lv| lv < rhs_v.float,
-                else => false,
-            },
-            .gt => switch (lhs_v) {
-                .int => |lv| lv > rhs_v.int,
-                .float => |lv| lv > rhs_v.float,
-                else => false,
-            },
-            .le => switch (lhs_v) {
-                .int => |lv| lv <= rhs_v.int,
-                .float => |lv| lv <= rhs_v.float,
-                else => false,
-            },
-            .ge => switch (lhs_v) {
-                .int => |lv| lv >= rhs_v.int,
-                .float => |lv| lv >= rhs_v.float,
-                else => false,
-            },
-            .eq => switch (lhs_v) {
-                .bool => |lv| lv == rhs_v.bool,
-                .int => |lv| lv == rhs_v.int,
-                .float => |lv| lv == rhs_v.float,
-                else => false,
-            },
-            .ne => switch (lhs_v) {
-                .bool => |lv| lv != rhs_v.bool,
-                .int => |lv| lv != rhs_v.int,
-                .float => |lv| lv != rhs_v.float,
+        const tag = a.nodes[idx].tag;
+        return switch (tag) {
+            .lt, .gt, .le, .ge, .eq, .ne => switch (lhs_v) {
+                .int => |lv| switch (tag) {
+                    .lt => lv < rhs_v.int,
+                    .gt => lv > rhs_v.int,
+                    .le => lv <= rhs_v.int,
+                    .ge => lv >= rhs_v.int,
+                    .eq => lv == rhs_v.int,
+                    .ne => lv != rhs_v.int,
+                    else => unreachable,
+                },
+                .float => |lv| switch (tag) {
+                    .lt => lv < rhs_v.float,
+                    .gt => lv > rhs_v.float,
+                    .le => lv <= rhs_v.float,
+                    .ge => lv >= rhs_v.float,
+                    .eq => lv == rhs_v.float,
+                    .ne => lv != rhs_v.float,
+                    else => unreachable,
+                },
+                .bool => |lv| switch (tag) {
+                    .eq => lv == rhs_v.bool,
+                    .ne => lv != rhs_v.bool,
+                    else => false,
+                },
                 else => false,
             },
             else => false,
@@ -710,6 +711,7 @@ const Checker = struct {
                 return v;
             },
             .comptime_value_decl => {
+                const a = self.parsed.ast;
                 const state = try self.comptimeDeclStatePtr(decl_idx);
                 switch (state.val_phase) {
                     .done => return state.value.?,
@@ -720,7 +722,7 @@ const Checker = struct {
                 state.val_phase = .running;
                 const prev = self.in_comptime_context;
                 self.in_comptime_context = true;
-                const eval_result = self.evalNodeStep(decl.data1, locals) catch |err| {
+                const eval_result = self.evalNodeStep(a.comptimeValueDeclValue(decl_idx), locals) catch |err| {
                     self.in_comptime_context = prev;
                     state.val_phase = .pending;
                     return err;
@@ -728,7 +730,7 @@ const Checker = struct {
                 self.in_comptime_context = prev;
                 state.value = eval_result.value;
                 state.val_phase = .done;
-                try self.typed.comptime_values.put(self.parsed.ast.identOf(decl.data0), eval_result.value);
+                try self.typed.comptime_values.put(a.identOf(decl.data0), eval_result.value);
                 return eval_result.value;
             },
             else => return self.failAtNode(decl_idx, error.ComptimeValueNotAvailable),
@@ -745,18 +747,50 @@ const Checker = struct {
         const fn_params = self.parsed.ast.fnParams(info.decl);
         for (fn_params, args) |param, arg_value| {
             const pname = self.parsed.ast.identOf(param.name);
-            const copied = try self.cloneCtValue(arg_value);
-            locals.push(self.gpa, pname, .{
-                .value = copied,
-                .mutable = false,
-            }) catch |err| switch (err) {
-                error.DuplicateVariable => return self.failAtNode(info.decl, error.DuplicateSymbol),
-                error.OutOfMemory => return error.OutOfMemory,
-            };
+            try self.pushLocal(&locals, info.decl, pname, .{ .value = try self.cloneCtValue(arg_value), .mutable = false });
         }
 
         const step = try self.evalNodeStep(self.parsed.ast.fnBody(info.decl), &locals);
         return step.value;
+    }
+
+    fn pushLocal(self: *@This(), locals: *scope_mod.ScopeStack(EvalBinding), idx: ast.NodeIdx, name: []const u8, eb: EvalBinding) InferError!void {
+        locals.push(self.gpa, name, eb) catch |err| switch (err) {
+            error.DuplicateVariable => return self.failAtNode(idx, error.DuplicateSymbol),
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+    }
+
+    fn evalDecl(self: *@This(), idx: ast.NodeIdx, mutable: bool, locals: *scope_mod.ScopeStack(EvalBinding)) InferError!EvalStep {
+        const a = self.parsed.ast;
+        const name = a.identOf(a.nodes[idx].data0);
+        const value = (try self.evalNodeStep(a.varDeclValue(idx), locals)).value;
+        try self.pushLocal(locals, idx, name, .{ .value = try self.cloneCtValue(value), .mutable = mutable });
+        return .{ .value = .unit, .returned = false };
+    }
+
+    fn evalArithmetic(self: *@This(), idx: ast.NodeIdx, locals: *scope_mod.ScopeStack(EvalBinding)) InferError!EvalStep {
+        const a = self.parsed.ast;
+        const l = (try self.evalNodeStep(a.nodes[idx].data0, locals)).value;
+        const r = (try self.evalNodeStep(a.nodes[idx].data1, locals)).value;
+        const v: ComptimeValue = switch (l) {
+            .int => |lv| .{ .int = switch (a.nodes[idx].tag) {
+                .add => lv + r.int,
+                .sub => lv - r.int,
+                .mul => lv * r.int,
+                .div => @divTrunc(lv, r.int),
+                else => unreachable,
+            } },
+            .float => |lv| .{ .float = switch (a.nodes[idx].tag) {
+                .add => lv + r.float,
+                .sub => lv - r.float,
+                .mul => lv * r.float,
+                .div => lv / r.float,
+                else => unreachable,
+            } },
+            else => return self.failAtNode(idx, error.ArithmeticRequiresNumeric),
+        };
+        return .{ .value = v, .returned = false };
     }
 
     fn evalNodeStep(self: *@This(), idx: ast.NodeIdx, locals: *scope_mod.ScopeStack(EvalBinding)) InferError!EvalStep {
@@ -790,30 +824,8 @@ const Checker = struct {
                     .local => return self.failAtNode(idx, error.ComptimeCaptureNotAllowed),
                 }
             },
-            .const_decl => blk: {
-                const name = a.identOf(a.nodes[idx].data0);
-                const value = (try self.evalNodeStep(a.varDeclValue(idx), locals)).value;
-                locals.push(self.gpa, name, .{
-                    .value = try self.cloneCtValue(value),
-                    .mutable = false,
-                }) catch |err| switch (err) {
-                    error.DuplicateVariable => return self.failAtNode(idx, error.DuplicateSymbol),
-                    error.OutOfMemory => return error.OutOfMemory,
-                };
-                break :blk .{ .value = .unit, .returned = false };
-            },
-            .var_decl => blk: {
-                const name = a.identOf(a.nodes[idx].data0);
-                const value = (try self.evalNodeStep(a.varDeclValue(idx), locals)).value;
-                locals.push(self.gpa, name, .{
-                    .value = try self.cloneCtValue(value),
-                    .mutable = true,
-                }) catch |err| switch (err) {
-                    error.DuplicateVariable => return self.failAtNode(idx, error.DuplicateSymbol),
-                    error.OutOfMemory => return error.OutOfMemory,
-                };
-                break :blk .{ .value = .unit, .returned = false };
-            },
+            .const_decl => try self.evalDecl(idx, false, locals),
+            .var_decl => try self.evalDecl(idx, true, locals),
             .assign => blk: {
                 const name = a.identOf(a.nodes[idx].data0);
                 const value = (try self.evalNodeStep(a.nodes[idx].data1, locals)).value;
@@ -843,42 +855,7 @@ const Checker = struct {
                 break :blk .{ .value = try self.evalFunction(fn_id, arg_values.items), .returned = false };
             },
             .print_stmt, .arg => self.failAtNode(idx, error.ComptimePureOperationNotAllowed),
-            .add => blk: {
-                const l = (try self.evalNodeStep(a.nodes[idx].data0, locals)).value;
-                const r = (try self.evalNodeStep(a.nodes[idx].data1, locals)).value;
-                break :blk .{ .value = switch (l) {
-                    .int => |lv| .{ .int = lv + r.int },
-                    .float => |lv| .{ .float = lv + r.float },
-                    else => return self.failAtNode(idx, error.ArithmeticRequiresNumeric),
-                }, .returned = false };
-            },
-            .sub => blk: {
-                const l = (try self.evalNodeStep(a.nodes[idx].data0, locals)).value;
-                const r = (try self.evalNodeStep(a.nodes[idx].data1, locals)).value;
-                break :blk .{ .value = switch (l) {
-                    .int => |lv| .{ .int = lv - r.int },
-                    .float => |lv| .{ .float = lv - r.float },
-                    else => return self.failAtNode(idx, error.ArithmeticRequiresNumeric),
-                }, .returned = false };
-            },
-            .mul => blk: {
-                const l = (try self.evalNodeStep(a.nodes[idx].data0, locals)).value;
-                const r = (try self.evalNodeStep(a.nodes[idx].data1, locals)).value;
-                break :blk .{ .value = switch (l) {
-                    .int => |lv| .{ .int = lv * r.int },
-                    .float => |lv| .{ .float = lv * r.float },
-                    else => return self.failAtNode(idx, error.ArithmeticRequiresNumeric),
-                }, .returned = false };
-            },
-            .div => blk: {
-                const l = (try self.evalNodeStep(a.nodes[idx].data0, locals)).value;
-                const r = (try self.evalNodeStep(a.nodes[idx].data1, locals)).value;
-                break :blk .{ .value = switch (l) {
-                    .int => |lv| .{ .int = @divTrunc(lv, r.int) },
-                    .float => |lv| .{ .float = lv / r.float },
-                    else => return self.failAtNode(idx, error.ArithmeticRequiresNumeric),
-                }, .returned = false };
-            },
+            .add, .sub, .mul, .div => try self.evalArithmetic(idx, locals),
             .lt, .gt, .le, .ge, .eq, .ne => .{ .value = .unit, .returned = false },
             .if_stmt => blk: {
                 const data = a.ifData(idx);
@@ -945,8 +922,11 @@ const Checker = struct {
 
         const resolved_ref = self.resolved.node_refs.get(idx) orelse return self.failAtNode(idx, error.UnknownSymbol);
         return switch (resolved_ref) {
-            .local => return self.failAtNode(idx, if (self.in_comptime_context) error.ComptimeCaptureNotAllowed else error.UnknownSymbol),
-            .function => |fn_id| return self.remember(idx, .{ .func = self.typed.functionType(fn_id) }),
+            .local => self.failAtNode(idx, if (self.in_comptime_context) error.ComptimeCaptureNotAllowed else error.UnknownSymbol),
+            .function => |fn_id| blk: {
+                const fn_ty: Type = .{ .func = self.typed.functionType(fn_id) };
+                break :blk try self.remember(idx, fn_ty);
+            },
             .comptime_value => |decl_idx| blk: {
                 const ty = try self.inferComptimeDeclType(decl_idx);
                 if (!self.in_comptime_context) {
@@ -956,7 +936,7 @@ const Checker = struct {
                 }
                 break :blk try self.remember(idx, ty);
             },
-            .struct_decl => |decl_idx| return self.remember(idx, .{ .named = self.parsed.ast.identOf(self.parsed.ast.nodes[decl_idx].data0) }),
+            .struct_decl => |decl_idx| self.remember(idx, .{ .named = self.parsed.ast.identOf(self.parsed.ast.nodes[decl_idx].data0) }),
         };
     }
 
@@ -971,9 +951,9 @@ const Checker = struct {
             .bool_lit => self.remember(idx, .bool),
             .unit_lit => self.remember(idx, .unit),
             .var_ref => self.inferVarRef(idx),
-            .var_decl => self.inferVar(idx),
+            .var_decl => self.inferDecl(idx, true),
             .assign => self.inferAssign(idx),
-            .const_decl => self.inferConst(idx),
+            .const_decl => self.inferDecl(idx, false),
             .return_stmt => self.inferReturn(idx),
             .call => self.inferCall(idx),
             .arg => if (self.in_comptime_context) self.failAtNode(idx, error.ComptimePureOperationNotAllowed) else self.remember(idx, .int),
@@ -992,12 +972,8 @@ const Checker = struct {
             .sub => self.inferArithmetic(idx, a.nodes[idx].data0, a.nodes[idx].data1),
             .mul => self.inferArithmetic(idx, a.nodes[idx].data0, a.nodes[idx].data1),
             .div => self.inferArithmetic(idx, a.nodes[idx].data0, a.nodes[idx].data1),
-            .lt => try self.inferFallible(idx, a.nodes[idx].data0, a.nodes[idx].data1, Checker.inferComparison),
-            .gt => try self.inferFallible(idx, a.nodes[idx].data0, a.nodes[idx].data1, Checker.inferComparison),
-            .le => try self.inferFallible(idx, a.nodes[idx].data0, a.nodes[idx].data1, Checker.inferComparison),
-            .ge => try self.inferFallible(idx, a.nodes[idx].data0, a.nodes[idx].data1, Checker.inferComparison),
-            .eq => try self.inferFallible(idx, a.nodes[idx].data0, a.nodes[idx].data1, Checker.inferEquality),
-            .ne => try self.inferFallible(idx, a.nodes[idx].data0, a.nodes[idx].data1, Checker.inferEquality),
+            .lt, .gt, .le, .ge => try self.inferComparison(idx, a.nodes[idx].data0, a.nodes[idx].data1),
+            .eq, .ne => try self.inferEquality(idx, a.nodes[idx].data0, a.nodes[idx].data1),
             .if_stmt => self.inferIf(idx),
             .struct_init => self.inferStructInit(idx),
             .field_access => self.inferFieldAccess(idx),
@@ -1021,10 +997,7 @@ const Checker = struct {
             const a = self.parsed.ast;
             for (a.fnParams(info.decl), info.ty.params) |param, param_ty| {
                 const pname = a.identOf(param.name);
-                self.bindings.push(self.gpa, pname, .{ .ty = param_ty, .mutable = false, .comptime_visible = false }) catch |err| switch (err) {
-                    error.DuplicateVariable => return self.failAtNode(info.decl, error.DuplicateSymbol),
-                    error.OutOfMemory => return error.OutOfMemory,
-                };
+                try self.pushBinding(info.decl, pname, .{ .ty = param_ty, .mutable = false, .comptime_visible = false });
             }
         }
 
@@ -1035,7 +1008,7 @@ const Checker = struct {
                 const mutable_sig = @constCast(info.ty);
                 mutable_sig.ret = body_ty;
             } else {
-                return self.failAtNode(body, error.FunctionBodyTypeMismatch);
+                return self.failAtNodeWithTypes(body, error.FunctionBodyTypeMismatch, info.ty.ret, body_ty);
             }
         }
         info.has_explicit_return = self.current_saw_return;
@@ -1104,12 +1077,22 @@ pub fn typecheckReport(
         error.TypecheckFailed => {
             const failure = checker.failure.?;
             checker.deinit();
+            const message = if (failure.expected_type) |expected| msg: {
+                const base = typeErrorMessage(failure.kind);
+                const expected_str = typeName(expected);
+                const actual_str = typeName(failure.actual_type.?);
+                if (failure.kind == error.IfBranchTypeMismatch) {
+                    break :msg try std.fmt.allocPrint(gpa, "{s}: '{s}' vs '{s}'", .{ base, expected_str, actual_str });
+                }
+                break :msg try std.fmt.allocPrint(gpa, "{s}: expected '{s}', got '{s}'", .{ base, expected_str, actual_str });
+            } else typeErrorMessage(failure.kind);
             return .{
                 .typed = null,
                 .diagnostic = .{
                     .stage = .typecheck,
                     .span = failure.span,
-                    .message = typeErrorMessage(failure.kind),
+                    .message = message,
+                    .message_allocated = failure.expected_type != null,
                 },
             };
         },

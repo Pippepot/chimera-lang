@@ -211,7 +211,7 @@ fn dumpAstNode(a: *const ast.Ast, idx: ast.NodeIdx, writer: *std.Io.Writer, pref
         },
         .field_access => dumpAstNode(a, a.nodes[idx].data0, writer, next_prefix, true, false),
         .comptime_expr => dumpAstNode(a, a.comptimeExprBody(idx), writer, next_prefix, true, false),
-        .comptime_value_decl => dumpAstNode(a, a.nodes[idx].data1, writer, next_prefix, true, false),
+        .comptime_value_decl => dumpAstNode(a, a.comptimeValueDeclValue(idx), writer, next_prefix, true, false),
         .struct_init => {
             const fields = a.structInitFields(idx);
             for (fields, 0..) |field, i| {

@@ -224,7 +224,7 @@ const Resolver = struct {
                 try self.resolveNode(ast_.nodes[idx].data0);
             },
             .comptime_expr => try self.resolveNode(ast_.comptimeExprBody(idx)),
-            .comptime_value_decl => try self.resolveNode(ast_.nodes[idx].data1),
+            .comptime_value_decl => try self.resolveNode(ast_.comptimeValueDeclValue(idx)),
             .type_name, .type_func, .comptime_fn, .comptime_struct => {},
         }
     }
