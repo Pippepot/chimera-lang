@@ -101,21 +101,13 @@ pub const Ast = struct {
         return ast.extra[start..][0..count];
     }
 
-    pub fn varDeclHasType(ast: *const Ast, idx: NodeIdx) bool {
-        return ast.nodes[idx].data1 & 0x80000000 != 0;
-    }
+    pub fn varDeclHasType(ast: *const Ast, idx: NodeIdx) bool { return declHasType(ast, idx); }
+    pub fn varDeclType(ast: *const Ast, idx: NodeIdx) ?TypeIdx { return declType(ast, idx); }
+    pub fn varDeclValue(ast: *const Ast, idx: NodeIdx) NodeIdx { return declValue(ast, idx); }
 
-    pub fn varDeclType(ast: *const Ast, idx: NodeIdx) ?TypeIdx {
-        if (!varDeclHasType(ast, idx)) return null;
-        const extra_idx = ast.nodes[idx].data1 & ~@as(u32, 0x80000000);
-        return ast.extra[extra_idx];
-    }
-
-    pub fn varDeclValue(ast: *const Ast, idx: NodeIdx) NodeIdx {
-        if (!varDeclHasType(ast, idx)) return ast.nodes[idx].data1;
-        const extra_idx = ast.nodes[idx].data1 & ~@as(u32, 0x80000000);
-        return ast.extra[extra_idx + 1];
-    }
+    pub const comptimeValueDeclHasType = varDeclHasType;
+    pub const comptimeValueDeclType = varDeclType;
+    pub const comptimeValueDeclValue = varDeclValue;
 
     pub fn callArgs(ast: *const Ast, idx: NodeIdx) []const NodeIdx {
         const extra_idx = ast.nodes[idx].data1;
@@ -159,20 +151,18 @@ pub const Ast = struct {
         return ast.nodes[idx].data1;
     }
 
-    pub fn asLhs(ast: *const Ast, idx: NodeIdx) NodeIdx {
-        return ast.nodes[idx].data0;
-    }
+    fn hasAnnotation(data1: u32) bool { return data1 & 0x80000000 != 0; }
+    fn extraIdx(data1: u32) u32 { return data1 & ~@as(u32, 0x80000000); }
 
-    pub fn asRhsType(ast: *const Ast, idx: NodeIdx) TypeIdx {
-        return ast.nodes[idx].data1;
+    fn declHasType(ast: *const Ast, idx: NodeIdx) bool { return hasAnnotation(ast.nodes[idx].data1); }
+    fn declType(ast: *const Ast, idx: NodeIdx) ?TypeIdx {
+        if (!hasAnnotation(ast.nodes[idx].data1)) return null;
+        return ast.extra[extraIdx(ast.nodes[idx].data1)];
     }
-
-    pub fn queryOpLhs(ast: *const Ast, idx: NodeIdx) NodeIdx {
-        return ast.nodes[idx].data0;
-    }
-
-    fn extraIdx(data1: u32) u32 {
-        return data1 & ~@as(u32, 0x80000000);
+    fn declValue(ast: *const Ast, idx: NodeIdx) NodeIdx {
+        const d1 = ast.nodes[idx].data1;
+        if (!hasAnnotation(d1)) return d1;
+        return ast.extra[extraIdx(d1) + 1];
     }
 
     pub const FnAnnotationInfo = struct {
@@ -180,25 +170,12 @@ pub const Ast = struct {
         annotation: ?TypeIdx,
     };
 
-    pub fn fnComptimeMask(ast: *const Ast, idx: NodeIdx) u32 {
-        const ei = extraIdx(ast.nodes[idx].data1);
-        return ast.extra[ei + 1]; // second u32 after count
-    }
+    fn fnExtraBase(ast: *const Ast, idx: NodeIdx) u32 { return extraIdx(ast.nodes[idx].data1); }
 
-    pub fn fnMutMask(ast: *const Ast, idx: NodeIdx) u32 {
-        const ei = extraIdx(ast.nodes[idx].data1);
-        return ast.extra[ei + 2];
-    }
-
-    pub fn fnVarMask(ast: *const Ast, idx: NodeIdx) u32 {
-        const ei = extraIdx(ast.nodes[idx].data1);
-        return ast.extra[ei + 3];
-    }
-
-    pub fn fnDeinitMask(ast: *const Ast, idx: NodeIdx) u32 {
-        const ei = extraIdx(ast.nodes[idx].data1);
-        return ast.extra[ei + 4];
-    }
+    pub fn fnComptimeMask(ast: *const Ast, idx: NodeIdx) u32 { return ast.extra[ast.fnExtraBase(idx) + 1]; }
+    pub fn fnMutMask(ast: *const Ast, idx: NodeIdx) u32 { return ast.extra[ast.fnExtraBase(idx) + 2]; }
+    pub fn fnVarMask(ast: *const Ast, idx: NodeIdx) u32 { return ast.extra[ast.fnExtraBase(idx) + 3]; }
+    pub fn fnDeinitMask(ast: *const Ast, idx: NodeIdx) u32 { return ast.extra[ast.fnExtraBase(idx) + 4]; }
 
     pub fn fnParamAccessMode(ast: *const Ast, idx: NodeIdx, param_index: u32) ParamAccessMode {
         if (fnComptimeMask(ast, idx) & (@as(u32, 1) << @intCast(param_index)) != 0) return .read;
@@ -213,27 +190,27 @@ pub const Ast = struct {
     }
 
     pub fn fnParams(ast: *const Ast, idx: NodeIdx) []const ParamPair {
-        const ei = extraIdx(ast.nodes[idx].data1);
+        const ei = ast.fnExtraBase(idx);
         const count = ast.extra[ei];
-        const pairs = @as([*]const ParamPair, @ptrCast(&ast.extra[ei + 5])); // skip count + masks
+        const pairs = @as([*]const ParamPair, @ptrCast(&ast.extra[ei + 5]));
         return pairs[0..count];
     }
 
     pub fn fnRetType(ast: *const Ast, idx: NodeIdx) TypeIdx {
-        const ei = extraIdx(ast.nodes[idx].data1);
+        const ei = ast.fnExtraBase(idx);
         const count = ast.extra[ei];
         return ast.extra[ei + 5 + count * 2];
     }
 
     pub fn fnBody(ast: *const Ast, idx: NodeIdx) NodeIdx {
-        const ei = extraIdx(ast.nodes[idx].data1);
+        const ei = ast.fnExtraBase(idx);
         const count = ast.extra[ei];
         return ast.extra[ei + 5 + count * 2 + 1];
     }
 
     pub fn comptimeFnAnnotation(ast: *const Ast, idx: NodeIdx) ?TypeIdx {
-        if (ast.nodes[idx].data1 & 0x80000000 == 0) return null;
-        const ei = extraIdx(ast.nodes[idx].data1);
+        if (!hasAnnotation(ast.nodes[idx].data1)) return null;
+        const ei = ast.fnExtraBase(idx);
         const count = ast.extra[ei];
         return ast.extra[ei + 7 + count * 2];
     }
@@ -245,69 +222,41 @@ pub const Ast = struct {
         return pairs[0..count];
     }
 
+    fn structExtraBase(ast: *const Ast, idx: NodeIdx) u32 { return extraIdx(ast.nodes[idx].data1); }
+
     pub fn structFields(ast: *const Ast, idx: NodeIdx) []const ParamPair {
-        const ei = extraIdx(ast.nodes[idx].data1);
+        const ei = ast.structExtraBase(idx);
         const count = ast.extra[ei];
         const pairs = @as([*]const ParamPair, @ptrCast(&ast.extra[ei + 8]));
         return pairs[0..count];
     }
 
     pub fn comptimeStructAnnotation(ast: *const Ast, idx: NodeIdx) ?TypeIdx {
-        if (ast.nodes[idx].data1 & 0x80000000 == 0) return null;
-        const ei = extraIdx(ast.nodes[idx].data1);
+        if (!hasAnnotation(ast.nodes[idx].data1)) return null;
+        const ei = ast.structExtraBase(idx);
         const count = ast.extra[ei];
         return ast.extra[ei + 8 + count * 2];
     }
 
-    pub fn structPolicyExplicitMask(ast: *const Ast, idx: NodeIdx) u32 {
-        const ei = extraIdx(ast.nodes[idx].data1);
-        return ast.extra[ei + 7];
-    }
+    pub fn structMoveExplicit(ast: *const Ast, idx: NodeIdx) bool { return ast.extra[ast.structExtraBase(idx) + 7] & 0b001 != 0; }
+    pub fn structCopyExplicit(ast: *const Ast, idx: NodeIdx) bool { return ast.extra[ast.structExtraBase(idx) + 7] & 0b010 != 0; }
+    pub fn structDropExplicit(ast: *const Ast, idx: NodeIdx) bool { return ast.extra[ast.structExtraBase(idx) + 7] & 0b100 != 0; }
 
-    pub fn structMoveExplicit(ast: *const Ast, idx: NodeIdx) bool {
-        return structPolicyExplicitMask(ast, idx) & 0b001 != 0;
-    }
-
-    pub fn structCopyExplicit(ast: *const Ast, idx: NodeIdx) bool {
-        return structPolicyExplicitMask(ast, idx) & 0b010 != 0;
-    }
-
-    pub fn structDropExplicit(ast: *const Ast, idx: NodeIdx) bool {
-        return structPolicyExplicitMask(ast, idx) & 0b100 != 0;
-    }
-
-    pub fn structMoveKind(ast: *const Ast, idx: NodeIdx) StructMoveKind {
-        const ei = extraIdx(ast.nodes[idx].data1);
-        return @enumFromInt(ast.extra[ei + 1]);
-    }
-
+    pub fn structMoveKind(ast: *const Ast, idx: NodeIdx) StructMoveKind { return @enumFromInt(ast.extra[ast.structExtraBase(idx) + 1]); }
     pub fn structMoveHook(ast: *const Ast, idx: NodeIdx) ?IdentIdx {
-        const ei = extraIdx(ast.nodes[idx].data1);
-        const hook = ast.extra[ei + 2];
+        const hook = ast.extra[ast.structExtraBase(idx) + 2];
         if (hook == no_hook_ident) return null;
         return hook;
     }
-
-    pub fn structCopyKind(ast: *const Ast, idx: NodeIdx) StructCopyKind {
-        const ei = extraIdx(ast.nodes[idx].data1);
-        return @enumFromInt(ast.extra[ei + 3]);
-    }
-
+    pub fn structCopyKind(ast: *const Ast, idx: NodeIdx) StructCopyKind { return @enumFromInt(ast.extra[ast.structExtraBase(idx) + 3]); }
     pub fn structCopyHook(ast: *const Ast, idx: NodeIdx) ?IdentIdx {
-        const ei = extraIdx(ast.nodes[idx].data1);
-        const hook = ast.extra[ei + 4];
+        const hook = ast.extra[ast.structExtraBase(idx) + 4];
         if (hook == no_hook_ident) return null;
         return hook;
     }
-
-    pub fn structDropKind(ast: *const Ast, idx: NodeIdx) StructDropKind {
-        const ei = extraIdx(ast.nodes[idx].data1);
-        return @enumFromInt(ast.extra[ei + 5]);
-    }
-
+    pub fn structDropKind(ast: *const Ast, idx: NodeIdx) StructDropKind { return @enumFromInt(ast.extra[ast.structExtraBase(idx) + 5]); }
     pub fn structDropHook(ast: *const Ast, idx: NodeIdx) ?IdentIdx {
-        const ei = extraIdx(ast.nodes[idx].data1);
-        const hook = ast.extra[ei + 6];
+        const hook = ast.extra[ast.structExtraBase(idx) + 6];
         if (hook == no_hook_ident) return null;
         return hook;
     }
@@ -334,22 +283,6 @@ pub const Ast = struct {
         const extra_idx = ast.nodes[idx].data0;
         const count = ast.nodes[idx].data1;
         return ast.extra[extra_idx..][0..count];
-    }
-
-    pub fn comptimeValueDeclHasType(ast: *const Ast, idx: NodeIdx) bool {
-        return ast.nodes[idx].data1 & 0x80000000 != 0;
-    }
-
-    pub fn comptimeValueDeclType(ast: *const Ast, idx: NodeIdx) ?TypeIdx {
-        if (!comptimeValueDeclHasType(ast, idx)) return null;
-        const extra_idx = ast.nodes[idx].data1 & ~@as(u32, 0x80000000);
-        return ast.extra[extra_idx];
-    }
-
-    pub fn comptimeValueDeclValue(ast: *const Ast, idx: NodeIdx) NodeIdx {
-        if (!comptimeValueDeclHasType(ast, idx)) return ast.nodes[idx].data1;
-        const extra_idx = ast.nodes[idx].data1 & ~@as(u32, 0x80000000);
-        return ast.extra[extra_idx + 1];
     }
 
     pub fn comptimeExprBody(ast: *const Ast, idx: NodeIdx) NodeIdx {
@@ -519,22 +452,6 @@ pub const no_hook_ident: u32 = std.math.maxInt(u32);
 /// Sentinel value stored in the extra array as `ret_ty` when a function declaration
 /// omits the return type annotation, indicating it should be inferred from the body.
 pub const FN_NO_RET_TYPE: u32 = std.math.maxInt(u32);
-
-pub fn typeName(ast: *const Ast, idx: TypeIdx) []const u8 {
-    return ast.identOf(ast.nodes[idx].data0);
-}
-
-pub fn typeFuncParams(ast: *const Ast, idx: TypeIdx) []const TypeIdx {
-    return ast.funcTypeParams(idx);
-}
-
-pub fn typeFuncRet(ast: *const Ast, idx: TypeIdx) TypeIdx {
-    return ast.funcTypeRet(idx);
-}
-
-pub fn typeVariantMembers(ast: *const Ast, idx: TypeIdx) []const TypeIdx {
-    return ast.variantTypeMembers(idx);
-}
 
 pub const FieldPair = struct { name: IdentIdx, value: NodeIdx };
 pub const ParamPair = struct { name: IdentIdx, ty: TypeIdx };

@@ -716,7 +716,7 @@ const FunctionLowerer = struct {
         else_target: BlockId,
     ) LowerResult!void {
         const a = self.parent.typed.ast;
-        const lhs = a.asLhs(as_node);
+        const lhs = a.isLhs(as_node);
         const lhs_base = try self.lowerAst(lhs);
         const lhs_ty = try self.nodeType(lhs);
         const lhs_variant = switch (lhs_ty) {
@@ -758,7 +758,7 @@ const FunctionLowerer = struct {
         else_target: BlockId,
     ) LowerResult!void {
         const a = self.parent.typed.ast;
-        const lhs = a.queryOpLhs(query_node);
+        const lhs = a.isLhs(query_node);
         const lhs_base = try self.lowerAst(lhs);
         const none_tag = self.parent.typed.query_none_tags.get(query_node) orelse return error.IfConditionNotFallible;
 
@@ -1407,7 +1407,7 @@ const FunctionLowerer = struct {
 
     fn lowerAsValue(self: *@This(), idx: ast.NodeIdx) LowerResult!ValueRef {
         const a = self.parent.typed.ast;
-        const lhs = a.asLhs(idx);
+        const lhs = a.isLhs(idx);
         const lhs_base = try self.lowerAst(lhs);
         const lhs_ty = try self.nodeType(lhs);
         const lhs_variant = switch (lhs_ty) {
@@ -1427,7 +1427,7 @@ const FunctionLowerer = struct {
 
     fn lowerQueryOpValue(self: *@This(), idx: ast.NodeIdx) LowerResult!ValueRef {
         const a = self.parent.typed.ast;
-        const lhs = a.queryOpLhs(idx);
+        const lhs = a.isLhs(idx);
         const lhs_base = try self.lowerAst(lhs);
         const result_ty = try self.nodeType(idx);
         const binding_slots = try self.typeSlotCount(result_ty);

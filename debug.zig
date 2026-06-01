@@ -239,13 +239,13 @@ fn dumpAstNode(a: *const ast.Ast, idx: ast.NodeIdx, writer: *std.Io.Writer, pref
             writer.writeAll("\n") catch return;
         },
         .as => {
-            dumpAstNode(a, a.asLhs(idx), writer, next_prefix, false, false);
+            dumpAstNode(a, a.isLhs(idx), writer, next_prefix, false, false);
             writer.print("{s}└─type ", .{next_prefix}) catch return;
-            dumpTypeNode(a, a.asRhsType(idx), writer);
+            dumpTypeNode(a, a.isRhsType(idx), writer);
             writer.writeAll("\n") catch return;
         },
         .query_op => {
-            dumpAstNode(a, a.queryOpLhs(idx), writer, next_prefix, true, false);
+            dumpAstNode(a, a.isLhs(idx), writer, next_prefix, true, false);
         },
         .if_stmt => {
             const id = a.ifData(idx);

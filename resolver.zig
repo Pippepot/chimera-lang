@@ -228,7 +228,7 @@ const Resolver = struct {
                 try self.resolveNode(ast_.isLhs(idx));
             },
             .as => {
-                try self.resolveNode(ast_.asLhs(idx));
+                try self.resolveNode(ast_.isLhs(idx));
             },
             .if_stmt => {
                 const data = ast_.ifData(idx);
@@ -272,7 +272,7 @@ const Resolver = struct {
                 try self.resolveNode(ast_.nodes[idx].data0);
             },
             .query_op => {
-                try self.resolveNode(ast_.queryOpLhs(idx));
+                try self.resolveNode(ast_.isLhs(idx));
             },
             .struct_expr => {},
             .type_union => {

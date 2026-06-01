@@ -1121,8 +1121,8 @@ const Binding = struct {
                 try self.ownershipUseExpr(a.nodes[idx].data1, stack, .read, current_ret);
             },
             .is => try self.ownershipUseExpr(a.isLhs(idx), stack, .read, current_ret),
-            .as => try self.ownershipUseExpr(a.asLhs(idx), stack, .read, current_ret),
-            .query_op => try self.ownershipUseExpr(a.queryOpLhs(idx), stack, .read, current_ret),
+            .as => try self.ownershipUseExpr(a.isLhs(idx), stack, .read, current_ret),
+            .query_op => try self.ownershipUseExpr(a.isLhs(idx), stack, .read, current_ret),
             .@"not" => try self.ownershipUseExpr(a.nodes[idx].data0, stack, .read, current_ret),
             .if_stmt => try self.ownershipVisitIf(idx, stack, current_ret),
             .const_decl => try self.ownershipVisitDecl(idx, stack, false, current_ret),
@@ -2186,10 +2186,10 @@ const Binding = struct {
                 };
             },
             .as => blk: {
-                const lhs_node = a.asLhs(idx);
+                const lhs_node = a.isLhs(idx);
                 const lhs_value = (try self.evalNodeStep(lhs_node, locals)).value;
                 const lhs_ty = try self.runtimeTypeOfComptimeValue(lhs_node, lhs_value);
-                const rhs_ty = try self.resolveTypeNode(a.asRhsType(idx));
+                const rhs_ty = try self.resolveTypeNode(a.isRhsType(idx));
                 if (rhs_ty == .variant) break :blk false;
                 break :blk typeEql(lhs_ty, rhs_ty);
             },
@@ -2197,10 +2197,10 @@ const Binding = struct {
                 const value_node = a.varDeclValue(idx);
                 if (a.nodes[value_node].tag != .as) break :blk false;
 
-                const lhs_node = a.asLhs(value_node);
+                const lhs_node = a.isLhs(value_node);
                 const lhs_value = (try self.evalNodeStep(lhs_node, locals)).value;
                 const lhs_ty = try self.runtimeTypeOfComptimeValue(lhs_node, lhs_value);
-                const rhs_ty = try self.resolveTypeNode(a.asRhsType(value_node));
+                const rhs_ty = try self.resolveTypeNode(a.isRhsType(value_node));
                 if (rhs_ty == .variant or !typeEql(lhs_ty, rhs_ty)) break :blk false;
 
                 const name = a.identOf(a.nodes[idx].data0);
@@ -2393,17 +2393,17 @@ const Binding = struct {
             .add, .sub, .mul, .div => try self.evalArithmetic(idx, locals),
             .lt, .gt, .le, .ge, .eq, .ne, .is, .@"and", .@"or", .@"not" => .{ .value = .unit, .returned = false },
             .as => blk: {
-                const lhs_node = a.asLhs(idx);
+                const lhs_node = a.isLhs(idx);
                 const lhs_step = try self.evalNodeStep(lhs_node, locals);
                 const lhs_ty = try self.runtimeTypeOfComptimeValue(lhs_node, lhs_step.value);
-                const rhs_ty = try self.resolveTypeNode(a.asRhsType(idx));
+                const rhs_ty = try self.resolveTypeNode(a.isRhsType(idx));
                 if (typeEql(lhs_ty, rhs_ty)) {
                     break :blk .{ .value = try self.cloneCtValue(lhs_step.value), .returned = false };
                 }
                 break :blk .{ .value = .unit, .returned = false };
             },
             .query_op => blk: {
-                const lhs_node = a.queryOpLhs(idx);
+                const lhs_node = a.isLhs(idx);
                 const lhs_step = try self.evalNodeStep(lhs_node, locals);
                 break :blk .{ .value = try self.cloneCtValue(lhs_step.value), .returned = false };
             },
@@ -2597,8 +2597,8 @@ const Binding = struct {
             .lt, .gt, .le, .ge => try self.inferComparison(idx, a.nodes[idx].data0, a.nodes[idx].data1),
             .eq, .ne => try self.inferEquality(idx, a.nodes[idx].data0, a.nodes[idx].data1),
             .is => try self.inferIs(idx, a.isLhs(idx), a.isRhsType(idx)),
-            .as => try self.inferAs(idx, a.asLhs(idx), a.asRhsType(idx)),
-            .query_op => try self.inferQueryOp(idx, a.queryOpLhs(idx)),
+            .as => try self.inferAs(idx, a.isLhs(idx), a.isRhsType(idx)),
+            .query_op => try self.inferQueryOp(idx, a.isLhs(idx)),
             .@"and", .@"or" => try self.inferLogical(idx, a.nodes[idx].data0, a.nodes[idx].data1),
             .@"not" => try self.inferNot(idx),
             .if_stmt => self.inferIf(idx),
