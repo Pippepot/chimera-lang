@@ -354,6 +354,12 @@ fn writeInst(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, inst: ir_mod.Inst)
             try appendU8(buf, gpa, c.ret_slots);
             for (&c.args) |a| try appendU32(buf, gpa, a);
         },
+        .direct_call => |dc| {
+            try appendU32(buf, gpa, dc.callee);
+            try appendU8(buf, gpa, dc.argc);
+            try appendU8(buf, gpa, dc.ret_slots);
+            for (&dc.args) |a| try appendU32(buf, gpa, a);
+        },
         .addi, .addf, .subi, .subf, .muli, .mulf, .divi, .divf, .store => |p| {
             try appendU32(buf, gpa, p.l);
             try appendU32(buf, gpa, p.r);
@@ -413,6 +419,16 @@ fn readInst(r: *Reader) LoadError!ir_mod.Inst {
             .ptr = try r.readU32(),
             .src = try r.readU32(),
             .offset_slots = try r.readU32(),
+        } },
+        21 => .{ .direct_call = .{
+            .callee = try r.readU32(),
+            .argc = try r.readU8(),
+            .ret_slots = try r.readU8(),
+            .args = blk: {
+                var args: [ir_mod.MaxCallArgs]ir_mod.ValueRef = undefined;
+                for (&args) |*a| a.* = try r.readU32();
+                break :blk args;
+            },
         } },
         else => error.InvalidData,
     };

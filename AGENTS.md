@@ -68,6 +68,11 @@
 - **IR fields added:**
   - `field_assign` AST tag in `ast.zig` stores `data0 = field_access_node, data1 = value_expr`.
   - `Function.ret_slots: u32` in `ir.zig` stores the return value slot count explicitly (not inferred from IR `Type`, which loses struct field count).
+- **IR direct vs indirect calls:**
+  - `direct_call` (`DirectCallInst`) is used for calling a known function by name (no function-pointer indirection). Emits `call rel32` in codegen.
+  - `call` (`CallInst`) is used for function-pointer calls (indirect). Emits `call rax` after loading callee address.
+  - `lowerCall` detects `var_ref` to a known function (not shadowed by a local binding) and emits `direct_call` via `lowerDirectCall`.
+  - `lowerMonomorphizedCall` also uses `direct_call`.
 - **IR lowering:**
   - `var`/`const` with a `struct_init` value allocates N consecutive stack slots (one per field) and emits `store` for each field value.
   - Field access for index 0 returns the base slot directly. For higher indices it emits `field_load(base, field_index)` which loads from slot `base + field_index`.

@@ -19,6 +19,16 @@ fn printCallInst(writer: *std.Io.Writer, id: u32, call_info: ir_mod.CallInst) vo
     writer.writeAll(")\n") catch return;
 }
 
+fn printDirectCallInst(writer: *std.Io.Writer, id: u32, dc: ir_mod.DirectCallInst) void {
+    writer.print("  %{d} = call @{d}(", .{ id, dc.callee }) catch return;
+    var idx: usize = 0;
+    while (idx < dc.argc) : (idx += 1) {
+        if (idx > 0) writer.writeAll(", ") catch return;
+        writer.print("%{d}", .{dc.args[idx]}) catch return;
+    }
+    writer.writeAll(")\n") catch return;
+}
+
 fn printBranch(writer: *std.Io.Writer, b: ir_mod.Branch) void {
     if (b.arg) |arg| writer.print("  br L{d}(%{d})\n", .{ b.target, arg }) catch return else writer.print("  br L{d}\n", .{b.target}) catch return;
 }
@@ -63,6 +73,7 @@ fn dumpIr(program: *const Program, writer: *std.Io.Writer) void {
                     .fconst => |v| writer.print("  %{d} = fconst {d}\n", .{ vinst.id, v }) catch return,
                     .fn_addr => |fn_id| writer.print("  %{d} = fn_addr @{d}\n", .{ vinst.id, fn_id }) catch return,
                     .call => |call_info| printCallInst(writer, vinst.id, call_info),
+                    .direct_call => |dc| printDirectCallInst(writer, vinst.id, dc),
                     .addi => |p| printBinInst(writer, vinst.id, "addi", p),
                     .addf => |p| printBinInst(writer, vinst.id, "addf", p),
                     .subi => |p| printBinInst(writer, vinst.id, "subi", p),

@@ -19,7 +19,10 @@ fn patterns() [patternCount()]Pattern {
     return [_]Pattern{
         // stack frame
         .{ .prefix = &.{0x55}, .total_len = 1, .operand = .none, .asm_prefix = "push rbp", .asm_suffix = "" },
+        .{ .prefix = &.{0x53}, .total_len = 1, .operand = .none, .asm_prefix = "push rbx", .asm_suffix = "" },
+        .{ .prefix = &.{0x5B}, .total_len = 1, .operand = .none, .asm_prefix = "pop rbx", .asm_suffix = "" },
         .{ .prefix = &.{0x5D}, .total_len = 1, .operand = .none, .asm_prefix = "pop rbp", .asm_suffix = "" },
+        .{ .prefix = &.{0xC9}, .total_len = 1, .operand = .none, .asm_prefix = "leave", .asm_suffix = "" },
         .{ .prefix = &.{0xC3}, .total_len = 1, .operand = .none, .asm_prefix = "ret", .asm_suffix = "" },
         .{ .prefix = &.{ 0x48, 0x89, 0xE5 }, .total_len = 3, .operand = .none, .asm_prefix = "mov rbp, rsp", .asm_suffix = "" },
         .{ .prefix = &.{ 0x48, 0x89, 0xEC }, .total_len = 3, .operand = .none, .asm_prefix = "mov rsp, rbp", .asm_suffix = "" },
@@ -122,6 +125,24 @@ fn patterns() [patternCount()]Pattern {
         // immediate (signed)
         .{ .prefix = &.{0xB8}, .total_len = 5, .operand = .i32, .asm_prefix = "mov eax, ", .asm_suffix = "" },
 
+        // immediate arithmetic
+        .{ .prefix = &.{0x2D}, .total_len = 5, .operand = .i32, .asm_prefix = "sub eax, ", .asm_suffix = "" },
+        .{ .prefix = &.{0x05}, .total_len = 5, .operand = .i32, .asm_prefix = "add eax, ", .asm_suffix = "" },
+        .{ .prefix = &.{0x3D}, .total_len = 5, .operand = .i32, .asm_prefix = "cmp eax, ", .asm_suffix = "" },
+
+        // mov ebx, eax
+        .{ .prefix = &.{ 0x89, 0xC3 }, .total_len = 2, .operand = .none, .asm_prefix = "mov ebx, eax", .asm_suffix = "" },
+        .{ .prefix = &.{ 0x89, 0xD8 }, .total_len = 2, .operand = .none, .asm_prefix = "mov eax, ebx", .asm_suffix = "" },
+        .{ .prefix = &.{ 0x85, 0xC0 }, .total_len = 2, .operand = .none, .asm_prefix = "test eax, eax", .asm_suffix = "" },
+
+        // reg-to-reg 64-bit: mov rXX, rax
+        .{ .prefix = &.{ 0x48, 0x89, 0xC7 }, .total_len = 3, .operand = .none, .asm_prefix = "mov rdi, rax", .asm_suffix = "" },
+        .{ .prefix = &.{ 0x48, 0x89, 0xC6 }, .total_len = 3, .operand = .none, .asm_prefix = "mov rsi, rax", .asm_suffix = "" },
+        .{ .prefix = &.{ 0x48, 0x89, 0xC2 }, .total_len = 3, .operand = .none, .asm_prefix = "mov rdx, rax", .asm_suffix = "" },
+        .{ .prefix = &.{ 0x48, 0x89, 0xC1 }, .total_len = 3, .operand = .none, .asm_prefix = "mov rcx, rax", .asm_suffix = "" },
+        .{ .prefix = &.{ 0x4C, 0x89, 0xC0 }, .total_len = 3, .operand = .none, .asm_prefix = "mov r8, rax", .asm_suffix = "" },
+        .{ .prefix = &.{ 0x4C, 0x89, 0xC8 }, .total_len = 3, .operand = .none, .asm_prefix = "mov r9, rax", .asm_suffix = "" },
+
         // sub rsp, frame_size
         .{ .prefix = &.{ 0x48, 0x81, 0xEC }, .total_len = 7, .operand = .u32, .asm_prefix = "sub rsp, ", .asm_suffix = "" },
 
@@ -138,7 +159,7 @@ fn patterns() [patternCount()]Pattern {
 }
 
 fn patternCount() comptime_int {
-    return 80;
+    return 95;
 }
 
 fn matchPattern(code: []const u8) ?Pattern {

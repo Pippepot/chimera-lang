@@ -26,6 +26,13 @@ const BinaryEmitter = struct {
     function_layouts: []FunctionLayout,
     helper_symbols: []u32,
     program_code_len: u32 = 0,
+    slot_addr_map: std.AutoHashMap(InstRef, InstRef),
+    reg_eax: ?InstRef,
+    reg_eax_dirty: bool,
+    reg_ebx: ?InstRef,
+    reg_ebx_dirty: bool,
+    use_counts: std.AutoHashMap(InstRef, u32),
+    const_values: std.AutoHashMap(InstRef, i32),
 
     const SetccCond = enum(u8) {
         b = 0x92,
@@ -78,6 +85,15 @@ const BinaryEmitter = struct {
         var helper_symbols = try gpa.alloc(u32, helpers.all_helpers.len);
         errdefer gpa.free(helper_symbols);
 
+        var slot_addr_map = std.AutoHashMap(InstRef, InstRef).init(gpa);
+        errdefer slot_addr_map.deinit();
+
+        var use_counts = std.AutoHashMap(InstRef, u32).init(gpa);
+        errdefer use_counts.deinit();
+
+        var const_values = std.AutoHashMap(InstRef, i32).init(gpa);
+        errdefer const_values.deinit();
+
         const start_symbol = try createSymbol(&symbols, gpa);
 
         for (prog.functions.items, 0..) |func, fn_idx| {
@@ -106,6 +122,13 @@ const BinaryEmitter = struct {
             .start_symbol = start_symbol,
             .function_layouts = function_layouts,
             .helper_symbols = helper_symbols,
+            .slot_addr_map = slot_addr_map,
+            .reg_eax = null,
+            .reg_eax_dirty = false,
+            .reg_ebx = null,
+            .reg_ebx_dirty = false,
+            .use_counts = use_counts,
+            .const_values = const_values,
         };
     }
 
@@ -123,6 +146,9 @@ const BinaryEmitter = struct {
         self.code.deinit(self.gpa);
         self.symbols.deinit(self.gpa);
         self.fixups.deinit(self.gpa);
+        self.slot_addr_map.deinit();
+        self.use_counts.deinit();
+        self.const_values.deinit();
     }
 
     fn layoutFor(self: *const @This(), fn_id: FuncId) *const FunctionLayout {
@@ -212,6 +238,14 @@ const BinaryEmitter = struct {
         try self.appendByte(0x55);
     }
 
+    fn emitPushRbx(self: *@This()) !void {
+        try self.appendByte(0x53);
+    }
+
+    fn emitPopRbx(self: *@This()) !void {
+        try self.appendByte(0x5B);
+    }
+
     fn emitMovRbpRsp(self: *@This()) !void {
         try self.appendBytes(&.{ 0x48, 0x89, 0xE5 });
     }
@@ -222,6 +256,10 @@ const BinaryEmitter = struct {
 
     fn emitPopRbp(self: *@This()) !void {
         try self.appendByte(0x5D);
+    }
+
+    fn emitLeave(self: *@This()) !void {
+        try self.appendByte(0xC9);
     }
 
     fn emitRet(self: *@This()) !void {
@@ -300,6 +338,33 @@ const BinaryEmitter = struct {
         try self.appendLeU32(slotOffset(value_ref));
     }
 
+    fn emitLeaRegFromSlot(self: *@This(), reg_index: usize, slot: InstRef) !void {
+        const prefixes = [_][]const u8{
+            &.{ 0x48, 0x8D, 0xBC, 0x24 },
+            &.{ 0x48, 0x8D, 0xB4, 0x24 },
+            &.{ 0x48, 0x8D, 0x94, 0x24 },
+            &.{ 0x48, 0x8D, 0x8C, 0x24 },
+            &.{ 0x4C, 0x8D, 0x84, 0x24 },
+            &.{ 0x4C, 0x8D, 0x8C, 0x24 },
+        };
+        if (reg_index >= prefixes.len) return error.UnsupportedRegister;
+        try self.appendBytes(prefixes[reg_index]);
+        try self.appendLeU32(slotOffset(slot));
+    }
+
+    fn emitMovRegFromEax(self: *@This(), reg_index: usize) !void {
+        const prefixes = [_][]const u8{
+            &.{ 0x48, 0x89, 0xC7 },  // mov rdi, rax
+            &.{ 0x48, 0x89, 0xC6 },  // mov rsi, rax
+            &.{ 0x48, 0x89, 0xC2 },  // mov rdx, rax
+            &.{ 0x48, 0x89, 0xC1 },  // mov rcx, rax
+            &.{ 0x4C, 0x89, 0xC0 },  // mov r8, rax
+            &.{ 0x4C, 0x89, 0xC8 },  // mov r9, rax
+        };
+        if (reg_index >= prefixes.len) return error.UnsupportedRegister;
+        try self.appendBytes(prefixes[reg_index]);
+    }
+
     fn emitLoadXmm0FromSlot(self: *@This(), value_ref: InstRef) !void {
         try self.appendBytes(&.{ 0xF3, 0x0F, 0x10, 0x84, 0x24 });
         try self.appendLeU32(slotOffset(value_ref));
@@ -335,14 +400,161 @@ const BinaryEmitter = struct {
         try self.appendLeU32(slotOffset(value_ref));
     }
 
+    fn countInstOperands(self: *@This(), inst: ir_mod.Inst) void {
+        switch (inst) {
+            .addi, .subi, .muli, .divi, .addf, .subf, .mulf, .divf => |p| {
+                self.countUse(p.l);
+                self.countUse(p.r);
+            },
+            .store => |p| self.countUse(p.l),
+            .call => |c| {
+                self.countUse(c.callee);
+                var i: usize = 0;
+                while (i < c.argc) : (i += 1) self.countUse(c.args[i]);
+            },
+            .direct_call => |dc| {
+                var i: usize = 0;
+                while (i < dc.argc) : (i += 1) self.countUse(dc.args[i]);
+            },
+            .printi, .printf, .printb => |v| self.countUse(v),
+            .load_ptr => |l| self.countUse(l.ptr),
+            .store_ptr => |st| {
+                self.countUse(st.src);
+                self.countUse(st.ptr);
+            },
+            .field_load => |fl| self.countUse(fl.base + fl.field_index),
+            .iconst, .fconst, .fn_addr, .argi, .slot_addr => {},
+        }
+    }
+
+    fn countUse(self: *@This(), ref: InstRef) void {
+        const entry = self.use_counts.getOrPut(ref) catch return;
+        if (entry.found_existing) entry.value_ptr.* += 1 else entry.value_ptr.* = 1;
+    }
+
+    fn decrementUses(self: *@This(), inst: ir_mod.Inst) void {
+        switch (inst) {
+            .addi, .subi, .muli, .divi, .addf, .subf, .mulf, .divf => |p| {
+                self.decUse(p.l);
+                self.decUse(p.r);
+            },
+            .store => |p| self.decUse(p.l),
+            .call => |c| {
+                self.decUse(c.callee);
+                var i: usize = 0;
+                while (i < c.argc) : (i += 1) self.decUse(c.args[i]);
+            },
+            .direct_call => |dc| {
+                var i: usize = 0;
+                while (i < dc.argc) : (i += 1) self.decUse(dc.args[i]);
+            },
+            .printi, .printf, .printb => |v| self.decUse(v),
+            .load_ptr => |l| self.decUse(l.ptr),
+            .store_ptr => |st| {
+                self.decUse(st.src);
+                self.decUse(st.ptr);
+            },
+            .field_load => |fl| self.decUse(fl.base + fl.field_index),
+            .iconst, .fconst, .fn_addr, .argi, .slot_addr => {},
+        }
+    }
+
+    fn decUse(self: *@This(), ref: InstRef) void {
+        if (self.use_counts.getPtr(ref)) |ptr| {
+            if (ptr.* > 0) ptr.* -= 1;
+        }
+    }
+
     fn emitCopySlot(self: *@This(), src_ref: InstRef, dst_ref: InstRef) !void {
-        try self.emitLoadRaxFromSlot(src_ref);
+        try self.loadEax(src_ref);
         try self.emitStoreRaxToSlot(dst_ref);
+    }
+
+    fn flushEax(self: *@This()) !void {
+        if (self.reg_eax) |ref| {
+            if (self.reg_eax_dirty) {
+                try self.emitStoreRaxToSlot(ref);
+            }
+            self.reg_eax = null;
+            self.reg_eax_dirty = false;
+        }
+    }
+
+    fn loadEax(self: *@This(), value_ref: InstRef) !void {
+        if (self.reg_eax == value_ref) return;
+        if (self.reg_eax) |old| {
+            if (self.reg_eax_dirty) {
+                if (!self.const_values.contains(old) and (self.use_counts.get(old) orelse 0) > 0) {
+                    try self.emitStoreRaxToSlot(old);
+                }
+            }
+            self.reg_eax = null;
+            self.reg_eax_dirty = false;
+        }
+        try self.emitLoadEaxFromSlot(value_ref);
+        self.reg_eax = value_ref;
+        self.reg_eax_dirty = false;
+    }
+
+    fn setEax(self: *@This(), value_ref: InstRef) void {
+        self.reg_eax = value_ref;
+        self.reg_eax_dirty = true;
+    }
+
+    fn setEaxClean(self: *@This(), value_ref: InstRef) void {
+        self.reg_eax = value_ref;
+        self.reg_eax_dirty = false;
+    }
+
+    fn flushEbx(self: *@This()) void {
+        self.reg_ebx = null;
+        self.reg_ebx_dirty = false;
+    }
+
+    fn loadEbx(self: *@This(), value_ref: InstRef) !void {
+        if (self.reg_ebx == value_ref) return;
+        self.flushEbx();
+        try self.emitLoadEbxFromSlot(value_ref);
+        self.reg_ebx = value_ref;
+        self.reg_ebx_dirty = false;
+    }
+
+    fn setEbx(self: *@This(), value_ref: InstRef) void {
+        self.reg_ebx = value_ref;
+        self.reg_ebx_dirty = true;
+    }
+
+    fn setEbxClean(self: *@This(), value_ref: InstRef) void {
+        self.reg_ebx = value_ref;
+        self.reg_ebx_dirty = false;
     }
 
     fn emitMovRdiFromArgv(self: *@This(), disp: u32) !void {
         try self.appendBytes(&.{ 0x49, 0x8B, 0xBF });
         try self.appendLeU32(disp);
+    }
+
+    fn emitMovEbxEax(self: *@This()) !void {
+        try self.appendBytes(&.{ 0x89, 0xC3 });
+    }
+
+    fn emitMovEaxEbx(self: *@This()) !void {
+        try self.appendBytes(&.{ 0x89, 0xD8 });
+    }
+
+    fn emitAddEaxImm32(self: *@This(), value: i32) !void {
+        try self.appendByte(0x05);
+        try self.appendLeU32(@bitCast(value));
+    }
+
+    fn emitSubEaxImm32(self: *@This(), value: i32) !void {
+        try self.appendByte(0x2D);
+        try self.appendLeU32(@bitCast(value));
+    }
+
+    fn emitCmpEaxImm32(self: *@This(), value: i32) !void {
+        try self.appendByte(0x3D);
+        try self.appendLeU32(@bitCast(value));
     }
 
     fn emitAddEaxEbx(self: *@This()) !void {
@@ -371,6 +583,10 @@ const BinaryEmitter = struct {
 
     fn emitCmpEaxZero(self: *@This()) !void {
         try self.appendBytes(&.{ 0x83, 0xF8, 0x00 });
+    }
+
+    fn emitTestEaxEax(self: *@This()) !void {
+        try self.appendBytes(&.{ 0x85, 0xC0 });
     }
 
     fn emitUcomissXmm0Xmm1(self: *@This()) !void {
@@ -431,14 +647,39 @@ const BinaryEmitter = struct {
     }
 
     fn emitBinaryArithmeticInt(self: *@This(), pair: InstPair, opcode: enum { add, sub, imul }, out: InstRef) !void {
-        try self.emitLoadEaxFromSlot(pair.l);
-        try self.emitLoadEbxFromSlot(pair.r);
-        switch (opcode) {
-            .add => try self.emitAddEaxEbx(),
-            .sub => try self.emitSubEaxEbx(),
-            .imul => try self.emitImulEaxEbx(),
+        if (self.const_values.get(pair.r)) |imm| {
+            try self.loadEax(pair.l);
+            switch (opcode) {
+                .add => try self.emitAddEaxImm32(imm),
+                .sub => try self.emitSubEaxImm32(imm),
+                .imul => {
+                    // For imul, load into ebx and use imul eax, ebx
+                    try self.emitLoadEbxFromSlot(pair.r);
+                    try self.emitImulEaxEbx();
+                },
+            }
+        } else if (self.reg_eax == pair.r) {
+            try self.emitMovEbxEax();
+            self.reg_ebx = pair.r;
+            self.reg_ebx_dirty = false;
+            self.reg_eax = null;
+            self.reg_eax_dirty = false;
+            try self.loadEax(pair.l);
+            switch (opcode) {
+                .add => try self.emitAddEaxEbx(),
+                .sub => try self.emitSubEaxEbx(),
+                .imul => try self.emitImulEaxEbx(),
+            }
+        } else {
+            try self.loadEbx(pair.r);
+            try self.loadEax(pair.l);
+            switch (opcode) {
+                .add => try self.emitAddEaxEbx(),
+                .sub => try self.emitSubEaxEbx(),
+                .imul => try self.emitImulEaxEbx(),
+            }
         }
-        try self.emitStoreRaxToSlot(out);
+        self.setEax(out);
     }
 
     fn emitBinaryArithmeticFloat(self: *@This(), pair: InstPair, opcode: u8, out: InstRef) !void {
@@ -449,11 +690,19 @@ const BinaryEmitter = struct {
     }
 
     fn emitBinaryDivInt(self: *@This(), pair: InstPair, out: InstRef) !void {
-        try self.emitLoadEaxFromSlot(pair.l);
-        try self.emitLoadEbxFromSlot(pair.r);
+        if (self.reg_eax == pair.r) {
+            try self.emitMovEbxEax();
+            self.reg_ebx = pair.r;
+            self.reg_ebx_dirty = false;
+            self.reg_eax = null;
+            self.reg_eax_dirty = false;
+        } else {
+            try self.loadEbx(pair.r);
+        }
+        try self.loadEax(pair.l);
         try self.emitCdq();
         try self.emitIdivEbx();
-        try self.emitStoreRaxToSlot(out);
+        self.setEax(out);
     }
 
     fn emitBinaryDivFloat(self: *@This(), pair: InstPair, out: InstRef) !void {
@@ -464,9 +713,22 @@ const BinaryEmitter = struct {
     }
 
     fn emitCompareIntToEax(self: *@This(), pair: InstPair, cond: SetccCond) !void {
-        try self.emitLoadEaxFromSlot(pair.l);
-        try self.emitLoadEbxFromSlot(pair.r);
-        try self.emitCmpEaxEbx();
+        if (self.const_values.get(pair.r)) |imm| {
+            try self.loadEax(pair.l);
+            try self.emitCmpEaxImm32(imm);
+        } else if (self.reg_eax == pair.r) {
+            try self.emitMovEbxEax();
+            self.reg_ebx = pair.r;
+            self.reg_ebx_dirty = false;
+            self.reg_eax = null;
+            self.reg_eax_dirty = false;
+            try self.loadEax(pair.l);
+            try self.emitCmpEaxEbx();
+        } else {
+            try self.loadEbx(pair.r);
+            try self.loadEax(pair.l);
+            try self.emitCmpEaxEbx();
+        }
         try self.emitSetcc(cond);
         try self.emitMovzxEaxAl();
     }
@@ -514,6 +776,7 @@ const BinaryEmitter = struct {
     }
 
     fn emitFunctionReturn(self: *@This(), value_ref: InstRef, ret_slots: u32) !void {
+        try self.flushEax();
         if (ret_slots > 1) {
             var i: u32 = 0;
             while (i < ret_slots) : (i += 1) {
@@ -523,30 +786,53 @@ const BinaryEmitter = struct {
         } else {
             try self.emitLoadRaxFromSlot(value_ref);
         }
-        try self.emitMovRspRbp();
-        try self.emitPopRbp();
+        try self.emitLeave();
         try self.emitRet();
     }
 
     fn emitValueInst(self: *@This(), value_inst: ir_mod.ValueInst) !void {
         switch (value_inst.op) {
             .iconst => |value| {
+                try self.flushEax();
                 try self.emitMovEaxImm32(value);
-                try self.emitStoreRaxToSlot(value_inst.id);
+                try self.const_values.put(value_inst.id, value);
+                self.setEax(value_inst.id);
             },
             .fconst => |value| {
+                try self.flushEax();
                 try self.emitMovEaxImmU32(@bitCast(value));
-                try self.emitStoreRaxToSlot(value_inst.id);
+                self.setEax(value_inst.id);
             },
             .fn_addr => |fn_id| {
+                try self.flushEax();
                 const symbol = self.layoutFor(fn_id).symbol;
                 try self.emitLeaRaxSymbol(symbol);
-                try self.emitStoreRaxToSlot(value_inst.id);
+                self.setEax(value_inst.id);
             },
             .call => |call_info| {
-                var idx: usize = 0;
-                while (idx < call_info.argc) : (idx += 1) {
-                    try self.emitLoadRegFromSlot(idx, call_info.args[idx]);
+                var handled: [ir_mod.MaxCallArgs]bool = [_]bool{false} ** ir_mod.MaxCallArgs;
+                {
+                    var idx: usize = 0;
+                    while (idx < call_info.argc) : (idx += 1) {
+                        if (self.reg_eax == call_info.args[idx]) {
+                            try self.emitMovRegFromEax(idx);
+                            handled[idx] = true;
+                            self.reg_eax = null;
+                            self.reg_eax_dirty = false;
+                        } else if (self.slot_addr_map.get(call_info.args[idx])) |slot| {
+                            try self.emitLeaRegFromSlot(idx, slot);
+                            handled[idx] = true;
+                        }
+                    }
+                }
+                try self.flushEax();
+                {
+                    var j: usize = 0;
+                    while (j < call_info.argc) : (j += 1) {
+                        if (!handled[j]) {
+                            try self.emitLoadRegFromSlot(j, call_info.args[j]);
+                        }
+                    }
                 }
                 if (call_info.ret_slots > 1) {
                     try self.emitLeaR10RspOffset(slotOffset(value_inst.id));
@@ -554,7 +840,41 @@ const BinaryEmitter = struct {
                 try self.emitLoadRaxFromSlot(call_info.callee);
                 try self.emitCallRax();
                 if (call_info.ret_slots == 1) {
-                    try self.emitStoreRaxToSlot(value_inst.id);
+                    self.setEax(value_inst.id);
+                }
+            },
+            .direct_call => |dc| {
+                var handled: [ir_mod.MaxCallArgs]bool = [_]bool{false} ** ir_mod.MaxCallArgs;
+                {
+                    var idx: usize = 0;
+                    while (idx < dc.argc) : (idx += 1) {
+                        if (self.reg_eax == dc.args[idx]) {
+                            try self.emitMovRegFromEax(idx);
+                            handled[idx] = true;
+                            self.reg_eax = null;
+                            self.reg_eax_dirty = false;
+                        } else if (self.slot_addr_map.get(dc.args[idx])) |slot| {
+                            try self.emitLeaRegFromSlot(idx, slot);
+                            handled[idx] = true;
+                        }
+                    }
+                }
+                try self.flushEax();
+                {
+                    var j: usize = 0;
+                    while (j < dc.argc) : (j += 1) {
+                        if (!handled[j]) {
+                            try self.emitLoadRegFromSlot(j, dc.args[j]);
+                        }
+                    }
+                }
+                if (dc.ret_slots > 1) {
+                    try self.emitLeaR10RspOffset(slotOffset(value_inst.id));
+                }
+                const symbol = self.layoutFor(dc.callee).symbol;
+                try self.emitCallRel(symbol);
+                if (dc.ret_slots == 1) {
+                    self.setEax(value_inst.id);
                 }
             },
             .addi => |pair| try self.emitBinaryArithmeticInt(pair, .add, value_inst.id),
@@ -566,47 +886,75 @@ const BinaryEmitter = struct {
             .divi => |pair| try self.emitBinaryDivInt(pair, value_inst.id),
             .divf => |pair| try self.emitBinaryDivFloat(pair, value_inst.id),
             .printi => |value_ref| {
-                try self.emitLoadEaxFromSlot(value_ref);
+                try self.loadEax(value_ref);
                 try self.emitCallRel(self.helperSymbol(.print_int));
-                try self.emitStoreUnitValue(value_inst.id);
+                try self.emitMovEaxImm32(0);
+                if ((self.use_counts.get(value_inst.id) orelse 0) > 0) {
+                    try self.emitStoreRaxToSlot(value_inst.id);
+                }
+                self.setEaxClean(value_inst.id);
             },
             .printf => |value_ref| {
+                try self.flushEax();
                 try self.emitLoadXmm0FromSlot(value_ref);
                 try self.emitCallRel(self.helperSymbol(.print_float32));
-                try self.emitStoreUnitValue(value_inst.id);
+                try self.emitMovEaxImm32(0);
+                if ((self.use_counts.get(value_inst.id) orelse 0) > 0) {
+                    try self.emitStoreRaxToSlot(value_inst.id);
+                }
+                self.setEaxClean(value_inst.id);
             },
             .printb => |value_ref| {
-                try self.emitLoadEaxFromSlot(value_ref);
+                try self.loadEax(value_ref);
                 try self.emitCallRel(self.helperSymbol(.print_bool));
-                try self.emitStoreUnitValue(value_inst.id);
+                try self.emitMovEaxImm32(0);
+                if ((self.use_counts.get(value_inst.id) orelse 0) > 0) {
+                    try self.emitStoreRaxToSlot(value_inst.id);
+                }
+                self.setEaxClean(value_inst.id);
             },
             .argi => |idx| {
+                try self.flushEax();
                 try self.emitMovRdiFromArgv(idx * 8);
                 try self.emitCallAndStore(self.helperSymbol(.atoi), value_inst.id);
+                self.setEaxClean(value_inst.id);
             },
             .store => |pair| {
-                try self.emitLoadRaxFromSlot(pair.l);
+                try self.loadEax(pair.l);
                 try self.emitStoreRaxToSlot(pair.r);
-                try self.emitStoreUnitValue(value_inst.id);
+                try self.emitMovEaxImm32(0);
+                if ((self.use_counts.get(value_inst.id) orelse 0) > 0) {
+                    try self.emitStoreRaxToSlot(value_inst.id);
+                }
+                self.setEaxClean(value_inst.id);
             },
             .field_load => |fl| {
+                try self.flushEax();
                 try self.emitLoadRaxFromSlot(fl.base + fl.field_index);
-                try self.emitStoreRaxToSlot(value_inst.id);
+                self.setEax(value_inst.id);
             },
             .slot_addr => |slot| {
+                try self.flushEax();
                 try self.emitLeaRaxRspOffset(slotOffset(slot));
                 try self.emitStoreRaxToSlot(value_inst.id);
+                self.setEaxClean(value_inst.id);
+                try self.slot_addr_map.put(value_inst.id, slot);
             },
             .load_ptr => |load| {
+                try self.flushEax();
                 try self.emitLoadRaxFromSlot(load.ptr);
                 try self.emitLoadRaxFromRaxOffset32(load.offset_slots * 8);
-                try self.emitStoreRaxToSlot(value_inst.id);
+                self.setEax(value_inst.id);
             },
             .store_ptr => |st| {
-                try self.emitLoadRaxFromSlot(st.src);
+                try self.loadEax(st.src);
                 try self.emitLoadRegFromSlot(2, st.ptr);
                 try self.emitStoreRaxToRdxOffset32(st.offset_slots * 8);
-                try self.emitStoreUnitValue(value_inst.id);
+                try self.emitMovEaxImm32(0);
+                if ((self.use_counts.get(value_inst.id) orelse 0) > 0) {
+                    try self.emitStoreRaxToSlot(value_inst.id);
+                }
+                self.setEaxClean(value_inst.id);
             },
         }
     }
@@ -618,6 +966,7 @@ const BinaryEmitter = struct {
         block_params: []const ?InstRef,
         block_param_widths: []const u32,
     ) !void {
+        try self.flushEax();
         const maybe_copy = branchCopy(branch, block_params, block_param_widths);
         if (maybe_copy) |copy| try self.emitCopySlots(copy.src, copy.dst, copy.width);
         try self.emitJmp(block_symbols[branch.target]);
@@ -650,7 +999,7 @@ const BinaryEmitter = struct {
         block_params: []const ?InstRef,
         block_param_widths: []const u32,
     ) !void {
-        try self.emitCmpEaxZero();
+        try self.emitTestEaxEax();
 
         const then_copy = branchCopy(then_branch, block_params, block_param_widths);
         const else_copy = branchCopy(else_branch, block_params, block_param_widths);
@@ -658,13 +1007,13 @@ const BinaryEmitter = struct {
         const else_symbol = block_symbols[else_branch.target];
 
         if (then_copy == null and else_copy == null) {
-            try self.emitJe(else_symbol);
-            try self.emitJmp(then_symbol);
+            try self.emitJne(then_symbol);
+            try self.emitJmp(else_symbol);
             return;
         }
 
         if (then_copy != null and else_copy == null) {
-            try self.emitJe(else_symbol);
+            try self.emitJne(then_symbol);
             const copy = then_copy.?;
             try self.emitCopySlots(copy.src, copy.dst, copy.width);
             try self.emitJmp(then_symbol);
@@ -672,7 +1021,7 @@ const BinaryEmitter = struct {
         }
 
         if (then_copy == null and else_copy != null) {
-            try self.emitJne(then_symbol);
+            try self.emitJe(else_symbol);
             const copy = else_copy.?;
             try self.emitCopySlots(copy.src, copy.dst, copy.width);
             try self.emitJmp(else_symbol);
@@ -680,12 +1029,16 @@ const BinaryEmitter = struct {
         }
 
         const prep_symbol = try createSymbol(&self.symbols, self.gpa);
-        try self.emitJe(prep_symbol);
+        try self.emitJne(then_symbol);
+        const prep2_symbol = try createSymbol(&self.symbols, self.gpa);
+        try self.emitJmp(prep2_symbol);
+
+        self.bindSymbol(prep_symbol);
         const then_copy_value = then_copy.?;
         try self.emitCopySlots(then_copy_value.src, then_copy_value.dst, then_copy_value.width);
         try self.emitJmp(then_symbol);
 
-        self.bindSymbol(prep_symbol);
+        self.bindSymbol(prep2_symbol);
         const else_copy_value = else_copy.?;
         try self.emitCopySlots(else_copy_value.src, else_copy_value.dst, else_copy_value.width);
         try self.emitJmp(else_symbol);
@@ -727,7 +1080,15 @@ const BinaryEmitter = struct {
         ret_slots: u32,
     ) !void {
         self.bindSymbol(symbol);
-        for (block.insts.items) |value_inst| try self.emitValueInst(value_inst);
+        try self.flushEax();
+        self.flushEbx();
+        self.use_counts.clearRetainingCapacity();
+        self.const_values.clearRetainingCapacity();
+        for (block.insts.items) |vinst| self.countInstOperands(vinst.op);
+        for (block.insts.items) |value_inst| {
+            try self.emitValueInst(value_inst);
+            self.decrementUses(value_inst.op);
+        }
         const terminator = block.terminator orelse unreachable;
         try self.emitTerm(terminator, block_symbols, block_params, block_param_widths, ret_slots);
     }
@@ -770,6 +1131,7 @@ const BinaryEmitter = struct {
         const entry_layout = self.layoutFor(self.prog.entry);
         try self.emitCallRel(entry_layout.symbol);
 
+        try self.flushEax();
         if (ret_slot_count == 1) {
             try self.emitMovEdiEax();
         } else {
