@@ -2015,3 +2015,98 @@ test "sizeof used in variable" {
         \\print(s)
     , "4\n");
 }
+
+test "inferred return type from explicit return" {
+    try testProgram(
+        \\comptime f = func(var x: int)
+        \\  return x
+        \\
+        \\comptime main = func()
+        \\  print(f(42))
+        \\
+    , "42\n");
+}
+
+test "inferred return type from body expression" {
+    try testProgram(
+        \\comptime f = func(a: int, b: int)
+        \\  a + b
+        \\
+        \\comptime main = func()
+        \\  print(f(20, 22))
+        \\
+    , "42\n");
+}
+
+test "inferred return type multiple returns same type" {
+    try testProgram(
+        \\comptime f = func(b: bool)
+        \\  if b == true -> return 42
+        \\  return 99
+        \\
+        \\comptime main = func()
+        \\  print(f(true))
+        \\  print(f(false))
+        \\
+    , "42\n99\n");
+}
+
+test "inferred return type multiple returns different types yields variant" {
+    try testProgram(
+        \\comptime f = func(b: bool)
+        \\  if b == true -> return 42
+        \\  return 1.0
+        \\
+        \\comptime main = func()
+        \\  if const v = f(true) as int -> print(v)
+        \\  if const v = f(false) as float -> print(v)
+        \\
+    , "42\n1.000000\n");
+}
+
+test "inferred return type no returns body expression yields unit" {
+    try testProgram(
+        \\comptime f = func()
+        \\  none
+        \\
+        \\comptime main = func()
+        \\  print(1)
+        \\
+    , "1\n");
+}
+
+test "inferred return type with monomorphized function" {
+    try testProgram(
+        \\comptime wrap = func(comptime T: type, var x: T)
+        \\  return x
+        \\
+        \\comptime main = func()
+        \\  print(wrap(int, 42))
+        \\  print(wrap(float, 1.5))
+        \\
+    , "42\n1.500000\n");
+}
+
+test "inferred return type recursive function" {
+    try testProgram(
+        \\comptime trail = func(x: int)
+        \\  if x == 0 -> return 0
+        \\  trail(x - 1)
+        \\  return 0
+        \\
+        \\comptime main = func()
+        \\  print(trail(5))
+        \\
+    , "0\n");
+}
+
+test "inferred return type explicit annotation still works" {
+    try testProgram(
+        \\comptime f = func(a: int, b: int) int
+        \\  return a + b
+        \\
+        \\comptime main = func()
+        \\  print(f(20, 22))
+        \\
+    , "42\n");
+}

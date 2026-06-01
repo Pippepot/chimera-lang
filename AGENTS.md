@@ -245,6 +245,14 @@
 - **All-comptime-param functions** must be monomorphized (not skipped). The `inferCall` condition should check `mask != 0` without requiring `has_runtime_params`. Pure-comptime functions (all params are comptime, zero runtime params) need monomorphized instances so their bodies get lowered and executed.
 - **`comptime struct` name type** — when a `comptime struct` name (e.g. `Bar`) is used in value position (e.g. as a call argument to a `comptime T: type` parameter), its type should be `.type_type`, not `.{ .named = name }`. The struct instance type is only correct in type annotation position.
 
+## Inferred return types
+
+- **Optional return type annotation:** Function declarations may omit the return type after the parameter list. The type is inferred from `return` statements (or the body expression if no explicit return).
+- **Variant inference:** If multiple `return` statements return different types, the inferred return type is a variant over the deduplicated set of types.
+- **Recursive functions:** Two-pass inference handles recursion. First pass collects return types with a placeholder (`.unit`), catching `TypecheckFailed` errors from self-referential calls. Second pass re-checks with the correct inferred type.
+- **Monormorphized functions** with inferred return types are checked immediately on creation (not deferred to the `run()` loop), with checker state saved/restored around the recursive call to avoid corrupting the outer function's inference state.
+- **`lowerValueAsType`** derives the source type from the local binding for `var_ref` nodes, not the shared `node_types` map, avoiding stale types across shared AST nodes in monomorphized instances.
+
 ## Style
 
 - **No scoped blocks** for variable reuse. Use descriptive names instead (`asm_child`, `ld_child`).

@@ -898,12 +898,11 @@ const Parser = struct {
             }
         }
 
-        const rp_span = tokenSpan(self.current);
         try self.expect(.r_paren, error.ExpectedRParen);
-        const ret_ty = if (self.current.tag == .ident or self.current.tag == .kw_func)
+        const ret_ty: ast.NodeIdx = if (self.current.tag == .ident or self.current.tag == .kw_func)
             try self.parseType()
         else
-            try self.makeUnitTypeNode(rp_span);
+            ast.FN_NO_RET_TYPE;
 
         const body = if (self.current.tag == .arrow) body: {
             try self.advance();

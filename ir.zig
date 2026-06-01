@@ -630,8 +630,15 @@ const FunctionLowerer = struct {
     }
 
     fn lowerValueAsType(self: *@This(), value_node: ast.NodeIdx, target_ty: analyze.Type) LowerResult!ValueRef {
-        const source_ty = try self.parent.typed.typeOf(value_node);
         const source_ref = try self.lowerAst(value_node);
+        // For var_ref nodes, derive the source type from the binding rather than
+        // from the shared node_types map, which may contain stale entries for
+        // AST nodes shared across monomorphized function instances.
+        const source_ty = if (self.parent.typed.ast.nodes[value_node].tag == .var_ref) src: {
+            const name = self.parent.typed.ast.identOf(self.parent.typed.ast.nodes[value_node].data0);
+            if (self.lookupBinding(name)) |binding| break :src binding.ty;
+            break :src try self.parent.typed.typeOf(value_node);
+        } else try self.parent.typed.typeOf(value_node);
         return self.wrapValueRefToType(source_ref, source_ty, target_ty);
     }
 

@@ -1,5 +1,46 @@
 # Changelog
 
+## 2026-06-01 — Optional return type inference
+
+### Language surface
+
+- Function return type annotations on declarations are now optional.
+  - `comptime f = func(x: int)` (no return type) — type is inferred from return statements or body expression.
+  - If multiple return statements return different types, the inferred type is a variant over those types (e.g. `int | float`).
+  - Recursive functions with inferred return types are supported (two-pass inference).
+- Error messages for arithmetic/comparison type errors now include the actual type received (e.g. `arithmetic requires int or float operands: got 'bool'`).
+
+### Compiler implementation
+
+- **Parser:** Stores `ast.FN_NO_RET_TYPE` sentinel in the extra array when no return type follows `)` in a function declaration. Removed unused `rp_span` variable.
+- **AST:** Added `FN_NO_RET_TYPE` sentinel (`std.math.maxInt(u32)`).
+- **Type analysis:**
+  - `FunctionInfo.ty` changed from `*const FuncType` to `*FuncType` to allow updating the return type after inference.
+  - Added `inferring_return` flag and `seen_return_types` list to Checker. When inferring, `inferReturn` collects return value types instead of validating against a declared return type.
+  - `setupFunctionSignatures` uses `.unit` as placeholder for functions without explicit return type.
+  - `checkFunction` performs two-pass inference: (1) collects return types with placeholder, (2) re-checks body with the correct inferred type so recursive calls resolve. First-pass errors from recursive call placeholders are caught and cleared.
+  - `computeInferredReturnType` deduplicates collected types and creates a variant if multiple distinct types are found.
+  - Monomorphized functions with inferred return types are checked immediately after creation, with checker state saved/restored across the recursive call.
+  - Monomorphized function signature setup handles `FN_NO_RET_TYPE` by using `.unit` placeholder.
+  - `retTypeReferencesComptimeParam` guards against `FN_NO_RET_TYPE` sentinel.
+  - `typecheckReport` success path frees `seen_return_types`.
+- **IR lowering:**
+  - `lowerValueAsType` derives source type from the local binding for `var_ref` nodes (instead of shared `node_types` map), fixing stale type data across shared AST nodes in monomorphized instances.
+- **Debug:** AST dump prints `<inferred>` for functions without explicit return type.
+
+### Tests
+
+- Added tests for:
+  - Inferred return type from explicit return statement
+  - Inferred return type from body expression
+  - Multiple returns with same type (deduplication)
+  - Multiple returns with different types (variant inference)
+  - No returns — body expression yields unit
+  - Recursive function with inferred return type
+  - Monomorphized function with inferred return type
+  - Explicit return type annotation still works (backward compat)
+- Suite now passes at **160 tests**.
+
 ## 2026-05-31 — Ownership MVP foundations (struct policies + borrows + deinit)
 
 ### Language surface

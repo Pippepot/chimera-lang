@@ -54,10 +54,11 @@ fn variantTypeEql(a: *const VariantType, b: *const VariantType) bool {
 
 pub const FunctionInfo = struct {
     decl: ast.NodeIdx,
-    ty: *const FuncType,
+    ty: *FuncType,
     param_modes: []const ast.ParamAccessMode,
     has_explicit_return: bool,
     is_monomorphized: bool = false,
+    body_checked_during_mono: bool = false,
 };
 
 pub const MovePolicy = struct {
@@ -336,6 +337,8 @@ const Binding = struct {
         in_comptime_context: bool,
         current_return: Type,
         current_saw_return: bool,
+        inferring_return: bool,
+        seen_return_types: std.ArrayList(Type),
         anon_counter: u32,
 
     const Failure = struct {
@@ -385,6 +388,8 @@ const Binding = struct {
             .in_comptime_context = false,
             .current_return = .unit,
             .current_saw_return = false,
+            .inferring_return = false,
+            .seen_return_types = std.ArrayList(Type).initCapacity(gpa, 0) catch unreachable,
             .anon_counter = 0,
         };
     }
@@ -394,6 +399,7 @@ const Binding = struct {
         self.bindings.deinit(self.gpa);
         self.comptime_decl_state.deinit();
         self.monomorph_cache.deinit();
+        self.seen_return_types.deinit(self.gpa);
         self.ownership_in_progress.deinit();
     }
 
@@ -435,7 +441,7 @@ const Binding = struct {
         return self.bindings.lookup(name);
     }
 
-    fn allocFuncType(self: *@This(), params: []const Type, ret: Type) std.mem.Allocator.Error!*const FuncType {
+    fn allocFuncType(self: *@This(), params: []const Type, ret: Type) std.mem.Allocator.Error!*FuncType {
         const arena_alloc = self.typed.arena.allocator();
         const owned_params = try arena_alloc.alloc(Type, params.len);
         @memcpy(owned_params, params);
@@ -471,6 +477,27 @@ const Binding = struct {
             .variant => |variant_ty| variantMemberIndex(variant_ty, value_ty) != null,
             else => false,
         };
+    }
+
+    fn computeInferredReturnType(self: *@This(), return_types: []const Type) InferError!Type {
+        if (return_types.len == 0) return .unit;
+
+        var unique = try std.ArrayList(Type).initCapacity(self.gpa, 0);
+        defer unique.deinit(self.gpa);
+
+        for (return_types) |rt| {
+            var found = false;
+            for (unique.items) |existing| {
+                if (typeEql(existing, rt)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) try unique.append(self.gpa, rt);
+        }
+
+        if (unique.items.len == 1) return unique.items[0];
+        return .{ .variant = try self.allocVariantType(unique.items) };
     }
 
     fn resolveTypeNode(self: *@This(), type_idx: ast.TypeIdx) InferError!Type {
@@ -596,6 +623,7 @@ const Binding = struct {
     fn retTypeReferencesComptimeParam(self: *const @This(), func_decl_idx: ast.NodeIdx) bool {
         const a = self.parsed.ast;
         const ret_ty = a.fnRetType(func_decl_idx);
+        if (ret_ty == ast.FN_NO_RET_TYPE) return false;
         if (a.nodes[ret_ty].tag != .type_name) return false;
         const tname = a.identOf(a.nodes[ret_ty].data0);
         const mask = a.fnComptimeMask(func_decl_idx);
@@ -629,10 +657,13 @@ const Binding = struct {
                     try param_types.append(self.gpa, try self.resolveTypeNode(param.ty));
                 }
             }
+            const ret_ty_node = a.fnRetType(func_decl_idx);
             const ret_ty = if (self.retTypeReferencesComptimeParam(func_decl_idx))
                 .type_type
+            else if (ret_ty_node == ast.FN_NO_RET_TYPE)
+                .unit
             else
-                try self.resolveTypeNode(a.fnRetType(func_decl_idx));
+                try self.resolveTypeNode(ret_ty_node);
             const fn_ty = try self.allocFuncType(param_types.items, ret_ty);
             const param_modes = try self.runtimeParamModes(func_decl_idx);
             if (a.comptimeFnAnnotation(func_decl_idx)) |annot| {
@@ -1319,8 +1350,8 @@ const Binding = struct {
 
     fn inferArithmetic(self: *@This(), idx: ast.NodeIdx, lhs: ast.NodeIdx, rhs: ast.NodeIdx) InferError!Type {
         const pair = try self.inferPair(lhs, rhs);
-        if (!isNumeric(pair[0])) return self.failAtNode(lhs, error.ArithmeticRequiresNumeric);
-        if (!isNumeric(pair[1])) return self.failAtNode(rhs, error.ArithmeticRequiresNumeric);
+        if (!isNumeric(pair[0])) return self.failAtNodeWithTypes(lhs, error.ArithmeticRequiresNumeric, pair[0], pair[0]);
+        if (!isNumeric(pair[1])) return self.failAtNodeWithTypes(rhs, error.ArithmeticRequiresNumeric, pair[1], pair[1]);
         if (!typeEql(pair[0], pair[1])) return self.failAtNode(idx, error.ArithmeticOperandMismatch);
         return self.remember(idx, pair[0]);
     }
@@ -1328,8 +1359,8 @@ const Binding = struct {
     fn inferComparison(self: *@This(), idx: ast.NodeIdx, lhs: ast.NodeIdx, rhs: ast.NodeIdx) InferError!Type {
         if (!self.in_fallible_scope) return self.failAtNode(idx, error.FallibleOutsideFallibleContext);
         const pair = try self.inferPair(lhs, rhs);
-        if (!isNumeric(pair[0])) return self.failAtNode(lhs, error.ComparisonRequiresNumeric);
-        if (!isNumeric(pair[1])) return self.failAtNode(rhs, error.ComparisonRequiresNumeric);
+        if (!isNumeric(pair[0])) return self.failAtNodeWithTypes(lhs, error.ComparisonRequiresNumeric, pair[0], pair[0]);
+        if (!isNumeric(pair[1])) return self.failAtNodeWithTypes(rhs, error.ComparisonRequiresNumeric, pair[1], pair[1]);
         if (!typeEql(pair[0], pair[1])) return self.failAtNode(idx, error.ComparisonOperandMismatch);
         return self.remember(idx, .unit);
     }
@@ -1726,8 +1757,12 @@ const Binding = struct {
             try mono_param_types.append(self.gpa, resolved_ty);
         }
 
-        const ret_ty = try self.resolveTypeNode(a.fnRetType(func_decl));
-        const mono_fn_ty = try self.allocFuncType(mono_param_types.items, ret_ty);
+        const ret_ty_node = a.fnRetType(func_decl);
+        const mono_ret_ty = if (ret_ty_node == ast.FN_NO_RET_TYPE)
+            .unit
+        else
+            try self.resolveTypeNode(ret_ty_node);
+        const mono_fn_ty = try self.allocFuncType(mono_param_types.items, mono_ret_ty);
 
         // Check binding annotation if present
         if (a.comptimeFnAnnotation(func_decl)) |annot| {
@@ -1758,6 +1793,19 @@ const Binding = struct {
         for (runtime_arg_nodes.items, mono_params) |arg_node, param_ty| {
             const arg_ty = try self.inferNode(arg_node);
             if (!isAssignableTo(param_ty, arg_ty)) return self.failAtNodeWithTypes(arg_node, error.CallArgumentMismatch, param_ty, arg_ty);
+        }
+
+        // Check monomorphized function body immediately so it doesn't get re-checked
+        // in the run() loop, which would overwrite shared AST node types.
+        {
+            const saved_saw_return = self.current_saw_return;
+            const saved_inferring = self.inferring_return;
+            const saved_seen = self.seen_return_types.items.len;
+            try self.checkFunction(new_fn_id);
+            self.current_saw_return = saved_saw_return;
+            self.inferring_return = saved_inferring;
+            self.seen_return_types.shrinkRetainingCapacity(saved_seen);
+            self.typed.functions.items[new_fn_id].body_checked_during_mono = true;
         }
 
         return self.remember(call_idx, mono_fn_ty.ret);
@@ -1815,7 +1863,11 @@ const Binding = struct {
         const a = self.parsed.ast;
         const ret_val = a.nodes[idx].data0;
         const ret_ty = try self.inferNode(ret_val);
-        if (!isAssignableTo(self.current_return, ret_ty)) return self.failAtNodeWithTypes(idx, error.ReturnTypeMismatch, self.current_return, ret_ty);
+        if (self.inferring_return) {
+            try self.seen_return_types.append(self.gpa, ret_ty);
+        } else if (!isAssignableTo(self.current_return, ret_ty)) {
+            return self.failAtNodeWithTypes(idx, error.ReturnTypeMismatch, self.current_return, ret_ty);
+        }
         self.current_saw_return = true;
         return self.remember(idx, .unit);
     }
@@ -2663,10 +2715,24 @@ const Binding = struct {
         const mark = self.bindings.mark();
         defer self.bindings.restore(mark);
 
-        self.current_return = info.ty.ret;
+        const is_top_level = info.decl == std.math.maxInt(ast.NodeIdx);
+
+        // Determine if return type should be inferred from return statements
+        const has_inferred_ret = if (!is_top_level) blk: {
+            const a = self.parsed.ast;
+            break :blk a.fnRetType(info.decl) == ast.FN_NO_RET_TYPE;
+        } else false;
+
+        if (has_inferred_ret) {
+            self.inferring_return = true;
+            self.seen_return_types.clearRetainingCapacity();
+            self.current_return = .unit;
+        } else {
+            self.inferring_return = false;
+            self.current_return = info.ty.ret;
+        }
         self.current_saw_return = false;
 
-        const is_top_level = info.decl == std.math.maxInt(ast.NodeIdx);
         if (!is_top_level) {
             const a = self.parsed.ast;
             if (info.is_monomorphized) {
@@ -2702,11 +2768,32 @@ const Binding = struct {
         }
 
         const body = if (is_top_level) self.parsed.ast.entry else self.parsed.ast.fnBody(info.decl);
-        const body_ty = try self.inferNode(body);
-        if (!self.current_saw_return and !isAssignableTo(info.ty.ret, body_ty)) {
+        const body_ty: Type = if (has_inferred_ret) blk: {
+            break :blk self.inferNode(body) catch |err| switch (err) {
+                error.TypecheckFailed => .unit,
+                error.OutOfMemory => return error.OutOfMemory,
+            };
+        } else try self.inferNode(body);
+
+        if (has_inferred_ret) {
+            const inferred_ty = if (self.current_saw_return)
+                try self.computeInferredReturnType(self.seen_return_types.items)
+            else
+                body_ty;
+            self.typed.functions.items[fn_id].ty.ret = inferred_ty;
+
+            // Second pass: re-check body with the correct return type so that
+            // recursive calls resolve properly. Clear failure from first pass.
+            self.failure = null;
+            self.current_return = inferred_ty;
+            self.inferring_return = false;
+            self.current_saw_return = false;
+            self.seen_return_types.clearRetainingCapacity();
+            self.clearNodeTypesInSubtree(body);
+            _ = try self.inferNode(body);
+        } else if (!self.current_saw_return and !isAssignableTo(info.ty.ret, body_ty)) {
             if (is_top_level) {
-                const mutable_sig = @constCast(self.typed.functions.items[fn_id].ty);
-                mutable_sig.ret = body_ty;
+                self.typed.functions.items[fn_id].ty.ret = body_ty;
             } else {
                 return self.failAtNodeWithTypes(body, error.FunctionBodyTypeMismatch, info.ty.ret, body_ty);
             }
@@ -2721,7 +2808,10 @@ const Binding = struct {
 
         var idx: u32 = 0;
         while (idx < self.typed.functions.items.len) : (idx += 1) {
-            try self.checkFunction(idx);
+            // Skip monomorphized functions already checked during monomorphization
+            if (!self.typed.functions.items[idx].body_checked_during_mono) {
+                try self.checkFunction(idx);
+            }
         }
         try self.runOwnershipChecks();
     }
@@ -2784,6 +2874,9 @@ pub fn typecheckReport(
                 if (failure.kind == error.IfBranchTypeMismatch) {
                     break :msg try std.fmt.allocPrint(gpa, "{s}: '{s}' vs '{s}'", .{ base, expected_str, actual_str });
                 }
+                if (failure.kind == error.ArithmeticRequiresNumeric or failure.kind == error.ComparisonRequiresNumeric) {
+                    break :msg try std.fmt.allocPrint(gpa, "{s}: got '{s}'", .{ base, actual_str });
+                }
                 if (failure.kind == error.EqualityUnsupportedType) {
                     break :msg try std.fmt.allocPrint(gpa, "{s}: '{s}'", .{ base, expected_str });
                 }
@@ -2807,6 +2900,7 @@ pub fn typecheckReport(
     checker.bindings.deinit(gpa);
     checker.comptime_decl_state.deinit();
     checker.monomorph_cache.deinit();
+    checker.seen_return_types.deinit(gpa);
     checker.ownership_in_progress.deinit();
     return .{
         .typed = checker.typed,

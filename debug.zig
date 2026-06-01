@@ -335,7 +335,12 @@ fn dumpProgram(a: *const ast.Ast, writer: *std.Io.Writer) void {
                     dumpTypeNode(a, param.ty, writer);
                 }
                 writer.writeAll(") ") catch return;
-                dumpTypeNode(a, a.fnRetType(decl_idx), writer);
+                const ret_ty = a.fnRetType(decl_idx);
+                if (ret_ty == ast.FN_NO_RET_TYPE) {
+                    writer.writeAll("<inferred>") catch return;
+                } else {
+                    dumpTypeNode(a, ret_ty, writer);
+                }
                 writer.writeAll("\n") catch return;
                 dumpAstNode(a, a.fnBody(decl_idx), writer, "  ", true, true);
                 writer.writeAll("\n") catch return;

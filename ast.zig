@@ -516,6 +516,10 @@ pub const StructDropKind = enum(u32) {
 
 pub const no_hook_ident: u32 = std.math.maxInt(u32);
 
+/// Sentinel value stored in the extra array as `ret_ty` when a function declaration
+/// omits the return type annotation, indicating it should be inferred from the body.
+pub const FN_NO_RET_TYPE: u32 = std.math.maxInt(u32);
+
 pub fn typeName(ast: *const Ast, idx: TypeIdx) []const u8 {
     return ast.identOf(ast.nodes[idx].data0);
 }
