@@ -37,6 +37,15 @@ pub fn ScopeStack(comptime T: type) type {
             return null;
         }
 
+        pub fn lookupPtr(self: *Self, name: []const u8) ?*T {
+            var idx = self.entries.items.len;
+            while (idx > 0) {
+                idx -= 1;
+                if (std.mem.eql(u8, self.entries.items[idx].name, name)) return &self.entries.items[idx].value;
+            }
+            return null;
+        }
+
         pub fn push(self: *Self, gpa: std.mem.Allocator, name: []const u8, value: T) !void {
             if (self.lookup(name) != null) return error.DuplicateVariable;
             try self.entries.append(gpa, .{ .name = name, .value = value });

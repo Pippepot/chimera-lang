@@ -479,23 +479,21 @@ const Binding = struct {
         };
     }
 
+    fn collectUniqueType(self: *@This(), list: *std.ArrayList(Type), ty: Type) InferError!void {
+        switch (ty) {
+            .variant => |vt| { for (vt.members) |m| try self.collectUniqueType(list, m); },
+            else => {
+                for (list.items) |existing| { if (typeEql(existing, ty)) return; }
+                try list.append(self.gpa, ty);
+            },
+        }
+    }
+
     fn computeInferredReturnType(self: *@This(), return_types: []const Type) InferError!Type {
         if (return_types.len == 0) return .unit;
-
         var unique = try std.ArrayList(Type).initCapacity(self.gpa, 0);
         defer unique.deinit(self.gpa);
-
-        for (return_types) |rt| {
-            var found = false;
-            for (unique.items) |existing| {
-                if (typeEql(existing, rt)) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) try unique.append(self.gpa, rt);
-        }
-
+        for (return_types) |rt| try self.collectUniqueType(&unique, rt);
         if (unique.items.len == 1) return unique.items[0];
         return .{ .variant = try self.allocVariantType(unique.items) };
     }
@@ -657,13 +655,10 @@ const Binding = struct {
                     try param_types.append(self.gpa, try self.resolveTypeNode(param.ty));
                 }
             }
-            const ret_ty_node = a.fnRetType(func_decl_idx);
             const ret_ty = if (self.retTypeReferencesComptimeParam(func_decl_idx))
                 .type_type
-            else if (ret_ty_node == ast.FN_NO_RET_TYPE)
-                .unit
             else
-                try self.resolveTypeNode(ret_ty_node);
+                try self.resolveFnRetType(func_decl_idx);
             const fn_ty = try self.allocFuncType(param_types.items, ret_ty);
             const param_modes = try self.runtimeParamModes(func_decl_idx);
             if (a.comptimeFnAnnotation(func_decl_idx)) |annot| {
@@ -695,6 +690,27 @@ const Binding = struct {
         }
     }
 
+    fn paramModeIsMutable(mode: ast.ParamAccessMode) bool {
+        return switch (mode) {
+            .read => false,
+            .mut, .var_mode, .deinit => true,
+        };
+    }
+
+    fn paramModeIsOwned(mode: ast.ParamAccessMode) bool {
+        return switch (mode) {
+            .read, .mut => false,
+            .var_mode, .deinit => true,
+        };
+    }
+
+    fn resolveFnRetType(self: *@This(), func_decl_idx: ast.NodeIdx) InferError!Type {
+        const a = self.parsed.ast;
+        const ret_ty_node = a.fnRetType(func_decl_idx);
+        if (ret_ty_node == ast.FN_NO_RET_TYPE) return .unit;
+        return self.resolveTypeNode(ret_ty_node);
+    }
+
     fn runtimeParamModes(self: *@This(), func_decl_idx: ast.NodeIdx) InferError![]const ast.ParamAccessMode {
         const a = self.parsed.ast;
         var modes = try std.ArrayList(ast.ParamAccessMode).initCapacity(self.gpa, a.fnParams(func_decl_idx).len);
@@ -723,7 +739,7 @@ const Binding = struct {
         };
     }
 
-    fn findStructDeclByName(self: *const @This(), name: []const u8) ?ast.NodeIdx {
+    fn findStructDecl(self: *const @This(), name: []const u8) ?ast.NodeIdx {
         for (self.parsed.ast.decls) |decl_idx| {
             if (self.parsed.ast.nodes[decl_idx].tag != .comptime_struct) continue;
             const decl_name = self.parsed.ast.identOf(self.parsed.ast.nodes[decl_idx].data0);
@@ -811,12 +827,6 @@ const Binding = struct {
 
     fn computeOwnershipForDecl(self: *@This(), decl_idx: ast.NodeIdx, name: []const u8) InferError!OwnershipSpec {
         const a = self.parsed.ast;
-        const fields = a.structFields(decl_idx);
-        var field_types = try std.ArrayList(Type).initCapacity(self.gpa, fields.len);
-        defer field_types.deinit(self.gpa);
-        for (fields) |field| {
-            try field_types.append(self.gpa, try self.resolveTypeNode(field.ty));
-        }
 
         var all_move_supported = true;
         var all_copy_supported = true;
@@ -825,7 +835,8 @@ const Binding = struct {
         var all_copy_trivial = true;
         var all_drop_trivial = true;
         var any_explicit_drop = false;
-        for (field_types.items) |field_ty| {
+        for (a.structFields(decl_idx)) |field| {
+            const field_ty = try self.resolveTypeNode(field.ty);
             const caps = try self.typeCaps(field_ty);
             all_move_supported = all_move_supported and caps.move_supported;
             all_copy_supported = all_copy_supported and caps.copy_supported;
@@ -898,13 +909,13 @@ const Binding = struct {
     fn computeOwnershipForNamed(self: *@This(), name: []const u8) InferError!OwnershipSpec {
         if (self.typed.ownership_specs.get(name)) |spec| return spec;
         if (self.ownership_in_progress.contains(name)) {
-            const decl = self.findStructDeclByName(name) orelse self.parsed.ast.entry;
+            const decl = self.findStructDecl(name) orelse self.parsed.ast.entry;
             return self.failAtNode(decl, error.RecursiveStruct);
         }
         try self.ownership_in_progress.put(name, {});
         defer _ = self.ownership_in_progress.remove(name);
 
-        const spec = if (self.findStructDeclByName(name)) |decl_idx| blk: {
+        const spec = if (self.findStructDecl(name)) |decl_idx| blk: {
             break :blk try self.computeOwnershipForDecl(decl_idx, name);
         } else if (self.typed.comptime_struct_fields.get(name)) |fields| blk: {
             var field_types = try std.ArrayList(Type).initCapacity(self.gpa, fields.len);
@@ -949,15 +960,6 @@ const Binding = struct {
         borrow_mut,
         deinit_transfer,
     };
-
-    fn ownershipLookupIndex(stack: *scope_mod.ScopeStack(OwnershipBinding), name: []const u8) ?usize {
-        var idx = stack.entries.items.len;
-        while (idx > 0) {
-            idx -= 1;
-            if (std.mem.eql(u8, stack.entries.items[idx].name, name)) return idx;
-        }
-        return null;
-    }
 
     fn copyAllowed(self: *@This(), ty: Type) InferError!bool {
         return switch (ty) {
@@ -1067,8 +1069,7 @@ const Binding = struct {
             .int_lit, .float_lit, .bool_lit, .unit_lit, .none_lit, .arg, .type_name, .type_func, .type_variant, .type_union, .struct_expr, .comptime_expr, .comptime_fn, .comptime_struct, .comptime_value_decl, .sizeof_expr => {},
             .var_ref => {
                 const name = a.identOf(a.nodes[idx].data0);
-                if (ownershipLookupIndex(stack, name)) |binding_idx| {
-                    const binding = &stack.entries.items[binding_idx].value;
+                if (stack.lookupPtr(name)) |binding| {
                     try self.applyOwnershipUseOnBinding(idx, binding, use);
                 }
             },
@@ -1159,8 +1160,7 @@ const Binding = struct {
     fn ownershipVisitAssign(self: *@This(), idx: ast.NodeIdx, stack: *scope_mod.ScopeStack(OwnershipBinding), current_ret: Type) InferError!void {
         const a = self.parsed.ast;
         const name = a.identOf(a.nodes[idx].data0);
-        if (ownershipLookupIndex(stack, name)) |binding_idx| {
-            const binding = &stack.entries.items[binding_idx].value;
+        if (stack.lookupPtr(name)) |binding| {
             if (binding.state == .alive and try self.dropExplicit(binding.ty)) return self.failAtNode(idx, error.DeinitNotSatisfied);
             try self.ownershipUseExpr(a.nodes[idx].data1, stack, .copy, current_ret);
             binding.state = .alive;
@@ -1173,12 +1173,6 @@ const Binding = struct {
         const states = try self.gpa.alloc(OwnershipState, count);
         for (0..count) |i| states[i] = stack.entries.items[i].value.state;
         return states;
-    }
-
-    fn restoreOwnershipStates(stack: *scope_mod.ScopeStack(OwnershipBinding), states: []const OwnershipState) void {
-        for (states, 0..) |state, idx| {
-            stack.entries.items[idx].value.state = state;
-        }
     }
 
     fn mergeOwnershipStates(then_state: OwnershipState, else_state: OwnershipState) OwnershipState {
@@ -1231,7 +1225,7 @@ const Binding = struct {
         const then_states = try self.snapshotOwnershipStates(stack, baseline_count);
         defer self.gpa.free(then_states);
 
-        restoreOwnershipStates(stack, baseline);
+        for (baseline, 0..) |state, i| stack.entries.items[i].value.state = state;
         if (data.else_ != std.math.maxInt(ast.NodeIdx)) {
             const mark = stack.mark();
             try self.ownershipUseExpr(data.else_, stack, .read, current_ret);
@@ -1281,14 +1275,8 @@ const Binding = struct {
                 if (runtime_idx >= info.ty.params.len or runtime_idx >= info.param_modes.len) break;
                 const pname = a.identOf(param.name);
                 const mode = info.param_modes[runtime_idx];
-                const mutable = switch (mode) {
-                    .read => false,
-                    .mut, .var_mode, .deinit => true,
-                };
-                const owned = switch (mode) {
-                    .read, .mut => false,
-                    .var_mode, .deinit => true,
-                };
+                const mutable = paramModeIsMutable(mode);
+                const owned = paramModeIsOwned(mode);
                 stack.push(self.gpa, pname, .{
                     .ty = info.ty.params[runtime_idx],
                     .mutable = mutable,
@@ -1545,40 +1533,8 @@ const Binding = struct {
                 defer self.bindings.restore(mark);
                 break :else_blk try self.inferNode(data.else_);
             };
-            if (!typeEql(then_ty, else_ty)) {
-                var all_members = try std.ArrayList(Type).initCapacity(self.gpa, 4);
-                defer all_members.deinit(self.gpa);
-                const branch_types = [_]Type{ then_ty, else_ty };
-                for (branch_types) |ty| {
-                    switch (ty) {
-                        .variant => |vt| {
-                            for (vt.members) |m| {
-                                var found = false;
-                                for (all_members.items) |existing| {
-                                    if (typeEql(existing, m)) {
-                                        found = true;
-                                        break;
-                                    }
-                                }
-                                if (!found) try all_members.append(self.gpa, m);
-                            }
-                        },
-                        else => {
-                            var found = false;
-                            for (all_members.items) |existing| {
-                                if (typeEql(existing, ty)) {
-                                    found = true;
-                                    break;
-                                }
-                            }
-                            if (!found) try all_members.append(self.gpa, ty);
-                        },
-                    }
-                }
-                const variant_ty = try self.allocVariantType(all_members.items);
-                return self.remember(idx, .{ .variant = variant_ty });
-            }
-            return self.remember(idx, then_ty);
+            const merged = if (typeEql(then_ty, else_ty)) then_ty else try self.computeInferredReturnType(&.{ then_ty, else_ty });
+            return self.remember(idx, merged);
         }
 
         if (!typeEql(then_ty, .unit)) return self.failAtNode(data.then_, error.IfWithoutElseRequiresUnit);
@@ -1670,6 +1626,14 @@ const Binding = struct {
         return self.remember(idx, fn_ty.ret);
     }
 
+    fn checkRuntimeArgs(self: *@This(), call_idx: ast.NodeIdx, args: []const ast.NodeIdx, params: []const Type) InferError!void {
+        if (args.len != params.len) return self.failAtNode(call_idx, error.CallArityMismatch);
+        for (args, params) |arg_node, param_ty| {
+            const arg_ty = try self.inferNode(arg_node);
+            if (!isAssignableTo(param_ty, arg_ty)) return self.failAtNodeWithTypes(arg_node, error.CallArgumentMismatch, param_ty, arg_ty);
+        }
+    }
+
     fn inferMonomorphizedCall(self: *@This(), call_idx: ast.NodeIdx, generic_fn_id: u32, comptime_mask: u32) InferError!Type {
         const a = self.parsed.ast;
         const generic_info = self.typed.functions.items[generic_fn_id];
@@ -1727,12 +1691,7 @@ const Binding = struct {
         // Check cache
         if (self.monomorph_cache.get(key)) |existing_fn_id| {
             const mono_info = self.typed.functions.items[existing_fn_id];
-            const mono_params = mono_info.ty.params;
-            if (runtime_arg_nodes.items.len != mono_params.len) return self.failAtNode(call_idx, error.CallArityMismatch);
-            for (runtime_arg_nodes.items, mono_params) |arg_node, param_ty| {
-                const arg_ty = try self.inferNode(arg_node);
-                if (!isAssignableTo(param_ty, arg_ty)) return self.failAtNodeWithTypes(arg_node, error.CallArgumentMismatch, param_ty, arg_ty);
-            }
+            try self.checkRuntimeArgs(call_idx, runtime_arg_nodes.items, mono_info.ty.params);
             try self.typed.call_monomorph_targets.put(call_idx, existing_fn_id);
             return self.remember(call_idx, mono_info.ty.ret);
         }
@@ -1757,11 +1716,7 @@ const Binding = struct {
             try mono_param_types.append(self.gpa, resolved_ty);
         }
 
-        const ret_ty_node = a.fnRetType(func_decl);
-        const mono_ret_ty = if (ret_ty_node == ast.FN_NO_RET_TYPE)
-            .unit
-        else
-            try self.resolveTypeNode(ret_ty_node);
+        const mono_ret_ty = try self.resolveFnRetType(func_decl);
         const mono_fn_ty = try self.allocFuncType(mono_param_types.items, mono_ret_ty);
 
         // Check binding annotation if present
@@ -1787,13 +1742,7 @@ const Binding = struct {
         // Record this call node -> monomorphized function mapping
         try self.typed.call_monomorph_targets.put(call_idx, new_fn_id);
 
-        // Check runtime args against monomorphized params
-        const mono_params = mono_fn_ty.params;
-        if (runtime_arg_nodes.items.len != mono_params.len) return self.failAtNode(call_idx, error.CallArityMismatch);
-        for (runtime_arg_nodes.items, mono_params) |arg_node, param_ty| {
-            const arg_ty = try self.inferNode(arg_node);
-            if (!isAssignableTo(param_ty, arg_ty)) return self.failAtNodeWithTypes(arg_node, error.CallArgumentMismatch, param_ty, arg_ty);
-        }
+        try self.checkRuntimeArgs(call_idx, runtime_arg_nodes.items, mono_fn_ty.params);
 
         // Check monomorphized function body immediately so it doesn't get re-checked
         // in the run() loop, which would overwrite shared AST node types.
@@ -1872,17 +1821,6 @@ const Binding = struct {
         return self.remember(idx, .unit);
     }
 
-    fn findStructDecl(self: *const @This(), name: []const u8) ?ast.NodeIdx {
-        for (self.parsed.ast.decls) |decl_idx| {
-            if (self.parsed.ast.nodes[decl_idx].tag == .comptime_struct) {
-                const st_name = self.parsed.ast.identOf(self.parsed.ast.nodes[decl_idx].data0);
-                if (std.mem.eql(u8, st_name, name)) return decl_idx;
-            }
-        }
-        if (self.typed.comptime_struct_fields.contains(name)) return 0;
-        return null;
-    }
-
     fn ensureComptimeStructFields(self: *@This(), name: []const u8) InferError!void {
         if (self.typed.comptime_struct_fields.contains(name)) return;
         if (self.typed.comptime_values.contains(name)) return;
@@ -1910,15 +1848,6 @@ const Binding = struct {
         if (self.comptime_decl_state.getPtr(decl_idx)) |state| return state;
         try self.comptime_decl_state.put(decl_idx, .{});
         return self.comptime_decl_state.getPtr(decl_idx).?;
-    }
-
-    fn evalBindingIndex(bindings: *scope_mod.ScopeStack(EvalBinding), name: []const u8) ?usize {
-        var idx = bindings.entries.items.len;
-        while (idx > 0) {
-            idx -= 1;
-            if (std.mem.eql(u8, bindings.entries.items[idx].name, name)) return idx;
-        }
-        return null;
     }
 
     fn materializeAnonStructType(self: *@This(), source_idx: ast.NodeIdx, struct_node: ast.NodeIdx) InferError!Type {
@@ -1972,6 +1901,26 @@ const Binding = struct {
         return self.remember(idx, .type_type);
     }
 
+    fn checkStructInitFields(self: *@This(), idx: ast.NodeIdx, expected: []const ResolvedField) InferError!void {
+        const a = self.parsed.ast;
+        const fields = a.structInitFields(idx);
+        if (fields.len != expected.len) return self.failAtNode(idx, error.StructInitFieldCountMismatch);
+        for (fields, expected) |given, exp| {
+            if (!std.mem.eql(u8, a.identOf(given.name), exp.name)) return self.failAtNode(idx, error.StructInitFieldNameMismatch);
+            const value_ty = try self.inferNode(given.value);
+            if (!typeEql(value_ty, exp.ty)) return self.failAtNodeWithTypes(idx, error.BindingTypeMismatch, exp.ty, value_ty);
+        }
+    }
+
+    fn resolveDeclFields(self: *@This(), struct_decl: ast.NodeIdx) InferError![]const ResolvedField {
+        const a = self.parsed.ast;
+        const decl_fields = a.structFields(struct_decl);
+        const arena = self.typed.arena.allocator();
+        const resolved = try arena.alloc(ResolvedField, decl_fields.len);
+        for (decl_fields, 0..) |df, i| resolved[i] = .{ .name = a.identOf(df.name), .ty = try self.resolveTypeNode(df.ty) };
+        return resolved;
+    }
+
     fn inferStructInit(self: *@This(), idx: ast.NodeIdx) InferError!Type {
         const a = self.parsed.ast;
         const type_expr = a.structInitTypeExpr(idx);
@@ -2005,58 +1954,31 @@ const Binding = struct {
         if (si_name_idx == std.math.maxInt(ast.IdentIdx)) return self.failAtNode(idx, error.UnknownType);
         const si_name = a.identOf(si_name_idx);
 
+        // Try named struct decl
         if (self.findStructDecl(si_name)) |struct_decl| {
-            if (struct_decl != 0) {
-                const fields = a.structInitFields(idx);
-                const decl_fields = a.structFields(struct_decl);
-                if (fields.len != decl_fields.len) return self.failAtNode(idx, error.StructInitFieldCountMismatch);
-                for (fields, decl_fields) |given, decl_field| {
-                    const given_name = a.identOf(given.name);
-                    const decl_field_name = a.identOf(decl_field.name);
-                    if (!std.mem.eql(u8, given_name, decl_field_name)) return self.failAtNode(idx, error.StructInitFieldNameMismatch);
-                    const field_ty = try self.resolveTypeNode(decl_field.ty);
-                    const value_ty = try self.inferNode(given.value);
-                    if (!typeEql(value_ty, field_ty)) return self.failAtNodeWithTypes(idx, error.BindingTypeMismatch, field_ty, value_ty);
-                }
-                return self.remember(idx, .{ .named = si_name });
-            }
-        }
-
-        try self.ensureComptimeStructFields(si_name);
-        if (self.typed.comptime_struct_fields.get(si_name)) |resolved_fields| {
-            const fields = a.structInitFields(idx);
-            if (fields.len != resolved_fields.len) return self.failAtNode(idx, error.StructInitFieldCountMismatch);
-            for (fields, resolved_fields) |given, resolved| {
-                const given_name = a.identOf(given.name);
-                if (!std.mem.eql(u8, given_name, resolved.name)) return self.failAtNode(idx, error.StructInitFieldNameMismatch);
-                const value_ty = try self.inferNode(given.value);
-                if (!typeEql(value_ty, resolved.ty)) return self.failAtNodeWithTypes(idx, error.BindingTypeMismatch, resolved.ty, value_ty);
-            }
+            const expected = try self.resolveDeclFields(struct_decl);
+            try self.checkStructInitFields(idx, expected);
             return self.remember(idx, .{ .named = si_name });
         }
 
+        // Try comptime-evaluated struct fields
+        try self.ensureComptimeStructFields(si_name);
+        if (self.typed.comptime_struct_fields.get(si_name)) |resolved_fields| {
+            try self.checkStructInitFields(idx, resolved_fields);
+            return self.remember(idx, .{ .named = si_name });
+        }
+
+        // Try comptime value holding a struct type
         if (a.nodes[type_expr].tag == .var_ref) {
             const tv_name = a.identOf(a.nodes[type_expr].data0);
             if (self.typed.comptime_values.get(tv_name)) |cv| {
                 if (cv == .struct_type) {
                     const struct_decl = cv.struct_type;
-                    const fields = a.structInitFields(idx);
-                    const decl_fields = a.structFields(struct_decl);
-                    if (fields.len != decl_fields.len) return self.failAtNode(idx, error.StructInitFieldCountMismatch);
-                    for (fields, decl_fields) |given, decl_field| {
-                        const given_name = a.identOf(given.name);
-                        const decl_field_name = a.identOf(decl_field.name);
-                        if (!std.mem.eql(u8, given_name, decl_field_name)) return self.failAtNode(idx, error.StructInitFieldNameMismatch);
-                        const field_ty = try self.resolveTypeNode(decl_field.ty);
-                        const value_ty = try self.inferNode(given.value);
-                        if (!typeEql(value_ty, field_ty)) return self.failAtNodeWithTypes(idx, error.BindingTypeMismatch, field_ty, value_ty);
-                    }
+                    const expected = try self.resolveDeclFields(struct_decl);
+                    try self.checkStructInitFields(idx, expected);
                     return self.remember(idx, .{ .named = a.identOf(a.nodes[struct_decl].data0) });
                 }
-                const actual_ty = switch (cv) {
-                    .type_value => |ty| ty,
-                    else => comptimeValueCtype(cv),
-                };
+                const actual_ty = comptimeValueCtype(cv);
                 return self.failAtNodeWithTypes(idx, error.StructInitTypeNotStruct, .type_type, actual_ty);
             }
         }
@@ -2075,16 +1997,14 @@ const Binding = struct {
         };
 
         if (self.findStructDecl(struct_name)) |struct_decl| {
-            if (struct_decl != 0) {
-                for (a.structFields(struct_decl), 0..) |f, i| {
-                    const f_name = a.identOf(f.name);
-                    if (std.mem.eql(u8, f_name, field_name)) {
-                        try self.typed.field_index.put(idx, @intCast(i));
-                        return self.remember(idx, try self.resolveTypeNode(f.ty));
-                    }
+            for (a.structFields(struct_decl), 0..) |f, i| {
+                const f_name = a.identOf(f.name);
+                if (std.mem.eql(u8, f_name, field_name)) {
+                    try self.typed.field_index.put(idx, @intCast(i));
+                    return self.remember(idx, try self.resolveTypeNode(f.ty));
                 }
-                return self.failAtNode(idx, error.UnknownField);
             }
+            return self.failAtNode(idx, error.UnknownField);
         }
 
         if (self.typed.comptime_struct_fields.get(struct_name)) |resolved_fields| {
@@ -2422,8 +2342,8 @@ const Binding = struct {
             .none_lit => .{ .value = .none, .returned = false },
             .var_ref => blk: {
                 const name = a.identOf(a.nodes[idx].data0);
-                if (evalBindingIndex(locals, name)) |binding_idx| {
-                    break :blk .{ .value = locals.entries.items[binding_idx].value.value, .returned = false };
+                if (locals.lookupPtr(name)) |binding| {
+                    break :blk .{ .value = binding.value, .returned = false };
                 }
                 const resolved_ref = self.resolved.node_refs.get(idx) orelse return self.failAtNode(idx, error.UnknownSymbol);
                 switch (resolved_ref) {
@@ -2439,9 +2359,9 @@ const Binding = struct {
             .assign => blk: {
                 const name = a.identOf(a.nodes[idx].data0);
                 const value = (try self.evalNodeStep(a.nodes[idx].data1, locals)).value;
-                const binding_idx = evalBindingIndex(locals, name) orelse return self.failAtNode(idx, error.ComptimeCaptureNotAllowed);
-                if (!locals.entries.items[binding_idx].value.mutable) return self.failAtNode(idx, error.AssignToConst);
-                locals.entries.items[binding_idx].value.value = try self.cloneCtValue(value);
+                const binding = locals.lookupPtr(name) orelse return self.failAtNode(idx, error.ComptimeCaptureNotAllowed);
+                if (!binding.mutable) return self.failAtNode(idx, error.AssignToConst);
+                binding.value = try self.cloneCtValue(value);
                 break :blk .{ .value = .unit, .returned = false };
             },
             .return_stmt => blk: {
@@ -2545,8 +2465,8 @@ const Binding = struct {
             .comptime_fn, .comptime_struct => .{ .value = .unit, .returned = false },
             .type_name => blk: {
                 const name = a.identOf(a.nodes[idx].data0);
-                if (evalBindingIndex(locals, name)) |binding_idx| {
-                    break :blk .{ .value = locals.entries.items[binding_idx].value.value, .returned = false };
+                if (locals.lookupPtr(name)) |binding| {
+                    break :blk .{ .value = binding.value, .returned = false };
                 }
                 const ty = builtinType(name);
                 break :blk .{ .value = .{ .type_value = ty }, .returned = false };
@@ -2745,10 +2665,7 @@ const Binding = struct {
                     const param_ty = info.ty.params[runtime_idx];
                     const access_mode = info.param_modes[runtime_idx];
                     const pname = a.identOf(param.name);
-                    const mutable = switch (access_mode) {
-                        .read => false,
-                        .mut, .var_mode, .deinit => true,
-                    };
+                    const mutable = paramModeIsMutable(access_mode);
                     try self.pushBinding(info.decl, pname, .{ .ty = param_ty, .mutable = mutable, .comptime_visible = false });
                     runtime_idx += 1;
                 }
@@ -2758,10 +2675,7 @@ const Binding = struct {
             } else {
                 for (a.fnParams(info.decl), info.ty.params, info.param_modes) |param, param_ty, access_mode| {
                     const pname = a.identOf(param.name);
-                    const mutable = switch (access_mode) {
-                        .read => false,
-                        .mut, .var_mode, .deinit => true,
-                    };
+                    const mutable = paramModeIsMutable(access_mode);
                     try self.pushBinding(info.decl, pname, .{ .ty = param_ty, .mutable = mutable, .comptime_visible = false });
                 }
             }
