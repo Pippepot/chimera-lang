@@ -21,18 +21,7 @@ pub const QueryDbOptions = struct {
     io: ?std.Io = null,
 };
 
-pub fn appendQueryDiagnostics(out: *std.ArrayList(u8), gpa: std.mem.Allocator, stats: QueryStats) !void {
-    try out.appendSlice(gpa, "; query diagnostics:\n");
-    try out.print(gpa, ";   revision: {d}\n", .{stats.revision});
-    try out.print(gpa, ";   source_sets: {d}\n", .{stats.source_sets});
-    try out.print(gpa, ";   source_unchanged: {d}\n", .{stats.source_unchanged});
-    try out.print(gpa, ";   parse: hits={d} recomputes={d}\n", .{ stats.parse_hits, stats.parse_recomputes });
-    try out.print(gpa, ";   resolve: hits={d} recomputes={d}\n", .{ stats.resolve_hits, stats.resolve_recomputes });
-    try out.print(gpa, ";   type: hits={d} recomputes={d}\n", .{ stats.type_hits, stats.type_recomputes });
-    try out.print(gpa, ";   lower: hits={d} recomputes={d}\n", .{ stats.lower_hits, stats.lower_recomputes });
-    try out.print(gpa, ";   compile: hits={d} recomputes={d}\n", .{ stats.compile_hits, stats.compile_recomputes });
-    try out.print(gpa, ";   dependencies: checks={d} invalidations={d}\n", .{ stats.dependency_checks, stats.dependency_invalidations });
-}
+
 
 const SourceInput = struct {
     text: []u8,
@@ -74,26 +63,6 @@ fn deinitMemo(comptime T: type, memo: *db.Memo(T), gpa: std.mem.Allocator) void 
     }
     memo.diagnostics.deinit(gpa);
     memo.deps.deinit(gpa);
-}
-
-fn recordHit(stats: *db.QueryStats, comptime stage: Stage) void {
-    switch (stage) {
-        .parse => stats.parse_hits += 1,
-        .resolve => stats.resolve_hits += 1,
-        .typecheck => stats.type_hits += 1,
-        .lower => stats.lower_hits += 1,
-        .compile => stats.compile_hits += 1,
-    }
-}
-
-fn recordRecompute(stats: *db.QueryStats, comptime stage: Stage) void {
-    switch (stage) {
-        .parse => stats.parse_recomputes += 1,
-        .resolve => stats.resolve_recomputes += 1,
-        .typecheck => stats.type_recomputes += 1,
-        .lower => stats.lower_recomputes += 1,
-        .compile => stats.compile_recomputes += 1,
-    }
 }
 
 pub const QueryDb = struct {
@@ -294,51 +263,91 @@ pub const QueryDb = struct {
         const io = self.io.?;
 
         var loaded = query_cache.load(io, self.gpa, self.cacheOptions(), source_path, input.text) catch return orelse return;
-        errdefer loaded.deinit(self.gpa);
 
-        const parse_value = if (loaded.parse.has_value and loaded.parse.bytes != null)
+        var parse_value: ?parser.ParsedAst = null;
+        var resolve_value: ?resolver.ResolvedAst = null;
+        var type_value: ?analyze.AnalyzedAst = null;
+        var lower_value: ?ir_mod.Program = null;
+        var compile_bytes: ?[]const u8 = null;
+
+        var parse_memo: ?db.Memo(parser.ParsedAst) = null;
+        var resolve_memo: ?db.Memo(resolver.ResolvedAst) = null;
+        var type_memo: ?db.Memo(analyze.AnalyzedAst) = null;
+        var lower_memo: ?db.Memo(ir_mod.Program) = null;
+        var compile_memo: ?db.Memo([]const u8) = null;
+
+        var success = false;
+        defer if (!success) {
+            if (parse_value) |*v| v.deinit(self.gpa);
+            if (resolve_value) |*v| v.deinit(self.gpa);
+            if (type_value) |*v| v.deinit();
+            if (lower_value) |*v| v.deinit(self.gpa);
+            if (compile_bytes) |b| self.gpa.free(b);
+            if (parse_memo) |*m| deinitMemo(parser.ParsedAst, m, self.gpa);
+            if (resolve_memo) |*m| deinitMemo(resolver.ResolvedAst, m, self.gpa);
+            if (type_memo) |*m| deinitMemo(analyze.AnalyzedAst, m, self.gpa);
+            if (lower_memo) |*m| deinitMemo(ir_mod.Program, m, self.gpa);
+            if (compile_memo) |*m| deinitMemo([]const u8, m, self.gpa);
+            loaded.deinit(self.gpa);
+        };
+
+        parse_value = if (loaded.parse.has_value and loaded.parse.bytes != null)
             query_cache.deserializeParsed(self.gpa, loaded.parse.bytes.?) catch return else null;
-        var parse_memo = loadMemo(parser.ParsedAst, parse_value, &loaded.parse) catch return;
-        parse_memo.deps = self.depForSource(source_id) catch return;
-        parse_memo.verified_at = self.revision;
-        parse_memo.changed_at = self.revision;
+        parse_memo = loadMemo(parser.ParsedAst, parse_value, &loaded.parse) catch return;
+        parse_value = null;
+        parse_memo.?.deps = self.depForSource(source_id) catch return;
+        parse_memo.?.verified_at = self.revision;
+        parse_memo.?.changed_at = self.revision;
 
-        const resolve_value = if (loaded.resolve.has_value and loaded.resolve.bytes != null)
+        resolve_value = if (loaded.resolve.has_value and loaded.resolve.bytes != null)
             query_cache.deserializeResolved(self.gpa, loaded.resolve.bytes.?) catch return else null;
-        var resolve_memo = loadMemo(resolver.ResolvedAst, resolve_value, &loaded.resolve) catch return;
-        resolve_memo.deps = self.depForStage(source_id, .parse) catch return;
-        resolve_memo.verified_at = self.revision;
-        resolve_memo.changed_at = self.revision;
+        resolve_memo = loadMemo(resolver.ResolvedAst, resolve_value, &loaded.resolve) catch return;
+        resolve_value = null;
+        resolve_memo.?.deps = self.depForStage(source_id, .parse) catch return;
+        resolve_memo.?.verified_at = self.revision;
+        resolve_memo.?.changed_at = self.revision;
 
-        const parse_ast = if (parse_memo.value) |*p| &p.ast else null;
-        const type_value = if (loaded.typecheck.has_value and loaded.typecheck.bytes != null and parse_ast != null)
+        const parse_ast = if (parse_memo.?.value) |*p| &p.ast else null;
+        type_value = if (loaded.typecheck.has_value and loaded.typecheck.bytes != null and parse_ast != null)
             query_cache.deserializeTyped(self.gpa, loaded.typecheck.bytes.?, parse_ast.?) catch return else null;
-        var type_memo = loadMemo(analyze.AnalyzedAst, type_value, &loaded.typecheck) catch return;
-        type_memo.deps = self.depForStage(source_id, .resolve) catch return;
-        type_memo.verified_at = self.revision;
-        type_memo.changed_at = self.revision;
+        type_memo = loadMemo(analyze.AnalyzedAst, type_value, &loaded.typecheck) catch return;
+        type_value = null;
+        type_memo.?.deps = self.depForStage(source_id, .resolve) catch return;
+        type_memo.?.verified_at = self.revision;
+        type_memo.?.changed_at = self.revision;
 
-        const lower_value = if (loaded.lower.has_value and loaded.lower.bytes != null)
+        lower_value = if (loaded.lower.has_value and loaded.lower.bytes != null)
             query_cache.deserializeProgram(self.gpa, loaded.lower.bytes.?) catch return else null;
-        var lower_memo = loadMemo(ir_mod.Program, lower_value, &loaded.lower) catch return;
-        lower_memo.deps = self.depForStage(source_id, .typecheck) catch return;
-        lower_memo.verified_at = self.revision;
-        lower_memo.changed_at = self.revision;
+        lower_memo = loadMemo(ir_mod.Program, lower_value, &loaded.lower) catch return;
+        lower_value = null;
+        lower_memo.?.deps = self.depForStage(source_id, .typecheck) catch return;
+        lower_memo.?.verified_at = self.revision;
+        lower_memo.?.changed_at = self.revision;
 
-        const compile_bytes = if (loaded.compile.bytes) |bytes| self.gpa.dupe(u8, bytes) catch return else null;
-        var compile_memo = loadMemo([]const u8, compile_bytes, &loaded.compile) catch return;
-        compile_memo.deps = self.depForStage(source_id, .lower) catch return;
-        compile_memo.verified_at = self.revision;
-        compile_memo.changed_at = self.revision;
+        compile_bytes = if (loaded.compile.bytes) |bytes| self.gpa.dupe(u8, bytes) catch return else null;
+        compile_memo = loadMemo([]const u8, compile_bytes, &loaded.compile) catch return;
+        compile_bytes = null;
+        compile_memo.?.deps = self.depForStage(source_id, .lower) catch return;
+        compile_memo.?.verified_at = self.revision;
+        compile_memo.?.changed_at = self.revision;
 
+        _ = self.parse_memos.fetchPut(source_id, parse_memo.?) catch return;
+        parse_memo = null;
+        _ = self.resolve_memos.fetchPut(source_id, resolve_memo.?) catch return;
+        resolve_memo = null;
+        _ = self.type_memos.fetchPut(source_id, type_memo.?) catch return;
+        type_memo = null;
+        _ = self.lower_memos.fetchPut(source_id, lower_memo.?) catch return;
+        lower_memo = null;
+        _ = self.compile_memos.fetchPut(source_id, compile_memo.?) catch return;
+        compile_memo = null;
+
+        // Transfer backing last so loaded.deinit() in the defer
+        // block can safely free it if any prior step fails.
         self.cache_backings.append(self.gpa, loaded.backing) catch return;
         loaded.backing = loaded.backing[0..0];
 
-        _ = self.parse_memos.fetchPut(source_id, parse_memo) catch return;
-        _ = self.resolve_memos.fetchPut(source_id, resolve_memo) catch return;
-        _ = self.type_memos.fetchPut(source_id, type_memo) catch return;
-        _ = self.lower_memos.fetchPut(source_id, lower_memo) catch return;
-        _ = self.compile_memos.fetchPut(source_id, compile_memo) catch return;
+        success = true;
     }
 
     fn loadMemo(comptime T: type, value: ?T, stage: *query_cache.LoadedStage) !db.Memo(T) {
@@ -447,17 +456,17 @@ pub const QueryDb = struct {
             if (memo.computing) return error.QueryCycle;
 
             if (memo.verified_at == self.revision) {
-                recordHit(&self.stats, stage);
+                self.stats.hit(stage);
                 return memo;
             }
 
             if (try self.dependenciesUnchanged(memo.deps.items, memo.verified_at)) {
                 memo.verified_at = self.revision;
-                recordHit(&self.stats, stage);
+                self.stats.hit(stage);
                 return memo;
             }
 
-            recordRecompute(&self.stats, stage);
+            self.stats.recompute(stage);
             memo.computing = true;
             defer memo.computing = false;
 
@@ -480,7 +489,7 @@ pub const QueryDb = struct {
             return memo;
         }
 
-        recordRecompute(&self.stats, stage);
+        self.stats.recompute(stage);
         try self.beginQuery(query_key);
         errdefer self.abortQuery();
         var fresh = try computeFn(self, source_id);
@@ -565,7 +574,7 @@ pub const QueryDb = struct {
 
     fn beginQuery(self: *@This(), key: db.QueryKey) db.DbError!void {
         for (self.active_stack.items) |active| {
-            if (db.queryKeyEql(active.key, key)) return error.QueryCycle;
+            if (active.key.kind == key.kind and active.key.source_id == key.source_id) return error.QueryCycle;
         }
 
         var deps = try std.ArrayList(db.Dependency).initCapacity(self.gpa, 8);

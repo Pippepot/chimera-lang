@@ -12,6 +12,16 @@ pub const Stage = enum {
     compile,
 };
 
+pub fn stageLabel(stage: Stage) []const u8 {
+    return switch (stage) {
+        .parse => "parse",
+        .resolve => "resolve",
+        .typecheck => "type",
+        .lower => "lower",
+        .compile => "compile",
+    };
+}
+
 pub const Diagnostic = struct {
     stage: Stage,
     span: ?ast.Span,
@@ -40,18 +50,32 @@ pub const QueryStats = struct {
     revision: Revision = 0,
     source_sets: usize = 0,
     source_unchanged: usize = 0,
-    parse_hits: usize = 0,
-    parse_recomputes: usize = 0,
-    resolve_hits: usize = 0,
-    resolve_recomputes: usize = 0,
-    type_hits: usize = 0,
-    type_recomputes: usize = 0,
-    lower_hits: usize = 0,
-    lower_recomputes: usize = 0,
-    compile_hits: usize = 0,
-    compile_recomputes: usize = 0,
+    hits: [5]usize = .{0} ** 5,
+    recomputes: [5]usize = .{0} ** 5,
     dependency_checks: usize = 0,
     dependency_invalidations: usize = 0,
+
+    pub fn hit(self: *QueryStats, stage: Stage) void {
+        self.hits[@intFromEnum(stage)] += 1;
+    }
+
+    pub fn recompute(self: *QueryStats, stage: Stage) void {
+        self.recomputes[@intFromEnum(stage)] += 1;
+    }
+
+    pub fn print(self: *const QueryStats, out: *std.ArrayList(u8), gpa: std.mem.Allocator) !void {
+        try out.appendSlice(gpa, "; query diagnostics:\n");
+        try out.print(gpa, ";   revision: {d}\n", .{self.revision});
+        try out.print(gpa, ";   source_sets: {d}\n", .{self.source_sets});
+        try out.print(gpa, ";   source_unchanged: {d}\n", .{self.source_unchanged});
+        inline for (std.meta.tags(Stage)) |stage| {
+            const i = @intFromEnum(stage);
+            try out.print(gpa, ";   {s}: hits={d} recomputes={d}\n", .{
+                stageLabel(stage), self.hits[i], self.recomputes[i],
+            });
+        }
+        try out.print(gpa, ";   dependencies: checks={d} invalidations={d}\n", .{ self.dependency_checks, self.dependency_invalidations });
+    }
 };
 
 pub const CompileResult = struct {
@@ -70,21 +94,11 @@ pub fn Memo(comptime T: type) type {
     };
 }
 
-pub fn queryKeyEql(a: QueryKey, b: QueryKey) bool {
-    return a.kind == b.kind and a.source_id == b.source_id;
-}
-
-pub fn spanEql(a: ?ast.Span, b: ?ast.Span) bool {
-    if (a == null and b == null) return true;
-    if (a == null or b == null) return false;
-    return a.?.start == b.?.start and a.?.end == b.?.end;
-}
-
 pub fn diagnosticsEqual(a: []const Diagnostic, b: []const Diagnostic) bool {
     if (a.len != b.len) return false;
     for (a, b) |left, right| {
         if (left.stage != right.stage) return false;
-        if (!spanEql(left.span, right.span)) return false;
+        if (!(if (left.span) |ls| (if (right.span) |rs| ls.start == rs.start and ls.end == rs.end else false) else right.span == null)) return false;
         if (!std.mem.eql(u8, left.message, right.message)) return false;
     }
     return true;
@@ -99,7 +113,7 @@ pub fn valuesEqual(a: ?[]const u8, b: ?[]const u8) bool {
 pub fn dependencyEql(a: Dependency, b: Dependency) bool {
     return switch (a) {
         .source => |lhs| b == .source and lhs == b.source,
-        .query => |lhs| b == .query and queryKeyEql(lhs, b.query),
+        .query => |lhs| b == .query and lhs.kind == b.query.kind and lhs.source_id == b.query.source_id,
     };
 }
 

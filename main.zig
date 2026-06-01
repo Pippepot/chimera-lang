@@ -36,7 +36,7 @@ fn printStageTimings(io: std.Io, header: []const u8, stages: []const StageTiming
 fn printQueryStats(io: std.Io, gpa: std.mem.Allocator, stats: query.QueryStats) !void {
     var text = try std.ArrayList(u8).initCapacity(gpa, 256);
     defer text.deinit(gpa);
-    try query.appendQueryDiagnostics(&text, gpa, stats);
+    try stats.print(&text, gpa);
     var wbuf: [2048]u8 = undefined;
     var w = std.Io.File.stderr().writer(io, &wbuf);
     try w.interface.writeAll(text.items);
