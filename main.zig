@@ -85,7 +85,7 @@ pub fn main(init: std.process.Init) !void {
     const cli_args = cli_args_list.items;
     if (cli_args.len == 0) {
         try printUsage(io, exe_name);
-        std.process.exit(1);
+        return error.MissingSourceFile;
     }
 
     const source_path = cli_args[0];
@@ -104,7 +104,7 @@ pub fn main(init: std.process.Init) !void {
         var w = std.Io.File.stderr().writer(io, &wbuf);
         w.interface.print("error: failed to read source file '{s}': {s}\n", .{ source_path, @errorName(err) }) catch {};
         w.interface.flush() catch {};
-        std.process.exit(1);
+        return error.SourceReadError;
     };
     defer gpa.free(source_text);
     try qdb.setSourceFile(source_id, source_path, source_text);
@@ -172,7 +172,7 @@ pub fn main(init: std.process.Init) !void {
         if (flags.query) {
             try printQueryStats(io, gpa, qdb.statsSnapshot());
         }
-        std.process.exit(1);
+        return error.CompileError;
     }
 
     if (flags.query) {
