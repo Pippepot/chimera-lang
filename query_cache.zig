@@ -268,7 +268,7 @@ fn writeType(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, ty: ir_mod.Type) !
     const tag = std.meta.activeTag(ty);
     try appendU8(buf, gpa, @intFromEnum(tag));
     switch (ty) {
-        .unit, .bool, .int, .float, .type_type => {},
+        .unit, .bool, .int, .float, .type_type, .none => {},
         .named => |id| try appendU32(buf, gpa, id),
         .func => |id| try appendU32(buf, gpa, id),
         .variant => |slot_count| try appendU32(buf, gpa, slot_count),
@@ -283,9 +283,10 @@ fn readType(r: *Reader) LoadError!ir_mod.Type {
         2 => .int,
         3 => .float,
         4 => .type_type,
-        5 => .{ .named = try r.readU32() },
-        6 => .{ .func = try r.readU32() },
-        7 => .{ .variant = try r.readU32() },
+        5 => .none,
+        6 => .{ .named = try r.readU32() },
+        7 => .{ .func = try r.readU32() },
+        8 => .{ .variant = try r.readU32() },
         else => error.InvalidData,
     };
 }
@@ -595,7 +596,7 @@ fn writeTcType(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, ty: analyze.Type
     const tag = std.meta.activeTag(ty);
     try appendU8(buf, gpa, @intFromEnum(tag));
     switch (ty) {
-        .unit, .bool, .int, .float, .type_type => {},
+        .unit, .bool, .int, .float, .type_type, .none => {},
         .named => |s| try appendBytes(buf, gpa, s),
         .func => |ft| try writeTcFuncType(buf, gpa, ft.*),
         .variant => |variant_ty| {
@@ -613,13 +614,14 @@ fn readTcType(r: *Reader, allocator: std.mem.Allocator) LoadError!analyze.Type {
         2 => .int,
         3 => .float,
         4 => .type_type,
-        5 => .{ .named = try allocator.dupe(u8, try r.readBytes()) },
-        6 => blk: {
+        5 => .none,
+        6 => .{ .named = try allocator.dupe(u8, try r.readBytes()) },
+        7 => blk: {
             const ft = try allocator.create(analyze.FuncType);
             ft.* = try readTcFuncType(r, allocator);
             break :blk .{ .func = ft };
         },
-        7 => blk: {
+        8 => blk: {
             const member_count = try r.readU32();
             const members = try allocator.alloc(analyze.Type, member_count);
             var member_index: u32 = 0;
@@ -764,6 +766,7 @@ fn writeComptimeValue(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, value: an
     try appendU8(buf, gpa, @intFromEnum(tag));
     switch (value) {
         .unit => {},
+        .none => {},
         .bool => |v| try appendU8(buf, gpa, if (v) 1 else 0),
         .int => |v| try appendU32(buf, gpa, @bitCast(v)),
         .float => |v| try appendU32(buf, gpa, @bitCast(v)),
@@ -782,12 +785,13 @@ fn readComptimeValue(r: *Reader, allocator: std.mem.Allocator) LoadError!analyze
     const tag = try r.readU8();
     return switch (tag) {
         0 => .unit,
-        1 => .{ .bool = (try r.readU8()) == 1 },
-        2 => .{ .int = @bitCast(try r.readU32()) },
-        3 => .{ .float = @bitCast(try r.readU32()) },
-        4 => .{ .func = try r.readU32() },
-        5 => .{ .struct_type = try r.readU32() },
-        6 => blk: {
+        1 => .none,
+        2 => .{ .bool = (try r.readU8()) == 1 },
+        3 => .{ .int = @bitCast(try r.readU32()) },
+        4 => .{ .float = @bitCast(try r.readU32()) },
+        5 => .{ .func = try r.readU32() },
+        6 => .{ .struct_type = try r.readU32() },
+        7 => blk: {
             const decl = try r.readU32();
             const field_count = try r.readU32();
             const fields = try allocator.alloc(analyze.ComptimeValue, field_count);
@@ -797,7 +801,7 @@ fn readComptimeValue(r: *Reader, allocator: std.mem.Allocator) LoadError!analyze
             }
             break :blk .{ .struct_value = .{ .decl = decl, .fields = fields } };
         },
-        7 => .{ .type_value = try readTcType(r, allocator) },
+        8 => .{ .type_value = try readTcType(r, allocator) },
         else => error.InvalidData,
     };
 }
@@ -837,6 +841,13 @@ pub fn serializeTyped(gpa: std.mem.Allocator, ta: *const analyze.AnalyzedAst) ![
         for (entry.value_ptr.*) |tag_value| {
             try appendU32(&buf, gpa, tag_value);
         }
+    }
+
+    try appendU32(&buf, gpa, @intCast(ta.query_none_tags.count()));
+    var qn_iter = ta.query_none_tags.iterator();
+    while (qn_iter.next()) |entry| {
+        try appendU32(&buf, gpa, entry.key_ptr.*);
+        try appendU32(&buf, gpa, entry.value_ptr.*);
     }
 
     try appendU32(&buf, gpa, @intCast(ta.comptime_node_values.count()));
@@ -913,6 +924,15 @@ pub fn deserializeTyped(gpa: std.mem.Allocator, data: []const u8, parse_ast: *co
             tags[ti] = try r.readU32();
         }
         ta.is_variant_tags.putAssumeCapacity(node_idx, tags);
+    }
+
+    const qn_count = try r.readU32();
+    try ta.query_none_tags.ensureUnusedCapacity(qn_count);
+    var qni: u32 = 0;
+    while (qni < qn_count) : (qni += 1) {
+        const node_idx = try r.readU32();
+        const none_tag = try r.readU32();
+        ta.query_none_tags.putAssumeCapacity(node_idx, none_tag);
     }
 
     const cn_count = try r.readU32();

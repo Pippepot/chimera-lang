@@ -17,6 +17,7 @@ pub const Type = union(enum) {
     int,
     float,
     type_type,
+    none,
     named: SymbolId,
     func: FuncTypeId,
     variant: u32,
@@ -25,7 +26,7 @@ pub const Type = union(enum) {
 pub fn typeEql(a: Type, b: Type) bool {
     if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
     return switch (a) {
-        .unit, .bool, .int, .float, .type_type => true,
+        .unit, .bool, .int, .float, .type_type, .none => true,
         .named => |lhs| lhs == b.named,
         .func => |lhs| lhs == b.func,
         .variant => |lhs| lhs == b.variant,
@@ -259,6 +260,7 @@ const Lowerer = struct {
             .int => .int,
             .float => .float,
             .type_type => .type_type,
+            .none => .none,
             .named => |name| .{ .named = try self.internIdent(name) },
             .func => |ft| .{ .func = try self.internFuncType(ft) },
             .variant => .{ .variant = try self.typeSlotCount(tc_ty) },
@@ -278,7 +280,7 @@ const Lowerer = struct {
 
     fn typeSlotCount(self: *const @This(), ty: analyze.Type) error{OutOfMemory}!u32 {
         return switch (ty) {
-            .unit, .bool, .int, .float, .type_type, .func => 1,
+            .unit, .bool, .int, .float, .type_type, .none, .func => 1,
             .named => |name| self.namedTypeFieldCount(name),
             .variant => |variant_ty| blk: {
                 var max_member_slots: u32 = 1;
@@ -715,6 +717,47 @@ const FunctionLowerer = struct {
         }
     }
 
+    fn lowerVariantQueryCondition(
+        self: *@This(),
+        start_block_id: BlockId,
+        query_node: ast.NodeIdx,
+        success_binding_slot: ?ValueRef,
+        success_binding_width: u32,
+        then_target: BlockId,
+        else_target: BlockId,
+    ) LowerResult!void {
+        const a = self.parent.typed.ast;
+        const lhs = a.queryOpLhs(query_node);
+        const lhs_base = try self.lowerAst(lhs);
+        const none_tag = self.parent.typed.query_none_tags.get(query_node) orelse return error.IfConditionNotFallible;
+
+        self.current_block_id = start_block_id;
+        const tag_const = try self.addInst(.{ .iconst = @intCast(none_tag) });
+
+        const success_target = if (success_binding_slot == null) then_target else try self.newBlock(null);
+        // predicate: tag != none_tag → success, tag == none_tag → else
+        self.currentBlock().terminator = .{
+            .pbr = .{
+                .pred = .{
+                    .op = .nei,
+                    .pair = .{ .l = lhs_base, .r = tag_const },
+                },
+                .then_branch = .{ .target = success_target },
+                .else_branch = .{ .target = else_target },
+            },
+        };
+
+        if (success_binding_slot) |binding_slot| {
+            self.current_block_id = success_target;
+            // If the result is still a variant, copy all slots (tag + payload)
+            // Otherwise, copy only the payload (skip the tag at lhs_base)
+            const binding_ty = try self.nodeType(query_node);
+            const copy_offset: ValueRef = if (binding_ty == .variant) 0 else 1;
+            try self.emitCopySlots(lhs_base + copy_offset, binding_slot, success_binding_width);
+            self.currentBlock().terminator = .{ .br = .{ .target = then_target } };
+        }
+    }
+
     const IfCondBinding = struct {
         name: []const u8,
         mutable: bool,
@@ -722,6 +765,7 @@ const FunctionLowerer = struct {
         slot: ValueRef,
         slot_count: u32,
         as_node: ast.NodeIdx,
+        is_query: bool,
     };
 
     fn setupIfCondBinding(self: *@This(), cond: ast.NodeIdx) LowerResult!?IfCondBinding {
@@ -730,19 +774,39 @@ const FunctionLowerer = struct {
         if (cond_tag != .const_decl and cond_tag != .var_decl) return null;
 
         const value_node = a.varDeclValue(cond);
-        if (a.nodes[value_node].tag != .as) return null;
+        const value_tag = a.nodes[value_node].tag;
 
-        const binding_ty = self.parent.typed.decl_binding_types.get(cond) orelse try self.nodeType(value_node);
-        const slot_count = try self.typeSlotCount(binding_ty);
-        const slot = try self.allocSlotRange(slot_count);
-        return .{
-            .name = a.identOf(a.nodes[cond].data0),
-            .mutable = cond_tag == .var_decl,
-            .ty = binding_ty,
-            .slot = slot,
-            .slot_count = slot_count,
-            .as_node = value_node,
-        };
+        if (value_tag == .as) {
+            const binding_ty = self.parent.typed.decl_binding_types.get(cond) orelse try self.nodeType(value_node);
+            const slot_count = try self.typeSlotCount(binding_ty);
+            const slot = try self.allocSlotRange(slot_count);
+            return .{
+                .name = a.identOf(a.nodes[cond].data0),
+                .mutable = cond_tag == .var_decl,
+                .ty = binding_ty,
+                .slot = slot,
+                .slot_count = slot_count,
+                .as_node = value_node,
+                .is_query = false,
+            };
+        }
+
+        if (value_tag == .query_op) {
+            const binding_ty = self.parent.typed.decl_binding_types.get(cond) orelse try self.nodeType(value_node);
+            const slot_count = try self.typeSlotCount(binding_ty);
+            const slot = try self.allocSlotRange(slot_count);
+            return .{
+                .name = a.identOf(a.nodes[cond].data0),
+                .mutable = cond_tag == .var_decl,
+                .ty = binding_ty,
+                .slot = slot,
+                .slot_count = slot_count,
+                .as_node = value_node,
+                .is_query = true,
+            };
+        }
+
+        return null;
     }
 
     fn lowerConditionToBranches(
@@ -773,6 +837,9 @@ const FunctionLowerer = struct {
             },
             .as => {
                 try self.lowerVariantAsCondition(start_block_id, cond, null, 0, then_target, else_target);
+            },
+            .query_op => {
+                try self.lowerVariantQueryCondition(start_block_id, cond, null, 0, then_target, else_target);
             },
             else => {
                 const predicate = try self.lowerConditionPredicate(cond);
@@ -817,7 +884,7 @@ const FunctionLowerer = struct {
                 .int => int_op,
                 .float => float_op,
                 .bool => bool_op,
-                .unit, .named, .func, .type_type, .variant => unreachable,
+                .unit, .none, .named, .func, .type_type, .variant => unreachable,
             },
             .pair = pair,
         };
@@ -976,7 +1043,11 @@ const FunctionLowerer = struct {
         const condition_entry_block = self.current_block_id;
         const cond_mark = self.bindings.mark();
         if (cond_binding) |binding| {
-            try self.lowerVariantAsCondition(condition_entry_block, binding.as_node, binding.slot, binding.slot_count, then_block_id, else_block_id);
+            if (binding.is_query) {
+                try self.lowerVariantQueryCondition(condition_entry_block, binding.as_node, binding.slot, binding.slot_count, then_block_id, else_block_id);
+            } else {
+                try self.lowerVariantAsCondition(condition_entry_block, binding.as_node, binding.slot, binding.slot_count, then_block_id, else_block_id);
+            }
         } else {
             const cond_node = if (is_if_binding)
                 a.varDeclValue(data.cond)
@@ -1207,6 +1278,7 @@ const FunctionLowerer = struct {
     fn lowerComptimeValue(self: *@This(), value: analyze.ComptimeValue) LowerResult!ValueRef {
         return switch (value) {
             .unit => self.lowerUnitValue(),
+            .none => self.lowerUnitValue(),
             .bool => |v| self.addInst(.{ .iconst = if (v) @as(i32, 1) else 0 }),
             .int => |v| self.addInst(.{ .iconst = v }),
             .float => |v| self.addInst(.{ .fconst = v }),
@@ -1256,6 +1328,18 @@ const FunctionLowerer = struct {
         return result_base;
     }
 
+    fn lowerQueryOpValue(self: *@This(), idx: ast.NodeIdx) LowerResult!ValueRef {
+        const a = self.parent.typed.ast;
+        const lhs = a.queryOpLhs(idx);
+        const lhs_base = try self.lowerAst(lhs);
+        const result_ty = try self.nodeType(idx);
+        const binding_slots = try self.typeSlotCount(result_ty);
+        const result_base = try self.allocSlotRange(binding_slots);
+        const copy_offset: ValueRef = if (result_ty == .variant) 0 else 1;
+        try self.emitCopySlots(lhs_base + copy_offset, result_base, binding_slots);
+        return result_base;
+    }
+
     fn lowerAst(self: *@This(), idx: ast.NodeIdx) LowerResult!ValueRef {
         const a = self.parent.typed.ast;
         return switch (a.nodes[idx].tag) {
@@ -1273,6 +1357,7 @@ const FunctionLowerer = struct {
                 break :blk try self.addInst(.{ .iconst = if (value) @as(i32, 1) else 0 });
             },
             .unit_lit => try self.lowerUnitValue(),
+            .none_lit => try self.lowerUnitValue(),
             .var_ref => blk: {
                 const name = a.identOf(a.nodes[idx].data0);
                 break :blk try self.lowerVarRef(name);
@@ -1305,6 +1390,7 @@ const FunctionLowerer = struct {
             },
             .lt, .gt, .le, .ge, .eq, .ne, .is, .@"and", .@"or", .@"not" => error.IfConditionNotFallible,
             .as => try self.lowerAsValue(idx),
+            .query_op => try self.lowerQueryOpValue(idx),
             .if_stmt => try self.lowerIf(idx),
             .struct_init => try self.lowerStructInit(idx),
             .move_expr => blk: {

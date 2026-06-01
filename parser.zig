@@ -52,6 +52,7 @@ const TokenTag = enum {
     kw_and,
     kw_or,
     kw_not,
+    kw_none,
     ident,
     l_paren,
     r_paren,
@@ -77,6 +78,7 @@ const TokenTag = enum {
     dot,
     pipe,
     caret,
+    question,
 };
 
 const Token = struct {
@@ -192,6 +194,7 @@ const Lexer = struct {
         if (std.mem.eql(u8, word, "and")) return .{ .tag = .kw_and, .start = start, .end = self.index };
         if (std.mem.eql(u8, word, "or")) return .{ .tag = .kw_or, .start = start, .end = self.index };
         if (std.mem.eql(u8, word, "not")) return .{ .tag = .kw_not, .start = start, .end = self.index };
+        if (std.mem.eql(u8, word, "none")) return .{ .tag = .kw_none, .start = start, .end = self.index };
         return .{ .tag = .ident, .start = start, .end = self.index, .ident = word };
     }
 
@@ -274,6 +277,7 @@ const Lexer = struct {
             '.' => .{ .tag = .dot, .start = start, .end = self.index },
             '|' => .{ .tag = .pipe, .start = start, .end = self.index },
             '^' => .{ .tag = .caret, .start = start, .end = self.index },
+            '?' => .{ .tag = .question, .start = start, .end = self.index },
             '#' => {
                 while (self.index < self.source.len and self.source[self.index] != '\n') {
                     self.index += 1;
@@ -1010,6 +1014,12 @@ const Parser = struct {
                 return;
             }
         }
+        if (self.current.tag == .kw_none) {
+            body.move_kind = .none;
+            body.move_hook = null;
+            try self.advance();
+            return;
+        }
         body.move_kind = .func;
         body.move_hook = try self.parseOwnershipHookRef(struct_name, "move", line_start);
     }
@@ -1035,6 +1045,12 @@ const Parser = struct {
                 try self.advance();
                 return;
             }
+        }
+        if (self.current.tag == .kw_none) {
+            body.copy_kind = .none;
+            body.copy_hook = null;
+            try self.advance();
+            return;
         }
         body.copy_kind = .func;
         body.copy_hook = try self.parseOwnershipHookRef(struct_name, "copy", line_start);
@@ -1170,6 +1186,12 @@ const Parser = struct {
                 const name = self.current.ident;
                 try self.advance();
                 const name_idx = try self.internName(name);
+                return self.allocNode(.type_name, name_idx, 0, span);
+            },
+            .kw_none => {
+                const span = tokenSpan(self.current);
+                try self.advance();
+                const name_idx = try self.internName("none");
                 return self.allocNode(.type_name, name_idx, 0, span);
             },
             .kw_func => {
@@ -1483,6 +1505,11 @@ const Parser = struct {
                 try self.advance();
                 const expr_span = try self.spanOf(expr);
                 expr = try self.allocNode(.move_expr, expr, 0, coverSpans(expr_span, caret_span));
+            } else if (self.current.tag == .question) {
+                const q_span = tokenSpan(self.current);
+                try self.advance();
+                const expr_span = try self.spanOf(expr);
+                expr = try self.allocNode(.query_op, expr, 0, coverSpans(expr_span, q_span));
             } else {
                 break;
             }
@@ -1592,6 +1619,11 @@ const Parser = struct {
                 const s_span = tokenSpan(self.current);
                 try self.advance();
                 return self.parseStructExpr(s_span);
+            },
+            .kw_none => {
+                const span = tokenSpan(self.current);
+                try self.advance();
+                return self.allocNode(.none_lit, 0, 0, span);
             },
             .ident => {
                 const ident_span = tokenSpan(self.current);

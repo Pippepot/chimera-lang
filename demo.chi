@@ -1,5 +1,6 @@
-comptime baz = func(comptime T: type)
-  const t = T{y = 233}
+comptime foo = func(x: int | none)
+  if x? > 3 -> print(3)
 
-baz(int)
-
+foo(2)
+foo(none)
+foo(4)

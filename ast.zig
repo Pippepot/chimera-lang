@@ -43,6 +43,7 @@ pub const Tag = enum(u8) {
     if_stmt,
     bool_lit,
     unit_lit,
+    none_lit,
     type_name,
     type_func,
     type_variant,
@@ -52,6 +53,7 @@ pub const Tag = enum(u8) {
     comptime_fn,
     comptime_struct,
     struct_expr,
+    query_op,
 };
 
 pub const Node = extern struct {
@@ -162,6 +164,10 @@ pub const Ast = struct {
 
     pub fn asRhsType(ast: *const Ast, idx: NodeIdx) TypeIdx {
         return ast.nodes[idx].data1;
+    }
+
+    pub fn queryOpLhs(ast: *const Ast, idx: NodeIdx) NodeIdx {
+        return ast.nodes[idx].data0;
     }
 
     fn extraIdx(data1: u32) u32 {

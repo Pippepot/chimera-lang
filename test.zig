@@ -1817,3 +1817,139 @@ test "second compile with no changes has zero recomputes" {
     try testing.expectEqual(@as(usize, 0), stats.lower_hits);
     try testing.expectEqual(@as(usize, 1), stats.compile_hits);
 }
+
+// ── none type tests ──
+
+test "none type: literal and annotation" {
+    try testProgram(
+        \\const n: none = none
+        \\print(42)
+    , "42\n");
+}
+
+test "none type: variant member and is check" {
+    try testProgram(
+        \\var x: int | none = 42
+        \\if x is int
+        \\  print(11)
+        \\else
+        \\  print(22)
+        \\x = none
+        \\if x is none
+        \\  print(33)
+        \\else
+        \\  print(44)
+    , "11\n33\n");
+}
+
+test "none type: assignment to variant from none" {
+    try testProgram(
+        \\var x: int | none = none
+        \\if x is none
+        \\  print(11)
+        \\else
+        \\  print(22)
+    , "11\n");
+}
+
+test "query operator without binding succeeds on non-none" {
+    try testProgram(
+        \\var x: int | none = 42
+        \\if x?
+        \\  print(11)
+        \\else
+        \\  print(22)
+    , "11\n");
+}
+
+test "query operator without binding fails on none" {
+    try testProgram(
+        \\var x: int | none = none
+        \\if x?
+        \\  print(11)
+        \\else
+        \\  print(22)
+    , "22\n");
+}
+
+test "query operator with binding unwraps value" {
+    try testProgram(
+        \\var x: int | none = 42
+        \\if const v = x?
+        \\  print(v)
+    , "42\n");
+}
+
+test "query operator with binding scoped to success branch" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+
+    try db.setSource(0,
+        \\var x: int | none = 42
+        \\if const v = x?
+        \\  print(v)
+        \\print(v)
+    );
+    try expectCompileErrorContains(&db, 0, "unknown symbol");
+}
+
+test "query operator errors on non-variant operand" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+
+    try db.setSource(0,
+        \\var x: int = 5
+        \\if x?
+        \\  print(11)
+    );
+    try expectCompileErrorContains(&db, 0, "left side of '?' must be a variant type");
+}
+
+test "query operator errors when variant has no none" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+
+    try db.setSource(0,
+        \\var x: int | float = 5
+        \\if x?
+        \\  print(11)
+    );
+    try expectCompileErrorContains(&db, 0, "variant does not contain 'none' member");
+}
+
+test "query operator with multi-member variant unwraps to variant" {
+    try testProgram(
+        \\var x: int | float | none = 3.14
+        \\if const v = x?
+        \\  if v is float -> print(11) else print(22)
+    , "11\n");
+}
+
+test "query operator: if else binding with mutable binding" {
+    try testProgram(
+        \\var x: int | none = 42
+        \\if var v = x?
+        \\  print(v)
+    , "42\n");
+}
+
+test "none type: in variant initializer from none" {
+    try testProgram(
+        \\comptime OptInt = int | none
+        \\var x: OptInt = none
+        \\if x is none
+        \\  print(11)
+        \\else
+        \\  print(22)
+    , "11\n");
+}
+
+test "none type: error on print none" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+
+    try db.setSource(0,
+        \\print(none)
+    );
+    try expectCompileErrorContains(&db, 0, "cannot print this type");
+}

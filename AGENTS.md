@@ -52,7 +52,7 @@
 - **Postfix move operator:** `expr^` parses to `Ast.Tag.move_expr` and has postfix precedence.
 ## Type syntax
 
-- **Primitive types:** `unit`, `bool`, `int`, `float`.
+- **Primitive types:** `unit`, `bool`, `int`, `float`, `none`.
 - **Function types:** `func(ParamType1, ParamType2, ...) ReturnType` — usable in parameter annotations (`f: func(int) int`), return type annotations, and `const`/`var` binding annotations.
 - **Named struct types:** referenced by their declared name (e.g. `Foo`) — usable in `const`/`var` binding annotations.
 - **Variant types:** compiletime type unions written with `|` (e.g. `comptime Sum = int | float | Foo`) and usable in annotations.
@@ -148,7 +148,10 @@
 - **Equality on bools** — also fallible (predicate branch `eqb`/`neb`, type `.unit`).
 - **`is`** — checks a variant's runtime tag against a RHS type (or RHS type-union alias).
 - **`as`** — checks a variant's runtime tag and on success yields payload typed as RHS member type.
-- **`isFallible(node)`** — helper checking node kind against `.lt`, `.gt`, `.le`, `.ge`, `.eq`, `.ne`, `.is`, `.as`, `.and`, `.or`.
+- **`none` type** — a unit-like type with a single literal value `none`. Useful in variant types as a "null" or "no value" member (e.g., `int | none` is a nullable int).
+- **`?` query operator** — postfix fallible operator that strips `none` from a variant. `x?` succeeds with the variant minus `none` (or the single unwrapped type); fails if the variant holds `none`. Works with condition binding: `if const v = x?`.
+- **`is none` check** — the existing `is` mechanism works with `none`: `if x is none` checks if a variant holds the none member.
+- **`isFallible(node)`** — helper checking node kind against `.lt`, `.gt`, `.le`, `.ge`, `.eq`, `.ne`, `.is`, `.as`, `.query_op`, `.and`, `.or`.
 - **Scope isolation:** each block and each `if` branch restores bindings after inference/lowering; branch-local `const` names do not leak.
 
 

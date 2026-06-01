@@ -20,6 +20,7 @@ pub const Type = union(enum) {
     int,
     float,
     type_type,
+    none,
     named: []const u8,
     func: *const FuncType,
     variant: *const VariantType,
@@ -28,7 +29,7 @@ pub const Type = union(enum) {
 pub fn typeEql(a: Type, b: Type) bool {
     if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
     return switch (a) {
-        .unit, .bool, .int, .float, .type_type => true,
+        .unit, .bool, .int, .float, .type_type, .none => true,
         .named => |lhs| std.mem.eql(u8, lhs, b.named),
         .func => |lhs| funcTypeEql(lhs, b.func),
         .variant => |lhs| variantTypeEql(lhs, b.variant),
@@ -87,6 +88,7 @@ pub const StructValue = struct {
 
 pub const ComptimeValue = union(enum) {
     unit,
+    none,
     bool: bool,
     int: i32,
     float: f32,
@@ -151,6 +153,8 @@ pub const TypeError = error{
     InvalidBorrowArgument,
     InvalidDeinitTransfer,
     MutateConst,
+    QueryOperandNotVariant,
+    QueryVariantNoNone,
 };
 
 pub const ResolvedField = struct {
@@ -165,6 +169,7 @@ pub const AnalyzedAst = struct {
     node_types: std.AutoHashMap(ast.NodeIdx, Type),
     field_index: std.AutoHashMap(ast.NodeIdx, u32),
     is_variant_tags: std.AutoHashMap(ast.NodeIdx, []const u32),
+    query_none_tags: std.AutoHashMap(ast.NodeIdx, u32),
     decl_binding_types: std.AutoHashMap(ast.NodeIdx, Type),
     comptime_node_values: std.AutoHashMap(ast.NodeIdx, ComptimeValue),
     comptime_values: std.StringHashMap(ComptimeValue),
@@ -183,6 +188,7 @@ pub const AnalyzedAst = struct {
             .node_types = std.AutoHashMap(ast.NodeIdx, Type).init(gpa),
             .field_index = std.AutoHashMap(ast.NodeIdx, u32).init(gpa),
             .is_variant_tags = std.AutoHashMap(ast.NodeIdx, []const u32).init(gpa),
+            .query_none_tags = std.AutoHashMap(ast.NodeIdx, u32).init(gpa),
             .decl_binding_types = std.AutoHashMap(ast.NodeIdx, Type).init(gpa),
             .comptime_node_values = std.AutoHashMap(ast.NodeIdx, ComptimeValue).init(gpa),
             .comptime_values = std.StringHashMap(ComptimeValue).init(gpa),
@@ -199,6 +205,7 @@ pub const AnalyzedAst = struct {
         self.node_types.deinit();
         self.field_index.deinit();
         self.is_variant_tags.deinit();
+        self.query_none_tags.deinit();
         self.decl_binding_types.deinit();
         self.comptime_node_values.deinit();
         self.comptime_values.deinit();
@@ -231,6 +238,7 @@ pub fn typeName(ty: Type) []const u8 {
         .int => "int",
         .float => "float",
         .type_type => "type",
+        .none => "none",
         .named => |name| name,
         .func => "function",
         .variant => "variant",
@@ -293,6 +301,8 @@ pub fn typeErrorMessage(kind: TypeError) []const u8 {
         error.InvalidBorrowArgument => "borrow argument must be a variable reference",
         error.InvalidDeinitTransfer => "deinit-owned value cannot be transferred except to deinit parameter",
         error.MutateConst => "cannot mutate a const variable; 'mut' parameter requires a mutable variable",
+        error.QueryOperandNotVariant => "left side of '?' must be a variant type",
+        error.QueryVariantNoNone => "variant does not contain 'none' member",
     };
 }
 
@@ -302,6 +312,7 @@ fn builtinType(name: []const u8) Type {
     if (std.mem.eql(u8, name, "int")) return .int;
     if (std.mem.eql(u8, name, "float")) return .float;
     if (std.mem.eql(u8, name, "type")) return .type_type;
+    if (std.mem.eql(u8, name, "none")) return .none;
     return .unit;
 }
 
@@ -472,6 +483,7 @@ const Binding = struct {
                 if (std.mem.eql(u8, name, "int")) return .int;
                 if (std.mem.eql(u8, name, "float")) return .float;
                 if (std.mem.eql(u8, name, "type")) return .type_type;
+                if (std.mem.eql(u8, name, "none")) return .none;
                 if (self.resolved.struct_names.contains(name)) return .{ .named = name };
                 if (self.resolved.comptime_value_names.get(name)) |decl_idx| {
                     var locals = scope_mod.ScopeStack(EvalBinding).init();
@@ -649,7 +661,7 @@ const Binding = struct {
 
     fn typeCaps(self: *@This(), ty: Type) InferError!TypeCaps {
         switch (ty) {
-            .unit, .bool, .int, .float, .type_type, .func => return .{},
+            .unit, .bool, .int, .float, .type_type, .none, .func => return .{},
             .variant => |variant_ty| {
                 var caps = TypeCaps{};
                 for (variant_ty.members) |member_ty| {
@@ -876,7 +888,7 @@ const Binding = struct {
 
     fn copyAllowed(self: *@This(), ty: Type) InferError!bool {
         return switch (ty) {
-            .unit, .bool, .int, .float, .type_type, .func => true,
+            .unit, .bool, .int, .float, .type_type, .none, .func => true,
             .named => |name| (try self.computeOwnershipForNamed(name)).copy.kind != .none,
             .variant => |variant_ty| blk: {
                 for (variant_ty.members) |member_ty| {
@@ -889,7 +901,7 @@ const Binding = struct {
 
     fn moveAllowed(self: *@This(), ty: Type) InferError!bool {
         return switch (ty) {
-            .unit, .bool, .int, .float, .type_type, .func => true,
+            .unit, .bool, .int, .float, .type_type, .none, .func => true,
             .named => |name| (try self.computeOwnershipForNamed(name)).move.kind != .none,
             .variant => |variant_ty| blk: {
                 for (variant_ty.members) |member_ty| {
@@ -902,7 +914,7 @@ const Binding = struct {
 
     fn dropExplicit(self: *@This(), ty: Type) InferError!bool {
         return switch (ty) {
-            .unit, .bool, .int, .float, .type_type, .func => false,
+            .unit, .bool, .int, .float, .type_type, .none, .func => false,
             .named => |name| (try self.computeOwnershipForNamed(name)).drop.kind == .explicit,
             .variant => |variant_ty| blk: {
                 for (variant_ty.members) |member_ty| {
@@ -979,7 +991,7 @@ const Binding = struct {
     fn ownershipUseExpr(self: *@This(), idx: ast.NodeIdx, stack: *scope_mod.ScopeStack(OwnershipBinding), use: OwnershipUse, current_ret: Type) InferError!void {
         const a = self.parsed.ast;
         switch (a.nodes[idx].tag) {
-            .int_lit, .float_lit, .bool_lit, .unit_lit, .arg, .type_name, .type_func, .type_variant, .type_union, .struct_expr, .comptime_expr, .comptime_fn, .comptime_struct, .comptime_value_decl => {},
+            .int_lit, .float_lit, .bool_lit, .unit_lit, .none_lit, .arg, .type_name, .type_func, .type_variant, .type_union, .struct_expr, .comptime_expr, .comptime_fn, .comptime_struct, .comptime_value_decl => {},
             .var_ref => {
                 const name = a.identOf(a.nodes[idx].data0);
                 if (ownershipLookupIndex(stack, name)) |binding_idx| {
@@ -1036,6 +1048,7 @@ const Binding = struct {
             },
             .is => try self.ownershipUseExpr(a.isLhs(idx), stack, .read, current_ret),
             .as => try self.ownershipUseExpr(a.asLhs(idx), stack, .read, current_ret),
+            .query_op => try self.ownershipUseExpr(a.queryOpLhs(idx), stack, .read, current_ret),
             .@"not" => try self.ownershipUseExpr(a.nodes[idx].data0, stack, .read, current_ret),
             .if_stmt => try self.ownershipVisitIf(idx, stack, current_ret),
             .const_decl => try self.ownershipVisitDecl(idx, stack, false, current_ret),
@@ -1251,7 +1264,7 @@ const Binding = struct {
 
     fn isFallibleNode(a: ast.Ast, idx: ast.NodeIdx) bool {
         return switch (a.nodes[idx].tag) {
-            .lt, .gt, .le, .ge, .eq, .ne, .is, .as, .@"and", .@"or", .@"not" => true,
+            .lt, .gt, .le, .ge, .eq, .ne, .is, .as, .query_op, .@"and", .@"or", .@"not" => true,
             else => false,
         };
     }
@@ -1285,7 +1298,7 @@ const Binding = struct {
         if (!typeEql(pair[0], pair[1])) return self.failAtNode(idx, error.EqualityOperandMismatch);
         switch (pair[0]) {
             .bool, .int, .float => {},
-            .unit, .named, .func, .type_type, .variant => return self.failAtNodeWithTypes(idx, error.EqualityUnsupportedType, pair[0], pair[0]),
+            .unit, .none, .named, .func, .type_type, .variant => return self.failAtNodeWithTypes(idx, error.EqualityUnsupportedType, pair[0], pair[0]),
         }
         return self.remember(idx, .unit);
     }
@@ -1362,6 +1375,34 @@ const Binding = struct {
                 return self.remember(idx, rhs_ty);
             },
         }
+    }
+
+    fn inferQueryOp(self: *@This(), idx: ast.NodeIdx, lhs: ast.NodeIdx) InferError!Type {
+        if (!self.in_fallible_scope) return self.failAtNode(idx, error.FallibleOutsideFallibleContext);
+        const lhs_ty = try self.inferNode(lhs);
+        const lhs_variant = switch (lhs_ty) {
+            .variant => |variant_ty| variant_ty,
+            else => return self.failAtNode(lhs, error.QueryOperandNotVariant),
+        };
+
+        // Find the none member tag index
+        const none_tag = variantMemberIndex(lhs_variant, .none) orelse return self.failAtNode(lhs, error.QueryVariantNoNone);
+
+        // Store the none tag for IR lowering
+        try self.typed.query_none_tags.put(idx, none_tag);
+
+        // Compute the stripped variant (minus none)
+        var remaining = try std.ArrayList(Type).initCapacity(self.gpa, lhs_variant.members.len - 1);
+        defer remaining.deinit(self.gpa);
+        for (lhs_variant.members) |member_ty| {
+            if (!typeEql(member_ty, .none)) {
+                try remaining.append(self.gpa, member_ty);
+            }
+        }
+
+        if (remaining.items.len == 1) return self.remember(idx, remaining.items[0]);
+        const stripped_variant = try self.allocVariantType(remaining.items);
+        return self.remember(idx, .{ .variant = stripped_variant });
     }
 
     const IfCondBinding = struct {
@@ -1687,7 +1728,8 @@ const Binding = struct {
             .block => {
                 for (a.blockItems(idx)) |item| self.clearNodeTypesInSubtree(item);
             },
-            .var_ref, .int_lit, .float_lit, .bool_lit, .unit_lit => {},
+            .var_ref, .int_lit, .float_lit, .bool_lit, .unit_lit, .none_lit => {},
+            .query_op => self.clearNodeTypesInSubtree(a.nodes[idx].data0),
             .const_decl, .var_decl => {
                 self.clearNodeTypesInSubtree(a.varDeclValue(idx));
             },
@@ -1797,6 +1839,7 @@ const Binding = struct {
     fn typeFromComptimeValue(self: *@This(), source_idx: ast.NodeIdx, value: ComptimeValue) InferError!Type {
         return switch (value) {
             .type_value => |ty| ty,
+            .none => .none,
             .struct_type => |struct_node| blk: {
                 const source_node = self.parsed.ast.nodes[source_idx];
                 if (source_node.tag == .var_ref) {
@@ -2045,6 +2088,7 @@ const Binding = struct {
     fn comptimeValueCtype(value: ComptimeValue) Type {
         return switch (value) {
             .unit => .unit,
+            .none => .none,
             .bool => .bool,
             .int => .int,
             .float => .float,
@@ -2055,6 +2099,7 @@ const Binding = struct {
     fn runtimeTypeOfComptimeValue(self: *@This(), source_idx: ast.NodeIdx, value: ComptimeValue) InferError!Type {
         return switch (value) {
             .unit => .unit,
+            .none => .none,
             .bool => .bool,
             .int => .int,
             .float => .float,
@@ -2279,6 +2324,7 @@ const Binding = struct {
             .float_lit => .{ .value = .{ .float = @bitCast(a.nodes[idx].data0) }, .returned = false },
             .bool_lit => .{ .value = .{ .bool = a.nodes[idx].data0 != 0 }, .returned = false },
             .unit_lit => .{ .value = .unit, .returned = false },
+            .none_lit => .{ .value = .none, .returned = false },
             .var_ref => blk: {
                 const name = a.identOf(a.nodes[idx].data0);
                 if (evalBindingIndex(locals, name)) |binding_idx| {
@@ -2340,6 +2386,11 @@ const Binding = struct {
                     break :blk .{ .value = try self.cloneCtValue(lhs_step.value), .returned = false };
                 }
                 break :blk .{ .value = .unit, .returned = false };
+            },
+            .query_op => blk: {
+                const lhs_node = a.queryOpLhs(idx);
+                const lhs_step = try self.evalNodeStep(lhs_node, locals);
+                break :blk .{ .value = try self.cloneCtValue(lhs_step.value), .returned = false };
             },
             .if_stmt => blk: {
                 const data = a.ifData(idx);
@@ -2500,6 +2551,7 @@ const Binding = struct {
             .float_lit => self.remember(idx, .float),
             .bool_lit => self.remember(idx, .bool),
             .unit_lit => self.remember(idx, .unit),
+            .none_lit => self.remember(idx, .none),
             .var_ref => self.inferVarRef(idx),
             .var_decl => self.inferDecl(idx, true),
             .assign => self.inferAssign(idx),
@@ -2514,8 +2566,8 @@ const Binding = struct {
                 const child_ty = try self.inferNode(child);
                 switch (child_ty) {
                     .int, .float, .bool => {},
-                    .unit => return self.failAtNode(child, error.PrintUnitValue),
-                    .named, .func, .type_type, .variant => return self.failAtNode(child, error.PrintUnsupportedType),
+            .unit => return self.failAtNode(child, error.PrintUnitValue),
+            .none, .named, .func, .type_type, .variant => return self.failAtNode(child, error.PrintUnsupportedType),
                 }
                 break :blk try self.remember(idx, .unit);
             },
@@ -2527,6 +2579,7 @@ const Binding = struct {
             .eq, .ne => try self.inferEquality(idx, a.nodes[idx].data0, a.nodes[idx].data1),
             .is => try self.inferIs(idx, a.isLhs(idx), a.isRhsType(idx)),
             .as => try self.inferAs(idx, a.asLhs(idx), a.asRhsType(idx)),
+            .query_op => try self.inferQueryOp(idx, a.queryOpLhs(idx)),
             .@"and", .@"or" => try self.inferLogical(idx, a.nodes[idx].data0, a.nodes[idx].data1),
             .@"not" => try self.inferNot(idx),
             .if_stmt => self.inferIf(idx),

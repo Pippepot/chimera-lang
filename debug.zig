@@ -141,7 +141,7 @@ fn writeAstLabel(writer: *std.Io.Writer, a: *const ast.Ast, idx: ast.NodeIdx) vo
         .const_decl, .var_decl => writer.print("{s} {s}", .{ @tagName(node.tag), a.identOf(node.data0) }) catch return,
         .assign => writer.print("assign {s}", .{a.identOf(node.data0)}) catch return,
         .field_assign => writer.writeAll("field_assign") catch return,
-        .call, .return_stmt, .print_stmt, .add, .sub, .mul, .div, .lt, .gt, .le, .ge, .eq, .ne, .is, .as, .@"and", .@"or", .@"not", .if_stmt, .block, .field_access, .comptime_expr, .struct_expr, .type_union, .unit_lit, .move_expr => writer.print("{s}", .{@tagName(node.tag)}) catch return,
+        .call, .return_stmt, .print_stmt, .add, .sub, .mul, .div, .lt, .gt, .le, .ge, .eq, .ne, .is, .as, .@"and", .@"or", .@"not", .if_stmt, .block, .field_access, .comptime_expr, .struct_expr, .type_union, .unit_lit, .none_lit, .query_op, .move_expr => writer.print("{s}", .{@tagName(node.tag)}) catch return,
         .arg => writer.print("arg {d}", .{node.data0}) catch return,
         .struct_init => {
             const type_expr = a.structInitTypeExpr(idx);
@@ -233,6 +233,9 @@ fn dumpAstNode(a: *const ast.Ast, idx: ast.NodeIdx, writer: *std.Io.Writer, pref
             dumpTypeNode(a, a.asRhsType(idx), writer);
             writer.writeAll("\n") catch return;
         },
+        .query_op => {
+            dumpAstNode(a, a.queryOpLhs(idx), writer, next_prefix, true, false);
+        },
         .if_stmt => {
             const id = a.ifData(idx);
             if (id.else_ != std.math.maxInt(ast.NodeIdx)) {
@@ -275,7 +278,7 @@ fn dumpAstNode(a: *const ast.Ast, idx: ast.NodeIdx, writer: *std.Io.Writer, pref
                 dumpAstNode(a, member, writer, next_prefix, i + 1 == members.len, false);
             }
         },
-        .int_lit, .float_lit, .var_ref, .arg, .bool_lit, .unit_lit => {},
+        .int_lit, .float_lit, .var_ref, .arg, .bool_lit, .unit_lit, .none_lit => {},
         .type_name, .type_func, .type_variant, .comptime_fn, .comptime_struct => {},
     }
 }

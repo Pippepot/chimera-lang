@@ -147,7 +147,7 @@ const Resolver = struct {
                     try self.resolveNode(item);
                 }
             },
-            .int_lit, .float_lit, .arg, .bool_lit, .unit_lit => {},
+            .int_lit, .float_lit, .arg, .bool_lit, .unit_lit, .none_lit => {},
             .var_ref => {
                 const name = ast_.identOf(ast_.nodes[idx].data0);
                 if (self.locals.lookup(name) != null) {
@@ -170,7 +170,7 @@ const Resolver = struct {
                 }
                 if (std.mem.eql(u8, name, "int") or std.mem.eql(u8, name, "float") or
                     std.mem.eql(u8, name, "bool") or std.mem.eql(u8, name, "unit") or
-                    std.mem.eql(u8, name, "type"))
+                    std.mem.eql(u8, name, "type") or std.mem.eql(u8, name, "none"))
                 {
                     try self.resolved.node_refs.put(idx, .builtin_type);
                     return;
@@ -198,7 +198,7 @@ const Resolver = struct {
                 if (self.locals.lookup(name) == null) {
                 if (std.mem.eql(u8, name, "int") or std.mem.eql(u8, name, "float") or
                     std.mem.eql(u8, name, "bool") or std.mem.eql(u8, name, "unit") or
-                    std.mem.eql(u8, name, "type"))
+                    std.mem.eql(u8, name, "type") or std.mem.eql(u8, name, "none"))
                 {
                     try self.resolved.node_refs.put(idx, .builtin_type);
                     return;
@@ -270,6 +270,9 @@ const Resolver = struct {
             },
             .move_expr => {
                 try self.resolveNode(ast_.nodes[idx].data0);
+            },
+            .query_op => {
+                try self.resolveNode(ast_.queryOpLhs(idx));
             },
             .struct_expr => {},
             .type_union => {

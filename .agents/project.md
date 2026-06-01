@@ -71,23 +71,24 @@ All 5 stages must be cached with `hits=1 recomputes=0` when cache is present. Th
 - **ast.zig** ✅ — Flat AST with `serialize`/`deserialize` (buffer-copy), `struct_expr` tag, ownership policy metadata for structs, param mode masks, `move_expr` tag
 - **parser.zig** ✅ — `AstBuilder`, `NodeIdx` returns, comptime params, struct expressions, inline call struct init, ownership syntax (`move/copy/drop`, access modes, postfix move)
 - **resolver.zig** ✅ — Flat AST, `NodeIdx` keys, builtin type name resolution, deps: parse
-- **analyze.zig** ✅ — Flat AST, `Type.type_type`, `ComptimeValue.type_value`, monomorphized struct type creation/lookup, comptime evaluator supports type_name/struct_expr, ownership policy computation + signature validation + liveness/transfer checks
+- **analyze.zig** ✅ — Flat AST, `Type.type_type`/`.none`, `ComptimeValue.type_value`, monomorphized struct type creation/lookup, comptime evaluator supports type_name/struct_expr, ownership policy computation + signature validation + liveness/transfer checks
 - **ir.zig** ✅ — Flat AST dispatch, `Type.type_type`, ownership-mode lowering (`read`/`mut` by-pointer, `var`/`deinit` transfer), ownership hook-call lowering, deps: analyze
 - **codegen.zig** ✅ — IR->x86 + ELF, backdate support, `program_code_len` in ELF padding, pointer load/store helpers for borrow path, deps: lower
 - **disasm.zig** ✅ — Pattern-based x86 disassembler, 80-entry table, two-pass label resolution, resilient decode fallback
 - **query.zig** ✅ — Generic `ensureMemo`, 5-stage pipeline, persistent cache load/save
 - **query_cache.zig** ✅ — Buffer-copy ser/des for all active stages, `type_type` and `type_value` serialization, ownership mode/function metadata and new IR inst serialization
 - **main.zig** ✅ — CLI, persistent cache
-- **test.zig** ✅ — All 98 tests pass including ownership parser/semantic/runtime cases plus prior monomorphization, variant, and cache suites
+- **test.zig** ✅ — All 145 tests pass including ownership parser/semantic/runtime cases plus prior monomorphization, variant, `none`/`?`, and cache suites
 
 ## Language notes
 
 - Statements are newline-separated.
 - `if`/`else` uses indentation-based blocks with inline `->` form supported.
 - Fallible comparisons (`<`, `>`, `<=`, `>=`, `==`, `!=`) are only legal in `if` conditions.
-- **Variant types** — compiletime type unions use `|` (e.g. `comptime T = int | float | Foo`).
-- **`is` predicate** — fallible runtime variant tag check (`if x is int`).
+- **Variant types** — compiletime type unions use `|` (e.g. `comptime T = int | float | Foo`). `none` is a primitive type useful as a variant member.
+- **`is` predicate** — fallible runtime variant tag check (`if x is int`). Works with `none`: `if x is none`.
 - **`as` cast** — fallible runtime variant cast (`if const i = x as int`).
+- **`?` query operator** — postfix fallible operator that strips `none` from a variant. `if x?` succeeds when `x` is not `none`. Supports binding: `if const v = x?`.
 - **Condition binding scope** — names introduced by `if const/var name = ... as Type` are visible only in the success (`then`) branch.
 - `const` and `var` bindings support optional type annotations.
 - **No language string values** — string literals and `string` type annotations are rejected.
@@ -132,4 +133,4 @@ All 5 stages must be cached with `hits=1 recomputes=0` when cache is present. Th
   - compile `changed_at` backdating
   - persistent cache reuse/disable/failure/corruption/stale cleanup behavior
 - Zero-recompute test: `compileResult` twice with no source change → 0 recomputes, 1 compile hit (compile is the only stage accessed on the second call; all others are implicitly cached).
-- Current suite: `zig test test.zig` (98 tests).
+- Current suite: `zig test test.zig` (145 tests).
