@@ -936,6 +936,39 @@ const FunctionLowerer = struct {
         };
     }
 
+    fn packCallArg(
+        self: *@This(),
+        arg_node: ast.NodeIdx,
+        param_ty: analyze.Type,
+        mode: ast.ParamAccessMode,
+        args: *[MaxCallArgs]ValueRef,
+        arg_word_count: *usize,
+    ) LowerResult!void {
+        switch (mode) {
+            .read => {
+                if (arg_word_count.* + 1 > MaxCallArgs) return error.TooManyCallArgs;
+                args[arg_word_count.*] = try self.lowerReadArgPointer(arg_node, param_ty);
+                arg_word_count.* += 1;
+            },
+            .mut => {
+                if (arg_word_count.* + 1 > MaxCallArgs) return error.TooManyCallArgs;
+                args[arg_word_count.*] = try self.lowerMutArgPointer(arg_node);
+                arg_word_count.* += 1;
+            },
+            .var_mode, .deinit => {
+                const arg_base = try self.lowerValueAsType(arg_node, param_ty);
+                const arg_width = try self.typeSlotCount(param_ty);
+                if (arg_word_count.* + arg_width > MaxCallArgs) return error.TooManyCallArgs;
+
+                var slot_offset: u32 = 0;
+                while (slot_offset < arg_width) : (slot_offset += 1) {
+                    args[arg_word_count.*] = arg_base + slot_offset;
+                    arg_word_count.* += 1;
+                }
+            },
+        }
+    }
+
     fn lowerCall(self: *@This(), idx: ast.NodeIdx) LowerResult!ValueRef {
         const a = self.parent.typed.ast;
 
@@ -974,29 +1007,7 @@ const FunctionLowerer = struct {
         var arg_word_count: usize = 0;
         for (call_args, fn_ty.params, 0..) |arg_node, param_ty, arg_idx| {
             const mode = if (arg_idx < param_modes.len) param_modes[arg_idx] else ast.ParamAccessMode.read;
-            switch (mode) {
-                .read => {
-                    if (arg_word_count + 1 > MaxCallArgs) return error.TooManyCallArgs;
-                    args[arg_word_count] = try self.lowerReadArgPointer(arg_node, param_ty);
-                    arg_word_count += 1;
-                },
-                .mut => {
-                    if (arg_word_count + 1 > MaxCallArgs) return error.TooManyCallArgs;
-                    args[arg_word_count] = try self.lowerMutArgPointer(arg_node);
-                    arg_word_count += 1;
-                },
-                .var_mode, .deinit => {
-                    const arg_base = try self.lowerValueAsType(arg_node, param_ty);
-                    const arg_width = try self.typeSlotCount(param_ty);
-                    if (arg_word_count + arg_width > MaxCallArgs) return error.TooManyCallArgs;
-
-                    var slot_offset: u32 = 0;
-                    while (slot_offset < arg_width) : (slot_offset += 1) {
-                        args[arg_word_count] = arg_base + slot_offset;
-                        arg_word_count += 1;
-                    }
-                },
-            }
+            try self.packCallArg(arg_node, param_ty, mode, &args, &arg_word_count);
         }
 
         const callee_ref = try self.lowerAst(callee);
@@ -1006,9 +1017,7 @@ const FunctionLowerer = struct {
             .args = args,
             .ret_slots = @intCast(ret_slots),
         } });
-        if (ret_slots > 1) {
-            self.function.next_value += ret_slots - 1;
-        }
+        if (ret_slots > 1) self.function.next_value += ret_slots - 1;
         return call_value;
     }
 
@@ -1020,44 +1029,19 @@ const FunctionLowerer = struct {
         const param_modes = target_info.param_modes;
 
         const ret_slots = try self.typeSlotCount(target_info.ty.ret);
-
-        var args: [MaxCallArgs]ValueRef = [_]ValueRef{0} ** MaxCallArgs;
-        var arg_word_count: usize = 0;
-
-        // Find the comptime mask to skip comptime args
         const mask = if (target_info.decl != std.math.maxInt(ast.NodeIdx))
             a.fnComptimeMask(target_info.decl)
         else
             0;
 
+        var args: [MaxCallArgs]ValueRef = [_]ValueRef{0} ** MaxCallArgs;
+        var arg_word_count: usize = 0;
         var runtime_idx: usize = 0;
         for (call_args, 0..) |arg_node, arg_idx| {
             if (mask & (@as(u32, 1) << @intCast(arg_idx)) != 0) continue;
             const param_ty = mono_params[runtime_idx];
             const mode = if (runtime_idx < param_modes.len) param_modes[runtime_idx] else ast.ParamAccessMode.read;
-            switch (mode) {
-                .read => {
-                    if (arg_word_count + 1 > MaxCallArgs) return error.TooManyCallArgs;
-                    args[arg_word_count] = try self.lowerReadArgPointer(arg_node, param_ty);
-                    arg_word_count += 1;
-                },
-                .mut => {
-                    if (arg_word_count + 1 > MaxCallArgs) return error.TooManyCallArgs;
-                    args[arg_word_count] = try self.lowerMutArgPointer(arg_node);
-                    arg_word_count += 1;
-                },
-                .var_mode, .deinit => {
-                    const arg_base = try self.lowerValueAsType(arg_node, param_ty);
-                    const arg_width = try self.typeSlotCount(param_ty);
-                    if (arg_word_count + arg_width > MaxCallArgs) return error.TooManyCallArgs;
-
-                    var slot_offset: u32 = 0;
-                    while (slot_offset < arg_width) : (slot_offset += 1) {
-                        args[arg_word_count] = arg_base + slot_offset;
-                        arg_word_count += 1;
-                    }
-                },
-            }
+            try self.packCallArg(arg_node, param_ty, mode, &args, &arg_word_count);
             runtime_idx += 1;
         }
 
@@ -1067,9 +1051,7 @@ const FunctionLowerer = struct {
             .args = args,
             .ret_slots = @intCast(ret_slots),
         } });
-        if (ret_slots > 1) {
-            self.function.next_value += ret_slots - 1;
-        }
+        if (ret_slots > 1) self.function.next_value += ret_slots - 1;
         return call_value;
     }
 
@@ -1086,29 +1068,7 @@ const FunctionLowerer = struct {
         var arg_word_count: usize = 0;
         for (call_args, fn_ty.params, 0..) |arg_node, param_ty, arg_idx| {
             const mode = if (arg_idx < param_modes.len) param_modes[arg_idx] else ast.ParamAccessMode.read;
-            switch (mode) {
-                .read => {
-                    if (arg_word_count + 1 > MaxCallArgs) return error.TooManyCallArgs;
-                    args[arg_word_count] = try self.lowerReadArgPointer(arg_node, param_ty);
-                    arg_word_count += 1;
-                },
-                .mut => {
-                    if (arg_word_count + 1 > MaxCallArgs) return error.TooManyCallArgs;
-                    args[arg_word_count] = try self.lowerMutArgPointer(arg_node);
-                    arg_word_count += 1;
-                },
-                .var_mode, .deinit => {
-                    const arg_base = try self.lowerValueAsType(arg_node, param_ty);
-                    const arg_width = try self.typeSlotCount(param_ty);
-                    if (arg_word_count + arg_width > MaxCallArgs) return error.TooManyCallArgs;
-
-                    var slot_offset: u32 = 0;
-                    while (slot_offset < arg_width) : (slot_offset += 1) {
-                        args[arg_word_count] = arg_base + slot_offset;
-                        arg_word_count += 1;
-                    }
-                },
-            }
+            try self.packCallArg(arg_node, param_ty, mode, &args, &arg_word_count);
         }
 
         const call_value = try self.addInst(.{ .direct_call = .{
@@ -1117,9 +1077,7 @@ const FunctionLowerer = struct {
             .args = args,
             .ret_slots = @intCast(ret_slots),
         } });
-        if (ret_slots > 1) {
-            self.function.next_value += ret_slots - 1;
-        }
+        if (ret_slots > 1) self.function.next_value += ret_slots - 1;
         return call_value;
     }
 
@@ -1151,7 +1109,6 @@ const FunctionLowerer = struct {
             try self.lowerConditionToBranches(condition_entry_block, cond_node, then_block_id, else_block_id);
         }
 
-        var then_fallthrough = false;
         self.current_block_id = then_block_id;
         const then_value = then_blk: {
             const mark = self.bindings.mark();
@@ -1176,12 +1133,13 @@ const FunctionLowerer = struct {
             }
             break :then_blk try self.lowerAst(data.then_);
         };
+        var then_fallthrough = false;
         if (self.currentBlock().terminator == null) {
-            const then_arg = if (if_ty == .variant) then_arg_blk: {
-                const then_ty = try self.parent.typed.typeOf(data.then_);
-                break :then_arg_blk try self.wrapValueRefToType(then_value, then_ty, if_ty);
-            } else then_value;
-            self.currentBlock().terminator = .{ .br = .{ .target = merge_block_id, .arg = then_arg } };
+            const arg = if (if_ty == .variant)
+                try self.wrapValueRefToType(then_value, try self.parent.typed.typeOf(data.then_), if_ty)
+            else
+                then_value;
+            self.currentBlock().terminator = .{ .br = .{ .target = merge_block_id, .arg = arg } };
             then_fallthrough = true;
         }
 
@@ -1198,21 +1156,16 @@ const FunctionLowerer = struct {
             break :else_blk try self.lowerUnitValue();
         };
         if (self.currentBlock().terminator == null) {
-            const else_arg = if (if_ty == .variant) else_arg_blk: {
-                const else_ty = if (data.else_ != std.math.maxInt(ast.NodeIdx))
-                    try self.parent.typed.typeOf(data.else_)
-                else
-                    analyze.Type.unit;
-                break :else_arg_blk try self.wrapValueRefToType(else_value, else_ty, if_ty);
-            } else else_value;
-            self.currentBlock().terminator = .{ .br = .{ .target = merge_block_id, .arg = else_arg } };
+            const arg = if (if_ty == .variant)
+                try self.wrapValueRefToType(else_value, if (data.else_ != std.math.maxInt(ast.NodeIdx)) try self.parent.typed.typeOf(data.else_) else analyze.Type.unit, if_ty)
+            else
+                else_value;
+            self.currentBlock().terminator = .{ .br = .{ .target = merge_block_id, .arg = arg } };
             else_fallthrough = true;
         }
 
         self.current_block_id = merge_block_id;
-        if (then_fallthrough or else_fallthrough) {
-            return self.currentBlock().param orelse unreachable;
-        }
+        if (then_fallthrough or else_fallthrough) return self.currentBlock().param orelse unreachable;
         return self.lowerUnitValue();
     }
 
@@ -1265,21 +1218,7 @@ const FunctionLowerer = struct {
     }
 
     fn lowerConst(self: *@This(), idx: ast.NodeIdx) LowerResult!ValueRef {
-        const a = self.parent.typed.ast;
-        const value = a.varDeclValue(idx);
-        const name = a.identOf(a.nodes[idx].data0);
-        const binding_ty = self.parent.typed.decl_binding_types.get(idx) orelse try self.parent.typed.typeOf(value);
-        const raw_value_ref = try self.lowerValueAsType(value, binding_ty);
-        const value_ref = try self.applyImplicitCopy(value, raw_value_ref, binding_ty);
-        const slot_count = try self.typeSlotCount(binding_ty);
-        const const_slot = try self.allocSlotRange(slot_count);
-        try self.emitCopySlots(value_ref, const_slot, slot_count);
-        try self.pushBinding(name, .{
-            .storage = .{ .local_slot = const_slot },
-            .ty = binding_ty,
-            .slot_count = slot_count,
-        });
-        return const_slot;
+        return self.lowerVar(idx);
     }
 
     fn lowerAssign(self: *@This(), idx: ast.NodeIdx) LowerResult!ValueRef {
@@ -1374,8 +1313,7 @@ const FunctionLowerer = struct {
 
     fn lowerComptimeValue(self: *@This(), value: analyze.ComptimeValue) LowerResult!ValueRef {
         return switch (value) {
-            .unit => self.lowerUnitValue(),
-            .none => self.lowerUnitValue(),
+            .unit, .none => self.lowerUnitValue(),
             .bool => |v| self.addInst(.{ .iconst = if (v) @as(i32, 1) else 0 }),
             .int => |v| self.addInst(.{ .iconst = v }),
             .float => |v| self.addInst(.{ .fconst = v }),
@@ -1415,12 +1353,9 @@ const FunctionLowerer = struct {
             else => return error.IfConditionNotFallible,
         };
         const rhs_ty = try self.nodeType(idx);
-        const member_tag = variantMemberIndex(lhs_variant, rhs_ty) orelse return error.IfConditionNotFallible;
+        if (variantMemberIndex(lhs_variant, rhs_ty) == null) return error.IfConditionNotFallible;
         const payload_slots = try self.typeSlotCount(rhs_ty);
         const result_base = try self.allocSlotRange(payload_slots);
-        const tag_const = try self.addInst(.{ .iconst = @intCast(member_tag) });
-        const check_eq = try self.addInst(.{ .subi = .{ .l = lhs_base, .r = tag_const } });
-        _ = check_eq;
         try self.emitCopySlots(lhs_base + 1, result_base, payload_slots);
         return result_base;
     }
@@ -1453,8 +1388,7 @@ const FunctionLowerer = struct {
                 const value = a.nodes[idx].data0 != 0;
                 break :blk try self.addInst(.{ .iconst = if (value) @as(i32, 1) else 0 });
             },
-            .unit_lit => try self.lowerUnitValue(),
-            .none_lit => try self.lowerUnitValue(),
+            .unit_lit, .none_lit => try self.lowerUnitValue(),
             .var_ref => blk: {
                 const name = a.identOf(a.nodes[idx].data0);
                 break :blk try self.lowerVarRef(name);
@@ -1500,11 +1434,7 @@ const FunctionLowerer = struct {
                 break :blk try self.emitMoveHook(hook_fn, source_ref, source_ty);
             },
             .field_access => try self.lowerFieldAccess(idx),
-            .comptime_expr => blk: {
-                const value = self.parent.typed.comptime_node_values.get(idx) orelse return error.MissingComptimeValue;
-                break :blk try self.lowerComptimeValue(value);
-            },
-            .sizeof_expr => blk: {
+            .comptime_expr, .sizeof_expr => blk: {
                 const value = self.parent.typed.comptime_node_values.get(idx) orelse return error.MissingComptimeValue;
                 break :blk try self.lowerComptimeValue(value);
             },
