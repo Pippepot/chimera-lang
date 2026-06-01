@@ -571,22 +571,13 @@ const Parser = struct {
         return ast.Span{ .start = 0, .end = 0 };
     }
 
-    fn makeConstNode(self: *@This(), name: []const u8, ty: ?NodeIdx, value: NodeIdx, span: ast.Span) !NodeIdx {
+    fn makeBindingNode(self: *@This(), tag: Tag, name: []const u8, ty: ?NodeIdx, value: NodeIdx, span: ast.Span) !NodeIdx {
         const name_idx = try self.internName(name);
         if (ty) |type_idx| {
             const extra_idx = try self.builder.allocExtraPair(type_idx, value);
-            return self.allocNode(.const_decl, name_idx, extra_idx | 0x80000000, span);
+            return self.allocNode(tag, name_idx, extra_idx | 0x80000000, span);
         }
-        return self.allocNode(.const_decl, name_idx, value, span);
-    }
-
-    fn makeVarNode(self: *@This(), name: []const u8, ty: ?NodeIdx, value: NodeIdx, span: ast.Span) !NodeIdx {
-        const name_idx = try self.internName(name);
-        if (ty) |type_idx| {
-            const extra_idx = try self.builder.allocExtraPair(type_idx, value);
-            return self.allocNode(.var_decl, name_idx, extra_idx | 0x80000000, span);
-        }
-        return self.allocNode(.var_decl, name_idx, value, span);
+        return self.allocNode(tag, name_idx, value, span);
     }
 
     fn makeAssignNode(self: *@This(), name: []const u8, value: NodeIdx, span: ast.Span) !NodeIdx {
@@ -910,6 +901,7 @@ const Parser = struct {
         } else try self.parseIndentedBlock(error.ExpectedIndent);
 
         const param_count: u32 = @intCast(param_names.items.len);
+        const extra_start = self.builder.extra.items.len;
         try self.builder.extra.append(self.builder.gpa, param_count);
         try self.builder.extra.append(self.builder.gpa, comptime_mask);
         try self.builder.extra.append(self.builder.gpa, mut_mask);
@@ -925,11 +917,7 @@ const Parser = struct {
         if (binding_ty) |annot| {
             try self.builder.extra.append(self.builder.gpa, annot);
         }
-        const extra_idx: u32 = if (binding_ty != null)
-            @intCast(self.builder.extra.items.len - 8 - param_count * 2)
-        else
-            @intCast(self.builder.extra.items.len - 7 - param_count * 2);
-
+        const extra_idx = extra_start;
         const data1 = if (binding_ty != null) extra_idx | 0x80000000 else extra_idx;
         const body_span = try self.spanOf(body);
         const span = coverSpans(decl_start, body_span);
@@ -993,94 +981,43 @@ const Parser = struct {
         return self.internName(hook_name);
     }
 
-    fn parseMovePolicy(self: *@This(), body: *ParsedStructBody, struct_name: []const u8, line_start: ast.Span) ParseError!void {
-        if (self.current.tag == .ident) {
-            const rhs = self.current.ident;
-            if (std.mem.eql(u8, rhs, "trivial")) {
-                body.move_kind = .trivial;
-                body.move_hook = null;
-                try self.advance();
-                return;
-            }
-            if (std.mem.eql(u8, rhs, "fieldwise")) {
-                body.move_kind = .fieldwise;
-                body.move_hook = null;
-                try self.advance();
-                return;
-            }
-            if (std.mem.eql(u8, rhs, "none")) {
-                body.move_kind = .none;
-                body.move_hook = null;
-                try self.advance();
-                return;
-            }
-        }
-        if (self.current.tag == .kw_none) {
-            body.move_kind = .none;
-            body.move_hook = null;
-            try self.advance();
-            return;
-        }
-        body.move_kind = .func;
-        body.move_hook = try self.parseOwnershipHookRef(struct_name, "move", line_start);
-    }
+    const PolicyProperty = enum { move, copy, drop };
 
-    fn parseCopyPolicy(self: *@This(), body: *ParsedStructBody, struct_name: []const u8, line_start: ast.Span) ParseError!void {
+    fn parsePolicyRhs(self: *@This(), body: *ParsedStructBody, prop: PolicyProperty, struct_name: []const u8, line_start: ast.Span) ParseError!void {
+        const is_drop = prop == .drop;
         if (self.current.tag == .ident) {
             const rhs = self.current.ident;
             if (std.mem.eql(u8, rhs, "trivial")) {
-                body.copy_kind = .trivial;
-                body.copy_hook = null;
-                try self.advance();
-                return;
+                if (is_drop) { body.drop_kind = .trivial; body.drop_hook = null; }
+                else if (prop == .move) { body.move_kind = .trivial; body.move_hook = null; }
+                else { body.copy_kind = .trivial; body.copy_hook = null; }
+                try self.advance(); return;
             }
             if (std.mem.eql(u8, rhs, "fieldwise")) {
-                body.copy_kind = .fieldwise;
-                body.copy_hook = null;
-                try self.advance();
-                return;
+                if (is_drop) { body.drop_kind = .fieldwise; body.drop_hook = null; }
+                else if (prop == .move) { body.move_kind = .fieldwise; body.move_hook = null; }
+                else { body.copy_kind = .fieldwise; body.copy_hook = null; }
+                try self.advance(); return;
             }
-            if (std.mem.eql(u8, rhs, "none")) {
-                body.copy_kind = .none;
-                body.copy_hook = null;
-                try self.advance();
-                return;
+            if (!is_drop and std.mem.eql(u8, rhs, "none")) {
+                if (prop == .move) { body.move_kind = .none; body.move_hook = null; }
+                else { body.copy_kind = .none; body.copy_hook = null; }
+                try self.advance(); return;
             }
-        }
-        if (self.current.tag == .kw_none) {
-            body.copy_kind = .none;
-            body.copy_hook = null;
-            try self.advance();
-            return;
-        }
-        body.copy_kind = .func;
-        body.copy_hook = try self.parseOwnershipHookRef(struct_name, "copy", line_start);
-    }
-
-    fn parseDropPolicy(self: *@This(), body: *ParsedStructBody, struct_name: []const u8, line_start: ast.Span) ParseError!void {
-        if (self.current.tag == .ident) {
-            const rhs = self.current.ident;
-            if (std.mem.eql(u8, rhs, "trivial")) {
-                body.drop_kind = .trivial;
-                body.drop_hook = null;
-                try self.advance();
-                return;
-            }
-            if (std.mem.eql(u8, rhs, "fieldwise")) {
-                body.drop_kind = .fieldwise;
-                body.drop_hook = null;
-                try self.advance();
-                return;
-            }
-            if (std.mem.eql(u8, rhs, "explicit")) {
-                body.drop_kind = .explicit;
-                body.drop_hook = null;
-                try self.advance();
-                return;
+            if (is_drop and std.mem.eql(u8, rhs, "explicit")) {
+                body.drop_kind = .explicit; body.drop_hook = null;
+                try self.advance(); return;
             }
         }
-        body.drop_kind = .func;
-        body.drop_hook = try self.parseOwnershipHookRef(struct_name, "drop", line_start);
+        if (!is_drop and self.current.tag == .kw_none) {
+            if (prop == .move) { body.move_kind = .none; body.move_hook = null; }
+            else { body.copy_kind = .none; body.copy_hook = null; }
+            try self.advance(); return;
+        }
+        const hook = try self.parseOwnershipHookRef(struct_name, @tagName(prop), line_start);
+        if (is_drop) { body.drop_kind = .func; body.drop_hook = hook; }
+        else if (prop == .move) { body.move_kind = .func; body.move_hook = hook; }
+        else { body.copy_kind = .func; body.copy_hook = hook; }
     }
 
     fn parseComptimeStructBody(self: *@This(), struct_name: []const u8) ParseError!ParsedStructBody {
@@ -1112,24 +1049,14 @@ const Parser = struct {
             try self.advance();
 
             if (std.mem.eql(u8, key, "move") or std.mem.eql(u8, key, "copy") or std.mem.eql(u8, key, "drop")) {
-                if (self.current.tag != .assign) return error.UnexpectedToken;
+                try self.expect(.assign, error.UnexpectedToken);
                 try self.advance();
-                if (std.mem.eql(u8, key, "move")) {
-                    if (saw_move) return error.UnexpectedToken;
-                    saw_move = true;
-                    body.explicit_mask |= 0b001;
-                    try self.parseMovePolicy(&body, struct_name, key_span);
-                } else if (std.mem.eql(u8, key, "copy")) {
-                    if (saw_copy) return error.UnexpectedToken;
-                    saw_copy = true;
-                    body.explicit_mask |= 0b010;
-                    try self.parseCopyPolicy(&body, struct_name, key_span);
-                } else {
-                    if (saw_drop) return error.UnexpectedToken;
-                    saw_drop = true;
-                    body.explicit_mask |= 0b100;
-                    try self.parseDropPolicy(&body, struct_name, key_span);
-                }
+                const prop: PolicyProperty = if (std.mem.eql(u8, key, "move")) .move else if (std.mem.eql(u8, key, "copy")) .copy else .drop;
+                const saw_ptr: *bool = switch (prop) { .move => &saw_move, .copy => &saw_copy, .drop => &saw_drop };
+                if (saw_ptr.*) return error.UnexpectedToken;
+                saw_ptr.* = true;
+                body.explicit_mask |= switch (prop) { .move => 0b001, .copy => 0b010, .drop => 0b100 };
+                try self.parsePolicyRhs(&body, prop, struct_name, key_span);
             } else {
                 const fname = try self.internName(key);
                 try self.expect(.colon, error.ExpectedColon);
@@ -1152,6 +1079,7 @@ const Parser = struct {
         const body = try self.parseComptimeStructBody(name);
 
         const field_count: u32 = @intCast(body.fields.names.items.len);
+        const extra_start = self.builder.extra.items.len;
         try self.builder.extra.append(self.builder.gpa, field_count);
         try self.builder.extra.append(self.builder.gpa, @intFromEnum(body.move_kind));
         try self.builder.extra.append(self.builder.gpa, body.move_hook orelse ast.no_hook_ident);
@@ -1167,11 +1095,7 @@ const Parser = struct {
         if (binding_ty) |annot| {
             try self.builder.extra.append(self.builder.gpa, annot);
         }
-        const extra_idx: u32 = if (binding_ty != null)
-            @intCast(self.builder.extra.items.len - 9 - field_count * 2)
-        else
-            @intCast(self.builder.extra.items.len - 8 - field_count * 2);
-
+        const extra_idx = extra_start;
         const data1 = if (binding_ty != null) extra_idx | 0x80000000 else extra_idx;
         const span = if (field_count > 0)
             coverSpans(decl_start, try self.spanOf(body.fields.types.items[field_count - 1]))
@@ -1182,18 +1106,11 @@ const Parser = struct {
 
     fn parseTypePrimary(self: *@This()) ParseError!u32 {
         switch (self.current.tag) {
-            .ident => {
+            .ident, .kw_none => {
                 const span = tokenSpan(self.current);
-                const name = self.current.ident;
+                const name = if (self.current.tag == .kw_none) "none" else self.current.ident;
                 try self.advance();
-                const name_idx = try self.internName(name);
-                return self.allocNode(.type_name, name_idx, 0, span);
-            },
-            .kw_none => {
-                const span = tokenSpan(self.current);
-                try self.advance();
-                const name_idx = try self.internName("none");
-                return self.allocNode(.type_name, name_idx, 0, span);
+                return self.allocNode(.type_name, try self.internName(name), 0, span);
             },
             .kw_func => {
                 const fn_span = tokenSpan(self.current);
@@ -1247,8 +1164,8 @@ const Parser = struct {
     const BindingKind = enum { const_kind, var_kind };
 
     fn parseStatement(self: *@This()) ParseError!NodeIdx {
-        if (self.current.tag == .kw_const) return self.parseBinding(.const_kind);
-        if (self.current.tag == .kw_var) return self.parseBinding(.var_kind);
+        if (self.current.tag == .kw_const) return self.parseBinding(.const_kind, true);
+        if (self.current.tag == .kw_var) return self.parseBinding(.var_kind, true);
         if (self.current.tag == .kw_return) return self.parseReturn();
         if (self.current.tag == .kw_comptime) return self.parseComptimeStatement();
         return self.parseExpression();
@@ -1344,7 +1261,7 @@ const Parser = struct {
         return self.makeReturnNode(value, span);
     }
 
-    fn parseBinding(self: *@This(), kind: BindingKind) ParseError!NodeIdx {
+    fn parseBinding(self: *@This(), kind: BindingKind, check_terminated: bool) ParseError!NodeIdx {
         const keyword_span = tokenSpan(self.current);
         const keyword_tag: TokenTag = switch (kind) {
             .const_kind => .kw_const,
@@ -1362,13 +1279,10 @@ const Parser = struct {
         try self.expect(.assign, error.ExpectedAssign);
         const value = try self.parseExpression();
         const value_span = try self.spanOf(value);
-        try self.expectStatementTerminated(value_span.end);
+        if (check_terminated) try self.expectStatementTerminated(value_span.end);
         const end_span = if (binding_ty) |ty| coverSpans(try self.spanOf(ty), value_span) else value_span;
         const node_span = coverSpans(keyword_span, end_span);
-        return switch (kind) {
-            .const_kind => self.makeConstNode(ident, binding_ty, value, node_span),
-            .var_kind => self.makeVarNode(ident, binding_ty, value, node_span),
-        };
+        return self.makeBindingNode(switch (kind) { .const_kind => .const_decl, .var_kind => .var_decl }, ident, binding_ty, value, node_span);
     }
 
     const BinOpEntry = struct { token: TokenTag, tag: BinTag };
@@ -1405,15 +1319,10 @@ const Parser = struct {
                     const rhs = try self.parseAdditive();
                     lhs = try self.makeBinop(op_tag, lhs, rhs);
                 },
-                .kw_is => {
+                .kw_is, .kw_as => {
+                    const is_tag = self.current.tag == .kw_is;
                     try self.advance();
-                    const rhs_type = try self.parseType();
-                    lhs = try self.makeIsNode(lhs, rhs_type);
-                },
-                .kw_as => {
-                    try self.advance();
-                    const rhs_type = try self.parseType();
-                    lhs = try self.makeAsNode(lhs, rhs_type);
+                    lhs = if (is_tag) try self.makeIsNode(lhs, try self.parseType()) else try self.makeAsNode(lhs, try self.parseType());
                 },
                 else => break,
             }
@@ -1643,8 +1552,8 @@ const Parser = struct {
                 const name_idx = try self.internName(name);
                 return self.allocNode(.var_ref, name_idx, 0, ident_span);
             },
-            .kw_const => return self.parseBinding(.const_kind),
-            .kw_var => return self.parseBinding(.var_kind),
+            .kw_const => return self.parseBinding(.const_kind, true),
+            .kw_var => return self.parseBinding(.var_kind, true),
             else => return error.ExpectedExpression,
         }
     }
@@ -1726,32 +1635,7 @@ const Parser = struct {
     }
 
     fn parseIfBindingCondition(self: *@This(), kind: BindingKind) ParseError!NodeIdx {
-        const keyword_span = tokenSpan(self.current);
-        const keyword_tag: TokenTag = switch (kind) {
-            .const_kind => .kw_const,
-            .var_kind => .kw_var,
-        };
-        try self.expect(keyword_tag, error.UnexpectedToken);
-
-        if (self.current.tag != .ident) return error.ExpectedIdentifier;
-        const ident = self.current.ident;
-        try self.advance();
-
-        var binding_ty: ?u32 = null;
-        if (self.current.tag == .colon) {
-            try self.advance();
-            binding_ty = try self.parseType();
-        }
-
-        try self.expect(.assign, error.ExpectedAssign);
-        const value = try self.parseExpression();
-        const value_span = try self.spanOf(value);
-        const end_span = if (binding_ty) |ty| coverSpans(try self.spanOf(ty), value_span) else value_span;
-        const node_span = coverSpans(keyword_span, end_span);
-        return switch (kind) {
-            .const_kind => self.makeConstNode(ident, binding_ty, value, node_span),
-            .var_kind => self.makeVarNode(ident, binding_ty, value, node_span),
-        };
+        return self.parseBinding(kind, false);
     }
 };
 
