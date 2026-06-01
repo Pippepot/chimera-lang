@@ -27,23 +27,23 @@ pub fn ScopeStack(comptime T: type) type {
             self.entries.shrinkRetainingCapacity(mark_len);
         }
 
-        pub fn lookup(self: *const Self, name: []const u8) ?T {
-            var idx = self.entries.items.len;
-            while (idx > 0) {
-                idx -= 1;
-                const entry = self.entries.items[idx];
-                if (std.mem.eql(u8, entry.name, name)) return entry.value;
+        fn find(self: *const Self, name: []const u8) ?usize {
+            var i = self.entries.items.len;
+            while (i > 0) {
+                i -= 1;
+                if (std.mem.eql(u8, self.entries.items[i].name, name)) return i;
             }
             return null;
         }
 
+        pub fn lookup(self: *const Self, name: []const u8) ?T {
+            const i = self.find(name) orelse return null;
+            return self.entries.items[i].value;
+        }
+
         pub fn lookupPtr(self: *Self, name: []const u8) ?*T {
-            var idx = self.entries.items.len;
-            while (idx > 0) {
-                idx -= 1;
-                if (std.mem.eql(u8, self.entries.items[idx].name, name)) return &self.entries.items[idx].value;
-            }
-            return null;
+            const i = self.find(name) orelse return null;
+            return &self.entries.items[i].value;
         }
 
         pub fn push(self: *Self, gpa: std.mem.Allocator, name: []const u8, value: T) !void {

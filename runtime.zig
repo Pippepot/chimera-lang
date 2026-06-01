@@ -1,12 +1,5 @@
 const std = @import("std");
 
-fn waitForExitCode(io: std.Io, child: *std.process.Child) u8 {
-    switch (child.wait(io) catch std.process.exit(1)) {
-        .exited => |code| return code,
-        else => std.process.exit(1),
-    }
-}
-
 pub fn writeProgram(io: std.Io, prog_bytes: []const u8) void {
     const cwd = std.Io.Dir.cwd();
     cwd.writeFile(io, .{
@@ -24,5 +17,8 @@ pub fn runProg(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) u8 
     for (args) |arg| argv.appendAssumeCapacity(arg);
 
     var child = std.process.spawn(io, .{ .argv = argv.items, .stderr = .inherit }) catch std.process.exit(1);
-    return waitForExitCode(io, &child);
+    return switch (child.wait(io) catch std.process.exit(1)) {
+        .exited => |code| code,
+        else => std.process.exit(1),
+    };
 }

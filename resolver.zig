@@ -51,6 +51,15 @@ pub const ResolveReport = struct {
     diagnostic: ?db.Diagnostic,
 };
 
+fn isBuiltinType(name: []const u8) bool {
+    return std.mem.eql(u8, name, "int") or
+        std.mem.eql(u8, name, "float") or
+        std.mem.eql(u8, name, "bool") or
+        std.mem.eql(u8, name, "unit") or
+        std.mem.eql(u8, name, "type") or
+        std.mem.eql(u8, name, "none");
+}
+
 const Resolver = struct {
     gpa: std.mem.Allocator,
     parsed: *const parser.ParsedAst,
@@ -83,6 +92,19 @@ const Resolver = struct {
         return error.ResolveFailed;
     }
 
+    fn pushLocal(self: *@This(), name: []const u8, span: ?ast.Span) !void {
+        self.locals.push(self.gpa, name, {}) catch |err| switch (err) {
+            error.DuplicateVariable => return self.fail(span, error.DuplicateSymbol),
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+    }
+
+    fn resolveInScope(self: *@This(), idx: ast.NodeIdx) !void {
+        const mark = self.locals.mark();
+        defer self.locals.restore(mark);
+        try self.resolveNode(idx);
+    }
+
     fn addTopLevelSymbol(self: *@This(), name: []const u8, decl_idx: ast.NodeIdx) !void {
         if (self.resolved.function_names.contains(name) or
             self.resolved.comptime_value_names.contains(name) or
@@ -97,12 +119,8 @@ const Resolver = struct {
                 try self.resolved.functions.append(self.gpa, decl_idx);
                 try self.resolved.function_names.put(name, fn_id);
             },
-            .comptime_struct => {
-                try self.resolved.struct_names.put(name, {});
-            },
-            .comptime_value_decl => {
-                try self.resolved.comptime_value_names.put(name, decl_idx);
-            },
+            .comptime_struct => try self.resolved.struct_names.put(name, {}),
+            .comptime_value_decl => try self.resolved.comptime_value_names.put(name, decl_idx),
             else => {},
         }
     }
@@ -127,11 +145,7 @@ const Resolver = struct {
         defer self.locals.restore(mark);
 
         for (self.parsed.ast.fnParams(func_decl_idx)) |param| {
-            const name = self.parsed.ast.identOf(param.name);
-            self.locals.push(self.gpa, name, {}) catch |err| switch (err) {
-                error.DuplicateVariable => return self.fail(self.parsed.ast.spanOf(func_decl_idx), error.DuplicateSymbol),
-                error.OutOfMemory => return error.OutOfMemory,
-            };
+            try self.pushLocal(self.parsed.ast.identOf(param.name), self.parsed.ast.spanOf(func_decl_idx));
         }
 
         try self.resolveNode(self.parsed.ast.fnBody(func_decl_idx));
@@ -143,9 +157,7 @@ const Resolver = struct {
             .block => {
                 const mark = self.locals.mark();
                 defer self.locals.restore(mark);
-                for (ast_.blockItems(idx)) |item| {
-                    try self.resolveNode(item);
-                }
+                for (ast_.blockItems(idx)) |item| try self.resolveNode(item);
             },
             .int_lit, .float_lit, .arg, .bool_lit, .unit_lit, .none_lit => {},
             .var_ref => {
@@ -168,42 +180,25 @@ const Resolver = struct {
                         return;
                     }
                 }
-                if (std.mem.eql(u8, name, "int") or std.mem.eql(u8, name, "float") or
-                    std.mem.eql(u8, name, "bool") or std.mem.eql(u8, name, "unit") or
-                    std.mem.eql(u8, name, "type") or std.mem.eql(u8, name, "none"))
-                {
+                if (isBuiltinType(name)) {
                     try self.resolved.node_refs.put(idx, .builtin_type);
                     return;
                 }
                 return self.fail(ast_.spanOf(idx), error.UnknownSymbol);
             },
-            .const_decl => {
+            .const_decl, .var_decl => {
                 const name = ast_.identOf(ast_.nodes[idx].data0);
                 try self.resolveNode(ast_.varDeclValue(idx));
-                self.locals.push(self.gpa, name, {}) catch |err| switch (err) {
-                    error.DuplicateVariable => return self.fail(ast_.spanOf(idx), error.DuplicateSymbol),
-                    error.OutOfMemory => return error.OutOfMemory,
-                };
-            },
-            .var_decl => {
-                const name = ast_.identOf(ast_.nodes[idx].data0);
-                try self.resolveNode(ast_.varDeclValue(idx));
-                self.locals.push(self.gpa, name, {}) catch |err| switch (err) {
-                    error.DuplicateVariable => return self.fail(ast_.spanOf(idx), error.DuplicateSymbol),
-                    error.OutOfMemory => return error.OutOfMemory,
-                };
+                try self.pushLocal(name, ast_.spanOf(idx));
             },
             .assign => {
                 const name = ast_.identOf(ast_.nodes[idx].data0);
                 if (self.locals.lookup(name) == null) {
-                if (std.mem.eql(u8, name, "int") or std.mem.eql(u8, name, "float") or
-                    std.mem.eql(u8, name, "bool") or std.mem.eql(u8, name, "unit") or
-                    std.mem.eql(u8, name, "type") or std.mem.eql(u8, name, "none"))
-                {
-                    try self.resolved.node_refs.put(idx, .builtin_type);
-                    return;
-                }
-                return self.fail(ast_.spanOf(idx), error.UnknownSymbol);
+                    if (isBuiltinType(name)) {
+                        try self.resolved.node_refs.put(idx, .builtin_type);
+                        return;
+                    }
+                    return self.fail(ast_.spanOf(idx), error.UnknownSymbol);
                 }
                 try self.resolveNode(ast_.nodes[idx].data1);
             },
@@ -217,70 +212,42 @@ const Resolver = struct {
                 for (ast_.callArgs(idx)) |arg| try self.resolveNode(arg);
             },
             .print_stmt => try self.resolveNode(ast_.nodes[idx].data0),
-            .@"not" => {
-                try self.resolveNode(ast_.nodes[idx].data0);
-            },
+            .@"not" => try self.resolveNode(ast_.nodes[idx].data0),
             .add, .sub, .mul, .div, .lt, .gt, .le, .ge, .eq, .ne, .@"and", .@"or" => {
                 try self.resolveNode(ast_.nodes[idx].data0);
                 try self.resolveNode(ast_.nodes[idx].data1);
             },
-            .is => {
-                try self.resolveNode(ast_.isLhs(idx));
-            },
-            .as => {
-                try self.resolveNode(ast_.isLhs(idx));
-            },
+            .is, .as => try self.resolveNode(ast_.isLhs(idx)),
             .if_stmt => {
                 const data = ast_.ifData(idx);
                 const cond_tag = ast_.nodes[data.cond].tag;
                 if (cond_tag == .const_decl or cond_tag == .var_decl) {
-                    const cond_name = ast_.identOf(ast_.nodes[data.cond].data0);
                     try self.resolveNode(ast_.varDeclValue(data.cond));
                     {
                         const mark = self.locals.mark();
                         defer self.locals.restore(mark);
-                        self.locals.push(self.gpa, cond_name, {}) catch |err| switch (err) {
-                            error.DuplicateVariable => return self.fail(ast_.spanOf(data.cond), error.DuplicateSymbol),
-                            error.OutOfMemory => return error.OutOfMemory,
-                        };
+                        try self.pushLocal(ast_.identOf(ast_.nodes[data.cond].data0), ast_.spanOf(data.cond));
                         try self.resolveNode(data.then_);
-                    }
-                    if (data.else_ != std.math.maxInt(ast.NodeIdx)) {
-                        const mark = self.locals.mark();
-                        defer self.locals.restore(mark);
-                        try self.resolveNode(data.else_);
                     }
                 } else {
                     try self.resolveNode(data.cond);
-                    {
-                        const mark = self.locals.mark();
-                        defer self.locals.restore(mark);
-                        try self.resolveNode(data.then_);
-                    }
-                    if (data.else_ != std.math.maxInt(ast.NodeIdx)) {
-                        const mark = self.locals.mark();
-                        defer self.locals.restore(mark);
-                        try self.resolveNode(data.else_);
-                    }
+                    try self.resolveInScope(data.then_);
+                }
+                if (data.else_ != std.math.maxInt(ast.NodeIdx)) {
+                    try self.resolveInScope(data.else_);
                 }
             },
             .struct_init => {
                 try self.resolveNode(ast_.structInitTypeExpr(idx));
                 for (ast_.structInitFields(idx)) |field| try self.resolveNode(field.value);
             },
-            .move_expr => {
-                try self.resolveNode(ast_.nodes[idx].data0);
-            },
-            .query_op => {
-                try self.resolveNode(ast_.isLhs(idx));
-            },
+            .move_expr => try self.resolveNode(ast_.nodes[idx].data0),
+            .query_op => try self.resolveNode(ast_.isLhs(idx)),
             .struct_expr => {},
             .type_union => {
                 for (ast_.typeUnionMembers(idx)) |member| try self.resolveNode(member);
             },
-            .field_access => {
-                try self.resolveNode(ast_.nodes[idx].data0);
-            },
+            .field_access => try self.resolveNode(ast_.nodes[idx].data0),
             .comptime_expr => try self.resolveNode(ast_.comptimeExprBody(idx)),
             .comptime_value_decl => try self.resolveNode(ast_.comptimeValueDeclValue(idx)),
             .sizeof_expr => {},
