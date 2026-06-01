@@ -174,11 +174,9 @@ fn serialize(gpa: std.mem.Allocator, payload: SavePayload) ![]u8 {
     try appendU64(&buf, gpa, sourceHash(payload.source_text));
     try appendBytes(&buf, gpa, payload.source_path);
 
-    try appendStage(&buf, gpa, payload.parse);
-    try appendStage(&buf, gpa, payload.resolve);
-    try appendStage(&buf, gpa, payload.typecheck);
-    try appendStage(&buf, gpa, payload.lower);
-    try appendStage(&buf, gpa, payload.compile);
+    inline for (.{ payload.parse, payload.resolve, payload.typecheck, payload.lower, payload.compile }) |s| {
+        try appendStage(&buf, gpa, s);
+    }
 
     return buf.toOwnedSlice(gpa);
 }
@@ -226,7 +224,7 @@ fn readDiagnosticsList(r: *Reader, gpa: std.mem.Allocator) LoadError!std.ArrayLi
     while (idx < count) : (idx += 1) {
         const stage = try stageFromByte(try r.readU8());
         const has_span = try r.readU8();
-        var span: ?@import("ast.zig").Span = null;
+        var span: ?ast.Span = null;
         if (has_span == 1) {
             const start = try r.readU64();
             const end = try r.readU64();
@@ -264,65 +262,121 @@ fn readStage(r: *Reader, gpa: std.mem.Allocator) LoadError!LoadedStage {
     };
 }
 
-fn writeType(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, ty: ir_mod.Type) !void {
-    const tag = std.meta.activeTag(ty);
-    try appendU8(buf, gpa, @intFromEnum(tag));
-    switch (ty) {
-        .unit, .bool, .int, .float, .type_type, .none => {},
-        .named => |id| try appendU32(buf, gpa, id),
-        .func => |id| try appendU32(buf, gpa, id),
-        .variant => |slot_count| try appendU32(buf, gpa, slot_count),
+const InstFields = switch (@typeInfo(ir_mod.Inst)) {
+    .@"union" => |u| u.fields,
+    else => @compileError("expected union"),
+};
+const TermFields = switch (@typeInfo(ir_mod.Terminator)) {
+    .@"union" => |u| u.fields,
+    else => @compileError("expected union"),
+};
+const TypeFields = switch (@typeInfo(ir_mod.Type)) {
+    .@"union" => |u| u.fields,
+    else => @compileError("expected union"),
+};
+
+const PbrPayload = blk: {
+    for (TermFields) |f| {
+        if (std.mem.eql(u8, f.name, "pbr")) break :blk f.type;
+    }
+    @compileError("pbr field not found in Terminator");
+};
+
+fn writeIrPayload(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, value: anytype) !void {
+    const T = @TypeOf(value);
+    if (T == void) {
+    } else if (T == u32) {
+        try appendU32(buf, gpa, value);
+    } else if (T == i32) {
+        try buf.appendSlice(gpa, std.mem.asBytes(&value));
+    } else if (T == f32) {
+        try buf.appendSlice(gpa, std.mem.asBytes(&value));
+    } else if (T == ir_mod.InstPair) {
+        try appendU32(buf, gpa, value.l);
+        try appendU32(buf, gpa, value.r);
+    } else if (T == ir_mod.CallInst or T == ir_mod.DirectCallInst) {
+        try appendU32(buf, gpa, value.callee);
+        try appendU8(buf, gpa, value.argc);
+        try appendU8(buf, gpa, value.ret_slots);
+        for (&value.args) |a| try appendU32(buf, gpa, a);
+    } else if (T == ir_mod.FieldLoad) {
+        try appendU32(buf, gpa, value.base);
+        try appendU32(buf, gpa, value.field_index);
+    } else if (T == ir_mod.PtrLoad) {
+        try appendU32(buf, gpa, value.ptr);
+        try appendU32(buf, gpa, value.offset_slots);
+    } else if (T == ir_mod.PtrStore) {
+        try appendU32(buf, gpa, value.ptr);
+        try appendU32(buf, gpa, value.src);
+        try appendU32(buf, gpa, value.offset_slots);
+    } else if (T == ir_mod.Branch) {
+        try appendU32(buf, gpa, value.target);
+        try appendU8(buf, gpa, if (value.arg != null) 1 else 0);
+        if (value.arg) |a| try appendU32(buf, gpa, a);
+    } else if (T == PbrPayload) {
+        try appendU8(buf, gpa, @intFromEnum(value.pred.op));
+        try appendU32(buf, gpa, value.pred.pair.l);
+        try appendU32(buf, gpa, value.pred.pair.r);
+        try appendU32(buf, gpa, value.then_branch.target);
+        try appendU8(buf, gpa, if (value.then_branch.arg != null) 1 else 0);
+        if (value.then_branch.arg) |a| try appendU32(buf, gpa, a);
+        try appendU32(buf, gpa, value.else_branch.target);
+        try appendU8(buf, gpa, if (value.else_branch.arg != null) 1 else 0);
+        if (value.else_branch.arg) |a| try appendU32(buf, gpa, a);
+    } else if (T == ir_mod.Type) {
+        try writeIrPayload(buf, gpa, @as(u32, @intCast(value.named)));
+        // type writing handled by the caller which already wrote the tag
+    } else {
+        @compileError("writeIrPayload: unsupported type " ++ @typeName(T));
     }
 }
 
-fn readType(r: *Reader) LoadError!ir_mod.Type {
-    const tag = try r.readU8();
-    return switch (tag) {
-        0 => .unit,
-        1 => .bool,
-        2 => .int,
-        3 => .float,
-        4 => .type_type,
-        5 => .none,
-        6 => .{ .named = try r.readU32() },
-        7 => .{ .func = try r.readU32() },
-        8 => .{ .variant = try r.readU32() },
-        else => error.InvalidData,
-    };
-}
-
-fn writeTerminator(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, term: ir_mod.Terminator) !void {
-    const tag = std.meta.activeTag(term);
-    try appendU8(buf, gpa, @intFromEnum(tag));
-    switch (term) {
-        .br => |b| {
-            try appendU32(buf, gpa, b.target);
-            try appendU8(buf, gpa, if (b.arg != null) 1 else 0);
-            if (b.arg) |arg| try appendU32(buf, gpa, arg);
-        },
-        .pbr => |p| {
-            try appendU8(buf, gpa, @intFromEnum(p.pred.op));
-            try appendU32(buf, gpa, p.pred.pair.l);
-            try appendU32(buf, gpa, p.pred.pair.r);
-            try appendU32(buf, gpa, p.then_branch.target);
-            try appendU8(buf, gpa, if (p.then_branch.arg != null) 1 else 0);
-            if (p.then_branch.arg) |arg| try appendU32(buf, gpa, arg);
-            try appendU32(buf, gpa, p.else_branch.target);
-            try appendU8(buf, gpa, if (p.else_branch.arg != null) 1 else 0);
-            if (p.else_branch.arg) |arg| try appendU32(buf, gpa, arg);
-        },
-        .ret => |v| try appendU32(buf, gpa, v),
-    }
-}
-
-fn readTerminator(r: *Reader) LoadError!ir_mod.Terminator {
-    const tag = try r.readU8();
-    return switch (tag) {
-        0 => .{ .br = .{
+fn readIrPayload(r: *Reader, comptime T: type) LoadError!T {
+    if (T == void) {
+        return {};
+    } else if (T == u32) {
+        return try r.readU32();
+    } else if (T == i32) {
+        return @as(i32, @bitCast(try r.readU32()));
+    } else if (T == f32) {
+        return @as(f32, @bitCast(try r.readU32()));
+    } else if (T == ir_mod.InstPair) {
+        return .{ .l = try r.readU32(), .r = try r.readU32() };
+    } else if (T == ir_mod.CallInst) {
+        return .{
+            .callee = try r.readU32(),
+            .argc = try r.readU8(),
+            .ret_slots = try r.readU8(),
+            .args = blk: {
+                var args: [ir_mod.MaxCallArgs]ir_mod.ValueRef = undefined;
+                for (&args) |*a| a.* = try r.readU32();
+                break :blk args;
+            },
+        };
+    } else if (T == ir_mod.DirectCallInst) {
+        return .{
+            .callee = try r.readU32(),
+            .argc = try r.readU8(),
+            .ret_slots = try r.readU8(),
+            .args = blk: {
+                var args: [ir_mod.MaxCallArgs]ir_mod.ValueRef = undefined;
+                for (&args) |*a| a.* = try r.readU32();
+                break :blk args;
+            },
+        };
+    } else if (T == ir_mod.FieldLoad) {
+        return .{ .base = try r.readU32(), .field_index = try r.readU32() };
+    } else if (T == ir_mod.PtrLoad) {
+        return .{ .ptr = try r.readU32(), .offset_slots = try r.readU32() };
+    } else if (T == ir_mod.PtrStore) {
+        return .{ .ptr = try r.readU32(), .src = try r.readU32(), .offset_slots = try r.readU32() };
+    } else if (T == ir_mod.Branch) {
+        return .{
             .target = try r.readU32(),
             .arg = if ((try r.readU8()) == 1) try r.readU32() else null,
-        } },
-        1 => .{ .pbr = .{
+        };
+    } else if (T == PbrPayload) {
+        return .{
             .pred = .{
                 .op = @enumFromInt(try r.readU8()),
                 .pair = .{ .l = try r.readU32(), .r = try r.readU32() },
@@ -335,103 +389,70 @@ fn readTerminator(r: *Reader) LoadError!ir_mod.Terminator {
                 .target = try r.readU32(),
                 .arg = if ((try r.readU8()) == 1) try r.readU32() else null,
             },
-        } },
-        2 => .{ .ret = try r.readU32() },
-        else => error.InvalidData,
-    };
+        };
+    } else {
+        @compileError("readIrPayload: unsupported type " ++ @typeName(T));
+    }
 }
 
 fn writeInst(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, inst: ir_mod.Inst) !void {
-    const tag = std.meta.activeTag(inst);
-    try appendU8(buf, gpa, @intFromEnum(tag));
-    switch (inst) {
-        .iconst => |v| try buf.appendSlice(gpa, std.mem.asBytes(&v)),
-        .fconst => |v| try buf.appendSlice(gpa, std.mem.asBytes(&v)),
-        .fn_addr => |id| try appendU32(buf, gpa, id),
-        .call => |c| {
-            try appendU32(buf, gpa, c.callee);
-            try appendU8(buf, gpa, c.argc);
-            try appendU8(buf, gpa, c.ret_slots);
-            for (&c.args) |a| try appendU32(buf, gpa, a);
-        },
-        .direct_call => |dc| {
-            try appendU32(buf, gpa, dc.callee);
-            try appendU8(buf, gpa, dc.argc);
-            try appendU8(buf, gpa, dc.ret_slots);
-            for (&dc.args) |a| try appendU32(buf, gpa, a);
-        },
-        .addi, .addf, .subi, .subf, .muli, .mulf, .divi, .divf, .store => |p| {
-            try appendU32(buf, gpa, p.l);
-            try appendU32(buf, gpa, p.r);
-        },
-        .printi, .printf, .printb => |v| try appendU32(buf, gpa, v),
-        .field_load => |fl| {
-            try appendU32(buf, gpa, fl.base);
-            try appendU32(buf, gpa, fl.field_index);
-        },
-        .slot_addr => |slot| try appendU32(buf, gpa, slot),
-        .load_ptr => |ptr_load| {
-            try appendU32(buf, gpa, ptr_load.ptr);
-            try appendU32(buf, gpa, ptr_load.offset_slots);
-        },
-        .store_ptr => |store_ptr| {
-            try appendU32(buf, gpa, store_ptr.ptr);
-            try appendU32(buf, gpa, store_ptr.src);
-            try appendU32(buf, gpa, store_ptr.offset_slots);
-        },
-        .argi => |idx| try appendU32(buf, gpa, idx),
+    const tag = @intFromEnum(std.meta.activeTag(inst));
+    try appendU8(buf, gpa, tag);
+    inline for (InstFields, 0..) |field, i| {
+        if (tag == i) {
+            try writeIrPayload(buf, gpa, @field(inst, field.name));
+        }
     }
 }
 
 fn readInst(r: *Reader) LoadError!ir_mod.Inst {
     const tag = try r.readU8();
-    return switch (tag) {
-        0 => .{ .iconst = @as(i32, @bitCast(try r.readU32())) },
-        1 => .{ .fconst = @as(f32, @bitCast(try r.readU32())) },
-        2 => .{ .fn_addr = try r.readU32() },
-        3 => .{ .call = .{
-            .callee = try r.readU32(),
-            .argc = try r.readU8(),
-            .ret_slots = try r.readU8(),
-            .args = blk: {
-                var args: [ir_mod.MaxCallArgs]ir_mod.ValueRef = undefined;
-                for (&args) |*a| a.* = try r.readU32();
-                break :blk args;
-            },
-        } },
-        4 => .{ .addi = .{ .l = try r.readU32(), .r = try r.readU32() } },
-        5 => .{ .addf = .{ .l = try r.readU32(), .r = try r.readU32() } },
-        6 => .{ .subi = .{ .l = try r.readU32(), .r = try r.readU32() } },
-        7 => .{ .subf = .{ .l = try r.readU32(), .r = try r.readU32() } },
-        8 => .{ .muli = .{ .l = try r.readU32(), .r = try r.readU32() } },
-        9 => .{ .mulf = .{ .l = try r.readU32(), .r = try r.readU32() } },
-        10 => .{ .divi = .{ .l = try r.readU32(), .r = try r.readU32() } },
-        11 => .{ .divf = .{ .l = try r.readU32(), .r = try r.readU32() } },
-        12 => .{ .printi = try r.readU32() },
-        13 => .{ .printf = try r.readU32() },
-        14 => .{ .printb = try r.readU32() },
-        15 => .{ .argi = try r.readU32() },
-        16 => .{ .store = .{ .l = try r.readU32(), .r = try r.readU32() } },
-        17 => .{ .field_load = .{ .base = try r.readU32(), .field_index = try r.readU32() } },
-        18 => .{ .slot_addr = try r.readU32() },
-        19 => .{ .load_ptr = .{ .ptr = try r.readU32(), .offset_slots = try r.readU32() } },
-        20 => .{ .store_ptr = .{
-            .ptr = try r.readU32(),
-            .src = try r.readU32(),
-            .offset_slots = try r.readU32(),
-        } },
-        21 => .{ .direct_call = .{
-            .callee = try r.readU32(),
-            .argc = try r.readU8(),
-            .ret_slots = try r.readU8(),
-            .args = blk: {
-                var args: [ir_mod.MaxCallArgs]ir_mod.ValueRef = undefined;
-                for (&args) |*a| a.* = try r.readU32();
-                break :blk args;
-            },
-        } },
-        else => error.InvalidData,
-    };
+    inline for (InstFields, 0..) |field, i| {
+        if (tag == i) {
+            return @unionInit(ir_mod.Inst, field.name, try readIrPayload(r, field.type));
+        }
+    }
+    return error.InvalidData;
+}
+
+fn writeTerminator(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, term: ir_mod.Terminator) !void {
+    const tag = @intFromEnum(std.meta.activeTag(term));
+    try appendU8(buf, gpa, tag);
+    inline for (TermFields, 0..) |field, i| {
+        if (tag == i) {
+            try writeIrPayload(buf, gpa, @field(term, field.name));
+        }
+    }
+}
+
+fn readTerminator(r: *Reader) LoadError!ir_mod.Terminator {
+    const tag = try r.readU8();
+    inline for (TermFields, 0..) |field, i| {
+        if (tag == i) {
+            return @unionInit(ir_mod.Terminator, field.name, try readIrPayload(r, field.type));
+        }
+    }
+    return error.InvalidData;
+}
+
+fn writeType(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, ty: ir_mod.Type) !void {
+    const tag = @intFromEnum(std.meta.activeTag(ty));
+    try appendU8(buf, gpa, tag);
+    inline for (TypeFields, 0..) |field, i| {
+        if (tag == i) {
+            try writeIrPayload(buf, gpa, @field(ty, field.name));
+        }
+    }
+}
+
+fn readType(r: *Reader) LoadError!ir_mod.Type {
+    const tag = try r.readU8();
+    inline for (TypeFields, 0..) |field, i| {
+        if (tag == i) {
+            return @unionInit(ir_mod.Type, field.name, try readIrPayload(r, field.type));
+        }
+    }
+    return error.InvalidData;
 }
 
 fn writeBlock(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, block: ir_mod.Block) !void {
@@ -673,6 +694,79 @@ fn readTcFuncType(r: *Reader, allocator: std.mem.Allocator) LoadError!analyze.Fu
     };
 }
 
+fn writeStrU32Map(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, map: anytype) !void {
+    try appendU32(buf, gpa, @intCast(map.count()));
+    var iter = map.iterator();
+    while (iter.next()) |entry| {
+        try appendBytes(buf, gpa, entry.key_ptr.*);
+        try appendU32(buf, gpa, entry.value_ptr.*);
+    }
+}
+
+fn readStrU32Map(r: *Reader, gpa: std.mem.Allocator, map_ptr: anytype) !void {
+    const count = try r.readU32();
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        const raw_key = try r.readBytes();
+        const owned_key = try gpa.dupe(u8, raw_key);
+        try map_ptr.put(owned_key, try r.readU32());
+    }
+}
+
+fn readStrVoidMap(r: *Reader, gpa: std.mem.Allocator, map_ptr: anytype) !void {
+    const count = try r.readU32();
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        const raw_key = try r.readBytes();
+        const owned_key = try gpa.dupe(u8, raw_key);
+        try map_ptr.put(owned_key, {});
+    }
+}
+
+fn readU32U32Map(r: *Reader, map_ptr: anytype) !void {
+    const count = try r.readU32();
+    try map_ptr.ensureUnusedCapacity(count);
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        map_ptr.putAssumeCapacity(try r.readU32(), try r.readU32());
+    }
+}
+
+fn readU32TypeMap(r: *Reader, alloc: std.mem.Allocator, map_ptr: anytype) !void {
+    const count = try r.readU32();
+    try map_ptr.ensureUnusedCapacity(count);
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        map_ptr.putAssumeCapacity(try r.readU32(), try readTcType(r, alloc));
+    }
+}
+
+fn writeStrVoidMap(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, map: anytype) !void {
+    try appendU32(buf, gpa, @intCast(map.count()));
+    var iter = map.iterator();
+    while (iter.next()) |entry| {
+        try appendBytes(buf, gpa, entry.key_ptr.*);
+    }
+}
+
+fn writeU32U32Map(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, map: anytype) !void {
+    try appendU32(buf, gpa, @intCast(map.count()));
+    var iter = map.iterator();
+    while (iter.next()) |entry| {
+        try appendU32(buf, gpa, entry.key_ptr.*);
+        try appendU32(buf, gpa, entry.value_ptr.*);
+    }
+}
+
+fn writeU32TypeMap(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, map: anytype) !void {
+    try appendU32(buf, gpa, @intCast(map.count()));
+    var iter = map.iterator();
+    while (iter.next()) |entry| {
+        try appendU32(buf, gpa, entry.key_ptr.*);
+        try writeTcType(buf, gpa, entry.value_ptr.*);
+    }
+}
+
 // ── ResolvedAst serialization ──
 
 pub fn serializeResolved(gpa: std.mem.Allocator, ra: *const resolver.ResolvedAst) ![]u8 {
@@ -682,25 +776,9 @@ pub fn serializeResolved(gpa: std.mem.Allocator, ra: *const resolver.ResolvedAst
     try appendU32(&buf, gpa, @intCast(ra.functions.items.len));
     for (ra.functions.items) |fn_idx| try appendU32(&buf, gpa, fn_idx);
 
-    try appendU32(&buf, gpa, @intCast(ra.function_names.count()));
-    var fn_iter = ra.function_names.iterator();
-    while (fn_iter.next()) |entry| {
-        try appendBytes(&buf, gpa, entry.key_ptr.*);
-        try appendU32(&buf, gpa, entry.value_ptr.*);
-    }
-
-    try appendU32(&buf, gpa, @intCast(ra.comptime_value_names.count()));
-    var cv_iter = ra.comptime_value_names.iterator();
-    while (cv_iter.next()) |entry| {
-        try appendBytes(&buf, gpa, entry.key_ptr.*);
-        try appendU32(&buf, gpa, entry.value_ptr.*);
-    }
-
-    try appendU32(&buf, gpa, @intCast(ra.struct_names.count()));
-    var sn_iter = ra.struct_names.iterator();
-    while (sn_iter.next()) |entry| {
-        try appendBytes(&buf, gpa, entry.key_ptr.*);
-    }
+    try writeStrU32Map(&buf, gpa, ra.function_names);
+    try writeStrU32Map(&buf, gpa, ra.comptime_value_names);
+    try writeStrVoidMap(&buf, gpa, ra.struct_names);
 
     try appendU32(&buf, gpa, @intCast(ra.node_refs.count()));
     var nr_iter = ra.node_refs.iterator();
@@ -731,31 +809,9 @@ pub fn deserializeResolved(gpa: std.mem.Allocator, data: []const u8) LoadError!r
         ra.functions.appendAssumeCapacity(try r.readU32());
     }
 
-    const fn_name_count = try r.readU32();
-    var fni: u32 = 0;
-    while (fni < fn_name_count) : (fni += 1) {
-        const raw_key = try r.readBytes();
-        const owned_key = try ra.key_arena.allocator().dupe(u8, raw_key);
-        const value = try r.readU32();
-        try ra.function_names.put(owned_key, value);
-    }
-
-    const cv_count = try r.readU32();
-    var cvi: u32 = 0;
-    while (cvi < cv_count) : (cvi += 1) {
-        const raw_key = try r.readBytes();
-        const owned_key = try ra.key_arena.allocator().dupe(u8, raw_key);
-        const value = try r.readU32();
-        try ra.comptime_value_names.put(owned_key, value);
-    }
-
-    const sn_count = try r.readU32();
-    var sni: u32 = 0;
-    while (sni < sn_count) : (sni += 1) {
-        const raw_key = try r.readBytes();
-        const owned_key = try ra.key_arena.allocator().dupe(u8, raw_key);
-        try ra.struct_names.put(owned_key, {});
-    }
+    try readStrU32Map(&r, gpa, &ra.function_names);
+    try readStrU32Map(&r, gpa, &ra.comptime_value_names);
+    try readStrVoidMap(&r, gpa, &ra.struct_names);
 
     const nr_count = try r.readU32();
     try ra.node_refs.ensureUnusedCapacity(nr_count);
@@ -828,26 +884,9 @@ pub fn serializeTyped(gpa: std.mem.Allocator, ta: *const analyze.AnalyzedAst) ![
     var buf = try std.ArrayList(u8).initCapacity(gpa, 2048);
     errdefer buf.deinit(gpa);
 
-    try appendU32(&buf, gpa, @intCast(ta.node_types.count()));
-    var nt_iter = ta.node_types.iterator();
-    while (nt_iter.next()) |entry| {
-        try appendU32(&buf, gpa, entry.key_ptr.*);
-        try writeTcType(&buf, gpa, entry.value_ptr.*);
-    }
-
-    try appendU32(&buf, gpa, @intCast(ta.field_index.count()));
-    var fi_iter = ta.field_index.iterator();
-    while (fi_iter.next()) |entry| {
-        try appendU32(&buf, gpa, entry.key_ptr.*);
-        try appendU32(&buf, gpa, entry.value_ptr.*);
-    }
-
-    try appendU32(&buf, gpa, @intCast(ta.decl_binding_types.count()));
-    var db_iter = ta.decl_binding_types.iterator();
-    while (db_iter.next()) |entry| {
-        try appendU32(&buf, gpa, entry.key_ptr.*);
-        try writeTcType(&buf, gpa, entry.value_ptr.*);
-    }
+    try writeU32TypeMap(&buf, gpa, ta.node_types);
+    try writeU32U32Map(&buf, gpa, ta.field_index);
+    try writeU32TypeMap(&buf, gpa, ta.decl_binding_types);
 
     try appendU32(&buf, gpa, @intCast(ta.is_variant_tags.count()));
     var iv_iter = ta.is_variant_tags.iterator();
@@ -859,12 +898,7 @@ pub fn serializeTyped(gpa: std.mem.Allocator, ta: *const analyze.AnalyzedAst) ![
         }
     }
 
-    try appendU32(&buf, gpa, @intCast(ta.query_none_tags.count()));
-    var qn_iter = ta.query_none_tags.iterator();
-    while (qn_iter.next()) |entry| {
-        try appendU32(&buf, gpa, entry.key_ptr.*);
-        try appendU32(&buf, gpa, entry.value_ptr.*);
-    }
+    try writeU32U32Map(&buf, gpa, ta.query_none_tags);
 
     try appendU32(&buf, gpa, @intCast(ta.comptime_node_values.count()));
     var cn_iter = ta.comptime_node_values.iterator();
@@ -899,34 +933,11 @@ pub fn deserializeTyped(gpa: std.mem.Allocator, data: []const u8, parse_ast: *co
     var r = Reader{ .data = data };
     var ta = analyze.AnalyzedAst.init(gpa, parse_ast);
     errdefer ta.deinit();
-    const arena_alloc = ta.arena.allocator();
+    const arena = ta.arena.allocator();
 
-    const nt_count = try r.readU32();
-    try ta.node_types.ensureUnusedCapacity(nt_count);
-    var nti: u32 = 0;
-    while (nti < nt_count) : (nti += 1) {
-        const node_idx = try r.readU32();
-        const ty = try readTcType(&r, arena_alloc);
-        ta.node_types.putAssumeCapacity(node_idx, ty);
-    }
-
-    const fi_count = try r.readU32();
-    try ta.field_index.ensureUnusedCapacity(fi_count);
-    var fii: u32 = 0;
-    while (fii < fi_count) : (fii += 1) {
-        const node_idx = try r.readU32();
-        const field_idx = try r.readU32();
-        ta.field_index.putAssumeCapacity(node_idx, field_idx);
-    }
-
-    const db_count = try r.readU32();
-    try ta.decl_binding_types.ensureUnusedCapacity(db_count);
-    var dbi: u32 = 0;
-    while (dbi < db_count) : (dbi += 1) {
-        const node_idx = try r.readU32();
-        const ty = try readTcType(&r, arena_alloc);
-        ta.decl_binding_types.putAssumeCapacity(node_idx, ty);
-    }
+    try readU32TypeMap(&r, arena, &ta.node_types);
+    try readU32U32Map(&r, &ta.field_index);
+    try readU32TypeMap(&r, arena, &ta.decl_binding_types);
 
     const iv_count = try r.readU32();
     try ta.is_variant_tags.ensureUnusedCapacity(iv_count);
@@ -934,7 +945,7 @@ pub fn deserializeTyped(gpa: std.mem.Allocator, data: []const u8, parse_ast: *co
     while (ivi < iv_count) : (ivi += 1) {
         const node_idx = try r.readU32();
         const tag_count = try r.readU32();
-        const tags = try arena_alloc.alloc(u32, tag_count);
+        const tags = try arena.alloc(u32, tag_count);
         var ti: u32 = 0;
         while (ti < tag_count) : (ti += 1) {
             tags[ti] = try r.readU32();
@@ -942,29 +953,22 @@ pub fn deserializeTyped(gpa: std.mem.Allocator, data: []const u8, parse_ast: *co
         ta.is_variant_tags.putAssumeCapacity(node_idx, tags);
     }
 
-    const qn_count = try r.readU32();
-    try ta.query_none_tags.ensureUnusedCapacity(qn_count);
-    var qni: u32 = 0;
-    while (qni < qn_count) : (qni += 1) {
-        const node_idx = try r.readU32();
-        const none_tag = try r.readU32();
-        ta.query_none_tags.putAssumeCapacity(node_idx, none_tag);
-    }
+    try readU32U32Map(&r, &ta.query_none_tags);
 
     const cn_count = try r.readU32();
     try ta.comptime_node_values.ensureUnusedCapacity(cn_count);
     var cni: u32 = 0;
     while (cni < cn_count) : (cni += 1) {
         const node_idx = try r.readU32();
-        const value = try readComptimeValue(&r, arena_alloc);
+        const value = try readComptimeValue(&r, arena);
         ta.comptime_node_values.putAssumeCapacity(node_idx, value);
     }
 
     const cv_count = try r.readU32();
     var cvi: u32 = 0;
     while (cvi < cv_count) : (cvi += 1) {
-        const name = try arena_alloc.dupe(u8, try r.readBytes());
-        const value = try readComptimeValue(&r, arena_alloc);
+        const name = try arena.dupe(u8, try r.readBytes());
+        const value = try readComptimeValue(&r, arena);
         try ta.comptime_values.put(name, value);
     }
 
@@ -973,10 +977,10 @@ pub fn deserializeTyped(gpa: std.mem.Allocator, data: []const u8, parse_ast: *co
     var fni: u32 = 0;
     while (fni < fn_count) : (fni += 1) {
         const decl = try r.readU32();
-        const ft_ptr = try arena_alloc.create(analyze.FuncType);
-        ft_ptr.* = try readTcFuncType(&r, arena_alloc);
+        const ft_ptr = try arena.create(analyze.FuncType);
+        ft_ptr.* = try readTcFuncType(&r, arena);
         const param_mode_count = try r.readU32();
-        const param_modes = try arena_alloc.alloc(ast.ParamAccessMode, param_mode_count);
+        const param_modes = try arena.alloc(ast.ParamAccessMode, param_mode_count);
         var pmi: u32 = 0;
         while (pmi < param_mode_count) : (pmi += 1) {
             const mode_value = try r.readU8();
@@ -1028,26 +1032,23 @@ fn deserialize(gpa: std.mem.Allocator, file_data: []u8, expected_source_hash: u6
 
     _ = try r.readBytes(); // stored source path; currently informational only
 
-    var parse_stage = try readStage(&r, gpa);
-    errdefer parse_stage.diagnostics.deinit(gpa);
-    var resolve_stage = try readStage(&r, gpa);
-    errdefer resolve_stage.diagnostics.deinit(gpa);
-    var type_stage = try readStage(&r, gpa);
-    errdefer type_stage.diagnostics.deinit(gpa);
-    var lower_stage = try readStage(&r, gpa);
-    errdefer lower_stage.diagnostics.deinit(gpa);
-    var compile_stage = try readStage(&r, gpa);
-    errdefer compile_stage.diagnostics.deinit(gpa);
+    var stages: [5]LoadedStage = undefined;
+    var stage_count: u32 = 0;
+    errdefer for (0..stage_count) |i| stages[i].diagnostics.deinit(gpa);
+    for (&stages) |*stage| {
+        stage.* = try readStage(&r, gpa);
+        stage_count += 1;
+    }
 
     if (r.idx != r.data.len) return error.InvalidData;
 
     return .{
         .backing = file_data,
-        .parse = parse_stage,
-        .resolve = resolve_stage,
-        .typecheck = type_stage,
-        .lower = lower_stage,
-        .compile = compile_stage,
+        .parse = stages[0],
+        .resolve = stages[1],
+        .typecheck = stages[2],
+        .lower = stages[3],
+        .compile = stages[4],
     };
 }
 
