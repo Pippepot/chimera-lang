@@ -1407,6 +1407,10 @@ const FunctionLowerer = struct {
                 const value = self.parent.typed.comptime_node_values.get(idx) orelse return error.MissingComptimeValue;
                 break :blk try self.lowerComptimeValue(value);
             },
+            .sizeof_expr => blk: {
+                const value = self.parent.typed.comptime_node_values.get(idx) orelse return error.MissingComptimeValue;
+                break :blk try self.lowerComptimeValue(value);
+            },
             .comptime_value_decl => try self.lowerUnitValue(),
             .comptime_fn, .comptime_struct => try self.lowerUnitValue(),
             .struct_expr => try self.lowerUnitValue(),

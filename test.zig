@@ -1953,3 +1953,65 @@ test "none type: error on print none" {
     );
     try expectCompileErrorContains(&db, 0, "cannot print this type");
 }
+
+test "sizeof primitive types" {
+    try testProgram(
+        \\print(sizeof(int))
+    , "4\n");
+    try testProgram(
+        \\print(sizeof(bool))
+    , "1\n");
+    try testProgram(
+        \\print(sizeof(float))
+    , "4\n");
+    try testProgram(
+        \\print(sizeof(unit))
+    , "0\n");
+    try testProgram(
+        \\print(sizeof(none))
+    , "0\n");
+}
+
+test "sizeof struct type" {
+    try testProgram(
+        \\comptime Point = struct
+        \\  x: int
+        \\  y: int
+        \\print(sizeof(Point))
+    , "8\n");
+}
+
+test "sizeof struct with 3 fields" {
+    try testProgram(
+        \\comptime Triple = struct
+        \\  a: int
+        \\  b: int
+        \\  c: int
+        \\print(sizeof(Triple))
+    , "12\n");
+}
+
+test "sizeof func type" {
+    try testProgram(
+        \\print(sizeof(func(int) int))
+    , "8\n");
+}
+
+test "sizeof variant type" {
+    try testProgram(
+        \\print(sizeof(int | float))
+    , "5\n");
+}
+
+test "sizeof used in arithmetic" {
+    try testProgram(
+        \\print(sizeof(int) + sizeof(int))
+    , "8\n");
+}
+
+test "sizeof used in variable" {
+    try testProgram(
+        \\const s = sizeof(int)
+        \\print(s)
+    , "4\n");
+}

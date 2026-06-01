@@ -155,6 +155,26 @@
 - **Scope isolation:** each block and each `if` branch restores bindings after inference/lowering; branch-local `const` names do not leak.
 
 
+## `sizeof(T)` operator
+
+- **Syntax:** `sizeof(type_expr)` — keyword `sizeof` followed by a type in parentheses.
+- **Evaluation:** A comptime expression that evaluates to the logical byte size of the type. The result is an `int` and can be used in any expression context (print, arithmetic, bindings).
+- **Size table:**
+
+  | Type | Byte size |
+  |------|-----------|
+  | `unit`, `none`, `type` | 0 |
+  | `bool` | 1 |
+  | `int`, `float` | 4 |
+  | `func(...)` | 8 (function pointer) |
+  | struct | sum of field sizes |
+  | variant (`A \| B`) | 1 (tag) + max member size |
+
+- **Parsing:** `parsePrimary` matches `kw_sizeof`, calls `parseType()` for the inner type expression. Creates a `sizeof_expr` AST node with the type node as `data0`.
+- **Typechecking:** `inferNode` resolves the inner type via `resolveTypeNode`, computes byte size via `computeByteSize`, stores it in `comptime_node_values` as a `ComptimeValue.int`.
+- **Lowering:** `sizeof_expr` reads from `comptime_node_values` and lowers via `lowerComptimeValue` (emits `iconst`).
+- **Tests cover:** primitive types, struct types, func types, variant types, arithmetic with sizeof, and variable binding.
+
 ## Query system design
 
 - **`QueryDb` is reusable state.** Keep one DB across revisions to get incremental behavior.

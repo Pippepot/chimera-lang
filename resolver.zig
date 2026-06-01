@@ -283,6 +283,7 @@ const Resolver = struct {
             },
             .comptime_expr => try self.resolveNode(ast_.comptimeExprBody(idx)),
             .comptime_value_decl => try self.resolveNode(ast_.comptimeValueDeclValue(idx)),
+            .sizeof_expr => {},
             .type_name, .type_func, .type_variant, .comptime_fn, .comptime_struct => {},
         }
     }

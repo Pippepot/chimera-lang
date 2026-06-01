@@ -54,6 +54,7 @@ pub const Tag = enum(u8) {
     comptime_struct,
     struct_expr,
     query_op,
+    sizeof_expr,
 };
 
 pub const Node = extern struct {
@@ -352,6 +353,10 @@ pub const Ast = struct {
     }
 
     pub fn comptimeExprBody(ast: *const Ast, idx: NodeIdx) NodeIdx {
+        return ast.nodes[idx].data0;
+    }
+
+    pub fn sizeofExprType(ast: *const Ast, idx: NodeIdx) NodeIdx {
         return ast.nodes[idx].data0;
     }
 

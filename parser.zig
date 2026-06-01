@@ -53,6 +53,7 @@ const TokenTag = enum {
     kw_or,
     kw_not,
     kw_none,
+    kw_sizeof,
     ident,
     l_paren,
     r_paren,
@@ -195,6 +196,7 @@ const Lexer = struct {
         if (std.mem.eql(u8, word, "or")) return .{ .tag = .kw_or, .start = start, .end = self.index };
         if (std.mem.eql(u8, word, "not")) return .{ .tag = .kw_not, .start = start, .end = self.index };
         if (std.mem.eql(u8, word, "none")) return .{ .tag = .kw_none, .start = start, .end = self.index };
+        if (std.mem.eql(u8, word, "sizeof")) return .{ .tag = .kw_sizeof, .start = start, .end = self.index };
         return .{ .tag = .ident, .start = start, .end = self.index, .ident = word };
     }
 
@@ -1624,6 +1626,16 @@ const Parser = struct {
                 const span = tokenSpan(self.current);
                 try self.advance();
                 return self.allocNode(.none_lit, 0, 0, span);
+            },
+            .kw_sizeof => {
+                const sizeof_span = tokenSpan(self.current);
+                try self.advance();
+                try self.expect(.l_paren, error.ExpectedLParen);
+                const type_node = try self.parseType();
+                const end_span = tokenSpan(self.current);
+                try self.expect(.r_paren, error.ExpectedRParen);
+                const span = coverSpans(sizeof_span, end_span);
+                return self.allocNode(.sizeof_expr, type_node, 0, span);
             },
             .ident => {
                 const ident_span = tokenSpan(self.current);

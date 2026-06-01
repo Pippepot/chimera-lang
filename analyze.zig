@@ -536,6 +536,48 @@ const Binding = struct {
         }
     }
 
+    fn computeByteSize(self: *@This(), ty: Type) InferError!u32 {
+        return switch (ty) {
+            .unit, .none, .type_type => 0,
+            .bool => 1,
+            .int, .float => 4,
+            .func => 8,
+            .named => |name| self.namedTypeByteSize(name),
+            .variant => |variant_ty| blk: {
+                var max_member_size: u32 = 0;
+                for (variant_ty.members) |member_ty| {
+                    const member_size = try self.computeByteSize(member_ty);
+                    if (member_size > max_member_size) max_member_size = member_size;
+                }
+                break :blk max_member_size + 1;
+            },
+        };
+    }
+
+    fn namedTypeByteSize(self: *@This(), name: []const u8) InferError!u32 {
+        const a = self.parsed.ast;
+        for (a.decls) |decl_idx| {
+            if (a.nodes[decl_idx].tag != .comptime_struct) continue;
+            const decl_name = a.identOf(a.nodes[decl_idx].data0);
+            if (std.mem.eql(u8, decl_name, name)) {
+                var total: u32 = 0;
+                for (a.structFields(decl_idx)) |field| {
+                    const field_ty = try self.resolveTypeNode(field.ty);
+                    total += try self.computeByteSize(field_ty);
+                }
+                return total;
+            }
+        }
+        if (self.typed.comptime_struct_fields.get(name)) |fields| {
+            var total: u32 = 0;
+            for (fields) |field| {
+                total += try self.computeByteSize(field.ty);
+            }
+            return total;
+        }
+        return 4;
+    }
+
     fn paramTypeReferencesComptimeParam(self: *const @This(), func_decl_idx: ast.NodeIdx, param_ty_idx: ast.TypeIdx) bool {
         const a = self.parsed.ast;
         if (a.nodes[param_ty_idx].tag != .type_name) return false;
@@ -991,7 +1033,7 @@ const Binding = struct {
     fn ownershipUseExpr(self: *@This(), idx: ast.NodeIdx, stack: *scope_mod.ScopeStack(OwnershipBinding), use: OwnershipUse, current_ret: Type) InferError!void {
         const a = self.parsed.ast;
         switch (a.nodes[idx].tag) {
-            .int_lit, .float_lit, .bool_lit, .unit_lit, .none_lit, .arg, .type_name, .type_func, .type_variant, .type_union, .struct_expr, .comptime_expr, .comptime_fn, .comptime_struct, .comptime_value_decl => {},
+            .int_lit, .float_lit, .bool_lit, .unit_lit, .none_lit, .arg, .type_name, .type_func, .type_variant, .type_union, .struct_expr, .comptime_expr, .comptime_fn, .comptime_struct, .comptime_value_decl, .sizeof_expr => {},
             .var_ref => {
                 const name = a.identOf(a.nodes[idx].data0);
                 if (ownershipLookupIndex(stack, name)) |binding_idx| {
@@ -1763,6 +1805,7 @@ const Binding = struct {
                 self.clearNodeTypesInSubtree(a.nodes[idx].data1);
             },
             .comptime_expr => self.clearNodeTypesInSubtree(a.comptimeExprBody(idx)),
+            .sizeof_expr => {},
             .comptime_value_decl => self.clearNodeTypesInSubtree(a.comptimeValueDeclValue(idx)),
             else => {},
         }
@@ -2442,6 +2485,10 @@ const Binding = struct {
                 break :blk .{ .value = sv.fields[field_idx], .returned = false };
             },
             .comptime_expr => self.evalNodeStep(a.comptimeExprBody(idx), locals),
+            .sizeof_expr => blk: {
+                const value = self.typed.comptime_node_values.get(idx) orelse return self.failAtNode(idx, error.ComptimeValueNotAvailable);
+                break :blk .{ .value = value, .returned = false };
+            },
             .comptime_value_decl => .{ .value = .unit, .returned = false },
             .comptime_fn, .comptime_struct => .{ .value = .unit, .returned = false },
             .type_name => blk: {
@@ -2587,6 +2634,13 @@ const Binding = struct {
             .move_expr => try self.remember(idx, try self.inferNode(a.nodes[idx].data0)),
             .field_access => self.inferFieldAccess(idx),
             .comptime_expr => self.inferComptimeExpr(idx),
+            .sizeof_expr => blk: {
+                const type_node = a.nodes[idx].data0;
+                const resolved_ty = try self.resolveTypeNode(type_node);
+                    const byte_size: i32 = @as(i32, @intCast(try self.computeByteSize(resolved_ty)));
+                try self.typed.comptime_node_values.put(idx, .{ .int = byte_size });
+                break :blk try self.remember(idx, .int);
+            },
             .comptime_value_decl => try self.remember(idx, .unit),
             .comptime_fn, .comptime_struct => try self.remember(idx, .unit),
             .struct_expr => self.remember(idx, .type_type),
