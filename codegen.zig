@@ -998,6 +998,7 @@ const BinaryEmitter = struct {
         block_symbols: []const u32,
         block_params: []const ?InstRef,
         block_param_widths: []const u32,
+        then_fallthrough: bool,
     ) !void {
         try self.emitTestEaxEax();
 
@@ -1007,8 +1008,12 @@ const BinaryEmitter = struct {
         const else_symbol = block_symbols[else_branch.target];
 
         if (then_copy == null and else_copy == null) {
-            try self.emitJne(then_symbol);
-            try self.emitJmp(else_symbol);
+            if (then_fallthrough) {
+                try self.emitJe(else_symbol);
+            } else {
+                try self.emitJne(then_symbol);
+                try self.emitJmp(else_symbol);
+            }
             return;
         }
 
@@ -1050,9 +1055,10 @@ const BinaryEmitter = struct {
         block_symbols: []const u32,
         block_params: []const ?InstRef,
         block_param_widths: []const u32,
+        then_fallthrough: bool,
     ) !void {
         try self.emitPredicateValueToEax(pbr.pred);
-        try self.emitBranchOnEaxNonZero(pbr.then_branch, pbr.else_branch, block_symbols, block_params, block_param_widths);
+        try self.emitBranchOnEaxNonZero(pbr.then_branch, pbr.else_branch, block_symbols, block_params, block_param_widths, then_fallthrough);
     }
 
     fn emitTerm(
@@ -1062,10 +1068,11 @@ const BinaryEmitter = struct {
         block_params: []const ?InstRef,
         block_param_widths: []const u32,
         ret_slots: u32,
+        then_fallthrough: bool,
     ) !void {
         switch (term) {
             .br => |branch| try self.emitBranch(branch, block_symbols, block_params, block_param_widths),
-            .pbr => |pbr| try self.emitPredicateBranch(pbr, block_symbols, block_params, block_param_widths),
+            .pbr => |pbr| try self.emitPredicateBranch(pbr, block_symbols, block_params, block_param_widths, then_fallthrough),
             .ret => |value_ref| try self.emitFunctionReturn(value_ref, ret_slots),
         }
     }
@@ -1078,6 +1085,7 @@ const BinaryEmitter = struct {
         block_params: []const ?InstRef,
         block_param_widths: []const u32,
         ret_slots: u32,
+        then_fallthrough: bool,
     ) !void {
         self.bindSymbol(symbol);
         try self.flushEax();
@@ -1090,7 +1098,46 @@ const BinaryEmitter = struct {
             self.decrementUses(value_inst.op);
         }
         const terminator = block.terminator orelse unreachable;
-        try self.emitTerm(terminator, block_symbols, block_params, block_param_widths, ret_slots);
+        try self.emitTerm(terminator, block_symbols, block_params, block_param_widths, ret_slots, then_fallthrough);
+    }
+
+    fn computeBlockOrder(self: *@This(), func: *const Function) ![]u32 {
+        const n = func.blocks.items.len;
+        var order = try std.ArrayList(u32).initCapacity(self.gpa, n);
+        errdefer order.deinit(self.gpa);
+        var visited = try self.gpa.alloc(bool, n);
+        defer self.gpa.free(visited);
+        for (visited) |*v| v.* = false;
+
+        var stack = try std.ArrayList(u32).initCapacity(self.gpa, n);
+        defer stack.deinit(self.gpa);
+        try stack.append(self.gpa, func.entry);
+
+        while (stack.items.len > 0) {
+            const bid: usize = @intCast(stack.pop().?);
+            if (visited[bid]) continue;
+            visited[bid] = true;
+            try order.append(self.gpa, @intCast(bid));
+
+            const block = &func.blocks.items[bid];
+            const term = block.terminator orelse continue;
+            switch (term) {
+                .pbr => |pbr| {
+                    try stack.append(self.gpa, pbr.else_branch.target);
+                    try stack.append(self.gpa, pbr.then_branch.target);
+                },
+                .br => |br| {
+                    try stack.append(self.gpa, br.target);
+                },
+                .ret => {},
+            }
+        }
+
+        for (0..n) |i| {
+            if (!visited[i]) try order.append(self.gpa, @intCast(i));
+        }
+
+        return order.toOwnedSlice(self.gpa);
     }
 
     fn emitFunction(self: *@This(), func: *const Function) !void {
@@ -1111,8 +1158,19 @@ const BinaryEmitter = struct {
             block_param_widths[block.id] = block.param_width;
         }
 
-        for (func.blocks.items, 0..) |block, block_idx| {
-            try self.emitBlock(block, layout.block_symbols[block_idx], layout.block_symbols, block_params, block_param_widths, func.ret_slots);
+        const emit_order = try self.computeBlockOrder(func);
+        defer self.gpa.free(emit_order);
+        for (emit_order, 0..) |block_idx, pos| {
+            const blk = func.blocks.items[block_idx];
+            const next_is_then = if (pos + 1 < emit_order.len) blk: {
+                const term = blk.terminator orelse break :blk false;
+                const then_target = switch (term) {
+                    .pbr => |pbr| pbr.then_branch.target,
+                    else => break :blk false,
+                };
+                break :blk then_target == emit_order[pos + 1];
+            } else false;
+            try self.emitBlock(blk, layout.block_symbols[block_idx], layout.block_symbols, block_params, block_param_widths, func.ret_slots, next_is_then);
         }
     }
 
