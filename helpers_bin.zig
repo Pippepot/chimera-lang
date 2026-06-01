@@ -1,13 +1,31 @@
 const std = @import("std");
 
-const max_helper_size = 384;
+const max_h = 384;
 
 pub const HelperBlob = struct {
-    bytes: [max_helper_size]u8,
-    len: usize,
+    bytes: [max_h]u8 = [_]u8{0} ** max_h,
+    len: usize = 0,
 
     pub fn slice(self: *const @This()) []const u8 {
         return self.bytes[0..self.len];
+    }
+
+    fn append(self: *@This(), bytes: []const u8) void {
+        const new_len = self.len + bytes.len;
+        if (new_len > self.bytes.len) @compileError("helper blob exceeds max_h");
+        @memcpy(self.bytes[self.len..new_len], bytes);
+        self.len = new_len;
+    }
+
+    fn rel32(self: *@This()) usize {
+        const pos = self.len;
+        self.append(&.{ 0, 0, 0, 0 });
+        return pos;
+    }
+
+    fn patch(self: *@This(), disp: usize, target: usize) void {
+        const rel: i32 = @intCast(@as(i64, @intCast(target)) - (@as(i64, @intCast(disp)) + 4));
+        std.mem.writeInt(i32, self.bytes[disp..][0..4], rel, .little);
     }
 };
 
@@ -23,198 +41,203 @@ pub const HelperDef = struct {
     blob: HelperBlob,
 };
 
-const HelperBuffer = struct {
-    bytes: [max_helper_size]u8 = [_]u8{0} ** max_helper_size,
-    len: usize = 0,
+const push6 = [_]u8{ 0x50, 0x53, 0x51, 0x52, 0x56, 0x57 };
+const pop6  = [_]u8{ 0x5F, 0x5E, 0x5A, 0x59, 0x5B, 0x58 };
+const push4 = [_]u8{ 0x50, 0x52, 0x56, 0x57 };
+const pop4  = [_]u8{ 0x5F, 0x5E, 0x5A, 0x58 };
 
-    fn appendSlice(self: *@This(), slice: []const u8) void {
-        if (self.len + slice.len > self.bytes.len) @compileError("helper blob exceeds max_helper_size");
-        for (slice) |byte| {
-            self.bytes[self.len] = byte;
-            self.len += 1;
-        }
-    }
-
-    fn appendRel32Placeholder(self: *@This()) usize {
-        const pos = self.len;
-        self.appendSlice(&.{ 0, 0, 0, 0 });
-        return pos;
-    }
+const write_stdout = [_]u8{
+    0xBF, 0x01, 0x00, 0x00, 0x00,
+    0xB8, 0x01, 0x00, 0x00, 0x00,
+    0x0F, 0x05,
 };
 
-fn patchRel32(buf: *HelperBuffer, disp_pos: usize, target_pos: usize) void {
-    const rel_i64 = @as(i64, @intCast(target_pos)) - (@as(i64, @intCast(disp_pos)) + 4);
-    if (rel_i64 < std.math.minInt(i32) or rel_i64 > std.math.maxInt(i32)) {
-        @compileError("helper rel32 out of range");
-    }
-    const rel_i32: i32 = @intCast(rel_i64);
-    std.mem.writeInt(i32, buf.bytes[disp_pos..][0..4], rel_i32, .little);
-}
-
 fn buildPrintIntBlob() HelperBlob {
-    var buf = HelperBuffer{};
+    var b = HelperBlob{};
 
-    buf.appendSlice(&.{
-        0x50, // push rax
-        0x53, // push rbx
-        0x51, // push rcx
-        0x52, // push rdx
-        0x57, // push rdi
-        0x56, // push rsi
-    });
+    b.append(&push6);
+    b.append(&.{ 0xBB, 0x0A, 0x00, 0x00, 0x00 });
+    b.append(&.{ 0x48, 0x83, 0xEC, 0x20 });
+    b.append(&.{ 0xC6, 0x04, 0x24, 0x00 });
+    b.append(&.{ 0x48, 0x8D, 0x7C, 0x24, 0x1F });
+    b.append(&.{ 0xC6, 0x07, 0x0A });
+    b.append(&.{ 0x48, 0xFF, 0xCF });
+    b.append(&.{ 0x83, 0xF8, 0x00 });
+    b.append(&.{ 0x0F, 0x8D });
+    const jge = b.rel32();
 
-    buf.appendSlice(&.{ 0xBB, 0x0A, 0x00, 0x00, 0x00 }); // mov ebx, 10
-    buf.appendSlice(&.{ 0x48, 0x83, 0xEC, 0x20 }); // sub rsp, 32
-    buf.appendSlice(&.{ 0xC6, 0x04, 0x24, 0x00 }); // mov byte [rsp], 0
-    buf.appendSlice(&.{ 0x48, 0x8D, 0x7C, 0x24, 0x1F }); // lea rdi, [rsp+31]
-    buf.appendSlice(&.{ 0xC6, 0x07, 0x0A }); // mov byte [rdi], 10
-    buf.appendSlice(&.{ 0x48, 0xFF, 0xCF }); // dec rdi
-    buf.appendSlice(&.{ 0x83, 0xF8, 0x00 }); // cmp eax, 0
+    b.append(&.{ 0xF7, 0xD8 });
+    b.append(&.{ 0xC6, 0x04, 0x24, 0x01 });
 
-    buf.appendSlice(&.{ 0x0F, 0x8D }); // jge .loop
-    const jge_loop_disp = buf.appendRel32Placeholder();
+    const loop = b.len;
 
-    buf.appendSlice(&.{ 0xF7, 0xD8 }); // neg eax
-    buf.appendSlice(&.{ 0xC6, 0x04, 0x24, 0x01 }); // mov byte [rsp], 1
+    b.append(&.{ 0x31, 0xD2 });
+    b.append(&.{ 0xF7, 0xF3 });
+    b.append(&.{ 0x80, 0xC2, '0' });
+    b.append(&.{ 0x88, 0x17 });
+    b.append(&.{ 0x48, 0xFF, 0xCF });
+    b.append(&.{ 0x85, 0xC0 });
+    b.append(&.{ 0x0F, 0x85 });
+    const jnz = b.rel32();
 
-    const loop_pos = buf.len;
+    b.append(&.{ 0x80, 0x3C, 0x24, 0x01 });
+    b.append(&.{ 0x0F, 0x85 });
+    const jne = b.rel32();
 
-    buf.appendSlice(&.{ 0x31, 0xD2 }); // xor edx, edx
-    buf.appendSlice(&.{ 0xF7, 0xF3 }); // div ebx
-    buf.appendSlice(&.{ 0x80, 0xC2, '0' }); // add dl, '0'
-    buf.appendSlice(&.{ 0x88, 0x17 }); // mov [rdi], dl
-    buf.appendSlice(&.{ 0x48, 0xFF, 0xCF }); // dec rdi
-    buf.appendSlice(&.{ 0x85, 0xC0 }); // test eax, eax
+    b.append(&.{ 0xC6, 0x07, '-' });
+    b.append(&.{ 0x48, 0xFF, 0xCF });
 
-    buf.appendSlice(&.{ 0x0F, 0x85 }); // jnz .loop
-    const jnz_loop_disp = buf.appendRel32Placeholder();
+    const write = b.len;
 
-    buf.appendSlice(&.{ 0x80, 0x3C, 0x24, 0x01 }); // cmp byte [rsp], 1
-    buf.appendSlice(&.{ 0x0F, 0x85 }); // jne .write
-    const jne_write_disp = buf.appendRel32Placeholder();
+    b.append(&.{ 0x48, 0x8D, 0x77, 0x01 });
+    b.append(&.{ 0x48, 0x89, 0xE2 });
+    b.append(&.{ 0x48, 0x83, 0xC2, 0x20 });
+    b.append(&.{ 0x48, 0x29, 0xF2 });
+    b.append(&write_stdout);
+    b.append(&.{ 0x48, 0x83, 0xC4, 0x20 });
 
-    buf.appendSlice(&.{ 0xC6, 0x07, '-' }); // mov byte [rdi], '-'
-    buf.appendSlice(&.{ 0x48, 0xFF, 0xCF }); // dec rdi
+    b.append(&pop6);
+    b.append(&.{0xC3});
 
-    const write_pos = buf.len;
+    b.patch(jge, loop);
+    b.patch(jnz, loop);
+    b.patch(jne, write);
 
-    buf.appendSlice(&.{ 0x48, 0x8D, 0x77, 0x01 }); // lea rsi, [rdi+1]
-    buf.appendSlice(&.{ 0x48, 0x89, 0xE2 }); // mov rdx, rsp
-    buf.appendSlice(&.{ 0x48, 0x83, 0xC2, 0x20 }); // add rdx, 32
-    buf.appendSlice(&.{ 0x48, 0x29, 0xF2 }); // sub rdx, rsi
-    buf.appendSlice(&.{ 0xBF, 0x01, 0x00, 0x00, 0x00 }); // mov edi, 1
-    buf.appendSlice(&.{ 0xB8, 0x01, 0x00, 0x00, 0x00 }); // mov eax, 1
-    buf.appendSlice(&.{ 0x0F, 0x05 }); // syscall
-    buf.appendSlice(&.{ 0x48, 0x83, 0xC4, 0x20 }); // add rsp, 32
-
-    buf.appendSlice(&.{
-        0x5E, // pop rsi
-        0x5F, // pop rdi
-        0x5A, // pop rdx
-        0x59, // pop rcx
-        0x5B, // pop rbx
-        0x58, // pop rax
-        0xC3, // ret
-    });
-
-    patchRel32(&buf, jge_loop_disp, loop_pos);
-    patchRel32(&buf, jnz_loop_disp, loop_pos);
-    patchRel32(&buf, jne_write_disp, write_pos);
-
-    return .{ .bytes = buf.bytes, .len = buf.len };
+    return b;
 }
 
 fn buildAtoiBlob() HelperBlob {
-    var buf = HelperBuffer{};
+    var b = HelperBlob{};
 
-    buf.appendSlice(&.{
-        0x51, // push rcx
-        0x31, 0xC0, // xor eax, eax
-        0x31, 0xC9, // xor ecx, ecx
-        0x80, 0x3F, '-', // cmp byte [rdi], '-'
-    });
+    b.append(&.{ 0x51 });
+    b.append(&.{ 0x31, 0xC0 });
+    b.append(&.{ 0x31, 0xC9 });
+    b.append(&.{ 0x80, 0x3F, '-' });
+    b.append(&.{ 0x0F, 0x85 });
+    const jne = b.rel32();
 
-    buf.appendSlice(&.{ 0x0F, 0x85 }); // jne .loop
-    const jne_loop_disp = buf.appendRel32Placeholder();
+    b.append(&.{ 0xB1, 0x01 });
+    b.append(&.{ 0x48, 0xFF, 0xC7 });
 
-    buf.appendSlice(&.{ 0xB1, 0x01 }); // mov cl, 1
-    buf.appendSlice(&.{ 0x48, 0xFF, 0xC7 }); // inc rdi
+    const loop = b.len;
 
-    const loop_pos = buf.len;
+    b.append(&.{ 0x0F, 0xB6, 0x17 });
+    b.append(&.{ 0x84, 0xD2 });
+    b.append(&.{ 0x0F, 0x84 });
+    const jz_done = b.rel32();
 
-    buf.appendSlice(&.{ 0x0F, 0xB6, 0x17 }); // movzx edx, byte [rdi]
-    buf.appendSlice(&.{ 0x84, 0xD2 }); // test dl, dl
+    b.append(&.{ 0x83, 0xEA, '0' });
+    b.append(&.{ 0x83, 0xFA, 0x09 });
+    b.append(&.{ 0x0F, 0x87 });
+    const ja_done = b.rel32();
 
-    buf.appendSlice(&.{ 0x0F, 0x84 }); // jz .done
-    const jz_done_disp = buf.appendRel32Placeholder();
+    b.append(&.{ 0x6B, 0xC0, 0x0A });
+    b.append(&.{ 0x01, 0xD0 });
+    b.append(&.{ 0x48, 0xFF, 0xC7 });
+    b.append(&.{ 0xE9 });
+    const jmp = b.rel32();
 
-    buf.appendSlice(&.{ 0x83, 0xEA, '0' }); // sub edx, '0'
-    buf.appendSlice(&.{ 0x83, 0xFA, 0x09 }); // cmp edx, 9
+    const done = b.len;
 
-    buf.appendSlice(&.{ 0x0F, 0x87 }); // ja .done
-    const ja_done_disp = buf.appendRel32Placeholder();
+    b.append(&.{ 0x85, 0xC9 });
+    b.append(&.{ 0x0F, 0x84 });
+    const jz_ret = b.rel32();
 
-    buf.appendSlice(&.{ 0x6B, 0xC0, 0x0A }); // imul eax, 10
-    buf.appendSlice(&.{ 0x01, 0xD0 }); // add eax, edx
-    buf.appendSlice(&.{ 0x48, 0xFF, 0xC7 }); // inc rdi
+    b.append(&.{ 0xF7, 0xD8 });
 
-    buf.appendSlice(&.{0xE9}); // jmp .loop
-    const jmp_loop_disp = buf.appendRel32Placeholder();
+    const ret = b.len;
 
-    const done_pos = buf.len;
+    b.append(&.{ 0x59 });
+    b.append(&.{ 0xC3 });
 
-    buf.appendSlice(&.{ 0x85, 0xC9 }); // test ecx, ecx
+    b.patch(jne, loop);
+    b.patch(jz_done, done);
+    b.patch(ja_done, done);
+    b.patch(jmp, loop);
+    b.patch(jz_ret, ret);
 
-    buf.appendSlice(&.{ 0x0F, 0x84 }); // jz .ret
-    const jz_ret_disp = buf.appendRel32Placeholder();
-
-    buf.appendSlice(&.{ 0xF7, 0xD8 }); // neg eax
-
-    const ret_pos = buf.len;
-
-    buf.appendSlice(&.{
-        0x59, // pop rcx
-        0xC3, // ret
-    });
-
-    patchRel32(&buf, jne_loop_disp, loop_pos);
-    patchRel32(&buf, jz_done_disp, done_pos);
-    patchRel32(&buf, ja_done_disp, done_pos);
-    patchRel32(&buf, jmp_loop_disp, loop_pos);
-    patchRel32(&buf, jz_ret_disp, ret_pos);
-
-    return .{ .bytes = buf.bytes, .len = buf.len };
+    return b;
 }
 
 fn buildPrintBoolBlob() HelperBlob {
-    var buf = HelperBuffer{};
-    buf.appendSlice(&.{
-        0x50, 0x52, 0x56, 0x57, 0x83, 0xF8, 0x00, 0x75, 0x0E, 0x48, 0x8D, 0x35, 0x29, 0x00, 0x00, 0x00,
-        0xBA, 0x06, 0x00, 0x00, 0x00, 0xEB, 0x0C, 0x48, 0x8D, 0x35, 0x16, 0x00, 0x00, 0x00, 0xBA, 0x05,
-        0x00, 0x00, 0x00, 0xBF, 0x01, 0x00, 0x00, 0x00, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x0F, 0x05, 0x5F,
-        0x5E, 0x5A, 0x58, 0xC3, 0x74, 0x72, 0x75, 0x65, 0x0A, 0x66, 0x61, 0x6C, 0x73, 0x65, 0x0A,
-    });
-    return .{ .bytes = buf.bytes, .len = buf.len };
+    var b = HelperBlob{};
+    b.append(&push4);
+    b.append(&.{ 0x83, 0xF8, 0x00 });
+    b.append(&.{ 0x75, 0x0E });
+    b.append(&.{ 0x48, 0x8D, 0x35, 0x29, 0x00, 0x00, 0x00 });
+    b.append(&.{ 0xBA, 0x06, 0x00, 0x00, 0x00 });
+    b.append(&.{ 0xEB, 0x0C });
+    b.append(&.{ 0x48, 0x8D, 0x35, 0x16, 0x00, 0x00, 0x00 });
+    b.append(&.{ 0xBA, 0x05, 0x00, 0x00, 0x00 });
+    b.append(&write_stdout);
+    b.append(&pop4);
+    b.append(&.{0xC3});
+    b.append(&.{ 0x74, 0x72, 0x75, 0x65, 0x0A });
+    b.append(&.{ 0x66, 0x61, 0x6C, 0x73, 0x65, 0x0A });
+    return b;
 }
 
 fn buildPrintFloat32Blob() HelperBlob {
-    var buf = HelperBuffer{};
-    buf.appendSlice(&.{
-        0x50, 0x53, 0x51, 0x52, 0x56, 0x57, 0x48, 0x83, 0xEC, 0x40, 0xC6, 0x04, 0x24, 0x00, 0x0F, 0x57,
-        0xD2, 0x0F, 0x2E, 0xC2, 0x73, 0x10, 0xC6, 0x04, 0x24, 0x01, 0xF3, 0x0F, 0x10, 0x15, 0xA9, 0x00,
-        0x00, 0x00, 0xF3, 0x0F, 0x59, 0xC2, 0xF3, 0x0F, 0x10, 0x0D, 0x99, 0x00, 0x00, 0x00, 0xF3, 0x0F,
-        0x59, 0xC1, 0xF3, 0x0F, 0x2C, 0xC0, 0xBB, 0x40, 0x42, 0x0F, 0x00, 0x31, 0xD2, 0xF7, 0xF3, 0x41,
-        0x89, 0xC0, 0x41, 0x89, 0xD1, 0x48, 0x8D, 0x7C, 0x24, 0x3F, 0xC6, 0x07, 0x0A, 0x48, 0xFF, 0xCF,
-        0x44, 0x89, 0xC8, 0xB9, 0x06, 0x00, 0x00, 0x00, 0x31, 0xD2, 0xBB, 0x0A, 0x00, 0x00, 0x00, 0xF7,
-        0xF3, 0x80, 0xC2, 0x30, 0x88, 0x17, 0x48, 0xFF, 0xCF, 0xFF, 0xC9, 0x75, 0xEB, 0xC6, 0x07, 0x2E,
-        0x48, 0xFF, 0xCF, 0x44, 0x89, 0xC0, 0x83, 0xF8, 0x00, 0x75, 0x08, 0xC6, 0x07, 0x30, 0x48, 0xFF,
-        0xCF, 0xEB, 0x15, 0x31, 0xD2, 0xBB, 0x0A, 0x00, 0x00, 0x00, 0xF7, 0xF3, 0x80, 0xC2, 0x30, 0x88,
-        0x17, 0x48, 0xFF, 0xCF, 0x85, 0xC0, 0x75, 0xEB, 0x80, 0x3C, 0x24, 0x01, 0x75, 0x06, 0xC6, 0x07,
-        0x2D, 0x48, 0xFF, 0xCF, 0x48, 0x8D, 0x77, 0x01, 0x48, 0x8D, 0x54, 0x24, 0x40, 0x48, 0x29, 0xF2,
-        0xBF, 0x01, 0x00, 0x00, 0x00, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x0F, 0x05, 0x48, 0x83, 0xC4, 0x40,
-        0x5F, 0x5E, 0x5A, 0x59, 0x5B, 0x58, 0xC3, 0x00, 0x24, 0x74, 0x49, 0x00, 0x00, 0x80, 0xBF,
-    });
-    return .{ .bytes = buf.bytes, .len = buf.len };
+    var b = HelperBlob{};
+    b.append(&push6);
+    b.append(&.{ 0x48, 0x83, 0xEC, 0x40 });
+    b.append(&.{ 0xC6, 0x04, 0x24, 0x00 });
+    b.append(&.{ 0x0F, 0x57, 0xD2 });
+    b.append(&.{ 0x0F, 0x2E, 0xC2 });
+    b.append(&.{ 0x73, 0x10 });
+    b.append(&.{ 0xC6, 0x04, 0x24, 0x01 });
+    b.append(&.{ 0xF3, 0x0F, 0x10, 0x15, 0xA9, 0x00, 0x00, 0x00 });
+    b.append(&.{ 0xF3, 0x0F, 0x59, 0xC2 });
+    b.append(&.{ 0xF3, 0x0F, 0x10, 0x0D, 0x99, 0x00, 0x00, 0x00 });
+    b.append(&.{ 0xF3, 0x0F, 0x59, 0xC1 });
+    b.append(&.{ 0xF3, 0x0F, 0x2C, 0xC0 });
+    b.append(&.{ 0xBB, 0x40, 0x42, 0x0F, 0x00 });
+    b.append(&.{ 0x31, 0xD2 });
+    b.append(&.{ 0xF7, 0xF3 });
+    b.append(&.{ 0x41, 0x89, 0xC0 });
+    b.append(&.{ 0x41, 0x89, 0xD1 });
+    b.append(&.{ 0x48, 0x8D, 0x7C, 0x24, 0x3F });
+    b.append(&.{ 0xC6, 0x07, 0x0A });
+    b.append(&.{ 0x48, 0xFF, 0xCF });
+    b.append(&.{ 0x44, 0x89, 0xC8 });
+    b.append(&.{ 0xB9, 0x06, 0x00, 0x00, 0x00 });
+    b.append(&.{ 0x31, 0xD2 });
+    b.append(&.{ 0xBB, 0x0A, 0x00, 0x00, 0x00 });
+    b.append(&.{ 0xF7, 0xF3 });
+    b.append(&.{ 0x80, 0xC2, 0x30 });
+    b.append(&.{ 0x88, 0x17 });
+    b.append(&.{ 0x48, 0xFF, 0xCF });
+    b.append(&.{ 0xFF, 0xC9 });
+    b.append(&.{ 0x75, 0xEB });
+    b.append(&.{ 0xC6, 0x07, 0x2E });
+    b.append(&.{ 0x48, 0xFF, 0xCF });
+    b.append(&.{ 0x44, 0x89, 0xC0 });
+    b.append(&.{ 0x83, 0xF8, 0x00 });
+    b.append(&.{ 0x75, 0x08 });
+    b.append(&.{ 0xC6, 0x07, 0x30 });
+    b.append(&.{ 0x48, 0xFF, 0xCF });
+    b.append(&.{ 0xEB, 0x15 });
+    b.append(&.{ 0x31, 0xD2 });
+    b.append(&.{ 0xBB, 0x0A, 0x00, 0x00, 0x00 });
+    b.append(&.{ 0xF7, 0xF3 });
+    b.append(&.{ 0x80, 0xC2, 0x30 });
+    b.append(&.{ 0x88, 0x17 });
+    b.append(&.{ 0x48, 0xFF, 0xCF });
+    b.append(&.{ 0x85, 0xC0 });
+    b.append(&.{ 0x75, 0xEB });
+    b.append(&.{ 0x80, 0x3C, 0x24, 0x01 });
+    b.append(&.{ 0x75, 0x06 });
+    b.append(&.{ 0xC6, 0x07, '-' });
+    b.append(&.{ 0x48, 0xFF, 0xCF });
+    b.append(&.{ 0x48, 0x8D, 0x77, 0x01 });
+    b.append(&.{ 0x48, 0x8D, 0x54, 0x24, 0x40 });
+    b.append(&.{ 0x48, 0x29, 0xF2 });
+    b.append(&write_stdout);
+    b.append(&.{ 0x48, 0x83, 0xC4, 0x40 });
+    b.append(&pop6);
+    b.append(&.{0xC3});
+    b.append(&.{ 0x00, 0x24, 0x74, 0x49, 0x00, 0x00, 0x80, 0xBF });
+    return b;
 }
 
 pub const print_int = buildPrintIntBlob();
@@ -230,21 +253,13 @@ pub const all_helpers = [_]HelperDef{
 };
 
 comptime {
-    _ = print_int;
-    _ = print_bool;
-    _ = print_float32;
-    _ = atoi;
-
-    if (print_int.len > max_helper_size) @compileError("print_int helper exceeds max_helper_size");
-    if (print_bool.len > max_helper_size) @compileError("print_bool helper exceeds max_helper_size");
-    if (print_float32.len > max_helper_size) @compileError("print_float32 helper exceeds max_helper_size");
-    if (atoi.len > max_helper_size) @compileError("atoi helper exceeds max_helper_size");
-
-    const helper_id_count = @typeInfo(HelperId).@"enum".fields.len;
-    if (all_helpers.len != helper_id_count) @compileError("all_helpers must include every HelperId");
-
-    for (all_helpers, 0..) |helper, idx| {
-        if (@intFromEnum(helper.id) != idx) @compileError("all_helpers must follow HelperId enum order");
+    for (&all_helpers) |h| {
+        if (h.blob.len > max_h) @compileError("helper " ++ @tagName(h.id) ++ " exceeds max");
+    }
+    const n = @typeInfo(HelperId).@"enum".fields.len;
+    if (all_helpers.len != n) @compileError("all_helpers must include every HelperId");
+    for (all_helpers, 0..) |h, i| {
+        if (@intFromEnum(h.id) != i) @compileError("all_helpers must follow HelperId enum order");
     }
 }
 
