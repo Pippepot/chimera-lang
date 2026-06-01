@@ -1,4 +1,3 @@
-// Chimera — Source → Query → Machine Code Compiler
 const std = @import("std");
 const debug = @import("debug.zig");
 const db = @import("db.zig");
@@ -6,15 +5,42 @@ const query = @import("query.zig");
 const runtime = @import("runtime.zig");
 const disasm = @import("disasm.zig");
 
-fn printUsage(io: std.Io, exe_name: []const u8) !void {
-    var wbuf: [512]u8 = undefined;
-    var w = std.Io.File.stderr().writer(io, &wbuf);
-    try w.interface.print("usage: {s} [--debug=ast,ssa,timing,query,asm] [--nocache] <source-file> [program-args...]\n", .{exe_name});
+fn usage(io: std.Io, exe: []const u8) !void {
+    var buf: [512]u8 = undefined;
+    var w = std.Io.File.stderr().writer(io, &buf);
+    try w.interface.print("usage: {s} [--debug=ast,ssa,timing,query,asm] [--nocache] <source-file> [program-args...]\n", .{exe});
     try w.interface.flush();
 }
 
-fn readSourceFile(io: std.Io, gpa: std.mem.Allocator, source_path: []const u8) ![]u8 {
-    return std.Io.Dir.cwd().readFileAlloc(io, source_path, gpa, .limited(std.math.maxInt(usize)));
+fn printTimings(io: std.Io, header: []const u8, stages: []const StageTiming, total: std.Io.Duration) !void {
+    var buf: [2048]u8 = undefined;
+    var w = std.Io.File.stderr().writer(io, &buf);
+    try w.interface.print("; {s}:\n", .{header});
+    for (stages) |s| {
+        try w.interface.print(";   {s}: {d} us\n", .{ s.label, s.duration.toMicroseconds() });
+    }
+    try w.interface.print(";   total: {d} us\n", .{total.toMicroseconds()});
+    try w.interface.flush();
+}
+
+fn printDiags(io: std.Io, gpa: std.mem.Allocator, path: []const u8, source: []const u8, diags: []const db.Diagnostic) !void {
+    var text = try std.ArrayList(u8).initCapacity(gpa, 512);
+    defer text.deinit(gpa);
+    try db.appendDiagnostics(&text, gpa, path, source, diags);
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.File.stderr().writer(io, &buf);
+    try w.interface.writeAll(text.items);
+    try w.interface.flush();
+}
+
+fn printStats(io: std.Io, gpa: std.mem.Allocator, stats: query.QueryStats) !void {
+    var text = try std.ArrayList(u8).initCapacity(gpa, 256);
+    defer text.deinit(gpa);
+    try stats.print(&text, gpa);
+    var buf: [2048]u8 = undefined;
+    var w = std.Io.File.stderr().writer(io, &buf);
+    try w.interface.writeAll(text.items);
+    try w.interface.flush();
 }
 
 const StageTiming = struct {
@@ -22,178 +48,140 @@ const StageTiming = struct {
     duration: std.Io.Duration,
 };
 
-fn printStageTimings(io: std.Io, header: []const u8, stages: []const StageTiming, total: std.Io.Duration) !void {
-    var wbuf: [2048]u8 = undefined;
-    var w = std.Io.File.stderr().writer(io, &wbuf);
-    try w.interface.print("; {s}:\n", .{header});
-    for (stages) |stage| {
-        try w.interface.print(";   {s}: {d} us\n", .{ stage.label, stage.duration.toMicroseconds() });
+const Timing = struct {
+    start: ?std.Io.Timestamp,
+
+    fn begin(io: std.Io, enabled: bool) Timing {
+        return .{ .start = if (enabled) std.Io.Clock.awake.now(io) else null };
     }
-    try w.interface.print(";   total: {d} us\n", .{total.toMicroseconds()});
-    try w.interface.flush();
-}
 
-fn printQueryStats(io: std.Io, gpa: std.mem.Allocator, stats: query.QueryStats) !void {
-    var text = try std.ArrayList(u8).initCapacity(gpa, 256);
-    defer text.deinit(gpa);
-    try stats.print(&text, gpa);
-    var wbuf: [2048]u8 = undefined;
-    var w = std.Io.File.stderr().writer(io, &wbuf);
-    try w.interface.writeAll(text.items);
-    try w.interface.flush();
-}
-
-fn printCompileDiagnostics(
-    io: std.Io,
-    gpa: std.mem.Allocator,
-    source_path: []const u8,
-    source: []const u8,
-    diags: []const db.Diagnostic,
-) !void {
-    var text = try std.ArrayList(u8).initCapacity(gpa, 512);
-    defer text.deinit(gpa);
-    try db.appendDiagnostics(&text, gpa, source_path, source, diags);
-
-    var wbuf: [4096]u8 = undefined;
-    var w = std.Io.File.stderr().writer(io, &wbuf);
-    try w.interface.writeAll(text.items);
-    try w.interface.flush();
-}
+    fn end(self: Timing, io: std.Io) std.Io.Duration {
+        return if (self.start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
+    }
+};
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const gpa = init.gpa;
 
     const flags = debug.parseDebugFlags(init.minimal.args);
-    var persistent_cache_enabled = true;
+    var cache = true;
 
-    var cli_args_list = try std.ArrayList([]const u8).initCapacity(gpa, 4);
-    defer cli_args_list.deinit(gpa);
+    var arg_list = try std.ArrayList([]const u8).initCapacity(gpa, 4);
+    defer arg_list.deinit(gpa);
 
     var iter = std.process.Args.Iterator.init(init.minimal.args);
     defer iter.deinit();
-    const exe_name = iter.next() orelse "main";
-    while (iter.next()) |arg| {
-        if (std.mem.startsWith(u8, arg, "--debug=")) continue;
-        if (std.mem.eql(u8, arg, "--nocache")) {
-            persistent_cache_enabled = false;
+    const exe = iter.next() orelse "main";
+    while (iter.next()) |a| {
+        if (std.mem.startsWith(u8, a, "--debug=")) continue;
+        if (std.mem.eql(u8, a, "--nocache")) {
+            cache = false;
             continue;
         }
-        try cli_args_list.append(gpa, arg);
+        try arg_list.append(gpa, a);
     }
 
-    const cli_args = cli_args_list.items;
-    if (cli_args.len == 0) {
-        try printUsage(io, exe_name);
+    const args = arg_list.items;
+    if (args.len == 0) {
+        try usage(io, exe);
         return error.MissingSourceFile;
     }
 
-    const source_path = cli_args[0];
-    const prog_args = cli_args[1..];
-    const source_id: query.SourceId = 0;
+    const src_path = args[0];
+    const prog_args = args[1..];
 
     var qdb = query.QueryDb.initWithOptions(gpa, .{
-        .persistent_cache_enabled = persistent_cache_enabled,
+        .persistent_cache_enabled = cache,
         .io = io,
     });
     defer qdb.deinit();
 
-    const set_source_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
-    const source_text = readSourceFile(io, gpa, source_path) catch |err| {
-        var wbuf: [512]u8 = undefined;
-        var w = std.Io.File.stderr().writer(io, &wbuf);
-        w.interface.print("error: failed to read source file '{s}': {s}\n", .{ source_path, @errorName(err) }) catch {};
+    const t_src = Timing.begin(io, flags.timing);
+    const src_text = std.Io.Dir.cwd().readFileAlloc(io, src_path, gpa, .limited(std.math.maxInt(usize))) catch |err| {
+        var buf: [512]u8 = undefined;
+        var w = std.Io.File.stderr().writer(io, &buf);
+        w.interface.print("error: failed to read '{s}': {s}\n", .{ src_path, @errorName(err) }) catch {};
         w.interface.flush() catch {};
         return error.SourceReadError;
     };
-    defer gpa.free(source_text);
-    try qdb.setSourceFile(source_id, source_path, source_text);
-    const set_source_duration = if (set_source_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
+    defer gpa.free(src_text);
+    try qdb.setSourceFile(0, src_path, src_text);
+    const d_src = t_src.end(io);
 
-    const need_stage_debug = flags.ast or flags.ssa;
-    const need_stage_pipeline = flags.timing or need_stage_debug;
+    var d_parse = std.Io.Duration.zero;
+    var d_resolve = std.Io.Duration.zero;
+    var d_type = std.Io.Duration.zero;
+    var d_lower = std.Io.Duration.zero;
+    var d_debug = std.Io.Duration.zero;
 
-    var parse_duration = std.Io.Duration.zero;
-    var resolve_duration = std.Io.Duration.zero;
-    var type_duration = std.Io.Duration.zero;
-    var lower_duration = std.Io.Duration.zero;
-    var debug_duration = std.Io.Duration.zero;
-    if (need_stage_pipeline) {
-        const parse_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
-        const module_or_null = try qdb.parsedAst(source_id);
-        parse_duration = if (parse_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
+    if (flags.timing or flags.ast or flags.ssa) {
+        const t = Timing.begin(io, flags.timing);
+        const mod = try qdb.parsedAst(0);
+        d_parse = t.end(io);
 
-        const resolve_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
-        _ = try qdb.resolvedAst(source_id);
-        resolve_duration = if (resolve_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
+        const t2 = Timing.begin(io, flags.timing);
+        _ = try qdb.resolvedAst(0);
+        d_resolve = t2.end(io);
 
-        const type_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
-        _ = try qdb.typedAst(source_id);
-        type_duration = if (type_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
+        const t3 = Timing.begin(io, flags.timing);
+        _ = try qdb.typedAst(0);
+        d_type = t3.end(io);
 
-        const lower_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
-        const ir = try qdb.loweredProgram(source_id);
-        lower_duration = if (lower_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
+        const t4 = Timing.begin(io, flags.timing);
+        const ir = try qdb.loweredProgram(0);
+        d_lower = t4.end(io);
 
-        const debug_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
-        try debug.dumpDebugInfo(io, flags, module_or_null, ir, null, gpa);
-        debug_duration = if (debug_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
+        const t5 = Timing.begin(io, flags.timing);
+        try debug.dumpDebugInfo(io, flags, mod, ir, null, gpa);
+        d_debug = t5.end(io);
     }
 
-    const compile_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
-    const compile_result = try qdb.compileResult(source_id);
-    const compile_duration = if (compile_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
+    const t_comp = Timing.begin(io, flags.timing);
+    const result = try qdb.compileResult(0);
+    const d_comp = t_comp.end(io);
 
-    if (flags.x86 and compile_result.bytes != null) {
-        const program_code_len = std.mem.readInt(u32, compile_result.bytes.?[120..124], .little);
-        const raw_code = compile_result.bytes.?[0x1000..];
-        const asm_text = try disasm.disassemble(raw_code[0..@intCast(program_code_len)], gpa);
+    if (flags.x86 and result.bytes != null) {
+        const len = std.mem.readInt(u32, result.bytes.?[120..124], .little);
+        const asm_text = try disasm.disassemble(result.bytes.?[0x1000..][0..@intCast(len)], gpa);
         defer gpa.free(asm_text);
         try debug.dumpDebugInfo(io, flags, null, null, asm_text, gpa);
     }
 
     if (flags.timing) {
-        const compile_total = std.Io.Duration{
-            .nanoseconds = set_source_duration.nanoseconds + parse_duration.nanoseconds + resolve_duration.nanoseconds + type_duration.nanoseconds + lower_duration.nanoseconds + debug_duration.nanoseconds + compile_duration.nanoseconds,
+        const total = std.Io.Duration{
+            .nanoseconds = d_src.nanoseconds + d_parse.nanoseconds + d_resolve.nanoseconds + d_type.nanoseconds + d_lower.nanoseconds + d_debug.nanoseconds + d_comp.nanoseconds,
         };
-        try printStageTimings(io, "compilation timing diagnostics", &.{
-            .{ .label = "set_source", .duration = set_source_duration },
-            .{ .label = "parse", .duration = parse_duration },
-            .{ .label = "resolve", .duration = resolve_duration },
-            .{ .label = "typecheck", .duration = type_duration },
-            .{ .label = "lower", .duration = lower_duration },
-            .{ .label = "debug_dump", .duration = debug_duration },
-            .{ .label = "compile_query", .duration = compile_duration },
-        }, compile_total);
+        try printTimings(io, "compilation timing diagnostics", &.{
+            .{ .label = "set_source", .duration = d_src },
+            .{ .label = "parse", .duration = d_parse },
+            .{ .label = "resolve", .duration = d_resolve },
+            .{ .label = "typecheck", .duration = d_type },
+            .{ .label = "lower", .duration = d_lower },
+            .{ .label = "debug_dump", .duration = d_debug },
+            .{ .label = "compile_query", .duration = d_comp },
+        }, total);
     }
 
-    if (compile_result.diagnostics.len > 0 or compile_result.bytes == null) {
-        try printCompileDiagnostics(io, gpa, source_path, source_text, compile_result.diagnostics);
-        if (flags.query) {
-            try printQueryStats(io, gpa, qdb.statsSnapshot());
-        }
-        return error.CompileError;
+    const has_err = result.diagnostics.len > 0 or result.bytes == null;
+    if (has_err or flags.query) {
+        if (has_err) try printDiags(io, gpa, src_path, src_text, result.diagnostics);
+        if (flags.query) try printStats(io, gpa, qdb.statsSnapshot());
+        if (has_err) return error.CompileError;
     }
 
-    if (flags.query) {
-        try printQueryStats(io, gpa, qdb.statsSnapshot());
-    }
+    const t_write = Timing.begin(io, flags.timing);
+    runtime.writeProgram(io, result.bytes.?);
+    const d_write = t_write.end(io);
 
-    const write_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
-    runtime.writeProgram(io, compile_result.bytes.?);
-    const write_duration = if (write_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
-
-    const run_start = if (flags.timing) std.Io.Clock.awake.now(io) else null;
+    const t_run = Timing.begin(io, flags.timing);
     _ = runtime.runProg(io, gpa, prog_args);
-    const run_duration = if (run_start) |ts| ts.untilNow(io, .awake) else std.Io.Duration.zero;
+    const d_run = t_run.end(io);
 
     if (flags.timing) {
-        const run_total = std.Io.Duration{
-            .nanoseconds = write_duration.nanoseconds + run_duration.nanoseconds,
-        };
-        try printStageTimings(io, "runtime timing diagnostics", &.{
-            .{ .label = "write_prog", .duration = write_duration },
-            .{ .label = "run_prog", .duration = run_duration },
-        }, run_total);
+        try printTimings(io, "runtime timing diagnostics", &.{
+            .{ .label = "write_prog", .duration = d_write },
+            .{ .label = "run_prog", .duration = d_run },
+        }, .{ .nanoseconds = d_write.nanoseconds + d_run.nanoseconds });
     }
 }
