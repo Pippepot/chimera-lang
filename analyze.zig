@@ -126,6 +126,7 @@ pub const TypeError = error{
     FieldAccessOnNonStruct,
     StructInitFieldCountMismatch,
     StructInitFieldNameMismatch,
+    StructInitTypeNotStruct,
     ComptimeCycle,
     ComptimeCaptureNotAllowed,
     ComptimePureOperationNotAllowed,
@@ -267,6 +268,7 @@ pub fn typeErrorMessage(kind: TypeError) []const u8 {
         error.FieldAccessOnNonStruct => "field access on non-struct type",
         error.StructInitFieldCountMismatch => "struct init field count mismatch",
         error.StructInitFieldNameMismatch => "struct init field name mismatch",
+        error.StructInitTypeNotStruct => "struct init type is not a struct type",
         error.ComptimeCycle => "comptime dependency cycle",
         error.ComptimeCaptureNotAllowed => "comptime can only reference comptime symbols and comptime locals",
         error.ComptimePureOperationNotAllowed => "operation is not allowed in pure comptime execution",
@@ -1530,11 +1532,7 @@ const Binding = struct {
                             a.fnComptimeMask(gen_info.decl)
                         else
                             0;
-                        // Only monomorphize if the function has runtime params
-                        // (comptime-only functions returning type use normal comptime eval)
-                        const has_runtime_params = gen_info.decl != std.math.maxInt(ast.NodeIdx) and
-                            a.fnParams(gen_info.decl).len > @popCount(mask);
-                        if (mask != 0 and has_runtime_params) {
+                        if (mask != 0) {
                             return self.inferMonomorphizedCall(idx, generic_fn_id, mask);
                         }
                     }
@@ -1917,6 +1915,11 @@ const Binding = struct {
                     }
                     return self.remember(idx, .{ .named = a.identOf(a.nodes[struct_decl].data0) });
                 }
+                const actual_ty = switch (cv) {
+                    .type_value => |ty| ty,
+                    else => comptimeValueCtype(cv),
+                };
+                return self.failAtNodeWithTypes(idx, error.StructInitTypeNotStruct, .type_type, actual_ty);
             }
         }
 
@@ -2483,7 +2486,7 @@ const Binding = struct {
                 break :blk try self.remember(idx, ty);
             },
             .builtin_type => self.remember(idx, .type_type),
-            .struct_decl => |decl_idx| self.remember(idx, .{ .named = self.parsed.ast.identOf(self.parsed.ast.nodes[decl_idx].data0) }),
+            .struct_decl => self.remember(idx, .type_type),
         };
     }
 
@@ -2676,6 +2679,9 @@ pub fn typecheckReport(
                 }
                 if (failure.kind == error.EqualityUnsupportedType) {
                     break :msg try std.fmt.allocPrint(gpa, "{s}: '{s}'", .{ base, expected_str });
+                }
+                if (failure.kind == error.StructInitTypeNotStruct) {
+                    break :msg try std.fmt.allocPrint(gpa, "{s}: '{s}'", .{ base, actual_str });
                 }
                 break :msg try std.fmt.allocPrint(gpa, "{s}: expected '{s}', got '{s}'", .{ base, expected_str, actual_str });
             } else typeErrorMessage(failure.kind);

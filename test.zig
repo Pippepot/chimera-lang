@@ -906,6 +906,18 @@ test "monomorphized function caching across same revision" {
     try testing.expectEqual(@as(usize, 0), stats.compile_recomputes);
 }
 
+test "comptime pure-function with comptime-only param and struct arg" {
+    try testProgram(
+        \\comptime Foo = struct
+        \\  x: int
+        \\
+        \\comptime bar = func(comptime T: type)
+        \\  print(T{x = 42}.x)
+        \\
+        \\bar(Foo)
+    , "42\n");
+}
+
 test "binding type annotation mismatch errors" {
     var db = query.QueryDb.init(testing.allocator);
     defer db.deinit();

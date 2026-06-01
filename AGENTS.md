@@ -212,6 +212,11 @@
 - **Moving a local `ArrayList` into a memo field transfers ownership.** Do NOT `defer list.deinit(gpa)` on a list that was assigned to `memo.deps` — the memo owns the memory and `deinitMemo` will free it. Using `defer` causes a double-free when `deinitMemo` later frees the same allocation.
 - **Zero-recompute test pattern:** call `compileResult` twice with no `setSource`/`setSourceFile` between calls. The second call returns an immediate hit because `memo.verified_at == self.revision` (set during first computation). All 6 recompute counters remain at 0.
 
+## Monomorphization
+
+- **All-comptime-param functions** must be monomorphized (not skipped). The `inferCall` condition should check `mask != 0` without requiring `has_runtime_params`. Pure-comptime functions (all params are comptime, zero runtime params) need monomorphized instances so their bodies get lowered and executed.
+- **`comptime struct` name type** — when a `comptime struct` name (e.g. `Bar`) is used in value position (e.g. as a call argument to a `comptime T: type` parameter), its type should be `.type_type`, not `.{ .named = name }`. The struct instance type is only correct in type annotation position.
+
 ## Style
 
 - **No scoped blocks** for variable reuse. Use descriptive names instead (`asm_child`, `ld_child`).
