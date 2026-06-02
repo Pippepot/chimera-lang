@@ -476,8 +476,8 @@ test "debug query diagnostics format includes resolve" {
     const stats = query.QueryStats{
         .revision = 7,
         .source_sets = 2,
-        .hits = .{ 3, 4, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
-        .recomputes = .{ 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+        .hits = .{ 3, 4, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+        .recomputes = .{ 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
         .dependency_checks = 5,
     };
     try stats.print(&buf, testing.allocator);

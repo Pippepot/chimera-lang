@@ -314,12 +314,6 @@ pub fn hashComptimeValue(value: ComptimeValue) u64 {
     };
 }
 
-pub fn hashComptimeArgs(values: []const ComptimeValue) u64 {
-    var h: u64 = 0;
-    for (values) |v| h = hashCombine(h, hashComptimeValue(v));
-    return h;
-}
-
 pub fn typeErrorMessage(kind: TypeError) []const u8 {
     return switch (kind) {
         error.UnknownSymbol => "unknown symbol",
@@ -404,7 +398,6 @@ const Binding = struct {
         typed: AnalyzedAst,
         bindings: scope_mod.ScopeStack(Binding),
         comptime_decl_state: std.AutoHashMap(ast.NodeIdx, DeclState),
-        monomorph_cache: std.AutoHashMap(u64, u32),
         ownership_in_progress: std.StringHashMap(void),
         failure: ?Failure,
         in_fallible_scope: bool,
@@ -455,7 +448,6 @@ const Binding = struct {
             .typed = AnalyzedAst.init(gpa, &parsed.ast),
             .bindings = scope_mod.ScopeStack(Binding).init(),
             .comptime_decl_state = std.AutoHashMap(ast.NodeIdx, DeclState).init(gpa),
-            .monomorph_cache = std.AutoHashMap(u64, u32).init(gpa),
             .ownership_in_progress = std.StringHashMap(void).init(gpa),
             .failure = null,
             .in_fallible_scope = false,
@@ -472,7 +464,6 @@ const Binding = struct {
         self.typed.deinit();
         self.bindings.deinit(self.gpa);
         self.comptime_decl_state.deinit();
-        self.monomorph_cache.deinit();
         self.seen_return_types.deinit(self.gpa);
         self.ownership_in_progress.deinit();
     }
@@ -1760,7 +1751,8 @@ const Binding = struct {
             .kind = .function,
             .name_hash = name_hash,
         };
-        const args_hash = hashComptimeArgs(comptime_values.items);
+        var args_hash: u64 = 0;
+        for (comptime_values.items) |v| args_hash = hashCombine(args_hash, hashComptimeValue(v));
         const instance_id: db.InstanceId = .{
             .item = item_id,
             .comptime_args_hash = args_hash,
@@ -1812,9 +1804,6 @@ const Binding = struct {
             .has_explicit_return = false,
             .is_monomorphized = true,
         });
-
-        // Cache by hash
-        try self.monomorph_cache.put(args_hash, new_fn_id);
 
         // Record the InstanceId -> function_id mapping
         try self.typed.monomorph_instances.put(instance_id, new_fn_id);
@@ -2825,13 +2814,11 @@ fn hasTopLevelEntry(a: ast.Ast, entry: ast.NodeIdx) bool {
     return true;
 }
 
-pub const AnalyzeMemo = db.Memo(AnalyzedAst);
-
 pub fn computeAnalyze(
-    resolve_memo: *const resolver.ResolveMemo,
-    parse_memo: *const parser.ParseMemo,
+    resolve_memo: *const db.Memo(resolver.ResolvedAst),
+    parse_memo: *const db.Memo(parser.ParsedAst),
     gpa: std.mem.Allocator,
-) error{OutOfMemory}!AnalyzeMemo {
+) error{OutOfMemory}!db.Memo(AnalyzedAst) {
     var diagnostics_list = try db.initDiagnosticList(gpa, resolve_memo.diagnostics.items, 1);
     errdefer diagnostics_list.deinit(gpa);
 
@@ -2893,7 +2880,6 @@ pub fn typecheckReport(
 
     checker.bindings.deinit(gpa);
     checker.comptime_decl_state.deinit();
-    checker.monomorph_cache.deinit();
     checker.seen_return_types.deinit(gpa);
     checker.ownership_in_progress.deinit();
     return .{

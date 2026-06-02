@@ -268,9 +268,7 @@ pub fn resolveErrorMessage(kind: ResolveError) []const u8 {
     };
 }
 
-pub const ResolveMemo = db.Memo(ResolvedAst);
-
-pub fn computeResolve(parse_memo: *const parser.ParseMemo, gpa: std.mem.Allocator) error{OutOfMemory}!ResolveMemo {
+pub fn computeResolve(parse_memo: *const db.Memo(parser.ParsedAst), gpa: std.mem.Allocator) error{OutOfMemory}!db.Memo(ResolvedAst) {
     var diagnostics_list = try db.initDiagnosticList(gpa, parse_memo.diagnostics.items, 1);
     errdefer diagnostics_list.deinit(gpa);
 

@@ -1572,8 +1572,6 @@ const FunctionLowerer = struct {
     }
 };
 
-pub const LowerMemo = db.Memo(Program);
-
 pub const FunctionIR = struct {
     func: Function,
     symbols: std.ArrayList([]const u8),
@@ -1589,9 +1587,9 @@ pub const FunctionIR = struct {
 };
 
 pub fn computeLower(
-    type_memo: *const analyze.AnalyzeMemo,
+    type_memo: *const db.Memo(analyze.AnalyzedAst),
     gpa: std.mem.Allocator,
-) error{OutOfMemory}!LowerMemo {
+) error{OutOfMemory}!db.Memo(Program) {
     var diagnostics_list = try db.initDiagnosticList(gpa, type_memo.diagnostics.items, 1);
     errdefer diagnostics_list.deinit(gpa);
 

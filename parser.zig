@@ -553,10 +553,7 @@ const Parser = struct {
             const span = ast.Span{ .start = self.lexer.index, .end = self.lexer.index };
             return self.allocNode(.unit_lit, 0, 0, span);
         }
-        const span = if (items.len == 0)
-            ast.Span{ .start = self.lexer.index, .end = self.lexer.index }
-        else
-            coverSpans(try self.spanOf(items[0]), try self.spanOf(items[items.len - 1]));
+        const span = coverSpans(try self.spanOf(items[0]), try self.spanOf(items[items.len - 1]));
         const extra_idx = try self.builder.allocExtraSlice(items);
         return self.allocNode(.block, extra_idx, count, span);
     }
@@ -1672,9 +1669,7 @@ pub fn parseOwned(source: []const u8, gpa: std.mem.Allocator) (ParseError || err
 }
 
 
-pub const ParseMemo = db.Memo(ParsedAst);
-
-pub fn computeParse(source: []const u8, gpa: std.mem.Allocator) error{OutOfMemory}!ParseMemo {
+pub fn computeParse(source: []const u8, gpa: std.mem.Allocator) error{OutOfMemory}!db.Memo(ParsedAst) {
     const report = try parseReport(source, gpa);
 
     var diagnostics_list = try db.initDiagnosticList(gpa, &.{}, 1);

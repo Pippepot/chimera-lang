@@ -94,9 +94,6 @@ pub const QueryKind = enum {
     lower_body,
     ct_lower_body,
     ct_eval,
-    codegen_function,
-    link_program,
-    diagnostics_for_file,
 
     pub const count = @typeInfo(QueryKind).@"enum".fields.len;
 
@@ -120,9 +117,6 @@ pub const QueryKind = enum {
             .lower_body => "lower_body",
             .ct_lower_body => "ct_lower_body",
             .ct_eval => "ct_eval",
-            .codegen_function => "codegen_function",
-            .link_program => "link_program",
-            .diagnostics_for_file => "diagnostics_for_file",
         };
     }
 

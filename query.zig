@@ -92,151 +92,74 @@ fn memoValueEqual(comptime T: type, gpa: std.mem.Allocator, a: ?T, b: ?T) bool {
     if (a == null and b == null) return true;
     if (a == null or b == null) return false;
     if (comptime T == []const u8) return std.mem.eql(u8, a.?, b.?);
-    if (comptime T == codegen.LinkResult) return std.mem.eql(u8, a.?.bytes, b.?.bytes);
-    if (comptime T == codegen.MachineFunction) return std.mem.eql(u8, a.?.code, b.?.code);
-    if (comptime T == parser.ParsedAst) {
-        const old = &a.?;
-        const new = &b.?;
-        const ao = &old.ast;
-        const an = &new.ast;
-        if (ao.nodes.len != an.nodes.len) return false;
-        if (ao.decls.len != an.decls.len) return false;
-        if (ao.entry != an.entry) return false;
-        if (ao.extra.len != an.extra.len) return false;
-        if (ao.ident_offsets.len != an.ident_offsets.len) return false;
-        if (ao.ident_bytes.len != an.ident_bytes.len) return false;
-        if (!std.mem.eql(u8, ao.ident_bytes, an.ident_bytes)) return false;
-        for (ao.nodes, an.nodes) |na, nb| {
-            if (@intFromEnum(na.tag) != @intFromEnum(nb.tag)) return false;
-            if (na.data0 != nb.data0) return false;
-            if (na.data1 != nb.data1) return false;
-        }
-        for (ao.extra, an.extra) |ea, eb| {
-            if (ea != eb) return false;
-        }
-        return true;
+    if (comptime T == parser.ParsedAst) return parsedAstEql(&a.?, &b.?);
+    if (comptime T == resolver.ResolvedAst) return resolvedAstEql(&a.?, &b.?);
+    if (comptime T == analyze.AnalyzedAst) return analyzedAstEql(&a.?, &b.?);
+    if (comptime T == ir_mod.Program) return programEql(gpa, &a.?, &b.?);
+    if (comptime T == ir_mod.FunctionIR) return functionIREql(gpa, &a.?, &b.?);
+    if (comptime T == discover.ItemTree) return itemTreeEql(&a.?, &b.?);
+    if (comptime T == semantic_queries.ScopeSummary) return scopeSummaryEql(&a.?, &b.?);
+    if (comptime T == semantic_queries.ResolvedItem) return resolvedItemEql(&a.?, &b.?);
+    if (comptime T == semantic_queries.HeaderSignature) return headerSignatureEql(&a.?, &b.?);
+    if (comptime T == semantic_queries.EffectiveSignature) return effectiveSignatureEql(&a.?, &b.?);
+    if (comptime T == semantic_queries.BodyAnalysis) return bodyAnalysisEql(&a.?, &b.?);
+    return false;
+}
+
+fn parsedAstEql(a: *const parser.ParsedAst, b: *const parser.ParsedAst) bool {
+    const ao = &a.ast;
+    const an = &b.ast;
+    if (ao.nodes.len != an.nodes.len) return false;
+    if (ao.decls.len != an.decls.len) return false;
+    if (ao.entry != an.entry) return false;
+    if (ao.extra.len != an.extra.len) return false;
+    if (ao.ident_offsets.len != an.ident_offsets.len) return false;
+    if (ao.ident_bytes.len != an.ident_bytes.len) return false;
+    if (!std.mem.eql(u8, ao.ident_bytes, an.ident_bytes)) return false;
+    for (ao.nodes, an.nodes) |na, nb| {
+        if (@intFromEnum(na.tag) != @intFromEnum(nb.tag)) return false;
+        if (na.data0 != nb.data0) return false;
+        if (na.data1 != nb.data1) return false;
     }
-    if (comptime T == resolver.ResolvedAst) {
-        const old = &a.?;
-        const new = &b.?;
-        if (old.functions.items.len != new.functions.items.len) return false;
-        for (old.functions.items, new.functions.items) |oi, ni| {
-            if (oi != ni) return false;
-        }
-        if (old.function_names.count() != new.function_names.count()) return false;
-        {
-            var iter = old.function_names.iterator();
-            while (iter.next()) |entry| {
-                const new_val = new.function_names.get(entry.key_ptr.*) orelse return false;
-                if (entry.value_ptr.* != new_val) return false;
-            }
-        }
-        if (old.comptime_value_names.count() != new.comptime_value_names.count()) return false;
-        {
-            var iter = old.comptime_value_names.iterator();
-            while (iter.next()) |entry| {
-                const new_val = new.comptime_value_names.get(entry.key_ptr.*) orelse return false;
-                if (entry.value_ptr.* != new_val) return false;
-            }
-        }
-        if (old.struct_names.count() != new.struct_names.count()) return false;
-        {
-            var iter = old.struct_names.iterator();
-            while (iter.next()) |entry| {
-                if (!new.struct_names.contains(entry.key_ptr.*)) return false;
-            }
-        }
-        if (old.node_refs.count() != new.node_refs.count()) return false;
-        {
-            var iter = old.node_refs.iterator();
-            while (iter.next()) |entry| {
-                const new_val = new.node_refs.get(entry.key_ptr.*) orelse return false;
-                const tag_a = std.meta.activeTag(entry.value_ptr.*);
-                const tag_b = std.meta.activeTag(new_val);
-                if (tag_a != tag_b) return false;
-                switch (entry.value_ptr.*) {
-                    .local, .builtin_type => {},
-                    .function => |id| if (id != new_val.function) return false,
-                    .comptime_value => |decl| if (decl != new_val.comptime_value) return false,
-                    .struct_decl => |decl| if (decl != new_val.struct_decl) return false,
-                }
-            }
-        }
-        return true;
+    for (ao.extra, an.extra) |ea, eb| {
+        if (ea != eb) return false;
     }
-    if (comptime T == analyze.AnalyzedAst) {
-        const old = &a.?;
-        const new = &b.?;
-        if (old.entry_function != new.entry_function) return false;
-        if (old.functions.items.len != new.functions.items.len) return false;
-        for (old.functions.items, new.functions.items) |oi, ni| {
-            if (oi.decl != ni.decl) return false;
-            if (!funcTypeEql(oi.ty.*, ni.ty.*)) return false;
-            if (!std.mem.eql(u8, std.mem.sliceAsBytes(oi.param_modes), std.mem.sliceAsBytes(ni.param_modes))) return false;
-            if (oi.has_explicit_return != ni.has_explicit_return) return false;
-            if (oi.is_monomorphized != ni.is_monomorphized) return false;
-        }
-        if (!hashMapTypeEql( old.node_types, new.node_types, analyze.typeEql)) return false;
-        if (!hashMapValueEql( old.field_index, new.field_index)) return false;
-        if (!hashMapTypeEql( old.decl_binding_types, new.decl_binding_types, analyze.typeEql)) return false;
-        if (!hashMapSliceEql( old.is_variant_tags, new.is_variant_tags)) return false;
-        if (!hashMapValueEql( old.query_none_tags, new.query_none_tags)) return false;
-        if (!hashMapComptimeValueEql( old.comptime_node_values, new.comptime_node_values)) return false;
-        if (!strHashMapComptimeValueEql(old.comptime_values, new.comptime_values)) return false;
-        return true;
+    return true;
+}
+
+fn resolvedAstEql(a: *const resolver.ResolvedAst, b: *const resolver.ResolvedAst) bool {
+    if (a.functions.items.len != b.functions.items.len) return false;
+    for (a.functions.items, b.functions.items) |oi, ni| {
+        if (oi != ni) return false;
     }
-    if (comptime T == ir_mod.Program) {
-        const ba = query_cache.serializeProgram(gpa, &a.?) catch return false;
-        defer gpa.free(ba);
-        const bb = query_cache.serializeProgram(gpa, &b.?) catch return false;
-        defer gpa.free(bb);
-        return std.mem.eql(u8, ba, bb);
-    }
-    if (comptime T == ir_mod.FunctionIR) {
-        const ba = query_cache.serializeFunctionIR(gpa, &a.?) catch return false;
-        defer gpa.free(ba);
-        const bb = query_cache.serializeFunctionIR(gpa, &b.?) catch return false;
-        defer gpa.free(bb);
-        return std.mem.eql(u8, ba, bb);
-    }
-    if (comptime T == discover.ItemTree) {
-        const old = &a.?;
-        const new = &b.?;
-        if (old.source_id != new.source_id) return false;
-        if (!db.moduleIdEql(old.module_id, new.module_id)) return false;
-        if (old.items.items.len != new.items.items.len) return false;
-        for (old.items.items, new.items.items) |oi, ni| {
-            if (!db.itemIdEql(oi.id, ni.id)) return false;
-            if (!std.mem.eql(u8, oi.name, ni.name)) return false;
-            if (oi.decl != ni.decl) return false;
-            if (oi.body) |ob| {
-                const nb = ni.body orelse return false;
-                if (!db.itemIdEql(ob.owner, nb.owner)) return false;
-                if (ob.kind != nb.kind) return false;
-            } else if (ni.body != null) return false;
-        }
-        return true;
-    }
-    if (comptime T == semantic_queries.ScopeSummary) {
-        const old = &a.?;
-        const new = &b.?;
-        if (old.entries.len != new.entries.len) return false;
-        for (old.entries, new.entries) |oe, ne| {
-            if (!std.mem.eql(u8, oe.name, ne.name)) return false;
-            if (!db.itemIdEql(oe.item_id, ne.item_id)) return false;
-            if (oe.decl != ne.decl) return false;
-        }
-        return true;
-    }
-    if (comptime T == semantic_queries.ResolvedItem) {
-        const old = &a.?;
-        const new = &b.?;
-        if (!db.itemIdEql(old.item, new.item)) return false;
-        if (old.decl != new.decl) return false;
-        if (old.node_refs.count() != new.node_refs.count()) return false;
-        var iter = old.node_refs.iterator();
+    if (a.function_names.count() != b.function_names.count()) return false;
+    {
+        var iter = a.function_names.iterator();
         while (iter.next()) |entry| {
-            const new_val = new.node_refs.get(entry.key_ptr.*) orelse return false;
+            const new_val = b.function_names.get(entry.key_ptr.*) orelse return false;
+            if (entry.value_ptr.* != new_val) return false;
+        }
+    }
+    if (a.comptime_value_names.count() != b.comptime_value_names.count()) return false;
+    {
+        var iter = a.comptime_value_names.iterator();
+        while (iter.next()) |entry| {
+            const new_val = b.comptime_value_names.get(entry.key_ptr.*) orelse return false;
+            if (entry.value_ptr.* != new_val) return false;
+        }
+    }
+    if (a.struct_names.count() != b.struct_names.count()) return false;
+    {
+        var iter = a.struct_names.iterator();
+        while (iter.next()) |entry| {
+            if (!b.struct_names.contains(entry.key_ptr.*)) return false;
+        }
+    }
+    if (a.node_refs.count() != b.node_refs.count()) return false;
+    {
+        var iter = a.node_refs.iterator();
+        while (iter.next()) |entry| {
+            const new_val = b.node_refs.get(entry.key_ptr.*) orelse return false;
             const tag_a = std.meta.activeTag(entry.value_ptr.*);
             const tag_b = std.meta.activeTag(new_val);
             if (tag_a != tag_b) return false;
@@ -247,55 +170,134 @@ fn memoValueEqual(comptime T: type, gpa: std.mem.Allocator, a: ?T, b: ?T) bool {
                 .struct_decl => |decl| if (decl != new_val.struct_decl) return false,
             }
         }
-        return true;
     }
-    if (comptime T == semantic_queries.HeaderSignature) {
-        const old = &a.?;
-        const new = &b.?;
-        if (!db.itemIdEql(old.item, new.item)) return false;
-        if (old.decl != new.decl) return false;
-        if (old.param_count != new.param_count) return false;
-        if (old.comptime_mask != new.comptime_mask) return false;
-        if (old.has_inferred_return != new.has_inferred_return) return false;
-        if (old.has_body != new.has_body) return false;
-        if (old.param_modes.len != new.param_modes.len) return false;
-        for (old.param_modes, new.param_modes) |om, nm| {
-            if (@intFromEnum(om) != @intFromEnum(nm)) return false;
+    return true;
+}
+
+fn analyzedAstEql(a: *const analyze.AnalyzedAst, b: *const analyze.AnalyzedAst) bool {
+    if (a.entry_function != b.entry_function) return false;
+    if (a.functions.items.len != b.functions.items.len) return false;
+    for (a.functions.items, b.functions.items) |oi, ni| {
+        if (oi.decl != ni.decl) return false;
+        if (!funcTypeEql(oi.ty.*, ni.ty.*)) return false;
+        if (!std.mem.eql(u8, std.mem.sliceAsBytes(oi.param_modes), std.mem.sliceAsBytes(ni.param_modes))) return false;
+        if (oi.has_explicit_return != ni.has_explicit_return) return false;
+        if (oi.is_monomorphized != ni.is_monomorphized) return false;
+    }
+    if (!hashMapTypeEql( a.node_types, b.node_types, analyze.typeEql)) return false;
+    if (!hashMapValueEql( a.field_index, b.field_index)) return false;
+    if (!hashMapTypeEql( a.decl_binding_types, b.decl_binding_types, analyze.typeEql)) return false;
+    if (!hashMapSliceEql( a.is_variant_tags, b.is_variant_tags)) return false;
+    if (!hashMapValueEql( a.query_none_tags, b.query_none_tags)) return false;
+    if (!hashMapComptimeValueEql( a.comptime_node_values, b.comptime_node_values)) return false;
+    if (!strHashMapComptimeValueEql(a.comptime_values, b.comptime_values)) return false;
+    return true;
+}
+
+fn programEql(gpa: std.mem.Allocator, a: *const ir_mod.Program, b: *const ir_mod.Program) bool {
+    const ba = query_cache.serializeProgram(gpa, a) catch return false;
+    defer gpa.free(ba);
+    const bb = query_cache.serializeProgram(gpa, b) catch return false;
+    defer gpa.free(bb);
+    return std.mem.eql(u8, ba, bb);
+}
+
+fn functionIREql(gpa: std.mem.Allocator, a: *const ir_mod.FunctionIR, b: *const ir_mod.FunctionIR) bool {
+    const ba = query_cache.serializeFunctionIR(gpa, a) catch return false;
+    defer gpa.free(ba);
+    const bb = query_cache.serializeFunctionIR(gpa, b) catch return false;
+    defer gpa.free(bb);
+    return std.mem.eql(u8, ba, bb);
+}
+
+fn itemTreeEql(a: *const discover.ItemTree, b: *const discover.ItemTree) bool {
+    if (a.source_id != b.source_id) return false;
+    if (!db.moduleIdEql(a.module_id, b.module_id)) return false;
+    if (a.items.items.len != b.items.items.len) return false;
+    for (a.items.items, b.items.items) |oi, ni| {
+        if (!db.itemIdEql(oi.id, ni.id)) return false;
+        if (!std.mem.eql(u8, oi.name, ni.name)) return false;
+        if (oi.decl != ni.decl) return false;
+        if (oi.body) |ob| {
+            const nb = ni.body orelse return false;
+            if (!db.itemIdEql(ob.owner, nb.owner)) return false;
+            if (ob.kind != nb.kind) return false;
+        } else if (ni.body != null) return false;
+    }
+    return true;
+}
+
+fn scopeSummaryEql(a: *const semantic_queries.ScopeSummary, b: *const semantic_queries.ScopeSummary) bool {
+    if (a.entries.len != b.entries.len) return false;
+    for (a.entries, b.entries) |oe, ne| {
+        if (!std.mem.eql(u8, oe.name, ne.name)) return false;
+        if (!db.itemIdEql(oe.item_id, ne.item_id)) return false;
+        if (oe.decl != ne.decl) return false;
+    }
+    return true;
+}
+
+fn resolvedItemEql(a: *const semantic_queries.ResolvedItem, b: *const semantic_queries.ResolvedItem) bool {
+    if (!db.itemIdEql(a.item, b.item)) return false;
+    if (a.decl != b.decl) return false;
+    if (a.node_refs.count() != b.node_refs.count()) return false;
+    var iter = a.node_refs.iterator();
+    while (iter.next()) |entry| {
+        const new_val = b.node_refs.get(entry.key_ptr.*) orelse return false;
+        const tag_a = std.meta.activeTag(entry.value_ptr.*);
+        const tag_b = std.meta.activeTag(new_val);
+        if (tag_a != tag_b) return false;
+        switch (entry.value_ptr.*) {
+            .local, .builtin_type => {},
+            .function => |id| if (id != new_val.function) return false,
+            .comptime_value => |decl| if (decl != new_val.comptime_value) return false,
+            .struct_decl => |decl| if (decl != new_val.struct_decl) return false,
         }
-        if (old.param_types.len != new.param_types.len) return false;
-        for (old.param_types, new.param_types) |ot, nt| {
-            if (!analyze.typeEql(ot, nt)) return false;
-        }
-        if (!analyze.typeEql(old.return_type, new.return_type)) return false;
-        return true;
     }
-    if (comptime T == semantic_queries.EffectiveSignature) {
-        const old = &a.?;
-        const new = &b.?;
-        if (!db.instanceIdEql(old.instance, new.instance)) return false;
-        if (old.function_id != new.function_id) return false;
-        if (old.decl != new.decl) return false;
-        if (old.param_count != new.param_count) return false;
-        if (old.has_inferred_return != new.has_inferred_return) return false;
-        if (old.has_explicit_return != new.has_explicit_return) return false;
-        return true;
+    return true;
+}
+
+fn headerSignatureEql(a: *const semantic_queries.HeaderSignature, b: *const semantic_queries.HeaderSignature) bool {
+    if (!db.itemIdEql(a.item, b.item)) return false;
+    if (a.decl != b.decl) return false;
+    if (a.param_count != b.param_count) return false;
+    if (a.comptime_mask != b.comptime_mask) return false;
+    if (a.has_inferred_return != b.has_inferred_return) return false;
+    if (a.has_body != b.has_body) return false;
+    if (a.param_modes.len != b.param_modes.len) return false;
+    for (a.param_modes, b.param_modes) |om, nm| {
+        if (@intFromEnum(om) != @intFromEnum(nm)) return false;
     }
-    if (comptime T == semantic_queries.BodyAnalysis) {
-        const old = &a.?;
-        const new = &b.?;
-        if (!db.instanceIdEql(old.instance, new.instance)) return false;
-        if (old.function_id != new.function_id) return false;
-        if (old.decl != new.decl) return false;
-        if (old.body != new.body) return false;
-        if (!hashMapTypeEql( old.node_types, new.node_types, analyze.typeEql)) return false;
-        if (!hashMapValueEql( old.field_index, new.field_index)) return false;
-        if (!hashMapInstanceIdEql( old.call_targets, new.call_targets)) return false;
-        if (!hashMapSliceEql( old.is_variant_tags, new.is_variant_tags)) return false;
-        if (!hashMapValueEql( old.query_none_tags, new.query_none_tags)) return false;
-        if (!hashMapTypeEql( old.decl_binding_types, new.decl_binding_types, analyze.typeEql)) return false;
-        return true;
+    if (a.param_types.len != b.param_types.len) return false;
+    for (a.param_types, b.param_types) |ot, nt| {
+        if (!analyze.typeEql(ot, nt)) return false;
     }
-    return false;
+    if (!analyze.typeEql(a.return_type, b.return_type)) return false;
+    return true;
+}
+
+fn effectiveSignatureEql(a: *const semantic_queries.EffectiveSignature, b: *const semantic_queries.EffectiveSignature) bool {
+    if (!db.instanceIdEql(a.instance, b.instance)) return false;
+    if (a.function_id != b.function_id) return false;
+    if (a.decl != b.decl) return false;
+    if (a.param_count != b.param_count) return false;
+    if (a.has_inferred_return != b.has_inferred_return) return false;
+    if (a.has_explicit_return != b.has_explicit_return) return false;
+    return true;
+}
+
+fn bodyAnalysisEql(a: *const semantic_queries.BodyAnalysis, b: *const semantic_queries.BodyAnalysis) bool {
+    if (!db.instanceIdEql(a.instance, b.instance)) return false;
+    if (a.function_id != b.function_id) return false;
+    if (a.decl != b.decl) return false;
+    if (a.body != b.body) return false;
+    if (!hashMapTypeEql( a.node_types, b.node_types, analyze.typeEql)) return false;
+    if (!hashMapValueEql( a.field_index, b.field_index)) return false;
+    if (!hashMapInstanceIdEql( a.call_targets, b.call_targets)) return false;
+    if (!hashMapSliceEql( a.is_variant_tags, b.is_variant_tags)) return false;
+    if (!hashMapValueEql( a.query_none_tags, b.query_none_tags)) return false;
+    if (!hashMapTypeEql( a.decl_binding_types, b.decl_binding_types, analyze.typeEql)) return false;
+    return true;
 }
 
 fn hashMapValueEql(a: anytype, b: anytype) bool {
@@ -411,8 +413,6 @@ pub const QueryDb = struct {
     effective_memos: std.AutoHashMap(db.InstanceId, db.Memo(semantic_queries.EffectiveSignature)),
     body_memos: std.AutoHashMap(db.InstanceId, db.Memo(semantic_queries.BodyAnalysis)),
     lower_body_memos: std.AutoHashMap(db.InstanceId, db.Memo(ir_mod.FunctionIR)),
-    codegen_memos: std.AutoHashMap(db.InstanceId, db.Memo(codegen.MachineFunction)),
-    link_memos: std.AutoHashMap(db.ProgramKey, db.Memo(codegen.LinkResult)),
     active_stack: std.ArrayList(ActiveQuery),
     stats: db.QueryStats,
 
@@ -444,8 +444,6 @@ pub const QueryDb = struct {
             .effective_memos = std.AutoHashMap(db.InstanceId, db.Memo(semantic_queries.EffectiveSignature)).init(gpa),
             .body_memos = std.AutoHashMap(db.InstanceId, db.Memo(semantic_queries.BodyAnalysis)).init(gpa),
             .lower_body_memos = std.AutoHashMap(db.InstanceId, db.Memo(ir_mod.FunctionIR)).init(gpa),
-            .codegen_memos = std.AutoHashMap(db.InstanceId, db.Memo(codegen.MachineFunction)).init(gpa),
-            .link_memos = std.AutoHashMap(db.ProgramKey, db.Memo(codegen.LinkResult)).init(gpa),
             .active_stack = .empty,
             .stats = .{},
         };
@@ -486,8 +484,6 @@ pub const QueryDb = struct {
         self.deinitMemoMap(semantic_queries.EffectiveSignature, &self.effective_memos);
         self.deinitMemoMap(semantic_queries.BodyAnalysis, &self.body_memos);
         self.deinitMemoMap(ir_mod.FunctionIR, &self.lower_body_memos);
-        self.deinitMemoMap(codegen.MachineFunction, &self.codegen_memos);
-        self.deinitMemoMap(codegen.LinkResult, &self.link_memos);
 
         for (self.active_stack.items) |*frame| {
             frame.deps.deinit(self.gpa);
@@ -638,14 +634,6 @@ pub const QueryDb = struct {
         const memo = try self.ensureLowerBodyMemo(instance_id);
         if (memo.value) |*v| return v;
         return null;
-    }
-
-    pub fn diagnosticsForFile(self: *@This(), source_id: db.SourceId) db.DbError![]const db.Diagnostic {
-        _ = self;
-        _ = source_id;
-        // diagnostics_for_file is a stub — in a full implementation it would
-        // aggregate diagnostics across all known memos for this source file.
-        return &.{};
     }
 
     pub fn statsSnapshot(self: *const @This()) QueryStats {
@@ -1018,64 +1006,13 @@ pub const QueryDb = struct {
         comptime stage: Stage,
     ) (db.DbError || std.mem.Allocator.Error)!*db.Memo(stageValueType(stage)) {
         const T = stageValueType(stage);
-        const memos = self.memosFor(stage);
-        const query_kind = db.QueryKind.fromStage(stage);
-        const query_key = queryFor(query_kind, source_id);
-        if (track_dependency) try self.noteQueryDependency(query_key);
-
-        if (memos.getPtr(source_id)) |memo| {
-            if (memo.computing) return error.QueryCycle;
-
-            if (memo.verified_at == self.revision) {
-                self.stats.hit(query_kind);
-                return memo;
+        const qk = queryFor(db.QueryKind.fromStage(stage), source_id);
+        const compute = struct {
+            fn f(ql: *QueryDb, sid: db.SourceId) (db.DbError || std.mem.Allocator.Error)!db.Memo(T) {
+                return ql.computeStage(sid, stage);
             }
-
-            if (try self.dependenciesUnchanged(memo.deps.items, memo.verified_at)) {
-                memo.verified_at = self.revision;
-                self.stats.hit(query_kind);
-                return memo;
-            }
-
-            self.stats.recompute(query_kind);
-            memo.computing = true;
-            defer memo.computing = false;
-
-            try self.beginQuery(query_key);
-            errdefer self.abortQuery();
-            var fresh = try self.computeStage(source_id, stage);
-            errdefer deinitMemo(T, &fresh, self.gpa);
-            const frame = self.endQuery();
-
-            const old_changed_at = memo.changed_at;
-            const same_value = memoValueEqual(T, self.gpa, memo.value, fresh.value);
-            const same_diagnostics = db.diagnosticsEqual(memo.diagnostics.items, fresh.diagnostics.items);
-
-            deinitMemo(T, memo, self.gpa);
-            memo.value = fresh.value;
-            memo.diagnostics = fresh.diagnostics;
-            memo.deps = frame.deps;
-            memo.verified_at = self.revision;
-            memo.changed_at = if (same_value and same_diagnostics) old_changed_at else self.revision;
-            return memo;
-        }
-
-        self.stats.recompute(query_kind);
-        try self.beginQuery(query_key);
-        errdefer self.abortQuery();
-        var fresh = try self.computeStage(source_id, stage);
-        errdefer deinitMemo(T, &fresh, self.gpa);
-        const frame = self.endQuery();
-        fresh.deps = frame.deps;
-        fresh.verified_at = self.revision;
-        fresh.changed_at = self.revision;
-
-        const old = try memos.fetchPut(source_id, fresh);
-        if (old) |kv| {
-            var old_memo = kv.value;
-            deinitMemo(T, &old_memo, self.gpa);
-        }
-        return memos.getPtr(source_id).?;
+        }.f;
+        return try self.ensureGeneric(T, self.memosFor(stage), source_id, qk, track_dependency, compute);
     }
 
     fn ensureGeneric(
@@ -1311,30 +1248,6 @@ pub const QueryDb = struct {
         return db.makeMemo(ir_mod.FunctionIR, null, .empty);
     }
 
-    // ── Codegen function ──
-
-    pub fn ensureCodegenMemo(self: *@This(), instance_id: db.InstanceId) (db.DbError || std.mem.Allocator.Error)!*db.Memo(codegen.MachineFunction) {
-        const qk = db.QueryKey{ .kind = .codegen_function, .source_id = instance_id.item.module.source_id, .instance_id = instance_id };
-        return self.ensureGeneric(codegen.MachineFunction, &self.codegen_memos, instance_id, qk, true, @This().computeCodegenFunction);
-    }
-
-    fn computeCodegenFunction(_: *@This(), instance_id: db.InstanceId) (db.DbError || std.mem.Allocator.Error)!db.Memo(codegen.MachineFunction) {
-        _ = instance_id;
-        return db.makeMemo(codegen.MachineFunction, null, .empty);
-    }
-
-    // ── Link program ──
-
-    pub fn ensureLinkMemo(self: *@This(), program_key: db.ProgramKey) (db.DbError || std.mem.Allocator.Error)!*db.Memo(codegen.LinkResult) {
-        const qk = db.QueryKey{ .kind = .link_program, .source_id = program_key.entry.item.module.source_id, .program_key = program_key };
-        return self.ensureGeneric(codegen.LinkResult, &self.link_memos, program_key, qk, true, @This().computeLinkProgram);
-    }
-
-    fn computeLinkProgram(_: *@This(), program_key: db.ProgramKey) (db.DbError || std.mem.Allocator.Error)!db.Memo(codegen.LinkResult) {
-        _ = program_key;
-        return db.makeMemo(codegen.LinkResult, null, .empty);
-    }
-
     fn dependenciesUnchanged(self: *@This(), deps: []const db.Dependency, verified_at: db.Revision) db.DbError!bool {
         for (deps) |dep| {
             self.stats.dependency_checks += 1;
@@ -1371,8 +1284,6 @@ pub const QueryDb = struct {
             .effective_signature => (try self.ensureEffectiveSignature(key.instance_id.?)).changed_at > revision,
             .check_body => (try self.ensureBodyAnalysis(key.instance_id.?)).changed_at > revision,
             .lower_body => (try self.ensureLowerBodyMemo(key.instance_id.?)).changed_at > revision,
-            .codegen_function => (try self.ensureCodegenMemo(key.instance_id.?)).changed_at > revision,
-            .link_program => (try self.ensureLinkMemo(key.program_key.?)).changed_at > revision,
             else => false,
         };
     }

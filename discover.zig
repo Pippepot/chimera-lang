@@ -24,7 +24,7 @@ pub const DiscoverMemo = db.Memo(ItemTree);
 
 pub fn computeDiscover(
     source_id: db.SourceId,
-    parse_memo: *const parser.ParseMemo,
+    parse_memo: *const db.Memo(parser.ParsedAst),
     gpa: std.mem.Allocator,
 ) error{OutOfMemory}!DiscoverMemo {
     var diagnostics_list = try db.initDiagnosticList(gpa, parse_memo.diagnostics.items, 0);
