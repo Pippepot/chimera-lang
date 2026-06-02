@@ -179,7 +179,8 @@ pub const AnalyzedAst = struct {
     ownership_specs: std.StringHashMap(OwnershipSpec),
     functions: std.ArrayList(FunctionInfo),
     entry_function: u32,
-    call_monomorph_targets: std.AutoHashMap(ast.NodeIdx, u32),
+    call_monomorph_targets: std.AutoHashMap(ast.NodeIdx, db.InstanceId),
+    monomorph_instances: std.AutoHashMap(db.InstanceId, u32),
 
     pub fn init(gpa: std.mem.Allocator, parsed_ast: *const ast.Ast) AnalyzedAst {
         return .{
@@ -198,7 +199,8 @@ pub const AnalyzedAst = struct {
             .ownership_specs = std.StringHashMap(OwnershipSpec).init(gpa),
             .functions = std.ArrayList(FunctionInfo).empty,
             .entry_function = 0,
-            .call_monomorph_targets = std.AutoHashMap(ast.NodeIdx, u32).init(gpa),
+            .call_monomorph_targets = std.AutoHashMap(ast.NodeIdx, db.InstanceId).init(gpa),
+            .monomorph_instances = std.AutoHashMap(db.InstanceId, u32).init(gpa),
         };
     }
 
@@ -215,6 +217,7 @@ pub const AnalyzedAst = struct {
         self.ownership_specs.deinit();
         self.functions.deinit(self.gpa);
         self.call_monomorph_targets.deinit();
+        self.monomorph_instances.deinit();
         self.arena.deinit();
     }
 
@@ -244,6 +247,77 @@ pub fn typeName(ty: Type) []const u8 {
         .func => "function",
         .variant => "variant",
     };
+}
+
+fn hashCombine(h: u64, x: u64) u64 {
+    return h ^ (x +% 0x9e3779b9 +% (h << 6) +% (h >> 2));
+}
+
+pub fn hashType(ty: Type) u64 {
+    return switch (ty) {
+        .unit => 0,
+        .bool => 1,
+        .int => 2,
+        .float => 3,
+        .type_type => 4,
+        .none => 5,
+        .named => |name| blk: {
+            var h: u64 = 6;
+            for (name) |b| h = hashCombine(h, b);
+            break :blk h;
+        },
+        .func => |f| blk: {
+            var h: u64 = 7;
+            for (f.params) |p| h = hashCombine(h, hashType(p));
+            h = hashCombine(h, hashType(f.ret));
+            break :blk h;
+        },
+        .variant => |v| blk: {
+            var h: u64 = 8;
+            for (v.members) |m| h = hashCombine(h, hashType(m));
+            break :blk h;
+        },
+    };
+}
+
+pub fn hashComptimeValue(value: ComptimeValue) u64 {
+    return switch (value) {
+        .unit => 0,
+        .none => 1,
+        .bool => |b| if (b) @as(u64, 2) else 3,
+        .int => |i| blk: {
+            const base: u64 = 4;
+            break :blk hashCombine(base, @as(u64, @intCast(@as(u32, @bitCast(i)))));
+        },
+        .float => |f| blk: {
+            const base: u64 = 5;
+            break :blk hashCombine(base, @as(u64, @intCast(@as(u32, @bitCast(f)))));
+        },
+        .func => |fn_id| blk: {
+            const base: u64 = 6;
+            break :blk hashCombine(base, fn_id);
+        },
+        .struct_type => |decl_idx| blk: {
+            const base: u64 = 7;
+            break :blk hashCombine(base, decl_idx);
+        },
+        .struct_value => |sv| blk: {
+            var h: u64 = 8;
+            h = hashCombine(h, hashType(.{ .named = @as([]const u8, "") }));
+            for (sv.fields) |f| h = hashCombine(h, hashComptimeValue(f));
+            break :blk h;
+        },
+        .type_value => |ty| blk: {
+            const base: u64 = 9;
+            break :blk hashCombine(base, hashType(ty));
+        },
+    };
+}
+
+pub fn hashComptimeArgs(values: []const ComptimeValue) u64 {
+    var h: u64 = 0;
+    for (values) |v| h = hashCombine(h, hashComptimeValue(v));
+    return h;
 }
 
 pub fn typeErrorMessage(kind: TypeError) []const u8 {
@@ -330,7 +404,7 @@ const Binding = struct {
         typed: AnalyzedAst,
         bindings: scope_mod.ScopeStack(Binding),
         comptime_decl_state: std.AutoHashMap(ast.NodeIdx, DeclState),
-        monomorph_cache: std.StringHashMap(u32),
+        monomorph_cache: std.AutoHashMap(u64, u32),
         ownership_in_progress: std.StringHashMap(void),
         failure: ?Failure,
         in_fallible_scope: bool,
@@ -381,7 +455,7 @@ const Binding = struct {
             .typed = AnalyzedAst.init(gpa, &parsed.ast),
             .bindings = scope_mod.ScopeStack(Binding).init(),
             .comptime_decl_state = std.AutoHashMap(ast.NodeIdx, DeclState).init(gpa),
-            .monomorph_cache = std.StringHashMap(u32).init(gpa),
+            .monomorph_cache = std.AutoHashMap(u64, u32).init(gpa),
             .ownership_in_progress = std.StringHashMap(void).init(gpa),
             .failure = null,
             .in_fallible_scope = false,
@@ -1051,8 +1125,10 @@ const Binding = struct {
     }
 
     fn callParamModes(self: *@This(), call_idx: ast.NodeIdx, callee: ast.NodeIdx) []const ast.ParamAccessMode {
-        if (self.typed.call_monomorph_targets.get(call_idx)) |fn_id| {
-            if (fn_id < self.typed.functions.items.len) return self.typed.functions.items[fn_id].param_modes;
+        if (self.typed.call_monomorph_targets.get(call_idx)) |target_instance_id| {
+            if (self.typed.monomorph_instances.get(target_instance_id)) |fn_id| {
+                if (fn_id < self.typed.functions.items.len) return self.typed.functions.items[fn_id].param_modes;
+            }
         }
         if (self.resolved.node_refs.get(callee)) |ref| {
             if (ref == .function) {
@@ -1677,22 +1753,24 @@ const Binding = struct {
             }
         }
 
-        // Build cache key
-        const fn_name = a.identOf(a.nodes[func_decl].data0);
-        var key_buf = try std.ArrayList(u8).initCapacity(self.gpa, 64);
-        defer key_buf.deinit(self.gpa);
-        try key_buf.appendSlice(self.gpa, fn_name);
-        for (comptime_types.items) |ct| {
-            try key_buf.append(self.gpa, '$');
-            try key_buf.appendSlice(self.gpa, typeName(ct));
-        }
-        const key = key_buf.items;
+        // Build InstanceId from base item + comptime args hash
+        const name_hash = @as(u64, func_decl);
+        const item_id: db.ItemId = .{
+            .module = .{ .package_id = 0, .source_id = 0 },
+            .kind = .function,
+            .name_hash = name_hash,
+        };
+        const args_hash = hashComptimeArgs(comptime_values.items);
+        const instance_id: db.InstanceId = .{
+            .item = item_id,
+            .comptime_args_hash = args_hash,
+        };
 
-        // Check cache
-        if (self.monomorph_cache.get(key)) |existing_fn_id| {
+        // Check cache by InstanceId
+        if (self.typed.monomorph_instances.get(instance_id)) |existing_fn_id| {
             const mono_info = self.typed.functions.items[existing_fn_id];
             try self.checkRuntimeArgs(call_idx, runtime_arg_nodes.items, mono_info.ty.params);
-            try self.typed.call_monomorph_targets.put(call_idx, existing_fn_id);
+            try self.typed.call_monomorph_targets.put(call_idx, instance_id);
             return self.remember(call_idx, mono_info.ty.ret);
         }
 
@@ -1735,12 +1813,14 @@ const Binding = struct {
             .is_monomorphized = true,
         });
 
-        // Cache
-        const owned_key = try self.typed.arena.allocator().dupe(u8, key);
-        try self.monomorph_cache.put(owned_key, new_fn_id);
+        // Cache by hash
+        try self.monomorph_cache.put(args_hash, new_fn_id);
 
-        // Record this call node -> monomorphized function mapping
-        try self.typed.call_monomorph_targets.put(call_idx, new_fn_id);
+        // Record the InstanceId -> function_id mapping
+        try self.typed.monomorph_instances.put(instance_id, new_fn_id);
+
+        // Record this call node -> InstanceId mapping
+        try self.typed.call_monomorph_targets.put(call_idx, instance_id);
 
         try self.checkRuntimeArgs(call_idx, runtime_arg_nodes.items, mono_fn_ty.params);
 

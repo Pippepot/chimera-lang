@@ -1,5 +1,6 @@
 comptime foo = func()
-  print(1)
+  print(3)
+  return 1
 
+comptime b = 23 * 304
 
-foo()

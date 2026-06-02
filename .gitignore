@@ -1,8 +1,7 @@
-/prog
-/main
-/chimera.asm
-/chimera.o
-/.zig-cache/
-.qcache
+prog
+main
+chimera.asm
+chimera.o
+.zig-cache/
 *.qcache
-.agents/main
+*.o

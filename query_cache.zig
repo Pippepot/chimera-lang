@@ -10,8 +10,8 @@ const analyze = @import("analyze.zig");
 
 const CacheExt = ".qcache";
 const Magic: [8]u8 = .{ 'X', '8', '6', 'Q', 'C', 'A', 'C', 'H' };
-const SchemaVersion: u32 = 11;
-const CompilerAbiVersion: u32 = 8;
+const SchemaVersion: u32 = 13;
+const CompilerAbiVersion: u32 = 9;
 
 pub const CacheOptions = struct {
     cache_dir_override: ?[]const u8 = null,
@@ -27,6 +27,8 @@ pub const StageSnapshot = struct {
 pub const SavePayload = struct {
     source_path: []const u8,
     source_text: []const u8,
+    ast_hash: u64,
+    ir_hash: u64,
     parse: StageSnapshot,
     resolve: StageSnapshot,
     typecheck: StageSnapshot,
@@ -172,6 +174,8 @@ fn serialize(gpa: std.mem.Allocator, payload: SavePayload) ![]u8 {
     try appendU32(&buf, gpa, SchemaVersion);
     try appendU64(&buf, gpa, compilerFingerprint());
     try appendU64(&buf, gpa, sourceHash(payload.source_text));
+    try appendU64(&buf, gpa, payload.ast_hash);
+    try appendU64(&buf, gpa, payload.ir_hash);
     try appendBytes(&buf, gpa, payload.source_path);
 
     inline for (.{ payload.parse, payload.resolve, payload.typecheck, payload.lower, payload.compile }) |s| {
@@ -565,6 +569,27 @@ pub fn serializeProgram(gpa: std.mem.Allocator, prog: *const ir_mod.Program) ![]
     for (prog.functions.items) |*func| try writeFunction(&buf, gpa, func.*);
 
     try appendU32(&buf, gpa, prog.entry);
+
+    return buf.toOwnedSlice(gpa);
+}
+
+pub fn serializeFunctionIR(gpa: std.mem.Allocator, fir: *const ir_mod.FunctionIR) ![]u8 {
+    var buf = try std.ArrayList(u8).initCapacity(gpa, 4096);
+    errdefer buf.deinit(gpa);
+
+    try writeFunction(&buf, gpa, fir.func);
+
+    try appendU32(&buf, gpa, @intCast(fir.symbols.items.len));
+    for (fir.symbols.items) |s| {
+        try appendBytes(&buf, gpa, s);
+    }
+
+    try appendU32(&buf, gpa, @intCast(fir.func_types.items.len));
+    for (fir.func_types.items) |ft| {
+        try appendU32(&buf, gpa, @intCast(ft.params.len));
+        for (ft.params) |p| try writeType(&buf, gpa, p);
+        try writeType(&buf, gpa, ft.ret);
+    }
 
     return buf.toOwnedSlice(gpa);
 }
@@ -1016,7 +1041,7 @@ pub fn deserializeParsed(gpa: std.mem.Allocator, data: []const u8) !parser.Parse
     };
 }
 
-fn deserialize(gpa: std.mem.Allocator, file_data: []u8, expected_source_hash: u64) LoadError!?LoadPayload {
+fn deserialize(gpa: std.mem.Allocator, file_data: []u8, expected_source_hash: u64, expected_ast_hash: ?u64, expected_ir_hash: ?u64) LoadError!?LoadPayload {
     var r = Reader{ .data = file_data };
 
     const magic = try r.readSlice(Magic.len);
@@ -1029,7 +1054,25 @@ fn deserialize(gpa: std.mem.Allocator, file_data: []u8, expected_source_hash: u6
     if (compiler != compilerFingerprint()) return error.InvalidCompiler;
 
     const cached_source_hash = try r.readU64();
-    if (cached_source_hash != expected_source_hash) return null;
+    const cached_ast_hash = try r.readU64();
+    const cached_ir_hash = try r.readU64();
+    if (cached_source_hash == expected_source_hash) {
+        // Source hash matches — fast path
+    } else if (expected_ast_hash) |ast_hash| {
+        if (cached_ast_hash == ast_hash) {
+            // AST hash matches — use cached data despite different source text
+        } else if (expected_ir_hash) |ir_hash| {
+            if (cached_ir_hash != ir_hash) return null;
+            // Lowered IR hash matches — use cached compile despite different source/AST
+        } else {
+            return null;
+        }
+    } else if (expected_ir_hash) |ir_hash| {
+        if (cached_ir_hash != ir_hash) return null;
+        // Lowered IR hash matches — use cached compile despite different source/AST
+    } else {
+        return null;
+    }
 
     _ = try r.readBytes(); // stored source path; currently informational only
 
@@ -1086,7 +1129,7 @@ pub fn save(io: std.Io, gpa: std.mem.Allocator, options: CacheOptions, payload: 
     try writeAtomically(io, gpa, cache_path, bytes);
 }
 
-pub fn load(io: std.Io, gpa: std.mem.Allocator, options: CacheOptions, source_path: []const u8, source_text: []const u8) !?LoadPayload {
+pub fn load(io: std.Io, gpa: std.mem.Allocator, options: CacheOptions, source_path: []const u8, source_text: []const u8, ast_hash: ?u64, ir_hash: ?u64) !?LoadPayload {
     const cache_path = try cachePathForSource(gpa, source_path, options);
     defer gpa.free(cache_path);
 
@@ -1096,7 +1139,7 @@ pub fn load(io: std.Io, gpa: std.mem.Allocator, options: CacheOptions, source_pa
     };
 
     const expected_hash = sourceHash(source_text);
-    const result = deserialize(gpa, data, expected_hash) catch {
+    const result = deserialize(gpa, data, expected_hash, ast_hash, ir_hash) catch {
         gpa.free(data);
         return null;
     };

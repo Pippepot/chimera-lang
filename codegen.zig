@@ -1382,6 +1382,24 @@ fn buildElfExecutable(code: []const u8, entry_code_offset: u64, program_code_len
 
 pub const CompileMemo = db.Memo([]const u8);
 
+pub const MachineFunction = struct {
+    instance: db.InstanceId,
+    code: []const u8,
+    call_fixups: std.ArrayList(struct { offset: u32, target: db.InstanceId }),
+
+    pub fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
+        gpa.free(self.code);
+        self.call_fixups.deinit(gpa);
+    }
+};
+
+pub const LinkResult = struct {
+    bytes: []const u8,
+    pub fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
+        gpa.free(self.bytes);
+    }
+};
+
 pub fn computeCompile(lower_memo: *const ir_mod.LowerMemo, gpa: std.mem.Allocator) error{OutOfMemory}!CompileMemo {
     var diagnostics_list = try db.initDiagnosticList(gpa, lower_memo.diagnostics.items, 1);
     errdefer diagnostics_list.deinit(gpa);

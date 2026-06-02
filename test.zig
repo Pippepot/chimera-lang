@@ -391,11 +391,11 @@ test "query cache hits within same revision includes resolve" {
     _ = try expectCompileOk(&db, 0);
 
     const stats = db.statsSnapshot();
-    try testing.expectEqual(@as(usize, 1), stats.hits[@intFromEnum(query.Stage.parse)]);
-    try testing.expectEqual(@as(usize, 1), stats.hits[@intFromEnum(query.Stage.resolve)]);
-    try testing.expectEqual(@as(usize, 1), stats.hits[@intFromEnum(query.Stage.typecheck)]);
-    try testing.expectEqual(@as(usize, 1), stats.hits[@intFromEnum(query.Stage.lower)]);
-    try testing.expectEqual(@as(usize, 1), stats.hits[@intFromEnum(query.Stage.compile)]);
+    try testing.expectEqual(@as(usize, 1), stats.hits[@intFromEnum(query.QueryKind.parse)]);
+    try testing.expectEqual(@as(usize, 1), stats.hits[@intFromEnum(query.QueryKind.resolve)]);
+    try testing.expectEqual(@as(usize, 1), stats.hits[@intFromEnum(query.QueryKind.typecheck)]);
+    try testing.expectEqual(@as(usize, 1), stats.hits[@intFromEnum(query.QueryKind.lower)]);
+    try testing.expectEqual(@as(usize, 1), stats.hits[@intFromEnum(query.QueryKind.compile)]);
 }
 
 test "source change invalidates all stages" {
@@ -411,11 +411,47 @@ test "source change invalidates all stages" {
     _ = try expectCompileOk(&db, 0);
 
     const stats = db.statsSnapshot();
-    try testing.expectEqual(@as(usize, 1), stats.recomputes[@intFromEnum(query.Stage.parse)]);
-    try testing.expectEqual(@as(usize, 1), stats.recomputes[@intFromEnum(query.Stage.resolve)]);
-    try testing.expectEqual(@as(usize, 1), stats.recomputes[@intFromEnum(query.Stage.typecheck)]);
-    try testing.expectEqual(@as(usize, 1), stats.recomputes[@intFromEnum(query.Stage.lower)]);
-    try testing.expectEqual(@as(usize, 1), stats.recomputes[@intFromEnum(query.Stage.compile)]);
+    try testing.expectEqual(@as(usize, 1), stats.recomputes[@intFromEnum(query.QueryKind.parse)]);
+    try testing.expectEqual(@as(usize, 1), stats.recomputes[@intFromEnum(query.QueryKind.resolve)]);
+    try testing.expectEqual(@as(usize, 1), stats.recomputes[@intFromEnum(query.QueryKind.typecheck)]);
+    try testing.expectEqual(@as(usize, 1), stats.recomputes[@intFromEnum(query.QueryKind.lower)]);
+    try testing.expectEqual(@as(usize, 1), stats.recomputes[@intFromEnum(query.QueryKind.compile)]);
+}
+
+test "whitespace-only change does not recompute downstream stages" {
+    var db = query.QueryDb.init(testing.allocator);
+    defer db.deinit();
+
+    try db.setSource(0,
+        \\comptime f = func() int
+        \\  return 10
+        \\comptime g = func() int
+        \\  return 20
+        \\print(f())
+        \\print(g())
+    );
+    _ = try expectCompileOk(&db, 0);
+
+    db.resetStats();
+
+    try db.setSource(0,
+        \\comptime f = func() int
+        \\  return 10
+        \\
+        \\comptime g = func() int
+        \\  return 20
+        \\
+        \\print(f())
+        \\print(g())
+    );
+    _ = try expectCompileOk(&db, 0);
+
+    const stats = db.statsSnapshot();
+    try testing.expectEqual(@as(usize, 1), stats.recomputes[@intFromEnum(query.QueryKind.parse)]);
+    try testing.expectEqual(@as(usize, 0), stats.recomputes[@intFromEnum(query.QueryKind.resolve)]);
+    try testing.expectEqual(@as(usize, 0), stats.recomputes[@intFromEnum(query.QueryKind.typecheck)]);
+    try testing.expectEqual(@as(usize, 0), stats.recomputes[@intFromEnum(query.QueryKind.lower)]);
+    try testing.expectEqual(@as(usize, 0), stats.recomputes[@intFromEnum(query.QueryKind.compile)]);
 }
 
 test "compile changed_at backdates on equal output" {
@@ -440,8 +476,8 @@ test "debug query diagnostics format includes resolve" {
     const stats = query.QueryStats{
         .revision = 7,
         .source_sets = 2,
-        .hits = .{ 3, 4, 5, 0, 0 },
-        .recomputes = .{ 0, 0, 0, 0, 1 },
+        .hits = .{ 3, 4, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+        .recomputes = .{ 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
         .dependency_checks = 5,
     };
     try stats.print(&buf, testing.allocator);
@@ -762,8 +798,8 @@ test "comptime function monomorphization caching" {
     db.resetStats();
     _ = try expectCompileOk(&db, 0);
     const stats = db.statsSnapshot();
-    try testing.expect(stats.hits[@intFromEnum(query.Stage.compile)] >= 1);
-    try testing.expectEqual(@as(usize, 0), stats.recomputes[@intFromEnum(query.Stage.compile)]);
+    try testing.expect(stats.hits[@intFromEnum(query.QueryKind.compile)] >= 1);
+    try testing.expectEqual(@as(usize, 0), stats.recomputes[@intFromEnum(query.QueryKind.compile)]);
 
 }
 
@@ -900,8 +936,8 @@ test "monomorphized function caching across same revision" {
     db.resetStats();
     _ = try expectCompileOk(&db, 0);
     const stats = db.statsSnapshot();
-    try testing.expect(stats.hits[@intFromEnum(query.Stage.compile)] >= 1);
-    try testing.expectEqual(@as(usize, 0), stats.recomputes[@intFromEnum(query.Stage.compile)]);
+    try testing.expect(stats.hits[@intFromEnum(query.QueryKind.compile)] >= 1);
+    try testing.expectEqual(@as(usize, 0), stats.recomputes[@intFromEnum(query.QueryKind.compile)]);
 }
 
 test "comptime pure-function with comptime-only param and struct arg" {
@@ -1002,8 +1038,8 @@ test "persistent cache reuses compile result across db instances" {
         db.resetStats();
         _ = try expectCompileOk(&db, 0);
         const stats = db.statsSnapshot();
-        try testing.expect(stats.hits[@intFromEnum(query.Stage.compile)] >= 1);
-        try testing.expectEqual(@as(usize, 0), stats.recomputes[@intFromEnum(query.Stage.compile)]);
+        try testing.expect(stats.hits[@intFromEnum(query.QueryKind.compile)] >= 1);
+        try testing.expectEqual(@as(usize, 0), stats.recomputes[@intFromEnum(query.QueryKind.compile)]);
     }
 }
 
@@ -1026,8 +1062,8 @@ test "persistent cache disable option bypasses disk cache" {
         db.resetStats();
         _ = try expectCompileOk(&db, 0);
         const stats = db.statsSnapshot();
-        try testing.expectEqual(@as(usize, 0), stats.hits[@intFromEnum(query.Stage.compile)]);
-        try testing.expectEqual(@as(usize, 1), stats.recomputes[@intFromEnum(query.Stage.compile)]);
+        try testing.expectEqual(@as(usize, 0), stats.hits[@intFromEnum(query.QueryKind.compile)]);
+        try testing.expectEqual(@as(usize, 1), stats.recomputes[@intFromEnum(query.QueryKind.compile)]);
     }
 }
 
@@ -1050,7 +1086,7 @@ test "persistent cache stores compile failures and diagnostics" {
         db.resetStats();
         try expectCompileErrorContains(&db, 0, "unknown symbol");
         const stats = db.statsSnapshot();
-        try testing.expect(stats.hits[@intFromEnum(query.Stage.compile)] >= 1);
+        try testing.expect(stats.hits[@intFromEnum(query.QueryKind.compile)] >= 1);
     }
 }
 
@@ -1078,7 +1114,7 @@ test "corrupted persistent cache is ignored and rebuilt" {
         db.resetStats();
         _ = try expectCompileOk(&db, 0);
         const stats = db.statsSnapshot();
-        try testing.expectEqual(@as(usize, 1), stats.recomputes[@intFromEnum(query.Stage.compile)]);
+        try testing.expectEqual(@as(usize, 1), stats.recomputes[@intFromEnum(query.QueryKind.compile)]);
     }
 }
 
@@ -1091,6 +1127,8 @@ test "persistent cache load frees data on hash mismatch (regression)" {
     try query_cache.save(testing.io, testing.allocator, .{}, .{
         .source_path = pt.source_path,
         .source_text = source_text,
+        .ast_hash = 0,
+        .ir_hash = 0,
         .parse = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
         .resolve = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
         .typecheck = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
@@ -1098,7 +1136,7 @@ test "persistent cache load frees data on hash mismatch (regression)" {
         .compile = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
     });
 
-    const result = try query_cache.load(testing.io, testing.allocator, .{}, pt.source_path, different_text);
+    const result = try query_cache.load(testing.io, testing.allocator, .{}, pt.source_path, different_text, null, null);
     try testing.expect(result == null);
 }
 
@@ -1127,6 +1165,8 @@ test "stale cache files are removed by eager sweep" {
     try query_cache.save(testing.io, testing.allocator, .{}, .{
         .source_path = stale_source,
         .source_text = source_text,
+        .ast_hash = 0,
+        .ir_hash = 0,
         .parse = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
         .resolve = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
         .typecheck = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
@@ -1149,6 +1189,40 @@ test "stale cache files are removed by eager sweep" {
     return error.TestFailed;
 }
 
+test "persistent cache reuses compile when IR matches despite different AST" {
+    const src_inferred  = "comptime foo = func()\n  print(42)\nfoo()";
+    const src_explicit  = "comptime foo = func() unit\n  print(42)\nfoo()";
+    var pt = try PersistTest.init("persist_ir_phase3.chi", src_inferred);
+    defer pt.deinit();
+
+    // First db — compile with inferred return type, saves cache
+    {
+        var db = initCacheDb(true);
+        defer db.deinit();
+        try db.setSourceFile(0, pt.source_path, src_inferred);
+        _ = try expectCompileOk(&db, 0);
+    }
+
+    // Overwrite source with explicit return type but identical program
+    try std.Io.Dir.cwd().writeFile(testing.io, .{
+        .sub_path = pt.source_path,
+        .data = src_explicit,
+    });
+
+    // Second db — compile with explicit return type, should hit phase 3
+    {
+        var db = initCacheDb(true);
+        defer db.deinit();
+        try db.setSourceFile(0, pt.source_path, src_explicit);
+        db.resetStats();
+        _ = try expectCompileOk(&db, 0);
+        const stats = db.statsSnapshot();
+        // Compile should be a hit (loaded from phase 3 cache)
+        try testing.expect(stats.hits[@intFromEnum(query.QueryKind.compile)] >= 1);
+        try testing.expectEqual(@as(usize, 0), stats.recomputes[@intFromEnum(query.QueryKind.compile)]);
+    }
+}
+
 test "persistent cache partial load failure frees partial allocations" {
     const source_text = "const x = 42\n";
     var pt = try PersistTest.init("persist_partial_fail.chi", source_text);
@@ -1168,6 +1242,8 @@ test "persistent cache partial load failure frees partial allocations" {
     try query_cache.save(testing.io, testing.allocator, .{}, .{
         .source_path = pt.source_path,
         .source_text = source_text,
+        .ast_hash = 0,
+        .ir_hash = 0,
         .parse = .{ .changed_at = 1, .has_value = true, .diagnostics = &.{}, .bytes = parse_bytes },
         .resolve = .{ .changed_at = 1, .has_value = true, .diagnostics = &.{}, .bytes = resolve_garbage },
         .typecheck = .{ .changed_at = 1, .has_value = false, .diagnostics = &.{}, .bytes = null },
@@ -1843,15 +1919,15 @@ test "second compile with no changes has zero recomputes" {
     _ = try expectCompileOk(&db, 0);
 
     const stats = db.statsSnapshot();
-    try testing.expectEqual(@as(usize, 0), stats.recomputes[@intFromEnum(query.Stage.parse)]);
-    try testing.expectEqual(@as(usize, 0), stats.recomputes[@intFromEnum(query.Stage.resolve)]);
-    try testing.expectEqual(@as(usize, 0), stats.recomputes[@intFromEnum(query.Stage.typecheck)]);
-    try testing.expectEqual(@as(usize, 0), stats.recomputes[@intFromEnum(query.Stage.lower)]);
-    try testing.expectEqual(@as(usize, 0), stats.hits[@intFromEnum(query.Stage.parse)]);
-    try testing.expectEqual(@as(usize, 0), stats.hits[@intFromEnum(query.Stage.resolve)]);
-    try testing.expectEqual(@as(usize, 0), stats.hits[@intFromEnum(query.Stage.typecheck)]);
-    try testing.expectEqual(@as(usize, 0), stats.hits[@intFromEnum(query.Stage.lower)]);
-    try testing.expectEqual(@as(usize, 1), stats.hits[@intFromEnum(query.Stage.compile)]);
+    try testing.expectEqual(@as(usize, 0), stats.recomputes[@intFromEnum(query.QueryKind.parse)]);
+    try testing.expectEqual(@as(usize, 0), stats.recomputes[@intFromEnum(query.QueryKind.resolve)]);
+    try testing.expectEqual(@as(usize, 0), stats.recomputes[@intFromEnum(query.QueryKind.typecheck)]);
+    try testing.expectEqual(@as(usize, 0), stats.recomputes[@intFromEnum(query.QueryKind.lower)]);
+    try testing.expectEqual(@as(usize, 0), stats.hits[@intFromEnum(query.QueryKind.parse)]);
+    try testing.expectEqual(@as(usize, 0), stats.hits[@intFromEnum(query.QueryKind.resolve)]);
+    try testing.expectEqual(@as(usize, 0), stats.hits[@intFromEnum(query.QueryKind.typecheck)]);
+    try testing.expectEqual(@as(usize, 0), stats.hits[@intFromEnum(query.QueryKind.lower)]);
+    try testing.expectEqual(@as(usize, 1), stats.hits[@intFromEnum(query.QueryKind.compile)]);
 }
 
 // ── none type tests ──

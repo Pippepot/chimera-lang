@@ -1050,7 +1050,6 @@ const Parser = struct {
 
             if (std.mem.eql(u8, key, "move") or std.mem.eql(u8, key, "copy") or std.mem.eql(u8, key, "drop")) {
                 try self.expect(.assign, error.UnexpectedToken);
-                try self.advance();
                 const prop: PolicyProperty = if (std.mem.eql(u8, key, "move")) .move else if (std.mem.eql(u8, key, "copy")) .copy else .drop;
                 const saw_ptr: *bool = switch (prop) { .move => &saw_move, .copy => &saw_copy, .drop => &saw_drop };
                 if (saw_ptr.*) return error.UnexpectedToken;

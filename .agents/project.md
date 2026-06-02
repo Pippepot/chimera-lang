@@ -22,11 +22,13 @@ This compiler now supports a declaration-first language with optional top-level 
 | `parser.zig` | **Rewritten** — builds flat arrays via `AstBuilder`, returns `NodeIdx` not `*const AstNode`, `AstBuilder.seal()` packs contiguous backing buffer; includes ownership grammar (`move/copy/drop`, `read/mut/var/deinit`, postfix `^`) |
 | `resolver.zig` | **Rewritten** — `NodeIdx` keys, flat AST accessors, no `*const AstNode`/`*const ast.Module` |
 | `analyze.zig` | Active semantic analysis/type inference/comptime stage (`AnalyzedAst`) + ownership policy/default validation + ownership-flow checks |
-| `db.zig` | Shared query types/stats/deps/memo helpers + diagnostics formatting (was `diagnostics.zig`) |
+| `db.zig` | Shared query/stable identity types, stats/deps/memo helpers + diagnostics formatting (was `diagnostics.zig`) |
+| `discover.zig` | Item discovery query result for stable top-level item/body identities |
+| `semantic_queries.zig` | Granular semantic query result types for headers, effective signatures, and checked bodies |
 | `ir.zig` | Flat AST dispatch via `ast.nodes[idx].tag` and accessors; ownership-aware lowering and borrow-pointer call path |
 | `codegen.zig` | IR->x86 + ELF, backdate support, records `program_code_len` in ELF padding |
 | `disasm.zig` | Pattern-based x86 disassembler (80-entry table), two-pass label collection, resilient unknown-byte fallback, used by `--debug=asm` |
-| `query.zig` | Generic `ensureMemo`, 5-stage pipeline, persistent cache load/save |
+| `query.zig` | Generic `ensureMemo`, 5-stage pipeline + item discovery query, persistent cache load/save |
 | `query_cache.zig` | Buffer-copy ser/des for all active stages, persistent cache |
 | `debug.zig` | Flat AST dispatch, debug flag parsing (ast/ssa/asm/timing/query) |
 | `runtime.zig` | Runtime helpers (`writeProgram`, `runProg`) — unchanged |
@@ -36,13 +38,21 @@ This compiler now supports a declaration-first language with optional top-level 
 
 ## Query architecture
 
-`QueryDb` stages (5-stage pipeline):
+`QueryDb` stages (5-stage pipeline plus initial granular item discovery):
 
 1. `parse(source_id)` -> `ParsedAst`
 2. `resolve(source_id)` -> `ResolvedAst`
 3. `typecheck(source_id)` -> `AnalyzedAst`
 4. `lower(source_id)` -> `Program`
 5. `compile(source_id)` -> `[]const u8`
+
+Granular foundation:
+
+- `discover_items(module_id)` -> `ItemTree`
+- `header_signature(item_id)` -> `HeaderSignature`
+- `effective_signature(instance_id)` -> `EffectiveSignature`
+- `check_body(instance_id)` -> `BodyAnalysis`
+- `QueryKey` now carries future package/module/item/body/type/instance/comptime/program identities while preserving stage compatibility.
 
 ### Red/green behavior
 
@@ -75,10 +85,10 @@ All 5 stages must be cached with `hits=1 recomputes=0` when cache is present. Th
 - **ir.zig** ✅ — Flat AST dispatch, `Type.type_type`, ownership-mode lowering (`read`/`mut` by-pointer, `var`/`deinit` transfer), ownership hook-call lowering, deps: analyze
 - **codegen.zig** ✅ — IR->x86 + ELF, backdate support, `program_code_len` in ELF padding, pointer load/store helpers for borrow path, deps: lower
 - **disasm.zig** ✅ — Pattern-based x86 disassembler, 80-entry table, two-pass label resolution, resilient decode fallback
-- **query.zig** ✅ — Generic `ensureMemo`, 5-stage pipeline, persistent cache load/save
+- **query.zig** ✅ — Generic `ensureMemo`, 5-stage pipeline, item discovery query, persistent cache load/save
 - **query_cache.zig** ✅ — Buffer-copy ser/des for all active stages, `type_type` and `type_value` serialization, ownership mode/function metadata and new IR inst serialization
 - **main.zig** ✅ — CLI, persistent cache
-- **test.zig** ✅ — All 145 tests pass including ownership parser/semantic/runtime cases plus prior monomorphization, variant, `none`/`?`, and cache suites
+- **test.zig** ✅ — All 163 tests pass including ownership parser/semantic/runtime cases plus prior monomorphization, variant, `none`/`?`, query discovery/semantic queries, and cache suites
 
 ## Language notes
 

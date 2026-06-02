@@ -239,6 +239,8 @@
 
 - **Moving a local `ArrayList` into a memo field transfers ownership.** Do NOT `defer list.deinit(gpa)` on a list that was assigned to `memo.deps` — the memo owns the memory and `deinitMemo` will free it. Using `defer` causes a double-free when `deinitMemo` later frees the same allocation.
 - **Zero-recompute test pattern:** call `compileResult` twice with no `setSource`/`setSourceFile` between calls. The second call returns an immediate hit because `memo.verified_at == self.revision` (set during first computation). All 6 recompute counters remain at 0.
+- **`memoValueEqual` must exist for every memo value type** so structural equality can be detected after recomputation. When a memo recomputes but the value is structurally identical, `changed_at` is preserved, preventing needless cascading to downstream stages. Implementations for `ParsedAst`, `ResolvedAst`, `AnalyzedAst`, `Program`, `FunctionIR`, `ItemTree`, `ScopeSummary`, `ResolvedItem`, `HeaderSignature`, `EffectiveSignature`, and `BodyAnalysis` all exist in `query.zig`.
+- **Extra parse dependency for lower stage:** `computeStage(.lower)` calls `ensureMemo(.parse, true, .parse)` in addition to `ensureMemo(.typecheck)`. The IR lowering reads from the parse AST (literal values, structure), not just type info. Without this explicit dependency, AST changes that preserve type information (e.g. changing `0` to `1`) wouldn't trigger lower recompute because typecheck's `changed_at` is preserved when the type info is identical.
 
 ## Monomorphization
 

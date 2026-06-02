@@ -3,6 +3,7 @@ const ast = @import("ast.zig");
 const analyze = @import("analyze.zig");
 const scope_mod = @import("scope.zig");
 const db = @import("db.zig");
+const semantic_queries = @import("semantic_queries.zig");
 
 pub const SymbolId = u32;
 pub const FuncTypeId = u32;
@@ -461,8 +462,10 @@ const FunctionLowerer = struct {
     }
 
     fn callParamModes(self: *const @This(), call_idx: ast.NodeIdx, callee: ast.NodeIdx) []const ast.ParamAccessMode {
-        if (self.parent.typed.call_monomorph_targets.get(call_idx)) |target_fn_id| {
-            if (target_fn_id < self.parent.typed.functions.items.len) return self.parent.typed.functions.items[target_fn_id].param_modes;
+        if (self.parent.typed.call_monomorph_targets.get(call_idx)) |target_instance_id| {
+            if (self.parent.typed.monomorph_instances.get(target_instance_id)) |target_fn_id| {
+                if (target_fn_id < self.parent.typed.functions.items.len) return self.parent.typed.functions.items[target_fn_id].param_modes;
+            }
         }
         if (self.parent.typed.ast.nodes[callee].tag == .var_ref) {
             const cname = self.parent.typed.ast.identOf(self.parent.typed.ast.nodes[callee].data0);
@@ -565,10 +568,24 @@ const FunctionLowerer = struct {
         return call_value;
     }
 
+    fn emitDirectCallWithArgs(self: *@This(), callee_fn_id: FuncId, arg_values: []const ValueRef, ret_ty: analyze.Type) LowerResult!ValueRef {
+        if (arg_values.len > MaxCallArgs) return error.TooManyCallArgs;
+        const ret_slots = try self.typeSlotCount(ret_ty);
+        var args: [MaxCallArgs]ValueRef = [_]ValueRef{0} ** MaxCallArgs;
+        for (arg_values, 0..) |arg, idx| args[idx] = arg;
+        const call_value = try self.addInst(.{ .direct_call = .{
+            .callee = callee_fn_id,
+            .argc = @intCast(arg_values.len),
+            .args = args,
+            .ret_slots = @intCast(ret_slots),
+        } });
+        if (ret_slots > 1) self.function.next_value += ret_slots - 1;
+        return call_value;
+    }
+
     fn emitCopyHook(self: *@This(), hook_fn_id: FuncId, source_base: ValueRef, ty: analyze.Type) LowerResult!ValueRef {
         const source_ptr = try self.addInst(.{ .slot_addr = source_base });
-        const callee_ref = try self.addInst(.{ .fn_addr = hook_fn_id });
-        return self.emitCallWithArgs(callee_ref, &.{source_ptr}, ty);
+        return self.emitDirectCallWithArgs(hook_fn_id, &.{source_ptr}, ty);
     }
 
     fn emitMoveHook(self: *@This(), hook_fn_id: FuncId, source_base: ValueRef, ty: analyze.Type) LowerResult!ValueRef {
@@ -579,8 +596,7 @@ const FunctionLowerer = struct {
         while (i < width) : (i += 1) {
             args_buf[i] = source_base + i;
         }
-        const callee_ref = try self.addInst(.{ .fn_addr = hook_fn_id });
-        return self.emitCallWithArgs(callee_ref, args_buf[0..width], ty);
+        return self.emitDirectCallWithArgs(hook_fn_id, args_buf[0..width], ty);
     }
 
     fn applyImplicitCopy(self: *@This(), value_node: ast.NodeIdx, value_ref: ValueRef, ty: analyze.Type) LowerResult!ValueRef {
@@ -977,8 +993,10 @@ const FunctionLowerer = struct {
     fn lowerCall(self: *@This(), idx: ast.NodeIdx) LowerResult!ValueRef {
         const a = self.parent.typed.ast;
 
-        if (self.parent.typed.call_monomorph_targets.get(idx)) |target_fn_id| {
-            return self.lowerMonomorphizedCall(idx, target_fn_id);
+        if (self.parent.typed.call_monomorph_targets.get(idx)) |target_instance_id| {
+            if (self.parent.typed.monomorph_instances.get(target_instance_id)) |target_fn_id| {
+                return self.lowerMonomorphizedCall(idx, target_fn_id);
+            }
         }
 
         const call_args = a.callArgs(idx);
@@ -1556,6 +1574,20 @@ const FunctionLowerer = struct {
 
 pub const LowerMemo = db.Memo(Program);
 
+pub const FunctionIR = struct {
+    func: Function,
+    symbols: std.ArrayList([]const u8),
+    func_types: std.ArrayList(IrFuncType),
+
+    pub fn deinit(self: *FunctionIR, gpa: std.mem.Allocator) void {
+        self.func.deinit(gpa);
+        for (self.symbols.items) |s| gpa.free(s);
+        self.symbols.deinit(gpa);
+        for (self.func_types.items) |ft| gpa.free(ft.params);
+        self.func_types.deinit(gpa);
+    }
+};
+
 pub fn computeLower(
     type_memo: *const analyze.AnalyzeMemo,
     gpa: std.mem.Allocator,
@@ -1583,4 +1615,38 @@ fn lower(typed: *const analyze.AnalyzedAst, gpa: std.mem.Allocator) !Program {
     defer lowerer.deinit();
 
     return lowerer.lowerProgram();
+}
+
+pub fn computeLowerBody(
+    typed: *const analyze.AnalyzedAst,
+    body: *const semantic_queries.BodyAnalysis,
+    gpa: std.mem.Allocator,
+) !FunctionIR {
+    var lowerer = try Lowerer.init(gpa, typed);
+    defer lowerer.deinit();
+
+    var prog = try lowerer.lowerProgram();
+    // Find and extract the matching function
+    for (prog.functions.items, 0..) |func, i| {
+        if (func.id == body.function_id) {
+            // Steal this function from the program (replace with dummy to avoid double-free)
+            prog.functions.items[i] = .{
+                .id = 0,
+                .name = 0,
+                .entry = 0,
+                .blocks = .empty,
+                .next_value = 0,
+                .param_values = .empty,
+                .ret_type = .unit,
+                .ret_slots = 0,
+            };
+            // Steal symbols and func_types
+            const symbols = prog.symbols;
+            const func_types = prog.func_types;
+            prog.symbols = .empty;
+            prog.func_types = .empty;
+            return FunctionIR{ .func = func, .symbols = symbols, .func_types = func_types };
+        }
+    }
+    return error.UnknownFunction;
 }

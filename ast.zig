@@ -453,5 +453,20 @@ pub const no_hook_ident: u32 = std.math.maxInt(u32);
 /// omits the return type annotation, indicating it should be inferred from the body.
 pub const FN_NO_RET_TYPE: u32 = std.math.maxInt(u32);
 
+pub fn structuralHash(ast: *const Ast) u64 {
+    var hasher = std.hash.Wyhash.init(0);
+    for (ast.nodes) |node| {
+        hasher.update(std.mem.asBytes(&node.tag));
+        hasher.update(std.mem.asBytes(&node.data0));
+        hasher.update(std.mem.asBytes(&node.data1));
+    }
+    hasher.update(std.mem.sliceAsBytes(ast.extra));
+    hasher.update(ast.ident_bytes);
+    hasher.update(std.mem.sliceAsBytes(ast.ident_offsets));
+    hasher.update(std.mem.sliceAsBytes(ast.decls));
+    hasher.update(std.mem.asBytes(&ast.entry));
+    return hasher.final();
+}
+
 pub const FieldPair = struct { name: IdentIdx, value: NodeIdx };
 pub const ParamPair = struct { name: IdentIdx, ty: TypeIdx };

@@ -101,7 +101,7 @@ pub fn main(init: std.process.Init) !void {
     const src_text = std.Io.Dir.cwd().readFileAlloc(io, src_path, gpa, .limited(std.math.maxInt(usize))) catch |err| {
         var buf: [512]u8 = undefined;
         var w = std.Io.File.stderr().writer(io, &buf);
-        w.interface.print("error: failed to read '{s}': {s}\n", .{ src_path, @errorName(err) }) catch {};
+        w.interface.print("\x1b[31merror:\x1b[0m failed to read '{s}': {s}\n", .{ src_path, @errorName(err) }) catch {};
         w.interface.flush() catch {};
         return error.SourceReadError;
     };
@@ -167,7 +167,7 @@ pub fn main(init: std.process.Init) !void {
     if (has_err or flags.query) {
         if (has_err) try printDiags(io, gpa, src_path, src_text, result.diagnostics);
         if (flags.query) try printStats(io, gpa, qdb.statsSnapshot());
-        if (has_err) return error.CompileError;
+        if (has_err) return;
     }
 
     const t_write = Timing.begin(io, flags.timing);

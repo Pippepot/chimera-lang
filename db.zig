@@ -4,6 +4,59 @@ const ast = @import("ast.zig");
 pub const SourceId = u32;
 pub const Revision = u64;
 
+pub const PackageId = u32;
+
+pub const ModuleId = struct {
+    package_id: PackageId,
+    source_id: SourceId,
+};
+
+pub const ItemKind = enum {
+    function,
+    comptime_value,
+    comptime_struct,
+    top_level_entry,
+    synthetic,
+};
+
+pub const ItemId = struct {
+    module: ModuleId,
+    kind: ItemKind,
+    name_hash: u64,
+};
+
+pub const BodyKind = enum {
+    function,
+    comptime_value,
+    struct_policy_hook,
+    top_level_entry,
+};
+
+pub const BodyId = struct {
+    owner: ItemId,
+    kind: BodyKind,
+};
+
+pub const TypeId = u32;
+pub const ComptimeArgHash = u64;
+
+pub const InstanceId = struct {
+    item: ItemId,
+    comptime_args_hash: ComptimeArgHash,
+};
+
+pub const CtEvalKey = struct {
+    body: BodyId,
+    instance: ?InstanceId = null,
+    args_hash: ComptimeArgHash,
+    target_hash: u64,
+};
+
+pub const ProgramKey = struct {
+    package_id: PackageId,
+    entry: InstanceId,
+};
+
 pub const Stage = enum {
     parse,
     resolve,
@@ -22,6 +75,79 @@ pub fn stageLabel(stage: Stage) []const u8 {
     };
 }
 
+pub const QueryKind = enum {
+    parse,
+    resolve,
+    typecheck,
+    lower,
+    compile,
+    discover_items,
+    module_scope,
+    package_scope,
+    resolve_item,
+    header_signature,
+    effective_signature,
+    comptime_value,
+    struct_layout,
+    ownership_policy,
+    check_body,
+    lower_body,
+    ct_lower_body,
+    ct_eval,
+    codegen_function,
+    link_program,
+    diagnostics_for_file,
+
+    pub const count = @typeInfo(QueryKind).@"enum".fields.len;
+
+    pub fn label(self: QueryKind) []const u8 {
+        return switch (self) {
+            .parse => "parse",
+            .resolve => "resolve",
+            .typecheck => "type",
+            .lower => "lower",
+            .compile => "compile",
+            .discover_items => "discover_items",
+            .module_scope => "module_scope",
+            .package_scope => "package_scope",
+            .resolve_item => "resolve_item",
+            .header_signature => "header_signature",
+            .effective_signature => "effective_signature",
+            .comptime_value => "comptime_value",
+            .struct_layout => "struct_layout",
+            .ownership_policy => "ownership_policy",
+            .check_body => "check_body",
+            .lower_body => "lower_body",
+            .ct_lower_body => "ct_lower_body",
+            .ct_eval => "ct_eval",
+            .codegen_function => "codegen_function",
+            .link_program => "link_program",
+            .diagnostics_for_file => "diagnostics_for_file",
+        };
+    }
+
+    pub fn fromStage(stage_value: Stage) QueryKind {
+        return switch (stage_value) {
+            .parse => .parse,
+            .resolve => .resolve,
+            .typecheck => .typecheck,
+            .lower => .lower,
+            .compile => .compile,
+        };
+    }
+
+    pub fn stage(self: QueryKind) ?Stage {
+        return switch (self) {
+            .parse => .parse,
+            .resolve => .resolve,
+            .typecheck => .typecheck,
+            .lower => .lower,
+            .compile => .compile,
+            else => null,
+        };
+    }
+};
+
 pub const Diagnostic = struct {
     stage: Stage,
     span: ?ast.Span,
@@ -37,8 +163,16 @@ pub const QueryError = error{
 pub const DbError = QueryError || std.mem.Allocator.Error;
 
 pub const QueryKey = struct {
-    kind: Stage,
+    kind: QueryKind,
     source_id: SourceId,
+    package_id: PackageId = 0,
+    module_id: ModuleId = .{ .package_id = 0, .source_id = 0 },
+    item_id: ?ItemId = null,
+    body_id: ?BodyId = null,
+    type_id: ?TypeId = null,
+    instance_id: ?InstanceId = null,
+    ct_eval_key: ?CtEvalKey = null,
+    program_key: ?ProgramKey = null,
 };
 
 pub const Dependency = union(enum) {
@@ -50,17 +184,17 @@ pub const QueryStats = struct {
     revision: Revision = 0,
     source_sets: usize = 0,
     source_unchanged: usize = 0,
-    hits: [5]usize = .{0} ** 5,
-    recomputes: [5]usize = .{0} ** 5,
+    hits: [QueryKind.count]usize = .{0} ** QueryKind.count,
+    recomputes: [QueryKind.count]usize = .{0} ** QueryKind.count,
     dependency_checks: usize = 0,
     dependency_invalidations: usize = 0,
 
-    pub fn hit(self: *QueryStats, stage: Stage) void {
-        self.hits[@intFromEnum(stage)] += 1;
+    pub fn hit(self: *QueryStats, kind: QueryKind) void {
+        self.hits[@intFromEnum(kind)] += 1;
     }
 
-    pub fn recompute(self: *QueryStats, stage: Stage) void {
-        self.recomputes[@intFromEnum(stage)] += 1;
+    pub fn recompute(self: *QueryStats, kind: QueryKind) void {
+        self.recomputes[@intFromEnum(kind)] += 1;
     }
 
     pub fn print(self: *const QueryStats, out: *std.ArrayList(u8), gpa: std.mem.Allocator) !void {
@@ -68,10 +202,14 @@ pub const QueryStats = struct {
         try out.print(gpa, ";   revision: {d}\n", .{self.revision});
         try out.print(gpa, ";   source_sets: {d}\n", .{self.source_sets});
         try out.print(gpa, ";   source_unchanged: {d}\n", .{self.source_unchanged});
-        inline for (std.meta.tags(Stage)) |stage| {
-            const i = @intFromEnum(stage);
+        for (std.meta.tags(QueryKind)) |kind| {
+            const i = @intFromEnum(kind);
+            const h = self.hits[i];
+            const r = self.recomputes[i];
+            const is_legacy = kind.stage() != null;
+            if (h == 0 and r == 0 and !is_legacy) continue;
             try out.print(gpa, ";   {s}: hits={d} recomputes={d}\n", .{
-                stageLabel(stage), self.hits[i], self.recomputes[i],
+                kind.label(), h, r,
             });
         }
         try out.print(gpa, ";   dependencies: checks={d} invalidations={d}\n", .{ self.dependency_checks, self.dependency_invalidations });
@@ -113,8 +251,78 @@ pub fn valuesEqual(a: ?[]const u8, b: ?[]const u8) bool {
 pub fn dependencyEql(a: Dependency, b: Dependency) bool {
     return switch (a) {
         .source => |lhs| b == .source and lhs == b.source,
-        .query => |lhs| b == .query and lhs.kind == b.query.kind and lhs.source_id == b.query.source_id,
+        .query => |lhs| b == .query and queryKeyEql(lhs, b.query),
     };
+}
+
+pub fn queryKeyEql(a: QueryKey, b: QueryKey) bool {
+    if (a.kind != b.kind) return false;
+    if (a.source_id != b.source_id) return false;
+    if (a.package_id != b.package_id) return false;
+    if (!moduleIdEql(a.module_id, b.module_id)) return false;
+    if (!optionalItemIdEql(a.item_id, b.item_id)) return false;
+    if (!optionalBodyIdEql(a.body_id, b.body_id)) return false;
+    if (a.type_id != b.type_id) return false;
+    if (!optionalInstanceIdEql(a.instance_id, b.instance_id)) return false;
+    if (!optionalCtEvalKeyEql(a.ct_eval_key, b.ct_eval_key)) return false;
+    if (!optionalProgramKeyEql(a.program_key, b.program_key)) return false;
+    return true;
+}
+
+pub fn moduleIdEql(a: ModuleId, b: ModuleId) bool {
+    return a.package_id == b.package_id and a.source_id == b.source_id;
+}
+
+pub fn itemIdEql(a: ItemId, b: ItemId) bool {
+    return moduleIdEql(a.module, b.module) and a.kind == b.kind and a.name_hash == b.name_hash;
+}
+
+fn optionalItemIdEql(a: ?ItemId, b: ?ItemId) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return itemIdEql(a.?, b.?);
+}
+
+pub fn bodyIdEql(a: BodyId, b: BodyId) bool {
+    return itemIdEql(a.owner, b.owner) and a.kind == b.kind;
+}
+
+fn optionalBodyIdEql(a: ?BodyId, b: ?BodyId) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return bodyIdEql(a.?, b.?);
+}
+
+pub fn instanceIdEql(a: InstanceId, b: InstanceId) bool {
+    return itemIdEql(a.item, b.item) and a.comptime_args_hash == b.comptime_args_hash;
+}
+
+fn optionalInstanceIdEql(a: ?InstanceId, b: ?InstanceId) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return instanceIdEql(a.?, b.?);
+}
+
+pub fn ctEvalKeyEql(a: CtEvalKey, b: CtEvalKey) bool {
+    if (!bodyIdEql(a.body, b.body)) return false;
+    if (!optionalInstanceIdEql(a.instance, b.instance)) return false;
+    return a.args_hash == b.args_hash and a.target_hash == b.target_hash;
+}
+
+fn optionalCtEvalKeyEql(a: ?CtEvalKey, b: ?CtEvalKey) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return ctEvalKeyEql(a.?, b.?);
+}
+
+pub fn programKeyEql(a: ProgramKey, b: ProgramKey) bool {
+    return a.package_id == b.package_id and instanceIdEql(a.entry, b.entry);
+}
+
+fn optionalProgramKeyEql(a: ?ProgramKey, b: ?ProgramKey) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return programKeyEql(a.?, b.?);
 }
 
 pub fn appendDependencyUnique(deps: *std.ArrayList(Dependency), gpa: std.mem.Allocator, dep: Dependency) std.mem.Allocator.Error!void {
@@ -224,7 +432,7 @@ pub fn appendDiagnostic(
 ) !void {
     if (diag.span) |span| {
         const info = lineInfoForOffset(source, span.start);
-        try out.print(gpa, "error: {s}:{d}:{d}: {s}\n", .{ source_path, info.line, info.column, diag.message });
+        try out.print(gpa, "\x1b[31merror:\x1b[0m {s}:{d}:{d}: {s}\n", .{ source_path, info.line, info.column, diag.message });
 
         const line_text = source[info.line_start..info.line_end];
         try out.appendSlice(gpa, line_text);
@@ -240,7 +448,7 @@ pub fn appendDiagnostic(
         return;
     }
 
-    try out.print(gpa, "error: {s}: {s}\n", .{ source_path, diag.message });
+    try out.print(gpa, "\x1b[31merror:\x1b[0m {s}: {s}\n", .{ source_path, diag.message });
 }
 
 pub fn appendDiagnostics(
