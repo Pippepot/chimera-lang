@@ -288,10 +288,11 @@ const Lowerer = struct {
 
     fn typeSlotCount(self: *const @This(), ty: analyze.Type) error{OutOfMemory}!u32 {
         return switch (ty) {
-            .unit, .bool, .int, .float, .type_type, .none, .func => 1,
+            .unit, .none => 0,
+            .bool, .int, .float, .type_type, .func => 1,
             .named => |name| self.namedTypeFieldCount(name),
             .variant => |variant_ty| blk: {
-                var max_member_slots: u32 = 1;
+                var max_member_slots: u32 = 0;
                 for (variant_ty.members) |member_ty| {
                     const member_slots = try self.typeSlotCount(member_ty);
                     if (member_slots > max_member_slots) max_member_slots = member_slots;
@@ -374,6 +375,8 @@ const Lowerer = struct {
 };
 
 const FunctionLowerer = struct {
+    const zero_width_ref: ValueRef = 0;
+
     const BindingStorage = union(enum) {
         local_slot: ValueRef,
         borrowed_ptr: ValueRef,
@@ -607,6 +610,7 @@ const FunctionLowerer = struct {
     }
 
     fn allocSlotRange(self: *@This(), slot_count: u32) LowerResult!ValueRef {
+        if (slot_count == 0) return zero_width_ref;
         const base = try self.allocValue();
         if (slot_count > 1) self.function.next_value += slot_count - 1;
         return base;
@@ -659,7 +663,8 @@ const FunctionLowerer = struct {
     }
 
     fn lowerUnitValue(self: *@This()) error{OutOfMemory}!ValueRef {
-        return self.addInst(.{ .iconst = 0 });
+        _ = self;
+        return zero_width_ref;
     }
 
     fn lowerConditionPredicate(self: *@This(), cond: ast.NodeIdx) LowerResult!Predicate {
@@ -1165,7 +1170,10 @@ const FunctionLowerer = struct {
         }
 
         self.current_block_id = merge_block_id;
-        if (then_fallthrough or else_fallthrough) return self.currentBlock().param orelse unreachable;
+        if (then_fallthrough or else_fallthrough) {
+            if (self.currentBlock().param) |param| return param;
+            return self.lowerUnitValue();
+        }
         return self.lowerUnitValue();
     }
 

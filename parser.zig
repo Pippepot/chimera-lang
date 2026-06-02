@@ -917,7 +917,7 @@ const Parser = struct {
         if (binding_ty) |annot| {
             try self.builder.extra.append(self.builder.gpa, annot);
         }
-        const extra_idx = extra_start;
+        const extra_idx: u32 = @intCast(extra_start);
         const data1 = if (binding_ty != null) extra_idx | 0x80000000 else extra_idx;
         const body_span = try self.spanOf(body);
         const span = coverSpans(decl_start, body_span);
@@ -1095,7 +1095,7 @@ const Parser = struct {
         if (binding_ty) |annot| {
             try self.builder.extra.append(self.builder.gpa, annot);
         }
-        const extra_idx = extra_start;
+        const extra_idx: u32 = @intCast(extra_start);
         const data1 = if (binding_ty != null) extra_idx | 0x80000000 else extra_idx;
         const span = if (field_count > 0)
             coverSpans(decl_start, try self.spanOf(body.fields.types.items[field_count - 1]))

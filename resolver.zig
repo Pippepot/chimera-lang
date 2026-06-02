@@ -61,6 +61,11 @@ fn isBuiltinType(name: []const u8) bool {
 }
 
 const Resolver = struct {
+    const ResolveFnError = error{
+        OutOfMemory,
+        ResolveFailed,
+    };
+
     gpa: std.mem.Allocator,
     parsed: *const parser.ParsedAst,
     resolved: ResolvedAst,
@@ -92,20 +97,20 @@ const Resolver = struct {
         return error.ResolveFailed;
     }
 
-    fn pushLocal(self: *@This(), name: []const u8, span: ?ast.Span) !void {
+    fn pushLocal(self: *@This(), name: []const u8, span: ?ast.Span) ResolveFnError!void {
         self.locals.push(self.gpa, name, {}) catch |err| switch (err) {
             error.DuplicateVariable => return self.fail(span, error.DuplicateSymbol),
             error.OutOfMemory => return error.OutOfMemory,
         };
     }
 
-    fn resolveInScope(self: *@This(), idx: ast.NodeIdx) !void {
+    fn resolveInScope(self: *@This(), idx: ast.NodeIdx) ResolveFnError!void {
         const mark = self.locals.mark();
         defer self.locals.restore(mark);
         try self.resolveNode(idx);
     }
 
-    fn addTopLevelSymbol(self: *@This(), name: []const u8, decl_idx: ast.NodeIdx) !void {
+    fn addTopLevelSymbol(self: *@This(), name: []const u8, decl_idx: ast.NodeIdx) ResolveFnError!void {
         if (self.resolved.function_names.contains(name) or
             self.resolved.comptime_value_names.contains(name) or
             self.resolved.struct_names.contains(name))
@@ -125,14 +130,14 @@ const Resolver = struct {
         }
     }
 
-    fn resolveTopLevel(self: *@This()) !void {
+    fn resolveTopLevel(self: *@This()) ResolveFnError!void {
         for (self.parsed.ast.decls) |decl_idx| {
             const name = self.parsed.ast.identOf(self.parsed.ast.nodes[decl_idx].data0);
             try self.addTopLevelSymbol(name, decl_idx);
         }
     }
 
-    fn resolve(self: *@This()) !void {
+    fn resolve(self: *@This()) ResolveFnError!void {
         try self.resolveTopLevel();
         for (self.resolved.functions.items) |func_decl_idx| {
             try self.resolveFunction(func_decl_idx);
@@ -140,7 +145,7 @@ const Resolver = struct {
         try self.resolveNode(self.parsed.ast.entry);
     }
 
-    fn resolveFunction(self: *@This(), func_decl_idx: ast.NodeIdx) !void {
+    fn resolveFunction(self: *@This(), func_decl_idx: ast.NodeIdx) ResolveFnError!void {
         const mark = self.locals.mark();
         defer self.locals.restore(mark);
 
@@ -151,7 +156,7 @@ const Resolver = struct {
         try self.resolveNode(self.parsed.ast.fnBody(func_decl_idx));
     }
 
-    fn resolveNode(self: *@This(), idx: ast.NodeIdx) !void {
+    fn resolveNode(self: *@This(), idx: ast.NodeIdx) ResolveFnError!void {
         const ast_ = self.parsed.ast;
         switch (ast_.nodes[idx].tag) {
             .block => {

@@ -809,9 +809,10 @@ pub fn deserializeResolved(gpa: std.mem.Allocator, data: []const u8) LoadError!r
         ra.functions.appendAssumeCapacity(try r.readU32());
     }
 
-    try readStrU32Map(&r, gpa, &ra.function_names);
-    try readStrU32Map(&r, gpa, &ra.comptime_value_names);
-    try readStrVoidMap(&r, gpa, &ra.struct_names);
+    const arena_alloc = ra.key_arena.allocator();
+    try readStrU32Map(&r, arena_alloc, &ra.function_names);
+    try readStrU32Map(&r, arena_alloc, &ra.comptime_value_names);
+    try readStrVoidMap(&r, arena_alloc, &ra.struct_names);
 
     const nr_count = try r.readU32();
     try ra.node_refs.ensureUnusedCapacity(nr_count);

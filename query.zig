@@ -73,7 +73,7 @@ fn prevStage(comptime stage: Stage) Stage {
     };
 }
 
-fn deserializeStageValue(comptime stage: Stage, gpa: std.mem.Allocator, bytes: []const u8, parse_ast: ?*const ast.Ast) (error{OutOfMemory}!stageValueType(stage)) {
+fn deserializeStageValue(comptime stage: Stage, gpa: std.mem.Allocator, bytes: []const u8, parse_ast: ?*const ast.Ast) (anyerror!stageValueType(stage)) {
     return switch (stage) {
         .parse => query_cache.deserializeParsed(gpa, bytes),
         .resolve => query_cache.deserializeResolved(gpa, bytes),
@@ -147,12 +147,11 @@ pub const QueryDb = struct {
         }
         self.sources.deinit();
 
-        inline for (std.meta.tags(Stage)) |s| {
-            const T = stageValueType(s);
-            var iter = self.memosFor(s).iterator();
-            while (iter.next()) |entry| deinitMemo(T, entry.value_ptr, self.gpa);
-            self.memosFor(s).deinit();
-        }
+        self.deinitStageMemos(.parse);
+        self.deinitStageMemos(.resolve);
+        self.deinitStageMemos(.typecheck);
+        self.deinitStageMemos(.lower);
+        self.deinitStageMemos(.compile);
 
         for (self.active_stack.items) |*frame| {
             frame.deps.deinit(self.gpa);
@@ -163,6 +162,13 @@ pub const QueryDb = struct {
         self.cache_backings.deinit(self.gpa);
 
         if (self.cache_dir_override) |dir| self.gpa.free(dir);
+    }
+
+    fn deinitStageMemos(self: *@This(), comptime stage: Stage) void {
+        const T = stageValueType(stage);
+        var iter = self.memosFor(stage).iterator();
+        while (iter.next()) |entry| deinitMemo(T, entry.value_ptr, self.gpa);
+        self.memosFor(stage).deinit();
     }
 
     pub fn setSource(self: *@This(), source_id: db.SourceId, text: []const u8) !void {
@@ -261,8 +267,13 @@ pub const QueryDb = struct {
     }
 
     pub fn changedAt(self: *@This(), stage: Stage, source_id: SourceId) ?db.Revision {
-        if (self.memosFor(stage).get(source_id)) |memo| return memo.changed_at;
-        return null;
+        return switch (stage) {
+            .parse => if (self.parse_memos.get(source_id)) |memo| memo.changed_at else null,
+            .resolve => if (self.resolve_memos.get(source_id)) |memo| memo.changed_at else null,
+            .typecheck => if (self.type_memos.get(source_id)) |memo| memo.changed_at else null,
+            .lower => if (self.lower_memos.get(source_id)) |memo| memo.changed_at else null,
+            .compile => if (self.compile_memos.get(source_id)) |memo| memo.changed_at else null,
+        };
     }
 
     fn cacheOptions(self: *const @This()) query_cache.CacheOptions {
@@ -279,54 +290,57 @@ pub const QueryDb = struct {
         defer if (loaded.backing.len > 0) loaded.deinit(self.gpa);
 
         var parse_ast: ?*const ast.Ast = null;
-
-        inline for (std.meta.tags(Stage)) |s| {
-            const T = stageValueType(s);
-            var ls = &@field(loaded, @tagName(s));
-            if (!ls.has_value or ls.bytes == null) continue;
-
-            var value: ?T = null;
-            var memo: ?db.Memo(T) = null;
-
-            value = if (s == .compile)
-                self.gpa.dupe(u8, ls.bytes.?) catch return
-            else if (s == .typecheck)
-                query_cache.deserializeTyped(self.gpa, ls.bytes.?, parse_ast.?) catch return
-            else
-                deserializeStageValue(s, self.gpa, ls.bytes.?, null) catch return;
-
-            memo = db.makeMemo(T, value, ls.diagnostics);
-            ls.diagnostics = .empty;
-            value = null;
-
-            memo.?.deps = if (s == .parse) (self.depForSource(source_id) catch {
-                deinitMemo(T, &memo.?, self.gpa);
-                return;
-            }) else (self.depForStage(source_id, prevStage(s)) catch {
-                deinitMemo(T, &memo.?, self.gpa);
-                return;
-            });
-            memo.?.verified_at = self.revision;
-            memo.?.changed_at = self.revision;
-
-            const old = self.memosFor(s).fetchPut(source_id, memo.?) catch {
-                deinitMemo(T, &memo.?, self.gpa);
-                return;
-            };
-            if (old) |kv| {
-                var old_memo = kv.value;
-                deinitMemo(T, &old_memo, self.gpa);
-            }
-            memo = null;
-
-            if (s == .parse) {
-                const stored = self.parse_memos.get(source_id) orelse unreachable;
-                parse_ast = if (stored.value) |*p| &p.ast else null;
-            }
+        self.loadPersistentStage(source_id, .parse, &loaded.parse, parse_ast);
+        if (self.parse_memos.get(source_id)) |stored| {
+            parse_ast = if (stored.value) |*p| &p.ast else null;
         }
+        self.loadPersistentStage(source_id, .resolve, &loaded.resolve, parse_ast);
+        self.loadPersistentStage(source_id, .typecheck, &loaded.typecheck, parse_ast);
+        self.loadPersistentStage(source_id, .lower, &loaded.lower, parse_ast);
+        self.loadPersistentStage(source_id, .compile, &loaded.compile, parse_ast);
 
         self.cache_backings.append(self.gpa, loaded.backing) catch return;
         loaded.backing = loaded.backing[0..0];
+    }
+
+    fn loadPersistentStage(
+        self: *@This(),
+        source_id: db.SourceId,
+        comptime stage: Stage,
+        loaded_stage: *query_cache.LoadedStage,
+        parse_ast: ?*const ast.Ast,
+    ) void {
+        const T = stageValueType(stage);
+        if (!loaded_stage.has_value or loaded_stage.bytes == null) return;
+
+        var value: ?T = switch (stage) {
+            .compile => self.gpa.dupe(u8, loaded_stage.bytes.?) catch return,
+            .typecheck => query_cache.deserializeTyped(self.gpa, loaded_stage.bytes.?, parse_ast orelse return) catch return,
+            else => deserializeStageValue(stage, self.gpa, loaded_stage.bytes.?, null) catch return,
+        };
+
+        var memo = db.makeMemo(T, value, loaded_stage.diagnostics);
+        loaded_stage.diagnostics = .empty;
+        value = null;
+
+        memo.deps = if (stage == .parse) (self.depForSource(source_id) catch {
+            deinitMemo(T, &memo, self.gpa);
+            return;
+        }) else (self.depForStage(source_id, prevStage(stage)) catch {
+            deinitMemo(T, &memo, self.gpa);
+            return;
+        });
+        memo.verified_at = self.revision;
+        memo.changed_at = self.revision;
+
+        const old = self.memosFor(stage).fetchPut(source_id, memo) catch {
+            deinitMemo(T, &memo, self.gpa);
+            return;
+        };
+        if (old) |kv| {
+            var old_memo = kv.value;
+            deinitMemo(T, &old_memo, self.gpa);
+        }
     }
 
     fn depForSource(self: *@This(), source_id: db.SourceId) std.mem.Allocator.Error!std.ArrayList(db.Dependency) {
@@ -383,9 +397,11 @@ pub const QueryDb = struct {
             if (self.compile_memos.get(source_id) == null) continue;
 
             var snaps: [5]query_cache.StageSnapshot = undefined;
-            inline for (std.meta.tags(Stage), &snaps) |s, *dest| {
-                dest.* = try self.snapshotStage(source_id, s, self.gpa);
-            }
+            snaps[0] = try self.snapshotStage(source_id, .parse, self.gpa);
+            snaps[1] = try self.snapshotStage(source_id, .resolve, self.gpa);
+            snaps[2] = try self.snapshotStage(source_id, .typecheck, self.gpa);
+            snaps[3] = try self.snapshotStage(source_id, .lower, self.gpa);
+            snaps[4] = try self.snapshotStage(source_id, .compile, self.gpa);
             errdefer for (&snaps) |s| if (s.bytes) |b| self.gpa.free(b);
 
             try query_cache.save(io, self.gpa, self.cacheOptions(), .{
@@ -514,7 +530,13 @@ pub const QueryDb = struct {
     }
 
     fn queryChangedAfter(self: *@This(), key: db.QueryKey, revision: db.Revision) db.DbError!bool {
-        return (try self.ensureMemo(key.source_id, false, key.kind)).changed_at > revision;
+        return switch (key.kind) {
+            .parse => (try self.ensureMemo(key.source_id, false, .parse)).changed_at > revision,
+            .resolve => (try self.ensureMemo(key.source_id, false, .resolve)).changed_at > revision,
+            .typecheck => (try self.ensureMemo(key.source_id, false, .typecheck)).changed_at > revision,
+            .lower => (try self.ensureMemo(key.source_id, false, .lower)).changed_at > revision,
+            .compile => (try self.ensureMemo(key.source_id, false, .compile)).changed_at > revision,
+        };
     }
 
     fn getSourceText(self: *@This(), source_id: db.SourceId) db.DbError![]const u8 {
