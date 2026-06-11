@@ -7,7 +7,6 @@ const parser = @import("parser.zig");
 const resolver = @import("resolver.zig");
 const analyze = @import("analyze.zig");
 
-
 const CacheExt = ".qcache";
 const Magic: [8]u8 = .{ 'X', '8', '6', 'Q', 'C', 'A', 'C', 'H' };
 const SchemaVersion: u32 = 13;
@@ -95,11 +94,7 @@ pub fn compilerFingerprint() u64 {
     return hasher.final();
 }
 
-fn cachePathForSource(gpa: std.mem.Allocator, source_path: []const u8, options: CacheOptions) ![]u8 {
-    if (options.cache_dir_override) |override_dir| {
-        const key_hash = std.hash.Wyhash.hash(0, source_path);
-        return std.fmt.allocPrint(gpa, "{s}{c}{x}{s}", .{ override_dir, std.fs.path.sep, key_hash, CacheExt });
-    }
+fn cachePathForSource(gpa: std.mem.Allocator, source_path: []const u8) ![]u8 {
     return std.fmt.allocPrint(gpa, "{s}{s}", .{ source_path, CacheExt });
 }
 
@@ -288,8 +283,7 @@ const PbrPayload = blk: {
 
 fn writeIrPayload(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, value: anytype) !void {
     const T = @TypeOf(value);
-    if (T == void) {
-    } else if (T == u32) {
+    if (T == void) {} else if (T == u32) {
         try appendU32(buf, gpa, value);
     } else if (T == i32) {
         try buf.appendSlice(gpa, std.mem.asBytes(&value));
@@ -1112,15 +1106,8 @@ fn writeAtomically(io: std.Io, gpa: std.mem.Allocator, cache_path: []const u8, b
     };
 }
 
-fn ensureOverrideDir(io: std.Io, options: CacheOptions) !void {
-    if (options.cache_dir_override) |override_dir| {
-        try std.Io.Dir.cwd().createDirPath(io, override_dir);
-    }
-}
-
-pub fn save(io: std.Io, gpa: std.mem.Allocator, options: CacheOptions, payload: SavePayload) !void {
-    try ensureOverrideDir(io, options);
-    const cache_path = try cachePathForSource(gpa, payload.source_path, options);
+pub fn save(io: std.Io, gpa: std.mem.Allocator, payload: SavePayload) !void {
+    const cache_path = try cachePathForSource(gpa, payload.source_path);
     defer gpa.free(cache_path);
 
     const bytes = try serialize(gpa, payload);
@@ -1129,8 +1116,8 @@ pub fn save(io: std.Io, gpa: std.mem.Allocator, options: CacheOptions, payload: 
     try writeAtomically(io, gpa, cache_path, bytes);
 }
 
-pub fn load(io: std.Io, gpa: std.mem.Allocator, options: CacheOptions, source_path: []const u8, source_text: []const u8, ast_hash: ?u64, ir_hash: ?u64) !?LoadPayload {
-    const cache_path = try cachePathForSource(gpa, source_path, options);
+pub fn load(io: std.Io, gpa: std.mem.Allocator, source_path: []const u8, source_text: []const u8, ast_hash: ?u64, ir_hash: ?u64) !?LoadPayload {
+    const cache_path = try cachePathForSource(gpa, source_path);
     defer gpa.free(cache_path);
 
     const data = std.Io.Dir.cwd().readFileAlloc(io, cache_path, gpa, .limited(std.math.maxInt(usize))) catch |err| switch (err) {
@@ -1183,12 +1170,7 @@ fn sweepCacheDir(io: std.Io, gpa: std.mem.Allocator, dir_path: []const u8) !void
     }
 }
 
-pub fn sweepStaleCaches(io: std.Io, gpa: std.mem.Allocator, options: CacheOptions, source_path: []const u8) !void {
-    if (options.cache_dir_override) |override_dir| {
-        try sweepCacheDir(io, gpa, override_dir);
-        return;
-    }
-
+pub fn sweepStaleCaches(io: std.Io, gpa: std.mem.Allocator, source_path: []const u8) !void {
     const parts = splitDirAndName(source_path);
     try sweepCacheDir(io, gpa, parts.dir);
 }

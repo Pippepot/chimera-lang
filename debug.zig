@@ -1,9 +1,16 @@
 const std = @import("std");
 const ast = @import("ast.zig");
 const ir_mod = @import("ir.zig");
+const disasm = @import("disasm.zig");
 
 const Program = ir_mod.Program;
 const InstPair = ir_mod.InstPair;
+
+pub fn printError(err: *std.Io.Writer, comptime fmt: []const u8, args: anytype) !void {
+    try err.writeAll("\x1b[31merror:\x1b[0m ");
+    try err.print(fmt, args);
+    try err.writeByte('\n');
+}
 
 fn branchRef(writer: *std.Io.Writer, b: ir_mod.Branch) void {
     if (b.arg) |arg|
@@ -40,7 +47,7 @@ fn printCallCommon(writer: *std.Io.Writer, id: u32, callee_prefix: u8, callee: u
     writer.writeAll(")\n") catch return;
 }
 
-fn dumpIr(program: *const Program, writer: *std.Io.Writer) void {
+pub fn dumpSSA(program: *const Program, writer: *std.Io.Writer) void {
     for (program.functions.items) |func| {
         writer.print("fn {s} (id={d})\n", .{ program.symbolFor(func.name), func.id }) catch return;
         for (func.blocks.items) |blk| {
@@ -80,37 +87,6 @@ fn dumpIr(program: *const Program, writer: *std.Io.Writer) void {
         }
         writer.writeAll("\n") catch return;
     }
-}
-
-pub const DebugFlags = struct {
-    ast: bool = false,
-    ssa: bool = false,
-    timing: bool = false,
-    query: bool = false,
-    x86: bool = false,
-};
-
-pub fn parseDebugFlags(args: std.process.Args) DebugFlags {
-    var flags = DebugFlags{};
-    var iter = std.process.Args.Iterator.init(args);
-    defer iter.deinit();
-    _ = iter.next();
-    while (iter.next()) |arg| {
-        if (!std.mem.startsWith(u8, arg, "--debug=")) continue;
-        var rest = arg["--debug=".len..];
-        while (rest.len > 0) {
-            const comma = std.mem.indexOfScalar(u8, rest, ',') orelse rest.len;
-            const item = rest[0..comma];
-            if (std.mem.eql(u8, item, "ast")) flags.ast = true;
-            if (std.mem.eql(u8, item, "ssa")) flags.ssa = true;
-            if (std.mem.eql(u8, item, "timing")) flags.timing = true;
-            if (std.mem.eql(u8, item, "query")) flags.query = true;
-            if (std.mem.eql(u8, item, "asm")) flags.x86 = true;
-            if (comma == rest.len) break;
-            rest = rest[comma + 1 ..];
-        }
-    }
-    return flags;
 }
 
 fn appendPrefix(prefix: []const u8, suffix: []const u8, buf: *[256]u8) ?[]const u8 {
@@ -219,8 +195,7 @@ fn dumpAstNode(a: *const ast.Ast, idx: ast.NodeIdx, writer: *std.Io.Writer, pref
         },
         .const_decl, .var_decl => dumpAstNode(a, a.varDeclValue(idx), writer, next_prefix, true, false),
         .comptime_value_decl => dumpAstNode(a, a.comptimeValueDeclValue(idx), writer, next_prefix, true, false),
-        .return_stmt, .print_stmt, .field_access, .move_expr, .sizeof_expr,
-        .comptime_expr, .@"not", .query_op => dumpAstNode(a, a.nodes[idx].data0, writer, next_prefix, true, false),
+        .return_stmt, .print_stmt, .field_access, .move_expr, .sizeof_expr, .comptime_expr, .not, .query_op => dumpAstNode(a, a.nodes[idx].data0, writer, next_prefix, true, false),
         .assign => dumpAstNode(a, a.nodes[idx].data1, writer, next_prefix, true, false),
         .type_union => {
             const members = a.typeUnionMembers(idx);
@@ -228,8 +203,7 @@ fn dumpAstNode(a: *const ast.Ast, idx: ast.NodeIdx, writer: *std.Io.Writer, pref
                 dumpAstNode(a, member, writer, next_prefix, i + 1 == members.len, false);
             }
         },
-        .int_lit, .float_lit, .var_ref, .arg, .bool_lit, .unit_lit, .none_lit,
-        .type_name, .type_func, .type_variant, .comptime_fn, .comptime_struct => {},
+        .int_lit, .float_lit, .var_ref, .arg, .bool_lit, .unit_lit, .none_lit, .type_name, .type_func, .type_variant, .comptime_fn, .comptime_struct => {},
     }
 }
 
@@ -257,7 +231,7 @@ fn dumpTypeNode(a: *const ast.Ast, type_idx: ast.TypeIdx, writer: *std.Io.Writer
     }
 }
 
-fn dumpProgram(a: *const ast.Ast, writer: *std.Io.Writer) void {
+pub fn dumpAst(a: *const ast.Ast, writer: *std.Io.Writer) void {
     for (a.decls) |decl_idx| {
         switch (a.nodes[decl_idx].tag) {
             .comptime_fn => {
@@ -308,33 +282,11 @@ fn dumpProgram(a: *const ast.Ast, writer: *std.Io.Writer) void {
     }
 }
 
-pub fn dumpDebugInfo(
-    io: std.Io,
-    flags: DebugFlags,
-    ast_ast: ?*const ast.Ast,
-    ir: ?*const Program,
-    asm_text: ?[]const u8,
-    gpa: std.mem.Allocator,
-) !void {
-    _ = gpa;
-    var wbuf: [4096]u8 = undefined;
-    var w = std.Io.File.stdout().writer(io, &wbuf);
-    const wi = &w.interface;
-
-    if (flags.ast) if (ast_ast) |aa| {
-        try wi.writeAll("; AST:\n");
-        dumpProgram(aa, wi);
-        try wi.writeAll("\n");
-    };
-    if (flags.ssa) if (ir) |irim| {
-        try wi.writeAll("; SSA IR:\n");
-        dumpIr(irim, wi);
-        try wi.writeAll("\n");
-    };
-    if (flags.x86) if (asm_text) |at| {
-        try wi.writeAll("; x86 assembly:\n");
-        try wi.writeAll(at);
-        try wi.writeAll("\n");
-    };
-    try wi.flush();
+pub fn dumpAssembly(binary: []const u8, writer: *std.Io.Writer, allocator: std.mem.Allocator) !void {
+    const len = std.mem.readInt(u32, binary[120..124], .little);
+    const asm_text = try disasm.disassemble(binary[0x1000..][0..@intCast(len)], allocator);
+    try writer.writeAll("; x86 assembly:\n");
+    try writer.writeAll(asm_text);
+    try writer.writeByte('\n');
+    defer allocator.free(asm_text);
 }

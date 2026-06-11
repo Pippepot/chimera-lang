@@ -415,9 +415,12 @@ pub const AstBuilder = struct {
         defer self.gpa.free(spans);
 
         const layout = ast.Ast.computedSize(
-            @intCast(nodes.len), @intCast(extra.len),
-            @intCast(ident_bytes.len), @intCast(ident_offsets.len),
-            @intCast(spans.len), @intCast(decls_slice.len),
+            @intCast(nodes.len),
+            @intCast(extra.len),
+            @intCast(ident_bytes.len),
+            @intCast(ident_offsets.len),
+            @intCast(spans.len),
+            @intCast(decls_slice.len),
         );
 
         const backing = try self.gpa.alloc(u8, layout.total);
@@ -434,12 +437,12 @@ pub const AstBuilder = struct {
             .entry = entry,
         };
 
-        @memcpy(backing[layout.nodes_off..][0..nodes.len * @sizeOf(ast.Node)], std.mem.sliceAsBytes(nodes));
-        @memcpy(backing[layout.extra_off..][0..extra.len * 4], std.mem.sliceAsBytes(extra));
+        @memcpy(backing[layout.nodes_off..][0 .. nodes.len * @sizeOf(ast.Node)], std.mem.sliceAsBytes(nodes));
+        @memcpy(backing[layout.extra_off..][0 .. extra.len * 4], std.mem.sliceAsBytes(extra));
         @memcpy(backing[layout.str_bytes_off..][0..ident_bytes.len], ident_bytes);
-        @memcpy(backing[layout.str_offs_off..][0..ident_offsets.len * 4], std.mem.sliceAsBytes(ident_offsets));
-        @memcpy(backing[layout.spans_off..][0..spans.len * @sizeOf(ast.Span)], std.mem.sliceAsBytes(spans));
-        @memcpy(backing[layout.decls_off..][0..decls_slice.len * 4], std.mem.sliceAsBytes(decls_slice));
+        @memcpy(backing[layout.str_offs_off..][0 .. ident_offsets.len * 4], std.mem.sliceAsBytes(ident_offsets));
+        @memcpy(backing[layout.spans_off..][0 .. spans.len * @sizeOf(ast.Span)], std.mem.sliceAsBytes(spans));
+        @memcpy(backing[layout.decls_off..][0 .. decls_slice.len * 4], std.mem.sliceAsBytes(decls_slice));
 
         var name_map = std.StringHashMap(ast.NodeIdx).init(self.gpa);
         errdefer name_map.deinit();
@@ -985,36 +988,73 @@ const Parser = struct {
         if (self.current.tag == .ident) {
             const rhs = self.current.ident;
             if (std.mem.eql(u8, rhs, "trivial")) {
-                if (is_drop) { body.drop_kind = .trivial; body.drop_hook = null; }
-                else if (prop == .move) { body.move_kind = .trivial; body.move_hook = null; }
-                else { body.copy_kind = .trivial; body.copy_hook = null; }
-                try self.advance(); return;
+                if (is_drop) {
+                    body.drop_kind = .trivial;
+                    body.drop_hook = null;
+                } else if (prop == .move) {
+                    body.move_kind = .trivial;
+                    body.move_hook = null;
+                } else {
+                    body.copy_kind = .trivial;
+                    body.copy_hook = null;
+                }
+                try self.advance();
+                return;
             }
             if (std.mem.eql(u8, rhs, "fieldwise")) {
-                if (is_drop) { body.drop_kind = .fieldwise; body.drop_hook = null; }
-                else if (prop == .move) { body.move_kind = .fieldwise; body.move_hook = null; }
-                else { body.copy_kind = .fieldwise; body.copy_hook = null; }
-                try self.advance(); return;
+                if (is_drop) {
+                    body.drop_kind = .fieldwise;
+                    body.drop_hook = null;
+                } else if (prop == .move) {
+                    body.move_kind = .fieldwise;
+                    body.move_hook = null;
+                } else {
+                    body.copy_kind = .fieldwise;
+                    body.copy_hook = null;
+                }
+                try self.advance();
+                return;
             }
             if (!is_drop and std.mem.eql(u8, rhs, "none")) {
-                if (prop == .move) { body.move_kind = .none; body.move_hook = null; }
-                else { body.copy_kind = .none; body.copy_hook = null; }
-                try self.advance(); return;
+                if (prop == .move) {
+                    body.move_kind = .none;
+                    body.move_hook = null;
+                } else {
+                    body.copy_kind = .none;
+                    body.copy_hook = null;
+                }
+                try self.advance();
+                return;
             }
             if (is_drop and std.mem.eql(u8, rhs, "explicit")) {
-                body.drop_kind = .explicit; body.drop_hook = null;
-                try self.advance(); return;
+                body.drop_kind = .explicit;
+                body.drop_hook = null;
+                try self.advance();
+                return;
             }
         }
         if (!is_drop and self.current.tag == .kw_none) {
-            if (prop == .move) { body.move_kind = .none; body.move_hook = null; }
-            else { body.copy_kind = .none; body.copy_hook = null; }
-            try self.advance(); return;
+            if (prop == .move) {
+                body.move_kind = .none;
+                body.move_hook = null;
+            } else {
+                body.copy_kind = .none;
+                body.copy_hook = null;
+            }
+            try self.advance();
+            return;
         }
         const hook = try self.parseOwnershipHookRef(struct_name, @tagName(prop), line_start);
-        if (is_drop) { body.drop_kind = .func; body.drop_hook = hook; }
-        else if (prop == .move) { body.move_kind = .func; body.move_hook = hook; }
-        else { body.copy_kind = .func; body.copy_hook = hook; }
+        if (is_drop) {
+            body.drop_kind = .func;
+            body.drop_hook = hook;
+        } else if (prop == .move) {
+            body.move_kind = .func;
+            body.move_hook = hook;
+        } else {
+            body.copy_kind = .func;
+            body.copy_hook = hook;
+        }
     }
 
     fn parseComptimeStructBody(self: *@This(), struct_name: []const u8) ParseError!ParsedStructBody {
@@ -1048,10 +1088,18 @@ const Parser = struct {
             if (std.mem.eql(u8, key, "move") or std.mem.eql(u8, key, "copy") or std.mem.eql(u8, key, "drop")) {
                 try self.expect(.assign, error.UnexpectedToken);
                 const prop: PolicyProperty = if (std.mem.eql(u8, key, "move")) .move else if (std.mem.eql(u8, key, "copy")) .copy else .drop;
-                const saw_ptr: *bool = switch (prop) { .move => &saw_move, .copy => &saw_copy, .drop => &saw_drop };
+                const saw_ptr: *bool = switch (prop) {
+                    .move => &saw_move,
+                    .copy => &saw_copy,
+                    .drop => &saw_drop,
+                };
                 if (saw_ptr.*) return error.UnexpectedToken;
                 saw_ptr.* = true;
-                body.explicit_mask |= switch (prop) { .move => 0b001, .copy => 0b010, .drop => 0b100 };
+                body.explicit_mask |= switch (prop) {
+                    .move => 0b001,
+                    .copy => 0b010,
+                    .drop => 0b100,
+                };
                 try self.parsePolicyRhs(&body, prop, struct_name, key_span);
             } else {
                 const fname = try self.internName(key);
@@ -1278,7 +1326,10 @@ const Parser = struct {
         if (check_terminated) try self.expectStatementTerminated(value_span.end);
         const end_span = if (binding_ty) |ty| coverSpans(try self.spanOf(ty), value_span) else value_span;
         const node_span = coverSpans(keyword_span, end_span);
-        return self.makeBindingNode(switch (kind) { .const_kind => .const_decl, .var_kind => .var_decl }, ident, binding_ty, value, node_span);
+        return self.makeBindingNode(switch (kind) {
+            .const_kind => .const_decl,
+            .var_kind => .var_decl,
+        }, ident, binding_ty, value, node_span);
     }
 
     const BinOpEntry = struct { token: TokenTag, tag: BinTag };
@@ -1340,7 +1391,7 @@ const Parser = struct {
             try self.advance();
             const inner = try self.parseComparison();
             const span = coverSpans(not_span, try self.spanOf(inner));
-            return self.allocNode(.@"not", inner, 0, span);
+            return self.allocNode(.not, inner, 0, span);
         }
         return self.parseComparison();
     }
@@ -1667,7 +1718,6 @@ pub fn parseOwned(source: []const u8, gpa: std.mem.Allocator) (ParseError || err
     const report = try parseReport(source, gpa);
     return report.parsed orelse error.ExpectedExpression;
 }
-
 
 pub fn computeParse(source: []const u8, gpa: std.mem.Allocator) error{OutOfMemory}!db.Memo(ParsedAst) {
     const report = try parseReport(source, gpa);

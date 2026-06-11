@@ -20,11 +20,7 @@ pub const Stage = db.Stage;
 pub const CompileResult = db.CompileResult;
 pub const QueryError = db.QueryError;
 
-pub const QueryDbOptions = struct {
-    persistent_cache_enabled: bool = true,
-    cache_dir_override: ?[]const u8 = null,
-    io: ?std.Io = null,
-};
+pub const QueryDbOptions = struct { persistent_cache_enabled: bool = true };
 
 const SourceInput = struct {
     text: []u8,
@@ -184,12 +180,12 @@ fn analyzedAstEql(a: *const analyze.AnalyzedAst, b: *const analyze.AnalyzedAst) 
         if (oi.has_explicit_return != ni.has_explicit_return) return false;
         if (oi.is_monomorphized != ni.is_monomorphized) return false;
     }
-    if (!hashMapTypeEql( a.node_types, b.node_types, analyze.typeEql)) return false;
-    if (!hashMapValueEql( a.field_index, b.field_index)) return false;
-    if (!hashMapTypeEql( a.decl_binding_types, b.decl_binding_types, analyze.typeEql)) return false;
-    if (!hashMapSliceEql( a.is_variant_tags, b.is_variant_tags)) return false;
-    if (!hashMapValueEql( a.query_none_tags, b.query_none_tags)) return false;
-    if (!hashMapComptimeValueEql( a.comptime_node_values, b.comptime_node_values)) return false;
+    if (!hashMapTypeEql(a.node_types, b.node_types, analyze.typeEql)) return false;
+    if (!hashMapValueEql(a.field_index, b.field_index)) return false;
+    if (!hashMapTypeEql(a.decl_binding_types, b.decl_binding_types, analyze.typeEql)) return false;
+    if (!hashMapSliceEql(a.is_variant_tags, b.is_variant_tags)) return false;
+    if (!hashMapValueEql(a.query_none_tags, b.query_none_tags)) return false;
+    if (!hashMapComptimeValueEql(a.comptime_node_values, b.comptime_node_values)) return false;
     if (!strHashMapComptimeValueEql(a.comptime_values, b.comptime_values)) return false;
     return true;
 }
@@ -291,12 +287,12 @@ fn bodyAnalysisEql(a: *const semantic_queries.BodyAnalysis, b: *const semantic_q
     if (a.function_id != b.function_id) return false;
     if (a.decl != b.decl) return false;
     if (a.body != b.body) return false;
-    if (!hashMapTypeEql( a.node_types, b.node_types, analyze.typeEql)) return false;
-    if (!hashMapValueEql( a.field_index, b.field_index)) return false;
-    if (!hashMapInstanceIdEql( a.call_targets, b.call_targets)) return false;
-    if (!hashMapSliceEql( a.is_variant_tags, b.is_variant_tags)) return false;
-    if (!hashMapValueEql( a.query_none_tags, b.query_none_tags)) return false;
-    if (!hashMapTypeEql( a.decl_binding_types, b.decl_binding_types, analyze.typeEql)) return false;
+    if (!hashMapTypeEql(a.node_types, b.node_types, analyze.typeEql)) return false;
+    if (!hashMapValueEql(a.field_index, b.field_index)) return false;
+    if (!hashMapInstanceIdEql(a.call_targets, b.call_targets)) return false;
+    if (!hashMapSliceEql(a.is_variant_tags, b.is_variant_tags)) return false;
+    if (!hashMapValueEql(a.query_none_tags, b.query_none_tags)) return false;
+    if (!hashMapTypeEql(a.decl_binding_types, b.decl_binding_types, analyze.typeEql)) return false;
     return true;
 }
 
@@ -395,9 +391,8 @@ fn comptimeStructValueEql(a: analyze.StructValue, b: analyze.StructValue) bool {
 
 pub const QueryDb = struct {
     gpa: std.mem.Allocator,
-    io: ?std.Io,
+    io: std.Io,
     persistent_cache_enabled: bool,
-    cache_dir_override: ?[]u8,
     cache_backings: std.ArrayList([]u8),
     revision: db.Revision,
     sources: std.AutoHashMap(db.SourceId, SourceInput),
@@ -416,19 +411,11 @@ pub const QueryDb = struct {
     active_stack: std.ArrayList(ActiveQuery),
     stats: db.QueryStats,
 
-    pub fn init(gpa: std.mem.Allocator) QueryDb {
-        return initWithOptions(gpa, .{
-            .io = if (builtin.is_test) std.testing.io else null,
-        });
-    }
-
-    pub fn initWithOptions(gpa: std.mem.Allocator, options: QueryDbOptions) QueryDb {
-        const override_copy = if (options.cache_dir_override) |dir| gpa.dupe(u8, dir) catch null else null;
+    pub fn initWithOptions(gpa: std.mem.Allocator, io: std.Io, options: QueryDbOptions) QueryDb {
         return .{
             .gpa = gpa,
-            .io = options.io,
+            .io = io,
             .persistent_cache_enabled = options.persistent_cache_enabled,
-            .cache_dir_override = override_copy,
             .cache_backings = .empty,
             .revision = 0,
             .sources = std.AutoHashMap(db.SourceId, SourceInput).init(gpa),
@@ -460,9 +447,7 @@ pub const QueryDb = struct {
     }
 
     pub fn deinit(self: *@This()) void {
-        if (self.io) |io| {
-            self.flushPersistentCaches(io) catch {};
-        }
+        self.flushPersistentCaches(self.io) catch {};
 
         var source_iter = self.sources.iterator();
         while (source_iter.next()) |entry| {
@@ -492,8 +477,6 @@ pub const QueryDb = struct {
 
         for (self.cache_backings.items) |backing| self.gpa.free(backing);
         self.cache_backings.deinit(self.gpa);
-
-        if (self.cache_dir_override) |dir| self.gpa.free(dir);
     }
 
     fn deinitStageMemos(self: *@This(), comptime stage: Stage) void {
@@ -534,7 +517,7 @@ pub const QueryDb = struct {
             self.bumpRevision();
             existing.changed_at = self.revision;
             self.stats.source_sets += 1;
-            self.tryLoadPersistentCache(source_id, existing);
+            // self.tryLoadPersistentCache(source_id, existing);
             return;
         }
 
@@ -548,8 +531,8 @@ pub const QueryDb = struct {
             .source_path = owned_path,
         });
 
-        const input = self.sources.getPtr(source_id).?;
-        self.tryLoadPersistentCache(source_id, input);
+        // const input = self.sources.getPtr(source_id).?;
+        // self.tryLoadPersistentCache(source_id, input);
     }
 
     pub fn sourceText(self: *const @This(), source_id: db.SourceId) ?[]const u8 {
@@ -656,18 +639,12 @@ pub const QueryDb = struct {
         };
     }
 
-    fn cacheOptions(self: *const @This()) query_cache.CacheOptions {
-        return .{ .cache_dir_override = self.cache_dir_override };
-    }
-
     fn tryLoadPersistentCache(self: *@This(), source_id: db.SourceId, input: *SourceInput) void {
         if (!self.persistent_cache_enabled) return;
-        if (self.io == null) return;
         const source_path = input.source_path orelse return;
-        const io = self.io.?;
 
         // Phase 1: try source-hash-based match (fast path, no parsing needed)
-        const maybe_loaded = query_cache.load(io, self.gpa, self.cacheOptions(), source_path, input.text, null, null) catch null;
+        const maybe_loaded = query_cache.load(self.io, self.gpa, source_path, input.text, null, null) catch null;
         if (maybe_loaded) |loaded| {
             self.loadAllFromCache(source_id, loaded, null);
             // All 5 stages loaded from cache — no computation needed
@@ -682,7 +659,7 @@ pub const QueryDb = struct {
         // Phase 2: parse source, compute AST hash, try AST-hash-based match
         var parsed = parser.parseOwned(input.text, self.gpa) catch return;
         const ast_hash = ast.structuralHash(&parsed.ast);
-        const ast_cached = query_cache.load(io, self.gpa, self.cacheOptions(), source_path, input.text, ast_hash, null) catch {
+        const ast_cached = query_cache.load(self.io, self.gpa, source_path, input.text, ast_hash, null) catch {
             parsed.deinit(self.gpa);
             return;
         };
@@ -738,7 +715,7 @@ pub const QueryDb = struct {
                 defer self.gpa.free(ir_bytes);
                 const ir_hash = std.hash.Wyhash.hash(0, ir_bytes);
 
-                var ir_cached = query_cache.load(io, self.gpa, self.cacheOptions(), source_path, input.text, ast_hash, ir_hash) catch return;
+                var ir_cached = query_cache.load(self.io, self.gpa, source_path, input.text, ast_hash, ir_hash) catch return;
 
                 if (ir_cached) |*loaded| {
                     // IR hash matched — parse (phase 2), resolve, typecheck, lower
@@ -925,8 +902,7 @@ pub const QueryDb = struct {
             .has_value = memo.value != null,
             .diagnostics = memo.diagnostics.items,
             .bytes = if (memo.value) |*v|
-                if (comptime stage == .compile) try gpa.dupe(u8, v.*)
-                else try serializeStageValue(stage, gpa, v)
+                if (comptime stage == .compile) try gpa.dupe(u8, v.*) else try serializeStageValue(stage, gpa, v)
             else
                 null,
         } else .{ .changed_at = 0, .has_value = false, .diagnostics = &.{}, .bytes = null };
@@ -949,7 +925,7 @@ pub const QueryDb = struct {
             if (iter.next()) |entry| {
                 const source = entry.value_ptr.*;
                 if (source.source_path) |path|
-                    query_cache.sweepStaleCaches(io, self.gpa, self.cacheOptions(), path) catch {};
+                    query_cache.sweepStaleCaches(io, self.gpa, path) catch {};
             }
         }
 
@@ -975,7 +951,7 @@ pub const QueryDb = struct {
 
             const ir_hash: u64 = if (snaps[3].bytes) |bytes| std.hash.Wyhash.hash(0, bytes) else 0;
 
-            try query_cache.save(io, self.gpa, self.cacheOptions(), .{
+            try query_cache.save(io, self.gpa, .{
                 .source_path = source_path,
                 .source_text = source.text,
                 .ast_hash = ast_hash,

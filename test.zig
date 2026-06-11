@@ -26,7 +26,7 @@ fn runTestCapture(source: []const u8, args: []const []const u8) ![]u8 {
     defer threaded.deinit();
     const io = threaded.io();
 
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
 
     try db.setSource(0, source);
@@ -73,11 +73,12 @@ fn makeTmpSourcePath(gpa: std.mem.Allocator, tmp: *const testing.TmpDir, file_na
     });
 }
 
-fn initCacheDb(cache_enabled: bool) query.QueryDb {
-    return query.QueryDb.initWithOptions(testing.allocator, .{
-        .persistent_cache_enabled = cache_enabled,
-        .io = testing.io,
-    });
+fn initDb() query.QueryDb {
+    return query.QueryDb.initWithOptions(testing.allocator, std.testing.io, .{ .persistent_cache_enabled = false });
+}
+
+fn initCacheDb() query.QueryDb {
+    return query.QueryDb.initWithOptions(testing.allocator, std.testing.io, .{ .persistent_cache_enabled = true });
 }
 
 const PersistTest = struct {
@@ -134,7 +135,7 @@ test "top-level call expression executes as entry point" {
 }
 
 test "compile emits ELF executable bytes" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
 
     try db.setSource(0, "0");
@@ -148,7 +149,7 @@ test "compile emits ELF executable bytes" {
 }
 
 test "resolver duplicate symbol" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
 
     try db.setSource(0,
@@ -162,7 +163,7 @@ test "resolver duplicate symbol" {
 }
 
 test "resolver unknown symbol" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
 
     try db.setSource(0, "print(missing_name)");
@@ -251,7 +252,7 @@ test "fallible and binds tighter than or" {
 }
 
 test "logical operands must be fallible" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
 
     try db.setSource(0,
@@ -297,7 +298,7 @@ test "comptime value declaration resolves dependencies regardless of order" {
 }
 
 test "comptime declaration cycle reports diagnostic" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
 
     try db.setSource(0,
@@ -309,7 +310,7 @@ test "comptime declaration cycle reports diagnostic" {
 }
 
 test "comptime expressions are pure in v1" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
 
     try db.setSource(0,
@@ -320,7 +321,7 @@ test "comptime expressions are pure in v1" {
 }
 
 test "comptime expressions cannot capture runtime locals" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
 
     try db.setSource(0,
@@ -332,7 +333,7 @@ test "comptime expressions cannot capture runtime locals" {
 }
 
 test "typecheck call arity mismatch" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
 
     try db.setSource(0,
@@ -346,7 +347,7 @@ test "typecheck call arity mismatch" {
 }
 
 test "typecheck call argument type mismatch" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
 
     try db.setSource(0,
@@ -360,7 +361,7 @@ test "typecheck call argument type mismatch" {
 }
 
 test "typecheck return mismatch" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
 
     try db.setSource(0,
@@ -370,9 +371,8 @@ test "typecheck return mismatch" {
     try expectCompileErrorContains(&db, 0, "return type mismatch");
 }
 
-
 test "query cache hits within same revision includes resolve" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
 
     try db.setSource(0, "0");
@@ -399,7 +399,7 @@ test "query cache hits within same revision includes resolve" {
 }
 
 test "source change invalidates all stages" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
 
     try db.setSource(0, "0");
@@ -419,7 +419,7 @@ test "source change invalidates all stages" {
 }
 
 test "whitespace-only change does not recompute downstream stages" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
 
     try db.setSource(0,
@@ -455,7 +455,7 @@ test "whitespace-only change does not recompute downstream stages" {
 }
 
 test "compile changed_at backdates on equal output" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
 
     try db.setSource(0, "5");
@@ -553,7 +553,7 @@ test "if condition binding with as unwraps variant payload" {
 }
 
 test "if condition binding with as is scoped to success branch" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
 
     try db.setSource(0,
@@ -566,7 +566,7 @@ test "if condition binding with as is scoped to success branch" {
 }
 
 test "is requires a variant lhs" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
 
     try db.setSource(0,
@@ -577,7 +577,7 @@ test "is requires a variant lhs" {
 }
 
 test "is rhs must be a variant member type" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
 
     try db.setSource(0,
@@ -590,7 +590,7 @@ test "is rhs must be a variant member type" {
 }
 
 test "variant type rejects duplicate members" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
 
     try db.setSource(0,
@@ -658,7 +658,7 @@ test "comptime const/var as expression and as in comptime eval" {
 }
 
 test "const in if condition scoped to then-branch only" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
 
     try db.setSource(0,
@@ -709,7 +709,7 @@ test "struct init const and field access" {
 }
 
 test "struct init unknown field error" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
     try db.setSource(0,
         \\comptime Foo = struct
@@ -720,7 +720,7 @@ test "struct init unknown field error" {
 }
 
 test "struct init field count mismatch error" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
     try db.setSource(0,
         \\comptime Foo = struct
@@ -732,7 +732,7 @@ test "struct init field count mismatch error" {
 }
 
 test "field access on non-struct error" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
     try db.setSource(0,
         \\const x = 5
@@ -742,7 +742,7 @@ test "field access on non-struct error" {
 }
 
 test "struct field type mismatch error" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
     try db.setSource(0,
         \\comptime Foo = struct
@@ -753,7 +753,6 @@ test "struct field type mismatch error" {
 }
 
 test "comptime function returns monomorphized struct type" {
-
     try testProgram(
         \\comptime Wrapper = func(comptime T: type) type
         \\  return struct
@@ -765,7 +764,6 @@ test "comptime function returns monomorphized struct type" {
 }
 
 test "comptime function with dual monomorphized parameter" {
-
     try testProgram(
         \\comptime Pair = func(comptime A: type, comptime B: type) type
         \\  return struct
@@ -779,8 +777,7 @@ test "comptime function with dual monomorphized parameter" {
 }
 
 test "comptime function monomorphization caching" {
-
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
 
     try db.setSource(0,
@@ -800,12 +797,10 @@ test "comptime function monomorphization caching" {
     const stats = db.statsSnapshot();
     try testing.expect(stats.hits[@intFromEnum(query.QueryKind.compile)] >= 1);
     try testing.expectEqual(@as(usize, 0), stats.recomputes[@intFromEnum(query.QueryKind.compile)]);
-
 }
 
 test "comptime function error passing non-type as type param" {
-
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
 
     try db.setSource(0,
@@ -817,7 +812,7 @@ test "comptime function error passing non-type as type param" {
 }
 
 test "runtime type value in const decl errors" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
 
     try db.setSource(0,
@@ -830,7 +825,7 @@ test "runtime type value in const decl errors" {
 }
 
 test "runtime type value in var decl errors" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
 
     try db.setSource(0,
@@ -848,7 +843,7 @@ test "comptime value used as type annotation in const decl" {
 }
 
 test "comptime value not a type in annotation errors" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
 
     try db.setSource(0,
@@ -859,7 +854,6 @@ test "comptime value not a type in annotation errors" {
 }
 
 test "comptime function inline struct init" {
-
     try testProgram(
         \\comptime Wrapper = func(comptime T: type) type
         \\  return struct
@@ -870,7 +864,6 @@ test "comptime function inline struct init" {
 }
 
 test "monomorphized function with comptime type param and runtime param" {
-
     try testProgram(
         \\comptime foo = func(comptime T: type, x: T)
         \\  print(x)
@@ -879,7 +872,6 @@ test "monomorphized function with comptime type param and runtime param" {
 }
 
 test "monomorphized function multiple type instantiations" {
-
     try testProgram(
         \\comptime foo = func(comptime T: type, x: T)
         \\  print(x)
@@ -889,7 +881,6 @@ test "monomorphized function multiple type instantiations" {
 }
 
 test "monomorphized function int parameter used as field type" {
-
     try testProgram(
         \\comptime wrap = func(comptime T: type, x: T)
         \\  print(x)
@@ -899,7 +890,7 @@ test "monomorphized function int parameter used as field type" {
 }
 
 test "monomorphized function arg type mismatch errors" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
 
     try db.setSource(0,
@@ -911,7 +902,7 @@ test "monomorphized function arg type mismatch errors" {
 }
 
 test "monomorphized function comptime arg type mismatch errors" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
 
     try db.setSource(0,
@@ -923,7 +914,7 @@ test "monomorphized function comptime arg type mismatch errors" {
 }
 
 test "monomorphized function caching across same revision" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
 
     try db.setSource(0,
@@ -953,7 +944,7 @@ test "comptime pure-function with comptime-only param and struct arg" {
 }
 
 test "binding type annotation mismatch errors" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
 
     try db.setSource(0, "const x: int = 1.0");
@@ -978,7 +969,7 @@ test "comptime value decl with float type annotation" {
 }
 
 test "comptime value decl type annotation mismatch" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
 
     try db.setSource(0,
@@ -1004,7 +995,7 @@ test "comptime value decl with bool type annotation" {
 }
 
 test "string type annotation is rejected" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
 
     try db.setSource(0, "const s: string = 1");
@@ -1012,7 +1003,7 @@ test "string type annotation is rejected" {
 }
 
 test "string literal syntax is rejected" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
 
     try db.setSource(0, "print(\"hello\")");
@@ -1025,14 +1016,14 @@ test "persistent cache reuses compile result across db instances" {
     defer pt.deinit();
 
     {
-        var db = initCacheDb(true);
+        var db = initCacheDb();
         defer db.deinit();
         try db.setSourceFile(0, pt.source_path, source_text);
         _ = try expectCompileOk(&db, 0);
     }
 
     {
-        var db = initCacheDb(true);
+        var db = initCacheDb();
         defer db.deinit();
         try db.setSourceFile(0, pt.source_path, source_text);
         db.resetStats();
@@ -1049,14 +1040,14 @@ test "persistent cache disable option bypasses disk cache" {
     defer pt.deinit();
 
     {
-        var db = initCacheDb(true);
+        var db = initCacheDb();
         defer db.deinit();
         try db.setSourceFile(0, pt.source_path, source_text);
         _ = try expectCompileOk(&db, 0);
     }
 
     {
-        var db = initCacheDb(false);
+        var db = initDb();
         defer db.deinit();
         try db.setSourceFile(0, pt.source_path, source_text);
         db.resetStats();
@@ -1073,14 +1064,14 @@ test "persistent cache stores compile failures and diagnostics" {
     defer pt.deinit();
 
     {
-        var db = initCacheDb(true);
+        var db = initCacheDb();
         defer db.deinit();
         try db.setSourceFile(0, pt.source_path, source_text);
         try expectCompileErrorContains(&db, 0, "unknown symbol");
     }
 
     {
-        var db = initCacheDb(true);
+        var db = initCacheDb();
         defer db.deinit();
         try db.setSourceFile(0, pt.source_path, source_text);
         db.resetStats();
@@ -1096,7 +1087,7 @@ test "corrupted persistent cache is ignored and rebuilt" {
     defer pt.deinit();
 
     {
-        var db = initCacheDb(true);
+        var db = initCacheDb();
         defer db.deinit();
         try db.setSourceFile(0, pt.source_path, source_text);
         _ = try expectCompileOk(&db, 0);
@@ -1108,7 +1099,7 @@ test "corrupted persistent cache is ignored and rebuilt" {
     });
 
     {
-        var db = initCacheDb(true);
+        var db = initCacheDb();
         defer db.deinit();
         try db.setSourceFile(0, pt.source_path, source_text);
         db.resetStats();
@@ -1124,7 +1115,7 @@ test "persistent cache load frees data on hash mismatch (regression)" {
     var pt = try PersistTest.init("persist_hash_mismatch.chi", source_text);
     defer pt.deinit();
 
-    try query_cache.save(testing.io, testing.allocator, .{}, .{
+    try query_cache.save(testing.io, testing.allocator, .{
         .source_path = pt.source_path,
         .source_text = source_text,
         .ast_hash = 0,
@@ -1162,7 +1153,7 @@ test "stale cache files are removed by eager sweep" {
     defer std.Io.Dir.cwd().deleteFile(testing.io, live_cache) catch {};
     defer std.Io.Dir.cwd().deleteFile(testing.io, stale_cache) catch {};
 
-    try query_cache.save(testing.io, testing.allocator, .{}, .{
+    try query_cache.save(testing.io, testing.allocator, .{
         .source_path = stale_source,
         .source_text = source_text,
         .ast_hash = 0,
@@ -1175,7 +1166,7 @@ test "stale cache files are removed by eager sweep" {
     });
 
     {
-        var db = initCacheDb(true);
+        var db = initCacheDb();
         defer db.deinit();
         try db.setSourceFile(0, live_source, source_text);
         _ = try expectCompileOk(&db, 0);
@@ -1190,14 +1181,14 @@ test "stale cache files are removed by eager sweep" {
 }
 
 test "persistent cache reuses compile when IR matches despite different AST" {
-    const src_inferred  = "comptime foo = func()\n  print(42)\nfoo()";
-    const src_explicit  = "comptime foo = func() unit\n  print(42)\nfoo()";
+    const src_inferred = "comptime foo = func()\n  print(42)\nfoo()";
+    const src_explicit = "comptime foo = func() unit\n  print(42)\nfoo()";
     var pt = try PersistTest.init("persist_ir_phase3.chi", src_inferred);
     defer pt.deinit();
 
     // First db — compile with inferred return type, saves cache
     {
-        var db = initCacheDb(true);
+        var db = initCacheDb();
         defer db.deinit();
         try db.setSourceFile(0, pt.source_path, src_inferred);
         _ = try expectCompileOk(&db, 0);
@@ -1211,7 +1202,7 @@ test "persistent cache reuses compile when IR matches despite different AST" {
 
     // Second db — compile with explicit return type, should hit phase 3
     {
-        var db = initCacheDb(true);
+        var db = initCacheDb();
         defer db.deinit();
         try db.setSourceFile(0, pt.source_path, src_explicit);
         db.resetStats();
@@ -1239,7 +1230,7 @@ test "persistent cache partial load failure frees partial allocations" {
     // been deserialized, exercising the partial-failure cleanup path.
     const resolve_garbage = &[_]u8{ 0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00 };
 
-    try query_cache.save(testing.io, testing.allocator, .{}, .{
+    try query_cache.save(testing.io, testing.allocator, .{
         .source_path = pt.source_path,
         .source_text = source_text,
         .ast_hash = 0,
@@ -1256,7 +1247,7 @@ test "persistent cache partial load failure frees partial allocations" {
     // catch return, and the defer block frees the partial parse memo.
     // The testing allocator catches any leak.
     {
-        var db = initCacheDb(true);
+        var db = initCacheDb();
         defer db.deinit();
         try db.setSourceFile(0, pt.source_path, source_text);
         _ = try expectCompileOk(&db, 0);
@@ -1298,7 +1289,7 @@ test "parser ownership syntax and parameter modes" {
 }
 
 test "struct ownership keys are reserved and cannot be field names" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
 
     try db.setSource(0,
@@ -1309,7 +1300,7 @@ test "struct ownership keys are reserved and cannot be field names" {
 }
 
 test "ownership copy none rejects implicit struct copy" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
 
     try db.setSource(0,
@@ -1358,7 +1349,7 @@ test "var parameter consume supports both x and x^ call forms" {
 }
 
 test "use after move is diagnosed" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
 
     try db.setSource(0,
@@ -1395,7 +1386,7 @@ test "mut parameter writes back to caller value" {
 }
 
 test "move none values cannot be transferred" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
 
     try db.setSource(0,
@@ -1411,7 +1402,7 @@ test "move none values cannot be transferred" {
 }
 
 test "move none forces copy none compatibility" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
 
     try db.setSource(0,
@@ -1424,7 +1415,7 @@ test "move none forces copy none compatibility" {
 }
 
 test "drop explicit requires deinit path before scope exit" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
 
     try db.setSource(0,
@@ -1463,7 +1454,7 @@ test "deinit-to-deinit transfer is allowed" {
 }
 
 test "deinit-owned value cannot be transferred to var parameter" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
 
     try db.setSource(0,
@@ -1483,7 +1474,7 @@ test "deinit-owned value cannot be transferred to var parameter" {
 }
 
 test "ownership hook signature mismatch is diagnosed" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
 
     try db.setSource(0,
@@ -1668,21 +1659,21 @@ test "regression: swap via mut params and field assignment" {
 }
 
 test "error: arithmetic operands must have the same type" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
     try db.setSource(0, "print(1 + 2.0)");
     try expectCompileErrorContains(&db, 0, "arithmetic operands must have the same type");
 }
 
 test "error: arithmetic requires int or float operands" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
     try db.setSource(0, "print(true + 1)");
     try expectCompileErrorContains(&db, 0, "arithmetic requires int or float operands");
 }
 
 test "error: as operand not variant" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
     try db.setSource(0,
         \\const x = 1
@@ -1693,7 +1684,7 @@ test "error: as operand not variant" {
 }
 
 test "error: as type not in variant" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
     try db.setSource(0,
         \\comptime V = int | float
@@ -1705,7 +1696,7 @@ test "error: as type not in variant" {
 }
 
 test "error: assign to const symbol" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
     try db.setSource(0,
         \\const x = 1
@@ -1715,7 +1706,7 @@ test "error: assign to const symbol" {
 }
 
 test "error: assignment type mismatch" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
     try db.setSource(0,
         \\var x: int = 1
@@ -1725,7 +1716,7 @@ test "error: assignment type mismatch" {
 }
 
 test "error: call target not function" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
     try db.setSource(0,
         \\const x = 1
@@ -1735,14 +1726,14 @@ test "error: call target not function" {
 }
 
 test "error: comparison operands must have the same type" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
     try db.setSource(0, "if 1 < 2.0\n  print(1)");
     try expectCompileErrorContains(&db, 0, "comparison operands must have the same type");
 }
 
 test "error: comparison requires numeric" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
     try db.setSource(0, "if true < false\n  print(1)");
     try expectCompileErrorContains(&db, 0, "comparison requires int or float operands");
@@ -1759,14 +1750,14 @@ test "if branches variant type (no error — if returns variant)" {
 }
 
 test "error: equality operands must have the same type" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
     try db.setSource(0, "if 1 == 2.0\n  print(1)");
     try expectCompileErrorContains(&db, 0, "equality operands must have the same type");
 }
 
 test "error: equality unsupported type" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
     try db.setSource(0,
         \\comptime A = struct
@@ -1779,14 +1770,14 @@ test "error: equality unsupported type" {
 }
 
 test "error: fallible outside fallible context" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
     try db.setSource(0, "print(1 < 2)");
     try expectCompileErrorContains(&db, 0, "Fallible expression is not allowed outside fallible context");
 }
 
 test "error: function body type mismatch" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
     try db.setSource(0,
         \\comptime f = func() int
@@ -1795,9 +1786,8 @@ test "error: function body type mismatch" {
     try expectCompileErrorContains(&db, 0, "function body type does not match declared return type");
 }
 
-
 test "error: if without else must have unit then-branch" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
     try db.setSource(0,
         \\if 1 < 2
@@ -1807,7 +1797,7 @@ test "error: if without else must have unit then-branch" {
 }
 
 test "error: invalid borrow argument" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
     try db.setSource(0,
         \\comptime f = func(mut x: int) unit
@@ -1818,7 +1808,7 @@ test "error: invalid borrow argument" {
 }
 
 test "error: move borrowed value" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
     try db.setSource(0,
         \\comptime f = func(x: int) int
@@ -1828,7 +1818,7 @@ test "error: move borrowed value" {
 }
 
 test "error: mutate const" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
     try db.setSource(0,
         \\comptime f = func(mut x: int) unit
@@ -1840,7 +1830,7 @@ test "error: mutate const" {
 }
 
 test "error: move not allowed for type" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
     try db.setSource(0,
         \\comptime Id = struct
@@ -1855,7 +1845,7 @@ test "error: move not allowed for type" {
 }
 
 test "error: print unit value" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
     try db.setSource(0,
         \\const x = if 1 < 2
@@ -1868,7 +1858,7 @@ test "error: print unit value" {
 }
 
 test "error: recursive struct types" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
     try db.setSource(0,
         \\comptime S = struct
@@ -1880,7 +1870,7 @@ test "error: recursive struct types" {
 }
 
 test "error: use after deinit" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
     try db.setSource(0,
         \\comptime D = struct
@@ -1908,7 +1898,7 @@ test "comments are ignored by parser" {
 }
 
 test "second compile with no changes has zero recomputes" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
 
     try db.setSource(0, "0");
@@ -1993,7 +1983,7 @@ test "query operator with binding unwraps value" {
 }
 
 test "query operator with binding scoped to success branch" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
 
     try db.setSource(0,
@@ -2006,7 +1996,7 @@ test "query operator with binding scoped to success branch" {
 }
 
 test "query operator errors on non-variant operand" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
 
     try db.setSource(0,
@@ -2018,7 +2008,7 @@ test "query operator errors on non-variant operand" {
 }
 
 test "query operator errors when variant has no none" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
 
     try db.setSource(0,
@@ -2057,7 +2047,7 @@ test "none type: in variant initializer from none" {
 }
 
 test "none type: error on print none" {
-    var db = query.QueryDb.init(testing.allocator);
+    var db = initDb();
     defer db.deinit();
 
     try db.setSource(0,

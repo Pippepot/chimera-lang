@@ -217,7 +217,7 @@ pub const CompileResult = struct {
 
 pub fn Memo(comptime T: type) type {
     return struct {
-        value: ?T,
+        value: ?T, // value can be null when a query has failed, producing diagnostics only
         diagnostics: std.ArrayList(Diagnostic),
         deps: std.ArrayList(Dependency),
         verified_at: Revision = 0,
@@ -320,7 +320,7 @@ fn optionalProgramKeyEql(a: ?ProgramKey, b: ?ProgramKey) bool {
 }
 
 pub fn appendDependencyUnique(deps: *std.ArrayList(Dependency), gpa: std.mem.Allocator, dep: Dependency) std.mem.Allocator.Error!void {
-    for (deps.items) |existing| {
+    for (deps.items) |existing| { // Replace with set (AutoHashmap(Dependency, void)) if order does not matter
         if (dependencyEql(existing, dep)) return;
     }
     try deps.append(gpa, dep);
