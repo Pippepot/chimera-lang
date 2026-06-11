@@ -27,8 +27,13 @@ pub const Node = struct {
         mul, // node_node: lhs, rhs
         div, // node_node: lhs, rhs
         eq, // node_node: lhs, rhs
+        ne, // node_node: lhs, rhs
         lt, // node_node: lhs, rhs
         gt, // node_node: lhs, rhs
+        le, // node_node: lhs, rhs
+        ge, // node_node: lhs, rhs
+        is, // node_node: lhs, type
+        as, // node_node: lhs, type
         @"if", // node_node: condition, then expr
         if_else, // ref: condition, then expr, else expr
         @"and", // node_node: lhs, rhs
@@ -45,6 +50,8 @@ pub const Node = struct {
         const_binding, // node_node: type_annotation, value
         var_binding, // node_node: type_annotation, value
         comptime_binding, // node_node: type_annotation, value
+        comptime_expr, // node: body
+        field_access, // token_index: field name; node: target
         func, // node_node: signature, body
         identifier, // token_index: standalone identifier; bindings use their own token_index
         none_literal, // token_index: none literal
@@ -52,9 +59,16 @@ pub const Node = struct {
         param, // token_index: identifier; node_node: access, type
         param_list_small, // node_node: first param, second param
         param_list, // ref: parameter nodes
+        query_op, // node: operand
+        move_expr, // node: operand
         return_nothing, // none
         return_expr, // node: returned expression
         signature, // node_node: param_list, return_type
+        sizeof_expr, // node: type
+        @"struct", // ref: fields
+        struct_field, // token_index: identifier; node: type
+        struct_init, // ref: target, fields
+        struct_init_field, // token_index: identifier; node: value
         type, // token_index: type name
         type_func, // node_node: param_type_list, return_type
         type_list_small, // node_node: first type, second type
@@ -108,11 +122,15 @@ fn renderNode(node_index: Node.Index, ast: *const ParserState, source: []const u
             const loc = ast.tokens[node.token_index].loc;
             try writer.print(" : {s}\n", .{source[loc.start..loc.end]});
         },
-        .return_expr, .not, .neg => {
+        .return_expr, .not, .neg, .query_op, .move_expr, .comptime_expr, .sizeof_expr, .field_access, .struct_field, .struct_init_field => {
+            if (node.tag == .field_access or node.tag == .struct_field or node.tag == .struct_init_field) {
+                const loc = ast.tokens[node.token_index].loc;
+                try writer.print(" : {s}", .{source[loc.start..loc.end]});
+            }
             try writer.writeByte('\n');
             try renderNode(node.data.node, ast, source, writer, seen, new_indent, true, false);
         },
-        .add, .sub, .mul, .div, .eq, .lt, .gt, .@"and", .@"or", .assign, .call, .call_arg_list_small, .const_binding, .var_binding, .comptime_binding, .func, .param, .param_list_small, .signature, .type_func, .type_list_small, .type_variant_small, .@"if" => {
+        .add, .sub, .mul, .div, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .@"and", .@"or", .assign, .call, .call_arg_list_small, .const_binding, .var_binding, .comptime_binding, .func, .param, .param_list_small, .signature, .type_func, .type_list_small, .type_variant_small, .@"if" => {
             if (node.tag == .param) {
                 const loc = ast.tokens[node.token_index].loc;
                 try writer.print(" : {s}", .{source[loc.start..loc.end]});
@@ -126,7 +144,7 @@ fn renderNode(node_index: Node.Index, ast: *const ParserState, source: []const u
                 try renderNode(b, ast, source, writer, seen, new_indent, true, false);
             }
         },
-        .block, .call_arg_list, .param_list, .type_list, .type_variant, .if_else => {
+        .block, .call_arg_list, .param_list, .type_list, .type_variant, .if_else, .@"struct", .struct_init => {
             try writer.writeByte('\n');
             for (node.data.ref.start..node.data.ref.end) |i| {
                 try renderNode(ast.node_refs.items[i], ast, source, writer, seen, new_indent, i == node.data.ref.end - 1, false);
@@ -368,30 +386,41 @@ fn parseExpression(parser: *ParserState) ParseError!Node.Index {
         .keyword_const, .keyword_var => return parseBinding(parser) catch return .null,
         .keyword_func => return parseFunction(parser) catch return .null,
         .keyword_return => return parseReturn(parser) catch return .null,
-        .identifier => {
-            if (parser.tokens[parser.index + 1].tag == .equal) return parseAssign(parser) catch return .null;
-            return parseExpressionPrecedence(parser, 0);
+        else => {
+            const expr = try parseExpressionPrecedence(parser, 0);
+            if (parser.tokens[parser.index].tag == .equal) return parseAssign(parser, expr) catch return .null;
+            return expr;
         },
-        else => return parseExpressionPrecedence(parser, 0),
     };
 }
 
 const BinaryOpInfo = struct {
     tag: Node.Tag,
     precedence: u8,
+    rhs: Rhs,
+
+    const Rhs = enum {
+        expression,
+        type,
+    };
 };
 
 fn binaryOpInfo(token: Token.Tag) ?BinaryOpInfo {
     return switch (token) {
-        .keyword_or => .{ .tag = .@"or", .precedence = 1 },
-        .keyword_and => .{ .tag = .@"and", .precedence = 2 },
-        .equal_equal => .{ .tag = .eq, .precedence = 3 },
-        .angle_bracket_left => .{ .tag = .lt, .precedence = 3 },
-        .angle_bracket_right => .{ .tag = .gt, .precedence = 3 },
-        .plus => .{ .tag = .add, .precedence = 4 },
-        .minus => .{ .tag = .sub, .precedence = 4 },
-        .asterisk => .{ .tag = .mul, .precedence = 5 },
-        .slash => .{ .tag = .div, .precedence = 5 },
+        .keyword_or => .{ .tag = .@"or", .precedence = 1, .rhs = .expression },
+        .keyword_and => .{ .tag = .@"and", .precedence = 2, .rhs = .expression },
+        .equal_equal => .{ .tag = .eq, .precedence = 3, .rhs = .expression },
+        .angle_bracket_left_angle_bracket_right => .{ .tag = .ne, .precedence = 3, .rhs = .expression },
+        .angle_bracket_left => .{ .tag = .lt, .precedence = 3, .rhs = .expression },
+        .angle_bracket_right => .{ .tag = .gt, .precedence = 3, .rhs = .expression },
+        .angle_bracket_left_equal => .{ .tag = .le, .precedence = 3, .rhs = .expression },
+        .angle_bracket_right_equal => .{ .tag = .ge, .precedence = 3, .rhs = .expression },
+        .keyword_is => .{ .tag = .is, .precedence = 3, .rhs = .type },
+        .keyword_as => .{ .tag = .as, .precedence = 3, .rhs = .type },
+        .plus => .{ .tag = .add, .precedence = 4, .rhs = .expression },
+        .minus => .{ .tag = .sub, .precedence = 4, .rhs = .expression },
+        .asterisk => .{ .tag = .mul, .precedence = 5, .rhs = .expression },
+        .slash => .{ .tag = .div, .precedence = 5, .rhs = .expression },
         else => null,
     };
 }
@@ -404,7 +433,10 @@ fn parseExpressionPrecedence(parser: *ParserState, min_precedence: u8) ParseErro
 
         const token_index = parser.index;
         parser.index += 1;
-        const rhs = try parseExpressionPrecedence(parser, op_info.precedence + 1);
+        const rhs = switch (op_info.rhs) {
+            .expression => try parseExpressionPrecedence(parser, op_info.precedence + 1),
+            .type => try parseType(parser),
+        };
         lhs = try parser.addNode(.{ .tag = op_info.tag, .token_index = token_index, .data = .{ .node_node = .{ .a = lhs, .b = rhs } } });
     }
 
@@ -427,10 +459,19 @@ fn parseUnary(parser: *ParserState) ParseError!Node.Index {
 fn parsePostfix(parser: *ParserState) ParseError!Node.Index {
     var lhs = try parsePrimary(parser);
 
-    while (parser.tokens[parser.index].tag == .l_paren) {
-        const token_index = parser.index;
-        const args = try parseCallArgList(parser);
-        lhs = try parser.addNode(.{ .tag = .call, .token_index = token_index, .data = .{ .node_node = .{ .a = lhs, .b = args } } });
+    while (true) {
+        switch (parser.tokens[parser.index].tag) {
+            .l_paren => {
+                const token_index = parser.index;
+                const args = try parseCallArgList(parser);
+                lhs = try parser.addNode(.{ .tag = .call, .token_index = token_index, .data = .{ .node_node = .{ .a = lhs, .b = args } } });
+            },
+            .l_brace => lhs = try parseStructInit(parser, lhs),
+            .period => lhs = try parseFieldAccess(parser, lhs),
+            .question_mark => lhs = try parsePostfixNode(parser, lhs, .query_op),
+            .caret => lhs = try parsePostfixNode(parser, lhs, .move_expr),
+            else => break,
+        }
     }
 
     return lhs;
@@ -443,6 +484,9 @@ fn parsePrimary(parser: *ParserState) ParseError!Node.Index {
         .keyword_false => return parseTokenNode(parser, .keyword_false, .bool_literal) catch return .null,
         .keyword_none => return parseTokenNode(parser, .keyword_none, .none_literal) catch return .null,
         .keyword_if => return parseIfExpr(parser) catch return .null,
+        .keyword_comptime => return parseComptime(parser) catch return .null,
+        .keyword_sizeof => return parseSizeof(parser) catch return .null,
+        .keyword_struct => return parseStruct(parser) catch return .null,
         .identifier => return parseTokenNode(parser, .identifier, .identifier) catch return .null,
         .l_paren => {
             _ = parser.eat(.l_paren);
@@ -475,6 +519,83 @@ fn parseCallArgList(parser: *ParserState) !Node.Index {
     }
 
     return try addNodeList(parser, token_index, parser.scratch_stack.items[stack_top..], .call_arg_list_small, .call_arg_list);
+}
+
+fn parseStruct(parser: *ParserState) ParseError!Node.Index {
+    const token_index = parser.index;
+    _ = try parser.expect(.keyword_struct);
+    _ = try parser.expect(.indent);
+    const stack_top = parser.scratch_stack.items.len;
+    defer parser.scratch_stack.shrinkRetainingCapacity(stack_top);
+
+    while (true) {
+        if (parser.eat(.dedent) != null) break;
+        if (parser.tokens[parser.index].tag == .eof) break;
+
+        const field = try parseStructField(parser);
+        try parser.scratch_stack.append(parser.gpa, field);
+    }
+
+    return try parser.addNode(.{ .tag = .@"struct", .token_index = token_index, .data = try parser.listToSpan(parser.scratch_stack.items[stack_top..]) });
+}
+
+fn parseStructField(parser: *ParserState) ParseError!Node.Index {
+    const identifier_index = parser.index;
+    _ = try parser.expect(.identifier);
+    _ = try parser.expect(.colon);
+    const field_type = try parseType(parser);
+    return try parser.addNode(.{ .tag = .struct_field, .token_index = identifier_index, .data = .{ .node = field_type } });
+}
+
+fn parseStructInit(parser: *ParserState, target: Node.Index) ParseError!Node.Index {
+    const token_index = parser.index;
+    _ = try parser.expect(.l_brace);
+    const stack_top = parser.scratch_stack.items.len;
+    defer parser.scratch_stack.shrinkRetainingCapacity(stack_top);
+
+    try parser.scratch_stack.append(parser.gpa, target);
+    while (true) {
+        if (parser.eat(.r_brace) != null) break;
+
+        const field = try parseStructInitField(parser);
+        try parser.scratch_stack.append(parser.gpa, field);
+
+        if (parser.eat(.comma) != null) continue;
+        _ = try parser.expect(.r_brace);
+        break;
+    }
+
+    return try parser.addNode(.{ .tag = .struct_init, .token_index = token_index, .data = try parser.listToSpan(parser.scratch_stack.items[stack_top..]) });
+}
+
+fn parseStructInitField(parser: *ParserState) ParseError!Node.Index {
+    const identifier_index = parser.index;
+    _ = try parser.expect(.identifier);
+    _ = try parser.expect(.equal);
+    const value = try parseExpression(parser);
+    return try parser.addNode(.{ .tag = .struct_init_field, .token_index = identifier_index, .data = .{ .node = value } });
+}
+
+fn parseFieldAccess(parser: *ParserState, target: Node.Index) ParseError!Node.Index {
+    _ = try parser.expect(.period);
+    const field_index = parser.index;
+    _ = try parser.expect(.identifier);
+    return try parser.addNode(.{ .tag = .field_access, .token_index = field_index, .data = .{ .node = target } });
+}
+
+fn parseSizeof(parser: *ParserState) ParseError!Node.Index {
+    const token_index = parser.index;
+    _ = try parser.expect(.keyword_sizeof);
+    _ = try parser.expect(.l_paren);
+    const ty = try parseType(parser);
+    _ = try parser.expect(.r_paren);
+    return try parser.addNode(.{ .tag = .sizeof_expr, .token_index = token_index, .data = .{ .node = ty } });
+}
+
+fn parsePostfixNode(parser: *ParserState, operand: Node.Index, tag: Node.Tag) ParseError!Node.Index {
+    const token_index = parser.index;
+    parser.index += 1;
+    return try parser.addNode(.{ .tag = tag, .token_index = token_index, .data = .{ .node = operand } });
 }
 
 fn addNodeList(parser: *ParserState, token_index: u32, items: []const Node.Index, small_tag: Node.Tag, list_tag: Node.Tag) !Node.Index {
@@ -522,18 +643,15 @@ fn parseBinding(parser: *ParserState) !Node.Index {
     return parser.addNode(.{ .tag = tag, .token_index = token_index, .data = .{ .node_node = .{ .a = type_annotation, .b = value } } });
 }
 
-fn parseAssign(parser: *ParserState) !Node.Index {
-    const target = try parseTokenNode(parser, .identifier, .identifier);
+fn parseAssign(parser: *ParserState, target: Node.Index) !Node.Index {
     const token_index = parser.index;
     _ = try parser.expect(.equal);
     const value = try parseExpression(parser);
-    return parser.addNode(.{ .tag = .assign, .token_index = token_index, .data = .{ .node_node = .{ .a = target, .b = value } } });
+    return try parser.addNode(.{ .tag = .assign, .token_index = token_index, .data = .{ .node_node = .{ .a = target, .b = value } } });
 }
 
 fn parseTypeAnnotation(parser: *ParserState) !Node.Index {
-    if (parser.eat(.colon) != null) {
-        return try parseType(parser);
-    }
+    if (parser.eat(.colon) != null) return try parseType(parser);
     return .null;
 }
 
@@ -595,9 +713,14 @@ fn parseTypeList(parser: *ParserState) !Node.Index {
 }
 
 fn parseComptime(parser: *ParserState) !Node.Index {
-    if ((try parseBinding(parser)).unwrap()) |binding| return binding;
-    // TODO comptime block
-    return .null;
+    if (parser.tokens[parser.index + 1].tag == .identifier) {
+        if ((try parseBinding(parser)).unwrap()) |binding| return binding;
+    }
+
+    const token_index = parser.index;
+    _ = try parser.expect(.keyword_comptime);
+    const body = try parseBody(parser);
+    return try parser.addNode(.{ .tag = .comptime_expr, .token_index = token_index, .data = .{ .node = body } });
 }
 
 fn parseFunction(parser: *ParserState) !Node.Index {
@@ -628,7 +751,7 @@ fn parseParamList(parser: *ParserState) !Node.Index {
         if (parser.eat(.r_paren) != null) break;
 
         const access_token_index = parser.index;
-        const opt_access = parser.eatAny(&.{ .keyword_read, .keyword_mut, .keyword_var, .keyword_comptime });
+        const opt_access = parser.eatAny(&.{ .keyword_read, .keyword_mut, .keyword_var, .keyword_deinit, .keyword_comptime });
         _ = parser.expect(.identifier) catch return .null;
         const identifier_index = parser.index - 1;
         const type_annotation = try parseTypeAnnotation(parser);
@@ -678,7 +801,6 @@ test "parse function no parameters" {
         \\  └─block
         \\    └─return_expr
         \\      └─number_literal : 1
-        \\
     );
 }
 
@@ -692,7 +814,6 @@ test "parse inline function no parameters" {
         \\  │ └─type : int
         \\  └─return_expr
         \\    └─number_literal : 1
-        \\
     );
 }
 
@@ -715,7 +836,6 @@ test "parse function with parameters" {
         \\      └─add
         \\        ├─identifier : x
         \\        └─identifier : y
-        \\
     );
 }
 
@@ -741,7 +861,6 @@ test "parse const var assignment" {
         \\└─assign
         \\  ├─identifier : c
         \\  └─number_literal : 4.5
-        \\
     );
 }
 
@@ -761,7 +880,6 @@ test "parse variant type annotations" {
         \\│ ├─type : float
         \\│ └─type : none
         \\└─none_literal : none
-        \\
     );
 }
 
@@ -790,7 +908,6 @@ test "parse function type annotations" {
         \\│ │ └─type : bool
         \\│ └─type : none
         \\└─identifier : tri
-        \\
     );
 }
 
@@ -818,7 +935,320 @@ test "parse function signatures with compound types" {
         \\  └─block
         \\    └─return_expr
         \\      └─none_literal : none
-        \\
+    );
+}
+
+test "parse struct declaration" {
+    try testParsing(
+        \\comptime Vec2 = struct
+        \\  x: int
+        \\  y: float
+    ,
+        \\comptime_binding
+        \\└─struct
+        \\  ├─struct_field : x
+        \\  │ └─type : int
+        \\  └─struct_field : y
+        \\    └─type : float
+    );
+}
+
+test "parse anonymous struct expression" {
+    try testParsing(
+        \\comptime Wrapper = func(comptime T: type) type
+        \\  return struct
+        \\    x: T
+    ,
+        \\comptime_binding
+        \\└─func
+        \\  ├─signature
+        \\  │ ├─param_list_small
+        \\  │ │ └─param : T
+        \\  │ │   ├─access : comptime
+        \\  │ │   └─type : type
+        \\  │ └─type : type
+        \\  └─block
+        \\    └─return_expr
+        \\      └─struct
+        \\        └─struct_field : x
+        \\          └─type : T
+    );
+}
+
+test "parse struct init" {
+    try testParsing(
+        \\const p = Point{x = 3, y = 4}
+    ,
+        \\const_binding
+        \\└─struct_init
+        \\  ├─identifier : Point
+        \\  ├─struct_init_field : x
+        \\  │ └─number_literal : 3
+        \\  └─struct_init_field : y
+        \\    └─number_literal : 4
+    );
+}
+
+test "parse nested struct init" {
+    try testParsing(
+        \\const o = Outer{inner = Inner{v = 1}, tag = 2}
+    ,
+        \\const_binding
+        \\└─struct_init
+        \\  ├─identifier : Outer
+        \\  ├─struct_init_field : inner
+        \\  │ └─struct_init
+        \\  │   ├─identifier : Inner
+        \\  │   └─struct_init_field : v
+        \\  │     └─number_literal : 1
+        \\  └─struct_init_field : tag
+        \\    └─number_literal : 2
+    );
+}
+
+test "parse struct init after call" {
+    try testParsing(
+        \\const val = Wrapper(float){x = 3.0}
+    ,
+        \\const_binding
+        \\└─struct_init
+        \\  ├─call
+        \\  │ ├─identifier : Wrapper
+        \\  │ └─call_arg_list_small
+        \\  │   └─identifier : float
+        \\  └─struct_init_field : x
+        \\    └─number_literal : 3.0
+    );
+}
+
+test "parse field access" {
+    try testParsing(
+        \\print(foo.x)
+        \\const value = outer.inner.v
+    ,
+        \\call
+        \\├─identifier : print
+        \\└─call_arg_list_small
+        \\  └─field_access : x
+        \\    └─identifier : foo
+        \\const_binding
+        \\└─field_access : v
+        \\  └─field_access : inner
+        \\    └─identifier : outer
+    );
+}
+
+test "parse field assignment" {
+    try testParsing(
+        \\p.x = val
+        \\o.inner.v = p.y
+    ,
+        \\assign
+        \\├─field_access : x
+        \\│ └─identifier : p
+        \\└─identifier : val
+        \\assign
+        \\├─field_access : v
+        \\│ └─field_access : inner
+        \\│   └─identifier : o
+        \\└─field_access : y
+        \\  └─identifier : p
+    );
+}
+
+test "parse variant runtime operators" {
+    try testParsing(
+        \\if x is int | A -> print(1)
+        \\if const i = b as int -> print(i)
+    ,
+        \\if
+        \\├─is
+        \\│ ├─identifier : x
+        \\│ └─type_variant_small
+        \\│   ├─type : int
+        \\│   └─type : A
+        \\└─call
+        \\  ├─identifier : print
+        \\  └─call_arg_list_small
+        \\    └─number_literal : 1
+        \\if
+        \\├─const_binding
+        \\│ └─as
+        \\│   ├─identifier : b
+        \\│   └─type : int
+        \\└─call
+        \\  ├─identifier : print
+        \\  └─call_arg_list_small
+        \\    └─identifier : i
+    );
+}
+
+test "parse variant operator precedence" {
+    try testParsing(
+        \\if x is int or y is float and z is none -> print(1)
+    ,
+        \\if
+        \\├─or
+        \\│ ├─is
+        \\│ │ ├─identifier : x
+        \\│ │ └─type : int
+        \\│ └─and
+        \\│   ├─is
+        \\│   │ ├─identifier : y
+        \\│   │ └─type : float
+        \\│   └─is
+        \\│     ├─identifier : z
+        \\│     └─type : none
+        \\└─call
+        \\  ├─identifier : print
+        \\  └─call_arg_list_small
+        \\    └─number_literal : 1
+    );
+}
+
+test "parse query and move postfix operators" {
+    try testParsing(
+        \\const a = value?
+        \\const b = a^
+        \\take(b^)
+        \\if const v = maybe? -> print(v)
+    ,
+        \\const_binding
+        \\└─query_op
+        \\  └─identifier : value
+        \\const_binding
+        \\└─move_expr
+        \\  └─identifier : a
+        \\call
+        \\├─identifier : take
+        \\└─call_arg_list_small
+        \\  └─move_expr
+        \\    └─identifier : b
+        \\if
+        \\├─const_binding
+        \\│ └─query_op
+        \\│   └─identifier : maybe
+        \\└─call
+        \\  ├─identifier : print
+        \\  └─call_arg_list_small
+        \\    └─identifier : v
+    );
+}
+
+test "parse inline comptime expression" {
+    try testParsing(
+        \\const x = comptime -> 40 + 2
+        \\print(comptime -> 1)
+    ,
+        \\const_binding
+        \\└─comptime_expr
+        \\  └─add
+        \\    ├─number_literal : 40
+        \\    └─number_literal : 2
+        \\call
+        \\├─identifier : print
+        \\└─call_arg_list_small
+        \\  └─comptime_expr
+        \\    └─number_literal : 1
+    );
+}
+
+test "parse block comptime expression" {
+    try testParsing(
+        \\const x = comptime
+        \\  const a = 40
+        \\  a + 2
+    ,
+        \\const_binding
+        \\└─comptime_expr
+        \\  └─block
+        \\    ├─const_binding
+        \\    │ └─number_literal : 40
+        \\    └─add
+        \\      ├─identifier : a
+        \\      └─number_literal : 2
+    );
+}
+
+test "parse deinit parameter mode" {
+    try testParsing(
+        \\comptime consume = func(deinit d: D) unit
+        \\  print(d.x)
+    ,
+        \\comptime_binding
+        \\└─func
+        \\  ├─signature
+        \\  │ ├─param_list_small
+        \\  │ │ └─param : d
+        \\  │ │   ├─access : deinit
+        \\  │ │   └─type : D
+        \\  │ └─type : unit
+        \\  └─block
+        \\    └─call
+        \\      ├─identifier : print
+        \\      └─call_arg_list_small
+        \\        └─field_access : x
+        \\          └─identifier : d
+    );
+}
+
+test "parse sizeof expression" {
+    try testParsing(
+        \\print(sizeof(int))
+        \\print(sizeof(func(int) int))
+        \\const s = sizeof(int | float)
+    ,
+        \\call
+        \\├─identifier : print
+        \\└─call_arg_list_small
+        \\  └─sizeof_expr
+        \\    └─type : int
+        \\call
+        \\├─identifier : print
+        \\└─call_arg_list_small
+        \\  └─sizeof_expr
+        \\    └─type_func
+        \\      ├─type_list_small
+        \\      │ └─type : int
+        \\      └─type : int
+        \\const_binding
+        \\└─sizeof_expr
+        \\  └─type_variant_small
+        \\    ├─type : int
+        \\    └─type : float
+    );
+}
+
+test "parse extra comparison operators" {
+    try testParsing(
+        \\if a <= b -> print(1)
+        \\if b >= c -> print(2)
+        \\if c <> d -> print(3)
+    ,
+        \\if
+        \\├─le
+        \\│ ├─identifier : a
+        \\│ └─identifier : b
+        \\└─call
+        \\  ├─identifier : print
+        \\  └─call_arg_list_small
+        \\    └─number_literal : 1
+        \\if
+        \\├─ge
+        \\│ ├─identifier : b
+        \\│ └─identifier : c
+        \\└─call
+        \\  ├─identifier : print
+        \\  └─call_arg_list_small
+        \\    └─number_literal : 2
+        \\if
+        \\├─ne
+        \\│ ├─identifier : c
+        \\│ └─identifier : d
+        \\└─call
+        \\  ├─identifier : print
+        \\  └─call_arg_list_small
+        \\    └─number_literal : 3
     );
 }
 
@@ -843,7 +1273,6 @@ test "parse block if else" {
         \\    ├─identifier : print
         \\    └─call_arg_list_small
         \\      └─number_literal : 22
-        \\
     );
 }
 
@@ -856,7 +1285,6 @@ test "parse inline if expression" {
         \\  ├─bool_literal : true
         \\  ├─number_literal : 1
         \\  └─number_literal : 2
-        \\
     );
 }
 
@@ -884,7 +1312,6 @@ test "parse else if chain" {
         \\    ├─identifier : print
         \\    └─call_arg_list_small
         \\      └─number_literal : 3
-        \\
     );
 }
 
@@ -901,7 +1328,6 @@ test "parse if condition binding" {
         \\    ├─identifier : print
         \\    └─call_arg_list_small
         \\      └─identifier : v
-        \\
     );
 }
 
@@ -935,7 +1361,6 @@ test "parse calls and literals" {
         \\    └─call_arg_list_small
         \\      ├─number_literal : 2
         \\      └─number_literal : 3
-        \\
     );
 }
 
@@ -966,7 +1391,6 @@ test "parse with precedence" {
         \\      └─gt
         \\        ├─number_literal : 8
         \\        └─number_literal : 9
-        \\
     );
 }
 
@@ -978,5 +1402,5 @@ fn testParsing(source: [:0]const u8, expected: []const u8) !void {
     defer buffer.deinit();
     defer ast.deinit();
     try renderAst(&ast, source, &buffer.writer);
-    try std.testing.expectEqualStrings(expected, buffer.writer.buffered());
+    try std.testing.expectEqualStrings(expected, std.mem.trimEnd(u8, buffer.writer.buffered(), "\n"));
 }
