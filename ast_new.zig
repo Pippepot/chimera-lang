@@ -93,125 +93,6 @@ pub const Node = struct {
     };
 };
 
-pub fn renderAst(ast: *const ParserState, source: []const u8, writer: *std.Io.Writer) !void {
-    std.debug.assert(ast.nodes.items[0].tag == .block);
-    const seen = try ast.gpa.alloc(bool, ast.nodes.items.len);
-    defer ast.gpa.free(seen);
-    const block_ref = ast.nodes.items[0].data.ref;
-    for (block_ref.start..block_ref.end) |i| {
-        try renderNode(ast.node_refs.items[i], ast, source, writer, seen, "", i == block_ref.end - 1, true);
-    }
-}
-
-fn renderNode(node_index: Node.Index, ast: *const ParserState, source: []const u8, writer: *std.Io.Writer, seen: []bool, indent: []const u8, is_last: bool, at_root: bool) !void {
-    const node = ast.nodes.items[node_index.index()];
-    try writer.writeAll(indent);
-    if (!at_root) try writer.writeAll(if (is_last) "└─" else "├─");
-    try writer.print("{s}", .{@tagName(node.tag)});
-
-    if (seen[node_index.index()]) {
-        try writer.writeAll(" ...\n");
-        return;
-    }
-
-    seen[node_index.index()] = true;
-    const new_indent = if (at_root) "" else try std.mem.concat(ast.gpa, u8, &.{ indent, if (is_last) "  " else "│ " });
-    defer ast.gpa.free(new_indent);
-    switch (node.tag) {
-        .return_nothing => {},
-        .access, .bool_literal, .identifier, .none_literal, .type, .number_literal => {
-            const loc = ast.tokens[node.token_index].loc;
-            try writer.print(" : {s}\n", .{source[loc.start..loc.end]});
-        },
-        .return_expr, .not, .neg, .query_op, .move_expr, .comptime_expr, .sizeof_expr, .field_access, .struct_field, .struct_property, .struct_init_field => {
-            if (node.tag == .field_access or node.tag == .struct_field or node.tag == .struct_property or node.tag == .struct_init_field) {
-                const loc = ast.tokens[node.token_index].loc;
-                try writer.print(" : {s}", .{source[loc.start..loc.end]});
-            }
-            try writer.writeByte('\n');
-            try renderNode(node.data.node, ast, source, writer, seen, new_indent, true, false);
-        },
-        .add, .sub, .mul, .div, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .@"and", .@"or", .assign, .call, .call_arg_list_small, .const_binding, .var_binding, .comptime_binding, .func, .param, .param_list_small, .signature, .type_func, .type_list_small, .type_variant_small, .@"if" => {
-            if (node.tag == .param) {
-                const loc = ast.tokens[node.token_index].loc;
-                try writer.print(" : {s}", .{source[loc.start..loc.end]});
-            }
-            try writer.writeByte('\n');
-            const b_node = node.data.node_node.b.unwrap();
-            if (node.data.node_node.a.unwrap()) |a| {
-                try renderNode(a, ast, source, writer, seen, new_indent, b_node == null, false);
-            }
-            if (b_node) |b| {
-                try renderNode(b, ast, source, writer, seen, new_indent, true, false);
-            }
-        },
-        .block, .call_arg_list, .param_list, .type_list, .type_variant, .if_else, .@"struct", .struct_init => {
-            try writer.writeByte('\n');
-            for (node.data.ref.start..node.data.ref.end) |i| {
-                try renderNode(ast.node_refs.items[i], ast, source, writer, seen, new_indent, i == node.data.ref.end - 1, false);
-            }
-        },
-        else => try writer.print("Not implemented {}\n", .{node.tag}),
-    }
-}
-
-const LineInfoCursor = struct {
-    offset: usize = 0,
-    line: usize = 1,
-    column: usize = 1,
-    line_start: usize = 0,
-    line_end: usize = 0,
-};
-
-fn lineInfoForOffset(source: []const u8, offset: usize, cursor: *LineInfoCursor) void {
-    const safe_offset = if (offset > source.len) source.len else offset;
-    if (safe_offset < cursor.offset) {
-        cursor.* = .{};
-    }
-
-    while (cursor.offset < safe_offset) : (cursor.offset += 1) {
-        if (source[cursor.offset] == '\n') {
-            cursor.line += 1;
-            cursor.column = 1;
-            cursor.line_start = cursor.offset + 1;
-            cursor.line_end = cursor.line_start;
-        } else {
-            cursor.column += 1;
-        }
-    }
-
-    var idx = cursor.line_end;
-    while (idx < source.len) : (idx += 1) {
-        if (source[idx] == '\n') {
-            break;
-        }
-    }
-    cursor.line_end = idx;
-}
-
-pub fn renderDiagnostics(w: *std.Io.Writer, ast: *ParserState, source_path: []const u8, source: []const u8, diags: []const Diagnostic) !void {
-    var line_info_cursor: LineInfoCursor = .{};
-    for (diags) |diag| {
-        const source_location = ast.tokens[diag.token_index].loc;
-        lineInfoForOffset(source, source_location.start, &line_info_cursor);
-        try w.print("\x1b[31merror:\x1b[0m {s}:{d}:{d}: ", .{ source_path, line_info_cursor.line, line_info_cursor.column });
-        try diag.render(ast, w);
-        try w.writeByte('\n');
-
-        try w.writeAll(source[line_info_cursor.line_start..line_info_cursor.line_end]);
-        try w.writeByte('\n');
-
-        const caret_indent = if (line_info_cursor.column > 0) line_info_cursor.column - 1 else 0;
-        try w.splatByteAll(' ', caret_indent);
-        try w.writeByte('^');
-
-        const extra = @min(source_location.end, line_info_cursor.line_end) - @max(source_location.start, line_info_cursor.line_start);
-        if (extra > 1) try w.splatByteAll('~', extra - 1);
-        try w.writeByte('\n');
-    }
-}
-
-const ParseError = std.mem.Allocator.Error || error{ParseError};
 const Diagnostic = struct {
     tag: Tag,
     token_index: u32,
@@ -236,6 +117,8 @@ const Diagnostic = struct {
         };
     }
 };
+
+const ParseError = std.mem.Allocator.Error || error{ParseError};
 
 pub const ParserState = struct {
     gpa: std.mem.Allocator,
@@ -282,17 +165,6 @@ pub const ParserState = struct {
         self.nodes.items[@intFromEnum(i)] = node;
         return i;
     }
-
-    // pub fn addRef(self: *@This(), layout: anytype) !u32 {
-    //     const fields = std.meta.fields(@TypeOf(layout));
-    //     try self.node_refs.ensureUnusedCapacity(self.gpa, fields.len);
-
-    //     const idx: u32 = @intCast(self.node_refs.items.len);
-    //     inline for (fields) |field| {
-    //         self.node_refs.appendAssumeCapacity(@field(layout, field.name));
-    //     }
-    //     return idx;
-    // }
 
     pub fn eat(self: *@This(), token: Token.Tag) ?Token {
         const tok = self.tokens[self.index];
@@ -398,6 +270,175 @@ fn parseExpression(parser: *ParserState) ParseError!Node.Index {
         },
         else => .null,
     };
+}
+
+fn parseBody(parser: *ParserState) !Node.Index {
+    if (parser.eat(.arrow) != null) return try parseExpression(parser);
+    _ = try parser.expect(.indent);
+    return try parseBlock(parser);
+}
+
+fn parseReturn(parser: *ParserState) !Node.Index {
+    const token_index = parser.index;
+    _ = parser.expect(.keyword_return) catch return .null;
+    if ((try parseExpression(parser)).unwrap()) |expr| {
+        return try parser.addNode(.{ .tag = .return_expr, .token_index = token_index, .data = .{ .node = expr } });
+    }
+    return try parser.addNode(.{ .tag = .return_nothing, .token_index = token_index, .data = .{ .none = {} } });
+}
+
+fn parseComptime(parser: *ParserState) !Node.Index {
+    if (parser.tokens[parser.index + 1].tag == .identifier) {
+        if ((try parseBinding(parser)).unwrap()) |binding| return binding;
+    }
+
+    const token_index = parser.index;
+    _ = try parser.expect(.keyword_comptime);
+    const body = try parseBody(parser);
+    return try parser.addNode(.{ .tag = .comptime_expr, .token_index = token_index, .data = .{ .node = body } });
+}
+
+fn parseBinding(parser: *ParserState) !Node.Index {
+    const token_index = parser.index;
+    const binding_keyword = parser.eat(.keyword_const) orelse parser.eat(.keyword_var) orelse parser.eat(.keyword_comptime) orelse return .null;
+    _ = try parser.expect(.identifier);
+    const type_annotation = try parseTypeAnnotation(parser);
+    _ = try parser.expect(.equal);
+    const value = try parseExpression(parser);
+    const tag: Node.Tag = if (binding_keyword.tag == .keyword_const) .const_binding else if (binding_keyword.tag == .keyword_var) .var_binding else .comptime_binding;
+
+    return parser.addNode(.{ .tag = tag, .token_index = token_index, .data = .{ .node_node = .{ .a = type_annotation, .b = value } } });
+}
+
+fn parseAssign(parser: *ParserState, target: Node.Index) !Node.Index {
+    const token_index = parser.index;
+    _ = try parser.expect(.equal);
+    const value = try parseExpression(parser);
+    return try parser.addNode(.{ .tag = .assign, .token_index = token_index, .data = .{ .node_node = .{ .a = target, .b = value } } });
+}
+
+fn parseIfExpr(parser: *ParserState) ParseError!Node.Index {
+    const token_index = parser.index;
+    _ = try parser.expect(.keyword_if);
+
+    const condition = try parseExpression(parser);
+    const then_body = try parseBody(parser);
+    if (parser.eat(.keyword_else) != null) {
+        const else_body = if (parser.eat(.indent) != null) try parseBlock(parser) else try parseExpression(parser);
+        const ref_start: u32 = @intCast(parser.node_refs.items.len);
+        try parser.node_refs.appendSlice(parser.gpa, &.{ condition, then_body, else_body });
+        const ref_end: u32 = @intCast(parser.node_refs.items.len);
+        return try parser.addNode(.{ .tag = .if_else, .token_index = token_index, .data = .{ .ref = .{ .start = ref_start, .end = ref_end } } });
+    }
+    return try parser.addNode(.{ .tag = .@"if", .token_index = token_index, .data = .{ .node_node = .{ .a = condition, .b = then_body } } });
+}
+
+fn parseFunction(parser: *ParserState) !Node.Index {
+    const token_index = parser.index;
+    _ = parser.eat(.keyword_func) orelse return .null;
+    const signature = parseFuncSignature(parser) catch return .null;
+    const body = if ((try parseBody(parser)).unwrap()) |b| b else return .null;
+    return parser.addNode(.{ .tag = .func, .token_index = token_index, .data = .{ .node_node = .{ .a = signature, .b = body } } });
+}
+
+fn parseFuncSignature(parser: *ParserState) !Node.Index {
+    const token_index = parser.index;
+    const params = try parseParamList(parser);
+    const return_type: Node.Index = switch (parser.tokens[parser.index].tag) {
+        .identifier, .keyword_func, .keyword_none => try parseType(parser),
+        else => .null,
+    };
+    return parser.addNode(.{ .tag = .signature, .token_index = token_index, .data = .{ .node_node = .{ .a = params, .b = return_type } } });
+}
+
+fn parseParamList(parser: *ParserState) !Node.Index {
+    const token_index = parser.index;
+    _ = try parser.expect(.l_paren);
+    const stack_top = parser.scratch_stack.items.len;
+    defer parser.scratch_stack.shrinkRetainingCapacity(stack_top);
+
+    while (true) {
+        if (parser.eat(.r_paren) != null) break;
+
+        const access_token_index = parser.index;
+        const opt_access = parser.eatAny(&.{ .keyword_read, .keyword_mut, .keyword_var, .keyword_deinit, .keyword_comptime });
+        _ = parser.expect(.identifier) catch return .null;
+        const identifier_index = parser.index - 1;
+        const type_annotation = try parseTypeAnnotation(parser);
+
+        const access_idx: Node.Index = if (opt_access != null) try parser.addNode(.{ .tag = .access, .token_index = access_token_index, .data = .{ .none = {} } }) else .null;
+        const param = try parser.addNode(.{ .tag = .param, .token_index = identifier_index, .data = .{ .node_node = .{ .a = access_idx, .b = type_annotation } } });
+
+        try parser.scratch_stack.append(parser.gpa, param);
+
+        if (parser.eat(.comma) != null) continue;
+        _ = try parser.expect(.r_paren);
+        break;
+    }
+
+    return try addNodeList(parser, token_index, parser.scratch_stack.items[stack_top..], .param_list_small, .param_list);
+}
+
+fn parseTypeAnnotation(parser: *ParserState) !Node.Index {
+    if (parser.eat(.colon) != null) return try parseType(parser);
+    return .null;
+}
+
+fn parseType(parser: *ParserState) ParseError!Node.Index {
+    const token_index = parser.index;
+    const first = try parseTypePrimary(parser);
+    if (parser.tokens[parser.index].tag != .pipe) return first;
+
+    const stack_top = parser.scratch_stack.items.len;
+    defer parser.scratch_stack.shrinkRetainingCapacity(stack_top);
+    try parser.scratch_stack.append(parser.gpa, first);
+
+    while (parser.eat(.pipe) != null) {
+        const member = try parseTypePrimary(parser);
+        try parser.scratch_stack.append(parser.gpa, member);
+    }
+
+    return try addNodeList(parser, token_index, parser.scratch_stack.items[stack_top..], .type_variant_small, .type_variant);
+}
+
+fn parseTypePrimary(parser: *ParserState) ParseError!Node.Index {
+    return switch (parser.tokens[parser.index].tag) {
+        .identifier => return parseTokenNode(parser, .identifier, .type) catch return .null,
+        .keyword_none => return parseTokenNode(parser, .keyword_none, .type) catch return .null,
+        .keyword_func => return parseFunctionType(parser) catch return .null,
+        else => {
+            try parser.addError(.invalid_expression, .{ .none = {} });
+            return error.ParseError;
+        },
+    };
+}
+
+fn parseFunctionType(parser: *ParserState) !Node.Index {
+    const token_index = parser.index;
+    _ = try parser.expect(.keyword_func);
+    const params = try parseTypeList(parser);
+    const return_type = try parseType(parser);
+    return parser.addNode(.{ .tag = .type_func, .token_index = token_index, .data = .{ .node_node = .{ .a = params, .b = return_type } } });
+}
+
+fn parseTypeList(parser: *ParserState) !Node.Index {
+    const token_index = parser.index;
+    _ = try parser.expect(.l_paren);
+    const stack_top = parser.scratch_stack.items.len;
+    defer parser.scratch_stack.shrinkRetainingCapacity(stack_top);
+
+    while (true) {
+        if (parser.eat(.r_paren) != null) break;
+
+        const ty = try parseType(parser);
+        try parser.scratch_stack.append(parser.gpa, ty);
+
+        if (parser.eat(.comma) != null) continue;
+        _ = try parser.expect(.r_paren);
+        break;
+    }
+
+    return try addNodeList(parser, token_index, parser.scratch_stack.items[stack_top..], .type_list_small, .type_list);
 }
 
 const BinaryOpInfo = struct {
@@ -637,178 +678,127 @@ fn addNodeList(parser: *ParserState, token_index: u32, items: []const Node.Index
     return try parser.addNode(.{ .tag = list_tag, .token_index = token_index, .data = try parser.listToSpan(items) });
 }
 
-fn parseIfExpr(parser: *ParserState) ParseError!Node.Index {
-    const token_index = parser.index;
-    _ = try parser.expect(.keyword_if);
-
-    const condition = try parseExpression(parser);
-    const then_body = try parseBody(parser);
-    if (parser.eat(.keyword_else) != null) {
-        const else_body = if (parser.eat(.indent) != null) try parseBlock(parser) else try parseExpression(parser);
-        const ref_start: u32 = @intCast(parser.node_refs.items.len);
-        try parser.node_refs.appendSlice(parser.gpa, &.{ condition, then_body, else_body });
-        const ref_end: u32 = @intCast(parser.node_refs.items.len);
-        return try parser.addNode(.{ .tag = .if_else, .token_index = token_index, .data = .{ .ref = .{ .start = ref_start, .end = ref_end } } });
-    }
-    return try parser.addNode(.{ .tag = .@"if", .token_index = token_index, .data = .{ .node_node = .{ .a = condition, .b = then_body } } });
-}
-
-fn parseBinding(parser: *ParserState) !Node.Index {
-    const token_index = parser.index;
-    const binding_keyword = parser.eat(.keyword_const) orelse parser.eat(.keyword_var) orelse parser.eat(.keyword_comptime) orelse return .null;
-    _ = try parser.expect(.identifier);
-    const type_annotation = try parseTypeAnnotation(parser);
-    _ = try parser.expect(.equal);
-    const value = try parseExpression(parser);
-    const tag: Node.Tag = if (binding_keyword.tag == .keyword_const) .const_binding else if (binding_keyword.tag == .keyword_var) .var_binding else .comptime_binding;
-
-    return parser.addNode(.{ .tag = tag, .token_index = token_index, .data = .{ .node_node = .{ .a = type_annotation, .b = value } } });
-}
-
-fn parseAssign(parser: *ParserState, target: Node.Index) !Node.Index {
-    const token_index = parser.index;
-    _ = try parser.expect(.equal);
-    const value = try parseExpression(parser);
-    return try parser.addNode(.{ .tag = .assign, .token_index = token_index, .data = .{ .node_node = .{ .a = target, .b = value } } });
-}
-
-fn parseTypeAnnotation(parser: *ParserState) !Node.Index {
-    if (parser.eat(.colon) != null) return try parseType(parser);
-    return .null;
-}
-
-fn parseType(parser: *ParserState) ParseError!Node.Index {
-    const token_index = parser.index;
-    const first = try parseTypePrimary(parser);
-    if (parser.tokens[parser.index].tag != .pipe) return first;
-
-    const stack_top = parser.scratch_stack.items.len;
-    defer parser.scratch_stack.shrinkRetainingCapacity(stack_top);
-    try parser.scratch_stack.append(parser.gpa, first);
-
-    while (parser.eat(.pipe) != null) {
-        const member = try parseTypePrimary(parser);
-        try parser.scratch_stack.append(parser.gpa, member);
-    }
-
-    return try addNodeList(parser, token_index, parser.scratch_stack.items[stack_top..], .type_variant_small, .type_variant);
-}
-
-fn parseTypePrimary(parser: *ParserState) ParseError!Node.Index {
-    return switch (parser.tokens[parser.index].tag) {
-        .identifier => return parseTokenNode(parser, .identifier, .type) catch return .null,
-        .keyword_none => return parseTokenNode(parser, .keyword_none, .type) catch return .null,
-        .keyword_func => return parseFunctionType(parser) catch return .null,
-        else => {
-            try parser.addError(.invalid_expression, .{ .none = {} });
-            return error.ParseError;
-        },
-    };
-}
-
-fn parseFunctionType(parser: *ParserState) !Node.Index {
-    const token_index = parser.index;
-    _ = try parser.expect(.keyword_func);
-    const params = try parseTypeList(parser);
-    const return_type = try parseType(parser);
-    return parser.addNode(.{ .tag = .type_func, .token_index = token_index, .data = .{ .node_node = .{ .a = params, .b = return_type } } });
-}
-
-fn parseTypeList(parser: *ParserState) !Node.Index {
-    const token_index = parser.index;
-    _ = try parser.expect(.l_paren);
-    const stack_top = parser.scratch_stack.items.len;
-    defer parser.scratch_stack.shrinkRetainingCapacity(stack_top);
-
-    while (true) {
-        if (parser.eat(.r_paren) != null) break;
-
-        const ty = try parseType(parser);
-        try parser.scratch_stack.append(parser.gpa, ty);
-
-        if (parser.eat(.comma) != null) continue;
-        _ = try parser.expect(.r_paren);
-        break;
-    }
-
-    return try addNodeList(parser, token_index, parser.scratch_stack.items[stack_top..], .type_list_small, .type_list);
-}
-
-fn parseComptime(parser: *ParserState) !Node.Index {
-    if (parser.tokens[parser.index + 1].tag == .identifier) {
-        if ((try parseBinding(parser)).unwrap()) |binding| return binding;
-    }
-
-    const token_index = parser.index;
-    _ = try parser.expect(.keyword_comptime);
-    const body = try parseBody(parser);
-    return try parser.addNode(.{ .tag = .comptime_expr, .token_index = token_index, .data = .{ .node = body } });
-}
-
-fn parseFunction(parser: *ParserState) !Node.Index {
-    const token_index = parser.index;
-    _ = parser.eat(.keyword_func) orelse return .null;
-    const signature = parseFuncSignature(parser) catch return .null;
-    const body = if ((try parseBody(parser)).unwrap()) |b| b else return .null;
-    return parser.addNode(.{ .tag = .func, .token_index = token_index, .data = .{ .node_node = .{ .a = signature, .b = body } } });
-}
-
-fn parseFuncSignature(parser: *ParserState) !Node.Index {
-    const token_index = parser.index;
-    const params = try parseParamList(parser);
-    const return_type: Node.Index = switch (parser.tokens[parser.index].tag) {
-        .identifier, .keyword_func, .keyword_none => try parseType(parser),
-        else => .null,
-    };
-    return parser.addNode(.{ .tag = .signature, .token_index = token_index, .data = .{ .node_node = .{ .a = params, .b = return_type } } });
-}
-
-fn parseParamList(parser: *ParserState) !Node.Index {
-    const token_index = parser.index;
-    _ = try parser.expect(.l_paren);
-    const stack_top = parser.scratch_stack.items.len;
-    defer parser.scratch_stack.shrinkRetainingCapacity(stack_top);
-
-    while (true) {
-        if (parser.eat(.r_paren) != null) break;
-
-        const access_token_index = parser.index;
-        const opt_access = parser.eatAny(&.{ .keyword_read, .keyword_mut, .keyword_var, .keyword_deinit, .keyword_comptime });
-        _ = parser.expect(.identifier) catch return .null;
-        const identifier_index = parser.index - 1;
-        const type_annotation = try parseTypeAnnotation(parser);
-
-        const access_idx: Node.Index = if (opt_access != null) try parser.addNode(.{ .tag = .access, .token_index = access_token_index, .data = .{ .none = {} } }) else .null;
-        const param = try parser.addNode(.{ .tag = .param, .token_index = identifier_index, .data = .{ .node_node = .{ .a = access_idx, .b = type_annotation } } });
-
-        try parser.scratch_stack.append(parser.gpa, param);
-
-        if (parser.eat(.comma) != null) continue;
-        _ = try parser.expect(.r_paren);
-        break;
-    }
-
-    return try addNodeList(parser, token_index, parser.scratch_stack.items[stack_top..], .param_list_small, .param_list);
-}
-
-fn parseBody(parser: *ParserState) !Node.Index {
-    if (parser.eat(.arrow) != null) return try parseExpression(parser);
-    _ = try parser.expect(.indent);
-    return try parseBlock(parser);
-}
-
-fn parseReturn(parser: *ParserState) !Node.Index {
-    const token_index = parser.index;
-    _ = parser.expect(.keyword_return) catch return .null;
-    if ((try parseExpression(parser)).unwrap()) |expr| {
-        return try parser.addNode(.{ .tag = .return_expr, .token_index = token_index, .data = .{ .node = expr } });
-    }
-    return try parser.addNode(.{ .tag = .return_nothing, .token_index = token_index, .data = .{ .none = {} } });
-}
-
 fn parseTokenNode(parser: *ParserState, token: Token.Tag, tag: Node.Tag) !Node.Index {
     _ = try parser.expect(token);
     return parser.addNode(.{ .tag = tag, .token_index = parser.index - 1, .data = .{ .none = {} } });
+}
+
+pub fn renderAst(ast: *const ParserState, source: []const u8, writer: *std.Io.Writer) !void {
+    std.debug.assert(ast.nodes.items[0].tag == .block);
+    const seen = try ast.gpa.alloc(bool, ast.nodes.items.len);
+    defer ast.gpa.free(seen);
+    const block_ref = ast.nodes.items[0].data.ref;
+    for (block_ref.start..block_ref.end) |i| {
+        try renderNode(ast.node_refs.items[i], ast, source, writer, seen, "", i == block_ref.end - 1, true);
+    }
+}
+
+fn renderNode(node_index: Node.Index, ast: *const ParserState, source: []const u8, writer: *std.Io.Writer, seen: []bool, indent: []const u8, is_last: bool, at_root: bool) !void {
+    const node = ast.nodes.items[node_index.index()];
+    try writer.writeAll(indent);
+    if (!at_root) try writer.writeAll(if (is_last) "└─" else "├─");
+    try writer.print("{s}", .{@tagName(node.tag)});
+
+    if (seen[node_index.index()]) {
+        try writer.writeAll(" ...\n");
+        return;
+    }
+
+    seen[node_index.index()] = true;
+    const new_indent = if (at_root) "" else try std.mem.concat(ast.gpa, u8, &.{ indent, if (is_last) "  " else "│ " });
+    defer ast.gpa.free(new_indent);
+    switch (node.tag) {
+        .return_nothing => {},
+        .access, .bool_literal, .identifier, .none_literal, .type, .number_literal => {
+            const loc = ast.tokens[node.token_index].loc;
+            try writer.print(" : {s}\n", .{source[loc.start..loc.end]});
+        },
+        .return_expr, .not, .neg, .query_op, .move_expr, .comptime_expr, .sizeof_expr, .field_access, .struct_field, .struct_property, .struct_init_field => {
+            if (node.tag == .field_access or node.tag == .struct_field or node.tag == .struct_property or node.tag == .struct_init_field) {
+                const loc = ast.tokens[node.token_index].loc;
+                try writer.print(" : {s}", .{source[loc.start..loc.end]});
+            }
+            try writer.writeByte('\n');
+            try renderNode(node.data.node, ast, source, writer, seen, new_indent, true, false);
+        },
+        .add, .sub, .mul, .div, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .@"and", .@"or", .assign, .call, .call_arg_list_small, .const_binding, .var_binding, .comptime_binding, .func, .param, .param_list_small, .signature, .type_func, .type_list_small, .type_variant_small, .@"if" => {
+            if (node.tag == .param) {
+                const loc = ast.tokens[node.token_index].loc;
+                try writer.print(" : {s}", .{source[loc.start..loc.end]});
+            }
+            try writer.writeByte('\n');
+            const b_node = node.data.node_node.b.unwrap();
+            if (node.data.node_node.a.unwrap()) |a| {
+                try renderNode(a, ast, source, writer, seen, new_indent, b_node == null, false);
+            }
+            if (b_node) |b| {
+                try renderNode(b, ast, source, writer, seen, new_indent, true, false);
+            }
+        },
+        .block, .call_arg_list, .param_list, .type_list, .type_variant, .if_else, .@"struct", .struct_init => {
+            try writer.writeByte('\n');
+            for (node.data.ref.start..node.data.ref.end) |i| {
+                try renderNode(ast.node_refs.items[i], ast, source, writer, seen, new_indent, i == node.data.ref.end - 1, false);
+            }
+        },
+        else => try writer.print("Not implemented {}\n", .{node.tag}),
+    }
+}
+
+const LineInfoCursor = struct {
+    offset: usize = 0,
+    line: usize = 1,
+    column: usize = 1,
+    line_start: usize = 0,
+    line_end: usize = 0,
+};
+
+fn lineInfoForOffset(source: []const u8, offset: usize, cursor: *LineInfoCursor) void {
+    const safe_offset = if (offset > source.len) source.len else offset;
+    if (safe_offset < cursor.offset) {
+        cursor.* = .{};
+    }
+
+    while (cursor.offset < safe_offset) : (cursor.offset += 1) {
+        if (source[cursor.offset] == '\n') {
+            cursor.line += 1;
+            cursor.column = 1;
+            cursor.line_start = cursor.offset + 1;
+            cursor.line_end = cursor.line_start;
+        } else {
+            cursor.column += 1;
+        }
+    }
+
+    var idx = cursor.line_end;
+    while (idx < source.len) : (idx += 1) {
+        if (source[idx] == '\n') {
+            break;
+        }
+    }
+    cursor.line_end = idx;
+}
+
+pub fn renderDiagnostics(w: *std.Io.Writer, ast: *ParserState, source_path: []const u8, source: []const u8, diags: []const Diagnostic) !void {
+    var line_info_cursor: LineInfoCursor = .{};
+    for (diags) |diag| {
+        const source_location = ast.tokens[diag.token_index].loc;
+        lineInfoForOffset(source, source_location.start, &line_info_cursor);
+        try w.print("\x1b[31merror:\x1b[0m {s}:{d}:{d}: ", .{ source_path, line_info_cursor.line, line_info_cursor.column });
+        try diag.render(ast, w);
+        try w.writeByte('\n');
+
+        try w.writeAll(source[line_info_cursor.line_start..line_info_cursor.line_end]);
+        try w.writeByte('\n');
+
+        const caret_indent = if (line_info_cursor.column > 0) line_info_cursor.column - 1 else 0;
+        try w.splatByteAll(' ', caret_indent);
+        try w.writeByte('^');
+
+        const extra = @min(source_location.end, line_info_cursor.line_end) - @max(source_location.start, line_info_cursor.line_start);
+        if (extra > 1) try w.splatByteAll('~', extra - 1);
+        try w.writeByte('\n');
+    }
 }
 
 test "parse function no parameters" {
@@ -1576,25 +1566,25 @@ test "parse with precedence" {
 // Diagnostic failure cases
 
 test "diagnostic tag for missing binding equals" {
-    try expectDiagnosticTag(
+    try testExpectDiagnosticTag(
         \\const x 1
     , .expectedToken);
 }
 
 test "diagnostic tag for invalid call argument expression" {
-    try expectDiagnosticTag(
+    try testExpectDiagnosticTag(
         \\print(,)
     , .invalid_expression);
 }
 
 test "diagnostic tag for malformed struct item" {
-    try expectDiagnosticTag(
+    try testExpectDiagnosticTag(
         \\comptime S = struct
         \\  x int
     , .expectedToken);
 }
 
-fn expectDiagnosticTag(source: [:0]const u8, expected: Diagnostic.Tag) !void {
+fn testExpectDiagnosticTag(source: [:0]const u8, expected: Diagnostic.Tag) !void {
     var ast = try parse(std.testing.allocator, source);
     defer ast.deinit();
 
