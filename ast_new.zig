@@ -155,64 +155,57 @@ fn renderNode(node_index: Node.Index, ast: *const ParserState, source: []const u
     }
 }
 
-const LineInfo = struct {
-    line: usize,
-    column: usize,
-    line_start: usize,
-    line_end: usize,
+const LineInfoCursor = struct {
+    offset: usize = 0,
+    line: usize = 1,
+    column: usize = 1,
+    line_start: usize = 0,
+    line_end: usize = 0,
 };
 
-// TODO: add start offset such that we don't traverse the entire source for each error. Errors are in ascending line order
-fn lineInfoForOffset(source: []const u8, offset: usize) LineInfo {
-    var line: usize = 1;
-    var column: usize = 1;
-    var line_start: usize = 0;
-
-    var idx: usize = 0;
+fn lineInfoForOffset(source: []const u8, offset: usize, cursor: *LineInfoCursor) void {
     const safe_offset = if (offset > source.len) source.len else offset;
-    while (idx < safe_offset) : (idx += 1) {
-        if (source[idx] == '\n') {
-            line += 1;
-            column = 1;
-            line_start = idx + 1;
+    if (safe_offset < cursor.offset) {
+        cursor.* = .{};
+    }
+
+    while (cursor.offset < safe_offset) : (cursor.offset += 1) {
+        if (source[cursor.offset] == '\n') {
+            cursor.line += 1;
+            cursor.column = 1;
+            cursor.line_start = cursor.offset + 1;
+            cursor.line_end = cursor.line_start;
         } else {
-            column += 1;
+            cursor.column += 1;
         }
     }
 
-    var line_end = source.len;
-    idx = line_start;
+    var idx = cursor.line_end;
     while (idx < source.len) : (idx += 1) {
         if (source[idx] == '\n') {
-            line_end = idx;
             break;
         }
     }
-
-    return .{
-        .line = line,
-        .column = column,
-        .line_start = line_start,
-        .line_end = line_end,
-    };
+    cursor.line_end = idx;
 }
 
 pub fn renderDiagnostics(w: *std.Io.Writer, ast: *ParserState, source_path: []const u8, source: []const u8, diags: []const Diagnostic) !void {
+    var line_info_cursor: LineInfoCursor = .{};
     for (diags) |diag| {
         const source_location = ast.tokens[diag.token_index].loc;
-        const info = lineInfoForOffset(source, source_location.start);
-        try w.print("\x1b[31merror:\x1b[0m {s}:{d}:{d}: ", .{ source_path, info.line, info.column });
+        lineInfoForOffset(source, source_location.start, &line_info_cursor);
+        try w.print("\x1b[31merror:\x1b[0m {s}:{d}:{d}: ", .{ source_path, line_info_cursor.line, line_info_cursor.column });
         try diag.render(ast, w);
         try w.writeByte('\n');
 
-        try w.writeAll(source[info.line_start..info.line_end]);
+        try w.writeAll(source[line_info_cursor.line_start..line_info_cursor.line_end]);
         try w.writeByte('\n');
 
-        const caret_indent = if (info.column > 0) info.column - 1 else 0;
+        const caret_indent = if (line_info_cursor.column > 0) line_info_cursor.column - 1 else 0;
         try w.splatByteAll(' ', caret_indent);
         try w.writeByte('^');
 
-        const extra = @min(source_location.end, info.line_end) - @max(source_location.start, info.line_start);
+        const extra = @min(source_location.end, line_info_cursor.line_end) - @max(source_location.start, line_info_cursor.line_start);
         if (extra > 1) try w.splatByteAll('~', extra - 1);
         try w.writeByte('\n');
     }
