@@ -67,6 +67,7 @@ pub const Node = struct {
         sizeof_expr, // node: type
         @"struct", // ref: fields
         struct_field, // token_index: identifier; node: type
+        struct_property, // token_index: identifier; node: value
         struct_init, // ref: target, fields
         struct_init_field, // token_index: identifier; node: value
         type, // token_index: type name
@@ -122,8 +123,8 @@ fn renderNode(node_index: Node.Index, ast: *const ParserState, source: []const u
             const loc = ast.tokens[node.token_index].loc;
             try writer.print(" : {s}\n", .{source[loc.start..loc.end]});
         },
-        .return_expr, .not, .neg, .query_op, .move_expr, .comptime_expr, .sizeof_expr, .field_access, .struct_field, .struct_init_field => {
-            if (node.tag == .field_access or node.tag == .struct_field or node.tag == .struct_init_field) {
+        .return_expr, .not, .neg, .query_op, .move_expr, .comptime_expr, .sizeof_expr, .field_access, .struct_field, .struct_property, .struct_init_field => {
+            if (node.tag == .field_access or node.tag == .struct_field or node.tag == .struct_property or node.tag == .struct_init_field) {
                 const loc = ast.tokens[node.token_index].loc;
                 try writer.print(" : {s}", .{source[loc.start..loc.end]});
             }
@@ -386,11 +387,23 @@ fn parseExpression(parser: *ParserState) ParseError!Node.Index {
         .keyword_const, .keyword_var => return parseBinding(parser) catch return .null,
         .keyword_func => return parseFunction(parser) catch return .null,
         .keyword_return => return parseReturn(parser) catch return .null,
-        else => {
+        .number_literal,
+        .keyword_true,
+        .keyword_false,
+        .keyword_none,
+        .keyword_if,
+        .keyword_sizeof,
+        .keyword_struct,
+        .identifier,
+        .l_paren,
+        .keyword_not,
+        .minus,
+        => {
             const expr = try parseExpressionPrecedence(parser, 0);
             if (parser.tokens[parser.index].tag == .equal) return parseAssign(parser, expr) catch return .null;
             return expr;
         },
+        else => .null,
     };
 }
 
@@ -532,11 +545,19 @@ fn parseStruct(parser: *ParserState) ParseError!Node.Index {
         if (parser.eat(.dedent) != null) break;
         if (parser.tokens[parser.index].tag == .eof) break;
 
-        const field = try parseStructField(parser);
-        try parser.scratch_stack.append(parser.gpa, field);
+        const item = try parseStructItem(parser);
+        try parser.scratch_stack.append(parser.gpa, item);
     }
 
     return try parser.addNode(.{ .tag = .@"struct", .token_index = token_index, .data = try parser.listToSpan(parser.scratch_stack.items[stack_top..]) });
+}
+
+fn parseStructItem(parser: *ParserState) ParseError!Node.Index {
+    if ((try parseBinding(parser)).unwrap()) |binding| return binding;
+    return switch (parser.tokens[parser.index + 1].tag) {
+        .equal => try parseStructProperty(parser),
+        else => try parseStructField(parser),
+    };
 }
 
 fn parseStructField(parser: *ParserState) ParseError!Node.Index {
@@ -545,6 +566,14 @@ fn parseStructField(parser: *ParserState) ParseError!Node.Index {
     _ = try parser.expect(.colon);
     const field_type = try parseType(parser);
     return try parser.addNode(.{ .tag = .struct_field, .token_index = identifier_index, .data = .{ .node = field_type } });
+}
+
+fn parseStructProperty(parser: *ParserState) ParseError!Node.Index {
+    const identifier_index = parser.index;
+    _ = try parser.expect(.identifier);
+    _ = try parser.expect(.equal);
+    const value = try parseExpression(parser);
+    return try parser.addNode(.{ .tag = .struct_property, .token_index = identifier_index, .data = .{ .node = value } });
 }
 
 fn parseStructInit(parser: *ParserState, target: Node.Index) ParseError!Node.Index {
@@ -817,6 +846,20 @@ test "parse inline function no parameters" {
     );
 }
 
+test "parse bare return" {
+    try testParsing(
+        \\comptime noop = func() unit
+        \\  return
+    ,
+        \\comptime_binding
+        \\└─func
+        \\  ├─signature
+        \\  │ └─type : unit
+        \\  └─block
+        \\    └─return_nothing
+    );
+}
+
 test "parse function with parameters" {
     try testParsing(
         \\comptime add = func(x: int, y: int) int
@@ -950,6 +993,149 @@ test "parse struct declaration" {
         \\  │ └─type : int
         \\  └─struct_field : y
         \\    └─type : float
+    );
+}
+
+test "parse struct properties" {
+    try testParsing(
+        \\comptime S = struct
+        \\  move = none
+        \\  copy = trivial
+        \\  drop = explicit
+        \\  debug = true
+        \\  x: int
+    ,
+        \\comptime_binding
+        \\└─struct
+        \\  ├─struct_property : move
+        \\  │ └─none_literal : none
+        \\  ├─struct_property : copy
+        \\  │ └─identifier : trivial
+        \\  ├─struct_property : drop
+        \\  │ └─identifier : explicit
+        \\  ├─struct_property : debug
+        \\  │ └─bool_literal : true
+        \\  └─struct_field : x
+        \\    └─type : int
+    );
+}
+
+test "parse reserved-looking struct field names" {
+    try testParsing(
+        \\comptime S = struct
+        \\  move: int
+        \\  copy: int
+        \\  drop: int
+    ,
+        \\comptime_binding
+        \\└─struct
+        \\  ├─struct_field : move
+        \\  │ └─type : int
+        \\  ├─struct_field : copy
+        \\  │ └─type : int
+        \\  └─struct_field : drop
+        \\    └─type : int
+    );
+}
+
+test "parse function defined inside struct" {
+    try testParsing(
+        \\comptime S = struct
+        \\  x: int
+        \\  comptime make = func(v: int) S
+        \\    return S{x = v}
+        \\  y: int
+    ,
+        \\comptime_binding
+        \\└─struct
+        \\  ├─struct_field : x
+        \\  │ └─type : int
+        \\  ├─comptime_binding
+        \\  │ └─func
+        \\  │   ├─signature
+        \\  │   │ ├─param_list_small
+        \\  │   │ │ └─param : v
+        \\  │   │ │   └─type : int
+        \\  │   │ └─type : S
+        \\  │   └─block
+        \\  │     └─return_expr
+        \\  │       └─struct_init
+        \\  │         ├─identifier : S
+        \\  │         └─struct_init_field : x
+        \\  │           └─identifier : v
+        \\  └─struct_field : y
+        \\    └─type : int
+    );
+}
+
+test "parse struct ownership hook functions" {
+    try testParsing(
+        \\comptime Box = struct
+        \\  x: int
+        \\  copy = func(read self: Box) Box -> Box{x = self.x + 1}
+        \\  move = func(var self: Box) Box -> Box{x = self.x + 10}
+    ,
+        \\comptime_binding
+        \\└─struct
+        \\  ├─struct_field : x
+        \\  │ └─type : int
+        \\  ├─struct_property : copy
+        \\  │ └─func
+        \\  │   ├─signature
+        \\  │   │ ├─param_list_small
+        \\  │   │ │ └─param : self
+        \\  │   │ │   ├─access : read
+        \\  │   │ │   └─type : Box
+        \\  │   │ └─type : Box
+        \\  │   └─struct_init
+        \\  │     ├─identifier : Box
+        \\  │     └─struct_init_field : x
+        \\  │       └─add
+        \\  │         ├─field_access : x
+        \\  │         │ └─identifier : self
+        \\  │         └─number_literal : 1
+        \\  └─struct_property : move
+        \\    └─func
+        \\      ├─signature
+        \\      │ ├─param_list_small
+        \\      │ │ └─param : self
+        \\      │ │   ├─access : var
+        \\      │ │   └─type : Box
+        \\      │ └─type : Box
+        \\      └─struct_init
+        \\        ├─identifier : Box
+        \\        └─struct_init_field : x
+        \\          └─add
+        \\            ├─field_access : x
+        \\            │ └─identifier : self
+        \\            └─number_literal : 10
+    );
+}
+
+test "parse struct ownership hook indented body followed by field" {
+    try testParsing(
+        \\comptime D = struct
+        \\  drop = func(deinit self: D) unit
+        \\    print(99)
+        \\  x: int
+    ,
+        \\comptime_binding
+        \\└─struct
+        \\  ├─struct_property : drop
+        \\  │ └─func
+        \\  │   ├─signature
+        \\  │   │ ├─param_list_small
+        \\  │   │ │ └─param : self
+        \\  │   │ │   ├─access : deinit
+        \\  │   │ │   └─type : D
+        \\  │   │ └─type : unit
+        \\  │   └─block
+        \\  │     └─call
+        \\  │       ├─identifier : print
+        \\  │       └─call_arg_list_small
+        \\  │         └─number_literal : 99
+        \\  └─struct_field : x
+        \\    └─type : int
     );
 }
 
@@ -1392,6 +1578,35 @@ test "parse with precedence" {
         \\        ├─number_literal : 8
         \\        └─number_literal : 9
     );
+}
+
+// Diagnostic failure cases
+
+test "diagnostic tag for missing binding equals" {
+    try expectDiagnosticTag(
+        \\const x 1
+    , .expectedToken);
+}
+
+test "diagnostic tag for invalid call argument expression" {
+    try expectDiagnosticTag(
+        \\print(,)
+    , .invalid_expression);
+}
+
+test "diagnostic tag for malformed struct item" {
+    try expectDiagnosticTag(
+        \\comptime S = struct
+        \\  x int
+    , .expectedToken);
+}
+
+fn expectDiagnosticTag(source: [:0]const u8, expected: Diagnostic.Tag) !void {
+    var ast = try parse(std.testing.allocator, source);
+    defer ast.deinit();
+
+    try std.testing.expect(ast.errors.items.len > 0);
+    try std.testing.expectEqual(expected, ast.errors.items[0].tag);
 }
 
 fn testParsing(source: [:0]const u8, expected: []const u8) !void {
