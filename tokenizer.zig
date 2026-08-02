@@ -1,156 +1,17 @@
 const std = @import("std");
+const structures = @import("structures.zig");
 
-// Structured like zig tokenizer
-pub const Token = struct {
-    tag: Tag,
-    loc: Location,
-
-    pub const Location = struct { start: u32, end: u32 };
-
-    pub const Tag = enum {
-        invalid,
-        eof,
-        indent,
-        dedent,
-        identifier,
-
-        equal,
-        equal_angle_bracket_right,
-        plus,
-        minus,
-        asterisk,
-        slash,
-        percent,
-        caret,
-        pipe,
-        ampersand,
-        angle_bracket_left,
-        angle_bracket_angle_bracket_left,
-        angle_bracket_left_angle_bracket_right,
-        angle_bracket_right,
-        angle_bracket_angle_bracket_right,
-
-        equal_equal,
-        plus_equal,
-        minus_equal,
-        asterisk_equal,
-        slash_equal,
-        percent_equal,
-        caret_equal,
-        pipe_equal,
-        ampersand_equal,
-        angle_bracket_left_equal,
-        angle_bracket_angle_bracket_left_equal,
-        angle_bracket_right_equal,
-        angle_bracket_angle_bracket_right_equal,
-
-        l_brace,
-        r_brace,
-        l_paren,
-        r_paren,
-        l_bracket,
-        r_bracket,
-        question_mark,
-        arrow,
-        tilde,
-        period,
-        comma,
-        colon,
-        semicolon,
-        char_literal,
-        string_literal,
-        number_literal,
-        ellipsis2,
-        ellipsis3,
-
-        keyword_and,
-        keyword_as,
-        keyword_break,
-        keyword_comptime,
-        keyword_const,
-        keyword_continue,
-        keyword_deinit,
-        keyword_else,
-        keyword_extern,
-        keyword_false,
-        keyword_func,
-        keyword_for,
-        keyword_if,
-        keyword_is,
-        keyword_mut,
-        keyword_not,
-        keyword_none,
-        keyword_or,
-        keyword_read,
-        keyword_return,
-        keyword_sizeof,
-        keyword_struct,
-        keyword_test,
-        keyword_true,
-        keyword_var,
-
-        pub fn toCompound(self: Tag) Tag {
-            return switch (self) {
-                .equal => .equal_equal,
-                .plus => .plus_equal,
-                .minus => .minus_equal,
-                .asterisk => .asterisk_equal,
-                .slash => .slash_equal,
-                .percent => .percent_equal,
-                .caret => .caret_equal,
-                .pipe => .pipe_equal,
-                .ampersand => .ampersand_equal,
-                .angle_bracket_left => .angle_bracket_left_equal,
-                .angle_bracket_angle_bracket_left => .angle_bracket_angle_bracket_left_equal,
-                .angle_bracket_right => .angle_bracket_right_equal,
-                .angle_bracket_angle_bracket_right => .angle_bracket_angle_bracket_right_equal,
-                else => unreachable,
-            };
-        }
-    };
-
-    pub const keywords = std.StaticStringMap(Tag).initComptime(.{
-        .{ "and", .keyword_and },
-        .{ "as", .keyword_as },
-        .{ "break", .keyword_break },
-        .{ "comptime", .keyword_comptime },
-        .{ "const", .keyword_const },
-        .{ "continue", .keyword_continue },
-        .{ "deinit", .keyword_deinit },
-        .{ "else", .keyword_else },
-        .{ "extern", .keyword_extern },
-        .{ "false", .keyword_false },
-        .{ "func", .keyword_func },
-        .{ "for", .keyword_for },
-        .{ "if", .keyword_if },
-        .{ "is", .keyword_is },
-        .{ "mut", .keyword_mut },
-        .{ "not", .keyword_not },
-        .{ "none", .keyword_none },
-        .{ "or", .keyword_or },
-        .{ "read", .keyword_read },
-        .{ "return", .keyword_return },
-        .{ "sizeof", .keyword_sizeof },
-        .{ "struct", .keyword_struct },
-        .{ "test", .keyword_test },
-        .{ "true", .keyword_true },
-        .{ "var", .keyword_var },
-    });
-
-    pub fn getKeyword(bytes: []const u8) ?Tag {
-        return keywords.get(bytes);
-    }
-};
+pub const Token = structures.Token;
 
 pub const Tokenizer = struct {
     gpa: std.mem.Allocator,
-    buffer: [:0]const u8,
+    buffer: []const u8,
     index: u32,
     at_line_start: bool,
     indent: u16,
     indent_levels: std.ArrayList(u16),
 
-    pub fn init(gpa: std.mem.Allocator, buffer: [:0]const u8) !Tokenizer {
+    pub fn init(gpa: std.mem.Allocator, buffer: []const u8) !Tokenizer {
         var indent_levels = try std.ArrayList(u16).initCapacity(gpa, 8);
         errdefer indent_levels.deinit(gpa);
         // Start with indentation level 0, such that previous indentation can be checked against
@@ -181,7 +42,6 @@ pub const Tokenizer = struct {
         char_literal_backslash,
         equal,
         minus,
-        compound,
         line_comment,
         int,
         int_exponent,
@@ -195,9 +55,23 @@ pub const Tokenizer = struct {
         invalid,
     };
 
+    fn current(self: *const Tokenizer) u8 {
+        return if (self.index < self.buffer.len) self.buffer[self.index] else 0;
+    }
+
+    // EOF can be observed either between tokens or while scanning trailing
+    // whitespace or a comment. Every path must emit all pending dedents first.
+    fn eofOrDedent(self: *Tokenizer) Token {
+        if (self.indent_levels.items.len > 1) {
+            _ = self.indent_levels.pop();
+            return .{ .tag = .dedent, .loc = .{ .start = self.index, .end = self.index } };
+        }
+        return .{ .tag = .eof, .loc = .{ .start = self.index, .end = self.index } };
+    }
+
     fn binary_op(self: *Tokenizer, tag: Token.Tag, equal_tag: Token.Tag) Token.Tag {
         self.index += 1;
-        if (self.buffer[self.index] == '=') {
+        if (self.current() == '=') {
             self.index += 1;
             return equal_tag;
         }
@@ -206,13 +80,13 @@ pub const Tokenizer = struct {
 
     fn checkIndentation(self: *Tokenizer) !?Token {
         line_start: while (true) {
-            while (self.buffer[self.index] == ' ') {
+            while (self.current() == ' ') {
                 self.index += 1;
                 self.indent += 1;
             }
 
             // Reset indentation counting on newline. This avoids bloating with dedent/indent that cancel out
-            if (self.buffer[self.index] == '\n') {
+            if (self.current() == '\n') {
                 self.index += 1;
                 self.indent = 0;
                 continue :line_start;
@@ -248,20 +122,14 @@ pub const Tokenizer = struct {
         }
 
         if (self.index == self.buffer.len) {
-            return Token{ .tag = .eof, .loc = .{ .start = self.index, .end = self.index } };
+            return self.eofOrDedent();
         }
 
         state: switch (State.start) {
-            .start => switch (self.buffer[self.index]) {
+            .start => switch (self.current()) {
                 0 => {
                     if (self.index == self.buffer.len) {
-                        // On end of file, unroll indentation levels TODO is this ever called?
-                        if (self.indent_levels.items.len > 1) {
-                            _ = self.indent_levels.pop();
-                            return Token{ .tag = .dedent, .loc = .{ .start = self.index, .end = self.index } };
-                        }
-
-                        return Token{ .tag = .eof, .loc = .{ .start = self.index, .end = self.index } };
+                        return self.eofOrDedent();
                     } else {
                         continue :state .invalid;
                     }
@@ -293,12 +161,9 @@ pub const Tokenizer = struct {
                 },
                 '=' => {
                     result.tag = .equal;
-                    continue :state .compound;
+                    continue :state .equal;
                 },
-                '|' => {
-                    result.tag = .pipe;
-                    continue :state .compound;
-                },
+                '|' => result.tag = self.binary_op(.pipe, .pipe_equal),
                 '(' => {
                     result.tag = .l_paren;
                     self.index += 1;
@@ -331,24 +196,12 @@ pub const Tokenizer = struct {
                     result.tag = .colon;
                     self.index += 1;
                 },
-                '%' => {
-                    result.tag = .percent;
-                    continue :state .compound;
-                },
-                '*' => {
-                    result.tag = .asterisk;
-                    continue :state .compound;
-                },
-                '+' => {
-                    result.tag = .plus;
-                    continue :state .compound;
-                },
+                '%' => result.tag = self.binary_op(.percent, .percent_equal),
+                '*' => result.tag = self.binary_op(.asterisk, .asterisk_equal),
+                '+' => result.tag = self.binary_op(.plus, .plus_equal),
                 '<' => continue :state .angle_bracket_left,
                 '>' => continue :state .angle_bracket_right,
-                '^' => {
-                    result.tag = .caret;
-                    continue :state .compound;
-                },
+                '^' => result.tag = self.binary_op(.caret, .caret_equal),
                 '{' => {
                     result.tag = .l_brace;
                     self.index += 1;
@@ -366,14 +219,8 @@ pub const Tokenizer = struct {
                     result.tag = .minus;
                     continue :state .minus;
                 },
-                '/' => {
-                    result.tag = .slash;
-                    continue :state .compound;
-                },
-                '&' => {
-                    result.tag = .ampersand;
-                    continue :state .compound;
-                },
+                '/' => result.tag = self.binary_op(.slash, .slash_equal),
+                '&' => result.tag = self.binary_op(.ampersand, .ampersand_equal),
                 '0'...'9' => {
                     result.tag = .number_literal;
                     self.index += 1;
@@ -385,7 +232,7 @@ pub const Tokenizer = struct {
 
             .expect_newline => {
                 self.index += 1;
-                switch (self.buffer[self.index]) {
+                switch (self.current()) {
                     0 => {
                         if (self.index == self.buffer.len) {
                             result.tag = .invalid;
@@ -407,7 +254,7 @@ pub const Tokenizer = struct {
 
             .invalid => {
                 self.index += 1;
-                switch (self.buffer[self.index]) {
+                switch (self.current()) {
                     0 => if (self.index == self.buffer.len) {
                         result.tag = .invalid;
                     } else {
@@ -418,11 +265,9 @@ pub const Tokenizer = struct {
                 }
             },
 
-            .compound => result.tag = self.binary_op(result.tag, Token.Tag.toCompound(result.tag)),
-
             .identifier => {
                 self.index += 1;
-                switch (self.buffer[self.index]) {
+                switch (self.current()) {
                     'a'...'z', 'A'...'Z', '_', '0'...'9' => continue :state .identifier,
                     else => {
                         const ident = self.buffer[result.loc.start..self.index];
@@ -435,7 +280,7 @@ pub const Tokenizer = struct {
 
             .string_literal => {
                 self.index += 1;
-                switch (self.buffer[self.index]) {
+                switch (self.current()) {
                     0 => {
                         if (self.index != self.buffer.len) {
                             continue :state .invalid;
@@ -455,7 +300,7 @@ pub const Tokenizer = struct {
 
             .string_literal_backslash => {
                 self.index += 1;
-                switch (self.buffer[self.index]) {
+                switch (self.current()) {
                     0, '\n' => result.tag = .invalid,
                     0x01...0x09, 0x0b...0x1f, 0x7f => {
                         continue :state .invalid;
@@ -466,7 +311,7 @@ pub const Tokenizer = struct {
 
             .char_literal => {
                 self.index += 1;
-                switch (self.buffer[self.index]) {
+                switch (self.current()) {
                     0 => {
                         if (self.index != self.buffer.len) {
                             continue :state .invalid;
@@ -486,7 +331,7 @@ pub const Tokenizer = struct {
 
             .char_literal_backslash => {
                 self.index += 1;
-                switch (self.buffer[self.index]) {
+                switch (self.current()) {
                     0 => {
                         if (self.index != self.buffer.len) {
                             continue :state .invalid;
@@ -504,7 +349,7 @@ pub const Tokenizer = struct {
 
             .equal => {
                 self.index += 1;
-                switch (self.buffer[self.index]) {
+                switch (self.current()) {
                     '=' => {
                         result.tag = .equal_equal;
                         self.index += 1;
@@ -519,7 +364,7 @@ pub const Tokenizer = struct {
 
             .minus => {
                 self.index += 1;
-                switch (self.buffer[self.index]) {
+                switch (self.current()) {
                     '>' => {
                         result.tag = .arrow;
                         self.index += 1;
@@ -534,11 +379,11 @@ pub const Tokenizer = struct {
 
             .angle_bracket_left => {
                 self.index += 1;
-                switch (self.buffer[self.index]) {
-                    '<' => {
-                        result.tag = .angle_bracket_angle_bracket_left;
-                        continue :state .compound;
-                    },
+                switch (self.current()) {
+                    '<' => result.tag = self.binary_op(
+                        .angle_bracket_angle_bracket_left,
+                        .angle_bracket_angle_bracket_left_equal,
+                    ),
                     '>' => {
                         result.tag = .angle_bracket_left_angle_bracket_right;
                         self.index += 1;
@@ -553,11 +398,11 @@ pub const Tokenizer = struct {
 
             .angle_bracket_right => {
                 self.index += 1;
-                switch (self.buffer[self.index]) {
-                    '>' => {
-                        result.tag = .angle_bracket_angle_bracket_right;
-                        continue :state .compound;
-                    },
+                switch (self.current()) {
+                    '>' => result.tag = self.binary_op(
+                        .angle_bracket_angle_bracket_right,
+                        .angle_bracket_angle_bracket_right_equal,
+                    ),
                     '=' => {
                         result.tag = .angle_bracket_right_equal;
                         self.index += 1;
@@ -568,7 +413,7 @@ pub const Tokenizer = struct {
 
             .period => {
                 self.index += 1;
-                switch (self.buffer[self.index]) {
+                switch (self.current()) {
                     '.' => continue :state .period_2,
                     else => result.tag = .period,
                 }
@@ -576,7 +421,7 @@ pub const Tokenizer = struct {
 
             .period_2 => {
                 self.index += 1;
-                switch (self.buffer[self.index]) {
+                switch (self.current()) {
                     '.' => {
                         result.tag = .ellipsis3;
                         self.index += 1;
@@ -587,17 +432,11 @@ pub const Tokenizer = struct {
 
             .line_comment => {
                 self.index += 1;
-                switch (self.buffer[self.index]) {
+                switch (self.current()) {
                     0 => {
                         if (self.index != self.buffer.len) {
                             continue :state .invalid;
-                        } else return .{
-                            .tag = .eof,
-                            .loc = .{
-                                .start = self.index,
-                                .end = self.index,
-                            },
-                        };
+                        } else return self.eofOrDedent();
                     },
                     '\n' => {
                         self.index += 1;
@@ -615,7 +454,7 @@ pub const Tokenizer = struct {
                 }
             },
 
-            .int => switch (self.buffer[self.index]) {
+            .int => switch (self.current()) {
                 '.' => continue :state .int_period,
                 '_', 'a'...'d', 'f'...'o', 'q'...'z', 'A'...'D', 'F'...'O', 'Q'...'Z', '0'...'9' => {
                     self.index += 1;
@@ -628,7 +467,7 @@ pub const Tokenizer = struct {
             },
             .int_exponent => {
                 self.index += 1;
-                switch (self.buffer[self.index]) {
+                switch (self.current()) {
                     '-', '+' => {
                         self.index += 1;
                         continue :state .float;
@@ -638,7 +477,7 @@ pub const Tokenizer = struct {
             },
             .int_period => {
                 self.index += 1;
-                switch (self.buffer[self.index]) {
+                switch (self.current()) {
                     '_', 'a'...'d', 'f'...'o', 'q'...'z', 'A'...'D', 'F'...'O', 'Q'...'Z', '0'...'9' => {
                         self.index += 1;
                         continue :state .float;
@@ -649,7 +488,7 @@ pub const Tokenizer = struct {
                     else => self.index -= 1,
                 }
             },
-            .float => switch (self.buffer[self.index]) {
+            .float => switch (self.current()) {
                 '_', 'a'...'d', 'f'...'o', 'q'...'z', 'A'...'D', 'F'...'O', 'Q'...'Z', '0'...'9' => {
                     self.index += 1;
                     continue :state .float;
@@ -661,7 +500,7 @@ pub const Tokenizer = struct {
             },
             .float_exponent => {
                 self.index += 1;
-                switch (self.buffer[self.index]) {
+                switch (self.current()) {
                     '-', '+' => {
                         self.index += 1;
                         continue :state .float;
@@ -727,6 +566,34 @@ test "nested indentation" {
         .identifier,       .l_paren,          .number_literal, .r_paren,
         .dedent,           .dedent,           .identifier,     .l_paren,
         .number_literal,   .r_paren,
+    });
+}
+
+test "eof unwinds indentation without trailing newline" {
+    try testTokenize("comptime foo\n  bar", &.{
+        .keyword_comptime,
+        .identifier,
+        .indent,
+        .identifier,
+        .dedent,
+    });
+}
+
+test "eof unwinds indentation after trailing spaces" {
+    try testTokenize("comptime foo\n  bar ", &.{
+        .keyword_comptime,
+        .identifier,
+        .indent,
+        .identifier,
+        .dedent,
+    });
+}
+
+test "equal tokens keep their distinct spellings" {
+    try testTokenize("= == =>", &.{
+        .equal,
+        .equal_equal,
+        .equal_angle_bracket_right,
     });
 }
 

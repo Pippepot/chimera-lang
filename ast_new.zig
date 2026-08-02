@@ -1,97 +1,10 @@
 const std = @import("std");
 const structures = @import("structures.zig");
-const Tokenizer = @import("tokenizer.zig").Tokenizer;
-const Token = @import("tokenizer.zig").Token;
-
-pub const Node = struct {
-    tag: Tag,
-    token_index: u32,
-    data: Data,
-
-    const Index = enum(u32) {
-        null = 0,
-        _,
-
-        fn unwrap(self: @This()) ?Index {
-            return if (self == .null) return null else self;
-        }
-
-        fn index(self: @This()) u32 {
-            return @intFromEnum(self);
-        }
-    };
-
-    pub const Tag = enum(u8) {
-        add, // node_node: lhs, rhs
-        sub, // node_node: lhs, rhs
-        mul, // node_node: lhs, rhs
-        div, // node_node: lhs, rhs
-        eq, // node_node: lhs, rhs
-        ne, // node_node: lhs, rhs
-        lt, // node_node: lhs, rhs
-        gt, // node_node: lhs, rhs
-        le, // node_node: lhs, rhs
-        ge, // node_node: lhs, rhs
-        is, // node_node: lhs, type
-        as, // node_node: lhs, type
-        @"if", // node_node: condition, then expr
-        if_else, // ref: condition, then expr, else expr
-        @"and", // node_node: lhs, rhs
-        @"or", // node_node: lhs, rhs
-        not, // node: operand
-        neg, // node: operand
-        access, // token_index: parameter access modifier
-        assign, // node_node: target, value
-        block, // ref: statements
-        bool_literal, // token_index: bool literal
-        call, // node_node: callee, arg_list
-        call_arg_list_small, // node_node: first arg, second arg
-        call_arg_list, // ref: argument nodes
-        const_binding, // node_node: type_annotation, value
-        var_binding, // node_node: type_annotation, value
-        comptime_binding, // node_node: type_annotation, value
-        comptime_expr, // node: body
-        field_access, // token_index: field name; node: target
-        func, // node_node: signature, body
-        identifier, // token_index: standalone identifier; bindings use their own token_index
-        none_literal, // token_index: none literal
-        number_literal, // token_index: number literal
-        param, // token_index: identifier; node_node: access, type
-        param_list_small, // node_node: first param, second param
-        param_list, // ref: parameter nodes
-        query_op, // node: operand
-        move_expr, // node: operand
-        return_nothing, // none
-        return_expr, // node: returned expression
-        signature, // node_node: param_list, return_type
-        sizeof_expr, // node: type
-        @"struct", // ref: fields
-        struct_field, // token_index: identifier; node: type
-        struct_property, // token_index: identifier; node: value
-        struct_init, // ref: target, fields
-        struct_init_field, // token_index: identifier; node: value
-        type, // token_index: type name
-        type_func, // node_node: param_type_list, return_type
-        type_list_small, // node_node: first type, second type
-        type_list, // ref: type nodes
-        type_variant_small, // node_node: first type, second type
-        type_variant, // ref: member type nodes
-        _, // future tag fallback
-    };
-
-    pub const Data = union {
-        none: void,
-        node: Index,
-        node_node: struct {
-            a: Index,
-            b: Index,
-        },
-        ref: struct {
-            start: u32,
-            end: u32,
-        },
-    };
-};
+const tokenizer = @import("tokenizer.zig");
+const Tokenizer = tokenizer.Tokenizer;
+pub const Token = structures.Token;
+pub const Node = structures.Node;
+pub const Ast = structures.Ast;
 
 const Diagnostic = struct {
     tag: Tag,
@@ -108,19 +21,23 @@ const Diagnostic = struct {
         invalid_expression,
         _,
     };
-
-    pub fn render(self: @This(), ast: *ParserState, w: *std.Io.Writer) !void {
-        try switch (self.tag) {
-            .expectedToken => w.print("expected {}, found {}", .{ self.extra.token_tag, ast.tokens[self.token_index].tag }),
-            .invalid_expression => w.print("{} is not a vaild expression", .{ast.tokens[self.token_index].tag}),
-            else => w.print("{}", .{self.tag}),
-        };
-    }
 };
 
 const ParseError = std.mem.Allocator.Error || error{ParseError};
 
-pub const ParserState = struct {
+pub const ParseReport = struct {
+    ast: ?Ast,
+    diagnostics: []structures.Diagnostic,
+
+    pub fn deinit(self: *ParseReport, gpa: std.mem.Allocator) void {
+        if (self.ast) |*parsed| parsed.deinit(gpa);
+        for (self.diagnostics) |*diag| diag.deinit(gpa);
+        gpa.free(self.diagnostics);
+        self.* = undefined;
+    }
+};
+
+const ParserState = struct {
     gpa: std.mem.Allocator,
     tokens: []Token,
     index: u32,
@@ -129,24 +46,28 @@ pub const ParserState = struct {
     scratch_stack: std.ArrayList(Node.Index),
     errors: std.ArrayList(Diagnostic),
 
-    pub fn init(gpa: std.mem.Allocator, tokens: []Token) !ParserState {
-        return .{
-            .gpa = gpa,
-            .tokens = tokens,
-            .index = 0,
-            .nodes = try std.ArrayList(Node).initCapacity(gpa, tokens.len / 2),
-            .node_refs = try std.ArrayList(Node.Index).initCapacity(gpa, tokens.len / 4),
-            .scratch_stack = .empty,
-            .errors = .empty,
-        };
-    }
-
     pub fn deinit(self: *@This()) void {
         self.gpa.free(self.tokens);
         self.nodes.deinit(self.gpa);
         self.node_refs.deinit(self.gpa);
         self.scratch_stack.deinit(self.gpa);
         self.errors.deinit(self.gpa);
+        self.* = undefined;
+    }
+
+    pub fn intoAst(self: *@This(), file_id: structures.FileId) !Ast {
+        const tokens = self.tokens;
+        self.tokens = &.{};
+        errdefer self.gpa.free(tokens);
+        const nodes = try self.nodes.toOwnedSlice(self.gpa);
+        errdefer self.gpa.free(nodes);
+        const node_refs = try self.node_refs.toOwnedSlice(self.gpa);
+        return .{
+            .file_id = file_id,
+            .tokens = tokens,
+            .nodes = nodes,
+            .node_refs = node_refs,
+        };
     }
 
     pub fn addNode(self: *@This(), node: Node) !Node.Index {
@@ -193,11 +114,11 @@ pub const ParserState = struct {
             return tok;
         }
         try self.addError(.expectedToken, .{ .token_tag = token });
-        return ParseError.ParseError;
+        return error.ParseError;
     }
 
     pub fn listToSpan(parser: *@This(), list: []const Node.Index) !Node.Data {
-        try parser.node_refs.appendSlice(parser.gpa, @ptrCast(list));
+        try parser.node_refs.appendSlice(parser.gpa, list);
         return .{ .ref = .{
             .start = @intCast(parser.node_refs.items.len - list.len),
             .end = @intCast(parser.node_refs.items.len),
@@ -209,12 +130,13 @@ pub const ParserState = struct {
     }
 };
 
-pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8) !ParserState {
+fn parseState(gpa: std.mem.Allocator, source: []const u8) !ParserState {
     var tok = try Tokenizer.init(gpa, source);
     defer tok.deinit();
 
     const estimated_token_count = source.len / 8;
     var tokens = try std.ArrayList(Token).initCapacity(gpa, estimated_token_count);
+    errdefer tokens.deinit(gpa);
 
     while (true) {
         const token = try tok.next();
@@ -222,10 +144,49 @@ pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8) !ParserState {
         if (token.tag == .eof) break;
     }
 
-    var parser = try ParserState.init(gpa, try tokens.toOwnedSlice(gpa));
-    _ = parseBlock(&parser) catch return parser;
-    _ = parser.expect(.eof) catch return parser;
+    var parser: ParserState = .{
+        .gpa = gpa,
+        .tokens = try tokens.toOwnedSlice(gpa),
+        .index = 0,
+        .nodes = .empty,
+        .node_refs = .empty,
+        .scratch_stack = .empty,
+        .errors = .empty,
+    };
+    errdefer parser.deinit();
+
+    try parser.nodes.ensureTotalCapacity(gpa, parser.tokens.len / 2);
+    try parser.node_refs.ensureTotalCapacity(gpa, parser.tokens.len / 4);
+
+    parseDocument(&parser) catch |err| switch (err) {
+        error.ParseError => {
+            std.debug.assert(parser.errors.items.len != 0);
+            return parser;
+        },
+        error.OutOfMemory => return error.OutOfMemory,
+    };
     return parser;
+}
+
+fn parseDocument(parser: *ParserState) ParseError!void {
+    _ = try parseBlock(parser);
+    _ = try parser.expect(.eof);
+}
+
+pub fn parseReport(gpa: std.mem.Allocator, file_id: structures.FileId, source: []const u8) !ParseReport {
+    var parser = try parseState(gpa, source);
+    defer parser.deinit();
+
+    const diagnostics = try parserDiagnostics(gpa, file_id, &parser);
+    errdefer {
+        for (diagnostics) |*diag| diag.deinit(gpa);
+        gpa.free(diagnostics);
+    }
+
+    if (diagnostics.len != 0) return .{ .ast = null, .diagnostics = diagnostics };
+
+    const parsed = try parser.intoAst(file_id);
+    return .{ .ast = parsed, .diagnostics = diagnostics };
 }
 
 fn parseBlock(parser: *ParserState) ParseError!Node.Index {
@@ -238,7 +199,7 @@ fn parseBlock(parser: *ParserState) ParseError!Node.Index {
         if (parser.eat(.dedent) != null) break;
         if (parser.tokens[parser.index].tag == .eof) break;
 
-        const expr = parseExpression(parser) catch break;
+        const expr = try parseExpression(parser);
         if (expr == .null) break;
 
         try parser.scratch_stack.append(parser.gpa, expr);
@@ -248,10 +209,10 @@ fn parseBlock(parser: *ParserState) ParseError!Node.Index {
 
 fn parseExpression(parser: *ParserState) ParseError!Node.Index {
     return switch (parser.tokens[parser.index].tag) {
-        .keyword_comptime => return parseComptime(parser) catch return .null,
-        .keyword_const, .keyword_var => return parseBinding(parser) catch return .null,
-        .keyword_func => return parseFunction(parser) catch return .null,
-        .keyword_return => return parseReturn(parser) catch return .null,
+        .keyword_comptime => try parseComptime(parser),
+        .keyword_const, .keyword_var => try parseBinding(parser),
+        .keyword_func => try parseFunction(parser),
+        .keyword_return => try parseReturn(parser),
         .number_literal,
         .keyword_true,
         .keyword_false,
@@ -265,7 +226,7 @@ fn parseExpression(parser: *ParserState) ParseError!Node.Index {
         .minus,
         => {
             const expr = try parseExpressionPrecedence(parser, 0);
-            if (parser.tokens[parser.index].tag == .equal) return parseAssign(parser, expr) catch return .null;
+            if (parser.tokens[parser.index].tag == .equal) return try parseAssign(parser, expr);
             return expr;
         },
         else => .null,
@@ -273,14 +234,14 @@ fn parseExpression(parser: *ParserState) ParseError!Node.Index {
 }
 
 fn parseBody(parser: *ParserState) !Node.Index {
-    if (parser.eat(.arrow) != null) return try parseExpression(parser);
+    if (parser.eat(.arrow) != null) return try parseRequiredExpression(parser);
     _ = try parser.expect(.indent);
     return try parseBlock(parser);
 }
 
 fn parseReturn(parser: *ParserState) !Node.Index {
     const token_index = parser.index;
-    _ = parser.expect(.keyword_return) catch return .null;
+    _ = try parser.expect(.keyword_return);
     if ((try parseExpression(parser)).unwrap()) |expr| {
         return try parser.addNode(.{ .tag = .return_expr, .token_index = token_index, .data = .{ .node = expr } });
     }
@@ -299,21 +260,26 @@ fn parseComptime(parser: *ParserState) !Node.Index {
 }
 
 fn parseBinding(parser: *ParserState) !Node.Index {
-    const token_index = parser.index;
     const binding_keyword = parser.eat(.keyword_const) orelse parser.eat(.keyword_var) orelse parser.eat(.keyword_comptime) orelse return .null;
     _ = try parser.expect(.identifier);
+    const identifier_index = parser.index - 1;
     const type_annotation = try parseTypeAnnotation(parser);
     _ = try parser.expect(.equal);
-    const value = try parseExpression(parser);
-    const tag: Node.Tag = if (binding_keyword.tag == .keyword_const) .const_binding else if (binding_keyword.tag == .keyword_var) .var_binding else .comptime_binding;
+    const value = try parseRequiredExpression(parser);
+    const tag: Node.Tag = switch (binding_keyword.tag) {
+        .keyword_const => .const_binding,
+        .keyword_var => .var_binding,
+        .keyword_comptime => .comptime_binding,
+        else => unreachable,
+    };
 
-    return parser.addNode(.{ .tag = tag, .token_index = token_index, .data = .{ .node_node = .{ .a = type_annotation, .b = value } } });
+    return parser.addNode(.{ .tag = tag, .token_index = identifier_index, .data = .{ .node_node = .{ .a = type_annotation, .b = value } } });
 }
 
 fn parseAssign(parser: *ParserState, target: Node.Index) !Node.Index {
     const token_index = parser.index;
     _ = try parser.expect(.equal);
-    const value = try parseExpression(parser);
+    const value = try parseRequiredExpression(parser);
     return try parser.addNode(.{ .tag = .assign, .token_index = token_index, .data = .{ .node_node = .{ .a = target, .b = value } } });
 }
 
@@ -321,10 +287,10 @@ fn parseIfExpr(parser: *ParserState) ParseError!Node.Index {
     const token_index = parser.index;
     _ = try parser.expect(.keyword_if);
 
-    const condition = try parseExpression(parser);
+    const condition = try parseRequiredExpression(parser);
     const then_body = try parseBody(parser);
     if (parser.eat(.keyword_else) != null) {
-        const else_body = if (parser.eat(.indent) != null) try parseBlock(parser) else try parseExpression(parser);
+        const else_body = if (parser.eat(.indent) != null) try parseBlock(parser) else try parseRequiredExpression(parser);
         const ref_start: u32 = @intCast(parser.node_refs.items.len);
         try parser.node_refs.appendSlice(parser.gpa, &.{ condition, then_body, else_body });
         const ref_end: u32 = @intCast(parser.node_refs.items.len);
@@ -335,9 +301,9 @@ fn parseIfExpr(parser: *ParserState) ParseError!Node.Index {
 
 fn parseFunction(parser: *ParserState) !Node.Index {
     const token_index = parser.index;
-    _ = parser.eat(.keyword_func) orelse return .null;
-    const signature = parseFuncSignature(parser) catch return .null;
-    const body = if ((try parseBody(parser)).unwrap()) |b| b else return .null;
+    _ = try parser.expect(.keyword_func);
+    const signature = try parseFuncSignature(parser);
+    const body = try parseBody(parser);
     return parser.addNode(.{ .tag = .func, .token_index = token_index, .data = .{ .node_node = .{ .a = signature, .b = body } } });
 }
 
@@ -362,7 +328,7 @@ fn parseParamList(parser: *ParserState) !Node.Index {
 
         const access_token_index = parser.index;
         const opt_access = parser.eatAny(&.{ .keyword_read, .keyword_mut, .keyword_var, .keyword_deinit, .keyword_comptime });
-        _ = parser.expect(.identifier) catch return .null;
+        _ = try parser.expect(.identifier);
         const identifier_index = parser.index - 1;
         const type_annotation = try parseTypeAnnotation(parser);
 
@@ -403,9 +369,9 @@ fn parseType(parser: *ParserState) ParseError!Node.Index {
 
 fn parseTypePrimary(parser: *ParserState) ParseError!Node.Index {
     return switch (parser.tokens[parser.index].tag) {
-        .identifier => return parseTokenNode(parser, .identifier, .type) catch return .null,
-        .keyword_none => return parseTokenNode(parser, .keyword_none, .type) catch return .null,
-        .keyword_func => return parseFunctionType(parser) catch return .null,
+        .identifier => try parseTokenNode(parser, .identifier, .type),
+        .keyword_none => try parseTokenNode(parser, .keyword_none, .type),
+        .keyword_func => try parseFunctionType(parser),
         else => {
             try parser.addError(.invalid_expression, .{ .none = {} });
             return error.ParseError;
@@ -526,19 +492,19 @@ fn parsePostfix(parser: *ParserState) ParseError!Node.Index {
 
 fn parsePrimary(parser: *ParserState) ParseError!Node.Index {
     return switch (parser.tokens[parser.index].tag) {
-        .number_literal => return parseTokenNode(parser, .number_literal, .number_literal) catch return .null,
-        .keyword_true => return parseTokenNode(parser, .keyword_true, .bool_literal) catch return .null,
-        .keyword_false => return parseTokenNode(parser, .keyword_false, .bool_literal) catch return .null,
-        .keyword_none => return parseTokenNode(parser, .keyword_none, .none_literal) catch return .null,
-        .keyword_if => return parseIfExpr(parser) catch return .null,
-        .keyword_comptime => return parseComptime(parser) catch return .null,
-        .keyword_sizeof => return parseSizeof(parser) catch return .null,
-        .keyword_struct => return parseStruct(parser) catch return .null,
-        .identifier => return parseTokenNode(parser, .identifier, .identifier) catch return .null,
+        .number_literal => try parseTokenNode(parser, .number_literal, .number_literal),
+        .keyword_true => try parseTokenNode(parser, .keyword_true, .bool_literal),
+        .keyword_false => try parseTokenNode(parser, .keyword_false, .bool_literal),
+        .keyword_none => try parseTokenNode(parser, .keyword_none, .none_literal),
+        .keyword_if => try parseIfExpr(parser),
+        .keyword_comptime => try parseComptime(parser),
+        .keyword_sizeof => try parseSizeof(parser),
+        .keyword_struct => try parseStruct(parser),
+        .identifier => try parseTokenNode(parser, .identifier, .identifier),
         .l_paren => {
             _ = parser.eat(.l_paren);
             const expr = try parseExpressionPrecedence(parser, 0);
-            _ = parser.expect(.r_paren) catch return .null;
+            _ = try parser.expect(.r_paren);
             return expr;
         },
         else => {
@@ -606,7 +572,7 @@ fn parseStructProperty(parser: *ParserState) ParseError!Node.Index {
     const identifier_index = parser.index;
     _ = try parser.expect(.identifier);
     _ = try parser.expect(.equal);
-    const value = try parseExpression(parser);
+    const value = try parseRequiredExpression(parser);
     return try parser.addNode(.{ .tag = .struct_property, .token_index = identifier_index, .data = .{ .node = value } });
 }
 
@@ -635,7 +601,7 @@ fn parseStructInitField(parser: *ParserState) ParseError!Node.Index {
     const identifier_index = parser.index;
     _ = try parser.expect(.identifier);
     _ = try parser.expect(.equal);
-    const value = try parseExpression(parser);
+    const value = try parseRequiredExpression(parser);
     return try parser.addNode(.{ .tag = .struct_init_field, .token_index = identifier_index, .data = .{ .node = value } });
 }
 
@@ -661,6 +627,14 @@ fn parsePostfixNode(parser: *ParserState, operand: Node.Index, tag: Node.Tag) Pa
     return try parser.addNode(.{ .tag = tag, .token_index = token_index, .data = .{ .node = operand } });
 }
 
+fn parseRequiredExpression(parser: *ParserState) ParseError!Node.Index {
+    const expression = try parseExpression(parser);
+    if (expression != .null) return expression;
+
+    try parser.addError(.invalid_expression, .{ .none = {} });
+    return error.ParseError;
+}
+
 fn addNodeList(parser: *ParserState, token_index: u32, items: []const Node.Index, small_tag: Node.Tag, list_tag: Node.Tag) !Node.Index {
     if (items.len == 0) return .null;
 
@@ -683,18 +657,60 @@ fn parseTokenNode(parser: *ParserState, token: Token.Tag, tag: Node.Tag) !Node.I
     return parser.addNode(.{ .tag = tag, .token_index = parser.index - 1, .data = .{ .none = {} } });
 }
 
-pub fn renderAst(ast: *const ParserState, source: []const u8, writer: *std.Io.Writer) !void {
-    std.debug.assert(ast.nodes.items[0].tag == .block);
-    const seen = try ast.gpa.alloc(bool, ast.nodes.items.len);
-    defer ast.gpa.free(seen);
-    const block_ref = ast.nodes.items[0].data.ref;
+fn diagnosticMessage(gpa: std.mem.Allocator, parser: *const ParserState, diagnostic: Diagnostic) ![]const u8 {
+    var buf = try std.ArrayList(u8).initCapacity(gpa, 64);
+    errdefer buf.deinit(gpa);
+
+    switch (diagnostic.tag) {
+        .expectedToken => try buf.print(gpa, "expected {}, found {}", .{
+            diagnostic.extra.token_tag,
+            parser.tokens[diagnostic.token_index].tag,
+        }),
+        .invalid_expression => try buf.print(gpa, "{} is not a valid expression", .{
+            parser.tokens[diagnostic.token_index].tag,
+        }),
+        else => try buf.print(gpa, "{s}", .{@tagName(diagnostic.tag)}),
+    }
+
+    return try buf.toOwnedSlice(gpa);
+}
+
+fn parserDiagnostics(gpa: std.mem.Allocator, file_id: structures.FileId, parser: *const ParserState) ![]structures.Diagnostic {
+    const diagnostics = try gpa.alloc(structures.Diagnostic, parser.errors.items.len);
+    errdefer gpa.free(diagnostics);
+
+    var filled: usize = 0;
+    errdefer {
+        for (diagnostics[0..filled]) |*diag| diag.deinit(gpa);
+    }
+
+    for (parser.errors.items, diagnostics) |parse_diag, *out| {
+        const token = parser.tokens[parse_diag.token_index];
+        out.* = .{
+            .file_id = file_id,
+            .span = .{ .start = token.loc.start, .end = token.loc.end },
+            .message = try diagnosticMessage(gpa, parser, parse_diag),
+            .message_allocated = true,
+        };
+        filled += 1;
+    }
+
+    return diagnostics;
+}
+
+pub fn renderAst(gpa: std.mem.Allocator, ast: *const Ast, source: []const u8, writer: *std.Io.Writer) !void {
+    std.debug.assert(ast.nodes[0].tag == .block);
+    const seen = try gpa.alloc(bool, ast.nodes.len);
+    defer gpa.free(seen);
+    @memset(seen, false);
+    const block_ref = ast.nodes[0].data.ref;
     for (block_ref.start..block_ref.end) |i| {
-        try renderNode(ast.node_refs.items[i], ast, source, writer, seen, "", i == block_ref.end - 1, true);
+        try renderNode(gpa, ast.node_refs[i], ast, source, writer, seen, "", i == block_ref.end - 1, true);
     }
 }
 
-fn renderNode(node_index: Node.Index, ast: *const ParserState, source: []const u8, writer: *std.Io.Writer, seen: []bool, indent: []const u8, is_last: bool, at_root: bool) !void {
-    const node = ast.nodes.items[node_index.index()];
+fn renderNode(gpa: std.mem.Allocator, node_index: Node.Index, ast: *const Ast, source: []const u8, writer: *std.Io.Writer, seen: []bool, indent: []const u8, is_last: bool, at_root: bool) !void {
+    const node = ast.nodes[node_index.index()];
     try writer.writeAll(indent);
     if (!at_root) try writer.writeAll(if (is_last) "└─" else "├─");
     try writer.print("{s}", .{@tagName(node.tag)});
@@ -705,8 +721,8 @@ fn renderNode(node_index: Node.Index, ast: *const ParserState, source: []const u
     }
 
     seen[node_index.index()] = true;
-    const new_indent = if (at_root) "" else try std.mem.concat(ast.gpa, u8, &.{ indent, if (is_last) "  " else "│ " });
-    defer ast.gpa.free(new_indent);
+    const new_indent = if (at_root) "" else try std.mem.concat(gpa, u8, &.{ indent, if (is_last) "  " else "│ " });
+    defer if (!at_root) gpa.free(new_indent);
     switch (node.tag) {
         .return_nothing => {},
         .access, .bool_literal, .identifier, .none_literal, .type, .number_literal => {
@@ -719,7 +735,7 @@ fn renderNode(node_index: Node.Index, ast: *const ParserState, source: []const u
                 try writer.print(" : {s}", .{source[loc.start..loc.end]});
             }
             try writer.writeByte('\n');
-            try renderNode(node.data.node, ast, source, writer, seen, new_indent, true, false);
+            try renderNode(gpa, node.data.node, ast, source, writer, seen, new_indent, true, false);
         },
         .add, .sub, .mul, .div, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .@"and", .@"or", .assign, .call, .call_arg_list_small, .const_binding, .var_binding, .comptime_binding, .func, .param, .param_list_small, .signature, .type_func, .type_list_small, .type_variant_small, .@"if" => {
             if (node.tag == .param) {
@@ -729,75 +745,19 @@ fn renderNode(node_index: Node.Index, ast: *const ParserState, source: []const u
             try writer.writeByte('\n');
             const b_node = node.data.node_node.b.unwrap();
             if (node.data.node_node.a.unwrap()) |a| {
-                try renderNode(a, ast, source, writer, seen, new_indent, b_node == null, false);
+                try renderNode(gpa, a, ast, source, writer, seen, new_indent, b_node == null, false);
             }
             if (b_node) |b| {
-                try renderNode(b, ast, source, writer, seen, new_indent, true, false);
+                try renderNode(gpa, b, ast, source, writer, seen, new_indent, true, false);
             }
         },
         .block, .call_arg_list, .param_list, .type_list, .type_variant, .if_else, .@"struct", .struct_init => {
             try writer.writeByte('\n');
             for (node.data.ref.start..node.data.ref.end) |i| {
-                try renderNode(ast.node_refs.items[i], ast, source, writer, seen, new_indent, i == node.data.ref.end - 1, false);
+                try renderNode(gpa, ast.node_refs[i], ast, source, writer, seen, new_indent, i == node.data.ref.end - 1, false);
             }
         },
         else => try writer.print("Not implemented {}\n", .{node.tag}),
-    }
-}
-
-const LineInfoCursor = struct {
-    offset: usize = 0,
-    line: usize = 1,
-    column: usize = 1,
-    line_start: usize = 0,
-    line_end: usize = 0,
-};
-
-fn lineInfoForOffset(source: []const u8, offset: usize, cursor: *LineInfoCursor) void {
-    const safe_offset = if (offset > source.len) source.len else offset;
-    if (safe_offset < cursor.offset) {
-        cursor.* = .{};
-    }
-
-    while (cursor.offset < safe_offset) : (cursor.offset += 1) {
-        if (source[cursor.offset] == '\n') {
-            cursor.line += 1;
-            cursor.column = 1;
-            cursor.line_start = cursor.offset + 1;
-            cursor.line_end = cursor.line_start;
-        } else {
-            cursor.column += 1;
-        }
-    }
-
-    var idx = cursor.line_end;
-    while (idx < source.len) : (idx += 1) {
-        if (source[idx] == '\n') {
-            break;
-        }
-    }
-    cursor.line_end = idx;
-}
-
-pub fn renderDiagnostics(w: *std.Io.Writer, ast: *ParserState, source_path: []const u8, source: []const u8, diags: []const Diagnostic) !void {
-    var line_info_cursor: LineInfoCursor = .{};
-    for (diags) |diag| {
-        const source_location = ast.tokens[diag.token_index].loc;
-        lineInfoForOffset(source, source_location.start, &line_info_cursor);
-        try w.print("\x1b[31merror:\x1b[0m {s}:{d}:{d}: ", .{ source_path, line_info_cursor.line, line_info_cursor.column });
-        try diag.render(ast, w);
-        try w.writeByte('\n');
-
-        try w.writeAll(source[line_info_cursor.line_start..line_info_cursor.line_end]);
-        try w.writeByte('\n');
-
-        const caret_indent = if (line_info_cursor.column > 0) line_info_cursor.column - 1 else 0;
-        try w.splatByteAll(' ', caret_indent);
-        try w.writeByte('^');
-
-        const extra = @min(source_location.end, line_info_cursor.line_end) - @max(source_location.start, line_info_cursor.line_start);
-        if (extra > 1) try w.splatByteAll('~', extra - 1);
-        try w.writeByte('\n');
     }
 }
 
@@ -1584,21 +1544,66 @@ test "diagnostic tag for malformed struct item" {
     , .expectedToken);
 }
 
-fn testExpectDiagnosticTag(source: [:0]const u8, expected: Diagnostic.Tag) !void {
-    var ast = try parse(std.testing.allocator, source);
-    defer ast.deinit();
+test "required expression failures stop at one diagnostic" {
+    const sources = [_][:0]const u8{
+        "const x =",
+        "x =",
+        "comptime f = func() int ->",
+        "if",
+        "if true -> 1 else",
+        "comptime S = struct\n  x =",
+        "S{ x = }",
+    };
+    for (sources) |source| {
+        try testExpectDiagnosticTag(source, .invalid_expression);
+    }
+}
 
-    try std.testing.expect(ast.errors.items.len > 0);
-    try std.testing.expectEqual(expected, ast.errors.items[0].tag);
+test "parse report cleans up every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testParseReportAllocations, .{
+        "comptime f = func(x: int, y: int) int\n  return x + y",
+        null,
+    });
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testParseReportAllocations, .{
+        "const x 1",
+        "expected .equal, found .number_literal",
+    });
+}
+
+fn testExpectDiagnosticTag(source: [:0]const u8, expected: Diagnostic.Tag) !void {
+    var parser = try parseState(std.testing.allocator, source);
+    defer parser.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), parser.errors.items.len);
+    try std.testing.expectEqual(expected, parser.errors.items[0].tag);
+}
+
+fn testParseReportAllocations(gpa: std.mem.Allocator, source: []const u8, expected_message: ?[]const u8) !void {
+    var report = try parseReport(gpa, 42, source);
+    defer report.deinit(gpa);
+
+    if (expected_message) |message| {
+        try std.testing.expect(report.ast == null);
+        try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len);
+        try std.testing.expectEqual(@as(structures.FileId, 42), report.diagnostics[0].file_id);
+        try std.testing.expectEqual(structures.SourceSpan{ .start = 8, .end = 9 }, report.diagnostics[0].span.?);
+        try std.testing.expectEqualStrings(message, report.diagnostics[0].message);
+    } else {
+        try std.testing.expect(report.ast != null);
+        try std.testing.expectEqual(@as(structures.FileId, 42), report.ast.?.file_id);
+        try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len);
+    }
 }
 
 fn testParsing(source: [:0]const u8, expected: []const u8) !void {
-    var ast = try parse(std.testing.allocator, source);
-    var buffer: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    try renderDiagnostics(&buffer.writer, &ast, "test_path", source, ast.errors.items);
+    var parser = try parseState(std.testing.allocator, source);
+    defer parser.deinit();
+    try std.testing.expectEqual(@as(usize, 0), parser.errors.items.len);
 
+    var buffer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer buffer.deinit();
-    defer ast.deinit();
-    try renderAst(&ast, source, &buffer.writer);
+    var ast = try parser.intoAst(0);
+    defer ast.deinit(std.testing.allocator);
+    try renderAst(std.testing.allocator, &ast, source, &buffer.writer);
     try std.testing.expectEqualStrings(expected, std.mem.trimEnd(u8, buffer.writer.buffered(), "\n"));
 }

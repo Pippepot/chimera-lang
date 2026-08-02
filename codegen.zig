@@ -380,12 +380,12 @@ const BinaryEmitter = struct {
 
     fn emitMovRegFromEax(self: *@This(), reg_index: usize) !void {
         const prefixes = [_][]const u8{
-            &.{ 0x48, 0x89, 0xC7 },  // mov rdi, rax
-            &.{ 0x48, 0x89, 0xC6 },  // mov rsi, rax
-            &.{ 0x48, 0x89, 0xC2 },  // mov rdx, rax
-            &.{ 0x48, 0x89, 0xC1 },  // mov rcx, rax
-            &.{ 0x4C, 0x89, 0xC0 },  // mov r8, rax
-            &.{ 0x4C, 0x89, 0xC8 },  // mov r9, rax
+            &.{ 0x48, 0x89, 0xC7 }, // mov rdi, rax
+            &.{ 0x48, 0x89, 0xC6 }, // mov rsi, rax
+            &.{ 0x48, 0x89, 0xC2 }, // mov rdx, rax
+            &.{ 0x48, 0x89, 0xC1 }, // mov rcx, rax
+            &.{ 0x4C, 0x89, 0xC0 }, // mov r8, rax
+            &.{ 0x4C, 0x89, 0xC8 }, // mov r9, rax
         };
         if (reg_index >= prefixes.len) return error.UnsupportedRegister;
         try self.appendBytes(prefixes[reg_index]);
@@ -456,14 +456,18 @@ const BinaryEmitter = struct {
 
     fn countInstOperands(self: *BinaryEmitter, inst: ir_mod.Inst) void {
         const W = struct {
-            fn visit(s: *BinaryEmitter, r: InstRef) void { s.countUse(r); }
+            fn visit(s: *BinaryEmitter, r: InstRef) void {
+                s.countUse(r);
+            }
         };
         self.forEachInstRef(inst, W.visit);
     }
 
     fn decrementUses(self: *BinaryEmitter, inst: ir_mod.Inst) void {
         const W = struct {
-            fn visit(s: *BinaryEmitter, r: InstRef) void { s.decUse(r); }
+            fn visit(s: *BinaryEmitter, r: InstRef) void {
+                s.decUse(r);
+            }
         };
         self.forEachInstRef(inst, W.visit);
     }
@@ -567,12 +571,20 @@ const BinaryEmitter = struct {
     const AluOp = enum { add, sub, cmp };
 
     fn emitAluEaxImm32(self: *@This(), op: AluOp, value: i32) !void {
-        try self.appendByte(switch (op) { .add => 0x05, .sub => 0x2D, .cmp => 0x3D });
+        try self.appendByte(switch (op) {
+            .add => 0x05,
+            .sub => 0x2D,
+            .cmp => 0x3D,
+        });
         try self.appendLeU32(@bitCast(value));
     }
 
     fn emitAluEaxEbx(self: *@This(), op: AluOp) !void {
-        const opcode: u8 = switch (op) { .add => 0x01, .sub => 0x29, .cmp => 0x39 };
+        const opcode: u8 = switch (op) {
+            .add => 0x01,
+            .sub => 0x29,
+            .cmp => 0x39,
+        };
         try self.appendBytes(&.{ opcode, 0xD8 });
     }
 
@@ -1371,6 +1383,7 @@ fn buildElfExecutable(code: []const u8, entry_code_offset: u64, program_code_len
     try file_buf.appendSlice(gpa, std.mem.asBytes(&elf_header));
     try file_buf.appendSlice(gpa, std.mem.asBytes(&phdr));
     var plen_bytes: [4]u8 = undefined;
+    // Why is the helpers not included in the program_code_len?
     std.mem.writeInt(u32, &plen_bytes, program_code_len, .little);
     try file_buf.appendSlice(gpa, &plen_bytes);
     const remaining = code_file_offset - file_buf.items.len;

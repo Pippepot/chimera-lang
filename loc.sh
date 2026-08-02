@@ -72,6 +72,14 @@ def is_test_file(path: str) -> bool:
     return name == "test.zig" or name.endswith("_test.zig")
 
 
+def starts_test_decl(view: str) -> bool:
+    if re.match(r"^\s*test\b", view) is not None:
+        return True
+    if re.match(r"^\s*(pub\s+)?fn\s+test", view) is not None:
+        return True
+    return re.match(r"^\s*(pub\s+)?const\s+[Tt]est\w*\s*=\s*struct\b", view) is not None
+
+
 def count_file(path: str) -> Counts:
     counts = Counts()
     all_test_file = is_test_file(path)
@@ -86,10 +94,7 @@ def count_file(path: str) -> Counts:
             starts_test = (
                 not all_test_file
                 and not in_test
-                and (
-                    re.match(r"^\s*test\b", view) is not None
-                    or re.match(r"^\s*(pub\s+)?fn\s+test", view) is not None
-                )
+                and starts_test_decl(view)
             )
 
             if stripped == "":

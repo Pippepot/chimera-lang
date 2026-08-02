@@ -1,8 +1,7 @@
 const std = @import("std");
 const debug = @import("debug.zig");
 const db = @import("db.zig");
-const queryold = @import("query.zig");
-const query = @import("query_new.zig");
+const query = @import("query.zig");
 const runtime = @import("runtime.zig");
 
 // todo probs move to debug.zig
@@ -100,8 +99,8 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // Source -> tokenize -> parse (AST) -> semantic (name resolution & typing) -> ir (SSA) -> optimization -> codegen (x86)
-    var qdb = query.QueryDB.init(gpa);
-    defer qdb.deInit();
+    var qdb = query.QueryDb.initWithOptions(gpa, io, .{ .persistent_cache_enabled = query_cache });
+    defer qdb.deinit();
 
     const src_path = arg_list.items[0];
     const src_text = std.Io.Dir.cwd().readFileAlloc(io, src_path, gpa, .limited(std.math.maxInt(usize))) catch |e| {
@@ -110,7 +109,7 @@ pub fn main(init: std.process.Init) !void {
     };
     defer gpa.free(src_text);
 
-    try qdb.setSource(src_path, src_text);
+    try qdb.setSourceFile(0, src_path, src_text);
     const program_binary = try qdb.compileResult(0);
 
     var debugBuf: [4096]u8 = undefined;
