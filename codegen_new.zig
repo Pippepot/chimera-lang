@@ -33,68 +33,255 @@ const Elf64Phdr = extern struct {
 
 const code_file_offset = @sizeOf(Elf64Header) + @sizeOf(Elf64Phdr);
 
-pub fn compileFunction(ssa: *const structures.SsaFunction, gpa: std.mem.Allocator) error{ OutOfMemory, InvalidSsa }!structures.CompiledFunction {
-    if (ssa.blocks.len != 1) return error.InvalidSsa;
-    if (@intFromEnum(ssa.entry) != 0) return error.InvalidSsa;
-    const block = ssa.blocks[0];
-    if (block.instruction_start != 0) return error.InvalidSsa;
-    if (block.instruction_end != ssa.instructions.len) return error.InvalidSsa;
+const ValueLocation = union(enum) {
+    discarded,
+    immediate: i32,
+    eax,
+    stack: u32,
+    incoming_argument: u32,
+};
 
-    var encoder = try X86Encoder.init(gpa);
-    defer encoder.deinit();
-    var relocations: std.ArrayList(structures.CompiledFunction.Relocation) = .empty;
-    defer relocations.deinit(gpa);
-    var referenced_instances: std.ArrayList(structures.InstanceId) = .empty;
-    defer referenced_instances.deinit(gpa);
+const LocationPlan = struct {
+    locations: []ValueLocation,
+    stack_size: u32,
+    returned_value: ?usize,
 
-    for (ssa.instructions) |instruction| {
-        switch (instruction) {
-            .integer_constant => {},
-            .direct_call => |target| {
-                const offset_usize = std.math.add(usize, encoder.code.items.len, 1) catch return error.InvalidSsa;
-                const offset = std.math.cast(u32, offset_usize) orelse return error.InvalidSsa;
-                try encoder.callRelative32(0);
+    fn init(
+        ssa: *const structures.SsaFunction,
+        block: structures.SsaFunction.Block,
+        gpa: std.mem.Allocator,
+    ) error{ OutOfMemory, FunctionTooLarge }!LocationPlan {
+        const needed = try gpa.alloc(bool, ssa.valueCount());
+        defer gpa.free(needed);
+        @memset(needed, false);
 
-                var reference_index: ?usize = null;
-                for (referenced_instances.items, 0..) |existing, index| {
-                    if (std.meta.eql(existing, target)) {
-                        reference_index = index;
-                        break;
-                    }
-                }
-                if (reference_index == null) {
-                    reference_index = referenced_instances.items.len;
-                    try referenced_instances.append(gpa, target);
-                }
-                const reference = std.math.cast(u32, reference_index.?) orelse return error.InvalidSsa;
-                try relocations.append(gpa, .{
-                    .offset = offset,
-                    .kind = .call_relative_32,
-                    .reference = @enumFromInt(reference),
-                    .addend = 0,
-                });
+        var maximum_argument_count: usize = 0;
+        for (ssa.instructions) |instruction| {
+            switch (instruction) {
+                .consti => {},
+                .call => |call| {
+                    const arguments = ssa.call_arguments[call.arguments.start..call.arguments.end];
+                    maximum_argument_count = @max(maximum_argument_count, arguments.len);
+                    for (arguments) |argument| needed[@intFromEnum(argument)] = true;
+                },
+                .negi => |operand_id| {
+                    const operand = @intFromEnum(operand_id);
+                    needed[operand] = true;
+                },
+                .addi, .subi, .muli, .divsi => |operands| {
+                    const lhs = @intFromEnum(operands.lhs);
+                    const rhs = @intFromEnum(operands.rhs);
+                    needed[lhs] = true;
+                    needed[rhs] = true;
+                },
+            }
+        }
+        const returned_value: ?usize = switch (block.terminator) {
+            .return_unit => null,
+            .return_value => |value| blk: {
+                const index = @intFromEnum(value);
+                needed[index] = true;
+                break :blk index;
             },
+        };
+
+        // One reusable area handles every call this function makes. After the
+        // prologue, this function's own incoming arguments remain above its
+        // frame, past its return address:
+        //   rsp + 0..outgoing_size: outgoing arguments
+        //   rsp + outgoing_size..stack_size: local spills
+        //   rsp + stack_size: return address
+        //   rsp + stack_size + 8: incoming argument 0
+        const outgoing_size_usize = std.math.mul(usize, maximum_argument_count, @sizeOf(i32)) catch return error.FunctionTooLarge;
+        const outgoing_size = std.math.cast(u32, outgoing_size_usize) orelse return error.FunctionTooLarge;
+        const locations = try gpa.alloc(ValueLocation, ssa.valueCount());
+        errdefer gpa.free(locations);
+        @memset(locations[0..ssa.block_argument_types.len], .discarded);
+        var stack_slot_count: u32 = 0;
+        for (ssa.instructions, locations[ssa.block_argument_types.len..], 0..) |instruction, *location, instruction_index| {
+            const value_index = @intFromEnum(ssa.instructionValue(instruction_index));
+            location.* = switch (instruction) {
+                .consti => |value| .{ .immediate = value },
+                else => if (returned_value == value_index and instruction_index + 1 == ssa.instructions.len)
+                    .eax
+                else if (needed[value_index]) blk: {
+                    const slot_offset = std.math.mul(u32, stack_slot_count, @sizeOf(i32)) catch return error.FunctionTooLarge;
+                    stack_slot_count = std.math.add(u32, stack_slot_count, 1) catch return error.FunctionTooLarge;
+                    const offset = std.math.add(u32, outgoing_size, slot_offset) catch return error.FunctionTooLarge;
+                    break :blk .{ .stack = offset };
+                } else .discarded,
+            };
+        }
+        const local_size = std.math.mul(u32, stack_slot_count, @sizeOf(i32)) catch return error.FunctionTooLarge;
+        const stack_size = std.math.add(u32, outgoing_size, local_size) catch return error.FunctionTooLarge;
+        if (stack_size > std.math.maxInt(i32)) return error.FunctionTooLarge;
+        for (locations[0..ssa.block_argument_types.len], 0..) |*location, argument_index| {
+            if (!needed[argument_index]) continue;
+            const argument_offset_usize = std.math.mul(usize, argument_index, @sizeOf(i32)) catch return error.FunctionTooLarge;
+            const argument_offset = std.math.cast(u32, argument_offset_usize) orelse return error.FunctionTooLarge;
+            const caller_stack_offset = std.math.add(u32, stack_size, @sizeOf(u64)) catch return error.FunctionTooLarge;
+            const offset = std.math.add(u32, caller_stack_offset, argument_offset) catch return error.FunctionTooLarge;
+            if (offset > std.math.maxInt(i32)) return error.FunctionTooLarge;
+            location.* = .{ .incoming_argument = offset };
+        }
+        return .{ .locations = locations, .stack_size = stack_size, .returned_value = returned_value };
+    }
+
+    fn deinit(self: *LocationPlan, gpa: std.mem.Allocator) void {
+        gpa.free(self.locations);
+        self.* = undefined;
+    }
+};
+
+const IntegerBinaryOperation = enum {
+    add,
+    subtract,
+    multiply,
+    divide_signed,
+};
+
+const FunctionEmitter = struct {
+    gpa: std.mem.Allocator,
+    encoder: X86Encoder,
+    relocations: std.ArrayList(structures.CompiledFunction.Relocation) = .empty,
+    referenced_instances: std.ArrayList(structures.InstanceId) = .empty,
+    locations: []const ValueLocation,
+    call_arguments: []const structures.FunctionValueId,
+
+    fn init(
+        gpa: std.mem.Allocator,
+        locations: []const ValueLocation,
+        call_arguments: []const structures.FunctionValueId,
+    ) !FunctionEmitter {
+        return .{
+            .gpa = gpa,
+            .encoder = try X86Encoder.init(gpa),
+            .locations = locations,
+            .call_arguments = call_arguments,
+        };
+    }
+
+    fn deinit(self: *FunctionEmitter) void {
+        self.referenced_instances.deinit(self.gpa);
+        self.relocations.deinit(self.gpa);
+        self.encoder.deinit();
+        self.* = undefined;
+    }
+
+    fn emit(self: *FunctionEmitter, ssa: *const structures.SsaFunction, plan: LocationPlan) !void {
+        if (plan.stack_size != 0) try self.encoder.subRspImmediate32(plan.stack_size);
+        for (ssa.instructions, plan.locations[ssa.block_argument_types.len..]) |instruction, destination| {
+            switch (instruction) {
+                .consti => {},
+                .call => |call| try self.emitDirectCall(call, destination),
+                .negi => |operand| {
+                    try self.loadValue(plan.locations[@intFromEnum(operand)]);
+                    try self.encoder.negateEax();
+                    try self.storeResult(destination);
+                },
+                .addi => |operands| try self.emitIntegerBinary(.add, operands, destination),
+                .subi => |operands| try self.emitIntegerBinary(.subtract, operands, destination),
+                .muli => |operands| try self.emitIntegerBinary(.multiply, operands, destination),
+                .divsi => |operands| try self.emitIntegerBinary(.divide_signed, operands, destination),
+            }
+        }
+        if (plan.returned_value) |value| try self.loadValue(plan.locations[value]);
+        if (plan.stack_size != 0) try self.encoder.addRspImmediate32(plan.stack_size);
+        try self.encoder.ret();
+    }
+
+    fn emitDirectCall(
+        self: *FunctionEmitter,
+        call: structures.FunctionCall(structures.InstanceId),
+        destination: ValueLocation,
+    ) !void {
+        for (self.call_arguments[call.arguments.start..call.arguments.end], 0..) |argument, argument_index| {
+            try self.loadValue(self.locations[@intFromEnum(argument)]);
+            const offset: u32 = @intCast(argument_index * @sizeOf(i32));
+            try self.encoder.movRspFromEax(offset);
+        }
+        const offset_usize = std.math.add(usize, self.encoder.code.items.len, 1) catch return error.FunctionTooLarge;
+        const offset = std.math.cast(u32, offset_usize) orelse return error.FunctionTooLarge;
+        try self.encoder.callRelative32(0);
+
+        var reference_index: ?usize = null;
+        for (self.referenced_instances.items, 0..) |existing, index| {
+            if (std.meta.eql(existing, call.target)) {
+                reference_index = index;
+                break;
+            }
+        }
+        if (reference_index == null) {
+            reference_index = self.referenced_instances.items.len;
+            try self.referenced_instances.append(self.gpa, call.target);
+        }
+        const reference = std.math.cast(u32, reference_index.?) orelse return error.FunctionTooLarge;
+        try self.relocations.append(self.gpa, .{
+            .offset = offset,
+            .kind = .call_relative_32,
+            .reference = @enumFromInt(reference),
+            .addend = 0,
+        });
+        try self.storeResult(destination);
+    }
+
+    fn emitIntegerBinary(
+        self: *FunctionEmitter,
+        operation: IntegerBinaryOperation,
+        operands: structures.BinaryOperands,
+        destination: ValueLocation,
+    ) !void {
+        try self.loadValue(self.locations[@intFromEnum(operands.lhs)]);
+        try self.encoder.integerBinary(operation, self.locations[@intFromEnum(operands.rhs)]);
+        try self.storeResult(destination);
+    }
+
+    fn loadValue(self: *FunctionEmitter, location: ValueLocation) !void {
+        switch (location) {
+            .immediate => |value| try self.encoder.movEaxImmediate32(value),
+            .eax => {},
+            .stack, .incoming_argument => |offset| try self.encoder.movEaxFromRsp(offset),
+            .discarded => unreachable,
         }
     }
-    try emitTerminator(&encoder, ssa, block.terminator);
 
-    const owned_relocations: []const structures.CompiledFunction.Relocation = if (relocations.items.len == 0)
-        &.{}
-    else
-        try relocations.toOwnedSlice(gpa);
-    errdefer if (owned_relocations.len != 0) gpa.free(owned_relocations);
-    const owned_references: []const structures.InstanceId = if (referenced_instances.items.len == 0)
-        &.{}
-    else
-        try referenced_instances.toOwnedSlice(gpa);
-    errdefer if (owned_references.len != 0) gpa.free(owned_references);
+    fn storeResult(self: *FunctionEmitter, location: ValueLocation) !void {
+        switch (location) {
+            .stack => |offset| try self.encoder.movRspFromEax(offset),
+            .eax, .discarded => {},
+            .immediate, .incoming_argument => unreachable,
+        }
+    }
 
-    return .{
-        .code = try encoder.code.toOwnedSlice(gpa),
-        .required_alignment = 1,
-        .relocations = owned_relocations,
-        .referenced_instances = owned_references,
-    };
+    fn finish(self: *FunctionEmitter) !structures.CompiledFunction {
+        const relocations = try self.relocations.toOwnedSlice(self.gpa);
+        errdefer self.gpa.free(relocations);
+        const references = try self.referenced_instances.toOwnedSlice(self.gpa);
+        errdefer self.gpa.free(references);
+        return .{
+            .code = try self.encoder.code.toOwnedSlice(self.gpa),
+            .required_alignment = 1,
+            .relocations = relocations,
+            .referenced_instances = references,
+        };
+    }
+};
+
+pub fn compileFunction(ssa: *const structures.SsaFunction, gpa: std.mem.Allocator) error{ OutOfMemory, FunctionTooLarge, UnsupportedControlFlow }!structures.CompiledFunction {
+    if (ssa.blocks.len != 1) return error.UnsupportedControlFlow;
+    if (@intFromEnum(ssa.entry) != 0) return error.UnsupportedControlFlow;
+    const block = ssa.blocks[0];
+    if (block.argument_start != 0) return error.UnsupportedControlFlow;
+    if (block.argument_end != ssa.block_argument_types.len) return error.UnsupportedControlFlow;
+    if (block.instruction_start != 0) return error.UnsupportedControlFlow;
+    if (block.instruction_end != ssa.instructions.len) return error.UnsupportedControlFlow;
+
+    var plan = try LocationPlan.init(ssa, block, gpa);
+    defer plan.deinit(gpa);
+    var emitter = try FunctionEmitter.init(gpa, plan.locations, ssa.call_arguments);
+    defer emitter.deinit();
+    try emitter.emit(ssa, plan);
+    return emitter.finish();
 }
 
 pub const ReachableFunction = struct {
@@ -218,27 +405,6 @@ fn patchRelativeDisplacement(
     std.mem.writeInt(i32, buffer[field_offset..][0..@sizeOf(i32)], @intCast(displacement), .little);
 }
 
-fn emitTerminator(
-    encoder: *X86Encoder,
-    ssa: *const structures.SsaFunction,
-    terminator: structures.SsaFunction.Terminator,
-) error{ OutOfMemory, InvalidSsa }!void {
-    switch (terminator) {
-        .return_unit => try encoder.ret(),
-        .return_value => |value_id| {
-            const instruction_index = @intFromEnum(value_id);
-            if (instruction_index >= ssa.instructions.len) return error.InvalidSsa;
-            switch (ssa.instructions[instruction_index]) {
-                .integer_constant => |value| try encoder.movEaxImmediate32(value),
-                .direct_call => {
-                    if (instruction_index + 1 != ssa.instructions.len) return error.InvalidSsa;
-                },
-            }
-            try encoder.ret();
-        },
-    }
-}
-
 const X86Encoder = struct {
     gpa: std.mem.Allocator,
     code: std.ArrayList(u8),
@@ -258,11 +424,23 @@ const X86Encoder = struct {
         try self.code.appendSlice(self.gpa, bytes);
     }
 
+    fn appendBits32(self: *@This(), prefix: []const u8, bits: u32) !void {
+        try self.appendBytes(prefix);
+        var encoded: [4]u8 = undefined;
+        std.mem.writeInt(u32, &encoded, bits, .little);
+        try self.appendBytes(&encoded);
+    }
+
     fn callRelative32(self: *@This(), displacement: i32) !void {
-        var instruction: [5]u8 = undefined;
-        instruction[0] = 0xE8;
-        std.mem.writeInt(i32, instruction[1..5], displacement, .little);
-        try self.appendBytes(&instruction);
+        try self.appendBits32(&.{0xE8}, @bitCast(displacement));
+    }
+
+    fn subRspImmediate32(self: *@This(), value: u32) !void {
+        try self.appendBits32(&.{ 0x48, 0x81, 0xEC }, value);
+    }
+
+    fn addRspImmediate32(self: *@This(), value: u32) !void {
+        try self.appendBits32(&.{ 0x48, 0x81, 0xC4 }, value);
     }
 
     fn zeroEdi(self: *@This()) !void {
@@ -270,10 +448,52 @@ const X86Encoder = struct {
     }
 
     fn movEaxImmediate32(self: *@This(), value: i32) !void {
-        var instruction: [5]u8 = undefined;
-        instruction[0] = 0xB8;
-        std.mem.writeInt(i32, instruction[1..5], value, .little);
-        try self.appendBytes(&instruction);
+        try self.appendBits32(&.{0xB8}, @bitCast(value));
+    }
+
+    fn movEcxImmediate32(self: *@This(), value: i32) !void {
+        try self.appendBits32(&.{0xB9}, @bitCast(value));
+    }
+
+    fn movEaxFromRsp(self: *@This(), offset: u32) !void {
+        try self.appendBits32(&.{ 0x8B, 0x84, 0x24 }, offset);
+    }
+
+    fn movRspFromEax(self: *@This(), offset: u32) !void {
+        try self.appendBits32(&.{ 0x89, 0x84, 0x24 }, offset);
+    }
+
+    fn negateEax(self: *@This()) !void {
+        try self.appendBytes(&.{ 0xF7, 0xD8 });
+    }
+
+    fn integerBinary(self: *@This(), operation: IntegerBinaryOperation, rhs: ValueLocation) !void {
+        if (operation == .divide_signed) {
+            switch (rhs) {
+                .immediate => |value| {
+                    try self.movEcxImmediate32(value);
+                    try self.appendBytes(&.{ 0x99, 0xF7, 0xF9 });
+                },
+                .stack, .incoming_argument => |offset| {
+                    try self.appendBytes(&.{0x99});
+                    try self.appendBits32(&.{ 0xF7, 0xBC, 0x24 }, offset);
+                },
+                .eax, .discarded => unreachable,
+            }
+            return;
+        }
+
+        const encoding: struct { immediate: []const u8, stack: []const u8 } = switch (operation) {
+            .add => .{ .immediate = &.{0x05}, .stack = &.{ 0x03, 0x84, 0x24 } },
+            .subtract => .{ .immediate = &.{0x2D}, .stack = &.{ 0x2B, 0x84, 0x24 } },
+            .multiply => .{ .immediate = &.{ 0x69, 0xC0 }, .stack = &.{ 0x0F, 0xAF, 0x84, 0x24 } },
+            .divide_signed => unreachable,
+        };
+        switch (rhs) {
+            .immediate => |value| try self.appendBits32(encoding.immediate, @bitCast(value)),
+            .stack, .incoming_argument => |offset| try self.appendBits32(encoding.stack, offset),
+            .eax, .discarded => unreachable,
+        }
     }
 
     fn ret(self: *@This()) !void {

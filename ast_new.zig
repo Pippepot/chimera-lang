@@ -210,7 +210,7 @@ fn parseBlock(parser: *ParserState) ParseError!Node.Index {
 fn parseExpression(parser: *ParserState) ParseError!Node.Index {
     return switch (parser.tokens[parser.index].tag) {
         .keyword_comptime => try parseComptime(parser),
-        .keyword_const, .keyword_var => try parseBinding(parser),
+        .keyword_const, .keyword_var, .keyword_static => try parseBinding(parser),
         .keyword_func => try parseFunction(parser),
         .keyword_return => try parseReturn(parser),
         .number_literal,
@@ -249,10 +249,6 @@ fn parseReturn(parser: *ParserState) !Node.Index {
 }
 
 fn parseComptime(parser: *ParserState) !Node.Index {
-    if (parser.tokens[parser.index + 1].tag == .identifier) {
-        if ((try parseBinding(parser)).unwrap()) |binding| return binding;
-    }
-
     const token_index = parser.index;
     _ = try parser.expect(.keyword_comptime);
     const body = try parseBody(parser);
@@ -260,7 +256,7 @@ fn parseComptime(parser: *ParserState) !Node.Index {
 }
 
 fn parseBinding(parser: *ParserState) !Node.Index {
-    const binding_keyword = parser.eat(.keyword_const) orelse parser.eat(.keyword_var) orelse parser.eat(.keyword_comptime) orelse return .null;
+    const binding_keyword = parser.eat(.keyword_const) orelse parser.eat(.keyword_var) orelse parser.eat(.keyword_static) orelse return .null;
     _ = try parser.expect(.identifier);
     const identifier_index = parser.index - 1;
     const type_annotation = try parseTypeAnnotation(parser);
@@ -269,7 +265,7 @@ fn parseBinding(parser: *ParserState) !Node.Index {
     const tag: Node.Tag = switch (binding_keyword.tag) {
         .keyword_const => .const_binding,
         .keyword_var => .var_binding,
-        .keyword_comptime => .comptime_binding,
+        .keyword_static => .static_binding,
         else => unreachable,
     };
 
@@ -737,7 +733,7 @@ fn renderNode(gpa: std.mem.Allocator, node_index: Node.Index, ast: *const Ast, s
             try writer.writeByte('\n');
             try renderNode(gpa, node.data.node, ast, source, writer, seen, new_indent, true, false);
         },
-        .add, .sub, .mul, .div, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .@"and", .@"or", .assign, .call, .call_arg_list_small, .const_binding, .var_binding, .comptime_binding, .func, .param, .param_list_small, .signature, .type_func, .type_list_small, .type_variant_small, .@"if" => {
+        .add, .sub, .mul, .div, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .@"and", .@"or", .assign, .call, .call_arg_list_small, .const_binding, .var_binding, .static_binding, .func, .param, .param_list_small, .signature, .type_func, .type_list_small, .type_variant_small, .@"if" => {
             if (node.tag == .param) {
                 const loc = ast.tokens[node.token_index].loc;
                 try writer.print(" : {s}", .{source[loc.start..loc.end]});
@@ -763,10 +759,10 @@ fn renderNode(gpa: std.mem.Allocator, node_index: Node.Index, ast: *const Ast, s
 
 test "parse function no parameters" {
     try testParsing(
-        \\comptime foo = func() int
+        \\static foo = func() int
         \\  return 1
     ,
-        \\comptime_binding
+        \\static_binding
         \\└─func
         \\  ├─signature
         \\  │ └─type : int
@@ -778,9 +774,9 @@ test "parse function no parameters" {
 
 test "parse inline function no parameters" {
     try testParsing(
-        \\comptime foo = func() int -> return 1
+        \\static foo = func() int -> return 1
     ,
-        \\comptime_binding
+        \\static_binding
         \\└─func
         \\  ├─signature
         \\  │ └─type : int
@@ -791,10 +787,10 @@ test "parse inline function no parameters" {
 
 test "parse bare return" {
     try testParsing(
-        \\comptime noop = func() unit
+        \\static noop = func() unit
         \\  return
     ,
-        \\comptime_binding
+        \\static_binding
         \\└─func
         \\  ├─signature
         \\  │ └─type : unit
@@ -805,10 +801,10 @@ test "parse bare return" {
 
 test "parse function with parameters" {
     try testParsing(
-        \\comptime add = func(x: int, y: int) int
+        \\static add = func(x: int, y: int) int
         \\  return x + y
     ,
-        \\comptime_binding
+        \\static_binding
         \\└─func
         \\  ├─signature
         \\  │ ├─param_list_small
@@ -899,10 +895,10 @@ test "parse function type annotations" {
 
 test "parse function signatures with compound types" {
     try testParsing(
-        \\comptime apply = func(f: func(int) int, x: int | float) int | none
+        \\static apply = func(f: func(int) int, x: int | float) int | none
         \\  return none
     ,
-        \\comptime_binding
+        \\static_binding
         \\└─func
         \\  ├─signature
         \\  │ ├─param_list_small
@@ -926,11 +922,11 @@ test "parse function signatures with compound types" {
 
 test "parse struct declaration" {
     try testParsing(
-        \\comptime Vec2 = struct
+        \\static Vec2 = struct
         \\  x: int
         \\  y: float
     ,
-        \\comptime_binding
+        \\static_binding
         \\└─struct
         \\  ├─struct_field : x
         \\  │ └─type : int
@@ -941,14 +937,14 @@ test "parse struct declaration" {
 
 test "parse struct properties" {
     try testParsing(
-        \\comptime S = struct
+        \\static S = struct
         \\  move = none
         \\  copy = trivial
         \\  drop = explicit
         \\  debug = true
         \\  x: int
     ,
-        \\comptime_binding
+        \\static_binding
         \\└─struct
         \\  ├─struct_property : move
         \\  │ └─none_literal : none
@@ -965,12 +961,12 @@ test "parse struct properties" {
 
 test "parse reserved-looking struct field names" {
     try testParsing(
-        \\comptime S = struct
+        \\static S = struct
         \\  move: int
         \\  copy: int
         \\  drop: int
     ,
-        \\comptime_binding
+        \\static_binding
         \\└─struct
         \\  ├─struct_field : move
         \\  │ └─type : int
@@ -983,17 +979,17 @@ test "parse reserved-looking struct field names" {
 
 test "parse function defined inside struct" {
     try testParsing(
-        \\comptime S = struct
+        \\static S = struct
         \\  x: int
-        \\  comptime make = func(v: int) S
+        \\  static make = func(v: int) S
         \\    return S{x = v}
         \\  y: int
     ,
-        \\comptime_binding
+        \\static_binding
         \\└─struct
         \\  ├─struct_field : x
         \\  │ └─type : int
-        \\  ├─comptime_binding
+        \\  ├─static_binding
         \\  │ └─func
         \\  │   ├─signature
         \\  │   │ ├─param_list_small
@@ -1013,12 +1009,12 @@ test "parse function defined inside struct" {
 
 test "parse struct ownership hook functions" {
     try testParsing(
-        \\comptime Box = struct
+        \\static Box = struct
         \\  x: int
         \\  copy = func(read self: Box) Box -> Box{x = self.x + 1}
         \\  move = func(var self: Box) Box -> Box{x = self.x + 10}
     ,
-        \\comptime_binding
+        \\static_binding
         \\└─struct
         \\  ├─struct_field : x
         \\  │ └─type : int
@@ -1057,12 +1053,12 @@ test "parse struct ownership hook functions" {
 
 test "parse struct ownership hook indented body followed by field" {
     try testParsing(
-        \\comptime D = struct
+        \\static D = struct
         \\  drop = func(deinit self: D) unit
         \\    print(99)
         \\  x: int
     ,
-        \\comptime_binding
+        \\static_binding
         \\└─struct
         \\  ├─struct_property : drop
         \\  │ └─func
@@ -1084,11 +1080,11 @@ test "parse struct ownership hook indented body followed by field" {
 
 test "parse anonymous struct expression" {
     try testParsing(
-        \\comptime Wrapper = func(comptime T: type) type
+        \\static Wrapper = func(comptime T: type) type
         \\  return struct
         \\    x: T
     ,
-        \\comptime_binding
+        \\static_binding
         \\└─func
         \\  ├─signature
         \\  │ ├─param_list_small
@@ -1301,10 +1297,10 @@ test "parse block comptime expression" {
 
 test "parse deinit parameter mode" {
     try testParsing(
-        \\comptime consume = func(deinit d: D) unit
+        \\static consume = func(deinit d: D) unit
         \\  print(d.x)
     ,
-        \\comptime_binding
+        \\static_binding
         \\└─func
         \\  ├─signature
         \\  │ ├─param_list_small
@@ -1539,7 +1535,7 @@ test "diagnostic tag for invalid call argument expression" {
 
 test "diagnostic tag for malformed struct item" {
     try testExpectDiagnosticTag(
-        \\comptime S = struct
+        \\static S = struct
         \\  x int
     , .expectedToken);
 }
@@ -1548,10 +1544,10 @@ test "required expression failures stop at one diagnostic" {
     const sources = [_][:0]const u8{
         "const x =",
         "x =",
-        "comptime f = func() int ->",
+        "static f = func() int ->",
         "if",
         "if true -> 1 else",
-        "comptime S = struct\n  x =",
+        "static S = struct\n  x =",
         "S{ x = }",
     };
     for (sources) |source| {
@@ -1561,7 +1557,7 @@ test "required expression failures stop at one diagnostic" {
 
 test "parse report cleans up every allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, testParseReportAllocations, .{
-        "comptime f = func(x: int, y: int) int\n  return x + y",
+        "static f = func(x: int, y: int) int\n  return x + y",
         null,
     });
     try std.testing.checkAllAllocationFailures(std.testing.allocator, testParseReportAllocations, .{

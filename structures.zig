@@ -89,6 +89,7 @@ pub const Token = struct {
         keyword_read,
         keyword_return,
         keyword_sizeof,
+        keyword_static,
         keyword_struct,
         keyword_test,
         keyword_true,
@@ -117,6 +118,7 @@ pub const Token = struct {
         .{ "read", .keyword_read },
         .{ "return", .keyword_return },
         .{ "sizeof", .keyword_sizeof },
+        .{ "static", .keyword_static },
         .{ "struct", .keyword_struct },
         .{ "test", .keyword_test },
         .{ "true", .keyword_true },
@@ -174,7 +176,7 @@ pub const Node = struct {
         call_arg_list,
         const_binding,
         var_binding,
-        comptime_binding,
+        static_binding,
         comptime_expr,
         field_access,
         func,
@@ -237,7 +239,7 @@ pub const Ast = struct {
                 .return_expr, .not, .neg, .query_op, .move_expr, .comptime_expr, .sizeof_expr, .field_access, .struct_field, .struct_property, .struct_init_field => {
                     if (left.data.node != right.data.node) return false;
                 },
-                .add, .sub, .mul, .div, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .@"and", .@"or", .assign, .call, .call_arg_list_small, .const_binding, .var_binding, .comptime_binding, .func, .param, .param_list_small, .signature, .type_func, .type_list_small, .type_variant_small, .@"if" => {
+                .add, .sub, .mul, .div, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .@"and", .@"or", .assign, .call, .call_arg_list_small, .const_binding, .var_binding, .static_binding, .func, .param, .param_list_small, .signature, .type_func, .type_list_small, .type_variant_small, .@"if" => {
                     if (left.data.node_node.a != right.data.node_node.a or left.data.node_node.b != right.data.node_node.b) return false;
                 },
                 .block, .call_arg_list, .param_list, .type_list, .type_variant, .if_else, .@"struct", .struct_init => {
@@ -382,58 +384,126 @@ pub const ResolvedItem = struct {
     declaration: u32,
 };
 
-pub const PrimitiveType = enum {
+pub const Type = enum {
     int,
 };
 
-pub const FunctionSignature = struct {
-    parameter_count: u32,
-    return_type: PrimitiveType,
+pub const FunctionValueId = enum(u32) { _ };
+pub const FunctionBlockId = enum(u32) { _ };
+
+pub const FunctionValueRange = struct {
+    start: u32,
+    end: u32,
 };
 
-/// Owned semantic control-flow graph. Instruction ranges are stored in one
-/// flat array while each block owns its terminator.
-pub const FunctionBodyAnalysis = struct {
-    instructions: []Instruction,
-    blocks: []Block,
-    entry: BlockId,
+pub fn functionInstructionValue(argument_count: usize, instruction_index: usize) FunctionValueId {
+    return @enumFromInt(argument_count + instruction_index);
+}
 
-    pub const ValueId = enum(u32) { _ };
-    pub const BlockId = enum(u32) { _ };
+pub const BinaryOperands = struct {
+    lhs: FunctionValueId,
+    rhs: FunctionValueId,
+};
 
-    pub const Instruction = union(enum) {
-        integer_constant: i32,
-        call: ItemId,
-    };
+pub const FunctionTerminator = union(enum) {
+    return_unit,
+    return_value: FunctionValueId,
+};
 
-    pub const Terminator = union(enum) {
-        return_unit,
-        return_value: ValueId,
-    };
+pub const FunctionBlock = struct {
+    argument_start: u32 = 0,
+    argument_end: u32 = 0,
+    instruction_start: u32,
+    instruction_end: u32,
+    terminator: FunctionTerminator,
+};
 
-    pub const Block = struct {
-        instruction_start: u32,
-        instruction_end: u32,
-        terminator: Terminator,
-    };
+pub const FunctionSignature = struct {
+    parameter_types: []const Type,
+    return_type: Type,
 
-    pub fn eql(a: FunctionBodyAnalysis, b: FunctionBodyAnalysis) bool {
-        if (a.entry != b.entry or a.instructions.len != b.instructions.len or a.blocks.len != b.blocks.len) return false;
-        for (a.instructions, b.instructions) |left, right| {
-            if (!std.meta.eql(left, right)) return false;
-        }
-        for (a.blocks, b.blocks) |left, right| {
-            if (!std.meta.eql(left, right)) return false;
-        }
-        return true;
+    pub fn eql(a: FunctionSignature, b: FunctionSignature) bool {
+        return a.return_type == b.return_type and std.mem.eql(Type, a.parameter_types, b.parameter_types);
     }
 
-    pub fn deinit(self: *FunctionBodyAnalysis, gpa: std.mem.Allocator) void {
-        gpa.free(self.instructions);
-        gpa.free(self.blocks);
+    pub fn deinit(self: *FunctionSignature, gpa: std.mem.Allocator) void {
+        gpa.free(self.parameter_types);
         self.* = undefined;
     }
 };
+
+pub fn FunctionCall(comptime CallTarget: type) type {
+    return struct {
+        target: CallTarget,
+        arguments: FunctionValueRange,
+    };
+}
+
+pub fn FunctionInstruction(comptime CallTarget: type) type {
+    return union(enum) {
+        consti: i32,
+        call: FunctionCall(CallTarget),
+        negi: FunctionValueId,
+        addi: BinaryOperands,
+        subi: BinaryOperands,
+        muli: BinaryOperands,
+        divsi: BinaryOperands,
+    };
+}
+
+/// Owned function control-flow graph. Block arguments, call operands, and
+/// instructions use flat arrays while each block owns its ranges and
+/// terminator. CallTarget is the only representation difference between
+/// semantic and per-instance IR.
+pub fn FunctionIr(comptime CallTarget: type) type {
+    return struct {
+        block_argument_types: []Type,
+        call_arguments: []ValueId,
+        instructions: []Instruction,
+        blocks: []Block,
+        entry: BlockId,
+
+        pub const ValueId = FunctionValueId;
+        pub const BlockId = FunctionBlockId;
+        pub const Instruction = FunctionInstruction(CallTarget);
+        pub const Terminator = FunctionTerminator;
+        pub const Block = FunctionBlock;
+
+        pub fn instructionValue(self: @This(), instruction_index: usize) ValueId {
+            std.debug.assert(instruction_index < self.instructions.len);
+            return functionInstructionValue(self.block_argument_types.len, instruction_index);
+        }
+
+        pub fn valueCount(self: @This()) usize {
+            return self.block_argument_types.len + self.instructions.len;
+        }
+
+        pub fn eql(a: @This(), b: @This()) bool {
+            if (a.entry != b.entry or
+                !std.mem.eql(Type, a.block_argument_types, b.block_argument_types) or
+                !std.mem.eql(ValueId, a.call_arguments, b.call_arguments) or
+                a.instructions.len != b.instructions.len or
+                a.blocks.len != b.blocks.len) return false;
+            for (a.instructions, b.instructions) |left, right| {
+                if (!std.meta.eql(left, right)) return false;
+            }
+            for (a.blocks, b.blocks) |left, right| {
+                if (!std.meta.eql(left, right)) return false;
+            }
+            return true;
+        }
+
+        pub fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
+            gpa.free(self.block_argument_types);
+            gpa.free(self.call_arguments);
+            gpa.free(self.instructions);
+            gpa.free(self.blocks);
+            self.* = undefined;
+        }
+    };
+}
+
+pub const FunctionBodyAnalysis = FunctionIr(ItemId);
 
 /// Structural non-generic instance key. Future generic substitutions extend
 /// this identity without changing declaration identity.
@@ -442,47 +512,7 @@ pub const InstanceId = struct {
 };
 
 /// Owned per-instance SSA control-flow graph.
-pub const SsaFunction = struct {
-    instructions: []Instruction,
-    blocks: []Block,
-    entry: BlockId,
-
-    pub const ValueId = enum(u32) { _ };
-    pub const BlockId = enum(u32) { _ };
-
-    pub const Instruction = union(enum) {
-        integer_constant: i32,
-        direct_call: InstanceId,
-    };
-
-    pub const Terminator = union(enum) {
-        return_unit,
-        return_value: ValueId,
-    };
-
-    pub const Block = struct {
-        instruction_start: u32,
-        instruction_end: u32,
-        terminator: Terminator,
-    };
-
-    pub fn eql(a: SsaFunction, b: SsaFunction) bool {
-        if (a.entry != b.entry or a.instructions.len != b.instructions.len or a.blocks.len != b.blocks.len) return false;
-        for (a.instructions, b.instructions) |left, right| {
-            if (!std.meta.eql(left, right)) return false;
-        }
-        for (a.blocks, b.blocks) |left, right| {
-            if (!std.meta.eql(left, right)) return false;
-        }
-        return true;
-    }
-
-    pub fn deinit(self: *SsaFunction, gpa: std.mem.Allocator) void {
-        gpa.free(self.instructions);
-        gpa.free(self.blocks);
-        self.* = undefined;
-    }
-};
+pub const SsaFunction = FunctionIr(InstanceId);
 
 pub const CompiledFunction = struct {
     /// Owned, nonempty machine code implementing the callable ABI.
@@ -526,10 +556,8 @@ pub const CompiledFunction = struct {
 
     pub fn deinit(self: *CompiledFunction, gpa: std.mem.Allocator) void {
         gpa.free(self.code);
-        // Empty metadata uses canonical static slices; non-empty metadata is
-        // owned by the artifact.
-        if (self.relocations.len != 0) gpa.free(self.relocations);
-        if (self.referenced_instances.len != 0) gpa.free(self.referenced_instances);
+        gpa.free(self.relocations);
+        gpa.free(self.referenced_instances);
         self.* = undefined;
     }
 };

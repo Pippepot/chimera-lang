@@ -124,7 +124,7 @@ pub const BuildModuleScope = struct {
             const declaration = index.resolve(item_id) orelse unreachable;
             std.debug.assert(declaration < parsed.nodes.len);
             const node = parsed.nodes[declaration];
-            std.debug.assert(node.tag == .comptime_binding);
+            std.debug.assert(node.tag == .static_binding);
             std.debug.assert(node.token_index < parsed.tokens.len);
             const token = parsed.tokens[node.token_index];
             try ctx.emit(structures.Diagnostic, .{
@@ -181,7 +181,7 @@ pub const FunctionSignature = struct {
         const resolved = (try ctx.get(ResolveItem, item_id)).* orelse return null;
         const parsed = (try ctx.get(ParseFile, resolved.file_id)).* orelse return null;
         const source = (try ctx.input(SourceText, resolved.file_id)).*;
-        return switch (semantic.analyzeFunctionSignature(&parsed, source, resolved.declaration)) {
+        return switch (try semantic.analyzeFunctionSignature(&parsed, source, resolved.declaration, ctx.allocator())) {
             .success => |signature| signature,
             .unsupported => |issue| blk: {
                 try emitSemanticIssue(ctx, resolved.file_id, issue);
@@ -197,22 +197,21 @@ pub const AnalyzeFunctionBody = struct {
 
     pub fn run(ctx: anytype, item_id: Input) anyerror!Output {
         const loc = try ctx.lookupInterned(ItemLocations, item_id);
-        if (loc.kind == .function) {
-            // Body analysis is defined only for function headers supported by
-            // FunctionSignature; its payload is not needed yet.
-            if ((try ctx.get(FunctionSignature, item_id)).* == null) return null;
-        }
+        const signature = if (loc.kind == .function)
+            (try ctx.get(FunctionSignature, item_id)).* orelse return null
+        else
+            null;
         const resolved = (try ctx.get(ResolveItem, item_id)).* orelse return null;
         const parsed = (try ctx.get(ParseFile, resolved.file_id)).* orelse return null;
         return switch (loc.kind) {
             .function => blk: {
                 const source = (try ctx.input(SourceText, resolved.file_id)).*;
-                const result = try semantic.analyzeFunctionBody(&parsed, source, resolved.declaration, ctx.allocator());
+                const result = try semantic.buildUnresolvedFunctionBody(&parsed, source, resolved.declaration, signature.?, ctx.allocator());
                 break :blk switch (result) {
-                    .success => |body_value| result_blk: {
-                        var body = body_value;
-                        defer body.deinit(ctx.allocator());
-                        break :result_blk try resolveBodyShape(ctx, resolved.file_id, source, body);
+                    .success => |unresolved_value| result_blk: {
+                        var unresolved = unresolved_value;
+                        defer unresolved.deinit(ctx.allocator());
+                        break :result_blk try resolveBodyCalls(ctx, resolved.file_id, source, signature.?.parameter_types, unresolved);
                     },
                     .unsupported => |issue| result_blk: {
                         try emitSemanticIssue(ctx, resolved.file_id, issue);
@@ -220,64 +219,91 @@ pub const AnalyzeFunctionBody = struct {
                     },
                 };
             },
-            .top_level_entry => switch (try semantic.analyzeEntryBody(&parsed, resolved.declaration, ctx.allocator())) {
-                .success => |body_value| blk: {
-                    var body = body_value;
-                    defer body.deinit(ctx.allocator());
-                    break :blk try resolveBodyShape(ctx, resolved.file_id, null, body);
-                },
-                .unsupported => |issue| blk: {
-                    try emitSemanticIssue(ctx, resolved.file_id, issue);
-                    break :blk null;
-                },
+            .top_level_entry => entry_blk: {
+                const source = (try ctx.input(SourceText, resolved.file_id)).*;
+                break :entry_blk switch (try semantic.buildUnresolvedEntryBody(&parsed, source, resolved.declaration, ctx.allocator())) {
+                    .success => |unresolved_value| blk: {
+                        var unresolved = unresolved_value;
+                        defer unresolved.deinit(ctx.allocator());
+                        break :blk try resolveBodyCalls(ctx, resolved.file_id, source, &.{}, unresolved);
+                    },
+                    .unsupported => |issue| blk: {
+                        try emitSemanticIssue(ctx, resolved.file_id, issue);
+                        break :blk null;
+                    },
+                };
             },
         };
     }
 };
 
-fn resolveBodyShape(
+fn resolveBodyCalls(
     ctx: anytype,
     file_id: structures.FileId,
-    known_source: ?[]const u8,
-    body: semantic.BodyShape,
+    source: []const u8,
+    parameter_types: []const structures.Type,
+    unresolved: semantic.UnresolvedBody,
 ) !?structures.FunctionBodyAnalysis {
-    const instructions = try ctx.allocator().alloc(structures.FunctionBodyAnalysis.Instruction, body.instructions.len);
+    const instructions = try ctx.allocator().alloc(structures.FunctionBodyAnalysis.Instruction, unresolved.instructions.len);
     var owns_instructions = true;
     defer if (owns_instructions) ctx.allocator().free(instructions);
 
-    var source = known_source;
+    const block_argument_types = try ctx.allocator().dupe(structures.Type, parameter_types);
+    var owns_block_arguments = true;
+    defer if (owns_block_arguments) ctx.allocator().free(block_argument_types);
+
+    const call_arguments = try ctx.allocator().dupe(structures.FunctionValueId, unresolved.call_arguments);
+    var owns_call_arguments = true;
+    defer if (owns_call_arguments) ctx.allocator().free(call_arguments);
+
     var scope: ?structures.ModuleScope = null;
-    for (body.instructions, instructions) |instruction, *resolved| {
+    for (unresolved.instructions, instructions) |instruction, *resolved| {
         resolved.* = switch (instruction) {
-            .integer_constant => |value| .{ .integer_constant = value },
-            .call => |name_span| blk: {
-                if (source == null) source = (try ctx.input(SourceText, file_id)).*;
-                std.debug.assert(name_span.start <= name_span.end);
-                std.debug.assert(name_span.end <= source.?.len);
+            .consti => |value| .{ .consti = value },
+            .call => |call| blk: {
+                const name_span = call.target;
                 if (scope == null) scope = (try ctx.get(BuildModuleScope, file_id)).* orelse return null;
-                const target = scope.?.resolve(source.?[name_span.start..name_span.end]) orelse {
+                const target = scope.?.resolve(source[name_span.start..name_span.end]) orelse {
                     try emitSemanticIssue(ctx, file_id, .{ .span = name_span, .message = "unknown function" });
                     return null;
                 };
-                const signature = (try ctx.get(FunctionSignature, target)).* orelse return null;
-                std.debug.assert(signature.parameter_count == 0);
-                std.debug.assert(signature.return_type == .int);
-                break :blk .{ .call = target };
+                const callee_signature = (try ctx.get(FunctionSignature, target)).* orelse return null;
+                const arguments = unresolved.call_arguments[call.arguments.start..call.arguments.end];
+                if (arguments.len != callee_signature.parameter_types.len) {
+                    try emitSemanticIssue(ctx, file_id, .{ .span = name_span, .message = "call argument count does not match function signature" });
+                    return null;
+                }
+                break :blk .{ .call = .{ .target = target, .arguments = call.arguments } };
             },
+            .negi => |operand| .{ .negi = operand },
+            .addi => |operands| .{ .addi = operands },
+            .subi => |operands| .{ .subi = operands },
+            .muli => |operands| .{ .muli = operands },
+            .divsi => |operands| .{ .divsi = operands },
         };
     }
 
     const blocks = try ctx.allocator().alloc(structures.FunctionBodyAnalysis.Block, 1);
     blocks[0] = .{
+        .argument_start = 0,
+        .argument_end = @intCast(parameter_types.len),
         .instruction_start = 0,
         .instruction_end = @intCast(instructions.len),
-        .terminator = switch (body.block.terminator) {
+        .terminator = switch (unresolved.block.terminator) {
             .return_unit => .return_unit,
-            .return_value => |value| .{ .return_value = @enumFromInt(@intFromEnum(value)) },
+            .return_value => |value| .{ .return_value = value },
         },
     };
     owns_instructions = false;
-    return .{ .instructions = instructions, .blocks = blocks, .entry = @enumFromInt(0) };
+    owns_block_arguments = false;
+    owns_call_arguments = false;
+    return .{
+        .block_argument_types = block_argument_types,
+        .call_arguments = call_arguments,
+        .instructions = instructions,
+        .blocks = blocks,
+        .entry = @enumFromInt(0),
+    };
 }
 
 fn emitSemanticIssue(ctx: anytype, file_id: structures.FileId, issue: semantic.Issue) !void {

@@ -1,6 +1,8 @@
 const std = @import("std");
+const codegen = @import("codegen_new.zig");
 const query = @import("query_new.zig");
 const query_structures = @import("query_structures.zig");
+const runtime = @import("runtime.zig");
 const structures = @import("structures.zig");
 
 const Context = query.Context;
@@ -43,7 +45,7 @@ fn freeDiagnostics(diagnostics: []structures.Diagnostic) void {
 
 fn expectDirectCallSsa(ssa: structures.SsaFunction, target: structures.ItemId) !void {
     try testing.expectEqual(@as(usize, 1), ssa.instructions.len);
-    try testing.expectEqual(structures.InstanceId{ .item = target }, ssa.instructions[0].direct_call);
+    try testing.expectEqual(structures.InstanceId{ .item = target }, ssa.instructions[0].call.target);
     try testing.expectEqual(@as(usize, 1), ssa.blocks.len);
     try testing.expectEqual(structures.SsaFunction.Terminator.return_unit, ssa.blocks[0].terminator);
 }
@@ -67,7 +69,7 @@ fn expectUnitSsa(ssa: structures.SsaFunction) !void {
 
 fn expectIntegerReturnBody(body: structures.FunctionBodyAnalysis, expected: i32) !void {
     try testing.expectEqual(@as(usize, 1), body.instructions.len);
-    try testing.expectEqual(expected, body.instructions[0].integer_constant);
+    try testing.expectEqual(expected, body.instructions[0].consti);
     try testing.expectEqual(@as(usize, 1), body.blocks.len);
     try testing.expectEqual(@as(u32, 0), @intFromEnum(body.blocks[0].terminator.return_value));
 }
@@ -76,6 +78,55 @@ fn expectUnitBody(body: structures.FunctionBodyAnalysis) !void {
     try testing.expectEqual(@as(usize, 0), body.instructions.len);
     try testing.expectEqual(@as(usize, 1), body.blocks.len);
     try testing.expectEqual(structures.FunctionBodyAnalysis.Terminator.return_unit, body.blocks[0].terminator);
+}
+
+fn expectCompiledFunctionResult(
+    db: *Database,
+    file_id: structures.FileId,
+    function_name: []const u8,
+    reachable_names: []const []const u8,
+    expected: u8,
+) !void {
+    const scope = (try db.get(query_structures.BuildModuleScope, file_id)).*.?;
+    const function_id: structures.InstanceId = .{ .item = scope.resolve(function_name).? };
+    const entry_id: structures.InstanceId = .{ .item = (try db.get(query_structures.SelectEntry, file_id)).*.? };
+
+    // Test-only process entry: call the selected function, copy its return
+    // value into the Linux exit-status argument, then invoke the exit syscall.
+    const exit_with_result_code = [_]u8{
+        0xE8, 0,    0,    0,    0,
+        0x89, 0xC7, 0xB8, 60,   0,
+        0,    0,    0x0F, 0x05,
+    };
+    const exit_with_result_relocations = [_]structures.CompiledFunction.Relocation{.{
+        .offset = 1,
+        .kind = .call_relative_32,
+        .reference = @enumFromInt(0),
+        .addend = 0,
+    }};
+    const exit_with_result_references = [_]structures.InstanceId{function_id};
+    const exit_with_result: structures.CompiledFunction = .{
+        .code = &exit_with_result_code,
+        .required_alignment = 1,
+        .relocations = &exit_with_result_relocations,
+        .referenced_instances = &exit_with_result_references,
+    };
+
+    var functions: std.ArrayList(codegen.ReachableFunction) = .empty;
+    defer functions.deinit(testing.allocator);
+    try functions.append(testing.allocator, .{ .instance = entry_id, .artifact = exit_with_result });
+    for (reachable_names) |name| {
+        const instance: structures.InstanceId = .{ .item = scope.resolve(name).? };
+        const artifact = (try db.get(query_structures.CompileFunction, instance)).*.?;
+        try functions.append(testing.allocator, .{ .instance = instance, .artifact = artifact });
+    }
+
+    var executable = try codegen.buildExecutable(entry_id, functions.items, testing.allocator);
+    defer executable.deinit(testing.allocator);
+    const io = testing.io;
+    runtime.writeProgram(io, executable.bytes);
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    try testing.expectEqual(expected, runtime.runProg(io, testing.allocator, &.{}));
 }
 
 // Query fixtures expose otherwise-internal lifecycle and recomputation behavior.
@@ -359,13 +410,14 @@ const ModuleScopeParent = struct {
 
 const SignatureParent = struct {
     pub const Input = structures.ItemId;
-    pub const Output = ?structures.FunctionSignature;
+    pub const Output = ?usize;
 
     var executions: Counter = .{};
 
     pub fn run(ctx: *Context, item_id: Input) anyerror!Output {
         executions.increment();
-        return (try ctx.get(query_structures.FunctionSignature, item_id)).*;
+        const signature = (try ctx.get(query_structures.FunctionSignature, item_id)).* orelse return null;
+        return signature.parameter_types.len;
     }
 };
 
@@ -381,8 +433,14 @@ const EntryCallParent = struct {
         const body = (try ctx.get(query_structures.AnalyzeFunctionBody, entry_id)).* orelse return null;
         if (body.instructions.len != 1) return null;
         return switch (body.instructions[0]) {
-            .call => |target| target,
-            .integer_constant => null,
+            .call => |call| call.target,
+            .consti,
+            .negi,
+            .addi,
+            .subi,
+            .muli,
+            .divsi,
+            => null,
         };
     }
 };
@@ -461,10 +519,10 @@ test "DiscoverItems owns names and disambiguates duplicate functions" {
     defer db.deinit();
 
     const source =
-        \\comptime duplicate = func() int -> return 1
+        \\static duplicate = func() int -> return 1
         \\print(0)
-        \\comptime duplicate = func() int -> return 2
-        \\comptime value = 3
+        \\static duplicate = func() int -> return 2
+        \\static value = 3
     ;
     try addSource(db, 1, source);
     const result = try db.get(query_structures.DiscoverItems, 1);
@@ -478,7 +536,7 @@ test "DiscoverItems owns names and disambiguates duplicate functions" {
     try testing.expectEqual(structures.ItemKind.top_level_entry, tree.items[2].loc.kind);
     try testing.expectEqualStrings("$entry", tree.items[2].loc.name);
 
-    try setSource(db, 1, "comptime replacement = func() int -> return 3");
+    try setSource(db, 1, "static replacement = func() int -> return 3");
     try testing.expectEqualStrings("duplicate", tree.items[0].loc.name);
 }
 
@@ -487,19 +545,19 @@ test "DiscoverItems creates an entry for every parsed file" {
     defer db.deinit();
 
     try addSource(db, 1, "");
-    try addSource(db, 2, "comptime f = func() int -> return 1");
-    try addSource(db, 3, "comptime value = 1");
+    try addSource(db, 2, "static f = func() int -> return 1");
+    try addSource(db, 3, "static value = 1");
 
     const empty = (try db.get(query_structures.DiscoverItems, 1)).*;
     const function_only = (try db.get(query_structures.DiscoverItems, 2)).*;
-    const comptime_only = (try db.get(query_structures.DiscoverItems, 3)).*;
+    const static_only = (try db.get(query_structures.DiscoverItems, 3)).*;
     try testing.expectEqual(@as(usize, 1), empty.?.items.len);
     try testing.expectEqual(structures.ItemKind.top_level_entry, empty.?.items[0].loc.kind);
     try testing.expectEqual(@as(usize, 2), function_only.?.items.len);
     try testing.expectEqual(structures.ItemKind.function, function_only.?.items[0].loc.kind);
     try testing.expectEqual(structures.ItemKind.top_level_entry, function_only.?.items[1].loc.kind);
-    try testing.expectEqual(@as(usize, 1), comptime_only.?.items.len);
-    try testing.expectEqual(structures.ItemKind.top_level_entry, comptime_only.?.items[0].loc.kind);
+    try testing.expectEqual(@as(usize, 1), static_only.?.items.len);
+    try testing.expectEqual(structures.ItemKind.top_level_entry, static_only.?.items[0].loc.kind);
 }
 
 test "item indexing handles empty malformed missing and distinct locations" {
@@ -509,10 +567,10 @@ test "item indexing handles empty malformed missing and distinct locations" {
     try addSource(db, 1, "");
     try addSource(db, 2, "const x 1");
     try addSource(db, 3,
-        \\comptime duplicate = func() int -> return 1
-        \\comptime duplicate = func() int -> return 2
+        \\static duplicate = func() int -> return 1
+        \\static duplicate = func() int -> return 2
     );
-    try addSource(db, 4, "comptime duplicate = func() int -> return 1");
+    try addSource(db, 4, "static duplicate = func() int -> return 1");
 
     const empty = (try db.get(query_structures.IndexItems, 1)).*;
     try testing.expect(empty != null);
@@ -541,10 +599,10 @@ test "module scope owns sorted callable lookup and leaves bodies demand-driven" 
     defer db.deinit();
 
     try addSource(db, 1,
-        \\comptime zeta = func() int -> return missing
-        \\comptime value = 1
+        \\static zeta = func() int -> return missing
+        \\static value = 1
         \\print(0)
-        \\comptime alpha = func() int -> return 1
+        \\static alpha = func() int -> return 1
     );
     const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
     try testing.expectEqual(@as(usize, 2), scope.entries.len);
@@ -557,7 +615,7 @@ test "module scope owns sorted callable lookup and leaves bodies demand-driven" 
     try testing.expect(scope.resolve("$entry") == null);
     try testing.expectEqual(@as(usize, 0), (try db.directAccumulatorValues(query_structures.BuildModuleScope, 1, structures.Diagnostic)).len);
 
-    try setSource(db, 1, "comptime replacement = func() int -> return 2");
+    try setSource(db, 1, "static replacement = func() int -> return 2");
     try testing.expectEqualStrings("alpha", scope.entries[0].name);
 }
 
@@ -566,7 +624,7 @@ test "module scope classifies empty missing and malformed inputs" {
     defer db.deinit();
 
     try addSource(db, 1, "");
-    try addSource(db, 2, "comptime value = 1");
+    try addSource(db, 2, "static value = 1");
     try addSource(db, 3, "const value 1");
 
     try testing.expectEqual(@as(usize, 0), (try db.get(query_structures.BuildModuleScope, 1)).*.?.entries.len);
@@ -584,10 +642,10 @@ test "module scope diagnoses later duplicate functions and recovers" {
     defer db.deinit();
 
     const duplicate_source =
-        \\comptime duplicate = func() int -> return 1
-        \\comptime other = func() int -> return 0
-        \\comptime duplicate = func() int -> return 2
-        \\comptime duplicate = func() int -> return 3
+        \\static duplicate = func() int -> return 1
+        \\static other = func() int -> return 0
+        \\static duplicate = func() int -> return 2
+        \\static duplicate = func() int -> return 3
     ;
     try addSource(db, 1, duplicate_source);
     try testing.expect((try db.get(query_structures.BuildModuleScope, 1)).* == null);
@@ -602,8 +660,8 @@ test "module scope diagnoses later duplicate functions and recovers" {
     }
 
     try setSource(db, 1,
-        \\comptime other = func() int -> return 0
-        \\comptime duplicate = func() int -> return 3
+        \\static other = func() int -> return 0
+        \\static duplicate = func() int -> return 3
     );
     const recovered = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
     try testing.expect(recovered.resolve("duplicate") != null);
@@ -617,8 +675,8 @@ test "module scope refreshes duplicate spans when its index remains equal" {
     defer db.deinit();
 
     try addSource(db, 1,
-        \\comptime duplicate = func() int -> return 1
-        \\comptime duplicate = func() int -> return 2
+        \\static duplicate = func() int -> return 1
+        \\static duplicate = func() int -> return 2
     );
     const initial_index = try db.get(query_structures.IndexItems, 1);
     try testing.expect((try db.get(query_structures.BuildModuleScope, 1)).* == null);
@@ -627,8 +685,8 @@ test "module scope refreshes duplicate spans when its index remains equal" {
     const initial_span = initial_diagnostics[0].span.?;
 
     try setSource(db, 1,
-        \\comptime duplicate = func() int -> return 123456789
-        \\comptime duplicate = func() int -> return 2
+        \\static duplicate = func() int -> return 123456789
+        \\static duplicate = func() int -> return 2
     );
     try testing.expectEqual(initial_index, try db.get(query_structures.IndexItems, 1));
     try testing.expect((try db.get(query_structures.BuildModuleScope, 1)).* == null);
@@ -643,31 +701,31 @@ test "module scope preserves stable identity and canonical equality" {
 
     ModuleScopeParent.executions.reset();
     const original =
-        \\comptime beta = func() int -> return 2
-        \\comptime alpha = func() int -> return 1
+        \\static beta = func() int -> return 2
+        \\static alpha = func() int -> return 1
     ;
     try addSource(db, 1, original);
     const initial_scope = try db.get(query_structures.BuildModuleScope, 1);
     const alpha_id = (try db.get(ModuleScopeParent, 1)).*.?;
 
     try setSource(db, 1,
-        \\comptime beta = func() int -> return 20
-        \\comptime alpha = func() int -> return 10
+        \\static beta = func() int -> return 20
+        \\static alpha = func() int -> return 10
     );
     try testing.expectEqual(initial_scope, try db.get(query_structures.BuildModuleScope, 1));
     try testing.expectEqual(alpha_id, (try db.get(ModuleScopeParent, 1)).*.?);
 
     try setSource(db, 1,
-        \\comptime alpha = func() int -> return 10
-        \\comptime beta = func() int -> return 20
+        \\static alpha = func() int -> return 10
+        \\static beta = func() int -> return 20
     );
     try testing.expectEqual(initial_scope, try db.get(query_structures.BuildModuleScope, 1));
     try testing.expectEqual(alpha_id, (try db.get(ModuleScopeParent, 1)).*.?);
     try ModuleScopeParent.executions.expect(1);
 
     try setSource(db, 1,
-        \\comptime gamma = func() int -> return 10
-        \\comptime beta = func() int -> return 20
+        \\static gamma = func() int -> return 10
+        \\static beta = func() int -> return 20
     );
     const renamed = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
     try testing.expect(renamed.resolve("alpha") == null);
@@ -686,8 +744,8 @@ fn testModuleScopeAllocations(gpa: std.mem.Allocator) !void {
     const db = try Database.init(gpa, .{ .worker_count = 1 });
     defer db.deinit();
     try addSource(db, 1,
-        \\comptime beta = func() int -> return 2
-        \\comptime alpha = func() int -> return 1
+        \\static beta = func() int -> return 2
+        \\static alpha = func() int -> return 1
     );
     try testing.expect((try db.get(query_structures.BuildModuleScope, 1)).* != null);
 }
@@ -696,15 +754,15 @@ test "concurrent module scope requests share successful and duplicate results" {
     const db = try testDatabase(4);
     defer db.deinit();
 
-    try addSource(db, 1, "comptime alpha = func() int -> return 1");
+    try addSource(db, 1, "static alpha = func() int -> return 1");
     var successful: [8]Handle(query_structures.BuildModuleScope) = undefined;
     for (&successful) |*handle| handle.* = try db.spawn(query_structures.BuildModuleScope, 1);
     const first = try successful[0].wait();
     for (successful[1..]) |handle| try testing.expectEqual(first, try handle.wait());
 
     try addSource(db, 2,
-        \\comptime duplicate = func() int -> return 1
-        \\comptime duplicate = func() int -> return 2
+        \\static duplicate = func() int -> return 1
+        \\static duplicate = func() int -> return 2
     );
     var duplicate: [8]Handle(query_structures.BuildModuleScope) = undefined;
     for (&duplicate) |*handle| handle.* = try db.spawn(query_structures.BuildModuleScope, 2);
@@ -718,7 +776,7 @@ test "resolution requested before interning retries after identity issuance" {
     const db = try testDatabase(1);
     defer db.deinit();
 
-    try addSource(db, 1, "comptime target = func() int -> return 1");
+    try addSource(db, 1, "static target = func() int -> return 1");
     const first_id: structures.ItemId = @enumFromInt(0);
     try testing.expectError(error.InvalidInternId, db.get(query_structures.ResolveItem, first_id));
     try testing.expectEqual(first_id, (try db.get(query_structures.IndexItems, 1)).*.?.ids()[0]);
@@ -729,22 +787,22 @@ test "item identity survives relocation and restoration" {
     const db = try testDatabase(1);
     defer db.deinit();
 
-    const original = "comptime target = func() int -> return 1";
+    const original = "static target = func() int -> return 1";
     try addSource(db, 1, original);
     const initial_index = (try db.get(query_structures.IndexItems, 1)).*.?;
     const target_id = initial_index.ids()[0];
     const initial_resolution = (try db.get(query_structures.ResolveItem, target_id)).*.?;
 
     try setSource(db, 1,
-        \\comptime unrelated = func() int -> return 0
-        \\comptime target = func() int -> return 2
+        \\static unrelated = func() int -> return 0
+        \\static target = func() int -> return 2
     );
     const relocated_index = (try db.get(query_structures.IndexItems, 1)).*.?;
     try testing.expectEqual(target_id, relocated_index.ids()[1]);
     const relocated = (try db.get(query_structures.ResolveItem, target_id)).*.?;
     try testing.expect(initial_resolution.declaration != relocated.declaration);
 
-    try setSource(db, 1, "comptime renamed = func() int -> return 3");
+    try setSource(db, 1, "static renamed = func() int -> return 3");
     try testing.expect((try db.get(query_structures.ResolveItem, target_id)).* == null);
     try setSource(db, 1, "const x 1");
     try testing.expect((try db.get(query_structures.ResolveItem, target_id)).* == null);
@@ -782,12 +840,12 @@ test "SelectEntry selects the indexed entry and handles invalid inputs" {
 
     try addSource(db, 1, "");
     try addSource(db, 2,
-        \\comptime duplicate = func() int -> return 1
-        \\comptime duplicate = func() int -> return 2
+        \\static duplicate = func() int -> return 1
+        \\static duplicate = func() int -> return 2
     );
     try addSource(db, 3, "const x 1");
     try addSource(db, 4, "");
-    try addSource(db, 5, "comptime f = func() int -> return 1");
+    try addSource(db, 5, "static f = func() int -> return 1");
 
     for ([_]structures.FileId{ 1, 2, 4, 5 }) |file_id| {
         const selected = (try db.get(query_structures.SelectEntry, file_id)).*.?;
@@ -813,7 +871,7 @@ test "SelectEntry restores stable identity after malformed source" {
     const db = try testDatabase(1);
     defer db.deinit();
 
-    const valid = "comptime f = func() int -> return 1";
+    const valid = "static f = func() int -> return 1";
     try addSource(db, 1, valid);
     const entry_id = (try db.get(query_structures.SelectEntry, 1)).*.?;
 
@@ -833,7 +891,7 @@ test "equal SelectEntry result does not recompute its parent" {
     const entry_id = (try db.get(SelectEntryParent, 1)).*.?;
     try testing.expectEqual(@as(usize, 1), (try db.get(query_structures.IndexItems, 1)).*.?.count());
 
-    try setSource(db, 1, "comptime f = func() int -> return 1");
+    try setSource(db, 1, "static f = func() int -> return 1");
     try testing.expectEqual(entry_id, (try db.get(SelectEntryParent, 1)).*.?);
     try testing.expectEqual(@as(usize, 2), (try db.get(query_structures.IndexItems, 1)).*.?.count());
     try SelectEntryParent.executions.expect(1);
@@ -859,13 +917,12 @@ test "SelectEntry exposes changed diagnostics while remaining null" {
 }
 
 test "BuildExecutable runs empty entry sources" {
-    const runtime = @import("runtime.zig");
     const db = try testDatabase(2);
     defer db.deinit();
 
     try addSource(db, 1, "");
-    try addSource(db, 2, "comptime f = func() int -> return 1");
-    try addSource(db, 3, "comptime value = 1");
+    try addSource(db, 2, "static f = func() int -> return 1");
+    try addSource(db, 3, "static value = 1");
 
     const io = testing.io;
     defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
@@ -895,7 +952,7 @@ test "BuildExecutable follows compiled entry diagnostics and recovers" {
     const diagnostics = try db.transitiveAccumulatorValues(query_structures.BuildExecutable, 1, structures.Diagnostic, testing.allocator);
     defer freeDiagnostics(diagnostics);
     try testing.expectEqual(@as(usize, 1), diagnostics.len);
-    try testing.expectEqualStrings("runtime top-level statements are not supported yet", diagnostics[0].message);
+    try testing.expectEqualStrings("unknown function", diagnostics[0].message);
 
     try setSource(db, 1, "");
     try testing.expectEqual(entry_id, (try db.get(query_structures.SelectEntry, 1)).*.?);
@@ -935,7 +992,7 @@ test "BuildExecutable retries missing input and retains equal output" {
     const initial = try db.get(query_structures.BuildExecutable, 1);
     try testing.expect(initial.* != null);
 
-    try setSource(db, 1, "comptime f = func() int -> return 1");
+    try setSource(db, 1, "static f = func() int -> return 1");
     try testing.expectEqual(entry_id, (try db.get(query_structures.SelectEntry, 1)).*.?);
     try testing.expectEqual(initial_artifact, try db.get(query_structures.CompileFunction, entry_instance));
     const updated = try db.get(query_structures.BuildExecutable, 1);
@@ -958,12 +1015,12 @@ test "function signature and body analysis support inline and block literal retu
     const db = try testDatabase(2);
     defer db.deinit();
 
-    try addSource(db, 1, "comptime inline_fn = func() int -> return 7");
+    try addSource(db, 1, "static inline_fn = func() int -> return 7");
     try addSource(db, 2,
-        \\comptime block_fn = func() int
+        \\static block_fn = func() int
         \\  return 9
     );
-    try addSource(db, 3, "comptime max_int = func() int -> return 2147483647");
+    try addSource(db, 3, "static max_int = func() int -> return 2147483647");
 
     for ([_]struct { file_id: structures.FileId, expected: i32 }{
         .{ .file_id = 1, .expected = 7 },
@@ -972,10 +1029,273 @@ test "function signature and body analysis support inline and block literal retu
     }) |case| {
         const function_id = (try db.get(query_structures.IndexItems, case.file_id)).*.?.ids()[0];
         const signature = (try db.get(query_structures.FunctionSignature, function_id)).*.?;
-        try testing.expectEqual(@as(u32, 0), signature.parameter_count);
-        try testing.expectEqual(structures.PrimitiveType.int, signature.return_type);
+        try testing.expectEqual(@as(usize, 0), signature.parameter_types.len);
+        try testing.expectEqual(structures.Type.int, signature.return_type);
         try expectIntegerReturnBody((try db.get(query_structures.AnalyzeFunctionBody, function_id)).*.?, case.expected);
     }
+}
+
+test "function expressions analyze nested arithmetic and calls as one typed value graph" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static leaf = func() int -> return 6
+        \\static expression = func() int -> return -(-(120 / leaf() - (2 + 3) * 1))
+        \\expression()
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const expression_id = scope.resolve("expression").?;
+    const body = (try db.get(query_structures.AnalyzeFunctionBody, expression_id)).*.?;
+
+    try testing.expectEqual(@as(usize, 11), body.instructions.len);
+    try testing.expectEqual(@as(i32, 120), body.instructions[0].consti);
+    try testing.expectEqual(scope.resolve("leaf").?, body.instructions[1].call.target);
+    try testing.expectEqual(@as(u32, 0), @intFromEnum(body.instructions[2].divsi.lhs));
+    try testing.expectEqual(@as(u32, 1), @intFromEnum(body.instructions[2].divsi.rhs));
+    try testing.expectEqual(@as(i32, 2), body.instructions[3].consti);
+    try testing.expectEqual(@as(i32, 3), body.instructions[4].consti);
+    try testing.expectEqual(@as(u32, 3), @intFromEnum(body.instructions[5].addi.lhs));
+    try testing.expectEqual(@as(u32, 4), @intFromEnum(body.instructions[5].addi.rhs));
+    try testing.expectEqual(@as(u32, 5), @intFromEnum(body.instructions[7].muli.lhs));
+    try testing.expectEqual(@as(u32, 2), @intFromEnum(body.instructions[8].subi.lhs));
+    try testing.expectEqual(@as(u32, 7), @intFromEnum(body.instructions[8].subi.rhs));
+    try testing.expectEqual(@as(u32, 8), @intFromEnum(body.instructions[9].negi));
+    try testing.expectEqual(@as(u32, 9), @intFromEnum(body.instructions[10].negi));
+    try testing.expectEqual(@as(u32, 10), @intFromEnum(body.blocks[0].terminator.return_value));
+    const lowered = (try db.get(query_structures.LowerToSSA, .{ .item = expression_id })).*.?;
+    try testing.expectEqual(@as(u32, 9), @intFromEnum(lowered.instructions[10].negi));
+    try testing.expect((try db.get(query_structures.BuildExecutable, 1)).* != null);
+}
+
+test "parameters and nested call arguments form one typed value graph" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static add = func(a: int, b: int) int -> return a + b
+        \\static twice = func(value: int) int -> return add(value, value)
+        \\static answer = func() int
+        \\  const base = add(20, 1)
+        \\  return add(twice(base), base)
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const add_id = scope.resolve("add").?;
+    const twice_id = scope.resolve("twice").?;
+
+    const add_signature = (try db.get(query_structures.FunctionSignature, add_id)).*.?;
+    try testing.expectEqualSlices(structures.Type, &.{ .int, .int }, add_signature.parameter_types);
+    const add = (try db.get(query_structures.AnalyzeFunctionBody, add_id)).*.?;
+    try testing.expectEqualSlices(structures.Type, &.{ .int, .int }, add.block_argument_types);
+    try testing.expectEqual(@as(u32, 0), add.blocks[0].argument_start);
+    try testing.expectEqual(@as(u32, 2), add.blocks[0].argument_end);
+    try testing.expectEqual(@as(u32, 0), @intFromEnum(add.instructions[0].addi.lhs));
+    try testing.expectEqual(@as(u32, 1), @intFromEnum(add.instructions[0].addi.rhs));
+    try testing.expectEqual(@as(u32, 2), @intFromEnum(add.blocks[0].terminator.return_value));
+
+    const twice = (try db.get(query_structures.AnalyzeFunctionBody, twice_id)).*.?;
+    try testing.expectEqualSlices(structures.FunctionValueId, &.{ @enumFromInt(0), @enumFromInt(0) }, twice.call_arguments);
+    try testing.expectEqual(add_id, twice.instructions[0].call.target);
+    try testing.expectEqual(structures.FunctionValueRange{ .start = 0, .end = 2 }, twice.instructions[0].call.arguments);
+    try testing.expectEqual(@as(u32, 1), @intFromEnum(twice.blocks[0].terminator.return_value));
+
+    const answer = (try db.get(query_structures.AnalyzeFunctionBody, scope.resolve("answer").?)).*.?;
+    try testing.expectEqualSlices(structures.FunctionValueId, &.{
+        @enumFromInt(0),
+        @enumFromInt(1),
+        @enumFromInt(2),
+        @enumFromInt(3),
+        @enumFromInt(2),
+    }, answer.call_arguments);
+    try testing.expectEqual(structures.FunctionValueRange{ .start = 0, .end = 2 }, answer.instructions[2].call.arguments);
+    try testing.expectEqual(structures.FunctionValueRange{ .start = 2, .end = 3 }, answer.instructions[3].call.arguments);
+    try testing.expectEqual(structures.FunctionValueRange{ .start = 3, .end = 5 }, answer.instructions[4].call.arguments);
+}
+
+test "call arity and parameter scope diagnostics are reported at their owning boundary" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    const cases = [_]struct {
+        file_id: structures.FileId,
+        source: []const u8,
+        function_name: []const u8,
+        message: []const u8,
+    }{
+        .{
+            .file_id = 1,
+            .source = "static target = func(x: int) int -> return x\nstatic caller = func() int -> return target()",
+            .function_name = "caller",
+            .message = "call argument count does not match function signature",
+        },
+        .{
+            .file_id = 2,
+            .source = "static target = func(x: int) int -> return x\nstatic caller = func() int -> return target(1, 2)",
+            .function_name = "caller",
+            .message = "call argument count does not match function signature",
+        },
+        .{
+            .file_id = 3,
+            .source = "static caller = func(x: int) int\n  const x = 1\n  return x",
+            .function_name = "caller",
+            .message = "duplicate local binding",
+        },
+    };
+    for (cases) |case| {
+        try addSource(db, case.file_id, case.source);
+        const function_id = (try db.get(query_structures.BuildModuleScope, case.file_id)).*.?.resolve(case.function_name).?;
+        try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, function_id)).* == null);
+        const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, function_id, structures.Diagnostic, testing.allocator);
+        defer freeDiagnostics(diagnostics);
+        try testing.expectEqual(@as(usize, 1), diagnostics.len);
+        try testing.expectEqualStrings(case.message, diagnostics[0].message);
+    }
+}
+
+test "parameter arity edits invalidate callers and recovery restores them" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    SignatureParent.executions.reset();
+    try addSource(db, 1,
+        \\static target = func(x: int) int -> return x
+        \\static caller = func() int -> return target(7)
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const target_id = scope.resolve("target").?;
+    const caller_id = scope.resolve("caller").?;
+    try testing.expectEqual(@as(?usize, 1), (try db.get(SignatureParent, target_id)).*);
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, caller_id)).* != null);
+
+    try setSource(db, 1,
+        \\static target = func(x: int, y: int) int -> return x + y
+        \\static caller = func() int -> return target(7)
+    );
+    try testing.expectEqual(@as(?usize, 2), (try db.get(SignatureParent, target_id)).*);
+    try testing.expectEqualSlices(structures.Type, &.{ .int, .int }, (try db.get(query_structures.FunctionSignature, target_id)).*.?.parameter_types);
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, caller_id)).* == null);
+
+    try setSource(db, 1,
+        \\static target = func(renamed: int) int -> return renamed
+        \\static caller = func() int -> return target(7)
+    );
+    try testing.expectEqual(@as(?usize, 1), (try db.get(SignatureParent, target_id)).*);
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, caller_id)).* != null);
+
+    try setSource(db, 1,
+        \\static target = func(again: int) int -> return again
+        \\static caller = func() int -> return target(7)
+    );
+    try testing.expectEqual(@as(?usize, 1), (try db.get(SignatureParent, target_id)).*);
+    try SignatureParent.executions.expect(3);
+}
+
+test "immutable locals name typed values without adding binding instructions" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static leaf = func() int -> return 7
+        \\static locals = func() int
+        \\  const base = leaf()
+        \\  leaf()
+        \\  const adjustment: int = 2 + 1
+        \\  const scaled = base * adjustment
+        \\  const alias = scaled
+        \\  return alias + base
+        \\locals()
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const body = (try db.get(query_structures.AnalyzeFunctionBody, scope.resolve("locals").?)).*.?;
+
+    try testing.expectEqual(@as(usize, 7), body.instructions.len);
+    try testing.expectEqual(scope.resolve("leaf").?, body.instructions[0].call.target);
+    try testing.expectEqual(scope.resolve("leaf").?, body.instructions[1].call.target);
+    try testing.expectEqual(@as(i32, 2), body.instructions[2].consti);
+    try testing.expectEqual(@as(i32, 1), body.instructions[3].consti);
+    try testing.expectEqual(@as(u32, 2), @intFromEnum(body.instructions[4].addi.lhs));
+    try testing.expectEqual(@as(u32, 3), @intFromEnum(body.instructions[4].addi.rhs));
+    try testing.expectEqual(@as(u32, 0), @intFromEnum(body.instructions[5].muli.lhs));
+    try testing.expectEqual(@as(u32, 4), @intFromEnum(body.instructions[5].muli.rhs));
+    try testing.expectEqual(@as(u32, 5), @intFromEnum(body.instructions[6].addi.lhs));
+    try testing.expectEqual(@as(u32, 0), @intFromEnum(body.instructions[6].addi.rhs));
+    try testing.expectEqual(@as(u32, 6), @intFromEnum(body.blocks[0].terminator.return_value));
+    try testing.expect((try db.get(query_structures.BuildExecutable, 1)).* != null);
+}
+
+test "compiled immutable locals preserve reused values across a call" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static leaf = func() int -> return 7
+        \\static answer = func() int
+        \\  const base = leaf()
+        \\  const doubled = base * 2
+        \\  return doubled + base * 4
+    );
+    try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "leaf" }, 42);
+}
+
+test "compiled parameters and nested calls preserve every argument" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static sum3 = func(a: int, b: int, c: int) int -> return a + b + c
+        \\static twice = func(value: int) int -> return value * 2
+        \\static answer = func() int -> return sum3(twice(10), 20, 2)
+        \\sum3(1, 2, 3)
+    );
+    try testing.expect((try db.get(query_structures.BuildExecutable, 1)).* != null);
+    try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "sum3", "twice" }, 42);
+}
+
+test "local binding diagnostics follow lexical scope and declared type" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    const cases = [_]struct {
+        file_id: structures.FileId,
+        source: []const u8,
+        marker: []const u8,
+        message: []const u8,
+    }{
+        .{ .file_id = 1, .source = "static f = func() int\n  const duplicate = 1\n  const duplicate = 2\n  return 1", .marker = "duplicate", .message = "duplicate local binding" },
+        .{ .file_id = 2, .source = "static f = func() int\n  const x = missing\n  return x", .marker = "missing", .message = "unknown value" },
+        .{ .file_id = 3, .source = "static f = func() int\n  const x: float = 1\n  return x", .marker = "float", .message = "only int local bindings are supported yet" },
+        .{ .file_id = 4, .source = "static f = func() int\n  const leaf = 1\n  return leaf()", .marker = "leaf", .message = "value is not callable" },
+    };
+    for (cases) |case| {
+        try addSource(db, case.file_id, case.source);
+        const function_id = (try db.get(query_structures.IndexItems, case.file_id)).*.?.ids()[0];
+        try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, function_id)).* == null);
+        const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, function_id, structures.Diagnostic, testing.allocator);
+        defer freeDiagnostics(diagnostics);
+        try testing.expectEqual(@as(usize, 1), diagnostics.len);
+        try testing.expectEqualStrings(case.message, diagnostics[0].message);
+        const start = std.mem.lastIndexOf(u8, case.source, case.marker).?;
+        try testing.expectEqual(structures.SourceSpan{ .start = start, .end = start + case.marker.len }, diagnostics[0].span.?);
+    }
+}
+
+test "local initializer calls are typed through the callee signature" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static bad = func() float -> return 1
+        \\static user = func() int
+        \\  const value = bad()
+        \\  return value
+    );
+    const user_id = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolve("user").?;
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, user_id)).* == null);
+    try testing.expectEqual(@as(usize, 0), (try db.directAccumulatorValues(query_structures.AnalyzeFunctionBody, user_id, structures.Diagnostic)).len);
+    const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, user_id, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqualStrings("only int return type is supported yet", diagnostics[0].message);
 }
 
 test "body edits preserve signature consumers and update body analysis" {
@@ -983,30 +1303,32 @@ test "body edits preserve signature consumers and update body analysis" {
     defer db.deinit();
 
     SignatureParent.executions.reset();
-    try addSource(db, 1, "comptime f = func() int -> return 7");
+    try addSource(db, 1, "static f = func() int\n  const value = 7\n  return value");
     const function_id = (try db.get(query_structures.IndexItems, 1)).*.?.ids()[0];
     try testing.expect((try db.get(SignatureParent, function_id)).* != null);
     try expectIntegerReturnBody((try db.get(query_structures.AnalyzeFunctionBody, function_id)).*.?, 7);
 
-    try setSource(db, 1, "comptime f = func() int -> return 8");
+    try setSource(db, 1, "static f = func() int\n  const value = 8\n  return value");
     try testing.expect((try db.get(SignatureParent, function_id)).* != null);
     try SignatureParent.executions.expect(1);
     try expectIntegerReturnBody((try db.get(query_structures.AnalyzeFunctionBody, function_id)).*.?, 8);
 
-    try setSource(db, 1, "comptime f = func() foo -> return 8");
+    try setSource(db, 1, "static f = func() foo -> return 8");
     try testing.expect((try db.get(query_structures.FunctionSignature, function_id)).* == null);
 }
 
-test "function signature rejects unsupported headers without duplicate body diagnostics" {
+test "function signature rejects invalid parameter and return types without duplicate body diagnostics" {
     const db = try testDatabase(2);
     defer db.deinit();
 
-    try addSource(db, 1, "comptime missing = func() -> return 1");
-    try addSource(db, 2, "comptime unknown = func() foo -> return 1");
-    try addSource(db, 3, "comptime one = func(x: int) int -> return 1");
-    try addSource(db, 4, "comptime many = func(a: int, b: int, c: int) int -> return 1");
+    try addSource(db, 1, "static missing = func() -> return 1");
+    try addSource(db, 2, "static unknown = func() foo -> return 1");
+    try addSource(db, 3, "static missing_param = func(x) int -> return 1");
+    try addSource(db, 4, "static bad_param = func(x: float) int -> return 1");
+    try addSource(db, 5, "static duplicate = func(x: int, x: int) int -> return 1");
+    try addSource(db, 6, "static mode = func(read x: int) int -> return 1");
 
-    for ([_]structures.FileId{ 1, 2, 3, 4 }) |file_id| {
+    for ([_]structures.FileId{ 1, 2, 3, 4, 5, 6 }) |file_id| {
         const function_id = (try db.get(query_structures.IndexItems, file_id)).*.?.ids()[0];
         try testing.expect((try db.get(query_structures.FunctionSignature, function_id)).* == null);
         try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, function_id)).* == null);
@@ -1022,16 +1344,16 @@ test "function body analysis rejects unsupported body forms and literals" {
     const db = try testDatabase(2);
     defer db.deinit();
 
-    try addSource(db, 1, "comptime nonliteral = func() int -> return true");
-    try addSource(db, 2, "comptime bare_return = func() int -> return");
-    try addSource(db, 3, "comptime expression = func() int -> 7");
+    try addSource(db, 1, "static nonliteral = func() int -> return true");
+    try addSource(db, 2, "static bare_return = func() int -> return");
+    try addSource(db, 3, "static expression = func() int -> 7");
     try addSource(db, 4,
-        \\comptime extra = func() int
-        \\  const x = 1
+        \\static extra = func() int
+        \\  var x = 1
         \\  return 2
     );
-    try addSource(db, 5, "comptime float = func() int -> return 1.5");
-    try addSource(db, 6, "comptime overflow = func() int -> return 2147483648");
+    try addSource(db, 5, "static float = func() int -> return 1.5");
+    try addSource(db, 6, "static overflow = func() int -> return 2147483648");
 
     for ([_]structures.FileId{ 1, 2, 3, 4, 5, 6 }) |file_id| {
         const function_id = (try db.get(query_structures.IndexItems, file_id)).*.?.ids()[0];
@@ -1048,7 +1370,7 @@ test "function analysis distinguishes entry stale restored and invalid identitie
     const db = try testDatabase(1);
     defer db.deinit();
 
-    const valid = "comptime f = func() int -> return 7";
+    const valid = "static f = func() int -> return 7";
     try addSource(db, 1, valid);
     const index = (try db.get(query_structures.IndexItems, 1)).*.?;
     const function_id = index.ids()[0];
@@ -1072,8 +1394,8 @@ test "duplicate function ordinals analyze independently across reorder" {
     defer db.deinit();
 
     try addSource(db, 1,
-        \\comptime duplicate = func() int -> return 1
-        \\comptime duplicate = func() int -> return 2
+        \\static duplicate = func() int -> return 1
+        \\static duplicate = func() int -> return 2
     );
     const ids = (try db.get(query_structures.IndexItems, 1)).*.?.ids();
     const first_id = ids[0];
@@ -1085,8 +1407,8 @@ test "duplicate function ordinals analyze independently across reorder" {
     try expectIntegerReturnBody((try db.get(query_structures.AnalyzeFunctionBody, second_id)).*.?, 2);
 
     try setSource(db, 1,
-        \\comptime duplicate = func() int -> return 2
-        \\comptime duplicate = func() int -> return 1
+        \\static duplicate = func() int -> return 2
+        \\static duplicate = func() int -> return 1
     );
     try testing.expect((try db.get(SignatureParent, first_id)).* != null);
     try testing.expect((try db.get(SignatureParent, second_id)).* != null);
@@ -1099,9 +1421,9 @@ test "malformed function diagnostics remain parse-only and top-level return stay
     const db = try testDatabase(1);
     defer db.deinit();
 
-    try addSource(db, 1, "comptime f = func() int -> return 1");
+    try addSource(db, 1, "static f = func() int -> return 1");
     const function_id = (try db.get(query_structures.IndexItems, 1)).*.?.ids()[0];
-    try setSource(db, 1, "comptime f = func() int");
+    try setSource(db, 1, "static f = func() int");
     try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, function_id)).* == null);
     const direct = try db.directAccumulatorValues(query_structures.AnalyzeFunctionBody, function_id, structures.Diagnostic);
     try testing.expectEqual(@as(usize, 0), direct.len);
@@ -1140,10 +1462,9 @@ test "entry analysis rejects every runtime root" {
         .{ .source = "var x = 1", .marker = "x" },
         .{ .source = "1", .marker = "1" },
         .{ .source = "if true -> 1", .marker = "if" },
-        .{ .source = "print(1)", .marker = "(" },
         .{ .source = "x = 1", .marker = "=" },
         .{ .source = "comptime -> return 7", .marker = "comptime" },
-        .{ .source = "comptime ok = 1\nreturn 7\nprint(1)", .marker = "return" },
+        .{ .source = "static ok = 1\nreturn 7\nprint(1)", .marker = "return" },
     };
     const entry_message = "runtime top-level statements are not supported yet";
 
@@ -1169,7 +1490,7 @@ test "entry analysis resolves one direct call without analyzing its callee body"
     defer db.deinit();
 
     try addSource(db, 1,
-        \\comptime broken = func() int -> return true
+        \\static broken = func() int -> return true
         \\broken()
     );
     const index = (try db.get(query_structures.IndexItems, 1)).*.?;
@@ -1178,7 +1499,7 @@ test "entry analysis resolves one direct call without analyzing its callee body"
 
     const entry_body = (try db.get(query_structures.AnalyzeFunctionBody, entry_id)).*.?;
     try testing.expectEqual(@as(usize, 1), entry_body.instructions.len);
-    try testing.expectEqual(callee_id, entry_body.instructions[0].call);
+    try testing.expectEqual(callee_id, entry_body.instructions[0].call.target);
     try testing.expect((try db.get(query_structures.FunctionSignature, callee_id)).* != null);
     try testing.expectEqual(@as(usize, 0), (try db.directAccumulatorValues(query_structures.AnalyzeFunctionBody, entry_id, structures.Diagnostic)).len);
 
@@ -1193,12 +1514,11 @@ test "entry analysis validates all root syntax before resolving a call" {
     const cases = [_]struct {
         source: []const u8,
         marker: []const u8,
+        message: []const u8,
     }{
-        .{ .source = "comptime bad = func(x: int) int -> return 1\nbad(1)", .marker = "(" },
-        .{ .source = "comptime bad = func() foo -> return 1\nbad()\nreturn", .marker = "return" },
-        .{ .source = "comptime f = func() int -> return 1\nf()()", .marker = "(" },
+        .{ .source = "static bad = func() foo -> return 1\nbad()\nreturn", .marker = "return", .message = "runtime top-level statements are not supported yet" },
+        .{ .source = "static f = func() int -> return 1\nf()()", .marker = "(", .message = "expression is not supported yet" },
     };
-    const message = "runtime top-level statements are not supported yet";
 
     for (cases, 10..) |case, file_id| {
         try addSource(db, file_id, case.source);
@@ -1208,7 +1528,7 @@ test "entry analysis validates all root syntax before resolving a call" {
         try expectSingleQueryDiagnostic(db, query_structures.AnalyzeFunctionBody, entry_id, true, file_id, .{
             .start = start,
             .end = start + case.marker.len,
-        }, message);
+        }, case.message);
     }
 }
 
@@ -1224,7 +1544,7 @@ test "entry call lookup reports only the demanded resolution failure" {
         .end = "missing".len,
     }, "unknown function");
 
-    const unsupported = "comptime bad = func() foo -> return 1\nbad()";
+    const unsupported = "static bad = func() foo -> return 1\nbad()";
     try addSource(db, 2, unsupported);
     const unsupported_entry = (try db.get(query_structures.SelectEntry, 2)).*.?;
     try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, unsupported_entry)).* == null);
@@ -1234,8 +1554,8 @@ test "entry call lookup reports only the demanded resolution failure" {
     try testing.expectEqualStrings("only int return type is supported yet", unsupported_diagnostics[0].message);
 
     try addSource(db, 3,
-        \\comptime duplicate = func() int -> return 1
-        \\comptime duplicate = func() int -> return 2
+        \\static duplicate = func() int -> return 1
+        \\static duplicate = func() int -> return 2
         \\duplicate()
     );
     const duplicate_entry = (try db.get(query_structures.SelectEntry, 3)).*.?;
@@ -1245,7 +1565,7 @@ test "entry call lookup reports only the demanded resolution failure" {
     try testing.expectEqual(@as(usize, 1), duplicate_diagnostics.len);
     try testing.expectEqualStrings("duplicate top-level function name", duplicate_diagnostics[0].message);
 
-    const value_source = "comptime value = 1\nvalue()";
+    const value_source = "static value = 1\nvalue()";
     try addSource(db, 4, value_source);
     const value_entry = (try db.get(query_structures.SelectEntry, 4)).*.?;
     try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, value_entry)).* == null);
@@ -1262,8 +1582,8 @@ test "entry call dependencies follow spelling identity and runtime shape" {
 
     EntryCallParent.executions.reset();
     const alpha_source =
-        \\comptime alpha = func() int -> return 1
-        \\comptime bravo = func() int -> return 2
+        \\static alpha = func() int -> return 1
+        \\static bravo = func() int -> return 2
         \\alpha()
     ;
     try addSource(db, 1, alpha_source);
@@ -1274,8 +1594,8 @@ test "entry call dependencies follow spelling identity and runtime shape" {
     try testing.expectEqual(alpha_id, (try db.get(EntryCallParent, 1)).*.?);
 
     try setSource(db, 1,
-        \\comptime alpha = func() int -> return 1
-        \\comptime bravo = func() int -> return 2
+        \\static alpha = func() int -> return 1
+        \\static bravo = func() int -> return 2
         \\bravo()
     );
     try testing.expectEqual(initial_parse, try db.get(query_structures.ParseFile, 1));
@@ -1283,8 +1603,8 @@ test "entry call dependencies follow spelling identity and runtime shape" {
     try testing.expectEqual(bravo_id, (try db.get(EntryCallParent, 1)).*.?);
 
     try setSource(db, 1,
-        \\comptime bravo = func() int -> return 20
-        \\comptime alpha = func() int -> return 10
+        \\static bravo = func() int -> return 20
+        \\static alpha = func() int -> return 10
         \\bravo()
     );
     try testing.expectEqual(bravo_id, (try db.get(EntryCallParent, 1)).*.?);
@@ -1293,8 +1613,8 @@ test "entry call dependencies follow spelling identity and runtime shape" {
     // Removing the runtime call removes the scope dependency as well. Duplicate
     // names therefore remain undiagnosed until a later query demands the scope.
     try setSource(db, 1,
-        \\comptime duplicate = func() int -> return 20
-        \\comptime duplicate = func() int -> return 10
+        \\static duplicate = func() int -> return 20
+        \\static duplicate = func() int -> return 10
     );
     try testing.expect((try db.get(EntryCallParent, 1)).* == null);
     const entry_id = (try db.get(query_structures.SelectEntry, 1)).*.?;
@@ -1311,7 +1631,7 @@ test "entry call diagnostics and downstream refusal update and recover" {
     const db = try testDatabase(1);
     defer db.deinit();
 
-    try addSource(db, 1, "comptime value = 1\nmissing()");
+    try addSource(db, 1, "static value = 1\nmissing()");
     const entry_id = (try db.get(query_structures.SelectEntry, 1)).*.?;
     const instance: structures.InstanceId = .{ .item = entry_id };
     try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, entry_id)).* == null);
@@ -1319,14 +1639,14 @@ test "entry call diagnostics and downstream refusal update and recover" {
     try testing.expectEqual(@as(usize, 1), initial.len);
     const initial_span = initial[0].span.?;
 
-    try setSource(db, 1, "comptime longer = 1\nmissing()");
+    try setSource(db, 1, "static longer = 1\nmissing()");
     try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, entry_id)).* == null);
     const moved = try db.directAccumulatorValues(query_structures.AnalyzeFunctionBody, entry_id, structures.Diagnostic);
     try testing.expectEqual(@as(usize, 1), moved.len);
     try testing.expect(initial_span.start != moved[0].span.?.start);
 
     const unsupported_signature =
-        \\comptime target = func() foo -> return 1
+        \\static target = func() foo -> return 1
         \\target()
     ;
     try setSource(db, 1, unsupported_signature);
@@ -1334,7 +1654,7 @@ test "entry call diagnostics and downstream refusal update and recover" {
     try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, entry_id)).* == null);
 
     try setSource(db, 1,
-        \\comptime target = func() int -> return 1
+        \\static target = func() int -> return 1
         \\target()
     );
     try testing.expectEqual(unsupported_parse, try db.get(query_structures.ParseFile, 1));
@@ -1355,12 +1675,11 @@ test "entry call diagnostics and downstream refusal update and recover" {
 }
 
 test "BuildExecutable links a direct call while keeping the entry artifact independent of the callee's value" {
-    const runtime = @import("runtime.zig");
     const db = try testDatabase(2);
     defer db.deinit();
 
     try addSource(db, 1,
-        \\comptime target = func() int -> return 1
+        \\static target = func() int -> return 1
         \\target()
     );
     const entry_id = (try db.get(query_structures.SelectEntry, 1)).*.?;
@@ -1380,7 +1699,7 @@ test "BuildExecutable links a direct call while keeping the entry artifact indep
     // artifact and the linked executable, but not the caller's own artifact:
     // direct-call compilation stays independent of the callee body.
     try setSource(db, 1,
-        \\comptime target = func() int -> return 99
+        \\static target = func() int -> return 99
         \\target()
     );
     try testing.expectEqual(entry_id, (try db.get(query_structures.SelectEntry, 1)).*.?);
@@ -1395,13 +1714,12 @@ test "BuildExecutable links a direct call while keeping the entry artifact indep
 }
 
 test "BuildExecutable links and runs transitively reachable calls" {
-    const runtime = @import("runtime.zig");
     const db = try testDatabase(2);
     defer db.deinit();
 
     try addSource(db, 1,
-        \\comptime leaf = func() int -> return 7
-        \\comptime middle = func() int -> return leaf()
+        \\static leaf = func() int -> return 7
+        \\static middle = func() int -> return leaf()
         \\middle()
     );
     const executable = try db.get(query_structures.BuildExecutable, 1);
@@ -1418,8 +1736,8 @@ test "BuildExecutable collects cyclic reachability without recursive compilation
     defer db.deinit();
 
     try addSource(db, 1,
-        \\comptime first = func() int -> return second()
-        \\comptime second = func() int -> return first()
+        \\static first = func() int -> return second()
+        \\static second = func() int -> return first()
         \\first()
     );
     try testing.expect((try db.get(query_structures.BuildExecutable, 1)).* != null);
@@ -1430,11 +1748,11 @@ test "BuildExecutable places a shared reachable function once" {
     defer db.deinit();
 
     try addSource(db, 1,
-        \\comptime shared = func() int -> return 305419896
-        \\comptime left = func() int
+        \\static shared = func() int -> return 305419896
+        \\static left = func() int
         \\  shared()
         \\  return 1
-        \\comptime right = func() int
+        \\static right = func() int
         \\  shared()
         \\  return 2
         \\left()
@@ -1458,16 +1776,16 @@ test "BuildExecutable drops dependencies that become unreachable" {
     defer db.deinit();
 
     try addSource(db, 1,
-        \\comptime leaf = func() int -> return 1
-        \\comptime middle = func() int -> return leaf()
+        \\static leaf = func() int -> return 1
+        \\static middle = func() int -> return leaf()
         \\middle()
     );
     const with_leaf = try db.get(query_structures.BuildExecutable, 1);
     try testing.expect(with_leaf.* != null);
 
     try setSource(db, 1,
-        \\comptime leaf = func() int -> return 1
-        \\comptime middle = func() int -> return 9
+        \\static leaf = func() int -> return 1
+        \\static middle = func() int -> return 9
         \\middle()
     );
     const without_leaf = try db.get(query_structures.BuildExecutable, 1);
@@ -1475,8 +1793,8 @@ test "BuildExecutable drops dependencies that become unreachable" {
     try testing.expect(!structures.Executable.eql(with_leaf.*.?, without_leaf.*.?));
 
     try setSource(db, 1,
-        \\comptime leaf = func() int -> return true
-        \\comptime middle = func() int -> return 9
+        \\static leaf = func() int -> return true
+        \\static middle = func() int -> return 9
         \\middle()
     );
     try testing.expectEqual(without_leaf, try db.get(query_structures.BuildExecutable, 1));
@@ -1490,17 +1808,17 @@ test "BuildExecutable surfaces a callee compile failure as null with its diagnos
     defer db.deinit();
 
     try addSource(db, 1,
-        \\comptime target = func() int -> return true
+        \\static target = func() int -> return true
         \\target()
     );
     try testing.expect((try db.get(query_structures.BuildExecutable, 1)).* == null);
     const diagnostics = try db.transitiveAccumulatorValues(query_structures.BuildExecutable, 1, structures.Diagnostic, testing.allocator);
     defer freeDiagnostics(diagnostics);
     try testing.expectEqual(@as(usize, 1), diagnostics.len);
-    try testing.expectEqualStrings("function must return an integer literal or zero-argument function call", diagnostics[0].message);
+    try testing.expectEqualStrings("expression is not supported yet", diagnostics[0].message);
 
     try setSource(db, 1,
-        \\comptime target = func() int -> return 1
+        \\static target = func() int -> return 1
         \\target()
     );
     try testing.expect((try db.get(query_structures.BuildExecutable, 1)).* != null);
@@ -1511,7 +1829,7 @@ test "concurrent entry call analysis shares one stable result" {
     defer db.deinit();
 
     try addSource(db, 1,
-        \\comptime target = func() int -> return 1
+        \\static target = func() int -> return 1
         \\target()
     );
     const entry_id = (try db.get(query_structures.SelectEntry, 1)).*.?;
@@ -1547,8 +1865,8 @@ test "direct entry call SSA remains demand driven across callee edits and reorde
     defer db.deinit();
 
     try addSource(db, 1,
-        \\comptime broken = func() int -> return true
-        \\comptime other = func() int -> return 2
+        \\static broken = func() int -> return true
+        \\static other = func() int -> return 2
         \\broken()
     );
     const entry_id = (try db.get(query_structures.SelectEntry, 1)).*.?;
@@ -1561,15 +1879,15 @@ test "direct entry call SSA remains demand driven across callee edits and reorde
     // lowering dependency on it.
     try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, broken_id)).* == null);
     try setSource(db, 1,
-        \\comptime broken = func() int -> return false
-        \\comptime other = func() int -> return 20
+        \\static broken = func() int -> return false
+        \\static other = func() int -> return 20
         \\broken()
     );
     try testing.expectEqual(initial, try db.get(query_structures.LowerToSSA, instance));
 
     try setSource(db, 1,
-        \\comptime other = func() int -> return 20
-        \\comptime broken = func() int -> return false
+        \\static other = func() int -> return 20
+        \\static broken = func() int -> return false
         \\broken()
     );
     try testing.expectEqual(initial, try db.get(query_structures.LowerToSSA, instance));
@@ -1580,8 +1898,8 @@ test "direct entry call SSA tracks target changes removal and restoration" {
     defer db.deinit();
 
     try addSource(db, 1,
-        \\comptime alpha = func() int -> return 1
-        \\comptime bravo = func() int -> return 2
+        \\static alpha = func() int -> return 1
+        \\static bravo = func() int -> return 2
         \\alpha()
     );
     const entry_id = (try db.get(query_structures.SelectEntry, 1)).*.?;
@@ -1592,22 +1910,22 @@ test "direct entry call SSA tracks target changes removal and restoration" {
     try expectDirectCallSsa((try db.get(query_structures.LowerToSSA, instance)).*.?, alpha_id);
 
     try setSource(db, 1,
-        \\comptime alpha = func() int -> return 1
-        \\comptime bravo = func() int -> return 2
+        \\static alpha = func() int -> return 1
+        \\static bravo = func() int -> return 2
         \\bravo()
     );
     try expectDirectCallSsa((try db.get(query_structures.LowerToSSA, instance)).*.?, bravo_id);
 
     try setSource(db, 1,
-        \\comptime alpha = func() int -> return 1
-        \\comptime bravo = func() int -> return 2
+        \\static alpha = func() int -> return 1
+        \\static bravo = func() int -> return 2
     );
     const unit = (try db.get(query_structures.LowerToSSA, instance)).*.?;
     try expectUnitSsa(unit);
 
     try setSource(db, 1,
-        \\comptime alpha = func() int -> return 1
-        \\comptime bravo = func() int -> return 2
+        \\static alpha = func() int -> return 1
+        \\static bravo = func() int -> return 2
         \\bravo()
     );
     try expectDirectCallSsa((try db.get(query_structures.LowerToSSA, instance)).*.?, bravo_id);
@@ -1617,8 +1935,8 @@ test "LowerToSSA produces owned value-equal functions for distinct instances" {
     const db = try testDatabase(2);
     defer db.deinit();
 
-    try addSource(db, 1, "comptime first = func() int -> return 7");
-    try addSource(db, 2, "comptime second = func() int -> return 7");
+    try addSource(db, 1, "static first = func() int -> return 7");
+    try addSource(db, 2, "static second = func() int -> return 7");
     const first_id = (try db.get(query_structures.IndexItems, 1)).*.?.ids()[0];
     const second_id = (try db.get(query_structures.IndexItems, 2)).*.?.ids()[0];
     const first = try db.get(query_structures.LowerToSSA, .{ .item = first_id });
@@ -1628,7 +1946,7 @@ test "LowerToSSA produces owned value-equal functions for distinct instances" {
     try testing.expect(first.*.?.instructions.ptr != second.*.?.instructions.ptr);
     try testing.expect(structures.SsaFunction.eql(first.*.?, second.*.?));
     try testing.expectEqual(@as(usize, 1), first.*.?.instructions.len);
-    try testing.expectEqual(@as(i32, 7), first.*.?.instructions[0].integer_constant);
+    try testing.expectEqual(@as(i32, 7), first.*.?.instructions[0].consti);
     try testing.expectEqual(@as(u32, 0), @intFromEnum(first.*.?.blocks[0].terminator.return_value));
 }
 
@@ -1637,32 +1955,32 @@ test "LowerToSSA changes with its body and retains equal results" {
     defer db.deinit();
 
     try addSource(db, 1,
-        \\comptime target = func() int -> return 7
-        \\comptime unrelated = func() int -> return 1
+        \\static target = func() int -> return 7
+        \\static unrelated = func() int -> return 1
     );
     const target_id = (try db.get(query_structures.IndexItems, 1)).*.?.ids()[0];
     const instance: structures.InstanceId = .{ .item = target_id };
-    try testing.expectEqual(@as(i32, 7), (try db.get(query_structures.LowerToSSA, instance)).*.?.instructions[0].integer_constant);
+    try testing.expectEqual(@as(i32, 7), (try db.get(query_structures.LowerToSSA, instance)).*.?.instructions[0].consti);
 
     try setSource(db, 1,
-        \\comptime target = func() int -> return 8
-        \\comptime unrelated = func() int -> return 1
+        \\static target = func() int -> return 8
+        \\static unrelated = func() int -> return 1
     );
     const changed = try db.get(query_structures.LowerToSSA, instance);
-    try testing.expectEqual(@as(i32, 8), changed.*.?.instructions[0].integer_constant);
+    try testing.expectEqual(@as(i32, 8), changed.*.?.instructions[0].consti);
 
     try setSource(db, 1,
-        \\comptime target = func() int
+        \\static target = func() int
         \\  return 8
-        \\comptime unrelated = func() int -> return 1
+        \\static unrelated = func() int -> return 1
     );
     const equal_shape = try db.get(query_structures.LowerToSSA, instance);
     try testing.expectEqual(changed, equal_shape);
 
     try setSource(db, 1,
-        \\comptime target = func() int
+        \\static target = func() int
         \\  return 8
-        \\comptime unrelated = func() int -> return 2
+        \\static unrelated = func() int -> return 2
     );
     try testing.expectEqual(equal_shape, try db.get(query_structures.LowerToSSA, instance));
 }
@@ -1671,8 +1989,8 @@ test "LowerToSSA exposes semantic diagnostics without duplicating them" {
     const db = try testDatabase(2);
     defer db.deinit();
 
-    try addSource(db, 1, "comptime header = func() foo -> return 1");
-    try addSource(db, 2, "comptime body = func() int -> return true");
+    try addSource(db, 1, "static header = func() foo -> return 1");
+    try addSource(db, 2, "static body = func() int -> return true");
     for ([_]structures.FileId{ 1, 2 }) |file_id| {
         const item_id = (try db.get(query_structures.IndexItems, file_id)).*.?.ids()[0];
         const instance: structures.InstanceId = .{ .item = item_id };
@@ -1689,7 +2007,7 @@ test "LowerToSSA supports entry retention failure restoration and invalid instan
     const db = try testDatabase(1);
     defer db.deinit();
 
-    const valid = "comptime f = func() int -> return 7";
+    const valid = "static f = func() int -> return 7";
     try addSource(db, 1, valid);
     const function_id = (try db.get(query_structures.IndexItems, 1)).*.?.ids()[0];
     const entry_id = (try db.get(query_structures.SelectEntry, 1)).*.?;
@@ -1698,7 +2016,7 @@ test "LowerToSSA supports entry retention failure restoration and invalid instan
     const initial_entry = try db.get(query_structures.LowerToSSA, entry_instance);
     try expectUnitSsa(initial_entry.*.?);
 
-    try setSource(db, 1, "comptime value = 1");
+    try setSource(db, 1, "static value = 1");
     try testing.expectEqual(entry_id, (try db.get(query_structures.SelectEntry, 1)).*.?);
     try testing.expectEqual(initial_entry, try db.get(query_structures.LowerToSSA, entry_instance));
 
@@ -1733,7 +2051,7 @@ test "concurrent LowerToSSA requests share function and entry results" {
     const db = try testDatabase(4);
     defer db.deinit();
 
-    try addSource(db, 1, "comptime f = func() int -> return 7\nf()");
+    try addSource(db, 1, "static f = func() int -> return 7\nf()");
     const function_id = (try db.get(query_structures.IndexItems, 1)).*.?.ids()[0];
     const entry_id = (try db.get(query_structures.SelectEntry, 1)).*.?;
     for ([_]structures.InstanceId{ .{ .item = function_id }, .{ .item = entry_id } }) |instance| {
@@ -1751,8 +2069,8 @@ test "CompileFunction produces owned value-equal artifacts for distinct instance
     const db = try testDatabase(2);
     defer db.deinit();
 
-    try addSource(db, 1, "comptime first = func() int -> return 7");
-    try addSource(db, 2, "comptime second = func() int -> return 7");
+    try addSource(db, 1, "static first = func() int -> return 7");
+    try addSource(db, 2, "static second = func() int -> return 7");
     const first_id = (try db.get(query_structures.IndexItems, 1)).*.?.ids()[0];
     const second_id = (try db.get(query_structures.IndexItems, 2)).*.?.ids()[0];
     const first = try db.get(query_structures.CompileFunction, .{ .item = first_id });
@@ -1772,33 +2090,33 @@ test "CompileFunction changes with machine code and retains equal results" {
     defer db.deinit();
 
     try addSource(db, 1,
-        \\comptime target = func() int -> return 7
-        \\comptime unrelated = func() int -> return 1
+        \\static target = func() int -> return 7
+        \\static unrelated = func() int -> return 1
     );
     const target_id = (try db.get(query_structures.IndexItems, 1)).*.?.ids()[0];
     const instance: structures.InstanceId = .{ .item = target_id };
     const initial = try db.get(query_structures.CompileFunction, instance);
 
     try setSource(db, 1,
-        \\comptime target = func() int -> return 8
-        \\comptime unrelated = func() int -> return 1
+        \\static target = func() int -> return 8
+        \\static unrelated = func() int -> return 1
     );
     const changed = try db.get(query_structures.CompileFunction, instance);
     try testing.expect(initial != changed);
     try testing.expectEqual(@as(i32, 8), std.mem.readInt(i32, changed.*.?.code[1..5], .little));
 
     try setSource(db, 1,
-        \\comptime target = func() int
+        \\static target = func() int
         \\  return 8
-        \\comptime unrelated = func() int -> return 1
+        \\static unrelated = func() int -> return 1
     );
     const equal_shape = try db.get(query_structures.CompileFunction, instance);
     try testing.expectEqual(changed, equal_shape);
 
     try setSource(db, 1,
-        \\comptime target = func() int
+        \\static target = func() int
         \\  return 8
-        \\comptime unrelated = func() int -> return 2
+        \\static unrelated = func() int -> return 2
     );
     try testing.expectEqual(equal_shape, try db.get(query_structures.CompileFunction, instance));
 }
@@ -1808,8 +2126,8 @@ test "direct call artifacts follow target identity without demanding the callee"
     defer db.deinit();
 
     try addSource(db, 1,
-        \\comptime broken = func() int -> return true
-        \\comptime other = func() int -> return 2
+        \\static broken = func() int -> return true
+        \\static other = func() int -> return 2
         \\broken()
     );
     const entry_id = (try db.get(query_structures.SelectEntry, 1)).*.?;
@@ -1822,23 +2140,23 @@ test "direct call artifacts follow target identity without demanding the callee"
     try testing.expect((try db.get(query_structures.CompileFunction, .{ .item = broken_id })).* == null);
 
     try setSource(db, 1,
-        \\comptime other = func() int -> return 20
-        \\comptime broken = func() int -> return false
+        \\static other = func() int -> return 20
+        \\static broken = func() int -> return false
         \\broken()
     );
     try testing.expectEqual(initial, try db.get(query_structures.CompileFunction, instance));
 
     try setSource(db, 1,
-        \\comptime other = func() int -> return 20
-        \\comptime broken = func() int -> return false
+        \\static other = func() int -> return 20
+        \\static broken = func() int -> return false
         \\other()
     );
     const changed = (try db.get(query_structures.CompileFunction, instance)).*.?;
     try expectDirectCallArtifact(changed, other_id);
 
     try setSource(db, 1,
-        \\comptime other = func() int -> return 20
-        \\comptime broken = func() int -> return false
+        \\static other = func() int -> return 20
+        \\static broken = func() int -> return false
     );
     const unit = (try db.get(query_structures.CompileFunction, instance)).*.?;
     try testing.expectEqualSlices(u8, &.{0xC3}, unit.code);
@@ -1846,8 +2164,8 @@ test "direct call artifacts follow target identity without demanding the callee"
     try testing.expectEqual(@as(usize, 0), unit.referenced_instances.len);
 
     try setSource(db, 1,
-        \\comptime other = func() int -> return 20
-        \\comptime broken = func() int -> return false
+        \\static other = func() int -> return 20
+        \\static broken = func() int -> return false
         \\other()
     );
     try expectDirectCallArtifact((try db.get(query_structures.CompileFunction, instance)).*.?, other_id);
@@ -1857,8 +2175,8 @@ test "CompileFunction exposes semantic diagnostics without duplicating them" {
     const db = try testDatabase(2);
     defer db.deinit();
 
-    try addSource(db, 1, "comptime header = func() foo -> return 1");
-    try addSource(db, 2, "comptime body = func() int -> return true");
+    try addSource(db, 1, "static header = func() foo -> return 1");
+    try addSource(db, 2, "static body = func() int -> return true");
     for ([_]structures.FileId{ 1, 2 }) |file_id| {
         const item_id = (try db.get(query_structures.IndexItems, file_id)).*.?.ids()[0];
         const instance: structures.InstanceId = .{ .item = item_id };
@@ -1875,7 +2193,7 @@ test "CompileFunction supports entry retention stale restoration and invalid ins
     const db = try testDatabase(1);
     defer db.deinit();
 
-    const valid = "comptime f = func() int -> return 7";
+    const valid = "static f = func() int -> return 7";
     try addSource(db, 1, valid);
     const function_id = (try db.get(query_structures.IndexItems, 1)).*.?.ids()[0];
     const entry_id = (try db.get(query_structures.SelectEntry, 1)).*.?;
@@ -1884,7 +2202,7 @@ test "CompileFunction supports entry retention stale restoration and invalid ins
     const initial_entry = try db.get(query_structures.CompileFunction, entry_instance);
     try testing.expectEqualSlices(u8, &.{0xC3}, initial_entry.*.?.code);
 
-    try setSource(db, 1, "comptime f = func() foo -> return true");
+    try setSource(db, 1, "static f = func() foo -> return true");
     try testing.expectEqual(initial_entry, try db.get(query_structures.CompileFunction, entry_instance));
     try testing.expect((try db.get(query_structures.CompileFunction, function_instance)).* == null);
 
@@ -1903,7 +2221,7 @@ test "concurrent CompileFunction requests share function and entry results" {
     const db = try testDatabase(4);
     defer db.deinit();
 
-    try addSource(db, 1, "comptime f = func() int -> return 7\nf()");
+    try addSource(db, 1, "static f = func() int -> return 7\nf()");
     const function_id = (try db.get(query_structures.IndexItems, 1)).*.?.ids()[0];
     const entry_id = (try db.get(query_structures.SelectEntry, 1)).*.?;
     for ([_]structures.InstanceId{ .{ .item = function_id }, .{ .item = entry_id } }) |instance| {
@@ -1919,7 +2237,7 @@ test "item locations survive body and unrelated-index edits but not renames" {
     const db = try testDatabase(1);
     defer db.deinit();
 
-    try addSource(db, 1, "comptime target = func() int -> return 1");
+    try addSource(db, 1, "static target = func() int -> return 1");
     const initial_result = try db.get(query_structures.DiscoverItems, 1);
     const initial_tree = initial_result.*.?;
     const initial_name = try testing.allocator.dupe(u8, initial_tree.items[0].loc.name);
@@ -1933,8 +2251,8 @@ test "item locations survive body and unrelated-index edits but not renames" {
     const initial_declaration = initial_tree.items[0].declaration;
 
     const updated_source =
-        \\comptime unrelated = func() int -> return 0
-        \\comptime target = func() int
+        \\static unrelated = func() int -> return 0
+        \\static target = func() int
         \\  const x = 1
         \\  return x + 1
     ;
@@ -1945,7 +2263,7 @@ test "item locations survive body and unrelated-index edits but not renames" {
     try testing.expect(structures.ItemLoc.eql(initial_loc, target.loc));
     try testing.expect(initial_declaration != target.declaration);
 
-    try setSource(db, 1, "comptime renamed = func() int -> return 2");
+    try setSource(db, 1, "static renamed = func() int -> return 2");
     const renamed_result = try db.get(query_structures.DiscoverItems, 1);
     const renamed_tree = renamed_result.*.?;
     try testing.expect(!structures.ItemLoc.eql(initial_loc, renamed_tree.items[0].loc));

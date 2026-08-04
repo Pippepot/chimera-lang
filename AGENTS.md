@@ -12,6 +12,7 @@ Build clear, correct code with the least total machinery.
 - Prefer the smallest complete solution. Do not add abstractions for hypothetical future needs.
 - Do not add no-op branches, switches, hooks, or dispatch scaffolding for hypothetical future variants.
 - Before choosing a representation, enumerate every shape required by the current milestone and separate independent semantic dimensions. Do not encode the first syntax shape or test case as a semantic kind.
+- Generalize expression structure separately from operation typing. Once types are known, use type-specific operations; do not add one-variant value unions or repeated type fields in anticipation of future types.
 - Avoid a helper used only once when it adds indirection without meaningful clarity.
 - Follow the style of the file being edited. Prefer fully qualified names except for obvious shorthand such as AST.
 - Look for nearby patterns and reusable functionality before creating a new implementation.
@@ -24,6 +25,7 @@ Build clear, correct code with the least total machinery.
 - Before adding special-case traversal, check whether the surrounding subtree is otherwise semantically analyzed. Do not validate one construct inside an otherwise opaque subtree.
 - Classify every `null`, error, and diagnostic branch as an expected user error, stale or missing query state, or compiler invariant violation.
 - Represent compiler invariant violations with assertions or `unreachable`, never user diagnostics.
+- Validate a fact at the boundary that owns it. Downstream stages may rely on trusted IR and should check only their own capability and resource limits.
 - Put one invariant in each assertion so a failure identifies the violated condition.
 - A discarded query result must have an explicit validation or dependency purpose. Express that purpose directly in code or a concise comment.
 - During cleanup, identify machinery added for only one unsupported construct and attempt to delete it.

@@ -516,7 +516,7 @@ pub const Tokenizer = struct {
 };
 
 test "keywords" {
-    try testTokenize("if else const var read mut deinit return true false comptime func struct is as and or not none sizeof test", &.{
+    try testTokenize("if else const var read mut deinit return true false comptime static func struct is as and or not none sizeof test", &.{
         .keyword_if,
         .keyword_else,
         .keyword_const,
@@ -528,6 +528,7 @@ test "keywords" {
         .keyword_true,
         .keyword_false,
         .keyword_comptime,
+        .keyword_static,
         .keyword_func,
         .keyword_struct,
         .keyword_is,
@@ -543,29 +544,29 @@ test "keywords" {
 
 test "function indentation" {
     try testTokenize(
-        \\comptime foo = func()
+        \\static foo = func()
         \\  print(1)
         \\print(2)
     , &.{
-        .keyword_comptime, .identifier, .equal,          .keyword_func,   .l_paren, .r_paren,
-        .indent,           .identifier, .l_paren,        .number_literal, .r_paren, .dedent,
-        .identifier,       .l_paren,    .number_literal, .r_paren,        .eof,
+        .keyword_static, .identifier, .equal,          .keyword_func,   .l_paren, .r_paren,
+        .indent,         .identifier, .l_paren,        .number_literal, .r_paren, .dedent,
+        .identifier,     .l_paren,    .number_literal, .r_paren,        .eof,
     });
 }
 
 test "nested indentation" {
     try testTokenize(
-        \\comptime foo = struct
-        \\  comptime bar = func()
+        \\static foo = struct
+        \\  static bar = func()
         \\      print(1)
         \\print(1)
     , &.{
-        .keyword_comptime, .identifier,       .equal,          .keyword_struct,
-        .indent,           .keyword_comptime, .identifier,     .equal,
-        .keyword_func,     .l_paren,          .r_paren,        .indent,
-        .identifier,       .l_paren,          .number_literal, .r_paren,
-        .dedent,           .dedent,           .identifier,     .l_paren,
-        .number_literal,   .r_paren,
+        .keyword_static, .identifier,     .equal,          .keyword_struct,
+        .indent,         .keyword_static, .identifier,     .equal,
+        .keyword_func,   .l_paren,        .r_paren,        .indent,
+        .identifier,     .l_paren,        .number_literal, .r_paren,
+        .dedent,         .dedent,         .identifier,     .l_paren,
+        .number_literal, .r_paren,
     });
 }
 

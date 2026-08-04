@@ -3,6 +3,49 @@ const codegen = @import("codegen_new.zig");
 const runtime = @import("runtime.zig");
 const structures = @import("structures.zig");
 
+fn integerConstant(value: i32) structures.SsaFunction.Instruction {
+    return .{ .consti = value };
+}
+
+fn directCall(target: structures.InstanceId) structures.SsaFunction.Instruction {
+    return .{ .call = .{
+        .target = target,
+        .arguments = .{ .start = 0, .end = 0 },
+    } };
+}
+
+fn integerNegate(operand: u32) structures.SsaFunction.Instruction {
+    return .{ .negi = @enumFromInt(operand) };
+}
+
+const IntegerBinaryOperation = enum { add, subtract, multiply, divide_signed };
+
+fn integerBinary(operation: IntegerBinaryOperation, lhs: u32, rhs: u32) structures.SsaFunction.Instruction {
+    const operands: structures.BinaryOperands = .{
+        .lhs = @enumFromInt(lhs),
+        .rhs = @enumFromInt(rhs),
+    };
+    return switch (operation) {
+        .add => .{ .addi = operands },
+        .subtract => .{ .subi = operands },
+        .multiply => .{ .muli = operands },
+        .divide_signed => .{ .divsi = operands },
+    };
+}
+
+fn functionSsa(
+    instructions: []structures.SsaFunction.Instruction,
+    blocks: []structures.SsaFunction.Block,
+) structures.SsaFunction {
+    return .{
+        .block_argument_types = &.{},
+        .call_arguments = &.{},
+        .instructions = instructions,
+        .blocks = blocks,
+        .entry = @enumFromInt(0),
+    };
+}
+
 test "single aligned function artifact builds and runs without borrowing code" {
     const io = std.testing.io;
     var executable = blk: {
@@ -11,11 +54,7 @@ test "single aligned function artifact builds and runs without borrowing code" {
             .instruction_end = 0,
             .terminator = .return_unit,
         }};
-        const ssa: structures.SsaFunction = .{
-            .instructions = &.{},
-            .blocks = &blocks,
-            .entry = @enumFromInt(0),
-        };
+        const ssa = functionSsa(&.{}, &blocks);
         var artifact = try codegen.compileFunction(&ssa, std.testing.allocator);
         defer artifact.deinit(std.testing.allocator);
         artifact.required_alignment = 16;
@@ -37,18 +76,14 @@ test "single aligned function artifact builds and runs without borrowing code" {
 test "ordinary function artifacts encode signed 32-bit literal returns" {
     for ([_]i32{ std.math.minInt(i32), 7, std.math.maxInt(i32) }) |return_value| {
         var instructions = [_]structures.SsaFunction.Instruction{
-            .{ .integer_constant = return_value },
+            integerConstant(return_value),
         };
         var blocks = [_]structures.SsaFunction.Block{.{
             .instruction_start = 0,
             .instruction_end = 1,
             .terminator = .{ .return_value = @enumFromInt(0) },
         }};
-        const ssa: structures.SsaFunction = .{
-            .instructions = &instructions,
-            .blocks = &blocks,
-            .entry = @enumFromInt(0),
-        };
+        const ssa = functionSsa(&instructions, &blocks);
         var artifact = try codegen.compileFunction(&ssa, std.testing.allocator);
         defer artifact.deinit(std.testing.allocator);
 
@@ -62,38 +97,17 @@ test "ordinary function artifacts encode signed 32-bit literal returns" {
     }
 }
 
-test "ordinary function compilation rejects an invalid return value" {
-    var instructions = [_]structures.SsaFunction.Instruction{
-        .{ .integer_constant = 7 },
-    };
-    var blocks = [_]structures.SsaFunction.Block{.{
-        .instruction_start = 0,
-        .instruction_end = 1,
-        .terminator = .{ .return_value = @enumFromInt(1) },
-    }};
-    const ssa: structures.SsaFunction = .{
-        .instructions = &instructions,
-        .blocks = &blocks,
-        .entry = @enumFromInt(0),
-    };
-    try std.testing.expectError(error.InvalidSsa, codegen.compileFunction(&ssa, std.testing.allocator));
-}
-
 test "direct call artifacts own exact relocation metadata" {
     const target: structures.InstanceId = .{ .item = @enumFromInt(0xdeadbeef) };
     var instructions = [_]structures.SsaFunction.Instruction{
-        .{ .direct_call = target },
+        directCall(target),
     };
     var blocks = [_]structures.SsaFunction.Block{.{
         .instruction_start = 0,
         .instruction_end = 1,
         .terminator = .return_unit,
     }};
-    const ssa: structures.SsaFunction = .{
-        .instructions = &instructions,
-        .blocks = &blocks,
-        .entry = @enumFromInt(0),
-    };
+    const ssa = functionSsa(&instructions, &blocks);
 
     var first = try codegen.compileFunction(&ssa, std.testing.allocator);
     defer first.deinit(std.testing.allocator);
@@ -107,7 +121,7 @@ test "direct call artifacts own exact relocation metadata" {
     try std.testing.expect(first.referenced_instances.ptr != second.referenced_instances.ptr);
     try std.testing.expect(structures.CompiledFunction.eql(first, second));
 
-    instructions[0] = .{ .direct_call = .{ .item = @enumFromInt(1) } };
+    instructions[0] = directCall(.{ .item = @enumFromInt(1) });
     var different_target = try codegen.compileFunction(&ssa, std.testing.allocator);
     defer different_target.deinit(std.testing.allocator);
     try std.testing.expectEqualSlices(u8, first.code, different_target.code);
@@ -129,20 +143,16 @@ fn expectDirectCallArtifact(artifact: structures.CompiledFunction, target: struc
 test "multiple calls produce ordered relocations and deduplicate references" {
     const target: structures.InstanceId = .{ .item = @enumFromInt(7) };
     var instructions = [_]structures.SsaFunction.Instruction{
-        .{ .direct_call = target },
-        .{ .direct_call = target },
-        .{ .integer_constant = 42 },
+        directCall(target),
+        directCall(target),
+        integerConstant(42),
     };
     var blocks = [_]structures.SsaFunction.Block{.{
         .instruction_start = 0,
         .instruction_end = instructions.len,
         .terminator = .{ .return_value = @enumFromInt(2) },
     }};
-    const ssa: structures.SsaFunction = .{
-        .instructions = &instructions,
-        .blocks = &blocks,
-        .entry = @enumFromInt(0),
-    };
+    const ssa = functionSsa(&instructions, &blocks);
 
     var artifact = try codegen.compileFunction(&ssa, std.testing.allocator);
     defer artifact.deinit(std.testing.allocator);
@@ -160,9 +170,81 @@ test "multiple calls produce ordered relocations and deduplicate references" {
     try std.testing.expectEqualSlices(structures.InstanceId, &.{target}, artifact.referenced_instances);
 }
 
-test "structurally invalid SSA is rejected without allocating" {
+test "typed expression values survive calls and execute every integer arithmetic operator" {
+    const entry_id: structures.InstanceId = .{ .item = @enumFromInt(3) };
+    const expression_id: structures.InstanceId = .{ .item = @enumFromInt(2) };
+    const left_id: structures.InstanceId = .{ .item = @enumFromInt(1) };
+    const right_id: structures.InstanceId = .{ .item = @enumFromInt(0) };
+    var instructions = [_]structures.SsaFunction.Instruction{
+        directCall(left_id),
+        directCall(right_id),
+        integerBinary(.divide_signed, 0, 1),
+        integerConstant(5),
+        integerConstant(3),
+        integerBinary(.multiply, 3, 4),
+        integerBinary(.add, 2, 5),
+        integerConstant(15),
+        integerBinary(.subtract, 6, 7),
+        integerNegate(8),
+        integerNegate(9),
+    };
+    var blocks = [_]structures.SsaFunction.Block{.{
+        .instruction_start = 0,
+        .instruction_end = instructions.len,
+        .terminator = .{ .return_value = @enumFromInt(10) },
+    }};
+    const ssa = functionSsa(&instructions, &blocks);
+    var expression = try codegen.compileFunction(&ssa, std.testing.allocator);
+    defer expression.deinit(std.testing.allocator);
+
+    const entry_code = [_]u8{
+        0xE8, 0,    0,    0,    0,
+        0x89, 0xC7, 0xB8, 60,   0,
+        0,    0,    0x0F, 0x05,
+    };
+    const entry_relocations = [_]structures.CompiledFunction.Relocation{.{
+        .offset = 1,
+        .kind = .call_relative_32,
+        .reference = @enumFromInt(0),
+        .addend = 0,
+    }};
+    const entry_references = [_]structures.InstanceId{expression_id};
+    const entry: structures.CompiledFunction = .{
+        .code = &entry_code,
+        .required_alignment = 1,
+        .relocations = &entry_relocations,
+        .referenced_instances = &entry_references,
+    };
+    const left_code = [_]u8{ 0xB8, 84, 0, 0, 0, 0xC3 };
+    const right_code = [_]u8{ 0xB8, 2, 0, 0, 0, 0xC3 };
+    const functions = [_]codegen.ReachableFunction{
+        .{ .instance = entry_id, .artifact = entry },
+        .{ .instance = expression_id, .artifact = expression },
+        .{ .instance = left_id, .artifact = .{
+            .code = &left_code,
+            .required_alignment = 1,
+            .relocations = &.{},
+            .referenced_instances = &.{},
+        } },
+        .{ .instance = right_id, .artifact = .{
+            .code = &right_code,
+            .required_alignment = 1,
+            .relocations = &.{},
+            .referenced_instances = &.{},
+        } },
+    };
+    var executable = try codegen.buildExecutable(entry_id, &functions, std.testing.allocator);
+    defer executable.deinit(std.testing.allocator);
+
+    const io = std.testing.io;
+    runtime.writeProgram(io, executable.bytes);
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    try std.testing.expectEqual(@as(u8, 42), runtime.runProg(io, std.testing.allocator, &.{}));
+}
+
+test "unsupported control-flow shapes are rejected without allocating" {
     const target: structures.InstanceId = .{ .item = @enumFromInt(0) };
-    var one_call = [_]structures.SsaFunction.Instruction{.{ .direct_call = target }};
+    var one_call = [_]structures.SsaFunction.Instruction{directCall(target)};
     var bad_start = [_]structures.SsaFunction.Block{.{ .instruction_start = 1, .instruction_end = 1, .terminator = .return_unit }};
     var bad_end = [_]structures.SsaFunction.Block{.{ .instruction_start = 0, .instruction_end = 0, .terminator = .return_unit }};
     var two_blocks = [_]structures.SsaFunction.Block{
@@ -170,14 +252,14 @@ test "structurally invalid SSA is rejected without allocating" {
         .{ .instruction_start = 1, .instruction_end = 1, .terminator = .return_unit },
     };
     const cases = [_]structures.SsaFunction{
-        .{ .instructions = &one_call, .blocks = &bad_start, .entry = @enumFromInt(0) },
-        .{ .instructions = &one_call, .blocks = &bad_end, .entry = @enumFromInt(0) },
-        .{ .instructions = &one_call, .blocks = &two_blocks, .entry = @enumFromInt(0) },
+        functionSsa(&one_call, &bad_start),
+        functionSsa(&one_call, &bad_end),
+        functionSsa(&one_call, &two_blocks),
     };
 
     for (cases) |ssa| {
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-        try std.testing.expectError(error.InvalidSsa, codegen.compileFunction(&ssa, failing.allocator()));
+        try std.testing.expectError(error.UnsupportedControlFlow, codegen.compileFunction(&ssa, failing.allocator()));
         try std.testing.expect(!failing.has_induced_failure);
     }
 }
@@ -186,38 +268,52 @@ test "direct call artifact construction cleans up every allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, testCompileDirectCallAllocations, .{});
 }
 
+test "expression artifact construction cleans up every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testCompileExpressionAllocations, .{});
+}
+
+fn testCompileExpressionAllocations(gpa: std.mem.Allocator) !void {
+    var instructions = [_]structures.SsaFunction.Instruction{
+        directCall(.{ .item = @enumFromInt(0) }),
+        integerConstant(2),
+        integerBinary(.multiply, 0, 1),
+        integerConstant(1),
+        integerBinary(.add, 2, 3),
+    };
+    var blocks = [_]structures.SsaFunction.Block{.{
+        .instruction_start = 0,
+        .instruction_end = instructions.len,
+        .terminator = .{ .return_value = @enumFromInt(4) },
+    }};
+    const ssa = functionSsa(&instructions, &blocks);
+    var artifact = try codegen.compileFunction(&ssa, gpa);
+    defer artifact.deinit(gpa);
+}
+
 fn testCompileDirectCallAllocations(gpa: std.mem.Allocator) !void {
     var instructions = [_]structures.SsaFunction.Instruction{
-        .{ .direct_call = .{ .item = @enumFromInt(0) } },
+        directCall(.{ .item = @enumFromInt(0) }),
     };
     var blocks = [_]structures.SsaFunction.Block{.{
         .instruction_start = 0,
         .instruction_end = 1,
         .terminator = .return_unit,
     }};
-    const ssa: structures.SsaFunction = .{
-        .instructions = &instructions,
-        .blocks = &blocks,
-        .entry = @enumFromInt(0),
-    };
+    const ssa = functionSsa(&instructions, &blocks);
     var artifact = try codegen.compileFunction(&ssa, gpa);
     defer artifact.deinit(gpa);
 }
 
 test "ordinary function compilation cleans up allocation failure" {
     var instructions = [_]structures.SsaFunction.Instruction{
-        .{ .integer_constant = 7 },
+        integerConstant(7),
     };
     var blocks = [_]structures.SsaFunction.Block{.{
         .instruction_start = 0,
         .instruction_end = 1,
         .terminator = .{ .return_value = @enumFromInt(0) },
     }};
-    const ssa: structures.SsaFunction = .{
-        .instructions = &instructions,
-        .blocks = &blocks,
-        .entry = @enumFromInt(0),
-    };
+    const ssa = functionSsa(&instructions, &blocks);
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     try std.testing.expectError(error.OutOfMemory, codegen.compileFunction(&ssa, failing.allocator()));
     try std.testing.expect(failing.has_induced_failure);
