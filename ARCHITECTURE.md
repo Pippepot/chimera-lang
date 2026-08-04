@@ -9,6 +9,8 @@ This document records durable design boundaries, not current implementation stat
 - Observable optional query results derive equality from their payload type; query-specific `eqlOutput` is reserved for equality that differs from the output type's semantics.
 - Inputs and query dependencies are recorded through the query context rather than hidden in globals.
 - Function-body semantic analysis, lowering, and machine-code generation operate per function or instantiated function. Module and item queries own cross-function declarations, scopes, and other shared semantic data.
+- Calls produce values. Discarding a call result and returning it are uses of that value, not distinct call kinds.
+- Control flow is block-structured: every basic block has exactly one terminator, while a function may contain multiple blocks and terminators.
 - Function compilation produces relocatable function artifacts; whole-program construction resolves references and emits the executable format.
 - Every file uses its synthetic top-level item as the program entry. A declaration named `main` is an ordinary function, and values produced by top-level statements are discarded because the entry result is `unit`.
 - The language `int` type is a signed 32-bit value, returned through the x86-64 callable ABI in `eax`.

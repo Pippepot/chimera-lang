@@ -207,42 +207,78 @@ pub const AnalyzeFunctionBody = struct {
         return switch (loc.kind) {
             .function => blk: {
                 const source = (try ctx.input(SourceText, resolved.file_id)).*;
-                const result = semantic.analyzeFunctionBody(&parsed, source, resolved.declaration);
+                const result = try semantic.analyzeFunctionBody(&parsed, source, resolved.declaration, ctx.allocator());
                 break :blk switch (result) {
-                    .success => |body| body,
+                    .success => |body_value| result_blk: {
+                        var body = body_value;
+                        defer body.deinit(ctx.allocator());
+                        break :result_blk try resolveBodyShape(ctx, resolved.file_id, source, body);
+                    },
                     .unsupported => |issue| result_blk: {
                         try emitSemanticIssue(ctx, resolved.file_id, issue);
                         break :result_blk null;
                     },
                 };
             },
-            .top_level_entry => switch (semantic.analyzeEntryBody(&parsed, resolved.declaration)) {
-                .empty => .unit,
+            .top_level_entry => switch (try semantic.analyzeEntryBody(&parsed, resolved.declaration, ctx.allocator())) {
+                .success => |body_value| blk: {
+                    var body = body_value;
+                    defer body.deinit(ctx.allocator());
+                    break :blk try resolveBodyShape(ctx, resolved.file_id, null, body);
+                },
                 .unsupported => |issue| blk: {
                     try emitSemanticIssue(ctx, resolved.file_id, issue);
                     break :blk null;
-                },
-                .direct_call => |name_span| blk: {
-                    const source = (try ctx.input(SourceText, resolved.file_id)).*;
-                    std.debug.assert(name_span.start <= name_span.end);
-                    std.debug.assert(name_span.end <= source.len);
-                    const scope = (try ctx.get(BuildModuleScope, resolved.file_id)).* orelse break :blk null;
-                    const target = scope.resolve(source[name_span.start..name_span.end]) orelse {
-                        try emitSemanticIssue(ctx, resolved.file_id, .{
-                            .span = name_span,
-                            .message = "unknown function",
-                        });
-                        break :blk null;
-                    };
-                    const signature = (try ctx.get(FunctionSignature, target)).* orelse break :blk null;
-                    std.debug.assert(signature.parameter_count == 0);
-                    std.debug.assert(signature.return_type == .int);
-                    break :blk .{ .direct_call = target };
                 },
             },
         };
     }
 };
+
+fn resolveBodyShape(
+    ctx: anytype,
+    file_id: structures.FileId,
+    known_source: ?[]const u8,
+    body: semantic.BodyShape,
+) !?structures.FunctionBodyAnalysis {
+    const instructions = try ctx.allocator().alloc(structures.FunctionBodyAnalysis.Instruction, body.instructions.len);
+    var owns_instructions = true;
+    defer if (owns_instructions) ctx.allocator().free(instructions);
+
+    var source = known_source;
+    var scope: ?structures.ModuleScope = null;
+    for (body.instructions, instructions) |instruction, *resolved| {
+        resolved.* = switch (instruction) {
+            .integer_constant => |value| .{ .integer_constant = value },
+            .call => |name_span| blk: {
+                if (source == null) source = (try ctx.input(SourceText, file_id)).*;
+                std.debug.assert(name_span.start <= name_span.end);
+                std.debug.assert(name_span.end <= source.?.len);
+                if (scope == null) scope = (try ctx.get(BuildModuleScope, file_id)).* orelse return null;
+                const target = scope.?.resolve(source.?[name_span.start..name_span.end]) orelse {
+                    try emitSemanticIssue(ctx, file_id, .{ .span = name_span, .message = "unknown function" });
+                    return null;
+                };
+                const signature = (try ctx.get(FunctionSignature, target)).* orelse return null;
+                std.debug.assert(signature.parameter_count == 0);
+                std.debug.assert(signature.return_type == .int);
+                break :blk .{ .call = target };
+            },
+        };
+    }
+
+    const blocks = try ctx.allocator().alloc(structures.FunctionBodyAnalysis.Block, 1);
+    blocks[0] = .{
+        .instruction_start = 0,
+        .instruction_end = @intCast(instructions.len),
+        .terminator = switch (body.block.terminator) {
+            .return_unit => .return_unit,
+            .return_value => |value| .{ .return_value = @enumFromInt(@intFromEnum(value)) },
+        },
+    };
+    owns_instructions = false;
+    return .{ .instructions = instructions, .blocks = blocks, .entry = @enumFromInt(0) };
+}
 
 fn emitSemanticIssue(ctx: anytype, file_id: structures.FileId, issue: semantic.Issue) !void {
     try ctx.emit(structures.Diagnostic, .{
@@ -295,18 +331,28 @@ pub const BuildExecutable = struct {
 
     pub fn run(ctx: anytype, file_id: Input) anyerror!Output {
         const entry_id = (try ctx.get(SelectEntry, file_id)).* orelse return null;
-        const artifact = (try ctx.get(CompileFunction, .{ .item = entry_id })).* orelse return null;
+        const entry: structures.InstanceId = .{ .item = entry_id };
 
-        // CompileFunction currently emits only the one-call shape: matching
-        // relocation/reference counts of 0 or 1.
-        std.debug.assert(artifact.relocations.len == artifact.referenced_instances.len);
-        std.debug.assert(artifact.relocations.len <= 1);
+        var instances: std.ArrayList(structures.InstanceId) = .empty;
+        defer instances.deinit(ctx.allocator());
+        var seen = std.AutoHashMap(structures.InstanceId, void).init(ctx.allocator());
+        defer seen.deinit();
+        var functions: std.ArrayList(codegen.ReachableFunction) = .empty;
+        defer functions.deinit(ctx.allocator());
 
-        var callee: ?structures.CompiledFunction = null;
-        if (artifact.referenced_instances.len == 1) {
-            callee = (try ctx.get(CompileFunction, artifact.referenced_instances[0])).* orelse return null;
+        try instances.append(ctx.allocator(), entry);
+        try seen.put(entry, {});
+        var next: usize = 0;
+        while (next < instances.items.len) : (next += 1) {
+            const instance = instances.items[next];
+            const artifact = (try ctx.get(CompileFunction, instance)).* orelse return null;
+            try functions.append(ctx.allocator(), .{ .instance = instance, .artifact = artifact });
+            for (artifact.referenced_instances) |referenced| {
+                const result = try seen.getOrPut(referenced);
+                if (!result.found_existing) try instances.append(ctx.allocator(), referenced);
+            }
         }
 
-        return try codegen.buildExecutable(&artifact, if (callee) |*target| target else null, ctx.allocator());
+        return try codegen.buildExecutable(entry, functions.items, ctx.allocator());
     }
 };

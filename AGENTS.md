@@ -10,6 +10,8 @@ Build clear, correct code with the least total machinery.
 - Before editing, inspect the surrounding ownership, dependencies, state transitions, and failure paths.
 - Preserve unrelated user changes and avoid cleanup outside the requested scope.
 - Prefer the smallest complete solution. Do not add abstractions for hypothetical future needs.
+- Do not add no-op branches, switches, hooks, or dispatch scaffolding for hypothetical future variants.
+- Before choosing a representation, enumerate every shape required by the current milestone and separate independent semantic dimensions. Do not encode the first syntax shape or test case as a semantic kind.
 - Avoid a helper used only once when it adds indirection without meaningful clarity.
 - Follow the style of the file being edited. Prefer fully qualified names except for obvious shorthand such as AST.
 - Look for nearby patterns and reusable functionality before creating a new implementation.

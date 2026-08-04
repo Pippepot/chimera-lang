@@ -6,14 +6,22 @@ const structures = @import("structures.zig");
 test "single aligned function artifact builds and runs without borrowing code" {
     const io = std.testing.io;
     var executable = blk: {
+        var blocks = [_]structures.SsaFunction.Block{.{
+            .instruction_start = 0,
+            .instruction_end = 0,
+            .terminator = .return_unit,
+        }};
         const ssa: structures.SsaFunction = .{
             .instructions = &.{},
-            .terminator = .return_unit,
+            .blocks = &blocks,
+            .entry = @enumFromInt(0),
         };
         var artifact = try codegen.compileFunction(&ssa, std.testing.allocator);
         defer artifact.deinit(std.testing.allocator);
         artifact.required_alignment = 16;
-        break :blk try codegen.buildExecutable(&artifact, null, std.testing.allocator);
+        const entry: structures.InstanceId = .{ .item = @enumFromInt(0) };
+        const functions = [_]codegen.ReachableFunction{.{ .instance = entry, .artifact = artifact }};
+        break :blk try codegen.buildExecutable(entry, &functions, std.testing.allocator);
     };
     defer executable.deinit(std.testing.allocator);
 
@@ -31,9 +39,15 @@ test "ordinary function artifacts encode signed 32-bit literal returns" {
         var instructions = [_]structures.SsaFunction.Instruction{
             .{ .integer_constant = return_value },
         };
+        var blocks = [_]structures.SsaFunction.Block{.{
+            .instruction_start = 0,
+            .instruction_end = 1,
+            .terminator = .{ .return_value = @enumFromInt(0) },
+        }};
         const ssa: structures.SsaFunction = .{
             .instructions = &instructions,
-            .terminator = .{ .return_value = @enumFromInt(0) },
+            .blocks = &blocks,
+            .entry = @enumFromInt(0),
         };
         var artifact = try codegen.compileFunction(&ssa, std.testing.allocator);
         defer artifact.deinit(std.testing.allocator);
@@ -52,9 +66,15 @@ test "ordinary function compilation rejects an invalid return value" {
     var instructions = [_]structures.SsaFunction.Instruction{
         .{ .integer_constant = 7 },
     };
+    var blocks = [_]structures.SsaFunction.Block{.{
+        .instruction_start = 0,
+        .instruction_end = 1,
+        .terminator = .{ .return_value = @enumFromInt(1) },
+    }};
     const ssa: structures.SsaFunction = .{
         .instructions = &instructions,
-        .terminator = .{ .return_value = @enumFromInt(1) },
+        .blocks = &blocks,
+        .entry = @enumFromInt(0),
     };
     try std.testing.expectError(error.InvalidSsa, codegen.compileFunction(&ssa, std.testing.allocator));
 }
@@ -64,9 +84,15 @@ test "direct call artifacts own exact relocation metadata" {
     var instructions = [_]structures.SsaFunction.Instruction{
         .{ .direct_call = target },
     };
+    var blocks = [_]structures.SsaFunction.Block{.{
+        .instruction_start = 0,
+        .instruction_end = 1,
+        .terminator = .return_unit,
+    }};
     const ssa: structures.SsaFunction = .{
         .instructions = &instructions,
-        .terminator = .return_unit,
+        .blocks = &blocks,
+        .entry = @enumFromInt(0),
     };
 
     var first = try codegen.compileFunction(&ssa, std.testing.allocator);
@@ -100,15 +126,53 @@ fn expectDirectCallArtifact(artifact: structures.CompiledFunction, target: struc
     try std.testing.expectEqualSlices(structures.InstanceId, &.{target}, artifact.referenced_instances);
 }
 
-test "invalid direct call SSA is rejected without allocating" {
+test "multiple calls produce ordered relocations and deduplicate references" {
+    const target: structures.InstanceId = .{ .item = @enumFromInt(7) };
+    var instructions = [_]structures.SsaFunction.Instruction{
+        .{ .direct_call = target },
+        .{ .direct_call = target },
+        .{ .integer_constant = 42 },
+    };
+    var blocks = [_]structures.SsaFunction.Block{.{
+        .instruction_start = 0,
+        .instruction_end = instructions.len,
+        .terminator = .{ .return_value = @enumFromInt(2) },
+    }};
+    const ssa: structures.SsaFunction = .{
+        .instructions = &instructions,
+        .blocks = &blocks,
+        .entry = @enumFromInt(0),
+    };
+
+    var artifact = try codegen.compileFunction(&ssa, std.testing.allocator);
+    defer artifact.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualSlices(u8, &.{
+        0xE8, 0,  0, 0, 0,
+        0xE8, 0,  0, 0, 0,
+        0xB8, 42, 0, 0, 0,
+        0xC3,
+    }, artifact.code);
+    try std.testing.expectEqual(@as(usize, 2), artifact.relocations.len);
+    try std.testing.expectEqual(@as(u32, 1), artifact.relocations[0].offset);
+    try std.testing.expectEqual(@as(u32, 6), artifact.relocations[1].offset);
+    try std.testing.expectEqual(@intFromEnum(artifact.relocations[0].reference), @intFromEnum(artifact.relocations[1].reference));
+    try std.testing.expectEqualSlices(structures.InstanceId, &.{target}, artifact.referenced_instances);
+}
+
+test "structurally invalid SSA is rejected without allocating" {
     const target: structures.InstanceId = .{ .item = @enumFromInt(0) };
     var one_call = [_]structures.SsaFunction.Instruction{.{ .direct_call = target }};
-    var two_calls = [_]structures.SsaFunction.Instruction{ .{ .direct_call = target }, .{ .direct_call = target } };
-    var mixed = [_]structures.SsaFunction.Instruction{ .{ .direct_call = target }, .{ .integer_constant = 1 } };
+    var bad_start = [_]structures.SsaFunction.Block{.{ .instruction_start = 1, .instruction_end = 1, .terminator = .return_unit }};
+    var bad_end = [_]structures.SsaFunction.Block{.{ .instruction_start = 0, .instruction_end = 0, .terminator = .return_unit }};
+    var two_blocks = [_]structures.SsaFunction.Block{
+        .{ .instruction_start = 0, .instruction_end = 1, .terminator = .return_unit },
+        .{ .instruction_start = 1, .instruction_end = 1, .terminator = .return_unit },
+    };
     const cases = [_]structures.SsaFunction{
-        .{ .instructions = &one_call, .terminator = .{ .return_value = @enumFromInt(0) } },
-        .{ .instructions = &two_calls, .terminator = .return_unit },
-        .{ .instructions = &mixed, .terminator = .return_unit },
+        .{ .instructions = &one_call, .blocks = &bad_start, .entry = @enumFromInt(0) },
+        .{ .instructions = &one_call, .blocks = &bad_end, .entry = @enumFromInt(0) },
+        .{ .instructions = &one_call, .blocks = &two_blocks, .entry = @enumFromInt(0) },
     };
 
     for (cases) |ssa| {
@@ -126,9 +190,15 @@ fn testCompileDirectCallAllocations(gpa: std.mem.Allocator) !void {
     var instructions = [_]structures.SsaFunction.Instruction{
         .{ .direct_call = .{ .item = @enumFromInt(0) } },
     };
+    var blocks = [_]structures.SsaFunction.Block{.{
+        .instruction_start = 0,
+        .instruction_end = 1,
+        .terminator = .return_unit,
+    }};
     const ssa: structures.SsaFunction = .{
         .instructions = &instructions,
-        .terminator = .return_unit,
+        .blocks = &blocks,
+        .entry = @enumFromInt(0),
     };
     var artifact = try codegen.compileFunction(&ssa, gpa);
     defer artifact.deinit(gpa);
@@ -138,9 +208,15 @@ test "ordinary function compilation cleans up allocation failure" {
     var instructions = [_]structures.SsaFunction.Instruction{
         .{ .integer_constant = 7 },
     };
+    var blocks = [_]structures.SsaFunction.Block{.{
+        .instruction_start = 0,
+        .instruction_end = 1,
+        .terminator = .{ .return_value = @enumFromInt(0) },
+    }};
     const ssa: structures.SsaFunction = .{
         .instructions = &instructions,
-        .terminator = .{ .return_value = @enumFromInt(0) },
+        .blocks = &blocks,
+        .entry = @enumFromInt(0),
     };
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     try std.testing.expectError(error.OutOfMemory, codegen.compileFunction(&ssa, failing.allocator()));
@@ -150,6 +226,7 @@ test "ordinary function compilation cleans up allocation failure" {
 
 test "executable builder rejects artifact metadata independently" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const entry: structures.InstanceId = .{ .item = @enumFromInt(1) };
     const code = [_]u8{0xC3};
     const relocations = [_]structures.CompiledFunction.Relocation{.{
         .offset = 0,
@@ -165,7 +242,9 @@ test "executable builder rejects artifact metadata independently" {
         .relocations = &relocations,
         .referenced_instances = &.{},
     };
-    try std.testing.expectError(error.UnsupportedArtifactMetadata, codegen.buildExecutable(&with_relocation, null, failing.allocator()));
+    const invalid_functions = [_]codegen.ReachableFunction{.{ .instance = entry, .artifact = with_relocation }};
+    try std.testing.expectError(error.RelocationOutOfBounds, codegen.buildExecutable(entry, &invalid_functions, failing.allocator()));
+    try std.testing.expect(!failing.has_induced_failure);
 
     const with_reference: structures.CompiledFunction = .{
         .code = &code,
@@ -173,18 +252,13 @@ test "executable builder rejects artifact metadata independently" {
         .relocations = &.{},
         .referenced_instances = &references,
     };
-    try std.testing.expectError(error.UnsupportedArtifactMetadata, codegen.buildExecutable(&with_reference, null, failing.allocator()));
-    try std.testing.expect(!failing.has_induced_failure);
+    const missing_functions = [_]codegen.ReachableFunction{.{ .instance = entry, .artifact = with_reference }};
+    try std.testing.expectError(error.MissingReferencedArtifact, codegen.buildExecutable(entry, &missing_functions, std.testing.allocator));
 }
 
-test "executable builder rejects a callee mismatched with entry metadata" {
-    const code = [_]u8{0xC3};
-    const no_call: structures.CompiledFunction = .{
-        .code = &code,
-        .required_alignment = 1,
-        .relocations = &.{},
-        .referenced_instances = &.{},
-    };
+test "executable builder requires the entry and every referenced artifact" {
+    const entry: structures.InstanceId = .{ .item = @enumFromInt(1) };
+    const leaf_id: structures.InstanceId = .{ .item = @enumFromInt(0) };
     const leaf_code = [_]u8{0xC3};
     const leaf: structures.CompiledFunction = .{
         .code = &leaf_code,
@@ -192,7 +266,8 @@ test "executable builder rejects a callee mismatched with entry metadata" {
         .relocations = &.{},
         .referenced_instances = &.{},
     };
-    try std.testing.expectError(error.UnsupportedArtifactMetadata, codegen.buildExecutable(&no_call, &leaf, std.testing.allocator));
+    const only_leaf = [_]codegen.ReachableFunction{.{ .instance = leaf_id, .artifact = leaf }};
+    try std.testing.expectError(error.MissingEntryArtifact, codegen.buildExecutable(entry, &only_leaf, std.testing.allocator));
 
     const call_code = [_]u8{ 0xE8, 0, 0, 0, 0, 0xC3 };
     const relocations = [_]structures.CompiledFunction.Relocation{.{
@@ -201,17 +276,20 @@ test "executable builder rejects a callee mismatched with entry metadata" {
         .reference = @enumFromInt(0),
         .addend = 0,
     }};
-    const references = [_]structures.InstanceId{.{ .item = @enumFromInt(0) }};
+    const references = [_]structures.InstanceId{leaf_id};
     const with_call: structures.CompiledFunction = .{
         .code = &call_code,
         .required_alignment = 1,
         .relocations = &relocations,
         .referenced_instances = &references,
     };
-    try std.testing.expectError(error.UnsupportedArtifactMetadata, codegen.buildExecutable(&with_call, null, std.testing.allocator));
+    const only_entry = [_]codegen.ReachableFunction{.{ .instance = entry, .artifact = with_call }};
+    try std.testing.expectError(error.MissingReferencedArtifact, codegen.buildExecutable(entry, &only_entry, std.testing.allocator));
 }
 
 test "executable builder resolves a direct call to its callee's file offset" {
+    const entry_id: structures.InstanceId = .{ .item = @enumFromInt(1) };
+    const callee_id: structures.InstanceId = .{ .item = @enumFromInt(0) };
     const call_code = [_]u8{ 0xE8, 0, 0, 0, 0, 0xC3 };
     const relocations = [_]structures.CompiledFunction.Relocation{.{
         .offset = 1,
@@ -219,7 +297,7 @@ test "executable builder resolves a direct call to its callee's file offset" {
         .reference = @enumFromInt(0),
         .addend = 0,
     }};
-    const references = [_]structures.InstanceId{.{ .item = @enumFromInt(0) }};
+    const references = [_]structures.InstanceId{callee_id};
     const entry: structures.CompiledFunction = .{
         .code = &call_code,
         .required_alignment = 1,
@@ -234,7 +312,11 @@ test "executable builder resolves a direct call to its callee's file offset" {
         .referenced_instances = &.{},
     };
 
-    var executable = try codegen.buildExecutable(&entry, &callee, std.testing.allocator);
+    const functions = [_]codegen.ReachableFunction{
+        .{ .instance = entry_id, .artifact = entry },
+        .{ .instance = callee_id, .artifact = callee },
+    };
+    var executable = try codegen.buildExecutable(entry_id, &functions, std.testing.allocator);
     defer executable.deinit(std.testing.allocator);
 
     const callee_file_offset = std.mem.indexOf(u8, executable.bytes, &callee_code).?;
@@ -260,7 +342,75 @@ test "executable builder resolves a direct call to its callee's file offset" {
     try std.testing.expectEqual(@as(u8, 0), runtime.runProg(io, std.testing.allocator, &.{}));
 }
 
+test "executable builder patches multiple relocations to one shared artifact" {
+    const entry_id: structures.InstanceId = .{ .item = @enumFromInt(1) };
+    const shared_id: structures.InstanceId = .{ .item = @enumFromInt(0) };
+    const entry_code = [_]u8{ 0xE8, 0, 0, 0, 0, 0xE8, 0, 0, 0, 0, 0xC3 };
+    const relocations = [_]structures.CompiledFunction.Relocation{
+        .{ .offset = 1, .kind = .call_relative_32, .reference = @enumFromInt(0), .addend = 0 },
+        .{ .offset = 6, .kind = .call_relative_32, .reference = @enumFromInt(0), .addend = 0 },
+    };
+    const references = [_]structures.InstanceId{shared_id};
+    const entry: structures.CompiledFunction = .{
+        .code = &entry_code,
+        .required_alignment = 1,
+        .relocations = &relocations,
+        .referenced_instances = &references,
+    };
+    const shared_code = [_]u8{ 0xB8, 0x78, 0x56, 0x34, 0x12, 0xC3 };
+    const shared: structures.CompiledFunction = .{
+        .code = &shared_code,
+        .required_alignment = 1,
+        .relocations = &.{},
+        .referenced_instances = &.{},
+    };
+    const functions = [_]codegen.ReachableFunction{
+        .{ .instance = entry_id, .artifact = entry },
+        .{ .instance = shared_id, .artifact = shared },
+    };
+
+    var executable = try codegen.buildExecutable(entry_id, &functions, std.testing.allocator);
+    defer executable.deinit(std.testing.allocator);
+
+    const startup_suffix = [_]u8{ 0x31, 0xFF, 0xB8, 60, 0, 0, 0, 0x0F, 0x05 };
+    const entry_offset = std.mem.indexOf(u8, executable.bytes, &startup_suffix).? + startup_suffix.len;
+    const shared_offset = std.mem.indexOf(u8, executable.bytes, &shared_code).?;
+    for ([_]usize{ entry_offset + 1, entry_offset + 6 }) |field_offset| {
+        const displacement = std.mem.readInt(i32, executable.bytes[field_offset..][0..4], .little);
+        const expected: i64 = @as(i64, @intCast(shared_offset)) - @as(i64, @intCast(field_offset)) - 4;
+        try std.testing.expectEqual(expected, displacement);
+    }
+    try std.testing.expect(std.mem.indexOfPos(u8, executable.bytes, shared_offset + 1, &shared_code) == null);
+}
+
+test "executable builder resolves cyclic artifact graphs" {
+    const entry_id: structures.InstanceId = .{ .item = @enumFromInt(2) };
+    const first_id: structures.InstanceId = .{ .item = @enumFromInt(1) };
+    const second_id: structures.InstanceId = .{ .item = @enumFromInt(0) };
+    const call_code = [_]u8{ 0xE8, 0, 0, 0, 0, 0xC3 };
+    const relocation = [_]structures.CompiledFunction.Relocation{.{
+        .offset = 1,
+        .kind = .call_relative_32,
+        .reference = @enumFromInt(0),
+        .addend = 0,
+    }};
+    const entry_references = [_]structures.InstanceId{first_id};
+    const first_references = [_]structures.InstanceId{second_id};
+    const second_references = [_]structures.InstanceId{first_id};
+    const functions = [_]codegen.ReachableFunction{
+        .{ .instance = entry_id, .artifact = .{ .code = &call_code, .required_alignment = 1, .relocations = &relocation, .referenced_instances = &entry_references } },
+        .{ .instance = first_id, .artifact = .{ .code = &call_code, .required_alignment = 1, .relocations = &relocation, .referenced_instances = &first_references } },
+        .{ .instance = second_id, .artifact = .{ .code = &call_code, .required_alignment = 1, .relocations = &relocation, .referenced_instances = &second_references } },
+    };
+
+    var executable = try codegen.buildExecutable(entry_id, &functions, std.testing.allocator);
+    defer executable.deinit(std.testing.allocator);
+    try std.testing.expect(executable.bytes.len > 0);
+}
+
 test "executable builder rejects a relocation outside entry code bounds" {
+    const entry_id: structures.InstanceId = .{ .item = @enumFromInt(1) };
+    const callee_id: structures.InstanceId = .{ .item = @enumFromInt(0) };
     const call_code = [_]u8{ 0xE8, 0, 0, 0, 0, 0xC3 };
     const relocations = [_]structures.CompiledFunction.Relocation{.{
         .offset = 3,
@@ -268,7 +418,7 @@ test "executable builder rejects a relocation outside entry code bounds" {
         .reference = @enumFromInt(0),
         .addend = 0,
     }};
-    const references = [_]structures.InstanceId{.{ .item = @enumFromInt(0) }};
+    const references = [_]structures.InstanceId{callee_id};
     const entry: structures.CompiledFunction = .{
         .code = &call_code,
         .required_alignment = 1,
@@ -282,10 +432,16 @@ test "executable builder rejects a relocation outside entry code bounds" {
         .relocations = &.{},
         .referenced_instances = &.{},
     };
-    try std.testing.expectError(error.RelocationOutOfBounds, codegen.buildExecutable(&entry, &callee, std.testing.allocator));
+    const functions = [_]codegen.ReachableFunction{
+        .{ .instance = entry_id, .artifact = entry },
+        .{ .instance = callee_id, .artifact = callee },
+    };
+    try std.testing.expectError(error.RelocationOutOfBounds, codegen.buildExecutable(entry_id, &functions, std.testing.allocator));
 }
 
 test "executable builder rejects a reference index outside referenced_instances" {
+    const entry_id: structures.InstanceId = .{ .item = @enumFromInt(1) };
+    const callee_id: structures.InstanceId = .{ .item = @enumFromInt(0) };
     const call_code = [_]u8{ 0xE8, 0, 0, 0, 0, 0xC3 };
     const relocations = [_]structures.CompiledFunction.Relocation{.{
         .offset = 1,
@@ -293,7 +449,7 @@ test "executable builder rejects a reference index outside referenced_instances"
         .reference = @enumFromInt(1),
         .addend = 0,
     }};
-    const references = [_]structures.InstanceId{.{ .item = @enumFromInt(0) }};
+    const references = [_]structures.InstanceId{callee_id};
     const entry: structures.CompiledFunction = .{
         .code = &call_code,
         .required_alignment = 1,
@@ -307,10 +463,16 @@ test "executable builder rejects a reference index outside referenced_instances"
         .relocations = &.{},
         .referenced_instances = &.{},
     };
-    try std.testing.expectError(error.RelocationOutOfBounds, codegen.buildExecutable(&entry, &callee, std.testing.allocator));
+    const functions = [_]codegen.ReachableFunction{
+        .{ .instance = entry_id, .artifact = entry },
+        .{ .instance = callee_id, .artifact = callee },
+    };
+    try std.testing.expectError(error.RelocationOutOfBounds, codegen.buildExecutable(entry_id, &functions, std.testing.allocator));
 }
 
 test "executable builder rejects a displacement outside the signed 32-bit range" {
+    const entry_id: structures.InstanceId = .{ .item = @enumFromInt(1) };
+    const callee_id: structures.InstanceId = .{ .item = @enumFromInt(0) };
     const call_code = [_]u8{ 0xE8, 0, 0, 0, 0, 0xC3 };
     const relocations = [_]structures.CompiledFunction.Relocation{.{
         .offset = 1,
@@ -320,7 +482,7 @@ test "executable builder rejects a displacement outside the signed 32-bit range"
         // directly, without requiring a huge (real) address layout.
         .addend = std.math.maxInt(i64),
     }};
-    const references = [_]structures.InstanceId{.{ .item = @enumFromInt(0) }};
+    const references = [_]structures.InstanceId{callee_id};
     const entry: structures.CompiledFunction = .{
         .code = &call_code,
         .required_alignment = 1,
@@ -334,7 +496,11 @@ test "executable builder rejects a displacement outside the signed 32-bit range"
         .relocations = &.{},
         .referenced_instances = &.{},
     };
-    try std.testing.expectError(error.RelocationOverflow, codegen.buildExecutable(&entry, &callee, std.testing.allocator));
+    const functions = [_]codegen.ReachableFunction{
+        .{ .instance = entry_id, .artifact = entry },
+        .{ .instance = callee_id, .artifact = callee },
+    };
+    try std.testing.expectError(error.RelocationOverflow, codegen.buildExecutable(entry_id, &functions, std.testing.allocator));
 }
 
 test "executable construction cleans up every allocation failure" {
@@ -346,6 +512,8 @@ test "linked executable construction cleans up every allocation failure" {
 }
 
 fn testBuildExecutableWithCalleeAllocations(gpa: std.mem.Allocator) !void {
+    const entry_id: structures.InstanceId = .{ .item = @enumFromInt(1) };
+    const callee_id: structures.InstanceId = .{ .item = @enumFromInt(0) };
     const call_code = [_]u8{ 0xE8, 0, 0, 0, 0, 0xC3 };
     const relocations = [_]structures.CompiledFunction.Relocation{.{
         .offset = 1,
@@ -353,7 +521,7 @@ fn testBuildExecutableWithCalleeAllocations(gpa: std.mem.Allocator) !void {
         .reference = @enumFromInt(0),
         .addend = 0,
     }};
-    const references = [_]structures.InstanceId{.{ .item = @enumFromInt(0) }};
+    const references = [_]structures.InstanceId{callee_id};
     const entry: structures.CompiledFunction = .{
         .code = &call_code,
         .required_alignment = 1,
@@ -367,11 +535,16 @@ fn testBuildExecutableWithCalleeAllocations(gpa: std.mem.Allocator) !void {
         .relocations = &.{},
         .referenced_instances = &.{},
     };
-    var executable = try codegen.buildExecutable(&entry, &callee, gpa);
+    const functions = [_]codegen.ReachableFunction{
+        .{ .instance = entry_id, .artifact = entry },
+        .{ .instance = callee_id, .artifact = callee },
+    };
+    var executable = try codegen.buildExecutable(entry_id, &functions, gpa);
     defer executable.deinit(gpa);
 }
 
 fn testBuildExecutableAllocations(gpa: std.mem.Allocator) !void {
+    const entry: structures.InstanceId = .{ .item = @enumFromInt(0) };
     const code = [_]u8{0xC3};
     const artifact: structures.CompiledFunction = .{
         .code = &code,
@@ -379,6 +552,7 @@ fn testBuildExecutableAllocations(gpa: std.mem.Allocator) !void {
         .relocations = &.{},
         .referenced_instances = &.{},
     };
-    var executable = try codegen.buildExecutable(&artifact, null, gpa);
+    const functions = [_]codegen.ReachableFunction{.{ .instance = entry, .artifact = artifact }};
+    var executable = try codegen.buildExecutable(entry, &functions, gpa);
     defer executable.deinit(gpa);
 }

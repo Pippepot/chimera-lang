@@ -391,12 +391,48 @@ pub const FunctionSignature = struct {
     return_type: PrimitiveType,
 };
 
-/// Temporary minimal body result for the current unit-entry, literal-return,
-/// and entry-call slices. A direct call records only semantic intent.
-pub const FunctionBodyAnalysis = union(enum) {
-    unit,
-    integer_return: i32,
-    direct_call: ItemId,
+/// Owned semantic control-flow graph. Instruction ranges are stored in one
+/// flat array while each block owns its terminator.
+pub const FunctionBodyAnalysis = struct {
+    instructions: []Instruction,
+    blocks: []Block,
+    entry: BlockId,
+
+    pub const ValueId = enum(u32) { _ };
+    pub const BlockId = enum(u32) { _ };
+
+    pub const Instruction = union(enum) {
+        integer_constant: i32,
+        call: ItemId,
+    };
+
+    pub const Terminator = union(enum) {
+        return_unit,
+        return_value: ValueId,
+    };
+
+    pub const Block = struct {
+        instruction_start: u32,
+        instruction_end: u32,
+        terminator: Terminator,
+    };
+
+    pub fn eql(a: FunctionBodyAnalysis, b: FunctionBodyAnalysis) bool {
+        if (a.entry != b.entry or a.instructions.len != b.instructions.len or a.blocks.len != b.blocks.len) return false;
+        for (a.instructions, b.instructions) |left, right| {
+            if (!std.meta.eql(left, right)) return false;
+        }
+        for (a.blocks, b.blocks) |left, right| {
+            if (!std.meta.eql(left, right)) return false;
+        }
+        return true;
+    }
+
+    pub fn deinit(self: *FunctionBodyAnalysis, gpa: std.mem.Allocator) void {
+        gpa.free(self.instructions);
+        gpa.free(self.blocks);
+        self.* = undefined;
+    }
 };
 
 /// Structural non-generic instance key. Future generic substitutions extend
@@ -405,12 +441,14 @@ pub const InstanceId = struct {
     item: ItemId,
 };
 
-/// Temporary single-block function SSA for the first ordinary-function slice.
+/// Owned per-instance SSA control-flow graph.
 pub const SsaFunction = struct {
     instructions: []Instruction,
-    terminator: Terminator,
+    blocks: []Block,
+    entry: BlockId,
 
     pub const ValueId = enum(u32) { _ };
+    pub const BlockId = enum(u32) { _ };
 
     pub const Instruction = union(enum) {
         integer_constant: i32,
@@ -422,16 +460,26 @@ pub const SsaFunction = struct {
         return_value: ValueId,
     };
 
+    pub const Block = struct {
+        instruction_start: u32,
+        instruction_end: u32,
+        terminator: Terminator,
+    };
+
     pub fn eql(a: SsaFunction, b: SsaFunction) bool {
-        if (a.instructions.len != b.instructions.len) return false;
+        if (a.entry != b.entry or a.instructions.len != b.instructions.len or a.blocks.len != b.blocks.len) return false;
         for (a.instructions, b.instructions) |left, right| {
             if (!std.meta.eql(left, right)) return false;
         }
-        return std.meta.eql(a.terminator, b.terminator);
+        for (a.blocks, b.blocks) |left, right| {
+            if (!std.meta.eql(left, right)) return false;
+        }
+        return true;
     }
 
     pub fn deinit(self: *SsaFunction, gpa: std.mem.Allocator) void {
         gpa.free(self.instructions);
+        gpa.free(self.blocks);
         self.* = undefined;
     }
 };

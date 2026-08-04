@@ -34,80 +34,110 @@ const Elf64Phdr = extern struct {
 const code_file_offset = @sizeOf(Elf64Header) + @sizeOf(Elf64Phdr);
 
 pub fn compileFunction(ssa: *const structures.SsaFunction, gpa: std.mem.Allocator) error{ OutOfMemory, InvalidSsa }!structures.CompiledFunction {
-    var direct_call: ?structures.InstanceId = null;
+    if (ssa.blocks.len != 1) return error.InvalidSsa;
+    if (@intFromEnum(ssa.entry) != 0) return error.InvalidSsa;
+    const block = ssa.blocks[0];
+    if (block.instruction_start != 0) return error.InvalidSsa;
+    if (block.instruction_end != ssa.instructions.len) return error.InvalidSsa;
+
+    var encoder = try X86Encoder.init(gpa);
+    defer encoder.deinit();
+    var relocations: std.ArrayList(structures.CompiledFunction.Relocation) = .empty;
+    defer relocations.deinit(gpa);
+    var referenced_instances: std.ArrayList(structures.InstanceId) = .empty;
+    defer referenced_instances.deinit(gpa);
+
     for (ssa.instructions) |instruction| {
         switch (instruction) {
             .integer_constant => {},
             .direct_call => |target| {
-                if (direct_call != null) return error.InvalidSsa;
-                direct_call = target;
+                const offset_usize = std.math.add(usize, encoder.code.items.len, 1) catch return error.InvalidSsa;
+                const offset = std.math.cast(u32, offset_usize) orelse return error.InvalidSsa;
+                try encoder.callRelative32(0);
+
+                var reference_index: ?usize = null;
+                for (referenced_instances.items, 0..) |existing, index| {
+                    if (std.meta.eql(existing, target)) {
+                        reference_index = index;
+                        break;
+                    }
+                }
+                if (reference_index == null) {
+                    reference_index = referenced_instances.items.len;
+                    try referenced_instances.append(gpa, target);
+                }
+                const reference = std.math.cast(u32, reference_index.?) orelse return error.InvalidSsa;
+                try relocations.append(gpa, .{
+                    .offset = offset,
+                    .kind = .call_relative_32,
+                    .reference = @enumFromInt(reference),
+                    .addend = 0,
+                });
             },
         }
     }
-    if (direct_call != null) {
-        if (ssa.instructions.len != 1) return error.InvalidSsa;
-        switch (ssa.terminator) {
-            .return_unit => {},
-            .return_value => return error.InvalidSsa,
-        }
-    }
+    try emitTerminator(&encoder, ssa, block.terminator);
 
-    var encoder = try X86Encoder.init(gpa);
-    defer encoder.deinit();
-
-    if (direct_call != null) try encoder.callRelative32(0);
-    try emitTerminator(&encoder, ssa);
-
-    var relocations: []const structures.CompiledFunction.Relocation = &.{};
-    errdefer if (relocations.len != 0) gpa.free(relocations);
-    var referenced_instances: []const structures.InstanceId = &.{};
-    errdefer if (referenced_instances.len != 0) gpa.free(referenced_instances);
-    if (direct_call) |target| {
-        const owned_relocations = try gpa.alloc(structures.CompiledFunction.Relocation, 1);
-        owned_relocations[0] = .{
-            .offset = 1,
-            .kind = .call_relative_32,
-            .reference = @enumFromInt(0),
-            .addend = 0,
-        };
-        relocations = owned_relocations;
-
-        const owned_references = try gpa.alloc(structures.InstanceId, 1);
-        owned_references[0] = target;
-        referenced_instances = owned_references;
-    }
+    const owned_relocations: []const structures.CompiledFunction.Relocation = if (relocations.items.len == 0)
+        &.{}
+    else
+        try relocations.toOwnedSlice(gpa);
+    errdefer if (owned_relocations.len != 0) gpa.free(owned_relocations);
+    const owned_references: []const structures.InstanceId = if (referenced_instances.items.len == 0)
+        &.{}
+    else
+        try referenced_instances.toOwnedSlice(gpa);
+    errdefer if (owned_references.len != 0) gpa.free(owned_references);
 
     return .{
         .code = try encoder.code.toOwnedSlice(gpa),
         .required_alignment = 1,
-        .relocations = relocations,
-        .referenced_instances = referenced_instances,
+        .relocations = owned_relocations,
+        .referenced_instances = owned_references,
     };
 }
 
-/// `callee` must be non-null exactly when `entry` carries the one currently
-/// supported call shape (one relocation, one referenced instance); every
-/// other shape is `UnsupportedArtifactMetadata`.
+pub const ReachableFunction = struct {
+    instance: structures.InstanceId,
+    /// Shallow borrowed artifact; its owned slices outlive buildExecutable.
+    artifact: structures.CompiledFunction,
+};
+
 pub fn buildExecutable(
-    entry: *const structures.CompiledFunction,
-    callee: ?*const structures.CompiledFunction,
+    entry: structures.InstanceId,
+    functions: []const ReachableFunction,
     gpa: std.mem.Allocator,
 ) !structures.Executable {
-    std.debug.assert(entry.code.len != 0);
-    std.debug.assert(std.math.isPowerOfTwo(entry.required_alignment));
-
-    const has_call = entry.relocations.len == 1 and entry.referenced_instances.len == 1;
-    if (!has_call and (entry.relocations.len != 0 or entry.referenced_instances.len != 0)) {
-        return error.UnsupportedArtifactMetadata;
+    for (functions) |function| {
+        std.debug.assert(function.artifact.code.len != 0);
+        std.debug.assert(function.artifact.required_alignment != 0);
+        std.debug.assert(std.math.isPowerOfTwo(function.artifact.required_alignment));
+        for (function.artifact.relocations) |relocation| {
+            const reference_index = @intFromEnum(relocation.reference);
+            if (reference_index >= function.artifact.referenced_instances.len) return error.RelocationOutOfBounds;
+            const relocation_offset: usize = relocation.offset;
+            if (relocation_offset > function.artifact.code.len or
+                function.artifact.code.len - relocation_offset < @sizeOf(i32))
+            {
+                return error.RelocationOutOfBounds;
+            }
+        }
     }
-    if (has_call != (callee != null)) return error.UnsupportedArtifactMetadata;
-    if (callee) |target| {
-        std.debug.assert(target.code.len != 0);
-        std.debug.assert(std.math.isPowerOfTwo(target.required_alignment));
-        // Declared-function bodies cannot themselves call yet, so every callee
-        // reachable through this path is a leaf artifact.
-        std.debug.assert(target.relocations.len == 0);
-        std.debug.assert(target.referenced_instances.len == 0);
+
+    var function_indices = std.AutoHashMap(structures.InstanceId, usize).init(gpa);
+    defer function_indices.deinit();
+    const function_count = std.math.cast(u32, functions.len) orelse return error.FileTooBig;
+    try function_indices.ensureTotalCapacity(function_count);
+    for (functions, 0..) |function, index| {
+        const result = function_indices.getOrPutAssumeCapacity(function.instance);
+        if (result.found_existing) return error.DuplicateFunctionArtifact;
+        result.value_ptr.* = index;
+    }
+    const entry_index = function_indices.get(entry) orelse return error.MissingEntryArtifact;
+    for (functions) |function| {
+        for (function.artifact.referenced_instances) |target| {
+            if (!function_indices.contains(target)) return error.MissingReferencedArtifact;
+        }
     }
 
     var encoder = try X86Encoder.init(gpa);
@@ -119,48 +149,52 @@ pub fn buildExecutable(
     try encoder.movEaxImmediate32(60);
     try encoder.syscall();
 
+    const Layout = struct { address: u64, offset: usize };
+    const layouts = try gpa.alloc(Layout, functions.len);
+    defer gpa.free(layouts);
+
     const code_virtual_address = image_base + @as(u64, code_file_offset);
-    const entry_virtual_address = std.mem.alignForward(u64, code_virtual_address + encoder.code.items.len, entry.required_alignment);
-    const entry_offset = try offsetFromBase(entry_virtual_address, code_virtual_address);
+    for (functions, layouts) |function, *layout| {
+        const function_address = try alignedAddress(code_virtual_address, encoder.code.items.len, function.artifact.required_alignment);
+        const function_offset = try offsetFromBase(function_address, code_virtual_address);
+        if (function.artifact.code.len > std.math.maxInt(usize) - function_offset) return error.FileTooBig;
+        try encoder.code.appendNTimes(gpa, 0x90, function_offset - encoder.code.items.len);
+        try encoder.appendBytes(function.artifact.code);
+        layout.* = .{ .address = function_address, .offset = function_offset };
+    }
+
+    const entry_layout = layouts[entry_index];
     try patchRelativeDisplacement(
         encoder.code.items,
         call_displacement_offset,
-        entry_virtual_address,
+        entry_layout.address,
         code_virtual_address + @as(u64, call_displacement_offset) + @sizeOf(i32),
         0,
     );
 
-    if (entry.code.len > std.math.maxInt(usize) - entry_offset) return error.FileTooBig;
-    try encoder.code.appendNTimes(gpa, 0x90, entry_offset - encoder.code.items.len);
-    try encoder.appendBytes(entry.code);
-
-    if (callee) |target| {
-        const reloc = entry.relocations[0];
-        switch (reloc.kind) {
-            .call_relative_32 => {},
+    for (functions, layouts) |function, layout| {
+        for (function.artifact.relocations) |relocation| {
+            const target = function.artifact.referenced_instances[@intFromEnum(relocation.reference)];
+            const target_layout = layouts[function_indices.get(target).?];
+            try patchRelativeDisplacement(
+                encoder.code.items,
+                layout.offset + @as(usize, relocation.offset),
+                target_layout.address,
+                layout.address + @as(u64, relocation.offset) + @sizeOf(i32),
+                relocation.addend,
+            );
         }
-        if (@intFromEnum(reloc.reference) != 0) return error.RelocationOutOfBounds;
-        const reloc_offset: usize = reloc.offset;
-        if (reloc_offset > entry.code.len or entry.code.len - reloc_offset < @sizeOf(i32)) {
-            return error.RelocationOutOfBounds;
-        }
-
-        const callee_virtual_address = std.mem.alignForward(u64, code_virtual_address + encoder.code.items.len, target.required_alignment);
-        const callee_offset = try offsetFromBase(callee_virtual_address, code_virtual_address);
-        try patchRelativeDisplacement(
-            encoder.code.items,
-            entry_offset + reloc_offset,
-            callee_virtual_address,
-            entry_virtual_address + @as(u64, reloc.offset) + @sizeOf(i32),
-            reloc.addend,
-        );
-
-        if (target.code.len > std.math.maxInt(usize) - callee_offset) return error.FileTooBig;
-        try encoder.code.appendNTimes(gpa, 0x90, callee_offset - encoder.code.items.len);
-        try encoder.appendBytes(target.code);
     }
 
     return .{ .bytes = try buildElfExecutable(encoder.code.items, gpa) };
+}
+
+fn alignedAddress(base: u64, offset: usize, alignment: u32) error{FileTooBig}!u64 {
+    const offset_u64 = std.math.cast(u64, offset) orelse return error.FileTooBig;
+    const unaligned = std.math.add(u64, base, offset_u64) catch return error.FileTooBig;
+    const mask = @as(u64, alignment) - 1;
+    if (unaligned > std.math.maxInt(u64) - mask) return error.FileTooBig;
+    return (unaligned + mask) & ~mask;
 }
 
 fn offsetFromBase(address: u64, base: u64) error{FileTooBig}!usize {
@@ -184,15 +218,21 @@ fn patchRelativeDisplacement(
     std.mem.writeInt(i32, buffer[field_offset..][0..@sizeOf(i32)], @intCast(displacement), .little);
 }
 
-fn emitTerminator(encoder: *X86Encoder, ssa: *const structures.SsaFunction) error{ OutOfMemory, InvalidSsa }!void {
-    switch (ssa.terminator) {
+fn emitTerminator(
+    encoder: *X86Encoder,
+    ssa: *const structures.SsaFunction,
+    terminator: structures.SsaFunction.Terminator,
+) error{ OutOfMemory, InvalidSsa }!void {
+    switch (terminator) {
         .return_unit => try encoder.ret(),
         .return_value => |value_id| {
             const instruction_index = @intFromEnum(value_id);
             if (instruction_index >= ssa.instructions.len) return error.InvalidSsa;
             switch (ssa.instructions[instruction_index]) {
                 .integer_constant => |value| try encoder.movEaxImmediate32(value),
-                .direct_call => unreachable,
+                .direct_call => {
+                    if (instruction_index + 1 != ssa.instructions.len) return error.InvalidSsa;
+                },
             }
             try encoder.ret();
         },

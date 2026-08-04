@@ -44,7 +44,8 @@ fn freeDiagnostics(diagnostics: []structures.Diagnostic) void {
 fn expectDirectCallSsa(ssa: structures.SsaFunction, target: structures.ItemId) !void {
     try testing.expectEqual(@as(usize, 1), ssa.instructions.len);
     try testing.expectEqual(structures.InstanceId{ .item = target }, ssa.instructions[0].direct_call);
-    try testing.expectEqual(structures.SsaFunction.Terminator.return_unit, ssa.terminator);
+    try testing.expectEqual(@as(usize, 1), ssa.blocks.len);
+    try testing.expectEqual(structures.SsaFunction.Terminator.return_unit, ssa.blocks[0].terminator);
 }
 
 fn expectDirectCallArtifact(artifact: structures.CompiledFunction, target: structures.ItemId) !void {
@@ -60,7 +61,21 @@ fn expectDirectCallArtifact(artifact: structures.CompiledFunction, target: struc
 
 fn expectUnitSsa(ssa: structures.SsaFunction) !void {
     try testing.expectEqual(@as(usize, 0), ssa.instructions.len);
-    try testing.expectEqual(structures.SsaFunction.Terminator.return_unit, ssa.terminator);
+    try testing.expectEqual(@as(usize, 1), ssa.blocks.len);
+    try testing.expectEqual(structures.SsaFunction.Terminator.return_unit, ssa.blocks[0].terminator);
+}
+
+fn expectIntegerReturnBody(body: structures.FunctionBodyAnalysis, expected: i32) !void {
+    try testing.expectEqual(@as(usize, 1), body.instructions.len);
+    try testing.expectEqual(expected, body.instructions[0].integer_constant);
+    try testing.expectEqual(@as(usize, 1), body.blocks.len);
+    try testing.expectEqual(@as(u32, 0), @intFromEnum(body.blocks[0].terminator.return_value));
+}
+
+fn expectUnitBody(body: structures.FunctionBodyAnalysis) !void {
+    try testing.expectEqual(@as(usize, 0), body.instructions.len);
+    try testing.expectEqual(@as(usize, 1), body.blocks.len);
+    try testing.expectEqual(structures.FunctionBodyAnalysis.Terminator.return_unit, body.blocks[0].terminator);
 }
 
 // Query fixtures expose otherwise-internal lifecycle and recomputation behavior.
@@ -364,9 +379,10 @@ const EntryCallParent = struct {
         executions.increment();
         const entry_id = (try ctx.get(query_structures.SelectEntry, file_id)).* orelse return null;
         const body = (try ctx.get(query_structures.AnalyzeFunctionBody, entry_id)).* orelse return null;
-        return switch (body) {
-            .direct_call => |target| target,
-            .unit, .integer_return => null,
+        if (body.instructions.len != 1) return null;
+        return switch (body.instructions[0]) {
+            .call => |target| target,
+            .integer_constant => null,
         };
     }
 };
@@ -958,7 +974,7 @@ test "function signature and body analysis support inline and block literal retu
         const signature = (try db.get(query_structures.FunctionSignature, function_id)).*.?;
         try testing.expectEqual(@as(u32, 0), signature.parameter_count);
         try testing.expectEqual(structures.PrimitiveType.int, signature.return_type);
-        try testing.expectEqual(case.expected, (try db.get(query_structures.AnalyzeFunctionBody, function_id)).*.?.integer_return);
+        try expectIntegerReturnBody((try db.get(query_structures.AnalyzeFunctionBody, function_id)).*.?, case.expected);
     }
 }
 
@@ -970,12 +986,12 @@ test "body edits preserve signature consumers and update body analysis" {
     try addSource(db, 1, "comptime f = func() int -> return 7");
     const function_id = (try db.get(query_structures.IndexItems, 1)).*.?.ids()[0];
     try testing.expect((try db.get(SignatureParent, function_id)).* != null);
-    try testing.expectEqual(@as(i32, 7), (try db.get(query_structures.AnalyzeFunctionBody, function_id)).*.?.integer_return);
+    try expectIntegerReturnBody((try db.get(query_structures.AnalyzeFunctionBody, function_id)).*.?, 7);
 
     try setSource(db, 1, "comptime f = func() int -> return 8");
     try testing.expect((try db.get(SignatureParent, function_id)).* != null);
     try SignatureParent.executions.expect(1);
-    try testing.expectEqual(@as(i32, 8), (try db.get(query_structures.AnalyzeFunctionBody, function_id)).*.?.integer_return);
+    try expectIntegerReturnBody((try db.get(query_structures.AnalyzeFunctionBody, function_id)).*.?, 8);
 
     try setSource(db, 1, "comptime f = func() foo -> return 8");
     try testing.expect((try db.get(query_structures.FunctionSignature, function_id)).* == null);
@@ -1038,13 +1054,13 @@ test "function analysis distinguishes entry stale restored and invalid identitie
     const function_id = index.ids()[0];
     const entry_id = (try db.get(query_structures.SelectEntry, 1)).*.?;
     try testing.expect((try db.get(query_structures.FunctionSignature, entry_id)).* == null);
-    try testing.expectEqual(structures.FunctionBodyAnalysis.unit, (try db.get(query_structures.AnalyzeFunctionBody, entry_id)).*.?);
+    try expectUnitBody((try db.get(query_structures.AnalyzeFunctionBody, entry_id)).*.?);
 
     try setSource(db, 1, "");
     try testing.expect((try db.get(query_structures.FunctionSignature, function_id)).* == null);
     try setSource(db, 1, valid);
     try testing.expect((try db.get(query_structures.FunctionSignature, function_id)).* != null);
-    try testing.expectEqual(@as(i32, 7), (try db.get(query_structures.AnalyzeFunctionBody, function_id)).*.?.integer_return);
+    try expectIntegerReturnBody((try db.get(query_structures.AnalyzeFunctionBody, function_id)).*.?, 7);
 
     const invalid: structures.ItemId = @enumFromInt(std.math.maxInt(u32));
     try testing.expectError(error.InvalidInternId, db.get(query_structures.FunctionSignature, invalid));
@@ -1065,8 +1081,8 @@ test "duplicate function ordinals analyze independently across reorder" {
     SignatureParent.executions.reset();
     try testing.expect((try db.get(SignatureParent, first_id)).* != null);
     try testing.expect((try db.get(SignatureParent, second_id)).* != null);
-    try testing.expectEqual(@as(i32, 1), (try db.get(query_structures.AnalyzeFunctionBody, first_id)).*.?.integer_return);
-    try testing.expectEqual(@as(i32, 2), (try db.get(query_structures.AnalyzeFunctionBody, second_id)).*.?.integer_return);
+    try expectIntegerReturnBody((try db.get(query_structures.AnalyzeFunctionBody, first_id)).*.?, 1);
+    try expectIntegerReturnBody((try db.get(query_structures.AnalyzeFunctionBody, second_id)).*.?, 2);
 
     try setSource(db, 1,
         \\comptime duplicate = func() int -> return 2
@@ -1075,8 +1091,8 @@ test "duplicate function ordinals analyze independently across reorder" {
     try testing.expect((try db.get(SignatureParent, first_id)).* != null);
     try testing.expect((try db.get(SignatureParent, second_id)).* != null);
     try SignatureParent.executions.expect(2);
-    try testing.expectEqual(@as(i32, 2), (try db.get(query_structures.AnalyzeFunctionBody, first_id)).*.?.integer_return);
-    try testing.expectEqual(@as(i32, 1), (try db.get(query_structures.AnalyzeFunctionBody, second_id)).*.?.integer_return);
+    try expectIntegerReturnBody((try db.get(query_structures.AnalyzeFunctionBody, first_id)).*.?, 2);
+    try expectIntegerReturnBody((try db.get(query_structures.AnalyzeFunctionBody, second_id)).*.?, 1);
 }
 
 test "malformed function diagnostics remain parse-only and top-level return stays rejected" {
@@ -1160,7 +1176,9 @@ test "entry analysis resolves one direct call without analyzing its callee body"
     const callee_id = index.ids()[0];
     const entry_id = (try db.get(query_structures.SelectEntry, 1)).*.?;
 
-    try testing.expectEqual(callee_id, (try db.get(query_structures.AnalyzeFunctionBody, entry_id)).*.?.direct_call);
+    const entry_body = (try db.get(query_structures.AnalyzeFunctionBody, entry_id)).*.?;
+    try testing.expectEqual(@as(usize, 1), entry_body.instructions.len);
+    try testing.expectEqual(callee_id, entry_body.instructions[0].call);
     try testing.expect((try db.get(query_structures.FunctionSignature, callee_id)).* != null);
     try testing.expectEqual(@as(usize, 0), (try db.directAccumulatorValues(query_structures.AnalyzeFunctionBody, entry_id, structures.Diagnostic)).len);
 
@@ -1179,7 +1197,6 @@ test "entry analysis validates all root syntax before resolving a call" {
         .{ .source = "comptime bad = func(x: int) int -> return 1\nbad(1)", .marker = "(" },
         .{ .source = "comptime bad = func() foo -> return 1\nbad()\nreturn", .marker = "return" },
         .{ .source = "comptime f = func() int -> return 1\nf()()", .marker = "(" },
-        .{ .source = "comptime f = func() int -> return 1\nf()\nf()", .marker = "(" },
     };
     const message = "runtime top-level statements are not supported yet";
 
@@ -1281,7 +1298,7 @@ test "entry call dependencies follow spelling identity and runtime shape" {
     );
     try testing.expect((try db.get(EntryCallParent, 1)).* == null);
     const entry_id = (try db.get(query_structures.SelectEntry, 1)).*.?;
-    try testing.expectEqual(structures.FunctionBodyAnalysis.unit, (try db.get(query_structures.AnalyzeFunctionBody, entry_id)).*.?);
+    try expectUnitBody((try db.get(query_structures.AnalyzeFunctionBody, entry_id)).*.?);
     const empty_diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, entry_id, structures.Diagnostic, testing.allocator);
     defer freeDiagnostics(empty_diagnostics);
     try testing.expectEqual(@as(usize, 0), empty_diagnostics.len);
@@ -1377,6 +1394,97 @@ test "BuildExecutable links a direct call while keeping the entry artifact indep
     try testing.expectEqual(@as(u8, 0), runtime.runProg(io, testing.allocator, &.{}));
 }
 
+test "BuildExecutable links and runs transitively reachable calls" {
+    const runtime = @import("runtime.zig");
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\comptime leaf = func() int -> return 7
+        \\comptime middle = func() int -> return leaf()
+        \\middle()
+    );
+    const executable = try db.get(query_structures.BuildExecutable, 1);
+    try testing.expect(executable.* != null);
+
+    const io = testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    runtime.writeProgram(io, executable.*.?.bytes);
+    try testing.expectEqual(@as(u8, 0), runtime.runProg(io, testing.allocator, &.{}));
+}
+
+test "BuildExecutable collects cyclic reachability without recursive compilation" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\comptime first = func() int -> return second()
+        \\comptime second = func() int -> return first()
+        \\first()
+    );
+    try testing.expect((try db.get(query_structures.BuildExecutable, 1)).* != null);
+}
+
+test "BuildExecutable places a shared reachable function once" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\comptime shared = func() int -> return 305419896
+        \\comptime left = func() int
+        \\  shared()
+        \\  return 1
+        \\comptime right = func() int
+        \\  shared()
+        \\  return 2
+        \\left()
+        \\right()
+    );
+    const executable = try db.get(query_structures.BuildExecutable, 1);
+    try testing.expect(executable.* != null);
+
+    const shared_code = [_]u8{ 0xB8, 0x78, 0x56, 0x34, 0x12, 0xC3 };
+    var occurrences: usize = 0;
+    var search_from: usize = 0;
+    while (std.mem.indexOfPos(u8, executable.*.?.bytes, search_from, &shared_code)) |offset| {
+        occurrences += 1;
+        search_from = offset + shared_code.len;
+    }
+    try testing.expectEqual(@as(usize, 1), occurrences);
+}
+
+test "BuildExecutable drops dependencies that become unreachable" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\comptime leaf = func() int -> return 1
+        \\comptime middle = func() int -> return leaf()
+        \\middle()
+    );
+    const with_leaf = try db.get(query_structures.BuildExecutable, 1);
+    try testing.expect(with_leaf.* != null);
+
+    try setSource(db, 1,
+        \\comptime leaf = func() int -> return 1
+        \\comptime middle = func() int -> return 9
+        \\middle()
+    );
+    const without_leaf = try db.get(query_structures.BuildExecutable, 1);
+    try testing.expect(without_leaf.* != null);
+    try testing.expect(!structures.Executable.eql(with_leaf.*.?, without_leaf.*.?));
+
+    try setSource(db, 1,
+        \\comptime leaf = func() int -> return true
+        \\comptime middle = func() int -> return 9
+        \\middle()
+    );
+    try testing.expectEqual(without_leaf, try db.get(query_structures.BuildExecutable, 1));
+    const diagnostics = try db.transitiveAccumulatorValues(query_structures.BuildExecutable, 1, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 0), diagnostics.len);
+}
+
 test "BuildExecutable surfaces a callee compile failure as null with its diagnostic" {
     const db = try testDatabase(2);
     defer db.deinit();
@@ -1389,7 +1497,7 @@ test "BuildExecutable surfaces a callee compile failure as null with its diagnos
     const diagnostics = try db.transitiveAccumulatorValues(query_structures.BuildExecutable, 1, structures.Diagnostic, testing.allocator);
     defer freeDiagnostics(diagnostics);
     try testing.expectEqual(@as(usize, 1), diagnostics.len);
-    try testing.expectEqualStrings("function must return an integer literal", diagnostics[0].message);
+    try testing.expectEqualStrings("function must return an integer literal or zero-argument function call", diagnostics[0].message);
 
     try setSource(db, 1,
         \\comptime target = func() int -> return 1
@@ -1521,7 +1629,7 @@ test "LowerToSSA produces owned value-equal functions for distinct instances" {
     try testing.expect(structures.SsaFunction.eql(first.*.?, second.*.?));
     try testing.expectEqual(@as(usize, 1), first.*.?.instructions.len);
     try testing.expectEqual(@as(i32, 7), first.*.?.instructions[0].integer_constant);
-    try testing.expectEqual(@as(u32, 0), @intFromEnum(first.*.?.terminator.return_value));
+    try testing.expectEqual(@as(u32, 0), @intFromEnum(first.*.?.blocks[0].terminator.return_value));
 }
 
 test "LowerToSSA changes with its body and retains equal results" {

@@ -11,42 +11,60 @@ pub const SignatureResult = union(enum) {
     unsupported: Issue,
 };
 
-pub const BodyResult = union(enum) {
-    success: structures.FunctionBodyAnalysis,
-    unsupported: Issue,
+pub const BodyShape = struct {
+    instructions: []Instruction,
+    block: Block,
+
+    pub const ValueId = enum(u32) { _ };
+
+    pub const Instruction = union(enum) {
+        integer_constant: i32,
+        call: structures.SourceSpan,
+    };
+
+    pub const Terminator = union(enum) {
+        return_unit,
+        return_value: ValueId,
+    };
+
+    pub const Block = struct {
+        terminator: Terminator,
+    };
+
+    pub fn deinit(self: *BodyShape, gpa: std.mem.Allocator) void {
+        gpa.free(self.instructions);
+        self.* = undefined;
+    }
 };
 
-pub const EntryBodyResult = union(enum) {
-    empty,
-    direct_call: structures.SourceSpan,
+pub const BodyResult = union(enum) {
+    success: BodyShape,
     unsupported: Issue,
 };
 
 const unsupported_entry_message = "runtime top-level statements are not supported yet";
-const literal_return_message = "function body must contain one integer literal return";
+const body_shape_message = "function body must contain calls followed by one return";
+const return_value_message = "function must return an integer literal or zero-argument function call";
 
-pub fn analyzeEntryBody(ast: *const structures.Ast, declaration: u32) EntryBodyResult {
+pub fn analyzeEntryBody(ast: *const structures.Ast, declaration: u32, gpa: std.mem.Allocator) !BodyResult {
     const root = ast.nodes[declaration];
     std.debug.assert(root.tag == .block);
 
-    var direct_call: ?structures.SourceSpan = null;
+    var instructions: std.ArrayList(BodyShape.Instruction) = .empty;
+    defer instructions.deinit(gpa);
     for (root.data.ref.start..root.data.ref.end) |ref_index| {
         const child_index = ast.node_refs[ref_index];
         const child = ast.nodes[child_index.index()];
         if (child.tag == .comptime_binding) continue;
-        if (child.tag != .call or direct_call != null or child.data.node_node.b != .null) {
+        const name_span = callNameSpan(ast, child_index) orelse {
             return .{ .unsupported = issueAt(ast, child_index.index(), unsupported_entry_message) };
-        }
-
-        const callee_index = child.data.node_node.a.unwrap() orelse unreachable;
-        const callee = ast.nodes[callee_index.index()];
-        if (callee.tag != .identifier) {
-            return .{ .unsupported = issueAt(ast, child_index.index(), unsupported_entry_message) };
-        }
-        const token = ast.tokens[callee.token_index];
-        direct_call = .{ .start = token.loc.start, .end = token.loc.end };
+        };
+        try instructions.append(gpa, .{ .call = name_span });
     }
-    return if (direct_call) |call| .{ .direct_call = call } else .empty;
+    return .{ .success = .{
+        .instructions = try instructions.toOwnedSlice(gpa),
+        .block = .{ .terminator = .return_unit },
+    } };
 }
 
 const FunctionParts = struct {
@@ -76,41 +94,71 @@ pub fn analyzeFunctionSignature(ast: *const structures.Ast, source: []const u8, 
     return .{ .success = .{ .parameter_count = 0, .return_type = .int } };
 }
 
-pub fn analyzeFunctionBody(ast: *const structures.Ast, source: []const u8, declaration: u32) BodyResult {
+pub fn analyzeFunctionBody(ast: *const structures.Ast, source: []const u8, declaration: u32, gpa: std.mem.Allocator) !BodyResult {
     const parts = functionParts(ast, declaration);
     const body = ast.nodes[parts.body.index()];
-    const return_index: structures.Node.Index = switch (body.tag) {
-        .return_expr => parts.body,
-        .block => blk: {
-            if (body.data.ref.end - body.data.ref.start != 1) {
-                return .{ .unsupported = issueAt(ast, parts.body.index(), literal_return_message) };
-            }
-            break :blk ast.node_refs[body.data.ref.start];
-        },
-        else => return .{ .unsupported = issueAt(ast, parts.body.index(), literal_return_message) },
+    var instructions: std.ArrayList(BodyShape.Instruction) = .empty;
+    defer instructions.deinit(gpa);
+
+    const return_index: structures.Node.Index = if (body.tag == .return_expr)
+        parts.body
+    else if (body.tag == .block) blk: {
+        if (body.data.ref.start == body.data.ref.end) {
+            return .{ .unsupported = issueAt(ast, parts.body.index(), body_shape_message) };
+        }
+        const return_ref = body.data.ref.end - 1;
+        for (body.data.ref.start..return_ref) |ref_index| {
+            const statement_index = ast.node_refs[ref_index];
+            const name_span = callNameSpan(ast, statement_index) orelse
+                return .{ .unsupported = issueAt(ast, statement_index.index(), body_shape_message) };
+            try instructions.append(gpa, .{ .call = name_span });
+        }
+        break :blk ast.node_refs[return_ref];
+    } else {
+        return .{ .unsupported = issueAt(ast, parts.body.index(), body_shape_message) };
     };
 
     const return_node = ast.nodes[return_index.index()];
     if (return_node.tag != .return_expr) {
-        return .{ .unsupported = issueAt(ast, return_index.index(), literal_return_message) };
+        return .{ .unsupported = issueAt(ast, return_index.index(), body_shape_message) };
     }
     const value_index = return_node.data.node.unwrap() orelse
-        return .{ .unsupported = issueAt(ast, return_index.index(), "function must return an integer literal") };
+        return .{ .unsupported = issueAt(ast, return_index.index(), return_value_message) };
     const value = ast.nodes[value_index.index()];
-    if (value.tag != .number_literal) {
-        return .{ .unsupported = issueAt(ast, value_index.index(), "function must return an integer literal") };
+    const return_value: BodyShape.ValueId = @enumFromInt(instructions.items.len);
+    if (value.tag == .call) {
+        const name_span = callNameSpan(ast, value_index) orelse
+            return .{ .unsupported = issueAt(ast, value_index.index(), return_value_message) };
+        try instructions.append(gpa, .{ .call = name_span });
+    } else if (value.tag == .number_literal) {
+        const token = ast.tokens[value.token_index];
+        const literal = source[token.loc.start..token.loc.end];
+        for (literal) |byte| {
+            if (!std.ascii.isDigit(byte)) {
+                return .{ .unsupported = issueAt(ast, value_index.index(), "only decimal integer literals are supported yet") };
+            }
+        }
+        const integer = std.fmt.parseInt(i32, literal, 10) catch
+            return .{ .unsupported = issueAt(ast, value_index.index(), "integer literal does not fit i32") };
+        try instructions.append(gpa, .{ .integer_constant = integer });
+    } else {
+        return .{ .unsupported = issueAt(ast, value_index.index(), return_value_message) };
     }
 
-    const token = ast.tokens[value.token_index];
-    const literal = source[token.loc.start..token.loc.end];
-    for (literal) |byte| {
-        if (!std.ascii.isDigit(byte)) {
-            return .{ .unsupported = issueAt(ast, value_index.index(), "only decimal integer literals are supported yet") };
-        }
-    }
-    const return_value = std.fmt.parseInt(i32, literal, 10) catch
-        return .{ .unsupported = issueAt(ast, value_index.index(), "integer literal does not fit i32") };
-    return .{ .success = .{ .integer_return = return_value } };
+    return .{ .success = .{
+        .instructions = try instructions.toOwnedSlice(gpa),
+        .block = .{ .terminator = .{ .return_value = return_value } },
+    } };
+}
+
+fn callNameSpan(ast: *const structures.Ast, call_index: structures.Node.Index) ?structures.SourceSpan {
+    const call = ast.nodes[call_index.index()];
+    if (call.tag != .call or call.data.node_node.b != .null) return null;
+    const callee_index = call.data.node_node.a.unwrap() orelse unreachable;
+    const callee = ast.nodes[callee_index.index()];
+    if (callee.tag != .identifier) return null;
+    const token = ast.tokens[callee.token_index];
+    return .{ .start = token.loc.start, .end = token.loc.end };
 }
 
 fn functionParts(ast: *const structures.Ast, declaration: u32) FunctionParts {
@@ -177,4 +225,30 @@ fn appendItem(
         .loc = .{ .file_id = file_id, .kind = kind, .name = owned_name, .disambiguator = disambiguator },
         .declaration = declaration,
     });
+}
+
+test "function body shape cleans up every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testFunctionBodyShapeAllocations, .{});
+}
+
+fn testFunctionBodyShapeAllocations(gpa: std.mem.Allocator) !void {
+    const parser = @import("ast_new.zig");
+    const source =
+        \\comptime target = func() int
+        \\  first()
+        \\  second()
+        \\  return third()
+    ;
+    var report = try parser.parseReport(std.testing.allocator, 1, source);
+    defer report.deinit(std.testing.allocator);
+    const parsed = &report.ast.?;
+    const declaration = parsed.node_refs[parsed.nodes[0].data.ref.start];
+    const result = try analyzeFunctionBody(parsed, source, declaration.index(), gpa);
+    switch (result) {
+        .success => |body_value| {
+            var body = body_value;
+            body.deinit(gpa);
+        },
+        .unsupported => unreachable,
+    }
 }
