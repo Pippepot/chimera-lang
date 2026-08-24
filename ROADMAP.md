@@ -1,6 +1,6 @@
 # Refactor roadmap
 
-Last updated: 2026-08-04.
+Last updated: 2026-08-09.
 
 This is a temporary handoff document. Update it after each completed milestone and delete obsolete details rather than preserving history here. Durable design rules live in `ARCHITECTURE.md`; agent workflow lives in `AGENTS.md`.
 
@@ -51,6 +51,7 @@ BuildExecutable(FileId) -> ?Executable
 - `diagnostics.zig` renders the refactored pipeline's public `structures.Diagnostic` values from source paths, source text, spans, and messages.
 - Parser productions propagate syntax and allocation failures to one document boundary; syntax failure publishes exactly the first diagnostic, while allocation failure remains an infrastructure error.
 - Required expression positions reject missing values without making the expression after `return` mandatory.
+- A line break after `return` ends the bare return before a following top-level expression, including after an inline function body.
 - Token, parser-list, AST-transfer, and diagnostic construction paths have exact failure cleanup verified by allocation-failure injection.
 - Structural AST equality includes primitive type nodes, allowing equal-shape spelling edits to retain parsed values while source-sensitive semantic queries still observe changed text.
 - End-of-file tokenization unwinds every open indentation level even without a trailing newline.
@@ -99,14 +100,15 @@ BuildExecutable(FileId) -> ?Executable
 
 ### Ordinary function semantics
 
-- `FunctionSignature(ItemId)` analyzes only a function header and owns its ordered `int` parameter types plus explicit `int` return type. Parameter modes and non-`int` types remain unsupported.
-- For declared functions, `AnalyzeFunctionBody(ItemId)` depends on the signature and accepts a straight-line block of immutable local bindings and bare calls ending in a supported return expression.
+- `FunctionSignature(ItemId)` analyzes only a function header and owns its ordered `int` parameter types plus an explicit `int` or `unit` return type. Parameter modes and non-`int` parameter types remain unsupported.
+- For declared functions, `AnalyzeFunctionBody(ItemId)` depends on the signature and accepts a straight-line block of immutable local bindings and bare calls ending in a supported return. Integer functions return an `int` expression; unit functions use a bare return or return a unit-valued expression.
 - The parser encodes precedence and nesting in the AST. Body analysis walks that expression tree into typed values: parameters, decimal integer constants, and calls are leaves, and unary negation plus binary `+`, `-`, `*`, and `/` compose them.
-- Calls accept arbitrary numbers of expressions evaluated left-to-right. The typed boundary validates arity against the callee signature; parameter and argument types are already `int` by construction in the current subset.
+- Calls accept arbitrary numbers of expressions evaluated left-to-right. The typed boundary validates arity and each argument type against the callee signature.
 - For the synthetic entry, `AnalyzeFunctionBody(ItemId)` accepts root-level `static` bindings and any number of bare calls, discards their values, and returns `unit`.
-- Unresolved-body construction resolves lexical local names and validates optional `int` annotations. The query then resolves calls and validates their signatures before publishing type-specific `FunctionBodyAnalysis`; SSA and codegen do not repeat those type checks.
-- A `const` binding names an existing typed value and emits no semantic or SSA instruction. Bindings and bare calls may be interleaved, aliases reuse the same value ID, and local integer values shadow module callables.
+- Unresolved-body construction resolves lexical local names and records optional `int` or `unit` annotations. The query then resolves calls and validates annotations, operations, arguments, and returns before publishing type-specific `FunctionBodyAnalysis`; SSA and codegen do not repeat those type checks.
+- A `const` binding names an existing typed value and emits no semantic or SSA instruction. Bindings and bare calls may be interleaved, aliases reuse the same value ID, and local values shadow module callables. Optional `int` and `unit` annotations are validated against their initializers.
 - Body analysis owns block and typed-instruction arrays containing stable identities and value-ID operands; it stores no AST indices, token spans, or borrowed source text.
+- Typed calls record their `int` or `unit` result type. Unit values are rejected at integer operation, argument, annotation, and return boundaries before typed IR is published.
 - Declared-function signature and body analysis depend explicitly on source text, so equal-shape spelling edits remain observable despite structural AST equality.
 - Equal signatures suppress downstream recomputation across body-only edits; body analysis recomputes independently.
 - Top-level `return` remains invalid through semantic analysis, ordinary lowering and compilation, and executable construction.
@@ -118,6 +120,7 @@ BuildExecutable(FileId) -> ?Executable
 - The minimal function SSA has explicit blocks with typed block arguments, ordered instruction results, symbolic calls targeted by `InstanceId`, and type-specific integer operations over value IDs; each block owns its terminator.
 - Block arguments and instruction results share one value-ID namespace. Calls reference ranges in one flat operand array, so neither parameter count nor call arity is encoded as an instruction kind.
 - Semantic and SSA functions share one block/value/instruction representation parameterized by call-target identity (`ItemId` before instantiation, `InstanceId` after it).
+- Lowering preserves each call's trusted result type, so discarded unit calls remain ordinary symbolic calls without acquiring a machine value location.
 - `SsaFunction` defines semantic equality and exact cleanup, so equal recomputation retains cached allocations and changed lowering replaces them safely.
 - Synthetic entries lower through the same `SsaFunction` query as declared functions.
 - Direct-call lowering remains independent of the callee body and lowering. Callee-body and declaration-reorder edits that preserve the target identity retain equal caller SSA, while target changes update the embedded `InstanceId`.
@@ -133,6 +136,7 @@ BuildExecutable(FileId) -> ?Executable
 - Signed 32-bit negation, addition, subtraction, multiplication, and division are emitted from type-specific integer instructions.
 - Location planning is separate from instruction emission. Regular immediate and stack encodings share one 32-bit encoder and an operation-to-opcode mapping; division remains explicit because its machine sequence is structurally different.
 - Calls may be discarded or returned, and may precede a returned integer. The current backend accepts one explicit straight-line block and reports other valid SSA shapes as `UnsupportedControlFlow`.
+- Unit-returning calls use the same argument, relocation, and reachability machinery as integer-returning calls; code generation emits the call but assigns no result location.
 - Artifact equality is content-based across code, alignment, relocations, and referenced instances. Cleanup independently frees all three owned slices exactly once, including every partial-allocation failure path.
 - Semantic failures and diagnostics remain transitive through compilation, while backend capability and function-size failures remain infrastructure errors.
 - Unit and direct-call synthetic entries compile independently to retained ordinary function artifacts without demanding or compiling the callee.
@@ -168,10 +172,10 @@ BuildExecutable(FileId) -> ?Executable
 ## Current temporary limitations
 
 - Static binding initializers are currently opaque to entry analysis; contextual validation inside them belongs to future general semantic analysis.
-- Function signatures support ordered `int` parameters and an explicit `int` return; inferred returns, parameter modes, named types, and compound types are deferred.
+- Function signatures support ordered `int` parameters and an explicit `int` or `unit` return; inferred returns, parameter modes, other parameter types, named types, and compound types are deferred.
 - `FunctionBodyAnalysis` and `SsaFunction` use explicit block tables but semantic analysis and code generation currently accept only one straight-line block; branches, loops, and multiple source returns are deferred.
 - Calls currently support only bare file-local function names. Arguments can be any supported expression; mutable locals, assignment, and nested lexical scopes are deferred.
-- Expressions currently support only decimal `int` constants, calls returning `int`, immutable-local references, unary negation, and binary `+`, `-`, `*`, and `/`; other value types and operators remain unsupported.
+- Expressions currently support only decimal `int` constants, calls returning `int` or `unit`, immutable-local references, unary negation, and binary `+`, `-`, `*`, and `/`. Unit values can be discarded, aliased, or returned from unit functions; other value types and operators remain unsupported.
 - `InstanceId` has no generic substitutions yet.
 - Callable scope is file-local and contains only functions; imports, visibility, other namespaces, and overloading are deferred.
 - Input updates are allowed only while no query is queued or running.
@@ -217,11 +221,11 @@ git diff --check
 
 Last observed results:
 
-- `zig test ast_new.zig`: 70 passed.
+- `zig test ast_new.zig`: 71 passed.
 - `zig test tokenizer.zig`: 31 passed.
 - `zig test diagnostics.zig`: 2 passed.
-- `zig test semantic.zig`: 72 passed.
-- `zig test query_new_test.zig`: 159 passed.
+- `zig test semantic.zig`: 73 passed.
+- `zig test query_new_test.zig`: 163 passed.
 - `zig test ssa.zig`: 6 passed.
 - `zig test codegen_new_test.zig`: 19 passed.
 - The legacy `zig test test.zig` remains blocked by an unrelated `query_cache.load` call/signature mismatch.

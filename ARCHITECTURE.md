@@ -17,6 +17,6 @@ This document records durable design boundaries, not current implementation stat
 - Control flow is block-structured: every basic block has exactly one terminator, while a function may contain multiple blocks and terminators.
 - Function compilation produces relocatable function artifacts; whole-program construction resolves references and emits the executable format.
 - Every file uses its synthetic top-level item as the program entry. A declaration named `main` is an ordinary function, and values produced by top-level statements are discarded because the entry result is `unit`.
-- The language `int` type is a signed 32-bit value, returned through the current internal x86-64 calling convention in `eax`. Integer arguments use the caller's fixed outgoing stack area; this internal convention does not imply compatibility with an external platform ABI.
+- The language `int` type is a signed 32-bit value, returned through the current internal x86-64 calling convention in `eax`. Functions returning `unit` manufacture no machine value. Integer arguments use the caller's fixed outgoing stack area; this internal convention does not imply compatibility with an external platform ABI.
 - Expected source errors are diagnostics, while query failures are reserved for infrastructure failures.
 - Refactored compiler stages emit `structures.Diagnostic` values; resolving source paths and rendering source lines belongs to the presentation layer.

@@ -14,6 +14,7 @@ pub fn lowerFunction(body: structures.FunctionBodyAnalysis, gpa: std.mem.Allocat
             .call => |call| .{ .call = .{
                 .target = .{ .item = call.target },
                 .arguments = call.arguments,
+                .return_type = call.return_type,
             } },
             .negi => |operand| .{ .negi = operand },
             .addi => |operands| .{ .addi = operands },
@@ -119,6 +120,7 @@ test "direct call lowers to owned value-equal symbolic SSA" {
     var instructions = [_]structures.FunctionBodyAnalysis.Instruction{.{ .call = .{
         .target = target,
         .arguments = .{ .start = 0, .end = 2 },
+        .return_type = .int,
     } }};
     var blocks = [_]structures.FunctionBodyAnalysis.Block{.{
         .argument_end = 2,
@@ -152,6 +154,7 @@ test "direct call SSA allocation failure leaves no partial result" {
     var instructions = [_]structures.FunctionBodyAnalysis.Instruction{.{ .call = .{
         .target = @enumFromInt(0),
         .arguments = .{ .start = 0, .end = 0 },
+        .return_type = .int,
     } }};
     var blocks = [_]structures.FunctionBodyAnalysis.Block{.{
         .instruction_start = 0,

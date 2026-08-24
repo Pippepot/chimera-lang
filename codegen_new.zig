@@ -51,6 +51,7 @@ const LocationPlan = struct {
         block: structures.SsaFunction.Block,
         gpa: std.mem.Allocator,
     ) error{ OutOfMemory, FunctionTooLarge }!LocationPlan {
+        for (ssa.block_argument_types) |argument_type| std.debug.assert(argument_type == .int);
         const needed = try gpa.alloc(bool, ssa.valueCount());
         defer gpa.free(needed);
         @memset(needed, false);
@@ -100,16 +101,25 @@ const LocationPlan = struct {
         var stack_slot_count: u32 = 0;
         for (ssa.instructions, locations[ssa.block_argument_types.len..], 0..) |instruction, *location, instruction_index| {
             const value_index = @intFromEnum(ssa.instructionValue(instruction_index));
-            location.* = switch (instruction) {
-                .consti => |value| .{ .immediate = value },
-                else => if (returned_value == value_index and instruction_index + 1 == ssa.instructions.len)
-                    .eax
-                else if (needed[value_index]) blk: {
+            location.* = location_blk: {
+                switch (instruction) {
+                    .consti => |value| break :location_blk .{ .immediate = value },
+                    .call => |call| if (call.return_type == .unit) {
+                        std.debug.assert(!needed[value_index]);
+                        break :location_blk .discarded;
+                    },
+                    else => {},
+                }
+                if (returned_value == value_index and instruction_index + 1 == ssa.instructions.len) {
+                    break :location_blk .eax;
+                }
+                if (needed[value_index]) {
                     const slot_offset = std.math.mul(u32, stack_slot_count, @sizeOf(i32)) catch return error.FunctionTooLarge;
                     stack_slot_count = std.math.add(u32, stack_slot_count, 1) catch return error.FunctionTooLarge;
                     const offset = std.math.add(u32, outgoing_size, slot_offset) catch return error.FunctionTooLarge;
-                    break :blk .{ .stack = offset };
-                } else .discarded,
+                    break :location_blk .{ .stack = offset };
+                }
+                break :location_blk .discarded;
             };
         }
         const local_size = std.math.mul(u32, stack_slot_count, @sizeOf(i32)) catch return error.FunctionTooLarge;

@@ -386,6 +386,7 @@ pub const ResolvedItem = struct {
 
 pub const Type = enum {
     int,
+    unit,
 };
 
 pub const FunctionValueId = enum(u32) { _ };
@@ -436,6 +437,7 @@ pub fn FunctionCall(comptime CallTarget: type) type {
     return struct {
         target: CallTarget,
         arguments: FunctionValueRange,
+        return_type: Type,
     };
 }
 

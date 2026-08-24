@@ -11,6 +11,7 @@ fn directCall(target: structures.InstanceId) structures.SsaFunction.Instruction 
     return .{ .call = .{
         .target = target,
         .arguments = .{ .start = 0, .end = 0 },
+        .return_type = .int,
     } };
 }
 

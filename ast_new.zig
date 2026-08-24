@@ -39,6 +39,7 @@ pub const ParseReport = struct {
 
 const ParserState = struct {
     gpa: std.mem.Allocator,
+    source: []const u8,
     tokens: []Token,
     index: u32,
     nodes: std.ArrayList(Node),
@@ -146,6 +147,7 @@ fn parseState(gpa: std.mem.Allocator, source: []const u8) !ParserState {
 
     var parser: ParserState = .{
         .gpa = gpa,
+        .source = source,
         .tokens = try tokens.toOwnedSlice(gpa),
         .index = 0,
         .nodes = .empty,
@@ -241,7 +243,12 @@ fn parseBody(parser: *ParserState) !Node.Index {
 
 fn parseReturn(parser: *ParserState) !Node.Index {
     const token_index = parser.index;
-    _ = try parser.expect(.keyword_return);
+    const return_token = try parser.expect(.keyword_return);
+    const next_token = parser.tokens[parser.index];
+    std.debug.assert(return_token.loc.end <= next_token.loc.start);
+    if (std.mem.indexOfScalar(u8, parser.source[return_token.loc.end..next_token.loc.start], '\n') != null) {
+        return try parser.addNode(.{ .tag = .return_nothing, .token_index = token_index, .data = .{ .none = {} } });
+    }
     if ((try parseExpression(parser)).unwrap()) |expr| {
         return try parser.addNode(.{ .tag = .return_expr, .token_index = token_index, .data = .{ .node = expr } });
     }
@@ -797,6 +804,22 @@ test "parse bare return" {
         \\  └─block
         \\    └─return_nothing
     );
+}
+
+test "parse inline bare return before another declaration" {
+    const source =
+        \\static noop = func() unit -> return
+        \\static value = func() int -> return 1
+    ;
+    var report = try parseReport(std.testing.allocator, 1, source);
+    defer report.deinit(std.testing.allocator);
+    const parsed = &report.ast.?;
+    const root = parsed.nodes[0];
+    try std.testing.expectEqual(@as(u32, 2), root.data.ref.end - root.data.ref.start);
+    const first_binding = parsed.nodes[parsed.node_refs[root.data.ref.start].index()];
+    const first_function = parsed.nodes[first_binding.data.node_node.b.index()];
+    try std.testing.expectEqual(Node.Tag.return_nothing, parsed.nodes[first_function.data.node_node.b.index()].tag);
+    try std.testing.expectEqual(Node.Tag.static_binding, parsed.nodes[parsed.node_refs[root.data.ref.start + 1].index()].tag);
 }
 
 test "parse function with parameters" {

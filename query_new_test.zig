@@ -1035,6 +1035,77 @@ test "function signature and body analysis support inline and block literal retu
     }
 }
 
+test "declared unit functions analyze lower compile and execute as ordinary callables" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static leaf = func(value: int) unit
+        \\  return
+        \\static caller = func() unit
+        \\  const done: unit = leaf(7)
+        \\  return done
+        \\caller()
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const leaf_id = scope.resolve("leaf").?;
+    const caller_id = scope.resolve("caller").?;
+
+    const leaf_signature = (try db.get(query_structures.FunctionSignature, leaf_id)).*.?;
+    try testing.expectEqualSlices(structures.Type, &.{.int}, leaf_signature.parameter_types);
+    try testing.expectEqual(structures.Type.unit, leaf_signature.return_type);
+    const leaf_body = (try db.get(query_structures.AnalyzeFunctionBody, leaf_id)).*.?;
+    try testing.expectEqualSlices(structures.Type, &.{.int}, leaf_body.block_argument_types);
+    try testing.expectEqual(structures.FunctionBodyAnalysis.Terminator.return_unit, leaf_body.blocks[0].terminator);
+
+    const caller_body = (try db.get(query_structures.AnalyzeFunctionBody, caller_id)).*.?;
+    try testing.expectEqual(@as(usize, 2), caller_body.instructions.len);
+    try testing.expectEqual(@as(i32, 7), caller_body.instructions[0].consti);
+    try testing.expectEqual(leaf_id, caller_body.instructions[1].call.target);
+    try testing.expectEqual(structures.Type.unit, caller_body.instructions[1].call.return_type);
+    try testing.expectEqual(structures.FunctionBodyAnalysis.Terminator.return_unit, caller_body.blocks[0].terminator);
+
+    const caller_ssa = (try db.get(query_structures.LowerToSSA, .{ .item = caller_id })).*.?;
+    try testing.expectEqual(structures.Type.unit, caller_ssa.instructions[1].call.return_type);
+    try testing.expectEqual(structures.SsaFunction.Terminator.return_unit, caller_ssa.blocks[0].terminator);
+    const leaf_artifact = (try db.get(query_structures.CompileFunction, .{ .item = leaf_id })).*.?;
+    try testing.expectEqualSlices(u8, &.{0xC3}, leaf_artifact.code);
+
+    const executable = (try db.get(query_structures.BuildExecutable, 1)).*.?;
+    const io = testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    runtime.writeProgram(io, executable.bytes);
+    try testing.expectEqual(@as(u8, 0), runtime.runProg(io, testing.allocator, &.{}));
+}
+
+test "unit values are rejected at int boundaries" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    const cases = [_]struct {
+        file_id: structures.FileId,
+        source: []const u8,
+        message: []const u8,
+    }{
+        .{ .file_id = 1, .source = "static bad = func() int -> return", .message = "function returning int must return a value" },
+        .{ .file_id = 2, .source = "static bad = func() unit -> return 1", .message = "return type does not match function signature" },
+        .{ .file_id = 3, .source = "static noop = func() unit\n  return\nstatic bad = func() int -> return noop()", .message = "return type does not match function signature" },
+        .{ .file_id = 4, .source = "static noop = func() unit\n  return\nstatic bad = func() int -> return noop() + 1", .message = "integer operation requires int operands" },
+        .{ .file_id = 5, .source = "static noop = func() unit\n  return\nstatic take = func(value: int) int -> return value\nstatic bad = func() int -> return take(noop())", .message = "call argument type does not match function signature" },
+        .{ .file_id = 6, .source = "static noop = func() unit\n  return\nstatic bad = func() unit\n  const done: int = noop()\n  return", .message = "local binding type does not match initializer" },
+    };
+    for (cases) |case| {
+        try addSource(db, case.file_id, case.source);
+        const scope = (try db.get(query_structures.BuildModuleScope, case.file_id)).*.?;
+        const bad_id = scope.resolve("bad").?;
+        try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, bad_id)).* == null);
+        const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, bad_id, structures.Diagnostic, testing.allocator);
+        defer freeDiagnostics(diagnostics);
+        try testing.expectEqual(@as(usize, 1), diagnostics.len);
+        try testing.expectEqualStrings(case.message, diagnostics[0].message);
+    }
+}
+
 test "function expressions analyze nested arithmetic and calls as one typed value graph" {
     const db = try testDatabase(2);
     defer db.deinit();
@@ -1263,7 +1334,7 @@ test "local binding diagnostics follow lexical scope and declared type" {
     }{
         .{ .file_id = 1, .source = "static f = func() int\n  const duplicate = 1\n  const duplicate = 2\n  return 1", .marker = "duplicate", .message = "duplicate local binding" },
         .{ .file_id = 2, .source = "static f = func() int\n  const x = missing\n  return x", .marker = "missing", .message = "unknown value" },
-        .{ .file_id = 3, .source = "static f = func() int\n  const x: float = 1\n  return x", .marker = "float", .message = "only int local bindings are supported yet" },
+        .{ .file_id = 3, .source = "static f = func() int\n  const x: float = 1\n  return x", .marker = "float", .message = "only int and unit local bindings are supported yet" },
         .{ .file_id = 4, .source = "static f = func() int\n  const leaf = 1\n  return leaf()", .marker = "leaf", .message = "value is not callable" },
     };
     for (cases) |case| {
@@ -1295,7 +1366,7 @@ test "local initializer calls are typed through the callee signature" {
     const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, user_id, structures.Diagnostic, testing.allocator);
     defer freeDiagnostics(diagnostics);
     try testing.expectEqual(@as(usize, 1), diagnostics.len);
-    try testing.expectEqualStrings("only int return type is supported yet", diagnostics[0].message);
+    try testing.expectEqualStrings("only int and unit return types are supported yet", diagnostics[0].message);
 }
 
 test "body edits preserve signature consumers and update body analysis" {
@@ -1327,8 +1398,9 @@ test "function signature rejects invalid parameter and return types without dupl
     try addSource(db, 4, "static bad_param = func(x: float) int -> return 1");
     try addSource(db, 5, "static duplicate = func(x: int, x: int) int -> return 1");
     try addSource(db, 6, "static mode = func(read x: int) int -> return 1");
+    try addSource(db, 7, "static unit_param = func(x: unit) unit -> return");
 
-    for ([_]structures.FileId{ 1, 2, 3, 4, 5, 6 }) |file_id| {
+    for ([_]structures.FileId{ 1, 2, 3, 4, 5, 6, 7 }) |file_id| {
         const function_id = (try db.get(query_structures.IndexItems, file_id)).*.?.ids()[0];
         try testing.expect((try db.get(query_structures.FunctionSignature, function_id)).* == null);
         try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, function_id)).* == null);
@@ -1551,7 +1623,7 @@ test "entry call lookup reports only the demanded resolution failure" {
     const unsupported_diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, unsupported_entry, structures.Diagnostic, testing.allocator);
     defer freeDiagnostics(unsupported_diagnostics);
     try testing.expectEqual(@as(usize, 1), unsupported_diagnostics.len);
-    try testing.expectEqualStrings("only int return type is supported yet", unsupported_diagnostics[0].message);
+    try testing.expectEqualStrings("only int and unit return types are supported yet", unsupported_diagnostics[0].message);
 
     try addSource(db, 3,
         \\static duplicate = func() int -> return 1
@@ -1625,6 +1697,36 @@ test "entry call dependencies follow spelling identity and runtime shape" {
 
     try setSource(db, 1, alpha_source);
     try testing.expectEqual(alpha_id, (try db.get(EntryCallParent, 1)).*.?);
+}
+
+test "call result types track signature changes while equal artifacts are retained" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static target = func() unit
+        \\  return
+        \\target()
+    );
+    const entry_id = (try db.get(query_structures.SelectEntry, 1)).*.?;
+    const instance: structures.InstanceId = .{ .item = entry_id };
+    const initial_body = try db.get(query_structures.AnalyzeFunctionBody, entry_id);
+    const initial_ssa = try db.get(query_structures.LowerToSSA, instance);
+    const initial_artifact = try db.get(query_structures.CompileFunction, instance);
+    try testing.expectEqual(structures.Type.unit, initial_body.*.?.instructions[0].call.return_type);
+    try testing.expectEqual(structures.Type.unit, initial_ssa.*.?.instructions[0].call.return_type);
+
+    try setSource(db, 1,
+        \\static target = func() int -> return 1
+        \\target()
+    );
+    const updated_body = try db.get(query_structures.AnalyzeFunctionBody, entry_id);
+    const updated_ssa = try db.get(query_structures.LowerToSSA, instance);
+    try testing.expect(initial_body != updated_body);
+    try testing.expect(initial_ssa != updated_ssa);
+    try testing.expectEqual(structures.Type.int, updated_body.*.?.instructions[0].call.return_type);
+    try testing.expectEqual(structures.Type.int, updated_ssa.*.?.instructions[0].call.return_type);
+    try testing.expectEqual(initial_artifact, try db.get(query_structures.CompileFunction, instance));
 }
 
 test "entry call diagnostics and downstream refusal update and recover" {
