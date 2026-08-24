@@ -71,10 +71,18 @@ const body_shape_message = "function body must end in one return; preceding stat
 const return_value_message = "function return expression is not supported yet";
 const expression_message = "expression is not supported yet";
 
-pub fn buildUnresolvedEntryBody(ast: *const structures.Ast, source: []const u8, declaration: u32, gpa: std.mem.Allocator) !UnresolvedBodyResult {
-    const root = ast.nodes[declaration];
-    std.debug.assert(root.tag == .block);
-
+/// Builds one unresolved body for either callable kind. Entries accept bare
+/// calls and skip static bindings under a synthetic zero-parameter signature;
+/// declared functions additionally accept annotated const bindings and must
+/// end in a return.
+pub fn buildUnresolvedBody(
+    ast: *const structures.Ast,
+    source: []const u8,
+    declaration: u32,
+    kind: structures.ItemKind,
+    parameter_types: []const structures.Type,
+    gpa: std.mem.Allocator,
+) !UnresolvedBodyResult {
     var instructions: std.ArrayList(UnresolvedBody.Instruction) = .empty;
     defer instructions.deinit(gpa);
     var type_expectations: std.ArrayList(UnresolvedBody.TypeExpectation) = .empty;
@@ -88,13 +96,55 @@ pub fn buildUnresolvedEntryBody(ast: *const structures.Ast, source: []const u8, 
     var expression_builder: UnresolvedExpressionBuilder = .{
         .ast = ast,
         .source = source,
-        .parameter_count = 0,
+        .parameter_count = parameter_types.len,
         .locals = &locals,
         .instructions = &instructions,
         .call_arguments = &call_arguments,
         .scratch = &expression_scratch,
         .gpa = gpa,
     };
+
+    const tail_result: UnresolvedTailResult = switch (kind) {
+        .top_level_entry => try unresolvedEntryTail(ast, declaration, &expression_builder),
+        .function => try unresolvedFunctionTail(ast, source, declaration, parameter_types, &locals, &type_expectations, &expression_builder, gpa),
+    };
+    const tail = switch (tail_result) {
+        .unsupported => |issue| return .{ .unsupported = issue },
+        .tail => |tail_value| tail_value,
+    };
+
+    const owned_call_arguments = try call_arguments.toOwnedSlice(gpa);
+    errdefer gpa.free(owned_call_arguments);
+    const owned_type_expectations = try type_expectations.toOwnedSlice(gpa);
+    errdefer gpa.free(owned_type_expectations);
+    return .{ .success = .{
+        .call_arguments = owned_call_arguments,
+        .instructions = try instructions.toOwnedSlice(gpa),
+        .type_expectations = owned_type_expectations,
+        .block = .{
+            .terminator = tail.terminator,
+            .return_span = tail.return_span,
+        },
+    } };
+}
+
+const UnresolvedBodyTail = struct {
+    terminator: UnresolvedBody.Terminator,
+    return_span: structures.SourceSpan,
+};
+
+const UnresolvedTailResult = union(enum) {
+    unsupported: Issue,
+    tail: UnresolvedBodyTail,
+};
+
+fn unresolvedEntryTail(
+    ast: *const structures.Ast,
+    declaration: u32,
+    expression_builder: *UnresolvedExpressionBuilder,
+) std.mem.Allocator.Error!UnresolvedTailResult {
+    const root = ast.nodes[declaration];
+    std.debug.assert(root.tag == .block);
     for (root.data.ref.start..root.data.ref.end) |ref_index| {
         const child_index = ast.node_refs[ref_index];
         const child = ast.nodes[child_index.index()];
@@ -107,19 +157,119 @@ pub fn buildUnresolvedEntryBody(ast: *const structures.Ast, source: []const u8, 
             .unsupported => |issue| return .{ .unsupported = issue },
         }
     }
-    const owned_call_arguments = try call_arguments.toOwnedSlice(gpa);
-    errdefer gpa.free(owned_call_arguments);
-    const owned_type_expectations = try type_expectations.toOwnedSlice(gpa);
-    errdefer gpa.free(owned_type_expectations);
-    return .{ .success = .{
-        .call_arguments = owned_call_arguments,
-        .instructions = try instructions.toOwnedSlice(gpa),
-        .type_expectations = owned_type_expectations,
-        .block = .{
-            .terminator = .return_unit,
-            .return_span = tokenSpan(ast, root.token_index),
-        },
+    return .{ .tail = .{
+        .terminator = .return_unit,
+        .return_span = tokenSpan(ast, root.token_index),
     } };
+}
+
+fn unresolvedFunctionTail(
+    ast: *const structures.Ast,
+    source: []const u8,
+    declaration: u32,
+    parameter_types: []const structures.Type,
+    locals: *std.StringHashMap(UnresolvedBody.ValueId),
+    type_expectations: *std.ArrayList(UnresolvedBody.TypeExpectation),
+    expression_builder: *UnresolvedExpressionBuilder,
+    gpa: std.mem.Allocator,
+) std.mem.Allocator.Error!UnresolvedTailResult {
+    const parts = functionParts(ast, declaration);
+    const function_signature = ast.nodes[parts.signature.index()];
+    var parameters = AstNodeListIterator.init(ast, function_signature.data.node_node.a, .param_list_small, .param_list);
+    var parameter_index: usize = 0;
+    while (parameters.next()) |parameter_node_index| : (parameter_index += 1) {
+        const parameter = ast.nodes[parameter_node_index.index()];
+        const name_span = tokenSpan(ast, parameter.token_index);
+        try locals.put(source[name_span.start..name_span.end], @enumFromInt(parameter_index));
+    }
+    std.debug.assert(parameter_index == parameter_types.len);
+
+    const body = ast.nodes[parts.body.index()];
+    const return_index: structures.Node.Index = if (body.tag == .return_expr or body.tag == .return_nothing)
+        parts.body
+    else if (body.tag == .block) blk: {
+        if (body.data.ref.start == body.data.ref.end) {
+            return .{ .unsupported = issueAt(ast, parts.body.index(), body_shape_message) };
+        }
+        const return_ref = body.data.ref.end - 1;
+        for (body.data.ref.start..return_ref) |ref_index| {
+            const statement_index = ast.node_refs[ref_index];
+            const statement = ast.nodes[statement_index.index()];
+            switch (statement.tag) {
+                .const_binding => switch (try appendConstBinding(ast, source, statement_index, locals, type_expectations, expression_builder, gpa)) {
+                    .success => {},
+                    .unsupported => |issue| return .{ .unsupported = issue },
+                },
+                .call => switch (try expression_builder.append(statement_index)) {
+                    .success => {},
+                    .unsupported => |issue| return .{ .unsupported = issue },
+                },
+                else => return .{ .unsupported = issueAt(ast, statement_index.index(), body_shape_message) },
+            }
+        }
+        break :blk ast.node_refs[return_ref];
+    } else {
+        return .{ .unsupported = issueAt(ast, parts.body.index(), body_shape_message) };
+    };
+
+    const return_node = ast.nodes[return_index.index()];
+    const terminator: UnresolvedBody.Terminator = switch (return_node.tag) {
+        .return_nothing => .return_unit,
+        .return_expr => blk: {
+            const value_index = return_node.data.node.unwrap() orelse
+                return .{ .unsupported = issueAt(ast, return_index.index(), return_value_message) };
+            const return_value = switch (try expression_builder.append(value_index)) {
+                .success => |value| value,
+                .unsupported => |issue| return .{ .unsupported = issue },
+            };
+            break :blk .{ .return_value = return_value };
+        },
+        else => return .{ .unsupported = issueAt(ast, return_index.index(), body_shape_message) },
+    };
+    return .{ .tail = .{
+        .terminator = terminator,
+        .return_span = tokenSpan(ast, return_node.token_index),
+    } };
+}
+
+fn appendConstBinding(
+    ast: *const structures.Ast,
+    source: []const u8,
+    statement_index: structures.Node.Index,
+    locals: *std.StringHashMap(UnresolvedBody.ValueId),
+    type_expectations: *std.ArrayList(UnresolvedBody.TypeExpectation),
+    expression_builder: *UnresolvedExpressionBuilder,
+    gpa: std.mem.Allocator,
+) std.mem.Allocator.Error!ExpressionResult {
+    const statement = ast.nodes[statement_index.index()];
+    const name_span = tokenSpan(ast, statement.token_index);
+    const name = source[name_span.start..name_span.end];
+    if (locals.contains(name)) {
+        return .{ .unsupported = .{ .span = name_span, .message = "duplicate local binding" } };
+    }
+    const annotation = statement.data.node_node.a.unwrap();
+    const expected_type = if (annotation) |type_node|
+        analyzeType(ast, source, type_node) orelse
+            return .{ .unsupported = issueAt(ast, type_node.index(), "only int and unit local bindings are supported yet") }
+    else
+        null;
+    const initializer = statement.data.node_node.b.unwrap() orelse unreachable;
+    const value = switch (try expression_builder.append(initializer)) {
+        .success => |value| value,
+        .unsupported => |issue| return .{ .unsupported = issue },
+    };
+    if (expected_type) |expected| {
+        const type_node = annotation.?;
+        try type_expectations.append(gpa, .{
+            .value = value,
+            .expected = expected,
+            .span = tokenSpan(ast, ast.nodes[type_node.index()].token_index),
+            .instruction_count = @intCast(expression_builder.instructions.items.len),
+        });
+    }
+    try locals.put(name, value);
+    // A binding evaluates to its bound value, mirroring the initializer.
+    return .{ .success = value };
 }
 
 const FunctionParts = struct {
@@ -162,128 +312,6 @@ pub fn analyzeFunctionSignature(ast: *const structures.Ast, source: []const u8, 
         return .{ .unsupported = issueAt(ast, return_type_index.index(), "only int and unit return types are supported yet") };
 
     return .{ .success = .{ .parameter_types = try parameter_types.toOwnedSlice(gpa), .return_type = return_type } };
-}
-
-pub fn buildUnresolvedFunctionBody(
-    ast: *const structures.Ast,
-    source: []const u8,
-    declaration: u32,
-    signature: structures.FunctionSignature,
-    gpa: std.mem.Allocator,
-) !UnresolvedBodyResult {
-    const parts = functionParts(ast, declaration);
-    const body = ast.nodes[parts.body.index()];
-    var instructions: std.ArrayList(UnresolvedBody.Instruction) = .empty;
-    defer instructions.deinit(gpa);
-    var type_expectations: std.ArrayList(UnresolvedBody.TypeExpectation) = .empty;
-    defer type_expectations.deinit(gpa);
-    var call_arguments: std.ArrayList(UnresolvedBody.ValueId) = .empty;
-    defer call_arguments.deinit(gpa);
-    var expression_scratch: std.ArrayList(UnresolvedBody.ValueId) = .empty;
-    defer expression_scratch.deinit(gpa);
-    var locals = std.StringHashMap(UnresolvedBody.ValueId).init(gpa);
-    defer locals.deinit();
-
-    const function_signature = ast.nodes[parts.signature.index()];
-    var parameters = AstNodeListIterator.init(ast, function_signature.data.node_node.a, .param_list_small, .param_list);
-    var parameter_index: usize = 0;
-    while (parameters.next()) |parameter_node_index| : (parameter_index += 1) {
-        const parameter = ast.nodes[parameter_node_index.index()];
-        const name_span = tokenSpan(ast, parameter.token_index);
-        try locals.put(source[name_span.start..name_span.end], @enumFromInt(parameter_index));
-    }
-    std.debug.assert(parameter_index == signature.parameter_types.len);
-
-    var expression_builder: UnresolvedExpressionBuilder = .{
-        .ast = ast,
-        .source = source,
-        .parameter_count = signature.parameter_types.len,
-        .locals = &locals,
-        .instructions = &instructions,
-        .call_arguments = &call_arguments,
-        .scratch = &expression_scratch,
-        .gpa = gpa,
-    };
-
-    const return_index: structures.Node.Index = if (body.tag == .return_expr or body.tag == .return_nothing)
-        parts.body
-    else if (body.tag == .block) blk: {
-        if (body.data.ref.start == body.data.ref.end) {
-            return .{ .unsupported = issueAt(ast, parts.body.index(), body_shape_message) };
-        }
-        const return_ref = body.data.ref.end - 1;
-        for (body.data.ref.start..return_ref) |ref_index| {
-            const statement_index = ast.node_refs[ref_index];
-            const statement = ast.nodes[statement_index.index()];
-            switch (statement.tag) {
-                .const_binding => {
-                    const name_span = tokenSpan(ast, statement.token_index);
-                    const name = source[name_span.start..name_span.end];
-                    if (locals.contains(name)) {
-                        return .{ .unsupported = .{ .span = name_span, .message = "duplicate local binding" } };
-                    }
-                    const annotation = statement.data.node_node.a.unwrap();
-                    const expected_type = if (annotation) |type_node|
-                        analyzeType(ast, source, type_node) orelse
-                            return .{ .unsupported = issueAt(ast, type_node.index(), "only int and unit local bindings are supported yet") }
-                    else
-                        null;
-                    const initializer = statement.data.node_node.b.unwrap() orelse unreachable;
-                    const value = switch (try expression_builder.append(initializer)) {
-                        .success => |value| value,
-                        .unsupported => |issue| return .{ .unsupported = issue },
-                    };
-                    if (expected_type) |expected| {
-                        const type_node = annotation.?;
-                        try type_expectations.append(gpa, .{
-                            .value = value,
-                            .expected = expected,
-                            .span = tokenSpan(ast, ast.nodes[type_node.index()].token_index),
-                            .instruction_count = @intCast(instructions.items.len),
-                        });
-                    }
-                    try locals.put(name, value);
-                },
-                .call => switch (try expression_builder.append(statement_index)) {
-                    .success => {},
-                    .unsupported => |issue| return .{ .unsupported = issue },
-                },
-                else => return .{ .unsupported = issueAt(ast, statement_index.index(), body_shape_message) },
-            }
-        }
-        break :blk ast.node_refs[return_ref];
-    } else {
-        return .{ .unsupported = issueAt(ast, parts.body.index(), body_shape_message) };
-    };
-
-    const return_node = ast.nodes[return_index.index()];
-    const terminator: UnresolvedBody.Terminator = switch (return_node.tag) {
-        .return_nothing => .return_unit,
-        .return_expr => blk: {
-            const value_index = return_node.data.node.unwrap() orelse
-                return .{ .unsupported = issueAt(ast, return_index.index(), return_value_message) };
-            const return_value = switch (try expression_builder.append(value_index)) {
-                .success => |value| value,
-                .unsupported => |issue| return .{ .unsupported = issue },
-            };
-            break :blk .{ .return_value = return_value };
-        },
-        else => return .{ .unsupported = issueAt(ast, return_index.index(), body_shape_message) },
-    };
-
-    const owned_call_arguments = try call_arguments.toOwnedSlice(gpa);
-    errdefer gpa.free(owned_call_arguments);
-    const owned_type_expectations = try type_expectations.toOwnedSlice(gpa);
-    errdefer gpa.free(owned_type_expectations);
-    return .{ .success = .{
-        .call_arguments = owned_call_arguments,
-        .instructions = try instructions.toOwnedSlice(gpa),
-        .type_expectations = owned_type_expectations,
-        .block = .{
-            .terminator = terminator,
-            .return_span = tokenSpan(ast, return_node.token_index),
-        },
-    } };
 }
 
 const ExpressionResult = union(enum) {
@@ -554,10 +582,7 @@ fn testUnresolvedFunctionBodyAllocations(gpa: std.mem.Allocator) !void {
     defer report.deinit(std.testing.allocator);
     const parsed = &report.ast.?;
     const declaration = parsed.node_refs[parsed.nodes[0].data.ref.start];
-    const result = try buildUnresolvedFunctionBody(parsed, source, declaration.index(), .{
-        .parameter_types = &.{ .int, .int, .int },
-        .return_type = .int,
-    }, gpa);
+    const result = try buildUnresolvedBody(parsed, source, declaration.index(), .function, &.{ .int, .int, .int }, gpa);
     switch (result) {
         .success => |unresolved_value| {
             var unresolved = unresolved_value;
