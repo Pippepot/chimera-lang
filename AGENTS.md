@@ -14,6 +14,7 @@ Build clear, correct code with the least total machinery.
 - Before choosing a representation, enumerate every shape required by the current milestone and separate independent semantic dimensions. Do not encode the first syntax shape or test case as a semantic kind.
 - Generalize expression structure separately from operation typing. Once types are known, use type-specific operations; do not add one-variant value unions or repeated type fields in anticipation of future types.
 - Avoid a helper used only once when it adds indirection without meaningful clarity.
+- Keep switch arms at statement level. When a case needs more than a few statements, move its body into a named function so each arm reads as intent; the arm names the variant's outcome, the function owns the steps.
 - Follow the style of the file being edited. Prefer fully qualified names except for obvious shorthand such as AST.
 - Look for nearby patterns and reusable functionality before creating a new implementation.
 - Follow the Zig 0.16 APIs used by nearby code and verify assumptions with the local compiler.

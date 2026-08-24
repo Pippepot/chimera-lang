@@ -399,6 +399,8 @@ pub const Database = struct {
 
     fn waitFor(db: *Database, comptime Q: type, entry: *Entry, waiter: ?*Context) anyerror!*const Q.Output {
         try db.waitForEntry(entry, if (waiter) |ctx| ctx.worker_index else null);
+        // Output payloads are boxed, so an absent value such as a failed
+        // parse's `?Ast = null` still has a non-null box pointer here.
         return @ptrCast(@alignCast(entry.output_ptr.?));
     }
 
@@ -468,6 +470,10 @@ pub const Database = struct {
                 db.commitComputationLocked(entry, output);
             },
             .failure => |err| {
+                // Infrastructure failure: discard the fresh computation but
+                // keep the last completed memo. A later demand revalidates the
+                // recorded dependencies and can restore `.complete` without
+                // rerunning `Q.run`, so transient failures stay retryable.
                 if (entry.computation) |*computation| db.deinitComputation(computation);
                 entry.computation = null;
                 entry.err = err;
