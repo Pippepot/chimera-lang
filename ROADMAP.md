@@ -191,7 +191,7 @@ BuildExecutable(FileId) -> ?Executable
 - Add module- and item-level queries for declarations, scopes, type definitions, layouts, and compile-time values.
 - Add per-function or per-instance name resolution, typing, diagnostics, lowering, and code generation only as each slice requires.
 - Extend SSA and codegen only as each semantic feature requires.
-- Next prioritize control flow and observable output, before aggregate, compile-time, variant, and ownership features.
+- Next prioritize control flow and observable output, before aggregate, compile-time, variant, and ownership features. The selected first effect is an `exit(value: int)` intrinsic.
 - Port relevant legacy behavior and regression tests with each supported feature, not as a final batch.
 - Keep machine addresses and executable layout out of semantic and SSA results.
 - Preserve the boundary between relocatable function emission and whole-program executable construction.
@@ -228,9 +228,10 @@ Last observed results:
 - `zig test query_new_test.zig`: 163 passed.
 - `zig test ssa.zig`: 6 passed.
 - `zig test codegen_new_test.zig`: 19 passed.
-- The legacy `zig test test.zig` remains blocked by an unrelated `query_cache.load` call/signature mismatch.
+- The legacy `zig test legacy/test.zig` remains blocked by an unrelated `query_cache.load` call/signature mismatch.
 
 ## Handoff notes
 
-- `query_new.zig`, `query_new_test.zig`, `query_structures.zig`, `structures.zig`, `ast_new.zig`, `diagnostics.zig`, `ssa.zig`, and `codegen_new.zig` are the main files for the current refactor path.
+- `query_new.zig`, `query_new_test.zig`, `query_structures.zig`, `structures.zig`, `ast_new.zig`, `diagnostics.zig`, `typing.zig`, `ssa.zig`, and `codegen_new.zig` are the main files for the current refactor path.
+- The refactor path owns the repository root. The legacy pipeline and CLI live under `legacy/` with their own copy of `runtime.zig` and import nothing from the refactor path.
 - Run `git status --short` before editing and preserve all user-owned changes.
