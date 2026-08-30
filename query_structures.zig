@@ -258,9 +258,9 @@ pub const CompileFunction = struct {
     }
 };
 
-pub const BuildExecutable = struct {
+pub const CollectReachableInstances = struct {
     pub const Input = structures.FileId;
-    pub const Output = ?structures.Executable;
+    pub const Output = ?structures.ReachableInstances;
 
     pub fn run(ctx: anytype, file_id: Input) anyerror!Output {
         const entry_id = (try ctx.get(SelectEntry, file_id)).* orelse return null;
@@ -270,8 +270,6 @@ pub const BuildExecutable = struct {
         defer instances.deinit(ctx.allocator());
         var seen = std.AutoHashMap(structures.InstanceId, void).init(ctx.allocator());
         defer seen.deinit();
-        var functions: std.ArrayList(codegen.ReachableFunction) = .empty;
-        defer functions.deinit(ctx.allocator());
 
         try instances.append(ctx.allocator(), entry);
         try seen.put(entry, {});
@@ -279,13 +277,33 @@ pub const BuildExecutable = struct {
         while (next < instances.items.len) : (next += 1) {
             const instance = instances.items[next];
             const artifact = (try ctx.get(CompileFunction, instance)).* orelse return null;
-            try functions.append(ctx.allocator(), .{ .instance = instance, .artifact = artifact });
             for (artifact.referenced_instances) |referenced| {
                 const result = try seen.getOrPut(referenced);
                 if (!result.found_existing) try instances.append(ctx.allocator(), referenced);
             }
         }
 
+        return .{ .instances = try instances.toOwnedSlice(ctx.allocator()) };
+    }
+};
+
+pub const BuildExecutable = struct {
+    pub const Input = structures.FileId;
+    pub const Output = ?structures.Executable;
+
+    pub fn run(ctx: anytype, file_id: Input) anyerror!Output {
+        const reachable = (try ctx.get(CollectReachableInstances, file_id)).* orelse return null;
+        std.debug.assert(reachable.instances.len != 0);
+
+        var functions: std.ArrayList(codegen.ReachableFunction) = .empty;
+        defer functions.deinit(ctx.allocator());
+        try functions.ensureTotalCapacity(ctx.allocator(), reachable.instances.len);
+        for (reachable.instances) |instance| {
+            const artifact = (try ctx.get(CompileFunction, instance)).* orelse unreachable;
+            functions.appendAssumeCapacity(.{ .instance = instance, .artifact = artifact });
+        }
+
+        const entry = reachable.instances[0];
         return try codegen.buildExecutable(entry, functions.items, ctx.allocator());
     }
 };

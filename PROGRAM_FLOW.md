@@ -21,7 +21,9 @@ flowchart TD
     FS -->|"validate calls / returns"| AB
     AB --> SSA["LowerToSSA(InstanceId)<br/>→ ?SsaFunction (ssa.zig)"]
     SSA --> CF["CompileFunction(InstanceId)<br/>→ ?CompiledFunction (codegen_new.zig,<br/>relocatable: code + relocations<br/>+ referenced_instances)"]
-    SE --> BE["BuildExecutable(FileId) → ?Executable<br/>BFS over referenced_instances,<br/>layout + resolve relocations (codegen_new.zig)"]
+    SE --> CRI["CollectReachableInstances(FileId)<br/>→ ?ReachableInstances<br/>BFS over referenced_instances"]
+    CF --> CRI
+    CRI --> BE["BuildExecutable(FileId) → ?Executable<br/>layout + resolve relocations (codegen_new.zig)"]
     CF --> BE
 ```
 
@@ -63,10 +65,11 @@ Ownership follows one rule: **cached values own their allocations; identities ar
 | " | `FunctionBodyAnalysis` | `FunctionIr(ItemId)`: flat arrays of block args, branch operands, call operands, typed instructions, blocks |
 | " | `SsaFunction` | Same shape as above with symbolic `InstanceId` call targets |
 | " | `CompiledFunction` | Relocatable machine code + relocation records + referenced-instance table; no addresses |
+| " | `ReachableInstances` | Deterministic breadth-first list of stable instance identities |
 | " | `Executable` | Final linked bytes; consumer must copy before `Database.deinit` |
 | Per-recompute metadata | `Entry.deps`, `Entry.input_deps` | Fresh dependency edge lists committed atomically or discarded |
 | Query-transient (freed within one query run) | `UnresolvedBody` | Name-resolution scratch built by semantic.zig, consumed and freed before publishing `FunctionBodyAnalysis` |
-| " | BFS sets, scratch lists | e.g. reachability set in `BuildExecutable` |
+| " | BFS set and scratch list | Reachability scratch inside `CollectReachableInstances` |
 | Beyond the process | `Executable.bytes` | Copied into the `./prog` file by `runtime.writeProgram` |
 
 Result pointers are stable across equal recomputations but must be treated as invalid once a changed recomputation replaces a memo.

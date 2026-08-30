@@ -179,7 +179,7 @@ The repository root now has a new-pipeline CLI in `main.zig`. `legacy/main.zig` 
 
 ### General reachable-function linking
 
-- `BuildExecutable` breadth-first traverses deterministic referenced-instance tables, compiles each reachable instance once, and terminates on shared targets and cycles by marking identities before enqueueing them.
+- `CollectReachableInstances` breadth-first traverses deterministic referenced-instance tables, compiles each reachable instance once, and terminates on shared targets and cycles by marking identities before enqueueing them. `BuildExecutable` and SSA debug rendering consume its cached order.
 - The linker accepts a pre-collected artifact graph, rejects duplicate, missing-entry, missing-reference, and malformed-relocation metadata, and lays out each supplied artifact once in collection order.
 - Every relocation is patched after layout using the target artifact's recorded address; reference bounds, patch-field bounds, alignment, signed 32-bit displacement, and addends are validated independently of frontend-producible graph shapes.
 - Callee compile failure (a semantic issue in the called function's body) surfaces as `BuildExecutable` returning `null` with the callee's diagnostic transitively attached; this is demand-driven specifically by `BuildExecutable`'s own dependency on the callee's `CompileFunction`, since entry analysis itself validates only the callee's signature.

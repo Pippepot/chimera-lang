@@ -20,31 +20,14 @@ pub fn renderAst(
 pub fn renderReachableSsa(
     db: *query.Database,
     file_id: structures.FileId,
-    gpa: std.mem.Allocator,
     writer: *std.Io.Writer,
 ) !void {
-    const entry_id = (try db.get(queries.SelectEntry, file_id)).* orelse unreachable;
-    const entry: structures.InstanceId = .{ .item = entry_id };
-
-    var instances: std.ArrayList(structures.InstanceId) = .empty;
-    defer instances.deinit(gpa);
-    var seen = std.AutoHashMap(structures.InstanceId, void).init(gpa);
-    defer seen.deinit();
+    const reachable = (try db.get(queries.CollectReachableInstances, file_id)).* orelse unreachable;
 
     try writer.writeAll("SSA\n");
-    try instances.append(gpa, entry);
-    try seen.put(entry, {});
-    var next: usize = 0;
-    while (next < instances.items.len) : (next += 1) {
-        const instance = instances.items[next];
+    for (reachable.instances) |instance| {
         const lowered = (try db.get(queries.LowerToSSA, instance)).* orelse unreachable;
         try renderSsaFunction(db, instance, &lowered, writer);
-
-        const artifact = (try db.get(queries.CompileFunction, instance)).* orelse unreachable;
-        for (artifact.referenced_instances) |referenced| {
-            const result = try seen.getOrPut(referenced);
-            if (!result.found_existing) try instances.append(gpa, referenced);
-        }
     }
 }
 

@@ -121,7 +121,7 @@ fn compileAndRun(
     std.debug.assert(emitted.len == 0);
     const executable = executable_result.*.?;
 
-    if (input.debug_flags.ssa) try debug.renderReachableSsa(db, file_id, gpa, output);
+    if (input.debug_flags.ssa) try debug.renderReachableSsa(db, file_id, output);
     if (input.debug_flags.@"asm") try debug.renderAssembly(executable, gpa, output);
     try output.flush();
     const debug_finished = std.Io.Clock.awake.now(io);

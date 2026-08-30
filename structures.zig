@@ -538,6 +538,25 @@ pub const InstanceId = struct {
     item: ItemId,
 };
 
+/// Owned deterministic breadth-first order of instances reachable from an entry.
+/// The slice is nonempty and stores the entry first.
+pub const ReachableInstances = struct {
+    instances: []const InstanceId,
+
+    pub fn eql(a: ReachableInstances, b: ReachableInstances) bool {
+        if (a.instances.len != b.instances.len) return false;
+        for (a.instances, b.instances) |left, right| {
+            if (!std.meta.eql(left, right)) return false;
+        }
+        return true;
+    }
+
+    pub fn deinit(self: *ReachableInstances, gpa: std.mem.Allocator) void {
+        gpa.free(self.instances);
+        self.* = undefined;
+    }
+};
+
 /// Owned per-instance SSA control-flow graph.
 pub const SsaFunction = FunctionIr(InstanceId);
 

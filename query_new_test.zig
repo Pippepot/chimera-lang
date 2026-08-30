@@ -2017,6 +2017,40 @@ test "BuildExecutable links and runs transitively reachable calls" {
     try testing.expectEqual(@as(u8, 0), runtime.runProg(io, testing.allocator, &.{}));
 }
 
+test "CollectReachableInstances publishes stable breadth-first order" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static shared = func() int -> return 1
+        \\static left = func() int -> return shared()
+        \\static right = func() int -> return shared()
+        \\left()
+        \\right()
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const entry: structures.InstanceId = .{ .item = (try db.get(query_structures.SelectEntry, 1)).*.? };
+    const left: structures.InstanceId = .{ .item = scope.resolve("left").? };
+    const right: structures.InstanceId = .{ .item = scope.resolve("right").? };
+    const shared: structures.InstanceId = .{ .item = scope.resolve("shared").? };
+
+    const initial = try db.get(query_structures.CollectReachableInstances, 1);
+    try testing.expectEqualSlices(
+        structures.InstanceId,
+        &.{ entry, left, right, shared },
+        initial.*.?.instances,
+    );
+
+    try setSource(db, 1,
+        \\static shared = func() int -> return 2
+        \\static left = func() int -> return shared()
+        \\static right = func() int -> return shared()
+        \\left()
+        \\right()
+    );
+    try testing.expectEqual(initial, try db.get(query_structures.CollectReachableInstances, 1));
+}
+
 test "BuildExecutable collects cyclic reachability without recursive compilation" {
     const db = try testDatabase(2);
     defer db.deinit();

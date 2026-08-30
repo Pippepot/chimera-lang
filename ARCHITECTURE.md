@@ -19,6 +19,7 @@ This document records durable design boundaries, not current implementation stat
 - Parameters are entry-block arguments, not synthetic instructions. All block arguments and instruction results share the value-ID namespace, while call and branch operands use separate flat per-function arrays.
 - Control flow is block-structured: every basic block has exactly one terminator, branches carry zero or more arguments to typed target-block parameters, and the graph may contain forward edges or backedges.
 - Function compilation produces relocatable function artifacts; whole-program construction resolves references and emits the executable format.
+- Reachable-instance discovery is a cached query with one deterministic breadth-first order shared by whole-program construction and debug presentation.
 - Every file uses its synthetic top-level item as the program entry. A declaration named `main` is an ordinary function, and values produced by top-level statements are discarded because the entry result is `unit`.
 - The language `int` type is a signed 32-bit value, returned through the current internal x86-64 calling convention in `eax`. Functions returning `unit` manufacture no machine value. Integer arguments use the caller's fixed outgoing stack area; this internal convention does not imply compatibility with an external platform ABI.
 - Expected source errors are diagnostics, while query failures are reserved for infrastructure failures.
