@@ -1,6 +1,6 @@
 # Refactor roadmap
 
-Last updated: 2026-08-09.
+Last updated: 2026-08-27.
 
 This is a temporary handoff document. Update it after each completed milestone and delete obsolete details rather than preserving history here. Durable design rules live in `ARCHITECTURE.md`; agent workflow lives in `AGENTS.md`.
 
@@ -13,6 +13,7 @@ The target is a deliberately selected language subset, not complete legacy featu
 - Every successfully parsed file has one synthetic top-level entry. A declaration named `main` has no entry-point significance.
 - The top-level body has `unit` result. Values produced by top-level statements, including calls, are discarded.
 - `int` is a signed 32-bit value.
+- `exit(value: int)` is an unshadowable intrinsic that terminates the process with the supplied status.
 - The legacy `arg` builtin is outside the refactor scope.
 - Legacy behavior and tests remain useful references only where they exercise the selected language subset.
 
@@ -38,7 +39,7 @@ BuildExecutable(FileId) -> ?Executable
     └── CompileFunction(InstanceId) for every reachable referenced instance
 ```
 
-`main.zig` still uses the legacy pipeline. Keep the legacy implementation as behavioral reference, but do not copy its architecture automatically.
+The repository root now has a new-pipeline CLI in `main.zig`. `legacy/main.zig` remains a behavioral reference and is not part of the refactored execution path.
 
 ## Completed
 
@@ -101,14 +102,16 @@ BuildExecutable(FileId) -> ?Executable
 ### Ordinary function semantics
 
 - `FunctionSignature(ItemId)` analyzes only a function header and owns its ordered `int` parameter types plus an explicit `int` or `unit` return type. Parameter modes and non-`int` parameter types remain unsupported.
-- For declared functions, `AnalyzeFunctionBody(ItemId)` depends on the signature and accepts a straight-line block of immutable local bindings and bare calls ending in a supported return. Integer functions return an `int` expression; unit functions use a bare return or return a unit-valued expression.
-- The parser encodes precedence and nesting in the AST. Body analysis walks that expression tree into typed values: parameters, decimal integer constants, and calls are leaves, and unary negation plus binary `+`, `-`, `*`, and `/` compose them.
+- For declared functions, `AnalyzeFunctionBody(ItemId)` depends on the signature and accepts immutable local bindings and bare calls ending in a supported return. Integer functions return an `int` expression; unit functions use a bare return or return a unit-valued expression.
+- The parser encodes precedence and nesting in the AST. Body analysis walks that expression tree into typed values: parameters, decimal integer constants, and calls are leaves; unary negation and binary `+`, `-`, `*`, and `/` compose them; value-producing `if/else` joins equal-typed branch results.
+- An `if` condition is a fallible expression, not a `bool`. The selected forms are integer `<`, `>`, `<=`, `>=`, `==`, and `<>`; their success or failure becomes a typed predicate terminator and no comparison-result value enters SSA.
 - Calls accept arbitrary numbers of expressions evaluated left-to-right. The typed boundary validates arity and each argument type against the callee signature.
 - For the synthetic entry, `AnalyzeFunctionBody(ItemId)` accepts root-level `static` bindings and any number of bare calls, discards their values, and returns `unit`.
-- Unresolved-body construction resolves lexical local names and records optional `int` or `unit` annotations. The query then resolves calls and validates annotations, operations, arguments, and returns before publishing type-specific `FunctionBodyAnalysis`; SSA and codegen do not repeat those type checks.
+- Unresolved-body construction resolves lexical local names and records optional `int` or `unit` annotations. The query then resolves calls and validates annotations, operations, fallible predicate operands, branch joins, arguments, and returns before publishing type-specific `FunctionBodyAnalysis`; SSA and codegen do not repeat those type checks.
 - A `const` binding names an existing typed value and emits no semantic or SSA instruction. Bindings and bare calls may be interleaved, aliases reuse the same value ID, and local values shadow module callables. Optional `int` and `unit` annotations are validated against their initializers.
 - Body analysis owns block and typed-instruction arrays containing stable identities and value-ID operands; it stores no AST indices, token spans, or borrowed source text.
 - Typed calls record their `int` or `unit` result type. Unit values are rejected at integer operation, argument, annotation, and return boundaries before typed IR is published.
+- `exit(value: int)` bypasses local and module callable lookup, publishes a dedicated unit-valued instruction, and requires exactly one `int` operand.
 - Declared-function signature and body analysis depend explicitly on source text, so equal-shape spelling edits remain observable despite structural AST equality.
 - Equal signatures suppress downstream recomputation across body-only edits; body analysis recomputes independently.
 - Top-level `return` remains invalid through semantic analysis, ordinary lowering and compilation, and executable construction.
@@ -117,8 +120,9 @@ BuildExecutable(FileId) -> ?Executable
 
 - `InstanceId` is currently a structural non-generic wrapper around `ItemId`, keeping callable identity distinct from declaration identity without an interner or registry.
 - `LowerToSSA(InstanceId)` depends only on `AnalyzeFunctionBody` and produces an owned `SsaFunction`.
-- The minimal function SSA has explicit blocks with typed block arguments, ordered instruction results, symbolic calls targeted by `InstanceId`, and type-specific integer operations over value IDs; each block owns its terminator.
-- Block arguments and instruction results share one value-ID namespace. Calls reference ranges in one flat operand array, so neither parameter count nor call arity is encoded as an instruction kind.
+- Function SSA has explicit blocks with typed block arguments, ordered instruction results, symbolic calls targeted by `InstanceId`, type-specific integer operations, and one predicate-branch shape carrying a type-specific operation.
+- Block arguments and instruction results share one value-ID namespace. Calls and CFG edges reference ranges in separate flat operand arrays, so neither call arity nor edge arity is encoded as a terminator kind.
+- A value-producing `if/else` lowers to one predicate branch, two result-producing regions, and a merge block whose argument is the expression's value. Branches may carry any number of arguments; edge arity and types are validated against the target block.
 - Semantic and SSA functions share one block/value/instruction representation parameterized by call-target identity (`ItemId` before instantiation, `InstanceId` after it).
 - Lowering preserves each call's trusted result type, so discarded unit calls remain ordinary symbolic calls without acquiring a machine value location.
 - `SsaFunction` defines semantic equality and exact cleanup, so equal recomputation retains cached allocations and changed lowering replaces them safely.
@@ -131,17 +135,30 @@ BuildExecutable(FileId) -> ?Executable
 - Declared integer-return artifacts use the current internal x86-64 calling convention and return a signed 32-bit value in `eax`; unit artifacts return without manufacturing a value. External ABI compatibility is not currently selected.
 - Artifacts carry required alignment, relocation records, and a deterministic referenced-instance table. Literal and unit artifacts use byte alignment and owned zero-length metadata.
 - Each symbolic call emits `E8 00 00 00 00` and one `call_relative_32` relocation; the deterministic reference table deduplicates repeated targets while preserving first-use order.
-- Code generation assigns constants to immediate locations, leaves a final computed result in `eax`, and gives earlier computed values needed later fixed stack slots. This preserves expression operands across intervening calls without embedding machine locations in SSA.
+- Code generation assigns constants to immediate locations, leaves a directly returned computed result in `eax`, and gives values needed across instructions or blocks fixed stack slots. This preserves operands across intervening calls and control-flow edges without embedding machine locations in SSA.
 - The current internal calling convention reserves one fixed outgoing argument area per caller frame and passes signed 32-bit arguments there. Callees address incoming arguments relative to their own fixed frame, supporting arbitrary current arity and nested or recursive calls without dynamic call-site stack adjustment.
 - Signed 32-bit negation, addition, subtraction, multiplication, and division are emitted from type-specific integer instructions.
+- The `exit` instruction emits the Linux exit syscall inline and contributes no callable reference or relocation.
 - Location planning is separate from instruction emission. Regular immediate and stack encodings share one 32-bit encoder and an operation-to-opcode mapping; division remains explicit because its machine sequence is structurally different.
-- Calls may be discarded or returned, and may precede a returned integer. The current backend accepts one explicit straight-line block and reports other valid SSA shapes as `UnsupportedControlFlow`.
+- The backend lays out arbitrary block graphs, patches forward and backward relative jumps, and transfers edge arguments in parallel through one reusable scratch area. This supports value joins now and avoids sequential-copy corruption when future loops carry multiple values across a backedge.
 - Unit-returning calls use the same argument, relocation, and reachability machinery as integer-returning calls; code generation emits the call but assigns no result location.
 - Artifact equality is content-based across code, alignment, relocations, and referenced instances. Cleanup independently frees all three owned slices exactly once, including every partial-allocation failure path.
 - Semantic failures and diagnostics remain transitive through compilation, while backend capability and function-size failures remain infrastructure errors.
 - Unit and direct-call synthetic entries compile independently to retained ordinary function artifacts without demanding or compiling the callee.
 - Relocation resolution belongs to the linker boundary rather than `CompileFunction`; `CompileFunction` never lays out addresses or resolves references.
 - Equal selected-entry artifacts preserve the retained executable allocation across unrelated valid source edits.
+
+### CLI
+
+- `main.zig` accepts `--debug=ast,ssa,asm,timing`, one source path, and optional program arguments.
+- The CLI reads the source into `SourceText`, requests `BuildExecutable`, renders transitive source diagnostics, writes `prog`, runs it, and prints its exit code.
+- SSA debug output follows the same reachable function graph as executable construction; it does not analyze unrelated functions merely for display.
+- AST rendering uses the parser's existing source-aware renderer. Assembly rendering decodes the final linked code, including the startup stub and resolved calls.
+- Timing separates source loading, query-database initialization, input insertion, executable construction, diagnostic collection, debug rendering, executable writing, execution, and the total. It does not invent per-query timings that the engine does not expose.
+- The single-file CLI uses one query worker because the current dependency chain has no useful coarse parallelism; restore automatic worker sizing when multiple independent source or compilation roots can run concurrently and measurements show a benefit.
+- `runtime.zig` reports write, spawn, wait, and abnormal-termination failures to the CLI instead of terminating the compiler internally.
+- `example.chi` is the manual smoke input: `zig run main.zig -- example.chi` builds and runs it, then reports exit code 42.
+- CLI-level tests cover successful execution with every debug view and diagnostic failure without execution.
 
 ### Module scope for callable lookup
 
@@ -173,9 +190,9 @@ BuildExecutable(FileId) -> ?Executable
 
 - Static binding initializers are currently opaque to entry analysis; contextual validation inside them belongs to future general semantic analysis.
 - Function signatures support ordered `int` parameters and an explicit `int` or `unit` return; inferred returns, parameter modes, other parameter types, named types, and compound types are deferred.
-- `FunctionBodyAnalysis` and `SsaFunction` use explicit block tables but semantic analysis and code generation currently accept only one straight-line block; branches, loops, and multiple source returns are deferred.
+- Value-producing `if/else` supports integer comparison conditions and equal-typed single-expression branches. Statement-only `if`, compound branch bodies, condition bindings, multiple source returns, and loop syntax are deferred.
 - Calls currently support only bare file-local function names. Arguments can be any supported expression; mutable locals, assignment, and nested lexical scopes are deferred.
-- Expressions currently support only decimal `int` constants, calls returning `int` or `unit`, immutable-local references, unary negation, and binary `+`, `-`, `*`, and `/`. Unit values can be discarded, aliased, or returned from unit functions; other value types and operators remain unsupported.
+- Expressions currently support decimal `int` constants, calls returning `int` or `unit`, `exit(value: int)`, immutable-local references, unary negation, binary `+`, `-`, `*`, and `/`, and value-producing `if/else` over integer comparisons. Unit values can be discarded, aliased, returned, or joined with unit; other value types and operators remain unsupported.
 - `InstanceId` has no generic substitutions yet.
 - Callable scope is file-local and contains only functions; imports, visibility, other namespaces, and overloading are deferred.
 - Input updates are allowed only while no query is queued or running.
@@ -191,15 +208,53 @@ BuildExecutable(FileId) -> ?Executable
 - Add module- and item-level queries for declarations, scopes, type definitions, layouts, and compile-time values.
 - Add per-function or per-instance name resolution, typing, diagnostics, lowering, and code generation only as each slice requires.
 - Extend SSA and codegen only as each semantic feature requires.
-- Next prioritize control flow and observable output, before aggregate, compile-time, variant, and ownership features. The selected first effect is an `exit(value: int)` intrinsic.
+- Next prioritize control flow and further observable output before aggregate, compile-time, variant, and ownership features.
 - Port relevant legacy behavior and regression tests with each supported feature, not as a final batch.
 - Keep machine addresses and executable layout out of semantic and SSA results.
 - Preserve the boundary between relocatable function emission and whole-program executable construction.
 
-### 2. CLI migration and legacy retirement
+### Fallible control-flow expansion gates
 
-- Move `main.zig` to the new query database.
-- Restore diagnostics and debug output against new data structures.
+In this language, a fallible expression either succeeds or fails in a fallible context. It does not produce `bool`; success may additionally expose a value to the success path. The current integer comparisons only select an `if` edge. Preserve that model as the feature grows:
+
+- Add `and`, `or`, and `not` when compound conditions are selected. Lower them by short-circuiting between predicate blocks (`and`: lhs success continues to rhs; `or`: lhs failure continues to rhs; `not`: swap destinations), with no boolean instruction or value.
+- Add `is`, `as`, and `?` only when variants enter the selected type system. `is` selects an edge; successful `as` and `?` also pass the extracted payload as a success-edge argument.
+- Add condition bindings with `as` or `?`, not as an isolated declaration feature. The binding exists only in the success region and uses the payload delivered by that edge.
+- Permit fallible expressions outside `if` only when another consuming context is selected. Until then, comparisons remain valid only while lowering an `if` condition.
+- Add loop syntax when its source semantics are selected. Reuse the existing predicate terminators, general edge arguments, backedge patching, and parallel copies; represent loop-carried state as header block arguments. A cyclic SSA/codegen regression already protects that representation even though no loop source form exists yet.
+
+The fallible slice is complete when the relevant legacy short-circuit, variant extraction, binding-scope, and failure-path tests pass through the refactored pipeline without introducing a boolean condition value.
+
+### Runtime declaration migration gate
+
+The inline `exit` operation is deliberately temporary. Do not build external linking solely to remove this one operation. Start the migration when any of these makes the machinery pay for itself:
+
+- a second runtime-backed function is selected;
+- another target cannot use the inline Linux syscall sequence; or
+- source-level foreign functions or system-library calls enter the selected language subset.
+
+Migrate only after whole-program construction can represent and resolve runtime symbols and a runtime artifact can follow the selected calling convention. Then:
+
+- seed the callable namespace with an unshadowable declaration associated with `__lang_exit`: `exit: (int) -> Never` when `Never` exists, or temporarily `(int) -> unit` plus `noreturn` otherwise;
+- represent user-function and runtime-symbol call targets as their two actual identity shapes;
+- reuse ordinary call validation, SSA, machine-call emission, and relocation handling;
+- supply `__lang_exit` from a runtime artifact and remove the dedicated semantic/SSA `exit` operation and inline syscall emission.
+
+The migration is complete when `exit` has no dedicated typing, SSA, or instruction-emission branch; its only special data is its compiler-seeded declaration and runtime symbol implementation.
+
+### `Never` type migration gate
+
+Do not add `Never` merely to improve the current straight-line `exit` model. Add it when the next control-flow slice requires at least one of:
+
+- joining a diverging branch with a value-producing branch;
+- proving that every reachable path of a value-returning function returns; or
+- typing a second non-returning operation such as panic.
+
+At that point, add `Never` as the bottom type in expression and branch-type joins, give non-returning runtime declarations a `Never` result, and remove any temporary `noreturn` property. Tests must cover branch joining, return completeness, unreachable continuations, and incremental recomputation when a path changes between returning and diverging.
+
+### 2. Legacy retirement
+
+- Add debug output to the new CLI only as corresponding refactored representations stabilize.
 - Remove legacy modules only after every selected behavior has a refactored regression test.
 - Add persistent cross-run caching only after query values and serialization formats stabilize.
 
@@ -211,6 +266,7 @@ Current focused commands:
 zig test ast_new.zig
 zig test tokenizer.zig
 zig test diagnostics.zig
+zig test main.zig
 zig test semantic.zig
 zig test query_new_test.zig
 zig test ssa.zig
@@ -224,10 +280,11 @@ Last observed results:
 - `zig test ast_new.zig`: 71 passed.
 - `zig test tokenizer.zig`: 31 passed.
 - `zig test diagnostics.zig`: 2 passed.
+- `zig test main.zig`: 84 passed.
 - `zig test semantic.zig`: 73 passed.
-- `zig test query_new_test.zig`: 163 passed.
-- `zig test ssa.zig`: 6 passed.
-- `zig test codegen_new_test.zig`: 19 passed.
+- `zig test query_new_test.zig`: 171 passed.
+- `zig test ssa.zig`: 7 passed.
+- `zig test codegen_new_test.zig`: 20 passed.
 - The legacy `zig test legacy/test.zig` remains blocked by an unrelated `query_cache.load` call/signature mismatch.
 
 ## Handoff notes

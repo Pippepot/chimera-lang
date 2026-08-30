@@ -2,6 +2,7 @@ const std = @import("std");
 const structures = @import("structures.zig");
 
 const image_base: u64 = 0x400000;
+const linux_exit_syscall: i32 = 60;
 
 const Elf64Header = extern struct {
     ident: [16]u8,
@@ -44,19 +45,26 @@ const ValueLocation = union(enum) {
 const LocationPlan = struct {
     locations: []ValueLocation,
     stack_size: u32,
-    returned_value: ?usize,
+    edge_scratch_offset: u32,
 
-    fn init(
+    fn markBranchArguments(
         ssa: *const structures.SsaFunction,
-        block: structures.SsaFunction.Block,
-        gpa: std.mem.Allocator,
-    ) error{ OutOfMemory, FunctionTooLarge }!LocationPlan {
-        for (ssa.block_argument_types) |argument_type| std.debug.assert(argument_type == .int);
+        branch: structures.FunctionBranch,
+        needed: []bool,
+        maximum_count: *usize,
+    ) void {
+        const arguments = ssa.branch_arguments[branch.arguments.start..branch.arguments.end];
+        maximum_count.* = @max(maximum_count.*, arguments.len);
+        for (arguments) |argument| needed[@intFromEnum(argument)] = true;
+    }
+
+    fn init(ssa: *const structures.SsaFunction, gpa: std.mem.Allocator) error{ OutOfMemory, FunctionTooLarge }!LocationPlan {
         const needed = try gpa.alloc(bool, ssa.valueCount());
         defer gpa.free(needed);
         @memset(needed, false);
 
         var maximum_argument_count: usize = 0;
+        var maximum_edge_argument_count: usize = 0;
         for (ssa.instructions) |instruction| {
             switch (instruction) {
                 .consti => {},
@@ -65,6 +73,7 @@ const LocationPlan = struct {
                     maximum_argument_count = @max(maximum_argument_count, arguments.len);
                     for (arguments) |argument| needed[@intFromEnum(argument)] = true;
                 },
+                .exit => |operand| needed[@intFromEnum(operand)] = true,
                 .negi => |operand_id| {
                     const operand = @intFromEnum(operand_id);
                     needed[operand] = true;
@@ -77,13 +86,16 @@ const LocationPlan = struct {
                 },
             }
         }
-        const returned_value: ?usize = switch (block.terminator) {
-            .return_unit => null,
-            .return_value => |value| blk: {
-                const index = @intFromEnum(value);
-                needed[index] = true;
-                break :blk index;
+        for (ssa.blocks) |block| switch (block.terminator) {
+            .branch => |branch| markBranchArguments(ssa, branch, needed, &maximum_edge_argument_count),
+            .predicate_branch => |predicate| {
+                needed[@intFromEnum(predicate.operands.lhs)] = true;
+                needed[@intFromEnum(predicate.operands.rhs)] = true;
+                markBranchArguments(ssa, predicate.then_branch, needed, &maximum_edge_argument_count);
+                markBranchArguments(ssa, predicate.else_branch, needed, &maximum_edge_argument_count);
             },
+            .return_value => |value| needed[@intFromEnum(value)] = true,
+            .return_unit => {},
         };
 
         // One reusable area handles every call this function makes. After the
@@ -95,46 +107,67 @@ const LocationPlan = struct {
         //   rsp + stack_size + 8: incoming argument 0
         const outgoing_size_usize = std.math.mul(usize, maximum_argument_count, @sizeOf(i32)) catch return error.FunctionTooLarge;
         const outgoing_size = std.math.cast(u32, outgoing_size_usize) orelse return error.FunctionTooLarge;
+        const edge_scratch_size_usize = std.math.mul(usize, maximum_edge_argument_count, @sizeOf(i32)) catch return error.FunctionTooLarge;
+        const edge_scratch_size = std.math.cast(u32, edge_scratch_size_usize) orelse return error.FunctionTooLarge;
+        const local_start = std.math.add(u32, outgoing_size, edge_scratch_size) catch return error.FunctionTooLarge;
         const locations = try gpa.alloc(ValueLocation, ssa.valueCount());
         errdefer gpa.free(locations);
         @memset(locations[0..ssa.block_argument_types.len], .discarded);
         var stack_slot_count: u32 = 0;
+        const entry_index = @intFromEnum(ssa.entry);
+        std.debug.assert(entry_index < ssa.blocks.len);
+        for (ssa.blocks, 0..) |block, block_index| {
+            std.debug.assert(block.argument_start <= block.argument_end);
+            std.debug.assert(block.argument_end <= ssa.block_argument_types.len);
+            if (block_index == entry_index) continue;
+            for (block.argument_start..block.argument_end) |argument_index| {
+                if (ssa.block_argument_types[argument_index] == .unit or !needed[argument_index]) continue;
+                const slot_offset = std.math.mul(u32, stack_slot_count, @sizeOf(i32)) catch return error.FunctionTooLarge;
+                stack_slot_count = std.math.add(u32, stack_slot_count, 1) catch return error.FunctionTooLarge;
+                locations[argument_index] = .{ .stack = std.math.add(u32, local_start, slot_offset) catch return error.FunctionTooLarge };
+            }
+        }
         for (ssa.instructions, locations[ssa.block_argument_types.len..], 0..) |instruction, *location, instruction_index| {
             const value_index = @intFromEnum(ssa.instructionValue(instruction_index));
             location.* = location_blk: {
                 switch (instruction) {
                     .consti => |value| break :location_blk .{ .immediate = value },
                     .call => |call| if (call.return_type == .unit) {
-                        std.debug.assert(!needed[value_index]);
+                        break :location_blk .discarded;
+                    },
+                    .exit => {
                         break :location_blk .discarded;
                     },
                     else => {},
                 }
-                if (returned_value == value_index and instruction_index + 1 == ssa.instructions.len) {
+                if (isDirectReturn(ssa, instruction_index)) {
                     break :location_blk .eax;
                 }
                 if (needed[value_index]) {
                     const slot_offset = std.math.mul(u32, stack_slot_count, @sizeOf(i32)) catch return error.FunctionTooLarge;
                     stack_slot_count = std.math.add(u32, stack_slot_count, 1) catch return error.FunctionTooLarge;
-                    const offset = std.math.add(u32, outgoing_size, slot_offset) catch return error.FunctionTooLarge;
+                    const offset = std.math.add(u32, local_start, slot_offset) catch return error.FunctionTooLarge;
                     break :location_blk .{ .stack = offset };
                 }
                 break :location_blk .discarded;
             };
         }
         const local_size = std.math.mul(u32, stack_slot_count, @sizeOf(i32)) catch return error.FunctionTooLarge;
-        const stack_size = std.math.add(u32, outgoing_size, local_size) catch return error.FunctionTooLarge;
+        const stack_size = std.math.add(u32, local_start, local_size) catch return error.FunctionTooLarge;
         if (stack_size > std.math.maxInt(i32)) return error.FunctionTooLarge;
-        for (locations[0..ssa.block_argument_types.len], 0..) |*location, argument_index| {
+        const entry = ssa.blocks[entry_index];
+        for (locations[entry.argument_start..entry.argument_end], 0..) |*location, argument_offset| {
+            const argument_index = entry.argument_start + argument_offset;
             if (!needed[argument_index]) continue;
-            const argument_offset_usize = std.math.mul(usize, argument_index, @sizeOf(i32)) catch return error.FunctionTooLarge;
-            const argument_offset = std.math.cast(u32, argument_offset_usize) orelse return error.FunctionTooLarge;
+            std.debug.assert(ssa.block_argument_types[argument_index] == .int);
+            const incoming_offset_usize = std.math.mul(usize, argument_offset, @sizeOf(i32)) catch return error.FunctionTooLarge;
+            const incoming_offset = std.math.cast(u32, incoming_offset_usize) orelse return error.FunctionTooLarge;
             const caller_stack_offset = std.math.add(u32, stack_size, @sizeOf(u64)) catch return error.FunctionTooLarge;
-            const offset = std.math.add(u32, caller_stack_offset, argument_offset) catch return error.FunctionTooLarge;
+            const offset = std.math.add(u32, caller_stack_offset, incoming_offset) catch return error.FunctionTooLarge;
             if (offset > std.math.maxInt(i32)) return error.FunctionTooLarge;
             location.* = .{ .incoming_argument = offset };
         }
-        return .{ .locations = locations, .stack_size = stack_size, .returned_value = returned_value };
+        return .{ .locations = locations, .stack_size = stack_size, .edge_scratch_offset = outgoing_size };
     }
 
     fn deinit(self: *LocationPlan, gpa: std.mem.Allocator) void {
@@ -142,6 +175,18 @@ const LocationPlan = struct {
         self.* = undefined;
     }
 };
+
+fn isDirectReturn(ssa: *const structures.SsaFunction, instruction_index: usize) bool {
+    const value = ssa.instructionValue(instruction_index);
+    for (ssa.blocks) |block| {
+        if (block.instruction_end != instruction_index + 1) continue;
+        switch (block.terminator) {
+            .return_value => |returned| if (returned == value) return true,
+            else => {},
+        }
+    }
+    return false;
+}
 
 const IntegerBinaryOperation = enum {
     add,
@@ -151,41 +196,82 @@ const IntegerBinaryOperation = enum {
 };
 
 const FunctionEmitter = struct {
+    const JumpPatch = struct {
+        field_offset: u32,
+        target: structures.FunctionBlockId,
+    };
+
     gpa: std.mem.Allocator,
     encoder: X86Encoder,
     relocations: std.ArrayList(structures.CompiledFunction.Relocation) = .empty,
     referenced_instances: std.ArrayList(structures.InstanceId) = .empty,
+    jump_patches: std.ArrayList(JumpPatch) = .empty,
     locations: []const ValueLocation,
+    branch_arguments: []const structures.FunctionValueId,
     call_arguments: []const structures.FunctionValueId,
+    block_offsets: []u32,
+    stack_size: u32,
+    edge_scratch_offset: u32,
 
     fn init(
         gpa: std.mem.Allocator,
-        locations: []const ValueLocation,
-        call_arguments: []const structures.FunctionValueId,
+        ssa: *const structures.SsaFunction,
+        plan: LocationPlan,
     ) !FunctionEmitter {
+        const block_offsets = try gpa.alloc(u32, ssa.blocks.len);
+        errdefer gpa.free(block_offsets);
+        @memset(block_offsets, std.math.maxInt(u32));
+        const encoder = try X86Encoder.init(gpa);
         return .{
             .gpa = gpa,
-            .encoder = try X86Encoder.init(gpa),
-            .locations = locations,
-            .call_arguments = call_arguments,
+            .encoder = encoder,
+            .locations = plan.locations,
+            .branch_arguments = ssa.branch_arguments,
+            .call_arguments = ssa.call_arguments,
+            .block_offsets = block_offsets,
+            .stack_size = plan.stack_size,
+            .edge_scratch_offset = plan.edge_scratch_offset,
         };
     }
 
     fn deinit(self: *FunctionEmitter) void {
+        self.gpa.free(self.block_offsets);
+        self.jump_patches.deinit(self.gpa);
         self.referenced_instances.deinit(self.gpa);
         self.relocations.deinit(self.gpa);
         self.encoder.deinit();
         self.* = undefined;
     }
 
-    fn emit(self: *FunctionEmitter, ssa: *const structures.SsaFunction, plan: LocationPlan) !void {
-        if (plan.stack_size != 0) try self.encoder.subRspImmediate32(plan.stack_size);
-        for (ssa.instructions, plan.locations[ssa.block_argument_types.len..]) |instruction, destination| {
+    fn emit(self: *FunctionEmitter, ssa: *const structures.SsaFunction) !void {
+        if (self.stack_size != 0) try self.encoder.subRspImmediate32(self.stack_size);
+        try self.emitBlock(ssa, ssa.entry);
+        for (ssa.blocks, 0..) |_, block_index| {
+            if (block_index == @intFromEnum(ssa.entry)) continue;
+            try self.emitBlock(ssa, @enumFromInt(block_index));
+        }
+        for (self.jump_patches.items) |patch| {
+            const target_offset = self.block_offsets[@intFromEnum(patch.target)];
+            std.debug.assert(target_offset != std.math.maxInt(u32));
+            try self.patchJump(patch.field_offset, target_offset);
+        }
+    }
+
+    fn emitBlock(self: *FunctionEmitter, ssa: *const structures.SsaFunction, block_id: structures.FunctionBlockId) !void {
+        const block_index = @intFromEnum(block_id);
+        const block = ssa.blocks[block_index];
+        self.block_offsets[block_index] = std.math.cast(u32, self.encoder.code.items.len) orelse return error.FunctionTooLarge;
+        std.debug.assert(block.instruction_start <= block.instruction_end);
+        std.debug.assert(block.instruction_end <= ssa.instructions.len);
+        for (block.instruction_start..block.instruction_end) |instruction_index| {
+            const instruction = ssa.instructions[instruction_index];
+            const destination = self.locations[@intFromEnum(ssa.instructionValue(instruction_index))];
             switch (instruction) {
                 .consti => {},
                 .call => |call| try self.emitDirectCall(call, destination),
+                .exit => |operand| try self.emitExit(operand),
                 .negi => |operand| {
-                    try self.loadValue(plan.locations[@intFromEnum(operand)]);
+                    try self.loadValue(self.locations[@intFromEnum(operand)]);
                     try self.encoder.negateEax();
                     try self.storeResult(destination);
                 },
@@ -195,8 +281,79 @@ const FunctionEmitter = struct {
                 .divsi => |operands| try self.emitIntegerBinary(.divide_signed, operands, destination),
             }
         }
-        if (plan.returned_value) |value| try self.loadValue(plan.locations[value]);
-        if (plan.stack_size != 0) try self.encoder.addRspImmediate32(plan.stack_size);
+        try self.emitTerminator(ssa, block.terminator);
+    }
+
+    fn emitTerminator(self: *FunctionEmitter, ssa: *const structures.SsaFunction, terminator: structures.FunctionTerminator) !void {
+        switch (terminator) {
+            .branch => |branch| {
+                try self.emitBranchCopies(ssa, branch);
+                try self.emitJump(branch.target);
+            },
+            .predicate_branch => |predicate| try self.emitPredicateBranch(ssa, predicate),
+            .return_unit => try self.emitReturn(null),
+            .return_value => |value| try self.emitReturn(value),
+        }
+    }
+
+    fn emitPredicateBranch(
+        self: *FunctionEmitter,
+        ssa: *const structures.SsaFunction,
+        predicate: @FieldType(structures.FunctionTerminator, "predicate_branch"),
+    ) !void {
+        try self.loadValue(self.locations[@intFromEnum(predicate.operands.lhs)]);
+        try self.encoder.compareEax(self.locations[@intFromEnum(predicate.operands.rhs)]);
+        const then_field = try self.encoder.conditionalJumpRelative32(predicate.operation, 0);
+        try self.emitBranchCopies(ssa, predicate.else_branch);
+        try self.emitJump(predicate.else_branch.target);
+        const then_offset = std.math.cast(u32, self.encoder.code.items.len) orelse return error.FunctionTooLarge;
+        try self.patchJump(then_field, then_offset);
+        try self.emitBranchCopies(ssa, predicate.then_branch);
+        try self.emitJump(predicate.then_branch.target);
+    }
+
+    fn emitBranchCopies(self: *FunctionEmitter, ssa: *const structures.SsaFunction, branch: structures.FunctionBranch) !void {
+        const target = ssa.blocks[@intFromEnum(branch.target)];
+        const arguments = self.branch_arguments[branch.arguments.start..branch.arguments.end];
+        std.debug.assert(arguments.len == target.argument_end - target.argument_start);
+        for (arguments, 0..) |argument, argument_offset| {
+            const destination = self.locations[target.argument_start + argument_offset];
+            if (destination == .discarded) continue;
+            try self.loadValue(self.locations[@intFromEnum(argument)]);
+            try self.encoder.movRspFromEax(try self.edgeScratchSlot(argument_offset));
+        }
+        for (arguments, 0..) |_, argument_offset| {
+            const destination = self.locations[target.argument_start + argument_offset];
+            if (destination == .discarded) continue;
+            try self.encoder.movEaxFromRsp(try self.edgeScratchSlot(argument_offset));
+            try self.storeResult(destination);
+        }
+    }
+
+    fn edgeScratchSlot(self: *FunctionEmitter, argument_offset: usize) error{FunctionTooLarge}!u32 {
+        const byte_offset = std.math.mul(usize, argument_offset, @sizeOf(i32)) catch return error.FunctionTooLarge;
+        const offset = std.math.cast(u32, byte_offset) orelse return error.FunctionTooLarge;
+        return std.math.add(u32, self.edge_scratch_offset, offset) catch return error.FunctionTooLarge;
+    }
+
+    fn emitJump(self: *FunctionEmitter, target: structures.FunctionBlockId) !void {
+        const field_offset = try self.encoder.jumpRelative32(0);
+        try self.jump_patches.append(self.gpa, .{ .field_offset = field_offset, .target = target });
+    }
+
+    fn patchJump(self: *FunctionEmitter, field_offset: u32, target_offset: u32) error{RelocationOverflow}!void {
+        try patchRelativeDisplacement(
+            self.encoder.code.items,
+            field_offset,
+            target_offset,
+            @as(u64, field_offset) + @sizeOf(i32),
+            0,
+        );
+    }
+
+    fn emitReturn(self: *FunctionEmitter, value: ?structures.FunctionValueId) !void {
+        if (value) |returned| try self.loadValue(self.locations[@intFromEnum(returned)]);
+        if (self.stack_size != 0) try self.encoder.addRspImmediate32(self.stack_size);
         try self.encoder.ret();
     }
 
@@ -233,6 +390,13 @@ const FunctionEmitter = struct {
             .addend = 0,
         });
         try self.storeResult(destination);
+    }
+
+    fn emitExit(self: *FunctionEmitter, operand: structures.FunctionValueId) !void {
+        try self.loadValue(self.locations[@intFromEnum(operand)]);
+        try self.encoder.movEdiFromEax();
+        try self.encoder.movEaxImmediate32(linux_exit_syscall);
+        try self.encoder.syscall();
     }
 
     fn emitIntegerBinary(
@@ -277,20 +441,14 @@ const FunctionEmitter = struct {
     }
 };
 
-pub fn compileFunction(ssa: *const structures.SsaFunction, gpa: std.mem.Allocator) error{ OutOfMemory, FunctionTooLarge, UnsupportedControlFlow }!structures.CompiledFunction {
-    if (ssa.blocks.len != 1) return error.UnsupportedControlFlow;
-    if (@intFromEnum(ssa.entry) != 0) return error.UnsupportedControlFlow;
-    const block = ssa.blocks[0];
-    if (block.argument_start != 0) return error.UnsupportedControlFlow;
-    if (block.argument_end != ssa.block_argument_types.len) return error.UnsupportedControlFlow;
-    if (block.instruction_start != 0) return error.UnsupportedControlFlow;
-    if (block.instruction_end != ssa.instructions.len) return error.UnsupportedControlFlow;
-
-    var plan = try LocationPlan.init(ssa, block, gpa);
+pub fn compileFunction(ssa: *const structures.SsaFunction, gpa: std.mem.Allocator) error{ OutOfMemory, FunctionTooLarge, RelocationOverflow }!structures.CompiledFunction {
+    std.debug.assert(ssa.blocks.len != 0);
+    std.debug.assert(@intFromEnum(ssa.entry) < ssa.blocks.len);
+    var plan = try LocationPlan.init(ssa, gpa);
     defer plan.deinit(gpa);
-    var emitter = try FunctionEmitter.init(gpa, plan.locations, ssa.call_arguments);
+    var emitter = try FunctionEmitter.init(gpa, ssa, plan);
     defer emitter.deinit();
-    try emitter.emit(ssa, plan);
+    try emitter.emit(ssa);
     return emitter.finish();
 }
 
@@ -343,7 +501,7 @@ pub fn buildExecutable(
     const call_displacement_offset = encoder.code.items.len + 1;
     try encoder.callRelative32(0);
     try encoder.zeroEdi();
-    try encoder.movEaxImmediate32(60);
+    try encoder.movEaxImmediate32(linux_exit_syscall);
     try encoder.syscall();
 
     const Layout = struct { address: u64, offset: usize };
@@ -384,6 +542,11 @@ pub fn buildExecutable(
     }
 
     return .{ .bytes = try buildElfExecutable(encoder.code.items, gpa) };
+}
+
+pub fn executableCode(executable: structures.Executable) []const u8 {
+    std.debug.assert(executable.bytes.len >= code_file_offset);
+    return executable.bytes[code_file_offset..];
 }
 
 fn alignedAddress(base: u64, offset: usize, alignment: u32) error{FileTooBig}!u64 {
@@ -445,6 +608,26 @@ const X86Encoder = struct {
         try self.appendBits32(&.{0xE8}, @bitCast(displacement));
     }
 
+    fn jumpRelative32(self: *@This(), displacement: i32) !u32 {
+        const field_offset = std.math.cast(u32, self.code.items.len + 1) orelse return error.FunctionTooLarge;
+        try self.appendBits32(&.{0xE9}, @bitCast(displacement));
+        return field_offset;
+    }
+
+    fn conditionalJumpRelative32(self: *@This(), operation: structures.PredicateOperation, displacement: i32) !u32 {
+        const opcode: u8 = switch (operation) {
+            .lti => 0x8C,
+            .gti => 0x8F,
+            .lei => 0x8E,
+            .gei => 0x8D,
+            .eqi => 0x84,
+            .nei => 0x85,
+        };
+        const field_offset = std.math.cast(u32, self.code.items.len + 2) orelse return error.FunctionTooLarge;
+        try self.appendBits32(&.{ 0x0F, opcode }, @bitCast(displacement));
+        return field_offset;
+    }
+
     fn subRspImmediate32(self: *@This(), value: u32) !void {
         try self.appendBits32(&.{ 0x48, 0x81, 0xEC }, value);
     }
@@ -461,6 +644,10 @@ const X86Encoder = struct {
         try self.appendBits32(&.{0xB8}, @bitCast(value));
     }
 
+    fn movEdiFromEax(self: *@This()) !void {
+        try self.appendBytes(&.{ 0x89, 0xC7 });
+    }
+
     fn movEcxImmediate32(self: *@This(), value: i32) !void {
         try self.appendBits32(&.{0xB9}, @bitCast(value));
     }
@@ -475,6 +662,14 @@ const X86Encoder = struct {
 
     fn negateEax(self: *@This()) !void {
         try self.appendBytes(&.{ 0xF7, 0xD8 });
+    }
+
+    fn compareEax(self: *@This(), rhs: ValueLocation) !void {
+        switch (rhs) {
+            .immediate => |value| try self.appendBits32(&.{0x3D}, @bitCast(value)),
+            .stack, .incoming_argument => |offset| try self.appendBits32(&.{ 0x3B, 0x84, 0x24 }, offset),
+            .eax, .discarded => unreachable,
+        }
     }
 
     fn integerBinary(self: *@This(), operation: IntegerBinaryOperation, rhs: ValueLocation) !void {

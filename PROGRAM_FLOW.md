@@ -2,7 +2,7 @@
 
 How the incremental compiler pipeline executes. Design rules live in `ARCHITECTURE.md`; milestone status lives in `ROADMAP.md`.
 
-The pipeline is a Salsa-style query system: every compilation step is a memoized query that pulls its inputs on demand, records what it read, and survives source edits by re-verifying dependencies instead of recomputing. Queries are defined in `query_structures.zig`, run on the concurrent engine in `query_new.zig`, and exchange the shared value types in `structures.zig`. `query_new_test.zig` drives the full path, ending in `runtime.writeProgram`/`runProg`.
+The pipeline is a Salsa-style query system: every compilation step is a memoized query that pulls its inputs on demand, records what it read, and survives source edits by re-verifying dependencies instead of recomputing. Queries are defined in `query_structures.zig`, run on the concurrent engine in `query_new.zig`, and exchange the shared value types in `structures.zig`. The root `main.zig` drives the full path, ending in `runtime.writeProgram`/`runProg`; `query_new_test.zig` exercises the same path directly.
 
 ## Query graph
 
@@ -60,7 +60,7 @@ Ownership follows one rule: **cached values own their allocations; identities ar
 | Session (memoized outputs) | `Ast` | Flat `[]Token`, `[]Node`, `[]Node.Index`; owns its arrays, stores `FileId` instead of borrowing text |
 | " | `ItemTree`, `ItemIndex`, `ModuleScope` | Owned slices/hash map of file items; scope maps names to `ItemId`s |
 | " | `FunctionSignature` | Owned parameter-type slice |
-| " | `FunctionBodyAnalysis` | `FunctionIr(ItemId)`: flat arrays of block args, call operands, typed instructions, blocks |
+| " | `FunctionBodyAnalysis` | `FunctionIr(ItemId)`: flat arrays of block args, branch operands, call operands, typed instructions, blocks |
 | " | `SsaFunction` | Same shape as above with symbolic `InstanceId` call targets |
 | " | `CompiledFunction` | Relocatable machine code + relocation records + referenced-instance table; no addresses |
 | " | `Executable` | Final linked bytes; consumer must copy before `Database.deinit` |

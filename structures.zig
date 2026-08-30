@@ -406,7 +406,28 @@ pub const BinaryOperands = struct {
     rhs: FunctionValueId,
 };
 
+pub const PredicateOperation = enum {
+    lti,
+    gti,
+    lei,
+    gei,
+    eqi,
+    nei,
+};
+
+pub const FunctionBranch = struct {
+    target: FunctionBlockId,
+    arguments: FunctionValueRange,
+};
+
 pub const FunctionTerminator = union(enum) {
+    branch: FunctionBranch,
+    predicate_branch: struct {
+        operation: PredicateOperation,
+        operands: BinaryOperands,
+        then_branch: FunctionBranch,
+        else_branch: FunctionBranch,
+    },
     return_unit,
     return_value: FunctionValueId,
 };
@@ -445,6 +466,7 @@ pub fn FunctionInstruction(comptime CallTarget: type) type {
     return union(enum) {
         consti: i32,
         call: FunctionCall(CallTarget),
+        exit: FunctionValueId,
         negi: FunctionValueId,
         addi: BinaryOperands,
         subi: BinaryOperands,
@@ -453,13 +475,14 @@ pub fn FunctionInstruction(comptime CallTarget: type) type {
     };
 }
 
-/// Owned function control-flow graph. Block arguments, call operands, and
-/// instructions use flat arrays while each block owns its ranges and
-/// terminator. CallTarget is the only representation difference between
+/// Owned function control-flow graph. Block arguments, branch operands, call
+/// operands, and instructions use flat arrays while each block owns its ranges
+/// and terminator. CallTarget is the only representation difference between
 /// semantic and per-instance IR.
 pub fn FunctionIr(comptime CallTarget: type) type {
     return struct {
         block_argument_types: []Type,
+        branch_arguments: []ValueId,
         call_arguments: []ValueId,
         instructions: []Instruction,
         blocks: []Block,
@@ -483,6 +506,7 @@ pub fn FunctionIr(comptime CallTarget: type) type {
         pub fn eql(a: @This(), b: @This()) bool {
             if (a.entry != b.entry or
                 !std.mem.eql(Type, a.block_argument_types, b.block_argument_types) or
+                !std.mem.eql(ValueId, a.branch_arguments, b.branch_arguments) or
                 !std.mem.eql(ValueId, a.call_arguments, b.call_arguments) or
                 a.instructions.len != b.instructions.len or
                 a.blocks.len != b.blocks.len) return false;
@@ -497,6 +521,7 @@ pub fn FunctionIr(comptime CallTarget: type) type {
 
         pub fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
             gpa.free(self.block_argument_types);
+            gpa.free(self.branch_arguments);
             gpa.free(self.call_arguments);
             gpa.free(self.instructions);
             gpa.free(self.blocks);

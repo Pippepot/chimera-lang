@@ -4,6 +4,8 @@ const structures = @import("structures.zig");
 pub fn lowerFunction(body: structures.FunctionBodyAnalysis, gpa: std.mem.Allocator) !structures.SsaFunction {
     const block_argument_types = try gpa.dupe(structures.Type, body.block_argument_types);
     errdefer gpa.free(block_argument_types);
+    const branch_arguments = try gpa.dupe(structures.FunctionValueId, body.branch_arguments);
+    errdefer gpa.free(branch_arguments);
     const call_arguments = try gpa.dupe(structures.FunctionValueId, body.call_arguments);
     errdefer gpa.free(call_arguments);
     const instructions = try gpa.alloc(structures.SsaFunction.Instruction, body.instructions.len);
@@ -16,6 +18,7 @@ pub fn lowerFunction(body: structures.FunctionBodyAnalysis, gpa: std.mem.Allocat
                 .arguments = call.arguments,
                 .return_type = call.return_type,
             } },
+            .exit => |operand| .{ .exit = operand },
             .negi => |operand| .{ .negi = operand },
             .addi => |operands| .{ .addi = operands },
             .subi => |operands| .{ .subi = operands },
@@ -28,6 +31,7 @@ pub fn lowerFunction(body: structures.FunctionBodyAnalysis, gpa: std.mem.Allocat
     @memcpy(blocks, body.blocks);
     return .{
         .block_argument_types = block_argument_types,
+        .branch_arguments = branch_arguments,
         .call_arguments = call_arguments,
         .instructions = instructions,
         .blocks = blocks,
@@ -41,6 +45,7 @@ fn functionBody(
 ) structures.FunctionBodyAnalysis {
     return .{
         .block_argument_types = &.{},
+        .branch_arguments = &.{},
         .call_arguments = &.{},
         .instructions = instructions,
         .blocks = blocks,
@@ -74,6 +79,23 @@ test "unit lowers to an explicit empty block" {
 
     try std.testing.expectEqual(@as(usize, 0), lowered.instructions.len);
     try std.testing.expectEqual(@as(usize, 1), lowered.blocks.len);
+    try std.testing.expectEqual(structures.SsaFunction.Terminator.return_unit, lowered.blocks[0].terminator);
+}
+
+test "exit preserves its typed integer operand" {
+    var instructions = [_]structures.FunctionBodyAnalysis.Instruction{
+        .{ .consti = 42 },
+        .{ .exit = @enumFromInt(0) },
+    };
+    var blocks = [_]structures.FunctionBodyAnalysis.Block{.{
+        .instruction_start = 0,
+        .instruction_end = instructions.len,
+        .terminator = .return_unit,
+    }};
+    var lowered = try lowerFunction(functionBody(&instructions, &blocks), std.testing.allocator);
+    defer lowered.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 0), @intFromEnum(lowered.instructions[1].exit));
     try std.testing.expectEqual(structures.SsaFunction.Terminator.return_unit, lowered.blocks[0].terminator);
 }
 
@@ -130,6 +152,7 @@ test "direct call lowers to owned value-equal symbolic SSA" {
     }};
     const body: structures.FunctionBodyAnalysis = .{
         .block_argument_types = &block_argument_types,
+        .branch_arguments = &.{},
         .call_arguments = &call_arguments,
         .instructions = &instructions,
         .blocks = &blocks,

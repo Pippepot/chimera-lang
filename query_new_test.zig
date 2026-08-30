@@ -124,7 +124,7 @@ fn expectCompiledFunctionResult(
     var executable = try codegen.buildExecutable(entry_id, functions.items, testing.allocator);
     defer executable.deinit(testing.allocator);
     const io = testing.io;
-    runtime.writeProgram(io, executable.bytes);
+    try runtime.writeProgram(io, executable.bytes);
     defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
     try testing.expectEqual(expected, runtime.runProg(io, testing.allocator, &.{}));
 }
@@ -435,6 +435,7 @@ const EntryCallParent = struct {
         return switch (body.instructions[0]) {
             .call => |call| call.target,
             .consti,
+            .exit,
             .negi,
             .addi,
             .subi,
@@ -928,7 +929,7 @@ test "BuildExecutable runs empty entry sources" {
     defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
     for ([_]structures.FileId{ 1, 2, 3 }) |file_id| {
         const executable = (try db.get(query_structures.BuildExecutable, file_id)).*.?;
-        runtime.writeProgram(io, executable.bytes);
+        try runtime.writeProgram(io, executable.bytes);
         try testing.expectEqual(@as(u8, 0), runtime.runProg(io, testing.allocator, &.{}));
     }
 }
@@ -1074,8 +1075,94 @@ test "declared unit functions analyze lower compile and execute as ordinary call
     const executable = (try db.get(query_structures.BuildExecutable, 1)).*.?;
     const io = testing.io;
     defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
-    runtime.writeProgram(io, executable.bytes);
+    try runtime.writeProgram(io, executable.bytes);
     try testing.expectEqual(@as(u8, 0), runtime.runProg(io, testing.allocator, &.{}));
+}
+
+test "exit is an unshadowable int to unit intrinsic" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static exit = func() unit -> return
+        \\static caller = func(value: int) unit
+        \\  const exit = 1
+        \\  return exit(value)
+        \\caller(42)
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const caller_id = scope.resolve("caller").?;
+    const body = (try db.get(query_structures.AnalyzeFunctionBody, caller_id)).*.?;
+
+    try testing.expectEqualSlices(structures.Type, &.{.int}, body.block_argument_types);
+    try testing.expectEqual(@as(usize, 2), body.instructions.len);
+    try testing.expectEqual(@as(i32, 1), body.instructions[0].consti);
+    try testing.expectEqual(@as(u32, 0), @intFromEnum(body.instructions[1].exit));
+    try testing.expectEqual(structures.FunctionBodyAnalysis.Terminator.return_unit, body.blocks[0].terminator);
+
+    const lowered = (try db.get(query_structures.LowerToSSA, .{ .item = caller_id })).*.?;
+    try testing.expectEqual(@as(u32, 0), @intFromEnum(lowered.instructions[1].exit));
+    const artifact = (try db.get(query_structures.CompileFunction, .{ .item = caller_id })).*.?;
+    try testing.expectEqual(@as(usize, 0), artifact.relocations.len);
+    try testing.expectEqual(@as(usize, 0), artifact.referenced_instances.len);
+
+    const executable = (try db.get(query_structures.BuildExecutable, 1)).*.?;
+    const io = testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    try runtime.writeProgram(io, executable.bytes);
+    try testing.expectEqual(@as(u8, 42), runtime.runProg(io, testing.allocator, &.{}));
+}
+
+test "exit validates its one int argument at the typed boundary" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    const cases = [_]struct {
+        file_id: structures.FileId,
+        source: []const u8,
+        message: []const u8,
+    }{
+        .{ .file_id = 1, .source = "exit()", .message = "call argument count does not match function signature" },
+        .{ .file_id = 2, .source = "exit(1, 2)", .message = "call argument count does not match function signature" },
+        .{
+            .file_id = 3,
+            .source = "static noop = func() unit -> return\nexit(noop())",
+            .message = "call argument type does not match function signature",
+        },
+    };
+    for (cases) |case| {
+        try addSource(db, case.file_id, case.source);
+        const entry_id = (try db.get(query_structures.SelectEntry, case.file_id)).*.?;
+        try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, entry_id)).* == null);
+        const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, entry_id, structures.Diagnostic, testing.allocator);
+        defer freeDiagnostics(diagnostics);
+        try testing.expectEqual(@as(usize, 1), diagnostics.len);
+        try testing.expectEqualStrings(case.message, diagnostics[0].message);
+    }
+}
+
+test "exit callers retain equal results across same-name declaration edits" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1, "static exit = func() int -> return 1\nexit(42)");
+    const entry_id = (try db.get(query_structures.SelectEntry, 1)).*.?;
+    const instance: structures.InstanceId = .{ .item = entry_id };
+    const body = try db.get(query_structures.AnalyzeFunctionBody, entry_id);
+    const lowered = try db.get(query_structures.LowerToSSA, instance);
+    const artifact = try db.get(query_structures.CompileFunction, instance);
+    const executable = try db.get(query_structures.BuildExecutable, 1);
+
+    try setSource(db, 1, "static exit = func(value: int) unit -> return\nexit(42)");
+    try testing.expectEqual(body, try db.get(query_structures.AnalyzeFunctionBody, entry_id));
+    try testing.expectEqual(lowered, try db.get(query_structures.LowerToSSA, instance));
+    try testing.expectEqual(artifact, try db.get(query_structures.CompileFunction, instance));
+    try testing.expectEqual(executable, try db.get(query_structures.BuildExecutable, 1));
+
+    const io = testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    try runtime.writeProgram(io, executable.*.?.bytes);
+    try testing.expectEqual(@as(u8, 42), runtime.runProg(io, testing.allocator, &.{}));
 }
 
 test "unit values are rejected at int boundaries" {
@@ -1137,6 +1224,103 @@ test "function expressions analyze nested arithmetic and calls as one typed valu
     const lowered = (try db.get(query_structures.LowerToSSA, .{ .item = expression_id })).*.?;
     try testing.expectEqual(@as(u32, 9), @intFromEnum(lowered.instructions[10].negi));
     try testing.expect((try db.get(query_structures.BuildExecutable, 1)).* != null);
+}
+
+test "fallible integer if joins branch values through a block argument" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static choose = func(value: int) int
+        \\  return if value < 0
+        \\    20
+        \\  else
+        \\    22
+        \\static answer = func() int -> return choose(-1) + choose(1)
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const choose_id = scope.resolve("choose").?;
+    const body = (try db.get(query_structures.AnalyzeFunctionBody, choose_id)).*.?;
+
+    try testing.expectEqualSlices(structures.Type, &.{ .int, .int }, body.block_argument_types);
+    try testing.expectEqual(@as(usize, 4), body.blocks.len);
+    try testing.expectEqual(@as(usize, 2), body.branch_arguments.len);
+    const predicate = body.blocks[0].terminator.predicate_branch;
+    try testing.expectEqual(structures.PredicateOperation.lti, predicate.operation);
+    try testing.expectEqual(@as(u32, 0), @intFromEnum(predicate.operands.lhs));
+    try testing.expectEqual(@as(u32, 2), @intFromEnum(predicate.operands.rhs));
+    try testing.expectEqual(@as(u32, 1), body.blocks[3].argument_start);
+    try testing.expectEqual(@as(u32, 2), body.blocks[3].argument_end);
+    try testing.expectEqual(@as(u32, 1), @intFromEnum(body.blocks[3].terminator.return_value));
+
+    const lowered = (try db.get(query_structures.LowerToSSA, .{ .item = choose_id })).*.?;
+    try testing.expectEqualSlices(structures.FunctionValueId, body.branch_arguments, lowered.branch_arguments);
+    try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "choose" }, 42);
+}
+
+test "every integer comparison selects the fallible success edge" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static answer = func() int
+        \\  const a = if 1 < 2 -> 1 else 0
+        \\  const b = if 2 > 1 -> 2 else 0
+        \\  const c = if 1 <= 1 -> 4 else 0
+        \\  const d = if 1 >= 1 -> 8 else 0
+        \\  const e = if 1 == 1 -> 16 else 0
+        \\  const f = if 1 <> 2 -> 11 else 0
+        \\  return a + b + c + d + e + f
+    );
+    try expectCompiledFunctionResult(db, 1, "answer", &.{"answer"}, 42);
+}
+
+test "if requires supported fallible operands and equal branch types" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    const cases = [_]struct { file_id: structures.FileId, source: []const u8, message: []const u8 }{
+        .{
+            .file_id = 1,
+            .source = "static bad = func() int -> return if true -> 1 else 2",
+            .message = "if condition must be a fallible expression",
+        },
+        .{
+            .file_id = 2,
+            .source = "static noop = func() unit -> return\nstatic bad = func() int -> return if noop() < 1 -> 1 else 2",
+            .message = "fallible comparison requires int operands",
+        },
+        .{
+            .file_id = 3,
+            .source = "static noop = func() unit -> return\nstatic bad = func() int -> return if 1 == 1 -> 1 else noop()",
+            .message = "if branches must have the same type",
+        },
+    };
+    for (cases) |case| {
+        try addSource(db, case.file_id, case.source);
+        const bad_id = (try db.get(query_structures.BuildModuleScope, case.file_id)).*.?.resolve("bad").?;
+        try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, bad_id)).* == null);
+        const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, bad_id, structures.Diagnostic, testing.allocator);
+        defer freeDiagnostics(diagnostics);
+        try testing.expectEqual(@as(usize, 1), diagnostics.len);
+        try testing.expectEqualStrings(case.message, diagnostics[0].message);
+    }
+}
+
+test "unit branch results join without a machine value" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static noop = func() unit -> return
+        \\static choose = func(value: int) unit -> return if value == 0 -> noop() else noop()
+        \\choose(0)
+    );
+    const executable = (try db.get(query_structures.BuildExecutable, 1)).*.?;
+    const io = testing.io;
+    try runtime.writeProgram(io, executable.bytes);
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    try testing.expectEqual(@as(u8, 0), runtime.runProg(io, testing.allocator, &.{}));
 }
 
 test "parameters and nested call arguments form one typed value graph" {
@@ -1794,7 +1978,7 @@ test "BuildExecutable links a direct call while keeping the entry artifact indep
 
     const io = testing.io;
     defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
-    runtime.writeProgram(io, initial_executable.*.?.bytes);
+    try runtime.writeProgram(io, initial_executable.*.?.bytes);
     try testing.expectEqual(@as(u8, 0), runtime.runProg(io, testing.allocator, &.{}));
 
     // Editing only the callee's return value changes the callee's compiled
@@ -1811,7 +1995,7 @@ test "BuildExecutable links a direct call while keeping the entry artifact indep
     try testing.expect(updated_executable.* != null);
     try testing.expect(!structures.Executable.eql(initial_executable.*.?, updated_executable.*.?));
 
-    runtime.writeProgram(io, updated_executable.*.?.bytes);
+    try runtime.writeProgram(io, updated_executable.*.?.bytes);
     try testing.expectEqual(@as(u8, 0), runtime.runProg(io, testing.allocator, &.{}));
 }
 
@@ -1829,7 +2013,7 @@ test "BuildExecutable links and runs transitively reachable calls" {
 
     const io = testing.io;
     defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
-    runtime.writeProgram(io, executable.*.?.bytes);
+    try runtime.writeProgram(io, executable.*.?.bytes);
     try testing.expectEqual(@as(u8, 0), runtime.runProg(io, testing.allocator, &.{}));
 }
 

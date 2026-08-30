@@ -40,6 +40,7 @@ fn functionSsa(
 ) structures.SsaFunction {
     return .{
         .block_argument_types = &.{},
+        .branch_arguments = &.{},
         .call_arguments = &.{},
         .instructions = instructions,
         .blocks = blocks,
@@ -69,7 +70,7 @@ test "single aligned function artifact builds and runs without borrowing code" {
     const artifact_file_offset = std.mem.indexOf(u8, executable.bytes, &artifact_code).?;
     try std.testing.expectEqual(@as(u64, 0), (0x400000 + artifact_file_offset) % 16);
 
-    runtime.writeProgram(io, executable.bytes);
+    try runtime.writeProgram(io, executable.bytes);
     defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
     try std.testing.expectEqual(@as(u8, 0), runtime.runProg(io, std.testing.allocator, &.{}));
 }
@@ -96,6 +97,29 @@ test "ordinary function artifacts encode signed 32-bit literal returns" {
         try std.testing.expectEqual(@as(usize, 0), artifact.relocations.len);
         try std.testing.expectEqual(@as(usize, 0), artifact.referenced_instances.len);
     }
+}
+
+test "exit emits an inline syscall without references" {
+    var instructions = [_]structures.SsaFunction.Instruction{
+        integerConstant(42),
+        .{ .exit = @enumFromInt(0) },
+    };
+    var blocks = [_]structures.SsaFunction.Block{.{
+        .instruction_start = 0,
+        .instruction_end = instructions.len,
+        .terminator = .return_unit,
+    }};
+    const ssa = functionSsa(&instructions, &blocks);
+    var artifact = try codegen.compileFunction(&ssa, std.testing.allocator);
+    defer artifact.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualSlices(u8, &.{
+        0xB8, 42,   0,    0,    0,
+        0x89, 0xC7, 0xB8, 60,   0,
+        0,    0,    0x0F, 0x05, 0xC3,
+    }, artifact.code);
+    try std.testing.expectEqual(@as(usize, 0), artifact.relocations.len);
+    try std.testing.expectEqual(@as(usize, 0), artifact.referenced_instances.len);
 }
 
 test "direct call artifacts own exact relocation metadata" {
@@ -238,31 +262,61 @@ test "typed expression values survive calls and execute every integer arithmetic
     defer executable.deinit(std.testing.allocator);
 
     const io = std.testing.io;
-    runtime.writeProgram(io, executable.bytes);
+    try runtime.writeProgram(io, executable.bytes);
     defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
     try std.testing.expectEqual(@as(u8, 42), runtime.runProg(io, std.testing.allocator, &.{}));
 }
 
-test "unsupported control-flow shapes are rejected without allocating" {
-    const target: structures.InstanceId = .{ .item = @enumFromInt(0) };
-    var one_call = [_]structures.SsaFunction.Instruction{directCall(target)};
-    var bad_start = [_]structures.SsaFunction.Block{.{ .instruction_start = 1, .instruction_end = 1, .terminator = .return_unit }};
-    var bad_end = [_]structures.SsaFunction.Block{.{ .instruction_start = 0, .instruction_end = 0, .terminator = .return_unit }};
-    var two_blocks = [_]structures.SsaFunction.Block{
-        .{ .instruction_start = 0, .instruction_end = 1, .terminator = .return_unit },
-        .{ .instruction_start = 1, .instruction_end = 1, .terminator = .return_unit },
+test "cyclic CFG accepts multi-value parallel backedge copies" {
+    var block_argument_types = [_]structures.Type{ .int, .int, .int, .int, .int };
+    var branch_arguments = [_]structures.FunctionValueId{
+        @enumFromInt(0),
+        @enumFromInt(1),
+        @enumFromInt(3),
+        @enumFromInt(2),
+        @enumFromInt(2),
     };
-    const cases = [_]structures.SsaFunction{
-        functionSsa(&one_call, &bad_start),
-        functionSsa(&one_call, &bad_end),
-        functionSsa(&one_call, &two_blocks),
+    var instructions = [_]structures.SsaFunction.Instruction{integerConstant(0)};
+    var blocks = [_]structures.SsaFunction.Block{
+        .{
+            .argument_start = 0,
+            .argument_end = 2,
+            .instruction_start = 0,
+            .instruction_end = 0,
+            .terminator = .{ .branch = .{ .target = @enumFromInt(1), .arguments = .{ .start = 0, .end = 2 } } },
+        },
+        .{
+            .argument_start = 2,
+            .argument_end = 4,
+            .instruction_start = 0,
+            .instruction_end = 1,
+            .terminator = .{ .predicate_branch = .{
+                .operation = .gti,
+                .operands = .{ .lhs = @enumFromInt(2), .rhs = @enumFromInt(5) },
+                .then_branch = .{ .target = @enumFromInt(2), .arguments = .{ .start = 4, .end = 5 } },
+                .else_branch = .{ .target = @enumFromInt(1), .arguments = .{ .start = 2, .end = 4 } },
+            } },
+        },
+        .{
+            .argument_start = 4,
+            .argument_end = 5,
+            .instruction_start = 1,
+            .instruction_end = 1,
+            .terminator = .{ .return_value = @enumFromInt(4) },
+        },
+    };
+    const ssa: structures.SsaFunction = .{
+        .block_argument_types = &block_argument_types,
+        .branch_arguments = &branch_arguments,
+        .call_arguments = &.{},
+        .instructions = &instructions,
+        .blocks = &blocks,
+        .entry = @enumFromInt(0),
     };
 
-    for (cases) |ssa| {
-        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-        try std.testing.expectError(error.UnsupportedControlFlow, codegen.compileFunction(&ssa, failing.allocator()));
-        try std.testing.expect(!failing.has_induced_failure);
-    }
+    var artifact = try codegen.compileFunction(&ssa, std.testing.allocator);
+    defer artifact.deinit(std.testing.allocator);
+    try std.testing.expect(artifact.code.len != 0);
 }
 
 test "direct call artifact construction cleans up every allocation failure" {
@@ -434,7 +488,7 @@ test "executable builder resolves a direct call to its callee's file offset" {
     try std.testing.expectEqual(expected, displacement);
 
     const io = std.testing.io;
-    runtime.writeProgram(io, executable.bytes);
+    try runtime.writeProgram(io, executable.bytes);
     defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
     try std.testing.expectEqual(@as(u8, 0), runtime.runProg(io, std.testing.allocator, &.{}));
 }

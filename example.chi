@@ -1,0 +1,2 @@
+static status = func(value: int) int -> return value * 2
+exit(status(21))

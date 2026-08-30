@@ -5,3 +5,4 @@ chimera.o
 .zig-cache/
 *.qcache
 *.o
+agentloop
