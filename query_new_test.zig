@@ -1705,7 +1705,7 @@ test "malformed function diagnostics remain parse-only and top-level return stay
     try testing.expectEqualStrings(entry_message, entry_diagnostics[0].message);
 }
 
-test "entry analysis rejects every runtime root" {
+test "entry analysis rejects top-level returns" {
     const db = try testDatabase(2);
     defer db.deinit();
 
@@ -1714,12 +1714,6 @@ test "entry analysis rejects every runtime root" {
         marker: []const u8,
     }{
         .{ .source = "return", .marker = "return" },
-        .{ .source = "const x = 1", .marker = "x" },
-        .{ .source = "var x = 1", .marker = "x" },
-        .{ .source = "1", .marker = "1" },
-        .{ .source = "if true -> 1", .marker = "if" },
-        .{ .source = "x = 1", .marker = "=" },
-        .{ .source = "comptime -> return 7", .marker = "comptime" },
         .{ .source = "static ok = 1\nreturn 7\nprint(1)", .marker = "return" },
     };
     const entry_message = "runtime top-level statements are not supported yet";
@@ -1739,6 +1733,55 @@ test "entry analysis rejects every runtime root" {
         try expectSingleQueryDiagnostic(db, query_structures.CompileFunction, entry_instance, false, file_id, span, entry_message);
         try expectSingleQueryDiagnostic(db, query_structures.BuildExecutable, file_id, false, file_id, span, entry_message);
     }
+}
+
+test "entry const bindings name typed values and execute" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static status = func(value: int) int -> return value * 2
+        \\const a = status(21)
+        \\exit(a)
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const status_id = scope.resolve("status").?;
+    const entry_id = (try db.get(query_structures.SelectEntry, 1)).*.?;
+    const body = (try db.get(query_structures.AnalyzeFunctionBody, entry_id)).*.?;
+
+    try testing.expectEqual(@as(usize, 3), body.instructions.len);
+    try testing.expectEqual(@as(i32, 21), body.instructions[0].consti);
+    try testing.expectEqual(status_id, body.instructions[1].call.target);
+    try testing.expectEqual(@as(u32, 1), @intFromEnum(body.instructions[2].exit));
+
+    const executable = (try db.get(query_structures.BuildExecutable, 1)).*.?;
+    const io = testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    try runtime.writeProgram(io, executable.bytes);
+    try testing.expectEqual(@as(u8, 42), runtime.runProg(io, testing.allocator, &.{}));
+}
+
+test "entry const binding edits retain equal analysis and recover" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1, "const value = 21\nexit(value)");
+    const entry_id = (try db.get(query_structures.SelectEntry, 1)).*.?;
+    const initial = try db.get(query_structures.AnalyzeFunctionBody, entry_id);
+    try testing.expect(initial.* != null);
+
+    try setSource(db, 1, "const renamed = 21\nexit(renamed)");
+    try testing.expectEqual(initial, try db.get(query_structures.AnalyzeFunctionBody, entry_id));
+
+    try setSource(db, 1, "exit(renamed)");
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, entry_id)).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, entry_id, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqualStrings("unknown value", diagnostics[0].message);
+
+    try setSource(db, 1, "const restored = 21\nexit(restored)");
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, entry_id)).* != null);
 }
 
 test "entry analysis resolves one direct call without analyzing its callee body" {

@@ -227,15 +227,16 @@ test "CLI core renders debug output and runs the compiled program" {
     const exit_code = try compileAndRun(io, std.testing.allocator, .{
         .source_path = "test.chi",
         .source =
-        \\static add = func(value: int) int -> return value + 2
-        \\exit(add(21))
+        \\static status = func(value: int) int -> return value * 2
+        \\const a = status(21)
+        \\exit(a)
         ,
         .program_args = &.{},
         .debug_flags = .{ .ast = true, .ssa = true, .@"asm" = true, .timing = true },
         .started = std.Io.Clock.awake.now(io),
     }, &output.writer, &errors.writer);
 
-    try std.testing.expectEqual(@as(?u8, 23), exit_code);
+    try std.testing.expectEqual(@as(?u8, 42), exit_code);
     try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "AST\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "SSA\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "ASM\n") != null);

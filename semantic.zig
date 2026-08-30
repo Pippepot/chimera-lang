@@ -114,10 +114,9 @@ const unsupported_entry_message = "runtime top-level statements are not supporte
 const body_shape_message = "function body must end in one return; preceding statements must be const bindings or calls";
 const expression_message = "expression is not supported yet";
 
-/// Builds one unresolved body for either callable kind. Entries accept bare
-/// calls and skip static bindings under a synthetic zero-parameter signature;
-/// declared functions additionally accept annotated const bindings and must
-/// end in a return.
+/// Builds one unresolved body for either callable kind. Entries accept const
+/// bindings and bare calls, and skip static bindings under a synthetic
+/// zero-parameter signature; declared functions must end in a return.
 pub fn buildUnresolvedBody(
     ast: *const structures.Ast,
     source: []const u8,
@@ -162,7 +161,7 @@ pub fn buildUnresolvedBody(
     };
 
     const body_result: SemanticResult(void) = switch (kind) {
-        .top_level_entry => try buildEntryBlock(ast, declaration, &expression_builder),
+        .top_level_entry => try buildEntryBlock(ast, source, declaration, &locals, &type_expectations, &expression_builder, gpa),
         .function => try buildFunctionBlock(ast, source, declaration, parameter_types, &locals, &type_expectations, &expression_builder, gpa),
     };
     switch (body_result) {
@@ -193,21 +192,29 @@ pub fn buildUnresolvedBody(
 
 fn buildEntryBlock(
     ast: *const structures.Ast,
+    source: []const u8,
     declaration: u32,
+    locals: *std.StringHashMap(UnresolvedBody.ValueId),
+    type_expectations: *std.ArrayList(UnresolvedBody.TypeExpectation),
     expression_builder: *UnresolvedExpressionBuilder,
+    gpa: std.mem.Allocator,
 ) std.mem.Allocator.Error!SemanticResult(void) {
     const root = ast.nodes[declaration];
     std.debug.assert(root.tag == .block);
     for (root.data.ref.start..root.data.ref.end) |ref_index| {
         const child_index = ast.node_refs[ref_index];
         const child = ast.nodes[child_index.index()];
-        if (child.tag == .static_binding) continue;
-        if (child.tag != .call) {
-            return .{ .unsupported = issueAt(ast, child_index.index(), unsupported_entry_message) };
-        }
-        switch (try expression_builder.append(child_index)) {
-            .success => {},
-            .unsupported => |issue| return .{ .unsupported = issue },
+        switch (child.tag) {
+            .static_binding => continue,
+            .const_binding => switch (try appendConstBinding(ast, source, child_index, locals, type_expectations, expression_builder, gpa)) {
+                .success => {},
+                .unsupported => |issue| return .{ .unsupported = issue },
+            },
+            .call => switch (try expression_builder.append(child_index)) {
+                .success => {},
+                .unsupported => |issue| return .{ .unsupported = issue },
+            },
+            else => return .{ .unsupported = issueAt(ast, child_index.index(), unsupported_entry_message) },
         }
     }
     expression_builder.terminate(.{ .return_unit = tokenSpan(ast, root.token_index) });
