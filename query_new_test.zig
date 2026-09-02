@@ -1636,6 +1636,33 @@ test "if requires supported fallible operands and compatible branch types" {
     }
 }
 
+test "if conditions separate unimplemented fallible forms from non-fallible expressions" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    const cases = [_]struct { file_id: structures.FileId, source: []const u8, marker: []const u8, message: []const u8 }{
+        .{ .file_id = 1, .source = "static bad = func(v: int) int -> return if v is int -> 1 else 2", .marker = "is", .message = "fallible condition form is not supported yet" },
+        .{ .file_id = 2, .source = "static bad = func(v: int) int -> return if v as int -> 1 else 2", .marker = "as", .message = "fallible condition form is not supported yet" },
+        .{ .file_id = 3, .source = "static bad = func(v: int) int -> return if v? -> 1 else 2", .marker = "?", .message = "fallible condition form is not supported yet" },
+        .{ .file_id = 4, .source = "static bad = func(v: int) int -> return if v < 1 and v > 2 -> 1 else 2", .marker = "and", .message = "fallible condition form is not supported yet" },
+        .{ .file_id = 5, .source = "static bad = func(v: int) int -> return if not (v < 1) -> 1 else 2", .marker = "not", .message = "fallible condition form is not supported yet" },
+        .{ .file_id = 6, .source = "static bad = func(v: int) int -> return if const x = v as int -> x else 2", .marker = "as", .message = "fallible condition form is not supported yet" },
+        .{ .file_id = 7, .source = "static bad = func(v: int) int -> return if const x = v? -> x else 2", .marker = "?", .message = "fallible condition form is not supported yet" },
+        .{ .file_id = 8, .source = "static bad = func(v: int) int -> return if const x = v -> x else 2", .marker = "v", .message = "if condition must be a fallible expression" },
+    };
+    for (cases) |case| {
+        try addSource(db, case.file_id, case.source);
+        const bad_id = (try db.get(query_structures.BuildModuleScope, case.file_id)).*.?.resolve("bad").?;
+        try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, bad_id)).* == null);
+        const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, bad_id, structures.Diagnostic, testing.allocator);
+        defer freeDiagnostics(diagnostics);
+        try testing.expectEqual(@as(usize, 1), diagnostics.len);
+        try testing.expectEqualStrings(case.message, diagnostics[0].message);
+        const marker_start = std.mem.lastIndexOf(u8, case.source, case.marker).?;
+        try testing.expectEqual(structures.SourceSpan{ .start = marker_start, .end = marker_start + case.marker.len }, diagnostics[0].span.?);
+    }
+}
+
 test "unit branch results join without a machine value" {
     const db = try testDatabase(2);
     defer db.deinit();

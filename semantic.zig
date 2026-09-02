@@ -551,8 +551,14 @@ const UnresolvedExpressionBuilder = struct {
             .ge => .ge,
             .eq => .eq,
             .ne => .ne,
-            .@"and", .@"or", .not, .is, .as => return .{ .unsupported = issueAt(self.ast, node_index.index(), "fallible condition form is not supported yet") },
-            else => return .{ .unsupported = issueAt(self.ast, node_index.index(), "if condition must be a fallible expression") },
+            else => {
+                const form_index = if (node.tag == .const_binding or node.tag == .var_binding) node.data.node_node.b else node_index;
+                const message = if (isFallibleExpression(self.ast.nodes[form_index.index()].tag))
+                    "fallible condition form is not supported yet"
+                else
+                    "if condition must be a fallible expression";
+                return .{ .unsupported = issueAt(self.ast, form_index.index(), message) };
+            },
         };
         const lhs = switch (try self.append(node.data.node_node.a)) {
             .success => |value| value,
@@ -704,6 +710,13 @@ const AstNodeListIterator = struct {
         return if (self.uses_refs) self.ast.node_refs[index] else self.inline_nodes[index];
     }
 };
+
+fn isFallibleExpression(tag: structures.Node.Tag) bool {
+    return switch (tag) {
+        .lt, .gt, .le, .ge, .eq, .ne, .is, .as, .query_op, .@"and", .@"or", .not => true,
+        else => false,
+    };
+}
 
 fn analyzeType(
     ast: *const structures.Ast,
