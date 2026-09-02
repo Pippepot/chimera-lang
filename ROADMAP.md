@@ -1,6 +1,6 @@
 # Refactor roadmap
 
-Last updated: 2026-08-27.
+Last updated: 2026-08-30.
 
 This is a temporary handoff document. Update it after each completed milestone and delete obsolete details rather than preserving history here. Durable design rules live in `ARCHITECTURE.md`; agent workflow lives in `AGENTS.md`.
 
@@ -37,6 +37,13 @@ SourceText(FileId)
 BuildExecutable(FileId) -> ?Executable
     ├── SelectEntry(FileId) -> ?ItemId
     └── CompileFunction(InstanceId) for every reachable referenced instance
+```
+
+Type identity is shared by those queries:
+
+```text
+VariantTypes canonical interner -> InternedTypeId -> TypeId
+TypeLayout(TypeId) -> TypeLayout
 ```
 
 The repository root now has a new-pipeline CLI in `main.zig`. `legacy/main.zig` remains a behavioral reference and is not part of the refactored execution path.
@@ -101,20 +108,36 @@ The repository root now has a new-pipeline CLI in `main.zig`. `legacy/main.zig` 
 
 ### Ordinary function semantics
 
-- `FunctionSignature(ItemId)` analyzes only a function header and owns its ordered `int` parameter types plus an explicit `int` or `unit` return type. Parameter modes and non-`int` parameter types remain unsupported.
+- `FunctionSignature(ItemId)` analyzes only a function header and owns its ordered parameter `TypeId`s plus its explicit return `TypeId`. It resolves `int`, `unit`, `none`, and structural variants through the type interner; direct `unit`/`none` parameters, direct `none` returns, parameter modes, and other type families remain unsupported.
 - For declared functions, `AnalyzeFunctionBody(ItemId)` depends on the signature and accepts immutable local bindings and bare calls ending in a supported return. Integer functions return an `int` expression; unit functions use a bare return or return a unit-valued expression.
-- The parser encodes precedence and nesting in the AST. Body analysis walks that expression tree into typed values: parameters, decimal integer constants, and calls are leaves; unary negation and binary `+`, `-`, `*`, and `/` compose them; value-producing `if/else` joins equal-typed branch results.
+- The parser encodes precedence and nesting in the AST. Body analysis walks that expression tree into typed values: parameters, decimal integer constants, `none`, and calls are leaves; unary negation and binary `+`, `-`, `*`, and `/` compose integers; value-producing `if/else` joins equal types or infers a containing variant for compatible member branches.
 - An `if` condition is a fallible expression, not a `bool`. The selected forms are integer `<`, `>`, `<=`, `>=`, `==`, and `<>`; their success or failure becomes a typed predicate terminator and no comparison-result value enters SSA.
 - Calls accept arbitrary numbers of expressions evaluated left-to-right. The typed boundary validates arity and each argument type against the callee signature.
 - For the synthetic entry, `AnalyzeFunctionBody(ItemId)` accepts root-level `static` bindings, immutable local bindings, and bare calls, discards unused values, and returns `unit`.
-- Unresolved-body construction resolves lexical local names and records optional `int` or `unit` annotations. The query then resolves calls and validates annotations, operations, fallible predicate operands, branch joins, arguments, and returns before publishing type-specific `FunctionBodyAnalysis`; SSA and codegen do not repeat those type checks.
-- A `const` binding names an existing typed value and emits no semantic or SSA instruction. Bindings and bare calls may be interleaved, aliases reuse the same value ID, and local values shadow module callables. Optional `int` and `unit` annotations are validated against their initializers.
+- Unresolved-body construction resolves lexical local names and resolves optional `int`, `unit`, or variant annotations through the same type protocol as signatures. The query then resolves calls and validates annotations, operations, fallible predicate operands, branch joins, arguments, and returns before publishing type-specific `FunctionBodyAnalysis`; SSA and codegen do not repeat those type checks.
+- A `const` binding normally names an existing typed value without an instruction. A variant annotation emits the explicit exact-member injection required to give the binding its declared representation. Bindings and bare calls may be interleaved, aliases reuse the same value ID, and local values shadow module callables.
 - Body analysis owns block and typed-instruction arrays containing stable identities and value-ID operands; it stores no AST indices, token spans, or borrowed source text.
-- Typed calls record their `int` or `unit` result type. Unit values are rejected at integer operation, argument, annotation, and return boundaries before typed IR is published.
+- Typed calls record their result `TypeId`. Unit and variant values are rejected at integer-operation boundaries before typed IR is published.
 - `exit(value: int)` bypasses local and module callable lookup, publishes a dedicated unit-valued instruction, and requires exactly one `int` operand.
 - Declared-function signature and body analysis depend explicitly on source text, so equal-shape spelling edits remain observable despite structural AST equality.
 - Equal signatures suppress downstream recomputation across body-only edits; body analysis recomputes independently.
 - Top-level `return` remains invalid through semantic analysis, ordinary lowering and compilation, and executable construction.
+
+### Variant types and first runtime value slice
+
+- `TypeId` replaces the closed primitive-type enum throughout semantic IR, SSA, signatures, and typed calls. `int`, `unit`, and `none` have reserved identities; database-interned identities occupy a disjoint encoded range.
+- The encoded range means "interned type," not "variant." `InternedTypeId` is a 31-bit interner index because the enclosing 32-bit `TypeId` uses its remaining high bit to distinguish interned identities from reserved primitives. When a second interned type shape is implemented, replace the variant-only store with one type-data interner over the then-real shapes; do not add another type-ID encoding or parallel struct identity mechanism.
+- `VariantTypes` owns its member slice and interns variants structurally. Canonicalization flattens nested variants, ignores source member order, and reports explicit or flattening-induced duplicate members before interning.
+- The current canonical member universe is deliberately limited to `int`, `unit`, and `none`. Named types, aliases, and further runtime types extend canonicalization only when their own vertical slice needs them.
+- `TypeLayout(TypeId)` publishes only immutable byte size and alignment. `int` is 4-byte aligned and sized; `unit` and `none` are zero-sized; a variant uses a 4-byte `u32` tag plus naturally aligned maximum-member payload storage and final tail padding. Variant payload offsets and future struct field offsets are not fields of this common result.
+- Consequently, `int | none` is 8 bytes rather than the legacy layout's packed 5 bytes. The extra 3 bytes buy naturally aligned tag/payload loads and copies, remove the `u8` tag's 255-member ceiling, and give calls, stack slots, and future aggregate layout one ordinary alignment rule. A compact representation remains a possible measured optimization, not the semantic layout baseline.
+- The type foundation establishes stable identity, ownership, equality, duplicate handling, and layout.
+- Function parameter, return, and local annotations now resolve variant syntax at the semantic/query boundary. Successful signatures publish canonical `TypeId`s, reordered member spellings retain equal signatures, and no cached value borrows type AST nodes or source text.
+- Explicit duplicate members produce one diagnostic at the repeated member. Unknown type-family diagnostics remain owned by the parameter, return, or local-annotation boundary.
+- `AnalyzeFunctionBody` publishes variant-bearing typed IR only after validating exact-member injection and the one implicit subset-widening site: a function argument accepted by a wider variant parameter. Other subset widening remains rejected pending explicit operation syntax.
+- `FunctionValueUse` carries a source value plus an optional target variant at branches, calls, and returns. Local variant annotations use the type-specific `variant_coerce` instruction. SSA preserves both forms without repeating semantic checks.
+- Codegen allocates arguments, edge-copy scratch space, and spills from `TypeLayout`. Exactly four-byte results use `eax`; every other nonzero-sized result uses caller-provided stack storage. Copies cover the full layout, including payloads larger than one word. Subset calls remap variant tags by structural member identity.
+- Differing primitive branch values infer their canonical containing variant. A member-to-existing-variant join keeps that variant; two different existing variants do not widen implicitly.
 
 ### Ordinary function SSA
 
@@ -189,10 +212,10 @@ The repository root now has a new-pipeline CLI in `main.zig`. `legacy/main.zig` 
 ## Current temporary limitations
 
 - Static binding initializers are currently opaque to entry analysis; contextual validation inside them belongs to future general semantic analysis.
-- Function signatures support ordered `int` parameters and an explicit `int` or `unit` return; inferred returns, parameter modes, other parameter types, named types, and compound types are deferred.
+- Function signatures and bodies support structural variants over `int`, `unit`, and `none`, including aligned runtime values in locals, branches, calls, and returns. Inferred function returns, parameter modes, aliases, named types, and other compound types remain deferred.
 - Value-producing `if/else` supports integer comparison conditions and equal-typed single-expression branches. Statement-only `if`, compound branch bodies, condition bindings, multiple source returns, and loop syntax are deferred.
 - Calls currently support only bare file-local function names. Arguments can be any supported expression; mutable locals, assignment, and nested lexical scopes are deferred.
-- Expressions currently support decimal `int` constants, calls returning `int` or `unit`, `exit(value: int)`, immutable-local references, unary negation, binary `+`, `-`, `*`, and `/`, and value-producing `if/else` over integer comparisons. Unit values can be discarded, aliased, returned, or joined with unit; other value types and operators remain unsupported.
+- Expressions currently support decimal `int` constants, `none`, calls returning supported primitive or variant types, `exit(value: int)`, immutable-local references, unary negation, binary `+`, `-`, `*`, and `/`, and value-producing `if/else` over integer comparisons. Variant inspection and extraction operators remain unsupported.
 - `InstanceId` has no generic substitutions yet.
 - Callable scope is file-local and contains only functions; imports, visibility, other namespaces, and overloading are deferred.
 - Input updates are allowed only while no query is queued or running.
@@ -208,10 +231,33 @@ The repository root now has a new-pipeline CLI in `main.zig`. `legacy/main.zig` 
 - Add module- and item-level queries for declarations, scopes, type definitions, layouts, and compile-time values.
 - Add per-function or per-instance name resolution, typing, diagnostics, lowering, and code generation only as each slice requires.
 - Extend SSA and codegen only as each semantic feature requires.
-- Next prioritize control flow and further observable output before aggregate, compile-time, variant, and ownership features.
+- Continue variants through the dedicated rollout below; keep unrelated aggregate, compile-time, and ownership machinery out of those slices.
 - Port relevant legacy behavior and regression tests with each supported feature, not as a final batch.
 - Keep machine addresses and executable layout out of semantic and SSA results.
 - Preserve the boundary between relocatable function emission and whole-program executable construction.
+
+### Variant rollout after the foundation
+
+The selected semantics are:
+
+- `none` is distinct from `unit`; both are valid variant members. The first source-facing member types are `int`, `unit`, and `none`.
+- Variants are structural and aliases are transparent. Member order is irrelevant, nested variants flatten, and an explicit or alias-expanded duplicate is a source diagnostic rather than silent deduplication.
+- A plain member value may be injected wherever an expected type is a variant containing that exact member. A smaller variant may widen implicitly when passed to a function parameter whose variant contains all of its members. Other variant-subset widening, including rebinding an existing variant with a wider type, requires an explicit widening operation; select that operation's spelling before implementing those sites.
+- Differing `if/else` value types infer their canonical containing variant once branch inference is selected. Diverging branches later join through `Never`, independently of variant construction.
+- `is` accepts a member or subset type on its right and only selects success/failure control-flow edges. `as` is fallible extraction, not an unsafe cast; its success edge carries the narrowed payload. A bare `if value as int` is valid and discards that payload.
+- Successful narrowing does not change the original binding's type. A condition binding receives the narrowed type and exists only in the success region. Immutable condition bindings arrive with extraction; mutable condition bindings remain deferred.
+- Postfix `?` is valid only for a variant containing `none`. Its success payload is the sole remaining member or the canonical variant of all remaining members.
+- `is`, `as`, and `?` remain valid only in a fallible-expression consumer until another consumer is deliberately added. They lower through the existing predicate terminator and success-edge block arguments, never through a materialized boolean.
+- Variant parameters and returns are part of the first complete runtime slice. Initial variant-return functions require explicit returns; implicit unit fallthrough remains a separate feature.
+- Variant equality and `match` are later slices. `match` should consume the same tag tests and payload-carrying edges rather than introduce a second narrowing model.
+- The planned transparent alias syntax is `static MaybeInt = int | none`; `comptime` remains an expression modifier rather than a declaration keyword.
+
+Implement the remaining work as vertical phases:
+
+1. **Complete.** Exact-member injection, directional call-boundary subset coercion, semantic construction, SSA values, layout-driven locations, calls, returns, copies, and branch joins use the aligned tag-plus-payload representation end to end.
+2. Represent explicit widening only after its operation syntax is selected; keep non-call subset widening rejected until then.
+3. Add `is`, fallible `as`, postfix `?`, and immutable condition bindings together, using success-edge payload arguments and testing success, failure, scope, and narrowed types.
+4. Expose `sizeof` through `TypeLayout` now that the runtime representation is exercised end to end. Then add inferred multi-return joins, equality, aliases, and `match` as separately tested slices.
 
 ### Fallible control-flow expansion gates
 
@@ -282,9 +328,9 @@ Last observed results:
 - `zig test diagnostics.zig`: 2 passed.
 - `zig test main.zig`: 84 passed.
 - `zig test semantic.zig`: 73 passed.
-- `zig test query_new_test.zig`: 171 passed.
+- `zig test query_new_test.zig`: 183 passed.
 - `zig test ssa.zig`: 7 passed.
-- `zig test codegen_new_test.zig`: 20 passed.
+- `zig test codegen_new_test.zig`: 22 passed.
 - The legacy `zig test legacy/test.zig` remains blocked by an unrelated `query_cache.load` call/signature mismatch.
 
 ## Handoff notes

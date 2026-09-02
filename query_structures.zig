@@ -84,6 +84,133 @@ pub const ItemLocations = struct {
     }
 };
 
+/// Interned values are flattened, duplicate-free, and ordered by TypeId.
+pub const VariantTypes = struct {
+    pub const Value = structures.VariantType;
+    pub const Id = structures.InternedTypeId;
+
+    pub fn hash(value: Value) u64 {
+        var hasher = std.hash.Wyhash.init(0);
+        std.hash.autoHash(&hasher, value.members.len);
+        for (value.members) |member| std.hash.autoHash(&hasher, member);
+        return hasher.final();
+    }
+
+    pub fn eql(a: Value, b: Value) bool {
+        return std.mem.eql(structures.TypeId, a.members, b.members);
+    }
+
+    pub fn clone(gpa: std.mem.Allocator, value: Value) !Value {
+        std.debug.assert(value.members.len >= 2);
+        for (value.members, 0..) |member, index| {
+            if (index > 0) std.debug.assert(@intFromEnum(value.members[index - 1]) < @intFromEnum(member));
+        }
+        return .{ .members = try gpa.dupe(structures.TypeId, value.members) };
+    }
+
+    pub fn deinit(gpa: std.mem.Allocator, value: *Value) void {
+        gpa.free(value.members);
+        value.* = undefined;
+    }
+};
+
+pub fn internVariantType(ctx: anytype, members: []const structures.TypeId) !structures.InternVariantResult {
+    std.debug.assert(members.len >= 2);
+
+    var canonical: std.ArrayList(structures.TypeId) = .empty;
+    defer canonical.deinit(ctx.allocator());
+    for (members) |member| {
+        if (member.isPrimitive()) {
+            try canonical.append(ctx.allocator(), member);
+            continue;
+        }
+
+        if (try lookupVariantMembers(ctx, member)) |nested_members| {
+            try canonical.appendSlice(ctx.allocator(), nested_members);
+        } else {
+            try canonical.append(ctx.allocator(), member);
+        }
+    }
+
+    std.mem.sort(structures.TypeId, canonical.items, {}, struct {
+        fn lessThan(_: void, left: structures.TypeId, right: structures.TypeId) bool {
+            return @intFromEnum(left) < @intFromEnum(right);
+        }
+    }.lessThan);
+    for (canonical.items[1..], canonical.items[0 .. canonical.items.len - 1]) |member, previous| {
+        if (member == previous) return .{ .duplicate = member };
+    }
+
+    const interned_id = try ctx.intern(VariantTypes, .{ .members = canonical.items });
+    return .{ .type_id = .fromInterned(interned_id) };
+}
+
+fn TypeInterner(comptime Context: type) type {
+    return struct {
+        ctx: Context,
+
+        pub fn internVariant(self: @This(), members: []const structures.TypeId) !structures.InternVariantResult {
+            return internVariantType(self.ctx, members);
+        }
+
+        pub fn variantMembers(self: @This(), type_id: structures.TypeId) !?[]const structures.TypeId {
+            return lookupVariantMembers(self.ctx, type_id);
+        }
+
+        pub fn layout(self: @This(), type_id: structures.TypeId) !structures.TypeLayout {
+            return (try self.ctx.get(TypeLayout, type_id)).*;
+        }
+    };
+}
+
+fn lookupVariantMembers(ctx: anytype, type_id: structures.TypeId) !?[]const structures.TypeId {
+    if (type_id.isPrimitive()) return null;
+    const interned_id = type_id.interned() orelse unreachable;
+    const variant = (try ctx.lookupInternedAs(VariantTypes, interned_id)) orelse return null;
+    return variant.members;
+}
+
+pub const TypeLayout = struct {
+    pub const Input = structures.TypeId;
+    pub const Output = structures.TypeLayout;
+
+    pub fn run(ctx: anytype, type_id: Input) anyerror!Output {
+        if (type_id == .int) return .{ .byte_size = 4, .byte_alignment = 4 };
+        if (type_id == .unit or type_id == .none) return .{ .byte_size = 0, .byte_alignment = 1 };
+
+        return layoutVariantType(ctx, (try lookupVariantMembers(ctx, type_id)) orelse unreachable);
+    }
+
+    fn layoutVariantType(ctx: anytype, members: []const structures.TypeId) anyerror!Output {
+        if (members.len > std.math.maxInt(u32)) return error.TypeTooLarge;
+
+        var payload_size: u32 = 0;
+        var payload_alignment: u32 = 1;
+        for (members) |member| {
+            const member_layout = (try ctx.get(TypeLayout, member)).*;
+            payload_size = @max(payload_size, member_layout.byte_size);
+            payload_alignment = @max(payload_alignment, member_layout.byte_alignment);
+        }
+
+        const tag_size: u32 = @sizeOf(u32);
+        const tag_alignment: u32 = @alignOf(u32);
+        const byte_alignment = @max(tag_alignment, payload_alignment);
+        const payload_offset = try alignForward(tag_size, payload_alignment);
+        const unaligned_size = std.math.add(u32, payload_offset, payload_size) catch return error.TypeTooLarge;
+        return .{
+            .byte_size = try alignForward(unaligned_size, byte_alignment),
+            .byte_alignment = byte_alignment,
+        };
+    }
+};
+
+fn alignForward(value: u32, alignment: u32) error{TypeTooLarge}!u32 {
+    std.debug.assert(std.math.isPowerOfTwo(alignment));
+    const mask = alignment - 1;
+    const with_padding = std.math.add(u32, value, mask) catch return error.TypeTooLarge;
+    return with_padding & ~mask;
+}
+
 pub const IndexItems = struct {
     pub const Input = structures.FileId;
     pub const Output = ?structures.ItemIndex;
@@ -182,7 +309,8 @@ pub const FunctionSignature = struct {
         const resolved = (try ctx.get(ResolveItem, item_id)).* orelse return null;
         const parsed = (try ctx.get(ParseFile, resolved.file_id)).* orelse return null;
         const source = (try ctx.input(SourceText, resolved.file_id)).*;
-        return switch (try semantic.analyzeFunctionSignature(&parsed, source, resolved.declaration, ctx.allocator())) {
+        const type_interner: TypeInterner(@TypeOf(ctx)) = .{ .ctx = ctx };
+        return switch (try semantic.analyzeFunctionSignature(&parsed, source, resolved.declaration, type_interner, ctx.allocator())) {
             .success => |signature| signature,
             .unsupported => |issue| blk: {
                 try typing.emitSemanticIssue(ctx, resolved.file_id, issue);
@@ -198,8 +326,8 @@ pub const AnalyzeFunctionBody = struct {
 
     pub fn run(ctx: anytype, item_id: Input) anyerror!Output {
         const loc = try ctx.lookupInterned(ItemLocations, item_id);
-        var parameter_types: []const structures.Type = &.{};
-        var return_type: structures.Type = .unit;
+        var parameter_types: []const structures.TypeId = &.{};
+        var return_type: structures.TypeId = .unit;
         if (loc.kind == .function) {
             const signature = (try ctx.get(FunctionSignature, item_id)).* orelse return null;
             parameter_types = signature.parameter_types;
@@ -208,7 +336,8 @@ pub const AnalyzeFunctionBody = struct {
         const resolved = (try ctx.get(ResolveItem, item_id)).* orelse return null;
         const parsed = (try ctx.get(ParseFile, resolved.file_id)).* orelse return null;
         const source = (try ctx.input(SourceText, resolved.file_id)).*;
-        const result = try semantic.buildUnresolvedBody(&parsed, source, resolved.declaration, loc.kind, parameter_types, ctx.allocator());
+        const type_interner: TypeInterner(@TypeOf(ctx)) = .{ .ctx = ctx };
+        const result = try semantic.buildUnresolvedBody(&parsed, source, resolved.declaration, loc.kind, parameter_types, return_type, type_interner, ctx.allocator());
         var unresolved = switch (result) {
             .success => |unresolved_value| unresolved_value,
             .unsupported => |issue| {
@@ -217,7 +346,7 @@ pub const AnalyzeFunctionBody = struct {
             },
         };
         defer unresolved.deinit(ctx.allocator());
-        return typing.resolveAndTypeBody(ctx, BuildModuleScope, FunctionSignature, resolved.file_id, source, parameter_types, return_type, unresolved);
+        return typing.resolveAndTypeBody(ctx, BuildModuleScope, FunctionSignature, resolved.file_id, source, parameter_types, return_type, type_interner, unresolved);
     }
 };
 
@@ -254,7 +383,8 @@ pub const CompileFunction = struct {
 
     pub fn run(ctx: anytype, instance_id: Input) anyerror!Output {
         const lowered = (try ctx.get(LowerToSSA, instance_id)).* orelse return null;
-        return try codegen.compileFunction(&lowered, ctx.allocator());
+        const type_interner: TypeInterner(@TypeOf(ctx)) = .{ .ctx = ctx };
+        return try codegen.compileFunction(&lowered, type_interner, ctx.allocator());
     }
 };
 

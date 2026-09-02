@@ -384,9 +384,47 @@ pub const ResolvedItem = struct {
     declaration: u32,
 };
 
-pub const Type = enum {
+/// Database interner index carried inside a non-primitive TypeId. The remaining
+/// TypeId bit distinguishes interned identities from reserved primitive IDs.
+pub const InternedTypeId = enum(u31) { _ };
+
+pub const TypeId = enum(u32) {
     int,
     unit,
+    none,
+    _,
+
+    const interned_mask: u32 = 1 << 31;
+
+    pub fn fromInterned(interned_id: InternedTypeId) TypeId {
+        return @enumFromInt(interned_mask | @intFromEnum(interned_id));
+    }
+
+    pub fn interned(self: TypeId) ?InternedTypeId {
+        const raw = @intFromEnum(self);
+        if (raw & interned_mask == 0) return null;
+        return @enumFromInt(@as(u31, @truncate(raw)));
+    }
+
+    pub fn isPrimitive(self: TypeId) bool {
+        return self == .int or self == .unit or self == .none;
+    }
+};
+
+pub const VariantType = struct {
+    members: []const TypeId,
+};
+
+pub const InternVariantResult = union(enum) {
+    type_id: TypeId,
+    duplicate: TypeId,
+};
+
+/// Representation facts shared by every runtime type. Type-specific metadata,
+/// such as field or payload offsets, belongs to that representation's query.
+pub const TypeLayout = struct {
+    byte_size: u32,
+    byte_alignment: u32,
 };
 
 pub const FunctionValueId = enum(u32) { _ };
@@ -404,6 +442,11 @@ pub fn functionInstructionValue(argument_count: usize, instruction_index: usize)
 pub const BinaryOperands = struct {
     lhs: FunctionValueId,
     rhs: FunctionValueId,
+};
+
+pub const FunctionValueUse = struct {
+    value: FunctionValueId,
+    coerce_to: ?TypeId = null,
 };
 
 pub const PredicateOperation = enum {
@@ -429,7 +472,7 @@ pub const FunctionTerminator = union(enum) {
         else_branch: FunctionBranch,
     },
     return_unit,
-    return_value: FunctionValueId,
+    return_value: FunctionValueUse,
 };
 
 pub const FunctionBlock = struct {
@@ -441,11 +484,11 @@ pub const FunctionBlock = struct {
 };
 
 pub const FunctionSignature = struct {
-    parameter_types: []const Type,
-    return_type: Type,
+    parameter_types: []const TypeId,
+    return_type: TypeId,
 
     pub fn eql(a: FunctionSignature, b: FunctionSignature) bool {
-        return a.return_type == b.return_type and std.mem.eql(Type, a.parameter_types, b.parameter_types);
+        return a.return_type == b.return_type and std.mem.eql(TypeId, a.parameter_types, b.parameter_types);
     }
 
     pub fn deinit(self: *FunctionSignature, gpa: std.mem.Allocator) void {
@@ -458,13 +501,19 @@ pub fn FunctionCall(comptime CallTarget: type) type {
     return struct {
         target: CallTarget,
         arguments: FunctionValueRange,
-        return_type: Type,
+        return_type: TypeId,
     };
 }
 
 pub fn FunctionInstruction(comptime CallTarget: type) type {
     return union(enum) {
         consti: i32,
+        const_unit,
+        const_none,
+        variant_coerce: struct {
+            operand: FunctionValueId,
+            target_type: TypeId,
+        },
         call: FunctionCall(CallTarget),
         exit: FunctionValueId,
         negi: FunctionValueId,
@@ -481,9 +530,10 @@ pub fn FunctionInstruction(comptime CallTarget: type) type {
 /// semantic and per-instance IR.
 pub fn FunctionIr(comptime CallTarget: type) type {
     return struct {
-        block_argument_types: []Type,
-        branch_arguments: []ValueId,
-        call_arguments: []ValueId,
+        return_type: TypeId,
+        block_argument_types: []TypeId,
+        branch_arguments: []FunctionValueUse,
+        call_arguments: []FunctionValueUse,
         instructions: []Instruction,
         blocks: []Block,
         entry: BlockId,
@@ -505,9 +555,10 @@ pub fn FunctionIr(comptime CallTarget: type) type {
 
         pub fn eql(a: @This(), b: @This()) bool {
             if (a.entry != b.entry or
-                !std.mem.eql(Type, a.block_argument_types, b.block_argument_types) or
-                !std.mem.eql(ValueId, a.branch_arguments, b.branch_arguments) or
-                !std.mem.eql(ValueId, a.call_arguments, b.call_arguments) or
+                a.return_type != b.return_type or
+                !std.mem.eql(TypeId, a.block_argument_types, b.block_argument_types) or
+                !valueUsesEql(a.branch_arguments, b.branch_arguments) or
+                !valueUsesEql(a.call_arguments, b.call_arguments) or
                 a.instructions.len != b.instructions.len or
                 a.blocks.len != b.blocks.len) return false;
             for (a.instructions, b.instructions) |left, right| {
@@ -515,6 +566,14 @@ pub fn FunctionIr(comptime CallTarget: type) type {
             }
             for (a.blocks, b.blocks) |left, right| {
                 if (!std.meta.eql(left, right)) return false;
+            }
+            return true;
+        }
+
+        fn valueUsesEql(left: []const FunctionValueUse, right: []const FunctionValueUse) bool {
+            if (left.len != right.len) return false;
+            for (left, right) |left_use, right_use| {
+                if (!std.meta.eql(left_use, right_use)) return false;
             }
             return true;
         }

@@ -3,6 +3,29 @@ const codegen = @import("codegen_new.zig");
 const runtime = @import("runtime.zig");
 const structures = @import("structures.zig");
 
+const small_variant = structures.TypeId.fromInterned(@enumFromInt(0));
+const wide_variant = structures.TypeId.fromInterned(@enumFromInt(1));
+const seven_byte_payload = structures.TypeId.fromInterned(@enumFromInt(2));
+const payload_variant = structures.TypeId.fromInterned(@enumFromInt(3));
+
+const TestTypes = struct {
+    pub fn layout(_: @This(), type_id: structures.TypeId) !structures.TypeLayout {
+        if (type_id == .int) return .{ .byte_size = 4, .byte_alignment = 4 };
+        if (type_id == .unit or type_id == .none) return .{ .byte_size = 0, .byte_alignment = 1 };
+        if (type_id == small_variant or type_id == wide_variant) return .{ .byte_size = 8, .byte_alignment = 4 };
+        if (type_id == seven_byte_payload) return .{ .byte_size = 7, .byte_alignment = 1 };
+        if (type_id == payload_variant) return .{ .byte_size = 12, .byte_alignment = 4 };
+        unreachable;
+    }
+
+    pub fn variantMembers(_: @This(), type_id: structures.TypeId) !?[]const structures.TypeId {
+        if (type_id == small_variant) return &.{ .int, .none };
+        if (type_id == wide_variant) return &.{ .int, .unit, .none };
+        if (type_id == payload_variant) return &.{ .none, seven_byte_payload };
+        return null;
+    }
+};
+
 fn integerConstant(value: i32) structures.SsaFunction.Instruction {
     return .{ .consti = value };
 }
@@ -38,7 +61,13 @@ fn functionSsa(
     instructions: []structures.SsaFunction.Instruction,
     blocks: []structures.SsaFunction.Block,
 ) structures.SsaFunction {
+    var return_type: structures.TypeId = .unit;
+    for (blocks) |block| switch (block.terminator) {
+        .return_value => return_type = .int,
+        else => {},
+    };
     return .{
+        .return_type = return_type,
         .block_argument_types = &.{},
         .branch_arguments = &.{},
         .call_arguments = &.{},
@@ -57,7 +86,7 @@ test "single aligned function artifact builds and runs without borrowing code" {
             .terminator = .return_unit,
         }};
         const ssa = functionSsa(&.{}, &blocks);
-        var artifact = try codegen.compileFunction(&ssa, std.testing.allocator);
+        var artifact = try codegen.compileFunction(&ssa, TestTypes{}, std.testing.allocator);
         defer artifact.deinit(std.testing.allocator);
         artifact.required_alignment = 16;
         const entry: structures.InstanceId = .{ .item = @enumFromInt(0) };
@@ -83,10 +112,10 @@ test "ordinary function artifacts encode signed 32-bit literal returns" {
         var blocks = [_]structures.SsaFunction.Block{.{
             .instruction_start = 0,
             .instruction_end = 1,
-            .terminator = .{ .return_value = @enumFromInt(0) },
+            .terminator = .{ .return_value = .{ .value = @enumFromInt(0) } },
         }};
         const ssa = functionSsa(&instructions, &blocks);
-        var artifact = try codegen.compileFunction(&ssa, std.testing.allocator);
+        var artifact = try codegen.compileFunction(&ssa, TestTypes{}, std.testing.allocator);
         defer artifact.deinit(std.testing.allocator);
 
         try std.testing.expectEqual(@as(usize, 6), artifact.code.len);
@@ -110,7 +139,7 @@ test "exit emits an inline syscall without references" {
         .terminator = .return_unit,
     }};
     const ssa = functionSsa(&instructions, &blocks);
-    var artifact = try codegen.compileFunction(&ssa, std.testing.allocator);
+    var artifact = try codegen.compileFunction(&ssa, TestTypes{}, std.testing.allocator);
     defer artifact.deinit(std.testing.allocator);
 
     try std.testing.expectEqualSlices(u8, &.{
@@ -134,9 +163,9 @@ test "direct call artifacts own exact relocation metadata" {
     }};
     const ssa = functionSsa(&instructions, &blocks);
 
-    var first = try codegen.compileFunction(&ssa, std.testing.allocator);
+    var first = try codegen.compileFunction(&ssa, TestTypes{}, std.testing.allocator);
     defer first.deinit(std.testing.allocator);
-    var second = try codegen.compileFunction(&ssa, std.testing.allocator);
+    var second = try codegen.compileFunction(&ssa, TestTypes{}, std.testing.allocator);
     defer second.deinit(std.testing.allocator);
 
     try expectDirectCallArtifact(first, target);
@@ -147,7 +176,7 @@ test "direct call artifacts own exact relocation metadata" {
     try std.testing.expect(structures.CompiledFunction.eql(first, second));
 
     instructions[0] = directCall(.{ .item = @enumFromInt(1) });
-    var different_target = try codegen.compileFunction(&ssa, std.testing.allocator);
+    var different_target = try codegen.compileFunction(&ssa, TestTypes{}, std.testing.allocator);
     defer different_target.deinit(std.testing.allocator);
     try std.testing.expectEqualSlices(u8, first.code, different_target.code);
     try std.testing.expectEqualSlices(structures.CompiledFunction.Relocation, first.relocations, different_target.relocations);
@@ -175,11 +204,11 @@ test "multiple calls produce ordered relocations and deduplicate references" {
     var blocks = [_]structures.SsaFunction.Block{.{
         .instruction_start = 0,
         .instruction_end = instructions.len,
-        .terminator = .{ .return_value = @enumFromInt(2) },
+        .terminator = .{ .return_value = .{ .value = @enumFromInt(2) } },
     }};
     const ssa = functionSsa(&instructions, &blocks);
 
-    var artifact = try codegen.compileFunction(&ssa, std.testing.allocator);
+    var artifact = try codegen.compileFunction(&ssa, TestTypes{}, std.testing.allocator);
     defer artifact.deinit(std.testing.allocator);
 
     try std.testing.expectEqualSlices(u8, &.{
@@ -216,10 +245,10 @@ test "typed expression values survive calls and execute every integer arithmetic
     var blocks = [_]structures.SsaFunction.Block{.{
         .instruction_start = 0,
         .instruction_end = instructions.len,
-        .terminator = .{ .return_value = @enumFromInt(10) },
+        .terminator = .{ .return_value = .{ .value = @enumFromInt(10) } },
     }};
     const ssa = functionSsa(&instructions, &blocks);
-    var expression = try codegen.compileFunction(&ssa, std.testing.allocator);
+    var expression = try codegen.compileFunction(&ssa, TestTypes{}, std.testing.allocator);
     defer expression.deinit(std.testing.allocator);
 
     const entry_code = [_]u8{
@@ -268,13 +297,13 @@ test "typed expression values survive calls and execute every integer arithmetic
 }
 
 test "cyclic CFG accepts multi-value parallel backedge copies" {
-    var block_argument_types = [_]structures.Type{ .int, .int, .int, .int, .int };
-    var branch_arguments = [_]structures.FunctionValueId{
-        @enumFromInt(0),
-        @enumFromInt(1),
-        @enumFromInt(3),
-        @enumFromInt(2),
-        @enumFromInt(2),
+    var block_argument_types = [_]structures.TypeId{ .int, .int, .int, .int, .int };
+    var branch_arguments = [_]structures.FunctionValueUse{
+        .{ .value = @enumFromInt(0) },
+        .{ .value = @enumFromInt(1) },
+        .{ .value = @enumFromInt(3) },
+        .{ .value = @enumFromInt(2) },
+        .{ .value = @enumFromInt(2) },
     };
     var instructions = [_]structures.SsaFunction.Instruction{integerConstant(0)};
     var blocks = [_]structures.SsaFunction.Block{
@@ -302,10 +331,11 @@ test "cyclic CFG accepts multi-value parallel backedge copies" {
             .argument_end = 5,
             .instruction_start = 1,
             .instruction_end = 1,
-            .terminator = .{ .return_value = @enumFromInt(4) },
+            .terminator = .{ .return_value = .{ .value = @enumFromInt(4) } },
         },
     };
     const ssa: structures.SsaFunction = .{
+        .return_type = .int,
         .block_argument_types = &block_argument_types,
         .branch_arguments = &branch_arguments,
         .call_arguments = &.{},
@@ -314,7 +344,7 @@ test "cyclic CFG accepts multi-value parallel backedge copies" {
         .entry = @enumFromInt(0),
     };
 
-    var artifact = try codegen.compileFunction(&ssa, std.testing.allocator);
+    var artifact = try codegen.compileFunction(&ssa, TestTypes{}, std.testing.allocator);
     defer artifact.deinit(std.testing.allocator);
     try std.testing.expect(artifact.code.len != 0);
 }
@@ -325,6 +355,65 @@ test "direct call artifact construction cleans up every allocation failure" {
 
 test "expression artifact construction cleans up every allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, testCompileExpressionAllocations, .{});
+}
+
+test "variant subset call construction cleans up every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testCompileVariantSubsetCallAllocations, .{});
+}
+
+test "variant injection copies an arbitrary-size non-variant interned payload" {
+    var block_argument_types = [_]structures.TypeId{seven_byte_payload};
+    var instructions = [_]structures.SsaFunction.Instruction{.{ .variant_coerce = .{
+        .operand = @enumFromInt(0),
+        .target_type = payload_variant,
+    } }};
+    var blocks = [_]structures.SsaFunction.Block{.{
+        .argument_end = 1,
+        .instruction_start = 0,
+        .instruction_end = 1,
+        .terminator = .{ .return_value = .{ .value = @enumFromInt(1) } },
+    }};
+    const ssa: structures.SsaFunction = .{
+        .return_type = payload_variant,
+        .block_argument_types = &block_argument_types,
+        .branch_arguments = &.{},
+        .call_arguments = &.{},
+        .instructions = &instructions,
+        .blocks = &blocks,
+        .entry = @enumFromInt(0),
+    };
+    var artifact = try codegen.compileFunction(&ssa, TestTypes{}, std.testing.allocator);
+    defer artifact.deinit(std.testing.allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, artifact.code, &.{ 0x0F, 0xB6, 0x84, 0x24 }) != null);
+    try std.testing.expect(std.mem.indexOf(u8, artifact.code, &.{ 0x88, 0x84, 0x24 }) != null);
+}
+
+fn testCompileVariantSubsetCallAllocations(gpa: std.mem.Allocator) !void {
+    var block_argument_types = [_]structures.TypeId{small_variant};
+    var call_arguments = [_]structures.FunctionValueUse{.{ .value = @enumFromInt(0), .coerce_to = wide_variant }};
+    var instructions = [_]structures.SsaFunction.Instruction{.{ .call = .{
+        .target = .{ .item = @enumFromInt(0) },
+        .arguments = .{ .start = 0, .end = 1 },
+        .return_type = wide_variant,
+    } }};
+    var blocks = [_]structures.SsaFunction.Block{.{
+        .argument_end = 1,
+        .instruction_start = 0,
+        .instruction_end = 1,
+        .terminator = .{ .return_value = .{ .value = @enumFromInt(1) } },
+    }};
+    const ssa: structures.SsaFunction = .{
+        .return_type = wide_variant,
+        .block_argument_types = &block_argument_types,
+        .branch_arguments = &.{},
+        .call_arguments = &call_arguments,
+        .instructions = &instructions,
+        .blocks = &blocks,
+        .entry = @enumFromInt(0),
+    };
+    var artifact = try codegen.compileFunction(&ssa, TestTypes{}, gpa);
+    defer artifact.deinit(gpa);
 }
 
 fn testCompileExpressionAllocations(gpa: std.mem.Allocator) !void {
@@ -338,10 +427,10 @@ fn testCompileExpressionAllocations(gpa: std.mem.Allocator) !void {
     var blocks = [_]structures.SsaFunction.Block{.{
         .instruction_start = 0,
         .instruction_end = instructions.len,
-        .terminator = .{ .return_value = @enumFromInt(4) },
+        .terminator = .{ .return_value = .{ .value = @enumFromInt(4) } },
     }};
     const ssa = functionSsa(&instructions, &blocks);
-    var artifact = try codegen.compileFunction(&ssa, gpa);
+    var artifact = try codegen.compileFunction(&ssa, TestTypes{}, gpa);
     defer artifact.deinit(gpa);
 }
 
@@ -355,7 +444,7 @@ fn testCompileDirectCallAllocations(gpa: std.mem.Allocator) !void {
         .terminator = .return_unit,
     }};
     const ssa = functionSsa(&instructions, &blocks);
-    var artifact = try codegen.compileFunction(&ssa, gpa);
+    var artifact = try codegen.compileFunction(&ssa, TestTypes{}, gpa);
     defer artifact.deinit(gpa);
 }
 
@@ -366,11 +455,11 @@ test "ordinary function compilation cleans up allocation failure" {
     var blocks = [_]structures.SsaFunction.Block{.{
         .instruction_start = 0,
         .instruction_end = 1,
-        .terminator = .{ .return_value = @enumFromInt(0) },
+        .terminator = .{ .return_value = .{ .value = @enumFromInt(0) } },
     }};
     const ssa = functionSsa(&instructions, &blocks);
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-    try std.testing.expectError(error.OutOfMemory, codegen.compileFunction(&ssa, failing.allocator()));
+    try std.testing.expectError(error.OutOfMemory, codegen.compileFunction(&ssa, TestTypes{}, failing.allocator()));
     try std.testing.expect(failing.has_induced_failure);
     try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
 }

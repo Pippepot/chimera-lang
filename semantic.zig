@@ -40,6 +40,12 @@ pub const UnresolvedBody = struct {
 
         pub const Operation = union(enum) {
             consti: i32,
+            const_unit,
+            const_none,
+            variant_coerce: struct {
+                operand: ValueId,
+                target_type: structures.TypeId,
+            },
             call: struct {
                 target: structures.SourceSpan,
                 arguments: structures.FunctionValueRange,
@@ -61,7 +67,7 @@ pub const UnresolvedBody = struct {
 
     pub const TypeExpectation = struct {
         value: ValueId,
-        expected: structures.Type,
+        expected: structures.TypeId,
         span: structures.SourceSpan,
         instruction_count: u32,
     };
@@ -122,7 +128,9 @@ pub fn buildUnresolvedBody(
     source: []const u8,
     declaration: u32,
     kind: structures.ItemKind,
-    parameter_types: []const structures.Type,
+    parameter_types: []const structures.TypeId,
+    return_type: structures.TypeId,
+    type_interner: anytype,
     gpa: std.mem.Allocator,
 ) !UnresolvedBodyResult {
     var branch_arguments: std.ArrayList(UnresolvedBody.ValueId) = .empty;
@@ -161,8 +169,8 @@ pub fn buildUnresolvedBody(
     };
 
     const body_result: SemanticResult(void) = switch (kind) {
-        .top_level_entry => try buildEntryBlock(ast, source, declaration, &locals, &type_expectations, &expression_builder, gpa),
-        .function => try buildFunctionBlock(ast, source, declaration, parameter_types, &locals, &type_expectations, &expression_builder, gpa),
+        .top_level_entry => try buildEntryBlock(ast, source, declaration, &locals, &type_expectations, &expression_builder, type_interner, gpa),
+        .function => try buildFunctionBlock(ast, source, declaration, parameter_types, return_type, &locals, &type_expectations, &expression_builder, type_interner, gpa),
     };
     switch (body_result) {
         .unsupported => |issue| return .{ .unsupported = issue },
@@ -197,8 +205,9 @@ fn buildEntryBlock(
     locals: *std.StringHashMap(UnresolvedBody.ValueId),
     type_expectations: *std.ArrayList(UnresolvedBody.TypeExpectation),
     expression_builder: *UnresolvedExpressionBuilder,
+    type_interner: anytype,
     gpa: std.mem.Allocator,
-) std.mem.Allocator.Error!SemanticResult(void) {
+) anyerror!SemanticResult(void) {
     const root = ast.nodes[declaration];
     std.debug.assert(root.tag == .block);
     for (root.data.ref.start..root.data.ref.end) |ref_index| {
@@ -206,7 +215,7 @@ fn buildEntryBlock(
         const child = ast.nodes[child_index.index()];
         switch (child.tag) {
             .static_binding => continue,
-            .const_binding => switch (try appendConstBinding(ast, source, child_index, locals, type_expectations, expression_builder, gpa)) {
+            .const_binding => switch (try appendConstBinding(ast, source, child_index, locals, type_expectations, expression_builder, type_interner, gpa)) {
                 .success => {},
                 .unsupported => |issue| return .{ .unsupported = issue },
             },
@@ -225,12 +234,14 @@ fn buildFunctionBlock(
     ast: *const structures.Ast,
     source: []const u8,
     declaration: u32,
-    parameter_types: []const structures.Type,
+    parameter_types: []const structures.TypeId,
+    return_type: structures.TypeId,
     locals: *std.StringHashMap(UnresolvedBody.ValueId),
     type_expectations: *std.ArrayList(UnresolvedBody.TypeExpectation),
     expression_builder: *UnresolvedExpressionBuilder,
+    type_interner: anytype,
     gpa: std.mem.Allocator,
-) std.mem.Allocator.Error!SemanticResult(void) {
+) anyerror!SemanticResult(void) {
     const parts = functionParts(ast, declaration);
     const function_signature = ast.nodes[parts.signature.index()];
     var parameters = AstNodeListIterator.init(ast, function_signature.data.node_node.a, .param_list_small, .param_list);
@@ -254,7 +265,7 @@ fn buildFunctionBlock(
             const statement_index = ast.node_refs[ref_index];
             const statement = ast.nodes[statement_index.index()];
             switch (statement.tag) {
-                .const_binding => switch (try appendConstBinding(ast, source, statement_index, locals, type_expectations, expression_builder, gpa)) {
+                .const_binding => switch (try appendConstBinding(ast, source, statement_index, locals, type_expectations, expression_builder, type_interner, gpa)) {
                     .success => {},
                     .unsupported => |issue| return .{ .unsupported = issue },
                 },
@@ -271,8 +282,20 @@ fn buildFunctionBlock(
     };
 
     const return_node = ast.nodes[return_index.index()];
+    const return_is_variant = try type_interner.variantMembers(return_type) != null;
     const terminator: UnresolvedBody.Terminator = switch (return_node.tag) {
-        .return_nothing => .{ .return_unit = tokenSpan(ast, return_node.token_index) },
+        .return_nothing => if (!return_is_variant)
+            .{ .return_unit = tokenSpan(ast, return_node.token_index) }
+        else blk: {
+            const unit_value = switch (try expression_builder.appendInstruction(return_index, .const_unit)) {
+                .success => |value| value,
+                .unsupported => unreachable,
+            };
+            break :blk .{ .return_value = .{
+                .value = unit_value,
+                .span = tokenSpan(ast, return_node.token_index),
+            } };
+        },
         .return_expr => blk: {
             const value_index = return_node.data.node.unwrap() orelse unreachable;
             const return_value = switch (try expression_builder.append(value_index)) {
@@ -297,8 +320,9 @@ fn appendConstBinding(
     locals: *std.StringHashMap(UnresolvedBody.ValueId),
     type_expectations: *std.ArrayList(UnresolvedBody.TypeExpectation),
     expression_builder: *UnresolvedExpressionBuilder,
+    type_interner: anytype,
     gpa: std.mem.Allocator,
-) std.mem.Allocator.Error!ExpressionResult {
+) anyerror!ExpressionResult {
     const statement = ast.nodes[statement_index.index()];
     const name_span = tokenSpan(ast, statement.token_index);
     const name = source[name_span.start..name_span.end];
@@ -306,24 +330,39 @@ fn appendConstBinding(
         return .{ .unsupported = .{ .span = name_span, .message = "duplicate local binding" } };
     }
     const annotation = statement.data.node_node.a.unwrap();
-    const expected_type = if (annotation) |type_node|
-        analyzeType(ast, source, type_node) orelse
-            return .{ .unsupported = issueAt(ast, type_node.index(), "only int and unit local bindings are supported yet") }
-    else
-        null;
+    const expected_type = if (annotation) |type_node| blk: {
+        const resolved = switch (try analyzeType(ast, source, type_node, type_interner, gpa, "only int and unit local bindings are supported yet")) {
+            .success => |type_id| type_id,
+            .unsupported => |issue| return .{ .unsupported = issue },
+        };
+        if (resolved == .none) {
+            return .{ .unsupported = issueAt(ast, type_node.index(), "only int and unit local bindings are supported yet") };
+        }
+        break :blk resolved;
+    } else null;
     const initializer = statement.data.node_node.b.unwrap() orelse unreachable;
-    const value = switch (try expression_builder.append(initializer)) {
+    var value = switch (try expression_builder.append(initializer)) {
         .success => |value| value,
         .unsupported => |issue| return .{ .unsupported = issue },
     };
     if (expected_type) |expected| {
         const type_node = annotation.?;
-        try type_expectations.append(gpa, .{
-            .value = value,
-            .expected = expected,
-            .span = tokenSpan(ast, ast.nodes[type_node.index()].token_index),
-            .instruction_count = @intCast(expression_builder.instructions.items.len),
-        });
+        if (try type_interner.variantMembers(expected) != null) {
+            value = switch (try expression_builder.appendInstruction(type_node, .{ .variant_coerce = .{
+                .operand = value,
+                .target_type = expected,
+            } })) {
+                .success => |coerced| coerced,
+                .unsupported => unreachable,
+            };
+        } else {
+            try type_expectations.append(gpa, .{
+                .value = value,
+                .expected = expected,
+                .span = tokenSpan(ast, ast.nodes[type_node.index()].token_index),
+                .instruction_count = @intCast(expression_builder.instructions.items.len),
+            });
+        }
     }
     try locals.put(name, value);
     // A binding evaluates to its bound value, mirroring the initializer.
@@ -335,11 +374,17 @@ const FunctionParts = struct {
     body: structures.Node.Index,
 };
 
-pub fn analyzeFunctionSignature(ast: *const structures.Ast, source: []const u8, declaration: u32, gpa: std.mem.Allocator) !SignatureResult {
+pub fn analyzeFunctionSignature(
+    ast: *const structures.Ast,
+    source: []const u8,
+    declaration: u32,
+    type_interner: anytype,
+    gpa: std.mem.Allocator,
+) !SignatureResult {
     const parts = functionParts(ast, declaration);
     const signature = ast.nodes[parts.signature.index()];
 
-    var parameter_types: std.ArrayList(structures.Type) = .empty;
+    var parameter_types: std.ArrayList(structures.TypeId) = .empty;
     defer parameter_types.deinit(gpa);
     var names = std.StringHashMap(void).init(gpa);
     defer names.deinit();
@@ -356,17 +401,26 @@ pub fn analyzeFunctionSignature(ast: *const structures.Ast, source: []const u8, 
             return .{ .unsupported = .{ .span = name_span, .message = "duplicate parameter" } };
         }
         const annotation = parameter.data.node_node.b.unwrap() orelse
-            return .{ .unsupported = .{ .span = name_span, .message = "function parameters must declare type int" } };
-        if (analyzeType(ast, source, annotation) != .int) {
-            return .{ .unsupported = issueAt(ast, annotation.index(), "only int parameters are supported yet") };
+            return .{ .unsupported = .{ .span = name_span, .message = "function parameters must declare a type" } };
+        const parameter_type = switch (try analyzeType(ast, source, annotation, type_interner, gpa, "only int and variant parameter types are supported yet")) {
+            .success => |type_id| type_id,
+            .unsupported => |issue| return .{ .unsupported = issue },
+        };
+        if (parameter_type != .int and try type_interner.variantMembers(parameter_type) == null) {
+            return .{ .unsupported = issueAt(ast, annotation.index(), "only int and variant parameter types are supported yet") };
         }
-        try parameter_types.append(gpa, .int);
+        try parameter_types.append(gpa, parameter_type);
     }
 
     const return_type_index = signature.data.node_node.b.unwrap() orelse
-        return .{ .unsupported = issueAt(ast, parts.signature.index(), "function must declare return type int or unit") };
-    const return_type = analyzeType(ast, source, return_type_index) orelse
-        return .{ .unsupported = issueAt(ast, return_type_index.index(), "only int and unit return types are supported yet") };
+        return .{ .unsupported = issueAt(ast, parts.signature.index(), "function must declare a return type") };
+    const return_type = switch (try analyzeType(ast, source, return_type_index, type_interner, gpa, "only int, unit, and variant return types are supported yet")) {
+        .success => |type_id| type_id,
+        .unsupported => |issue| return .{ .unsupported = issue },
+    };
+    if (return_type != .int and return_type != .unit and try type_interner.variantMembers(return_type) == null) {
+        return .{ .unsupported = issueAt(ast, return_type_index.index(), "only int, unit, and variant return types are supported yet") };
+    }
 
     return .{ .success = .{ .parameter_types = try parameter_types.toOwnedSlice(gpa), .return_type = return_type } };
 }
@@ -391,6 +445,7 @@ const UnresolvedExpressionBuilder = struct {
         const node = self.ast.nodes[node_index.index()];
         switch (node.tag) {
             .number_literal => return self.appendIntegerLiteral(node_index),
+            .none_literal => return self.appendInstruction(node_index, .const_none),
             .call => return self.appendCall(node_index),
             .identifier => {
                 const name_span = tokenSpan(self.ast, node.token_index);
@@ -650,14 +705,54 @@ const AstNodeListIterator = struct {
     }
 };
 
-fn analyzeType(ast: *const structures.Ast, source: []const u8, node_index: structures.Node.Index) ?structures.Type {
+fn analyzeType(
+    ast: *const structures.Ast,
+    source: []const u8,
+    node_index: structures.Node.Index,
+    type_interner: anytype,
+    gpa: std.mem.Allocator,
+    unsupported_message: []const u8,
+) anyerror!SemanticResult(structures.TypeId) {
     const node = ast.nodes[node_index.index()];
-    if (node.tag != .type) return null;
-    const span = tokenSpan(ast, node.token_index);
-    const name = source[span.start..span.end];
-    if (std.mem.eql(u8, name, "int")) return .int;
-    if (std.mem.eql(u8, name, "unit")) return .unit;
-    return null;
+    if (node.tag == .type) {
+        const span = tokenSpan(ast, node.token_index);
+        const name = source[span.start..span.end];
+        if (std.mem.eql(u8, name, "int")) return .{ .success = .int };
+        if (std.mem.eql(u8, name, "unit")) return .{ .success = .unit };
+        if (std.mem.eql(u8, name, "none")) return .{ .success = .none };
+        return .{ .unsupported = .{ .span = span, .message = unsupported_message } };
+    }
+    if (node.tag != .type_variant_small and node.tag != .type_variant) {
+        return .{ .unsupported = issueAt(ast, node_index.index(), unsupported_message) };
+    }
+
+    var member_types: std.ArrayList(structures.TypeId) = .empty;
+    defer member_types.deinit(gpa);
+    var members = AstNodeListIterator.init(ast, node_index, .type_variant_small, .type_variant);
+    while (members.next()) |member_index| {
+        const member_type = switch (try analyzeType(ast, source, member_index, type_interner, gpa, unsupported_message)) {
+            .success => |type_id| type_id,
+            .unsupported => |issue| return .{ .unsupported = issue },
+        };
+        try member_types.append(gpa, member_type);
+    }
+    std.debug.assert(member_types.items.len >= 2);
+
+    return switch (try type_interner.internVariant(member_types.items)) {
+        .type_id => |type_id| .{ .success = type_id },
+        .duplicate => |duplicate| blk: {
+            var seen = false;
+            var member_index: usize = 0;
+            var duplicate_members = AstNodeListIterator.init(ast, node_index, .type_variant_small, .type_variant);
+            while (duplicate_members.next()) |duplicate_member| : (member_index += 1) {
+                std.debug.assert(member_index < member_types.items.len);
+                if (member_types.items[member_index] != duplicate) continue;
+                if (seen) break :blk .{ .unsupported = issueAt(ast, duplicate_member.index(), "duplicate variant member type") };
+                seen = true;
+            }
+            break :blk .{ .unsupported = issueAt(ast, node_index.index(), "duplicate variant member type") };
+        },
+    };
 }
 
 fn functionParts(ast: *const structures.Ast, declaration: u32) FunctionParts {
@@ -745,7 +840,7 @@ fn testFunctionSignatureAllocations(gpa: std.mem.Allocator) !void {
     defer report.deinit(std.testing.allocator);
     const parsed = &report.ast.?;
     const declaration = parsed.node_refs[parsed.nodes[0].data.ref.start];
-    const result = try analyzeFunctionSignature(parsed, source, declaration.index(), gpa);
+    const result = try analyzeFunctionSignature(parsed, source, declaration.index(), TestTypeInterner{}, gpa);
     switch (result) {
         .success => |signature_value| {
             var signature = signature_value;
@@ -767,7 +862,7 @@ fn testUnresolvedFunctionBodyAllocations(gpa: std.mem.Allocator) !void {
     defer report.deinit(std.testing.allocator);
     const parsed = &report.ast.?;
     const declaration = parsed.node_refs[parsed.nodes[0].data.ref.start];
-    const result = try buildUnresolvedBody(parsed, source, declaration.index(), .function, &.{ .int, .int, .int }, gpa);
+    const result = try buildUnresolvedBody(parsed, source, declaration.index(), .function, &.{ .int, .int, .int }, .int, TestTypeInterner{}, gpa);
     switch (result) {
         .success => |unresolved_value| {
             var unresolved = unresolved_value;
@@ -776,3 +871,13 @@ fn testUnresolvedFunctionBodyAllocations(gpa: std.mem.Allocator) !void {
         .unsupported => unreachable,
     }
 }
+
+const TestTypeInterner = struct {
+    pub fn internVariant(_: @This(), _: []const structures.TypeId) !structures.InternVariantResult {
+        unreachable;
+    }
+
+    pub fn variantMembers(_: @This(), _: structures.TypeId) !?[]const structures.TypeId {
+        return null;
+    }
+};

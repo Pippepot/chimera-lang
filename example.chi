@@ -1,3 +1,6 @@
-static status = func(value: int) int -> return value * 2
-const a = status(21)
-exit(a)
+const a: int | none = 1
+static foo = func(arg: int | none) int | none
+    return arg
+const b = foo(a)
+const d = none
+const c = foo(d)

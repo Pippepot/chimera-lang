@@ -43,7 +43,8 @@ fn renderSsaFunction(
         try writer.print("  b{d}(", .{block_index});
         for (block.argument_start..block.argument_end) |argument_index| {
             if (argument_index != block.argument_start) try writer.writeAll(", ");
-            try writer.print("%{d}: {s}", .{ argument_index, @tagName(ssa.block_argument_types[argument_index]) });
+            try writer.print("%{d}: ", .{argument_index});
+            try renderType(ssa.block_argument_types[argument_index], writer);
         }
         try writer.writeByte(')');
         if (block_index == @intFromEnum(ssa.entry)) try writer.writeAll(" [entry]");
@@ -66,7 +67,11 @@ fn renderSsaFunction(
                 try writer.writeByte('\n');
             },
             .return_unit => try writer.writeAll("    ret\n"),
-            .return_value => |value| try writer.print("    ret %{d}\n", .{@intFromEnum(value)}),
+            .return_value => |value| {
+                try writer.writeAll("    ret ");
+                try renderValueUse(value, writer);
+                try writer.writeByte('\n');
+            },
         }
     }
     try writer.writeByte('\n');
@@ -82,7 +87,7 @@ fn renderBranchTarget(ssa: *const structures.SsaFunction, branch: structures.Fun
     try writer.print("b{d}(", .{@intFromEnum(branch.target)});
     for (ssa.branch_arguments[branch.arguments.start..branch.arguments.end], 0..) |argument, index| {
         if (index != 0) try writer.writeAll(", ");
-        try writer.print("%{d}", .{@intFromEnum(argument)});
+        try renderValueUse(argument, writer);
     }
     try writer.writeByte(')');
 }
@@ -96,14 +101,23 @@ fn renderInstruction(
     const result = @intFromEnum(ssa.instructionValue(instruction_index));
     switch (ssa.instructions[instruction_index]) {
         .consti => |value| try writer.print("    %{d} = consti {d}\n", .{ result, value }),
+        .const_unit => try writer.print("    %{d} = const_unit\n", .{result}),
+        .const_none => try writer.print("    %{d} = const_none\n", .{result}),
+        .variant_coerce => |coercion| {
+            try writer.print("    %{d} = variant_coerce %{d} to ", .{ result, @intFromEnum(coercion.operand) });
+            try renderType(coercion.target_type, writer);
+            try writer.writeByte('\n');
+        },
         .call => |call| {
             const target = try db.lookupInterned(queries.ItemLocations, call.target.item);
             try writer.print("    %{d} = call @{s}(", .{ result, target.name });
             for (ssa.call_arguments[call.arguments.start..call.arguments.end], 0..) |argument, index| {
                 if (index != 0) try writer.writeAll(", ");
-                try writer.print("%{d}", .{@intFromEnum(argument)});
+                try renderValueUse(argument, writer);
             }
-            try writer.print(") : {s}\n", .{@tagName(call.return_type)});
+            try writer.writeAll(") : ");
+            try renderType(call.return_type, writer);
+            try writer.writeByte('\n');
         },
         .exit => |operand| try writer.print("    %{d} = exit %{d}\n", .{ result, @intFromEnum(operand) }),
         .negi => |operand| try writer.print("    %{d} = negi %{d}\n", .{ result, @intFromEnum(operand) }),
@@ -111,6 +125,22 @@ fn renderInstruction(
         .subi => |operands| try renderBinary(writer, result, "subi", operands),
         .muli => |operands| try renderBinary(writer, result, "muli", operands),
         .divsi => |operands| try renderBinary(writer, result, "divsi", operands),
+    }
+}
+
+fn renderValueUse(value_use: structures.FunctionValueUse, writer: *std.Io.Writer) !void {
+    try writer.print("%{d}", .{@intFromEnum(value_use.value)});
+    if (value_use.coerce_to) |target_type| {
+        try writer.writeAll(" as ");
+        try renderType(target_type, writer);
+    }
+}
+
+fn renderType(type_id: structures.TypeId, writer: *std.Io.Writer) !void {
+    if (type_id.interned()) |interned_id| {
+        try writer.print("type#{d}", .{@intFromEnum(interned_id)});
+    } else {
+        try writer.writeAll(@tagName(type_id));
     }
 }
 

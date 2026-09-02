@@ -71,6 +71,10 @@ pub const Context = struct {
     pub fn lookupInterned(ctx: *Context, comptime I: type, id: I.Id) QueryError!*const I.Value {
         return ctx.db.lookupInterned(I, id);
     }
+
+    pub fn lookupInternedAs(ctx: *Context, comptime I: type, id: I.Id) QueryError!?*const I.Value {
+        return ctx.db.lookupInternedAs(I, id);
+    }
 };
 
 pub fn Handle(comptime Q: type) type {
@@ -263,6 +267,12 @@ pub const Database = struct {
     }
 
     pub fn lookupInterned(db: *Database, comptime I: type, id: I.Id) QueryError!*const I.Value {
+        return (try db.lookupInternedAs(I, id)) orelse error.InvalidInternId;
+    }
+
+    /// Returns null when the global ID is valid but belongs to another
+    /// interner. An out-of-range ID still returns InvalidInternId.
+    pub fn lookupInternedAs(db: *Database, comptime I: type, id: I.Id) QueryError!?*const I.Value {
         validateInterner(I);
         const index: usize = @intFromEnum(id);
 
@@ -272,7 +282,7 @@ pub const Database = struct {
         if (db.stopping) return error.SchedulerStopped;
         if (index >= db.interned_values.items.len) return error.InvalidInternId;
         const entry = db.interned_values.items[index];
-        if (!std.mem.eql(u8, entry.type_name, @typeName(I))) return error.InvalidInternId;
+        if (!std.mem.eql(u8, entry.type_name, @typeName(I))) return null;
         return @ptrCast(@alignCast(entry.value_ptr));
     }
 
