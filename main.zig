@@ -212,6 +212,10 @@ pub fn main(init: std.process.Init) !void {
     if (exit_code) |code| {
         try output.print("exit code: {d}\n", .{code});
         try output.flush();
+    } else {
+        // Rejected source is an expected user error: exit quietly so the
+        // caller sees status 1 without the runtime's error trace.
+        std.process.exit(1);
     }
 }
 

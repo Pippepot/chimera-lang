@@ -175,6 +175,7 @@ The repository root now has a new-pipeline CLI in `main.zig`. `legacy/main.zig` 
 
 - `main.zig` accepts `--debug=ast,ssa,asm,timing`, one source path, and optional program arguments.
 - The CLI reads the source into `SourceText`, requests `BuildExecutable`, renders transitive source diagnostics, writes `prog`, runs it, and prints its exit code.
+- The process exits 0 when the compiled program ran (the program's own exit code is only reported on stdout) and exits 1 when the source was rejected with diagnostics or the compiler failed internally; rejected and internal failures stay distinguishable by their stderr text.
 - SSA debug output follows the same reachable function graph as executable construction; it does not analyze unrelated functions merely for display.
 - AST rendering uses the parser's existing source-aware renderer. Assembly rendering decodes the final linked code, including the startup stub and resolved calls.
 - Timing separates source loading, query-database initialization, input insertion, executable construction, diagnostic collection, debug rendering, executable writing, execution, and the total. It does not invent per-query timings that the engine does not expose.
