@@ -12,7 +12,7 @@ pub fn emitSemanticIssue(ctx: anytype, file_id: structures.FileId, issue: semant
     try ctx.emit(structures.Diagnostic, .{
         .file_id = file_id,
         .span = issue.span,
-        .message = issue.message,
+        .kind = issue.kind,
     });
 }
 
@@ -74,7 +74,7 @@ pub fn resolveAndTypeBody(
                 const operand_index = @intFromEnum(operand);
                 std.debug.assert(known_types[operand_index]);
                 if (try coerceValue(type_interner, operand, value_types[operand_index], coercion.target_type, false) == null) {
-                    try emitSemanticIssue(ctx, file_id, .{ .span = instruction.span, .message = "local binding type does not match initializer" });
+                    try emitSemanticIssue(ctx, file_id, .{ .span = instruction.span, .kind = .local_type_mismatch });
                     return null;
                 }
                 resolved.* = .{ .variant_coerce = .{ .operand = operand, .target_type = coercion.target_type } };
@@ -101,7 +101,7 @@ pub fn resolveAndTypeBody(
                 const operand_index = @intFromEnum(resolved_operand);
                 std.debug.assert(known_types[operand_index]);
                 if (value_types[operand_index] != .int) {
-                    try emitSemanticIssue(ctx, file_id, .{ .span = instruction.span, .message = "integer negation requires an int operand" });
+                    try emitSemanticIssue(ctx, file_id, .{ .span = instruction.span, .kind = .negation_operand_not_int });
                     return null;
                 }
                 resolved.* = .{ .negi = resolved_operand };
@@ -114,7 +114,7 @@ pub fn resolveAndTypeBody(
                 std.debug.assert(known_types[lhs_index]);
                 std.debug.assert(known_types[rhs_index]);
                 if (value_types[lhs_index] != .int or value_types[rhs_index] != .int) {
-                    try emitSemanticIssue(ctx, file_id, .{ .span = instruction.span, .message = "integer operation requires int operands" });
+                    try emitSemanticIssue(ctx, file_id, .{ .span = instruction.span, .kind = .arithmetic_operands_not_int });
                     return null;
                 }
                 resolved.* = switch (instruction.operation) {
@@ -150,7 +150,7 @@ pub fn resolveAndTypeBody(
                 std.debug.assert(known_types[lhs_index]);
                 std.debug.assert(known_types[rhs_index]);
                 if (value_types[lhs_index] != .int or value_types[rhs_index] != .int) {
-                    try emitSemanticIssue(ctx, file_id, .{ .span = predicate.span, .message = "fallible comparison requires int operands" });
+                    try emitSemanticIssue(ctx, file_id, .{ .span = predicate.span, .kind = .comparison_operands_not_int });
                     return null;
                 }
                 break :blk .{ .predicate_branch = .{
@@ -170,7 +170,7 @@ pub fn resolveAndTypeBody(
             .return_unit => |span| if (return_type == .unit) .return_unit else {
                 try emitSemanticIssue(ctx, file_id, .{
                     .span = span,
-                    .message = if (return_type == .int) "function returning int must return a value" else "function return type requires a value",
+                    .kind = .{ .missing_return_value = return_type },
                 });
                 return null;
             },
@@ -179,7 +179,7 @@ pub fn resolveAndTypeBody(
                 const value_index = @intFromEnum(value);
                 std.debug.assert(known_types[value_index]);
                 const use = try coerceValue(type_interner, value, value_types[value_index], return_type, false) orelse {
-                    try emitSemanticIssue(ctx, file_id, .{ .span = return_value.span, .message = "return type does not match function signature" });
+                    try emitSemanticIssue(ctx, file_id, .{ .span = return_value.span, .kind = .return_type_mismatch });
                     return null;
                 };
                 break :blk if (return_type == .unit) .return_unit else .{ .return_value = use };
@@ -229,7 +229,7 @@ fn resolveConstraints(
         std.debug.assert(known_types[lhs_index]);
         std.debug.assert(known_types[rhs_index]);
         const joined_type = try joinTypes(type_interner, value_types[lhs_index], value_types[rhs_index]) orelse {
-            try emitSemanticIssue(ctx, file_id, .{ .span = join.span, .message = "if branches must have the same type" });
+            try emitSemanticIssue(ctx, file_id, .{ .span = join.span, .kind = .if_branch_type_mismatch });
             return false;
         };
         std.debug.assert(join.argument < block_argument_types.len);
@@ -395,7 +395,7 @@ fn resolveAndTypeCall(
     else blk: {
         if (scope.* == null) scope.* = (try ctx.get(ModuleScopeQuery, file_id)).* orelse return null;
         const target = scope.*.?.resolve(name) orelse {
-            try emitSemanticIssue(ctx, file_id, .{ .span = name_span, .message = "unknown function" });
+            try emitSemanticIssue(ctx, file_id, .{ .span = name_span, .kind = .unknown_function });
             return null;
         };
         const signature = (try ctx.get(FunctionSignatureQuery, target)).* orelse return null;
@@ -411,7 +411,7 @@ fn resolveAndTypeCall(
         .function => |function| function.signature.parameter_types,
     };
     if (arguments.len != parameter_types.len) {
-        try emitSemanticIssue(ctx, file_id, .{ .span = name_span, .message = "call argument count does not match function signature" });
+        try emitSemanticIssue(ctx, file_id, .{ .span = name_span, .kind = .call_argument_count_mismatch });
         return null;
     }
     for (raw_arguments, arguments, parameter_types) |raw_argument, *argument, expected_type| {
@@ -421,7 +421,7 @@ fn resolveAndTypeCall(
         argument.* = try coerceValue(type_interner, value, value_types[argument_index], expected_type, true) orelse {
             try emitSemanticIssue(ctx, file_id, .{
                 .span = argumentSpan(unresolved.instructions, raw_argument, name_span),
-                .message = "call argument type does not match function signature",
+                .kind = .call_argument_type_mismatch,
             });
             return null;
         };
@@ -454,7 +454,7 @@ fn validateTypeExpectation(
     const value_index = @intFromEnum(resolveValue(expectation.value, block_argument_count));
     std.debug.assert(known_types[value_index]);
     if (value_types[value_index] == expectation.expected) return true;
-    try emitSemanticIssue(ctx, file_id, .{ .span = expectation.span, .message = "local binding type does not match initializer" });
+    try emitSemanticIssue(ctx, file_id, .{ .span = expectation.span, .kind = .local_type_mismatch });
     return false;
 }
 

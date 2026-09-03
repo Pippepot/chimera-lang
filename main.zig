@@ -63,11 +63,6 @@ fn printTimings(
     try writer.print("  total: {d} us\n", .{total.toMicroseconds()});
 }
 
-fn freeDiagnostics(gpa: std.mem.Allocator, values: []structures.Diagnostic) void {
-    for (values) |*diagnostic| diagnostic.deinit(gpa);
-    gpa.free(values);
-}
-
 fn compileAndRun(
     io: std.Io,
     gpa: std.mem.Allocator,
@@ -90,7 +85,7 @@ fn compileAndRun(
         structures.Diagnostic,
         gpa,
     );
-    defer freeDiagnostics(gpa, emitted);
+    defer gpa.free(emitted);
     const diagnostics_collected = std.Io.Clock.awake.now(io);
 
     const debug_started = diagnostics_collected;

@@ -55,8 +55,8 @@ The repository root now has a new-pipeline CLI in `main.zig`. `legacy/main.zig` 
 - `tokenizer.zig` and `ast_new.zig` implement the new tokenizer/parser and have broad parser coverage.
 - `Ast` owns its token/node arrays and stores `FileId`; it does not borrow source text.
 - Text rendering receives source text explicitly and uses token byte offsets.
-- `ParseFile` reads `SourceText` through the query context and emits owned diagnostics.
-- `diagnostics.zig` renders the refactored pipeline's public `structures.Diagnostic` values from source paths, source text, spans, and messages.
+- `ParseFile` reads `SourceText` through the query context and emits diagnostics.
+- `diagnostics.zig` is the only site that translates a diagnostic kind to user-facing text; it renders the refactored pipeline's public `structures.Diagnostic` values from source paths, source text, spans, and kinds.
 - Parser productions propagate syntax and allocation failures to one document boundary; syntax failure publishes exactly the first diagnostic, while allocation failure remains an infrastructure error.
 - Required expression positions reject missing values without making the expression after `return` mandatory.
 - A line break after `return` ends the bare return before a following top-level expression, including after an inline function body.

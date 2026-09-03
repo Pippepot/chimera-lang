@@ -675,26 +675,43 @@ pub const SourceSpan = struct {
 pub const Diagnostic = struct {
     file_id: FileId,
     span: ?SourceSpan,
-    message: []const u8,
-    message_allocated: bool = false,
+    kind: Kind,
 
-    pub fn eql(a: Diagnostic, b: Diagnostic) bool {
-        return a.file_id == b.file_id and
-            std.meta.eql(a.span, b.span) and
-            std.mem.eql(u8, a.message, b.message);
-    }
-
-    pub fn clone(gpa: std.mem.Allocator, value: Diagnostic) std.mem.Allocator.Error!Diagnostic {
-        return .{
-            .file_id = value.file_id,
-            .span = value.span,
-            .message = try gpa.dupe(u8, value.message),
-            .message_allocated = true,
-        };
-    }
-
-    pub fn deinit(self: *Diagnostic, gpa: std.mem.Allocator) void {
-        if (self.message_allocated) gpa.free(self.message);
-        self.* = undefined;
-    }
+    pub const Kind = union(enum) {
+        expected_token: struct {
+            expected: Token.Tag,
+            found: Token.Tag,
+        },
+        invalid_expression: Token.Tag,
+        duplicate_top_level_function,
+        parameter_mode_not_supported,
+        duplicate_parameter,
+        parameter_type_missing,
+        parameter_type_not_supported,
+        return_type_missing,
+        return_type_not_supported,
+        entry_statement_not_supported,
+        body_shape_not_supported,
+        expression_not_supported,
+        duplicate_local_binding,
+        local_type_not_supported,
+        unknown_value,
+        integer_literal_not_decimal,
+        integer_literal_out_of_range,
+        fallible_condition_not_supported,
+        if_condition_not_fallible,
+        if_branch_shape_not_supported,
+        value_not_callable,
+        duplicate_variant_member_type,
+        local_type_mismatch,
+        negation_operand_not_int,
+        arithmetic_operands_not_int,
+        comparison_operands_not_int,
+        missing_return_value: TypeId,
+        return_type_mismatch,
+        if_branch_type_mismatch,
+        unknown_function,
+        call_argument_count_mismatch,
+        call_argument_type_mismatch,
+    };
 };

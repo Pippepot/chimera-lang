@@ -66,7 +66,7 @@ pub const DiscoverItems = struct {
             try ctx.emit(structures.Diagnostic, .{
                 .file_id = file_id,
                 .span = .{ .start = token.loc.start, .end = token.loc.end },
-                .message = "duplicate top-level function name",
+                .kind = .duplicate_top_level_function,
             });
         }
         if (has_duplicates) {

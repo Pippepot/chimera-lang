@@ -6,21 +6,9 @@ pub const Token = structures.Token;
 pub const Node = structures.Node;
 pub const Ast = structures.Ast;
 
-const Diagnostic = struct {
-    tag: Tag,
+const ParseDiagnostic = struct {
+    kind: structures.Diagnostic.Kind,
     token_index: u32,
-    extra: Extra,
-
-    const Extra = union {
-        none: void,
-        token_tag: Token.Tag,
-    };
-
-    const Tag = enum(u8) {
-        expectedToken,
-        invalid_expression,
-        _,
-    };
 };
 
 const ParseError = std.mem.Allocator.Error || error{ParseError};
@@ -31,7 +19,6 @@ pub const ParseReport = struct {
 
     pub fn deinit(self: *ParseReport, gpa: std.mem.Allocator) void {
         if (self.ast) |*parsed| parsed.deinit(gpa);
-        for (self.diagnostics) |*diag| diag.deinit(gpa);
         gpa.free(self.diagnostics);
         self.* = undefined;
     }
@@ -45,7 +32,7 @@ const ParserState = struct {
     nodes: std.ArrayList(Node),
     node_refs: std.ArrayList(Node.Index),
     scratch_stack: std.ArrayList(Node.Index),
-    errors: std.ArrayList(Diagnostic),
+    errors: std.ArrayList(ParseDiagnostic),
 
     pub fn deinit(self: *@This()) void {
         self.gpa.free(self.tokens);
@@ -114,7 +101,7 @@ const ParserState = struct {
             self.index += 1;
             return tok;
         }
-        try self.addError(.expectedToken, .{ .token_tag = token });
+        try self.addError(.{ .expected_token = .{ .expected = token, .found = tok.tag } });
         return error.ParseError;
     }
 
@@ -126,8 +113,8 @@ const ParserState = struct {
         } };
     }
 
-    pub fn addError(self: *@This(), tag: Diagnostic.Tag, extra: Diagnostic.Extra) !void {
-        try self.errors.append(self.gpa, .{ .tag = tag, .token_index = self.index, .extra = extra });
+    pub fn addError(self: *@This(), kind: structures.Diagnostic.Kind) !void {
+        try self.errors.append(self.gpa, .{ .kind = kind, .token_index = self.index });
     }
 };
 
@@ -180,10 +167,7 @@ pub fn parseReport(gpa: std.mem.Allocator, file_id: structures.FileId, source: [
     defer parser.deinit();
 
     const diagnostics = try parserDiagnostics(gpa, file_id, &parser);
-    errdefer {
-        for (diagnostics) |*diag| diag.deinit(gpa);
-        gpa.free(diagnostics);
-    }
+    errdefer gpa.free(diagnostics);
 
     if (diagnostics.len != 0) return .{ .ast = null, .diagnostics = diagnostics };
 
@@ -376,7 +360,7 @@ fn parseTypePrimary(parser: *ParserState) ParseError!Node.Index {
         .keyword_none => try parseTokenNode(parser, .keyword_none, .type),
         .keyword_func => try parseFunctionType(parser),
         else => {
-            try parser.addError(.invalid_expression, .{ .none = {} });
+            try parser.addError(.{ .invalid_expression = parser.tokens[parser.index].tag });
             return error.ParseError;
         },
     };
@@ -511,7 +495,7 @@ fn parsePrimary(parser: *ParserState) ParseError!Node.Index {
             return expr;
         },
         else => {
-            try parser.addError(.invalid_expression, .{ .none = {} });
+            try parser.addError(.{ .invalid_expression = parser.tokens[parser.index].tag });
             return error.ParseError;
         },
     };
@@ -634,7 +618,7 @@ fn parseRequiredExpression(parser: *ParserState) ParseError!Node.Index {
     const expression = try parseExpression(parser);
     if (expression != .null) return expression;
 
-    try parser.addError(.invalid_expression, .{ .none = {} });
+    try parser.addError(.{ .invalid_expression = parser.tokens[parser.index].tag });
     return error.ParseError;
 }
 
@@ -660,42 +644,17 @@ fn parseTokenNode(parser: *ParserState, token: Token.Tag, tag: Node.Tag) !Node.I
     return parser.addNode(.{ .tag = tag, .token_index = parser.index - 1, .data = .{ .none = {} } });
 }
 
-fn diagnosticMessage(gpa: std.mem.Allocator, parser: *const ParserState, diagnostic: Diagnostic) ![]const u8 {
-    var buf = try std.ArrayList(u8).initCapacity(gpa, 64);
-    errdefer buf.deinit(gpa);
-
-    switch (diagnostic.tag) {
-        .expectedToken => try buf.print(gpa, "expected {}, found {}", .{
-            diagnostic.extra.token_tag,
-            parser.tokens[diagnostic.token_index].tag,
-        }),
-        .invalid_expression => try buf.print(gpa, "{} is not a valid expression", .{
-            parser.tokens[diagnostic.token_index].tag,
-        }),
-        else => try buf.print(gpa, "{s}", .{@tagName(diagnostic.tag)}),
-    }
-
-    return try buf.toOwnedSlice(gpa);
-}
-
 fn parserDiagnostics(gpa: std.mem.Allocator, file_id: structures.FileId, parser: *const ParserState) ![]structures.Diagnostic {
     const diagnostics = try gpa.alloc(structures.Diagnostic, parser.errors.items.len);
     errdefer gpa.free(diagnostics);
-
-    var filled: usize = 0;
-    errdefer {
-        for (diagnostics[0..filled]) |*diag| diag.deinit(gpa);
-    }
 
     for (parser.errors.items, diagnostics) |parse_diag, *out| {
         const token = parser.tokens[parse_diag.token_index];
         out.* = .{
             .file_id = file_id,
             .span = .{ .start = token.loc.start, .end = token.loc.end },
-            .message = try diagnosticMessage(gpa, parser, parse_diag),
-            .message_allocated = true,
+            .kind = parse_diag.kind,
         };
-        filled += 1;
     }
 
     return diagnostics;
@@ -1547,34 +1506,37 @@ test "parse with precedence" {
 test "diagnostic tag for missing binding equals" {
     try testExpectDiagnosticTag(
         \\const x 1
-    , .expectedToken);
+    , .{ .expected_token = .{ .expected = .equal, .found = .number_literal } });
 }
 
 test "diagnostic tag for invalid call argument expression" {
     try testExpectDiagnosticTag(
         \\print(,)
-    , .invalid_expression);
+    , .{ .invalid_expression = .comma });
 }
 
 test "diagnostic tag for malformed struct item" {
     try testExpectDiagnosticTag(
         \\static S = struct
         \\  x int
-    , .expectedToken);
+    , .{ .expected_token = .{ .expected = .colon, .found = .identifier } });
 }
 
 test "required expression failures stop at one diagnostic" {
-    const sources = [_][:0]const u8{
-        "const x =",
-        "x =",
-        "static f = func() int ->",
-        "if",
-        "if true -> 1 else",
-        "static S = struct\n  x =",
-        "S{ x = }",
+    const cases = [_]struct {
+        source: [:0]const u8,
+        kind: structures.Diagnostic.Kind,
+    }{
+        .{ .source = "const x =", .kind = .{ .invalid_expression = .eof } },
+        .{ .source = "x =", .kind = .{ .invalid_expression = .eof } },
+        .{ .source = "static f = func() int ->", .kind = .{ .invalid_expression = .eof } },
+        .{ .source = "if", .kind = .{ .invalid_expression = .eof } },
+        .{ .source = "if true -> 1 else", .kind = .{ .invalid_expression = .eof } },
+        .{ .source = "static S = struct\n  x =", .kind = .{ .invalid_expression = .dedent } },
+        .{ .source = "S{ x = }", .kind = .{ .invalid_expression = .r_brace } },
     };
-    for (sources) |source| {
-        try testExpectDiagnosticTag(source, .invalid_expression);
+    for (cases) |case| {
+        try testExpectDiagnosticTag(case.source, case.kind);
     }
 }
 
@@ -1585,28 +1547,28 @@ test "parse report cleans up every allocation failure" {
     });
     try std.testing.checkAllAllocationFailures(std.testing.allocator, testParseReportAllocations, .{
         "const x 1",
-        "expected .equal, found .number_literal",
+        .{ .expected_token = .{ .expected = .equal, .found = .number_literal } },
     });
 }
 
-fn testExpectDiagnosticTag(source: [:0]const u8, expected: Diagnostic.Tag) !void {
+fn testExpectDiagnosticTag(source: [:0]const u8, expected: structures.Diagnostic.Kind) !void {
     var parser = try parseState(std.testing.allocator, source);
     defer parser.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), parser.errors.items.len);
-    try std.testing.expectEqual(expected, parser.errors.items[0].tag);
+    try std.testing.expectEqual(expected, parser.errors.items[0].kind);
 }
 
-fn testParseReportAllocations(gpa: std.mem.Allocator, source: []const u8, expected_message: ?[]const u8) !void {
+fn testParseReportAllocations(gpa: std.mem.Allocator, source: []const u8, expected_kind: ?structures.Diagnostic.Kind) !void {
     var report = try parseReport(gpa, 42, source);
     defer report.deinit(gpa);
 
-    if (expected_message) |message| {
+    if (expected_kind) |kind| {
         try std.testing.expect(report.ast == null);
         try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len);
         try std.testing.expectEqual(@as(structures.FileId, 42), report.diagnostics[0].file_id);
         try std.testing.expectEqual(structures.SourceSpan{ .start = 8, .end = 9 }, report.diagnostics[0].span.?);
-        try std.testing.expectEqualStrings(message, report.diagnostics[0].message);
+        try std.testing.expectEqual(kind, report.diagnostics[0].kind);
     } else {
         try std.testing.expect(report.ast != null);
         try std.testing.expectEqual(@as(structures.FileId, 42), report.ast.?.file_id);

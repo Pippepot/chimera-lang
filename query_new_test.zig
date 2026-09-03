@@ -39,6 +39,35 @@ fn setSource(db: *Database, file_id: structures.FileId, source: []const u8) !voi
 }
 
 fn freeDiagnostics(diagnostics: []structures.Diagnostic) void {
+    testing.allocator.free(diagnostics);
+}
+
+/// Synthetic accumulator payload with an owned message, used to exercise the
+/// engine's clone, equality, and cleanup paths for owned accumulators.
+const OwnedDiagnostic = struct {
+    file_id: structures.FileId,
+    span: ?structures.SourceSpan,
+    message: []const u8,
+
+    pub fn clone(gpa: std.mem.Allocator, value: OwnedDiagnostic) !OwnedDiagnostic {
+        return .{
+            .file_id = value.file_id,
+            .span = value.span,
+            .message = try gpa.dupe(u8, value.message),
+        };
+    }
+
+    pub fn deinit(self: *OwnedDiagnostic, gpa: std.mem.Allocator) void {
+        gpa.free(self.message);
+        self.* = undefined;
+    }
+
+    pub fn eql(a: OwnedDiagnostic, b: OwnedDiagnostic) bool {
+        return a.file_id == b.file_id and std.meta.eql(a.span, b.span) and std.mem.eql(u8, a.message, b.message);
+    }
+};
+
+fn freeOwnedDiagnostics(diagnostics: []OwnedDiagnostic) void {
     for (diagnostics) |*diagnostic| diagnostic.deinit(testing.allocator);
     testing.allocator.free(diagnostics);
 }
@@ -260,7 +289,7 @@ const Parity = struct {
     pub fn run(ctx: *Context, input_value: Input) anyerror!Output {
         executions.increment();
         const value = (try ctx.input(NumberInput, input_value)).*;
-        try ctx.emit(structures.Diagnostic, .{ .file_id = input_value, .span = null, .message = "parity" });
+        try ctx.emit(OwnedDiagnostic, .{ .file_id = input_value, .span = null, .message = "parity" });
         return value % 2;
     }
 };
@@ -283,7 +312,7 @@ const ParityWithDiagnostic = struct {
 
     pub fn run(ctx: *Context, input_value: Input) anyerror!Output {
         const value = (try ctx.input(NumberInput, input_value)).*;
-        try ctx.emit(structures.Diagnostic, .{
+        try ctx.emit(OwnedDiagnostic, .{
             .file_id = input_value,
             .span = null,
             .message = if (value == 2) "two" else "four",
@@ -353,7 +382,7 @@ const RetryableFailure = struct {
     pub fn run(ctx: *Context, input_value: Input) anyerror!Output {
         executions.increment();
         const value = (try ctx.input(NumberInput, input_value)).*;
-        try ctx.emit(structures.Diagnostic, .{
+        try ctx.emit(OwnedDiagnostic, .{
             .file_id = input_value,
             .span = null,
             .message = if (value == 2) "initial" else "replacement",
@@ -440,7 +469,7 @@ const EmitDiagnostic = struct {
     pub const Output = u32;
 
     pub fn run(ctx: *Context, file_id: Input) anyerror!Output {
-        try ctx.emit(structures.Diagnostic, .{
+        try ctx.emit(OwnedDiagnostic, .{
             .file_id = file_id,
             .span = .{ .start = 0, .end = 1 },
             .message = "leaf",
@@ -454,7 +483,7 @@ const CallEmitDiagnostic = struct {
     pub const Output = u32;
 
     pub fn run(ctx: *Context, file_id: Input) anyerror!Output {
-        try ctx.emit(structures.Diagnostic, .{
+        try ctx.emit(OwnedDiagnostic, .{
             .file_id = file_id,
             .span = null,
             .message = "root",
@@ -562,12 +591,12 @@ test "typed accumulators expose direct and transitive diagnostics" {
 
     try testing.expectEqual(@as(u32, 11), (try db.get(CallEmitDiagnostic, 3)).*);
 
-    const direct = try db.directAccumulatorValues(CallEmitDiagnostic, 3, structures.Diagnostic);
+    const direct = try db.directAccumulatorValues(CallEmitDiagnostic, 3, OwnedDiagnostic);
     try testing.expectEqual(@as(usize, 1), direct.len);
     try testing.expectEqualStrings("root", direct[0].message);
 
-    const all = try db.transitiveAccumulatorValues(CallEmitDiagnostic, 3, structures.Diagnostic, testing.allocator);
-    defer freeDiagnostics(all);
+    const all = try db.transitiveAccumulatorValues(CallEmitDiagnostic, 3, OwnedDiagnostic, testing.allocator);
+    defer freeOwnedDiagnostics(all);
     try testing.expectEqual(@as(usize, 2), all.len);
     try testing.expectEqualStrings("root", all[0].message);
     try testing.expectEqualStrings("leaf", all[1].message);
@@ -637,7 +666,7 @@ test "discovery rejects duplicate top-level function names" {
     try testing.expect((try db.get(query_structures.DiscoverItems, 1)).* == null);
     const diagnostics = try db.directAccumulatorValues(query_structures.DiscoverItems, 1, structures.Diagnostic);
     try testing.expectEqual(@as(usize, 1), diagnostics.len);
-    try testing.expectEqualStrings("duplicate top-level function name", diagnostics[0].message);
+    try testing.expectEqual(structures.Diagnostic.Kind.duplicate_top_level_function, diagnostics[0].kind);
     const start = std.mem.lastIndexOf(u8, source, "duplicate").?;
     try testing.expectEqual(structures.SourceSpan{ .start = start, .end = start + "duplicate".len }, diagnostics[0].span.?);
 
@@ -878,7 +907,7 @@ test "discovery diagnoses later duplicate functions and scope recovers" {
     try testing.expectEqual(@as(usize, 2), diagnostics.len);
     var search_from = std.mem.indexOf(u8, duplicate_source, "duplicate").? + "duplicate".len;
     for (diagnostics) |diagnostic| {
-        try testing.expectEqualStrings("duplicate top-level function name", diagnostic.message);
+        try testing.expectEqual(structures.Diagnostic.Kind.duplicate_top_level_function, diagnostic.kind);
         const start = std.mem.indexOfPos(u8, duplicate_source, search_from, "duplicate").?;
         try testing.expectEqual(structures.SourceSpan{ .start = start, .end = start + "duplicate".len }, diagnostic.span.?);
         search_from = start + "duplicate".len;
@@ -1142,7 +1171,7 @@ test "SelectEntry exposes changed diagnostics while remaining null" {
 
     try testing.expect(initial.len > 0);
     try testing.expectEqual(initial.len, updated.len);
-    try testing.expect(!structures.Diagnostic.eql(initial[0], updated[0]));
+    try testing.expect(!std.meta.eql(initial[0], updated[0]));
 }
 
 test "BuildExecutable runs empty entry sources" {
@@ -1181,7 +1210,7 @@ test "BuildExecutable follows compiled entry diagnostics and recovers" {
     const diagnostics = try db.transitiveAccumulatorValues(query_structures.BuildExecutable, 1, structures.Diagnostic, testing.allocator);
     defer freeDiagnostics(diagnostics);
     try testing.expectEqual(@as(usize, 1), diagnostics.len);
-    try testing.expectEqualStrings("unknown function", diagnostics[0].message);
+    try testing.expectEqual(structures.Diagnostic.Kind.unknown_function, diagnostics[0].kind);
 
     try setSource(db, 1, "");
     try testing.expectEqual(entry_id, (try db.get(query_structures.SelectEntry, 1)).*.?);
@@ -1205,7 +1234,7 @@ test "BuildExecutable exposes changed malformed diagnostics while remaining null
 
     try testing.expect(initial.len > 0);
     try testing.expectEqual(initial.len, updated.len);
-    try testing.expect(!structures.Diagnostic.eql(initial[0], updated[0]));
+    try testing.expect(!std.meta.eql(initial[0], updated[0]));
 }
 
 test "BuildExecutable retries missing input and retains equal output" {
@@ -1289,11 +1318,11 @@ test "variant annotation diagnostics belong to their semantic boundary" {
         source: []const u8,
         query_signature: bool,
         marker: []const u8,
-        message: []const u8,
+        kind: structures.Diagnostic.Kind,
     }{
-        .{ .file_id = 1, .source = "static target = func(value: int | int) unit -> return", .query_signature = true, .marker = "int", .message = "duplicate variant member type" },
-        .{ .file_id = 2, .source = "static target = func() unit | unit -> return", .query_signature = true, .marker = "unit", .message = "duplicate variant member type" },
-        .{ .file_id = 3, .source = "static target = func() int\n  const value: none | none = 1\n  return 1", .query_signature = false, .marker = "none", .message = "duplicate variant member type" },
+        .{ .file_id = 1, .source = "static target = func(value: int | int) unit -> return", .query_signature = true, .marker = "int", .kind = .duplicate_variant_member_type },
+        .{ .file_id = 2, .source = "static target = func() unit | unit -> return", .query_signature = true, .marker = "unit", .kind = .duplicate_variant_member_type },
+        .{ .file_id = 3, .source = "static target = func() int\n  const value: none | none = 1\n  return 1", .query_signature = false, .marker = "none", .kind = .duplicate_variant_member_type },
     };
     for (cases) |case| {
         try addSource(db, case.file_id, case.source);
@@ -1307,7 +1336,7 @@ test "variant annotation diagnostics belong to their semantic boundary" {
             break :blk try db.directAccumulatorValues(query_structures.AnalyzeFunctionBody, target_id, structures.Diagnostic);
         };
         try testing.expectEqual(@as(usize, 1), diagnostics.len);
-        try testing.expectEqualStrings(case.message, diagnostics[0].message);
+        try testing.expectEqual(case.kind, diagnostics[0].kind);
         const start = std.mem.lastIndexOf(u8, case.source, case.marker).?;
         try testing.expectEqual(structures.SourceSpan{ .start = start, .end = start + case.marker.len }, diagnostics[0].span.?);
     }
@@ -1487,14 +1516,14 @@ test "exit validates its one int argument at the typed boundary" {
     const cases = [_]struct {
         file_id: structures.FileId,
         source: []const u8,
-        message: []const u8,
+        kind: structures.Diagnostic.Kind,
     }{
-        .{ .file_id = 1, .source = "exit()", .message = "call argument count does not match function signature" },
-        .{ .file_id = 2, .source = "exit(1, 2)", .message = "call argument count does not match function signature" },
+        .{ .file_id = 1, .source = "exit()", .kind = .call_argument_count_mismatch },
+        .{ .file_id = 2, .source = "exit(1, 2)", .kind = .call_argument_count_mismatch },
         .{
             .file_id = 3,
             .source = "static noop = func() unit -> return\nexit(noop())",
-            .message = "call argument type does not match function signature",
+            .kind = .call_argument_type_mismatch,
         },
     };
     for (cases) |case| {
@@ -1504,7 +1533,7 @@ test "exit validates its one int argument at the typed boundary" {
         const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, entry_id, structures.Diagnostic, testing.allocator);
         defer freeDiagnostics(diagnostics);
         try testing.expectEqual(@as(usize, 1), diagnostics.len);
-        try testing.expectEqualStrings(case.message, diagnostics[0].message);
+        try testing.expectEqual(case.kind, diagnostics[0].kind);
     }
 }
 
@@ -1539,14 +1568,14 @@ test "unit values are rejected at int boundaries" {
     const cases = [_]struct {
         file_id: structures.FileId,
         source: []const u8,
-        message: []const u8,
+        kind: structures.Diagnostic.Kind,
     }{
-        .{ .file_id = 1, .source = "static bad = func() int -> return", .message = "function returning int must return a value" },
-        .{ .file_id = 2, .source = "static bad = func() unit -> return 1", .message = "return type does not match function signature" },
-        .{ .file_id = 3, .source = "static noop = func() unit\n  return\nstatic bad = func() int -> return noop()", .message = "return type does not match function signature" },
-        .{ .file_id = 4, .source = "static noop = func() unit\n  return\nstatic bad = func() int -> return noop() + 1", .message = "integer operation requires int operands" },
-        .{ .file_id = 5, .source = "static noop = func() unit\n  return\nstatic take = func(value: int) int -> return value\nstatic bad = func() int -> return take(noop())", .message = "call argument type does not match function signature" },
-        .{ .file_id = 6, .source = "static noop = func() unit\n  return\nstatic bad = func() unit\n  const done: int = noop()\n  return", .message = "local binding type does not match initializer" },
+        .{ .file_id = 1, .source = "static bad = func() int -> return", .kind = .{ .missing_return_value = .int } },
+        .{ .file_id = 2, .source = "static bad = func() unit -> return 1", .kind = .return_type_mismatch },
+        .{ .file_id = 3, .source = "static noop = func() unit\n  return\nstatic bad = func() int -> return noop()", .kind = .return_type_mismatch },
+        .{ .file_id = 4, .source = "static noop = func() unit\n  return\nstatic bad = func() int -> return noop() + 1", .kind = .arithmetic_operands_not_int },
+        .{ .file_id = 5, .source = "static noop = func() unit\n  return\nstatic take = func(value: int) int -> return value\nstatic bad = func() int -> return take(noop())", .kind = .call_argument_type_mismatch },
+        .{ .file_id = 6, .source = "static noop = func() unit\n  return\nstatic bad = func() unit\n  const done: int = noop()\n  return", .kind = .local_type_mismatch },
     };
     for (cases) |case| {
         try addSource(db, case.file_id, case.source);
@@ -1556,7 +1585,7 @@ test "unit values are rejected at int boundaries" {
         const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, bad_id, structures.Diagnostic, testing.allocator);
         defer freeDiagnostics(diagnostics);
         try testing.expectEqual(@as(usize, 1), diagnostics.len);
-        try testing.expectEqualStrings(case.message, diagnostics[0].message);
+        try testing.expectEqual(case.kind, diagnostics[0].kind);
     }
 }
 
@@ -1646,21 +1675,21 @@ test "if requires supported fallible operands and compatible branch types" {
     const db = try testDatabase(2);
     defer db.deinit();
 
-    const cases = [_]struct { file_id: structures.FileId, source: []const u8, message: []const u8 }{
+    const cases = [_]struct { file_id: structures.FileId, source: []const u8, kind: structures.Diagnostic.Kind }{
         .{
             .file_id = 1,
             .source = "static bad = func() int -> return if true -> 1 else 2",
-            .message = "if condition must be a fallible expression",
+            .kind = .if_condition_not_fallible,
         },
         .{
             .file_id = 2,
             .source = "static noop = func() unit -> return\nstatic bad = func() int -> return if noop() < 1 -> 1 else 2",
-            .message = "fallible comparison requires int operands",
+            .kind = .comparison_operands_not_int,
         },
         .{
             .file_id = 3,
             .source = "static bad = func() int\n  const left: int | none = 1\n  const right: int | unit = 1\n  return if 1 == 1 -> left else right",
-            .message = "if branches must have the same type",
+            .kind = .if_branch_type_mismatch,
         },
     };
     for (cases) |case| {
@@ -1670,7 +1699,7 @@ test "if requires supported fallible operands and compatible branch types" {
         const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, bad_id, structures.Diagnostic, testing.allocator);
         defer freeDiagnostics(diagnostics);
         try testing.expectEqual(@as(usize, 1), diagnostics.len);
-        try testing.expectEqualStrings(case.message, diagnostics[0].message);
+        try testing.expectEqual(case.kind, diagnostics[0].kind);
     }
 }
 
@@ -1678,15 +1707,15 @@ test "if conditions separate unimplemented fallible forms from non-fallible expr
     const db = try testDatabase(2);
     defer db.deinit();
 
-    const cases = [_]struct { file_id: structures.FileId, source: []const u8, marker: []const u8, message: []const u8 }{
-        .{ .file_id = 1, .source = "static bad = func(v: int) int -> return if v is int -> 1 else 2", .marker = "is", .message = "fallible condition form is not supported yet" },
-        .{ .file_id = 2, .source = "static bad = func(v: int) int -> return if v as int -> 1 else 2", .marker = "as", .message = "fallible condition form is not supported yet" },
-        .{ .file_id = 3, .source = "static bad = func(v: int) int -> return if v? -> 1 else 2", .marker = "?", .message = "fallible condition form is not supported yet" },
-        .{ .file_id = 4, .source = "static bad = func(v: int) int -> return if v < 1 and v > 2 -> 1 else 2", .marker = "and", .message = "fallible condition form is not supported yet" },
-        .{ .file_id = 5, .source = "static bad = func(v: int) int -> return if not (v < 1) -> 1 else 2", .marker = "not", .message = "fallible condition form is not supported yet" },
-        .{ .file_id = 6, .source = "static bad = func(v: int) int -> return if const x = v as int -> x else 2", .marker = "as", .message = "fallible condition form is not supported yet" },
-        .{ .file_id = 7, .source = "static bad = func(v: int) int -> return if const x = v? -> x else 2", .marker = "?", .message = "fallible condition form is not supported yet" },
-        .{ .file_id = 8, .source = "static bad = func(v: int) int -> return if const x = v -> x else 2", .marker = "v", .message = "if condition must be a fallible expression" },
+    const cases = [_]struct { file_id: structures.FileId, source: []const u8, marker: []const u8, kind: structures.Diagnostic.Kind }{
+        .{ .file_id = 1, .source = "static bad = func(v: int) int -> return if v is int -> 1 else 2", .marker = "is", .kind = .fallible_condition_not_supported },
+        .{ .file_id = 2, .source = "static bad = func(v: int) int -> return if v as int -> 1 else 2", .marker = "as", .kind = .fallible_condition_not_supported },
+        .{ .file_id = 3, .source = "static bad = func(v: int) int -> return if v? -> 1 else 2", .marker = "?", .kind = .fallible_condition_not_supported },
+        .{ .file_id = 4, .source = "static bad = func(v: int) int -> return if v < 1 and v > 2 -> 1 else 2", .marker = "and", .kind = .fallible_condition_not_supported },
+        .{ .file_id = 5, .source = "static bad = func(v: int) int -> return if not (v < 1) -> 1 else 2", .marker = "not", .kind = .fallible_condition_not_supported },
+        .{ .file_id = 6, .source = "static bad = func(v: int) int -> return if const x = v as int -> x else 2", .marker = "as", .kind = .fallible_condition_not_supported },
+        .{ .file_id = 7, .source = "static bad = func(v: int) int -> return if const x = v? -> x else 2", .marker = "?", .kind = .fallible_condition_not_supported },
+        .{ .file_id = 8, .source = "static bad = func(v: int) int -> return if const x = v -> x else 2", .marker = "v", .kind = .if_condition_not_fallible },
     };
     for (cases) |case| {
         try addSource(db, case.file_id, case.source);
@@ -1695,7 +1724,7 @@ test "if conditions separate unimplemented fallible forms from non-fallible expr
         const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, bad_id, structures.Diagnostic, testing.allocator);
         defer freeDiagnostics(diagnostics);
         try testing.expectEqual(@as(usize, 1), diagnostics.len);
-        try testing.expectEqualStrings(case.message, diagnostics[0].message);
+        try testing.expectEqual(case.kind, diagnostics[0].kind);
         const marker_start = std.mem.lastIndexOf(u8, case.source, case.marker).?;
         try testing.expectEqual(structures.SourceSpan{ .start = marker_start, .end = marker_start + case.marker.len }, diagnostics[0].span.?);
     }
@@ -1769,25 +1798,25 @@ test "call arity and parameter scope diagnostics are reported at their owning bo
         file_id: structures.FileId,
         source: []const u8,
         function_name: []const u8,
-        message: []const u8,
+        kind: structures.Diagnostic.Kind,
     }{
         .{
             .file_id = 1,
             .source = "static target = func(x: int) int -> return x\nstatic caller = func() int -> return target()",
             .function_name = "caller",
-            .message = "call argument count does not match function signature",
+            .kind = .call_argument_count_mismatch,
         },
         .{
             .file_id = 2,
             .source = "static target = func(x: int) int -> return x\nstatic caller = func() int -> return target(1, 2)",
             .function_name = "caller",
-            .message = "call argument count does not match function signature",
+            .kind = .call_argument_count_mismatch,
         },
         .{
             .file_id = 3,
             .source = "static caller = func(x: int) int\n  const x = 1\n  return x",
             .function_name = "caller",
-            .message = "duplicate local binding",
+            .kind = .duplicate_local_binding,
         },
     };
     for (cases) |case| {
@@ -1797,7 +1826,7 @@ test "call arity and parameter scope diagnostics are reported at their owning bo
         const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, function_id, structures.Diagnostic, testing.allocator);
         defer freeDiagnostics(diagnostics);
         try testing.expectEqual(@as(usize, 1), diagnostics.len);
-        try testing.expectEqualStrings(case.message, diagnostics[0].message);
+        try testing.expectEqual(case.kind, diagnostics[0].kind);
     }
 }
 
@@ -1908,12 +1937,12 @@ test "local binding diagnostics follow lexical scope and declared type" {
         file_id: structures.FileId,
         source: []const u8,
         marker: []const u8,
-        message: []const u8,
+        kind: structures.Diagnostic.Kind,
     }{
-        .{ .file_id = 1, .source = "static f = func() int\n  const duplicate = 1\n  const duplicate = 2\n  return 1", .marker = "duplicate", .message = "duplicate local binding" },
-        .{ .file_id = 2, .source = "static f = func() int\n  const x = missing\n  return x", .marker = "missing", .message = "unknown value" },
-        .{ .file_id = 3, .source = "static f = func() int\n  const x: float = 1\n  return x", .marker = "float", .message = "only int and unit local bindings are supported yet" },
-        .{ .file_id = 4, .source = "static f = func() int\n  const leaf = 1\n  return leaf()", .marker = "leaf", .message = "value is not callable" },
+        .{ .file_id = 1, .source = "static f = func() int\n  const duplicate = 1\n  const duplicate = 2\n  return 1", .marker = "duplicate", .kind = .duplicate_local_binding },
+        .{ .file_id = 2, .source = "static f = func() int\n  const x = missing\n  return x", .marker = "missing", .kind = .unknown_value },
+        .{ .file_id = 3, .source = "static f = func() int\n  const x: float = 1\n  return x", .marker = "float", .kind = .local_type_not_supported },
+        .{ .file_id = 4, .source = "static f = func() int\n  const leaf = 1\n  return leaf()", .marker = "leaf", .kind = .value_not_callable },
     };
     for (cases) |case| {
         try addSource(db, case.file_id, case.source);
@@ -1922,7 +1951,7 @@ test "local binding diagnostics follow lexical scope and declared type" {
         const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, function_id, structures.Diagnostic, testing.allocator);
         defer freeDiagnostics(diagnostics);
         try testing.expectEqual(@as(usize, 1), diagnostics.len);
-        try testing.expectEqualStrings(case.message, diagnostics[0].message);
+        try testing.expectEqual(case.kind, diagnostics[0].kind);
         const start = std.mem.lastIndexOf(u8, case.source, case.marker).?;
         try testing.expectEqual(structures.SourceSpan{ .start = start, .end = start + case.marker.len }, diagnostics[0].span.?);
     }
@@ -1944,7 +1973,7 @@ test "local initializer calls are typed through the callee signature" {
     const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, user_id, structures.Diagnostic, testing.allocator);
     defer freeDiagnostics(diagnostics);
     try testing.expectEqual(@as(usize, 1), diagnostics.len);
-    try testing.expectEqualStrings("only int, unit, and variant return types are supported yet", diagnostics[0].message);
+    try testing.expectEqual(structures.Diagnostic.Kind.return_type_not_supported, diagnostics[0].kind);
 }
 
 test "body edits preserve signature consumers and update body analysis" {
@@ -2011,8 +2040,8 @@ test "function body analysis rejects unsupported body forms and literals" {
         const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, function_id, structures.Diagnostic, testing.allocator);
         defer freeDiagnostics(diagnostics);
         try testing.expectEqual(@as(usize, 1), diagnostics.len);
-        if (file_id == 5) try testing.expectEqualStrings("only decimal integer literals are supported yet", diagnostics[0].message);
-        if (file_id == 6) try testing.expectEqualStrings("integer literal does not fit i32", diagnostics[0].message);
+        if (file_id == 5) try testing.expectEqual(structures.Diagnostic.Kind.integer_literal_not_decimal, diagnostics[0].kind);
+        if (file_id == 6) try testing.expectEqual(structures.Diagnostic.Kind.integer_literal_out_of_range, diagnostics[0].kind);
     }
 }
 
@@ -2053,7 +2082,7 @@ test "duplicate names block module analysis until deduplicated" {
     const blocked_diagnostics = try db.transitiveAccumulatorValues(query_structures.SelectEntry, 1, structures.Diagnostic, testing.allocator);
     defer freeDiagnostics(blocked_diagnostics);
     try testing.expectEqual(@as(usize, 1), blocked_diagnostics.len);
-    try testing.expectEqualStrings("duplicate top-level function name", blocked_diagnostics[0].message);
+    try testing.expectEqual(structures.Diagnostic.Kind.duplicate_top_level_function, blocked_diagnostics[0].kind);
 
     try setSource(db, 1,
         \\static duplicate = func() int -> return 1
@@ -2079,7 +2108,7 @@ test "duplicate top-level names fail executable construction without any call" {
     const diagnostics = try db.transitiveAccumulatorValues(query_structures.BuildExecutable, 1, structures.Diagnostic, testing.allocator);
     defer freeDiagnostics(diagnostics);
     try testing.expectEqual(@as(usize, 1), diagnostics.len);
-    try testing.expectEqualStrings("duplicate top-level function name", diagnostics[0].message);
+    try testing.expectEqual(structures.Diagnostic.Kind.duplicate_top_level_function, diagnostics[0].kind);
 }
 
 test "malformed function diagnostics remain parse-only and top-level return stays rejected" {
@@ -2104,14 +2133,14 @@ test "malformed function diagnostics remain parse-only and top-level return stay
     try testing.expect((try db.get(query_structures.CompileFunction, entry_instance)).* == null);
     try testing.expect((try db.get(query_structures.BuildExecutable, 2)).* == null);
     const return_span: structures.SourceSpan = .{ .start = 0, .end = "return".len };
-    const entry_message = "runtime top-level statements are not supported yet";
-    try expectSingleQueryDiagnostic(db, query_structures.AnalyzeFunctionBody, entry_id, true, 2, return_span, entry_message);
-    try expectSingleQueryDiagnostic(db, query_structures.LowerToSSA, entry_instance, false, 2, return_span, entry_message);
-    try expectSingleQueryDiagnostic(db, query_structures.CompileFunction, entry_instance, false, 2, return_span, entry_message);
+    const entry_kind: structures.Diagnostic.Kind = .entry_statement_not_supported;
+    try expectSingleQueryDiagnostic(db, query_structures.AnalyzeFunctionBody, entry_id, true, 2, return_span, entry_kind);
+    try expectSingleQueryDiagnostic(db, query_structures.LowerToSSA, entry_instance, false, 2, return_span, entry_kind);
+    try expectSingleQueryDiagnostic(db, query_structures.CompileFunction, entry_instance, false, 2, return_span, entry_kind);
     const entry_diagnostics = try db.transitiveAccumulatorValues(query_structures.BuildExecutable, 2, structures.Diagnostic, testing.allocator);
     defer freeDiagnostics(entry_diagnostics);
     try testing.expectEqual(@as(usize, 1), entry_diagnostics.len);
-    try testing.expectEqualStrings(entry_message, entry_diagnostics[0].message);
+    try testing.expectEqual(entry_kind, entry_diagnostics[0].kind);
 }
 
 test "entry analysis rejects top-level returns" {
@@ -2125,7 +2154,7 @@ test "entry analysis rejects top-level returns" {
         .{ .source = "return", .marker = "return" },
         .{ .source = "static ok = 1\nreturn 7\nprint(1)", .marker = "return" },
     };
-    const entry_message = "runtime top-level statements are not supported yet";
+    const entry_kind: structures.Diagnostic.Kind = .entry_statement_not_supported;
 
     for (cases, 10..) |case, file_id| {
         try addSource(db, file_id, case.source);
@@ -2137,10 +2166,10 @@ test "entry analysis rejects top-level returns" {
         try testing.expect((try db.get(query_structures.BuildExecutable, file_id)).* == null);
         const start = std.mem.indexOf(u8, case.source, case.marker).?;
         const span: structures.SourceSpan = .{ .start = start, .end = start + case.marker.len };
-        try expectSingleQueryDiagnostic(db, query_structures.AnalyzeFunctionBody, entry_id, true, file_id, span, entry_message);
-        try expectSingleQueryDiagnostic(db, query_structures.LowerToSSA, entry_instance, false, file_id, span, entry_message);
-        try expectSingleQueryDiagnostic(db, query_structures.CompileFunction, entry_instance, false, file_id, span, entry_message);
-        try expectSingleQueryDiagnostic(db, query_structures.BuildExecutable, file_id, false, file_id, span, entry_message);
+        try expectSingleQueryDiagnostic(db, query_structures.AnalyzeFunctionBody, entry_id, true, file_id, span, entry_kind);
+        try expectSingleQueryDiagnostic(db, query_structures.LowerToSSA, entry_instance, false, file_id, span, entry_kind);
+        try expectSingleQueryDiagnostic(db, query_structures.CompileFunction, entry_instance, false, file_id, span, entry_kind);
+        try expectSingleQueryDiagnostic(db, query_structures.BuildExecutable, file_id, false, file_id, span, entry_kind);
     }
 }
 
@@ -2187,7 +2216,7 @@ test "entry const binding edits retain equal analysis and recover" {
     const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, entry_id, structures.Diagnostic, testing.allocator);
     defer freeDiagnostics(diagnostics);
     try testing.expectEqual(@as(usize, 1), diagnostics.len);
-    try testing.expectEqualStrings("unknown value", diagnostics[0].message);
+    try testing.expectEqual(structures.Diagnostic.Kind.unknown_value, diagnostics[0].kind);
 
     try setSource(db, 1, "const restored = 21\nexit(restored)");
     try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, entry_id)).* != null);
@@ -2222,10 +2251,10 @@ test "entry analysis validates all root syntax before resolving a call" {
     const cases = [_]struct {
         source: []const u8,
         marker: []const u8,
-        message: []const u8,
+        kind: structures.Diagnostic.Kind,
     }{
-        .{ .source = "static bad = func() foo -> return 1\nbad()\nreturn", .marker = "return", .message = "runtime top-level statements are not supported yet" },
-        .{ .source = "static f = func() int -> return 1\nf()()", .marker = "(", .message = "expression is not supported yet" },
+        .{ .source = "static bad = func() foo -> return 1\nbad()\nreturn", .marker = "return", .kind = .entry_statement_not_supported },
+        .{ .source = "static f = func() int -> return 1\nf()()", .marker = "(", .kind = .expression_not_supported },
     };
 
     for (cases, 10..) |case, file_id| {
@@ -2236,7 +2265,7 @@ test "entry analysis validates all root syntax before resolving a call" {
         try expectSingleQueryDiagnostic(db, query_structures.AnalyzeFunctionBody, entry_id, true, file_id, .{
             .start = start,
             .end = start + case.marker.len,
-        }, case.message);
+        }, case.kind);
     }
 }
 
@@ -2250,7 +2279,7 @@ test "entry call lookup reports only the demanded resolution failure" {
     try expectSingleQueryDiagnostic(db, query_structures.AnalyzeFunctionBody, missing_entry, true, 1, .{
         .start = 0,
         .end = "missing".len,
-    }, "unknown function");
+    }, .unknown_function);
 
     const unsupported = "static bad = func() foo -> return 1\nbad()";
     try addSource(db, 2, unsupported);
@@ -2259,7 +2288,7 @@ test "entry call lookup reports only the demanded resolution failure" {
     const unsupported_diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, unsupported_entry, structures.Diagnostic, testing.allocator);
     defer freeDiagnostics(unsupported_diagnostics);
     try testing.expectEqual(@as(usize, 1), unsupported_diagnostics.len);
-    try testing.expectEqualStrings("only int, unit, and variant return types are supported yet", unsupported_diagnostics[0].message);
+    try testing.expectEqual(structures.Diagnostic.Kind.return_type_not_supported, unsupported_diagnostics[0].kind);
 
     // A call to a duplicated name adds no "unknown function" diagnostic; the
     // discovery rejection is the only failure the file reports.
@@ -2273,7 +2302,7 @@ test "entry call lookup reports only the demanded resolution failure" {
     const duplicate_diagnostics = try db.transitiveAccumulatorValues(query_structures.BuildExecutable, 3, structures.Diagnostic, testing.allocator);
     defer freeDiagnostics(duplicate_diagnostics);
     try testing.expectEqual(@as(usize, 1), duplicate_diagnostics.len);
-    try testing.expectEqualStrings("duplicate top-level function name", duplicate_diagnostics[0].message);
+    try testing.expectEqual(structures.Diagnostic.Kind.duplicate_top_level_function, duplicate_diagnostics[0].kind);
 
     const value_source = "static value = 1\nvalue()";
     try addSource(db, 4, value_source);
@@ -2283,7 +2312,7 @@ test "entry call lookup reports only the demanded resolution failure" {
     try expectSingleQueryDiagnostic(db, query_structures.AnalyzeFunctionBody, value_entry, true, 4, .{
         .start = value_start,
         .end = value_start + "value".len,
-    }, "unknown function");
+    }, .unknown_function);
 }
 
 test "entry call dependencies follow spelling identity and runtime shape" {
@@ -2332,7 +2361,7 @@ test "entry call dependencies follow spelling identity and runtime shape" {
     const blocked_diagnostics = try db.transitiveAccumulatorValues(query_structures.SelectEntry, 1, structures.Diagnostic, testing.allocator);
     defer freeDiagnostics(blocked_diagnostics);
     try testing.expectEqual(@as(usize, 1), blocked_diagnostics.len);
-    try testing.expectEqualStrings("duplicate top-level function name", blocked_diagnostics[0].message);
+    try testing.expectEqual(structures.Diagnostic.Kind.duplicate_top_level_function, blocked_diagnostics[0].kind);
 
     try setSource(db, 1, alpha_source);
     try testing.expectEqual(alpha_id, (try db.get(EntryCallParent, 1)).*.?);
@@ -2590,7 +2619,7 @@ test "BuildExecutable surfaces a callee compile failure as null with its diagnos
     const diagnostics = try db.transitiveAccumulatorValues(query_structures.BuildExecutable, 1, structures.Diagnostic, testing.allocator);
     defer freeDiagnostics(diagnostics);
     try testing.expectEqual(@as(usize, 1), diagnostics.len);
-    try testing.expectEqualStrings("expression is not supported yet", diagnostics[0].message);
+    try testing.expectEqual(structures.Diagnostic.Kind.expression_not_supported, diagnostics[0].kind);
 
     try setSource(db, 1,
         \\static target = func() int -> return 1
@@ -2622,7 +2651,7 @@ fn expectSingleQueryDiagnostic(
     owns_direct_diagnostic: bool,
     file_id: structures.FileId,
     span: structures.SourceSpan,
-    message: []const u8,
+    kind: structures.Diagnostic.Kind,
 ) !void {
     const direct = try db.directAccumulatorValues(Q, input, structures.Diagnostic);
     try testing.expectEqual(@as(usize, if (owns_direct_diagnostic) 1 else 0), direct.len);
@@ -2632,7 +2661,7 @@ fn expectSingleQueryDiagnostic(
     try testing.expectEqual(@as(usize, 1), transitive.len);
     try testing.expectEqual(file_id, transitive[0].file_id);
     try testing.expectEqual(span, transitive[0].span.?);
-    try testing.expectEqualStrings(message, transitive[0].message);
+    try testing.expectEqual(kind, transitive[0].kind);
 }
 
 test "direct entry call SSA remains demand driven across callee edits and reorder" {
@@ -2807,10 +2836,10 @@ test "LowerToSSA supports entry retention failure restoration and invalid instan
     try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, entry_id)).* == null);
     try testing.expect((try db.get(query_structures.CompileFunction, entry_instance)).* == null);
     const parse_span: structures.SourceSpan = .{ .start = 8, .end = 9 };
-    const parse_message = "expected .equal, found .number_literal";
-    try expectSingleQueryDiagnostic(db, query_structures.AnalyzeFunctionBody, entry_id, false, 1, parse_span, parse_message);
-    try expectSingleQueryDiagnostic(db, query_structures.LowerToSSA, entry_instance, false, 1, parse_span, parse_message);
-    try expectSingleQueryDiagnostic(db, query_structures.CompileFunction, entry_instance, false, 1, parse_span, parse_message);
+    const parse_kind: structures.Diagnostic.Kind = .{ .expected_token = .{ .expected = .equal, .found = .number_literal } };
+    try expectSingleQueryDiagnostic(db, query_structures.AnalyzeFunctionBody, entry_id, false, 1, parse_span, parse_kind);
+    try expectSingleQueryDiagnostic(db, query_structures.LowerToSSA, entry_instance, false, 1, parse_span, parse_kind);
+    try expectSingleQueryDiagnostic(db, query_structures.CompileFunction, entry_instance, false, 1, parse_span, parse_kind);
 
     try setSource(db, 1, valid);
     try testing.expectEqual(entry_id, (try db.get(query_structures.SelectEntry, 1)).*.?);
@@ -3084,7 +3113,7 @@ test "equal recomputed child does not recompute parent" {
 
     try db.addInput(NumberInput, 1, 2);
     try testing.expectEqual(@as(u32, 0), (try db.get(ParityParent, 1)).*);
-    const diagnostics_before = try db.directAccumulatorValues(Parity, 1, structures.Diagnostic);
+    const diagnostics_before = try db.directAccumulatorValues(Parity, 1, OwnedDiagnostic);
 
     try db.setInput(NumberInput, 1, 2);
     try testing.expectEqual(@as(u32, 0), (try db.get(ParityParent, 1)).*);
@@ -3093,7 +3122,7 @@ test "equal recomputed child does not recompute parent" {
 
     try db.setInput(NumberInput, 1, 4);
     try testing.expectEqual(@as(u32, 0), (try db.get(ParityParent, 1)).*);
-    const diagnostics_after = try db.directAccumulatorValues(Parity, 1, structures.Diagnostic);
+    const diagnostics_after = try db.directAccumulatorValues(Parity, 1, OwnedDiagnostic);
 
     try Parity.executions.expect(2);
     try ParityParent.executions.expect(1);
@@ -3112,8 +3141,8 @@ test "changed diagnostic makes an equal value observable" {
     _ = try db.get(DiagnosticParent, 1);
     try DiagnosticParent.executions.expect(2);
 
-    const diagnostics = try db.transitiveAccumulatorValues(DiagnosticParent, 1, structures.Diagnostic, testing.allocator);
-    defer freeDiagnostics(diagnostics);
+    const diagnostics = try db.transitiveAccumulatorValues(DiagnosticParent, 1, OwnedDiagnostic, testing.allocator);
+    defer freeOwnedDiagnostics(diagnostics);
     try testing.expectEqual(@as(usize, 1), diagnostics.len);
     try testing.expectEqualStrings("four", diagnostics[0].message);
 }
@@ -3182,7 +3211,7 @@ test "failed recomputation preserves retained state and is retryable" {
     try RetryableFailure.executions.expect(4);
     try OwnedOutput.deinits.expect(1);
 
-    const diagnostics = try db.directAccumulatorValues(RetryableFailure, 1, structures.Diagnostic);
+    const diagnostics = try db.directAccumulatorValues(RetryableFailure, 1, OwnedDiagnostic);
     try testing.expectEqual(@as(usize, 1), diagnostics.len);
     try testing.expectEqualStrings("replacement", diagnostics[0].message);
 

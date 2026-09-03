@@ -3,7 +3,7 @@ const structures = @import("structures.zig");
 
 pub const Issue = struct {
     span: structures.SourceSpan,
-    message: []const u8,
+    kind: structures.Diagnostic.Kind,
 };
 
 fn SemanticResult(comptime Success: type) type {
@@ -119,10 +119,6 @@ pub const UnresolvedBody = struct {
 
 pub const UnresolvedBodyResult = SemanticResult(UnresolvedBody);
 
-const unsupported_entry_message = "runtime top-level statements are not supported yet";
-const body_shape_message = "function body must end in one return; preceding statements must be const bindings or calls";
-const expression_message = "expression is not supported yet";
-
 /// Builds one unresolved body for either callable kind. Entries accept const
 /// bindings and bare calls, and skip static bindings under a synthetic
 /// zero-parameter signature; declared functions must end in a return.
@@ -226,7 +222,7 @@ fn buildEntryBlock(
                 .success => {},
                 .unsupported => |issue| return .{ .unsupported = issue },
             },
-            else => return .{ .unsupported = issueAt(ast, child_index.index(), unsupported_entry_message) },
+            else => return .{ .unsupported = issueAt(ast, child_index.index(), .entry_statement_not_supported) },
         }
     }
     expression_builder.terminate(.{ .return_unit = tokenSpan(ast, root.token_index) });
@@ -261,7 +257,7 @@ fn buildFunctionBlock(
         parts.body
     else if (body.tag == .block) blk: {
         if (body.data.ref.start == body.data.ref.end) {
-            return .{ .unsupported = issueAt(ast, parts.body.index(), body_shape_message) };
+            return .{ .unsupported = issueAt(ast, parts.body.index(), .body_shape_not_supported) };
         }
         const return_ref = body.data.ref.end - 1;
         for (body.data.ref.start..return_ref) |ref_index| {
@@ -276,12 +272,12 @@ fn buildFunctionBlock(
                     .success => {},
                     .unsupported => |issue| return .{ .unsupported = issue },
                 },
-                else => return .{ .unsupported = issueAt(ast, statement_index.index(), body_shape_message) },
+                else => return .{ .unsupported = issueAt(ast, statement_index.index(), .body_shape_not_supported) },
             }
         }
         break :blk ast.node_refs[return_ref];
     } else {
-        return .{ .unsupported = issueAt(ast, parts.body.index(), body_shape_message) };
+        return .{ .unsupported = issueAt(ast, parts.body.index(), .body_shape_not_supported) };
     };
 
     const return_node = ast.nodes[return_index.index()];
@@ -310,7 +306,7 @@ fn buildFunctionBlock(
                 .span = tokenSpan(ast, return_node.token_index),
             } };
         },
-        else => return .{ .unsupported = issueAt(ast, return_index.index(), body_shape_message) },
+        else => return .{ .unsupported = issueAt(ast, return_index.index(), .body_shape_not_supported) },
     };
     expression_builder.terminate(terminator);
     return .{ .success = {} };
@@ -330,16 +326,16 @@ fn appendConstBinding(
     const name_span = tokenSpan(ast, statement.token_index);
     const name = source[name_span.start..name_span.end];
     if (locals.contains(name)) {
-        return .{ .unsupported = .{ .span = name_span, .message = "duplicate local binding" } };
+        return .{ .unsupported = .{ .span = name_span, .kind = .duplicate_local_binding } };
     }
     const annotation = statement.data.node_node.a.unwrap();
     const expected_type = if (annotation) |type_node| blk: {
-        const resolved = switch (try analyzeType(ast, source, type_node, type_interner, gpa, "only int and unit local bindings are supported yet")) {
+        const resolved = switch (try analyzeType(ast, source, type_node, type_interner, gpa, .local_type_not_supported)) {
             .success => |type_id| type_id,
             .unsupported => |issue| return .{ .unsupported = issue },
         };
         if (resolved == .none) {
-            return .{ .unsupported = issueAt(ast, type_node.index(), "only int and unit local bindings are supported yet") };
+            return .{ .unsupported = issueAt(ast, type_node.index(), .local_type_not_supported) };
         }
         break :blk resolved;
     } else null;
@@ -396,33 +392,33 @@ pub fn analyzeFunctionSignature(
         const parameter = ast.nodes[parameter_index.index()];
         std.debug.assert(parameter.tag == .param);
         if (parameter.data.node_node.a.unwrap()) |access| {
-            return .{ .unsupported = issueAt(ast, access.index(), "parameter modes are not supported yet") };
+            return .{ .unsupported = issueAt(ast, access.index(), .parameter_mode_not_supported) };
         }
         const name_span = tokenSpan(ast, parameter.token_index);
         const name = source[name_span.start..name_span.end];
         if ((try names.getOrPut(name)).found_existing) {
-            return .{ .unsupported = .{ .span = name_span, .message = "duplicate parameter" } };
+            return .{ .unsupported = .{ .span = name_span, .kind = .duplicate_parameter } };
         }
         const annotation = parameter.data.node_node.b.unwrap() orelse
-            return .{ .unsupported = .{ .span = name_span, .message = "function parameters must declare a type" } };
-        const parameter_type = switch (try analyzeType(ast, source, annotation, type_interner, gpa, "only int and variant parameter types are supported yet")) {
+            return .{ .unsupported = .{ .span = name_span, .kind = .parameter_type_missing } };
+        const parameter_type = switch (try analyzeType(ast, source, annotation, type_interner, gpa, .parameter_type_not_supported)) {
             .success => |type_id| type_id,
             .unsupported => |issue| return .{ .unsupported = issue },
         };
         if (parameter_type != .int and try type_interner.variantMembers(parameter_type) == null) {
-            return .{ .unsupported = issueAt(ast, annotation.index(), "only int and variant parameter types are supported yet") };
+            return .{ .unsupported = issueAt(ast, annotation.index(), .parameter_type_not_supported) };
         }
         try parameter_types.append(gpa, parameter_type);
     }
 
     const return_type_index = signature.data.node_node.b.unwrap() orelse
-        return .{ .unsupported = issueAt(ast, parts.signature.index(), "function must declare a return type") };
-    const return_type = switch (try analyzeType(ast, source, return_type_index, type_interner, gpa, "only int, unit, and variant return types are supported yet")) {
+        return .{ .unsupported = issueAt(ast, parts.signature.index(), .return_type_missing) };
+    const return_type = switch (try analyzeType(ast, source, return_type_index, type_interner, gpa, .return_type_not_supported)) {
         .success => |type_id| type_id,
         .unsupported => |issue| return .{ .unsupported = issue },
     };
     if (return_type != .int and return_type != .unit and try type_interner.variantMembers(return_type) == null) {
-        return .{ .unsupported = issueAt(ast, return_type_index.index(), "only int, unit, and variant return types are supported yet") };
+        return .{ .unsupported = issueAt(ast, return_type_index.index(), .return_type_not_supported) };
     }
 
     return .{ .success = .{ .parameter_types = try parameter_types.toOwnedSlice(gpa), .return_type = return_type } };
@@ -453,7 +449,7 @@ const UnresolvedExpressionBuilder = struct {
             .identifier => {
                 const name_span = tokenSpan(self.ast, node.token_index);
                 const value = self.locals.get(self.source[name_span.start..name_span.end]) orelse
-                    return .{ .unsupported = .{ .span = name_span, .message = "unknown value" } };
+                    return .{ .unsupported = .{ .span = name_span, .kind = .unknown_value } };
                 return .{ .success = value };
             },
             .neg => {
@@ -465,7 +461,7 @@ const UnresolvedExpressionBuilder = struct {
             },
             .add, .sub, .mul, .div => return self.appendBinary(node_index),
             .if_else => return self.appendIf(node_index),
-            else => return .{ .unsupported = issueAt(self.ast, node_index.index(), expression_message) },
+            else => return .{ .unsupported = issueAt(self.ast, node_index.index(), .expression_not_supported) },
         }
     }
 
@@ -475,11 +471,11 @@ const UnresolvedExpressionBuilder = struct {
         const literal = self.source[token.loc.start..token.loc.end];
         for (literal) |byte| {
             if (!std.ascii.isDigit(byte)) {
-                return .{ .unsupported = issueAt(self.ast, node_index.index(), "only decimal integer literals are supported yet") };
+                return .{ .unsupported = issueAt(self.ast, node_index.index(), .integer_literal_not_decimal) };
             }
         }
         const integer = std.fmt.parseInt(i32, literal, 10) catch
-            return .{ .unsupported = issueAt(self.ast, node_index.index(), "integer literal does not fit i32") };
+            return .{ .unsupported = issueAt(self.ast, node_index.index(), .integer_literal_out_of_range) };
         return self.appendInstruction(node_index, .{ .consti = integer });
     }
 
@@ -556,11 +552,11 @@ const UnresolvedExpressionBuilder = struct {
             .ne => .ne,
             else => {
                 const form_index = if (node.tag == .const_binding or node.tag == .var_binding) node.data.node_node.b else node_index;
-                const message = if (isFallibleExpression(self.ast.nodes[form_index.index()].tag))
-                    "fallible condition form is not supported yet"
+                const kind: structures.Diagnostic.Kind = if (isFallibleExpression(self.ast.nodes[form_index.index()].tag))
+                    .fallible_condition_not_supported
                 else
-                    "if condition must be a fallible expression";
-                return .{ .unsupported = issueAt(self.ast, form_index.index(), message) };
+                    .if_condition_not_fallible;
+                return .{ .unsupported = issueAt(self.ast, form_index.index(), kind) };
             },
         };
         const lhs = switch (try self.append(node.data.node_node.a)) {
@@ -585,7 +581,7 @@ const UnresolvedExpressionBuilder = struct {
         const node = self.ast.nodes[node_index.index()];
         if (node.tag != .block) return self.append(node_index);
         if (node.data.ref.end - node.data.ref.start != 1) {
-            return .{ .unsupported = issueAt(self.ast, node_index.index(), "if branch must contain one expression") };
+            return .{ .unsupported = issueAt(self.ast, node_index.index(), .if_branch_shape_not_supported) };
         }
         return self.append(self.ast.node_refs[node.data.ref.start]);
     }
@@ -595,13 +591,13 @@ const UnresolvedExpressionBuilder = struct {
         const callee_index = call.data.node_node.a.unwrap() orelse unreachable;
         const callee = self.ast.nodes[callee_index.index()];
         if (callee.tag != .identifier) {
-            return .{ .unsupported = issueAt(self.ast, call_index.index(), expression_message) };
+            return .{ .unsupported = issueAt(self.ast, call_index.index(), .expression_not_supported) };
         }
         const name_span = tokenSpan(self.ast, callee.token_index);
         const name = self.source[name_span.start..name_span.end];
         const is_exit_intrinsic = std.mem.eql(u8, name, "exit");
         if (!is_exit_intrinsic and self.locals.contains(name)) {
-            return .{ .unsupported = .{ .span = name_span, .message = "value is not callable" } };
+            return .{ .unsupported = .{ .span = name_span, .kind = .value_not_callable } };
         }
 
         const scratch_start = self.scratch.items.len;
@@ -728,7 +724,7 @@ fn analyzeType(
     node_index: structures.Node.Index,
     type_interner: anytype,
     gpa: std.mem.Allocator,
-    unsupported_message: []const u8,
+    unsupported_kind: structures.Diagnostic.Kind,
 ) anyerror!SemanticResult(structures.TypeId) {
     const node = ast.nodes[node_index.index()];
     if (node.tag == .type) {
@@ -737,17 +733,17 @@ fn analyzeType(
         if (std.mem.eql(u8, name, "int")) return .{ .success = .int };
         if (std.mem.eql(u8, name, "unit")) return .{ .success = .unit };
         if (std.mem.eql(u8, name, "none")) return .{ .success = .none };
-        return .{ .unsupported = .{ .span = span, .message = unsupported_message } };
+        return .{ .unsupported = .{ .span = span, .kind = unsupported_kind } };
     }
     if (node.tag != .type_variant_small and node.tag != .type_variant) {
-        return .{ .unsupported = issueAt(ast, node_index.index(), unsupported_message) };
+        return .{ .unsupported = issueAt(ast, node_index.index(), unsupported_kind) };
     }
 
     var member_types: std.ArrayList(structures.TypeId) = .empty;
     defer member_types.deinit(gpa);
     var members = AstNodeListIterator.init(ast, node_index, .type_variant_small, .type_variant);
     while (members.next()) |member_index| {
-        const member_type = switch (try analyzeType(ast, source, member_index, type_interner, gpa, unsupported_message)) {
+        const member_type = switch (try analyzeType(ast, source, member_index, type_interner, gpa, unsupported_kind)) {
             .success => |type_id| type_id,
             .unsupported => |issue| return .{ .unsupported = issue },
         };
@@ -764,10 +760,10 @@ fn analyzeType(
             while (duplicate_members.next()) |duplicate_member| : (member_index += 1) {
                 std.debug.assert(member_index < member_types.items.len);
                 if (member_types.items[member_index] != duplicate) continue;
-                if (seen) break :blk .{ .unsupported = issueAt(ast, duplicate_member.index(), "duplicate variant member type") };
+                if (seen) break :blk .{ .unsupported = issueAt(ast, duplicate_member.index(), .duplicate_variant_member_type) };
                 seen = true;
             }
-            break :blk .{ .unsupported = issueAt(ast, node_index.index(), "duplicate variant member type") };
+            break :blk .{ .unsupported = issueAt(ast, node_index.index(), .duplicate_variant_member_type) };
         },
     };
 }
@@ -785,8 +781,8 @@ fn functionParts(ast: *const structures.Ast, declaration: u32) FunctionParts {
     return .{ .signature = signature, .body = body };
 }
 
-fn issueAt(ast: *const structures.Ast, node_index: u32, message: []const u8) Issue {
-    return .{ .span = tokenSpan(ast, ast.nodes[node_index].token_index), .message = message };
+fn issueAt(ast: *const structures.Ast, node_index: u32, kind: structures.Diagnostic.Kind) Issue {
+    return .{ .span = tokenSpan(ast, ast.nodes[node_index].token_index), .kind = kind };
 }
 
 fn tokenSpan(ast: *const structures.Ast, token_index: u32) structures.SourceSpan {
