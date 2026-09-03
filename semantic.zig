@@ -48,6 +48,9 @@ pub const UnresolvedBody = struct {
             },
             call: struct {
                 target: structures.SourceSpan,
+                /// Borrowed from the source given to buildUnresolvedBody;
+                /// the unresolvedBody must not outlive that source.
+                name: []const u8,
                 arguments: structures.FunctionValueRange,
             },
             negi: ValueId,
@@ -617,6 +620,7 @@ const UnresolvedExpressionBuilder = struct {
         const argument_end: u32 = @intCast(self.call_arguments.items.len);
         return self.appendInstruction(call_index, .{ .call = .{
             .target = name_span,
+            .name = name,
             .arguments = .{ .start = argument_start, .end = argument_end },
         } });
     }

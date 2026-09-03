@@ -346,7 +346,7 @@ pub const AnalyzeFunctionBody = struct {
             },
         };
         defer unresolved.deinit(ctx.allocator());
-        return typing.resolveAndTypeBody(ctx, BuildModuleScope, FunctionSignature, resolved.file_id, source, parameter_types, return_type, type_interner, unresolved);
+        return typing.resolveAndTypeBody(ctx, BuildModuleScope, FunctionSignature, resolved.file_id, parameter_types, return_type, type_interner, unresolved);
     }
 };
 

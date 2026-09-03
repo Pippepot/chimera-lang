@@ -21,7 +21,6 @@ pub fn resolveAndTypeBody(
     comptime ModuleScopeQuery: type,
     comptime FunctionSignatureQuery: type,
     file_id: structures.FileId,
-    source: []const u8,
     parameter_types: []const structures.TypeId,
     return_type: structures.TypeId,
     type_interner: anytype,
@@ -87,7 +86,6 @@ pub fn resolveAndTypeBody(
                     ModuleScopeQuery,
                     FunctionSignatureQuery,
                     file_id,
-                    source,
                     unresolved,
                     value_types,
                     known_types,
@@ -374,7 +372,6 @@ fn resolveAndTypeCall(
     comptime ModuleScopeQuery: type,
     comptime FunctionSignatureQuery: type,
     file_id: structures.FileId,
-    source: []const u8,
     unresolved: semantic.UnresolvedBody,
     value_types: []const structures.TypeId,
     known_types: []const bool,
@@ -385,7 +382,7 @@ fn resolveAndTypeCall(
     resolved: *structures.FunctionBodyAnalysis.Instruction,
 ) !?structures.TypeId {
     const name_span = call.target;
-    const name = source[name_span.start..name_span.end];
+    const name = call.name;
     const Callee = union(enum) {
         exit,
         function: struct {
