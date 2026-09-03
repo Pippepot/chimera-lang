@@ -598,14 +598,14 @@ test "ParseFile returns public Ast and emits parser diagnostics" {
     try testing.expectEqual(@as(structures.FileId, 2), diagnostics[0].file_id);
 }
 
-test "DiscoverItems owns names and disambiguates duplicate functions" {
+test "DiscoverItems owns names across source edits" {
     const db = try testDatabase(2);
     defer db.deinit();
 
     const source =
-        \\static duplicate = func() int -> return 1
+        \\static first = func() int -> return 1
         \\print(0)
-        \\static duplicate = func() int -> return 2
+        \\static second = func() int -> return 2
         \\static value = 3
     ;
     try addSource(db, 1, source);
@@ -614,14 +614,46 @@ test "DiscoverItems owns names and disambiguates duplicate functions" {
 
     try testing.expectEqual(@as(usize, 3), tree.items.len);
     try testing.expectEqual(structures.ItemKind.function, tree.items[0].loc.kind);
-    try testing.expectEqualStrings("duplicate", tree.items[0].loc.name);
+    try testing.expectEqualStrings("first", tree.items[0].loc.name);
     try testing.expectEqual(@as(u32, 0), tree.items[0].loc.disambiguator);
-    try testing.expectEqual(@as(u32, 1), tree.items[1].loc.disambiguator);
+    try testing.expectEqual(@as(u32, 0), tree.items[1].loc.disambiguator);
     try testing.expectEqual(structures.ItemKind.top_level_entry, tree.items[2].loc.kind);
     try testing.expectEqualStrings("$entry", tree.items[2].loc.name);
 
     try setSource(db, 1, "static replacement = func() int -> return 3");
-    try testing.expectEqualStrings("duplicate", tree.items[0].loc.name);
+    try testing.expectEqualStrings("first", tree.items[0].loc.name);
+}
+
+test "discovery rejects duplicate top-level function names" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    const source =
+        \\static duplicate = func() int -> return 1
+        \\static other = func() int -> return 0
+        \\static duplicate = func() int -> return 2
+    ;
+    try addSource(db, 1, source);
+    try testing.expect((try db.get(query_structures.DiscoverItems, 1)).* == null);
+    const diagnostics = try db.directAccumulatorValues(query_structures.DiscoverItems, 1, structures.Diagnostic);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqualStrings("duplicate top-level function name", diagnostics[0].message);
+    const start = std.mem.lastIndexOf(u8, source, "duplicate").?;
+    try testing.expectEqual(structures.SourceSpan{ .start = start, .end = start + "duplicate".len }, diagnostics[0].span.?);
+
+    // The rejected tree reaches no downstream query.
+    try testing.expect((try db.get(query_structures.IndexItems, 1)).* == null);
+    try testing.expect((try db.get(query_structures.SelectEntry, 1)).* == null);
+    try testing.expect((try db.get(query_structures.BuildModuleScope, 1)).* == null);
+    try testing.expect((try db.get(query_structures.BuildExecutable, 1)).* == null);
+
+    try setSource(db, 1,
+        \\static other = func() int -> return 0
+        \\static duplicate = func() int -> return 2
+    );
+    const recovered = (try db.get(query_structures.DiscoverItems, 1)).*.?;
+    try testing.expectEqual(@as(usize, 3), recovered.items.len);
+    try testing.expectEqual(@as(usize, 0), (try db.directAccumulatorValues(query_structures.DiscoverItems, 1, structures.Diagnostic)).len);
 }
 
 test "DiscoverItems creates an entry for every parsed file" {
@@ -644,7 +676,7 @@ test "DiscoverItems creates an entry for every parsed file" {
     try testing.expectEqual(structures.ItemKind.top_level_entry, static_only.?.items[0].loc.kind);
 }
 
-test "item indexing handles empty malformed missing and distinct locations" {
+test "item indexing handles empty malformed missing and duplicate inputs" {
     const db = try testDatabase(2);
     defer db.deinit();
 
@@ -655,6 +687,7 @@ test "item indexing handles empty malformed missing and distinct locations" {
         \\static duplicate = func() int -> return 2
     );
     try addSource(db, 4, "static duplicate = func() int -> return 1");
+    try addSource(db, 5, "static duplicate = func() int -> return 2");
 
     const empty = (try db.get(query_structures.IndexItems, 1)).*;
     try testing.expect(empty != null);
@@ -662,11 +695,11 @@ test "item indexing handles empty malformed missing and distinct locations" {
     try testing.expect((try db.get(query_structures.IndexItems, 2)).* == null);
     try testing.expectError(error.InputNotFound, db.get(query_structures.IndexItems, 99));
 
-    const duplicates = (try db.get(query_structures.IndexItems, 3)).*.?;
-    try testing.expectEqual(@as(usize, 3), duplicates.count());
-    try testing.expect(duplicates.ids()[0] != duplicates.ids()[1]);
-    const other_file = (try db.get(query_structures.IndexItems, 4)).*.?;
-    try testing.expect(duplicates.ids()[0] != other_file.ids()[0]);
+    // Discovery rejects duplicate top-level names before indexing.
+    try testing.expect((try db.get(query_structures.IndexItems, 3)).* == null);
+    const first_file = (try db.get(query_structures.IndexItems, 4)).*.?;
+    const other_file = (try db.get(query_structures.IndexItems, 5)).*.?;
+    try testing.expect(first_file.ids()[0] != other_file.ids()[0]);
 
     const base: structures.ItemLoc = .{ .file_id = 8, .kind = .function, .name = "same", .disambiguator = 0 };
     const base_id = try db.intern(query_structures.ItemLocations, base);
@@ -828,7 +861,7 @@ test "module scope classifies empty missing and malformed inputs" {
     try testing.expect(malformed.len > 0);
 }
 
-test "module scope diagnoses later duplicate functions and recovers" {
+test "discovery diagnoses later duplicate functions and scope recovers" {
     const db = try testDatabase(2);
     defer db.deinit();
 
@@ -839,8 +872,9 @@ test "module scope diagnoses later duplicate functions and recovers" {
         \\static duplicate = func() int -> return 3
     ;
     try addSource(db, 1, duplicate_source);
+    try testing.expect((try db.get(query_structures.DiscoverItems, 1)).* == null);
     try testing.expect((try db.get(query_structures.BuildModuleScope, 1)).* == null);
-    const diagnostics = try db.directAccumulatorValues(query_structures.BuildModuleScope, 1, structures.Diagnostic);
+    const diagnostics = try db.directAccumulatorValues(query_structures.DiscoverItems, 1, structures.Diagnostic);
     try testing.expectEqual(@as(usize, 2), diagnostics.len);
     var search_from = std.mem.indexOf(u8, duplicate_source, "duplicate").? + "duplicate".len;
     for (diagnostics) |diagnostic| {
@@ -858,10 +892,10 @@ test "module scope diagnoses later duplicate functions and recovers" {
     try testing.expect(recovered.resolve("duplicate") != null);
     const loc = try db.lookupInterned(query_structures.ItemLocations, recovered.resolve("duplicate").?);
     try testing.expectEqual(@as(u32, 0), loc.disambiguator);
-    try testing.expectEqual(@as(usize, 0), (try db.directAccumulatorValues(query_structures.BuildModuleScope, 1, structures.Diagnostic)).len);
+    try testing.expectEqual(@as(usize, 0), (try db.directAccumulatorValues(query_structures.DiscoverItems, 1, structures.Diagnostic)).len);
 }
 
-test "module scope refreshes duplicate spans when its index remains equal" {
+test "discovery refreshes duplicate spans when its index remains equal" {
     const db = try testDatabase(1);
     defer db.deinit();
 
@@ -870,8 +904,8 @@ test "module scope refreshes duplicate spans when its index remains equal" {
         \\static duplicate = func() int -> return 2
     );
     const initial_index = try db.get(query_structures.IndexItems, 1);
-    try testing.expect((try db.get(query_structures.BuildModuleScope, 1)).* == null);
-    const initial_diagnostics = try db.directAccumulatorValues(query_structures.BuildModuleScope, 1, structures.Diagnostic);
+    try testing.expect((try db.get(query_structures.DiscoverItems, 1)).* == null);
+    const initial_diagnostics = try db.directAccumulatorValues(query_structures.DiscoverItems, 1, structures.Diagnostic);
     try testing.expectEqual(@as(usize, 1), initial_diagnostics.len);
     const initial_span = initial_diagnostics[0].span.?;
 
@@ -880,8 +914,8 @@ test "module scope refreshes duplicate spans when its index remains equal" {
         \\static duplicate = func() int -> return 2
     );
     try testing.expectEqual(initial_index, try db.get(query_structures.IndexItems, 1));
-    try testing.expect((try db.get(query_structures.BuildModuleScope, 1)).* == null);
-    const updated_diagnostics = try db.directAccumulatorValues(query_structures.BuildModuleScope, 1, structures.Diagnostic);
+    try testing.expect((try db.get(query_structures.DiscoverItems, 1)).* == null);
+    const updated_diagnostics = try db.directAccumulatorValues(query_structures.DiscoverItems, 1, structures.Diagnostic);
     try testing.expectEqual(@as(usize, 1), updated_diagnostics.len);
     try testing.expect(initial_span.start != updated_diagnostics[0].span.?.start);
 }
@@ -960,7 +994,9 @@ test "concurrent module scope requests share successful and duplicate results" {
     const duplicate_first = try duplicate[0].wait();
     try testing.expect(duplicate_first.* == null);
     for (duplicate[1..]) |handle| try testing.expectEqual(duplicate_first, try handle.wait());
-    try testing.expectEqual(@as(usize, 1), (try db.directAccumulatorValues(query_structures.BuildModuleScope, 2, structures.Diagnostic)).len);
+    const duplicate_diagnostics = try db.transitiveAccumulatorValues(query_structures.BuildModuleScope, 2, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(duplicate_diagnostics);
+    try testing.expectEqual(@as(usize, 1), duplicate_diagnostics.len);
 }
 
 test "resolution requested before interning retries after identity issuance" {
@@ -1038,7 +1074,7 @@ test "SelectEntry selects the indexed entry and handles invalid inputs" {
     try addSource(db, 4, "");
     try addSource(db, 5, "static f = func() int -> return 1");
 
-    for ([_]structures.FileId{ 1, 2, 4, 5 }) |file_id| {
+    for ([_]structures.FileId{ 1, 4, 5 }) |file_id| {
         const selected = (try db.get(query_structures.SelectEntry, file_id)).*.?;
         const index = (try db.get(query_structures.IndexItems, file_id)).*.?;
         var matching_entries: usize = 0;
@@ -1054,6 +1090,8 @@ test "SelectEntry selects the indexed entry and handles invalid inputs" {
     const first_entry = (try db.get(query_structures.SelectEntry, 1)).*.?;
     const other_entry = (try db.get(query_structures.SelectEntry, 4)).*.?;
     try testing.expect(first_entry != other_entry);
+    // File 2's duplicate top-level names are rejected before indexing.
+    try testing.expect((try db.get(query_structures.SelectEntry, 2)).* == null);
     try testing.expect((try db.get(query_structures.SelectEntry, 3)).* == null);
     try testing.expectError(error.InputNotFound, db.get(query_structures.SelectEntry, 99));
 }
@@ -2001,7 +2039,7 @@ test "function analysis distinguishes entry stale restored and invalid identitie
     try testing.expectError(error.InvalidInternId, db.get(query_structures.AnalyzeFunctionBody, invalid));
 }
 
-test "duplicate function ordinals analyze independently across reorder" {
+test "duplicate names block module analysis until deduplicated" {
     const db = try testDatabase(1);
     defer db.deinit();
 
@@ -2009,24 +2047,39 @@ test "duplicate function ordinals analyze independently across reorder" {
         \\static duplicate = func() int -> return 1
         \\static duplicate = func() int -> return 2
     );
-    const ids = (try db.get(query_structures.IndexItems, 1)).*.?.ids();
-    const first_id = ids[0];
-    const second_id = ids[1];
-    SignatureParent.executions.reset();
-    try testing.expect((try db.get(SignatureParent, first_id)).* != null);
-    try testing.expect((try db.get(SignatureParent, second_id)).* != null);
-    try expectIntegerReturnBody((try db.get(query_structures.AnalyzeFunctionBody, first_id)).*.?, 1);
-    try expectIntegerReturnBody((try db.get(query_structures.AnalyzeFunctionBody, second_id)).*.?, 2);
+    try testing.expect((try db.get(query_structures.IndexItems, 1)).* == null);
+    try testing.expect((try db.get(query_structures.SelectEntry, 1)).* == null);
+    try testing.expect((try db.get(query_structures.BuildExecutable, 1)).* == null);
+    const blocked_diagnostics = try db.transitiveAccumulatorValues(query_structures.SelectEntry, 1, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(blocked_diagnostics);
+    try testing.expectEqual(@as(usize, 1), blocked_diagnostics.len);
+    try testing.expectEqualStrings("duplicate top-level function name", blocked_diagnostics[0].message);
 
     try setSource(db, 1,
-        \\static duplicate = func() int -> return 2
         \\static duplicate = func() int -> return 1
+        \\static renamed = func() int -> return 2
     );
-    try testing.expect((try db.get(SignatureParent, first_id)).* != null);
-    try testing.expect((try db.get(SignatureParent, second_id)).* != null);
-    try SignatureParent.executions.expect(2);
-    try expectIntegerReturnBody((try db.get(query_structures.AnalyzeFunctionBody, first_id)).*.?, 2);
-    try expectIntegerReturnBody((try db.get(query_structures.AnalyzeFunctionBody, second_id)).*.?, 1);
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const first_id = scope.resolve("duplicate").?;
+    const second_id = scope.resolve("renamed").?;
+    try expectIntegerReturnBody((try db.get(query_structures.AnalyzeFunctionBody, first_id)).*.?, 1);
+    try expectIntegerReturnBody((try db.get(query_structures.AnalyzeFunctionBody, second_id)).*.?, 2);
+}
+
+test "duplicate top-level names fail executable construction without any call" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static duplicate = func() int -> return 1
+        \\static duplicate = func() int -> return 2
+        \\exit(0)
+    );
+    try testing.expect((try db.get(query_structures.BuildExecutable, 1)).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(query_structures.BuildExecutable, 1, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqualStrings("duplicate top-level function name", diagnostics[0].message);
 }
 
 test "malformed function diagnostics remain parse-only and top-level return stays rejected" {
@@ -2208,14 +2261,16 @@ test "entry call lookup reports only the demanded resolution failure" {
     try testing.expectEqual(@as(usize, 1), unsupported_diagnostics.len);
     try testing.expectEqualStrings("only int, unit, and variant return types are supported yet", unsupported_diagnostics[0].message);
 
+    // A call to a duplicated name adds no "unknown function" diagnostic; the
+    // discovery rejection is the only failure the file reports.
     try addSource(db, 3,
         \\static duplicate = func() int -> return 1
         \\static duplicate = func() int -> return 2
         \\duplicate()
     );
-    const duplicate_entry = (try db.get(query_structures.SelectEntry, 3)).*.?;
-    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, duplicate_entry)).* == null);
-    const duplicate_diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, duplicate_entry, structures.Diagnostic, testing.allocator);
+    try testing.expect((try db.get(query_structures.SelectEntry, 3)).* == null);
+    try testing.expect((try db.get(query_structures.BuildExecutable, 3)).* == null);
+    const duplicate_diagnostics = try db.transitiveAccumulatorValues(query_structures.BuildExecutable, 3, structures.Diagnostic, testing.allocator);
     defer freeDiagnostics(duplicate_diagnostics);
     try testing.expectEqual(@as(usize, 1), duplicate_diagnostics.len);
     try testing.expectEqualStrings("duplicate top-level function name", duplicate_diagnostics[0].message);
@@ -2265,18 +2320,19 @@ test "entry call dependencies follow spelling identity and runtime shape" {
     try testing.expectEqual(bravo_id, (try db.get(EntryCallParent, 1)).*.?);
     try EntryCallParent.executions.expect(2);
 
-    // Removing the runtime call removes the scope dependency as well. Duplicate
-    // names therefore remain undiagnosed until a later query demands the scope.
+    // Removing the runtime call removes the scope dependency as well, but the
+    // duplicate-name error is owned by discovery, so it stays diagnosed even
+    // though no body requests the module scope.
     try setSource(db, 1,
         \\static duplicate = func() int -> return 20
         \\static duplicate = func() int -> return 10
     );
     try testing.expect((try db.get(EntryCallParent, 1)).* == null);
-    const entry_id = (try db.get(query_structures.SelectEntry, 1)).*.?;
-    try expectUnitBody((try db.get(query_structures.AnalyzeFunctionBody, entry_id)).*.?);
-    const empty_diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, entry_id, structures.Diagnostic, testing.allocator);
-    defer freeDiagnostics(empty_diagnostics);
-    try testing.expectEqual(@as(usize, 0), empty_diagnostics.len);
+    try testing.expect((try db.get(query_structures.SelectEntry, 1)).* == null);
+    const blocked_diagnostics = try db.transitiveAccumulatorValues(query_structures.SelectEntry, 1, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(blocked_diagnostics);
+    try testing.expectEqual(@as(usize, 1), blocked_diagnostics.len);
+    try testing.expectEqualStrings("duplicate top-level function name", blocked_diagnostics[0].message);
 
     try setSource(db, 1, alpha_source);
     try testing.expectEqual(alpha_id, (try db.get(EntryCallParent, 1)).*.?);

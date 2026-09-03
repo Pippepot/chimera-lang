@@ -28,6 +28,7 @@ flowchart TD
 ```
 
 - Per-function granularity: editing one body invalidates only `AnalyzeFunctionBody` for that item and downstream per-instance queries; equal signatures suppress callee-side recomputation.
+- Duplicate top-level function names are rejected at discovery: `DiscoverItems` emits one diagnostic per later declaration and returns `null`, so indexing, entry selection, and executable construction all fail for that file regardless of whether any body contains a call.
 - Semantic failures are values (`?Output` plus emitted diagnostics); errors are reserved for infrastructure failures.
 - The executable's entry is each file's synthetic top-level `$entry`; a `main` declaration is ordinary.
 

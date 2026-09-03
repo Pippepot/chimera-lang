@@ -281,9 +281,9 @@ pub const ItemKind = enum {
     top_level_entry,
 };
 
-/// Stable within a file across edits that do not rename the item, change its
-/// kind, or reorder same-name duplicates. `ItemTree` and the item interner own
-/// their respective copies of `name`.
+/// Stable within a file across edits that do not rename the item or change
+/// its kind. `ItemTree` and the item interner own their respective copies of
+/// `name`.
 pub const ItemLoc = struct {
     file_id: FileId,
     kind: ItemKind,

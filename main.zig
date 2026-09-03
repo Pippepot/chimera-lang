@@ -277,3 +277,33 @@ test "CLI core renders source diagnostics without running" {
     ) != null);
     try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "timing\n") != null);
 }
+
+test "CLI core rejects duplicate top-level function names without running" {
+    const io = std.testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var errors: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer errors.deinit();
+
+    const exit_code = try compileAndRun(io, std.testing.allocator, .{
+        .source_path = "duplicates.chi",
+        .source =
+        \\static duplicate = func() int -> return 1
+        \\static duplicate = func() int -> return 2
+        \\exit(0)
+        ,
+        .program_args = &.{},
+        .debug_flags = .{},
+        .started = std.Io.Clock.awake.now(io),
+    }, &output.writer, &errors.writer);
+
+    try std.testing.expectEqual(@as(?u8, null), exit_code);
+    try std.testing.expectEqual(@as(usize, 0), output.writer.buffered().len);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        errors.writer.buffered(),
+        "duplicates.chi:2:8: duplicate top-level function name",
+    ) != null);
+}

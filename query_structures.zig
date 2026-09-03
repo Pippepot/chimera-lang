@@ -51,7 +51,31 @@ pub const DiscoverItems = struct {
         const parsed = try ctx.get(ParseFile, file_id);
         const ast_value = parsed.* orelse return null;
         const source = (try ctx.input(SourceText, file_id)).*;
-        return try semantic.discoverItems(ctx.allocator(), &ast_value, source);
+        var tree = try semantic.discoverItems(ctx.allocator(), &ast_value, source);
+        errdefer tree.deinit(ctx.allocator());
+
+        var has_duplicates = false;
+        for (tree.items) |item| {
+            // Discovery assigns source-order ordinals per function name, so a
+            // nonzero ordinal is always a later declaration of a duplicate.
+            if (item.loc.kind != .function or item.loc.disambiguator == 0) continue;
+            has_duplicates = true;
+            const node = ast_value.nodes[item.declaration];
+            std.debug.assert(node.tag == .static_binding);
+            const token = ast_value.tokens[node.token_index];
+            try ctx.emit(structures.Diagnostic, .{
+                .file_id = file_id,
+                .span = .{ .start = token.loc.start, .end = token.loc.end },
+                .message = "duplicate top-level function name",
+            });
+        }
+        if (has_duplicates) {
+            // A duplicated top-level name makes the module's namespace invalid,
+            // so no downstream query can index or build from the tree.
+            tree.deinit(ctx.allocator());
+            return null;
+        }
+        return tree;
     }
 };
 
@@ -236,33 +260,6 @@ pub const BuildModuleScope = struct {
     pub fn run(ctx: anytype, file_id: Input) anyerror!Output {
         const index = (try ctx.get(IndexItems, file_id)).* orelse return null;
 
-        var has_duplicates = false;
-        for (index.ids()) |item_id| {
-            const loc = try ctx.lookupInterned(ItemLocations, item_id);
-            std.debug.assert(loc.file_id == file_id);
-            if (loc.kind != .function or loc.disambiguator == 0) continue;
-
-            // Discovery assigns source-order ordinals per function name, so a
-            // nonzero ordinal is always a later declaration of a duplicate.
-            has_duplicates = true;
-            // Record ParseFile directly because a diagnostic span can move
-            // while the indexed identities and declarations remain equal.
-            const parsed = (try ctx.get(ParseFile, file_id)).* orelse unreachable;
-            std.debug.assert(parsed.file_id == file_id);
-            const declaration = index.resolve(item_id) orelse unreachable;
-            std.debug.assert(declaration < parsed.nodes.len);
-            const node = parsed.nodes[declaration];
-            std.debug.assert(node.tag == .static_binding);
-            std.debug.assert(node.token_index < parsed.tokens.len);
-            const token = parsed.tokens[node.token_index];
-            try ctx.emit(structures.Diagnostic, .{
-                .file_id = file_id,
-                .span = .{ .start = token.loc.start, .end = token.loc.end },
-                .message = "duplicate top-level function name",
-            });
-        }
-        if (has_duplicates) return null;
-
         var entries: std.ArrayList(structures.ModuleScope.Entry) = .empty;
         defer {
             for (entries.items) |entry| ctx.allocator().free(entry.name);
@@ -272,6 +269,8 @@ pub const BuildModuleScope = struct {
             const loc = try ctx.lookupInterned(ItemLocations, item_id);
             if (loc.kind != .function) continue;
             std.debug.assert(loc.file_id == file_id);
+            // Discovery rejects duplicate names before indexing, so every
+            // indexed function location has ordinal zero.
             std.debug.assert(loc.disambiguator == 0);
 
             const name = try ctx.allocator().dupe(u8, loc.name);

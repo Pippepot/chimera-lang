@@ -85,11 +85,11 @@ The repository root now has a new-pipeline CLI in `main.zig`. `legacy/main.zig` 
 
 ### Item discovery
 
-- `DiscoverItems(FileId)` produces an owned `ItemTree` for successfully parsed files.
+- `DiscoverItems(FileId)` produces an owned `ItemTree` for successfully parsed files without duplicate top-level function names.
 - Top-level function locations are stable across body and unrelated index changes; renames change identity.
-- Duplicate functions receive deterministic per-name disambiguators.
-- Duplicate ordinals follow source order, so reordering invalid same-name declarations may reassign which declaration an existing location denotes.
-- Every successfully parsed file produces a synthetic `$entry` for its root block, including empty, function-only, and static-only files.
+- Later same-name declarations emit source-ordered diagnostics at their binding names and make the result `null`; discovery uses deterministic per-name disambiguators to report them.
+- Duplicate diagnostic spans depend directly on the current AST, so moved spans remain observable even while the rejected result stays equal.
+- A file with duplicate top-level names has no indexed identities, synthetic entry, or module scope; every other successfully discovered file produces a synthetic `$entry` for its root block, including empty, function-only, and static-only files.
 - Stable `ItemLoc` data is separate from the current revision's raw declaration index.
 - Stable locations are interned into opaque, session-local `ItemId`s whose names are owned by the database.
 - `IndexItems` preserves source-order stable IDs and maps them to current declarations; `ResolveItem` performs an indexed lookup and returns the current declaration or `null`.
@@ -188,16 +188,16 @@ The repository root now has a new-pipeline CLI in `main.zig`. `legacy/main.zig` 
 
 - `BuildModuleScope(FileId)` produces an owned, name-sorted mapping from declared top-level function names to stable `ItemId`s.
 - Empty scopes are valid; synthetic entries and non-function top-level forms are excluded.
-- Later same-name functions emit source-ordered diagnostics at their binding names and make the scope unavailable, while discovery and indexing preserve their distinct identities.
+- Duplicate top-level names are rejected by discovery before indexing, so every scope entry has disambiguator zero and the table is well-defined; the scope is `null` only when the file's index is unavailable.
 - Scope equality is independent of declaration order, lookup is logarithmic, and no persistent scope hash table is required.
-- Scope construction does not request function signatures or bodies; duplicate diagnostics depend directly on the current AST so moved spans remain observable.
+- Scope construction does not request function signatures or bodies.
 
 ### Callable body semantics
 
 - Calls are value-producing operations; block terminators or statement position determine whether their values are returned or discarded.
 - Body analysis validates the complete supported block shape, resolves calls through `BuildModuleScope`, and validates only callee signatures. Callee bodies remain demand-driven.
 - Semantic call instructions store stable callee `ItemId`s with no AST indices, source spans, or borrowed spellings.
-- Empty and static-only entries do not request module scope, so duplicate-name diagnostics remain demand-driven and stale lookup dependencies are removed after edits.
+- Body analysis requests module scope only when a body reaches a call, so call-free bodies keep no lookup dependency; duplicate-name diagnostics are independent of that demand because discovery rejects duplicate top-level names before indexing.
 - Calls lower independently to symbolic SSA calls carrying callee `InstanceId`s.
 - Direct-call artifacts retain the stable target identity even though their machine-code and relocation bytes are target-independent. Callee body and declaration-order edits that preserve that identity retain the caller artifact.
 
