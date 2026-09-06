@@ -1,0 +1,155 @@
+# Comment
+
+# Variable declarations
+static a: int = 10 # compile time known
+const b: int = 20 # immutable variable
+var c: int = 30 # mutable variable
+const d = 30 # type declaration can be omitted when the type can be inferred from the value
+
+# built in types:
+# int
+# float
+# bool
+# unit - single valued type being unit, also written ()
+# none - type with only value being 'none'
+# never - will never return
+
+# exit(exit_code: int) (compiler known function for now). exit is of type 'never'
+exit(0)
+
+# function declaration
+static identity = func(a: int) int
+    return a
+
+# with type annotation
+static identity: func(int) int = func(a: int) int
+    return a
+
+# Ommission of return type returns unit
+static foo = func()
+    return
+
+# The -> can be used for inline bodies. Inline function bodies also have implicit return
+static foo = func(a: int) int -> a * 2
+
+# Syntax sugar for writing static name = func(). This is almost always used, but the semantics follow the first form
+func foo(a: int) -> a * 2
+
+# There are 4 parameter modifiers:
+# read - read only (implicit default)
+# static - value known at compile time
+# mut - mutable variable
+# var - owned variable
+
+func add1(mut a: int)
+    a += 1
+    # implicitly returns unit
+
+func take(var a: int) int
+    # here we could store a, as it is owned by the function. More on that later, just return for now
+    return a
+
+# The function can be called by copy
+var a = 10
+take(a)
+# or by value with the transfer sigil ^
+take(a^)
+# from now on access to 'a' results in a compiler error, as it's ownership has been transfered
+
+
+# Variant type (sum type)
+static int_or_float = int | float
+
+# Variants flatten
+static v = int_or_float | bool # same as int | float | bool
+
+func foo(a: int_or_float) v
+    return a # 'a' is coerced to the wider type 'v'
+
+foo(1) # '1' is coerced to the wider type 'a'
+
+# Conditionals
+if 1 < 2
+    exit(1)
+else
+    exit(0)
+
+# Can also be written inline or mixed
+if 1 < 2 -> exit(1) else exit(0)
+if 1 < 2 -> exit(1)
+else exit(0)
+
+# 'if' is an expression and produces a value
+const a: int = if 1 < 2
+    1
+else
+    2
+
+# 'if' can also produce a variant type
+const b: int | float = if 1 < 2
+    1
+else
+    2.5
+
+const c: int | float | bool = if 1 < 2
+    1
+else if 3 < 5
+    2.5
+else true
+
+# The 'never' type does not take part in the sum
+const d: int = if 1 < 2
+    1
+else
+    exit(0)
+
+# importantly, 1 < 2 does not produce a bool!
+# comparisons are 'fallible' functions that produce unit or fails
+# 'fallible' functions are defined like:
+static foo = fallible(a: int) int
+    return a # this one never fails for obvious reasons
+
+# fallible functions can be called within fallible contexts:
+# 'if' expression
+# fallible function body (fails the fallible function)
+static bar = fallible(a: int) int
+    a < 2 # fails 'bar' if a < 2
+    return a
+
+# like functions, syntax sugar is
+fallbile baz(arg: int) int
+    ...
+
+
+# Keywords 'is' 'as' 'in' are fallible keywords on variant types
+const fi: float | int = # imagine the value assigned somewhere and the concrete type is unknown
+if fi is float ...
+if const f = fi as float # f can be used inside the body and is a float
+if fi in float | bool # returns true if fi is a float in this case, as it can never be bool
+
+
+# struct definition
+# Define a struct named S with 2 fields - a, of type int, and b, of type float
+static S = struct
+    a: int
+    b: float
+
+# struct instantiation
+const s: S = S{a = 1, b = 2.5}
+
+# OPEN QUESTION - should field names in instantiation be required and should they be prepended with dot? (S{.a = 1, .b = 2.5})
+
+# field access
+const c:int = s.a
+
+# like functions, syntax sugar for structs
+struct Q
+    a: int
+
+# OPEN QUESTION - should field mutation require the field be marked with 'mut'?
+
+# structs passed to a function preserves the same parameter modification for fields:
+func foo(s: S) int
+    # 's' is implicit 'read', so fields in 's' cannot be mutated
+    return s.a # but they can be read
+
