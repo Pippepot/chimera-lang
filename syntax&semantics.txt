@@ -120,6 +120,8 @@ static bar = fallible(a: int) int
 fallbile baz(arg: int) int
     ...
 
+# Keywords 'and' 'or' 'not' apply to fallible types (standard precedence)
+if 2 < 3 and 5 > 4 or 1 < 5 and not 9 < 2
 
 # Keywords 'is' 'as' 'in' are fallible keywords on variant types
 const fi: float | int = # imagine the value assigned somewhere and the concrete type is unknown
@@ -153,3 +155,24 @@ func foo(s: S) int
     # 's' is implicit 'read', so fields in 's' cannot be mutated
     return s.a # but they can be read
 
+
+# loops
+const a = 1
+loop # has type 'never', as it never exits (breaks)
+    a += 1
+
+loop # has type 'unit', as it breaks
+    a += 1
+    if a > 10 -> break
+
+const b: int | float = loop
+    a += 1
+    if a > 3 -> break a
+    if a == 2 -> break 2.5
+
+# 'continue' keyword
+loop
+    a += 1
+    if a < 10
+        continue
+    break a
