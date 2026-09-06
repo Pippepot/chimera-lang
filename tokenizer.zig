@@ -78,6 +78,13 @@ pub const Tokenizer = struct {
         return tag;
     }
 
+    fn getNewLineTokens(self: *Tokenizer) ?u32 {
+        if (self.current() == '\n') return 1;
+        // A CR directly preceding NL is part of the newline sequence
+        if (self.current() == '\r' and self.index + 1 < self.buffer.len and self.buffer[self.index + 1] == '\n') return 2;
+        return null;
+    }
+
     fn checkIndentation(self: *Tokenizer) !?Token {
         line_start: while (true) {
             while (self.current() == ' ') {
@@ -86,8 +93,8 @@ pub const Tokenizer = struct {
             }
 
             // Reset indentation counting on newline. This avoids bloating with dedent/indent that cancel out
-            if (self.current() == '\n') {
-                self.index += 1;
+            if (getNewLineTokens(self)) |token_count| {
+                self.index += token_count;
                 self.indent = 0;
                 continue :line_start;
             }
@@ -119,6 +126,9 @@ pub const Tokenizer = struct {
 
         if (self.at_line_start) {
             if (try checkIndentation(self)) |tok| return tok;
+            // checkIndentation may have skipped blank lines;
+            // start the token scan at the first byte of the actual line.
+            result.loc.start = self.index;
         }
 
         if (self.index == self.buffer.len) {
@@ -134,15 +144,17 @@ pub const Tokenizer = struct {
                         continue :state .invalid;
                     }
                 },
-                '\n' => {
-                    self.index += 1;
-                    self.indent = 0;
-                    self.at_line_start = true;
-                    if (try checkIndentation(self)) |tok| return tok;
-                    result.loc.start = self.index;
-                    continue :state .start;
+                '\n', '\r' => {
+                    if (getNewLineTokens(self)) |token_count| {
+                        self.index += token_count;
+                        self.indent = 0;
+                        self.at_line_start = true;
+                        if (try checkIndentation(self)) |tok| return tok;
+                        result.loc.start = self.index;
+                        continue :state .start;
+                    } else continue :state .invalid;
                 },
-                ' ', '\t', '\r' => {
+                ' ', '\t' => {
                     self.index += 1;
                     result.loc.start = self.index;
                     continue :state .start;
@@ -1051,6 +1063,47 @@ test "invalid tabs and carriage returns" {
     try testTokenize("# \r ", &.{.invalid});
     try testTokenize("#\r\n", &.{});
     try testTokenize("# \r\n", &.{});
+}
+
+test "carriage returns in code" {
+    // CR directly preceding NL is part of the newline sequence.
+    try testTokenize("exit()\r\n", &.{ .identifier, .l_paren, .r_paren });
+    try testTokenize("\r\nexit()\n", &.{ .identifier, .l_paren, .r_paren });
+    try testTokenize("exit()\n\r\nexit()\n", &.{ .identifier, .l_paren, .r_paren, .identifier, .l_paren, .r_paren });
+    try testTokenize(
+        "comptime\n  foo\r\n\r\n  bar\n",
+        &.{ .keyword_comptime, .indent, .identifier, .identifier, .dedent },
+    );
+    try testTokenize(
+        "static foo = func() int\r\n  print(1)\r\nprint(2)\r\n",
+        &.{ .keyword_static, .identifier, .equal, .keyword_func, .l_paren, .r_paren, .identifier, .indent, .identifier, .l_paren, .number_literal, .r_paren, .dedent, .identifier, .l_paren, .number_literal, .r_paren },
+    );
+
+    // A CR not directly preceding NL is rejected.
+    try testTokenize("\r", &.{.invalid});
+    try testTokenize("\ra", &.{.invalid});
+    try testTokenize("exit()\r", &.{ .identifier, .l_paren, .r_paren, .invalid });
+    try testTokenize("exit()\r\r\n", &.{ .identifier, .l_paren, .r_paren, .invalid });
+    try testTokenize("exit()\n\rbad\n", &.{ .identifier, .l_paren, .r_paren, .invalid });
+    try testTokenize("a \r b", &.{ .identifier, .invalid });
+    try testTokenize("comptime foo\n\r  bar\n", &.{ .keyword_comptime, .identifier, .invalid });
+}
+
+test "token loc skips leading blank lines" {
+    const cases = [_]struct { source: [:0]const u8, start: u32, end: u32 }{
+        .{ .source = "\nexit()\n", .start = 1, .end = 5 },
+        .{ .source = "\n\nexit()\n", .start = 2, .end = 6 },
+        .{ .source = "\r\nexit()\n", .start = 2, .end = 6 },
+        .{ .source = "\r\n\r\nexit()\n", .start = 4, .end = 8 },
+    };
+    for (cases) |case| {
+        var tokenizer = try Tokenizer.init(std.testing.allocator, case.source);
+        defer tokenizer.deinit();
+        const token = try tokenizer.next();
+        try std.testing.expectEqual(Token.Tag.identifier, token.tag);
+        try std.testing.expectEqual(case.start, token.loc.start);
+        try std.testing.expectEqual(case.end, token.loc.end);
+    }
 }
 
 fn testTokenize(source: [:0]const u8, expected_token_tags: []const Token.Tag) !void {

@@ -1501,6 +1501,24 @@ test "parse with precedence" {
     );
 }
 
+test "parse CRLF line endings" {
+    try testParsing("static foo = func() int\r\n  return 1\r\n",
+        \\static_binding
+        \\└─func
+        \\  ├─signature
+        \\  │ └─type : int
+        \\  └─block
+        \\    └─return_expr
+        \\      └─number_literal : 1
+    );
+    try testParsing("comptime\r\n  foo\r\n\r\n  bar\r\n",
+        \\comptime_expr
+        \\└─block
+        \\  ├─identifier : foo
+        \\  └─identifier : bar
+    );
+}
+
 // Diagnostic failure cases
 
 test "diagnostic tag for missing binding equals" {
@@ -1513,6 +1531,17 @@ test "diagnostic tag for invalid call argument expression" {
     try testExpectDiagnosticTag(
         \\print(,)
     , .{ .invalid_expression = .comma });
+}
+
+test "diagnostic tag for stray carriage return" {
+    try testExpectDiagnosticTag(
+        "exit()\r",
+        .{ .expected_token = .{ .expected = .eof, .found = .invalid } },
+    );
+    try testExpectDiagnosticTag(
+        "static f = func() int\r  return 1\r",
+        .{ .expected_token = .{ .expected = .indent, .found = .invalid } },
+    );
 }
 
 test "diagnostic tag for malformed struct item" {
