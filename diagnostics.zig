@@ -72,7 +72,6 @@ fn writeKindMessage(writer: *std.Io.Writer, kind: structures.Diagnostic.Kind) !v
             else => try writer.writeAll("function return type requires a value"),
         },
         .return_type_mismatch => try writer.writeAll("return type does not match function signature"),
-        .if_branch_type_mismatch => try writer.writeAll("if branches must have the same type"),
         .unknown_function => try writer.writeAll("unknown function"),
         .call_argument_count_mismatch => try writer.writeAll("call argument count does not match function signature"),
         .call_argument_type_mismatch => try writer.writeAll("call argument type does not match function signature"),

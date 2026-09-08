@@ -64,7 +64,6 @@ pub const UnresolvedBody = struct {
     pub const Join = struct {
         argument: u32,
         incoming: [2]ValueId,
-        span: structures.SourceSpan,
         instruction_count: u32,
     };
 
@@ -529,7 +528,6 @@ const UnresolvedExpressionBuilder = struct {
         try self.joins.append(self.gpa, .{
             .argument = merge_argument,
             .incoming = .{ then_value, else_value },
-            .span = tokenSpan(self.ast, node.token_index),
             .instruction_count = @intCast(self.instructions.items.len),
         });
         self.enterBlock(merge_block);

@@ -1,178 +1,232 @@
-# Comment
+# Language syntax and semantics
+# Source of truth for the language, but incomplete. ROADMAP.md tracks support.
+# Unspecified behavior remains open; parser or legacy behavior does not define it.
+# Examples are independent; undeclared names stand for surrounding context.
+# Everything after '#' to the end of a line is a comment.
 
-# Variable declarations
-static a: int = 10 # compile time known
-const b: int = 20 # immutable variable
-var c: int = 30 # mutable variable
-const d = 30 # type declaration can be omitted when the type can be inferred from the value
 
-# built in types:
-# int
-# float
-# bool
-# unit - single valued type being unit, also written ()
-# none - type with only value being 'none'
-# never - will never return
+# Types and evaluation
+# int: signed 32-bit integer; +, -, *, and negation wrap modulo 2^32.
+# float: floating-point number.
+# bool: true or false.
+# type: the type of compile-time type values.
+# unit: single-valued type; its value is unit, also written ().
+# none: distinct single-valued type; its value is none.
+# never: bottom type for expressions that never return.
+# Subexpressions evaluate exactly once, left to right in source order.
+# Struct initializers evaluate in initializer order, not field declaration order.
+# Reordering is allowed only when unobservable.
 
-# exit(exit_code: int) (compiler known function for now). exit is of type 'never'
-exit(0)
 
-# function declaration
+# Bindings and compile-time execution
+static a: int = 10 # compile-time-known, immutable
+const b: int = 20  # immutable
+var c: int = 30    # mutable
+const d = 30      # inferred annotation
+
+# 'comptime' evaluates its body at compile time.
+const computed = comptime -> 40 + 2
+const computed_block = comptime
+    const value = 40
+    value + 2
+
+
+# Functions
 static identity = func(a: int) int
     return a
 
-# with type annotation
-static identity: func(int) int = func(a: int) int
-    return a
+# An explicit callable annotation describes the same function type.
+static identity: func(int) int = func(a: int) int -> a
 
-# Ommission of return type returns unit
-static foo = func()
+# Omitting the return type means unit; unit functions may fall through.
+static noop = func()
     return
 
-# The -> can be used for inline bodies. Inline function bodies also have implicit return
-static foo = func(a: int) int -> a * 2
+# '->' introduces an inline body with an implicit return.
+static double = func(a: int) int -> a * 2
 
-# Syntax sugar for writing static name = func(). This is almost always used, but the semantics follow the first form
-func foo(a: int) -> a * 2
+# Named declarations are sugar for 'static name = func(...)'.
+func double(a: int) int -> a * 2
 
-# There are 4 parameter modifiers:
-# read - read only (implicit default)
-# static - value known at compile time
-# mut - mutable variable
-# var - owned variable
+# exit(exit_code: int) is compiler-known for now and returns never.
+exit(0)
+
+
+# Parameters and transfer
+# read: read-only access (default).
+# static: value supplied at compile time.
+# mut: mutable access to a caller-owned variable.
+# var: function-owned variable, which may be stored or returned.
+# deinit: function-owned variable satisfying an explicit drop obligation.
+func make(static T: type) type -> T
 
 func add1(mut a: int)
     a += 1
-    # implicitly returns unit
 
-func take(var a: int) int
-    # here we could store a, as it is owned by the function. More on that later, just return for now
+func take(var a: int) int -> a
+
+var a = 10
+take(a)  # copy into an owned parameter, only if the type supports copy
+take(a^) # transfer ownership; any subsequent access to 'a' is an error
+# Passing to 'deinit' also transfers ownership and invalidates the value.
+
+
+# Structs
+static S = struct
+    a: int
+    b: float
+
+# Every field name is required exactly once; order does not change the value.
+const s: S = S{a = 1, b = 2.5}
+const c: int = s.a
+
+# Named declarations are sugar for 'static name = struct'.
+struct Q
+    a: int
+
+# Fields have no mutability modifier; access through the struct governs mutation.
+var mutable_s = S{a = 1, b = 2.5}
+mutable_s.a = 2
+
+func read_a(s: S) int
+    return s.a # default read access permits reading fields, not mutating them
+
+# Ownership properties and defaults:
+# move = trivial | fieldwise | none | func
+#        defaults to fieldwise if every direct field can move, otherwise none.
+# copy = trivial | fieldwise | none | func
+#        defaults to none.
+# drop = trivial | fieldwise | explicit | func
+#        defaults to trivial if every field's drop is trivial, otherwise fieldwise.
+# 'trivial' invokes no field hooks; 'fieldwise' recurses through fields.
+# 'func' provides a custom, infallible operation. Potentially failing duplication
+# is an explicitly called fallible function, not an implicit copy operation.
+# Without copy support, passing to an owned parameter requires transfer with '^'.
+# move = none requires construction in final storage and a stable address.
+# Directly containing an immovable value makes the containing struct immovable;
+# indirection does not.
+# drop = explicit requires every ownership path to transfer the value and its
+# obligation elsewhere or pass it to 'deinit' before its lifetime ends.
+
+
+# Variants
+# Variants are structural sets: flatten nested variants, ignore member order,
+# and reject duplicate member types.
+static int_or_float = int | float
+static number_or_bool = int_or_float | bool # same as bool | float | int
+
+# An exact member or structural subset implicitly widens into an expected
+# containing variant at bindings, assignments, arguments, and returns.
+func widen(a: int_or_float) number_or_bool -> a
+widen(1)
+const widened: number_or_bool = int_or_float_value
+var reassigned: number_or_bool = 1
+reassigned = int_or_float_value
+
+# Variants never narrow implicitly. Control flow does not refine existing
+# bindings; extraction or a pattern introduces a separate narrowed binding.
+
+
+# Fallibility
+# A fallible expression succeeds or fails; it does not produce bool.
+# Success may carry a value; failure carries no value.
+# Comparisons succeed with unit when true and fail otherwise.
+# 'fallible' replaces 'func' in declarations and callable types.
+static accept_small = fallible(a: int) int
+    a < 2 # failure propagates out of this fallible function
     return a
 
-# The function can be called by copy
-var a = 10
-take(a)
-# or by value with the transfer sigil ^
-take(a^)
-# from now on access to 'a' results in a compiler error, as it's ownership has been transfered
+# A fallible function need not fail. Fallibility is part of its type.
+static checked_identity: fallible(int) int = fallible(a: int) int -> a
 
+# Ordinary functions implicitly widen to compatible fallible functions,
+# but fallible functions never narrow implicitly to ordinary functions.
+static identity: func(int) int = func(a: int) int -> a
+static widened_identity: fallible(int) int = identity
 
-# Variant type (sum type)
-static int_or_float = int | float
+# Named declarations follow the same sugar as ordinary functions.
+fallible accept(arg: int) int
+    return arg
 
-# Variants flatten
-static v = int_or_float | bool # same as int | float | bool
+# 'is' succeeds when the active variant member belongs to the given type.
+# 'as' also carries the narrowed value on success.
+func inspect(fi: float | int)
+    if fi is float -> found_float()
+    if const f = fi as float -> use_float(f)
+    if fi is float | bool -> found_float_or_bool()
 
-func foo(a: int_or_float) v
-    return a # 'a' is coerced to the wider type 'v'
+# 'and', 'or', 'not' compose unit-success fallible expressions, short-circuiting
+# left to right. Precedence, tightest first: comparisons, not, and, or.
+if 2 < 3 and 5 > 4 or 1 < 5 and not 9 < 2 -> run()
+# 'not 9 < 2' means 'not (9 < 2)'.
 
-foo(1) # '1' is coerced to the wider type 'a'
 
 # Conditionals
+# 'if' selects its body on success and 'else' on failure.
+# bool is an ordinary value; compare explicitly to use it as a condition.
+const enabled: bool = true
+if enabled == true -> run()
+
+# Bodies can be indented, inline, or mixed.
 if 1 < 2
     exit(1)
 else
     exit(0)
 
-# Can also be written inline or mixed
 if 1 < 2 -> exit(1) else exit(0)
 if 1 < 2 -> exit(1)
 else exit(0)
 
-# 'if' is an expression and produces a value
-const a: int = if 1 < 2
-    1
-else
-    2
-
-# 'if' can also produce a variant type
-const b: int | float = if 1 < 2
-    1
-else
-    2.5
-
-const c: int | float | bool = if 1 < 2
+# The selected branch's final expression is the result.
+# Different branch types join into a variant; never contributes no member.
+# Joins flatten variants and count shared members once.
+const a: int = if 1 < 2 -> 1 else 2
+const b: int | float | bool = if 1 < 2
     1
 else if 3 < 5
     2.5
 else true
+const c: int = if 1 < 2 -> 1 else exit(0)
 
-# The 'never' type does not take part in the sum
-const d: int = if 1 < 2
-    1
-else
-    exit(0)
-
-# importantly, 1 < 2 does not produce a bool!
-# comparisons are 'fallible' functions that produce unit or fails
-# 'fallible' functions are defined like:
-static foo = fallible(a: int) int
-    return a # this one never fails for obvious reasons
-
-# fallible functions can be called within fallible contexts:
-# 'if' expression
-# fallible function body (fails the fallible function)
-static bar = fallible(a: int) int
-    a < 2 # fails 'bar' if a < 2
-    return a
-
-# like functions, syntax sugar is
-fallbile baz(arg: int) int
-    ...
-
-# Keywords 'and' 'or' 'not' apply to fallible types (standard precedence)
-if 2 < 3 and 5 > 4 or 1 < 5 and not 9 < 2
-
-# Keywords 'is' 'as' 'in' are fallible keywords on variant types
-const fi: float | int = # imagine the value assigned somewhere and the concrete type is unknown
-if fi is float ...
-if const f = fi as float # f can be used inside the body and is a float
-if fi in float | bool # returns true if fi is a float in this case, as it can never be bool
+# Without 'else', an if has type unit and discards its body value.
 
 
-# struct definition
-# Define a struct named S with 2 fields - a, of type int, and b, of type float
-static S = struct
-    a: int
-    b: float
+# Match
+# Literal: match an equal value. '_': match anything without binding.
+# Bare identifier: match anything and bind it immutably in the arm.
+# 'pattern as name': also bind the complete value matched by the pattern.
+# 'is Type': type pattern, distinct from an identifier binding.
+# Every match must be exhaustive; a fully covered arm is an error.
+# Arm values join like conditional branches. Pattern bindings do not refine
+# the original value's binding.
+match n
+    2 -> 3
+    10 as x ->
+        const y = x + 2
+        y
+    _ -> 6
 
-# struct instantiation
-const s: S = S{a = 1, b = 2.5}
-
-# OPEN QUESTION - should field names in instantiation be required and should they be prepended with dot? (S{.a = 1, .b = 2.5})
-
-# field access
-const c:int = s.a
-
-# like functions, syntax sugar for structs
-struct Q
-    a: int
-
-# OPEN QUESTION - should field mutation require the field be marked with 'mut'?
-
-# structs passed to a function preserves the same parameter modification for fields:
-func foo(s: S) int
-    # 's' is implicit 'read', so fields in 's' cannot be mutated
-    return s.a # but they can be read
+match fi
+    is int as i -> use_int(i)
+    is float as f -> use_float(f)
 
 
-# loops
-const a = 1
-loop # has type 'never', as it never exits (breaks)
+# Loops
+var a = 1
+loop # never if there is no reachable break
     a += 1
 
-loop # has type 'unit', as it breaks
+loop # a bare break contributes unit
     a += 1
     if a > 10 -> break
 
+# Break values join like conditional branch values.
 const b: int | float = loop
     a += 1
     if a > 3 -> break a
     if a == 2 -> break 2.5
 
-# 'continue' keyword
 loop
     a += 1
-    if a < 10
-        continue
+    if a < 10 -> continue # start the nearest loop's next iteration
     break a

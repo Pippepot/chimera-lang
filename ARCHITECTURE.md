@@ -1,33 +1,36 @@
 # Architecture
 
-This document records durable design boundaries, not current implementation status. Update it when those boundaries change.
+Durable compiler contracts live here. [syntax&semantics.txt](syntax&semantics.txt) owns language rules; [ROADMAP.md](ROADMAP.md) distinguishes implemented behavior from the target. The current execution path is in [PROGRAM_FLOW.md](PROGRAM_FLOW.md).
 
-- Compiler stages depend in the direction of data flow. Parser, semantic, SSA, and codegen modules do not depend on query orchestration.
-- The query engine remains compiler-independent. Query definitions use its context protocol without coupling stage implementations to the engine.
-- Query keys are small stable identities, never owned ASTs or other large results.
-- Cached values own their allocations or contain stable identities; they do not borrow from replaceable inputs.
-- Observable optional query results derive equality from their payload type; query-specific `eqlOutput` is reserved for equality that differs from the output type's semantics.
-- Inputs and query dependencies are recorded through the query context rather than hidden in globals.
-- Function-body semantic analysis, lowering, and machine-code generation operate per function or instantiated function. Module and item queries own cross-function declarations, scopes, and other shared semantic data.
-- `AnalyzeFunctionBody` is the typed publication boundary: lexical names, explicit annotations, and called signatures are validated before it returns type-specific instructions. SSA and codegen trust that result rather than repeating semantic type checks.
-- Source type syntax is resolved through a small interning protocol supplied by query orchestration. Semantic analysis owns syntax traversal and source issues without importing the query catalogue; the supplied `TypeInterner` owns canonical type interning. Cached signatures contain only `TypeId`s and owned slices, never AST nodes or source-backed member lists.
-- Expressions produce typed values. Once operand types are known, semantic IR uses type-specific operations such as `addi`; consumers do not repeatedly recover an operation's type from a generic opcode plus metadata. Value IDs describe data flow, while terminators and statement position describe how values are used.
-- Fallible expressions describe success or failure control flow; they are not boolean values, error unions, or `Never`. An `if` consumes that outcome through a predicate terminator. Predicate branches have one datatype-independent structure; the operation is type-specific after typing. Logical composition and future variant operations must lower by connecting success and failure edges rather than materializing a boolean SSA value.
-- Calls produce values. Discarding a call result and returning it are uses of that value, not distinct call kinds.
-- Runtime services ultimately enter semantic scope as compiler-seeded declarations and lower as ordinary symbolic calls to runtime linker symbols; this does not require source-level `extern` syntax. The current unit-valued, inline `exit(value: int)` operation is temporary until runtime-symbol linking is justified, and must not grow into general intrinsic dispatch machinery.
-- Add a `Never` type when control-flow joins or return-path completeness first need to represent divergence. If runtime declarations arrive earlier, a temporary `noreturn` property may bridge that gap, but it should disappear once `Never` owns the rule.
-- Function signatures own ordered parameter types; parameter names belong to the function body's lexical scope and do not affect callable type identity.
-- `TypeId` is the pointer-free, session-local identity carried across semantic IR, SSA, and queries. Primitive types have reserved identities; all other types carry an `InternedTypeId` database index. That index does not encode a semantic type kind. Once more than one interned type shape exists, one type-data store must discriminate the actual shapes rather than adding per-kind ID spaces or tag bits.
-- Variant types are structural sets. Canonicalization flattens nested variants, orders members deterministically, and rejects duplicates after alias expansion. `unit` and `none` are distinct types and both may be variant members.
-- `TypeLayout(TypeId)` exposes only byte size and alignment, the representation facts common to every runtime type. Type-specific metadata such as variant payload offsets or struct field offsets belongs to type-specific representation results. Variants use an aligned `u32` tag followed by storage aligned for the largest member payload; source-level `sizeof` must consume the common layout boundary when it is added.
-- A value whose type is exactly one member may be injected into an expected containing variant. Variant-subset widening is implicit only for a function argument accepted by a wider variant parameter; changing an existing variant value to a wider variant elsewhere requires an explicit widening operation.
-- Variant coercions are explicit in typed IR. A `FunctionValueUse` names its source value and, when required, the containing target variant; semantic analysis alone decides where injection or subset widening is legal. SSA and codegen trust that decision.
-- Machine representation is selected from `TypeLayout`, not from a closed list of source types. Exactly four-byte results use `eax`; every other nonzero-sized result uses caller-provided stack storage. Arguments, spills, and aggregate copies use the complete layout size, so variant payloads are not constrained to one machine word. Calls remap tags when a smaller structural variant is accepted by a wider parameter.
-- Parameters are entry-block arguments, not synthetic instructions. All block arguments and instruction results share the value-ID namespace, while call and branch operands use separate flat per-function arrays.
-- Control flow is block-structured: every basic block has exactly one terminator, branches carry zero or more arguments to typed target-block parameters, and the graph may contain forward edges or backedges.
-- Function compilation produces relocatable function artifacts; whole-program construction resolves references and emits the executable format.
-- Reachable-instance discovery is a cached query with one deterministic breadth-first order shared by whole-program construction and debug presentation.
-- Every file uses its synthetic top-level item as the program entry. A declaration named `main` is an ordinary function, and values produced by top-level statements are discarded because the entry result is `unit`.
-- The language `int` type is a signed 32-bit value, returned through the current internal x86-64 calling convention in `eax`. Functions returning `unit` manufacture no machine value. Integer arguments use the caller's fixed outgoing stack area; this internal convention does not imply compatibility with an external platform ABI.
-- Expected source errors are diagnostics, while query failures are reserved for infrastructure failures.
-- Refactored compiler stages emit `structures.Diagnostic` values whose kind identifies the expected error; resolving source paths, rendering source lines, and translating kinds to message text belong to the presentation layer.
+## Stage boundaries
+
+- Compiler stages depend in data-flow order. Shared types in `structures.zig` do not import stages. Parser, semantic analysis, SSA, and codegen do not import query orchestration; the query engine remains compiler-independent.
+- Query definitions supply dependencies and small protocols such as `TypeInterner`. Semantic analysis owns source traversal and issues; the interner owns canonical type identity.
+- Module and item queries own declarations, scopes, and shared semantic data. Body analysis, lowering, and compilation operate per function or instance. Calls demand callee signatures, not bodies.
+- `AnalyzeFunctionBody` is the typed publication boundary. It validates names, annotations, operations, calls, joins, and returns before publishing type-specific IR. SSA and codegen trust semantic facts and check their own capabilities and resource limits.
+- Expected source errors produce `structures.Diagnostic` values. Missing or stale query state remains distinct from rejection; infrastructure failures use errors. Broken compiler invariants use assertions or `unreachable`, never user diagnostics. `diagnostics.zig` alone translates kinds into messages; presentation resolves paths and source lines.
+
+## Identity and ownership
+
+- Query keys are small, pointer-free identities. Cached results own allocations or retain stable identities; they never borrow from replaceable inputs. Signatures own ordered parameter types and retain no AST nodes. Parameter names belong to body scope, not callable type identity; fallibility belongs in signatures when implemented.
+- `ItemId` identifies a declaration; `InstanceId` identifies a callable instance. Declaration identity must survive body edits and relocation. Generic substitutions extend instance identity only when needed.
+- `TypeId` is a pointer-free, session-local identity. Primitives have reserved IDs; other types use an `InternedTypeId` index. The index does not encode the type's semantic kind. Replace the variant-only store with one discriminated type-data store when a second interned shape arrives.
+- Inputs and dependencies are recorded through the query context. Observable equality includes payload contents and diagnostics. Optional results inherit payload equality; use query-specific `eqlOutput` only when its semantics differ.
+- Recomputations commit or discard fresh allocations, dependencies, and diagnostics together. Equal results retain allocations and `changed_at`; infrastructure failure preserves the last completed memo and permits retry. Input changes require an idle database.
+
+## Typed values and control flow
+
+- Expressions produce values; return and discard are uses, not operation kinds. Known operand types select operations such as `addi`, without redundant generic opcodes and type metadata.
+- Preserve exactly-once, left-to-right evaluation, including struct initializer source order. Reordering must be unobservable.
+- Fallibility is success/failure control flow, separate from `bool` and `never`. Use one predicate-branch structure with type-specific operations. Logical composition connects edges; extraction carries a value on the success edge. Do not materialize boolean SSA values for fallible outcomes.
+- Every block has one terminator. Typed block parameters and instruction results share a value-ID namespace; function parameters are entry-block arguments. Calls and branches use separate flat operand arrays. Edges may be forward or backward and carry any number of arguments; edge copies are parallel.
+- Semantic analysis owns variant canonicalization, joins, and widening legality. Canonicalization flattens and orders members, rejecting source duplicates after alias expansion. Publish coercions explicitly through `FunctionValueUse` or `variant_coerce`; consumers do not rediscover legality. Branch-local extraction and pattern bindings must not refine existing bindings.
+- As control flow expands, represent divergence with `never` in joins and return-path analysis. Ownership analysis must preserve the language's move/copy/drop defaults, infallible custom hooks, stable storage for immovable values, and transfer-or-`deinit` obligations on every path.
+
+## Representation and linking
+
+- `TypeLayout(TypeId)` exposes only byte size and alignment. Type-specific results own payload or field offsets. Variants use an aligned `u32` tag followed by storage aligned for the largest payload, with tail padding. A future `sizeof` consumes the common layout boundary.
+- Arguments, spills, and copies use the full layout. The current internal convention returns exactly four-byte values in `eax`, other nonzero-sized values in caller-provided stack storage, and zero-sized values without a machine result. Callers reserve a fixed outgoing area. This is not an external platform ABI.
+- Per-function compilation emits owned code, relocations, alignment, and symbolic references. Whole-program construction resolves addresses and emits ELF. Cached reachability provides one deterministic breadth-first order for linking and debug output.
+- Current startup calls the file's synthetic, unit-returning top-level entry, then exits with zero. Top-level statement values are discarded; `main` has no special status.
+- Inline, unit-typed `exit` is temporary. Its language result is `never`; correct that with divergence analysis without requiring external linking. Migrate runtime services to compiler-seeded declarations and ordinary symbolic calls when another service, target, or foreign call justifies runtime-symbol linking. Remove dedicated `exit` machinery then; do not grow it into general intrinsic dispatch. Any bridging `noreturn` property disappears once `never` owns divergence.

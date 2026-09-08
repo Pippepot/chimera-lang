@@ -1,56 +1,35 @@
-# AGENTS.md
-
-## Goal
+# Working rules
 
 Build clear, correct code with the least total machinery.
 
-## Working principles
+## Scope and design
 
-- Change one coherent issue at a time and keep the diff narrowly scoped.
-- Before editing, inspect the surrounding ownership, dependencies, state transitions, and failure paths.
-- Preserve unrelated user changes and avoid cleanup outside the requested scope.
-- Prefer the smallest complete solution. Do not add abstractions for hypothetical future needs.
-- Do not add no-op branches, switches, hooks, or dispatch scaffolding for hypothetical future variants.
-- Before choosing a representation, enumerate every shape required by the current milestone and separate independent semantic dimensions. Do not encode the first syntax shape or test case as a semantic kind.
-- Generalize expression structure separately from operation typing. Once types are known, use type-specific operations; do not add one-variant value unions or repeated type fields in anticipation of future types.
-- Avoid a helper used only once when it adds indirection without meaningful clarity.
-- Keep switch arms at statement level. When a case needs more than a few statements, move its body into a named function so each arm reads as intent; the arm names the variant's outcome, the function owns the steps.
-- Follow the style of the file being edited. Prefer fully qualified names except for obvious shorthand such as AST.
-- Look for nearby patterns and reusable functionality before creating a new implementation.
-- Follow the Zig 0.16 APIs used by nearby code and verify assumptions with the local compiler.
-- For changes to compiler or query boundaries, follow `ARCHITECTURE.md`.
+- [syntax&semantics.txt](syntax&semantics.txt) is the incomplete language source of truth. Follow [ARCHITECTURE.md](ARCHITECTURE.md) for compiler/query boundaries and [ROADMAP.md](ROADMAP.md) for priorities. State any broader semantic interpretation before implementing it.
+- Inspect ownership, dependencies, state transitions, failure paths, and nearby patterns before editing. Keep each diff to one coherent issue and preserve unrelated user changes.
+- Choose the smallest complete solution. Avoid hypothetical variants, no-op branches, dispatch scaffolding, and abstractions without a current use.
+- Before choosing a representation, enumerate the milestone's required shapes and separate independent semantic dimensions. Do not turn the first syntax shape or test case into a semantic kind. Generalize expression structure separately from operation typing; use type-specific operations after typing, without one-variant value unions or repeated type fields.
+- Follow surrounding style and Zig 0.16 APIs; verify assumptions with the local compiler. Prefer fully qualified names except obvious shorthand such as AST.
+- Keep switch arms at statement level. Move an arm with more than a few statements into a named function that owns the steps. Otherwise avoid single-use helpers that add indirection without clarity.
 
-## Scope and invariants
+## Boundaries and invariants
 
-- Do not strengthen a semantic rule beyond the user's explicit wording without first stating the broader interpretation.
-- Before adding special-case traversal, check whether the surrounding subtree is otherwise semantically analyzed. Do not validate one construct inside an otherwise opaque subtree.
-- Classify every `null`, error, and diagnostic branch as an expected user error, stale or missing query state, or compiler invariant violation.
-- Represent compiler invariant violations with assertions or `unreachable`, never user diagnostics.
-- Validate a fact at the boundary that owns it. Downstream stages may rely on trusted IR and should check only their own capability and resource limits.
-- Put one invariant in each assertion so a failure identifies the violated condition.
-- A discarded query result must have an explicit validation or dependency purpose. Express that purpose directly in code or a concise comment.
-- During cleanup, identify machinery added for only one unsupported construct and attempt to delete it.
+- Classify each `null`, error, and diagnostic path as source error, missing/stale query state, or compiler invariant violation. Use assertions or `unreachable` for invariants, with one invariant per assertion.
+- Validate facts at their owning boundary. Downstream stages trust IR and check only their capabilities and resource limits.
+- Before adding special-case traversal, check whether the surrounding subtree is analyzed. Do not validate one construct inside an otherwise opaque subtree.
+- Discard query results only for explicit validation or dependency purposes; express the purpose in code or a concise comment.
 
-## Implementation review
+## Review
 
-Before presenting an implementation, perform two passes:
+Before presenting changes, make two passes:
 
-1. Correctness: check ownership, error cleanup, pointer lifetimes, concurrency, cache invalidation, and state transitions.
-2. Cleanup: reread the complete flow and simplify names, conditions, duplication, helpers, and temporary state.
+1. **Correctness:** ownership, error cleanup, pointer lifetimes, concurrency, invalidation, and state transitions.
+2. **Cleanup:** reread the complete flow; simplify names, conditions, duplication, helpers, and temporary state. Attempt to delete machinery that exists only for an unsupported construct.
 
-During cleanup:
+Use descriptive, positive booleans and direct conditions. Give each lifecycle transition one clearly named home. Make ownership transfers explicit and invalidate deinitialized values when it prevents reuse. Comments explain why; identify temporary architecture as temporary. Minimize total complexity, not local line count.
 
-- Prefer descriptive, positive boolean names and direct conditions.
-- Represent each lifecycle transition in one clearly named place.
-- Optimize for minimum total complexity, not minimum local line count.
-- Comments explain why an invariant or instruction exists, not merely what the code says.
-- Make ownership transfers explicit and invalidate deinitialized values when that prevents accidental reuse.
-- Identify temporary architecture explicitly instead of presenting it as final.
+## Verification
 
-## Testing
-
-- Add tests for observable behavior, regressions, ownership, and incremental recomputation.
-- Do not add tests for declarations or constraints already guaranteed by the type system.
-- Prefer existing test infrastructure; temporary verification scaffolding must not remain in the repository.
-- Keep large cross-module suites in dedicated `*_test.zig` files and hide repeated setup, counters, and cleanup behind test-focused helpers.
-- Run the focused suite, relevant regressions, formatting, and `git diff --check`.
+- Test observable behavior, regressions, ownership, and incremental recomputation, not facts guaranteed by the type system.
+- Use existing infrastructure. Keep large cross-module suites in `*_test.zig`, with test helpers for repeated setup, counters, and cleanup. Remove temporary scaffolding.
+- Run focused tests, relevant regressions, formatting checks, and `git diff --check`. Commands live in [README.md](README.md).
+- Update the document that owns a changed fact. Remove obsolete roadmap details instead of accumulating history or repeating language rules.

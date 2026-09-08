@@ -1,76 +1,58 @@
-# Program Flow
+# Program flow
 
-How the incremental compiler pipeline executes. Design rules live in `ARCHITECTURE.md`; milestone status lives in `ROADMAP.md`.
+The current compiler is demand-driven. `main.zig` inserts owned source into a query database and requests `BuildExecutable`. Query definitions live in `query_structures.zig`; the concurrent engine lives in `query_new.zig`.
 
-The pipeline is a Salsa-style query system: every compilation step is a memoized query that pulls its inputs on demand, records what it read, and survives source edits by re-verifying dependencies instead of recomputing. Queries are defined in `query_structures.zig`, run on the concurrent engine in `query_new.zig`, and exchange the shared value types in `structures.zig`. The root `main.zig` drives the full path, ending in `runtime.writeProgram`/`runProg`; `query_new_test.zig` exercises the same path directly.
+## Compilation
 
-## Query graph
+Arrows show data dependencies; requests travel toward their inputs. The diagram omits repeated source and AST reads.
 
 ```mermaid
 flowchart TD
-    ST["SourceText(FileId)<br/>owned source bytes"]
-    ST --> PF["ParseFile(FileId) → ?Ast"]
-    PF --> DI["DiscoverItems(FileId) → ?ItemTree<br/>(incl. synthetic $entry)"]
-    DI --> IX["IndexItems(FileId) → ?ItemIndex<br/>interns ItemLoc → stable ItemId"]
-    IX --> SE["SelectEntry(FileId) → ?ItemId"]
-    IX --> MS["BuildModuleScope(FileId)<br/>→ ?ModuleScope (name-sorted)"]
-    IX --> RI["ResolveItem(ItemId)<br/>→ ?ResolvedItem (file + decl node)"]
-    RI --> FS["FunctionSignature(ItemId)<br/>→ ?FunctionSignature"]
-    RI --> AB["AnalyzeFunctionBody(ItemId)<br/>→ ?FunctionBodyAnalysis"]
-    MS -->|"resolve call names"| AB
-    FS -->|"validate calls / returns"| AB
-    AB --> SSA["LowerToSSA(InstanceId)<br/>→ ?SsaFunction (ssa.zig)"]
-    SSA --> CF["CompileFunction(InstanceId)<br/>→ ?CompiledFunction (codegen_new.zig,<br/>relocatable: code + relocations<br/>+ referenced_instances)"]
-    SE --> CRI["CollectReachableInstances(FileId)<br/>→ ?ReachableInstances<br/>BFS over referenced_instances"]
-    CF --> CRI
-    CRI --> BE["BuildExecutable(FileId) → ?Executable<br/>layout + resolve relocations (codegen_new.zig)"]
+    ST["SourceText(FileId)"] --> PF["ParseFile → ?Ast"]
+    PF --> DI["DiscoverItems → ?ItemTree"]
+    DI --> IX["IndexItems → ?ItemIndex"]
+    IX --> SE["SelectEntry → ?ItemId"]
+    IX --> MS["BuildModuleScope → ?ModuleScope"]
+    IX --> RI["ResolveItem(ItemId) → ?ResolvedItem"]
+    RI --> FS["FunctionSignature → ?FunctionSignature"]
+    RI --> AB["AnalyzeFunctionBody → ?FunctionBodyAnalysis"]
+    FS --> AB
+    MS --> AB
+    AB --> SSA["LowerToSSA(InstanceId) → ?SsaFunction"]
+    SSA --> CF["CompileFunction → ?CompiledFunction"]
+    TL["TypeLayout(TypeId)"] --> CF
+    SE --> CR["CollectReachableInstances(FileId)"]
+    CF --> CR
+    CR --> BE["BuildExecutable → ?Executable"]
     CF --> BE
 ```
 
-- Per-function granularity: editing one body invalidates only `AnalyzeFunctionBody` for that item and downstream per-instance queries; equal signatures suppress callee-side recomputation.
-- Duplicate top-level function names are rejected at discovery: `DiscoverItems` emits one diagnostic per later declaration and returns `null`, so indexing, entry selection, and executable construction all fail for that file regardless of whether any body contains a call.
-- Semantic failures are values (`?Output` plus emitted diagnostics); errors are reserved for infrastructure failures.
-- The executable's entry is each file's synthetic top-level `$entry`; a `main` declaration is ordinary.
+1. Parsing owns token/node arrays. Discovery identifies top-level functions and adds a synthetic `$entry`. Duplicate function names reject discovery for the whole file, even without a call.
+2. Indexing interns stable item locations. Resolution maps an `ItemId` to its current declaration. Module scope is an owned, name-sorted function table; building it does not analyze signatures or bodies.
+3. `semantic.zig` resolves type syntax and lexical values into query-local `UnresolvedBody` scratch. `typing.zig` demands callable scope and called signatures as needed, validates types, and publishes owned typed IR. Declared bodies also depend on their own signature; the synthetic entry supplies its unit signature directly.
+4. `ssa.zig` converts symbolic call targets from `ItemId` to `InstanceId`. `codegen_new.zig` uses interned variant data and layout queries to emit relocatable function artifacts, without compiling callees.
+5. Reachability compiles each referenced instance once in breadth-first order, including recursive graphs. The linker consumes that order, lays out artifacts, and patches relocations. Unreachable function bodies stay unanalyzed.
+6. The CLI renders transitive diagnostics or optional AST/SSA/assembly/timing views, writes the executable through `runtime.zig`, and runs it. SSA debug output uses the same reachable set. The single-file CLI currently uses one worker.
 
-## Engine execution cycle (`query_new.zig`)
+## Revisions and failures
 
-```mermaid
-flowchart TD
-    CALL["db.get(Q, key) or ctx.get(Q, key)<br/>(spawn/wait; work-stealing worker pool)"] --> KEY{"entry exists?"}
-    KEY -->|no| RUN["run Q.run(ctx, input)"]
-    KEY -->|yes| VER{"output present and<br/>verified_at == revision?"}
-    VER -->|yes| HIT["return cached output"]
-    VER -->|no| DEPS{"re-verify recorded deps:<br/>input changed_at / dep changed_at"}
-    DEPS -->|unchanged| MARK["verified_at = revision (hit)"]
-    DEPS -->|changed| RUN
-    RUN --> EMIT["ctx.input / ctx.get record deps;<br/>ctx.emit collects diagnostics"]
-    EMIT --> COMMIT{"output + accumulators equal<br/>to previous?"}
-    COMMIT -->|"equal"| KEEP["destroy fresh output;<br/>keep old allocation and changed_at"]
-    COMMIT -->|"different"| SWAP["free old output; store fresh;<br/>changed_at = revision"]
-    CYCLE["cycle detection via queued/running state"] -.-> RUN
-```
+`ctx.input` and `ctx.get` record dependencies; `ctx.emit` records diagnostics. Requests share queued/running work, use work stealing while waiting, and detect cycles.
 
-Inputs (`addInput`/`setInput`) may change only while the database is idle; a real value change bumps the global revision. Every result type defines structural equality — equality gates replacement, so unchanged results keep their allocation and pointer identity across revisions.
+An idle input update advances the revision only when its value changes. A cached query re-verifies recorded dependencies and reruns only if they changed. Equal output and accumulators preserve the previous allocation and `changed_at`; changed output or diagnostics become observable. Fresh dependency sets replace old edges on commit. An infrastructure failure discards fresh state, keeps the last completed memo, and remains retryable.
 
-## Data structures and lifetimes
+Per-function queries do **not** yet mean per-body source invalidation: signature and body queries read whole-file source and AST. A same-file edit can rerun several analyses; equal results stop changes propagating farther. Callee body edits can therefore retain caller SSA and code, while executable construction still observes the changed callee. Reachability edits remove obsolete dependencies.
 
-Ownership follows one rule: **cached values own their allocations; identities are small stable keys.** Everything below lives until `Database.deinit` unless noted.
+Most compiler queries return `?Output`: `null` propagates source rejection or unavailable/stale items. It does not by itself imply a new diagnostic. Missing inputs and infrastructure failures use errors; impossible state uses assertions. See [ARCHITECTURE.md](ARCHITECTURE.md) for the contracts.
 
-| Lifetime | Structure | Notes |
-| --- | --- | --- |
-| Session (owned by DB inputs) | `SourceText` value `[]const u8` | Cloned into `Database`; freed and replaced only by `setInput` |
-| Session (interner) | `ItemId` → interned `ItemLoc` | Opaque `enum(u32)`; names owned by the interner; stable across edits, reused after remove/restore |
-| Session (memoized outputs) | `Ast` | Flat `[]Token`, `[]Node`, `[]Node.Index`; owns its arrays, stores `FileId` instead of borrowing text |
-| " | `ItemTree`, `ItemIndex`, `ModuleScope` | Owned slices/hash map of file items; scope maps names to `ItemId`s |
-| " | `FunctionSignature` | Owned parameter-type slice |
-| " | `FunctionBodyAnalysis` | `FunctionIr(ItemId)`: flat arrays of block args, branch operands, call operands, typed instructions, blocks |
-| " | `SsaFunction` | Same shape as above with symbolic `InstanceId` call targets |
-| " | `CompiledFunction` | Relocatable machine code + relocation records + referenced-instance table; no addresses |
-| " | `ReachableInstances` | Deterministic breadth-first list of stable instance identities |
-| " | `Executable` | Final linked bytes; consumer must copy before `Database.deinit` |
-| Per-recompute metadata | `Entry.deps`, `Entry.input_deps` | Fresh dependency edge lists committed atomically or discarded |
-| Query-transient (freed within one query run) | `UnresolvedBody` | Name-resolution scratch built by semantic.zig, consumed and freed before publishing `FunctionBodyAnalysis` |
-| " | BFS set and scratch list | Reachability scratch inside `CollectReachableInstances` |
-| Beyond the process | `Executable.bytes` | Copied into the `./prog` file by `runtime.writeProgram` |
+## Lifetimes
 
-Result pointers are stable across equal recomputations but must be treated as invalid once a changed recomputation replaces a memo.
+| Data | Owner and validity |
+| --- | --- |
+| Source bytes | Database input; replaced by `setInput` |
+| Item names and canonical variant members | Database interners; valid for the session |
+| AST, indexes, scopes, signatures, IR, artifacts, reachability, executable bytes | Cached outputs; valid until replacement or database destruction |
+| Unresolved body, borrowed source spellings, typing and traversal scratch | One query run; freed before publication |
+| Dependency edges and diagnostics | Entry-owned; committed or discarded with recomputation |
+| `./prog` | File copy of executable bytes; independent of database lifetime |
+
+Equal recomputation retains result pointers. Changed recomputation may invalidate them; consumers needing longer lifetimes must copy or retain stable identities.

@@ -709,7 +709,6 @@ pub const Diagnostic = struct {
         comparison_operands_not_int,
         missing_return_value: TypeId,
         return_type_mismatch,
-        if_branch_type_mismatch,
         unknown_function,
         call_argument_count_mismatch,
         call_argument_type_mismatch,

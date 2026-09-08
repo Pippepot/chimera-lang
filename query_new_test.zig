@@ -171,23 +171,27 @@ fn expectCompiledFunctionResult(
     try testing.expectEqual(expected, runtime.runProg(io, testing.allocator, &.{}));
 }
 
-fn expectCompiledVariantTag(
+// Inspect eight-byte variant returns before source-level extraction exists.
+// The process status exposes the low byte of the selected tag or payload word.
+fn expectCompiledVariantWord(
     db: *Database,
     file_id: structures.FileId,
     function_name: []const u8,
     reachable_names: []const []const u8,
+    byte_offset: u8,
     expected: u8,
 ) !void {
+    std.debug.assert(byte_offset == 0 or byte_offset == 4);
     const scope = (try db.get(query_structures.BuildModuleScope, file_id)).*.?;
     const function_id: structures.InstanceId = .{ .item = scope.resolve(function_name).? };
     const entry_id: structures.InstanceId = .{ .item = (try db.get(query_structures.SelectEntry, file_id)).*.? };
 
-    const exit_with_tag_code = [_]u8{
-        0x48, 0x81, 0xEC, 8, 0, 0,    0,
-        0xE8, 0,    0,    0, 0, 0x8B, 0x84,
-        0x24, 0,    0,    0, 0, 0x48, 0x81,
-        0xC4, 8,    0,    0, 0, 0x89, 0xC7,
-        0xB8, 60,   0,    0, 0, 0x0F, 0x05,
+    const exit_with_word_code = [_]u8{
+        0x48, 0x81,        0xEC, 8, 0, 0,    0,
+        0xE8, 0,           0,    0, 0, 0x8B, 0x84,
+        0x24, byte_offset, 0,    0, 0, 0x48, 0x81,
+        0xC4, 8,           0,    0, 0, 0x89, 0xC7,
+        0xB8, 60,          0,    0, 0, 0x0F, 0x05,
     };
     const relocations = [_]structures.CompiledFunction.Relocation{.{
         .offset = 8,
@@ -197,7 +201,7 @@ fn expectCompiledVariantTag(
     }};
     const references = [_]structures.InstanceId{function_id};
     const entry: structures.CompiledFunction = .{
-        .code = &exit_with_tag_code,
+        .code = &exit_with_word_code,
         .required_alignment = 1,
         .relocations = &relocations,
         .referenced_instances = &references,
@@ -1361,7 +1365,114 @@ test "variant values cross calls and subset widening remaps their tag" {
     try testing.expect(caller.call_arguments[0].coerce_to != null);
     try testing.expect((try db.get(query_structures.LowerToSSA, .{ .item = caller_id })).* != null);
     try testing.expect((try db.get(query_structures.CompileFunction, .{ .item = caller_id })).* != null);
-    try expectCompiledVariantTag(db, 1, "caller", &.{ "caller", "producer", "accept" }, 2);
+    try expectCompiledVariantWord(db, 1, "caller", &.{ "caller", "producer", "accept" }, 0, 2);
+}
+
+test "variant subset widening at bindings and returns preserves tags and payloads" {
+    const cases = [_]struct { variant: []const u8, value: []const u8, tag: u8, payload: ?u8 }{
+        .{ .variant = "int | none", .value = "none", .tag = 2, .payload = null },
+        .{ .variant = "int | none", .value = "42", .tag = 0, .payload = 42 },
+        .{ .variant = "unit | none", .value = "none", .tag = 2, .payload = null },
+        .{ .variant = "unit | none", .value = "", .tag = 1, .payload = null },
+    };
+    for (cases) |case| {
+        const db = try testDatabase(2);
+        defer db.deinit();
+        const source = try std.fmt.allocPrint(testing.allocator,
+            \\static producer = func() {s} -> return {s}
+            \\static local = func() int | none | unit
+            \\  const widened: int | none | unit = producer()
+            \\  return widened
+            \\static returned = func() int | none | unit -> return producer()
+            \\const narrow = producer()
+            \\const wide: int | none | unit = narrow
+            \\local()
+            \\returned()
+        , .{ case.variant, case.value });
+        defer testing.allocator.free(source);
+        try addSource(db, 1, source);
+        try testing.expect((try db.get(query_structures.BuildExecutable, 1)).* != null);
+        for ([_][]const u8{ "local", "returned" }) |name| {
+            try expectCompiledVariantWord(db, 1, name, &.{ name, "producer" }, 0, case.tag);
+            if (case.payload) |payload| try expectCompiledVariantWord(db, 1, name, &.{ name, "producer" }, 4, payload);
+        }
+    }
+}
+
+test "variant coercion rejects narrowing and non-containing variants at every boundary" {
+    const boundaries = [_]struct { source: []const u8, kind: structures.Diagnostic.Kind }{
+        .{ .source = "static target = func(value: {s}) unit\n  const narrowed: {s} = value\n  return", .kind = .local_type_mismatch },
+        .{ .source = "static target = func(value: {s}) {s} -> return value", .kind = .return_type_mismatch },
+        .{ .source = "static target = func(value: {s}) unit -> return accept(value)\nstatic accept = func(value: {s}) unit -> return", .kind = .call_argument_type_mismatch },
+    };
+    const types = [_]struct { actual: []const u8, expected: []const u8 }{
+        .{ .actual = "int | none | unit", .expected = "int | none" },
+        .{ .actual = "int | none", .expected = "int | unit" },
+        .{ .actual = "int | none", .expected = "int" },
+    };
+    inline for (boundaries) |boundary| {
+        for (types) |pair| {
+            const db = try testDatabase(2);
+            defer db.deinit();
+            const source = try std.fmt.allocPrint(testing.allocator, boundary.source, .{ pair.actual, pair.expected });
+            defer testing.allocator.free(source);
+            try addSource(db, 1, source);
+            const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+            const target = scope.resolve("target").?;
+            try testing.expect((try db.get(query_structures.CompileFunction, .{ .item = target })).* == null);
+            const diagnostics = try db.transitiveAccumulatorValues(query_structures.CompileFunction, .{ .item = target }, structures.Diagnostic, testing.allocator);
+            defer freeDiagnostics(diagnostics);
+            try testing.expectEqual(@as(usize, 1), diagnostics.len);
+            try testing.expectEqual(boundary.kind, diagnostics[0].kind);
+        }
+    }
+}
+
+test "variant widening annotations retain equal results and recover after invalid edits" {
+    const boundaries = [_]struct { source: []const u8, kind: structures.Diagnostic.Kind }{
+        .{ .source = "static target = func(value: int | none) int | none | unit\n  const widened: {s} = value\n  return widened\ntarget(none)", .kind = .local_type_mismatch },
+        .{ .source = "static target = func(value: int | none) {s} -> return value\ntarget(none)", .kind = .return_type_mismatch },
+    };
+    inline for (boundaries) |boundary| {
+        const db = try testDatabase(2);
+        defer db.deinit();
+        const source = try std.fmt.allocPrint(testing.allocator, boundary.source, .{"int | none | unit"});
+        defer testing.allocator.free(source);
+        try addSource(db, 1, source);
+        const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+        const target = scope.resolve("target").?;
+        const instance: structures.InstanceId = .{ .item = target };
+        const body = try db.get(query_structures.AnalyzeFunctionBody, target);
+        try testing.expect(body.* != null);
+        const lowered = try db.get(query_structures.LowerToSSA, instance);
+        const compiled = try db.get(query_structures.CompileFunction, instance);
+        try testing.expect(compiled.* != null);
+        const executable = try db.get(query_structures.BuildExecutable, 1);
+        try testing.expect(executable.* != null);
+
+        const reordered = try std.fmt.allocPrint(testing.allocator, boundary.source, .{"unit | none | int"});
+        defer testing.allocator.free(reordered);
+        try setSource(db, 1, reordered);
+        try testing.expectEqual(body, try db.get(query_structures.AnalyzeFunctionBody, target));
+        try testing.expectEqual(lowered, try db.get(query_structures.LowerToSSA, instance));
+        try testing.expectEqual(compiled, try db.get(query_structures.CompileFunction, instance));
+        try testing.expectEqual(executable, try db.get(query_structures.BuildExecutable, 1));
+
+        const invalid = try std.fmt.allocPrint(testing.allocator, boundary.source, .{"int | unit"});
+        defer testing.allocator.free(invalid);
+        try setSource(db, 1, invalid);
+        try testing.expect((try db.get(query_structures.BuildExecutable, 1)).* == null);
+        const diagnostics = try db.transitiveAccumulatorValues(query_structures.BuildExecutable, 1, structures.Diagnostic, testing.allocator);
+        defer freeDiagnostics(diagnostics);
+        try testing.expectEqual(@as(usize, 1), diagnostics.len);
+        try testing.expectEqual(boundary.kind, diagnostics[0].kind);
+
+        try setSource(db, 1, source);
+        try testing.expect((try db.get(query_structures.BuildExecutable, 1)).* != null);
+        const recovered = try db.transitiveAccumulatorValues(query_structures.BuildExecutable, 1, structures.Diagnostic, testing.allocator);
+        defer freeDiagnostics(recovered);
+        try testing.expectEqual(@as(usize, 0), recovered.len);
+    }
 }
 
 test "variant branch joins inject members and preserve the selected tag" {
@@ -1377,7 +1488,105 @@ test "variant branch joins inject members and preserve the selected tag" {
     try testing.expectEqual(@as(usize, 2), body.branch_arguments.len);
     try testing.expect(body.branch_arguments[0].coerce_to != null);
     try testing.expect(body.branch_arguments[1].coerce_to != null);
-    try expectCompiledVariantTag(db, 1, "choose", &.{"choose"}, 1);
+    try expectCompiledVariantWord(db, 1, "choose", &.{"choose"}, 0, 1);
+}
+
+test "variant branch joins form structural unions and preserve selected values" {
+    const cases = [_]struct { left_type: []const u8, right_type: []const u8, right_value: []const u8, members: []const structures.TypeId, right_tag: u8 }{
+        .{ .left_type = "int | none", .right_type = "int | unit", .right_value = "42", .members = &.{ .int, .unit, .none }, .right_tag = 0 },
+        .{ .left_type = "int | none", .right_type = "int | unit | none", .right_value = "42", .members = &.{ .int, .unit, .none }, .right_tag = 0 },
+        .{ .left_type = "int | none", .right_type = "none | int", .right_value = "42", .members = &.{ .int, .none }, .right_tag = 0 },
+        .{ .left_type = "int | none", .right_type = "int", .right_value = "42", .members = &.{ .int, .none }, .right_tag = 0 },
+        .{ .left_type = "int | none", .right_type = "unit", .right_value = "noop()", .members = &.{ .int, .unit, .none }, .right_tag = 1 },
+        .{ .left_type = "unit | none", .right_type = "int", .right_value = "42", .members = &.{ .int, .unit, .none }, .right_tag = 0 },
+    };
+    for (cases) |case| {
+        for ([_]bool{ false, true }) |reverse| {
+            for ([_]bool{ false, true }) |select_left| {
+                const db = try testDatabase(2);
+                defer db.deinit();
+                const source = try std.fmt.allocPrint(testing.allocator,
+                    \\static noop = func() unit -> return
+                    \\static choose = func() int | unit | none
+                    \\  const left: {s} = none
+                    \\  const right: {s} = {s}
+                    \\  return if 1 {s} 2 -> {s} else {s}
+                    \\choose()
+                , .{ case.left_type, case.right_type, case.right_value, if (select_left != reverse) "<" else ">", if (reverse) "right" else "left", if (reverse) "left" else "right" });
+                defer testing.allocator.free(source);
+                try addSource(db, 1, source);
+                const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+                const body = (try db.get(query_structures.AnalyzeFunctionBody, scope.resolve("choose").?)).*;
+                try testing.expect(body != null);
+                const joined = body.?.block_argument_types[0];
+                const variant = try db.lookupInterned(query_structures.VariantTypes, joined.interned().?);
+                try testing.expectEqualSlices(structures.TypeId, case.members, variant.members);
+                try testing.expect((try db.get(query_structures.BuildExecutable, 1)).* != null);
+                try expectCompiledVariantWord(db, 1, "choose", &.{ "choose", "noop" }, 0, if (select_left) 2 else case.right_tag);
+                if (!select_left and case.right_tag == 0) try expectCompiledVariantWord(db, 1, "choose", &.{ "choose", "noop" }, 4, 42);
+            }
+        }
+    }
+}
+
+test "variant branch joins retain equal results and track changed member sets" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+    const format =
+        \\static noop = func() unit -> return
+        \\static choose = func() int | unit | none
+        \\  return if 1 < 2 -> (if 1 < 2 -> none else 42) else {s}
+        \\choose()
+    ;
+    const source = try std.fmt.allocPrint(testing.allocator, format, .{"noop()"});
+    defer testing.allocator.free(source);
+    try addSource(db, 1, source);
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const target = scope.resolve("choose").?;
+    const instance: structures.InstanceId = .{ .item = target };
+    const body = try db.get(query_structures.AnalyzeFunctionBody, target);
+    try testing.expect(body.* != null);
+    const joined = body.*.?.block_argument_types[1];
+    try testing.expectEqual(body.*.?.return_type, joined);
+    const compiled = try db.get(query_structures.CompileFunction, instance);
+    try testing.expect(compiled.* != null);
+
+    const equivalent = try std.fmt.allocPrint(testing.allocator, format, .{"(noop())"});
+    defer testing.allocator.free(equivalent);
+    try setSource(db, 1, equivalent);
+    try testing.expectEqual(body, try db.get(query_structures.AnalyzeFunctionBody, target));
+    try testing.expectEqual(compiled, try db.get(query_structures.CompileFunction, instance));
+
+    const changed = try std.fmt.allocPrint(testing.allocator, format, .{"42"});
+    defer testing.allocator.free(changed);
+    try setSource(db, 1, changed);
+    const updated = (try db.get(query_structures.AnalyzeFunctionBody, target)).*.?;
+    const narrower = updated.block_argument_types[1];
+    try testing.expect(narrower != joined);
+    try testing.expectEqualSlices(structures.TypeId, &.{ .int, .none }, (try db.lookupInterned(query_structures.VariantTypes, narrower.interned().?)).members);
+    try expectCompiledVariantWord(db, 1, "choose", &.{ "choose", "noop" }, 0, 2);
+
+    try setSource(db, 1, source);
+    const restored = (try db.get(query_structures.AnalyzeFunctionBody, target)).*.?;
+    try testing.expectEqual(joined, restored.block_argument_types[1]);
+    try expectCompiledVariantWord(db, 1, "choose", &.{ "choose", "noop" }, 0, 2);
+}
+
+test "variant branch join analysis cleans up every allocation failure" {
+    try testing.checkAllAllocationFailures(testing.allocator, testVariantJoinAllocations, .{});
+}
+
+fn testVariantJoinAllocations(gpa: std.mem.Allocator) !void {
+    const db = try Database.init(gpa, .{ .worker_count = 1 });
+    defer db.deinit();
+    try addSource(db, 1,
+        \\static choose = func() int | unit | none
+        \\  const left: int | none = none
+        \\  const right: int | unit = 42
+        \\  return if 1 < 2 -> left else right
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, scope.resolve("choose").?)).* != null);
 }
 
 test "variant local annotations explicitly inject exact members" {
@@ -1393,7 +1602,7 @@ test "variant local annotations explicitly inject exact members" {
     const body = (try db.get(query_structures.AnalyzeFunctionBody, scope.resolve("answer").?)).*.?;
     try testing.expectEqual(@as(usize, 2), body.instructions.len);
     try testing.expectEqual(body.return_type, body.instructions[1].variant_coerce.target_type);
-    try expectCompiledVariantTag(db, 1, "answer", &.{"answer"}, 1);
+    try expectCompiledVariantWord(db, 1, "answer", &.{"answer"}, 0, 1);
 }
 
 test "bare return injects unit into a containing variant" {
@@ -1405,7 +1614,7 @@ test "bare return injects unit into a containing variant" {
     const body = (try db.get(query_structures.AnalyzeFunctionBody, scope.resolve("answer").?)).*.?;
     try testing.expectEqual(structures.FunctionBodyAnalysis.Instruction.const_unit, body.instructions[0]);
     try testing.expect(body.blocks[0].terminator.return_value.coerce_to != null);
-    try expectCompiledVariantTag(db, 1, "answer", &.{"answer"}, 1);
+    try expectCompiledVariantWord(db, 1, "answer", &.{"answer"}, 0, 1);
 }
 
 test "function signature and body analysis support inline and block literal returns" {
@@ -1671,7 +1880,7 @@ test "every integer comparison selects the fallible success edge" {
     try expectCompiledFunctionResult(db, 1, "answer", &.{"answer"}, 42);
 }
 
-test "if requires supported fallible operands and compatible branch types" {
+test "if validates conditions and expected result types" {
     const db = try testDatabase(2);
     defer db.deinit();
 
@@ -1689,7 +1898,7 @@ test "if requires supported fallible operands and compatible branch types" {
         .{
             .file_id = 3,
             .source = "static bad = func() int\n  const left: int | none = 1\n  const right: int | unit = 1\n  return if 1 == 1 -> left else right",
-            .kind = .if_branch_type_mismatch,
+            .kind = .return_type_mismatch,
         },
     };
     for (cases) |case| {

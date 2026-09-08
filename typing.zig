@@ -73,7 +73,7 @@ pub fn resolveAndTypeBody(
                 const operand = resolveValue(coercion.operand, unresolved.block_argument_count);
                 const operand_index = @intFromEnum(operand);
                 std.debug.assert(known_types[operand_index]);
-                if (try coerceValue(type_interner, operand, value_types[operand_index], coercion.target_type, false) == null) {
+                if (try coerceValue(type_interner, operand, value_types[operand_index], coercion.target_type) == null) {
                     try emitSemanticIssue(ctx, file_id, .{ .span = instruction.span, .kind = .local_type_mismatch });
                     return null;
                 }
@@ -178,7 +178,7 @@ pub fn resolveAndTypeBody(
                 const value = resolveValue(return_value.value, unresolved.block_argument_count);
                 const value_index = @intFromEnum(value);
                 std.debug.assert(known_types[value_index]);
-                const use = try coerceValue(type_interner, value, value_types[value_index], return_type, false) orelse {
+                const use = try coerceValue(type_interner, value, value_types[value_index], return_type) orelse {
                     try emitSemanticIssue(ctx, file_id, .{ .span = return_value.span, .kind = .return_type_mismatch });
                     return null;
                 };
@@ -228,10 +228,7 @@ fn resolveConstraints(
         const rhs_index = @intFromEnum(resolveValue(join.incoming[1], unresolved.block_argument_count));
         std.debug.assert(known_types[lhs_index]);
         std.debug.assert(known_types[rhs_index]);
-        const joined_type = try joinTypes(type_interner, value_types[lhs_index], value_types[rhs_index]) orelse {
-            try emitSemanticIssue(ctx, file_id, .{ .span = join.span, .kind = .if_branch_type_mismatch });
-            return false;
-        };
+        const joined_type = try joinTypes(type_interner, value_types[lhs_index], value_types[rhs_index], ctx.allocator());
         std.debug.assert(join.argument < block_argument_types.len);
         std.debug.assert(!known_types[join.argument]);
         block_argument_types[join.argument] = joined_type;
@@ -244,26 +241,22 @@ fn resolveConstraints(
     return true;
 }
 
-fn joinTypes(type_interner: anytype, left: structures.TypeId, right: structures.TypeId) !?structures.TypeId {
+fn joinTypes(type_interner: anytype, left: structures.TypeId, right: structures.TypeId, gpa: std.mem.Allocator) !structures.TypeId {
     if (left == right) return left;
 
-    const left_members = try type_interner.variantMembers(left);
-    const right_members = try type_interner.variantMembers(right);
-    const left_is_variant = left_members != null;
-    const right_is_variant = right_members != null;
-    if (!left_is_variant and !right_is_variant) {
-        return switch (try type_interner.internVariant(&.{ left, right })) {
-            .type_id => |type_id| type_id,
-            .duplicate => unreachable,
-        };
+    const left_members = (try type_interner.variantMembers(left)) orelse &.{left};
+    const right_members = (try type_interner.variantMembers(right)) orelse &.{right};
+    var members: std.ArrayList(structures.TypeId) = .empty;
+    defer members.deinit(gpa);
+    try members.appendSlice(gpa, left_members);
+    // Shared members are one inferred alternative, not duplicate source syntax.
+    for (right_members) |member| {
+        if (!containsType(left_members, member)) try members.append(gpa, member);
     }
-    if (left_is_variant and !right_is_variant) {
-        return if (containsType(left_members.?, right)) left else null;
-    }
-    if (!left_is_variant and right_is_variant) {
-        return if (containsType(right_members.?, left)) right else null;
-    }
-    return null;
+    return switch (try type_interner.internVariant(members.items)) {
+        .type_id => |type_id| type_id,
+        .duplicate => unreachable,
+    };
 }
 
 fn coerceValue(
@@ -271,7 +264,6 @@ fn coerceValue(
     value: structures.FunctionValueId,
     actual_type: structures.TypeId,
     target_type: structures.TypeId,
-    allow_variant_subset: bool,
 ) !?structures.FunctionValueUse {
     if (actual_type == target_type) return .{ .value = value };
     const target_members = try type_interner.variantMembers(target_type) orelse return null;
@@ -279,8 +271,6 @@ fn coerceValue(
     if (actual_members == null) {
         return if (containsType(target_members, actual_type)) .{ .value = value, .coerce_to = target_type } else null;
     }
-    if (!allow_variant_subset) return null;
-
     for (actual_members.?) |member| {
         if (!containsType(target_members, member)) return null;
     }
@@ -322,7 +312,7 @@ fn resolveBranch(
     std.debug.assert(raw_arguments.len == parameter_types.len);
     for (raw_arguments, parameter_types, branch_arguments[branch.arguments.start..branch.arguments.end]) |raw_argument, parameter_type, *argument| {
         const value = resolveValue(raw_argument, unresolved.block_argument_count);
-        argument.* = (try coerceValue(type_interner, value, value_types[@intFromEnum(value)], parameter_type, false)) orelse unreachable;
+        argument.* = (try coerceValue(type_interner, value, value_types[@intFromEnum(value)], parameter_type)) orelse unreachable;
     }
     return .{ .target = branch.target, .arguments = branch.arguments };
 }
@@ -418,7 +408,7 @@ fn resolveAndTypeCall(
         const value = resolveValue(raw_argument, unresolved.block_argument_count);
         const argument_index = @intFromEnum(value);
         std.debug.assert(known_types[argument_index]);
-        argument.* = try coerceValue(type_interner, value, value_types[argument_index], expected_type, true) orelse {
+        argument.* = try coerceValue(type_interner, value, value_types[argument_index], expected_type) orelse {
             try emitSemanticIssue(ctx, file_id, .{
                 .span = argumentSpan(unresolved.instructions, raw_argument, name_span),
                 .kind = .call_argument_type_mismatch,

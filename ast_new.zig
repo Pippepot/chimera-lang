@@ -314,7 +314,7 @@ fn parseParamList(parser: *ParserState) !Node.Index {
         if (parser.eat(.r_paren) != null) break;
 
         const access_token_index = parser.index;
-        const opt_access = parser.eatAny(&.{ .keyword_read, .keyword_mut, .keyword_var, .keyword_deinit, .keyword_comptime });
+        const opt_access = parser.eatAny(&.{ .keyword_read, .keyword_mut, .keyword_var, .keyword_deinit, .keyword_static });
         _ = try parser.expect(.identifier);
         const identifier_index = parser.index - 1;
         const type_annotation = try parseTypeAnnotation(parser);
@@ -444,16 +444,20 @@ fn parseExpressionPrecedence(parser: *ParserState, min_precedence: u8) ParseErro
 }
 
 fn parseUnary(parser: *ParserState) ParseError!Node.Index {
-    const tag: Node.Tag = switch (parser.tokens[parser.index].tag) {
-        .keyword_not => .not,
-        .minus => .neg,
-        else => return parsePostfix(parser),
-    };
-
     const token_index = parser.index;
-    parser.index += 1;
-    const operand = try parseUnary(parser);
-    return parser.addNode(.{ .tag = tag, .token_index = token_index, .data = .{ .node = operand } });
+    return switch (parser.tokens[parser.index].tag) {
+        .keyword_not => {
+            parser.index += 1;
+            const operand = try parseExpressionPrecedence(parser, 3);
+            return parser.addNode(.{ .tag = .not, .token_index = token_index, .data = .{ .node = operand } });
+        },
+        .minus => {
+            parser.index += 1;
+            const operand = try parseUnary(parser);
+            return parser.addNode(.{ .tag = .neg, .token_index = token_index, .data = .{ .node = operand } });
+        },
+        else => parsePostfix(parser),
+    };
 }
 
 fn parsePostfix(parser: *ParserState) ParseError!Node.Index {
@@ -1062,7 +1066,7 @@ test "parse struct ownership hook indented body followed by field" {
 
 test "parse anonymous struct expression" {
     try testParsing(
-        \\static Wrapper = func(comptime T: type) type
+        \\static Wrapper = func(static T: type) type
         \\  return struct
         \\    x: T
     ,
@@ -1071,7 +1075,7 @@ test "parse anonymous struct expression" {
         \\  ├─signature
         \\  │ ├─param_list_small
         \\  │ │ └─param : T
-        \\  │ │   ├─access : comptime
+        \\  │ │   ├─access : static
         \\  │ │   └─type : type
         \\  │ └─type : type
         \\  └─block
@@ -1206,6 +1210,30 @@ test "parse variant operator precedence" {
         \\│   └─is
         \\│     ├─identifier : z
         \\│     └─type : none
+        \\└─call
+        \\  ├─identifier : print
+        \\  └─call_arg_list_small
+        \\    └─number_literal : 1
+    );
+}
+
+test "not binds below comparisons and above logical operators" {
+    try testParsing(
+        \\if not x < 1 and y > 2 or z == 3 -> print(1)
+    ,
+        \\if
+        \\├─or
+        \\│ ├─and
+        \\│ │ ├─not
+        \\│ │ │ └─lt
+        \\│ │ │   ├─identifier : x
+        \\│ │ │   └─number_literal : 1
+        \\│ │ └─gt
+        \\│ │   ├─identifier : y
+        \\│ │   └─number_literal : 2
+        \\│ └─eq
+        \\│   ├─identifier : z
+        \\│   └─number_literal : 3
         \\└─call
         \\  ├─identifier : print
         \\  └─call_arg_list_small
