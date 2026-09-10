@@ -169,6 +169,10 @@ pub const Node = struct {
         neg,
         access,
         assign,
+        add_assign,
+        sub_assign,
+        mul_assign,
+        div_assign,
         block,
         bool_literal,
         call,
@@ -245,7 +249,7 @@ pub const Ast = struct {
                 .return_expr, .not, .neg, .query_op, .move_expr, .comptime_expr, .sizeof_expr, .field_access, .struct_field, .struct_property, .struct_init_field => {
                     if (left.data.node != right.data.node) return false;
                 },
-                .add, .sub, .mul, .div, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .@"and", .@"or", .assign, .call, .const_binding, .var_binding, .static_binding, .func, .param, .signature, .type_func, .@"if" => {
+                .add, .sub, .mul, .div, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .@"and", .@"or", .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .call, .const_binding, .var_binding, .static_binding, .func, .param, .signature, .type_func, .@"if" => {
                     if (left.data.node_node.a != right.data.node_node.a or left.data.node_node.b != right.data.node_node.b) return false;
                 },
                 .block, .call_arg_list, .param_list, .type_list, .type_variant, .if_else, .@"struct", .struct_init => {
@@ -706,6 +710,9 @@ pub const Diagnostic = struct {
         duplicate_local_binding,
         local_type_not_supported,
         unknown_value,
+        assignment_target_not_local,
+        assignment_to_immutable,
+        assignment_type_mismatch,
         integer_literal_not_decimal,
         integer_literal_out_of_range,
         fallible_condition_not_supported,

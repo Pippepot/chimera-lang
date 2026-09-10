@@ -24,6 +24,13 @@ const b: int = 20  # immutable
 var c: int = 30    # mutable
 const d = 30      # inferred annotation
 
+# A variable keeps its declared or inferred type. Assignment evaluates its
+# right-hand side once, widens it to that type when permitted, updates the
+# variable, and evaluates to the updated value. Compound assignment uses the
+# current value as the left operand of the corresponding operation.
+c = 40
+c += 2
+
 # 'comptime' evaluates its body at compile time.
 const computed = comptime -> 40 + 2
 const computed_block = comptime

@@ -212,7 +212,7 @@ fn parseExpression(parser: *ParserState) ParseError!Node.Index {
         .minus,
         => {
             const expr = try parseExpressionPrecedence(parser, 0);
-            if (parser.tokens[parser.index].tag == .equal) return try parseAssign(parser, expr);
+            if (isAssignmentToken(parser.tokens[parser.index].tag)) return try parseAssign(parser, expr);
             return expr;
         },
         else => .null,
@@ -282,9 +282,25 @@ fn parseBinding(parser: *ParserState) !Node.Index {
 
 fn parseAssign(parser: *ParserState, target: Node.Index) !Node.Index {
     const token_index = parser.index;
-    _ = try parser.expect(.equal);
+    const token = parser.tokens[parser.index];
+    parser.index += 1;
     const value = try parseRequiredExpression(parser);
-    return try parser.addNode(.{ .tag = .assign, .token_index = token_index, .data = .{ .node_node = .{ .a = target, .b = value } } });
+    const tag: Node.Tag = switch (token.tag) {
+        .equal => .assign,
+        .plus_equal => .add_assign,
+        .minus_equal => .sub_assign,
+        .asterisk_equal => .mul_assign,
+        .slash_equal => .div_assign,
+        else => unreachable,
+    };
+    return try parser.addNode(.{ .tag = tag, .token_index = token_index, .data = .{ .node_node = .{ .a = target, .b = value } } });
+}
+
+fn isAssignmentToken(tag: Token.Tag) bool {
+    return switch (tag) {
+        .equal, .plus_equal, .minus_equal, .asterisk_equal, .slash_equal => true,
+        else => false,
+    };
 }
 
 fn parseIfExpr(parser: *ParserState) ParseError!Node.Index {
@@ -729,7 +745,7 @@ fn renderNode(gpa: std.mem.Allocator, node_index: Node.Index, ast: *const Ast, s
             try writer.writeByte('\n');
             try renderNode(gpa, node.data.node, ast, source, writer, seen, new_indent, true, false);
         },
-        .add, .sub, .mul, .div, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .@"and", .@"or", .assign, .call, .const_binding, .var_binding, .static_binding, .func, .param, .signature, .type_func, .@"if" => {
+        .add, .sub, .mul, .div, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .@"and", .@"or", .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .call, .const_binding, .var_binding, .static_binding, .func, .param, .signature, .type_func, .@"if" => {
             if (node.tag == .param) {
                 const loc = ast.tokens[node.token_index].loc;
                 try writer.print(" : {s}", .{source[loc.start..loc.end]});
@@ -869,6 +885,10 @@ test "parse const var assignment" {
         \\const b: int = 2
         \\var c = 2.5
         \\c = 3.5
+        \\c += 1.0
+        \\c -= 1.0
+        \\c *= 2.0
+        \\c /= 2.0
         \\const d = c = 4.5
     ,
         \\const_binding
@@ -881,6 +901,18 @@ test "parse const var assignment" {
         \\assign
         \\├─identifier : c
         \\└─number_literal : 3.5
+        \\add_assign
+        \\├─identifier : c
+        \\└─number_literal : 1.0
+        \\sub_assign
+        \\├─identifier : c
+        \\└─number_literal : 1.0
+        \\mul_assign
+        \\├─identifier : c
+        \\└─number_literal : 2.0
+        \\div_assign
+        \\├─identifier : c
+        \\└─number_literal : 2.0
         \\const_binding
         \\└─assign
         \\  ├─identifier : c

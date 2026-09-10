@@ -2354,6 +2354,143 @@ test "compiled immutable locals preserve reused values across a call" {
     try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "leaf" }, 42);
 }
 
+test "mutable locals and compound assignments reuse ordinary SSA values" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static answer = func() int
+        \\  var value = 10
+        \\  value = 20
+        \\  value += 2
+        \\  value *= 2
+        \\  value -= 2
+        \\  value /= 2
+        \\  const assigned = value = value
+        \\  return assigned + value
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const body = (try db.get(query_structures.AnalyzeFunctionBody, scope.resolve("answer").?)).*.?;
+    try testing.expectEqual(@as(usize, 11), body.instructions.len);
+    try testing.expectEqual(@as(u32, 10), @intFromEnum(body.blocks[0].terminator.return_value.value));
+    try expectCompiledFunctionResult(db, 1, "answer", &.{"answer"}, 42);
+}
+
+test "top-level mutable locals execute assignment right-hand sides once" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static one = func() int -> 1
+        \\var status = 41
+        \\status += one()
+        \\exit(status)
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const entry_id = (try db.get(query_structures.SelectEntry, 1)).*.?;
+    const body = (try db.get(query_structures.AnalyzeFunctionBody, entry_id)).*.?;
+    try testing.expectEqual(@as(usize, 4), body.instructions.len);
+    try testing.expectEqual(scope.resolve("one").?, body.instructions[1].call.target);
+    const executable = (try db.get(query_structures.BuildExecutable, 1)).*.?;
+    const io = testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    try runtime.writeProgram(io, executable.bytes);
+    try testing.expectEqual(@as(u8, 42), runtime.runProg(io, testing.allocator, &.{}));
+}
+
+test "conditional assignments merge mutable outer locals" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static selected = func() int
+        \\  var left = 1
+        \\  var right = 0
+        \\  if 1 < 2
+        \\    left = 40
+        \\    right = 2
+        \\  else
+        \\    left = 0
+        \\    right = 1
+        \\  return left + right
+        \\static skipped = func() int
+        \\  var value = 40
+        \\  if 2 < 1 -> value = exit(1)
+        \\  return value + 2
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const selected = (try db.get(query_structures.AnalyzeFunctionBody, scope.resolve("selected").?)).*.?;
+    try testing.expectEqual(@as(usize, 3), selected.blocks[3].argument_end - selected.blocks[3].argument_start);
+    try testing.expectEqual(@as(usize, 6), selected.branch_arguments.len);
+    try expectCompiledFunctionResult(db, 1, "selected", &.{"selected"}, 42);
+    try expectCompiledFunctionResult(db, 1, "skipped", &.{"skipped"}, 42);
+}
+
+test "assignment widening preserves a mutable variable's declared variant type" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static selected = func() int | none
+        \\  var value: int | none = none
+        \\  value = 42
+        \\  return value
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const body = (try db.get(query_structures.AnalyzeFunctionBody, scope.resolve("selected").?)).*.?;
+    try testing.expectEqual(body.return_type, body.instructions[3].variant_coerce.target_type);
+    try expectCompiledVariantWord(db, 1, "selected", &.{"selected"}, 0, 0);
+    try expectCompiledVariantWord(db, 1, "selected", &.{"selected"}, 4, 42);
+}
+
+test "assignment diagnostics distinguish targets mutability and type" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    const cases = [_]struct {
+        file_id: structures.FileId,
+        source: []const u8,
+        marker: []const u8,
+        kind: structures.Diagnostic.Kind,
+    }{
+        .{ .file_id = 1, .source = "static bad = func() int\n  const value = 1\n  value = 2\n  return value", .marker = "value = 2", .kind = .assignment_to_immutable },
+        .{ .file_id = 2, .source = "static bad = func(value: int) int\n  value = 2\n  return value", .marker = "value = 2", .kind = .assignment_to_immutable },
+        .{ .file_id = 3, .source = "static bad = func() int\n  missing = 2\n  return 1", .marker = "missing", .kind = .unknown_value },
+        .{ .file_id = 4, .source = "static bad = func() int\n  var value = 1\n  value = none\n  return value", .marker = "= none", .kind = .assignment_type_mismatch },
+        .{ .file_id = 5, .source = "static bad = func() int\n  var value = 1\n  (if 1 < 2 -> value else 2) = 3\n  return value", .marker = "(if", .kind = .assignment_target_not_local },
+    };
+    for (cases) |case| {
+        try addSource(db, case.file_id, case.source);
+        const function_id = (try db.get(query_structures.BuildModuleScope, case.file_id)).*.?.resolve("bad").?;
+        try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, function_id)).* == null);
+        const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, function_id, structures.Diagnostic, testing.allocator);
+        defer freeDiagnostics(diagnostics);
+        try testing.expectEqual(@as(usize, 1), diagnostics.len);
+        try testing.expectEqual(case.kind, diagnostics[0].kind);
+        const start = std.mem.indexOf(u8, case.source, case.marker).?;
+        try testing.expectEqual(start, diagnostics[0].span.?.start);
+    }
+}
+
+test "mutable body edits update analysis and recover from immutable assignment" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1, "static answer = func() int\n  var value = 40\n  value += 2\n  return value");
+    const answer_id = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolve("answer").?;
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, answer_id)).* != null);
+    try expectCompiledFunctionResult(db, 1, "answer", &.{"answer"}, 42);
+
+    try setSource(db, 1, "static answer = func() int\n  var value = 40\n  value += 3\n  return value");
+    try expectCompiledFunctionResult(db, 1, "answer", &.{"answer"}, 43);
+
+    try setSource(db, 1, "static answer = func() int\n  const value = 40\n  value += 2\n  return value");
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, answer_id)).* == null);
+
+    try setSource(db, 1, "static answer = func() int\n  var value = 40\n  value += 2\n  return value");
+    try expectCompiledFunctionResult(db, 1, "answer", &.{"answer"}, 42);
+}
+
 test "compiled parameters and nested calls preserve every argument" {
     const db = try testDatabase(2);
     defer db.deinit();
@@ -2462,15 +2599,10 @@ test "function body analysis rejects unsupported expressions and literals" {
 
     try addSource(db, 1, "static nonliteral = func() int -> return true");
     try addSource(db, 2, "static bare_return = func() int -> return");
-    try addSource(db, 3,
-        \\static extra = func() int
-        \\  var x = 1
-        \\  return 2
-    );
     try addSource(db, 4, "static float = func() int -> return 1.5");
     try addSource(db, 5, "static overflow = func() int -> return 2147483648");
 
-    for ([_]structures.FileId{ 1, 2, 3, 4, 5 }) |file_id| {
+    for ([_]structures.FileId{ 1, 2, 4, 5 }) |file_id| {
         const function_id = (try db.get(query_structures.IndexItems, file_id)).*.?.ids()[0];
         try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, function_id)).* == null);
         const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, function_id, structures.Diagnostic, testing.allocator);
@@ -3674,7 +3806,9 @@ fn testTypedExpressionAllocations(gpa: std.mem.Allocator) !void {
         \\  const alias: int = saved
         \\  identity(alias)
         \\  const selected: int | none = if saved < 0 -> if saved < -1 -> none else identity(alias) else identity(saved)
-        \\  return selected
+        \\  var mutable: int | none = selected
+        \\  if saved < 0 -> mutable = none else mutable = identity(saved)
+        \\  return mutable
     );
     const item = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolve("choose").?;
     try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, item)).* != null);

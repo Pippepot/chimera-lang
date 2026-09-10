@@ -134,10 +134,12 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 .unit => try self.appendInstruction(.const_unit),
                 .none => try self.appendInstruction(.const_none),
                 .annotation => |annotation| try self.annotate(annotation, expression.span),
+                .assignment => try self.assignment(expression),
                 .call => |call| try self.callFunction(call, expression.span),
                 .negate => |operand| try self.negate(operand, expression.span),
                 .add, .subtract, .multiply, .divide => try self.binary(expression),
                 .if_else => |expression_if| try self.conditional(expression_if),
+                .conditional_output => |conditional_id| return self.conditionalOutput(id, conditional_id),
             };
             self.values[index] = resolved;
             return resolved;
@@ -150,6 +152,34 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 return self.reject(span, .local_type_mismatch);
             if (use.coerce_to == null) return operand;
             return self.appendInstruction(.{ .variant_coerce = .{ .operand = operand.id, .target_type = annotation.type_id } });
+        }
+
+        fn assignment(self: *Self, expression: Expression) !Value {
+            const assignment_value = expression.operation.assignment;
+            const target = try self.value(assignment_value.target);
+            if (target.type_id == .never) return target;
+            const operand = try self.value(assignment_value.value);
+            if (operand.type_id == .never) return operand;
+            if (assignment_value.operation == .replace) {
+                const use = try coerceValue(self.type_interner, operand.id, operand.type_id, target.type_id) orelse
+                    return self.reject(expression.span, .assignment_type_mismatch);
+                if (use.coerce_to == null) return operand;
+                return self.appendInstruction(.{ .variant_coerce = .{ .operand = operand.id, .target_type = target.type_id } });
+            }
+            if (target.type_id != .int or operand.type_id != .int) return self.reject(expression.span, .arithmetic_operands_not_int);
+            const operands: structures.BinaryOperands = .{ .lhs = target.id, .rhs = operand.id };
+            return self.appendInstruction(switch (assignment_value.operation) {
+                .replace => unreachable,
+                .add => .{ .addi = operands },
+                .subtract => .{ .subi = operands },
+                .multiply => .{ .muli = operands },
+                .divide => .{ .divsi = operands },
+            });
+        }
+
+        fn conditionalOutput(self: *Self, id: semantic.UnresolvedBody.ValueId, conditional_id: semantic.UnresolvedBody.ValueId) !Value {
+            _ = try self.value(conditional_id);
+            return self.values[@intFromEnum(id)] orelse unreachable;
         }
 
         fn negate(self: *Self, id: semantic.UnresolvedBody.ValueId, span: structures.SourceSpan) !Value {
@@ -231,9 +261,9 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             const rhs = try self.value(condition.operands.rhs);
             if (rhs.type_id == .never) return rhs;
             if (lhs.type_id != .int or rhs.type_id != .int) return self.reject(condition.span, .comparison_operands_not_int);
-            const argument_start: u32 = @intCast(self.block_argument_types.items.len);
-            const then_block = try self.newBlock(argument_start, argument_start);
-            const else_block = try self.newBlock(argument_start, argument_start);
+            const branch_argument_start: u32 = @intCast(self.block_argument_types.items.len);
+            const then_block = try self.newBlock(branch_argument_start, branch_argument_start);
+            const else_block = try self.newBlock(branch_argument_start, branch_argument_start);
             self.terminate(.{ .predicate_branch = .{
                 .operation = switch (condition.operation) {
                     .lt => .lti,
@@ -247,24 +277,48 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 .then_branch = self.emptyBranch(then_block),
                 .else_branch = self.emptyBranch(else_block),
             } });
+
+            const outputs = self.unresolved.conditional_outputs[expression.outputs.start..expression.outputs.end];
+            var then_outputs: std.ArrayList(Value) = .empty;
+            defer then_outputs.deinit(self.ctx.allocator());
             self.enterBlock(then_block);
             const then_value = try self.block(expression.then_block);
-            const argument: u32 = @intCast(self.block_argument_types.items.len);
+            if (then_value != null) {
+                for (outputs) |output| try then_outputs.append(self.ctx.allocator(), try self.value(output.then_value));
+            }
+
+            const argument_start: u32 = @intCast(self.block_argument_types.items.len);
             try self.block_argument_types.append(self.ctx.allocator(), .never);
-            const merge_block = try self.newBlock(argument, argument + 1);
+            for (outputs) |_| try self.block_argument_types.append(self.ctx.allocator(), .never);
+            const merge_block = try self.newBlock(argument_start, @intCast(self.block_argument_types.items.len));
             const then_branch = if (then_value) |then_result| blk: {
-                const branch = try self.valueBranch(merge_block, .{ .value = then_result.id });
+                const branch = try self.resultAndOutputsBranch(merge_block, then_result, then_outputs.items);
                 self.terminate(.{ .branch = branch });
                 break :blk branch;
             } else null;
 
+            var else_outputs: std.ArrayList(Value) = .empty;
+            defer else_outputs.deinit(self.ctx.allocator());
             self.enterBlock(else_block);
             const else_value = try self.block(expression.else_block);
             if (then_value == null and else_value == null) {
                 self.enterBlock(merge_block);
                 self.terminate(.diverge);
-                return .{ .id = @enumFromInt(argument), .type_id = .never };
+                for (outputs, 0..) |output, output_index| {
+                    self.values[@intFromEnum(output.result)] = .{
+                        .id = @enumFromInt(argument_start + 1 + @as(u32, @intCast(output_index))),
+                        .type_id = .never,
+                    };
+                }
+                return .{ .id = @enumFromInt(argument_start), .type_id = .never };
             }
+
+            const else_branch = if (else_value) |else_result| blk: {
+                for (outputs) |output| try else_outputs.append(self.ctx.allocator(), try self.value(output.else_value));
+                const branch = try self.resultAndOutputsBranch(merge_block, else_result, else_outputs.items);
+                self.terminate(.{ .branch = branch });
+                break :blk branch;
+            } else null;
 
             const joined = if (then_value) |then_result|
                 if (else_value) |else_result|
@@ -273,17 +327,27 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                     then_result.type_id
             else
                 else_value.?.type_id;
-            self.block_argument_types.items[argument] = joined;
+            self.block_argument_types.items[argument_start] = joined;
             if (then_value) |then_result| {
                 const branch = then_branch.?;
                 self.branch_arguments.items[branch.arguments.start] = (try coerceValue(self.type_interner, then_result.id, then_result.type_id, joined)) orelse unreachable;
             }
             if (else_value) |else_result| {
-                const else_use = (try coerceValue(self.type_interner, else_result.id, else_result.type_id, joined)) orelse unreachable;
-                self.terminate(.{ .branch = try self.valueBranch(merge_block, else_use) });
+                const branch = else_branch.?;
+                self.branch_arguments.items[branch.arguments.start] = (try coerceValue(self.type_interner, else_result.id, else_result.type_id, joined)) orelse unreachable;
+            }
+            for (outputs, 0..) |output, output_index| {
+                const then_output: ?Value = if (then_value != null) then_outputs.items[output_index] else null;
+                const else_output: ?Value = if (else_value != null) else_outputs.items[output_index] else null;
+                const output_type = if (then_output) |output_value| output_value.type_id else else_output.?.type_id;
+                if (then_output) |output_value| std.debug.assert(output_value.type_id == output_type);
+                if (else_output) |output_value| std.debug.assert(output_value.type_id == output_type);
+                const block_argument = argument_start + 1 + @as(u32, @intCast(output_index));
+                self.block_argument_types.items[block_argument] = output_type;
+                self.values[@intFromEnum(output.result)] = .{ .id = @enumFromInt(block_argument), .type_id = output_type };
             }
             self.enterBlock(merge_block);
-            return .{ .id = @enumFromInt(argument), .type_id = joined };
+            return .{ .id = @enumFromInt(argument_start), .type_id = joined };
         }
 
         fn appendInstruction(self: *Self, instruction: structures.FunctionInstruction) !Value {
@@ -327,10 +391,11 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             return .{ .target = target, .arguments = .{ .start = start, .end = start } };
         }
 
-        fn valueBranch(self: *Self, target: structures.FunctionBlockId, use: structures.FunctionValueUse) !structures.FunctionBranch {
+        fn resultAndOutputsBranch(self: *Self, target: structures.FunctionBlockId, result: Value, outputs: []const Value) !structures.FunctionBranch {
             const start: u32 = @intCast(self.branch_arguments.items.len);
-            try self.branch_arguments.append(self.ctx.allocator(), use);
-            return .{ .target = target, .arguments = .{ .start = start, .end = start + 1 } };
+            try self.branch_arguments.append(self.ctx.allocator(), .{ .value = result.id });
+            for (outputs) |output| try self.branch_arguments.append(self.ctx.allocator(), .{ .value = output.id });
+            return .{ .target = target, .arguments = .{ .start = start, .end = @intCast(self.branch_arguments.items.len) } };
         }
 
         fn finish(self: *Self) !structures.FunctionBodyAnalysis {

@@ -10,7 +10,7 @@ The incremental pipeline works end to end. The next goal is to generalize bodies
 | --- | --- | --- |
 | Pipeline | Owned AST, stable item IDs, concurrent incremental queries, diagnostics, per-function SSA/code, reachable linking, Linux ELF CLI | Single-file callable scope; no generic instances or cross-run cache |
 | Functions | Named and static-bound declarations, typed parameters, direct calls, general statement bodies, unit fallthrough, early returns | Fallible functions, parameter modifiers, callable values |
-| Values | Decimal `int`, `unit`/`()`, `none`, `never`, immutable locals, calls, integer negation and `+ - * /` | Mutable locals, assignments, `bool`, `float`, general type values |
+| Values | Decimal `int`, `unit`/`()`, `none`, `never`, immutable and mutable locals, assignments, calls, integer negation and `+ - * /` | `bool`, `float`, general type values |
 | Variants | Canonical sets over `int`, `unit`, `none`; structural branch unions; layout, member injection, locals, calls, returns; subset widening at bindings, arguments, and returns | Named aliases, inspection/extraction |
 | Control flow | Value-producing `if` over integer comparisons, implicit-unit no-else joins, general lexical branch blocks, divergence-aware joins and returns | Short-circuit logic, loops, match |
 | Backend | Full-layout values, symbolic calls, recursion, arbitrary CFG edges, parallel edge copies | Frontend cannot yet produce all supported graphs; no external ABI |
@@ -19,7 +19,7 @@ Named function declarations canonicalize to static-bound function values during 
 
 `exit(int)` remains an inline syscall implementation but is typed as `never` and terminates its control-flow path.
 
-Top-level analysis accepts supported expressions, immutable locals, and general conditionals, skips static initializers, and synthesizes a unit return on reachable fallthrough. Successfully parsing a static initializer does not mean it was validated or evaluated. Discovery recognizes only static function initializers; uncalled bodies remain demand-driven. The parser also recognizes some future syntax—structs, parameter modifiers, `comptime`, `is`/`as`, `?`, and `sizeof`—without runtime semantics. `fallible`, `match`, and `loop` still need parser work.
+Top-level analysis accepts supported expressions, immutable and mutable locals, assignments, and general conditionals, skips static initializers, and synthesizes a unit return on reachable fallthrough. Successfully parsing a static initializer does not mean it was validated or evaluated. Discovery recognizes only static function initializers; uncalled bodies remain demand-driven. The parser also recognizes some future syntax—structs, parameter modifiers, `comptime`, `is`/`as`, `?`, and `sizeof`—without runtime semantics. `fallible`, `match`, and `loop` still need parser work.
 
 ## Priorities
 
@@ -40,7 +40,8 @@ General bodies and return control flow are complete. Finish the milestone with m
 
 1. **Done:** lexical block scopes, general statements in function and top-level bodies, multi-statement branch bodies, and `if` without `else`, joining its body value with an implicit unit failure branch. Ordinary unit fallthrough and reachable early returns are supported in functions.
 2. **Done:** `never`, divergence-aware joins, return-path completeness, and correctly typed inline `exit`; runtime-symbol linking remains unnecessary.
-3. Add mutable locals and assignments, then `loop`, `break` values, and `continue`. Use existing block arguments, backedges, and parallel copies for loop-carried state.
+3. **Done:** mutable locals and plain/arithmetic compound assignments, including SSA state joins across conditionals.
+4. Add `loop`, `break` values, and `continue`. Use existing block arguments, backedges, and parallel copies for loop-carried state.
 
 **Done:** branch-local names stay local; mixed returning/diverging paths type correctly; missing returns are diagnosed; loop break values join correctly. Tests cover evaluation order, skipped effects, mutation across backedges, and edits that change reachability.
 
