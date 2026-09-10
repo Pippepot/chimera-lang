@@ -11,7 +11,7 @@ const payload_variant = structures.TypeId.fromInterned(@enumFromInt(3));
 const TestTypes = struct {
     pub fn layout(_: @This(), type_id: structures.TypeId) !structures.TypeLayout {
         if (type_id == .int) return .{ .byte_size = 4, .byte_alignment = 4 };
-        if (type_id == .unit or type_id == .none) return .{ .byte_size = 0, .byte_alignment = 1 };
+        if (type_id == .unit or type_id == .none or type_id == .never) return .{ .byte_size = 0, .byte_alignment = 1 };
         if (type_id == small_variant or type_id == wide_variant) return .{ .byte_size = 8, .byte_alignment = 4 };
         if (type_id == seven_byte_payload) return .{ .byte_size = 7, .byte_alignment = 1 };
         if (type_id == payload_variant) return .{ .byte_size = 12, .byte_alignment = 4 };
@@ -141,7 +141,7 @@ test "exit emits an inline syscall without references" {
     var blocks = [_]structures.FunctionBodyAnalysis.Block{.{
         .instruction_start = 0,
         .instruction_end = instructions.len,
-        .terminator = .return_unit,
+        .terminator = .diverge,
     }};
     const ssa = functionSsa(&instructions, &blocks);
     var artifact = try codegen.compileFunction(&ssa, TestTypes{}, std.testing.allocator);
@@ -150,7 +150,7 @@ test "exit emits an inline syscall without references" {
     try std.testing.expectEqualSlices(u8, &.{
         0xB8, 42,   0,    0,    0,
         0x89, 0xC7, 0xB8, 60,   0,
-        0,    0,    0x0F, 0x05, 0xC3,
+        0,    0,    0x0F, 0x05,
     }, artifact.code);
     try std.testing.expectEqual(@as(usize, 0), artifact.relocations.len);
     try std.testing.expectEqual(@as(usize, 0), artifact.referenced_instances.len);

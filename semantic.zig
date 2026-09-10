@@ -15,20 +15,32 @@ fn SemanticResult(comptime Success: type) type {
 
 pub const SignatureResult = SemanticResult(structures.FunctionSignature);
 
-/// Query-local expression graph after syntax and lexical validation. Parameters
-/// precede expressions in the value namespace. Statements preserve evaluation
-/// order; references to an earlier binding reuse its value. Source names are
-/// borrowed only until typing finishes. Control-flow blocks belong to typed IR.
+/// Query-local source graph after syntax and lexical validation. Parameters
+/// precede expressions in the value namespace. Blocks and statements preserve
+/// evaluation order; references to an earlier binding reuse its value. Source
+/// names are borrowed only until typing finishes. CFG blocks belong to typed IR.
 pub const UnresolvedBody = struct {
     parameter_count: u32,
     expressions: []Expression,
-    statements: []ValueId,
+    blocks: []Block,
+    statements: []Statement,
     call_arguments: []ValueId,
-    return_value: ?ValueId,
-    return_span: structures.SourceSpan,
+    root_block: BlockId,
 
     pub const ValueId = enum(u32) { _ };
+    pub const BlockId = enum(u32) { _ };
     pub const BinaryOperands = struct { lhs: ValueId, rhs: ValueId };
+    pub const StatementRange = struct { start: u32, end: u32 };
+    pub const Block = struct {
+        statements: StatementRange,
+        result: ?ValueId,
+        span: structures.SourceSpan,
+    };
+    pub const Statement = union(enum) {
+        discard: ValueId,
+        return_nothing: structures.SourceSpan,
+        return_value: struct { value: ValueId, span: structures.SourceSpan },
+    };
     pub const PredicateOperation = enum { lt, gt, le, ge, eq, ne };
     pub const Condition = struct {
         operation: PredicateOperation,
@@ -50,12 +62,13 @@ pub const UnresolvedBody = struct {
             subtract: BinaryOperands,
             multiply: BinaryOperands,
             divide: BinaryOperands,
-            if_else: struct { condition: Condition, then_value: ValueId, else_value: ValueId },
+            if_else: struct { condition: Condition, then_block: BlockId, else_block: BlockId },
         };
     };
 
     pub fn deinit(self: *UnresolvedBody, gpa: std.mem.Allocator) void {
         gpa.free(self.expressions);
+        gpa.free(self.blocks);
         gpa.free(self.statements);
         gpa.free(self.call_arguments);
         self.* = undefined;
@@ -97,17 +110,20 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
         type_interner: TypeInterner,
         gpa: std.mem.Allocator,
         locals: std.StringHashMapUnmanaged(ValueId) = .empty,
+        local_names: std.ArrayList([]const u8) = .empty,
         expressions: std.ArrayList(UnresolvedBody.Expression) = .empty,
-        statements: std.ArrayList(ValueId) = .empty,
+        blocks: std.ArrayList(UnresolvedBody.Block) = .empty,
+        statements: std.ArrayList(UnresolvedBody.Statement) = .empty,
         call_arguments: std.ArrayList(ValueId) = .empty,
         scratch: std.ArrayList(ValueId) = .empty,
-        return_value: ?ValueId = null,
-        return_span: structures.SourceSpan = undefined,
+        root_block: ?UnresolvedBody.BlockId = null,
         issue: ?Issue = null,
 
         fn deinit(self: *Self) void {
             self.locals.deinit(self.gpa);
+            self.local_names.deinit(self.gpa);
             self.expressions.deinit(self.gpa);
+            self.blocks.deinit(self.gpa);
             self.statements.deinit(self.gpa);
             self.call_arguments.deinit(self.gpa);
             self.scratch.deinit(self.gpa);
@@ -129,11 +145,13 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
         fn buildEntry(self: *Self, declaration: u32) !void {
             const root = self.ast.nodes[declaration];
             std.debug.assert(root.tag == .block);
+            var body_statements: std.ArrayList(UnresolvedBody.Statement) = .empty;
+            defer body_statements.deinit(self.gpa);
             for (self.ast.node_refs[root.data.ref.start..root.data.ref.end]) |child| {
                 if (self.ast.nodes[child.index()].tag == .static_binding) continue;
-                try self.appendStatement(child, .entry_statement_not_supported);
+                try body_statements.append(self.gpa, try self.buildStatement(child, true));
             }
-            self.return_span = tokenSpan(self.ast, root.token_index);
+            self.root_block = try self.finishBlock(body_statements.items, null, tokenSpan(self.ast, root.token_index));
         }
 
         fn buildFunction(self: *Self, declaration: u32) !void {
@@ -143,35 +161,39 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             std.debug.assert(parameters.len == self.parameter_count);
             for (parameters, 0..) |parameter_index, index| {
                 const span = tokenSpan(self.ast, self.ast.nodes[parameter_index.index()].token_index);
-                try self.locals.put(self.gpa, self.source[span.start..span.end], @enumFromInt(index));
+                const name = self.source[span.start..span.end];
+                try self.locals.put(self.gpa, name, @enumFromInt(index));
+                try self.local_names.append(self.gpa, name);
             }
 
-            var return_index = parts.body;
             const body = self.ast.nodes[parts.body.index()];
+            var body_statements: std.ArrayList(UnresolvedBody.Statement) = .empty;
+            defer body_statements.deinit(self.gpa);
             if (body.tag == .block) {
-                const statements = self.ast.node_refs[body.data.ref.start..body.data.ref.end];
-                if (statements.len == 0) return self.reject(parts.body, .body_shape_not_supported);
-                for (statements[0 .. statements.len - 1]) |statement| {
-                    try self.appendStatement(statement, .body_shape_not_supported);
+                for (self.ast.node_refs[body.data.ref.start..body.data.ref.end]) |statement| {
+                    try body_statements.append(self.gpa, try self.buildStatement(statement, false));
                 }
-                return_index = statements[statements.len - 1];
+            } else {
+                try body_statements.append(self.gpa, try self.buildStatement(parts.body, false));
             }
-            const returned = self.ast.nodes[return_index.index()];
-            self.return_span = tokenSpan(self.ast, returned.token_index);
-            switch (returned.tag) {
-                .return_nothing => {},
-                .return_expr => self.return_value = try self.append(returned.data.node),
-                else => return self.reject(return_index, .body_shape_not_supported),
-            }
+            self.root_block = try self.finishBlock(body_statements.items, null, tokenSpan(self.ast, body.token_index));
         }
 
-        fn appendStatement(self: *Self, index: structures.Node.Index, unsupported: structures.Diagnostic.Kind) !void {
-            const value = switch (self.ast.nodes[index.index()].tag) {
-                .const_binding => try self.appendBinding(index),
-                .call => try self.append(index),
-                else => return self.reject(index, unsupported),
+        fn buildStatement(self: *Self, index: structures.Node.Index, comptime is_entry: bool) !UnresolvedBody.Statement {
+            const node = self.ast.nodes[index.index()];
+            const span = tokenSpan(self.ast, node.token_index);
+            return switch (node.tag) {
+                .const_binding => .{ .discard = try self.appendBinding(index) },
+                .return_nothing => if (is_entry)
+                    self.reject(index, .top_level_return)
+                else
+                    .{ .return_nothing = span },
+                .return_expr => if (is_entry)
+                    self.reject(index, .top_level_return)
+                else
+                    .{ .return_value = .{ .value = try self.append(node.data.node), .span = span } },
+                else => .{ .discard = try self.append(index) },
             };
-            try self.statements.append(self.gpa, value);
         }
 
         fn appendBinding(self: *Self, index: structures.Node.Index) anyerror!ValueId {
@@ -186,6 +208,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 value = try self.appendExpression(annotation.?, .{ .annotation = .{ .value = value, .type_id = type_id } });
             }
             try self.locals.put(self.gpa, name, value);
+            try self.local_names.append(self.gpa, name);
             return value;
         }
 
@@ -216,7 +239,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 },
                 .neg => return self.appendExpression(index, .{ .negate = try self.append(node.data.node) }),
                 .add, .sub, .mul, .div => return self.appendBinary(index),
-                .if_else => return self.appendIf(index),
+                .@"if", .if_else => return self.appendIf(index),
                 else => return self.reject(index, .expression_not_supported),
             }
         }
@@ -249,15 +272,25 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
 
         fn appendIf(self: *Self, index: structures.Node.Index) !ValueId {
             const node = self.ast.nodes[index.index()];
-            const parts = self.ast.node_refs[node.data.ref.start..node.data.ref.end];
-            std.debug.assert(parts.len == 3);
-            const condition = try self.buildCondition(parts[0]);
-            const then_value = try self.branchValue(parts[1]);
-            const else_value = try self.branchValue(parts[2]);
+            const condition_index, const then_index, const else_index = switch (node.tag) {
+                .@"if" => .{ node.data.node_node.a, node.data.node_node.b, @as(?structures.Node.Index, null) },
+                .if_else => blk: {
+                    const parts = self.ast.node_refs[node.data.ref.start..node.data.ref.end];
+                    std.debug.assert(parts.len == 3);
+                    break :blk .{ parts[0], parts[1], parts[2] };
+                },
+                else => unreachable,
+            };
+            const condition = try self.buildCondition(condition_index);
+            const then_block = try self.buildBranch(then_index);
+            const else_block = if (else_index) |explicit_else|
+                try self.buildBranch(explicit_else)
+            else
+                try self.buildUnitBranch(index);
             return self.appendExpression(index, .{ .if_else = .{
                 .condition = condition,
-                .then_value = then_value,
-                .else_value = else_value,
+                .then_block = then_block,
+                .else_block = else_block,
             } });
         }
 
@@ -289,11 +322,68 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             return self.reject(form, kind);
         }
 
-        fn branchValue(self: *Self, index: structures.Node.Index) !ValueId {
+        fn buildBranch(self: *Self, index: structures.Node.Index) !UnresolvedBody.BlockId {
+            const scope_mark = self.local_names.items.len;
+            defer self.restoreScope(scope_mark);
+
             const node = self.ast.nodes[index.index()];
-            if (node.tag != .block) return self.append(index);
-            if (node.data.ref.end - node.data.ref.start != 1) return self.reject(index, .if_branch_shape_not_supported);
-            return self.append(self.ast.node_refs[node.data.ref.start]);
+            if (node.tag != .block) {
+                if (node.tag == .return_nothing or node.tag == .return_expr) {
+                    var statements = [_]UnresolvedBody.Statement{try self.buildStatement(index, false)};
+                    return self.finishBlock(&statements, null, tokenSpan(self.ast, node.token_index));
+                }
+                return self.finishBlock(&.{}, try self.append(index), tokenSpan(self.ast, node.token_index));
+            }
+
+            const children = self.ast.node_refs[node.data.ref.start..node.data.ref.end];
+            if (children.len == 0) return self.buildUnitBranch(index);
+
+            var statements: std.ArrayList(UnresolvedBody.Statement) = .empty;
+            defer statements.deinit(self.gpa);
+            for (children[0 .. children.len - 1]) |statement| {
+                try statements.append(self.gpa, try self.buildStatement(statement, false));
+            }
+            const last = children[children.len - 1];
+            const last_node = self.ast.nodes[last.index()];
+            const result: ?ValueId = switch (last_node.tag) {
+                .const_binding, .return_nothing, .return_expr => blk: {
+                    try statements.append(self.gpa, try self.buildStatement(last, false));
+                    break :blk null;
+                },
+                else => try self.append(last),
+            };
+            if (result == null and last_node.tag == .const_binding) {
+                return self.finishBlock(statements.items, try self.appendExpression(index, .unit), tokenSpan(self.ast, node.token_index));
+            }
+            return self.finishBlock(statements.items, result, tokenSpan(self.ast, node.token_index));
+        }
+
+        fn buildUnitBranch(self: *Self, index: structures.Node.Index) !UnresolvedBody.BlockId {
+            return self.finishBlock(&.{}, try self.appendExpression(index, .unit), tokenSpan(self.ast, self.ast.nodes[index.index()].token_index));
+        }
+
+        fn finishBlock(
+            self: *Self,
+            pending: []const UnresolvedBody.Statement,
+            result: ?ValueId,
+            span: structures.SourceSpan,
+        ) !UnresolvedBody.BlockId {
+            const start: u32 = @intCast(self.statements.items.len);
+            try self.statements.appendSlice(self.gpa, pending);
+            const id: UnresolvedBody.BlockId = @enumFromInt(self.blocks.items.len);
+            try self.blocks.append(self.gpa, .{
+                .statements = .{ .start = start, .end = @intCast(self.statements.items.len) },
+                .result = result,
+                .span = span,
+            });
+            return id;
+        }
+
+        fn restoreScope(self: *Self, mark: usize) void {
+            while (self.local_names.items.len > mark) {
+                const name = self.local_names.pop().?;
+                std.debug.assert(self.locals.remove(name));
+            }
         }
 
         fn appendCall(self: *Self, index: structures.Node.Index) !ValueId {
@@ -327,15 +417,17 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
         fn finish(self: *Self) !UnresolvedBody {
             const expressions = try self.expressions.toOwnedSlice(self.gpa);
             errdefer self.gpa.free(expressions);
+            const blocks = try self.blocks.toOwnedSlice(self.gpa);
+            errdefer self.gpa.free(blocks);
             const statements = try self.statements.toOwnedSlice(self.gpa);
             errdefer self.gpa.free(statements);
             return .{
                 .parameter_count = self.parameter_count,
                 .expressions = expressions,
+                .blocks = blocks,
                 .statements = statements,
                 .call_arguments = try self.call_arguments.toOwnedSlice(self.gpa),
-                .return_value = self.return_value,
-                .return_span = self.return_span,
+                .root_block = self.root_block.?,
             };
         }
     };
@@ -417,6 +509,7 @@ fn analyzeType(
         if (std.mem.eql(u8, name, "int")) return .{ .success = .int };
         if (std.mem.eql(u8, name, "unit")) return .{ .success = .unit };
         if (std.mem.eql(u8, name, "none")) return .{ .success = .none };
+        if (std.mem.eql(u8, name, "never")) return .{ .success = .never };
         return .{ .unsupported = .{ .span = span, .kind = unsupported_kind } };
     }
     if (node.tag != .type_variant) {

@@ -45,9 +45,8 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
         return_type: structures.TypeId,
         scope: ?structures.ModuleScope = null,
         values: []?Value = &.{},
-        block_argument_types: []structures.TypeId = &.{},
-        next_argument: u32 = 0,
-        call_arguments: []structures.FunctionValueUse = &.{},
+        block_argument_types: std.ArrayList(structures.TypeId) = .empty,
+        call_arguments: std.ArrayList(structures.FunctionValueUse) = .empty,
         branch_arguments: std.ArrayList(structures.FunctionValueUse) = .empty,
         instructions: std.ArrayList(structures.FunctionInstruction) = .empty,
         blocks: std.ArrayList(structures.FunctionBlock) = .empty,
@@ -58,23 +57,16 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             self.values = try self.ctx.allocator().alloc(?Value, parameter_types.len + self.unresolved.expressions.len);
             @memset(self.values, null);
             for (parameter_types, 0..) |type_id, index| self.values[index] = .{ .id = @enumFromInt(index), .type_id = type_id };
-            var argument_count = parameter_types.len;
-            for (self.unresolved.expressions) |expression| {
-                if (expression.operation == .if_else) argument_count += 1;
-            }
-            self.block_argument_types = try self.ctx.allocator().alloc(structures.TypeId, argument_count);
-            @memcpy(self.block_argument_types[0..parameter_types.len], parameter_types);
-            self.next_argument = @intCast(parameter_types.len);
-            self.call_arguments = try self.ctx.allocator().alloc(structures.FunctionValueUse, self.unresolved.call_arguments.len);
-            const entry = try self.newBlock(0, self.next_argument);
+            try self.block_argument_types.appendSlice(self.ctx.allocator(), parameter_types);
+            const entry = try self.newBlock(0, @intCast(parameter_types.len));
             self.enterBlock(entry);
         }
 
         fn deinit(self: *Self) void {
             const gpa = self.ctx.allocator();
             gpa.free(self.values);
-            gpa.free(self.block_argument_types);
-            gpa.free(self.call_arguments);
+            self.block_argument_types.deinit(gpa);
+            self.call_arguments.deinit(gpa);
             self.branch_arguments.deinit(gpa);
             self.instructions.deinit(gpa);
             self.blocks.deinit(gpa);
@@ -86,25 +78,49 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
         }
 
         fn build(self: *Self) !void {
-            for (self.unresolved.statements) |statement| {
-                // A discarded statement still evaluates its initializer or call.
-                _ = try self.value(statement);
-            }
-            if (self.unresolved.return_value) |returned| {
-                try self.returnValue(try self.value(returned));
-            } else if (self.return_type == .unit) {
+            _ = try self.block(self.unresolved.root_block);
+            if (self.current_block == null) return;
+            const root = self.unresolved.blocks[@intFromEnum(self.unresolved.root_block)];
+            if (self.return_type == .unit) {
                 self.terminate(.return_unit);
-            } else if (try self.type_interner.variantMembers(self.return_type) != null) {
-                try self.returnValue(try self.appendInstruction(.const_unit));
             } else {
-                return self.reject(self.unresolved.return_span, .{ .missing_return_value = self.return_type });
+                return self.reject(root.span, .{ .missing_return_value = self.return_type });
             }
-            std.debug.assert(self.next_argument == self.block_argument_types.len);
         }
 
-        fn returnValue(self: *Self, value_to_return: Value) !void {
+        fn block(self: *Self, block_id: semantic.UnresolvedBody.BlockId) !?Value {
+            const unresolved_block = self.unresolved.blocks[@intFromEnum(block_id)];
+            for (self.unresolved.statements[unresolved_block.statements.start..unresolved_block.statements.end]) |statement| {
+                if (self.current_block == null) return null;
+                switch (statement) {
+                    .discard => |value_id| _ = try self.value(value_id),
+                    .return_nothing => |span| try self.returnNothing(span),
+                    .return_value => |returned| try self.returnValue(try self.value(returned.value), returned.span),
+                }
+            }
+            if (self.current_block == null) return null;
+            const result = if (unresolved_block.result) |result_id| try self.value(result_id) else return null;
+            return if (self.current_block == null) null else result;
+        }
+
+        fn returnNothing(self: *Self, span: structures.SourceSpan) !void {
+            if (self.return_type == .unit) {
+                self.terminate(.return_unit);
+                return;
+            }
+            const unit = try self.appendInstruction(.const_unit);
+            const use = try coerceValue(self.type_interner, unit.id, .unit, self.return_type) orelse
+                return self.reject(span, .{ .missing_return_value = self.return_type });
+            self.terminate(.{ .return_value = use });
+        }
+
+        fn returnValue(self: *Self, value_to_return: Value, span: structures.SourceSpan) !void {
+            if (value_to_return.type_id == .never) {
+                std.debug.assert(self.current_block == null);
+                return;
+            }
             const use = try coerceValue(self.type_interner, value_to_return.id, value_to_return.type_id, self.return_type) orelse
-                return self.reject(self.unresolved.return_span, .return_type_mismatch);
+                return self.reject(span, .return_type_mismatch);
             self.terminate(if (self.return_type == .unit) .return_unit else .{ .return_value = use });
         }
 
@@ -129,6 +145,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
 
         fn annotate(self: *Self, annotation: @FieldType(Expression.Operation, "annotation"), span: structures.SourceSpan) !Value {
             const operand = try self.value(annotation.value);
+            if (operand.type_id == .never) return operand;
             const use = try coerceValue(self.type_interner, operand.id, operand.type_id, annotation.type_id) orelse
                 return self.reject(span, .local_type_mismatch);
             if (use.coerce_to == null) return operand;
@@ -137,6 +154,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
 
         fn negate(self: *Self, id: semantic.UnresolvedBody.ValueId, span: structures.SourceSpan) !Value {
             const operand = try self.value(id);
+            if (operand.type_id == .never) return operand;
             if (operand.type_id != .int) return self.reject(span, .negation_operand_not_int);
             return self.appendInstruction(.{ .negi = operand.id });
         }
@@ -147,7 +165,9 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 else => unreachable,
             };
             const lhs = try self.value(raw.lhs);
+            if (lhs.type_id == .never) return lhs;
             const rhs = try self.value(raw.rhs);
+            if (rhs.type_id == .never) return rhs;
             if (lhs.type_id != .int or rhs.type_id != .int) return self.reject(expression.span, .arithmetic_operands_not_int);
             const operands: structures.BinaryOperands = .{ .lhs = lhs.id, .rhs = rhs.id };
             const instruction: structures.FunctionInstruction = switch (expression.operation) {
@@ -164,25 +184,38 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             const raw_arguments = self.unresolved.call_arguments[call.arguments.start..call.arguments.end];
             // Resolve nested argument expressions before the callee, preserving
             // source evaluation and diagnostic order. Later reads reuse values.
-            for (raw_arguments) |argument| _ = try self.value(argument);
+            for (raw_arguments) |argument| {
+                const resolved = try self.value(argument);
+                if (resolved.type_id == .never) return resolved;
+            }
             var target: ?structures.ItemId = null;
-            var signature: structures.FunctionSignature = .{ .parameter_types = &.{.int}, .return_type = .unit };
+            var signature: structures.FunctionSignature = .{ .parameter_types = &.{.int}, .return_type = .never };
             if (!std.mem.eql(u8, call.name, "exit")) {
                 if (self.scope == null) self.scope = (try self.ctx.get(ModuleScopeQuery, self.file_id)).* orelse return error.Unavailable;
                 target = self.scope.?.resolve(call.name) orelse return self.reject(span, .unknown_function);
                 signature = (try self.ctx.get(FunctionSignatureQuery, target.?)).* orelse return error.Unavailable;
             }
             if (raw_arguments.len != signature.parameter_types.len) return self.reject(span, .call_argument_count_mismatch);
-            const arguments = self.call_arguments[call.arguments.start..call.arguments.end];
-            for (raw_arguments, arguments, signature.parameter_types) |raw, *argument, expected| {
+            const argument_start: u32 = @intCast(self.call_arguments.items.len);
+            var intrinsic_argument: ?structures.FunctionValueId = null;
+            for (raw_arguments, signature.parameter_types) |raw, expected| {
                 const operand = self.values[@intFromEnum(raw)].?;
-                argument.* = try coerceValue(self.type_interner, operand.id, operand.type_id, expected) orelse
+                const argument = try coerceValue(self.type_interner, operand.id, operand.type_id, expected) orelse
                     return self.reject(self.argumentSpan(raw, span), .call_argument_type_mismatch);
+                if (target != null) {
+                    try self.call_arguments.append(self.ctx.allocator(), argument);
+                } else {
+                    std.debug.assert(intrinsic_argument == null);
+                    intrinsic_argument = argument.value;
+                }
             }
-            if (target) |item| {
-                return self.appendInstruction(.{ .call = .{ .target = item, .arguments = call.arguments, .return_type = signature.return_type } });
-            }
-            return self.appendInstruction(.{ .exit = arguments[0].value });
+            const arguments: structures.FunctionValueRange = .{ .start = argument_start, .end = @intCast(self.call_arguments.items.len) };
+            const result = if (target) |item|
+                try self.appendInstruction(.{ .call = .{ .target = item, .arguments = arguments, .return_type = signature.return_type } })
+            else
+                try self.appendInstruction(.{ .exit = intrinsic_argument.? });
+            if (signature.return_type == .never) self.terminate(.diverge);
+            return result;
         }
 
         fn argumentSpan(self: *const Self, argument: semantic.UnresolvedBody.ValueId, call_span: structures.SourceSpan) structures.SourceSpan {
@@ -192,12 +225,15 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
         }
 
         fn conditional(self: *Self, expression: @FieldType(Expression.Operation, "if_else")) !Value {
-            const then_block = try self.newBlock(self.next_argument, self.next_argument);
-            const else_block = try self.newBlock(self.next_argument, self.next_argument);
             const condition = expression.condition;
             const lhs = try self.value(condition.operands.lhs);
+            if (lhs.type_id == .never) return lhs;
             const rhs = try self.value(condition.operands.rhs);
+            if (rhs.type_id == .never) return rhs;
             if (lhs.type_id != .int or rhs.type_id != .int) return self.reject(condition.span, .comparison_operands_not_int);
+            const argument_start: u32 = @intCast(self.block_argument_types.items.len);
+            const then_block = try self.newBlock(argument_start, argument_start);
+            const else_block = try self.newBlock(argument_start, argument_start);
             self.terminate(.{ .predicate_branch = .{
                 .operation = switch (condition.operation) {
                     .lt => .lti,
@@ -212,27 +248,51 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 .else_branch = self.emptyBranch(else_block),
             } });
             self.enterBlock(then_block);
-            const then_value = try self.value(expression.then_value);
-            const argument = self.next_argument;
-            self.next_argument += 1;
+            const then_value = try self.block(expression.then_block);
+            const argument: u32 = @intCast(self.block_argument_types.items.len);
+            try self.block_argument_types.append(self.ctx.allocator(), .never);
             const merge_block = try self.newBlock(argument, argument + 1);
-            const then_branch = try self.valueBranch(merge_block, .{ .value = then_value.id });
-            self.terminate(.{ .branch = then_branch });
+            const then_branch = if (then_value) |then_result| blk: {
+                const branch = try self.valueBranch(merge_block, .{ .value = then_result.id });
+                self.terminate(.{ .branch = branch });
+                break :blk branch;
+            } else null;
 
             self.enterBlock(else_block);
-            const else_value = try self.value(expression.else_value);
-            const joined = try joinTypes(self.type_interner, then_value.type_id, else_value.type_id, self.ctx.allocator());
-            self.block_argument_types[argument] = joined;
-            self.branch_arguments.items[then_branch.arguments.start] = (try coerceValue(self.type_interner, then_value.id, then_value.type_id, joined)) orelse unreachable;
-            const else_use = (try coerceValue(self.type_interner, else_value.id, else_value.type_id, joined)) orelse unreachable;
-            self.terminate(.{ .branch = try self.valueBranch(merge_block, else_use) });
+            const else_value = try self.block(expression.else_block);
+            if (then_value == null and else_value == null) {
+                self.enterBlock(merge_block);
+                self.terminate(.diverge);
+                return .{ .id = @enumFromInt(argument), .type_id = .never };
+            }
+
+            const joined = if (then_value) |then_result|
+                if (else_value) |else_result|
+                    try joinTypes(self.type_interner, then_result.type_id, else_result.type_id, self.ctx.allocator())
+                else
+                    then_result.type_id
+            else
+                else_value.?.type_id;
+            self.block_argument_types.items[argument] = joined;
+            if (then_value) |then_result| {
+                const branch = then_branch.?;
+                self.branch_arguments.items[branch.arguments.start] = (try coerceValue(self.type_interner, then_result.id, then_result.type_id, joined)) orelse unreachable;
+            }
+            if (else_value) |else_result| {
+                const else_use = (try coerceValue(self.type_interner, else_result.id, else_result.type_id, joined)) orelse unreachable;
+                self.terminate(.{ .branch = try self.valueBranch(merge_block, else_use) });
+            }
             self.enterBlock(merge_block);
             return .{ .id = @enumFromInt(argument), .type_id = joined };
         }
 
         fn appendInstruction(self: *Self, instruction: structures.FunctionInstruction) !Value {
             std.debug.assert(self.current_block != null);
-            const id = structures.functionInstructionValue(self.block_argument_types.len, self.instructions.items.len);
+            const instruction_index = std.math.cast(u31, self.instructions.items.len) orelse return error.AnalysisTooLarge;
+            // The final block-argument count is known only after CFG construction.
+            // Temporary high-bit IDs keep instruction and argument values distinct;
+            // finish() rewrites them into the published contiguous namespace.
+            const id: structures.FunctionValueId = @enumFromInt(@as(u32, 1) << 31 | @as(u32, instruction_index));
             try self.instructions.append(self.ctx.allocator(), instruction);
             return .{ .id = id, .type_id = instruction.resultType() };
         }
@@ -256,9 +316,9 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
         }
 
         fn terminate(self: *Self, terminator: structures.FunctionTerminator) void {
-            const block = &self.blocks.items[@intFromEnum(self.current_block.?)];
-            block.instruction_end = @intCast(self.instructions.items.len);
-            block.terminator = terminator;
+            const current = &self.blocks.items[@intFromEnum(self.current_block.?)];
+            current.instruction_end = @intCast(self.instructions.items.len);
+            current.terminator = terminator;
             self.current_block = null;
         }
 
@@ -276,6 +336,15 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
         fn finish(self: *Self) !structures.FunctionBodyAnalysis {
             std.debug.assert(self.current_block == null);
             const gpa = self.ctx.allocator();
+            const argument_count: u32 = @intCast(std.math.cast(u31, self.block_argument_types.items.len) orelse return error.AnalysisTooLarge);
+            normalizeInstructions(self.instructions.items, argument_count);
+            normalizeValueUses(self.call_arguments.items, argument_count);
+            normalizeValueUses(self.branch_arguments.items, argument_count);
+            normalizeTerminators(self.blocks.items, argument_count);
+            const block_argument_types = try self.block_argument_types.toOwnedSlice(gpa);
+            errdefer gpa.free(block_argument_types);
+            const call_arguments = try self.call_arguments.toOwnedSlice(gpa);
+            errdefer gpa.free(call_arguments);
             const instructions = try self.instructions.toOwnedSlice(gpa);
             errdefer gpa.free(instructions);
             const blocks = try self.blocks.toOwnedSlice(gpa);
@@ -283,21 +352,61 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             const branches = try self.branch_arguments.toOwnedSlice(gpa);
             const body: structures.FunctionBodyAnalysis = .{
                 .return_type = self.return_type,
-                .block_argument_types = self.block_argument_types,
-                .call_arguments = self.call_arguments,
+                .block_argument_types = block_argument_types,
+                .call_arguments = call_arguments,
                 .branch_arguments = branches,
                 .instructions = instructions,
                 .blocks = blocks,
                 .entry = @enumFromInt(0),
             };
-            self.block_argument_types = &.{};
-            self.call_arguments = &.{};
             return body;
         }
     };
 }
 
+fn normalizeValue(value: structures.FunctionValueId, argument_count: u32) structures.FunctionValueId {
+    const instruction_mask: u32 = 1 << 31;
+    const raw = @intFromEnum(value);
+    if (raw & instruction_mask == 0) return value;
+    return @enumFromInt(argument_count + (raw & ~instruction_mask));
+}
+
+fn normalizeValueUse(value_use: *structures.FunctionValueUse, argument_count: u32) void {
+    value_use.value = normalizeValue(value_use.value, argument_count);
+}
+
+fn normalizeValueUses(value_uses: []structures.FunctionValueUse, argument_count: u32) void {
+    for (value_uses) |*value_use| normalizeValueUse(value_use, argument_count);
+}
+
+fn normalizeInstructions(instructions: []structures.FunctionInstruction, argument_count: u32) void {
+    for (instructions) |*instruction| switch (instruction.*) {
+        .consti, .const_unit, .const_none => {},
+        .variant_coerce => |*coercion| coercion.operand = normalizeValue(coercion.operand, argument_count),
+        .call => {},
+        .exit, .negi => |*operand| operand.* = normalizeValue(operand.*, argument_count),
+        .addi, .subi, .muli, .divsi => |*operands| {
+            operands.lhs = normalizeValue(operands.lhs, argument_count);
+            operands.rhs = normalizeValue(operands.rhs, argument_count);
+        },
+    };
+}
+
+fn normalizeTerminators(blocks: []structures.FunctionBlock, argument_count: u32) void {
+    for (blocks) |*block_value| switch (block_value.terminator) {
+        .branch, .diverge => {},
+        .predicate_branch => |*predicate| {
+            predicate.operands.lhs = normalizeValue(predicate.operands.lhs, argument_count);
+            predicate.operands.rhs = normalizeValue(predicate.operands.rhs, argument_count);
+        },
+        .return_unit => {},
+        .return_value => |*value_use| normalizeValueUse(value_use, argument_count),
+    };
+}
+
 fn joinTypes(type_interner: anytype, left: structures.TypeId, right: structures.TypeId, gpa: std.mem.Allocator) !structures.TypeId {
+    if (left == .never) return right;
+    if (right == .never) return left;
     if (left == right) return left;
 
     const left_members = (try type_interner.variantMembers(left)) orelse &.{left};

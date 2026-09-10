@@ -124,7 +124,7 @@ const LocationPlan = struct {
                 markBranchArguments(ssa, predicate.else_branch, needed);
             },
             .return_value => |value| needed[@intFromEnum(value.value)] = true,
-            .return_unit => {},
+            .return_unit, .diverge => {},
         };
         // One reusable area handles every call this function makes. After the
         // prologue, this function's own incoming arguments remain above its
@@ -375,6 +375,7 @@ fn FunctionEmitter(comptime Types: type) type {
                 .predicate_branch => |predicate| try self.emitPredicateBranch(ssa, predicate),
                 .return_unit => try self.emitReturn(null, .unit),
                 .return_value => |value| try self.emitReturn(value, ssa.return_type),
+                .diverge => {},
             }
         }
 

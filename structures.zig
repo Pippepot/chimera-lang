@@ -397,6 +397,7 @@ pub const TypeId = enum(u32) {
     int,
     unit,
     none,
+    never,
     _,
 
     const interned_mask: u32 = 1 << 31;
@@ -412,7 +413,7 @@ pub const TypeId = enum(u32) {
     }
 
     pub fn isPrimitive(self: TypeId) bool {
-        return self == .int or self == .unit or self == .none;
+        return self == .int or self == .unit or self == .none or self == .never;
     }
 };
 
@@ -483,6 +484,7 @@ pub const FunctionTerminator = union(enum) {
     },
     return_unit,
     return_value: FunctionValueUse,
+    diverge,
 };
 
 pub const FunctionBlock = struct {
@@ -532,8 +534,9 @@ pub const FunctionInstruction = union(enum) {
     pub fn resultType(self: FunctionInstruction) TypeId {
         return switch (self) {
             .consti, .negi, .addi, .subi, .muli, .divsi => .int,
-            .const_unit, .exit => .unit,
+            .const_unit => .unit,
             .const_none => .none,
+            .exit => .never,
             .variant_coerce => |coercion| coercion.target_type,
             .call => |call| call.return_type,
         };
@@ -698,8 +701,7 @@ pub const Diagnostic = struct {
         parameter_type_missing,
         parameter_type_not_supported,
         return_type_not_supported,
-        entry_statement_not_supported,
-        body_shape_not_supported,
+        top_level_return,
         expression_not_supported,
         duplicate_local_binding,
         local_type_not_supported,
@@ -708,7 +710,6 @@ pub const Diagnostic = struct {
         integer_literal_out_of_range,
         fallible_condition_not_supported,
         if_condition_not_fallible,
-        if_branch_shape_not_supported,
         value_not_callable,
         duplicate_variant_member_type,
         local_type_mismatch,

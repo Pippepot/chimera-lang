@@ -42,6 +42,9 @@ static identity: func(int) int = func(a: int) int -> a
 static noop = func()
     return
 
+# A return exits its reachable path. Every reachable path of a non-unit
+# function must return a compatible value or diverge.
+
 # '->' introduces an inline body with an implicit return.
 static double = func(a: int) int -> a * 2
 
@@ -112,6 +115,7 @@ func read_a(s: S) int
 # Variants
 # Variants are structural sets: flatten nested variants, ignore member order,
 # and reject duplicate member types.
+# never contributes no member, so T | never is T.
 static int_or_float = int | float
 static number_or_bool = int_or_float | bool # same as bool | float | int
 
@@ -178,6 +182,7 @@ if 1 < 2 -> exit(1)
 else exit(0)
 
 # The selected branch's final expression is the result.
+# A branch that reaches its end without a final value expression produces unit.
 # Different branch types join into a variant; never contributes no member.
 # Joins flatten variants and count shared members once.
 const a: int = if 1 < 2 -> 1 else 2
@@ -188,7 +193,14 @@ else if 3 < 5
 else true
 const c: int = if 1 < 2 -> 1 else exit(0)
 
-# Without 'else', an if has type unit and discards its body value.
+# Without 'else', the failure path produces unit and joins with the body value
+# like an explicit 'else ()'.
+const maybe: int | unit = if 1 < 2 -> 1
+
+# Function and conditional bodies are lexical scopes. A local is visible after
+# its declaration through the rest of its scope, but cannot escape that scope.
+# A declaration cannot reuse a name that is already visible; sibling scopes may
+# reuse the same name.
 
 
 # Match

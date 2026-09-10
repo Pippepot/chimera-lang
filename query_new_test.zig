@@ -746,6 +746,7 @@ test "variant types are structurally interned in canonical member order" {
     try testing.expect(structures.TypeId.int.interned() == null);
     try testing.expect(structures.TypeId.unit.interned() == null);
     try testing.expect(structures.TypeId.none.interned() == null);
+    try testing.expect(structures.TypeId.never.interned() == null);
 
     const variant = try db.lookupInterned(query_structures.VariantTypes, int_or_unit.interned().?);
     try testing.expectEqualSlices(structures.TypeId, &.{ .int, .unit }, variant.members);
@@ -778,6 +779,10 @@ test "variant types are structurally interned in canonical member order" {
         structures.InternVariantResult{ .duplicate = .unit },
         (try db.get(InternVariantTriple, .{ .none, .unit, int_or_unit })).*,
     );
+    try testing.expectEqual(
+        structures.InternVariantResult{ .type_id = .int },
+        (try db.get(InternVariantPair, .{ .int, .never })).*,
+    );
 }
 
 test "variant interning owns canonical members" {
@@ -807,6 +812,10 @@ test "type layout reports generic size and alignment for variants" {
     try testing.expectEqual(
         structures.TypeLayout{ .byte_size = 0, .byte_alignment = 1 },
         (try db.get(query_structures.TypeLayout, .none)).*,
+    );
+    try testing.expectEqual(
+        structures.TypeLayout{ .byte_size = 0, .byte_alignment = 1 },
+        (try db.get(query_structures.TypeLayout, .never)).*,
     );
 
     const int_or_none = switch ((try db.get(InternVariantPair, .{ .int, .none })).*) {
@@ -1740,7 +1749,7 @@ test "declared unit functions analyze lower compile and execute as ordinary call
     try testing.expectEqual(@as(u8, 0), runtime.runProg(io, testing.allocator, &.{}));
 }
 
-test "exit is an unshadowable int to unit intrinsic" {
+test "exit is an unshadowable int to never intrinsic" {
     const db = try testDatabase(2);
     defer db.deinit();
 
@@ -1759,7 +1768,7 @@ test "exit is an unshadowable int to unit intrinsic" {
     try testing.expectEqual(@as(usize, 2), body.instructions.len);
     try testing.expectEqual(@as(i32, 1), body.instructions[0].consti);
     try testing.expectEqual(@as(u32, 0), @intFromEnum(body.instructions[1].exit));
-    try testing.expectEqual(structures.FunctionBodyAnalysis.Terminator.return_unit, body.blocks[0].terminator);
+    try testing.expectEqual(structures.FunctionBodyAnalysis.Terminator.diverge, body.blocks[0].terminator);
 
     const artifact = (try db.get(query_structures.CompileFunction, .{ .item = caller_id })).*.?;
     try testing.expectEqual(@as(usize, 0), artifact.relocations.len);
@@ -2001,6 +2010,179 @@ test "unit branch results join without a machine value" {
     try runtime.writeProgram(io, executable.bytes);
     defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
     try testing.expectEqual(@as(u8, 0), runtime.runProg(io, testing.allocator, &.{}));
+}
+
+test "no-else if joins its body with implicit unit" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static selected = func() int | unit -> return if 1 < 2 -> 42
+        \\static skipped = func() int | unit -> return if 2 < 1 -> 42
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const selected = (try db.get(query_structures.AnalyzeFunctionBody, scope.resolve("selected").?)).*.?;
+    try testing.expectEqual(@as(usize, 1), selected.block_argument_types.len);
+    const result_type = selected.block_argument_types[0];
+    try testing.expectEqual(selected.return_type, result_type);
+    const members = (try db.lookupInterned(query_structures.VariantTypes, result_type.interned().?)).members;
+    try testing.expectEqualSlices(structures.TypeId, &.{ .int, .unit }, members);
+
+    try expectCompiledVariantWord(db, 1, "selected", &.{"selected"}, 0, 0);
+    try expectCompiledVariantWord(db, 1, "selected", &.{"selected"}, 4, 42);
+    try expectCompiledVariantWord(db, 1, "skipped", &.{"skipped"}, 0, 1);
+}
+
+test "multi-statement branches keep locals lexical and skip unselected effects" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static answer = func() int
+        \\  const selected = if 1 < 2
+        \\    const local = 20
+        \\    local + 1
+        \\  else
+        \\    const local = exit(99)
+        \\    0
+        \\  const other = if 2 < 1
+        \\    exit(98)
+        \\  else
+        \\    const local = 20
+        \\    local + 1
+        \\  return selected + other
+    );
+    try expectCompiledFunctionResult(db, 1, "answer", &.{"answer"}, 42);
+
+    try addSource(db, 2,
+        \\static bad = func() int
+        \\  const value = if 1 < 2
+        \\    const hidden = 42
+        \\    hidden
+        \\  else 0
+        \\  return hidden + value
+    );
+    const bad_id = (try db.get(query_structures.BuildModuleScope, 2)).*.?.resolve("bad").?;
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, bad_id)).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, bad_id, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(structures.Diagnostic.Kind.unknown_value, diagnostics[0].kind);
+}
+
+test "top-level conditionals support general scoped statements" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\if 1 < 2
+        \\  const code = 40 + 2
+        \\  exit(code)
+        \\else
+        \\  exit(99)
+    );
+    const executable = (try db.get(query_structures.BuildExecutable, 1)).*.?;
+    const io = testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    try runtime.writeProgram(io, executable.bytes);
+    try testing.expectEqual(@as(u8, 42), runtime.runProg(io, testing.allocator, &.{}));
+}
+
+test "early returns terminate only their reachable paths" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static choose = func(value: int) int
+        \\  if value < 0
+        \\    return 20
+        \\  const result = 22
+        \\  return result
+        \\static nested = func(value: int) int
+        \\  return if value < 0
+        \\    return 20
+        \\  else
+        \\    22
+        \\static answer = func() int -> choose(-1) + nested(1)
+    );
+    try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "choose", "nested" }, 42);
+}
+
+test "return completeness accepts divergence and rejects reachable fallthrough" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static complete = func(value: int) int
+        \\  if value < 0 -> return 20 else return 22
+        \\static stop = func() never -> exit(42)
+        \\static unit_fallthrough = func()
+        \\  const ignored = 1 + 2
+        \\stop()
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const complete = (try db.get(query_structures.AnalyzeFunctionBody, scope.resolve("complete").?)).*.?;
+    try testing.expectEqual(structures.TypeId.int, complete.return_type);
+    const stop = (try db.get(query_structures.AnalyzeFunctionBody, scope.resolve("stop").?)).*.?;
+    try testing.expectEqual(structures.TypeId.never, stop.return_type);
+    try testing.expectEqual(structures.FunctionBodyAnalysis.Terminator.diverge, stop.blocks[0].terminator);
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, scope.resolve("unit_fallthrough").?)).* != null);
+    try testing.expect((try db.get(query_structures.BuildExecutable, 1)).* != null);
+
+    try addSource(db, 2,
+        \\static incomplete = func(value: int) int
+        \\  if value < 0 -> return 1
+    );
+    const incomplete_id = (try db.get(query_structures.BuildModuleScope, 2)).*.?.resolve("incomplete").?;
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, incomplete_id)).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, incomplete_id, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(structures.Diagnostic.Kind{ .missing_return_value = .int }, diagnostics[0].kind);
+
+    try addSource(db, 3,
+        \\static incomplete = func() int | unit
+        \\  const value = 1
+    );
+    const variant_id = (try db.get(query_structures.BuildModuleScope, 3)).*.?.resolve("incomplete").?;
+    const return_type = (try db.get(query_structures.FunctionSignature, variant_id)).*.?.return_type;
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, variant_id)).* == null);
+    const variant_diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, variant_id, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(variant_diagnostics);
+    try testing.expectEqual(@as(usize, 1), variant_diagnostics.len);
+    try testing.expectEqual(structures.Diagnostic.Kind{ .missing_return_value = return_type }, variant_diagnostics[0].kind);
+}
+
+test "edits that change return reachability update only reachable calls" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static leaf = func() int -> 42
+        \\static answer = func(value: int) int
+        \\  if value < 0 -> return 1
+        \\  return leaf()
+        \\answer(1)
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const answer_id = scope.resolve("answer").?;
+    const leaf_id = scope.resolve("leaf").?;
+    const reachable = (try db.get(query_structures.CollectReachableInstances, 1)).*.?;
+    try testing.expectEqual(@as(usize, 3), reachable.instances.len);
+    try testing.expectEqual(leaf_id, reachable.instances[2].item);
+
+    try setSource(db, 1,
+        \\static leaf = func() int -> 42
+        \\static answer = func(value: int) int
+        \\  if value < 0 -> return 1 else return 2
+        \\  return leaf()
+        \\answer(1)
+    );
+    const updated = (try db.get(query_structures.AnalyzeFunctionBody, answer_id)).*.?;
+    try testing.expectEqual(@as(usize, 0), updated.call_arguments.len);
+    const updated_reachable = (try db.get(query_structures.CollectReachableInstances, 1)).*.?;
+    try testing.expectEqual(@as(usize, 2), updated_reachable.instances.len);
+    try testing.expectEqual(answer_id, updated_reachable.instances[1].item);
 }
 
 test "parameters and nested call arguments form one typed value graph" {
@@ -2274,7 +2456,7 @@ test "function signature rejects invalid parameter and return types without dupl
     }
 }
 
-test "function body analysis rejects unsupported body forms and literals" {
+test "function body analysis rejects unsupported expressions and literals" {
     const db = try testDatabase(2);
     defer db.deinit();
 
@@ -2387,7 +2569,7 @@ test "malformed function diagnostics remain parse-only and top-level return stay
     try testing.expect((try db.get(query_structures.CompileFunction, entry_instance)).* == null);
     try testing.expect((try db.get(query_structures.BuildExecutable, 2)).* == null);
     const return_span: structures.SourceSpan = .{ .start = 0, .end = "return".len };
-    const entry_kind: structures.Diagnostic.Kind = .entry_statement_not_supported;
+    const entry_kind: structures.Diagnostic.Kind = .top_level_return;
     try expectSingleQueryDiagnostic(db, query_structures.AnalyzeFunctionBody, entry_id, true, 2, return_span, entry_kind);
     try expectSingleQueryDiagnostic(db, query_structures.CompileFunction, entry_instance, false, 2, return_span, entry_kind);
     const entry_diagnostics = try db.transitiveAccumulatorValues(query_structures.BuildExecutable, 2, structures.Diagnostic, testing.allocator);
@@ -2407,7 +2589,7 @@ test "entry analysis rejects top-level returns" {
         .{ .source = "return", .marker = "return" },
         .{ .source = "static ok = 1\nreturn 7\nprint(1)", .marker = "return" },
     };
-    const entry_kind: structures.Diagnostic.Kind = .entry_statement_not_supported;
+    const entry_kind: structures.Diagnostic.Kind = .top_level_return;
 
     for (cases, 10..) |case, file_id| {
         try addSource(db, file_id, case.source);
@@ -2505,7 +2687,7 @@ test "entry analysis validates all root syntax before resolving a call" {
         marker: []const u8,
         kind: structures.Diagnostic.Kind,
     }{
-        .{ .source = "static bad = func() foo -> return 1\nbad()\nreturn", .marker = "return", .kind = .entry_statement_not_supported },
+        .{ .source = "static bad = func() foo -> return 1\nbad()\nreturn", .marker = "return", .kind = .top_level_return },
         .{ .source = "static f = func() int -> return 1\nf()()", .marker = "(", .kind = .expression_not_supported },
     };
 

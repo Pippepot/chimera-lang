@@ -9,17 +9,17 @@ The incremental pipeline works end to end. The next goal is to generalize bodies
 | Area | Implemented | Main gap |
 | --- | --- | --- |
 | Pipeline | Owned AST, stable item IDs, concurrent incremental queries, diagnostics, per-function SSA/code, reachable linking, Linux ELF CLI | Single-file callable scope; no generic instances or cross-run cache |
-| Functions | Named and static-bound declarations, typed parameters, direct calls, omitted `unit` return type, inline implicit return, explicit final returns | General bodies, fallible functions, parameter modifiers, callable values |
-| Values | Decimal `int`, `unit`/`()`, `none`, immutable locals, calls, integer negation and `+ - * /` | Mutable locals, assignments, `bool`, `float`, `never`, general type values |
+| Functions | Named and static-bound declarations, typed parameters, direct calls, general statement bodies, unit fallthrough, early returns | Fallible functions, parameter modifiers, callable values |
+| Values | Decimal `int`, `unit`/`()`, `none`, `never`, immutable locals, calls, integer negation and `+ - * /` | Mutable locals, assignments, `bool`, `float`, general type values |
 | Variants | Canonical sets over `int`, `unit`, `none`; structural branch unions; layout, member injection, locals, calls, returns; subset widening at bindings, arguments, and returns | Named aliases, inspection/extraction |
-| Control flow | Value-producing `if/else` over integer comparisons; one expression per branch, including nested conditionals | No-else/statement `if`, general branch blocks, short-circuit logic, early returns, loops, match |
+| Control flow | Value-producing `if` over integer comparisons, implicit-unit no-else joins, general lexical branch blocks, divergence-aware joins and returns | Short-circuit logic, loops, match |
 | Backend | Full-layout values, symbolic calls, recursion, arbitrary CFG edges, parallel edge copies | Frontend cannot yet produce all supported graphs; no external ABI |
 
-Named function declarations canonicalize to static-bound function values during parsing. Inline bodies acquire an implicit return, and an omitted return annotation means `unit`; block bodies still require a final explicit return until general body control flow is implemented. Annotations on the static function binding itself remain unsupported and are rejected when the function signature is demanded. Direct `unit` and `none` values work at binding, call, and return boundaries as well as inside variants.
+Named function declarations canonicalize to static-bound function values during parsing. Inline bodies acquire an implicit return, and an omitted return annotation means `unit`. Block bodies accept general supported statements; unit functions may fall through, while every reachable path of other functions must return or diverge. Annotations on the static function binding itself remain unsupported and are rejected when the function signature is demanded. Direct `unit` and `none` values work at binding, call, and return boundaries as well as inside variants.
 
-`exit(int)` emits a syscall but is still typed as `unit`, contrary to the specified `never` result.
+`exit(int)` remains an inline syscall implementation but is typed as `never` and terminates its control-flow path.
 
-Top-level analysis accepts immutable locals and calls, skips static initializers, and synthesizes a unit return. Successfully parsing a static initializer does not mean it was validated or evaluated. Discovery recognizes only static function initializers; uncalled bodies remain demand-driven. The parser also recognizes some future syntax—structs, parameter modifiers, `comptime`, `is`/`as`, `?`, and `sizeof`—without runtime semantics. `fallible`, `match`, and `loop` still need parser work.
+Top-level analysis accepts supported expressions, immutable locals, and general conditionals, skips static initializers, and synthesizes a unit return on reachable fallthrough. Successfully parsing a static initializer does not mean it was validated or evaluated. Discovery recognizes only static function initializers; uncalled bodies remain demand-driven. The parser also recognizes some future syntax—structs, parameter modifiers, `comptime`, `is`/`as`, `?`, and `sizeof`—without runtime semantics. `fallible`, `match`, and `loop` still need parser work.
 
 ## Priorities
 
@@ -36,10 +36,10 @@ Equivalent source forms retain equal typed and compiled results. Widening works 
 
 ### 2. Generalize bodies and control flow
 
-The current final-return and single-expression-branch restrictions block most of the language. Address them in dependent slices:
+General bodies and return control flow are complete. Finish the milestone with mutable loop-carried state:
 
-1. Add lexical block scopes, general statements in function and top-level bodies, multi-statement branch bodies, and `if` without `else`, discarding its body value and producing unit. Support ordinary unit fallthrough and reachable early returns in functions.
-2. Add `never` with divergence-aware joins and return-path completeness. Type `exit` correctly while keeping its inline implementation; runtime-symbol linking is not a prerequisite. Implement this alongside the first slice wherever return paths require it.
+1. **Done:** lexical block scopes, general statements in function and top-level bodies, multi-statement branch bodies, and `if` without `else`, joining its body value with an implicit unit failure branch. Ordinary unit fallthrough and reachable early returns are supported in functions.
+2. **Done:** `never`, divergence-aware joins, return-path completeness, and correctly typed inline `exit`; runtime-symbol linking remains unnecessary.
 3. Add mutable locals and assignments, then `loop`, `break` values, and `continue`. Use existing block arguments, backedges, and parallel copies for loop-carried state.
 
 **Done:** branch-local names stay local; mixed returning/diverging paths type correctly; missing returns are diagnosed; loop break values join correctly. Tests cover evaluation order, skipped effects, mutation across backedges, and edits that change reachability.

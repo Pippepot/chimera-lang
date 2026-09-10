@@ -72,6 +72,7 @@ fn renderSsaFunction(
                 try renderValueUse(value, writer);
                 try writer.writeByte('\n');
             },
+            .diverge => try writer.writeAll("    diverge\n"),
         }
     }
     try writer.writeByte('\n');

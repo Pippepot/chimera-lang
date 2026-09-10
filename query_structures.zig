@@ -163,6 +163,14 @@ pub fn internVariantType(ctx: anytype, members: []const structures.TypeId) !stru
     for (canonical.items[1..], canonical.items[0 .. canonical.items.len - 1]) |member, previous| {
         if (member == previous) return .{ .duplicate = member };
     }
+    for (canonical.items, 0..) |member, index| {
+        if (member == .never) {
+            _ = canonical.orderedRemove(index);
+            break;
+        }
+    }
+    if (canonical.items.len == 0) return .{ .type_id = .never };
+    if (canonical.items.len == 1) return .{ .type_id = canonical.items[0] };
 
     const interned_id = try ctx.intern(VariantTypes, .{ .members = canonical.items });
     return .{ .type_id = .fromInterned(interned_id) };
@@ -203,7 +211,7 @@ pub const TypeLayout = struct {
 
     pub fn run(ctx: anytype, type_id: Input) anyerror!Output {
         if (type_id == .int) return .{ .byte_size = 4, .byte_alignment = 4 };
-        if (type_id == .unit or type_id == .none) return .{ .byte_size = 0, .byte_alignment = 1 };
+        if (type_id == .unit or type_id == .none or type_id == .never) return .{ .byte_size = 0, .byte_alignment = 1 };
 
         return (try ctx.get(VariantLayout, type_id)).layout;
     }
