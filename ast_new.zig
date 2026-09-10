@@ -225,6 +225,23 @@ fn parseBody(parser: *ParserState) !Node.Index {
     return try parseBlock(parser);
 }
 
+fn parseCallableBody(parser: *ParserState) !Node.Index {
+    if (parser.eat(.arrow) == null) {
+        _ = try parser.expect(.indent);
+        return parseBlock(parser);
+    }
+
+    const expression = try parseRequiredExpression(parser);
+    return switch (parser.nodes.items[expression.index()].tag) {
+        .return_nothing, .return_expr => expression,
+        else => parser.addNode(.{
+            .tag = .return_expr,
+            .token_index = parser.nodes.items[expression.index()].token_index,
+            .data = .{ .node = expression },
+        }),
+    };
+}
+
 fn parseReturn(parser: *ParserState) !Node.Index {
     const token_index = parser.index;
     const return_token = try parser.expect(.keyword_return);
@@ -289,9 +306,11 @@ fn parseIfExpr(parser: *ParserState) ParseError!Node.Index {
 fn parseFunction(parser: *ParserState) !Node.Index {
     const token_index = parser.index;
     _ = try parser.expect(.keyword_func);
+    const name_token_index: ?u32 = if (parser.eat(.identifier) != null) parser.index - 1 else null;
     const signature = try parseFuncSignature(parser);
-    const body = try parseBody(parser);
-    return parser.addNode(.{ .tag = .func, .token_index = token_index, .data = .{ .node_node = .{ .a = signature, .b = body } } });
+    const body = try parseCallableBody(parser);
+    const value = try parser.addNode(.{ .tag = .func, .token_index = token_index, .data = .{ .node_node = .{ .a = signature, .b = body } } });
+    return finishNamedDeclaration(parser, name_token_index, value);
 }
 
 fn parseFuncSignature(parser: *ParserState) !Node.Index {
@@ -493,7 +512,11 @@ fn parsePrimary(parser: *ParserState) ParseError!Node.Index {
         .keyword_struct => try parseStruct(parser),
         .identifier => try parseTokenNode(parser, .identifier, .identifier),
         .l_paren => {
+            const token_index = parser.index;
             _ = parser.eat(.l_paren);
+            if (parser.eat(.r_paren) != null) {
+                return parser.addNode(.{ .tag = .unit_literal, .token_index = token_index, .data = .{ .none = {} } });
+            }
             const expr = try parseExpressionPrecedence(parser, 0);
             _ = try parser.expect(.r_paren);
             return expr;
@@ -528,6 +551,7 @@ fn parseCallArgList(parser: *ParserState) !Node.Index {
 fn parseStruct(parser: *ParserState) ParseError!Node.Index {
     const token_index = parser.index;
     _ = try parser.expect(.keyword_struct);
+    const name_token_index: ?u32 = if (parser.eat(.identifier) != null) parser.index - 1 else null;
     _ = try parser.expect(.indent);
     const stack_top = parser.scratch_stack.items.len;
     defer parser.scratch_stack.shrinkRetainingCapacity(stack_top);
@@ -540,11 +564,15 @@ fn parseStruct(parser: *ParserState) ParseError!Node.Index {
         try parser.scratch_stack.append(parser.gpa, item);
     }
 
-    return try parser.addNode(.{ .tag = .@"struct", .token_index = token_index, .data = try parser.listToSpan(parser.scratch_stack.items[stack_top..]) });
+    const value = try parser.addNode(.{ .tag = .@"struct", .token_index = token_index, .data = try parser.listToSpan(parser.scratch_stack.items[stack_top..]) });
+    return finishNamedDeclaration(parser, name_token_index, value);
 }
 
 fn parseStructItem(parser: *ParserState) ParseError!Node.Index {
     if ((try parseBinding(parser)).unwrap()) |binding| return binding;
+    if (parser.tokens[parser.index].tag == .keyword_func or parser.tokens[parser.index].tag == .keyword_struct) {
+        return parseExpression(parser);
+    }
     return switch (parser.tokens[parser.index + 1].tag) {
         .equal => try parseStructProperty(parser),
         else => try parseStructField(parser),
@@ -631,6 +659,15 @@ fn addNodeList(parser: *ParserState, token_index: u32, items: []const Node.Index
     return parser.addNode(.{ .tag = tag, .token_index = token_index, .data = try parser.listToSpan(items) });
 }
 
+fn finishNamedDeclaration(parser: *ParserState, name_token_index: ?u32, value: Node.Index) !Node.Index {
+    const token_index = name_token_index orelse return value;
+    return parser.addNode(.{
+        .tag = .static_binding,
+        .token_index = token_index,
+        .data = .{ .node_node = .{ .a = .null, .b = value } },
+    });
+}
+
 fn parseTokenNode(parser: *ParserState, token: Token.Tag, tag: Node.Tag) !Node.Index {
     _ = try parser.expect(token);
     return parser.addNode(.{ .tag = tag, .token_index = parser.index - 1, .data = .{ .none = {} } });
@@ -683,6 +720,7 @@ fn renderNode(gpa: std.mem.Allocator, node_index: Node.Index, ast: *const Ast, s
             const loc = ast.tokens[node.token_index].loc;
             try writer.print(" : {s}\n", .{source[loc.start..loc.end]});
         },
+        .unit_literal => try writer.writeAll(" : ()\n"),
         .return_expr, .not, .neg, .query_op, .move_expr, .comptime_expr, .sizeof_expr, .field_access, .struct_field, .struct_property, .struct_init_field => {
             if (node.tag == .field_access or node.tag == .struct_field or node.tag == .struct_property or node.tag == .struct_init_field) {
                 const loc = ast.tokens[node.token_index].loc;
@@ -740,6 +778,36 @@ test "parse inline function no parameters" {
         \\  │ └─type : int
         \\  └─return_expr
         \\    └─number_literal : 1
+    );
+}
+
+test "parse named function declaration and implicit inline return" {
+    try testParsing(
+        \\func double(x: int) int -> x * 2
+    ,
+        \\static_binding
+        \\└─func
+        \\  ├─signature
+        \\  │ ├─param_list
+        \\  │ │ └─param : x
+        \\  │ │   └─type : int
+        \\  │ └─type : int
+        \\  └─return_expr
+        \\    └─mul
+        \\      ├─identifier : x
+        \\      └─number_literal : 2
+    );
+}
+
+test "parse unit value spellings" {
+    try testParsing(
+        \\const word = unit
+        \\const punctuation = ()
+    ,
+        \\const_binding
+        \\└─identifier : unit
+        \\const_binding
+        \\└─unit_literal : ()
     );
 }
 
@@ -1000,13 +1068,14 @@ test "parse struct ownership hook functions" {
         \\  │   │ │   ├─access : read
         \\  │   │ │   └─type : Box
         \\  │   │ └─type : Box
-        \\  │   └─struct_init
-        \\  │     ├─identifier : Box
-        \\  │     └─struct_init_field : x
-        \\  │       └─add
-        \\  │         ├─field_access : x
-        \\  │         │ └─identifier : self
-        \\  │         └─number_literal : 1
+        \\  │   └─return_expr
+        \\  │     └─struct_init
+        \\  │       ├─identifier : Box
+        \\  │       └─struct_init_field : x
+        \\  │         └─add
+        \\  │           ├─field_access : x
+        \\  │           │ └─identifier : self
+        \\  │           └─number_literal : 1
         \\  └─struct_property : move
         \\    └─func
         \\      ├─signature
@@ -1015,13 +1084,29 @@ test "parse struct ownership hook functions" {
         \\      │ │   ├─access : var
         \\      │ │   └─type : Box
         \\      │ └─type : Box
-        \\      └─struct_init
-        \\        ├─identifier : Box
-        \\        └─struct_init_field : x
-        \\          └─add
-        \\            ├─field_access : x
-        \\            │ └─identifier : self
-        \\            └─number_literal : 10
+        \\      └─return_expr
+        \\        └─struct_init
+        \\          ├─identifier : Box
+        \\          └─struct_init_field : x
+        \\            └─add
+        \\              ├─field_access : x
+        \\              │ └─identifier : self
+        \\              └─number_literal : 10
+    );
+}
+
+test "parse named struct declaration through common declaration sugar" {
+    try testParsing(
+        \\struct Pair
+        \\  left: int
+        \\  right: int
+    ,
+        \\static_binding
+        \\└─struct
+        \\  ├─struct_field : left
+        \\  │ └─type : int
+        \\  └─struct_field : right
+        \\    └─type : int
     );
 }
 

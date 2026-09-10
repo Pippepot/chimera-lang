@@ -1,21 +1,21 @@
 # Roadmap
 
-Implementation audit: 2026-09-08, Zig 0.16.0.
+Implementation audit: 2026-09-10, Zig 0.16.0.
 
-The incremental pipeline works end to end. The next goal is to make the language in [syntax&semantics.txt](syntax&semantics.txt) usable through small, complete feature slices. That document is authoritative but incomplete: missing rules need a language decision, while missing implementation needs code. Legacy parity is not the goal.
+The incremental pipeline works end to end. The next goal is to generalize bodies and control flow. Continue making the language in [syntax&semantics.txt](syntax&semantics.txt) usable through small, complete feature slices. That document is authoritative but incomplete: missing rules need a language decision, while missing implementation needs code. Legacy parity is not the goal.
 
 ## Current baseline
 
 | Area | Implemented | Main gap |
 | --- | --- | --- |
 | Pipeline | Owned AST, stable item IDs, concurrent incremental queries, diagnostics, per-function SSA/code, reachable linking, Linux ELF CLI | Single-file callable scope; no generic instances or cross-run cache |
-| Functions | `static f = func(...) Type`, typed parameters, direct calls, explicit final returns | Named declaration sugar, omitted unit return type, inline implicit return, fallible functions, parameter modifiers, callable values |
-| Values | Decimal `int`, `none`, immutable locals, calls, integer negation and `+ - * /` | Mutable locals, assignments, `bool`, `float`, `never`, general type values; direct unit/none support is uneven |
+| Functions | Named and static-bound declarations, typed parameters, direct calls, omitted `unit` return type, inline implicit return, explicit final returns | General bodies, fallible functions, parameter modifiers, callable values |
+| Values | Decimal `int`, `unit`/`()`, `none`, immutable locals, calls, integer negation and `+ - * /` | Mutable locals, assignments, `bool`, `float`, `never`, general type values |
 | Variants | Canonical sets over `int`, `unit`, `none`; structural branch unions; layout, member injection, locals, calls, returns; subset widening at bindings, arguments, and returns | Named aliases, inspection/extraction |
 | Control flow | Value-producing `if/else` over integer comparisons; one expression per branch, including nested conditionals | No-else/statement `if`, general branch blocks, short-circuit logic, early returns, loops, match |
 | Backend | Full-layout values, symbolic calls, recursion, arbitrary CFG edges, parallel edge copies | Frontend cannot yet produce all supported graphs; no external ABI |
 
-The supported function form still requires an explicit return, even inline: `static f = func(a: int) int -> return a`. An omitted return annotation is rejected, despite the language's unit default. Annotations on the static function binding itself are also unsupported and rejected when the function signature is demanded. Direct `unit`/`none` parameters, returns or local annotations of exactly `none`, and unit literals remain unsupported; those types already work as variant members.
+Named function declarations canonicalize to static-bound function values during parsing. Inline bodies acquire an implicit return, and an omitted return annotation means `unit`; block bodies still require a final explicit return until general body control flow is implemented. Annotations on the static function binding itself remain unsupported and are rejected when the function signature is demanded. Direct `unit` and `none` values work at binding, call, and return boundaries as well as inside variants.
 
 `exit(int)` emits a syscall but is still typed as `unit`, contrary to the specified `never` result.
 
@@ -23,16 +23,16 @@ Top-level analysis accepts immutable locals and calls, skips static initializers
 
 ## Priorities
 
-Implement these in order, splitting each milestone into reviewable changes. Extend parsing, semantics, IR, codegen, diagnostics, and incremental tests only where the feature needs them. Architecture and query mechanics are documented separately.
+Implement the remaining milestones in order, splitting each milestone into reviewable changes. Extend parsing, semantics, IR, codegen, diagnostics, and incremental tests only where the feature needs them. Architecture and query mechanics are documented separately.
 
-### 1. Make the existing value and function subset consistent
+### 1. Make the existing value and function subset consistent — done
 
-Close known contradictions before adding new type families:
+Completed before adding new type families:
 
 - Support the specified ordinary function forms: named declaration sugar, omitted return type meaning `unit`, and implicit return from an inline expression. Omission does not request return-type inference.
 - Complete zero-sized values at ordinary binding/call/return boundaries: unit spellings, direct `none`, and direct `unit` parameters. Build on existing layout support.
 
-**Done:** equivalent source forms have equivalent typed results; widening works at every currently supported expected-type boundary; narrowing and duplicate source members remain rejected. Exercise tag remapping and equal-result retention after annotation edits.
+Equivalent source forms retain equal typed and compiled results. Widening works at every currently supported expected-type boundary; narrowing and duplicate source members remain rejected. Tests cover tag remapping and equal-result retention after syntax and annotation edits.
 
 ### 2. Generalize bodies and control flow
 

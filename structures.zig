@@ -182,6 +182,7 @@ pub const Node = struct {
         identifier,
         none_literal,
         number_literal,
+        unit_literal,
         param,
         param_list,
         query_op,
@@ -240,7 +241,7 @@ pub const Ast = struct {
         for (a.nodes, b.nodes) |left, right| {
             if (left.tag != right.tag or left.token_index != right.token_index) return false;
             switch (left.tag) {
-                .return_nothing, .access, .bool_literal, .identifier, .none_literal, .number_literal, .type => {},
+                .return_nothing, .access, .bool_literal, .identifier, .none_literal, .number_literal, .unit_literal, .type => {},
                 .return_expr, .not, .neg, .query_op, .move_expr, .comptime_expr, .sizeof_expr, .field_access, .struct_field, .struct_property, .struct_init_field => {
                     if (left.data.node != right.data.node) return false;
                 },
@@ -696,7 +697,6 @@ pub const Diagnostic = struct {
         duplicate_parameter,
         parameter_type_missing,
         parameter_type_not_supported,
-        return_type_missing,
         return_type_not_supported,
         entry_statement_not_supported,
         body_shape_not_supported,

@@ -1518,7 +1518,7 @@ test "variant branch joins retain equal results and track changed member sets" {
     const db = try testDatabase(2);
     defer db.deinit();
     const format =
-        \\static noop = func() unit -> return
+        \\static noop = func() unit -> return unit
         \\static choose = func() int | unit | none
         \\  return if 1 < 2 -> (if 1 < 2 -> none else 42) else {s}
         \\choose()
@@ -1624,6 +1624,80 @@ test "function signature and body analysis support inline and block literal retu
         try testing.expectEqual(structures.TypeId.int, signature.return_type);
         try expectIntegerReturnBody((try db.get(query_structures.AnalyzeFunctionBody, function_id)).*.?, case.expected);
     }
+}
+
+test "ordinary function spellings retain equivalent semantic and compiled results" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static identity = func(value: int) int -> return value
+        \\static noop = func() unit -> return
+        \\noop()
+        \\identity(7)
+    );
+    const first_scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const identity_id = first_scope.resolve("identity").?;
+    const noop_id = first_scope.resolve("noop").?;
+    const identity_signature = try db.get(query_structures.FunctionSignature, identity_id);
+    const identity_body = try db.get(query_structures.AnalyzeFunctionBody, identity_id);
+    const identity_artifact = try db.get(query_structures.CompileFunction, .{ .item = identity_id });
+    const noop_signature = try db.get(query_structures.FunctionSignature, noop_id);
+    const noop_artifact = try db.get(query_structures.CompileFunction, .{ .item = noop_id });
+    const executable = try db.get(query_structures.BuildExecutable, 1);
+
+    try setSource(db, 1,
+        \\func identity(value: int) int -> value
+        \\func noop() -> ()
+        \\noop()
+        \\identity(7)
+    );
+    const updated_scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    try testing.expectEqual(identity_id, updated_scope.resolve("identity").?);
+    try testing.expectEqual(noop_id, updated_scope.resolve("noop").?);
+    try testing.expectEqual(identity_signature, try db.get(query_structures.FunctionSignature, identity_id));
+    try testing.expectEqual(identity_body, try db.get(query_structures.AnalyzeFunctionBody, identity_id));
+    try testing.expectEqual(identity_artifact, try db.get(query_structures.CompileFunction, .{ .item = identity_id }));
+    try testing.expectEqual(noop_signature, try db.get(query_structures.FunctionSignature, noop_id));
+    try testing.expectEqual(noop_artifact, try db.get(query_structures.CompileFunction, .{ .item = noop_id }));
+    try testing.expectEqual(executable, try db.get(query_structures.BuildExecutable, 1));
+}
+
+test "zero-sized values cross direct binding call and return boundaries" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\func pass_unit(value: unit) unit -> value
+        \\func pass_none(value: none) none -> value
+        \\func widen_unit(value: unit) int | unit | none -> value
+        \\func widen_none(value: none) int | unit | none -> value
+        \\func unit_word() unit -> unit
+        \\func unit_parens() unit -> ()
+        \\func choose_unit() int | unit | none
+        \\  const saved: unit = pass_unit(())
+        \\  return widen_unit(saved)
+        \\func choose_none() int | unit | none
+        \\  const saved: none = pass_none(none)
+        \\  return widen_none(saved)
+        \\unit_word()
+        \\unit_parens()
+        \\choose_unit()
+        \\choose_none()
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const pass_unit = scope.resolve("pass_unit").?;
+    const pass_none = scope.resolve("pass_none").?;
+    const unit_signature = (try db.get(query_structures.FunctionSignature, pass_unit)).*.?;
+    const none_signature = (try db.get(query_structures.FunctionSignature, pass_none)).*.?;
+    try testing.expectEqualSlices(structures.TypeId, &.{.unit}, unit_signature.parameter_types);
+    try testing.expectEqual(structures.TypeId.unit, unit_signature.return_type);
+    try testing.expectEqualSlices(structures.TypeId, &.{.none}, none_signature.parameter_types);
+    try testing.expectEqual(structures.TypeId.none, none_signature.return_type);
+    try testing.expect((try db.get(query_structures.BuildExecutable, 1)).* != null);
+
+    try expectCompiledVariantWord(db, 1, "choose_unit", &.{ "choose_unit", "pass_unit", "widen_unit" }, 0, 1);
+    try expectCompiledVariantWord(db, 1, "choose_none", &.{ "choose_none", "pass_none", "widen_none" }, 0, 2);
 }
 
 test "declared unit functions analyze lower compile and execute as ordinary callables" {
@@ -2182,15 +2256,13 @@ test "function signature rejects invalid parameter and return types without dupl
     const db = try testDatabase(2);
     defer db.deinit();
 
-    try addSource(db, 1, "static missing = func() -> return 1");
-    try addSource(db, 2, "static unknown = func() foo -> return 1");
-    try addSource(db, 3, "static missing_param = func(x) int -> return 1");
-    try addSource(db, 4, "static bad_param = func(x: float) int -> return 1");
-    try addSource(db, 5, "static duplicate = func(x: int, x: int) int -> return 1");
-    try addSource(db, 6, "static mode = func(read x: int) int -> return 1");
-    try addSource(db, 7, "static unit_param = func(x: unit) unit -> return");
+    try addSource(db, 1, "static unknown = func() foo -> return 1");
+    try addSource(db, 2, "static missing_param = func(x) int -> return 1");
+    try addSource(db, 3, "static bad_param = func(x: float) int -> return 1");
+    try addSource(db, 4, "static duplicate = func(x: int, x: int) int -> return 1");
+    try addSource(db, 5, "static mode = func(read x: int) int -> return 1");
 
-    for ([_]structures.FileId{ 1, 2, 3, 4, 5, 6, 7 }) |file_id| {
+    for ([_]structures.FileId{ 1, 2, 3, 4, 5 }) |file_id| {
         const function_id = (try db.get(query_structures.IndexItems, file_id)).*.?.ids()[0];
         try testing.expect((try db.get(query_structures.FunctionSignature, function_id)).* == null);
         try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, function_id)).* == null);
@@ -2208,23 +2280,22 @@ test "function body analysis rejects unsupported body forms and literals" {
 
     try addSource(db, 1, "static nonliteral = func() int -> return true");
     try addSource(db, 2, "static bare_return = func() int -> return");
-    try addSource(db, 3, "static expression = func() int -> 7");
-    try addSource(db, 4,
+    try addSource(db, 3,
         \\static extra = func() int
         \\  var x = 1
         \\  return 2
     );
-    try addSource(db, 5, "static float = func() int -> return 1.5");
-    try addSource(db, 6, "static overflow = func() int -> return 2147483648");
+    try addSource(db, 4, "static float = func() int -> return 1.5");
+    try addSource(db, 5, "static overflow = func() int -> return 2147483648");
 
-    for ([_]structures.FileId{ 1, 2, 3, 4, 5, 6 }) |file_id| {
+    for ([_]structures.FileId{ 1, 2, 3, 4, 5 }) |file_id| {
         const function_id = (try db.get(query_structures.IndexItems, file_id)).*.?.ids()[0];
         try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, function_id)).* == null);
         const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, function_id, structures.Diagnostic, testing.allocator);
         defer freeDiagnostics(diagnostics);
         try testing.expectEqual(@as(usize, 1), diagnostics.len);
-        if (file_id == 5) try testing.expectEqual(structures.Diagnostic.Kind.integer_literal_not_decimal, diagnostics[0].kind);
-        if (file_id == 6) try testing.expectEqual(structures.Diagnostic.Kind.integer_literal_out_of_range, diagnostics[0].kind);
+        if (file_id == 4) try testing.expectEqual(structures.Diagnostic.Kind.integer_literal_not_decimal, diagnostics[0].kind);
+        if (file_id == 5) try testing.expectEqual(structures.Diagnostic.Kind.integer_literal_out_of_range, diagnostics[0].kind);
     }
 }
 

@@ -115,6 +115,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             const expression = self.unresolved.expressions[index - self.unresolved.parameter_count];
             const resolved: Value = switch (expression.operation) {
                 .integer => |integer| try self.appendInstruction(.{ .consti = integer }),
+                .unit => try self.appendInstruction(.const_unit),
                 .none => try self.appendInstruction(.const_none),
                 .annotation => |annotation| try self.annotate(annotation, expression.span),
                 .call => |call| try self.callFunction(call, expression.span),

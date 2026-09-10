@@ -41,6 +41,7 @@ pub const UnresolvedBody = struct {
 
         pub const Operation = union(enum) {
             integer: i32,
+            unit,
             none,
             annotation: struct { value: ValueId, type_id: structures.TypeId },
             call: struct { name: []const u8, arguments: structures.FunctionValueRange },
@@ -191,10 +192,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
         fn bindingType(self: *Self, node: structures.Node.Index) !structures.TypeId {
             const result = try analyzeType(self.ast, self.source, node, self.type_interner, self.gpa, .local_type_not_supported);
             switch (result) {
-                .success => |type_id| {
-                    if (type_id == .none) return self.reject(node, .local_type_not_supported);
-                    return type_id;
-                },
+                .success => |type_id| return type_id,
                 .unsupported => |issue| {
                     self.issue = issue;
                     return error.SourceRejected;
@@ -206,11 +204,15 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             const node = self.ast.nodes[index.index()];
             switch (node.tag) {
                 .number_literal => return self.appendInteger(index),
+                .unit_literal => return self.appendExpression(index, .unit),
                 .none_literal => return self.appendExpression(index, .none),
                 .call => return self.appendCall(index),
                 .identifier => {
                     const span = tokenSpan(self.ast, node.token_index);
-                    return self.locals.get(self.source[span.start..span.end]) orelse self.reject(index, .unknown_value);
+                    const name = self.source[span.start..span.end];
+                    if (self.locals.get(name)) |value| return value;
+                    if (std.mem.eql(u8, name, "unit")) return self.appendExpression(index, .unit);
+                    return self.reject(index, .unknown_value);
                 },
                 .neg => return self.appendExpression(index, .{ .negate = try self.append(node.data.node) }),
                 .add, .sub, .mul, .div => return self.appendBinary(index),
@@ -379,21 +381,16 @@ pub fn analyzeFunctionSignature(
             .success => |type_id| type_id,
             .unsupported => |issue| return .{ .unsupported = issue },
         };
-        if (parameter_type != .int and try type_interner.variantMembers(parameter_type) == null) {
-            return .{ .unsupported = issueAt(ast, annotation.index(), .parameter_type_not_supported) };
-        }
         try parameter_types.append(gpa, parameter_type);
     }
 
-    const return_type_index = signature.data.node_node.b.unwrap() orelse
-        return .{ .unsupported = issueAt(ast, parts.signature.index(), .return_type_missing) };
-    const return_type = switch (try analyzeType(ast, source, return_type_index, type_interner, gpa, .return_type_not_supported)) {
-        .success => |type_id| type_id,
-        .unsupported => |issue| return .{ .unsupported = issue },
-    };
-    if (return_type != .int and return_type != .unit and try type_interner.variantMembers(return_type) == null) {
-        return .{ .unsupported = issueAt(ast, return_type_index.index(), .return_type_not_supported) };
-    }
+    const return_type = if (signature.data.node_node.b.unwrap()) |return_type_index|
+        switch (try analyzeType(ast, source, return_type_index, type_interner, gpa, .return_type_not_supported)) {
+            .success => |type_id| type_id,
+            .unsupported => |issue| return .{ .unsupported = issue },
+        }
+    else
+        .unit;
 
     return .{ .success = .{ .parameter_types = try parameter_types.toOwnedSlice(gpa), .return_type = return_type } };
 }
