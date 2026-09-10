@@ -11,7 +11,7 @@ zig run main.zig -- --debug=ast,ssa,asm,timing example.chi
 
 The CLI compiles one source file, writes `./prog`, runs it, and reports its exit code. The current example exercises variant arguments and returns, then exits with 0. Extra arguments after the source path are passed to the generated program.
 
-Top-level code is the entry point; a function named `main` is ordinary. The CLI itself exits with 0 after a normal program exit, or 1 on source rejection or compiler failure. It reports the program's status separately.
+Top-level code is the entry point; a function named `main` is ordinary. The CLI itself exits with 0 after a normal program exit, or 1 on invalid arguments, source-read failure, source rejection, or compiler failure. It reports the program's status separately.
 
 ## Documentation
 
@@ -33,7 +33,6 @@ Use the suites relevant to the change. Query tests cover execution and increment
 zig test tokenizer.zig
 zig test ast_new.zig
 zig test semantic.zig
-zig test ssa.zig
 zig test diagnostics.zig
 zig test query_new_test.zig
 zig test codegen_new_test.zig

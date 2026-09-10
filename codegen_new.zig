@@ -64,7 +64,7 @@ fn ensureAddressableStackRange(offset: u32, byte_size: u32) error{FunctionTooLar
     if (last_byte > std.math.maxInt(i32)) return error.FunctionTooLarge;
 }
 
-fn branchStorageEnd(ssa: *const structures.SsaFunction, types: anytype, branch: structures.FunctionBranch, start: u32) !u32 {
+fn branchStorageEnd(ssa: *const structures.FunctionBodyAnalysis, types: anytype, branch: structures.FunctionBranch, start: u32) !u32 {
     const target = ssa.blocks[@intFromEnum(branch.target)];
     var end = start;
     for (ssa.block_argument_types[target.argument_start..target.argument_end]) |type_id| {
@@ -83,7 +83,7 @@ const LocationPlan = struct {
     return_buffer_offset: ?u32,
 
     fn markBranchArguments(
-        ssa: *const structures.SsaFunction,
+        ssa: *const structures.FunctionBodyAnalysis,
         branch: structures.FunctionBranch,
         needed: []bool,
     ) void {
@@ -91,7 +91,7 @@ const LocationPlan = struct {
         for (arguments) |argument| needed[@intFromEnum(argument.value)] = true;
     }
 
-    fn init(ssa: *const structures.SsaFunction, types: anytype, gpa: std.mem.Allocator) !LocationPlan {
+    fn init(ssa: *const structures.FunctionBodyAnalysis, types: anytype, gpa: std.mem.Allocator) !LocationPlan {
         const needed = try gpa.alloc(bool, ssa.valueCount());
         defer gpa.free(needed);
         @memset(needed, false);
@@ -101,34 +101,17 @@ const LocationPlan = struct {
 
         for (ssa.instructions, 0..) |instruction, instruction_index| {
             const value_index = @intFromEnum(ssa.instructionValue(instruction_index));
+            value_types[value_index] = instruction.resultType();
             switch (instruction) {
-                .consti => value_types[value_index] = .int,
-                .const_unit => value_types[value_index] = .unit,
-                .const_none => value_types[value_index] = .none,
-                .variant_coerce => |coercion| {
-                    needed[@intFromEnum(coercion.operand)] = true;
-                    value_types[value_index] = coercion.target_type;
-                },
+                .consti, .const_unit, .const_none => {},
+                .variant_coerce => |coercion| needed[@intFromEnum(coercion.operand)] = true,
                 .call => |call| {
-                    const arguments = ssa.call_arguments[call.arguments.start..call.arguments.end];
-                    for (arguments) |argument| needed[@intFromEnum(argument.value)] = true;
-                    value_types[value_index] = call.return_type;
+                    for (ssa.call_arguments[call.arguments.start..call.arguments.end]) |argument| needed[@intFromEnum(argument.value)] = true;
                 },
-                .exit => |operand| {
-                    needed[@intFromEnum(operand)] = true;
-                    value_types[value_index] = .unit;
-                },
-                .negi => |operand_id| {
-                    const operand = @intFromEnum(operand_id);
-                    needed[operand] = true;
-                    value_types[value_index] = .int;
-                },
+                .exit, .negi => |operand| needed[@intFromEnum(operand)] = true,
                 .addi, .subi, .muli, .divsi => |operands| {
-                    const lhs = @intFromEnum(operands.lhs);
-                    const rhs = @intFromEnum(operands.rhs);
-                    needed[lhs] = true;
-                    needed[rhs] = true;
-                    value_types[value_index] = .int;
+                    needed[@intFromEnum(operands.lhs)] = true;
+                    needed[@intFromEnum(operands.rhs)] = true;
                 },
             }
         }
@@ -265,7 +248,7 @@ const LocationPlan = struct {
     }
 };
 
-fn isDirectReturn(ssa: *const structures.SsaFunction, instruction_index: usize) bool {
+fn isDirectReturn(ssa: *const structures.FunctionBodyAnalysis, instruction_index: usize) bool {
     const value = ssa.instructionValue(instruction_index);
     for (ssa.blocks) |block| {
         if (block.instruction_end != instruction_index + 1) continue;
@@ -309,7 +292,7 @@ fn FunctionEmitter(comptime Types: type) type {
 
         fn init(
             gpa: std.mem.Allocator,
-            ssa: *const structures.SsaFunction,
+            ssa: *const structures.FunctionBodyAnalysis,
             plan: LocationPlan,
             types: Types,
         ) !Self {
@@ -341,7 +324,7 @@ fn FunctionEmitter(comptime Types: type) type {
             self.* = undefined;
         }
 
-        fn emit(self: *Self, ssa: *const structures.SsaFunction) !void {
+        fn emit(self: *Self, ssa: *const structures.FunctionBodyAnalysis) !void {
             if (self.stack_size != 0) try self.encoder.subRspImmediate32(self.stack_size);
             try self.emitBlock(ssa, ssa.entry);
             for (ssa.blocks, 0..) |_, block_index| {
@@ -355,7 +338,7 @@ fn FunctionEmitter(comptime Types: type) type {
             }
         }
 
-        fn emitBlock(self: *Self, ssa: *const structures.SsaFunction, block_id: structures.FunctionBlockId) !void {
+        fn emitBlock(self: *Self, ssa: *const structures.FunctionBodyAnalysis, block_id: structures.FunctionBlockId) !void {
             const block_index = @intFromEnum(block_id);
             const block = ssa.blocks[block_index];
             self.block_offsets[block_index] = std.math.cast(u32, self.encoder.code.items.len) orelse return error.FunctionTooLarge;
@@ -383,7 +366,7 @@ fn FunctionEmitter(comptime Types: type) type {
             try self.emitTerminator(ssa, block.terminator);
         }
 
-        fn emitTerminator(self: *Self, ssa: *const structures.SsaFunction, terminator: structures.FunctionTerminator) !void {
+        fn emitTerminator(self: *Self, ssa: *const structures.FunctionBodyAnalysis, terminator: structures.FunctionTerminator) !void {
             switch (terminator) {
                 .branch => |branch| {
                     try self.emitBranchCopies(ssa, branch);
@@ -397,7 +380,7 @@ fn FunctionEmitter(comptime Types: type) type {
 
         fn emitPredicateBranch(
             self: *Self,
-            ssa: *const structures.SsaFunction,
+            ssa: *const structures.FunctionBodyAnalysis,
             predicate: @FieldType(structures.FunctionTerminator, "predicate_branch"),
         ) !void {
             try self.loadValue(self.locations[@intFromEnum(predicate.operands.lhs)]);
@@ -411,7 +394,7 @@ fn FunctionEmitter(comptime Types: type) type {
             try self.emitJump(predicate.then_branch.target);
         }
 
-        fn emitBranchCopies(self: *Self, ssa: *const structures.SsaFunction, branch: structures.FunctionBranch) !void {
+        fn emitBranchCopies(self: *Self, ssa: *const structures.FunctionBodyAnalysis, branch: structures.FunctionBranch) !void {
             const target = ssa.blocks[@intFromEnum(branch.target)];
             const arguments = self.branch_arguments[branch.arguments.start..branch.arguments.end];
             std.debug.assert(arguments.len == target.argument_end - target.argument_start);
@@ -465,7 +448,7 @@ fn FunctionEmitter(comptime Types: type) type {
 
         fn emitDirectCall(
             self: *Self,
-            call: structures.FunctionCall(structures.InstanceId),
+            call: structures.FunctionCall,
             destination: ValueLocation,
         ) !void {
             var argument_end: u32 = 0;
@@ -488,14 +471,14 @@ fn FunctionEmitter(comptime Types: type) type {
 
             var reference_index: ?usize = null;
             for (self.referenced_instances.items, 0..) |existing, index| {
-                if (std.meta.eql(existing, call.target)) {
+                if (existing.item == call.target) {
                     reference_index = index;
                     break;
                 }
             }
             if (reference_index == null) {
                 reference_index = self.referenced_instances.items.len;
-                try self.referenced_instances.append(self.gpa, call.target);
+                try self.referenced_instances.append(self.gpa, .{ .item = call.target });
             }
             const reference = std.math.cast(u32, reference_index.?) orelse return error.FunctionTooLarge;
             try self.relocations.append(self.gpa, .{
@@ -568,7 +551,7 @@ fn FunctionEmitter(comptime Types: type) type {
         ) !void {
             const target_members = (try self.types.variantMembers(target_type)) orelse unreachable;
             std.debug.assert(target_members.len != 0);
-            const target_payload_offset = try self.variantPayloadOffset(target_members);
+            const target_payload_offset = (try self.types.variantLayout(target_type)).payload_offset;
             const actual_members = try self.types.variantMembers(actual_type);
             if (actual_members == null) {
                 const actual_layout = try self.types.layout(actual_type);
@@ -579,7 +562,7 @@ fn FunctionEmitter(comptime Types: type) type {
             }
 
             const actual_layout = try self.types.layout(actual_type);
-            const actual_payload_offset = try self.variantPayloadOffset(actual_members.?);
+            const actual_payload_offset = (try self.types.variantLayout(actual_type)).payload_offset;
             const actual_payload_size = actual_layout.byte_size - actual_payload_offset;
             try self.copyRange(source, actual_payload_offset, destination, target_payload_offset, actual_payload_size);
             try self.loadComponent(source, 0);
@@ -603,12 +586,6 @@ fn FunctionEmitter(comptime Types: type) type {
             try self.encoder.movEaxImmediate32(@intCast(typeIndex(target_members, last_member)));
             const done_offset = std.math.cast(u32, self.encoder.code.items.len) orelse return error.FunctionTooLarge;
             for (done_jumps.items) |jump| try self.patchJump(jump, done_offset);
-        }
-
-        fn variantPayloadOffset(self: *const Self, members: []const structures.TypeId) !u32 {
-            var alignment: u32 = 1;
-            for (members) |member| alignment = @max(alignment, (try self.types.layout(member)).byte_alignment);
-            return try alignForward32(@sizeOf(u32), alignment);
         }
 
         fn copyValue(self: *Self, type_id: structures.TypeId, source: ValueLocation, destination: ValueLocation) !void {
@@ -704,7 +681,7 @@ fn FunctionEmitter(comptime Types: type) type {
     };
 }
 
-pub fn compileFunction(ssa: *const structures.SsaFunction, types: anytype, gpa: std.mem.Allocator) !structures.CompiledFunction {
+pub fn compileFunction(ssa: *const structures.FunctionBodyAnalysis, types: anytype, gpa: std.mem.Allocator) !structures.CompiledFunction {
     std.debug.assert(ssa.blocks.len != 0);
     std.debug.assert(@intFromEnum(ssa.entry) < ssa.blocks.len);
     var plan = try LocationPlan.init(ssa, types, gpa);

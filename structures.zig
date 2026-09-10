@@ -172,7 +172,6 @@ pub const Node = struct {
         block,
         bool_literal,
         call,
-        call_arg_list_small,
         call_arg_list,
         const_binding,
         var_binding,
@@ -184,7 +183,6 @@ pub const Node = struct {
         none_literal,
         number_literal,
         param,
-        param_list_small,
         param_list,
         query_op,
         move_expr,
@@ -199,9 +197,7 @@ pub const Node = struct {
         struct_init_field,
         type,
         type_func,
-        type_list_small,
         type_list,
-        type_variant_small,
         type_variant,
         _,
     };
@@ -226,6 +222,15 @@ pub const Ast = struct {
     nodes: []Node,
     node_refs: []Node.Index,
 
+    pub fn nodeList(self: Ast, index: Node.Index) []const Node.Index {
+        const node = self.nodes[(index.unwrap() orelse return &.{}).index()];
+        switch (node.tag) {
+            .param_list, .type_variant, .type_list, .call_arg_list => {},
+            else => unreachable,
+        }
+        return self.node_refs[node.data.ref.start..node.data.ref.end];
+    }
+
     pub fn eql(a: Ast, b: Ast) bool {
         if (a.file_id != b.file_id) return false;
         if (a.tokens.len != b.tokens.len or a.nodes.len != b.nodes.len or a.node_refs.len != b.node_refs.len) return false;
@@ -239,7 +244,7 @@ pub const Ast = struct {
                 .return_expr, .not, .neg, .query_op, .move_expr, .comptime_expr, .sizeof_expr, .field_access, .struct_field, .struct_property, .struct_init_field => {
                     if (left.data.node != right.data.node) return false;
                 },
-                .add, .sub, .mul, .div, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .@"and", .@"or", .assign, .call, .call_arg_list_small, .const_binding, .var_binding, .static_binding, .func, .param, .param_list_small, .signature, .type_func, .type_list_small, .type_variant_small, .@"if" => {
+                .add, .sub, .mul, .div, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .@"and", .@"or", .assign, .call, .const_binding, .var_binding, .static_binding, .func, .param, .signature, .type_func, .@"if" => {
                     if (left.data.node_node.a != right.data.node_node.a or left.data.node_node.b != right.data.node_node.b) return false;
                 },
                 .block, .call_arg_list, .param_list, .type_list, .type_variant, .if_else, .@"struct", .struct_init => {
@@ -288,10 +293,9 @@ pub const ItemLoc = struct {
     file_id: FileId,
     kind: ItemKind,
     name: []const u8,
-    disambiguator: u32,
 
     pub fn eql(a: ItemLoc, b: ItemLoc) bool {
-        return a.file_id == b.file_id and a.kind == b.kind and a.disambiguator == b.disambiguator and std.mem.eql(u8, a.name, b.name);
+        return a.file_id == b.file_id and a.kind == b.kind and std.mem.eql(u8, a.name, b.name);
     }
 };
 
@@ -427,6 +431,11 @@ pub const TypeLayout = struct {
     byte_alignment: u32,
 };
 
+pub const VariantLayout = struct {
+    layout: TypeLayout,
+    payload_offset: u32,
+};
+
 pub const FunctionValueId = enum(u32) { _ };
 pub const FunctionBlockId = enum(u32) { _ };
 
@@ -497,99 +506,100 @@ pub const FunctionSignature = struct {
     }
 };
 
-pub fn FunctionCall(comptime CallTarget: type) type {
-    return struct {
-        target: CallTarget,
-        arguments: FunctionValueRange,
-        return_type: TypeId,
-    };
-}
+pub const FunctionCall = struct {
+    target: ItemId,
+    arguments: FunctionValueRange,
+    return_type: TypeId,
+};
 
-pub fn FunctionInstruction(comptime CallTarget: type) type {
-    return union(enum) {
-        consti: i32,
-        const_unit,
-        const_none,
-        variant_coerce: struct {
-            operand: FunctionValueId,
-            target_type: TypeId,
-        },
-        call: FunctionCall(CallTarget),
-        exit: FunctionValueId,
-        negi: FunctionValueId,
-        addi: BinaryOperands,
-        subi: BinaryOperands,
-        muli: BinaryOperands,
-        divsi: BinaryOperands,
-    };
-}
+pub const FunctionInstruction = union(enum) {
+    consti: i32,
+    const_unit,
+    const_none,
+    variant_coerce: struct {
+        operand: FunctionValueId,
+        target_type: TypeId,
+    },
+    call: FunctionCall,
+    exit: FunctionValueId,
+    negi: FunctionValueId,
+    addi: BinaryOperands,
+    subi: BinaryOperands,
+    muli: BinaryOperands,
+    divsi: BinaryOperands,
+
+    pub fn resultType(self: FunctionInstruction) TypeId {
+        return switch (self) {
+            .consti, .negi, .addi, .subi, .muli, .divsi => .int,
+            .const_unit, .exit => .unit,
+            .const_none => .none,
+            .variant_coerce => |coercion| coercion.target_type,
+            .call => |call| call.return_type,
+        };
+    }
+};
 
 /// Owned function control-flow graph. Block arguments, branch operands, call
 /// operands, and instructions use flat arrays while each block owns its ranges
-/// and terminator. CallTarget is the only representation difference between
-/// semantic and per-instance IR.
-pub fn FunctionIr(comptime CallTarget: type) type {
-    return struct {
-        return_type: TypeId,
-        block_argument_types: []TypeId,
-        branch_arguments: []FunctionValueUse,
-        call_arguments: []FunctionValueUse,
-        instructions: []Instruction,
-        blocks: []Block,
-        entry: BlockId,
+/// and terminator. Calls retain declaration identities until code emission.
+pub const FunctionBodyAnalysis = struct {
+    return_type: TypeId,
+    block_argument_types: []TypeId,
+    branch_arguments: []FunctionValueUse,
+    call_arguments: []FunctionValueUse,
+    instructions: []Instruction,
+    blocks: []Block,
+    entry: BlockId,
 
-        pub const ValueId = FunctionValueId;
-        pub const BlockId = FunctionBlockId;
-        pub const Instruction = FunctionInstruction(CallTarget);
-        pub const Terminator = FunctionTerminator;
-        pub const Block = FunctionBlock;
+    pub const ValueId = FunctionValueId;
+    pub const BlockId = FunctionBlockId;
+    pub const Instruction = FunctionInstruction;
+    pub const Terminator = FunctionTerminator;
+    pub const Block = FunctionBlock;
 
-        pub fn instructionValue(self: @This(), instruction_index: usize) ValueId {
-            std.debug.assert(instruction_index < self.instructions.len);
-            return functionInstructionValue(self.block_argument_types.len, instruction_index);
+    pub fn instructionValue(self: @This(), instruction_index: usize) ValueId {
+        std.debug.assert(instruction_index < self.instructions.len);
+        return functionInstructionValue(self.block_argument_types.len, instruction_index);
+    }
+
+    pub fn valueCount(self: @This()) usize {
+        return self.block_argument_types.len + self.instructions.len;
+    }
+
+    pub fn eql(a: @This(), b: @This()) bool {
+        if (a.entry != b.entry or
+            a.return_type != b.return_type or
+            !std.mem.eql(TypeId, a.block_argument_types, b.block_argument_types) or
+            !valueUsesEql(a.branch_arguments, b.branch_arguments) or
+            !valueUsesEql(a.call_arguments, b.call_arguments) or
+            a.instructions.len != b.instructions.len or
+            a.blocks.len != b.blocks.len) return false;
+        for (a.instructions, b.instructions) |left, right| {
+            if (!std.meta.eql(left, right)) return false;
         }
-
-        pub fn valueCount(self: @This()) usize {
-            return self.block_argument_types.len + self.instructions.len;
+        for (a.blocks, b.blocks) |left, right| {
+            if (!std.meta.eql(left, right)) return false;
         }
+        return true;
+    }
 
-        pub fn eql(a: @This(), b: @This()) bool {
-            if (a.entry != b.entry or
-                a.return_type != b.return_type or
-                !std.mem.eql(TypeId, a.block_argument_types, b.block_argument_types) or
-                !valueUsesEql(a.branch_arguments, b.branch_arguments) or
-                !valueUsesEql(a.call_arguments, b.call_arguments) or
-                a.instructions.len != b.instructions.len or
-                a.blocks.len != b.blocks.len) return false;
-            for (a.instructions, b.instructions) |left, right| {
-                if (!std.meta.eql(left, right)) return false;
-            }
-            for (a.blocks, b.blocks) |left, right| {
-                if (!std.meta.eql(left, right)) return false;
-            }
-            return true;
+    fn valueUsesEql(left: []const FunctionValueUse, right: []const FunctionValueUse) bool {
+        if (left.len != right.len) return false;
+        for (left, right) |left_use, right_use| {
+            if (!std.meta.eql(left_use, right_use)) return false;
         }
+        return true;
+    }
 
-        fn valueUsesEql(left: []const FunctionValueUse, right: []const FunctionValueUse) bool {
-            if (left.len != right.len) return false;
-            for (left, right) |left_use, right_use| {
-                if (!std.meta.eql(left_use, right_use)) return false;
-            }
-            return true;
-        }
-
-        pub fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
-            gpa.free(self.block_argument_types);
-            gpa.free(self.branch_arguments);
-            gpa.free(self.call_arguments);
-            gpa.free(self.instructions);
-            gpa.free(self.blocks);
-            self.* = undefined;
-        }
-    };
-}
-
-pub const FunctionBodyAnalysis = FunctionIr(ItemId);
+    pub fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
+        gpa.free(self.block_argument_types);
+        gpa.free(self.branch_arguments);
+        gpa.free(self.call_arguments);
+        gpa.free(self.instructions);
+        gpa.free(self.blocks);
+        self.* = undefined;
+    }
+};
 
 /// Structural non-generic instance key. Future generic substitutions extend
 /// this identity without changing declaration identity.
@@ -615,9 +625,6 @@ pub const ReachableInstances = struct {
         self.* = undefined;
     }
 };
-
-/// Owned per-instance SSA control-flow graph.
-pub const SsaFunction = FunctionIr(InstanceId);
 
 pub const CompiledFunction = struct {
     /// Owned, nonempty machine code implementing the callable ABI.
@@ -684,6 +691,7 @@ pub const Diagnostic = struct {
         },
         invalid_expression: Token.Tag,
         duplicate_top_level_function,
+        function_annotation_not_supported,
         parameter_mode_not_supported,
         duplicate_parameter,
         parameter_type_missing,

@@ -329,7 +329,7 @@ fn parseParamList(parser: *ParserState) !Node.Index {
         break;
     }
 
-    return try addNodeList(parser, token_index, parser.scratch_stack.items[stack_top..], .param_list_small, .param_list);
+    return try addNodeList(parser, token_index, parser.scratch_stack.items[stack_top..], .param_list);
 }
 
 fn parseTypeAnnotation(parser: *ParserState) !Node.Index {
@@ -351,7 +351,7 @@ fn parseType(parser: *ParserState) ParseError!Node.Index {
         try parser.scratch_stack.append(parser.gpa, member);
     }
 
-    return try addNodeList(parser, token_index, parser.scratch_stack.items[stack_top..], .type_variant_small, .type_variant);
+    return try addNodeList(parser, token_index, parser.scratch_stack.items[stack_top..], .type_variant);
 }
 
 fn parseTypePrimary(parser: *ParserState) ParseError!Node.Index {
@@ -391,7 +391,7 @@ fn parseTypeList(parser: *ParserState) !Node.Index {
         break;
     }
 
-    return try addNodeList(parser, token_index, parser.scratch_stack.items[stack_top..], .type_list_small, .type_list);
+    return try addNodeList(parser, token_index, parser.scratch_stack.items[stack_top..], .type_list);
 }
 
 const BinaryOpInfo = struct {
@@ -522,7 +522,7 @@ fn parseCallArgList(parser: *ParserState) !Node.Index {
         break;
     }
 
-    return try addNodeList(parser, token_index, parser.scratch_stack.items[stack_top..], .call_arg_list_small, .call_arg_list);
+    return try addNodeList(parser, token_index, parser.scratch_stack.items[stack_top..], .call_arg_list);
 }
 
 fn parseStruct(parser: *ParserState) ParseError!Node.Index {
@@ -626,21 +626,9 @@ fn parseRequiredExpression(parser: *ParserState) ParseError!Node.Index {
     return error.ParseError;
 }
 
-fn addNodeList(parser: *ParserState, token_index: u32, items: []const Node.Index, small_tag: Node.Tag, list_tag: Node.Tag) !Node.Index {
+fn addNodeList(parser: *ParserState, token_index: u32, items: []const Node.Index, tag: Node.Tag) !Node.Index {
     if (items.len == 0) return .null;
-
-    if (items.len <= 2) {
-        return try parser.addNode(.{
-            .tag = small_tag,
-            .token_index = token_index,
-            .data = .{ .node_node = .{
-                .a = items[0],
-                .b = if (items.len > 1) items[1] else .null,
-            } },
-        });
-    }
-
-    return try parser.addNode(.{ .tag = list_tag, .token_index = token_index, .data = try parser.listToSpan(items) });
+    return parser.addNode(.{ .tag = tag, .token_index = token_index, .data = try parser.listToSpan(items) });
 }
 
 fn parseTokenNode(parser: *ParserState, token: Token.Tag, tag: Node.Tag) !Node.Index {
@@ -703,7 +691,7 @@ fn renderNode(gpa: std.mem.Allocator, node_index: Node.Index, ast: *const Ast, s
             try writer.writeByte('\n');
             try renderNode(gpa, node.data.node, ast, source, writer, seen, new_indent, true, false);
         },
-        .add, .sub, .mul, .div, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .@"and", .@"or", .assign, .call, .call_arg_list_small, .const_binding, .var_binding, .static_binding, .func, .param, .param_list_small, .signature, .type_func, .type_list_small, .type_variant_small, .@"if" => {
+        .add, .sub, .mul, .div, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .@"and", .@"or", .assign, .call, .const_binding, .var_binding, .static_binding, .func, .param, .signature, .type_func, .@"if" => {
             if (node.tag == .param) {
                 const loc = ast.tokens[node.token_index].loc;
                 try writer.print(" : {s}", .{source[loc.start..loc.end]});
@@ -793,7 +781,7 @@ test "parse function with parameters" {
         \\static_binding
         \\└─func
         \\  ├─signature
-        \\  │ ├─param_list_small
+        \\  │ ├─param_list
         \\  │ │ ├─param : x
         \\  │ │ │ └─type : int
         \\  │ │ └─param : y
@@ -838,7 +826,7 @@ test "parse variant type annotations" {
         \\var b: int | float | none = none
     ,
         \\const_binding
-        \\├─type_variant_small
+        \\├─type_variant
         \\│ ├─type : int
         \\│ └─type : float
         \\└─number_literal : 1
@@ -859,7 +847,7 @@ test "parse function type annotations" {
     ,
         \\const_binding
         \\├─type_func
-        \\│ ├─type_list_small
+        \\│ ├─type_list
         \\│ │ ├─type : int
         \\│ │ └─type : float
         \\│ └─type : int
@@ -887,17 +875,17 @@ test "parse function signatures with compound types" {
         \\static_binding
         \\└─func
         \\  ├─signature
-        \\  │ ├─param_list_small
+        \\  │ ├─param_list
         \\  │ │ ├─param : f
         \\  │ │ │ └─type_func
-        \\  │ │ │   ├─type_list_small
+        \\  │ │ │   ├─type_list
         \\  │ │ │   │ └─type : int
         \\  │ │ │   └─type : int
         \\  │ │ └─param : x
-        \\  │ │   └─type_variant_small
+        \\  │ │   └─type_variant
         \\  │ │     ├─type : int
         \\  │ │     └─type : float
-        \\  │ └─type_variant_small
+        \\  │ └─type_variant
         \\  │   ├─type : int
         \\  │   └─type : none
         \\  └─block
@@ -978,7 +966,7 @@ test "parse function defined inside struct" {
         \\  ├─static_binding
         \\  │ └─func
         \\  │   ├─signature
-        \\  │   │ ├─param_list_small
+        \\  │   │ ├─param_list
         \\  │   │ │ └─param : v
         \\  │   │ │   └─type : int
         \\  │   │ └─type : S
@@ -1007,7 +995,7 @@ test "parse struct ownership hook functions" {
         \\  ├─struct_property : copy
         \\  │ └─func
         \\  │   ├─signature
-        \\  │   │ ├─param_list_small
+        \\  │   │ ├─param_list
         \\  │   │ │ └─param : self
         \\  │   │ │   ├─access : read
         \\  │   │ │   └─type : Box
@@ -1022,7 +1010,7 @@ test "parse struct ownership hook functions" {
         \\  └─struct_property : move
         \\    └─func
         \\      ├─signature
-        \\      │ ├─param_list_small
+        \\      │ ├─param_list
         \\      │ │ └─param : self
         \\      │ │   ├─access : var
         \\      │ │   └─type : Box
@@ -1049,7 +1037,7 @@ test "parse struct ownership hook indented body followed by field" {
         \\  ├─struct_property : drop
         \\  │ └─func
         \\  │   ├─signature
-        \\  │   │ ├─param_list_small
+        \\  │   │ ├─param_list
         \\  │   │ │ └─param : self
         \\  │   │ │   ├─access : deinit
         \\  │   │ │   └─type : D
@@ -1057,7 +1045,7 @@ test "parse struct ownership hook indented body followed by field" {
         \\  │   └─block
         \\  │     └─call
         \\  │       ├─identifier : print
-        \\  │       └─call_arg_list_small
+        \\  │       └─call_arg_list
         \\  │         └─number_literal : 99
         \\  └─struct_field : x
         \\    └─type : int
@@ -1073,7 +1061,7 @@ test "parse anonymous struct expression" {
         \\static_binding
         \\└─func
         \\  ├─signature
-        \\  │ ├─param_list_small
+        \\  │ ├─param_list
         \\  │ │ └─param : T
         \\  │ │   ├─access : static
         \\  │ │   └─type : type
@@ -1125,7 +1113,7 @@ test "parse struct init after call" {
         \\└─struct_init
         \\  ├─call
         \\  │ ├─identifier : Wrapper
-        \\  │ └─call_arg_list_small
+        \\  │ └─call_arg_list
         \\  │   └─identifier : float
         \\  └─struct_init_field : x
         \\    └─number_literal : 3.0
@@ -1139,7 +1127,7 @@ test "parse field access" {
     ,
         \\call
         \\├─identifier : print
-        \\└─call_arg_list_small
+        \\└─call_arg_list
         \\  └─field_access : x
         \\    └─identifier : foo
         \\const_binding
@@ -1175,12 +1163,12 @@ test "parse variant runtime operators" {
         \\if
         \\├─is
         \\│ ├─identifier : x
-        \\│ └─type_variant_small
+        \\│ └─type_variant
         \\│   ├─type : int
         \\│   └─type : A
         \\└─call
         \\  ├─identifier : print
-        \\  └─call_arg_list_small
+        \\  └─call_arg_list
         \\    └─number_literal : 1
         \\if
         \\├─const_binding
@@ -1189,7 +1177,7 @@ test "parse variant runtime operators" {
         \\│   └─type : int
         \\└─call
         \\  ├─identifier : print
-        \\  └─call_arg_list_small
+        \\  └─call_arg_list
         \\    └─identifier : i
     );
 }
@@ -1212,7 +1200,7 @@ test "parse variant operator precedence" {
         \\│     └─type : none
         \\└─call
         \\  ├─identifier : print
-        \\  └─call_arg_list_small
+        \\  └─call_arg_list
         \\    └─number_literal : 1
     );
 }
@@ -1236,7 +1224,7 @@ test "not binds below comparisons and above logical operators" {
         \\│   └─number_literal : 3
         \\└─call
         \\  ├─identifier : print
-        \\  └─call_arg_list_small
+        \\  └─call_arg_list
         \\    └─number_literal : 1
     );
 }
@@ -1256,7 +1244,7 @@ test "parse query and move postfix operators" {
         \\  └─identifier : a
         \\call
         \\├─identifier : take
-        \\└─call_arg_list_small
+        \\└─call_arg_list
         \\  └─move_expr
         \\    └─identifier : b
         \\if
@@ -1265,7 +1253,7 @@ test "parse query and move postfix operators" {
         \\│   └─identifier : maybe
         \\└─call
         \\  ├─identifier : print
-        \\  └─call_arg_list_small
+        \\  └─call_arg_list
         \\    └─identifier : v
     );
 }
@@ -1282,7 +1270,7 @@ test "parse inline comptime expression" {
         \\    └─number_literal : 2
         \\call
         \\├─identifier : print
-        \\└─call_arg_list_small
+        \\└─call_arg_list
         \\  └─comptime_expr
         \\    └─number_literal : 1
     );
@@ -1313,7 +1301,7 @@ test "parse deinit parameter mode" {
         \\static_binding
         \\└─func
         \\  ├─signature
-        \\  │ ├─param_list_small
+        \\  │ ├─param_list
         \\  │ │ └─param : d
         \\  │ │   ├─access : deinit
         \\  │ │   └─type : D
@@ -1321,7 +1309,7 @@ test "parse deinit parameter mode" {
         \\  └─block
         \\    └─call
         \\      ├─identifier : print
-        \\      └─call_arg_list_small
+        \\      └─call_arg_list
         \\        └─field_access : x
         \\          └─identifier : d
     );
@@ -1335,20 +1323,20 @@ test "parse sizeof expression" {
     ,
         \\call
         \\├─identifier : print
-        \\└─call_arg_list_small
+        \\└─call_arg_list
         \\  └─sizeof_expr
         \\    └─type : int
         \\call
         \\├─identifier : print
-        \\└─call_arg_list_small
+        \\└─call_arg_list
         \\  └─sizeof_expr
         \\    └─type_func
-        \\      ├─type_list_small
+        \\      ├─type_list
         \\      │ └─type : int
         \\      └─type : int
         \\const_binding
         \\└─sizeof_expr
-        \\  └─type_variant_small
+        \\  └─type_variant
         \\    ├─type : int
         \\    └─type : float
     );
@@ -1366,7 +1354,7 @@ test "parse extra comparison operators" {
         \\│ └─identifier : b
         \\└─call
         \\  ├─identifier : print
-        \\  └─call_arg_list_small
+        \\  └─call_arg_list
         \\    └─number_literal : 1
         \\if
         \\├─ge
@@ -1374,7 +1362,7 @@ test "parse extra comparison operators" {
         \\│ └─identifier : c
         \\└─call
         \\  ├─identifier : print
-        \\  └─call_arg_list_small
+        \\  └─call_arg_list
         \\    └─number_literal : 2
         \\if
         \\├─ne
@@ -1382,7 +1370,7 @@ test "parse extra comparison operators" {
         \\│ └─identifier : d
         \\└─call
         \\  ├─identifier : print
-        \\  └─call_arg_list_small
+        \\  └─call_arg_list
         \\    └─number_literal : 3
     );
 }
@@ -1401,12 +1389,12 @@ test "parse block if else" {
         \\├─block
         \\│ └─call
         \\│   ├─identifier : print
-        \\│   └─call_arg_list_small
+        \\│   └─call_arg_list
         \\│     └─number_literal : 11
         \\└─block
         \\  └─call
         \\    ├─identifier : print
-        \\    └─call_arg_list_small
+        \\    └─call_arg_list
         \\      └─number_literal : 22
     );
 }
@@ -1433,7 +1421,7 @@ test "parse else if chain" {
         \\│ └─number_literal : 2
         \\├─call
         \\│ ├─identifier : print
-        \\│ └─call_arg_list_small
+        \\│ └─call_arg_list
         \\│   └─number_literal : 1
         \\└─if_else
         \\  ├─lt
@@ -1441,11 +1429,11 @@ test "parse else if chain" {
         \\  │ └─number_literal : 3
         \\  ├─call
         \\  │ ├─identifier : print
-        \\  │ └─call_arg_list_small
+        \\  │ └─call_arg_list
         \\  │   └─number_literal : 2
         \\  └─call
         \\    ├─identifier : print
-        \\    └─call_arg_list_small
+        \\    └─call_arg_list
         \\      └─number_literal : 3
     );
 }
@@ -1461,7 +1449,7 @@ test "parse if condition binding" {
         \\└─block
         \\  └─call
         \\    ├─identifier : print
-        \\    └─call_arg_list_small
+        \\    └─call_arg_list
         \\      └─identifier : v
     );
 }
@@ -1477,23 +1465,23 @@ test "parse calls and literals" {
         \\└─identifier : foo
         \\call
         \\├─identifier : print
-        \\└─call_arg_list_small
+        \\└─call_arg_list
         \\  └─bool_literal : true
         \\call
         \\├─identifier : bar
-        \\└─call_arg_list_small
+        \\└─call_arg_list
         \\  ├─bool_literal : false
         \\  └─none_literal : none
         \\call
         \\├─identifier : baz
-        \\└─call_arg_list_small
+        \\└─call_arg_list
         \\  ├─call
         \\  │ ├─identifier : foo
-        \\  │ └─call_arg_list_small
+        \\  │ └─call_arg_list
         \\  │   └─number_literal : 1
         \\  └─call
         \\    ├─identifier : bar
-        \\    └─call_arg_list_small
+        \\    └─call_arg_list
         \\      ├─number_literal : 2
         \\      └─number_literal : 3
     );

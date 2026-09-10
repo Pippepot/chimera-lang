@@ -1,5 +1,4 @@
 const std = @import("std");
-const structures = @import("structures.zig");
 
 const Revision = u64;
 
@@ -504,14 +503,29 @@ pub const Database = struct {
             if (input.changed_at > verified_at) return true;
         }
         for (entry.deps.items) |dep| {
-            db.lock();
-            db.enqueueForCurrentRevisionLocked(dep);
-            db.unlock();
-            try db.waitForEntry(dep, worker_index);
-
+            try db.verifyDependency(entry, dep, worker_index);
             if (dep.changed_at > verified_at) return true;
         }
         return false;
+    }
+
+    fn verifyDependency(db: *Database, entry: *Entry, dep: *Entry, worker_index: ?usize) anyerror!void {
+        {
+            db.lock();
+            defer db.unlock();
+            std.debug.assert(entry.verification_dependency == null);
+            if (db.reachesLocked(dep, entry)) return error.QueryCycle;
+            // Only the dependency currently being verified is an active wait.
+            // Other old edges may disappear when this entry recomputes.
+            entry.verification_dependency = dep;
+            db.enqueueForCurrentRevisionLocked(dep);
+        }
+        defer {
+            db.lock();
+            entry.verification_dependency = null;
+            db.unlock();
+        }
+        try db.waitForEntry(dep, worker_index);
     }
 
     fn enqueueForCurrentRevisionLocked(db: *Database, entry: *Entry) void {
@@ -813,6 +827,7 @@ const Entry = struct {
     input_deps: std.ArrayList(*InputEntry),
     accums: ?*AccumBucket,
     computation: ?Computation,
+    verification_dependency: ?*Entry = null,
     queue_prev: ?*Entry,
     queue_next: ?*Entry,
     visit_token: usize,
@@ -919,6 +934,10 @@ fn reachesVisit(db: *Database, entry: *Entry, target: *Entry, token: usize) bool
     if (entry == target) return true;
     if (entry.visit_token == token) return false;
     entry.visit_token = token;
+
+    if (entry.verification_dependency) |dep| {
+        if (reachesVisit(db, dep, target, token)) return true;
+    }
 
     const deps = if (entry.computation) |*computation|
         computation.deps.items

@@ -15,7 +15,7 @@ The incremental pipeline works end to end. The next goal is to make the language
 | Control flow | Value-producing `if/else` over integer comparisons; one expression per branch, including nested conditionals | No-else/statement `if`, general branch blocks, short-circuit logic, early returns, loops, match |
 | Backend | Full-layout values, symbolic calls, recursion, arbitrary CFG edges, parallel edge copies | Frontend cannot yet produce all supported graphs; no external ABI |
 
-The supported function form still requires an explicit return, even inline: `static f = func(a: int) int -> return a`. An omitted return annotation is rejected, despite the language's unit default. Direct `unit`/`none` parameters, returns or local annotations of exactly `none`, and unit literals remain unsupported; those types already work as variant members.
+The supported function form still requires an explicit return, even inline: `static f = func(a: int) int -> return a`. An omitted return annotation is rejected, despite the language's unit default. Annotations on the static function binding itself are also unsupported and rejected when the function signature is demanded. Direct `unit`/`none` parameters, returns or local annotations of exactly `none`, and unit literals remain unsupported; those types already work as variant members.
 
 `exit(int)` emits a syscall but is still typed as `unit`, contrary to the specified `never` result.
 
@@ -99,4 +99,4 @@ Resolve each when its milestone reaches it; do not turn this list into a prerequ
 
 ## Verification baseline
 
-All eight active suites in [README.md](README.md) passed during this audit. They cover current behavior, including temporary restrictions; update those expectations with each conformance change. Parser tests and hand-built backend tests do not imply end-to-end language support. Keep live commands in README and behavioral evidence in tests, rather than duplicating test counts here.
+All seven active suites in [README.md](README.md) passed during this audit. They cover current behavior, including temporary restrictions; update those expectations with each conformance change. Parser tests and hand-built backend tests do not imply end-to-end language support. Keep live commands in README and behavioral evidence in tests, rather than duplicating test counts here.

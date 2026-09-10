@@ -72,11 +72,11 @@ fn freeOwnedDiagnostics(diagnostics: []OwnedDiagnostic) void {
     testing.allocator.free(diagnostics);
 }
 
-fn expectDirectCallSsa(ssa: structures.SsaFunction, target: structures.ItemId) !void {
+fn expectDirectCallBody(ssa: structures.FunctionBodyAnalysis, target: structures.ItemId) !void {
     try testing.expectEqual(@as(usize, 1), ssa.instructions.len);
-    try testing.expectEqual(structures.InstanceId{ .item = target }, ssa.instructions[0].call.target);
+    try testing.expectEqual(target, ssa.instructions[0].call.target);
     try testing.expectEqual(@as(usize, 1), ssa.blocks.len);
-    try testing.expectEqual(structures.SsaFunction.Terminator.return_unit, ssa.blocks[0].terminator);
+    try testing.expectEqual(structures.FunctionBodyAnalysis.Terminator.return_unit, ssa.blocks[0].terminator);
 }
 
 fn expectDirectCallArtifact(artifact: structures.CompiledFunction, target: structures.ItemId) !void {
@@ -88,12 +88,6 @@ fn expectDirectCallArtifact(artifact: structures.CompiledFunction, target: struc
     try testing.expectEqual(@as(u32, 0), @intFromEnum(artifact.relocations[0].reference));
     try testing.expectEqual(@as(i64, 0), artifact.relocations[0].addend);
     try testing.expectEqualSlices(structures.InstanceId, &.{.{ .item = target }}, artifact.referenced_instances);
-}
-
-fn expectUnitSsa(ssa: structures.SsaFunction) !void {
-    try testing.expectEqual(@as(usize, 0), ssa.instructions.len);
-    try testing.expectEqual(@as(usize, 1), ssa.blocks.len);
-    try testing.expectEqual(structures.SsaFunction.Terminator.return_unit, ssa.blocks[0].terminator);
 }
 
 fn expectIntegerReturnBody(body: structures.FunctionBodyAnalysis, expected: i32) !void {
@@ -109,11 +103,6 @@ fn expectDirectValueUses(expected: []const structures.FunctionValueId, actual: [
         try testing.expectEqual(expected_value, actual_use.value);
         try testing.expectEqual(@as(?structures.TypeId, null), actual_use.coerce_to);
     }
-}
-
-fn expectEqualValueUses(expected: []const structures.FunctionValueUse, actual: []const structures.FunctionValueUse) !void {
-    try testing.expectEqual(expected.len, actual.len);
-    for (expected, actual) |expected_use, actual_use| try testing.expect(std.meta.eql(expected_use, actual_use));
 }
 
 fn expectUnitBody(body: structures.FunctionBodyAnalysis) !void {
@@ -421,7 +410,6 @@ const InternItemLoc = struct {
             .file_id = 1,
             .kind = .function,
             .name = if (input_value % 2 == 0) "even" else "odd",
-            .disambiguator = 0,
         });
     }
 };
@@ -648,8 +636,6 @@ test "DiscoverItems owns names across source edits" {
     try testing.expectEqual(@as(usize, 3), tree.items.len);
     try testing.expectEqual(structures.ItemKind.function, tree.items[0].loc.kind);
     try testing.expectEqualStrings("first", tree.items[0].loc.name);
-    try testing.expectEqual(@as(u32, 0), tree.items[0].loc.disambiguator);
-    try testing.expectEqual(@as(u32, 0), tree.items[1].loc.disambiguator);
     try testing.expectEqual(structures.ItemKind.top_level_entry, tree.items[2].loc.kind);
     try testing.expectEqualStrings("$entry", tree.items[2].loc.name);
 
@@ -734,13 +720,12 @@ test "item indexing handles empty malformed missing and duplicate inputs" {
     const other_file = (try db.get(query_structures.IndexItems, 5)).*.?;
     try testing.expect(first_file.ids()[0] != other_file.ids()[0]);
 
-    const base: structures.ItemLoc = .{ .file_id = 8, .kind = .function, .name = "same", .disambiguator = 0 };
+    const base: structures.ItemLoc = .{ .file_id = 8, .kind = .function, .name = "same" };
     const base_id = try db.intern(query_structures.ItemLocations, base);
     try testing.expectEqual(base_id, try db.intern(query_structures.ItemLocations, base));
-    try testing.expect(base_id != try db.intern(query_structures.ItemLocations, .{ .file_id = 9, .kind = .function, .name = "same", .disambiguator = 0 }));
-    try testing.expect(base_id != try db.intern(query_structures.ItemLocations, .{ .file_id = 8, .kind = .top_level_entry, .name = "same", .disambiguator = 0 }));
-    try testing.expect(base_id != try db.intern(query_structures.ItemLocations, .{ .file_id = 8, .kind = .function, .name = "other", .disambiguator = 0 }));
-    try testing.expect(base_id != try db.intern(query_structures.ItemLocations, .{ .file_id = 8, .kind = .function, .name = "same", .disambiguator = 1 }));
+    try testing.expect(base_id != try db.intern(query_structures.ItemLocations, .{ .file_id = 9, .kind = .function, .name = "same" }));
+    try testing.expect(base_id != try db.intern(query_structures.ItemLocations, .{ .file_id = 8, .kind = .top_level_entry, .name = "same" }));
+    try testing.expect(base_id != try db.intern(query_structures.ItemLocations, .{ .file_id = 8, .kind = .function, .name = "other" }));
     try testing.expectError(error.InvalidInternId, db.lookupInterned(query_structures.ItemLocations, @enumFromInt(std.math.maxInt(u32))));
 }
 
@@ -836,6 +821,10 @@ test "type layout reports generic size and alignment for variants" {
         (try db.get(query_structures.TypeLayout, int_or_none)).*,
     );
 
+    const variant_layout = (try db.get(query_structures.VariantLayout, int_or_none)).*;
+    try testing.expectEqual(@as(u32, 4), variant_layout.payload_offset);
+    try testing.expectEqual((try db.get(query_structures.TypeLayout, int_or_none)).*, variant_layout.layout);
+
     const unit_or_none = switch ((try db.get(InternVariantPair, .{ .unit, .none })).*) {
         .type_id => |type_id| type_id,
         .duplicate => unreachable,
@@ -923,8 +912,6 @@ test "discovery diagnoses later duplicate functions and scope recovers" {
     );
     const recovered = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
     try testing.expect(recovered.resolve("duplicate") != null);
-    const loc = try db.lookupInterned(query_structures.ItemLocations, recovered.resolve("duplicate").?);
-    try testing.expectEqual(@as(u32, 0), loc.disambiguator);
     try testing.expectEqual(@as(usize, 0), (try db.directAccumulatorValues(query_structures.DiscoverItems, 1, structures.Diagnostic)).len);
 }
 
@@ -1363,7 +1350,7 @@ test "variant values cross calls and subset widening remaps their tag" {
     try testing.expect(producer.blocks[0].terminator.return_value.coerce_to != null);
     const caller = (try db.get(query_structures.AnalyzeFunctionBody, caller_id)).*.?;
     try testing.expect(caller.call_arguments[0].coerce_to != null);
-    try testing.expect((try db.get(query_structures.LowerToSSA, .{ .item = caller_id })).* != null);
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, caller_id)).* != null);
     try testing.expect((try db.get(query_structures.CompileFunction, .{ .item = caller_id })).* != null);
     try expectCompiledVariantWord(db, 1, "caller", &.{ "caller", "producer", "accept" }, 0, 2);
 }
@@ -1444,7 +1431,6 @@ test "variant widening annotations retain equal results and recover after invali
         const instance: structures.InstanceId = .{ .item = target };
         const body = try db.get(query_structures.AnalyzeFunctionBody, target);
         try testing.expect(body.* != null);
-        const lowered = try db.get(query_structures.LowerToSSA, instance);
         const compiled = try db.get(query_structures.CompileFunction, instance);
         try testing.expect(compiled.* != null);
         const executable = try db.get(query_structures.BuildExecutable, 1);
@@ -1454,7 +1440,6 @@ test "variant widening annotations retain equal results and recover after invali
         defer testing.allocator.free(reordered);
         try setSource(db, 1, reordered);
         try testing.expectEqual(body, try db.get(query_structures.AnalyzeFunctionBody, target));
-        try testing.expectEqual(lowered, try db.get(query_structures.LowerToSSA, instance));
         try testing.expectEqual(compiled, try db.get(query_structures.CompileFunction, instance));
         try testing.expectEqual(executable, try db.get(query_structures.BuildExecutable, 1));
 
@@ -1671,9 +1656,6 @@ test "declared unit functions analyze lower compile and execute as ordinary call
     try testing.expectEqual(structures.TypeId.unit, caller_body.instructions[1].call.return_type);
     try testing.expectEqual(structures.FunctionBodyAnalysis.Terminator.return_unit, caller_body.blocks[0].terminator);
 
-    const caller_ssa = (try db.get(query_structures.LowerToSSA, .{ .item = caller_id })).*.?;
-    try testing.expectEqual(structures.TypeId.unit, caller_ssa.instructions[1].call.return_type);
-    try testing.expectEqual(structures.SsaFunction.Terminator.return_unit, caller_ssa.blocks[0].terminator);
     const leaf_artifact = (try db.get(query_structures.CompileFunction, .{ .item = leaf_id })).*.?;
     try testing.expectEqualSlices(u8, &.{0xC3}, leaf_artifact.code);
 
@@ -1705,8 +1687,6 @@ test "exit is an unshadowable int to unit intrinsic" {
     try testing.expectEqual(@as(u32, 0), @intFromEnum(body.instructions[1].exit));
     try testing.expectEqual(structures.FunctionBodyAnalysis.Terminator.return_unit, body.blocks[0].terminator);
 
-    const lowered = (try db.get(query_structures.LowerToSSA, .{ .item = caller_id })).*.?;
-    try testing.expectEqual(@as(u32, 0), @intFromEnum(lowered.instructions[1].exit));
     const artifact = (try db.get(query_structures.CompileFunction, .{ .item = caller_id })).*.?;
     try testing.expectEqual(@as(usize, 0), artifact.relocations.len);
     try testing.expectEqual(@as(usize, 0), artifact.referenced_instances.len);
@@ -1754,13 +1734,11 @@ test "exit callers retain equal results across same-name declaration edits" {
     const entry_id = (try db.get(query_structures.SelectEntry, 1)).*.?;
     const instance: structures.InstanceId = .{ .item = entry_id };
     const body = try db.get(query_structures.AnalyzeFunctionBody, entry_id);
-    const lowered = try db.get(query_structures.LowerToSSA, instance);
     const artifact = try db.get(query_structures.CompileFunction, instance);
     const executable = try db.get(query_structures.BuildExecutable, 1);
 
     try setSource(db, 1, "static exit = func(value: int) unit -> return\nexit(42)");
     try testing.expectEqual(body, try db.get(query_structures.AnalyzeFunctionBody, entry_id));
-    try testing.expectEqual(lowered, try db.get(query_structures.LowerToSSA, instance));
     try testing.expectEqual(artifact, try db.get(query_structures.CompileFunction, instance));
     try testing.expectEqual(executable, try db.get(query_structures.BuildExecutable, 1));
 
@@ -1826,8 +1804,6 @@ test "function expressions analyze nested arithmetic and calls as one typed valu
     try testing.expectEqual(@as(u32, 8), @intFromEnum(body.instructions[9].negi));
     try testing.expectEqual(@as(u32, 9), @intFromEnum(body.instructions[10].negi));
     try testing.expectEqual(@as(u32, 10), @intFromEnum(body.blocks[0].terminator.return_value.value));
-    const lowered = (try db.get(query_structures.LowerToSSA, .{ .item = expression_id })).*.?;
-    try testing.expectEqual(@as(u32, 9), @intFromEnum(lowered.instructions[10].negi));
     try testing.expect((try db.get(query_structures.BuildExecutable, 1)).* != null);
 }
 
@@ -1858,8 +1834,6 @@ test "fallible integer if joins branch values through a block argument" {
     try testing.expectEqual(@as(u32, 2), body.blocks[3].argument_end);
     try testing.expectEqual(@as(u32, 1), @intFromEnum(body.blocks[3].terminator.return_value.value));
 
-    const lowered = (try db.get(query_structures.LowerToSSA, .{ .item = choose_id })).*.?;
-    try expectEqualValueUses(body.branch_arguments, lowered.branch_arguments);
     try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "choose" }, 42);
 }
 
@@ -2338,13 +2312,12 @@ test "malformed function diagnostics remain parse-only and top-level return stay
     const entry_id = (try db.get(query_structures.SelectEntry, 2)).*.?;
     const entry_instance: structures.InstanceId = .{ .item = entry_id };
     try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, entry_id)).* == null);
-    try testing.expect((try db.get(query_structures.LowerToSSA, entry_instance)).* == null);
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, entry_instance.item)).* == null);
     try testing.expect((try db.get(query_structures.CompileFunction, entry_instance)).* == null);
     try testing.expect((try db.get(query_structures.BuildExecutable, 2)).* == null);
     const return_span: structures.SourceSpan = .{ .start = 0, .end = "return".len };
     const entry_kind: structures.Diagnostic.Kind = .entry_statement_not_supported;
     try expectSingleQueryDiagnostic(db, query_structures.AnalyzeFunctionBody, entry_id, true, 2, return_span, entry_kind);
-    try expectSingleQueryDiagnostic(db, query_structures.LowerToSSA, entry_instance, false, 2, return_span, entry_kind);
     try expectSingleQueryDiagnostic(db, query_structures.CompileFunction, entry_instance, false, 2, return_span, entry_kind);
     const entry_diagnostics = try db.transitiveAccumulatorValues(query_structures.BuildExecutable, 2, structures.Diagnostic, testing.allocator);
     defer freeDiagnostics(entry_diagnostics);
@@ -2370,13 +2343,12 @@ test "entry analysis rejects top-level returns" {
         const entry_id = (try db.get(query_structures.SelectEntry, file_id)).*.?;
         const entry_instance: structures.InstanceId = .{ .item = entry_id };
         try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, entry_id)).* == null);
-        try testing.expect((try db.get(query_structures.LowerToSSA, entry_instance)).* == null);
+        try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, entry_instance.item)).* == null);
         try testing.expect((try db.get(query_structures.CompileFunction, entry_instance)).* == null);
         try testing.expect((try db.get(query_structures.BuildExecutable, file_id)).* == null);
         const start = std.mem.indexOf(u8, case.source, case.marker).?;
         const span: structures.SourceSpan = .{ .start = start, .end = start + case.marker.len };
         try expectSingleQueryDiagnostic(db, query_structures.AnalyzeFunctionBody, entry_id, true, file_id, span, entry_kind);
-        try expectSingleQueryDiagnostic(db, query_structures.LowerToSSA, entry_instance, false, file_id, span, entry_kind);
         try expectSingleQueryDiagnostic(db, query_structures.CompileFunction, entry_instance, false, file_id, span, entry_kind);
         try expectSingleQueryDiagnostic(db, query_structures.BuildExecutable, file_id, false, file_id, span, entry_kind);
     }
@@ -2588,21 +2560,16 @@ test "call result types track signature changes while equal artifacts are retain
     const entry_id = (try db.get(query_structures.SelectEntry, 1)).*.?;
     const instance: structures.InstanceId = .{ .item = entry_id };
     const initial_body = try db.get(query_structures.AnalyzeFunctionBody, entry_id);
-    const initial_ssa = try db.get(query_structures.LowerToSSA, instance);
     const initial_artifact = try db.get(query_structures.CompileFunction, instance);
     try testing.expectEqual(structures.TypeId.unit, initial_body.*.?.instructions[0].call.return_type);
-    try testing.expectEqual(structures.TypeId.unit, initial_ssa.*.?.instructions[0].call.return_type);
 
     try setSource(db, 1,
         \\static target = func() int -> return 1
         \\target()
     );
     const updated_body = try db.get(query_structures.AnalyzeFunctionBody, entry_id);
-    const updated_ssa = try db.get(query_structures.LowerToSSA, instance);
     try testing.expect(initial_body != updated_body);
-    try testing.expect(initial_ssa != updated_ssa);
     try testing.expectEqual(structures.TypeId.int, updated_body.*.?.instructions[0].call.return_type);
-    try testing.expectEqual(structures.TypeId.int, updated_ssa.*.?.instructions[0].call.return_type);
     try testing.expectEqual(initial_artifact, try db.get(query_structures.CompileFunction, instance));
 }
 
@@ -2638,18 +2605,18 @@ test "entry call diagnostics and downstream refusal update and recover" {
     );
     try testing.expectEqual(unsupported_parse, try db.get(query_structures.ParseFile, 1));
     try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, entry_id)).* != null);
-    const lowered = (try db.get(query_structures.LowerToSSA, instance)).*.?;
+    const body = (try db.get(query_structures.AnalyzeFunctionBody, instance.item)).*.?;
     const target_id = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolve("target").?;
-    try expectDirectCallSsa(lowered, target_id);
-    const lowering_diagnostics = try db.directAccumulatorValues(query_structures.LowerToSSA, instance, structures.Diagnostic);
-    try testing.expectEqual(@as(usize, 0), lowering_diagnostics.len);
+    try expectDirectCallBody(body, target_id);
+    const body_diagnostics = try db.directAccumulatorValues(query_structures.AnalyzeFunctionBody, instance.item, structures.Diagnostic);
+    try testing.expectEqual(@as(usize, 0), body_diagnostics.len);
     try expectDirectCallArtifact((try db.get(query_structures.CompileFunction, instance)).*.?, target_id);
     const compile_diagnostics = try db.directAccumulatorValues(query_structures.CompileFunction, instance, structures.Diagnostic);
     try testing.expectEqual(@as(usize, 0), compile_diagnostics.len);
     try testing.expect((try db.get(query_structures.BuildExecutable, 1)).* != null);
 
     try setSource(db, 1, "");
-    try testing.expect((try db.get(query_structures.LowerToSSA, instance)).* != null);
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, instance.item)).* != null);
     try testing.expect((try db.get(query_structures.BuildExecutable, 1)).* != null);
 }
 
@@ -2885,25 +2852,25 @@ test "direct entry call SSA remains demand driven across callee edits and reorde
     const entry_id = (try db.get(query_structures.SelectEntry, 1)).*.?;
     const instance: structures.InstanceId = .{ .item = entry_id };
     const broken_id = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolve("broken").?;
-    const initial = try db.get(query_structures.LowerToSSA, instance);
-    try expectDirectCallSsa(initial.*.?, broken_id);
+    const initial = try db.get(query_structures.AnalyzeFunctionBody, instance.item);
+    try expectDirectCallBody(initial.*.?, broken_id);
 
     // Independently demanding the invalid callee body must not create a caller
-    // lowering dependency on it.
+    // analysis dependency on it.
     try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, broken_id)).* == null);
     try setSource(db, 1,
         \\static broken = func() int -> return false
         \\static other = func() int -> return 20
         \\broken()
     );
-    try testing.expectEqual(initial, try db.get(query_structures.LowerToSSA, instance));
+    try testing.expectEqual(initial, try db.get(query_structures.AnalyzeFunctionBody, instance.item));
 
     try setSource(db, 1,
         \\static other = func() int -> return 20
         \\static broken = func() int -> return false
         \\broken()
     );
-    try testing.expectEqual(initial, try db.get(query_structures.LowerToSSA, instance));
+    try testing.expectEqual(initial, try db.get(query_structures.AnalyzeFunctionBody, instance.item));
 }
 
 test "direct entry call SSA tracks target changes removal and restoration" {
@@ -2920,162 +2887,28 @@ test "direct entry call SSA tracks target changes removal and restoration" {
     const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
     const alpha_id = scope.resolve("alpha").?;
     const bravo_id = scope.resolve("bravo").?;
-    try expectDirectCallSsa((try db.get(query_structures.LowerToSSA, instance)).*.?, alpha_id);
+    try expectDirectCallBody((try db.get(query_structures.AnalyzeFunctionBody, instance.item)).*.?, alpha_id);
 
     try setSource(db, 1,
         \\static alpha = func() int -> return 1
         \\static bravo = func() int -> return 2
         \\bravo()
     );
-    try expectDirectCallSsa((try db.get(query_structures.LowerToSSA, instance)).*.?, bravo_id);
+    try expectDirectCallBody((try db.get(query_structures.AnalyzeFunctionBody, instance.item)).*.?, bravo_id);
 
     try setSource(db, 1,
         \\static alpha = func() int -> return 1
         \\static bravo = func() int -> return 2
     );
-    const unit = (try db.get(query_structures.LowerToSSA, instance)).*.?;
-    try expectUnitSsa(unit);
+    const unit = (try db.get(query_structures.AnalyzeFunctionBody, instance.item)).*.?;
+    try expectUnitBody(unit);
 
     try setSource(db, 1,
         \\static alpha = func() int -> return 1
         \\static bravo = func() int -> return 2
         \\bravo()
     );
-    try expectDirectCallSsa((try db.get(query_structures.LowerToSSA, instance)).*.?, bravo_id);
-}
-
-test "LowerToSSA produces owned value-equal functions for distinct instances" {
-    const db = try testDatabase(2);
-    defer db.deinit();
-
-    try addSource(db, 1, "static first = func() int -> return 7");
-    try addSource(db, 2, "static second = func() int -> return 7");
-    const first_id = (try db.get(query_structures.IndexItems, 1)).*.?.ids()[0];
-    const second_id = (try db.get(query_structures.IndexItems, 2)).*.?.ids()[0];
-    const first = try db.get(query_structures.LowerToSSA, .{ .item = first_id });
-    const second = try db.get(query_structures.LowerToSSA, .{ .item = second_id });
-
-    try testing.expect(first != second);
-    try testing.expect(first.*.?.instructions.ptr != second.*.?.instructions.ptr);
-    try testing.expect(structures.SsaFunction.eql(first.*.?, second.*.?));
-    try testing.expectEqual(@as(usize, 1), first.*.?.instructions.len);
-    try testing.expectEqual(@as(i32, 7), first.*.?.instructions[0].consti);
-    try testing.expectEqual(@as(u32, 0), @intFromEnum(first.*.?.blocks[0].terminator.return_value.value));
-}
-
-test "LowerToSSA changes with its body and retains equal results" {
-    const db = try testDatabase(1);
-    defer db.deinit();
-
-    try addSource(db, 1,
-        \\static target = func() int -> return 7
-        \\static unrelated = func() int -> return 1
-    );
-    const target_id = (try db.get(query_structures.IndexItems, 1)).*.?.ids()[0];
-    const instance: structures.InstanceId = .{ .item = target_id };
-    try testing.expectEqual(@as(i32, 7), (try db.get(query_structures.LowerToSSA, instance)).*.?.instructions[0].consti);
-
-    try setSource(db, 1,
-        \\static target = func() int -> return 8
-        \\static unrelated = func() int -> return 1
-    );
-    const changed = try db.get(query_structures.LowerToSSA, instance);
-    try testing.expectEqual(@as(i32, 8), changed.*.?.instructions[0].consti);
-
-    try setSource(db, 1,
-        \\static target = func() int
-        \\  return 8
-        \\static unrelated = func() int -> return 1
-    );
-    const equal_shape = try db.get(query_structures.LowerToSSA, instance);
-    try testing.expectEqual(changed, equal_shape);
-
-    try setSource(db, 1,
-        \\static target = func() int
-        \\  return 8
-        \\static unrelated = func() int -> return 2
-    );
-    try testing.expectEqual(equal_shape, try db.get(query_structures.LowerToSSA, instance));
-}
-
-test "LowerToSSA exposes semantic diagnostics without duplicating them" {
-    const db = try testDatabase(2);
-    defer db.deinit();
-
-    try addSource(db, 1, "static header = func() foo -> return 1");
-    try addSource(db, 2, "static body = func() int -> return true");
-    for ([_]structures.FileId{ 1, 2 }) |file_id| {
-        const item_id = (try db.get(query_structures.IndexItems, file_id)).*.?.ids()[0];
-        const instance: structures.InstanceId = .{ .item = item_id };
-        try testing.expect((try db.get(query_structures.LowerToSSA, instance)).* == null);
-        const direct = try db.directAccumulatorValues(query_structures.LowerToSSA, instance, structures.Diagnostic);
-        try testing.expectEqual(@as(usize, 0), direct.len);
-        const transitive = try db.transitiveAccumulatorValues(query_structures.LowerToSSA, instance, structures.Diagnostic, testing.allocator);
-        defer freeDiagnostics(transitive);
-        try testing.expectEqual(@as(usize, 1), transitive.len);
-    }
-}
-
-test "LowerToSSA supports entry retention failure restoration and invalid instances" {
-    const db = try testDatabase(1);
-    defer db.deinit();
-
-    const valid = "static f = func() int -> return 7";
-    try addSource(db, 1, valid);
-    const function_id = (try db.get(query_structures.IndexItems, 1)).*.?.ids()[0];
-    const entry_id = (try db.get(query_structures.SelectEntry, 1)).*.?;
-    const function_instance: structures.InstanceId = .{ .item = function_id };
-    const entry_instance: structures.InstanceId = .{ .item = entry_id };
-    const initial_entry = try db.get(query_structures.LowerToSSA, entry_instance);
-    try expectUnitSsa(initial_entry.*.?);
-
-    try setSource(db, 1, "static value = 1");
-    try testing.expectEqual(entry_id, (try db.get(query_structures.SelectEntry, 1)).*.?);
-    try testing.expectEqual(initial_entry, try db.get(query_structures.LowerToSSA, entry_instance));
-
-    try setSource(db, 1, "");
-    try testing.expectEqual(entry_id, (try db.get(query_structures.SelectEntry, 1)).*.?);
-    try testing.expectEqual(initial_entry, try db.get(query_structures.LowerToSSA, entry_instance));
-    try testing.expect((try db.get(query_structures.LowerToSSA, function_instance)).* == null);
-
-    try setSource(db, 1, "return 7");
-    try testing.expect((try db.get(query_structures.LowerToSSA, entry_instance)).* == null);
-    try setSource(db, 1, "const x 1");
-    try testing.expect((try db.get(query_structures.LowerToSSA, entry_instance)).* == null);
-    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, entry_id)).* == null);
-    try testing.expect((try db.get(query_structures.CompileFunction, entry_instance)).* == null);
-    const parse_span: structures.SourceSpan = .{ .start = 8, .end = 9 };
-    const parse_kind: structures.Diagnostic.Kind = .{ .expected_token = .{ .expected = .equal, .found = .number_literal } };
-    try expectSingleQueryDiagnostic(db, query_structures.AnalyzeFunctionBody, entry_id, false, 1, parse_span, parse_kind);
-    try expectSingleQueryDiagnostic(db, query_structures.LowerToSSA, entry_instance, false, 1, parse_span, parse_kind);
-    try expectSingleQueryDiagnostic(db, query_structures.CompileFunction, entry_instance, false, 1, parse_span, parse_kind);
-
-    try setSource(db, 1, valid);
-    try testing.expectEqual(entry_id, (try db.get(query_structures.SelectEntry, 1)).*.?);
-    const restored_entry = (try db.get(query_structures.LowerToSSA, entry_instance)).*.?;
-    try expectUnitSsa(restored_entry);
-    try testing.expect((try db.get(query_structures.LowerToSSA, function_instance)).* != null);
-
-    const invalid: structures.InstanceId = .{ .item = @enumFromInt(std.math.maxInt(u32)) };
-    try testing.expectError(error.InvalidInternId, db.get(query_structures.LowerToSSA, invalid));
-}
-
-test "concurrent LowerToSSA requests share function and entry results" {
-    const db = try testDatabase(4);
-    defer db.deinit();
-
-    try addSource(db, 1, "static f = func() int -> return 7\nf()");
-    const function_id = (try db.get(query_structures.IndexItems, 1)).*.?.ids()[0];
-    const entry_id = (try db.get(query_structures.SelectEntry, 1)).*.?;
-    for ([_]structures.InstanceId{ .{ .item = function_id }, .{ .item = entry_id } }) |instance| {
-        var handles: [16]Handle(query_structures.LowerToSSA) = undefined;
-        for (&handles) |*handle| handle.* = try db.spawn(query_structures.LowerToSSA, instance);
-        const first = try handles[0].wait();
-        for (handles[1..]) |handle| try testing.expectEqual(first, try handle.wait());
-        if (instance.item == entry_id) {
-            try expectDirectCallSsa(first.*.?, function_id);
-        }
-    }
+    try expectDirectCallBody((try db.get(query_structures.AnalyzeFunctionBody, instance.item)).*.?, bravo_id);
 }
 
 test "CompileFunction produces owned value-equal artifacts for distinct instances" {
@@ -3259,7 +3092,6 @@ test "item locations survive body and unrelated-index edits but not renames" {
         .file_id = initial_tree.items[0].loc.file_id,
         .kind = initial_tree.items[0].loc.kind,
         .name = initial_name,
-        .disambiguator = initial_tree.items[0].loc.disambiguator,
     };
     const initial_declaration = initial_tree.items[0].declaration;
 
@@ -3462,7 +3294,7 @@ test "failed interning publishes no partial identity" {
     defer if (db_live) db.deinit();
 
     failing.fail_index = failing.alloc_index + 3;
-    const loc: structures.ItemLoc = .{ .file_id = 1, .kind = .function, .name = "owned", .disambiguator = 0 };
+    const loc: structures.ItemLoc = .{ .file_id = 1, .kind = .function, .name = "owned" };
     try testing.expectError(error.OutOfMemory, db.intern(query_structures.ItemLocations, loc));
     try testing.expect(failing.has_induced_failure);
     try testing.expectError(error.InvalidInternId, db.lookupInterned(query_structures.ItemLocations, @enumFromInt(0)));
@@ -3489,9 +3321,108 @@ test "stale dependencies do not create false cycles" {
     try testing.expectEqual(@as(u32, 1), (try db.get(DynamicCycleB, 1)).*);
 }
 
+test "cycles introduced during dependency verification reject retry and recover" {
+    for ([_]usize{ 1, 4 }) |worker_count| {
+        const db = try testDatabase(worker_count);
+        defer db.deinit();
+
+        try db.addInput(NumberInput, 10, 0);
+        try db.addInput(NumberInput, 11, 0);
+        const initial = try db.get(DynamicCycleA, 1);
+        try testing.expectEqual(@as(u32, 0), initial.*);
+
+        try db.setInput(NumberInput, 11, 1);
+        try testing.expectError(error.QueryCycle, db.get(DynamicCycleA, 1));
+        try testing.expectError(error.QueryCycle, db.get(DynamicCycleA, 1));
+
+        try db.setInput(NumberInput, 11, 0);
+        try testing.expectEqual(initial, try db.get(DynamicCycleA, 1));
+        try db.setInput(NumberInput, 10, 1);
+        try db.setInput(NumberInput, 11, 1);
+        try testing.expectEqual(@as(u32, 1), (try db.get(DynamicCycleB, 1)).*);
+    }
+}
+
 test "database initialization frees state when worker allocation fails" {
     var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1 });
     try testing.expectError(error.OutOfMemory, Database.init(failing.allocator(), .{ .worker_count = 1 }));
     try testing.expect(failing.has_induced_failure);
     try testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+}
+
+test "demanded function declaration annotations reject and recover" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    const valid = "static f = func() int -> return 7\nexit(f())";
+    try addSource(db, 1, valid);
+    try testing.expect((try db.get(query_structures.BuildExecutable, 1)).* != null);
+    for ([_][]const u8{ "int", "func(int) unit", "func() int" }) |annotation| {
+        const source = try std.fmt.allocPrint(testing.allocator, "static f: {s} = func() int -> return 7\nexit(f())", .{annotation});
+        defer testing.allocator.free(source);
+        try setSource(db, 1, source);
+        try testing.expect((try db.get(query_structures.BuildExecutable, 1)).* == null);
+        const diagnostics = try db.transitiveAccumulatorValues(query_structures.BuildExecutable, 1, structures.Diagnostic, testing.allocator);
+        defer freeDiagnostics(diagnostics);
+        try testing.expectEqual(@as(usize, 1), diagnostics.len);
+        try testing.expectEqual(structures.Diagnostic.Kind.function_annotation_not_supported, diagnostics[0].kind);
+    }
+    try setSource(db, 1, valid);
+    try testing.expect((try db.get(query_structures.BuildExecutable, 1)).* != null);
+    try setSource(db, 1, "static f: int = func() int -> return 7\nexit(0)");
+    try testing.expect((try db.get(query_structures.BuildExecutable, 1)).* != null);
+}
+
+test "expression graph preserves effects across statements arguments and selected branches" {
+    const cases = [_]struct { body: []const u8, expected: u8 }{
+        .{ .body = "pair(stop(11), stop(12))", .expected = 11 },
+        .{ .body = "const unused = stop(21)\nstop(22)", .expected = 21 },
+        .{ .body = "const selected = if 1 < 2 -> pair(1, 2) else stop(31)\nexit(selected)", .expected = 3 },
+        .{ .body = "const selected = if 2 < 1 -> stop(41) else if 1 < 2 -> 42 else stop(43)\nexit(selected)", .expected = 42 },
+        .{ .body = "const selected = if stop(51) < stop(52) -> stop(53) else stop(54)\nexit(selected)", .expected = 51 },
+    };
+    const io = testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    for (cases) |case| {
+        const db = try testDatabase(1);
+        defer db.deinit();
+        const source = try std.fmt.allocPrint(testing.allocator, "static stop = func(code: int) int\n  exit(code)\n  return 0\n" ++
+            "static pair = func(a: int, b: int) int -> return a + b\n{s}", .{case.body});
+        defer testing.allocator.free(source);
+        try addSource(db, 1, source);
+        const executable = (try db.get(query_structures.BuildExecutable, 1)).*.?;
+        try runtime.writeProgram(io, executable.bytes);
+        try testing.expectEqual(case.expected, try runtime.runProg(io, testing.allocator, &.{}));
+    }
+}
+
+test "redundant variant binding annotations retain typed and compiled results" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1, "static f = func(value: int | none) int | none\n  const bound = value\n  return bound");
+    const item = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolve("f").?;
+    const body = try db.get(query_structures.AnalyzeFunctionBody, item);
+    const artifact = try db.get(query_structures.CompileFunction, .{ .item = item });
+    try setSource(db, 1, "static f = func(value: int | none) int | none\n  const bound: int | none = value\n  return bound");
+    try testing.expectEqual(body, try db.get(query_structures.AnalyzeFunctionBody, item));
+    try testing.expectEqual(artifact, try db.get(query_structures.CompileFunction, .{ .item = item }));
+}
+
+test "typed expression graph construction cleans up every allocation failure" {
+    try testing.checkAllAllocationFailures(testing.allocator, testTypedExpressionAllocations, .{});
+}
+
+fn testTypedExpressionAllocations(gpa: std.mem.Allocator) !void {
+    const db = try Database.init(gpa, .{ .worker_count = 1 });
+    defer db.deinit();
+    try addSource(db, 1,
+        \\static identity = func(value: int) int -> return value
+        \\static choose = func(flag: int) int | none
+        \\  const saved = identity(flag)
+        \\  const alias: int = saved
+        \\  identity(alias)
+        \\  const selected: int | none = if saved < 0 -> if saved < -1 -> none else identity(alias) else identity(saved)
+        \\  return selected
+    );
+    const item = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolve("choose").?;
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, item)).* != null);
 }

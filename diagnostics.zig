@@ -44,6 +44,7 @@ fn writeKindMessage(writer: *std.Io.Writer, kind: structures.Diagnostic.Kind) !v
         .expected_token => |payload| try writer.print("expected {}, found {}", .{ payload.expected, payload.found }),
         .invalid_expression => |tag| try writer.print("{} is not a valid expression", .{tag}),
         .duplicate_top_level_function => try writer.writeAll("duplicate top-level function name"),
+        .function_annotation_not_supported => try writer.writeAll("function declaration annotations are not supported yet"),
         .parameter_mode_not_supported => try writer.writeAll("parameter modes are not supported yet"),
         .duplicate_parameter => try writer.writeAll("duplicate parameter"),
         .parameter_type_missing => try writer.writeAll("function parameters must declare a type"),

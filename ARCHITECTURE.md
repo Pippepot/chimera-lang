@@ -4,10 +4,11 @@ Durable compiler contracts live here. [syntax&semantics.txt](syntax&semantics.tx
 
 ## Stage boundaries
 
-- Compiler stages depend in data-flow order. Shared types in `structures.zig` do not import stages. Parser, semantic analysis, SSA, and codegen do not import query orchestration; the query engine remains compiler-independent.
+- Compiler stages depend in data-flow order. Shared types in `structures.zig` do not import stages. Parser, semantic analysis, and codegen do not import query orchestration; the query engine remains compiler-independent.
 - Query definitions supply dependencies and small protocols such as `TypeInterner`. Semantic analysis owns source traversal and issues; the interner owns canonical type identity.
-- Module and item queries own declarations, scopes, and shared semantic data. Body analysis, lowering, and compilation operate per function or instance. Calls demand callee signatures, not bodies.
-- `AnalyzeFunctionBody` is the typed publication boundary. It validates names, annotations, operations, calls, joins, and returns before publishing type-specific IR. SSA and codegen trust semantic facts and check their own capabilities and resource limits.
+- Module and item queries own declarations, scopes, and shared semantic data. Body analysis operates per declaration; compilation operates per instance. Calls demand callee signatures, not bodies.
+- Source and lexical validation build a query-local expression graph before callable resolution. Typing constructs the sole control-flow graph; codegen consumes it directly. Add a separate lowering representation only when a transformation requires it.
+- `AnalyzeFunctionBody` is the typed publication boundary. It validates names, annotations, operations, calls, joins, and returns before publishing type-specific IR. Codegen trusts semantic facts and checks its own capabilities and resource limits.
 - Expected source errors produce `structures.Diagnostic` values. Missing or stale query state remains distinct from rejection; infrastructure failures use errors. Broken compiler invariants use assertions or `unreachable`, never user diagnostics. `diagnostics.zig` alone translates kinds into messages; presentation resolves paths and source lines.
 
 ## Identity and ownership
@@ -29,7 +30,7 @@ Durable compiler contracts live here. [syntax&semantics.txt](syntax&semantics.tx
 
 ## Representation and linking
 
-- `TypeLayout(TypeId)` exposes only byte size and alignment. Type-specific results own payload or field offsets. Variants use an aligned `u32` tag followed by storage aligned for the largest payload, with tail padding. A future `sizeof` consumes the common layout boundary.
+- `TypeLayout(TypeId)` exposes only byte size and alignment. `VariantLayout(TypeId)` owns the variant payload offset and common layout; other type-specific results will own field offsets. Variants use an aligned `u32` tag followed by storage aligned for the largest payload, with tail padding. A future `sizeof` consumes the common layout boundary.
 - Arguments, spills, and copies use the full layout. The current internal convention returns exactly four-byte values in `eax`, other nonzero-sized values in caller-provided stack storage, and zero-sized values without a machine result. Callers reserve a fixed outgoing area. This is not an external platform ABI.
 - Per-function compilation emits owned code, relocations, alignment, and symbolic references. Whole-program construction resolves addresses and emits ELF. Cached reachability provides one deterministic breadth-first order for linking and debug output.
 - Current startup calls the file's synthetic, unit-returning top-level entry, then exits with zero. Top-level statement values are discarded; `main` has no special status.

@@ -3,7 +3,6 @@ const structures = @import("structures.zig");
 const ast = @import("ast_new.zig");
 const codegen = @import("codegen_new.zig");
 const semantic = @import("semantic.zig");
-const ssa = @import("ssa.zig");
 const typing = @import("typing.zig");
 
 pub const SourceText = struct {
@@ -54,11 +53,12 @@ pub const DiscoverItems = struct {
         var tree = try semantic.discoverItems(ctx.allocator(), &ast_value, source);
         errdefer tree.deinit(ctx.allocator());
 
+        var names = std.StringHashMap(void).init(ctx.allocator());
+        defer names.deinit();
         var has_duplicates = false;
         for (tree.items) |item| {
-            // Discovery assigns source-order ordinals per function name, so a
-            // nonzero ordinal is always a later declaration of a duplicate.
-            if (item.loc.kind != .function or item.loc.disambiguator == 0) continue;
+            if (item.loc.kind != .function) continue;
+            if (!(try names.getOrPut(item.loc.name)).found_existing) continue;
             has_duplicates = true;
             const node = ast_value.nodes[item.declaration];
             std.debug.assert(node.tag == .static_binding);
@@ -88,7 +88,6 @@ pub const ItemLocations = struct {
         std.hash.autoHash(&hasher, value.file_id);
         std.hash.autoHash(&hasher, value.kind);
         hasher.update(value.name);
-        std.hash.autoHash(&hasher, value.disambiguator);
         return hasher.final();
     }
 
@@ -181,6 +180,10 @@ fn TypeInterner(comptime Context: type) type {
             return lookupVariantMembers(self.ctx, type_id);
         }
 
+        pub fn variantLayout(self: @This(), type_id: structures.TypeId) !structures.VariantLayout {
+            return (try self.ctx.get(VariantLayout, type_id)).*;
+        }
+
         pub fn layout(self: @This(), type_id: structures.TypeId) !structures.TypeLayout {
             return (try self.ctx.get(TypeLayout, type_id)).*;
         }
@@ -202,10 +205,16 @@ pub const TypeLayout = struct {
         if (type_id == .int) return .{ .byte_size = 4, .byte_alignment = 4 };
         if (type_id == .unit or type_id == .none) return .{ .byte_size = 0, .byte_alignment = 1 };
 
-        return layoutVariantType(ctx, (try lookupVariantMembers(ctx, type_id)) orelse unreachable);
+        return (try ctx.get(VariantLayout, type_id)).layout;
     }
+};
 
-    fn layoutVariantType(ctx: anytype, members: []const structures.TypeId) anyerror!Output {
+pub const VariantLayout = struct {
+    pub const Input = structures.TypeId;
+    pub const Output = structures.VariantLayout;
+
+    pub fn run(ctx: anytype, type_id: Input) anyerror!Output {
+        const members = (try lookupVariantMembers(ctx, type_id)) orelse unreachable;
         if (members.len > std.math.maxInt(u32)) return error.TypeTooLarge;
 
         var payload_size: u32 = 0;
@@ -222,8 +231,11 @@ pub const TypeLayout = struct {
         const payload_offset = try alignForward(tag_size, payload_alignment);
         const unaligned_size = std.math.add(u32, payload_offset, payload_size) catch return error.TypeTooLarge;
         return .{
-            .byte_size = try alignForward(unaligned_size, byte_alignment),
-            .byte_alignment = byte_alignment,
+            .layout = .{
+                .byte_size = try alignForward(unaligned_size, byte_alignment),
+                .byte_alignment = byte_alignment,
+            },
+            .payload_offset = payload_offset,
         };
     }
 };
@@ -269,9 +281,6 @@ pub const BuildModuleScope = struct {
             const loc = try ctx.lookupInterned(ItemLocations, item_id);
             if (loc.kind != .function) continue;
             std.debug.assert(loc.file_id == file_id);
-            // Discovery rejects duplicate names before indexing, so every
-            // indexed function location has ordinal zero.
-            std.debug.assert(loc.disambiguator == 0);
 
             const name = try ctx.allocator().dupe(u8, loc.name);
             errdefer ctx.allocator().free(name);
@@ -336,7 +345,7 @@ pub const AnalyzeFunctionBody = struct {
         const parsed = (try ctx.get(ParseFile, resolved.file_id)).* orelse return null;
         const source = (try ctx.input(SourceText, resolved.file_id)).*;
         const type_interner: TypeInterner(@TypeOf(ctx)) = .{ .ctx = ctx };
-        const result = try semantic.buildUnresolvedBody(&parsed, source, resolved.declaration, loc.kind, parameter_types, return_type, type_interner, ctx.allocator());
+        const result = try semantic.buildUnresolvedBody(&parsed, source, resolved.declaration, loc.kind, parameter_types.len, type_interner, ctx.allocator());
         var unresolved = switch (result) {
             .success => |unresolved_value| unresolved_value,
             .unsupported => |issue| {
@@ -366,24 +375,14 @@ pub const SelectEntry = struct {
     }
 };
 
-pub const LowerToSSA = struct {
-    pub const Input = structures.InstanceId;
-    pub const Output = ?structures.SsaFunction;
-
-    pub fn run(ctx: anytype, instance_id: Input) anyerror!Output {
-        const body = (try ctx.get(AnalyzeFunctionBody, instance_id.item)).* orelse return null;
-        return try ssa.lowerFunction(body, ctx.allocator());
-    }
-};
-
 pub const CompileFunction = struct {
     pub const Input = structures.InstanceId;
     pub const Output = ?structures.CompiledFunction;
 
     pub fn run(ctx: anytype, instance_id: Input) anyerror!Output {
-        const lowered = (try ctx.get(LowerToSSA, instance_id)).* orelse return null;
+        const body = (try ctx.get(AnalyzeFunctionBody, instance_id.item)).* orelse return null;
         const type_interner: TypeInterner(@TypeOf(ctx)) = .{ .ctx = ctx };
-        return try codegen.compileFunction(&lowered, type_interner, ctx.allocator());
+        return try codegen.compileFunction(&body, type_interner, ctx.allocator());
     }
 };
 

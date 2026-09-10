@@ -2,18 +2,8 @@ const std = @import("std");
 const structures = @import("structures.zig");
 const semantic = @import("semantic.zig");
 
-// Specialized body-typing logic behind the AnalyzeFunctionBody publication
-// boundary. Query definitions live in query_structures.zig and delegate here;
-// this module owns how unresolved bodies become typed instructions. The query
-// types it demands arrive as comptime parameters so typing stays decoupled
-// from the query catalogue while ctx.get keeps recording real dependencies.
-
 pub fn emitSemanticIssue(ctx: anytype, file_id: structures.FileId, issue: semantic.Issue) !void {
-    try ctx.emit(structures.Diagnostic, .{
-        .file_id = file_id,
-        .span = issue.span,
-        .kind = issue.kind,
-    });
+    try ctx.emit(structures.Diagnostic, .{ .file_id = file_id, .span = issue.span, .kind = issue.kind });
 }
 
 pub fn resolveAndTypeBody(
@@ -26,219 +16,284 @@ pub fn resolveAndTypeBody(
     type_interner: anytype,
     unresolved: semantic.UnresolvedBody,
 ) !?structures.FunctionBodyAnalysis {
-    const instructions = try ctx.allocator().alloc(structures.FunctionBodyAnalysis.Instruction, unresolved.instructions.len);
-    var owns_instructions = true;
-    defer if (owns_instructions) ctx.allocator().free(instructions);
-
-    const block_argument_types = try ctx.allocator().alloc(structures.TypeId, unresolved.block_argument_count);
-    var owns_block_arguments = true;
-    defer if (owns_block_arguments) ctx.allocator().free(block_argument_types);
-    @memcpy(block_argument_types[0..parameter_types.len], parameter_types);
-
-    const branch_arguments = try ctx.allocator().alloc(structures.FunctionValueUse, unresolved.branch_arguments.len);
-    var owns_branch_arguments = true;
-    defer if (owns_branch_arguments) ctx.allocator().free(branch_arguments);
-
-    const call_arguments = try ctx.allocator().alloc(structures.FunctionValueUse, unresolved.call_arguments.len);
-    var owns_call_arguments = true;
-    defer if (owns_call_arguments) ctx.allocator().free(call_arguments);
-
-    const value_types = try ctx.allocator().alloc(structures.TypeId, unresolved.block_argument_count + unresolved.instructions.len);
-    defer ctx.allocator().free(value_types);
-    @memcpy(value_types[0..parameter_types.len], parameter_types);
-    const known_types = try ctx.allocator().alloc(bool, value_types.len);
-    defer ctx.allocator().free(known_types);
-    @memset(known_types, false);
-    @memset(known_types[0..parameter_types.len], true);
-
-    var scope: ?structures.ModuleScope = null;
-    var join_index: usize = 0;
-    var expectation_index: usize = 0;
-    if (!try resolveConstraints(ctx, file_id, unresolved, value_types, known_types, block_argument_types, type_interner, 0, &join_index, &expectation_index)) return null;
-    for (unresolved.instructions, instructions, 0..) |instruction, *resolved, instruction_index| {
-        const instruction_type: structures.TypeId = switch (instruction.operation) {
-            .consti => |value| blk: {
-                resolved.* = .{ .consti = value };
-                break :blk .int;
-            },
-            .const_unit => blk: {
-                resolved.* = .const_unit;
-                break :blk .unit;
-            },
-            .const_none => blk: {
-                resolved.* = .const_none;
-                break :blk .none;
-            },
-            .variant_coerce => |coercion| blk: {
-                const operand = resolveValue(coercion.operand, unresolved.block_argument_count);
-                const operand_index = @intFromEnum(operand);
-                std.debug.assert(known_types[operand_index]);
-                if (try coerceValue(type_interner, operand, value_types[operand_index], coercion.target_type) == null) {
-                    try emitSemanticIssue(ctx, file_id, .{ .span = instruction.span, .kind = .local_type_mismatch });
-                    return null;
-                }
-                resolved.* = .{ .variant_coerce = .{ .operand = operand, .target_type = coercion.target_type } };
-                break :blk coercion.target_type;
-            },
-            .call => |call| blk: {
-                break :blk try resolveAndTypeCall(
-                    ctx,
-                    ModuleScopeQuery,
-                    FunctionSignatureQuery,
-                    file_id,
-                    unresolved,
-                    value_types,
-                    known_types,
-                    call_arguments,
-                    type_interner,
-                    call,
-                    &scope,
-                    resolved,
-                ) orelse return null;
-            },
-            .negi => |operand| blk: {
-                const resolved_operand = resolveValue(operand, unresolved.block_argument_count);
-                const operand_index = @intFromEnum(resolved_operand);
-                std.debug.assert(known_types[operand_index]);
-                if (value_types[operand_index] != .int) {
-                    try emitSemanticIssue(ctx, file_id, .{ .span = instruction.span, .kind = .negation_operand_not_int });
-                    return null;
-                }
-                resolved.* = .{ .negi = resolved_operand };
-                break :blk .int;
-            },
-            .addi, .subi, .muli, .divsi => |operands| blk: {
-                const resolved_operands = resolveOperands(operands, unresolved.block_argument_count);
-                const lhs_index = @intFromEnum(resolved_operands.lhs);
-                const rhs_index = @intFromEnum(resolved_operands.rhs);
-                std.debug.assert(known_types[lhs_index]);
-                std.debug.assert(known_types[rhs_index]);
-                if (value_types[lhs_index] != .int or value_types[rhs_index] != .int) {
-                    try emitSemanticIssue(ctx, file_id, .{ .span = instruction.span, .kind = .arithmetic_operands_not_int });
-                    return null;
-                }
-                resolved.* = switch (instruction.operation) {
-                    .addi => .{ .addi = resolved_operands },
-                    .subi => .{ .subi = resolved_operands },
-                    .muli => .{ .muli = resolved_operands },
-                    .divsi => .{ .divsi = resolved_operands },
-                    else => unreachable,
-                };
-                break :blk .int;
-            },
-        };
-        const value_index = unresolved.block_argument_count + instruction_index;
-        value_types[value_index] = instruction_type;
-        known_types[value_index] = true;
-        const completed_instruction_count = instruction_index + 1;
-        if (!try resolveConstraints(ctx, file_id, unresolved, value_types, known_types, block_argument_types, type_interner, completed_instruction_count, &join_index, &expectation_index)) return null;
-    }
-    std.debug.assert(join_index == unresolved.joins.len);
-    std.debug.assert(expectation_index == unresolved.type_expectations.len);
-
-    const blocks = try ctx.allocator().alloc(structures.FunctionBodyAnalysis.Block, unresolved.blocks.len);
-    var owns_blocks = true;
-    defer if (owns_blocks) ctx.allocator().free(blocks);
-    for (unresolved.blocks, blocks) |block, *resolved| {
-        const unresolved_terminator = block.terminator orelse unreachable;
-        const terminator: structures.FunctionBodyAnalysis.Terminator = switch (unresolved_terminator) {
-            .branch => |branch| .{ .branch = try resolveBranch(type_interner, unresolved, value_types, block_argument_types, branch_arguments, branch) },
-            .predicate_branch => |predicate| blk: {
-                const operands = resolveOperands(predicate.operands, unresolved.block_argument_count);
-                const lhs_index = @intFromEnum(operands.lhs);
-                const rhs_index = @intFromEnum(operands.rhs);
-                std.debug.assert(known_types[lhs_index]);
-                std.debug.assert(known_types[rhs_index]);
-                if (value_types[lhs_index] != .int or value_types[rhs_index] != .int) {
-                    try emitSemanticIssue(ctx, file_id, .{ .span = predicate.span, .kind = .comparison_operands_not_int });
-                    return null;
-                }
-                break :blk .{ .predicate_branch = .{
-                    .operation = switch (predicate.operation) {
-                        .lt => .lti,
-                        .gt => .gti,
-                        .le => .lei,
-                        .ge => .gei,
-                        .eq => .eqi,
-                        .ne => .nei,
-                    },
-                    .operands = operands,
-                    .then_branch = try resolveBranch(type_interner, unresolved, value_types, block_argument_types, branch_arguments, predicate.then_branch),
-                    .else_branch = try resolveBranch(type_interner, unresolved, value_types, block_argument_types, branch_arguments, predicate.else_branch),
-                } };
-            },
-            .return_unit => |span| if (return_type == .unit) .return_unit else {
-                try emitSemanticIssue(ctx, file_id, .{
-                    .span = span,
-                    .kind = .{ .missing_return_value = return_type },
-                });
-                return null;
-            },
-            .return_value => |return_value| blk: {
-                const value = resolveValue(return_value.value, unresolved.block_argument_count);
-                const value_index = @intFromEnum(value);
-                std.debug.assert(known_types[value_index]);
-                const use = try coerceValue(type_interner, value, value_types[value_index], return_type) orelse {
-                    try emitSemanticIssue(ctx, file_id, .{ .span = return_value.span, .kind = .return_type_mismatch });
-                    return null;
-                };
-                break :blk if (return_type == .unit) .return_unit else .{ .return_value = use };
-            },
-        };
-        resolved.* = .{
-            .argument_start = block.argument_start,
-            .argument_end = block.argument_end,
-            .instruction_start = block.instruction_start,
-            .instruction_end = block.instruction_end,
-            .terminator = terminator,
-        };
-    }
-    validateEdges(blocks, block_argument_types, branch_arguments, value_types);
-    owns_instructions = false;
-    owns_block_arguments = false;
-    owns_branch_arguments = false;
-    owns_call_arguments = false;
-    owns_blocks = false;
-    return .{
+    var builder: BodyBuilder(@TypeOf(ctx), ModuleScopeQuery, FunctionSignatureQuery, @TypeOf(type_interner)) = .{
+        .ctx = ctx,
+        .type_interner = type_interner,
+        .file_id = file_id,
+        .unresolved = unresolved,
         .return_type = return_type,
-        .block_argument_types = block_argument_types,
-        .branch_arguments = branch_arguments,
-        .call_arguments = call_arguments,
-        .instructions = instructions,
-        .blocks = blocks,
-        .entry = @enumFromInt(0),
     };
+    defer builder.deinit();
+    try builder.init(parameter_types);
+    builder.build() catch |err| switch (err) {
+        error.SourceRejected, error.Unavailable => return null,
+        else => return err,
+    };
+    return try builder.finish();
 }
 
-fn resolveConstraints(
-    ctx: anytype,
-    file_id: structures.FileId,
-    unresolved: semantic.UnresolvedBody,
-    value_types: []structures.TypeId,
-    known_types: []bool,
-    block_argument_types: []structures.TypeId,
-    type_interner: anytype,
-    instruction_count: usize,
-    join_index: *usize,
-    expectation_index: *usize,
-) !bool {
-    while (join_index.* < unresolved.joins.len and unresolved.joins[join_index.*].instruction_count == instruction_count) : (join_index.* += 1) {
-        const join = unresolved.joins[join_index.*];
-        const lhs_index = @intFromEnum(resolveValue(join.incoming[0], unresolved.block_argument_count));
-        const rhs_index = @intFromEnum(resolveValue(join.incoming[1], unresolved.block_argument_count));
-        std.debug.assert(known_types[lhs_index]);
-        std.debug.assert(known_types[rhs_index]);
-        const joined_type = try joinTypes(type_interner, value_types[lhs_index], value_types[rhs_index], ctx.allocator());
-        std.debug.assert(join.argument < block_argument_types.len);
-        std.debug.assert(!known_types[join.argument]);
-        block_argument_types[join.argument] = joined_type;
-        value_types[join.argument] = joined_type;
-        known_types[join.argument] = true;
-    }
-    while (expectation_index.* < unresolved.type_expectations.len and unresolved.type_expectations[expectation_index.*].instruction_count == instruction_count) : (expectation_index.* += 1) {
-        if (!try validateTypeExpectation(ctx, file_id, unresolved.type_expectations[expectation_index.*], value_types, known_types, unresolved.block_argument_count)) return false;
-    }
-    return true;
+fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime FunctionSignatureQuery: type, comptime TypeInterner: type) type {
+    return struct {
+        const Self = @This();
+        const Value = struct { id: structures.FunctionValueId, type_id: structures.TypeId };
+        const Expression = semantic.UnresolvedBody.Expression;
+
+        ctx: Context,
+        type_interner: TypeInterner,
+        file_id: structures.FileId,
+        unresolved: semantic.UnresolvedBody,
+        return_type: structures.TypeId,
+        scope: ?structures.ModuleScope = null,
+        values: []?Value = &.{},
+        block_argument_types: []structures.TypeId = &.{},
+        next_argument: u32 = 0,
+        call_arguments: []structures.FunctionValueUse = &.{},
+        branch_arguments: std.ArrayList(structures.FunctionValueUse) = .empty,
+        instructions: std.ArrayList(structures.FunctionInstruction) = .empty,
+        blocks: std.ArrayList(structures.FunctionBlock) = .empty,
+        current_block: ?structures.FunctionBlockId = null,
+
+        fn init(self: *Self, parameter_types: []const structures.TypeId) !void {
+            std.debug.assert(parameter_types.len == self.unresolved.parameter_count);
+            self.values = try self.ctx.allocator().alloc(?Value, parameter_types.len + self.unresolved.expressions.len);
+            @memset(self.values, null);
+            for (parameter_types, 0..) |type_id, index| self.values[index] = .{ .id = @enumFromInt(index), .type_id = type_id };
+            var argument_count = parameter_types.len;
+            for (self.unresolved.expressions) |expression| {
+                if (expression.operation == .if_else) argument_count += 1;
+            }
+            self.block_argument_types = try self.ctx.allocator().alloc(structures.TypeId, argument_count);
+            @memcpy(self.block_argument_types[0..parameter_types.len], parameter_types);
+            self.next_argument = @intCast(parameter_types.len);
+            self.call_arguments = try self.ctx.allocator().alloc(structures.FunctionValueUse, self.unresolved.call_arguments.len);
+            const entry = try self.newBlock(0, self.next_argument);
+            self.enterBlock(entry);
+        }
+
+        fn deinit(self: *Self) void {
+            const gpa = self.ctx.allocator();
+            gpa.free(self.values);
+            gpa.free(self.block_argument_types);
+            gpa.free(self.call_arguments);
+            self.branch_arguments.deinit(gpa);
+            self.instructions.deinit(gpa);
+            self.blocks.deinit(gpa);
+        }
+
+        fn reject(self: *Self, span: structures.SourceSpan, kind: structures.Diagnostic.Kind) anyerror {
+            try emitSemanticIssue(self.ctx, self.file_id, .{ .span = span, .kind = kind });
+            return error.SourceRejected;
+        }
+
+        fn build(self: *Self) !void {
+            for (self.unresolved.statements) |statement| {
+                // A discarded statement still evaluates its initializer or call.
+                _ = try self.value(statement);
+            }
+            if (self.unresolved.return_value) |returned| {
+                try self.returnValue(try self.value(returned));
+            } else if (self.return_type == .unit) {
+                self.terminate(.return_unit);
+            } else if (try self.type_interner.variantMembers(self.return_type) != null) {
+                try self.returnValue(try self.appendInstruction(.const_unit));
+            } else {
+                return self.reject(self.unresolved.return_span, .{ .missing_return_value = self.return_type });
+            }
+            std.debug.assert(self.next_argument == self.block_argument_types.len);
+        }
+
+        fn returnValue(self: *Self, value_to_return: Value) !void {
+            const use = try coerceValue(self.type_interner, value_to_return.id, value_to_return.type_id, self.return_type) orelse
+                return self.reject(self.unresolved.return_span, .return_type_mismatch);
+            self.terminate(if (self.return_type == .unit) .return_unit else .{ .return_value = use });
+        }
+
+        fn value(self: *Self, id: semantic.UnresolvedBody.ValueId) anyerror!Value {
+            const index = @intFromEnum(id);
+            if (self.values[index]) |resolved| return resolved;
+            std.debug.assert(index >= self.unresolved.parameter_count);
+            const expression = self.unresolved.expressions[index - self.unresolved.parameter_count];
+            const resolved: Value = switch (expression.operation) {
+                .integer => |integer| try self.appendInstruction(.{ .consti = integer }),
+                .none => try self.appendInstruction(.const_none),
+                .annotation => |annotation| try self.annotate(annotation, expression.span),
+                .call => |call| try self.callFunction(call, expression.span),
+                .negate => |operand| try self.negate(operand, expression.span),
+                .add, .subtract, .multiply, .divide => try self.binary(expression),
+                .if_else => |expression_if| try self.conditional(expression_if),
+            };
+            self.values[index] = resolved;
+            return resolved;
+        }
+
+        fn annotate(self: *Self, annotation: @FieldType(Expression.Operation, "annotation"), span: structures.SourceSpan) !Value {
+            const operand = try self.value(annotation.value);
+            const use = try coerceValue(self.type_interner, operand.id, operand.type_id, annotation.type_id) orelse
+                return self.reject(span, .local_type_mismatch);
+            if (use.coerce_to == null) return operand;
+            return self.appendInstruction(.{ .variant_coerce = .{ .operand = operand.id, .target_type = annotation.type_id } });
+        }
+
+        fn negate(self: *Self, id: semantic.UnresolvedBody.ValueId, span: structures.SourceSpan) !Value {
+            const operand = try self.value(id);
+            if (operand.type_id != .int) return self.reject(span, .negation_operand_not_int);
+            return self.appendInstruction(.{ .negi = operand.id });
+        }
+
+        fn binary(self: *Self, expression: Expression) !Value {
+            const raw = switch (expression.operation) {
+                .add, .subtract, .multiply, .divide => |operands| operands,
+                else => unreachable,
+            };
+            const lhs = try self.value(raw.lhs);
+            const rhs = try self.value(raw.rhs);
+            if (lhs.type_id != .int or rhs.type_id != .int) return self.reject(expression.span, .arithmetic_operands_not_int);
+            const operands: structures.BinaryOperands = .{ .lhs = lhs.id, .rhs = rhs.id };
+            const instruction: structures.FunctionInstruction = switch (expression.operation) {
+                .add => .{ .addi = operands },
+                .subtract => .{ .subi = operands },
+                .multiply => .{ .muli = operands },
+                .divide => .{ .divsi = operands },
+                else => unreachable,
+            };
+            return self.appendInstruction(instruction);
+        }
+
+        fn callFunction(self: *Self, call: @FieldType(Expression.Operation, "call"), span: structures.SourceSpan) !Value {
+            const raw_arguments = self.unresolved.call_arguments[call.arguments.start..call.arguments.end];
+            // Resolve nested argument expressions before the callee, preserving
+            // source evaluation and diagnostic order. Later reads reuse values.
+            for (raw_arguments) |argument| _ = try self.value(argument);
+            var target: ?structures.ItemId = null;
+            var signature: structures.FunctionSignature = .{ .parameter_types = &.{.int}, .return_type = .unit };
+            if (!std.mem.eql(u8, call.name, "exit")) {
+                if (self.scope == null) self.scope = (try self.ctx.get(ModuleScopeQuery, self.file_id)).* orelse return error.Unavailable;
+                target = self.scope.?.resolve(call.name) orelse return self.reject(span, .unknown_function);
+                signature = (try self.ctx.get(FunctionSignatureQuery, target.?)).* orelse return error.Unavailable;
+            }
+            if (raw_arguments.len != signature.parameter_types.len) return self.reject(span, .call_argument_count_mismatch);
+            const arguments = self.call_arguments[call.arguments.start..call.arguments.end];
+            for (raw_arguments, arguments, signature.parameter_types) |raw, *argument, expected| {
+                const operand = self.values[@intFromEnum(raw)].?;
+                argument.* = try coerceValue(self.type_interner, operand.id, operand.type_id, expected) orelse
+                    return self.reject(self.argumentSpan(raw, span), .call_argument_type_mismatch);
+            }
+            if (target) |item| {
+                return self.appendInstruction(.{ .call = .{ .target = item, .arguments = call.arguments, .return_type = signature.return_type } });
+            }
+            return self.appendInstruction(.{ .exit = arguments[0].value });
+        }
+
+        fn argumentSpan(self: *const Self, argument: semantic.UnresolvedBody.ValueId, call_span: structures.SourceSpan) structures.SourceSpan {
+            const index = @intFromEnum(argument);
+            if (index < self.unresolved.parameter_count) return call_span;
+            return self.unresolved.expressions[index - self.unresolved.parameter_count].span;
+        }
+
+        fn conditional(self: *Self, expression: @FieldType(Expression.Operation, "if_else")) !Value {
+            const then_block = try self.newBlock(self.next_argument, self.next_argument);
+            const else_block = try self.newBlock(self.next_argument, self.next_argument);
+            const condition = expression.condition;
+            const lhs = try self.value(condition.operands.lhs);
+            const rhs = try self.value(condition.operands.rhs);
+            if (lhs.type_id != .int or rhs.type_id != .int) return self.reject(condition.span, .comparison_operands_not_int);
+            self.terminate(.{ .predicate_branch = .{
+                .operation = switch (condition.operation) {
+                    .lt => .lti,
+                    .gt => .gti,
+                    .le => .lei,
+                    .ge => .gei,
+                    .eq => .eqi,
+                    .ne => .nei,
+                },
+                .operands = .{ .lhs = lhs.id, .rhs = rhs.id },
+                .then_branch = self.emptyBranch(then_block),
+                .else_branch = self.emptyBranch(else_block),
+            } });
+            self.enterBlock(then_block);
+            const then_value = try self.value(expression.then_value);
+            const argument = self.next_argument;
+            self.next_argument += 1;
+            const merge_block = try self.newBlock(argument, argument + 1);
+            const then_branch = try self.valueBranch(merge_block, .{ .value = then_value.id });
+            self.terminate(.{ .branch = then_branch });
+
+            self.enterBlock(else_block);
+            const else_value = try self.value(expression.else_value);
+            const joined = try joinTypes(self.type_interner, then_value.type_id, else_value.type_id, self.ctx.allocator());
+            self.block_argument_types[argument] = joined;
+            self.branch_arguments.items[then_branch.arguments.start] = (try coerceValue(self.type_interner, then_value.id, then_value.type_id, joined)) orelse unreachable;
+            const else_use = (try coerceValue(self.type_interner, else_value.id, else_value.type_id, joined)) orelse unreachable;
+            self.terminate(.{ .branch = try self.valueBranch(merge_block, else_use) });
+            self.enterBlock(merge_block);
+            return .{ .id = @enumFromInt(argument), .type_id = joined };
+        }
+
+        fn appendInstruction(self: *Self, instruction: structures.FunctionInstruction) !Value {
+            std.debug.assert(self.current_block != null);
+            const id = structures.functionInstructionValue(self.block_argument_types.len, self.instructions.items.len);
+            try self.instructions.append(self.ctx.allocator(), instruction);
+            return .{ .id = id, .type_id = instruction.resultType() };
+        }
+
+        fn newBlock(self: *Self, argument_start: u32, argument_end: u32) !structures.FunctionBlockId {
+            const id: structures.FunctionBlockId = @enumFromInt(self.blocks.items.len);
+            try self.blocks.append(self.ctx.allocator(), .{
+                .argument_start = argument_start,
+                .argument_end = argument_end,
+                .instruction_start = undefined,
+                .instruction_end = undefined,
+                .terminator = undefined,
+            });
+            return id;
+        }
+
+        fn enterBlock(self: *Self, block_id: structures.FunctionBlockId) void {
+            std.debug.assert(self.current_block == null);
+            self.blocks.items[@intFromEnum(block_id)].instruction_start = @intCast(self.instructions.items.len);
+            self.current_block = block_id;
+        }
+
+        fn terminate(self: *Self, terminator: structures.FunctionTerminator) void {
+            const block = &self.blocks.items[@intFromEnum(self.current_block.?)];
+            block.instruction_end = @intCast(self.instructions.items.len);
+            block.terminator = terminator;
+            self.current_block = null;
+        }
+
+        fn emptyBranch(self: *const Self, target: structures.FunctionBlockId) structures.FunctionBranch {
+            const start: u32 = @intCast(self.branch_arguments.items.len);
+            return .{ .target = target, .arguments = .{ .start = start, .end = start } };
+        }
+
+        fn valueBranch(self: *Self, target: structures.FunctionBlockId, use: structures.FunctionValueUse) !structures.FunctionBranch {
+            const start: u32 = @intCast(self.branch_arguments.items.len);
+            try self.branch_arguments.append(self.ctx.allocator(), use);
+            return .{ .target = target, .arguments = .{ .start = start, .end = start + 1 } };
+        }
+
+        fn finish(self: *Self) !structures.FunctionBodyAnalysis {
+            std.debug.assert(self.current_block == null);
+            const gpa = self.ctx.allocator();
+            const instructions = try self.instructions.toOwnedSlice(gpa);
+            errdefer gpa.free(instructions);
+            const blocks = try self.blocks.toOwnedSlice(gpa);
+            errdefer gpa.free(blocks);
+            const branches = try self.branch_arguments.toOwnedSlice(gpa);
+            const body: structures.FunctionBodyAnalysis = .{
+                .return_type = self.return_type,
+                .block_argument_types = self.block_argument_types,
+                .call_arguments = self.call_arguments,
+                .branch_arguments = branches,
+                .instructions = instructions,
+                .blocks = blocks,
+                .entry = @enumFromInt(0),
+            };
+            self.block_argument_types = &.{};
+            self.call_arguments = &.{};
+            return body;
+        }
+    };
 }
 
 fn joinTypes(type_interner: anytype, left: structures.TypeId, right: structures.TypeId, gpa: std.mem.Allocator) !structures.TypeId {
@@ -282,179 +337,4 @@ fn containsType(types: []const structures.TypeId, needle: structures.TypeId) boo
         if (type_id == needle) return true;
     }
     return false;
-}
-
-fn resolveValue(value: semantic.UnresolvedBody.ValueId, block_argument_count: u32) structures.FunctionValueId {
-    return switch (value) {
-        .block_argument => |index| @enumFromInt(index),
-        .instruction => |index| structures.functionInstructionValue(block_argument_count, index),
-    };
-}
-
-fn resolveOperands(operands: semantic.UnresolvedBody.BinaryOperands, block_argument_count: u32) structures.BinaryOperands {
-    return .{
-        .lhs = resolveValue(operands.lhs, block_argument_count),
-        .rhs = resolveValue(operands.rhs, block_argument_count),
-    };
-}
-
-fn resolveBranch(
-    type_interner: anytype,
-    unresolved: semantic.UnresolvedBody,
-    value_types: []const structures.TypeId,
-    block_argument_types: []const structures.TypeId,
-    branch_arguments: []structures.FunctionValueUse,
-    branch: semantic.UnresolvedBody.Branch,
-) !structures.FunctionBranch {
-    const target = unresolved.blocks[@intFromEnum(branch.target)];
-    const raw_arguments = unresolved.branch_arguments[branch.arguments.start..branch.arguments.end];
-    const parameter_types = block_argument_types[target.argument_start..target.argument_end];
-    std.debug.assert(raw_arguments.len == parameter_types.len);
-    for (raw_arguments, parameter_types, branch_arguments[branch.arguments.start..branch.arguments.end]) |raw_argument, parameter_type, *argument| {
-        const value = resolveValue(raw_argument, unresolved.block_argument_count);
-        argument.* = (try coerceValue(type_interner, value, value_types[@intFromEnum(value)], parameter_type)) orelse unreachable;
-    }
-    return .{ .target = branch.target, .arguments = branch.arguments };
-}
-
-fn validateEdges(
-    blocks: []const structures.FunctionBodyAnalysis.Block,
-    block_argument_types: []const structures.TypeId,
-    branch_arguments: []const structures.FunctionValueUse,
-    value_types: []const structures.TypeId,
-) void {
-    for (blocks) |block| switch (block.terminator) {
-        .branch => |branch| validateEdge(blocks, block_argument_types, branch_arguments, value_types, branch),
-        .predicate_branch => |branch| {
-            validateEdge(blocks, block_argument_types, branch_arguments, value_types, branch.then_branch);
-            validateEdge(blocks, block_argument_types, branch_arguments, value_types, branch.else_branch);
-        },
-        .return_unit, .return_value => {},
-    };
-}
-
-fn validateEdge(
-    blocks: []const structures.FunctionBodyAnalysis.Block,
-    block_argument_types: []const structures.TypeId,
-    branch_arguments: []const structures.FunctionValueUse,
-    value_types: []const structures.TypeId,
-    branch: structures.FunctionBranch,
-) void {
-    const target_index = @intFromEnum(branch.target);
-    std.debug.assert(target_index < blocks.len);
-    const target = blocks[target_index];
-    std.debug.assert(target.argument_start <= target.argument_end);
-    std.debug.assert(target.argument_end <= block_argument_types.len);
-    std.debug.assert(branch.arguments.start <= branch.arguments.end);
-    std.debug.assert(branch.arguments.end <= branch_arguments.len);
-    const arguments = branch_arguments[branch.arguments.start..branch.arguments.end];
-    const parameters = block_argument_types[target.argument_start..target.argument_end];
-    std.debug.assert(arguments.len == parameters.len);
-    for (arguments, parameters) |argument, parameter_type| {
-        const value_index = @intFromEnum(argument.value);
-        std.debug.assert(value_index < value_types.len);
-        std.debug.assert((argument.coerce_to orelse value_types[value_index]) == parameter_type);
-    }
-}
-
-fn resolveAndTypeCall(
-    ctx: anytype,
-    comptime ModuleScopeQuery: type,
-    comptime FunctionSignatureQuery: type,
-    file_id: structures.FileId,
-    unresolved: semantic.UnresolvedBody,
-    value_types: []const structures.TypeId,
-    known_types: []const bool,
-    call_arguments: []structures.FunctionValueUse,
-    type_interner: anytype,
-    call: anytype,
-    scope: *?structures.ModuleScope,
-    resolved: *structures.FunctionBodyAnalysis.Instruction,
-) !?structures.TypeId {
-    const name_span = call.target;
-    const name = call.name;
-    const Callee = union(enum) {
-        exit,
-        function: struct {
-            target: structures.ItemId,
-            signature: structures.FunctionSignature,
-        },
-    };
-    const callee: Callee = if (std.mem.eql(u8, name, "exit"))
-        .exit
-    else blk: {
-        if (scope.* == null) scope.* = (try ctx.get(ModuleScopeQuery, file_id)).* orelse return null;
-        const target = scope.*.?.resolve(name) orelse {
-            try emitSemanticIssue(ctx, file_id, .{ .span = name_span, .kind = .unknown_function });
-            return null;
-        };
-        const signature = (try ctx.get(FunctionSignatureQuery, target)).* orelse return null;
-        break :blk .{ .function = .{ .target = target, .signature = signature } };
-    };
-
-    std.debug.assert(call.arguments.start <= call.arguments.end);
-    std.debug.assert(call.arguments.end <= unresolved.call_arguments.len);
-    const raw_arguments = unresolved.call_arguments[call.arguments.start..call.arguments.end];
-    const arguments = call_arguments[call.arguments.start..call.arguments.end];
-    const parameter_types: []const structures.TypeId = switch (callee) {
-        .exit => &.{.int},
-        .function => |function| function.signature.parameter_types,
-    };
-    if (arguments.len != parameter_types.len) {
-        try emitSemanticIssue(ctx, file_id, .{ .span = name_span, .kind = .call_argument_count_mismatch });
-        return null;
-    }
-    for (raw_arguments, arguments, parameter_types) |raw_argument, *argument, expected_type| {
-        const value = resolveValue(raw_argument, unresolved.block_argument_count);
-        const argument_index = @intFromEnum(value);
-        std.debug.assert(known_types[argument_index]);
-        argument.* = try coerceValue(type_interner, value, value_types[argument_index], expected_type) orelse {
-            try emitSemanticIssue(ctx, file_id, .{
-                .span = argumentSpan(unresolved.instructions, raw_argument, name_span),
-                .kind = .call_argument_type_mismatch,
-            });
-            return null;
-        };
-    }
-
-    return switch (callee) {
-        .exit => blk: {
-            resolved.* = .{ .exit = arguments[0].value };
-            break :blk .unit;
-        },
-        .function => |function| blk: {
-            resolved.* = .{ .call = .{
-                .target = function.target,
-                .arguments = call.arguments,
-                .return_type = function.signature.return_type,
-            } };
-            break :blk function.signature.return_type;
-        },
-    };
-}
-
-fn validateTypeExpectation(
-    ctx: anytype,
-    file_id: structures.FileId,
-    expectation: semantic.UnresolvedBody.TypeExpectation,
-    value_types: []const structures.TypeId,
-    known_types: []const bool,
-    block_argument_count: u32,
-) !bool {
-    const value_index = @intFromEnum(resolveValue(expectation.value, block_argument_count));
-    std.debug.assert(known_types[value_index]);
-    if (value_types[value_index] == expectation.expected) return true;
-    try emitSemanticIssue(ctx, file_id, .{ .span = expectation.span, .kind = .local_type_mismatch });
-    return false;
-}
-
-fn argumentSpan(
-    instructions: []const semantic.UnresolvedBody.Instruction,
-    value: semantic.UnresolvedBody.ValueId,
-    call_site_span: structures.SourceSpan,
-) structures.SourceSpan {
-    return switch (value) {
-        .instruction => |instruction_index| instructions[instruction_index].span,
-        .block_argument => call_site_span,
-    };
 }

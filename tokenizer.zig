@@ -102,6 +102,13 @@ pub const Tokenizer = struct {
             break :line_start;
         }
 
+        // Comment-only lines and trailing spaces do not open or close blocks.
+        // The token scanner still validates the comment's contents.
+        if (self.current() == '#' or self.index == self.buffer.len) {
+            self.at_line_start = false;
+            return null;
+        }
+
         const current_indent = self.indent_levels.items[self.indent_levels.items.len - 1];
         if (self.indent > current_indent) {
             self.at_line_start = false;
@@ -1120,4 +1127,12 @@ fn testTokenize(source: [:0]const u8, expected_token_tags: []const Token.Tag) !v
     try std.testing.expectEqual(Token.Tag.eof, last_token.tag);
     try std.testing.expectEqual(source.len, last_token.loc.start);
     try std.testing.expectEqual(source.len, last_token.loc.end);
+}
+
+test "comment indentation and trailing blank lines do not change blocks" {
+    try testTokenize("a\n  b\n# outside\n      # deeper\n  c\n    ", &.{
+        .identifier, .indent, .identifier, .identifier, .dedent,
+    });
+    try testTokenize("a\n    ", &.{.identifier});
+    try testTokenize("a\n  # comment at eof", &.{.identifier});
 }

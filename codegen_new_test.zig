@@ -18,6 +18,11 @@ const TestTypes = struct {
         unreachable;
     }
 
+    pub fn variantLayout(self: @This(), type_id: structures.TypeId) !structures.VariantLayout {
+        std.debug.assert(try self.variantMembers(type_id) != null);
+        return .{ .layout = try self.layout(type_id), .payload_offset = 4 };
+    }
+
     pub fn variantMembers(_: @This(), type_id: structures.TypeId) !?[]const structures.TypeId {
         if (type_id == small_variant) return &.{ .int, .none };
         if (type_id == wide_variant) return &.{ .int, .unit, .none };
@@ -26,25 +31,25 @@ const TestTypes = struct {
     }
 };
 
-fn integerConstant(value: i32) structures.SsaFunction.Instruction {
+fn integerConstant(value: i32) structures.FunctionBodyAnalysis.Instruction {
     return .{ .consti = value };
 }
 
-fn directCall(target: structures.InstanceId) structures.SsaFunction.Instruction {
+fn directCall(target: structures.InstanceId) structures.FunctionBodyAnalysis.Instruction {
     return .{ .call = .{
-        .target = target,
+        .target = target.item,
         .arguments = .{ .start = 0, .end = 0 },
         .return_type = .int,
     } };
 }
 
-fn integerNegate(operand: u32) structures.SsaFunction.Instruction {
+fn integerNegate(operand: u32) structures.FunctionBodyAnalysis.Instruction {
     return .{ .negi = @enumFromInt(operand) };
 }
 
 const IntegerBinaryOperation = enum { add, subtract, multiply, divide_signed };
 
-fn integerBinary(operation: IntegerBinaryOperation, lhs: u32, rhs: u32) structures.SsaFunction.Instruction {
+fn integerBinary(operation: IntegerBinaryOperation, lhs: u32, rhs: u32) structures.FunctionBodyAnalysis.Instruction {
     const operands: structures.BinaryOperands = .{
         .lhs = @enumFromInt(lhs),
         .rhs = @enumFromInt(rhs),
@@ -58,9 +63,9 @@ fn integerBinary(operation: IntegerBinaryOperation, lhs: u32, rhs: u32) structur
 }
 
 fn functionSsa(
-    instructions: []structures.SsaFunction.Instruction,
-    blocks: []structures.SsaFunction.Block,
-) structures.SsaFunction {
+    instructions: []structures.FunctionBodyAnalysis.Instruction,
+    blocks: []structures.FunctionBodyAnalysis.Block,
+) structures.FunctionBodyAnalysis {
     var return_type: structures.TypeId = .unit;
     for (blocks) |block| switch (block.terminator) {
         .return_value => return_type = .int,
@@ -80,7 +85,7 @@ fn functionSsa(
 test "single aligned function artifact builds and runs without borrowing code" {
     const io = std.testing.io;
     var executable = blk: {
-        var blocks = [_]structures.SsaFunction.Block{.{
+        var blocks = [_]structures.FunctionBodyAnalysis.Block{.{
             .instruction_start = 0,
             .instruction_end = 0,
             .terminator = .return_unit,
@@ -106,10 +111,10 @@ test "single aligned function artifact builds and runs without borrowing code" {
 
 test "ordinary function artifacts encode signed 32-bit literal returns" {
     for ([_]i32{ std.math.minInt(i32), 7, std.math.maxInt(i32) }) |return_value| {
-        var instructions = [_]structures.SsaFunction.Instruction{
+        var instructions = [_]structures.FunctionBodyAnalysis.Instruction{
             integerConstant(return_value),
         };
-        var blocks = [_]structures.SsaFunction.Block{.{
+        var blocks = [_]structures.FunctionBodyAnalysis.Block{.{
             .instruction_start = 0,
             .instruction_end = 1,
             .terminator = .{ .return_value = .{ .value = @enumFromInt(0) } },
@@ -129,11 +134,11 @@ test "ordinary function artifacts encode signed 32-bit literal returns" {
 }
 
 test "exit emits an inline syscall without references" {
-    var instructions = [_]structures.SsaFunction.Instruction{
+    var instructions = [_]structures.FunctionBodyAnalysis.Instruction{
         integerConstant(42),
         .{ .exit = @enumFromInt(0) },
     };
-    var blocks = [_]structures.SsaFunction.Block{.{
+    var blocks = [_]structures.FunctionBodyAnalysis.Block{.{
         .instruction_start = 0,
         .instruction_end = instructions.len,
         .terminator = .return_unit,
@@ -153,10 +158,10 @@ test "exit emits an inline syscall without references" {
 
 test "direct call artifacts own exact relocation metadata" {
     const target: structures.InstanceId = .{ .item = @enumFromInt(0xdeadbeef) };
-    var instructions = [_]structures.SsaFunction.Instruction{
+    var instructions = [_]structures.FunctionBodyAnalysis.Instruction{
         directCall(target),
     };
-    var blocks = [_]structures.SsaFunction.Block{.{
+    var blocks = [_]structures.FunctionBodyAnalysis.Block{.{
         .instruction_start = 0,
         .instruction_end = 1,
         .terminator = .return_unit,
@@ -196,12 +201,12 @@ fn expectDirectCallArtifact(artifact: structures.CompiledFunction, target: struc
 
 test "multiple calls produce ordered relocations and deduplicate references" {
     const target: structures.InstanceId = .{ .item = @enumFromInt(7) };
-    var instructions = [_]structures.SsaFunction.Instruction{
+    var instructions = [_]structures.FunctionBodyAnalysis.Instruction{
         directCall(target),
         directCall(target),
         integerConstant(42),
     };
-    var blocks = [_]structures.SsaFunction.Block{.{
+    var blocks = [_]structures.FunctionBodyAnalysis.Block{.{
         .instruction_start = 0,
         .instruction_end = instructions.len,
         .terminator = .{ .return_value = .{ .value = @enumFromInt(2) } },
@@ -229,7 +234,7 @@ test "typed expression values survive calls and execute every integer arithmetic
     const expression_id: structures.InstanceId = .{ .item = @enumFromInt(2) };
     const left_id: structures.InstanceId = .{ .item = @enumFromInt(1) };
     const right_id: structures.InstanceId = .{ .item = @enumFromInt(0) };
-    var instructions = [_]structures.SsaFunction.Instruction{
+    var instructions = [_]structures.FunctionBodyAnalysis.Instruction{
         directCall(left_id),
         directCall(right_id),
         integerBinary(.divide_signed, 0, 1),
@@ -242,7 +247,7 @@ test "typed expression values survive calls and execute every integer arithmetic
         integerNegate(8),
         integerNegate(9),
     };
-    var blocks = [_]structures.SsaFunction.Block{.{
+    var blocks = [_]structures.FunctionBodyAnalysis.Block{.{
         .instruction_start = 0,
         .instruction_end = instructions.len,
         .terminator = .{ .return_value = .{ .value = @enumFromInt(10) } },
@@ -305,8 +310,8 @@ test "cyclic CFG accepts multi-value parallel backedge copies" {
         .{ .value = @enumFromInt(2) },
         .{ .value = @enumFromInt(2) },
     };
-    var instructions = [_]structures.SsaFunction.Instruction{integerConstant(0)};
-    var blocks = [_]structures.SsaFunction.Block{
+    var instructions = [_]structures.FunctionBodyAnalysis.Instruction{integerConstant(0)};
+    var blocks = [_]structures.FunctionBodyAnalysis.Block{
         .{
             .argument_start = 0,
             .argument_end = 2,
@@ -334,7 +339,7 @@ test "cyclic CFG accepts multi-value parallel backedge copies" {
             .terminator = .{ .return_value = .{ .value = @enumFromInt(4) } },
         },
     };
-    const ssa: structures.SsaFunction = .{
+    const ssa: structures.FunctionBodyAnalysis = .{
         .return_type = .int,
         .block_argument_types = &block_argument_types,
         .branch_arguments = &branch_arguments,
@@ -363,17 +368,17 @@ test "variant subset call construction cleans up every allocation failure" {
 
 test "variant injection copies an arbitrary-size non-variant interned payload" {
     var block_argument_types = [_]structures.TypeId{seven_byte_payload};
-    var instructions = [_]structures.SsaFunction.Instruction{.{ .variant_coerce = .{
+    var instructions = [_]structures.FunctionBodyAnalysis.Instruction{.{ .variant_coerce = .{
         .operand = @enumFromInt(0),
         .target_type = payload_variant,
     } }};
-    var blocks = [_]structures.SsaFunction.Block{.{
+    var blocks = [_]structures.FunctionBodyAnalysis.Block{.{
         .argument_end = 1,
         .instruction_start = 0,
         .instruction_end = 1,
         .terminator = .{ .return_value = .{ .value = @enumFromInt(1) } },
     }};
-    const ssa: structures.SsaFunction = .{
+    const ssa: structures.FunctionBodyAnalysis = .{
         .return_type = payload_variant,
         .block_argument_types = &block_argument_types,
         .branch_arguments = &.{},
@@ -392,18 +397,18 @@ test "variant injection copies an arbitrary-size non-variant interned payload" {
 fn testCompileVariantSubsetCallAllocations(gpa: std.mem.Allocator) !void {
     var block_argument_types = [_]structures.TypeId{small_variant};
     var call_arguments = [_]structures.FunctionValueUse{.{ .value = @enumFromInt(0), .coerce_to = wide_variant }};
-    var instructions = [_]structures.SsaFunction.Instruction{.{ .call = .{
-        .target = .{ .item = @enumFromInt(0) },
+    var instructions = [_]structures.FunctionBodyAnalysis.Instruction{.{ .call = .{
+        .target = @enumFromInt(0),
         .arguments = .{ .start = 0, .end = 1 },
         .return_type = wide_variant,
     } }};
-    var blocks = [_]structures.SsaFunction.Block{.{
+    var blocks = [_]structures.FunctionBodyAnalysis.Block{.{
         .argument_end = 1,
         .instruction_start = 0,
         .instruction_end = 1,
         .terminator = .{ .return_value = .{ .value = @enumFromInt(1) } },
     }};
-    const ssa: structures.SsaFunction = .{
+    const ssa: structures.FunctionBodyAnalysis = .{
         .return_type = wide_variant,
         .block_argument_types = &block_argument_types,
         .branch_arguments = &.{},
@@ -417,14 +422,14 @@ fn testCompileVariantSubsetCallAllocations(gpa: std.mem.Allocator) !void {
 }
 
 fn testCompileExpressionAllocations(gpa: std.mem.Allocator) !void {
-    var instructions = [_]structures.SsaFunction.Instruction{
+    var instructions = [_]structures.FunctionBodyAnalysis.Instruction{
         directCall(.{ .item = @enumFromInt(0) }),
         integerConstant(2),
         integerBinary(.multiply, 0, 1),
         integerConstant(1),
         integerBinary(.add, 2, 3),
     };
-    var blocks = [_]structures.SsaFunction.Block{.{
+    var blocks = [_]structures.FunctionBodyAnalysis.Block{.{
         .instruction_start = 0,
         .instruction_end = instructions.len,
         .terminator = .{ .return_value = .{ .value = @enumFromInt(4) } },
@@ -435,10 +440,10 @@ fn testCompileExpressionAllocations(gpa: std.mem.Allocator) !void {
 }
 
 fn testCompileDirectCallAllocations(gpa: std.mem.Allocator) !void {
-    var instructions = [_]structures.SsaFunction.Instruction{
+    var instructions = [_]structures.FunctionBodyAnalysis.Instruction{
         directCall(.{ .item = @enumFromInt(0) }),
     };
-    var blocks = [_]structures.SsaFunction.Block{.{
+    var blocks = [_]structures.FunctionBodyAnalysis.Block{.{
         .instruction_start = 0,
         .instruction_end = 1,
         .terminator = .return_unit,
@@ -449,10 +454,10 @@ fn testCompileDirectCallAllocations(gpa: std.mem.Allocator) !void {
 }
 
 test "ordinary function compilation cleans up allocation failure" {
-    var instructions = [_]structures.SsaFunction.Instruction{
+    var instructions = [_]structures.FunctionBodyAnalysis.Instruction{
         integerConstant(7),
     };
-    var blocks = [_]structures.SsaFunction.Block{.{
+    var blocks = [_]structures.FunctionBodyAnalysis.Block{.{
         .instruction_start = 0,
         .instruction_end = 1,
         .terminator = .{ .return_value = .{ .value = @enumFromInt(0) } },

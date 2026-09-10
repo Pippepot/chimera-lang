@@ -26,15 +26,15 @@ pub fn renderReachableSsa(
 
     try writer.writeAll("SSA\n");
     for (reachable.instances) |instance| {
-        const lowered = (try db.get(queries.LowerToSSA, instance)).* orelse unreachable;
-        try renderSsaFunction(db, instance, &lowered, writer);
+        const body = (try db.get(queries.AnalyzeFunctionBody, instance.item)).* orelse unreachable;
+        try renderSsaFunction(db, instance, &body, writer);
     }
 }
 
 fn renderSsaFunction(
     db: *query.Database,
     instance: structures.InstanceId,
-    ssa: *const structures.SsaFunction,
+    ssa: *const structures.FunctionBodyAnalysis,
     writer: *std.Io.Writer,
 ) !void {
     const location = try db.lookupInterned(queries.ItemLocations, instance.item);
@@ -77,13 +77,13 @@ fn renderSsaFunction(
     try writer.writeByte('\n');
 }
 
-fn renderBranch(ssa: *const structures.SsaFunction, name: []const u8, branch: structures.FunctionBranch, writer: *std.Io.Writer) !void {
+fn renderBranch(ssa: *const structures.FunctionBodyAnalysis, name: []const u8, branch: structures.FunctionBranch, writer: *std.Io.Writer) !void {
     try writer.print("    {s} ", .{name});
     try renderBranchTarget(ssa, branch, writer);
     try writer.writeByte('\n');
 }
 
-fn renderBranchTarget(ssa: *const structures.SsaFunction, branch: structures.FunctionBranch, writer: *std.Io.Writer) !void {
+fn renderBranchTarget(ssa: *const structures.FunctionBodyAnalysis, branch: structures.FunctionBranch, writer: *std.Io.Writer) !void {
     try writer.print("b{d}(", .{@intFromEnum(branch.target)});
     for (ssa.branch_arguments[branch.arguments.start..branch.arguments.end], 0..) |argument, index| {
         if (index != 0) try writer.writeAll(", ");
@@ -94,7 +94,7 @@ fn renderBranchTarget(ssa: *const structures.SsaFunction, branch: structures.Fun
 
 fn renderInstruction(
     db: *query.Database,
-    ssa: *const structures.SsaFunction,
+    ssa: *const structures.FunctionBodyAnalysis,
     instruction_index: usize,
     writer: *std.Io.Writer,
 ) !void {
@@ -109,7 +109,7 @@ fn renderInstruction(
             try writer.writeByte('\n');
         },
         .call => |call| {
-            const target = try db.lookupInterned(queries.ItemLocations, call.target.item);
+            const target = try db.lookupInterned(queries.ItemLocations, call.target);
             try writer.print("    %{d} = call @{s}(", .{ result, target.name });
             for (ssa.call_arguments[call.arguments.start..call.arguments.end], 0..) |argument, index| {
                 if (index != 0) try writer.writeAll(", ");

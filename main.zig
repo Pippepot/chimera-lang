@@ -176,7 +176,7 @@ pub fn main(init: std.process.Init) !void {
     if (!valid_arguments or positional.items.len == 0) {
         try printUsage(errors, args[0]);
         try errors.flush();
-        return;
+        std.process.exit(1);
     }
 
     const started = std.Io.Clock.awake.now(io);
@@ -189,7 +189,7 @@ pub fn main(init: std.process.Init) !void {
     ) catch |read_error| {
         try printError(errors, "failed to read '{s}': {s}", .{ source_path, @errorName(read_error) });
         try errors.flush();
-        return;
+        std.process.exit(1);
     };
     defer gpa.free(source);
 
