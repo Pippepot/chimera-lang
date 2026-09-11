@@ -2,7 +2,7 @@
 
 Implementation audit: 2026-09-10, Zig 0.16.0.
 
-The incremental pipeline works end to end. The next goal is to generalize bodies and control flow. Continue making the language in [syntax&semantics.txt](syntax&semantics.txt) usable through small, complete feature slices. That document is authoritative but incomplete: missing rules need a language decision, while missing implementation needs code. Legacy parity is not the goal.
+The incremental pipeline works end to end. The next goal is to make variants inspectable and fallibility composable. Continue making the language in [syntax&semantics.txt](syntax&semantics.txt) usable through small, complete feature slices. That document is authoritative but incomplete: missing rules need a language decision, while missing implementation needs code. Legacy parity is not the goal.
 
 ## Current baseline
 
@@ -12,14 +12,14 @@ The incremental pipeline works end to end. The next goal is to generalize bodies
 | Functions | Named and static-bound declarations, typed parameters, direct calls, general statement bodies, unit fallthrough, early returns | Fallible functions, parameter modifiers, callable values |
 | Values | Decimal `int`, `unit`/`()`, `none`, `never`, immutable and mutable locals, assignments, calls, integer negation and `+ - * /` | `bool`, `float`, general type values |
 | Variants | Canonical sets over `int`, `unit`, `none`; structural branch unions; layout, member injection, locals, calls, returns; subset widening at bindings, arguments, and returns | Named aliases, inspection/extraction |
-| Control flow | Value-producing `if` over integer comparisons, implicit-unit no-else joins, general lexical branch blocks, divergence-aware joins and returns | Short-circuit logic, loops, match |
+| Control flow | Value-producing `if` over integer comparisons, lexical branch and loop blocks, divergence-aware joins, returns, loop-carried mutable state, `break` values, `continue` | Short-circuit logic, match |
 | Backend | Full-layout values, symbolic calls, recursion, arbitrary CFG edges, parallel edge copies | Frontend cannot yet produce all supported graphs; no external ABI |
 
 Named function declarations canonicalize to static-bound function values during parsing. Inline bodies acquire an implicit return, and an omitted return annotation means `unit`. Block bodies accept general supported statements; unit functions may fall through, while every reachable path of other functions must return or diverge. Annotations on the static function binding itself remain unsupported and are rejected when the function signature is demanded. Direct `unit` and `none` values work at binding, call, and return boundaries as well as inside variants.
 
 `exit(int)` remains an inline syscall implementation but is typed as `never` and terminates its control-flow path.
 
-Top-level analysis accepts supported expressions, immutable and mutable locals, assignments, and general conditionals, skips static initializers, and synthesizes a unit return on reachable fallthrough. Successfully parsing a static initializer does not mean it was validated or evaluated. Discovery recognizes only static function initializers; uncalled bodies remain demand-driven. The parser also recognizes some future syntax—structs, parameter modifiers, `comptime`, `is`/`as`, `?`, and `sizeof`—without runtime semantics. `fallible`, `match`, and `loop` still need parser work.
+Top-level analysis accepts supported expressions, immutable and mutable locals, assignments, general conditionals, and loops, skips static initializers, and synthesizes a unit return on reachable fallthrough. Successfully parsing a static initializer does not mean it was validated or evaluated. Discovery recognizes only static function initializers; uncalled bodies remain demand-driven. The parser also recognizes some future syntax—structs, parameter modifiers, `comptime`, `is`/`as`, `?`, and `sizeof`—without runtime semantics. `fallible` and `match` still need parser work.
 
 ## Priorities
 
@@ -36,12 +36,12 @@ Equivalent source forms retain equal typed and compiled results. Widening works 
 
 ### 2. Generalize bodies and control flow
 
-General bodies and return control flow are complete. Finish the milestone with mutable loop-carried state:
+General bodies and control flow are complete:
 
 1. **Done:** lexical block scopes, general statements in function and top-level bodies, multi-statement branch bodies, and `if` without `else`, joining its body value with an implicit unit failure branch. Ordinary unit fallthrough and reachable early returns are supported in functions.
 2. **Done:** `never`, divergence-aware joins, return-path completeness, and correctly typed inline `exit`; runtime-symbol linking remains unnecessary.
 3. **Done:** mutable locals and plain/arithmetic compound assignments, including SSA state joins across conditionals.
-4. Add `loop`, `break` values, and `continue`. Use existing block arguments, backedges, and parallel copies for loop-carried state.
+4. **Done:** `loop`, `break` values, and `continue`, using block arguments, backedges, and parallel copies for loop-carried state.
 
 **Done:** branch-local names stay local; mixed returning/diverging paths type correctly; missing returns are diagnosed; loop break values join correctly. Tests cover evaluation order, skipped effects, mutation across backedges, and edits that change reachability.
 

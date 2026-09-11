@@ -199,11 +199,14 @@ fn parseExpression(parser: *ParserState) ParseError!Node.Index {
         .keyword_const, .keyword_var, .keyword_static => try parseBinding(parser),
         .keyword_func => try parseFunction(parser),
         .keyword_return => try parseReturn(parser),
+        .keyword_break => try parseBreak(parser),
+        .keyword_continue => try parseTokenNode(parser, .keyword_continue, .continue_expr),
         .number_literal,
         .keyword_true,
         .keyword_false,
         .keyword_none,
         .keyword_if,
+        .keyword_loop,
         .keyword_sizeof,
         .keyword_struct,
         .identifier,
@@ -233,7 +236,7 @@ fn parseCallableBody(parser: *ParserState) !Node.Index {
 
     const expression = try parseRequiredExpression(parser);
     return switch (parser.nodes.items[expression.index()].tag) {
-        .return_nothing, .return_expr => expression,
+        .break_nothing, .break_expr, .continue_expr, .return_nothing, .return_expr => expression,
         else => parser.addNode(.{
             .tag = .return_expr,
             .token_index = parser.nodes.items[expression.index()].token_index,
@@ -254,6 +257,27 @@ fn parseReturn(parser: *ParserState) !Node.Index {
         return try parser.addNode(.{ .tag = .return_expr, .token_index = token_index, .data = .{ .node = expr } });
     }
     return try parser.addNode(.{ .tag = .return_nothing, .token_index = token_index, .data = .{ .none = {} } });
+}
+
+fn parseBreak(parser: *ParserState) !Node.Index {
+    const token_index = parser.index;
+    const break_token = try parser.expect(.keyword_break);
+    const next_token = parser.tokens[parser.index];
+    std.debug.assert(break_token.loc.end <= next_token.loc.start);
+    if (std.mem.indexOfScalar(u8, parser.source[break_token.loc.end..next_token.loc.start], '\n') != null) {
+        return try parser.addNode(.{ .tag = .break_nothing, .token_index = token_index, .data = .{ .none = {} } });
+    }
+    if ((try parseExpression(parser)).unwrap()) |expr| {
+        return try parser.addNode(.{ .tag = .break_expr, .token_index = token_index, .data = .{ .node = expr } });
+    }
+    return try parser.addNode(.{ .tag = .break_nothing, .token_index = token_index, .data = .{ .none = {} } });
+}
+
+fn parseLoop(parser: *ParserState) !Node.Index {
+    const token_index = parser.index;
+    _ = try parser.expect(.keyword_loop);
+    const body = try parseBody(parser);
+    return try parser.addNode(.{ .tag = .loop, .token_index = token_index, .data = .{ .node = body } });
 }
 
 fn parseComptime(parser: *ParserState) !Node.Index {
@@ -523,6 +547,7 @@ fn parsePrimary(parser: *ParserState) ParseError!Node.Index {
         .keyword_false => try parseTokenNode(parser, .keyword_false, .bool_literal),
         .keyword_none => try parseTokenNode(parser, .keyword_none, .none_literal),
         .keyword_if => try parseIfExpr(parser),
+        .keyword_loop => try parseLoop(parser),
         .keyword_comptime => try parseComptime(parser),
         .keyword_sizeof => try parseSizeof(parser),
         .keyword_struct => try parseStruct(parser),
@@ -731,13 +756,13 @@ fn renderNode(gpa: std.mem.Allocator, node_index: Node.Index, ast: *const Ast, s
     const new_indent = if (at_root) "" else try std.mem.concat(gpa, u8, &.{ indent, if (is_last) "  " else "│ " });
     defer if (!at_root) gpa.free(new_indent);
     switch (node.tag) {
-        .return_nothing => {},
+        .break_nothing, .continue_expr, .return_nothing => try writer.writeByte('\n'),
         .access, .bool_literal, .identifier, .none_literal, .type, .number_literal => {
             const loc = ast.tokens[node.token_index].loc;
             try writer.print(" : {s}\n", .{source[loc.start..loc.end]});
         },
         .unit_literal => try writer.writeAll(" : ()\n"),
-        .return_expr, .not, .neg, .query_op, .move_expr, .comptime_expr, .sizeof_expr, .field_access, .struct_field, .struct_property, .struct_init_field => {
+        .break_expr, .return_expr, .loop, .not, .neg, .query_op, .move_expr, .comptime_expr, .sizeof_expr, .field_access, .struct_field, .struct_property, .struct_init_field => {
             if (node.tag == .field_access or node.tag == .struct_field or node.tag == .struct_property or node.tag == .struct_init_field) {
                 const loc = ast.tokens[node.token_index].loc;
                 try writer.print(" : {s}", .{source[loc.start..loc.end]});
@@ -1525,6 +1550,34 @@ test "parse inline if expression" {
         \\  ├─bool_literal : true
         \\  ├─number_literal : 1
         \\  └─number_literal : 2
+    );
+}
+
+test "parse loop break and continue expressions" {
+    try testParsing(
+        \\var value = 0
+        \\const result = loop
+        \\  if value < 2 -> continue
+        \\  if value > 4 -> break value
+        \\  break
+    ,
+        \\var_binding
+        \\└─number_literal : 0
+        \\const_binding
+        \\└─loop
+        \\  └─block
+        \\    ├─if
+        \\    │ ├─lt
+        \\    │ │ ├─identifier : value
+        \\    │ │ └─number_literal : 2
+        \\    │ └─continue_expr
+        \\    ├─if
+        \\    │ ├─gt
+        \\    │ │ ├─identifier : value
+        \\    │ │ └─number_literal : 4
+        \\    │ └─break_expr
+        \\    │   └─identifier : value
+        \\    └─break_nothing
     );
 }
 

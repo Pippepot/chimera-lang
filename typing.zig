@@ -37,6 +37,13 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
         const Self = @This();
         const Value = struct { id: structures.FunctionValueId, type_id: structures.TypeId };
         const Expression = semantic.UnresolvedBody.Expression;
+        const LoopContext = struct {
+            header: structures.FunctionBlockId,
+            exit: structures.FunctionBlockId,
+            state_type_start: u32,
+            state_type_end: u32,
+        };
+        const LoopBreak = struct { branch: structures.FunctionBranch, value: Value };
 
         ctx: Context,
         type_interner: TypeInterner,
@@ -50,6 +57,8 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
         branch_arguments: std.ArrayList(structures.FunctionValueUse) = .empty,
         instructions: std.ArrayList(structures.FunctionInstruction) = .empty,
         blocks: std.ArrayList(structures.FunctionBlock) = .empty,
+        loop_stack: std.ArrayList(LoopContext) = .empty,
+        loop_breaks: std.ArrayList(LoopBreak) = .empty,
         current_block: ?structures.FunctionBlockId = null,
 
         fn init(self: *Self, parameter_types: []const structures.TypeId) !void {
@@ -70,11 +79,31 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             self.branch_arguments.deinit(gpa);
             self.instructions.deinit(gpa);
             self.blocks.deinit(gpa);
+            self.loop_stack.deinit(gpa);
+            self.loop_breaks.deinit(gpa);
         }
 
         fn reject(self: *Self, span: structures.SourceSpan, kind: structures.Diagnostic.Kind) anyerror {
             try emitSemanticIssue(self.ctx, self.file_id, .{ .span = span, .kind = kind });
             return error.SourceRejected;
+        }
+
+        fn describeType(self: *Self, type_id: structures.TypeId) !structures.Diagnostic.TypeDescription {
+            var description: structures.Diagnostic.TypeDescription = .{};
+            if (type_id.isPrimitive()) {
+                addTypeToDescription(&description, type_id);
+                return description;
+            }
+            const members = try self.type_interner.variantMembers(type_id) orelse unreachable;
+            for (members) |member| addTypeToDescription(&description, member);
+            return description;
+        }
+
+        fn typeMismatch(self: *Self, expected: structures.TypeId, found: structures.TypeId) !structures.Diagnostic.TypeMismatch {
+            return .{
+                .expected = try self.describeType(expected),
+                .found = try self.describeType(found),
+            };
         }
 
         fn build(self: *Self) !void {
@@ -84,7 +113,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             if (self.return_type == .unit) {
                 self.terminate(.return_unit);
             } else {
-                return self.reject(root.span, .{ .missing_return_value = self.return_type });
+                return self.reject(root.span, .{ .missing_return_value = try self.describeType(self.return_type) });
             }
         }
 
@@ -94,6 +123,8 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 if (self.current_block == null) return null;
                 switch (statement) {
                     .discard => |value_id| _ = try self.value(value_id),
+                    .break_loop => |break_loop| try self.breakLoop(break_loop),
+                    .continue_loop => |arguments| try self.continueLoop(arguments),
                     .return_nothing => |span| try self.returnNothing(span),
                     .return_value => |returned| try self.returnValue(try self.value(returned.value), returned.span),
                 }
@@ -103,6 +134,23 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             return if (self.current_block == null) null else result;
         }
 
+        fn breakLoop(self: *Self, break_loop: @FieldType(semantic.UnresolvedBody.Statement, "break_loop")) !void {
+            const value_to_break = try self.value(break_loop.value);
+            if (value_to_break.type_id == .never) return;
+            const context = self.loop_stack.getLast();
+            const state_values = self.unresolved.loop_values[break_loop.arguments.start..break_loop.arguments.end];
+            const branch = try self.loopBranch(context.exit, value_to_break, state_values, context.state_type_start, context.state_type_end);
+            self.terminate(.{ .branch = branch });
+            try self.loop_breaks.append(self.ctx.allocator(), .{ .branch = branch, .value = value_to_break });
+        }
+
+        fn continueLoop(self: *Self, arguments: structures.FunctionValueRange) !void {
+            const context = self.loop_stack.getLast();
+            const state_values = self.unresolved.loop_values[arguments.start..arguments.end];
+            const branch = try self.loopBranch(context.header, null, state_values, context.state_type_start, context.state_type_end);
+            self.terminate(.{ .branch = branch });
+        }
+
         fn returnNothing(self: *Self, span: structures.SourceSpan) !void {
             if (self.return_type == .unit) {
                 self.terminate(.return_unit);
@@ -110,7 +158,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             }
             const unit = try self.appendInstruction(.const_unit);
             const use = try coerceValue(self.type_interner, unit.id, .unit, self.return_type) orelse
-                return self.reject(span, .{ .missing_return_value = self.return_type });
+                return self.reject(span, .{ .missing_return_value = try self.describeType(self.return_type) });
             self.terminate(.{ .return_value = use });
         }
 
@@ -120,7 +168,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 return;
             }
             const use = try coerceValue(self.type_interner, value_to_return.id, value_to_return.type_id, self.return_type) orelse
-                return self.reject(span, .return_type_mismatch);
+                return self.reject(span, .{ .return_type_mismatch = try self.typeMismatch(self.return_type, value_to_return.type_id) });
             self.terminate(if (self.return_type == .unit) .return_unit else .{ .return_value = use });
         }
 
@@ -133,40 +181,147 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 .integer => |integer| try self.appendInstruction(.{ .consti = integer }),
                 .unit => try self.appendInstruction(.const_unit),
                 .none => try self.appendInstruction(.const_none),
-                .annotation => |annotation| try self.annotate(annotation, expression.span),
+                .annotation => |annotation| try self.annotate(annotation),
                 .assignment => try self.assignment(expression),
                 .call => |call| try self.callFunction(call, expression.span),
-                .negate => |operand| try self.negate(operand, expression.span),
+                .negate => |operand| try self.negate(operand),
                 .add, .subtract, .multiply, .divide => try self.binary(expression),
                 .if_else => |expression_if| try self.conditional(expression_if),
                 .conditional_output => |conditional_id| return self.conditionalOutput(id, conditional_id),
+                .loop => |loop_expression| try self.loop(loop_expression),
+                .loop_input => unreachable,
+                .loop_output => |loop_id| return self.loopOutput(id, loop_id),
             };
             self.values[index] = resolved;
             return resolved;
         }
 
-        fn annotate(self: *Self, annotation: @FieldType(Expression.Operation, "annotation"), span: structures.SourceSpan) !Value {
-            const operand = try self.value(annotation.value);
+        fn loopOutput(self: *Self, id: semantic.UnresolvedBody.ValueId, loop_id: semantic.UnresolvedBody.ValueId) !Value {
+            _ = try self.value(loop_id);
+            return self.values[@intFromEnum(id)] orelse unreachable;
+        }
+
+        fn loop(self: *Self, expression: @FieldType(Expression.Operation, "loop")) !Value {
+            const initial_ids = self.unresolved.loop_values[expression.initial_values.start..expression.initial_values.end];
+            var initial_values: std.ArrayList(Value) = .empty;
+            defer initial_values.deinit(self.ctx.allocator());
+            for (initial_ids) |initial_id| {
+                const initial = try self.value(initial_id);
+                if (initial.type_id == .never) return initial;
+                try initial_values.append(self.ctx.allocator(), initial);
+            }
+
+            const state_type_start: u32 = @intCast(self.block_argument_types.items.len);
+            for (initial_values.items) |initial| try self.block_argument_types.append(self.ctx.allocator(), initial.type_id);
+            const state_type_end: u32 = @intCast(self.block_argument_types.items.len);
+            const header = try self.newBlock(state_type_start, state_type_end);
+            const initial_branch = try self.valuesBranch(header, initial_values.items);
+            self.terminate(.{ .branch = initial_branch });
+
+            const exit_argument_start: u32 = @intCast(self.block_argument_types.items.len);
+            try self.block_argument_types.append(self.ctx.allocator(), .never);
+            for (state_type_start..state_type_end) |type_index| {
+                try self.block_argument_types.append(self.ctx.allocator(), self.block_argument_types.items[type_index]);
+            }
+            const exit = try self.newBlock(exit_argument_start, @intCast(self.block_argument_types.items.len));
+
+            const input_ids = self.unresolved.loop_values[expression.input_values.start..expression.input_values.end];
+            std.debug.assert(input_ids.len == initial_values.items.len);
+            for (input_ids, state_type_start..) |input_id, argument| {
+                self.values[@intFromEnum(input_id)] = .{ .id = @enumFromInt(argument), .type_id = self.block_argument_types.items[argument] };
+            }
+
+            const break_start: u32 = @intCast(self.loop_breaks.items.len);
+            try self.loop_stack.append(self.ctx.allocator(), .{
+                .header = header,
+                .exit = exit,
+                .state_type_start = state_type_start,
+                .state_type_end = state_type_end,
+            });
+            self.enterBlock(header);
+            const body_value = try self.block(expression.body);
+            if (body_value != null) {
+                const repeat_ids = self.unresolved.loop_values[expression.repeat_values.start..expression.repeat_values.end];
+                const repeat = try self.loopBranch(header, null, repeat_ids, state_type_start, state_type_end);
+                self.terminate(.{ .branch = repeat });
+            }
+            _ = self.loop_stack.pop();
+
+            const breaks = self.loop_breaks.items[break_start..];
+            if (breaks.len == 0) {
+                self.enterBlock(exit);
+                self.terminate(.diverge);
+                self.loop_breaks.shrinkRetainingCapacity(break_start);
+                return .{ .id = @enumFromInt(exit_argument_start), .type_id = .never };
+            }
+
+            var joined = breaks[0].value.type_id;
+            for (breaks[1..]) |break_edge| joined = try joinTypes(self.type_interner, joined, break_edge.value.type_id, self.ctx.allocator());
+            self.block_argument_types.items[exit_argument_start] = joined;
+            for (breaks) |break_edge| {
+                self.branch_arguments.items[break_edge.branch.arguments.start] =
+                    (try coerceValue(self.type_interner, break_edge.value.id, break_edge.value.type_id, joined)) orelse unreachable;
+            }
+            self.loop_breaks.shrinkRetainingCapacity(break_start);
+
+            const output_ids = self.unresolved.loop_values[expression.output_values.start..expression.output_values.end];
+            std.debug.assert(output_ids.len == initial_values.items.len);
+            for (output_ids, exit_argument_start + 1..) |output_id, argument| {
+                self.values[@intFromEnum(output_id)] = .{ .id = @enumFromInt(argument), .type_id = self.block_argument_types.items[argument] };
+            }
+            self.enterBlock(exit);
+            return .{ .id = @enumFromInt(exit_argument_start), .type_id = joined };
+        }
+
+        fn valuesBranch(self: *Self, target: structures.FunctionBlockId, values: []const Value) !structures.FunctionBranch {
+            const start: u32 = @intCast(self.branch_arguments.items.len);
+            for (values) |value_to_pass| try self.branch_arguments.append(self.ctx.allocator(), .{ .value = value_to_pass.id });
+            return .{ .target = target, .arguments = .{ .start = start, .end = @intCast(self.branch_arguments.items.len) } };
+        }
+
+        fn loopBranch(
+            self: *Self,
+            target: structures.FunctionBlockId,
+            result: ?Value,
+            state_ids: []const semantic.UnresolvedBody.ValueId,
+            state_type_start: u32,
+            state_type_end: u32,
+        ) !structures.FunctionBranch {
+            std.debug.assert(state_ids.len == state_type_end - state_type_start);
+            const start: u32 = @intCast(self.branch_arguments.items.len);
+            if (result) |result_value| try self.branch_arguments.append(self.ctx.allocator(), .{ .value = result_value.id });
+            for (state_ids, state_type_start..) |state_id, type_index| {
+                const state = try self.value(state_id);
+                std.debug.assert(state.type_id != .never);
+                const use = (try coerceValue(self.type_interner, state.id, state.type_id, self.block_argument_types.items[type_index])) orelse unreachable;
+                try self.branch_arguments.append(self.ctx.allocator(), use);
+            }
+            return .{ .target = target, .arguments = .{ .start = start, .end = @intCast(self.branch_arguments.items.len) } };
+        }
+
+        fn annotate(self: *Self, annotation: @FieldType(Expression.Operation, "annotation")) !Value {
+            const operand = try self.value(annotation.value.value);
             if (operand.type_id == .never) return operand;
             const use = try coerceValue(self.type_interner, operand.id, operand.type_id, annotation.type_id) orelse
-                return self.reject(span, .local_type_mismatch);
+                return self.reject(annotation.value.span, .{ .local_type_mismatch = try self.typeMismatch(annotation.type_id, operand.type_id) });
             if (use.coerce_to == null) return operand;
             return self.appendInstruction(.{ .variant_coerce = .{ .operand = operand.id, .target_type = annotation.type_id } });
         }
 
         fn assignment(self: *Self, expression: Expression) !Value {
             const assignment_value = expression.operation.assignment;
-            const target = try self.value(assignment_value.target);
+            const target = try self.value(assignment_value.target.value);
             if (target.type_id == .never) return target;
-            const operand = try self.value(assignment_value.value);
+            const operand = try self.value(assignment_value.value.value);
             if (operand.type_id == .never) return operand;
             if (assignment_value.operation == .replace) {
                 const use = try coerceValue(self.type_interner, operand.id, operand.type_id, target.type_id) orelse
-                    return self.reject(expression.span, .assignment_type_mismatch);
+                    return self.reject(assignment_value.value.span, .{ .assignment_type_mismatch = try self.typeMismatch(target.type_id, operand.type_id) });
                 if (use.coerce_to == null) return operand;
                 return self.appendInstruction(.{ .variant_coerce = .{ .operand = operand.id, .target_type = target.type_id } });
             }
-            if (target.type_id != .int or operand.type_id != .int) return self.reject(expression.span, .arithmetic_operands_not_int);
+            if (target.type_id != .int) return self.reject(assignment_value.target.span, .{ .arithmetic_operand_not_int = try self.describeType(target.type_id) });
+            if (operand.type_id != .int) return self.reject(assignment_value.value.span, .{ .arithmetic_operand_not_int = try self.describeType(operand.type_id) });
             const operands: structures.BinaryOperands = .{ .lhs = target.id, .rhs = operand.id };
             return self.appendInstruction(switch (assignment_value.operation) {
                 .replace => unreachable,
@@ -182,10 +337,10 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             return self.values[@intFromEnum(id)] orelse unreachable;
         }
 
-        fn negate(self: *Self, id: semantic.UnresolvedBody.ValueId, span: structures.SourceSpan) !Value {
-            const operand = try self.value(id);
+        fn negate(self: *Self, operand_use: semantic.UnresolvedBody.ValueUse) !Value {
+            const operand = try self.value(operand_use.value);
             if (operand.type_id == .never) return operand;
-            if (operand.type_id != .int) return self.reject(span, .negation_operand_not_int);
+            if (operand.type_id != .int) return self.reject(operand_use.span, .{ .negation_operand_not_int = try self.describeType(operand.type_id) });
             return self.appendInstruction(.{ .negi = operand.id });
         }
 
@@ -194,11 +349,12 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 .add, .subtract, .multiply, .divide => |operands| operands,
                 else => unreachable,
             };
-            const lhs = try self.value(raw.lhs);
+            const lhs = try self.value(raw.lhs.value);
             if (lhs.type_id == .never) return lhs;
-            const rhs = try self.value(raw.rhs);
+            const rhs = try self.value(raw.rhs.value);
             if (rhs.type_id == .never) return rhs;
-            if (lhs.type_id != .int or rhs.type_id != .int) return self.reject(expression.span, .arithmetic_operands_not_int);
+            if (lhs.type_id != .int) return self.reject(raw.lhs.span, .{ .arithmetic_operand_not_int = try self.describeType(lhs.type_id) });
+            if (rhs.type_id != .int) return self.reject(raw.rhs.span, .{ .arithmetic_operand_not_int = try self.describeType(rhs.type_id) });
             const operands: structures.BinaryOperands = .{ .lhs = lhs.id, .rhs = rhs.id };
             const instruction: structures.FunctionInstruction = switch (expression.operation) {
                 .add => .{ .addi = operands },
@@ -215,7 +371,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             // Resolve nested argument expressions before the callee, preserving
             // source evaluation and diagnostic order. Later reads reuse values.
             for (raw_arguments) |argument| {
-                const resolved = try self.value(argument);
+                const resolved = try self.value(argument.value);
                 if (resolved.type_id == .never) return resolved;
             }
             var target: ?structures.ItemId = null;
@@ -225,13 +381,16 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 target = self.scope.?.resolve(call.name) orelse return self.reject(span, .unknown_function);
                 signature = (try self.ctx.get(FunctionSignatureQuery, target.?)).* orelse return error.Unavailable;
             }
-            if (raw_arguments.len != signature.parameter_types.len) return self.reject(span, .call_argument_count_mismatch);
+            if (raw_arguments.len != signature.parameter_types.len) return self.reject(span, .{ .call_argument_count_mismatch = .{
+                .expected = @intCast(signature.parameter_types.len),
+                .found = @intCast(raw_arguments.len),
+            } });
             const argument_start: u32 = @intCast(self.call_arguments.items.len);
             var intrinsic_argument: ?structures.FunctionValueId = null;
             for (raw_arguments, signature.parameter_types) |raw, expected| {
-                const operand = self.values[@intFromEnum(raw)].?;
+                const operand = self.values[@intFromEnum(raw.value)].?;
                 const argument = try coerceValue(self.type_interner, operand.id, operand.type_id, expected) orelse
-                    return self.reject(self.argumentSpan(raw, span), .call_argument_type_mismatch);
+                    return self.reject(raw.span, .{ .call_argument_type_mismatch = try self.typeMismatch(expected, operand.type_id) });
                 if (target != null) {
                     try self.call_arguments.append(self.ctx.allocator(), argument);
                 } else {
@@ -248,19 +407,14 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             return result;
         }
 
-        fn argumentSpan(self: *const Self, argument: semantic.UnresolvedBody.ValueId, call_span: structures.SourceSpan) structures.SourceSpan {
-            const index = @intFromEnum(argument);
-            if (index < self.unresolved.parameter_count) return call_span;
-            return self.unresolved.expressions[index - self.unresolved.parameter_count].span;
-        }
-
         fn conditional(self: *Self, expression: @FieldType(Expression.Operation, "if_else")) !Value {
             const condition = expression.condition;
-            const lhs = try self.value(condition.operands.lhs);
+            const lhs = try self.value(condition.operands.lhs.value);
             if (lhs.type_id == .never) return lhs;
-            const rhs = try self.value(condition.operands.rhs);
+            const rhs = try self.value(condition.operands.rhs.value);
             if (rhs.type_id == .never) return rhs;
-            if (lhs.type_id != .int or rhs.type_id != .int) return self.reject(condition.span, .comparison_operands_not_int);
+            if (lhs.type_id != .int) return self.reject(condition.operands.lhs.span, .{ .comparison_operand_not_int = try self.describeType(lhs.type_id) });
+            if (rhs.type_id != .int) return self.reject(condition.operands.rhs.span, .{ .comparison_operand_not_int = try self.describeType(rhs.type_id) });
             const branch_argument_start: u32 = @intCast(self.block_argument_types.items.len);
             const then_block = try self.newBlock(branch_argument_start, branch_argument_start);
             const else_block = try self.newBlock(branch_argument_start, branch_argument_start);
@@ -512,4 +666,14 @@ fn containsType(types: []const structures.TypeId, needle: structures.TypeId) boo
         if (type_id == needle) return true;
     }
     return false;
+}
+
+fn addTypeToDescription(description: *structures.Diagnostic.TypeDescription, type_id: structures.TypeId) void {
+    switch (type_id) {
+        .int => description.int = true,
+        .unit => description.unit = true,
+        .none => description.none = true,
+        .never => description.never = true,
+        else => unreachable,
+    }
 }

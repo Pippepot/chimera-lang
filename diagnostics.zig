@@ -39,43 +39,199 @@ fn highlightLen(span: structures.SourceSpan, line_start: usize, line_end: usize)
     return if (end > start) end - start else 1;
 }
 
-fn writeKindMessage(writer: *std.Io.Writer, kind: structures.Diagnostic.Kind) !void {
-    switch (kind) {
-        .expected_token => |payload| try writer.print("expected {}, found {}", .{ payload.expected, payload.found }),
-        .invalid_expression => |tag| try writer.print("{} is not a valid expression", .{tag}),
-        .duplicate_top_level_function => try writer.writeAll("duplicate top-level function name"),
-        .function_annotation_not_supported => try writer.writeAll("function declaration annotations are not supported yet"),
-        .parameter_mode_not_supported => try writer.writeAll("parameter modes are not supported yet"),
-        .duplicate_parameter => try writer.writeAll("duplicate parameter"),
-        .parameter_type_missing => try writer.writeAll("function parameters must declare a type"),
-        .parameter_type_not_supported => try writer.writeAll("parameter type is not supported yet"),
-        .return_type_not_supported => try writer.writeAll("return type is not supported yet"),
-        .top_level_return => try writer.writeAll("return is not allowed at top level"),
-        .expression_not_supported => try writer.writeAll("expression is not supported yet"),
-        .duplicate_local_binding => try writer.writeAll("duplicate local binding"),
-        .local_type_not_supported => try writer.writeAll("local binding type is not supported yet"),
-        .unknown_value => try writer.writeAll("unknown value"),
-        .assignment_target_not_local => try writer.writeAll("assignment target must be a mutable local"),
-        .assignment_to_immutable => try writer.writeAll("cannot assign to an immutable binding"),
-        .assignment_type_mismatch => try writer.writeAll("assignment value does not match the variable type"),
-        .integer_literal_not_decimal => try writer.writeAll("only decimal integer literals are supported yet"),
-        .integer_literal_out_of_range => try writer.writeAll("integer literal does not fit i32"),
-        .fallible_condition_not_supported => try writer.writeAll("fallible condition form is not supported yet"),
-        .if_condition_not_fallible => try writer.writeAll("if condition must be a fallible expression"),
-        .value_not_callable => try writer.writeAll("value is not callable"),
-        .duplicate_variant_member_type => try writer.writeAll("duplicate variant member type"),
-        .local_type_mismatch => try writer.writeAll("local binding type does not match initializer"),
-        .negation_operand_not_int => try writer.writeAll("integer negation requires an int operand"),
-        .arithmetic_operands_not_int => try writer.writeAll("integer operation requires int operands"),
-        .comparison_operands_not_int => try writer.writeAll("fallible comparison requires int operands"),
-        .missing_return_value => |return_type| switch (return_type) {
-            .int => try writer.writeAll("function returning int must return a value"),
-            else => try writer.writeAll("function return type requires a value"),
+fn writeType(writer: *std.Io.Writer, description: structures.Diagnostic.TypeDescription) !void {
+    try writer.writeByte('`');
+    var needs_separator = false;
+    inline for (.{
+        .{ description.int, "int" },
+        .{ description.unit, "unit" },
+        .{ description.none, "none" },
+        .{ description.never, "never" },
+    }) |part| {
+        if (part[0]) {
+            if (needs_separator) try writer.writeAll(" | ");
+            try writer.writeAll(part[1]);
+            needs_separator = true;
+        }
+    }
+    std.debug.assert(needs_separator);
+    try writer.writeByte('`');
+}
+
+fn writeMismatch(writer: *std.Io.Writer, mismatch: structures.Diagnostic.TypeMismatch) !void {
+    try writer.writeAll("expected ");
+    try writeType(writer, mismatch.expected);
+    try writer.writeAll(", found ");
+    try writeType(writer, mismatch.found);
+}
+
+fn writeToken(writer: *std.Io.Writer, tag: structures.Token.Tag) !void {
+    const spelling: ?[]const u8 = switch (tag) {
+        .equal => "=",
+        .equal_angle_bracket_right => "=>",
+        .plus => "+",
+        .minus => "-",
+        .asterisk => "*",
+        .slash => "/",
+        .percent => "%",
+        .caret => "^",
+        .pipe => "|",
+        .ampersand => "&",
+        .angle_bracket_left => "<",
+        .angle_bracket_angle_bracket_left => "<<",
+        .angle_bracket_right => ">",
+        .angle_bracket_angle_bracket_right => ">>",
+        .equal_equal => "==",
+        .plus_equal => "+=",
+        .minus_equal => "-=",
+        .asterisk_equal => "*=",
+        .slash_equal => "/=",
+        .percent_equal => "%=",
+        .caret_equal => "^=",
+        .pipe_equal => "|=",
+        .ampersand_equal => "&=",
+        .angle_bracket_left_angle_bracket_right => "<>",
+        .angle_bracket_left_equal => "<=",
+        .angle_bracket_angle_bracket_left_equal => "<<=",
+        .angle_bracket_right_equal => ">=",
+        .angle_bracket_angle_bracket_right_equal => ">>=",
+        .l_brace => "{",
+        .r_brace => "}",
+        .l_paren => "(",
+        .r_paren => ")",
+        .l_bracket => "[",
+        .r_bracket => "]",
+        .question_mark => "?",
+        .arrow => "->",
+        .tilde => "~",
+        .period => ".",
+        .comma => ",",
+        .colon => ":",
+        .semicolon => ";",
+        .ellipsis2 => "..",
+        .ellipsis3 => "...",
+        else => null,
+    };
+    if (spelling) |text| {
+        try writer.print("`{s}`", .{text});
+        return;
+    }
+    switch (tag) {
+        .invalid => try writer.writeAll("an invalid token"),
+        .eof => try writer.writeAll("end of file"),
+        .indent => try writer.writeAll("an indented block"),
+        .dedent => try writer.writeAll("the end of the block"),
+        .identifier => try writer.writeAll("an identifier"),
+        .number_literal => try writer.writeAll("a number"),
+        .char_literal => try writer.writeAll("a character literal"),
+        .string_literal => try writer.writeAll("a string literal"),
+        else => {
+            const name = @tagName(tag);
+            if (std.mem.startsWith(u8, name, "keyword_")) {
+                try writer.print("`{s}`", .{name["keyword_".len..]});
+            } else {
+                try writer.print("{s}", .{name});
+            }
         },
-        .return_type_mismatch => try writer.writeAll("return type does not match function signature"),
-        .unknown_function => try writer.writeAll("unknown function"),
-        .call_argument_count_mismatch => try writer.writeAll("call argument count does not match function signature"),
-        .call_argument_type_mismatch => try writer.writeAll("call argument type does not match function signature"),
+    }
+}
+
+fn writeSourceLabel(writer: *std.Io.Writer, label: []const u8, source: []const u8, span: ?structures.SourceSpan) !void {
+    try writer.writeAll(label);
+    const focus = span orelse return;
+    const start = @min(focus.start, source.len);
+    const end = @min(@max(focus.end, start), source.len);
+    if (end == start or std.mem.indexOfScalar(u8, source[start..end], '\n') != null) return;
+    try writer.print(": `{s}`", .{source[start..end]});
+}
+
+fn writeKindMessage(writer: *std.Io.Writer, source: []const u8, span: ?structures.SourceSpan, kind: structures.Diagnostic.Kind) !void {
+    switch (kind) {
+        .expected_token => |payload| {
+            try writer.writeAll("expected ");
+            try writeToken(writer, payload.expected);
+            try writer.writeAll(", found ");
+            try writeToken(writer, payload.found);
+        },
+        .invalid_expression => |tag| {
+            try writer.writeAll("expected an expression, found ");
+            try writeToken(writer, tag);
+        },
+        .duplicate_top_level_function => {
+            try writeSourceLabel(writer, "function name is already declared", source, span);
+        },
+        .function_annotation_not_supported => try writer.writeAll("type annotations on function bindings are not supported yet"),
+        .parameter_mode_not_supported => try writer.writeAll("parameter access modes are not supported yet"),
+        .duplicate_parameter => {
+            try writeSourceLabel(writer, "parameter name is already declared", source, span);
+        },
+        .parameter_type_missing => try writer.writeAll("parameter requires a type annotation"),
+        .parameter_type_not_supported => try writer.writeAll("this parameter type is not supported yet"),
+        .return_type_not_supported => try writer.writeAll("this return type is not supported yet"),
+        .top_level_return => try writer.writeAll("cannot return from top-level code"),
+        .break_outside_loop => try writer.writeAll("break is only allowed inside a loop"),
+        .continue_outside_loop => try writer.writeAll("continue is only allowed inside a loop"),
+        .expression_not_supported => try writer.writeAll("this expression is not supported yet"),
+        .duplicate_local_binding => {
+            try writeSourceLabel(writer, "binding is already declared in this scope", source, span);
+        },
+        .local_type_not_supported => try writer.writeAll("this local binding type is not supported yet"),
+        .unknown_value => {
+            try writeSourceLabel(writer, "unknown value", source, span);
+        },
+        .assignment_target_not_local => try writer.writeAll("assignment target must be a mutable local binding"),
+        .assignment_to_immutable => {
+            try writeSourceLabel(writer, "cannot assign to immutable binding", source, span);
+        },
+        .assignment_type_mismatch => |mismatch| {
+            try writer.writeAll("assignment type mismatch: ");
+            try writeMismatch(writer, mismatch);
+        },
+        .integer_literal_not_decimal => try writer.writeAll("integer literal must use decimal notation"),
+        .integer_literal_out_of_range => try writer.writeAll("integer literal is outside the supported i32 range"),
+        .fallible_condition_not_supported => try writer.writeAll("this fallible condition form is not supported yet"),
+        .if_condition_not_fallible => try writer.writeAll("condition must be a comparison or another fallible expression"),
+        .value_not_callable => {
+            try writeSourceLabel(writer, "local value is not callable", source, span);
+        },
+        .duplicate_variant_member_type => try writer.writeAll("variant contains the same member type more than once"),
+        .local_type_mismatch => |mismatch| {
+            try writer.writeAll("initializer type mismatch: ");
+            try writeMismatch(writer, mismatch);
+        },
+        .negation_operand_not_int => |found| {
+            try writer.writeAll("negation requires `int`, found ");
+            try writeType(writer, found);
+        },
+        .arithmetic_operand_not_int => |found| {
+            try writer.writeAll("arithmetic requires `int`, found ");
+            try writeType(writer, found);
+        },
+        .comparison_operand_not_int => |found| {
+            try writer.writeAll("comparison requires `int`, found ");
+            try writeType(writer, found);
+        },
+        .missing_return_value => |expected| {
+            try writer.writeAll("function must return ");
+            try writeType(writer, expected);
+            try writer.writeAll(" on every reachable path");
+        },
+        .return_type_mismatch => |mismatch| {
+            try writer.writeAll("return type mismatch: ");
+            try writeMismatch(writer, mismatch);
+        },
+        .unknown_function => {
+            try writeSourceLabel(writer, "unknown function", source, span);
+        },
+        .call_argument_count_mismatch => |count| try writer.print("expected {d} call argument{s}, found {d}", .{
+            count.expected,
+            if (count.expected == 1) "" else "s",
+            count.found,
+        }),
+        .call_argument_type_mismatch => |mismatch| {
+            try writer.writeAll("argument type mismatch: ");
+            try writeMismatch(writer, mismatch);
+        },
     }
 }
 
@@ -92,7 +248,7 @@ pub fn renderDiagnostic(
             info.line,
             info.column,
         });
-        try writeKindMessage(writer, diagnostic.kind);
+        try writeKindMessage(writer, source, diagnostic.span, diagnostic.kind);
         try writer.writeByte('\n');
         try writer.writeAll(source[info.line_start..info.line_end]);
         try writer.writeByte('\n');
@@ -105,7 +261,7 @@ pub fn renderDiagnostic(
     }
 
     try writer.print("\x1b[31merror:\x1b[0m {s}: ", .{source_path});
-    try writeKindMessage(writer, diagnostic.kind);
+    try writeKindMessage(writer, source, diagnostic.span, diagnostic.kind);
     try writer.writeByte('\n');
 }
 
@@ -145,13 +301,13 @@ test "render diagnostics with source spans and messages" {
     try renderDiagnostics(&output.writer, "test.star", source, &diagnostics);
 
     try std.testing.expectEqualStrings(
-        "\x1b[31merror:\x1b[0m test.star:1:9: expected .equal, found .number_literal\n" ++
+        "\x1b[31merror:\x1b[0m test.star:1:9: expected `=`, found a number\n" ++
             "const x 1\n" ++
             "        ^\n" ++
-            "\x1b[31merror:\x1b[0m test.star:2:1: unknown value\n" ++
+            "\x1b[31merror:\x1b[0m test.star:2:1: unknown value: `beta`\n" ++
             "beta gamma\n" ++
             "^~~~\n" ++
-            "\x1b[31merror:\x1b[0m test.star: duplicate top-level function name\n",
+            "\x1b[31merror:\x1b[0m test.star: function name is already declared\n",
         output.writer.buffered(),
     );
 }
@@ -169,6 +325,39 @@ test "render diagnostic clamps locations past the source" {
 
     try std.testing.expectEqualStrings(
         "\x1b[31merror:\x1b[0m test.star:2:1: unknown value\n\n^\n",
+        output.writer.buffered(),
+    );
+}
+
+test "render type mismatches and call counts with concrete facts" {
+    const source = "exit(b)\n";
+    const diagnostics = [_]structures.Diagnostic{
+        .{
+            .file_id = 1,
+            .span = .{ .start = 5, .end = 6 },
+            .kind = .{ .call_argument_type_mismatch = .{
+                .expected = .{ .int = true },
+                .found = .{ .none = true },
+            } },
+        },
+        .{
+            .file_id = 1,
+            .span = .{ .start = 0, .end = 4 },
+            .kind = .{ .call_argument_count_mismatch = .{ .expected = 1, .found = 0 } },
+        },
+    };
+
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try renderDiagnostics(&output.writer, "test.chi", source, &diagnostics);
+
+    try std.testing.expectEqualStrings(
+        "\x1b[31merror:\x1b[0m test.chi:1:6: argument type mismatch: expected `int`, found `none`\n" ++
+            "exit(b)\n" ++
+            "     ^\n" ++
+            "\x1b[31merror:\x1b[0m test.chi:1:1: expected 1 call argument, found 0\n" ++
+            "exit(b)\n" ++
+            "^~~~\n",
         output.writer.buffered(),
     );
 }

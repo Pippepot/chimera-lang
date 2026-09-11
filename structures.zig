@@ -82,6 +82,7 @@ pub const Token = struct {
         keyword_for,
         keyword_if,
         keyword_is,
+        keyword_loop,
         keyword_mut,
         keyword_not,
         keyword_none,
@@ -111,6 +112,7 @@ pub const Token = struct {
         .{ "for", .keyword_for },
         .{ "if", .keyword_if },
         .{ "is", .keyword_is },
+        .{ "loop", .keyword_loop },
         .{ "mut", .keyword_mut },
         .{ "not", .keyword_not },
         .{ "none", .keyword_none },
@@ -163,6 +165,7 @@ pub const Node = struct {
         as,
         @"if",
         if_else,
+        loop,
         @"and",
         @"or",
         not,
@@ -191,6 +194,9 @@ pub const Node = struct {
         param_list,
         query_op,
         move_expr,
+        break_nothing,
+        break_expr,
+        continue_expr,
         return_nothing,
         return_expr,
         signature,
@@ -245,8 +251,8 @@ pub const Ast = struct {
         for (a.nodes, b.nodes) |left, right| {
             if (left.tag != right.tag or left.token_index != right.token_index) return false;
             switch (left.tag) {
-                .return_nothing, .access, .bool_literal, .identifier, .none_literal, .number_literal, .unit_literal, .type => {},
-                .return_expr, .not, .neg, .query_op, .move_expr, .comptime_expr, .sizeof_expr, .field_access, .struct_field, .struct_property, .struct_init_field => {
+                .break_nothing, .continue_expr, .return_nothing, .access, .bool_literal, .identifier, .none_literal, .number_literal, .unit_literal, .type => {},
+                .break_expr, .return_expr, .loop, .not, .neg, .query_op, .move_expr, .comptime_expr, .sizeof_expr, .field_access, .struct_field, .struct_property, .struct_init_field => {
                     if (left.data.node != right.data.node) return false;
                 },
                 .add, .sub, .mul, .div, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .@"and", .@"or", .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .call, .const_binding, .var_binding, .static_binding, .func, .param, .signature, .type_func, .@"if" => {
@@ -692,6 +698,19 @@ pub const Diagnostic = struct {
     span: ?SourceSpan,
     kind: Kind,
 
+    pub const TypeDescription = packed struct(u8) {
+        int: bool = false,
+        unit: bool = false,
+        none: bool = false,
+        never: bool = false,
+        padding: u4 = 0,
+    };
+
+    pub const TypeMismatch = struct {
+        expected: TypeDescription,
+        found: TypeDescription,
+    };
+
     pub const Kind = union(enum) {
         expected_token: struct {
             expected: Token.Tag,
@@ -706,27 +725,29 @@ pub const Diagnostic = struct {
         parameter_type_not_supported,
         return_type_not_supported,
         top_level_return,
+        break_outside_loop,
+        continue_outside_loop,
         expression_not_supported,
         duplicate_local_binding,
         local_type_not_supported,
         unknown_value,
         assignment_target_not_local,
         assignment_to_immutable,
-        assignment_type_mismatch,
+        assignment_type_mismatch: TypeMismatch,
         integer_literal_not_decimal,
         integer_literal_out_of_range,
         fallible_condition_not_supported,
         if_condition_not_fallible,
         value_not_callable,
         duplicate_variant_member_type,
-        local_type_mismatch,
-        negation_operand_not_int,
-        arithmetic_operands_not_int,
-        comparison_operands_not_int,
-        missing_return_value: TypeId,
-        return_type_mismatch,
+        local_type_mismatch: TypeMismatch,
+        negation_operand_not_int: TypeDescription,
+        arithmetic_operand_not_int: TypeDescription,
+        comparison_operand_not_int: TypeDescription,
+        missing_return_value: TypeDescription,
+        return_type_mismatch: TypeMismatch,
         unknown_function,
-        call_argument_count_mismatch,
-        call_argument_type_mismatch,
+        call_argument_count_mismatch: struct { expected: u32, found: u32 },
+        call_argument_type_mismatch: TypeMismatch,
     };
 };

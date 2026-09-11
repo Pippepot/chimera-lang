@@ -18,19 +18,22 @@ pub const SignatureResult = SemanticResult(structures.FunctionSignature);
 /// Query-local source graph after syntax and lexical validation. Parameters
 /// precede expressions in the value namespace. Blocks and statements preserve
 /// evaluation order; references to an earlier binding reuse its value. Source
-/// names are borrowed only until typing finishes. CFG blocks belong to typed IR.
+/// names are borrowed only until typing finishes. Loop-control edges remain
+/// structural until typing; CFG blocks belong to typed IR.
 pub const UnresolvedBody = struct {
     parameter_count: u32,
     expressions: []Expression,
     blocks: []Block,
     statements: []Statement,
-    call_arguments: []ValueId,
+    call_arguments: []ValueUse,
     conditional_outputs: []ConditionalOutput,
+    loop_values: []ValueId,
     root_block: BlockId,
 
     pub const ValueId = enum(u32) { _ };
     pub const BlockId = enum(u32) { _ };
-    pub const BinaryOperands = struct { lhs: ValueId, rhs: ValueId };
+    pub const ValueUse = struct { value: ValueId, span: structures.SourceSpan };
+    pub const BinaryOperands = struct { lhs: ValueUse, rhs: ValueUse };
     pub const StatementRange = struct { start: u32, end: u32 };
     pub const ConditionalOutputRange = struct { start: u32, end: u32 };
     pub const Block = struct {
@@ -40,14 +43,15 @@ pub const UnresolvedBody = struct {
     };
     pub const Statement = union(enum) {
         discard: ValueId,
+        break_loop: struct { value: ValueId, arguments: structures.FunctionValueRange },
+        continue_loop: structures.FunctionValueRange,
         return_nothing: structures.SourceSpan,
-        return_value: struct { value: ValueId, span: structures.SourceSpan },
+        return_value: ValueUse,
     };
     pub const PredicateOperation = enum { lt, gt, le, ge, eq, ne };
     pub const Condition = struct {
         operation: PredicateOperation,
         operands: BinaryOperands,
-        span: structures.SourceSpan,
     };
     pub const AssignmentOperation = enum { replace, add, subtract, multiply, divide };
     pub const ConditionalOutput = struct {
@@ -63,10 +67,10 @@ pub const UnresolvedBody = struct {
             integer: i32,
             unit,
             none,
-            annotation: struct { value: ValueId, type_id: structures.TypeId },
-            assignment: struct { target: ValueId, value: ValueId, operation: AssignmentOperation },
+            annotation: struct { value: ValueUse, type_id: structures.TypeId },
+            assignment: struct { target: ValueUse, value: ValueUse, operation: AssignmentOperation },
             call: struct { name: []const u8, arguments: structures.FunctionValueRange },
-            negate: ValueId,
+            negate: ValueUse,
             add: BinaryOperands,
             subtract: BinaryOperands,
             multiply: BinaryOperands,
@@ -78,6 +82,15 @@ pub const UnresolvedBody = struct {
                 outputs: ConditionalOutputRange,
             },
             conditional_output: ValueId,
+            loop: struct {
+                body: BlockId,
+                initial_values: structures.FunctionValueRange,
+                input_values: structures.FunctionValueRange,
+                output_values: structures.FunctionValueRange,
+                repeat_values: structures.FunctionValueRange,
+            },
+            loop_input: ValueId,
+            loop_output: ValueId,
         };
     };
 
@@ -87,6 +100,7 @@ pub const UnresolvedBody = struct {
         gpa.free(self.statements);
         gpa.free(self.call_arguments);
         gpa.free(self.conditional_outputs);
+        gpa.free(self.loop_values);
         self.* = undefined;
     }
 };
@@ -129,6 +143,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             then_value: ValueId = undefined,
             else_value: ValueId = undefined,
         };
+        const LoopContext = struct { name_start: u32, name_end: u32 };
 
         ast: *const structures.Ast,
         source: []const u8,
@@ -140,8 +155,11 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
         expressions: std.ArrayList(UnresolvedBody.Expression) = .empty,
         blocks: std.ArrayList(UnresolvedBody.Block) = .empty,
         statements: std.ArrayList(UnresolvedBody.Statement) = .empty,
-        call_arguments: std.ArrayList(ValueId) = .empty,
+        call_arguments: std.ArrayList(UnresolvedBody.ValueUse) = .empty,
         conditional_outputs: std.ArrayList(UnresolvedBody.ConditionalOutput) = .empty,
+        loop_values: std.ArrayList(ValueId) = .empty,
+        loop_state_names: std.ArrayList([]const u8) = .empty,
+        loop_stack: std.ArrayList(LoopContext) = .empty,
         scratch: std.ArrayList(ValueId) = .empty,
         root_block: ?UnresolvedBody.BlockId = null,
         issue: ?Issue = null,
@@ -154,6 +172,9 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             self.statements.deinit(self.gpa);
             self.call_arguments.deinit(self.gpa);
             self.conditional_outputs.deinit(self.gpa);
+            self.loop_values.deinit(self.gpa);
+            self.loop_state_names.deinit(self.gpa);
+            self.loop_stack.deinit(self.gpa);
             self.scratch.deinit(self.gpa);
         }
 
@@ -183,6 +204,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
         }
 
         fn buildFunction(self: *Self, declaration: u32) !void {
+            const binding = self.ast.nodes[declaration];
             const parts = functionParts(self.ast, declaration);
             const signature = self.ast.nodes[parts.signature.index()];
             const parameters = self.ast.nodeList(signature.data.node_node.a);
@@ -204,7 +226,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             } else {
                 try body_statements.append(self.gpa, try self.buildStatement(parts.body, false));
             }
-            self.root_block = try self.finishBlock(body_statements.items, null, tokenSpan(self.ast, body.token_index));
+            self.root_block = try self.finishBlock(body_statements.items, null, tokenSpan(self.ast, binding.token_index));
         }
 
         fn buildStatement(self: *Self, index: structures.Node.Index, comptime is_entry: bool) !UnresolvedBody.Statement {
@@ -219,9 +241,38 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 .return_expr => if (is_entry)
                     self.reject(index, .top_level_return)
                 else
-                    .{ .return_value = .{ .value = try self.append(node.data.node), .span = span } },
+                    .{ .return_value = try self.appendUse(node.data.node) },
+                .break_nothing, .break_expr => try self.buildBreak(index),
+                .continue_expr => try self.buildContinue(index),
                 else => .{ .discard = try self.append(index) },
             };
+        }
+
+        fn buildBreak(self: *Self, index: structures.Node.Index) !UnresolvedBody.Statement {
+            if (self.loop_stack.items.len == 0) return self.reject(index, .break_outside_loop);
+            const node = self.ast.nodes[index.index()];
+            const value = if (node.tag == .break_expr)
+                try self.append(node.data.node)
+            else
+                try self.appendExpression(index, .unit);
+            return .{ .break_loop = .{
+                .value = value,
+                .arguments = try self.captureLoopValues(),
+            } };
+        }
+
+        fn buildContinue(self: *Self, index: structures.Node.Index) !UnresolvedBody.Statement {
+            if (self.loop_stack.items.len == 0) return self.reject(index, .continue_outside_loop);
+            return .{ .continue_loop = try self.captureLoopValues() };
+        }
+
+        fn captureLoopValues(self: *Self) !structures.FunctionValueRange {
+            const context = self.loop_stack.getLast();
+            const start: u32 = @intCast(self.loop_values.items.len);
+            for (self.loop_state_names.items[context.name_start..context.name_end]) |name| {
+                try self.loop_values.append(self.gpa, self.locals.get(name).?.value);
+            }
+            return .{ .start = start, .end = @intCast(self.loop_values.items.len) };
         }
 
         fn appendBinding(self: *Self, index: structures.Node.Index) anyerror!ValueId {
@@ -233,7 +284,10 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             const expected = if (annotation) |type_node| try self.bindingType(type_node) else null;
             var value = try self.append(node.data.node_node.b);
             if (expected) |type_id| {
-                value = try self.appendExpression(annotation.?, .{ .annotation = .{ .value = value, .type_id = type_id } });
+                value = try self.appendExpression(annotation.?, .{ .annotation = .{ .value = .{
+                    .value = value,
+                    .span = nodeFocusSpan(self.ast, node.data.node_node.b),
+                }, .type_id = type_id } });
             }
             try self.locals.put(self.gpa, name, .{ .value = value, .mutable = node.tag == .var_binding });
             try self.local_names.append(self.gpa, name);
@@ -265,12 +319,69 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                     if (std.mem.eql(u8, name, "unit")) return self.appendExpression(index, .unit);
                     return self.reject(index, .unknown_value);
                 },
-                .neg => return self.appendExpression(index, .{ .negate = try self.append(node.data.node) }),
+                .neg => return self.appendExpression(index, .{ .negate = try self.appendUse(node.data.node) }),
                 .add, .sub, .mul, .div => return self.appendBinary(index),
                 .assign, .add_assign, .sub_assign, .mul_assign, .div_assign => return self.appendAssignment(index),
                 .@"if", .if_else => return self.appendIf(index),
+                .loop => return self.appendLoop(index),
                 else => return self.reject(index, .expression_not_supported),
             }
+        }
+
+        fn appendUse(self: *Self, index: structures.Node.Index) !UnresolvedBody.ValueUse {
+            return .{
+                .value = try self.append(index),
+                .span = nodeFocusSpan(self.ast, index),
+            };
+        }
+
+        fn appendLoop(self: *Self, index: structures.Node.Index) !ValueId {
+            const node = self.ast.nodes[index.index()];
+            const loop_id = try self.appendExpression(index, .{ .loop = undefined });
+
+            var states: std.ArrayList(MutableState) = .empty;
+            defer states.deinit(self.gpa);
+            for (self.local_names.items) |name| {
+                const local = self.locals.get(name).?;
+                if (local.mutable) try states.append(self.gpa, .{ .name = name, .incoming = local.value });
+            }
+
+            const initial_start: u32 = @intCast(self.loop_values.items.len);
+            for (states.items) |state| try self.loop_values.append(self.gpa, state.incoming);
+            const initial_values: structures.FunctionValueRange = .{ .start = initial_start, .end = @intCast(self.loop_values.items.len) };
+
+            const input_start: u32 = @intCast(self.loop_values.items.len);
+            for (states.items) |state| {
+                const input = try self.appendExpression(index, .{ .loop_input = loop_id });
+                try self.loop_values.append(self.gpa, input);
+                self.locals.getPtr(state.name).?.value = input;
+            }
+            const input_values: structures.FunctionValueRange = .{ .start = input_start, .end = @intCast(self.loop_values.items.len) };
+
+            const name_mark = self.loop_state_names.items.len;
+            defer self.loop_state_names.shrinkRetainingCapacity(name_mark);
+            for (states.items) |state| try self.loop_state_names.append(self.gpa, state.name);
+            try self.loop_stack.append(self.gpa, .{ .name_start = @intCast(name_mark), .name_end = @intCast(self.loop_state_names.items.len) });
+            const body = try self.buildBranch(node.data.node);
+            const repeat_values = try self.captureLoopValues();
+            _ = self.loop_stack.pop();
+
+            self.restoreMutableValues(states.items);
+            const output_start: u32 = @intCast(self.loop_values.items.len);
+            for (states.items) |state| {
+                const output = try self.appendExpression(index, .{ .loop_output = loop_id });
+                try self.loop_values.append(self.gpa, output);
+                self.locals.getPtr(state.name).?.value = output;
+            }
+            const output_values: structures.FunctionValueRange = .{ .start = output_start, .end = @intCast(self.loop_values.items.len) };
+            self.expressions.items[@intFromEnum(loop_id) - self.parameter_count].operation = .{ .loop = .{
+                .body = body,
+                .initial_values = initial_values,
+                .input_values = input_values,
+                .output_values = output_values,
+                .repeat_values = repeat_values,
+            } };
+            return loop_id;
         }
 
         fn appendInteger(self: *Self, index: structures.Node.Index) !ValueId {
@@ -286,8 +397,8 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
         fn appendBinary(self: *Self, index: structures.Node.Index) !ValueId {
             const node = self.ast.nodes[index.index()];
             const operands: UnresolvedBody.BinaryOperands = .{
-                .lhs = try self.append(node.data.node_node.a),
-                .rhs = try self.append(node.data.node_node.b),
+                .lhs = try self.appendUse(node.data.node_node.a),
+                .rhs = try self.appendUse(node.data.node_node.b),
             };
             const operation: UnresolvedBody.Expression.Operation = switch (node.tag) {
                 .add => .{ .add = operands },
@@ -309,8 +420,8 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             if (!local.mutable) return self.reject(node.data.node_node.a, .assignment_to_immutable);
             const value = try self.append(node.data.node_node.b);
             const assigned = try self.appendExpression(index, .{ .assignment = .{
-                .target = local.value,
-                .value = value,
+                .target = .{ .value = local.value, .span = span },
+                .value = .{ .value = value, .span = nodeFocusSpan(self.ast, node.data.node_node.b) },
                 .operation = switch (node.tag) {
                     .assign => .replace,
                     .add_assign => .add,
@@ -397,8 +508,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             };
             return .{
                 .operation = operation,
-                .operands = .{ .lhs = try self.append(node.data.node_node.a), .rhs = try self.append(node.data.node_node.b) },
-                .span = tokenSpan(self.ast, node.token_index),
+                .operands = .{ .lhs = try self.appendUse(node.data.node_node.a), .rhs = try self.appendUse(node.data.node_node.b) },
             };
         }
 
@@ -418,7 +528,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
 
             const node = self.ast.nodes[index.index()];
             if (node.tag != .block) {
-                if (node.tag == .return_nothing or node.tag == .return_expr) {
+                if (node.tag == .return_nothing or node.tag == .return_expr or node.tag == .break_nothing or node.tag == .break_expr or node.tag == .continue_expr) {
                     var statements = [_]UnresolvedBody.Statement{try self.buildStatement(index, false)};
                     return self.finishBlock(&statements, null, tokenSpan(self.ast, node.token_index));
                 }
@@ -436,7 +546,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             const last = children[children.len - 1];
             const last_node = self.ast.nodes[last.index()];
             const result: ?ValueId = switch (last_node.tag) {
-                .const_binding, .var_binding, .return_nothing, .return_expr => blk: {
+                .const_binding, .var_binding, .return_nothing, .return_expr, .break_nothing, .break_expr, .continue_expr => blk: {
                     try statements.append(self.gpa, try self.buildStatement(last, false));
                     break :blk null;
                 },
@@ -491,7 +601,12 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 try self.scratch.append(self.gpa, value);
             }
             const start: u32 = @intCast(self.call_arguments.items.len);
-            try self.call_arguments.appendSlice(self.gpa, self.scratch.items[scratch_start..]);
+            for (self.ast.nodeList(node.data.node_node.b), self.scratch.items[scratch_start..]) |argument, value| {
+                try self.call_arguments.append(self.gpa, .{
+                    .value = value,
+                    .span = nodeFocusSpan(self.ast, argument),
+                });
+            }
             return self.appendExpression(callee_index, .{ .call = .{
                 .name = name,
                 .arguments = .{ .start = start, .end = @intCast(self.call_arguments.items.len) },
@@ -514,6 +629,8 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             const call_arguments = try self.call_arguments.toOwnedSlice(self.gpa);
             errdefer self.gpa.free(call_arguments);
             const conditional_outputs = try self.conditional_outputs.toOwnedSlice(self.gpa);
+            errdefer self.gpa.free(conditional_outputs);
+            const loop_values = try self.loop_values.toOwnedSlice(self.gpa);
             return .{
                 .parameter_count = self.parameter_count,
                 .expressions = expressions,
@@ -521,6 +638,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 .statements = statements,
                 .call_arguments = call_arguments,
                 .conditional_outputs = conditional_outputs,
+                .loop_values = loop_values,
                 .root_block = self.root_block.?,
             };
         }
@@ -658,6 +776,12 @@ fn tokenSpan(ast: *const structures.Ast, token_index: u32) structures.SourceSpan
     return .{ .start = token.loc.start, .end = token.loc.end };
 }
 
+fn nodeFocusSpan(ast: *const structures.Ast, node_index: structures.Node.Index) structures.SourceSpan {
+    const node = ast.nodes[node_index.index()];
+    if (node.tag == .call) return nodeFocusSpan(ast, node.data.node_node.a);
+    return tokenSpan(ast, node.token_index);
+}
+
 pub fn discoverItems(gpa: std.mem.Allocator, ast: *const structures.Ast, source: []const u8) !structures.ItemTree {
     var items: std.ArrayList(structures.DiscoveredItem) = .empty;
     errdefer {
@@ -733,7 +857,11 @@ fn testUnresolvedFunctionBodyAllocations(gpa: std.mem.Allocator) !void {
         \\  var value: int = a
         \\  const selected: int = if a < b -> value = second(b, c) + 1 else value = third(c, b)
         \\  value = selected
-        \\  return third(value, a, b) + value * -c
+        \\  const looped = loop
+        \\    value += 1
+        \\    if value < b -> continue
+        \\    break value
+        \\  return third(looped, a, b) + value * -c
     ;
     var report = try parser.parseReport(std.testing.allocator, 1, source);
     defer report.deinit(std.testing.allocator);

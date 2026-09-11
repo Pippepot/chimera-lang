@@ -268,7 +268,7 @@ test "CLI core renders source diagnostics without running" {
     try std.testing.expect(std.mem.indexOf(
         u8,
         errors.writer.buffered(),
-        "broken.chi:1:1: call argument count does not match function signature",
+        "broken.chi:1:1: expected 1 call argument, found 0",
     ) != null);
     try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "timing\n") != null);
 }
@@ -299,6 +299,6 @@ test "CLI core rejects duplicate top-level function names without running" {
     try std.testing.expect(std.mem.indexOf(
         u8,
         errors.writer.buffered(),
-        "duplicates.chi:2:8: duplicate top-level function name",
+        "duplicates.chi:2:8: function name is already declared: `duplicate`",
     ) != null);
 }

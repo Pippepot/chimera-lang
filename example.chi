@@ -1,6 +1,5 @@
-const a: int | none = 1
-static foo = func(arg: int | none) int | none
-    return arg
-const b = foo(a)
-const d = none
-const c = foo(d)
+const b = loop
+  if 1 < 2
+    break 1
+
+exit(b)

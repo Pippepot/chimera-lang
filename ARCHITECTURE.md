@@ -22,6 +22,7 @@ Durable compiler contracts live here. [syntax&semantics.txt](syntax&semantics.tx
 ## Typed values and control flow
 
 - Expressions produce values; return and discard are uses, not operation kinds. Known operand types select operations such as `addi`, without redundant generic opcodes and type metadata.
+- Source-use spans remain separate from reused value identities until diagnostics are complete. An error at an alias use points to that use, not to the expression that originally defined its SSA value.
 - Mutable bindings retain one fixed type and lower to SSA values. Control-flow joins carry changed outer bindings as additional block arguments; mutation does not introduce memory-backed locals.
 - Preserve exactly-once, left-to-right evaluation, including struct initializer source order. Reordering must be unobservable.
 - Fallibility is success/failure control flow, separate from `bool` and `never`. Use one predicate-branch structure with type-specific operations. Logical composition connects edges; extraction carries a value on the success edge. Do not materialize boolean SSA values for fallible outcomes.

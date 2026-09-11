@@ -231,6 +231,10 @@ match fi
 
 
 # Loops
+# Reaching the end of a loop body starts the next iteration. Break and continue
+# target the nearest enclosing loop and are errors outside a loop. Mutable
+# bindings visible before the loop carry their current values across both
+# backedges and loop exits. Bindings declared in the body remain body-local.
 var a = 1
 loop # never if there is no reachable break
     a += 1
