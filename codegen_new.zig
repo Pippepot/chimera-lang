@@ -54,6 +54,12 @@ fn alignForward32(value: u32, alignment: u32) error{FunctionTooLarge}!u32 {
     return with_padding & ~(alignment - 1);
 }
 
+fn reserveStack(end: *u32, layout: structures.TypeLayout) error{FunctionTooLarge}!u32 {
+    const offset = try alignForward32(end.*, layout.byte_alignment);
+    end.* = std.math.add(u32, offset, layout.byte_size) catch return error.FunctionTooLarge;
+    return offset;
+}
+
 fn usesMemoryReturn(layout: structures.TypeLayout) bool {
     return layout.byte_size != 0 and layout.byte_size != @sizeOf(u32);
 }
@@ -69,8 +75,7 @@ fn branchStorageEnd(ssa: *const structures.FunctionBodyAnalysis, types: anytype,
     var end = start;
     for (ssa.block_argument_types[target.argument_start..target.argument_end]) |type_id| {
         const layout = try types.layout(type_id);
-        end = try alignForward32(end, layout.byte_alignment);
-        end = std.math.add(u32, end, layout.byte_size) catch return error.FunctionTooLarge;
+        _ = try reserveStack(&end, layout);
     }
     return end;
 }
@@ -139,14 +144,12 @@ const LocationPlan = struct {
                 var end: u32 = 0;
                 const return_layout = try types.layout(call.return_type);
                 if (usesMemoryReturn(return_layout)) {
-                    end = try alignForward32(end, return_layout.byte_alignment);
-                    end = std.math.add(u32, end, return_layout.byte_size) catch return error.FunctionTooLarge;
+                    _ = try reserveStack(&end, return_layout);
                 }
                 for (ssa.call_arguments[call.arguments.start..call.arguments.end]) |argument| {
                     const type_id = argument.coerce_to orelse value_types[@intFromEnum(argument.value)];
                     const layout = try types.layout(type_id);
-                    end = try alignForward32(end, layout.byte_alignment);
-                    end = std.math.add(u32, end, layout.byte_size) catch return error.FunctionTooLarge;
+                    _ = try reserveStack(&end, layout);
                 }
                 outgoing_size = @max(outgoing_size, end);
             },
@@ -176,9 +179,7 @@ const LocationPlan = struct {
                 if (!needed[argument_index]) continue;
                 const layout = try types.layout(value_types[argument_index]);
                 if (layout.byte_size == 0) continue;
-                local_end = try alignForward32(local_end, layout.byte_alignment);
-                locations[argument_index] = .{ .stack = local_end };
-                local_end = std.math.add(u32, local_end, layout.byte_size) catch return error.FunctionTooLarge;
+                locations[argument_index] = .{ .stack = try reserveStack(&local_end, layout) };
             }
         }
         for (ssa.instructions, locations[ssa.block_argument_types.len..], 0..) |instruction, *location, instruction_index| {
@@ -201,10 +202,7 @@ const LocationPlan = struct {
                 }
                 if (needed[value_index]) {
                     if (layout.byte_size == 0) break :location_blk .discarded;
-                    local_end = try alignForward32(local_end, layout.byte_alignment);
-                    const offset = local_end;
-                    local_end = std.math.add(u32, local_end, layout.byte_size) catch return error.FunctionTooLarge;
-                    break :location_blk .{ .stack = offset };
+                    break :location_blk .{ .stack = try reserveStack(&local_end, layout) };
                 }
                 break :location_blk .discarded;
             };
@@ -218,19 +216,17 @@ const LocationPlan = struct {
         const caller_stack_offset = std.math.add(u32, stack_size, @sizeOf(u64)) catch return error.FunctionTooLarge;
         if (caller_stack_offset > std.math.maxInt(i32)) return error.FunctionTooLarge;
         if (usesMemoryReturn(return_layout)) {
-            incoming_argument_offset = try alignForward32(incoming_argument_offset, return_layout.byte_alignment);
-            return_buffer_offset = std.math.add(u32, caller_stack_offset, incoming_argument_offset) catch return error.FunctionTooLarge;
+            const offset = try reserveStack(&incoming_argument_offset, return_layout);
+            return_buffer_offset = std.math.add(u32, caller_stack_offset, offset) catch return error.FunctionTooLarge;
             try ensureAddressableStackRange(return_buffer_offset.?, return_layout.byte_size);
-            incoming_argument_offset = std.math.add(u32, incoming_argument_offset, return_layout.byte_size) catch return error.FunctionTooLarge;
         }
         for (locations[entry.argument_start..entry.argument_end], 0..) |*location, argument_offset| {
             const argument_index = entry.argument_start + argument_offset;
             const layout = try types.layout(value_types[argument_index]);
-            incoming_argument_offset = try alignForward32(incoming_argument_offset, layout.byte_alignment);
-            const offset = std.math.add(u32, caller_stack_offset, incoming_argument_offset) catch return error.FunctionTooLarge;
+            const argument_stack_offset = try reserveStack(&incoming_argument_offset, layout);
+            const offset = std.math.add(u32, caller_stack_offset, argument_stack_offset) catch return error.FunctionTooLarge;
             try ensureAddressableStackRange(offset, layout.byte_size);
             if (needed[argument_index] and layout.byte_size != 0) location.* = .{ .incoming_argument = offset };
-            incoming_argument_offset = std.math.add(u32, incoming_argument_offset, layout.byte_size) catch return error.FunctionTooLarge;
         }
         return .{
             .locations = locations,
@@ -403,19 +399,17 @@ fn FunctionEmitter(comptime Types: type) type {
             for (arguments, 0..) |argument, argument_offset| {
                 const type_id = ssa.block_argument_types[target.argument_start + argument_offset];
                 const layout = try self.types.layout(type_id);
-                scratch_end = try alignForward32(scratch_end, layout.byte_alignment);
+                const scratch_offset = try reserveStack(&scratch_end, layout);
                 const destination = self.locations[target.argument_start + argument_offset];
-                if (destination != .discarded) try self.emitUseToMemory(argument, scratch_end);
-                scratch_end = std.math.add(u32, scratch_end, layout.byte_size) catch return error.FunctionTooLarge;
+                if (destination != .discarded) try self.emitUseToMemory(argument, scratch_offset);
             }
             scratch_end = self.edge_scratch_offset;
             for (arguments, 0..) |_, argument_offset| {
                 const type_id = ssa.block_argument_types[target.argument_start + argument_offset];
                 const layout = try self.types.layout(type_id);
-                scratch_end = try alignForward32(scratch_end, layout.byte_alignment);
+                const scratch_offset = try reserveStack(&scratch_end, layout);
                 const destination = self.locations[target.argument_start + argument_offset];
-                if (destination != .discarded) try self.copyValue(type_id, .{ .stack = scratch_end }, destination);
-                scratch_end = std.math.add(u32, scratch_end, layout.byte_size) catch return error.FunctionTooLarge;
+                if (destination != .discarded) try self.copyValue(type_id, .{ .stack = scratch_offset }, destination);
             }
         }
 
@@ -455,16 +449,14 @@ fn FunctionEmitter(comptime Types: type) type {
             var argument_end: u32 = 0;
             const return_layout = try self.types.layout(call.return_type);
             if (usesMemoryReturn(return_layout)) {
-                argument_end = try alignForward32(argument_end, return_layout.byte_alignment);
-                std.debug.assert(argument_end == 0);
-                argument_end = std.math.add(u32, argument_end, return_layout.byte_size) catch return error.FunctionTooLarge;
+                const return_offset = try reserveStack(&argument_end, return_layout);
+                std.debug.assert(return_offset == 0);
             }
             for (self.call_arguments[call.arguments.start..call.arguments.end]) |argument| {
                 const type_id = argument.coerce_to orelse self.valueType(argument.value);
                 const layout = try self.types.layout(type_id);
-                argument_end = try alignForward32(argument_end, layout.byte_alignment);
-                try self.emitUseToMemory(argument, argument_end);
-                argument_end = std.math.add(u32, argument_end, layout.byte_size) catch return error.FunctionTooLarge;
+                const argument_offset = try reserveStack(&argument_end, layout);
+                try self.emitUseToMemory(argument, argument_offset);
             }
             const offset_usize = std.math.add(usize, self.encoder.code.items.len, 1) catch return error.FunctionTooLarge;
             const offset = std.math.cast(u32, offset_usize) orelse return error.FunctionTooLarge;
