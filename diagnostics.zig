@@ -44,6 +44,7 @@ fn writeType(writer: *std.Io.Writer, description: structures.Diagnostic.TypeDesc
     var needs_separator = false;
     inline for (.{
         .{ description.int, "int" },
+        .{ description.bool, "bool" },
         .{ description.unit, "unit" },
         .{ description.none, "none" },
         .{ description.never, "never" },
@@ -225,6 +226,14 @@ fn writeKindMessage(writer: *std.Io.Writer, source: []const u8, span: ?structure
         .comparison_operand_not_int => |found| {
             try writer.writeAll("comparison requires `int`, found ");
             try writeType(writer, found);
+        },
+        .equality_operand_not_supported => |found| {
+            try writer.writeAll("equality is not supported for ");
+            try writeType(writer, found);
+        },
+        .equality_operand_type_mismatch => |mismatch| {
+            try writer.writeAll("equality operand type mismatch: ");
+            try writeMismatch(writer, mismatch);
         },
         .fallible_expression_outside_fallible_function => try writer.writeAll("fallible expression must be handled or used inside a fallible function"),
         .missing_return_value => |expected| {

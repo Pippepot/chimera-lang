@@ -426,12 +426,14 @@ pub const CompileTimeValue = union(enum) {
 
     pub const RuntimeValue = union(enum) {
         int: i32,
+        bool: bool,
         unit,
         none,
 
         pub fn typeId(self: @This()) TypeId {
             return switch (self) {
                 .int => .int,
+                .bool => .bool,
                 .unit => .unit,
                 .none => .none,
             };
@@ -445,6 +447,7 @@ pub const InternedTypeId = enum(u31) { _ };
 
 pub const TypeId = enum(u32) {
     int,
+    bool,
     unit,
     none,
     never,
@@ -463,7 +466,7 @@ pub const TypeId = enum(u32) {
     }
 
     pub fn isPrimitive(self: TypeId) bool {
-        return self == .int or self == .unit or self == .none or self == .never;
+        return self == .int or self == .bool or self == .unit or self == .none or self == .never;
     }
 };
 
@@ -517,6 +520,8 @@ pub const PredicateOperation = enum {
     gei,
     eqi,
     nei,
+    eqb,
+    neb,
 };
 
 pub const FunctionBranch = struct {
@@ -581,6 +586,7 @@ pub const VariantOperation = struct {
 
 pub const FunctionInstruction = union(enum) {
     consti: i32,
+    constb: bool,
     const_unit,
     const_none,
     variant_tag: FunctionValueId,
@@ -597,6 +603,7 @@ pub const FunctionInstruction = union(enum) {
     pub fn resultType(self: FunctionInstruction) TypeId {
         return switch (self) {
             .consti, .variant_tag, .negi, .addi, .subi, .muli, .divsi => .int,
+            .constb => .bool,
             .const_unit => .unit,
             .const_none => .none,
             .exit => .never,
@@ -755,10 +762,11 @@ pub const Diagnostic = struct {
 
     pub const TypeDescription = packed struct(u8) {
         int: bool = false,
+        bool: bool = false,
         unit: bool = false,
         none: bool = false,
         never: bool = false,
-        padding: u4 = 0,
+        padding: u3 = 0,
     };
 
     pub const TypeMismatch = struct {
@@ -808,6 +816,8 @@ pub const Diagnostic = struct {
         negation_operand_not_int: TypeDescription,
         arithmetic_operand_not_int: TypeDescription,
         comparison_operand_not_int: TypeDescription,
+        equality_operand_not_supported: TypeDescription,
+        equality_operand_type_mismatch: TypeMismatch,
         fallible_expression_outside_fallible_function,
         missing_return_value: TypeDescription,
         return_type_mismatch: TypeMismatch,

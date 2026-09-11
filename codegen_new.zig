@@ -129,7 +129,7 @@ const LocationPlan = struct {
             const value_index = @intFromEnum(ssa.instructionValue(instruction_index));
             value_types[value_index] = instruction.resultType();
             switch (instruction) {
-                .consti, .const_unit, .const_none => {},
+                .consti, .constb, .const_unit, .const_none => {},
                 .variant_coerce, .variant_extract => |operation| needed[@intFromEnum(operation.operand)] = true,
                 .call => |call| {
                     for (ssa.call_arguments[call.arguments.start..call.arguments.end]) |argument| needed[@intFromEnum(argument.value)] = true;
@@ -205,6 +205,7 @@ const LocationPlan = struct {
             location.* = location_blk: {
                 switch (instruction) {
                     .consti => |value| break :location_blk .{ .immediate = value },
+                    .constb => |value| break :location_blk .{ .immediate = @intFromBool(value) },
                     .const_unit, .const_none => break :location_blk .discarded,
                     .call => |call| if (call.return_type == .unit) {
                         break :location_blk .discarded;
@@ -364,7 +365,7 @@ fn FunctionEmitter(comptime Types: type) type {
                 const instruction = ssa.instructions[instruction_index];
                 const destination = self.locations[@intFromEnum(ssa.instructionValue(instruction_index))];
                 switch (instruction) {
-                    .consti, .const_unit, .const_none => {},
+                    .consti, .constb, .const_unit, .const_none => {},
                     .variant_tag => |operand| {
                         try self.loadComponent(self.locations[@intFromEnum(operand)], 0);
                         try self.storeResult(destination);
@@ -925,8 +926,8 @@ const X86Encoder = struct {
             .gti => 0x8F,
             .lei => 0x8E,
             .gei => 0x8D,
-            .eqi => 0x84,
-            .nei => 0x85,
+            .eqi, .eqb => 0x84,
+            .nei, .neb => 0x85,
         };
         const field_offset = std.math.cast(u32, self.code.items.len + 2) orelse return error.FunctionTooLarge;
         try self.appendBits32(&.{ 0x0F, opcode }, @bitCast(displacement));

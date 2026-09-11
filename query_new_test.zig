@@ -537,6 +537,7 @@ const EntryCallParent = struct {
         return switch (body.instructions[0]) {
             .call => |call| call.target,
             .consti,
+            .constb,
             .const_unit,
             .const_none,
             .variant_tag,
@@ -812,6 +813,10 @@ test "type layout reports generic size and alignment for variants" {
         (try db.get(query_structures.TypeLayout, .int)).*,
     );
     try testing.expectEqual(
+        structures.TypeLayout{ .byte_size = 4, .byte_alignment = 4 },
+        (try db.get(query_structures.TypeLayout, .bool)).*,
+    );
+    try testing.expectEqual(
         structures.TypeLayout{ .byte_size = 0, .byte_alignment = 1 },
         (try db.get(query_structures.TypeLayout, .unit)).*,
     );
@@ -912,6 +917,77 @@ test "named type aliases and integer statics resolve on demand" {
         .value = .{ .int = 40 },
     } }, default_value);
     try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "choose" }, 42);
+}
+
+test "bool values cross static local call return and variant boundaries" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static Flag = bool
+        \\static enabled: Flag = true
+        \\static disabled: bool = false
+        \\static maybe: bool | none = enabled
+        \\func identity(value: Flag) Flag -> value
+        \\func score(value: bool | none) int
+        \\  return if const flag = value as bool
+        \\    if flag == true -> 10 else 0
+        \\  else 12
+        \\func answer() int
+        \\  var selected = identity(enabled)
+        \\  selected = disabled
+        \\  const direct = if selected == false -> 10 else 0
+        \\  const unequal = if enabled <> disabled -> 10 else 0
+        \\  return direct + unequal + score(maybe) + score(none)
+    );
+
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    try testing.expectEqual(
+        structures.CompileTimeValue{ .type = .bool },
+        (try db.get(query_structures.ResolveStatic, scope.resolveStatic("Flag").?)).*.?,
+    );
+    try testing.expectEqual(
+        structures.CompileTimeValue{ .runtime = .{ .type_id = .bool, .value = .{ .bool = true } } },
+        (try db.get(query_structures.ResolveStatic, scope.resolveStatic("enabled").?)).*.?,
+    );
+    try testing.expectEqual(
+        structures.CompileTimeValue{ .runtime = .{ .type_id = .bool, .value = .{ .bool = false } } },
+        (try db.get(query_structures.ResolveStatic, scope.resolveStatic("disabled").?)).*.?,
+    );
+    try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "identity", "score" }, 42);
+}
+
+test "bool static edits invalidate consumers and retain equal results" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static flag = true
+        \\func answer() int -> if flag == true -> 42 else 24
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const flag = scope.resolveStatic("flag").?;
+    const answer = scope.resolveFunction("answer").?;
+    const first_flag = try db.get(query_structures.ResolveStatic, flag);
+    const first_body = try db.get(query_structures.AnalyzeFunctionBody, answer);
+    const first_artifact = try db.get(query_structures.CompileFunction, .{ .item = answer });
+
+    try setSource(db, 1,
+        \\static flag = (true)
+        \\func answer() int -> if flag == true -> 42 else 24
+    );
+    try testing.expectEqual(first_flag, try db.get(query_structures.ResolveStatic, flag));
+    try testing.expectEqual(first_body, try db.get(query_structures.AnalyzeFunctionBody, answer));
+    try testing.expectEqual(first_artifact, try db.get(query_structures.CompileFunction, .{ .item = answer }));
+
+    try setSource(db, 1,
+        \\static flag = false
+        \\func answer() int -> if flag == true -> 42 else 24
+    );
+    try testing.expect(first_flag != try db.get(query_structures.ResolveStatic, flag));
+    try testing.expect(first_body != try db.get(query_structures.AnalyzeFunctionBody, answer));
+    try testing.expect(first_artifact != try db.get(query_structures.CompileFunction, .{ .item = answer }));
+    try expectCompiledFunctionResult(db, 1, "answer", &.{"answer"}, 24);
 }
 
 test "static annotations widen values and reject mismatches when demanded" {
@@ -1039,7 +1115,10 @@ fn testStaticDeclarationAllocations(gpa: std.mem.Allocator) !void {
         \\static Empty: type = none
         \\static Result = int | Empty
         \\static value: Result = 40
-        \\func answer() int -> return if const number = value as int -> number + 2 else 1
+        \\static enabled = true
+        \\func answer() int -> return if enabled == true
+        \\  if const number = value as int -> number + 2 else 1
+        \\else 0
     );
     try testing.expect((try db.get(query_structures.BuildExecutable, 1)).* != null);
 }
@@ -2265,6 +2344,35 @@ test "every integer comparison selects the fallible success edge" {
     try expectCompiledFunctionResult(db, 1, "answer", &.{"answer"}, 42);
 }
 
+test "bool equality selects fallible edges without truthiness" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\func answer() int
+        \\  const equal = if true == true -> 20 else 0
+        \\  const unequal = if true <> false -> 22 else 0
+        \\  return equal + unequal
+    );
+    try expectCompiledFunctionResult(db, 1, "answer", &.{"answer"}, 42);
+
+    const cases = [_]struct { file_id: structures.FileId, source: []const u8, kind: DiagnosticKind }{
+        .{ .file_id = 2, .source = "func bad() int -> if true < false -> 1 else 0", .kind = .comparison_operand_not_int },
+        .{ .file_id = 3, .source = "func bad() int -> if true == 1 -> 1 else 0", .kind = .equality_operand_type_mismatch },
+        .{ .file_id = 4, .source = "func bad() int -> if none == none -> 1 else 0", .kind = .equality_operand_not_supported },
+        .{ .file_id = 5, .source = "func bad() int -> if true -> 1 else 0", .kind = .if_condition_not_fallible },
+    };
+    for (cases) |case| {
+        try addSource(db, case.file_id, case.source);
+        const bad = (try db.get(query_structures.BuildModuleScope, case.file_id)).*.?.resolveFunction("bad").?;
+        try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, bad)).* == null);
+        const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, bad, structures.Diagnostic, testing.allocator);
+        defer freeDiagnostics(diagnostics);
+        try testing.expectEqual(@as(usize, 1), diagnostics.len);
+        try testing.expectEqual(case.kind, std.meta.activeTag(diagnostics[0].kind));
+    }
+}
+
 test "unit-success logical conditions compose and preserve precedence" {
     const db = try testDatabase(2);
     defer db.deinit();
@@ -3317,7 +3425,7 @@ test "function body analysis rejects unsupported expressions and literals" {
     const db = try testDatabase(2);
     defer db.deinit();
 
-    try addSource(db, 1, "static nonliteral = func() int -> return true");
+    try addSource(db, 1, "static unsupported = func() int -> return sizeof(int)");
     try addSource(db, 2, "static bare_return = func() int -> return");
     try addSource(db, 4, "static float = func() int -> return 1.5");
     try addSource(db, 5, "static overflow = func() int -> return 2147483648");
@@ -3900,7 +4008,10 @@ test "BuildExecutable surfaces a callee compile failure as null with its diagnos
     const diagnostics = try db.transitiveAccumulatorValues(query_structures.BuildExecutable, 1, structures.Diagnostic, testing.allocator);
     defer freeDiagnostics(diagnostics);
     try testing.expectEqual(@as(usize, 1), diagnostics.len);
-    try testing.expectEqual(structures.Diagnostic.Kind.expression_not_supported, diagnostics[0].kind);
+    try testing.expectEqual(
+        structures.Diagnostic.Kind{ .return_type_mismatch = .{ .expected = .{ .int = true }, .found = .{ .bool = true } } },
+        diagnostics[0].kind,
+    );
 
     try setSource(db, 1,
         \\static target = func() int -> return 1

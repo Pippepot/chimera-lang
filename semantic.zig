@@ -85,6 +85,7 @@ pub const UnresolvedBody = struct {
 
         pub const Operation = union(enum) {
             integer: i32,
+            boolean: bool,
             unit,
             none,
             local_read: LocalId,
@@ -309,6 +310,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             const node = self.ast.nodes[index.index()];
             switch (node.tag) {
                 .number_literal => return self.appendInteger(index),
+                .bool_literal => return self.appendExpression(index, .{ .boolean = self.ast.tokens[node.token_index].tag == .keyword_true }),
                 .unit_literal => return self.appendExpression(index, .unit),
                 .none_literal => return self.appendExpression(index, .none),
                 .call => return self.appendCall(index),
@@ -331,6 +333,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                         .runtime => |runtime| blk: {
                             const primitive = switch (runtime.value) {
                                 .int => |value| try self.appendExpression(index, .{ .integer = value }),
+                                .bool => |value| try self.appendExpression(index, .{ .boolean = value }),
                                 .unit => try self.appendExpression(index, .unit),
                                 .none => try self.appendExpression(index, .none),
                             };
@@ -744,6 +747,7 @@ fn analyzeType(
         const span = tokenSpan(ast, node.token_index);
         const name = source[span.start..span.end];
         if (std.mem.eql(u8, name, "int")) return .{ .success = .int };
+        if (std.mem.eql(u8, name, "bool")) return .{ .success = .bool };
         if (std.mem.eql(u8, name, "unit")) return .{ .success = .unit };
         if (std.mem.eql(u8, name, "none")) return .{ .success = .none };
         if (std.mem.eql(u8, name, "never")) return .{ .success = .never };
@@ -854,6 +858,10 @@ fn analyzeStaticInitializer(
                 break :blk .{ .unsupported = .{ .span = span, .kind = .integer_literal_out_of_range } };
             break :blk .{ .success = .{ .runtime = .{ .type_id = .int, .value = .{ .int = value } } } };
         },
+        .bool_literal => .{ .success = .{ .runtime = .{
+            .type_id = .bool,
+            .value = .{ .bool = ast.tokens[node.token_index].tag == .keyword_true },
+        } } },
         .unit_literal => .{ .success = .{ .runtime = .{ .type_id = .unit, .value = .unit } } },
         .none_literal => .{ .success = .{ .runtime = .{ .type_id = .none, .value = .none } } },
         .type_variant => switch (try analyzeType(ast, source, initializer, type_interner, gpa, .static_initializer_not_supported)) {
@@ -864,6 +872,7 @@ fn analyzeStaticInitializer(
             const span = tokenSpan(ast, node.token_index);
             const name = source[span.start..span.end];
             if (std.mem.eql(u8, name, "int")) break :blk .{ .success = .{ .type = .int } };
+            if (std.mem.eql(u8, name, "bool")) break :blk .{ .success = .{ .type = .bool } };
             if (std.mem.eql(u8, name, "never")) break :blk .{ .success = .{ .type = .never } };
             if (std.mem.eql(u8, name, "unit")) break :blk .{ .success = .{ .runtime = .{ .type_id = .unit, .value = .unit } } };
             const resolved = type_interner.resolveStatic(name) catch |err| switch (err) {
@@ -914,6 +923,7 @@ pub fn describeType(type_interner: anytype, type_id: structures.TypeId) !structu
 fn addTypeDescriptionMember(description: *structures.Diagnostic.TypeDescription, type_id: structures.TypeId) void {
     switch (type_id) {
         .int => description.int = true,
+        .bool => description.bool = true,
         .unit => description.unit = true,
         .none => description.none = true,
         .never => description.never = true,

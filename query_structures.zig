@@ -217,7 +217,7 @@ pub const TypeLayout = struct {
     pub const Output = structures.TypeLayout;
 
     pub fn run(ctx: anytype, type_id: Input) anyerror!Output {
-        if (type_id == .int) return .{ .byte_size = 4, .byte_alignment = 4 };
+        if (type_id == .int or type_id == .bool) return .{ .byte_size = 4, .byte_alignment = 4 };
         if (type_id == .unit or type_id == .none or type_id == .never) return .{ .byte_size = 0, .byte_alignment = 1 };
 
         return (try ctx.get(VariantLayout, type_id)).layout;

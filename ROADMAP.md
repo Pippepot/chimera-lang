@@ -4,21 +4,9 @@ Implementation audit: 2026-09-11, Zig 0.16.0.
 
 [syntax&semantics.txt](syntax&semantics.txt) is authoritative but incomplete. Implement small end-to-end slices from it; make missing language decisions before coding behavior that depends on them. Legacy parity is not a goal.
 
-The compiler currently has an incremental single-file pipeline through x86-64 ELF emission, with functions, integer expressions, lexical control flow, loops, structural variants, fallibility, and demand-driven simple static declarations. Preserve body-independent signatures, owned query results, stable declaration identities, and equal-result retention as the language grows.
+Preserve body-independent signatures, owned query results, stable declaration identities, and equal-result retention as the language grows.
 
-## Next: bool values
-
-Add `bool` as the next complete scalar slice. This is the smallest specified feature that exercises the existing value pipeline without requiring compile-time evaluation, a new storage model, or unresolved floating-point rules.
-
-- Add distinct `bool` type identity and `true`/`false` values. Do not represent bool as an alias of `int`.
-- Support bool in static declarations, locals, mutable assignment, parameters, calls, returns, branch joins, and structural variants.
-- Support `==` and `!=` as fallible bool comparisons so the specified `if enabled == true` form works. Do not add truthiness or ordered bool comparisons.
-- Extend layouts, typed IR, code generation, diagnostics, debug output, and incremental equality only where bool requires it.
-- Test direct and variant values across static resolution, calls, returns, mutation, conditionals, execution, diagnostics, allocation failure, and equal-result recomputation.
-
-The slice is complete when bool survives every boundary already supported for `int`, while conditions still consume success/failure control flow rather than materializing boolean branch results.
-
-## Then: match
+## Next: match
 
 Implement `match` after bool. It builds on existing variant tag tests, success-scoped extraction, lexical arm scopes, and branch joins, but still needs parser and exhaustiveness work.
 

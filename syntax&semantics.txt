@@ -150,6 +150,8 @@ reassigned = int_or_float_value
 # A fallible expression succeeds or fails; it does not produce bool.
 # Success may carry a value; failure carries no value.
 # Comparisons succeed with unit when true and fail otherwise.
+# Equality and inequality accept matching int or bool operands. Ordered
+# comparisons accept int operands. Bool values are not conditions by themselves.
 # 'fallible' replaces 'func' in declarations and callable types.
 static accept_small = fallible(a: int) int
     a < 2 # failure propagates out of this fallible function

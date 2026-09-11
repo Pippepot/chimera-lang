@@ -227,6 +227,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             const expression = self.unresolved.expressions[index - self.unresolved.parameter_count];
             const resolved: Value = switch (expression.operation) {
                 .integer => |integer| try self.appendInstruction(.{ .consti = integer }),
+                .boolean => |boolean| try self.appendInstruction(.{ .constb = boolean }),
                 .unit => try self.appendInstruction(.const_unit),
                 .none => try self.appendInstruction(.const_none),
                 .local_read => |local| self.local_values[@intFromEnum(local)] orelse unreachable,
@@ -560,20 +561,37 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             if (lhs.type_id == .never) return .{ .success = null, .failure = null, .diverged = lhs };
             const rhs = try self.value(comparison.operands.rhs.value);
             if (rhs.type_id == .never) return .{ .success = null, .failure = null, .diverged = rhs };
-            if (lhs.type_id != .int) return self.reject(comparison.operands.lhs.span, .{ .comparison_operand_not_int = try self.describeType(lhs.type_id) });
-            if (rhs.type_id != .int) return self.reject(comparison.operands.rhs.span, .{ .comparison_operand_not_int = try self.describeType(rhs.type_id) });
+            const operation: structures.PredicateOperation = switch (comparison.operation) {
+                .lt, .gt, .le, .ge => blk: {
+                    if (lhs.type_id != .int) return self.reject(comparison.operands.lhs.span, .{ .comparison_operand_not_int = try self.describeType(lhs.type_id) });
+                    if (rhs.type_id != .int) return self.reject(comparison.operands.rhs.span, .{ .comparison_operand_not_int = try self.describeType(rhs.type_id) });
+                    break :blk switch (comparison.operation) {
+                        .lt => .lti,
+                        .gt => .gti,
+                        .le => .lei,
+                        .ge => .gei,
+                        .eq, .ne => unreachable,
+                    };
+                },
+                .eq, .ne => blk: {
+                    if (lhs.type_id != .int and lhs.type_id != .bool) {
+                        return self.reject(comparison.operands.lhs.span, .{ .equality_operand_not_supported = try self.describeType(lhs.type_id) });
+                    }
+                    if (rhs.type_id != lhs.type_id) {
+                        return self.reject(comparison.operands.rhs.span, .{ .equality_operand_type_mismatch = try self.typeMismatch(lhs.type_id, rhs.type_id) });
+                    }
+                    break :blk switch (lhs.type_id) {
+                        .int => if (comparison.operation == .eq) .eqi else .nei,
+                        .bool => if (comparison.operation == .eq) .eqb else .neb,
+                        else => unreachable,
+                    };
+                },
+            };
             const branch_argument_start: u32 = @intCast(self.block_argument_types.items.len);
             const success = try self.newBlock(branch_argument_start, branch_argument_start);
             const failure = try self.newBlock(branch_argument_start, branch_argument_start);
             self.terminate(.{ .predicate_branch = .{
-                .operation = switch (comparison.operation) {
-                    .lt => .lti,
-                    .gt => .gti,
-                    .le => .lei,
-                    .ge => .gei,
-                    .eq => .eqi,
-                    .ne => .nei,
-                },
+                .operation = operation,
                 .operands = .{ .lhs = lhs.id, .rhs = rhs.id },
                 .then_branch = self.emptyBranch(success),
                 .else_branch = self.emptyBranch(failure),
@@ -951,7 +969,7 @@ fn normalizeValueUses(value_uses: []structures.FunctionValueUse, argument_count:
 
 fn normalizeInstructions(instructions: []structures.FunctionInstruction, argument_count: u32) void {
     for (instructions) |*instruction| switch (instruction.*) {
-        .consti, .const_unit, .const_none => {},
+        .consti, .constb, .const_unit, .const_none => {},
         .variant_coerce, .variant_extract => |*operation| operation.operand = normalizeValue(operation.operand, argument_count),
         .call => {},
         .variant_tag, .exit, .negi => |*operand| operand.* = normalizeValue(operand.*, argument_count),
