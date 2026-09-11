@@ -66,12 +66,21 @@ fn renderSsaFunction(
                 try renderBranchTarget(ssa, predicate.else_branch, writer);
                 try writer.writeByte('\n');
             },
+            .fallible_call => |fallible| {
+                const target = try db.lookupInterned(queries.ItemLocations, fallible.call.target);
+                try writer.print("    fcall @{s} -> b{d}, b{d}\n", .{
+                    target.name,
+                    @intFromEnum(fallible.success),
+                    @intFromEnum(fallible.failure),
+                });
+            },
             .return_unit => try writer.writeAll("    ret\n"),
             .return_value => |value| {
                 try writer.writeAll("    ret ");
                 try renderValueUse(value, writer);
                 try writer.writeByte('\n');
             },
+            .return_failure => try writer.writeAll("    fail\n"),
             .diverge => try writer.writeAll("    diverge\n"),
         }
     }
@@ -104,9 +113,15 @@ fn renderInstruction(
         .consti => |value| try writer.print("    %{d} = consti {d}\n", .{ result, value }),
         .const_unit => try writer.print("    %{d} = const_unit\n", .{result}),
         .const_none => try writer.print("    %{d} = const_none\n", .{result}),
+        .variant_tag => |operand| try writer.print("    %{d} = variant_tag %{d}\n", .{ result, @intFromEnum(operand) }),
         .variant_coerce => |coercion| {
             try writer.print("    %{d} = variant_coerce %{d} to ", .{ result, @intFromEnum(coercion.operand) });
             try renderType(coercion.target_type, writer);
+            try writer.writeByte('\n');
+        },
+        .variant_extract => |extraction| {
+            try writer.print("    %{d} = variant_extract %{d} as ", .{ result, @intFromEnum(extraction.operand) });
+            try renderType(extraction.target_type, writer);
             try writer.writeByte('\n');
         },
         .call => |call| {

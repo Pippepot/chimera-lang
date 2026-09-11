@@ -24,6 +24,14 @@ const b: int = 20  # immutable
 var c: int = 30    # mutable
 const d = 30      # inferred annotation
 
+# Top-level static declarations share one namespace and are evaluated when a
+# consumer demands them. A declaration cycle is an error. A static type value
+# introduces an alias, not a distinct nominal type; aliases preserve canonical
+# structural identity when used within variants.
+static Result = int | none
+static Empty: type = none # annotation disambiguates a type from the value none
+static Default = 40
+
 # A variable keeps its declared or inferred type. Assignment evaluates its
 # right-hand side once, widens it to that type when permitted, updates the
 # variable, and evaluates to the updated value. Compound assignment uses the
@@ -161,6 +169,12 @@ fallible accept(arg: int) int
 
 # 'is' succeeds when the active variant member belongs to the given type.
 # 'as' also carries the narrowed value on success.
+# The inspected value must have a variant type. The inspected type may overlap
+# partially or not at all; 'as' produces the structural intersection on success,
+# and an empty intersection always fails.
+# A condition binding is immutable and visible only in the success body. Its
+# optional annotation follows ordinary widening rules. The original binding is
+# not refined or aliased by the extracted binding.
 func inspect(fi: float | int)
     if fi is float -> found_float()
     if const f = fi as float -> use_float(f)

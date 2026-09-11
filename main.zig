@@ -273,7 +273,7 @@ test "CLI core renders source diagnostics without running" {
     try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "timing\n") != null);
 }
 
-test "CLI core rejects duplicate top-level function names without running" {
+test "CLI core rejects duplicate top-level names without running" {
     const io = std.testing.io;
     defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
 
@@ -299,6 +299,6 @@ test "CLI core rejects duplicate top-level function names without running" {
     try std.testing.expect(std.mem.indexOf(
         u8,
         errors.writer.buffered(),
-        "duplicates.chi:2:8: function name is already declared: `duplicate`",
+        "duplicates.chi:2:8: top-level name is already declared: `duplicate`",
     ) != null);
 }

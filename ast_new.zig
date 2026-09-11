@@ -197,7 +197,7 @@ fn parseExpression(parser: *ParserState) ParseError!Node.Index {
     return switch (parser.tokens[parser.index].tag) {
         .keyword_comptime => try parseComptime(parser),
         .keyword_const, .keyword_var, .keyword_static => try parseBinding(parser),
-        .keyword_func => try parseFunction(parser),
+        .keyword_func, .keyword_fallible => try parseFunction(parser),
         .keyword_return => try parseReturn(parser),
         .keyword_break => try parseBreak(parser),
         .keyword_continue => try parseTokenNode(parser, .keyword_continue, .continue_expr),
@@ -293,7 +293,18 @@ fn parseBinding(parser: *ParserState) !Node.Index {
     const identifier_index = parser.index - 1;
     const type_annotation = try parseTypeAnnotation(parser);
     _ = try parser.expect(.equal);
-    const value = try parseRequiredExpression(parser);
+    const explicit_type_value = if (type_annotation.unwrap()) |annotation| blk: {
+        const node = parser.nodes.items[annotation.index()];
+        const token = parser.tokens[node.token_index];
+        break :blk node.tag == .type and std.mem.eql(u8, parser.source[token.loc.start..token.loc.end], "type");
+    } else false;
+    const inferred_variant_type = type_annotation == .null and
+        (parser.tokens[parser.index].tag == .identifier or parser.tokens[parser.index].tag == .keyword_none) and
+        parser.tokens[parser.index + 1].tag == .pipe;
+    const value = if (binding_keyword.tag == .keyword_static and (explicit_type_value or inferred_variant_type))
+        try parseType(parser)
+    else
+        try parseRequiredExpression(parser);
     const tag: Node.Tag = switch (binding_keyword.tag) {
         .keyword_const => .const_binding,
         .keyword_var => .var_binding,
@@ -345,7 +356,7 @@ fn parseIfExpr(parser: *ParserState) ParseError!Node.Index {
 
 fn parseFunction(parser: *ParserState) !Node.Index {
     const token_index = parser.index;
-    _ = try parser.expect(.keyword_func);
+    _ = parser.eatAny(&.{ .keyword_func, .keyword_fallible }).?;
     const name_token_index: ?u32 = if (parser.eat(.identifier) != null) parser.index - 1 else null;
     const signature = try parseFuncSignature(parser);
     const body = try parseCallableBody(parser);
@@ -357,7 +368,7 @@ fn parseFuncSignature(parser: *ParserState) !Node.Index {
     const token_index = parser.index;
     const params = try parseParamList(parser);
     const return_type: Node.Index = switch (parser.tokens[parser.index].tag) {
-        .identifier, .keyword_func, .keyword_none => try parseType(parser),
+        .identifier, .keyword_func, .keyword_fallible, .keyword_none => try parseType(parser),
         else => .null,
     };
     return parser.addNode(.{ .tag = .signature, .token_index = token_index, .data = .{ .node_node = .{ .a = params, .b = return_type } } });
@@ -417,7 +428,7 @@ fn parseTypePrimary(parser: *ParserState) ParseError!Node.Index {
     return switch (parser.tokens[parser.index].tag) {
         .identifier => try parseTokenNode(parser, .identifier, .type),
         .keyword_none => try parseTokenNode(parser, .keyword_none, .type),
-        .keyword_func => try parseFunctionType(parser),
+        .keyword_func, .keyword_fallible => try parseFunctionType(parser),
         else => {
             try parser.addError(.{ .invalid_expression = parser.tokens[parser.index].tag });
             return error.ParseError;
@@ -427,7 +438,7 @@ fn parseTypePrimary(parser: *ParserState) ParseError!Node.Index {
 
 fn parseFunctionType(parser: *ParserState) !Node.Index {
     const token_index = parser.index;
-    _ = try parser.expect(.keyword_func);
+    _ = parser.eatAny(&.{ .keyword_func, .keyword_fallible }).?;
     const params = try parseTypeList(parser);
     const return_type = try parseType(parser);
     return parser.addNode(.{ .tag = .type_func, .token_index = token_index, .data = .{ .node_node = .{ .a = params, .b = return_type } } });
@@ -611,7 +622,7 @@ fn parseStruct(parser: *ParserState) ParseError!Node.Index {
 
 fn parseStructItem(parser: *ParserState) ParseError!Node.Index {
     if ((try parseBinding(parser)).unwrap()) |binding| return binding;
-    if (parser.tokens[parser.index].tag == .keyword_func or parser.tokens[parser.index].tag == .keyword_struct) {
+    if (parser.tokens[parser.index].tag == .keyword_func or parser.tokens[parser.index].tag == .keyword_fallible or parser.tokens[parser.index].tag == .keyword_struct) {
         return parseExpression(parser);
     }
     return switch (parser.tokens[parser.index + 1].tag) {
@@ -840,6 +851,36 @@ test "parse named function declaration and implicit inline return" {
     );
 }
 
+test "parse fallible function declarations and callable types" {
+    try testParsing(
+        \\fallible checked(value: int) int -> value
+        \\static typed: fallible(int) int = fallible(value: int) int -> value
+    ,
+        \\static_binding
+        \\└─func
+        \\  ├─signature
+        \\  │ ├─param_list
+        \\  │ │ └─param : value
+        \\  │ │   └─type : int
+        \\  │ └─type : int
+        \\  └─return_expr
+        \\    └─identifier : value
+        \\static_binding
+        \\├─type_func
+        \\│ ├─type_list
+        \\│ │ └─type : int
+        \\│ └─type : int
+        \\└─func
+        \\  ├─signature
+        \\  │ ├─param_list
+        \\  │ │ └─param : value
+        \\  │ │   └─type : int
+        \\  │ └─type : int
+        \\  └─return_expr
+        \\    └─identifier : value
+    );
+}
+
 test "parse unit value spellings" {
     try testParsing(
         \\const word = unit
@@ -961,6 +1002,21 @@ test "parse variant type annotations" {
         \\│ ├─type : float
         \\│ └─type : none
         \\└─none_literal : none
+    );
+}
+
+test "parse static variant type value" {
+    try testParsing(
+        \\static Result = int | none
+        \\static Empty: type = none
+    ,
+        \\static_binding
+        \\└─type_variant
+        \\  ├─type : int
+        \\  └─type : none
+        \\static_binding
+        \\├─type : type
+        \\└─type : none
     );
 }
 

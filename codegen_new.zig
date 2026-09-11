@@ -48,6 +48,11 @@ fn typeIndex(types: []const structures.TypeId, needle: structures.TypeId) usize 
     unreachable;
 }
 
+fn containsType(types: []const structures.TypeId, needle: structures.TypeId) bool {
+    for (types) |type_id| if (type_id == needle) return true;
+    return false;
+}
+
 fn alignForward32(value: u32, alignment: u32) error{FunctionTooLarge}!u32 {
     std.debug.assert(std.math.isPowerOfTwo(alignment));
     const with_padding = std.math.add(u32, value, alignment - 1) catch return error.FunctionTooLarge;
@@ -109,11 +114,11 @@ const LocationPlan = struct {
             value_types[value_index] = instruction.resultType();
             switch (instruction) {
                 .consti, .const_unit, .const_none => {},
-                .variant_coerce => |coercion| needed[@intFromEnum(coercion.operand)] = true,
+                .variant_coerce, .variant_extract => |operation| needed[@intFromEnum(operation.operand)] = true,
                 .call => |call| {
                     for (ssa.call_arguments[call.arguments.start..call.arguments.end]) |argument| needed[@intFromEnum(argument.value)] = true;
                 },
-                .exit, .negi => |operand| needed[@intFromEnum(operand)] = true,
+                .variant_tag, .exit, .negi => |operand| needed[@intFromEnum(operand)] = true,
                 .addi, .subi, .muli, .divsi => |operands| {
                     needed[@intFromEnum(operands.lhs)] = true;
                     needed[@intFromEnum(operands.rhs)] = true;
@@ -128,8 +133,13 @@ const LocationPlan = struct {
                 markBranchArguments(ssa, predicate.then_branch, needed);
                 markBranchArguments(ssa, predicate.else_branch, needed);
             },
+            .fallible_call => |fallible| {
+                for (ssa.call_arguments[fallible.call.arguments.start..fallible.call.arguments.end]) |argument| {
+                    needed[@intFromEnum(argument.value)] = true;
+                }
+            },
             .return_value => |value| needed[@intFromEnum(value.value)] = true,
-            .return_unit, .diverge => {},
+            .return_unit, .return_failure, .diverge => {},
         };
         // One reusable area handles every call this function makes. After the
         // prologue, this function's own incoming arguments remain above its
@@ -150,6 +160,19 @@ const LocationPlan = struct {
                     const type_id = argument.coerce_to orelse value_types[@intFromEnum(argument.value)];
                     const layout = try types.layout(type_id);
                     _ = try reserveStack(&end, layout);
+                }
+                outgoing_size = @max(outgoing_size, end);
+            },
+            else => {},
+        };
+        for (ssa.blocks) |block| switch (block.terminator) {
+            .fallible_call => |fallible| {
+                var end: u32 = 0;
+                const return_layout = try types.layout(fallible.call.return_type);
+                if (usesMemoryReturn(return_layout)) _ = try reserveStack(&end, return_layout);
+                for (ssa.call_arguments[fallible.call.arguments.start..fallible.call.arguments.end]) |argument| {
+                    const type_id = argument.coerce_to orelse value_types[@intFromEnum(argument.value)];
+                    _ = try reserveStack(&end, try types.layout(type_id));
                 }
                 outgoing_size = @max(outgoing_size, end);
             },
@@ -285,6 +308,7 @@ fn FunctionEmitter(comptime Types: type) type {
         stack_size: u32,
         edge_scratch_offset: u32,
         return_buffer_offset: ?u32,
+        is_fallible: bool,
 
         fn init(
             gpa: std.mem.Allocator,
@@ -308,6 +332,7 @@ fn FunctionEmitter(comptime Types: type) type {
                 .stack_size = plan.stack_size,
                 .edge_scratch_offset = plan.edge_scratch_offset,
                 .return_buffer_offset = plan.return_buffer_offset,
+                .is_fallible = ssa.is_fallible,
             };
         }
 
@@ -345,7 +370,15 @@ fn FunctionEmitter(comptime Types: type) type {
                 const destination = self.locations[@intFromEnum(ssa.instructionValue(instruction_index))];
                 switch (instruction) {
                     .consti, .const_unit, .const_none => {},
+                    .variant_tag => |operand| {
+                        try self.loadComponent(self.locations[@intFromEnum(operand)], 0);
+                        try self.storeResult(destination);
+                    },
                     .variant_coerce => |coercion| try self.emitCoercion(.{ .value = coercion.operand, .coerce_to = coercion.target_type }, destination),
+                    .variant_extract => |extraction| if (destination != .discarded) {
+                        const source_type = self.valueType(extraction.operand);
+                        try self.convertVariant(source_type, extraction.target_type, self.locations[@intFromEnum(extraction.operand)], destination);
+                    },
                     .call => |call| try self.emitDirectCall(call, destination),
                     .exit => |operand| try self.emitExit(operand),
                     .negi => |operand| {
@@ -369,10 +402,28 @@ fn FunctionEmitter(comptime Types: type) type {
                     try self.emitJump(branch.target);
                 },
                 .predicate_branch => |predicate| try self.emitPredicateBranch(ssa, predicate),
+                .fallible_call => |fallible| try self.emitFallibleCall(ssa, fallible),
                 .return_unit => try self.emitReturn(null, .unit),
                 .return_value => |value| try self.emitReturn(value, ssa.return_type),
+                .return_failure => try self.emitFailureReturn(),
                 .diverge => {},
             }
+        }
+
+        fn emitFallibleCall(
+            self: *Self,
+            ssa: *const structures.FunctionBodyAnalysis,
+            fallible: @FieldType(structures.FunctionTerminator, "fallible_call"),
+        ) !void {
+            const success = ssa.blocks[@intFromEnum(fallible.success)];
+            std.debug.assert(success.argument_end - success.argument_start == 1);
+            try self.emitDirectCall(fallible.call, self.locations[success.argument_start]);
+            try self.encoder.compareEdxZero();
+            const success_field = try self.encoder.conditionalJumpRelative32(.nei, 0);
+            try self.emitJump(fallible.failure);
+            const success_offset = std.math.cast(u32, self.encoder.code.items.len) orelse return error.FunctionTooLarge;
+            try self.patchJump(success_field, success_offset);
+            try self.emitJump(fallible.success);
         }
 
         fn emitPredicateBranch(
@@ -437,6 +488,14 @@ fn FunctionEmitter(comptime Types: type) type {
                     .eax;
                 try self.emitUse(returned, return_type, destination);
             }
+            if (self.is_fallible) try self.encoder.movEdxImmediate32(1);
+            if (self.stack_size != 0) try self.encoder.addRspImmediate32(self.stack_size);
+            try self.encoder.ret();
+        }
+
+        fn emitFailureReturn(self: *Self) !void {
+            std.debug.assert(self.is_fallible);
+            try self.encoder.movEdxImmediate32(0);
             if (self.stack_size != 0) try self.encoder.addRspImmediate32(self.stack_size);
             try self.encoder.ret();
         }
@@ -532,21 +591,20 @@ fn FunctionEmitter(comptime Types: type) type {
                 return self.copyValue(target_type, self.locations[@intFromEnum(use.value)], destination);
             }
             std.debug.assert(use.coerce_to.? == target_type);
-            try self.coerceVariant(actual_type, target_type, self.locations[@intFromEnum(use.value)], destination);
+            try self.convertVariant(actual_type, target_type, self.locations[@intFromEnum(use.value)], destination);
         }
 
-        fn coerceVariant(
+        fn convertVariant(
             self: *Self,
             actual_type: structures.TypeId,
             target_type: structures.TypeId,
             source: ValueLocation,
             destination: ValueLocation,
         ) !void {
-            const target_members = (try self.types.variantMembers(target_type)) orelse unreachable;
-            std.debug.assert(target_members.len != 0);
-            const target_payload_offset = (try self.types.variantLayout(target_type)).payload_offset;
             const actual_members = try self.types.variantMembers(actual_type);
             if (actual_members == null) {
+                const target_members = (try self.types.variantMembers(target_type)) orelse unreachable;
+                const target_payload_offset = (try self.types.variantLayout(target_type)).payload_offset;
                 const actual_layout = try self.types.layout(actual_type);
                 try self.copyRange(source, 0, destination, target_payload_offset, actual_layout.byte_size);
                 try self.encoder.movEaxImmediate32(@intCast(typeIndex(target_members, actual_type)));
@@ -554,20 +612,40 @@ fn FunctionEmitter(comptime Types: type) type {
                 return;
             }
 
+            const target_members = try self.types.variantMembers(target_type) orelse {
+                const target_layout = try self.types.layout(target_type);
+                const actual_payload_offset = (try self.types.variantLayout(actual_type)).payload_offset;
+                return self.copyRange(source, actual_payload_offset, destination, 0, target_layout.byte_size);
+            };
+
             const actual_layout = try self.types.layout(actual_type);
             const actual_payload_offset = (try self.types.variantLayout(actual_type)).payload_offset;
             const actual_payload_size = actual_layout.byte_size - actual_payload_offset;
-            try self.copyRange(source, actual_payload_offset, destination, target_payload_offset, actual_payload_size);
+            const target_layout = try self.types.variantLayout(target_type);
+            const target_payload_size = target_layout.layout.byte_size - target_layout.payload_offset;
+            try self.copyRange(source, actual_payload_offset, destination, target_layout.payload_offset, @min(actual_payload_size, target_payload_size));
             try self.loadComponent(source, 0);
             try self.remapVariantTag(actual_members.?, target_members);
             try self.storeComponent(destination, 0);
         }
 
         fn remapVariantTag(self: *Self, source_members: []const structures.TypeId, target_members: []const structures.TypeId) !void {
-            std.debug.assert(source_members.len != 0);
+            var matching_count: usize = 0;
+            for (source_members) |member| {
+                if (containsType(target_members, member)) matching_count += 1;
+            }
+            std.debug.assert(matching_count >= 2);
+
+            var matched: usize = 0;
             var done_jumps: std.ArrayList(u32) = .empty;
             defer done_jumps.deinit(self.gpa);
-            for (source_members[0 .. source_members.len - 1], 0..) |member, source_index| {
+            for (source_members, 0..) |member, source_index| {
+                if (!containsType(target_members, member)) continue;
+                matched += 1;
+                if (matched == matching_count) {
+                    try self.encoder.movEaxImmediate32(@intCast(typeIndex(target_members, member)));
+                    break;
+                }
                 try self.encoder.compareEax(.{ .immediate = @intCast(source_index) });
                 const next = try self.encoder.conditionalJumpRelative32(.nei, 0);
                 try self.encoder.movEaxImmediate32(@intCast(typeIndex(target_members, member)));
@@ -575,8 +653,6 @@ fn FunctionEmitter(comptime Types: type) type {
                 const next_offset = std.math.cast(u32, self.encoder.code.items.len) orelse return error.FunctionTooLarge;
                 try self.patchJump(next, next_offset);
             }
-            const last_member = source_members[source_members.len - 1];
-            try self.encoder.movEaxImmediate32(@intCast(typeIndex(target_members, last_member)));
             const done_offset = std.math.cast(u32, self.encoder.code.items.len) orelse return error.FunctionTooLarge;
             for (done_jumps.items) |jump| try self.patchJump(jump, done_offset);
         }
@@ -878,6 +954,10 @@ const X86Encoder = struct {
         try self.appendBits32(&.{0xB8}, @bitCast(value));
     }
 
+    fn movEdxImmediate32(self: *@This(), value: i32) !void {
+        try self.appendBits32(&.{0xBA}, @bitCast(value));
+    }
+
     fn movEdiFromEax(self: *@This()) !void {
         try self.appendBytes(&.{ 0x89, 0xC7 });
     }
@@ -912,6 +992,10 @@ const X86Encoder = struct {
             .stack, .incoming_argument => |offset| try self.appendBits32(&.{ 0x3B, 0x84, 0x24 }, offset),
             .eax, .return_buffer, .discarded => unreachable,
         }
+    }
+
+    fn compareEdxZero(self: *@This()) !void {
+        try self.appendBytes(&.{ 0x85, 0xD2 });
     }
 
     fn integerBinary(self: *@This(), operation: IntegerBinaryOperation, rhs: ValueLocation) !void {

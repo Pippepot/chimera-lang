@@ -2,24 +2,24 @@
 
 Implementation audit: 2026-09-11, Zig 0.16.0.
 
-The incremental pipeline works end to end. The next goal is to make variants inspectable and fallibility composable. Continue making the language in [syntax&semantics.txt](syntax&semantics.txt) usable through small, complete feature slices. That document is authoritative but incomplete: missing rules need a language decision, while missing implementation needs code. Legacy parity is not the goal.
+The incremental pipeline works end to end. Variants are inspectable, fallibility composes across function boundaries, and simple static declarations resolve on demand; the next goal is general compile-time expressions and callable values. Continue making the language in [syntax&semantics.txt](syntax&semantics.txt) usable through small, complete feature slices. That document is authoritative but incomplete: missing rules need a language decision, while missing implementation needs code. Legacy parity is not the goal.
 
 ## Current baseline
 
 | Area | Implemented | Main gap |
 | --- | --- | --- |
-| Pipeline | Owned AST, stable item IDs, concurrent incremental queries, diagnostics, per-function SSA/code, reachable linking, Linux ELF CLI | Single-file callable scope; no generic instances or cross-run cache |
-| Functions | Named and static-bound declarations, typed parameters, direct calls, general statement bodies, unit fallthrough, early returns | Fallible functions, parameter modifiers, callable values |
-| Values | Decimal `int`, `unit`/`()`, `none`, `never`, immutable and mutable locals, assignments, calls, integer negation and `+ - * /` | `bool`, `float`, general type values |
-| Variants | Canonical sets over `int`, `unit`, `none`; structural branch unions; layout, member injection, locals, calls, returns; subset widening at bindings, arguments, and returns | Named aliases, inspection/extraction |
-| Control flow | Value-producing `if` over integer comparisons and short-circuiting unit-success logic, lexical branch and loop blocks, divergence-aware joins, returns, loop-carried mutable state, `break` values, `continue` | Match |
+| Pipeline | Owned AST, stable function/static item IDs, concurrent incremental queries, diagnostics, per-function SSA/code, reachable linking, Linux ELF CLI | Single-file declaration scope; no generic instances or cross-run cache |
+| Functions | Named and static-bound ordinary and fallible declarations, typed parameters, direct calls with failure propagation, general statement bodies, unit fallthrough, early returns | Parameter modifiers, callable values |
+| Values | Decimal `int`, `unit`/`()`, `none`, `never`, demanded simple static constants, immutable and mutable locals, assignments, calls, integer negation and `+ - * /` | General `comptime`, `bool`, `float`, callable values |
+| Variants | Canonical sets and aliases over `int`, `unit`, `none`; structural branch unions; layout, member injection and inspection/extraction; locals, calls, returns; subset widening at bindings, arguments, and returns | Named nominal types |
+| Control flow | Value-producing `if` over integer comparisons, variant inspection, and short-circuiting unit-success logic; success-scoped extraction bindings; lexical branch and loop blocks, divergence-aware joins, returns, loop-carried mutable state, `break` values, `continue` | Match |
 | Backend | Full-layout values, symbolic calls, recursion, arbitrary CFG edges, parallel edge copies | Frontend cannot yet produce all supported graphs; no external ABI |
 
 Named function declarations canonicalize to static-bound function values during parsing. Inline bodies acquire an implicit return, and an omitted return annotation means `unit`. Block bodies accept general supported statements; unit functions may fall through, while every reachable path of other functions must return or diverge. Annotations on the static function binding itself remain unsupported and are rejected when the function signature is demanded. Direct `unit` and `none` values work at binding, call, and return boundaries as well as inside variants.
 
 `exit(int)` remains an inline syscall implementation but is typed as `never` and terminates its control-flow path.
 
-Top-level analysis accepts supported expressions, immutable and mutable locals, assignments, general conditionals, and loops, skips static initializers, and synthesizes a unit return on reachable fallthrough. Successfully parsing a static initializer does not mean it was validated or evaluated. Discovery recognizes only static function initializers; uncalled bodies remain demand-driven. The parser also recognizes some future syntax—structs, parameter modifiers, `comptime`, `is`/`as`, `?`, and `sizeof`—without runtime semantics. `fallible` and `match` still need parser work.
+Top-level analysis accepts supported expressions, immutable and mutable locals, assignments, general conditionals, and loops, and synthesizes a unit return on reachable fallthrough. Discovery indexes function and static declarations without analyzing them. Simple `int`, `unit`, and `none` statics and structural type aliases are validated only when demanded; unsupported initializers remain dormant until use. Uncalled bodies are likewise demand-driven. The parser also recognizes some future syntax—structs, parameter modifiers, `comptime`, `?`, and `sizeof`—without runtime semantics. `match` still needs parser work.
 
 ## Priorities
 
@@ -50,8 +50,8 @@ General bodies and control flow are complete:
 Build on the control-flow model, without boolean condition values:
 
 - **Done:** unit-success `and`, `or`, and `not`, preserving precedence and left-to-right short-circuiting.
-- Add `is`, fallible `as`, and immutable success-region condition bindings. Existing bindings keep their original types. Test both successful extraction and failure, including subset types.
-- Add fallible function declarations, signatures, calls, and failure propagation. Preserve success payloads across calls and represent fallibility in callable type identity. Add ordinary-to-compatible-fallible widening with function values when that representation is available.
+- **Done:** `is`, fallible `as`, and immutable success-region condition bindings. Existing bindings keep their original types. Tests cover successful extraction, failure, partially overlapping inspection types, and subset tag remapping.
+- **Done:** fallible function declarations, signatures, calls, and failure propagation. Success payloads survive calls, and signature identity includes fallibility. Ordinary-to-compatible-fallible widening waits for function values.
 
 **Done:** conditions consume success/failure edges; extracted values exist only on success; a failed expression propagates from a fallible function without executing later effects. Calls, signatures, and diagnostics recompute correctly when fallibility changes.
 
@@ -59,11 +59,11 @@ Do not bundle postfix `?` into this milestone: its semantics are absent from the
 
 ### 4. Resolve declarations and compile-time values
 
-Start with named type aliases and simple static values, then extend to `comptime` expressions and `static` parameters. Add module/item queries for demanded declarations and values; do not build a universal compile-time evaluator before its first use.
+**Done:** named structural type aliases and simple `int`, `unit`, and `none` static values resolve through one demand-driven declaration query. Static annotations use ordinary subset widening. Top-level names share one namespace; cycles and kind errors have source diagnostics. Canonically equal alias edits retain signatures, bodies, and code, while changed values invalidate their actual consumers.
 
-Define missing declaration lookup, cycle, and compile-time evaluation rules in the language reference first. Preserve structural variant identity through aliases. Resolve function annotations and callable values through the same type system. Generalize the variant-only interner when another interned type shape actually arrives. Extend `InstanceId` with compile-time arguments when specialization needs them.
+Next extend static initializers to `comptime` expressions and `static` parameters; do not build a universal evaluator before its next concrete use. Resolve function annotations and callable values through the same type system. Generalize the variant-only interner when another interned type shape actually arrives. Extend `InstanceId` with compile-time arguments when specialization needs them.
 
-**Done:** static values are validated and evaluated when demanded, source type names resolve, cycles have defined diagnostics, and changes invalidate their actual consumers. Preserve body-independent signatures and owned query results.
+Preserve body-independent signatures and owned query results as these forms expand.
 
 ### 5. Complete scalar values and matching
 

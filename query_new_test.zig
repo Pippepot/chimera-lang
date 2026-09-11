@@ -539,7 +539,9 @@ const EntryCallParent = struct {
             .consti,
             .const_unit,
             .const_none,
+            .variant_tag,
             .variant_coerce,
+            .variant_extract,
             .exit,
             .negi,
             .addi,
@@ -634,30 +636,32 @@ test "DiscoverItems owns names across source edits" {
     const result = try db.get(query_structures.DiscoverItems, 1);
     const tree = result.*.?;
 
-    try testing.expectEqual(@as(usize, 3), tree.items.len);
+    try testing.expectEqual(@as(usize, 4), tree.items.len);
     try testing.expectEqual(structures.ItemKind.function, tree.items[0].loc.kind);
     try testing.expectEqualStrings("first", tree.items[0].loc.name);
-    try testing.expectEqual(structures.ItemKind.top_level_entry, tree.items[2].loc.kind);
-    try testing.expectEqualStrings("$entry", tree.items[2].loc.name);
+    try testing.expectEqual(structures.ItemKind.static, tree.items[2].loc.kind);
+    try testing.expectEqualStrings("value", tree.items[2].loc.name);
+    try testing.expectEqual(structures.ItemKind.top_level_entry, tree.items[3].loc.kind);
+    try testing.expectEqualStrings("$entry", tree.items[3].loc.name);
 
     try setSource(db, 1, "static replacement = func() int -> return 3");
     try testing.expectEqualStrings("first", tree.items[0].loc.name);
 }
 
-test "discovery rejects duplicate top-level function names" {
+test "discovery rejects duplicate top-level names across declaration kinds" {
     const db = try testDatabase(2);
     defer db.deinit();
 
     const source =
         \\static duplicate = func() int -> return 1
         \\static other = func() int -> return 0
-        \\static duplicate = func() int -> return 2
+        \\static duplicate = 2
     ;
     try addSource(db, 1, source);
     try testing.expect((try db.get(query_structures.DiscoverItems, 1)).* == null);
     const diagnostics = try db.directAccumulatorValues(query_structures.DiscoverItems, 1, structures.Diagnostic);
     try testing.expectEqual(@as(usize, 1), diagnostics.len);
-    try testing.expectEqual(structures.Diagnostic.Kind.duplicate_top_level_function, diagnostics[0].kind);
+    try testing.expectEqual(structures.Diagnostic.Kind.duplicate_top_level_declaration, diagnostics[0].kind);
     const start = std.mem.lastIndexOf(u8, source, "duplicate").?;
     try testing.expectEqual(structures.SourceSpan{ .start = start, .end = start + "duplicate".len }, diagnostics[0].span.?);
 
@@ -692,8 +696,9 @@ test "DiscoverItems creates an entry for every parsed file" {
     try testing.expectEqual(@as(usize, 2), function_only.?.items.len);
     try testing.expectEqual(structures.ItemKind.function, function_only.?.items[0].loc.kind);
     try testing.expectEqual(structures.ItemKind.top_level_entry, function_only.?.items[1].loc.kind);
-    try testing.expectEqual(@as(usize, 1), static_only.?.items.len);
-    try testing.expectEqual(structures.ItemKind.top_level_entry, static_only.?.items[0].loc.kind);
+    try testing.expectEqual(@as(usize, 2), static_only.?.items.len);
+    try testing.expectEqual(structures.ItemKind.static, static_only.?.items[0].loc.kind);
+    try testing.expectEqual(structures.ItemKind.top_level_entry, static_only.?.items[1].loc.kind);
 }
 
 test "item indexing handles empty malformed missing and duplicate inputs" {
@@ -850,7 +855,7 @@ test "type layout reports generic size and alignment for variants" {
     try testing.expectEqual(first_layout, try db.get(query_structures.TypeLayout, unit_or_none));
 }
 
-test "module scope owns sorted callable lookup and leaves bodies demand-driven" {
+test "module scope owns sorted declaration lookup and leaves bodies demand-driven" {
     const db = try testDatabase(2);
     defer db.deinit();
 
@@ -861,18 +866,182 @@ test "module scope owns sorted callable lookup and leaves bodies demand-driven" 
         \\static alpha = func() int -> return 1
     );
     const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
-    try testing.expectEqual(@as(usize, 2), scope.entries.len);
+    try testing.expectEqual(@as(usize, 3), scope.entries.len);
     try testing.expectEqualStrings("alpha", scope.entries[0].name);
-    try testing.expectEqualStrings("zeta", scope.entries[1].name);
+    try testing.expectEqualStrings("value", scope.entries[1].name);
+    try testing.expectEqualStrings("zeta", scope.entries[2].name);
     try testing.expectEqual(scope.entries[0].item_id, scope.resolve("alpha").?);
-    try testing.expectEqual(scope.entries[1].item_id, scope.resolve("zeta").?);
+    try testing.expectEqual(scope.entries[1].item_id, scope.resolve("value").?);
+    try testing.expectEqual(scope.entries[2].item_id, scope.resolve("zeta").?);
+    try testing.expectEqual(scope.entries[0].item_id, scope.resolveFunction("alpha").?);
+    try testing.expectEqual(scope.entries[1].item_id, scope.resolveStatic("value").?);
+    try testing.expect(scope.resolveStatic("alpha") == null);
+    try testing.expect(scope.resolveFunction("value") == null);
     try testing.expect(scope.resolve("missing") == null);
-    try testing.expect(scope.resolve("value") == null);
     try testing.expect(scope.resolve("$entry") == null);
     try testing.expectEqual(@as(usize, 0), (try db.directAccumulatorValues(query_structures.BuildModuleScope, 1, structures.Diagnostic)).len);
 
     try setSource(db, 1, "static replacement = func() int -> return 2");
     try testing.expectEqualStrings("alpha", scope.entries[0].name);
+}
+
+test "named type aliases and integer statics resolve on demand" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static Empty: type = none
+        \\static Result = int | Empty
+        \\static default_value = 40
+        \\func choose(value: Result) int
+        \\  return if const number = value as int -> number else default_value
+        \\func answer() int -> choose(default_value) + 2
+    );
+
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const empty = (try db.get(query_structures.ResolveStatic, scope.resolveStatic("Empty").?)).*.?;
+    try testing.expectEqual(structures.CompileTimeValue{ .type = .none }, empty);
+    const result = (try db.get(query_structures.ResolveStatic, scope.resolveStatic("Result").?)).*.?;
+    const result_type = result.type;
+    const members = (try db.lookupInterned(query_structures.VariantTypes, result_type.interned().?)).members;
+    try testing.expectEqualSlices(structures.TypeId, &.{ .int, .none }, members);
+
+    const default_value = (try db.get(query_structures.ResolveStatic, scope.resolveStatic("default_value").?)).*.?;
+    try testing.expectEqual(structures.CompileTimeValue{ .runtime = .{
+        .type_id = .int,
+        .value = .{ .int = 40 },
+    } }, default_value);
+    try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "choose" }, 42);
+}
+
+test "static annotations widen values and reject mismatches when demanded" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static widened: int | none = 40
+        \\static absent: int | none = none
+        \\static completed: int | unit = unit
+        \\func answer() int
+        \\  const number = if const value = widened as int -> value else 0
+        \\  const missing = if absent is none -> 1 else 0
+        \\  const done = if completed is unit -> 1 else 0
+        \\  return number + missing + done
+    );
+    try expectCompiledFunctionResult(db, 1, "answer", &.{"answer"}, 42);
+
+    try addSource(db, 2,
+        \\static bad: none = 40
+        \\func answer() int -> bad
+    );
+    const bad = (try db.get(query_structures.BuildModuleScope, 2)).*.?.resolveStatic("bad").?;
+    try testing.expect((try db.get(query_structures.ResolveStatic, bad)).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(query_structures.ResolveStatic, bad, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(DiagnosticKind.static_initializer_type_mismatch, std.meta.activeTag(diagnostics[0].kind));
+}
+
+test "unsupported statics stay dormant until demanded" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static unused = 1 + 2
+        \\func answer() int -> 42
+    );
+    try expectCompiledFunctionResult(db, 1, "answer", &.{"answer"}, 42);
+
+    const unused = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveStatic("unused").?;
+    try testing.expect((try db.get(query_structures.ResolveStatic, unused)).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(query_structures.ResolveStatic, unused, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(DiagnosticKind.static_initializer_not_supported, std.meta.activeTag(diagnostics[0].kind));
+}
+
+test "static declaration cycles are diagnosed and recover after edits" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static First = Second
+        \\static Second = First
+        \\func use(value: First) int -> 42
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const use = scope.resolveFunction("use").?;
+    try testing.expect((try db.get(query_structures.FunctionSignature, use)).* == null);
+    var diagnostics = try db.transitiveAccumulatorValues(query_structures.FunctionSignature, use, structures.Diagnostic, testing.allocator);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(DiagnosticKind.declaration_cycle, std.meta.activeTag(diagnostics[0].kind));
+    freeDiagnostics(diagnostics);
+
+    try setSource(db, 1,
+        \\static First = int | none
+        \\static Second = First
+        \\func use(value: First) int -> 42
+    );
+    try testing.expect((try db.get(query_structures.FunctionSignature, use)).* != null);
+    diagnostics = try db.transitiveAccumulatorValues(query_structures.FunctionSignature, use, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 0), diagnostics.len);
+}
+
+test "static declaration edits invalidate actual consumers and retain equal results" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static Result = int | none
+        \\static default_value = 40
+        \\func answer(value: Result) int -> default_value
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const result = scope.resolveStatic("Result").?;
+    const default_value = scope.resolveStatic("default_value").?;
+    const answer = scope.resolveFunction("answer").?;
+    const first_result = try db.get(query_structures.ResolveStatic, result);
+    const first_default = try db.get(query_structures.ResolveStatic, default_value);
+    const first_signature = try db.get(query_structures.FunctionSignature, answer);
+    const first_body = try db.get(query_structures.AnalyzeFunctionBody, answer);
+    const first_artifact = try db.get(query_structures.CompileFunction, .{ .item = answer });
+
+    try setSource(db, 1,
+        \\static Result = none | int
+        \\static default_value = 40
+        \\func answer(value: Result) int -> default_value
+    );
+    try testing.expectEqual(first_result, try db.get(query_structures.ResolveStatic, result));
+    try testing.expectEqual(first_default, try db.get(query_structures.ResolveStatic, default_value));
+    try testing.expectEqual(first_signature, try db.get(query_structures.FunctionSignature, answer));
+    try testing.expectEqual(first_body, try db.get(query_structures.AnalyzeFunctionBody, answer));
+    try testing.expectEqual(first_artifact, try db.get(query_structures.CompileFunction, .{ .item = answer }));
+
+    try setSource(db, 1,
+        \\static Result = none | int
+        \\static default_value = 41
+        \\func answer(value: Result) int -> default_value
+    );
+    try testing.expect(first_default != try db.get(query_structures.ResolveStatic, default_value));
+    try testing.expect(first_body != try db.get(query_structures.AnalyzeFunctionBody, answer));
+    try testing.expect(first_artifact != try db.get(query_structures.CompileFunction, .{ .item = answer }));
+}
+
+test "static declaration resolution cleans up every allocation failure" {
+    try testing.checkAllAllocationFailures(testing.allocator, testStaticDeclarationAllocations, .{});
+}
+
+fn testStaticDeclarationAllocations(gpa: std.mem.Allocator) !void {
+    const db = try Database.init(gpa, .{ .worker_count = 1 });
+    defer db.deinit();
+    try addSource(db, 1,
+        \\static Empty: type = none
+        \\static Result = int | Empty
+        \\static value: Result = 40
+        \\func answer() int -> return if const number = value as int -> number + 2 else 1
+    );
+    try testing.expect((try db.get(query_structures.BuildExecutable, 1)).* != null);
 }
 
 test "module scope classifies empty missing and malformed inputs" {
@@ -884,7 +1053,7 @@ test "module scope classifies empty missing and malformed inputs" {
     try addSource(db, 3, "const value 1");
 
     try testing.expectEqual(@as(usize, 0), (try db.get(query_structures.BuildModuleScope, 1)).*.?.entries.len);
-    try testing.expectEqual(@as(usize, 0), (try db.get(query_structures.BuildModuleScope, 2)).*.?.entries.len);
+    try testing.expectEqual(@as(usize, 1), (try db.get(query_structures.BuildModuleScope, 2)).*.?.entries.len);
     try testing.expect((try db.get(query_structures.BuildModuleScope, 3)).* == null);
     try testing.expectError(error.InputNotFound, db.get(query_structures.BuildModuleScope, 99));
     try testing.expectEqual(@as(usize, 0), (try db.directAccumulatorValues(query_structures.BuildModuleScope, 3, structures.Diagnostic)).len);
@@ -910,7 +1079,7 @@ test "discovery diagnoses later duplicate functions and scope recovers" {
     try testing.expectEqual(@as(usize, 2), diagnostics.len);
     var search_from = std.mem.indexOf(u8, duplicate_source, "duplicate").? + "duplicate".len;
     for (diagnostics) |diagnostic| {
-        try testing.expectEqual(structures.Diagnostic.Kind.duplicate_top_level_function, diagnostic.kind);
+        try testing.expectEqual(structures.Diagnostic.Kind.duplicate_top_level_declaration, diagnostic.kind);
         const start = std.mem.indexOfPos(u8, duplicate_source, search_from, "duplicate").?;
         try testing.expectEqual(structures.SourceSpan{ .start = start, .end = start + "duplicate".len }, diagnostic.span.?);
         search_from = start + "duplicate".len;
@@ -1943,6 +2112,142 @@ test "fallible integer if joins branch values through a block argument" {
     try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "choose" }, 42);
 }
 
+test "fallible function signatures distinguish declarations" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static ordinary = func(value: int) int -> value
+        \\static checked = fallible(value: int) int -> value
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const ordinary = (try db.get(query_structures.FunctionSignature, scope.resolve("ordinary").?)).*.?;
+    const checked = (try db.get(query_structures.FunctionSignature, scope.resolve("checked").?)).*.?;
+
+    try testing.expect(!ordinary.is_fallible);
+    try testing.expect(checked.is_fallible);
+    try testing.expect(!structures.FunctionSignature.eql(ordinary, checked));
+}
+
+test "fallible calls preserve success payloads across propagation" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\fallible positive(value: int) int
+        \\  value > 0
+        \\  return value
+        \\fallible sum() int -> positive(20) + positive(22)
+        \\fallible answer() unit
+        \\  sum() == 42
+        \\if answer() -> exit(42) else exit(1)
+    );
+    const executable = (try db.get(query_structures.BuildExecutable, 1)).*.?;
+    const io = testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    try runtime.writeProgram(io, executable.bytes);
+    try testing.expectEqual(@as(u8, 42), try runtime.runProg(io, testing.allocator, &.{}));
+}
+
+test "fallible call failure propagates without later effects" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\fallible negative(value: int) int
+        \\  value < 0
+        \\  return value
+        \\fallible caller() int
+        \\  const value = negative(1)
+        \\  exit(99)
+        \\  return value
+        \\if caller() -> exit(1) else exit(42)
+    );
+    const executable = (try db.get(query_structures.BuildExecutable, 1)).*.?;
+    const io = testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    try runtime.writeProgram(io, executable.bytes);
+    try testing.expectEqual(@as(u8, 42), try runtime.runProg(io, testing.allocator, &.{}));
+}
+
+test "fallible calls preserve zero-sized and memory-returned payloads" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\fallible produce(value: int) int | none
+        \\  value > 0
+        \\  return value
+        \\fallible inspect() unit
+        \\  const produced = produce(7)
+        \\  produced is int
+        \\  return
+        \\fallible forward() unit
+        \\  inspect()
+        \\if forward() -> exit(42) else exit(1)
+    );
+    const executable = (try db.get(query_structures.BuildExecutable, 1)).*.?;
+    const io = testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    try runtime.writeProgram(io, executable.bytes);
+    try testing.expectEqual(@as(u8, 42), try runtime.runProg(io, testing.allocator, &.{}));
+}
+
+test "unhandled fallible calls are rejected from ordinary functions" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\fallible checked() int -> 42
+        \\static bad = func() int -> checked()
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const bad = scope.resolve("bad").?;
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, bad)).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, bad, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(DiagnosticKind.fallible_expression_outside_fallible_function, std.meta.activeTag(diagnostics[0].kind));
+}
+
+test "fallibility edits invalidate signatures and callers" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\fallible target() int -> 42
+        \\fallible caller() int -> target()
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const target = scope.resolve("target").?;
+    const caller = scope.resolve("caller").?;
+    const fallible_signature = try db.get(query_structures.FunctionSignature, target);
+    const fallible_body = try db.get(query_structures.AnalyzeFunctionBody, caller);
+    try testing.expect(fallible_signature.*.?.is_fallible);
+    try testing.expectEqual(.fallible_call, std.meta.activeTag(fallible_body.*.?.blocks[0].terminator));
+
+    try setSource(db, 1,
+        \\func target() int -> 42
+        \\fallible caller() int -> target()
+    );
+    const ordinary_signature = try db.get(query_structures.FunctionSignature, target);
+    const ordinary_body = try db.get(query_structures.AnalyzeFunctionBody, caller);
+    try testing.expect(!ordinary_signature.*.?.is_fallible);
+    try testing.expect(fallible_signature != ordinary_signature);
+    try testing.expect(fallible_body != ordinary_body);
+    try testing.expectEqual(.return_value, std.meta.activeTag(ordinary_body.*.?.blocks[0].terminator));
+
+    try setSource(db, 1,
+        \\fallible target() int -> 42
+        \\func caller() int -> target()
+    );
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, caller)).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, caller, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(DiagnosticKind.fallible_expression_outside_fallible_function, std.meta.activeTag(diagnostics[0].kind));
+}
+
 test "every integer comparison selects the fallible success edge" {
     const db = try testDatabase(2);
     defer db.deinit();
@@ -2097,12 +2402,9 @@ test "if conditions separate unimplemented and non-fallible forms" {
     defer db.deinit();
 
     const cases = [_]struct { file_id: structures.FileId, source: []const u8, marker: []const u8, kind: structures.Diagnostic.Kind }{
-        .{ .file_id = 1, .source = "static bad = func(v: int) int -> return if v is int -> 1 else 2", .marker = "is", .kind = .fallible_condition_not_supported },
-        .{ .file_id = 2, .source = "static bad = func(v: int) int -> return if v as int -> 1 else 2", .marker = "as", .kind = .fallible_condition_not_supported },
         .{ .file_id = 3, .source = "static bad = func(v: int) int -> return if v? -> 1 else 2", .marker = "?", .kind = .fallible_condition_not_supported },
         .{ .file_id = 4, .source = "static bad = func(v: int) int -> return if v < 1 and v -> 1 else 2", .marker = "v", .kind = .if_condition_not_fallible },
         .{ .file_id = 5, .source = "static bad = func(v: int) int -> return if not v -> 1 else 2", .marker = "v", .kind = .if_condition_not_fallible },
-        .{ .file_id = 6, .source = "static bad = func(v: int) int -> return if const x = v as int -> x else 2", .marker = "as", .kind = .fallible_condition_not_supported },
         .{ .file_id = 7, .source = "static bad = func(v: int) int -> return if const x = v? -> x else 2", .marker = "?", .kind = .fallible_condition_not_supported },
         .{ .file_id = 8, .source = "static bad = func(v: int) int -> return if const x = v -> x else 2", .marker = "v", .kind = .if_condition_not_fallible },
     };
@@ -2117,6 +2419,168 @@ test "if conditions separate unimplemented and non-fallible forms" {
         const marker_start = std.mem.lastIndexOf(u8, case.source, case.marker).?;
         try testing.expectEqual(structures.SourceSpan{ .start = marker_start, .end = marker_start + case.marker.len }, diagnostics[0].span.?);
     }
+}
+
+test "variant inspection tests active members and permits partially overlapping selectors" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static classify = func(value: int | none) int
+        \\  const exact = if value is int -> 20 else 10
+        \\  const overlap = if value is int | unit -> 2 else 1
+        \\  const disjoint = if value is unit -> 100 else 0
+        \\  const composed = if value is int and not value is none -> 4 else 0
+        \\  return exact + overlap + disjoint + composed
+        \\static answer = func() int -> return classify(1) + classify(none)
+    );
+    try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "classify" }, 37);
+}
+
+test "variant extraction binds the narrowed value only in the success branch" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static extract = func(value: int | none) int
+        \\  return if const number = value as int -> number else 0
+        \\static answer = func() int -> return extract(42) + extract(none)
+    );
+    try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "extract" }, 42);
+}
+
+test "variant extraction annotations widen successful payloads" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static extract = func(value: int | none) int
+        \\  return if const widened: int | unit = value as int
+        \\    if const number = widened as int -> number else 1
+        \\  else
+        \\    0
+        \\static answer = func() int -> return extract(42) + extract(none)
+    );
+    try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "extract" }, 42);
+}
+
+test "variant extraction remaps subset tags and bare as discards its payload" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static select = func(value: int | unit | none) int
+        \\  return if const narrowed = value as int | none
+        \\    if const number = narrowed as int -> number else 2
+        \\  else
+        \\    0
+        \\static accepts_int = func(value: int | none) int -> return if value as int -> 1 else 0
+        \\static impossible = func(value: int | none) int -> return if const no: int = value as unit -> no else 42
+        \\static answer = func() int -> return select(39) + select(none) + select(unit) + accepts_int(1) + impossible(1)
+    );
+    try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "select", "accepts_int", "impossible" }, 84);
+}
+
+test "variant inspection enforces operand and condition binding rules" {
+    const db = try testDatabase(7);
+    defer db.deinit();
+
+    const cases = [_]struct { file_id: structures.FileId, source: []const u8, kind: DiagnosticKind }{
+        .{
+            .file_id = 1,
+            .source = "static bad = func(value: int) int -> return if value is int -> 1 else 0",
+            .kind = .variant_inspection_operand_not_variant,
+        },
+        .{
+            .file_id = 2,
+            .source = "static bad = func(value: int) int -> return if value as int -> 1 else 0",
+            .kind = .variant_inspection_operand_not_variant,
+        },
+        .{
+            .file_id = 3,
+            .source = "static bad = func(value: int | none) int -> return if var number = value as int -> number else 0",
+            .kind = .condition_binding_must_be_immutable,
+        },
+        .{
+            .file_id = 4,
+            .source = "static bad = func(value: int | none) int\n  const result = if const number = value as int -> number else 0\n  return number + result",
+            .kind = .unknown_value,
+        },
+        .{
+            .file_id = 5,
+            .source = "static bad = func(value: int | none) int -> return if value is int -> value else 0",
+            .kind = .return_type_mismatch,
+        },
+        .{
+            .file_id = 6,
+            .source = "static bad = func(value: int | none) int -> return if const number: none = value as int -> 1 else 0",
+            .kind = .local_type_mismatch,
+        },
+        .{
+            .file_id = 7,
+            .source = "static bad = func(value: int | none) int\n  const number = 0\n  return if const number = value as int -> number else 0",
+            .kind = .duplicate_local_binding,
+        },
+    };
+    for (cases) |case| {
+        try addSource(db, case.file_id, case.source);
+        const bad_id = (try db.get(query_structures.BuildModuleScope, case.file_id)).*.?.resolve("bad").?;
+        try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, bad_id)).* == null);
+        const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, bad_id, structures.Diagnostic, testing.allocator);
+        defer freeDiagnostics(diagnostics);
+        try testing.expectEqual(@as(usize, 1), diagnostics.len);
+        try testing.expectEqual(case.kind, std.meta.activeTag(diagnostics[0].kind));
+    }
+}
+
+test "variant inspection edits retain equal artifacts and recover diagnostics" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    const original = "static inspect = func(value: int | none) int -> return if const selected = value as int -> 42 else 24";
+    try addSource(db, 1, original);
+    const item = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolve("inspect").?;
+    const instance: structures.InstanceId = .{ .item = item };
+    const body = try db.get(query_structures.AnalyzeFunctionBody, item);
+    const artifact = try db.get(query_structures.CompileFunction, instance);
+
+    try setSource(db, 1, "static inspect = func(value: int | none) int -> return if const selected = (value) as int -> 42 else 24");
+    try testing.expectEqual(body, try db.get(query_structures.AnalyzeFunctionBody, item));
+    try testing.expectEqual(artifact, try db.get(query_structures.CompileFunction, instance));
+
+    try setSource(db, 1, "static inspect = func(value: int | none) int -> return if const selected = value as none -> 42 else 24");
+    try testing.expect(body != try db.get(query_structures.AnalyzeFunctionBody, item));
+    try testing.expect(artifact != try db.get(query_structures.CompileFunction, instance));
+
+    try setSource(db, 1, "static inspect = func(value: int) int -> return if value is int -> 42 else 24");
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, item)).* == null);
+    var diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, item, structures.Diagnostic, testing.allocator);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(DiagnosticKind.variant_inspection_operand_not_variant, std.meta.activeTag(diagnostics[0].kind));
+    freeDiagnostics(diagnostics);
+
+    try setSource(db, 1, original);
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, item)).* != null);
+    diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, item, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 0), diagnostics.len);
+}
+
+test "variant inspection compilation cleans up every allocation failure" {
+    try testing.checkAllAllocationFailures(testing.allocator, testVariantInspectionAllocations, .{});
+}
+
+fn testVariantInspectionAllocations(gpa: std.mem.Allocator) !void {
+    const db = try Database.init(gpa, .{ .worker_count = 1 });
+    defer db.deinit();
+    try addSource(db, 1,
+        \\static select = func(value: int | unit | none) int
+        \\  return if const narrowed = value as int | none
+        \\    if const number = narrowed as int -> number else 2
+        \\  else 0
+        \\select(40)
+    );
+    try testing.expect((try db.get(query_structures.BuildExecutable, 1)).* != null);
 }
 
 test "unit branch results join without a machine value" {
@@ -2773,7 +3237,7 @@ test "local binding diagnostics follow lexical scope and declared type" {
     }{
         .{ .file_id = 1, .source = "static f = func() int\n  const duplicate = 1\n  const duplicate = 2\n  return 1", .marker = "duplicate", .kind = .duplicate_local_binding },
         .{ .file_id = 2, .source = "static f = func() int\n  const x = missing\n  return x", .marker = "missing", .kind = .unknown_value },
-        .{ .file_id = 3, .source = "static f = func() int\n  const x: float = 1\n  return x", .marker = "float", .kind = .local_type_not_supported },
+        .{ .file_id = 3, .source = "static f = func() int\n  const x: float = 1\n  return x", .marker = "float", .kind = .unknown_type },
         .{ .file_id = 4, .source = "static f = func() int\n  const leaf = 1\n  return leaf()", .marker = "leaf", .kind = .value_not_callable },
     };
     for (cases) |case| {
@@ -2805,7 +3269,7 @@ test "local initializer calls are typed through the callee signature" {
     const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, user_id, structures.Diagnostic, testing.allocator);
     defer freeDiagnostics(diagnostics);
     try testing.expectEqual(@as(usize, 1), diagnostics.len);
-    try testing.expectEqual(structures.Diagnostic.Kind.return_type_not_supported, diagnostics[0].kind);
+    try testing.expectEqual(structures.Diagnostic.Kind.unknown_type, diagnostics[0].kind);
 }
 
 test "body edits preserve signature consumers and update body analysis" {
@@ -2906,7 +3370,7 @@ test "duplicate names block module analysis until deduplicated" {
     const blocked_diagnostics = try db.transitiveAccumulatorValues(query_structures.SelectEntry, 1, structures.Diagnostic, testing.allocator);
     defer freeDiagnostics(blocked_diagnostics);
     try testing.expectEqual(@as(usize, 1), blocked_diagnostics.len);
-    try testing.expectEqual(structures.Diagnostic.Kind.duplicate_top_level_function, blocked_diagnostics[0].kind);
+    try testing.expectEqual(structures.Diagnostic.Kind.duplicate_top_level_declaration, blocked_diagnostics[0].kind);
 
     try setSource(db, 1,
         \\static duplicate = func() int -> return 1
@@ -2932,7 +3396,7 @@ test "duplicate top-level names fail executable construction without any call" {
     const diagnostics = try db.transitiveAccumulatorValues(query_structures.BuildExecutable, 1, structures.Diagnostic, testing.allocator);
     defer freeDiagnostics(diagnostics);
     try testing.expectEqual(@as(usize, 1), diagnostics.len);
-    try testing.expectEqual(structures.Diagnostic.Kind.duplicate_top_level_function, diagnostics[0].kind);
+    try testing.expectEqual(structures.Diagnostic.Kind.duplicate_top_level_declaration, diagnostics[0].kind);
 }
 
 test "malformed function diagnostics remain parse-only and top-level return stays rejected" {
@@ -3110,7 +3574,7 @@ test "entry call lookup reports only the demanded resolution failure" {
     const unsupported_diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, unsupported_entry, structures.Diagnostic, testing.allocator);
     defer freeDiagnostics(unsupported_diagnostics);
     try testing.expectEqual(@as(usize, 1), unsupported_diagnostics.len);
-    try testing.expectEqual(structures.Diagnostic.Kind.return_type_not_supported, unsupported_diagnostics[0].kind);
+    try testing.expectEqual(structures.Diagnostic.Kind.unknown_type, unsupported_diagnostics[0].kind);
 
     // A call to a duplicated name adds no "unknown function" diagnostic; the
     // discovery rejection is the only failure the file reports.
@@ -3124,7 +3588,7 @@ test "entry call lookup reports only the demanded resolution failure" {
     const duplicate_diagnostics = try db.transitiveAccumulatorValues(query_structures.BuildExecutable, 3, structures.Diagnostic, testing.allocator);
     defer freeDiagnostics(duplicate_diagnostics);
     try testing.expectEqual(@as(usize, 1), duplicate_diagnostics.len);
-    try testing.expectEqual(structures.Diagnostic.Kind.duplicate_top_level_function, duplicate_diagnostics[0].kind);
+    try testing.expectEqual(structures.Diagnostic.Kind.duplicate_top_level_declaration, duplicate_diagnostics[0].kind);
 
     const value_source = "static value = 1\nvalue()";
     try addSource(db, 4, value_source);
@@ -3134,7 +3598,7 @@ test "entry call lookup reports only the demanded resolution failure" {
     try expectSingleQueryDiagnostic(db, query_structures.AnalyzeFunctionBody, value_entry, true, 4, .{
         .start = value_start,
         .end = value_start + "value".len,
-    }, .unknown_function);
+    }, .value_not_callable);
 }
 
 test "entry call dependencies follow spelling identity and runtime shape" {
@@ -3183,7 +3647,7 @@ test "entry call dependencies follow spelling identity and runtime shape" {
     const blocked_diagnostics = try db.transitiveAccumulatorValues(query_structures.SelectEntry, 1, structures.Diagnostic, testing.allocator);
     defer freeDiagnostics(blocked_diagnostics);
     try testing.expectEqual(@as(usize, 1), blocked_diagnostics.len);
-    try testing.expectEqual(structures.Diagnostic.Kind.duplicate_top_level_function, blocked_diagnostics[0].kind);
+    try testing.expectEqual(structures.Diagnostic.Kind.duplicate_top_level_declaration, blocked_diagnostics[0].kind);
 
     try setSource(db, 1, alpha_source);
     try testing.expectEqual(alpha_id, (try db.get(EntryCallParent, 1)).*.?);

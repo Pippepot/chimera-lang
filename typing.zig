@@ -13,6 +13,7 @@ pub fn resolveAndTypeBody(
     file_id: structures.FileId,
     parameter_types: []const structures.TypeId,
     return_type: structures.TypeId,
+    is_fallible: bool,
     type_interner: anytype,
     unresolved: semantic.UnresolvedBody,
 ) !?structures.FunctionBodyAnalysis {
@@ -22,6 +23,7 @@ pub fn resolveAndTypeBody(
         .file_id = file_id,
         .unresolved = unresolved,
         .return_type = return_type,
+        .is_fallible = is_fallible,
     };
     defer builder.deinit();
     try builder.init(parameter_types);
@@ -38,9 +40,17 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
         const Value = struct { id: structures.FunctionValueId, type_id: structures.TypeId };
         const Expression = semantic.UnresolvedBody.Expression;
         const StateId = enum(u32) { _ };
+        const PendingExtraction = struct {
+            result: semantic.UnresolvedBody.ValueId,
+            operand: Value,
+            target_type: structures.TypeId,
+            annotation_type: ?structures.TypeId,
+            span: structures.SourceSpan,
+        };
         const FlowExit = struct {
             block: structures.FunctionBlockId,
             state: StateId,
+            extraction: ?PendingExtraction = null,
         };
         const ValueExit = struct {
             block: structures.FunctionBlockId,
@@ -67,6 +77,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
         file_id: structures.FileId,
         unresolved: semantic.UnresolvedBody,
         return_type: structures.TypeId,
+        is_fallible: bool,
         scope: ?structures.ModuleScope = null,
         values: []?Value = &.{},
         local_values: []?Value = &.{},
@@ -147,6 +158,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 if (self.current_block == null) return null;
                 switch (statement) {
                     .discard => |value_id| _ = try self.value(value_id),
+                    .propagate => |propagation| try self.propagateCondition(propagation.condition, propagation.span),
                     .bind_mutable => |binding| try self.bindMutable(binding),
                     .break_loop => |value_id| try self.breakLoop(value_id),
                     .continue_loop => try self.continueLoop(),
@@ -203,6 +215,18 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             self.terminate(if (self.return_type == .unit) .return_unit else .{ .return_value = use });
         }
 
+        fn propagateCondition(self: *Self, condition_id: semantic.UnresolvedBody.ConditionId, span: structures.SourceSpan) !void {
+            if (!self.is_fallible) return self.reject(span, .fallible_expression_outside_fallible_function);
+            const flow = try self.condition(condition_id);
+            if (flow.failure) |failure| {
+                try self.enterFlowExit(failure);
+                self.terminate(.return_failure);
+            }
+            if (flow.success) |success| {
+                try self.enterFlowExit(success);
+            }
+        }
+
         fn value(self: *Self, id: semantic.UnresolvedBody.ValueId) anyerror!Value {
             const index = @intFromEnum(id);
             if (self.values[index]) |resolved| return resolved;
@@ -213,6 +237,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 .unit => try self.appendInstruction(.const_unit),
                 .none => try self.appendInstruction(.const_none),
                 .local_read => |local| self.local_values[@intFromEnum(local)] orelse unreachable,
+                .condition_extract => unreachable,
                 .annotation => |annotation| try self.annotate(annotation),
                 .assignment => try self.assignment(expression),
                 .call => |call| try self.callFunction(call, expression.span),
@@ -423,19 +448,30 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             return self.appendInstruction(instruction);
         }
 
-        fn callFunction(self: *Self, call: @FieldType(Expression.Operation, "call"), span: structures.SourceSpan) !Value {
+        const ResolvedCall = union(enum) {
+            diverged: Value,
+            direct: struct {
+                call: structures.FunctionCall,
+                is_fallible: bool,
+            },
+        };
+
+        fn resolveCall(self: *Self, call: semantic.UnresolvedBody.Call, span: structures.SourceSpan) !ResolvedCall {
             const raw_arguments = self.unresolved.call_arguments[call.arguments.start..call.arguments.end];
             // Resolve nested argument expressions before the callee, preserving
             // source evaluation and diagnostic order. Later reads reuse values.
             for (raw_arguments) |argument| {
                 const resolved = try self.value(argument.value);
-                if (resolved.type_id == .never) return resolved;
+                if (resolved.type_id == .never) return .{ .diverged = resolved };
             }
             var target: ?structures.ItemId = null;
             var signature: structures.FunctionSignature = .{ .parameter_types = &.{.int}, .return_type = .never };
             if (!std.mem.eql(u8, call.name, "exit")) {
                 if (self.scope == null) self.scope = (try self.ctx.get(ModuleScopeQuery, self.file_id)).* orelse return error.Unavailable;
-                target = self.scope.?.resolve(call.name) orelse return self.reject(span, .unknown_function);
+                target = self.scope.?.resolveFunction(call.name) orelse {
+                    if (self.scope.?.resolve(call.name) != null) return self.reject(span, .value_not_callable);
+                    return self.reject(span, .unknown_function);
+                };
                 signature = (try self.ctx.get(FunctionSignatureQuery, target.?)).* orelse return error.Unavailable;
             }
             if (raw_arguments.len != signature.parameter_types.len) return self.reject(span, .{ .call_argument_count_mismatch = .{
@@ -456,21 +492,73 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 }
             }
             const arguments: structures.FunctionValueRange = .{ .start = argument_start, .end = @intCast(self.call_arguments.items.len) };
-            const result = if (target) |item|
-                try self.appendInstruction(.{ .call = .{ .target = item, .arguments = arguments, .return_type = signature.return_type } })
-            else
-                try self.appendInstruction(.{ .exit = intrinsic_argument.? });
-            if (signature.return_type == .never) self.terminate(.diverge);
-            return result;
+            if (target) |item| return .{ .direct = .{
+                .call = .{ .target = item, .arguments = arguments, .return_type = signature.return_type },
+                .is_fallible = signature.is_fallible,
+            } };
+            const result = try self.appendInstruction(.{ .exit = intrinsic_argument.? });
+            self.terminate(.diverge);
+            return .{ .diverged = result };
+        }
+
+        fn callFunction(self: *Self, call: semantic.UnresolvedBody.Call, span: structures.SourceSpan) !Value {
+            const resolved = try self.resolveCall(call, span);
+            return switch (resolved) {
+                .diverged => |value_to_return| value_to_return,
+                .direct => |direct| if (direct.is_fallible) blk: {
+                    if (!self.is_fallible) return self.reject(span, .fallible_expression_outside_fallible_function);
+                    const flow = try self.lowerFallibleCall(direct.call);
+                    try self.enterFlowExit(flow.failure.?);
+                    self.terminate(.return_failure);
+                    try self.enterFlowExit(flow.success.?);
+                    const success_block = self.blocks.items[@intFromEnum(flow.success.?.block)];
+                    const value_to_return: Value = .{
+                        .id = @enumFromInt(success_block.argument_start),
+                        .type_id = direct.call.return_type,
+                    };
+                    if (value_to_return.type_id == .never) self.terminate(.diverge);
+                    break :blk value_to_return;
+                } else blk: {
+                    const value_to_return = try self.appendInstruction(.{ .call = direct.call });
+                    if (value_to_return.type_id == .never) self.terminate(.diverge);
+                    break :blk value_to_return;
+                },
+            };
+        }
+
+        fn lowerFallibleCall(self: *Self, call: structures.FunctionCall) !ConditionFlow {
+            const argument_start: u32 = @intCast(self.block_argument_types.items.len);
+            try self.block_argument_types.append(self.ctx.allocator(), call.return_type);
+            const success = try self.newBlock(argument_start, argument_start + 1);
+            const failure = try self.newBlock(argument_start + 1, argument_start + 1);
+            self.terminate(.{ .fallible_call = .{ .call = call, .success = success, .failure = failure } });
+            const state = try self.captureState();
+            return .{
+                .success = .{ .block = success, .state = state },
+                .failure = .{ .block = failure, .state = state },
+            };
         }
 
         fn condition(self: *Self, id: semantic.UnresolvedBody.ConditionId) anyerror!ConditionFlow {
             const condition_data = self.unresolved.conditions[@intFromEnum(id)];
             return switch (condition_data) {
                 .comparison => |comparison| self.comparisonCondition(comparison),
+                .variant_membership => |membership| self.variantMembershipCondition(membership),
                 .conjunction => |logical| self.conjunctionCondition(logical),
                 .disjunction => |logical| self.disjunctionCondition(logical),
                 .negation => |operand| self.negatedCondition(operand),
+                .call => |call| self.callCondition(call),
+            };
+        }
+
+        fn callCondition(self: *Self, call: semantic.UnresolvedBody.Call) !ConditionFlow {
+            const resolved = try self.resolveCall(call, call.span);
+            return switch (resolved) {
+                .diverged => |value_to_return| .{ .success = null, .failure = null, .diverged = value_to_return },
+                .direct => |direct| if (direct.is_fallible)
+                    self.lowerFallibleCall(direct.call)
+                else
+                    self.reject(call.span, .if_condition_not_fallible),
             };
         }
 
@@ -504,13 +592,66 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             };
         }
 
+        fn variantMembershipCondition(
+            self: *Self,
+            membership: @FieldType(semantic.UnresolvedBody.Condition, "variant_membership"),
+        ) !ConditionFlow {
+            const operand = try self.value(membership.operand.value);
+            if (operand.type_id == .never) return .{ .success = null, .failure = null, .diverged = operand };
+            const source_members = try self.type_interner.variantMembers(operand.type_id) orelse {
+                return self.reject(membership.operand.span, .{ .variant_inspection_operand_not_variant = try self.describeType(operand.type_id) });
+            };
+            const target_members = try self.type_interner.variantMembers(membership.target_type);
+            var matching_count: usize = 0;
+            for (source_members) |member| {
+                if (includesType(membership.target_type, target_members, member)) matching_count += 1;
+            }
+            const argument_start: u32 = @intCast(self.block_argument_types.items.len);
+            const success = try self.newBlock(argument_start, argument_start);
+            const failure = try self.newBlock(argument_start, argument_start);
+            if (matching_count == 0 or matching_count == source_members.len) {
+                self.terminate(.{ .branch = self.emptyBranch(if (matching_count == 0) failure else success) });
+            } else {
+                const tag = try self.appendInstruction(.{ .variant_tag = operand.id });
+                var remaining = matching_count;
+                for (source_members, 0..) |member, member_index| {
+                    if (!includesType(membership.target_type, target_members, member)) continue;
+                    remaining -= 1;
+                    const next_failure = if (remaining == 0)
+                        failure
+                    else
+                        try self.newBlock(argument_start, argument_start);
+                    const expected = try self.appendInstruction(.{ .consti = @intCast(member_index) });
+                    self.terminate(.{ .predicate_branch = .{
+                        .operation = .eqi,
+                        .operands = .{ .lhs = tag.id, .rhs = expected.id },
+                        .then_branch = self.emptyBranch(success),
+                        .else_branch = self.emptyBranch(next_failure),
+                    } });
+                    if (remaining != 0) self.enterBlock(next_failure);
+                }
+            }
+            const state = try self.captureState();
+            const extraction: ?PendingExtraction = if (membership.binding) |binding| .{
+                .result = binding.result,
+                .operand = operand,
+                .target_type = try intersectTypes(self.type_interner, source_members, membership.target_type, self.ctx.allocator()),
+                .annotation_type = binding.annotation_type,
+                .span = binding.span,
+            } else null;
+            return .{
+                .success = .{ .block = success, .state = state, .extraction = extraction },
+                .failure = .{ .block = failure, .state = state },
+            };
+        }
+
         fn conjunctionCondition(
             self: *Self,
             logical: @FieldType(semantic.UnresolvedBody.Condition, "conjunction"),
         ) !ConditionFlow {
             const lhs = try self.condition(logical.lhs);
             const rhs = if (lhs.success) |success| blk: {
-                self.enterFlowExit(success);
+                try self.enterFlowExit(success);
                 break :blk try self.condition(logical.rhs);
             } else ConditionFlow{ .success = null, .failure = null };
             return .{
@@ -526,7 +667,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
         ) !ConditionFlow {
             const lhs = try self.condition(logical.lhs);
             const rhs = if (lhs.failure) |failure| blk: {
-                self.enterFlowExit(failure);
+                try self.enterFlowExit(failure);
                 break :blk try self.condition(logical.rhs);
             } else ConditionFlow{ .success = null, .failure = null };
             return .{
@@ -541,14 +682,33 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             return .{ .success = flow.failure, .failure = flow.success, .diverged = flow.diverged };
         }
 
-        fn enterFlowExit(self: *Self, exit: FlowExit) void {
+        fn enterFlowExit(self: *Self, exit: FlowExit) !void {
             self.enterBlock(exit.block);
             self.restoreState(exit.state);
+            if (exit.extraction) |extraction| {
+                const index = @intFromEnum(extraction.result);
+                std.debug.assert(self.values[index] == null);
+                var extracted = try self.appendInstruction(.{ .variant_extract = .{
+                    .operand = extraction.operand.id,
+                    .target_type = extraction.target_type,
+                } });
+                if (extraction.target_type != .never and extraction.annotation_type != null) {
+                    const expected = extraction.annotation_type.?;
+                    const use = try coerceValue(self.type_interner, extracted.id, extracted.type_id, expected) orelse
+                        return self.reject(extraction.span, .{ .local_type_mismatch = try self.typeMismatch(expected, extracted.type_id) });
+                    if (use.coerce_to != null) {
+                        extracted = try self.appendInstruction(.{ .variant_coerce = .{ .operand = extracted.id, .target_type = expected } });
+                    }
+                }
+                self.values[index] = extracted;
+                if (extraction.target_type == .never) self.terminate(.diverge);
+            }
         }
 
         fn mergeFlowExits(self: *Self, first_exit: ?FlowExit, second_exit: ?FlowExit) !?FlowExit {
             const first = first_exit orelse return second_exit;
             const second = second_exit orelse return first;
+            std.debug.assert(first.extraction == null and second.extraction == null);
             const first_state = self.states.items[@intFromEnum(first.state)];
             const second_state = self.states.items[@intFromEnum(second.state)];
             std.debug.assert(first_state.len == second_state.len);
@@ -596,11 +756,11 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             }
 
             const then_exit = if (flow.success) |success| blk: {
-                self.enterFlowExit(success);
+                try self.enterFlowExit(success);
                 break :blk try self.valueExit(try self.block(expression.then_block));
             } else null;
             const else_exit = if (flow.failure) |failure| blk: {
-                self.enterFlowExit(failure);
+                try self.enterFlowExit(failure);
                 break :blk try self.valueExit(try self.block(expression.else_block));
             } else null;
 
@@ -768,6 +928,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             const branches = try self.branch_arguments.toOwnedSlice(gpa);
             const body: structures.FunctionBodyAnalysis = .{
                 .return_type = self.return_type,
+                .is_fallible = self.is_fallible,
                 .block_argument_types = block_argument_types,
                 .call_arguments = call_arguments,
                 .branch_arguments = branches,
@@ -798,9 +959,9 @@ fn normalizeValueUses(value_uses: []structures.FunctionValueUse, argument_count:
 fn normalizeInstructions(instructions: []structures.FunctionInstruction, argument_count: u32) void {
     for (instructions) |*instruction| switch (instruction.*) {
         .consti, .const_unit, .const_none => {},
-        .variant_coerce => |*coercion| coercion.operand = normalizeValue(coercion.operand, argument_count),
+        .variant_coerce, .variant_extract => |*operation| operation.operand = normalizeValue(operation.operand, argument_count),
         .call => {},
-        .exit, .negi => |*operand| operand.* = normalizeValue(operand.*, argument_count),
+        .variant_tag, .exit, .negi => |*operand| operand.* = normalizeValue(operand.*, argument_count),
         .addi, .subi, .muli, .divsi => |*operands| {
             operands.lhs = normalizeValue(operands.lhs, argument_count);
             operands.rhs = normalizeValue(operands.rhs, argument_count);
@@ -810,7 +971,7 @@ fn normalizeInstructions(instructions: []structures.FunctionInstruction, argumen
 
 fn normalizeTerminators(blocks: []structures.FunctionBlock, argument_count: u32) void {
     for (blocks) |*block_value| switch (block_value.terminator) {
-        .branch, .diverge => {},
+        .branch, .fallible_call, .return_failure, .diverge => {},
         .predicate_branch => |*predicate| {
             predicate.operands.lhs = normalizeValue(predicate.operands.lhs, argument_count);
             predicate.operands.rhs = normalizeValue(predicate.operands.rhs, argument_count);
@@ -818,6 +979,32 @@ fn normalizeTerminators(blocks: []structures.FunctionBlock, argument_count: u32)
         .return_unit => {},
         .return_value => |*value_use| normalizeValueUse(value_use, argument_count),
     };
+}
+
+fn intersectTypes(
+    type_interner: anytype,
+    source_members: []const structures.TypeId,
+    target_type: structures.TypeId,
+    gpa: std.mem.Allocator,
+) !structures.TypeId {
+    const target_members = try type_interner.variantMembers(target_type);
+    var intersection: std.ArrayList(structures.TypeId) = .empty;
+    defer intersection.deinit(gpa);
+    for (source_members) |member| {
+        if (includesType(target_type, target_members, member)) try intersection.append(gpa, member);
+    }
+    return switch (intersection.items.len) {
+        0 => .never,
+        1 => intersection.items[0],
+        else => switch (try type_interner.internVariant(intersection.items)) {
+            .type_id => |type_id| type_id,
+            .duplicate => unreachable,
+        },
+    };
+}
+
+fn includesType(container: structures.TypeId, members: ?[]const structures.TypeId, member: structures.TypeId) bool {
+    return if (members) |variant_members| containsType(variant_members, member) else container == member;
 }
 
 fn joinTypes(type_interner: anytype, left: structures.TypeId, right: structures.TypeId, gpa: std.mem.Allocator) !structures.TypeId {

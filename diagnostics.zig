@@ -157,9 +157,17 @@ fn writeKindMessage(writer: *std.Io.Writer, source: []const u8, span: ?structure
             try writer.writeAll("expected an expression, found ");
             try writeToken(writer, tag);
         },
-        .duplicate_top_level_function => {
-            try writeSourceLabel(writer, "function name is already declared", source, span);
+        .duplicate_top_level_declaration => {
+            try writeSourceLabel(writer, "top-level name is already declared", source, span);
         },
+        .declaration_cycle => try writeSourceLabel(writer, "declaration depends on itself", source, span),
+        .static_initializer_not_supported => try writer.writeAll("this static initializer is not supported yet"),
+        .static_initializer_type_mismatch => |mismatch| {
+            try writer.writeAll("static initializer type mismatch: ");
+            try writeMismatch(writer, mismatch);
+        },
+        .type_value_used_as_runtime_value => try writer.writeAll("a type cannot be used as a runtime value"),
+        .value_used_as_type => try writer.writeAll("a runtime value cannot be used as a type"),
         .function_annotation_not_supported => try writer.writeAll("type annotations on function bindings are not supported yet"),
         .parameter_mode_not_supported => try writer.writeAll("parameter access modes are not supported yet"),
         .duplicate_parameter => {
@@ -176,6 +184,7 @@ fn writeKindMessage(writer: *std.Io.Writer, source: []const u8, span: ?structure
             try writeSourceLabel(writer, "binding is already declared in this scope", source, span);
         },
         .local_type_not_supported => try writer.writeAll("this local binding type is not supported yet"),
+        .unknown_type => try writeSourceLabel(writer, "unknown type", source, span),
         .unknown_value => {
             try writeSourceLabel(writer, "unknown value", source, span);
         },
@@ -191,8 +200,14 @@ fn writeKindMessage(writer: *std.Io.Writer, source: []const u8, span: ?structure
         .integer_literal_out_of_range => try writer.writeAll("integer literal is outside the supported i32 range"),
         .fallible_condition_not_supported => try writer.writeAll("this fallible condition form is not supported yet"),
         .if_condition_not_fallible => try writer.writeAll("condition must be a comparison or another fallible expression"),
+        .inspection_type_not_supported => try writer.writeAll("this inspection type is not supported yet"),
+        .variant_inspection_operand_not_variant => |found| {
+            try writer.writeAll("variant inspection requires a variant value, found ");
+            try writeType(writer, found);
+        },
+        .condition_binding_must_be_immutable => try writer.writeAll("condition bindings must be immutable"),
         .value_not_callable => {
-            try writeSourceLabel(writer, "local value is not callable", source, span);
+            try writeSourceLabel(writer, "value is not callable", source, span);
         },
         .duplicate_variant_member_type => try writer.writeAll("variant contains the same member type more than once"),
         .local_type_mismatch => |mismatch| {
@@ -211,6 +226,7 @@ fn writeKindMessage(writer: *std.Io.Writer, source: []const u8, span: ?structure
             try writer.writeAll("comparison requires `int`, found ");
             try writeType(writer, found);
         },
+        .fallible_expression_outside_fallible_function => try writer.writeAll("fallible expression must be handled or used inside a fallible function"),
         .missing_return_value => |expected| {
             try writer.writeAll("function must return ");
             try writeType(writer, expected);
@@ -292,7 +308,7 @@ test "render diagnostics with source spans and messages" {
         .{
             .file_id = 1,
             .span = null,
-            .kind = .duplicate_top_level_function,
+            .kind = .duplicate_top_level_declaration,
         },
     };
 
@@ -307,7 +323,7 @@ test "render diagnostics with source spans and messages" {
             "\x1b[31merror:\x1b[0m test.star:2:1: unknown value: `beta`\n" ++
             "beta gamma\n" ++
             "^~~~\n" ++
-            "\x1b[31merror:\x1b[0m test.star: function name is already declared\n",
+            "\x1b[31merror:\x1b[0m test.star: top-level name is already declared\n",
         output.writer.buffered(),
     );
 }

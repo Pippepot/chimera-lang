@@ -57,7 +57,7 @@ pub const DiscoverItems = struct {
         defer names.deinit();
         var has_duplicates = false;
         for (tree.items) |item| {
-            if (item.loc.kind != .function) continue;
+            if (item.loc.kind == .top_level_entry) continue;
             if (!(try names.getOrPut(item.loc.name)).found_existing) continue;
             has_duplicates = true;
             const node = ast_value.nodes[item.declaration];
@@ -66,7 +66,7 @@ pub const DiscoverItems = struct {
             try ctx.emit(structures.Diagnostic, .{
                 .file_id = file_id,
                 .span = .{ .start = token.loc.start, .end = token.loc.end },
-                .kind = .duplicate_top_level_function,
+                .kind = .duplicate_top_level_declaration,
             });
         }
         if (has_duplicates) {
@@ -179,6 +179,7 @@ pub fn internVariantType(ctx: anytype, members: []const structures.TypeId) !stru
 fn TypeInterner(comptime Context: type) type {
     return struct {
         ctx: Context,
+        file_id: ?structures.FileId = null,
 
         pub fn internVariant(self: @This(), members: []const structures.TypeId) !structures.InternVariantResult {
             return internVariantType(self.ctx, members);
@@ -194,6 +195,12 @@ fn TypeInterner(comptime Context: type) type {
 
         pub fn layout(self: @This(), type_id: structures.TypeId) !structures.TypeLayout {
             return (try self.ctx.get(TypeLayout, type_id)).*;
+        }
+
+        pub fn resolveStatic(self: @This(), name: []const u8) !?structures.CompileTimeValue {
+            const scope = (try self.ctx.get(BuildModuleScope, self.file_id.?)).* orelse return error.Unavailable;
+            const item_id = scope.resolveStatic(name) orelse return null;
+            return (try self.ctx.get(ResolveStatic, item_id)).* orelse return error.Unavailable;
         }
     };
 }
@@ -287,12 +294,12 @@ pub const BuildModuleScope = struct {
         }
         for (index.ids()) |item_id| {
             const loc = try ctx.lookupInterned(ItemLocations, item_id);
-            if (loc.kind != .function) continue;
+            if (loc.kind == .top_level_entry) continue;
             std.debug.assert(loc.file_id == file_id);
 
             const name = try ctx.allocator().dupe(u8, loc.name);
             errdefer ctx.allocator().free(name);
-            try entries.append(ctx.allocator(), .{ .name = name, .item_id = item_id });
+            try entries.append(ctx.allocator(), .{ .name = name, .item_id = item_id, .kind = loc.kind });
         }
         std.mem.sort(structures.ModuleScope.Entry, entries.items, {}, struct {
             fn lessThan(_: void, left: structures.ModuleScope.Entry, right: structures.ModuleScope.Entry) bool {
@@ -325,9 +332,38 @@ pub const FunctionSignature = struct {
         const resolved = (try ctx.get(ResolveItem, item_id)).* orelse return null;
         const parsed = (try ctx.get(ParseFile, resolved.file_id)).* orelse return null;
         const source = (try ctx.input(SourceText, resolved.file_id)).*;
-        const type_interner: TypeInterner(@TypeOf(ctx)) = .{ .ctx = ctx };
-        return switch (try semantic.analyzeFunctionSignature(&parsed, source, resolved.declaration, type_interner, ctx.allocator())) {
+        const type_interner: TypeInterner(@TypeOf(ctx)) = .{ .ctx = ctx, .file_id = resolved.file_id };
+        const result = semantic.analyzeFunctionSignature(&parsed, source, resolved.declaration, type_interner, ctx.allocator()) catch |err| switch (err) {
+            error.Unavailable => return null,
+            else => return err,
+        };
+        return switch (result) {
             .success => |signature| signature,
+            .unsupported => |issue| blk: {
+                try typing.emitSemanticIssue(ctx, resolved.file_id, issue);
+                break :blk null;
+            },
+        };
+    }
+};
+
+pub const ResolveStatic = struct {
+    pub const Input = structures.ItemId;
+    pub const Output = ?structures.CompileTimeValue;
+
+    pub fn run(ctx: anytype, item_id: Input) anyerror!Output {
+        const loc = try ctx.lookupInterned(ItemLocations, item_id);
+        if (loc.kind != .static) return null;
+        const resolved = (try ctx.get(ResolveItem, item_id)).* orelse return null;
+        const parsed = (try ctx.get(ParseFile, resolved.file_id)).* orelse return null;
+        const source = (try ctx.input(SourceText, resolved.file_id)).*;
+        const type_interner: TypeInterner(@TypeOf(ctx)) = .{ .ctx = ctx, .file_id = resolved.file_id };
+        const result = semantic.analyzeStaticDeclaration(&parsed, source, resolved.declaration, type_interner, ctx.allocator()) catch |err| switch (err) {
+            error.Unavailable => return null,
+            else => return err,
+        };
+        return switch (result) {
+            .success => |value| value,
             .unsupported => |issue| blk: {
                 try typing.emitSemanticIssue(ctx, resolved.file_id, issue);
                 break :blk null;
@@ -342,18 +378,24 @@ pub const AnalyzeFunctionBody = struct {
 
     pub fn run(ctx: anytype, item_id: Input) anyerror!Output {
         const loc = try ctx.lookupInterned(ItemLocations, item_id);
+        if (loc.kind == .static) return null;
         var parameter_types: []const structures.TypeId = &.{};
         var return_type: structures.TypeId = .unit;
+        var is_fallible = false;
         if (loc.kind == .function) {
             const signature = (try ctx.get(FunctionSignature, item_id)).* orelse return null;
             parameter_types = signature.parameter_types;
             return_type = signature.return_type;
+            is_fallible = signature.is_fallible;
         }
         const resolved = (try ctx.get(ResolveItem, item_id)).* orelse return null;
         const parsed = (try ctx.get(ParseFile, resolved.file_id)).* orelse return null;
         const source = (try ctx.input(SourceText, resolved.file_id)).*;
-        const type_interner: TypeInterner(@TypeOf(ctx)) = .{ .ctx = ctx };
-        const result = try semantic.buildUnresolvedBody(&parsed, source, resolved.declaration, loc.kind, parameter_types.len, type_interner, ctx.allocator());
+        const type_interner: TypeInterner(@TypeOf(ctx)) = .{ .ctx = ctx, .file_id = resolved.file_id };
+        const result = semantic.buildUnresolvedBody(&parsed, source, resolved.declaration, loc.kind, parameter_types.len, type_interner, ctx.allocator()) catch |err| switch (err) {
+            error.Unavailable => return null,
+            else => return err,
+        };
         var unresolved = switch (result) {
             .success => |unresolved_value| unresolved_value,
             .unsupported => |issue| {
@@ -362,7 +404,7 @@ pub const AnalyzeFunctionBody = struct {
             },
         };
         defer unresolved.deinit(ctx.allocator());
-        return typing.resolveAndTypeBody(ctx, BuildModuleScope, FunctionSignature, resolved.file_id, parameter_types, return_type, type_interner, unresolved);
+        return typing.resolveAndTypeBody(ctx, BuildModuleScope, FunctionSignature, resolved.file_id, parameter_types, return_type, is_fallible, type_interner, unresolved);
     }
 };
 

@@ -77,6 +77,7 @@ pub const Token = struct {
         keyword_deinit,
         keyword_else,
         keyword_extern,
+        keyword_fallible,
         keyword_false,
         keyword_func,
         keyword_for,
@@ -107,6 +108,7 @@ pub const Token = struct {
         .{ "deinit", .keyword_deinit },
         .{ "else", .keyword_else },
         .{ "extern", .keyword_extern },
+        .{ "fallible", .keyword_fallible },
         .{ "false", .keyword_false },
         .{ "func", .keyword_func },
         .{ "for", .keyword_for },
@@ -294,6 +296,7 @@ pub const ItemId = enum(u32) { _ };
 
 pub const ItemKind = enum {
     function,
+    static,
     top_level_entry,
 };
 
@@ -368,21 +371,36 @@ pub const ModuleScope = struct {
     pub const Entry = struct {
         name: []const u8,
         item_id: ItemId,
+        kind: ItemKind,
     };
 
     pub fn resolve(self: ModuleScope, name: []const u8) ?ItemId {
+        return (self.resolveEntry(name) orelse return null).item_id;
+    }
+
+    pub fn resolveFunction(self: ModuleScope, name: []const u8) ?ItemId {
+        const entry = self.resolveEntry(name) orelse return null;
+        return if (entry.kind == .function) entry.item_id else null;
+    }
+
+    pub fn resolveStatic(self: ModuleScope, name: []const u8) ?ItemId {
+        const entry = self.resolveEntry(name) orelse return null;
+        return if (entry.kind == .static) entry.item_id else null;
+    }
+
+    fn resolveEntry(self: ModuleScope, name: []const u8) ?Entry {
         const index = std.sort.binarySearch(Entry, self.entries, name, struct {
             fn compare(target: []const u8, entry: Entry) std.math.Order {
                 return std.mem.order(u8, target, entry.name);
             }
         }.compare) orelse return null;
-        return self.entries[index].item_id;
+        return self.entries[index];
     }
 
     pub fn eql(a: ModuleScope, b: ModuleScope) bool {
         if (a.entries.len != b.entries.len) return false;
         for (a.entries, b.entries) |left, right| {
-            if (left.item_id != right.item_id or !std.mem.eql(u8, left.name, right.name)) return false;
+            if (left.item_id != right.item_id or left.kind != right.kind or !std.mem.eql(u8, left.name, right.name)) return false;
         }
         return true;
     }
@@ -397,6 +415,28 @@ pub const ModuleScope = struct {
 pub const ResolvedItem = struct {
     file_id: FileId,
     declaration: u32,
+};
+
+pub const CompileTimeValue = union(enum) {
+    type: TypeId,
+    runtime: struct {
+        type_id: TypeId,
+        value: RuntimeValue,
+    },
+
+    pub const RuntimeValue = union(enum) {
+        int: i32,
+        unit,
+        none,
+
+        pub fn typeId(self: @This()) TypeId {
+            return switch (self) {
+                .int => .int,
+                .unit => .unit,
+                .none => .none,
+            };
+        }
+    };
 };
 
 /// Database interner index carried inside a non-primitive TypeId. The remaining
@@ -492,8 +532,14 @@ pub const FunctionTerminator = union(enum) {
         then_branch: FunctionBranch,
         else_branch: FunctionBranch,
     },
+    fallible_call: struct {
+        call: FunctionCall,
+        success: FunctionBlockId,
+        failure: FunctionBlockId,
+    },
     return_unit,
     return_value: FunctionValueUse,
+    return_failure,
     diverge,
 };
 
@@ -508,9 +554,12 @@ pub const FunctionBlock = struct {
 pub const FunctionSignature = struct {
     parameter_types: []const TypeId,
     return_type: TypeId,
+    is_fallible: bool = false,
 
     pub fn eql(a: FunctionSignature, b: FunctionSignature) bool {
-        return a.return_type == b.return_type and std.mem.eql(TypeId, a.parameter_types, b.parameter_types);
+        return a.return_type == b.return_type and
+            a.is_fallible == b.is_fallible and
+            std.mem.eql(TypeId, a.parameter_types, b.parameter_types);
     }
 
     pub fn deinit(self: *FunctionSignature, gpa: std.mem.Allocator) void {
@@ -525,14 +574,18 @@ pub const FunctionCall = struct {
     return_type: TypeId,
 };
 
+pub const VariantOperation = struct {
+    operand: FunctionValueId,
+    target_type: TypeId,
+};
+
 pub const FunctionInstruction = union(enum) {
     consti: i32,
     const_unit,
     const_none,
-    variant_coerce: struct {
-        operand: FunctionValueId,
-        target_type: TypeId,
-    },
+    variant_tag: FunctionValueId,
+    variant_coerce: VariantOperation,
+    variant_extract: VariantOperation,
     call: FunctionCall,
     exit: FunctionValueId,
     negi: FunctionValueId,
@@ -543,11 +596,11 @@ pub const FunctionInstruction = union(enum) {
 
     pub fn resultType(self: FunctionInstruction) TypeId {
         return switch (self) {
-            .consti, .negi, .addi, .subi, .muli, .divsi => .int,
+            .consti, .variant_tag, .negi, .addi, .subi, .muli, .divsi => .int,
             .const_unit => .unit,
             .const_none => .none,
             .exit => .never,
-            .variant_coerce => |coercion| coercion.target_type,
+            .variant_coerce, .variant_extract => |operation| operation.target_type,
             .call => |call| call.return_type,
         };
     }
@@ -558,6 +611,7 @@ pub const FunctionInstruction = union(enum) {
 /// and terminator. Calls retain declaration identities until code emission.
 pub const FunctionBodyAnalysis = struct {
     return_type: TypeId,
+    is_fallible: bool = false,
     block_argument_types: []TypeId,
     branch_arguments: []FunctionValueUse,
     call_arguments: []FunctionValueUse,
@@ -583,6 +637,7 @@ pub const FunctionBodyAnalysis = struct {
     pub fn eql(a: @This(), b: @This()) bool {
         if (a.entry != b.entry or
             a.return_type != b.return_type or
+            a.is_fallible != b.is_fallible or
             !std.mem.eql(TypeId, a.block_argument_types, b.block_argument_types) or
             !valueUsesEql(a.branch_arguments, b.branch_arguments) or
             !valueUsesEql(a.call_arguments, b.call_arguments) or
@@ -717,7 +772,12 @@ pub const Diagnostic = struct {
             found: Token.Tag,
         },
         invalid_expression: Token.Tag,
-        duplicate_top_level_function,
+        duplicate_top_level_declaration,
+        declaration_cycle,
+        static_initializer_not_supported,
+        static_initializer_type_mismatch: TypeMismatch,
+        type_value_used_as_runtime_value,
+        value_used_as_type,
         function_annotation_not_supported,
         parameter_mode_not_supported,
         duplicate_parameter,
@@ -730,6 +790,7 @@ pub const Diagnostic = struct {
         expression_not_supported,
         duplicate_local_binding,
         local_type_not_supported,
+        unknown_type,
         unknown_value,
         assignment_target_not_local,
         assignment_to_immutable,
@@ -738,12 +799,16 @@ pub const Diagnostic = struct {
         integer_literal_out_of_range,
         fallible_condition_not_supported,
         if_condition_not_fallible,
+        inspection_type_not_supported,
+        variant_inspection_operand_not_variant: TypeDescription,
+        condition_binding_must_be_immutable,
         value_not_callable,
         duplicate_variant_member_type,
         local_type_mismatch: TypeMismatch,
         negation_operand_not_int: TypeDescription,
         arithmetic_operand_not_int: TypeDescription,
         comparison_operand_not_int: TypeDescription,
+        fallible_expression_outside_fallible_function,
         missing_return_value: TypeDescription,
         return_type_mismatch: TypeMismatch,
         unknown_function,
