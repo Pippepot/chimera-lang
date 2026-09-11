@@ -37,11 +37,28 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
         const Self = @This();
         const Value = struct { id: structures.FunctionValueId, type_id: structures.TypeId };
         const Expression = semantic.UnresolvedBody.Expression;
+        const StateId = enum(u32) { _ };
+        const FlowExit = struct {
+            block: structures.FunctionBlockId,
+            state: StateId,
+        };
+        const ValueExit = struct {
+            block: structures.FunctionBlockId,
+            state: StateId,
+            value: Value,
+        };
+        const ConditionFlow = struct {
+            success: ?FlowExit,
+            failure: ?FlowExit,
+            diverged: ?Value = null,
+        };
         const LoopContext = struct {
             header: structures.FunctionBlockId,
             exit: structures.FunctionBlockId,
+            baseline: StateId,
             state_type_start: u32,
             state_type_end: u32,
+            exit_state_start: u32,
         };
         const LoopBreak = struct { branch: structures.FunctionBranch, value: Value };
 
@@ -52,6 +69,8 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
         return_type: structures.TypeId,
         scope: ?structures.ModuleScope = null,
         values: []?Value = &.{},
+        local_values: []?Value = &.{},
+        states: std.ArrayList([]?Value) = .empty,
         block_argument_types: std.ArrayList(structures.TypeId) = .empty,
         call_arguments: std.ArrayList(structures.FunctionValueUse) = .empty,
         branch_arguments: std.ArrayList(structures.FunctionValueUse) = .empty,
@@ -65,6 +84,8 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             std.debug.assert(parameter_types.len == self.unresolved.parameter_count);
             self.values = try self.ctx.allocator().alloc(?Value, parameter_types.len + self.unresolved.expressions.len);
             @memset(self.values, null);
+            self.local_values = try self.ctx.allocator().alloc(?Value, self.unresolved.mutable_local_count);
+            @memset(self.local_values, null);
             for (parameter_types, 0..) |type_id, index| self.values[index] = .{ .id = @enumFromInt(index), .type_id = type_id };
             try self.block_argument_types.appendSlice(self.ctx.allocator(), parameter_types);
             const entry = try self.newBlock(0, @intCast(parameter_types.len));
@@ -74,6 +95,9 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
         fn deinit(self: *Self) void {
             const gpa = self.ctx.allocator();
             gpa.free(self.values);
+            gpa.free(self.local_values);
+            for (self.states.items) |state| gpa.free(state);
+            self.states.deinit(gpa);
             self.block_argument_types.deinit(gpa);
             self.call_arguments.deinit(gpa);
             self.branch_arguments.deinit(gpa);
@@ -123,8 +147,9 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 if (self.current_block == null) return null;
                 switch (statement) {
                     .discard => |value_id| _ = try self.value(value_id),
-                    .break_loop => |break_loop| try self.breakLoop(break_loop),
-                    .continue_loop => |arguments| try self.continueLoop(arguments),
+                    .bind_mutable => |binding| try self.bindMutable(binding),
+                    .break_loop => |value_id| try self.breakLoop(value_id),
+                    .continue_loop => try self.continueLoop(),
                     .return_nothing => |span| try self.returnNothing(span),
                     .return_value => |returned| try self.returnValue(try self.value(returned.value), returned.span),
                 }
@@ -134,20 +159,26 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             return if (self.current_block == null) null else result;
         }
 
-        fn breakLoop(self: *Self, break_loop: @FieldType(semantic.UnresolvedBody.Statement, "break_loop")) !void {
-            const value_to_break = try self.value(break_loop.value);
+        fn bindMutable(self: *Self, binding: @FieldType(semantic.UnresolvedBody.Statement, "bind_mutable")) !void {
+            const bound_value = try self.value(binding.value);
+            if (bound_value.type_id == .never) return;
+            const index = @intFromEnum(binding.local);
+            std.debug.assert(self.local_values[index] == null);
+            self.local_values[index] = bound_value;
+        }
+
+        fn breakLoop(self: *Self, value_id: semantic.UnresolvedBody.ValueId) !void {
+            const value_to_break = try self.value(value_id);
             if (value_to_break.type_id == .never) return;
             const context = self.loop_stack.getLast();
-            const state_values = self.unresolved.loop_values[break_loop.arguments.start..break_loop.arguments.end];
-            const branch = try self.loopBranch(context.exit, value_to_break, state_values, context.state_type_start, context.state_type_end);
+            const branch = try self.loopBranch(context, context.exit, value_to_break);
             self.terminate(.{ .branch = branch });
             try self.loop_breaks.append(self.ctx.allocator(), .{ .branch = branch, .value = value_to_break });
         }
 
-        fn continueLoop(self: *Self, arguments: structures.FunctionValueRange) !void {
+        fn continueLoop(self: *Self) !void {
             const context = self.loop_stack.getLast();
-            const state_values = self.unresolved.loop_values[arguments.start..arguments.end];
-            const branch = try self.loopBranch(context.header, null, state_values, context.state_type_start, context.state_type_end);
+            const branch = try self.loopBranch(context, context.header, null);
             self.terminate(.{ .branch = branch });
         }
 
@@ -181,35 +212,60 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 .integer => |integer| try self.appendInstruction(.{ .consti = integer }),
                 .unit => try self.appendInstruction(.const_unit),
                 .none => try self.appendInstruction(.const_none),
+                .local_read => |local| self.local_values[@intFromEnum(local)] orelse unreachable,
                 .annotation => |annotation| try self.annotate(annotation),
                 .assignment => try self.assignment(expression),
                 .call => |call| try self.callFunction(call, expression.span),
                 .negate => |operand| try self.negate(operand),
                 .add, .subtract, .multiply, .divide => try self.binary(expression),
                 .if_else => |expression_if| try self.conditional(expression_if),
-                .conditional_output => |conditional_id| return self.conditionalOutput(id, conditional_id),
-                .loop => |loop_expression| try self.loop(loop_expression),
-                .loop_input => unreachable,
-                .loop_output => |loop_id| return self.loopOutput(id, loop_id),
+                .loop => |body| try self.loop(body),
             };
             self.values[index] = resolved;
             return resolved;
         }
 
-        fn loopOutput(self: *Self, id: semantic.UnresolvedBody.ValueId, loop_id: semantic.UnresolvedBody.ValueId) !Value {
-            _ = try self.value(loop_id);
-            return self.values[@intFromEnum(id)] orelse unreachable;
+        fn captureState(self: *Self) !StateId {
+            const state = try self.ctx.allocator().dupe(?Value, self.local_values);
+            errdefer self.ctx.allocator().free(state);
+            return self.appendState(state);
         }
 
-        fn loop(self: *Self, expression: @FieldType(Expression.Operation, "loop")) !Value {
-            const initial_ids = self.unresolved.loop_values[expression.initial_values.start..expression.initial_values.end];
-            var initial_values: std.ArrayList(Value) = .empty;
-            defer initial_values.deinit(self.ctx.allocator());
-            for (initial_ids) |initial_id| {
-                const initial = try self.value(initial_id);
-                if (initial.type_id == .never) return initial;
-                try initial_values.append(self.ctx.allocator(), initial);
+        fn appendState(self: *Self, state: []?Value) !StateId {
+            const id: StateId = @enumFromInt(self.states.items.len);
+            try self.states.append(self.ctx.allocator(), state);
+            return id;
+        }
+
+        fn restoreState(self: *Self, id: StateId) void {
+            @memcpy(self.local_values, self.states.items[@intFromEnum(id)]);
+        }
+
+        fn activeStateValues(self: *Self, id: StateId) !std.ArrayList(Value) {
+            var values: std.ArrayList(Value) = .empty;
+            errdefer values.deinit(self.ctx.allocator());
+            for (self.states.items[@intFromEnum(id)]) |value_in_state| {
+                if (value_in_state) |value_to_append| try values.append(self.ctx.allocator(), value_to_append);
             }
+            return values;
+        }
+
+        fn stateWithArguments(self: *Self, baseline: StateId, argument_start: u32) !StateId {
+            const state = try self.ctx.allocator().dupe(?Value, self.states.items[@intFromEnum(baseline)]);
+            errdefer self.ctx.allocator().free(state);
+            var argument = argument_start;
+            for (state) |*value_in_state| {
+                if (value_in_state.* == null) continue;
+                value_in_state.* = .{ .id = @enumFromInt(argument), .type_id = self.block_argument_types.items[argument] };
+                argument += 1;
+            }
+            return self.appendState(state);
+        }
+
+        fn loop(self: *Self, body: semantic.UnresolvedBody.BlockId) !Value {
+            const baseline = try self.captureState();
+            var initial_values = try self.activeStateValues(baseline);
+            defer initial_values.deinit(self.ctx.allocator());
 
             const state_type_start: u32 = @intCast(self.block_argument_types.items.len);
             for (initial_values.items) |initial| try self.block_argument_types.append(self.ctx.allocator(), initial.type_id);
@@ -225,24 +281,22 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             }
             const exit = try self.newBlock(exit_argument_start, @intCast(self.block_argument_types.items.len));
 
-            const input_ids = self.unresolved.loop_values[expression.input_values.start..expression.input_values.end];
-            std.debug.assert(input_ids.len == initial_values.items.len);
-            for (input_ids, state_type_start..) |input_id, argument| {
-                self.values[@intFromEnum(input_id)] = .{ .id = @enumFromInt(argument), .type_id = self.block_argument_types.items[argument] };
-            }
+            const header_state = try self.stateWithArguments(baseline, state_type_start);
 
             const break_start: u32 = @intCast(self.loop_breaks.items.len);
             try self.loop_stack.append(self.ctx.allocator(), .{
                 .header = header,
                 .exit = exit,
+                .baseline = baseline,
                 .state_type_start = state_type_start,
                 .state_type_end = state_type_end,
+                .exit_state_start = exit_argument_start + 1,
             });
             self.enterBlock(header);
-            const body_value = try self.block(expression.body);
+            self.restoreState(header_state);
+            const body_value = try self.block(body);
             if (body_value != null) {
-                const repeat_ids = self.unresolved.loop_values[expression.repeat_values.start..expression.repeat_values.end];
-                const repeat = try self.loopBranch(header, null, repeat_ids, state_type_start, state_type_end);
+                const repeat = try self.loopBranch(self.loop_stack.getLast(), header, null);
                 self.terminate(.{ .branch = repeat });
             }
             _ = self.loop_stack.pop();
@@ -264,12 +318,9 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             }
             self.loop_breaks.shrinkRetainingCapacity(break_start);
 
-            const output_ids = self.unresolved.loop_values[expression.output_values.start..expression.output_values.end];
-            std.debug.assert(output_ids.len == initial_values.items.len);
-            for (output_ids, exit_argument_start + 1..) |output_id, argument| {
-                self.values[@intFromEnum(output_id)] = .{ .id = @enumFromInt(argument), .type_id = self.block_argument_types.items[argument] };
-            }
+            const output_state = try self.stateWithArguments(baseline, exit_argument_start + 1);
             self.enterBlock(exit);
+            self.restoreState(output_state);
             return .{ .id = @enumFromInt(exit_argument_start), .type_id = joined };
         }
 
@@ -281,21 +332,27 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
 
         fn loopBranch(
             self: *Self,
+            context: LoopContext,
             target: structures.FunctionBlockId,
             result: ?Value,
-            state_ids: []const semantic.UnresolvedBody.ValueId,
-            state_type_start: u32,
-            state_type_end: u32,
         ) !structures.FunctionBranch {
-            std.debug.assert(state_ids.len == state_type_end - state_type_start);
             const start: u32 = @intCast(self.branch_arguments.items.len);
             if (result) |result_value| try self.branch_arguments.append(self.ctx.allocator(), .{ .value = result_value.id });
-            for (state_ids, state_type_start..) |state_id, type_index| {
-                const state = try self.value(state_id);
-                std.debug.assert(state.type_id != .never);
+            const type_start = if (target == context.header)
+                context.state_type_start
+            else if (target == context.exit)
+                context.exit_state_start
+            else
+                unreachable;
+            var type_index = type_start;
+            for (self.states.items[@intFromEnum(context.baseline)], self.local_values) |initial, current| {
+                if (initial == null) continue;
+                const state = current.?;
                 const use = (try coerceValue(self.type_interner, state.id, state.type_id, self.block_argument_types.items[type_index])) orelse unreachable;
                 try self.branch_arguments.append(self.ctx.allocator(), use);
+                type_index += 1;
             }
+            std.debug.assert(type_index == type_start + context.state_type_end - context.state_type_start);
             return .{ .target = target, .arguments = .{ .start = start, .end = @intCast(self.branch_arguments.items.len) } };
         }
 
@@ -310,31 +367,31 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
 
         fn assignment(self: *Self, expression: Expression) !Value {
             const assignment_value = expression.operation.assignment;
-            const target = try self.value(assignment_value.target.value);
-            if (target.type_id == .never) return target;
+            const local_index = @intFromEnum(assignment_value.target);
+            const target = self.local_values[local_index].?;
             const operand = try self.value(assignment_value.value.value);
             if (operand.type_id == .never) return operand;
-            if (assignment_value.operation == .replace) {
+            const result = if (assignment_value.operation == .replace) blk: {
                 const use = try coerceValue(self.type_interner, operand.id, operand.type_id, target.type_id) orelse
                     return self.reject(assignment_value.value.span, .{ .assignment_type_mismatch = try self.typeMismatch(target.type_id, operand.type_id) });
-                if (use.coerce_to == null) return operand;
-                return self.appendInstruction(.{ .variant_coerce = .{ .operand = operand.id, .target_type = target.type_id } });
-            }
-            if (target.type_id != .int) return self.reject(assignment_value.target.span, .{ .arithmetic_operand_not_int = try self.describeType(target.type_id) });
-            if (operand.type_id != .int) return self.reject(assignment_value.value.span, .{ .arithmetic_operand_not_int = try self.describeType(operand.type_id) });
-            const operands: structures.BinaryOperands = .{ .lhs = target.id, .rhs = operand.id };
-            return self.appendInstruction(switch (assignment_value.operation) {
-                .replace => unreachable,
-                .add => .{ .addi = operands },
-                .subtract => .{ .subi = operands },
-                .multiply => .{ .muli = operands },
-                .divide => .{ .divsi = operands },
-            });
-        }
-
-        fn conditionalOutput(self: *Self, id: semantic.UnresolvedBody.ValueId, conditional_id: semantic.UnresolvedBody.ValueId) !Value {
-            _ = try self.value(conditional_id);
-            return self.values[@intFromEnum(id)] orelse unreachable;
+                break :blk if (use.coerce_to == null)
+                    operand
+                else
+                    try self.appendInstruction(.{ .variant_coerce = .{ .operand = operand.id, .target_type = target.type_id } });
+            } else blk: {
+                if (target.type_id != .int) return self.reject(assignment_value.target_span, .{ .arithmetic_operand_not_int = try self.describeType(target.type_id) });
+                if (operand.type_id != .int) return self.reject(assignment_value.value.span, .{ .arithmetic_operand_not_int = try self.describeType(operand.type_id) });
+                const operands: structures.BinaryOperands = .{ .lhs = target.id, .rhs = operand.id };
+                break :blk try self.appendInstruction(switch (assignment_value.operation) {
+                    .replace => unreachable,
+                    .add => .{ .addi = operands },
+                    .subtract => .{ .subi = operands },
+                    .multiply => .{ .muli = operands },
+                    .divide => .{ .divsi = operands },
+                });
+            };
+            self.local_values[local_index] = result;
+            return result;
         }
 
         fn negate(self: *Self, operand_use: semantic.UnresolvedBody.ValueUse) !Value {
@@ -407,19 +464,28 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             return result;
         }
 
-        fn conditional(self: *Self, expression: @FieldType(Expression.Operation, "if_else")) !Value {
-            const condition = expression.condition;
-            const lhs = try self.value(condition.operands.lhs.value);
-            if (lhs.type_id == .never) return lhs;
-            const rhs = try self.value(condition.operands.rhs.value);
-            if (rhs.type_id == .never) return rhs;
-            if (lhs.type_id != .int) return self.reject(condition.operands.lhs.span, .{ .comparison_operand_not_int = try self.describeType(lhs.type_id) });
-            if (rhs.type_id != .int) return self.reject(condition.operands.rhs.span, .{ .comparison_operand_not_int = try self.describeType(rhs.type_id) });
+        fn condition(self: *Self, id: semantic.UnresolvedBody.ConditionId) anyerror!ConditionFlow {
+            const condition_data = self.unresolved.conditions[@intFromEnum(id)];
+            return switch (condition_data) {
+                .comparison => |comparison| self.comparisonCondition(comparison),
+                .conjunction => |logical| self.conjunctionCondition(logical),
+                .disjunction => |logical| self.disjunctionCondition(logical),
+                .negation => |operand| self.negatedCondition(operand),
+            };
+        }
+
+        fn comparisonCondition(self: *Self, comparison: @FieldType(semantic.UnresolvedBody.Condition, "comparison")) !ConditionFlow {
+            const lhs = try self.value(comparison.operands.lhs.value);
+            if (lhs.type_id == .never) return .{ .success = null, .failure = null, .diverged = lhs };
+            const rhs = try self.value(comparison.operands.rhs.value);
+            if (rhs.type_id == .never) return .{ .success = null, .failure = null, .diverged = rhs };
+            if (lhs.type_id != .int) return self.reject(comparison.operands.lhs.span, .{ .comparison_operand_not_int = try self.describeType(lhs.type_id) });
+            if (rhs.type_id != .int) return self.reject(comparison.operands.rhs.span, .{ .comparison_operand_not_int = try self.describeType(rhs.type_id) });
             const branch_argument_start: u32 = @intCast(self.block_argument_types.items.len);
-            const then_block = try self.newBlock(branch_argument_start, branch_argument_start);
-            const else_block = try self.newBlock(branch_argument_start, branch_argument_start);
+            const success = try self.newBlock(branch_argument_start, branch_argument_start);
+            const failure = try self.newBlock(branch_argument_start, branch_argument_start);
             self.terminate(.{ .predicate_branch = .{
-                .operation = switch (condition.operation) {
+                .operation = switch (comparison.operation) {
                     .lt => .lti,
                     .gt => .gti,
                     .le => .lei,
@@ -428,80 +494,210 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                     .ne => .nei,
                 },
                 .operands = .{ .lhs = lhs.id, .rhs = rhs.id },
-                .then_branch = self.emptyBranch(then_block),
-                .else_branch = self.emptyBranch(else_block),
+                .then_branch = self.emptyBranch(success),
+                .else_branch = self.emptyBranch(failure),
             } });
+            const state = try self.captureState();
+            return .{
+                .success = .{ .block = success, .state = state },
+                .failure = .{ .block = failure, .state = state },
+            };
+        }
 
-            const outputs = self.unresolved.conditional_outputs[expression.outputs.start..expression.outputs.end];
-            var then_outputs: std.ArrayList(Value) = .empty;
-            defer then_outputs.deinit(self.ctx.allocator());
-            self.enterBlock(then_block);
-            const then_value = try self.block(expression.then_block);
-            if (then_value != null) {
-                for (outputs) |output| try then_outputs.append(self.ctx.allocator(), try self.value(output.then_value));
+        fn conjunctionCondition(
+            self: *Self,
+            logical: @FieldType(semantic.UnresolvedBody.Condition, "conjunction"),
+        ) !ConditionFlow {
+            const lhs = try self.condition(logical.lhs);
+            const rhs = if (lhs.success) |success| blk: {
+                self.enterFlowExit(success);
+                break :blk try self.condition(logical.rhs);
+            } else ConditionFlow{ .success = null, .failure = null };
+            return .{
+                .success = rhs.success,
+                .failure = try self.mergeFlowExits(lhs.failure, rhs.failure),
+                .diverged = rhs.diverged orelse lhs.diverged,
+            };
+        }
+
+        fn disjunctionCondition(
+            self: *Self,
+            logical: @FieldType(semantic.UnresolvedBody.Condition, "disjunction"),
+        ) !ConditionFlow {
+            const lhs = try self.condition(logical.lhs);
+            const rhs = if (lhs.failure) |failure| blk: {
+                self.enterFlowExit(failure);
+                break :blk try self.condition(logical.rhs);
+            } else ConditionFlow{ .success = null, .failure = null };
+            return .{
+                .success = try self.mergeFlowExits(lhs.success, rhs.success),
+                .failure = rhs.failure,
+                .diverged = rhs.diverged orelse lhs.diverged,
+            };
+        }
+
+        fn negatedCondition(self: *Self, operand: semantic.UnresolvedBody.ConditionId) !ConditionFlow {
+            const flow = try self.condition(operand);
+            return .{ .success = flow.failure, .failure = flow.success, .diverged = flow.diverged };
+        }
+
+        fn enterFlowExit(self: *Self, exit: FlowExit) void {
+            self.enterBlock(exit.block);
+            self.restoreState(exit.state);
+        }
+
+        fn mergeFlowExits(self: *Self, first_exit: ?FlowExit, second_exit: ?FlowExit) !?FlowExit {
+            const first = first_exit orelse return second_exit;
+            const second = second_exit orelse return first;
+            const first_state = self.states.items[@intFromEnum(first.state)];
+            const second_state = self.states.items[@intFromEnum(second.state)];
+            std.debug.assert(first_state.len == second_state.len);
+
+            var first_values: std.ArrayList(Value) = .empty;
+            defer first_values.deinit(self.ctx.allocator());
+            var second_values: std.ArrayList(Value) = .empty;
+            defer second_values.deinit(self.ctx.allocator());
+            var changed_slots: std.ArrayList(u32) = .empty;
+            defer changed_slots.deinit(self.ctx.allocator());
+            const argument_start: u32 = @intCast(self.block_argument_types.items.len);
+            for (first_state, second_state, 0..) |first_value, second_value, slot| {
+                std.debug.assert((first_value == null) == (second_value == null));
+                const left = first_value orelse continue;
+                const right = second_value.?;
+                std.debug.assert(left.type_id == right.type_id);
+                if (left.id == right.id) continue;
+                try first_values.append(self.ctx.allocator(), left);
+                try second_values.append(self.ctx.allocator(), right);
+                try changed_slots.append(self.ctx.allocator(), @intCast(slot));
+                try self.block_argument_types.append(self.ctx.allocator(), left.type_id);
             }
 
-            const argument_start: u32 = @intCast(self.block_argument_types.items.len);
-            try self.block_argument_types.append(self.ctx.allocator(), .never);
-            for (outputs) |_| try self.block_argument_types.append(self.ctx.allocator(), .never);
-            const merge_block = try self.newBlock(argument_start, @intCast(self.block_argument_types.items.len));
-            const then_branch = if (then_value) |then_result| blk: {
-                const branch = try self.resultAndOutputsBranch(merge_block, then_result, then_outputs.items);
-                self.terminate(.{ .branch = branch });
-                break :blk branch;
+            const merged = try self.newBlock(argument_start, @intCast(self.block_argument_types.items.len));
+            self.enterBlock(first.block);
+            self.terminate(.{ .branch = try self.valuesBranch(merged, first_values.items) });
+            self.enterBlock(second.block);
+            self.terminate(.{ .branch = try self.valuesBranch(merged, second_values.items) });
+
+            const state = try self.ctx.allocator().dupe(?Value, first_state);
+            errdefer self.ctx.allocator().free(state);
+            for (changed_slots.items, argument_start..) |slot, argument| {
+                state[slot] = .{ .id = @enumFromInt(argument), .type_id = self.block_argument_types.items[argument] };
+            }
+            const state_id = try self.appendState(state);
+            return .{ .block = merged, .state = state_id };
+        }
+
+        fn conditional(self: *Self, expression: @FieldType(Expression.Operation, "if_else")) !Value {
+            const baseline = try self.captureState();
+            const flow = try self.condition(expression.condition);
+            if (flow.success == null and flow.failure == null) {
+                std.debug.assert(flow.diverged != null);
+                return flow.diverged.?;
+            }
+
+            const then_exit = if (flow.success) |success| blk: {
+                self.enterFlowExit(success);
+                break :blk try self.valueExit(try self.block(expression.then_block));
+            } else null;
+            const else_exit = if (flow.failure) |failure| blk: {
+                self.enterFlowExit(failure);
+                break :blk try self.valueExit(try self.block(expression.else_block));
             } else null;
 
-            var else_outputs: std.ArrayList(Value) = .empty;
-            defer else_outputs.deinit(self.ctx.allocator());
-            self.enterBlock(else_block);
-            const else_value = try self.block(expression.else_block);
-            if (then_value == null and else_value == null) {
+            const argument_start: u32 = @intCast(self.block_argument_types.items.len);
+            if (then_exit == null and else_exit == null) {
+                try self.block_argument_types.append(self.ctx.allocator(), .never);
+                const merge_block = try self.newBlock(argument_start, argument_start + 1);
                 self.enterBlock(merge_block);
                 self.terminate(.diverge);
-                for (outputs, 0..) |output, output_index| {
-                    self.values[@intFromEnum(output.result)] = .{
-                        .id = @enumFromInt(argument_start + 1 + @as(u32, @intCast(output_index))),
-                        .type_id = .never,
-                    };
-                }
                 return .{ .id = @enumFromInt(argument_start), .type_id = .never };
             }
 
-            const else_branch = if (else_value) |else_result| blk: {
-                for (outputs) |output| try else_outputs.append(self.ctx.allocator(), try self.value(output.else_value));
-                const branch = try self.resultAndOutputsBranch(merge_block, else_result, else_outputs.items);
-                self.terminate(.{ .branch = branch });
-                break :blk branch;
-            } else null;
-
-            const joined = if (then_value) |then_result|
-                if (else_value) |else_result|
-                    try joinTypes(self.type_interner, then_result.type_id, else_result.type_id, self.ctx.allocator())
+            const joined = if (then_exit) |then_result|
+                if (else_exit) |else_result|
+                    try joinTypes(self.type_interner, then_result.value.type_id, else_result.value.type_id, self.ctx.allocator())
                 else
-                    then_result.type_id
+                    then_result.value.type_id
             else
-                else_value.?.type_id;
-            self.block_argument_types.items[argument_start] = joined;
-            if (then_value) |then_result| {
-                const branch = then_branch.?;
-                self.branch_arguments.items[branch.arguments.start] = (try coerceValue(self.type_interner, then_result.id, then_result.type_id, joined)) orelse unreachable;
+                else_exit.?.value.type_id;
+            try self.block_argument_types.append(self.ctx.allocator(), joined);
+            var changed_slots = try self.changedStateSlots(baseline, then_exit, else_exit);
+            defer changed_slots.deinit(self.ctx.allocator());
+            for (changed_slots.items) |slot| {
+                const source = if (then_exit) |exit| self.states.items[@intFromEnum(exit.state)][slot].? else self.states.items[@intFromEnum(else_exit.?.state)][slot].?;
+                try self.block_argument_types.append(self.ctx.allocator(), source.type_id);
             }
-            if (else_value) |else_result| {
-                const branch = else_branch.?;
-                self.branch_arguments.items[branch.arguments.start] = (try coerceValue(self.type_interner, else_result.id, else_result.type_id, joined)) orelse unreachable;
-            }
-            for (outputs, 0..) |output, output_index| {
-                const then_output: ?Value = if (then_value != null) then_outputs.items[output_index] else null;
-                const else_output: ?Value = if (else_value != null) else_outputs.items[output_index] else null;
-                const output_type = if (then_output) |output_value| output_value.type_id else else_output.?.type_id;
-                if (then_output) |output_value| std.debug.assert(output_value.type_id == output_type);
-                if (else_output) |output_value| std.debug.assert(output_value.type_id == output_type);
-                const block_argument = argument_start + 1 + @as(u32, @intCast(output_index));
-                self.block_argument_types.items[block_argument] = output_type;
-                self.values[@intFromEnum(output.result)] = .{ .id = @enumFromInt(block_argument), .type_id = output_type };
-            }
+            const merge_block = try self.newBlock(argument_start, @intCast(self.block_argument_types.items.len));
+            if (then_exit) |exit| self.setBlockTerminator(exit.block, .{ .branch = try self.conditionalBranch(merge_block, exit, joined, changed_slots.items) });
+            if (else_exit) |exit| self.setBlockTerminator(exit.block, .{ .branch = try self.conditionalBranch(merge_block, exit, joined, changed_slots.items) });
+
+            const output_state = try self.conditionalState(baseline, then_exit, else_exit, changed_slots.items, argument_start + 1);
             self.enterBlock(merge_block);
+            self.restoreState(output_state);
             return .{ .id = @enumFromInt(argument_start), .type_id = joined };
+        }
+
+        fn valueExit(self: *Self, result: ?Value) !?ValueExit {
+            const value_to_exit = result orelse return null;
+            const state = try self.captureState();
+            return .{ .block = self.suspendBlock(), .state = state, .value = value_to_exit };
+        }
+
+        fn changedStateSlots(
+            self: *Self,
+            baseline: StateId,
+            first: ?ValueExit,
+            second: ?ValueExit,
+        ) !std.ArrayList(u32) {
+            var slots: std.ArrayList(u32) = .empty;
+            errdefer slots.deinit(self.ctx.allocator());
+            if (first == null or second == null) return slots;
+            const baseline_state = self.states.items[@intFromEnum(baseline)];
+            const first_state = self.states.items[@intFromEnum(first.?.state)];
+            const second_state = self.states.items[@intFromEnum(second.?.state)];
+            for (baseline_state, first_state, second_state, 0..) |initial, left, right, slot| {
+                if (initial == null) continue;
+                std.debug.assert(left != null and right != null);
+                std.debug.assert(left.?.type_id == right.?.type_id);
+                if (left.?.id != right.?.id) try slots.append(self.ctx.allocator(), @intCast(slot));
+            }
+            return slots;
+        }
+
+        fn conditionalBranch(
+            self: *Self,
+            target: structures.FunctionBlockId,
+            exit: ValueExit,
+            result_type: structures.TypeId,
+            changed_slots: []const u32,
+        ) !structures.FunctionBranch {
+            const start: u32 = @intCast(self.branch_arguments.items.len);
+            const result = (try coerceValue(self.type_interner, exit.value.id, exit.value.type_id, result_type)) orelse unreachable;
+            try self.branch_arguments.append(self.ctx.allocator(), result);
+            const state = self.states.items[@intFromEnum(exit.state)];
+            for (changed_slots) |slot| try self.branch_arguments.append(self.ctx.allocator(), .{ .value = state[slot].?.id });
+            return .{ .target = target, .arguments = .{ .start = start, .end = @intCast(self.branch_arguments.items.len) } };
+        }
+
+        fn conditionalState(
+            self: *Self,
+            baseline: StateId,
+            first: ?ValueExit,
+            second: ?ValueExit,
+            changed_slots: []const u32,
+            argument_start: u32,
+        ) !StateId {
+            const source = if (first) |exit| exit.state else second.?.state;
+            const state = try self.ctx.allocator().dupe(?Value, self.states.items[@intFromEnum(baseline)]);
+            errdefer self.ctx.allocator().free(state);
+            const source_state = self.states.items[@intFromEnum(source)];
+            for (state, source_state) |*output, value_on_path| {
+                if (output.* != null) output.* = value_on_path.?;
+            }
+            for (changed_slots, argument_start..) |slot, argument| {
+                state[slot] = .{ .id = @enumFromInt(argument), .type_id = self.block_argument_types.items[argument] };
+            }
+            return self.appendState(state);
         }
 
         fn appendInstruction(self: *Self, instruction: structures.FunctionInstruction) !Value {
@@ -534,22 +730,23 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
         }
 
         fn terminate(self: *Self, terminator: structures.FunctionTerminator) void {
-            const current = &self.blocks.items[@intFromEnum(self.current_block.?)];
-            current.instruction_end = @intCast(self.instructions.items.len);
-            current.terminator = terminator;
+            self.setBlockTerminator(self.suspendBlock(), terminator);
+        }
+
+        fn suspendBlock(self: *Self) structures.FunctionBlockId {
+            const block_id = self.current_block.?;
+            self.blocks.items[@intFromEnum(block_id)].instruction_end = @intCast(self.instructions.items.len);
             self.current_block = null;
+            return block_id;
+        }
+
+        fn setBlockTerminator(self: *Self, block_id: structures.FunctionBlockId, terminator: structures.FunctionTerminator) void {
+            self.blocks.items[@intFromEnum(block_id)].terminator = terminator;
         }
 
         fn emptyBranch(self: *const Self, target: structures.FunctionBlockId) structures.FunctionBranch {
             const start: u32 = @intCast(self.branch_arguments.items.len);
             return .{ .target = target, .arguments = .{ .start = start, .end = start } };
-        }
-
-        fn resultAndOutputsBranch(self: *Self, target: structures.FunctionBlockId, result: Value, outputs: []const Value) !structures.FunctionBranch {
-            const start: u32 = @intCast(self.branch_arguments.items.len);
-            try self.branch_arguments.append(self.ctx.allocator(), .{ .value = result.id });
-            for (outputs) |output| try self.branch_arguments.append(self.ctx.allocator(), .{ .value = output.id });
-            return .{ .target = target, .arguments = .{ .start = start, .end = @intCast(self.branch_arguments.items.len) } };
         }
 
         fn finish(self: *Self) !structures.FunctionBodyAnalysis {

@@ -1,6 +1,6 @@
 # Roadmap
 
-Implementation audit: 2026-09-10, Zig 0.16.0.
+Implementation audit: 2026-09-11, Zig 0.16.0.
 
 The incremental pipeline works end to end. The next goal is to make variants inspectable and fallibility composable. Continue making the language in [syntax&semantics.txt](syntax&semantics.txt) usable through small, complete feature slices. That document is authoritative but incomplete: missing rules need a language decision, while missing implementation needs code. Legacy parity is not the goal.
 
@@ -12,7 +12,7 @@ The incremental pipeline works end to end. The next goal is to make variants ins
 | Functions | Named and static-bound declarations, typed parameters, direct calls, general statement bodies, unit fallthrough, early returns | Fallible functions, parameter modifiers, callable values |
 | Values | Decimal `int`, `unit`/`()`, `none`, `never`, immutable and mutable locals, assignments, calls, integer negation and `+ - * /` | `bool`, `float`, general type values |
 | Variants | Canonical sets over `int`, `unit`, `none`; structural branch unions; layout, member injection, locals, calls, returns; subset widening at bindings, arguments, and returns | Named aliases, inspection/extraction |
-| Control flow | Value-producing `if` over integer comparisons, lexical branch and loop blocks, divergence-aware joins, returns, loop-carried mutable state, `break` values, `continue` | Short-circuit logic, match |
+| Control flow | Value-producing `if` over integer comparisons and short-circuiting unit-success logic, lexical branch and loop blocks, divergence-aware joins, returns, loop-carried mutable state, `break` values, `continue` | Match |
 | Backend | Full-layout values, symbolic calls, recursion, arbitrary CFG edges, parallel edge copies | Frontend cannot yet produce all supported graphs; no external ABI |
 
 Named function declarations canonicalize to static-bound function values during parsing. Inline bodies acquire an implicit return, and an omitted return annotation means `unit`. Block bodies accept general supported statements; unit functions may fall through, while every reachable path of other functions must return or diverge. Annotations on the static function binding itself remain unsupported and are rejected when the function signature is demanded. Direct `unit` and `none` values work at binding, call, and return boundaries as well as inside variants.
@@ -49,7 +49,7 @@ General bodies and control flow are complete:
 
 Build on the control-flow model, without boolean condition values:
 
-- Add unit-success `and`, `or`, and `not`, preserving precedence and left-to-right short-circuiting.
+- **Done:** unit-success `and`, `or`, and `not`, preserving precedence and left-to-right short-circuiting.
 - Add `is`, fallible `as`, and immutable success-region condition bindings. Existing bindings keep their original types. Test both successful extraction and failure, including subset types.
 - Add fallible function declarations, signatures, calls, and failure propagation. Preserve success payloads across calls and represent fallibility in callable type identity. Add ordinary-to-compatible-fallible widening with function values when that representation is available.
 

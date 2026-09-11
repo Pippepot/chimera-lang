@@ -17,25 +17,27 @@ pub const SignatureResult = SemanticResult(structures.FunctionSignature);
 
 /// Query-local source graph after syntax and lexical validation. Parameters
 /// precede expressions in the value namespace. Blocks and statements preserve
-/// evaluation order; references to an earlier binding reuse its value. Source
-/// names are borrowed only until typing finishes. Loop-control edges remain
-/// structural until typing; CFG blocks belong to typed IR.
+/// evaluation order. Immutable references reuse their value; mutable references
+/// retain a stable local identity whose current SSA value is owned by typing.
+/// Source names are borrowed only until typing finishes. Control-flow edges
+/// remain structural until typing; CFG blocks belong to typed IR.
 pub const UnresolvedBody = struct {
     parameter_count: u32,
+    mutable_local_count: u32,
     expressions: []Expression,
+    conditions: []Condition,
     blocks: []Block,
     statements: []Statement,
     call_arguments: []ValueUse,
-    conditional_outputs: []ConditionalOutput,
-    loop_values: []ValueId,
     root_block: BlockId,
 
     pub const ValueId = enum(u32) { _ };
+    pub const LocalId = enum(u32) { _ };
+    pub const ConditionId = enum(u32) { _ };
     pub const BlockId = enum(u32) { _ };
     pub const ValueUse = struct { value: ValueId, span: structures.SourceSpan };
     pub const BinaryOperands = struct { lhs: ValueUse, rhs: ValueUse };
     pub const StatementRange = struct { start: u32, end: u32 };
-    pub const ConditionalOutputRange = struct { start: u32, end: u32 };
     pub const Block = struct {
         statements: StatementRange,
         result: ?ValueId,
@@ -43,22 +45,23 @@ pub const UnresolvedBody = struct {
     };
     pub const Statement = union(enum) {
         discard: ValueId,
-        break_loop: struct { value: ValueId, arguments: structures.FunctionValueRange },
-        continue_loop: structures.FunctionValueRange,
+        bind_mutable: struct { local: LocalId, value: ValueId },
+        break_loop: ValueId,
+        continue_loop,
         return_nothing: structures.SourceSpan,
         return_value: ValueUse,
     };
     pub const PredicateOperation = enum { lt, gt, le, ge, eq, ne };
-    pub const Condition = struct {
-        operation: PredicateOperation,
-        operands: BinaryOperands,
+    pub const Condition = union(enum) {
+        comparison: struct {
+            operation: PredicateOperation,
+            operands: BinaryOperands,
+        },
+        conjunction: struct { lhs: ConditionId, rhs: ConditionId },
+        disjunction: struct { lhs: ConditionId, rhs: ConditionId },
+        negation: ConditionId,
     };
     pub const AssignmentOperation = enum { replace, add, subtract, multiply, divide };
-    pub const ConditionalOutput = struct {
-        then_value: ValueId,
-        else_value: ValueId,
-        result: ValueId,
-    };
     pub const Expression = struct {
         operation: Operation,
         span: structures.SourceSpan,
@@ -67,8 +70,9 @@ pub const UnresolvedBody = struct {
             integer: i32,
             unit,
             none,
+            local_read: LocalId,
             annotation: struct { value: ValueUse, type_id: structures.TypeId },
-            assignment: struct { target: ValueUse, value: ValueUse, operation: AssignmentOperation },
+            assignment: struct { target: LocalId, target_span: structures.SourceSpan, value: ValueUse, operation: AssignmentOperation },
             call: struct { name: []const u8, arguments: structures.FunctionValueRange },
             negate: ValueUse,
             add: BinaryOperands,
@@ -76,31 +80,20 @@ pub const UnresolvedBody = struct {
             multiply: BinaryOperands,
             divide: BinaryOperands,
             if_else: struct {
-                condition: Condition,
+                condition: ConditionId,
                 then_block: BlockId,
                 else_block: BlockId,
-                outputs: ConditionalOutputRange,
             },
-            conditional_output: ValueId,
-            loop: struct {
-                body: BlockId,
-                initial_values: structures.FunctionValueRange,
-                input_values: structures.FunctionValueRange,
-                output_values: structures.FunctionValueRange,
-                repeat_values: structures.FunctionValueRange,
-            },
-            loop_input: ValueId,
-            loop_output: ValueId,
+            loop: BlockId,
         };
     };
 
     pub fn deinit(self: *UnresolvedBody, gpa: std.mem.Allocator) void {
         gpa.free(self.expressions);
+        gpa.free(self.conditions);
         gpa.free(self.blocks);
         gpa.free(self.statements);
         gpa.free(self.call_arguments);
-        gpa.free(self.conditional_outputs);
-        gpa.free(self.loop_values);
         self.* = undefined;
     }
 };
@@ -133,33 +126,25 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
     return struct {
         const Self = @This();
         const ValueId = UnresolvedBody.ValueId;
-        const Local = struct {
-            value: ValueId,
-            mutable: bool,
+        const Local = union(enum) {
+            immutable: ValueId,
+            mutable: UnresolvedBody.LocalId,
         };
-        const MutableState = struct {
-            name: []const u8,
-            incoming: ValueId,
-            then_value: ValueId = undefined,
-            else_value: ValueId = undefined,
-        };
-        const LoopContext = struct { name_start: u32, name_end: u32 };
 
         ast: *const structures.Ast,
         source: []const u8,
         parameter_count: u32,
         type_interner: TypeInterner,
         gpa: std.mem.Allocator,
+        mutable_local_count: u32 = 0,
         locals: std.StringHashMapUnmanaged(Local) = .empty,
         local_names: std.ArrayList([]const u8) = .empty,
         expressions: std.ArrayList(UnresolvedBody.Expression) = .empty,
+        conditions: std.ArrayList(UnresolvedBody.Condition) = .empty,
         blocks: std.ArrayList(UnresolvedBody.Block) = .empty,
         statements: std.ArrayList(UnresolvedBody.Statement) = .empty,
         call_arguments: std.ArrayList(UnresolvedBody.ValueUse) = .empty,
-        conditional_outputs: std.ArrayList(UnresolvedBody.ConditionalOutput) = .empty,
-        loop_values: std.ArrayList(ValueId) = .empty,
-        loop_state_names: std.ArrayList([]const u8) = .empty,
-        loop_stack: std.ArrayList(LoopContext) = .empty,
+        loop_depth: u32 = 0,
         scratch: std.ArrayList(ValueId) = .empty,
         root_block: ?UnresolvedBody.BlockId = null,
         issue: ?Issue = null,
@@ -168,13 +153,10 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             self.locals.deinit(self.gpa);
             self.local_names.deinit(self.gpa);
             self.expressions.deinit(self.gpa);
+            self.conditions.deinit(self.gpa);
             self.blocks.deinit(self.gpa);
             self.statements.deinit(self.gpa);
             self.call_arguments.deinit(self.gpa);
-            self.conditional_outputs.deinit(self.gpa);
-            self.loop_values.deinit(self.gpa);
-            self.loop_state_names.deinit(self.gpa);
-            self.loop_stack.deinit(self.gpa);
             self.scratch.deinit(self.gpa);
         }
 
@@ -212,7 +194,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             for (parameters, 0..) |parameter_index, index| {
                 const span = tokenSpan(self.ast, self.ast.nodes[parameter_index.index()].token_index);
                 const name = self.source[span.start..span.end];
-                try self.locals.put(self.gpa, name, .{ .value = @enumFromInt(index), .mutable = false });
+                try self.locals.put(self.gpa, name, .{ .immutable = @enumFromInt(index) });
                 try self.local_names.append(self.gpa, name);
             }
 
@@ -233,7 +215,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             const node = self.ast.nodes[index.index()];
             const span = tokenSpan(self.ast, node.token_index);
             return switch (node.tag) {
-                .const_binding, .var_binding => .{ .discard = try self.appendBinding(index) },
+                .const_binding, .var_binding => try self.buildBinding(index),
                 .return_nothing => if (is_entry)
                     self.reject(index, .top_level_return)
                 else
@@ -249,33 +231,21 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
         }
 
         fn buildBreak(self: *Self, index: structures.Node.Index) !UnresolvedBody.Statement {
-            if (self.loop_stack.items.len == 0) return self.reject(index, .break_outside_loop);
+            if (self.loop_depth == 0) return self.reject(index, .break_outside_loop);
             const node = self.ast.nodes[index.index()];
             const value = if (node.tag == .break_expr)
                 try self.append(node.data.node)
             else
                 try self.appendExpression(index, .unit);
-            return .{ .break_loop = .{
-                .value = value,
-                .arguments = try self.captureLoopValues(),
-            } };
+            return .{ .break_loop = value };
         }
 
         fn buildContinue(self: *Self, index: structures.Node.Index) !UnresolvedBody.Statement {
-            if (self.loop_stack.items.len == 0) return self.reject(index, .continue_outside_loop);
-            return .{ .continue_loop = try self.captureLoopValues() };
+            if (self.loop_depth == 0) return self.reject(index, .continue_outside_loop);
+            return .continue_loop;
         }
 
-        fn captureLoopValues(self: *Self) !structures.FunctionValueRange {
-            const context = self.loop_stack.getLast();
-            const start: u32 = @intCast(self.loop_values.items.len);
-            for (self.loop_state_names.items[context.name_start..context.name_end]) |name| {
-                try self.loop_values.append(self.gpa, self.locals.get(name).?.value);
-            }
-            return .{ .start = start, .end = @intCast(self.loop_values.items.len) };
-        }
-
-        fn appendBinding(self: *Self, index: structures.Node.Index) anyerror!ValueId {
+        fn buildBinding(self: *Self, index: structures.Node.Index) anyerror!UnresolvedBody.Statement {
             const node = self.ast.nodes[index.index()];
             const span = tokenSpan(self.ast, node.token_index);
             const name = self.source[span.start..span.end];
@@ -289,9 +259,17 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                     .span = nodeFocusSpan(self.ast, node.data.node_node.b),
                 }, .type_id = type_id } });
             }
-            try self.locals.put(self.gpa, name, .{ .value = value, .mutable = node.tag == .var_binding });
+            const statement: UnresolvedBody.Statement = if (node.tag == .var_binding) blk: {
+                const local: UnresolvedBody.LocalId = @enumFromInt(self.mutable_local_count);
+                self.mutable_local_count += 1;
+                try self.locals.put(self.gpa, name, .{ .mutable = local });
+                break :blk .{ .bind_mutable = .{ .local = local, .value = value } };
+            } else blk: {
+                try self.locals.put(self.gpa, name, .{ .immutable = value });
+                break :blk .{ .discard = value };
+            };
             try self.local_names.append(self.gpa, name);
-            return value;
+            return statement;
         }
 
         fn bindingType(self: *Self, node: structures.Node.Index) !structures.TypeId {
@@ -315,7 +293,10 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 .identifier => {
                     const span = tokenSpan(self.ast, node.token_index);
                     const name = self.source[span.start..span.end];
-                    if (self.locals.get(name)) |local| return local.value;
+                    if (self.locals.get(name)) |local| return switch (local) {
+                        .immutable => |value| value,
+                        .mutable => |mutable| self.appendExpression(index, .{ .local_read = mutable }),
+                    };
                     if (std.mem.eql(u8, name, "unit")) return self.appendExpression(index, .unit);
                     return self.reject(index, .unknown_value);
                 },
@@ -337,51 +318,10 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
 
         fn appendLoop(self: *Self, index: structures.Node.Index) !ValueId {
             const node = self.ast.nodes[index.index()];
-            const loop_id = try self.appendExpression(index, .{ .loop = undefined });
-
-            var states: std.ArrayList(MutableState) = .empty;
-            defer states.deinit(self.gpa);
-            for (self.local_names.items) |name| {
-                const local = self.locals.get(name).?;
-                if (local.mutable) try states.append(self.gpa, .{ .name = name, .incoming = local.value });
-            }
-
-            const initial_start: u32 = @intCast(self.loop_values.items.len);
-            for (states.items) |state| try self.loop_values.append(self.gpa, state.incoming);
-            const initial_values: structures.FunctionValueRange = .{ .start = initial_start, .end = @intCast(self.loop_values.items.len) };
-
-            const input_start: u32 = @intCast(self.loop_values.items.len);
-            for (states.items) |state| {
-                const input = try self.appendExpression(index, .{ .loop_input = loop_id });
-                try self.loop_values.append(self.gpa, input);
-                self.locals.getPtr(state.name).?.value = input;
-            }
-            const input_values: structures.FunctionValueRange = .{ .start = input_start, .end = @intCast(self.loop_values.items.len) };
-
-            const name_mark = self.loop_state_names.items.len;
-            defer self.loop_state_names.shrinkRetainingCapacity(name_mark);
-            for (states.items) |state| try self.loop_state_names.append(self.gpa, state.name);
-            try self.loop_stack.append(self.gpa, .{ .name_start = @intCast(name_mark), .name_end = @intCast(self.loop_state_names.items.len) });
+            self.loop_depth += 1;
+            defer self.loop_depth -= 1;
             const body = try self.buildBranch(node.data.node);
-            const repeat_values = try self.captureLoopValues();
-            _ = self.loop_stack.pop();
-
-            self.restoreMutableValues(states.items);
-            const output_start: u32 = @intCast(self.loop_values.items.len);
-            for (states.items) |state| {
-                const output = try self.appendExpression(index, .{ .loop_output = loop_id });
-                try self.loop_values.append(self.gpa, output);
-                self.locals.getPtr(state.name).?.value = output;
-            }
-            const output_values: structures.FunctionValueRange = .{ .start = output_start, .end = @intCast(self.loop_values.items.len) };
-            self.expressions.items[@intFromEnum(loop_id) - self.parameter_count].operation = .{ .loop = .{
-                .body = body,
-                .initial_values = initial_values,
-                .input_values = input_values,
-                .output_values = output_values,
-                .repeat_values = repeat_values,
-            } };
-            return loop_id;
+            return self.appendExpression(index, .{ .loop = body });
         }
 
         fn appendInteger(self: *Self, index: structures.Node.Index) !ValueId {
@@ -417,10 +357,14 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             const span = tokenSpan(self.ast, target_node.token_index);
             const name = self.source[span.start..span.end];
             const local = self.locals.get(name) orelse return self.reject(node.data.node_node.a, .unknown_value);
-            if (!local.mutable) return self.reject(node.data.node_node.a, .assignment_to_immutable);
+            const target = switch (local) {
+                .immutable => return self.reject(node.data.node_node.a, .assignment_to_immutable),
+                .mutable => |mutable| mutable,
+            };
             const value = try self.append(node.data.node_node.b);
-            const assigned = try self.appendExpression(index, .{ .assignment = .{
-                .target = .{ .value = local.value, .span = span },
+            return self.appendExpression(index, .{ .assignment = .{
+                .target = target,
+                .target_span = span,
                 .value = .{ .value = value, .span = nodeFocusSpan(self.ast, node.data.node_node.b) },
                 .operation = switch (node.tag) {
                     .assign => .replace,
@@ -431,8 +375,6 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                     else => unreachable,
                 },
             } });
-            self.locals.getPtr(name).?.value = assigned;
-            return assigned;
         }
 
         fn appendIf(self: *Self, index: structures.Node.Index) !ValueId {
@@ -447,69 +389,54 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 else => unreachable,
             };
             const condition = try self.buildCondition(condition_index);
-            var states: std.ArrayList(MutableState) = .empty;
-            defer states.deinit(self.gpa);
-            for (self.local_names.items) |name| {
-                const local = self.locals.get(name).?;
-                if (local.mutable) try states.append(self.gpa, .{ .name = name, .incoming = local.value });
-            }
             const then_block = try self.buildBranch(then_index);
-            for (states.items) |*state| state.then_value = self.locals.get(state.name).?.value;
-            self.restoreMutableValues(states.items);
             const else_block = if (else_index) |explicit_else|
                 try self.buildBranch(explicit_else)
             else
                 try self.buildUnitBranch(index);
-            for (states.items) |*state| state.else_value = self.locals.get(state.name).?.value;
-            self.restoreMutableValues(states.items);
-
-            const output_start: u32 = @intCast(self.conditional_outputs.items.len);
-            for (states.items) |state| {
-                if (state.then_value == state.incoming and state.else_value == state.incoming) continue;
-                try self.conditional_outputs.append(self.gpa, .{
-                    .then_value = state.then_value,
-                    .else_value = state.else_value,
-                    .result = undefined,
-                });
-            }
-            const output_end: u32 = @intCast(self.conditional_outputs.items.len);
-            const conditional = try self.appendExpression(index, .{ .if_else = .{
+            return self.appendExpression(index, .{ .if_else = .{
                 .condition = condition,
                 .then_block = then_block,
                 .else_block = else_block,
-                .outputs = .{ .start = output_start, .end = output_end },
             } });
-            var output_index = output_start;
-            for (states.items) |state| {
-                if (state.then_value == state.incoming and state.else_value == state.incoming) continue;
-                const output = try self.appendExpression(index, .{ .conditional_output = conditional });
-                self.conditional_outputs.items[output_index].result = output;
-                self.locals.getPtr(state.name).?.value = output;
-                output_index += 1;
-            }
-            std.debug.assert(output_index == output_end);
-            return conditional;
         }
 
-        fn restoreMutableValues(self: *Self, states: []const MutableState) void {
-            for (states) |state| self.locals.getPtr(state.name).?.value = state.incoming;
-        }
-
-        fn buildCondition(self: *Self, index: structures.Node.Index) !UnresolvedBody.Condition {
+        fn buildCondition(self: *Self, index: structures.Node.Index) !UnresolvedBody.ConditionId {
             const node = self.ast.nodes[index.index()];
-            const operation: UnresolvedBody.PredicateOperation = switch (node.tag) {
+            return switch (node.tag) {
+                .lt, .gt, .le, .ge, .eq, .ne => self.appendCondition(.{ .comparison = .{
+                    .operation = comparisonOperation(node.tag),
+                    .operands = .{ .lhs = try self.appendUse(node.data.node_node.a), .rhs = try self.appendUse(node.data.node_node.b) },
+                } }),
+                .@"and", .@"or" => {
+                    const lhs = try self.buildCondition(node.data.node_node.a);
+                    const rhs = try self.buildCondition(node.data.node_node.b);
+                    return self.appendCondition(if (node.tag == .@"and")
+                        .{ .conjunction = .{ .lhs = lhs, .rhs = rhs } }
+                    else
+                        .{ .disjunction = .{ .lhs = lhs, .rhs = rhs } });
+                },
+                .not => self.appendCondition(.{ .negation = try self.buildCondition(node.data.node) }),
+                else => self.rejectCondition(index),
+            };
+        }
+
+        fn comparisonOperation(tag: structures.Node.Tag) UnresolvedBody.PredicateOperation {
+            return switch (tag) {
                 .lt => .lt,
                 .gt => .gt,
                 .le => .le,
                 .ge => .ge,
                 .eq => .eq,
                 .ne => .ne,
-                else => return self.rejectCondition(index),
+                else => unreachable,
             };
-            return .{
-                .operation = operation,
-                .operands = .{ .lhs = try self.appendUse(node.data.node_node.a), .rhs = try self.appendUse(node.data.node_node.b) },
-            };
+        }
+
+        fn appendCondition(self: *Self, condition: UnresolvedBody.Condition) !UnresolvedBody.ConditionId {
+            const id: UnresolvedBody.ConditionId = @enumFromInt(self.conditions.items.len);
+            try self.conditions.append(self.gpa, condition);
+            return id;
         }
 
         fn rejectCondition(self: *Self, index: structures.Node.Index) error{SourceRejected} {
@@ -622,23 +549,21 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
         fn finish(self: *Self) !UnresolvedBody {
             const expressions = try self.expressions.toOwnedSlice(self.gpa);
             errdefer self.gpa.free(expressions);
+            const conditions = try self.conditions.toOwnedSlice(self.gpa);
+            errdefer self.gpa.free(conditions);
             const blocks = try self.blocks.toOwnedSlice(self.gpa);
             errdefer self.gpa.free(blocks);
             const statements = try self.statements.toOwnedSlice(self.gpa);
             errdefer self.gpa.free(statements);
             const call_arguments = try self.call_arguments.toOwnedSlice(self.gpa);
-            errdefer self.gpa.free(call_arguments);
-            const conditional_outputs = try self.conditional_outputs.toOwnedSlice(self.gpa);
-            errdefer self.gpa.free(conditional_outputs);
-            const loop_values = try self.loop_values.toOwnedSlice(self.gpa);
             return .{
                 .parameter_count = self.parameter_count,
+                .mutable_local_count = self.mutable_local_count,
                 .expressions = expressions,
+                .conditions = conditions,
                 .blocks = blocks,
                 .statements = statements,
                 .call_arguments = call_arguments,
-                .conditional_outputs = conditional_outputs,
-                .loop_values = loop_values,
                 .root_block = self.root_block.?,
             };
         }
@@ -855,7 +780,7 @@ fn testUnresolvedFunctionBodyAllocations(gpa: std.mem.Allocator) !void {
         \\static target = func(a: int, b: int, c: int) int
         \\  first(a)
         \\  var value: int = a
-        \\  const selected: int = if a < b -> value = second(b, c) + 1 else value = third(c, b)
+        \\  const selected: int = if a < b and (if a < b -> value = second(b, c) else value = third(c, b)) > 0 -> value + 1 else value
         \\  value = selected
         \\  const looped = loop
         \\    value += 1

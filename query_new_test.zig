@@ -1960,6 +1960,106 @@ test "every integer comparison selects the fallible success edge" {
     try expectCompiledFunctionResult(db, 1, "answer", &.{"answer"}, 42);
 }
 
+test "unit-success logical conditions compose and preserve precedence" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static answer = func() int
+        \\  const a = if 1 < 2 and 2 < 3 -> 1 else 0
+        \\  const b = if 2 < 1 and 2 < 3 -> 0 else 2
+        \\  const c = if 1 < 2 or 2 < 1 -> 4 else 0
+        \\  const d = if 2 < 1 or 1 < 2 -> 8 else 0
+        \\  const e = if not 2 < 1 -> 16 else 0
+        \\  const f = if not 1 < 2 -> 0 else 11
+        \\  return if 2 < 3 and 5 > 4 or 1 < 5 and not 9 < 2 -> a + b + c + d + e + f else 0
+    );
+    try expectCompiledFunctionResult(db, 1, "answer", &.{"answer"}, 42);
+}
+
+test "and and or evaluate their right operand only on the required edge" {
+    const cases = [_]struct { body: []const u8, expected: u8 }{
+        .{ .body = "if 2 < 1 and stop(61) < 0 -> exit(1) else exit(42)", .expected = 42 },
+        .{ .body = "if 1 < 2 or stop(62) < 0 -> exit(42) else exit(1)", .expected = 42 },
+        .{ .body = "if 1 < 2 and stop(63) < 0 -> exit(1) else exit(2)", .expected = 63 },
+        .{ .body = "if 2 < 1 or stop(64) < 0 -> exit(1) else exit(2)", .expected = 64 },
+    };
+    const io = testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    for (cases) |case| {
+        const db = try testDatabase(1);
+        defer db.deinit();
+        const source = try std.fmt.allocPrint(testing.allocator,
+            \\static stop = func(code: int) int
+            \\  exit(code)
+            \\  return 0
+            \\{s}
+        , .{case.body});
+        defer testing.allocator.free(source);
+        try addSource(db, 1, source);
+        const executable = (try db.get(query_structures.BuildExecutable, 1)).*.?;
+        try runtime.writeProgram(io, executable.bytes);
+        try testing.expectEqual(case.expected, try runtime.runProg(io, testing.allocator, &.{}));
+    }
+}
+
+test "short-circuit condition edges preserve mutable local state" {
+    const cases = [_]struct { condition: []const u8, expected: u8 }{
+        .{ .condition = "1 < 2 or (if 1 < 2 -> value = 1 else value = 2) < 3", .expected = 5 },
+        .{ .condition = "2 < 1 or (if 1 < 2 -> value = 1 else value = 2) < 3", .expected = 1 },
+        .{ .condition = "2 < 1 and (if 1 < 2 -> value = 1 else value = 2) < 3", .expected = 5 },
+        .{ .condition = "1 < 2 and (if 1 < 2 -> value = 1 else value = 2) < 3", .expected = 1 },
+    };
+    const io = testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    for (cases) |case| {
+        const db = try testDatabase(1);
+        defer db.deinit();
+        const source = try std.fmt.allocPrint(testing.allocator,
+            \\var value = 5
+            \\if {s} -> unit else unit
+            \\exit(value)
+        , .{case.condition});
+        defer testing.allocator.free(source);
+        try addSource(db, 1, source);
+        const executable = (try db.get(query_structures.BuildExecutable, 1)).*.?;
+        try runtime.writeProgram(io, executable.bytes);
+        try testing.expectEqual(case.expected, try runtime.runProg(io, testing.allocator, &.{}));
+    }
+}
+
+test "logical condition edits retain equal results and recover diagnostics" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    const original = "static choose = func() int -> return if 1 < 2 or 2 < 1 -> 42 else 24";
+    try addSource(db, 1, original);
+    const item = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolve("choose").?;
+    const instance: structures.InstanceId = .{ .item = item };
+    const body = try db.get(query_structures.AnalyzeFunctionBody, item);
+    const artifact = try db.get(query_structures.CompileFunction, instance);
+
+    try setSource(db, 1, "static choose = func() int -> return if (1 < 2) or (2 < 1) -> 42 else 24");
+    try testing.expectEqual(body, try db.get(query_structures.AnalyzeFunctionBody, item));
+    try testing.expectEqual(artifact, try db.get(query_structures.CompileFunction, instance));
+
+    try setSource(db, 1, "static choose = func() int -> return if 1 < 2 and 2 < 1 -> 42 else 24");
+    try expectCompiledFunctionResult(db, 1, "choose", &.{"choose"}, 24);
+
+    try setSource(db, 1, "static choose = func() int -> return if 1 < 2 and 2 -> 42 else 24");
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, item)).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, item, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(DiagnosticKind.if_condition_not_fallible, std.meta.activeTag(diagnostics[0].kind));
+
+    try setSource(db, 1, original);
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, item)).* != null);
+    const recovered = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, item, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(recovered);
+    try testing.expectEqual(@as(usize, 0), recovered.len);
+}
+
 test "if validates conditions and expected result types" {
     const db = try testDatabase(2);
     defer db.deinit();
@@ -1992,7 +2092,7 @@ test "if validates conditions and expected result types" {
     }
 }
 
-test "if conditions separate unimplemented fallible forms from non-fallible expressions" {
+test "if conditions separate unimplemented and non-fallible forms" {
     const db = try testDatabase(2);
     defer db.deinit();
 
@@ -2000,8 +2100,8 @@ test "if conditions separate unimplemented fallible forms from non-fallible expr
         .{ .file_id = 1, .source = "static bad = func(v: int) int -> return if v is int -> 1 else 2", .marker = "is", .kind = .fallible_condition_not_supported },
         .{ .file_id = 2, .source = "static bad = func(v: int) int -> return if v as int -> 1 else 2", .marker = "as", .kind = .fallible_condition_not_supported },
         .{ .file_id = 3, .source = "static bad = func(v: int) int -> return if v? -> 1 else 2", .marker = "?", .kind = .fallible_condition_not_supported },
-        .{ .file_id = 4, .source = "static bad = func(v: int) int -> return if v < 1 and v > 2 -> 1 else 2", .marker = "and", .kind = .fallible_condition_not_supported },
-        .{ .file_id = 5, .source = "static bad = func(v: int) int -> return if not (v < 1) -> 1 else 2", .marker = "not", .kind = .fallible_condition_not_supported },
+        .{ .file_id = 4, .source = "static bad = func(v: int) int -> return if v < 1 and v -> 1 else 2", .marker = "v", .kind = .if_condition_not_fallible },
+        .{ .file_id = 5, .source = "static bad = func(v: int) int -> return if not v -> 1 else 2", .marker = "v", .kind = .if_condition_not_fallible },
         .{ .file_id = 6, .source = "static bad = func(v: int) int -> return if const x = v as int -> x else 2", .marker = "as", .kind = .fallible_condition_not_supported },
         .{ .file_id = 7, .source = "static bad = func(v: int) int -> return if const x = v? -> x else 2", .marker = "?", .kind = .fallible_condition_not_supported },
         .{ .file_id = 8, .source = "static bad = func(v: int) int -> return if const x = v -> x else 2", .marker = "v", .kind = .if_condition_not_fallible },
@@ -3963,8 +4063,8 @@ fn testTypedExpressionAllocations(gpa: std.mem.Allocator) !void {
         \\  identity(alias)
         \\  const selected: int | none = if saved < 0 -> if saved < -1 -> none else identity(alias) else identity(saved)
         \\  var mutable: int | none = selected
-        \\  if saved < 0 -> mutable = none else mutable = identity(saved)
         \\  var count = 0
+        \\  if saved < 0 or (if saved < -1 -> count += 1 else count += 2) < 3 -> mutable = none else mutable = identity(saved)
         \\  return loop
         \\    count += 1
         \\    if count < 2 -> continue
