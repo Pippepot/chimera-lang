@@ -880,7 +880,7 @@ fn analyzeStaticInitializer(
     };
 }
 
-fn canWidenTo(type_interner: anytype, actual: structures.TypeId, expected: structures.TypeId) !bool {
+pub fn canWidenTo(type_interner: anytype, actual: structures.TypeId, expected: structures.TypeId) !bool {
     if (actual == expected or actual == .never) return true;
     const expected_members = try type_interner.variantMembers(expected) orelse return false;
     const actual_members = try type_interner.variantMembers(actual) orelse {
@@ -900,7 +900,7 @@ fn canWidenTo(type_interner: anytype, actual: structures.TypeId, expected: struc
     return true;
 }
 
-fn describeType(type_interner: anytype, type_id: structures.TypeId) !structures.Diagnostic.TypeDescription {
+pub fn describeType(type_interner: anytype, type_id: structures.TypeId) !structures.Diagnostic.TypeDescription {
     var description: structures.Diagnostic.TypeDescription = .{};
     if (type_id.isPrimitive()) {
         addTypeDescriptionMember(&description, type_id);

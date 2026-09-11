@@ -124,14 +124,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
         }
 
         fn describeType(self: *Self, type_id: structures.TypeId) !structures.Diagnostic.TypeDescription {
-            var description: structures.Diagnostic.TypeDescription = .{};
-            if (type_id.isPrimitive()) {
-                addTypeToDescription(&description, type_id);
-                return description;
-            }
-            const members = try self.type_interner.variantMembers(type_id) orelse unreachable;
-            for (members) |member| addTypeToDescription(&description, member);
-            return description;
+            return semantic.describeType(self.type_interner, type_id);
         }
 
         fn typeMismatch(self: *Self, expected: structures.TypeId, found: structures.TypeId) !structures.Diagnostic.TypeMismatch {
@@ -1034,14 +1027,7 @@ fn coerceValue(
     target_type: structures.TypeId,
 ) !?structures.FunctionValueUse {
     if (actual_type == target_type) return .{ .value = value };
-    const target_members = try type_interner.variantMembers(target_type) orelse return null;
-    const actual_members = try type_interner.variantMembers(actual_type);
-    if (actual_members == null) {
-        return if (containsType(target_members, actual_type)) .{ .value = value, .coerce_to = target_type } else null;
-    }
-    for (actual_members.?) |member| {
-        if (!containsType(target_members, member)) return null;
-    }
+    if (actual_type == .never or !try semantic.canWidenTo(type_interner, actual_type, target_type)) return null;
     return .{ .value = value, .coerce_to = target_type };
 }
 
@@ -1050,14 +1036,4 @@ fn containsType(types: []const structures.TypeId, needle: structures.TypeId) boo
         if (type_id == needle) return true;
     }
     return false;
-}
-
-fn addTypeToDescription(description: *structures.Diagnostic.TypeDescription, type_id: structures.TypeId) void {
-    switch (type_id) {
-        .int => description.int = true,
-        .unit => description.unit = true,
-        .none => description.none = true,
-        .never => description.never = true,
-        else => unreachable,
-    }
 }

@@ -85,6 +85,22 @@ fn branchStorageEnd(ssa: *const structures.FunctionBodyAnalysis, types: anytype,
     return end;
 }
 
+fn callStorageEnd(
+    ssa: *const structures.FunctionBodyAnalysis,
+    types: anytype,
+    value_types: []const structures.TypeId,
+    call: structures.FunctionCall,
+) !u32 {
+    var end: u32 = 0;
+    const return_layout = try types.layout(call.return_type);
+    if (usesMemoryReturn(return_layout)) _ = try reserveStack(&end, return_layout);
+    for (ssa.call_arguments[call.arguments.start..call.arguments.end]) |argument| {
+        const type_id = argument.coerce_to orelse value_types[@intFromEnum(argument.value)];
+        _ = try reserveStack(&end, try types.layout(type_id));
+    }
+    return end;
+}
+
 const LocationPlan = struct {
     locations: []ValueLocation,
     value_types: []structures.TypeId,
@@ -150,32 +166,11 @@ const LocationPlan = struct {
         //   rsp + stack_size + 8: incoming argument 0
         var outgoing_size: u32 = 0;
         for (ssa.instructions) |instruction| switch (instruction) {
-            .call => |call| {
-                var end: u32 = 0;
-                const return_layout = try types.layout(call.return_type);
-                if (usesMemoryReturn(return_layout)) {
-                    _ = try reserveStack(&end, return_layout);
-                }
-                for (ssa.call_arguments[call.arguments.start..call.arguments.end]) |argument| {
-                    const type_id = argument.coerce_to orelse value_types[@intFromEnum(argument.value)];
-                    const layout = try types.layout(type_id);
-                    _ = try reserveStack(&end, layout);
-                }
-                outgoing_size = @max(outgoing_size, end);
-            },
+            .call => |call| outgoing_size = @max(outgoing_size, try callStorageEnd(ssa, types, value_types, call)),
             else => {},
         };
         for (ssa.blocks) |block| switch (block.terminator) {
-            .fallible_call => |fallible| {
-                var end: u32 = 0;
-                const return_layout = try types.layout(fallible.call.return_type);
-                if (usesMemoryReturn(return_layout)) _ = try reserveStack(&end, return_layout);
-                for (ssa.call_arguments[fallible.call.arguments.start..fallible.call.arguments.end]) |argument| {
-                    const type_id = argument.coerce_to orelse value_types[@intFromEnum(argument.value)];
-                    _ = try reserveStack(&end, try types.layout(type_id));
-                }
-                outgoing_size = @max(outgoing_size, end);
-            },
+            .fallible_call => |fallible| outgoing_size = @max(outgoing_size, try callStorageEnd(ssa, types, value_types, fallible.call)),
             else => {},
         };
         var edge_scratch_end = outgoing_size;
