@@ -19,16 +19,6 @@ Implement `match` after bool. It builds on existing variant tag tests, success-s
 
 Do not assume every future type supports equality merely because literal patterns exist. Add pattern capabilities with each type family.
 
-## Callable values
-
-Resolve callable annotations and function values through the ordinary type system.
-
-- Intern ordinary and fallible callable types when they become the second interned type shape, replacing the variant-only type store with discriminated type data at that point.
-- Type-check callable compatibility, including ordinary-to-fallible widening, without changing direct-call behavior prematurely.
-- Support function values at bindings, parameters, calls, and returns before adding closures or captures.
-
-Parameter modes other than the current read-only behavior wait for the ownership work unless a smaller independently specified subset emerges.
-
 ## Later language slices
 
 ### Float
@@ -37,7 +27,7 @@ Specify representation, literal range, arithmetic, comparison domains, conversio
 
 ### Structs and ownership
 
-Decide struct identity and custom ownership-hook signatures first. Then add field layout, named initialization, field access and mutation, parameter access modes, move/copy/drop behavior, final storage for immovable values, and `deinit` obligations in coherent slices.
+Decide struct identity and custom ownership-hook signatures first. Then add field layout, named initialization, field access and mutation, parameter access modes, move/copy/drop behavior, closures and captures, final storage for immovable values, and `deinit` obligations in coherent slices.
 
 ### Compile-time execution and specialization
 

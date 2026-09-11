@@ -89,7 +89,7 @@ fn callStorageEnd(
     ssa: *const structures.FunctionBodyAnalysis,
     types: anytype,
     value_types: []const structures.TypeId,
-    call: structures.FunctionCall,
+    call: anytype,
 ) !u32 {
     var end: u32 = 0;
     const return_layout = try types.layout(call.return_type);
@@ -129,9 +129,13 @@ const LocationPlan = struct {
             const value_index = @intFromEnum(ssa.instructionValue(instruction_index));
             value_types[value_index] = instruction.resultType();
             switch (instruction) {
-                .consti, .constb, .const_unit, .const_none => {},
-                .variant_coerce, .variant_extract => |operation| needed[@intFromEnum(operation.operand)] = true,
+                .consti, .constb, .const_unit, .const_none, .function_ref => {},
+                .variant_coerce, .variant_extract, .callable_coerce => |operation| needed[@intFromEnum(operation.operand)] = true,
                 .call => |call| {
+                    for (ssa.call_arguments[call.arguments.start..call.arguments.end]) |argument| needed[@intFromEnum(argument.value)] = true;
+                },
+                .indirect_call => |call| {
+                    needed[@intFromEnum(call.target)] = true;
                     for (ssa.call_arguments[call.arguments.start..call.arguments.end]) |argument| needed[@intFromEnum(argument.value)] = true;
                 },
                 .variant_tag, .exit, .negi => |operand| needed[@intFromEnum(operand)] = true,
@@ -154,6 +158,12 @@ const LocationPlan = struct {
                     needed[@intFromEnum(argument.value)] = true;
                 }
             },
+            .fallible_indirect_call => |fallible| {
+                needed[@intFromEnum(fallible.call.target)] = true;
+                for (ssa.call_arguments[fallible.call.arguments.start..fallible.call.arguments.end]) |argument| {
+                    needed[@intFromEnum(argument.value)] = true;
+                }
+            },
             .return_value => |value| needed[@intFromEnum(value.value)] = true,
             .return_unit, .return_failure, .diverge => {},
         };
@@ -167,10 +177,12 @@ const LocationPlan = struct {
         var outgoing_size: u32 = 0;
         for (ssa.instructions) |instruction| switch (instruction) {
             .call => |call| outgoing_size = @max(outgoing_size, try callStorageEnd(ssa, types, value_types, call)),
+            .indirect_call => |call| outgoing_size = @max(outgoing_size, try callStorageEnd(ssa, types, value_types, call)),
             else => {},
         };
         for (ssa.blocks) |block| switch (block.terminator) {
             .fallible_call => |fallible| outgoing_size = @max(outgoing_size, try callStorageEnd(ssa, types, value_types, fallible.call)),
+            .fallible_indirect_call => |fallible| outgoing_size = @max(outgoing_size, try callStorageEnd(ssa, types, value_types, fallible.call)),
             else => {},
         };
         var edge_scratch_end = outgoing_size;
@@ -208,6 +220,9 @@ const LocationPlan = struct {
                     .constb => |value| break :location_blk .{ .immediate = @intFromBool(value) },
                     .const_unit, .const_none => break :location_blk .discarded,
                     .call => |call| if (call.return_type == .unit) {
+                        break :location_blk .discarded;
+                    },
+                    .indirect_call => |call| if (call.return_type == .unit) {
                         break :location_blk .discarded;
                     },
                     .exit => {
@@ -366,6 +381,7 @@ fn FunctionEmitter(comptime Types: type) type {
                 const destination = self.locations[@intFromEnum(ssa.instructionValue(instruction_index))];
                 switch (instruction) {
                     .consti, .constb, .const_unit, .const_none => {},
+                    .function_ref => |reference| try self.emitFunctionReference(reference, destination),
                     .variant_tag => |operand| {
                         try self.loadComponent(self.locations[@intFromEnum(operand)], 0);
                         try self.storeResult(destination);
@@ -375,7 +391,9 @@ fn FunctionEmitter(comptime Types: type) type {
                         const source_type = self.valueType(extraction.operand);
                         try self.convertVariant(source_type, extraction.target_type, self.locations[@intFromEnum(extraction.operand)], destination);
                     },
+                    .callable_coerce => |coercion| try self.copyValue(coercion.target_type, self.locations[@intFromEnum(coercion.operand)], destination),
                     .call => |call| try self.emitDirectCall(call, destination),
+                    .indirect_call => |call| try self.emitIndirectCall(call, destination),
                     .exit => |operand| try self.emitExit(operand),
                     .negi => |operand| {
                         try self.loadValue(self.locations[@intFromEnum(operand)]);
@@ -399,6 +417,7 @@ fn FunctionEmitter(comptime Types: type) type {
                 },
                 .predicate_branch => |predicate| try self.emitPredicateBranch(ssa, predicate),
                 .fallible_call => |fallible| try self.emitFallibleCall(ssa, fallible),
+                .fallible_indirect_call => |fallible| try self.emitFallibleIndirectCall(ssa, fallible),
                 .return_unit => try self.emitReturn(null, .unit),
                 .return_value => |value| try self.emitReturn(value, ssa.return_type),
                 .return_failure => try self.emitFailureReturn(),
@@ -414,6 +433,22 @@ fn FunctionEmitter(comptime Types: type) type {
             const success = ssa.blocks[@intFromEnum(fallible.success)];
             std.debug.assert(success.argument_end - success.argument_start == 1);
             try self.emitDirectCall(fallible.call, self.locations[success.argument_start]);
+            try self.encoder.compareEdxZero();
+            const success_field = try self.encoder.conditionalJumpRelative32(.nei, 0);
+            try self.emitJump(fallible.failure);
+            const success_offset = std.math.cast(u32, self.encoder.code.items.len) orelse return error.FunctionTooLarge;
+            try self.patchJump(success_field, success_offset);
+            try self.emitJump(fallible.success);
+        }
+
+        fn emitFallibleIndirectCall(
+            self: *Self,
+            ssa: *const structures.FunctionBodyAnalysis,
+            fallible: @FieldType(structures.FunctionTerminator, "fallible_indirect_call"),
+        ) !void {
+            const success = ssa.blocks[@intFromEnum(fallible.success)];
+            std.debug.assert(success.argument_end - success.argument_start == 1);
+            try self.emitIndirectCall(fallible.call, self.locations[success.argument_start]);
             try self.encoder.compareEdxZero();
             const success_field = try self.encoder.conditionalJumpRelative32(.nei, 0);
             try self.emitJump(fallible.failure);
@@ -484,7 +519,7 @@ fn FunctionEmitter(comptime Types: type) type {
                     .eax;
                 try self.emitUse(returned, return_type, destination);
             }
-            if (self.is_fallible) try self.encoder.movEdxImmediate32(1);
+            try self.encoder.movEdxImmediate32(1);
             if (self.stack_size != 0) try self.encoder.addRspImmediate32(self.stack_size);
             try self.encoder.ret();
         }
@@ -542,6 +577,78 @@ fn FunctionEmitter(comptime Types: type) type {
             }
         }
 
+        fn emitIndirectCall(self: *Self, call: structures.IndirectFunctionCall, destination: ValueLocation) !void {
+            try self.emitCallArguments(call);
+            try self.loadAddress(self.locations[@intFromEnum(call.target)]);
+            try self.encoder.callRax();
+            const return_layout = try self.types.layout(call.return_type);
+            if (usesMemoryReturn(return_layout)) {
+                try self.copyValue(call.return_type, .{ .stack = 0 }, destination);
+            } else {
+                try self.storeResult(destination);
+            }
+        }
+
+        fn emitCallArguments(self: *Self, call: anytype) !void {
+            var argument_end: u32 = 0;
+            const return_layout = try self.types.layout(call.return_type);
+            if (usesMemoryReturn(return_layout)) {
+                const return_offset = try reserveStack(&argument_end, return_layout);
+                std.debug.assert(return_offset == 0);
+            }
+            for (self.call_arguments[call.arguments.start..call.arguments.end]) |argument| {
+                const type_id = argument.coerce_to orelse self.valueType(argument.value);
+                const layout = try self.types.layout(type_id);
+                const argument_offset = try reserveStack(&argument_end, layout);
+                try self.emitUseToMemory(argument, argument_offset);
+            }
+        }
+
+        fn emitFunctionReference(self: *Self, reference: structures.FunctionReference, destination: ValueLocation) !void {
+            if (destination == .discarded) return;
+            const offset_usize = std.math.add(usize, self.encoder.code.items.len, 2) catch return error.FunctionTooLarge;
+            const offset = std.math.cast(u32, offset_usize) orelse return error.FunctionTooLarge;
+            try self.encoder.movRaxImmediate64(0);
+            try self.storeAddress(destination);
+            try self.appendRelocation(reference.target, offset, .address_absolute_64);
+        }
+
+        fn appendRelocation(self: *Self, target: structures.ItemId, offset: u32, kind: structures.CompiledFunction.RelocationKind) !void {
+            var reference_index: ?usize = null;
+            for (self.referenced_instances.items, 0..) |existing, index| {
+                if (existing.item == target) {
+                    reference_index = index;
+                    break;
+                }
+            }
+            if (reference_index == null) {
+                reference_index = self.referenced_instances.items.len;
+                try self.referenced_instances.append(self.gpa, .{ .item = target });
+            }
+            const reference = std.math.cast(u32, reference_index.?) orelse return error.FunctionTooLarge;
+            try self.relocations.append(self.gpa, .{
+                .offset = offset,
+                .kind = kind,
+                .reference = @enumFromInt(reference),
+                .addend = 0,
+            });
+        }
+
+        fn loadAddress(self: *Self, location: ValueLocation) !void {
+            switch (location) {
+                .stack, .incoming_argument, .return_buffer => |offset| try self.encoder.movRaxFromRsp(offset),
+                .discarded, .immediate, .eax => unreachable,
+            }
+        }
+
+        fn storeAddress(self: *Self, location: ValueLocation) !void {
+            switch (location) {
+                .stack, .return_buffer => |offset| try self.encoder.movRspFromRax(offset),
+                .discarded => {},
+                .immediate, .eax, .incoming_argument => unreachable,
+            }
+        }
+
         fn emitExit(self: *Self, operand: structures.FunctionValueId) !void {
             try self.loadValue(self.locations[@intFromEnum(operand)]);
             try self.encoder.movEdiFromEax();
@@ -587,6 +694,9 @@ fn FunctionEmitter(comptime Types: type) type {
                 return self.copyValue(target_type, self.locations[@intFromEnum(use.value)], destination);
             }
             std.debug.assert(use.coerce_to.? == target_type);
+            if (try self.types.callable(target_type) != null) {
+                return self.copyValue(target_type, self.locations[@intFromEnum(use.value)], destination);
+            }
             try self.convertVariant(actual_type, target_type, self.locations[@intFromEnum(use.value)], destination);
         }
 
@@ -777,8 +887,12 @@ pub fn buildExecutable(
             const reference_index = @intFromEnum(relocation.reference);
             if (reference_index >= function.artifact.referenced_instances.len) return error.RelocationOutOfBounds;
             const relocation_offset: usize = relocation.offset;
+            const field_size: usize = switch (relocation.kind) {
+                .call_relative_32 => @sizeOf(i32),
+                .address_absolute_64 => @sizeOf(u64),
+            };
             if (relocation_offset > function.artifact.code.len or
-                function.artifact.code.len - relocation_offset < @sizeOf(i32))
+                function.artifact.code.len - relocation_offset < field_size)
             {
                 return error.RelocationOutOfBounds;
             }
@@ -837,13 +951,22 @@ pub fn buildExecutable(
         for (function.artifact.relocations) |relocation| {
             const target = function.artifact.referenced_instances[@intFromEnum(relocation.reference)];
             const target_layout = layouts[function_indices.get(target).?];
-            try patchRelativeDisplacement(
-                encoder.code.items,
-                layout.offset + @as(usize, relocation.offset),
-                target_layout.address,
-                layout.address + @as(u64, relocation.offset) + @sizeOf(i32),
-                relocation.addend,
-            );
+            const field_offset = layout.offset + @as(usize, relocation.offset);
+            switch (relocation.kind) {
+                .call_relative_32 => try patchRelativeDisplacement(
+                    encoder.code.items,
+                    field_offset,
+                    target_layout.address,
+                    layout.address + @as(u64, relocation.offset) + @sizeOf(i32),
+                    relocation.addend,
+                ),
+                .address_absolute_64 => try patchAbsoluteAddress(
+                    encoder.code.items,
+                    field_offset,
+                    target_layout.address,
+                    relocation.addend,
+                ),
+            }
         }
     }
 
@@ -884,6 +1007,12 @@ fn patchRelativeDisplacement(
     std.mem.writeInt(i32, buffer[field_offset..][0..@sizeOf(i32)], @intCast(displacement), .little);
 }
 
+fn patchAbsoluteAddress(buffer: []u8, field_offset: usize, target_address: u64, addend: i64) error{RelocationOverflow}!void {
+    const address: i128 = @as(i128, target_address) + addend;
+    if (address < 0 or address > std.math.maxInt(u64)) return error.RelocationOverflow;
+    std.mem.writeInt(u64, buffer[field_offset..][0..@sizeOf(u64)], @intCast(address), .little);
+}
+
 const X86Encoder = struct {
     gpa: std.mem.Allocator,
     code: std.ArrayList(u8),
@@ -910,8 +1039,19 @@ const X86Encoder = struct {
         try self.appendBytes(&encoded);
     }
 
+    fn appendBits64(self: *@This(), prefix: []const u8, bits: u64) !void {
+        try self.appendBytes(prefix);
+        var encoded: [8]u8 = undefined;
+        std.mem.writeInt(u64, &encoded, bits, .little);
+        try self.appendBytes(&encoded);
+    }
+
     fn callRelative32(self: *@This(), displacement: i32) !void {
         try self.appendBits32(&.{0xE8}, @bitCast(displacement));
+    }
+
+    fn callRax(self: *@This()) !void {
+        try self.appendBytes(&.{ 0xFF, 0xD0 });
     }
 
     fn jumpRelative32(self: *@This(), displacement: i32) !u32 {
@@ -950,6 +1090,10 @@ const X86Encoder = struct {
         try self.appendBits32(&.{0xB8}, @bitCast(value));
     }
 
+    fn movRaxImmediate64(self: *@This(), value: u64) !void {
+        try self.appendBits64(&.{ 0x48, 0xB8 }, value);
+    }
+
     fn movEdxImmediate32(self: *@This(), value: i32) !void {
         try self.appendBits32(&.{0xBA}, @bitCast(value));
     }
@@ -966,8 +1110,16 @@ const X86Encoder = struct {
         try self.appendBits32(&.{ 0x8B, 0x84, 0x24 }, offset);
     }
 
+    fn movRaxFromRsp(self: *@This(), offset: u32) !void {
+        try self.appendBits32(&.{ 0x48, 0x8B, 0x84, 0x24 }, offset);
+    }
+
     fn movRspFromEax(self: *@This(), offset: u32) !void {
         try self.appendBits32(&.{ 0x89, 0x84, 0x24 }, offset);
+    }
+
+    fn movRspFromRax(self: *@This(), offset: u32) !void {
+        try self.appendBits32(&.{ 0x48, 0x89, 0x84, 0x24 }, offset);
     }
 
     fn movzxEaxByteFromRsp(self: *@This(), offset: u32) !void {

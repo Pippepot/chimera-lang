@@ -1,5 +1,3 @@
-const b = loop
-  if 1 < 2
-    break 1
-
-exit(b)
+func foo(a: int) int -> a
+func bar(a: func(int) int) int -> a(1)
+exit(bar(foo))

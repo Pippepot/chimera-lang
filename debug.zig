@@ -74,6 +74,11 @@ fn renderSsaFunction(
                     @intFromEnum(fallible.failure),
                 });
             },
+            .fallible_indirect_call => |fallible| try writer.print("    fcall %{d} -> b{d}, b{d}\n", .{
+                @intFromEnum(fallible.call.target),
+                @intFromEnum(fallible.success),
+                @intFromEnum(fallible.failure),
+            }),
             .return_unit => try writer.writeAll("    ret\n"),
             .return_value => |value| {
                 try writer.writeAll("    ret ");
@@ -114,6 +119,10 @@ fn renderInstruction(
         .constb => |value| try writer.print("    %{d} = constb {s}\n", .{ result, if (value) "true" else "false" }),
         .const_unit => try writer.print("    %{d} = const_unit\n", .{result}),
         .const_none => try writer.print("    %{d} = const_none\n", .{result}),
+        .function_ref => |reference| {
+            const target = try db.lookupInterned(queries.ItemLocations, reference.target);
+            try writer.print("    %{d} = function_ref @{s}\n", .{ result, target.name });
+        },
         .variant_tag => |operand| try writer.print("    %{d} = variant_tag %{d}\n", .{ result, @intFromEnum(operand) }),
         .variant_coerce => |coercion| {
             try writer.print("    %{d} = variant_coerce %{d} to ", .{ result, @intFromEnum(coercion.operand) });
@@ -125,6 +134,7 @@ fn renderInstruction(
             try renderType(extraction.target_type, writer);
             try writer.writeByte('\n');
         },
+        .callable_coerce => |coercion| try writer.print("    %{d} = callable_coerce %{d}\n", .{ result, @intFromEnum(coercion.operand) }),
         .call => |call| {
             const target = try db.lookupInterned(queries.ItemLocations, call.target);
             try writer.print("    %{d} = call @{s}(", .{ result, target.name });
@@ -136,6 +146,7 @@ fn renderInstruction(
             try renderType(call.return_type, writer);
             try writer.writeByte('\n');
         },
+        .indirect_call => |call| try writer.print("    %{d} = call %{d}\n", .{ result, @intFromEnum(call.target) }),
         .exit => |operand| try writer.print("    %{d} = exit %{d}\n", .{ result, @intFromEnum(operand) }),
         .negi => |operand| try writer.print("    %{d} = negi %{d}\n", .{ result, @intFromEnum(operand) }),
         .addi => |operands| try renderBinary(writer, result, "addi", operands),

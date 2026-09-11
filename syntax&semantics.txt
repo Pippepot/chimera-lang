@@ -66,6 +66,14 @@ static double = func(a: int) int -> a * 2
 # Named declarations are sugar for 'static name = func(...)'.
 func double(a: int) int -> a * 2
 
+# Function references are values and may be bound, passed, returned, and called.
+# Callable types contain parameter types, return type, and fallibility; parameter
+# names are not part of type identity. Functions do not capture local bindings.
+func choose() func(int) int -> double
+func apply(operation: func(int) int, value: int) int -> operation(value)
+const operation = choose()
+exit(apply(operation, 21))
+
 # exit(exit_code: int) is compiler-known for now and returns never.
 exit(0)
 

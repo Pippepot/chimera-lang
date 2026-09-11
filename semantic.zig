@@ -59,9 +59,14 @@ pub const UnresolvedBody = struct {
     };
     pub const PredicateOperation = enum { lt, gt, le, ge, eq, ne };
     pub const Call = struct {
-        name: []const u8,
+        target: Target,
         arguments: structures.FunctionValueRange,
         span: structures.SourceSpan,
+
+        pub const Target = union(enum) {
+            direct: []const u8,
+            value: ValueUse,
+        };
     };
     pub const Condition = union(enum) {
         comparison: struct {
@@ -88,6 +93,7 @@ pub const UnresolvedBody = struct {
             boolean: bool,
             unit,
             none,
+            function_ref: structures.FunctionReference,
             local_read: LocalId,
             condition_extract,
             annotation: struct { value: ValueUse, type_id: structures.TypeId },
@@ -327,9 +333,16 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                         error.Unavailable => return error.Unavailable,
                         else => return err,
                     };
-                    const static_value = resolved orelse return self.reject(index, .unknown_value);
+                    const static_value = resolved orelse {
+                        const function = self.type_interner.functionReference(name) catch |err| switch (err) {
+                            error.Unavailable => return error.Unavailable,
+                            else => return err,
+                        };
+                        return self.appendExpression(index, .{ .function_ref = function orelse return self.reject(index, .unknown_value) });
+                    };
                     return switch (static_value) {
                         .type => self.reject(index, .type_value_used_as_runtime_value),
+                        .function_ref => |reference| self.appendExpression(index, .{ .function_ref = reference }),
                         .runtime => |runtime| blk: {
                             const primitive = switch (runtime.value) {
                                 .int => |value| try self.appendExpression(index, .{ .integer = value }),
@@ -615,7 +628,28 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             if (callee.tag != .identifier) return self.reject(index, .expression_not_supported);
             const span = tokenSpan(self.ast, callee.token_index);
             const name = self.source[span.start..span.end];
-            if (!std.mem.eql(u8, name, "exit") and self.locals.contains(name)) return self.reject(callee_index, .value_not_callable);
+            const target: UnresolvedBody.Call.Target = target_blk: {
+                if (std.mem.eql(u8, name, "exit")) break :target_blk .{ .direct = name };
+                if (self.locals.contains(name)) break :target_blk .{ .value = try self.appendUse(callee_index) };
+                const function = self.type_interner.resolveFunction(name) catch |err| switch (err) {
+                    error.Unavailable => return error.Unavailable,
+                    else => return err,
+                };
+                if (function != null) break :target_blk .{ .direct = name };
+                const static_value = self.type_interner.resolveStatic(name) catch |err| switch (err) {
+                    error.QueryCycle => return self.reject(callee_index, .declaration_cycle),
+                    error.Unavailable => return error.Unavailable,
+                    else => return err,
+                };
+                if (static_value) |value| switch (value) {
+                    .function_ref => |reference| {
+                        const expression = try self.appendExpression(callee_index, .{ .function_ref = reference });
+                        break :target_blk .{ .value = .{ .value = expression, .span = span } };
+                    },
+                    .type, .runtime => {},
+                };
+                break :target_blk .{ .direct = name };
+            };
             const scratch_start = self.scratch.items.len;
             defer self.scratch.shrinkRetainingCapacity(scratch_start);
             for (self.ast.nodeList(node.data.node_node.b)) |argument| {
@@ -630,7 +664,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 });
             }
             return .{
-                .name = name,
+                .target = target,
                 .arguments = .{ .start = start, .end = @intCast(self.call_arguments.items.len) },
                 .span = span,
             };
@@ -679,9 +713,6 @@ pub fn analyzeFunctionSignature(
     gpa: std.mem.Allocator,
 ) !SignatureResult {
     const binding = ast.nodes[declaration];
-    if (binding.data.node_node.a.unwrap()) |annotation| {
-        return .{ .unsupported = issueAt(ast, annotation.index(), .function_annotation_not_supported) };
-    }
     const parts = functionParts(ast, declaration);
     const signature = ast.nodes[parts.signature.index()];
 
@@ -720,6 +751,24 @@ pub fn analyzeFunctionSignature(
     const function = ast.nodes[binding.data.node_node.b.index()];
     std.debug.assert(function.tag == .func);
     const is_fallible = ast.tokens[function.token_index].tag == .keyword_fallible;
+    if (binding.data.node_node.a.unwrap()) |annotation| {
+        const expected = switch (try analyzeType(ast, source, annotation, type_interner, gpa, .function_annotation_not_supported)) {
+            .success => |type_id| type_id,
+            .unsupported => |issue| return .{ .unsupported = issue },
+        };
+        const actual = try type_interner.internCallable(.{
+            .parameter_types = parameter_types.items,
+            .return_type = return_type,
+            .is_fallible = is_fallible,
+        });
+        if (expected != actual) return .{ .unsupported = .{
+            .span = nodeFocusSpan(ast, binding.data.node_node.b),
+            .kind = .{ .static_initializer_type_mismatch = .{
+                .expected = try describeType(type_interner, expected),
+                .found = try describeType(type_interner, actual),
+            } },
+        } };
+    }
     return .{ .success = .{
         .parameter_types = try parameter_types.toOwnedSlice(gpa),
         .return_type = return_type,
@@ -759,12 +808,30 @@ fn analyzeType(
         const value = resolved orelse return .{ .unsupported = .{ .span = span, .kind = .unknown_type } };
         return switch (value) {
             .type => |type_id| .{ .success = type_id },
-            .runtime => .{ .unsupported = .{ .span = span, .kind = .value_used_as_type } },
+            .function_ref, .runtime => .{ .unsupported = .{ .span = span, .kind = .value_used_as_type } },
         };
     }
-    if (node.tag != .type_variant) {
-        return .{ .unsupported = issueAt(ast, node_index.index(), unsupported_kind) };
+    if (node.tag == .type_func) {
+        var parameter_types: std.ArrayList(structures.TypeId) = .empty;
+        defer parameter_types.deinit(gpa);
+        for (ast.nodeList(node.data.node_node.a)) |parameter_index| {
+            const parameter_type = switch (try analyzeType(ast, source, parameter_index, type_interner, gpa, unsupported_kind)) {
+                .success => |type_id| type_id,
+                .unsupported => |issue| return .{ .unsupported = issue },
+            };
+            try parameter_types.append(gpa, parameter_type);
+        }
+        const return_type = switch (try analyzeType(ast, source, node.data.node_node.b, type_interner, gpa, unsupported_kind)) {
+            .success => |type_id| type_id,
+            .unsupported => |issue| return .{ .unsupported = issue },
+        };
+        return .{ .success = try type_interner.internCallable(.{
+            .parameter_types = parameter_types.items,
+            .return_type = return_type,
+            .is_fallible = ast.tokens[node.token_index].tag == .keyword_fallible,
+        }) };
     }
+    if (node.tag != .type_variant) return .{ .unsupported = issueAt(ast, node_index.index(), unsupported_kind) };
 
     var member_types: std.ArrayList(structures.TypeId) = .empty;
     defer member_types.deinit(gpa);
@@ -824,6 +891,19 @@ pub fn analyzeStaticDeclaration(
     };
     const runtime = switch (value) {
         .type => return .{ .unsupported = issueAt(ast, initializer.index(), .static_initializer_not_supported) },
+        .function_ref => |reference| {
+            if (!try canWidenTo(type_interner, reference.type_id, expected)) {
+                return .{ .unsupported = .{
+                    .span = nodeFocusSpan(ast, initializer),
+                    .kind = .{ .static_initializer_type_mismatch = .{
+                        .expected = try describeType(type_interner, expected),
+                        .found = try describeType(type_interner, reference.type_id),
+                    } },
+                } };
+            }
+            value.function_ref.type_id = expected;
+            return .{ .success = value };
+        },
         .runtime => |runtime| runtime,
     };
     if (!try canWidenTo(type_interner, runtime.type_id, expected)) {
@@ -880,8 +960,13 @@ fn analyzeStaticInitializer(
                 error.Unavailable => return error.Unavailable,
                 else => return err,
             };
-            break :blk if (resolved) |value|
-                .{ .success = value }
+            if (resolved) |value| break :blk .{ .success = value };
+            const reference = type_interner.functionReference(name) catch |err| switch (err) {
+                error.Unavailable => return error.Unavailable,
+                else => return err,
+            };
+            break :blk if (reference) |value|
+                .{ .success = .{ .function_ref = value } }
             else
                 .{ .unsupported = .{ .span = span, .kind = .unknown_value } };
         },
@@ -891,15 +976,16 @@ fn analyzeStaticInitializer(
 
 pub fn canWidenTo(type_interner: anytype, actual: structures.TypeId, expected: structures.TypeId) !bool {
     if (actual == expected or actual == .never) return true;
+    if (try canWidenMember(type_interner, actual, expected)) return true;
     const expected_members = try type_interner.variantMembers(expected) orelse return false;
     const actual_members = try type_interner.variantMembers(actual) orelse {
-        for (expected_members) |member| if (member == actual) return true;
+        for (expected_members) |member| if (try canWidenMember(type_interner, actual, member)) return true;
         return false;
     };
     for (actual_members) |actual_member| {
         var found = false;
         for (expected_members) |expected_member| {
-            if (actual_member == expected_member) {
+            if (try canWidenMember(type_interner, actual_member, expected_member)) {
                 found = true;
                 break;
             }
@@ -909,14 +995,33 @@ pub fn canWidenTo(type_interner: anytype, actual: structures.TypeId, expected: s
     return true;
 }
 
+fn canWidenMember(type_interner: anytype, actual: structures.TypeId, expected: structures.TypeId) !bool {
+    if (actual == expected) return true;
+    const expected_callable = try type_interner.callable(expected) orelse return false;
+    const actual_callable = try type_interner.callable(actual) orelse return false;
+    return actual_callable.return_type == expected_callable.return_type and
+        std.mem.eql(structures.TypeId, actual_callable.parameter_types, expected_callable.parameter_types) and
+        (!actual_callable.is_fallible or expected_callable.is_fallible);
+}
+
 pub fn describeType(type_interner: anytype, type_id: structures.TypeId) !structures.Diagnostic.TypeDescription {
     var description: structures.Diagnostic.TypeDescription = .{};
     if (type_id.isPrimitive()) {
         addTypeDescriptionMember(&description, type_id);
         return description;
     }
+    if (try type_interner.callable(type_id) != null) {
+        description.callable = true;
+        return description;
+    }
     const members = try type_interner.variantMembers(type_id) orelse unreachable;
-    for (members) |member| addTypeDescriptionMember(&description, member);
+    for (members) |member| {
+        if (try type_interner.callable(member) != null) {
+            description.callable = true;
+        } else {
+            addTypeDescriptionMember(&description, member);
+        }
+    }
     return description;
 }
 
@@ -1059,11 +1164,27 @@ const TestTypeInterner = struct {
         unreachable;
     }
 
+    pub fn internCallable(_: @This(), _: structures.CallableType) !structures.TypeId {
+        unreachable;
+    }
+
     pub fn variantMembers(_: @This(), _: structures.TypeId) !?[]const structures.TypeId {
         return null;
     }
 
+    pub fn callable(_: @This(), _: structures.TypeId) !?structures.CallableType {
+        return null;
+    }
+
     pub fn resolveStatic(_: @This(), _: []const u8) !?structures.CompileTimeValue {
+        return null;
+    }
+
+    pub fn resolveFunction(_: @This(), _: []const u8) !?structures.ItemId {
+        return null;
+    }
+
+    pub fn functionReference(_: @This(), _: []const u8) !?structures.FunctionReference {
         return null;
     }
 };

@@ -81,7 +81,7 @@ fn expectDirectCallBody(ssa: structures.FunctionBodyAnalysis, target: structures
 }
 
 fn expectDirectCallArtifact(artifact: structures.CompiledFunction, target: structures.ItemId) !void {
-    try testing.expectEqualSlices(u8, &.{ 0xE8, 0, 0, 0, 0, 0xC3 }, artifact.code);
+    try testing.expectEqualSlices(u8, &.{ 0xE8, 0, 0, 0, 0, 0xBA, 1, 0, 0, 0, 0xC3 }, artifact.code);
     try testing.expectEqual(@as(u32, 1), artifact.required_alignment);
     try testing.expectEqual(@as(usize, 1), artifact.relocations.len);
     try testing.expectEqual(@as(u32, 1), artifact.relocations[0].offset);
@@ -540,9 +540,12 @@ const EntryCallParent = struct {
             .constb,
             .const_unit,
             .const_none,
+            .function_ref,
             .variant_tag,
             .variant_coerce,
             .variant_extract,
+            .callable_coerce,
+            .indirect_call,
             .exit,
             .negi,
             .addi,
@@ -755,8 +758,8 @@ test "variant types are structurally interned in canonical member order" {
     try testing.expect(structures.TypeId.none.interned() == null);
     try testing.expect(structures.TypeId.never.interned() == null);
 
-    const variant = try db.lookupInterned(query_structures.VariantTypes, int_or_unit.interned().?);
-    try testing.expectEqualSlices(structures.TypeId, &.{ .int, .unit }, variant.members);
+    const variant = try db.lookupInterned(query_structures.Types, int_or_unit.interned().?);
+    try testing.expectEqualSlices(structures.TypeId, &.{ .int, .unit }, variant.variant.members);
 
     try testing.expect((try db.lookupInternedAs(
         query_structures.ItemLocations,
@@ -771,8 +774,8 @@ test "variant types are structurally interned in canonical member order" {
         .type_id => |type_id| type_id,
         .duplicate => unreachable,
     };
-    const widened_variant = try db.lookupInterned(query_structures.VariantTypes, widened.interned().?);
-    try testing.expectEqualSlices(structures.TypeId, &.{ .int, .unit, .none }, widened_variant.members);
+    const widened_variant = try db.lookupInterned(query_structures.Types, widened.interned().?);
+    try testing.expectEqualSlices(structures.TypeId, &.{ .int, .unit, .none }, widened_variant.variant.members);
 
     try testing.expectEqual(
         structures.InternVariantResult{ .duplicate = .int },
@@ -797,11 +800,11 @@ test "variant interning owns canonical members" {
     defer db.deinit();
 
     var members = [_]structures.TypeId{ .int, .unit };
-    const variant_id = try db.intern(query_structures.VariantTypes, .{ .members = &members });
+    const variant_id = try db.intern(query_structures.Types, .{ .variant = .{ .members = &members } });
     members[0] = .none;
 
-    const retained = try db.lookupInterned(query_structures.VariantTypes, variant_id);
-    try testing.expectEqualSlices(structures.TypeId, &.{ .int, .unit }, retained.members);
+    const retained = try db.lookupInterned(query_structures.Types, variant_id);
+    try testing.expectEqualSlices(structures.TypeId, &.{ .int, .unit }, retained.variant.members);
 }
 
 test "type layout reports generic size and alignment for variants" {
@@ -908,7 +911,7 @@ test "named type aliases and integer statics resolve on demand" {
     try testing.expectEqual(structures.CompileTimeValue{ .type = .none }, empty);
     const result = (try db.get(query_structures.ResolveStatic, scope.resolveStatic("Result").?)).*.?;
     const result_type = result.type;
-    const members = (try db.lookupInterned(query_structures.VariantTypes, result_type.interned().?)).members;
+    const members = (try db.lookupInterned(query_structures.Types, result_type.interned().?)).variant.members;
     try testing.expectEqualSlices(structures.TypeId, &.{ .int, .none }, members);
 
     const default_value = (try db.get(query_structures.ResolveStatic, scope.resolveStatic("default_value").?)).*.?;
@@ -1532,12 +1535,12 @@ test "function signatures intern canonical variant annotations" {
     try testing.expectEqualSlices(
         structures.TypeId,
         &.{ .int, .none },
-        (try db.lookupInterned(query_structures.VariantTypes, first_parameter.interned().?)).members,
+        (try db.lookupInterned(query_structures.Types, first_parameter.interned().?)).variant.members,
     );
     try testing.expectEqualSlices(
         structures.TypeId,
         &.{ .int, .unit },
-        (try db.lookupInterned(query_structures.VariantTypes, first_return.interned().?)).members,
+        (try db.lookupInterned(query_structures.Types, first_return.interned().?)).variant.members,
     );
     try testing.expectEqual(@as(?usize, 1), (try db.get(SignatureParent, target_id)).*);
 
@@ -1762,8 +1765,8 @@ test "variant branch joins form structural unions and preserve selected values" 
                 const body = (try db.get(query_structures.AnalyzeFunctionBody, scope.resolve("choose").?)).*;
                 try testing.expect(body != null);
                 const joined = body.?.block_argument_types[0];
-                const variant = try db.lookupInterned(query_structures.VariantTypes, joined.interned().?);
-                try testing.expectEqualSlices(structures.TypeId, case.members, variant.members);
+                const variant = try db.lookupInterned(query_structures.Types, joined.interned().?);
+                try testing.expectEqualSlices(structures.TypeId, case.members, variant.variant.members);
                 try testing.expect((try db.get(query_structures.BuildExecutable, 1)).* != null);
                 try expectCompiledVariantWord(db, 1, "choose", &.{ "choose", "noop" }, 0, if (select_left) 2 else case.right_tag);
                 if (!select_left and case.right_tag == 0) try expectCompiledVariantWord(db, 1, "choose", &.{ "choose", "noop" }, 4, 42);
@@ -1806,7 +1809,7 @@ test "variant branch joins retain equal results and track changed member sets" {
     const updated = (try db.get(query_structures.AnalyzeFunctionBody, target)).*.?;
     const narrower = updated.block_argument_types[1];
     try testing.expect(narrower != joined);
-    try testing.expectEqualSlices(structures.TypeId, &.{ .int, .none }, (try db.lookupInterned(query_structures.VariantTypes, narrower.interned().?)).members);
+    try testing.expectEqualSlices(structures.TypeId, &.{ .int, .none }, (try db.lookupInterned(query_structures.Types, narrower.interned().?)).variant.members);
     try expectCompiledVariantWord(db, 1, "choose", &.{ "choose", "noop" }, 0, 2);
 
     try setSource(db, 1, source);
@@ -1989,7 +1992,7 @@ test "declared unit functions analyze lower compile and execute as ordinary call
     try testing.expectEqual(structures.FunctionBodyAnalysis.Terminator.return_unit, caller_body.blocks[0].terminator);
 
     const leaf_artifact = (try db.get(query_structures.CompileFunction, .{ .item = leaf_id })).*.?;
-    try testing.expectEqualSlices(u8, &.{0xC3}, leaf_artifact.code);
+    try testing.expectEqualSlices(u8, &.{ 0xBA, 1, 0, 0, 0, 0xC3 }, leaf_artifact.code);
 
     const executable = (try db.get(query_structures.BuildExecutable, 1)).*.?;
     const io = testing.io;
@@ -2206,6 +2209,76 @@ test "fallible function signatures distinguish declarations" {
     try testing.expect(!ordinary.is_fallible);
     try testing.expect(checked.is_fallible);
     try testing.expect(!structures.FunctionSignature.eql(ordinary, checked));
+}
+
+test "callable values bind pass return and execute through indirect calls" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\func increment(value: int) int -> value + 1
+        \\func choose() func(int) int -> increment
+        \\func apply(callable: func(int) int, value: int) int
+        \\  const selected: func(int) int = callable
+        \\  return selected(value)
+        \\func answer() int
+        \\  const selected = choose()
+        \\  return apply(selected, 41)
+        \\exit(answer())
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const apply = (try db.get(query_structures.AnalyzeFunctionBody, scope.resolve("apply").?)).*.?;
+    try testing.expectEqual(.indirect_call, std.meta.activeTag(apply.instructions[0]));
+    const choose = (try db.get(query_structures.AnalyzeFunctionBody, scope.resolve("choose").?)).*.?;
+    try testing.expectEqual(.function_ref, std.meta.activeTag(choose.instructions[0]));
+    try testing.expectEqual(.return_value, std.meta.activeTag(choose.blocks[0].terminator));
+
+    const executable = (try db.get(query_structures.BuildExecutable, 1)).*.?;
+    const io = testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    try runtime.writeProgram(io, executable.bytes);
+    try testing.expectEqual(@as(u8, 42), try runtime.runProg(io, testing.allocator, &.{}));
+}
+
+test "ordinary callables widen to fallible aliases and calls" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\func identity(value: int) int -> value
+        \\static checked: fallible(int) int = identity
+        \\if checked(42) -> exit(42) else exit(1)
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const checked = (try db.get(query_structures.ResolveStatic, scope.resolve("checked").?)).*.?;
+    const checked_type = (try db.lookupInterned(query_structures.Types, checked.function_ref.type_id.interned().?)).callable;
+    try testing.expectEqualSlices(structures.TypeId, &.{.int}, checked_type.parameter_types);
+    try testing.expectEqual(structures.TypeId.int, checked_type.return_type);
+    try testing.expect(checked_type.is_fallible);
+    const entry = (try db.get(query_structures.AnalyzeFunctionBody, (try db.get(query_structures.SelectEntry, 1)).*.?)).*.?;
+    try testing.expectEqual(.fallible_indirect_call, std.meta.activeTag(entry.blocks[0].terminator));
+
+    const executable = (try db.get(query_structures.BuildExecutable, 1)).*.?;
+    const io = testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    try runtime.writeProgram(io, executable.bytes);
+    try testing.expectEqual(@as(u8, 42), try runtime.runProg(io, testing.allocator, &.{}));
+}
+
+test "fallible callables do not narrow to ordinary parameters" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\fallible checked(value: int) int -> value
+        \\func apply(callable: func(int) int) int -> callable(42)
+        \\exit(apply(checked))
+    );
+    try testing.expect((try db.get(query_structures.BuildExecutable, 1)).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(query_structures.BuildExecutable, 1, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(DiagnosticKind.call_argument_type_mismatch, std.meta.activeTag(diagnostics[0].kind));
 }
 
 test "fallible calls preserve success payloads across propagation" {
@@ -2720,7 +2793,7 @@ test "no-else if joins its body with implicit unit" {
     try testing.expectEqual(@as(usize, 1), selected.block_argument_types.len);
     const result_type = selected.block_argument_types[0];
     try testing.expectEqual(selected.return_type, result_type);
-    const members = (try db.lookupInterned(query_structures.VariantTypes, result_type.interned().?)).members;
+    const members = (try db.lookupInterned(query_structures.Types, result_type.interned().?)).variant.members;
     try testing.expectEqualSlices(structures.TypeId, &.{ .int, .unit }, members);
 
     try expectCompiledVariantWord(db, 1, "selected", &.{"selected"}, 0, 0);
@@ -3954,7 +4027,7 @@ test "BuildExecutable places a shared reachable function once" {
     const executable = try db.get(query_structures.BuildExecutable, 1);
     try testing.expect(executable.* != null);
 
-    const shared_code = [_]u8{ 0xB8, 0x78, 0x56, 0x34, 0x12, 0xC3 };
+    const shared_code = [_]u8{ 0xB8, 0x78, 0x56, 0x34, 0x12, 0xBA, 1, 0, 0, 0, 0xC3 };
     var occurrences: usize = 0;
     var search_from: usize = 0;
     while (std.mem.indexOfPos(u8, executable.*.?.bytes, search_from, &shared_code)) |offset| {
@@ -4141,7 +4214,7 @@ test "CompileFunction produces owned value-equal artifacts for distinct instance
     try testing.expect(first != second);
     try testing.expect(first.*.?.code.ptr != second.*.?.code.ptr);
     try testing.expect(structures.CompiledFunction.eql(first.*.?, second.*.?));
-    try testing.expectEqualSlices(u8, &.{ 0xB8, 7, 0, 0, 0, 0xC3 }, first.*.?.code);
+    try testing.expectEqualSlices(u8, &.{ 0xB8, 7, 0, 0, 0, 0xBA, 1, 0, 0, 0, 0xC3 }, first.*.?.code);
     try testing.expectEqual(@as(u32, 1), first.*.?.required_alignment);
     try testing.expectEqual(@as(usize, 0), first.*.?.relocations.len);
     try testing.expectEqual(@as(usize, 0), first.*.?.referenced_instances.len);
@@ -4221,7 +4294,7 @@ test "direct call artifacts follow target identity without demanding the callee"
         \\static broken = func() int -> return false
     );
     const unit = (try db.get(query_structures.CompileFunction, instance)).*.?;
-    try testing.expectEqualSlices(u8, &.{0xC3}, unit.code);
+    try testing.expectEqualSlices(u8, &.{ 0xBA, 1, 0, 0, 0, 0xC3 }, unit.code);
     try testing.expectEqual(@as(usize, 0), unit.relocations.len);
     try testing.expectEqual(@as(usize, 0), unit.referenced_instances.len);
 
@@ -4262,7 +4335,7 @@ test "CompileFunction supports entry retention stale restoration and invalid ins
     const function_instance: structures.InstanceId = .{ .item = function_id };
     const entry_instance: structures.InstanceId = .{ .item = entry_id };
     const initial_entry = try db.get(query_structures.CompileFunction, entry_instance);
-    try testing.expectEqualSlices(u8, &.{0xC3}, initial_entry.*.?.code);
+    try testing.expectEqualSlices(u8, &.{ 0xBA, 1, 0, 0, 0, 0xC3 }, initial_entry.*.?.code);
 
     try setSource(db, 1, "static f = func() foo -> return true");
     try testing.expectEqual(initial_entry, try db.get(query_structures.CompileFunction, entry_instance));
@@ -4566,13 +4639,15 @@ test "database initialization frees state when worker allocation fails" {
     try testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
 }
 
-test "demanded function declaration annotations reject and recover" {
+test "function declaration annotations validate when demanded and recover" {
     const db = try testDatabase(1);
     defer db.deinit();
     const valid = "static f = func() int -> return 7\nexit(f())";
     try addSource(db, 1, valid);
     try testing.expect((try db.get(query_structures.BuildExecutable, 1)).* != null);
-    for ([_][]const u8{ "int", "func(int) unit", "func() int" }) |annotation| {
+    try setSource(db, 1, "static f: func() int = func() int -> return 7\nexit(f())");
+    try testing.expect((try db.get(query_structures.BuildExecutable, 1)).* != null);
+    for ([_][]const u8{ "int", "func(int) unit" }) |annotation| {
         const source = try std.fmt.allocPrint(testing.allocator, "static f: {s} = func() int -> return 7\nexit(f())", .{annotation});
         defer testing.allocator.free(source);
         try setSource(db, 1, source);
@@ -4580,7 +4655,7 @@ test "demanded function declaration annotations reject and recover" {
         const diagnostics = try db.transitiveAccumulatorValues(query_structures.BuildExecutable, 1, structures.Diagnostic, testing.allocator);
         defer freeDiagnostics(diagnostics);
         try testing.expectEqual(@as(usize, 1), diagnostics.len);
-        try testing.expectEqual(structures.Diagnostic.Kind.function_annotation_not_supported, diagnostics[0].kind);
+        try testing.expectEqual(DiagnosticKind.static_initializer_type_mismatch, std.meta.activeTag(diagnostics[0].kind));
     }
     try setSource(db, 1, valid);
     try testing.expect((try db.get(query_structures.BuildExecutable, 1)).* != null);

@@ -419,6 +419,7 @@ pub const ResolvedItem = struct {
 
 pub const CompileTimeValue = union(enum) {
     type: TypeId,
+    function_ref: FunctionReference,
     runtime: struct {
         type_id: TypeId,
         value: RuntimeValue,
@@ -472,6 +473,23 @@ pub const TypeId = enum(u32) {
 
 pub const VariantType = struct {
     members: []const TypeId,
+};
+
+pub const CallableType = struct {
+    parameter_types: []const TypeId,
+    return_type: TypeId,
+    is_fallible: bool,
+
+    pub fn eql(a: CallableType, b: CallableType) bool {
+        return a.return_type == b.return_type and
+            a.is_fallible == b.is_fallible and
+            std.mem.eql(TypeId, a.parameter_types, b.parameter_types);
+    }
+};
+
+pub const TypeData = union(enum) {
+    variant: VariantType,
+    callable: CallableType,
 };
 
 pub const InternVariantResult = union(enum) {
@@ -542,6 +560,11 @@ pub const FunctionTerminator = union(enum) {
         success: FunctionBlockId,
         failure: FunctionBlockId,
     },
+    fallible_indirect_call: struct {
+        call: IndirectFunctionCall,
+        success: FunctionBlockId,
+        failure: FunctionBlockId,
+    },
     return_unit,
     return_value: FunctionValueUse,
     return_failure,
@@ -579,6 +602,17 @@ pub const FunctionCall = struct {
     return_type: TypeId,
 };
 
+pub const IndirectFunctionCall = struct {
+    target: FunctionValueId,
+    arguments: FunctionValueRange,
+    return_type: TypeId,
+};
+
+pub const FunctionReference = struct {
+    target: ItemId,
+    type_id: TypeId,
+};
+
 pub const VariantOperation = struct {
     operand: FunctionValueId,
     target_type: TypeId,
@@ -589,10 +623,13 @@ pub const FunctionInstruction = union(enum) {
     constb: bool,
     const_unit,
     const_none,
+    function_ref: FunctionReference,
     variant_tag: FunctionValueId,
     variant_coerce: VariantOperation,
     variant_extract: VariantOperation,
+    callable_coerce: VariantOperation,
     call: FunctionCall,
+    indirect_call: IndirectFunctionCall,
     exit: FunctionValueId,
     negi: FunctionValueId,
     addi: BinaryOperands,
@@ -607,8 +644,10 @@ pub const FunctionInstruction = union(enum) {
             .const_unit => .unit,
             .const_none => .none,
             .exit => .never,
-            .variant_coerce, .variant_extract => |operation| operation.target_type,
+            .function_ref => |reference| reference.type_id,
+            .variant_coerce, .variant_extract, .callable_coerce => |operation| operation.target_type,
             .call => |call| call.return_type,
+            .indirect_call => |call| call.return_type,
         };
     }
 };
@@ -714,6 +753,7 @@ pub const CompiledFunction = struct {
 
     pub const RelocationKind = enum {
         call_relative_32,
+        address_absolute_64,
     };
 
     pub const Relocation = struct {
@@ -766,7 +806,8 @@ pub const Diagnostic = struct {
         unit: bool = false,
         none: bool = false,
         never: bool = false,
-        padding: u3 = 0,
+        callable: bool = false,
+        padding: u2 = 0,
     };
 
     pub const TypeMismatch = struct {

@@ -107,32 +107,58 @@ pub const ItemLocations = struct {
     }
 };
 
-/// Interned values are flattened, duplicate-free, and ordered by TypeId.
-pub const VariantTypes = struct {
-    pub const Value = structures.VariantType;
+pub const Types = struct {
+    pub const Value = structures.TypeData;
     pub const Id = structures.InternedTypeId;
 
     pub fn hash(value: Value) u64 {
         var hasher = std.hash.Wyhash.init(0);
-        std.hash.autoHash(&hasher, value.members.len);
-        for (value.members) |member| std.hash.autoHash(&hasher, member);
+        std.hash.autoHash(&hasher, std.meta.activeTag(value));
+        switch (value) {
+            .variant => |variant| {
+                std.hash.autoHash(&hasher, variant.members.len);
+                for (variant.members) |member| std.hash.autoHash(&hasher, member);
+            },
+            .callable => |callable| {
+                std.hash.autoHash(&hasher, callable.parameter_types.len);
+                for (callable.parameter_types) |parameter_type| std.hash.autoHash(&hasher, parameter_type);
+                std.hash.autoHash(&hasher, callable.return_type);
+                std.hash.autoHash(&hasher, callable.is_fallible);
+            },
+        }
         return hasher.final();
     }
 
     pub fn eql(a: Value, b: Value) bool {
-        return std.mem.eql(structures.TypeId, a.members, b.members);
+        if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+        return switch (a) {
+            .variant => |variant| std.mem.eql(structures.TypeId, variant.members, b.variant.members),
+            .callable => |callable| structures.CallableType.eql(callable, b.callable),
+        };
     }
 
     pub fn clone(gpa: std.mem.Allocator, value: Value) !Value {
-        std.debug.assert(value.members.len >= 2);
-        for (value.members, 0..) |member, index| {
-            if (index > 0) std.debug.assert(@intFromEnum(value.members[index - 1]) < @intFromEnum(member));
-        }
-        return .{ .members = try gpa.dupe(structures.TypeId, value.members) };
+        return switch (value) {
+            .variant => |variant| blk: {
+                std.debug.assert(variant.members.len >= 2);
+                for (variant.members, 0..) |member, index| {
+                    if (index > 0) std.debug.assert(@intFromEnum(variant.members[index - 1]) < @intFromEnum(member));
+                }
+                break :blk .{ .variant = .{ .members = try gpa.dupe(structures.TypeId, variant.members) } };
+            },
+            .callable => |callable| .{ .callable = .{
+                .parameter_types = try gpa.dupe(structures.TypeId, callable.parameter_types),
+                .return_type = callable.return_type,
+                .is_fallible = callable.is_fallible,
+            } },
+        };
     }
 
     pub fn deinit(gpa: std.mem.Allocator, value: *Value) void {
-        gpa.free(value.members);
+        switch (value.*) {
+            .variant => |variant| gpa.free(variant.members),
+            .callable => |callable| gpa.free(callable.parameter_types),
+        }
         value.* = undefined;
     }
 };
@@ -172,8 +198,12 @@ pub fn internVariantType(ctx: anytype, members: []const structures.TypeId) !stru
     if (canonical.items.len == 0) return .{ .type_id = .never };
     if (canonical.items.len == 1) return .{ .type_id = canonical.items[0] };
 
-    const interned_id = try ctx.intern(VariantTypes, .{ .members = canonical.items });
+    const interned_id = try ctx.intern(Types, .{ .variant = .{ .members = canonical.items } });
     return .{ .type_id = .fromInterned(interned_id) };
+}
+
+pub fn internCallableType(ctx: anytype, callable: structures.CallableType) !structures.TypeId {
+    return .fromInterned(try ctx.intern(Types, .{ .callable = callable }));
 }
 
 fn TypeInterner(comptime Context: type) type {
@@ -185,8 +215,16 @@ fn TypeInterner(comptime Context: type) type {
             return internVariantType(self.ctx, members);
         }
 
+        pub fn internCallable(self: @This(), signature: structures.CallableType) !structures.TypeId {
+            return internCallableType(self.ctx, signature);
+        }
+
         pub fn variantMembers(self: @This(), type_id: structures.TypeId) !?[]const structures.TypeId {
             return lookupVariantMembers(self.ctx, type_id);
+        }
+
+        pub fn callable(self: @This(), type_id: structures.TypeId) !?structures.CallableType {
+            return lookupCallable(self.ctx, type_id);
         }
 
         pub fn variantLayout(self: @This(), type_id: structures.TypeId) !structures.VariantLayout {
@@ -202,14 +240,46 @@ fn TypeInterner(comptime Context: type) type {
             const item_id = scope.resolveStatic(name) orelse return null;
             return (try self.ctx.get(ResolveStatic, item_id)).* orelse return error.Unavailable;
         }
+
+        pub fn resolveFunction(self: @This(), name: []const u8) !?structures.ItemId {
+            const scope = (try self.ctx.get(BuildModuleScope, self.file_id.?)).* orelse return error.Unavailable;
+            return scope.resolveFunction(name);
+        }
+
+        pub fn functionReference(self: @This(), name: []const u8) !?structures.FunctionReference {
+            const scope = (try self.ctx.get(BuildModuleScope, self.file_id.?)).* orelse return error.Unavailable;
+            const item_id = scope.resolveFunction(name) orelse return null;
+            const signature = (try self.ctx.get(FunctionSignature, item_id)).* orelse return error.Unavailable;
+            return .{
+                .target = item_id,
+                .type_id = try self.internCallable(.{
+                    .parameter_types = signature.parameter_types,
+                    .return_type = signature.return_type,
+                    .is_fallible = signature.is_fallible,
+                }),
+            };
+        }
     };
 }
 
 fn lookupVariantMembers(ctx: anytype, type_id: structures.TypeId) !?[]const structures.TypeId {
     if (type_id.isPrimitive()) return null;
     const interned_id = type_id.interned() orelse unreachable;
-    const variant = (try ctx.lookupInternedAs(VariantTypes, interned_id)) orelse return null;
-    return variant.members;
+    const data = (try ctx.lookupInternedAs(Types, interned_id)) orelse return null;
+    return switch (data.*) {
+        .variant => |variant| variant.members,
+        .callable => null,
+    };
+}
+
+fn lookupCallable(ctx: anytype, type_id: structures.TypeId) !?structures.CallableType {
+    if (type_id.isPrimitive()) return null;
+    const interned_id = type_id.interned() orelse unreachable;
+    const data = (try ctx.lookupInternedAs(Types, interned_id)) orelse return null;
+    return switch (data.*) {
+        .variant => null,
+        .callable => |callable| callable,
+    };
 }
 
 pub const TypeLayout = struct {
@@ -219,6 +289,8 @@ pub const TypeLayout = struct {
     pub fn run(ctx: anytype, type_id: Input) anyerror!Output {
         if (type_id == .int or type_id == .bool) return .{ .byte_size = 4, .byte_alignment = 4 };
         if (type_id == .unit or type_id == .none or type_id == .never) return .{ .byte_size = 0, .byte_alignment = 1 };
+
+        if (try lookupCallable(ctx, type_id) != null) return .{ .byte_size = @sizeOf(u64), .byte_alignment = @alignOf(u64) };
 
         return (try ctx.get(VariantLayout, type_id)).layout;
     }

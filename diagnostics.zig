@@ -48,6 +48,7 @@ fn writeType(writer: *std.Io.Writer, description: structures.Diagnostic.TypeDesc
         .{ description.unit, "unit" },
         .{ description.none, "none" },
         .{ description.never, "never" },
+        .{ description.callable, "callable" },
     }) |part| {
         if (part[0]) {
             if (needs_separator) try writer.writeAll(" | ");

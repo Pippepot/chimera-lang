@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const Operand = enum { none, i32, u32, rel };
+const Operand = enum { none, i32, u32, u64, rel };
 
 const Pattern = struct {
     prefix: []const u8,
@@ -73,6 +73,8 @@ const PATTERNS = blk: {
         .{ .prefix = &.{ 0x48, 0x89, 0x82 }, .total_len = 7, .operand = .u32, .asm_prefix = "mov [rdx+", .asm_suffix = "], rax" },
         .{ .prefix = &.{0xB8}, .total_len = 5, .operand = .i32, .asm_prefix = "mov eax, ", .asm_suffix = "" },
         .{ .prefix = &.{0xB9}, .total_len = 5, .operand = .i32, .asm_prefix = "mov ecx, ", .asm_suffix = "" },
+        .{ .prefix = &.{0xBA}, .total_len = 5, .operand = .i32, .asm_prefix = "mov edx, ", .asm_suffix = "" },
+        .{ .prefix = &.{ 0x48, 0xB8 }, .total_len = 10, .operand = .u64, .asm_prefix = "mov rax, ", .asm_suffix = "" },
         .{ .prefix = &.{ 0x69, 0xC0 }, .total_len = 6, .operand = .i32, .asm_prefix = "imul eax, eax, ", .asm_suffix = "" },
         .{ .prefix = &.{0x2D}, .total_len = 5, .operand = .i32, .asm_prefix = "sub eax, ", .asm_suffix = "" },
         .{ .prefix = &.{0x05}, .total_len = 5, .operand = .i32, .asm_prefix = "add eax, ", .asm_suffix = "" },
@@ -190,6 +192,10 @@ pub fn disassemble(code: []const u8, gpa: std.mem.Allocator) ![]const u8 {
             .u32 => {
                 const val = std.mem.readInt(u32, code[cursor + pat.prefix.len ..][0..4], .little);
                 try out.print(gpa, "  {s}{d}{s}\n", .{ pat.asm_prefix, val, pat.asm_suffix });
+            },
+            .u64 => {
+                const val = std.mem.readInt(u64, code[cursor + pat.prefix.len ..][0..8], .little);
+                try out.print(gpa, "  {s}0x{x}{s}\n", .{ pat.asm_prefix, val, pat.asm_suffix });
             },
             .rel => {
                 const rel = std.mem.readInt(i32, code[cursor + pat.prefix.len ..][0..4], .little);

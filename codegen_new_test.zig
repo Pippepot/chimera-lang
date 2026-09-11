@@ -7,6 +7,7 @@ const small_variant = structures.TypeId.fromInterned(@enumFromInt(0));
 const wide_variant = structures.TypeId.fromInterned(@enumFromInt(1));
 const seven_byte_payload = structures.TypeId.fromInterned(@enumFromInt(2));
 const payload_variant = structures.TypeId.fromInterned(@enumFromInt(3));
+const callable_type = structures.TypeId.fromInterned(@enumFromInt(4));
 
 const TestTypes = struct {
     pub fn layout(_: @This(), type_id: structures.TypeId) !structures.TypeLayout {
@@ -15,6 +16,7 @@ const TestTypes = struct {
         if (type_id == small_variant or type_id == wide_variant) return .{ .byte_size = 8, .byte_alignment = 4 };
         if (type_id == seven_byte_payload) return .{ .byte_size = 7, .byte_alignment = 1 };
         if (type_id == payload_variant) return .{ .byte_size = 12, .byte_alignment = 4 };
+        if (type_id == callable_type) return .{ .byte_size = 8, .byte_alignment = 8 };
         unreachable;
     }
 
@@ -28,6 +30,13 @@ const TestTypes = struct {
         if (type_id == wide_variant) return &.{ .int, .unit, .none };
         if (type_id == payload_variant) return &.{ .none, seven_byte_payload };
         return null;
+    }
+
+    pub fn callable(_: @This(), type_id: structures.TypeId) !?structures.CallableType {
+        return if (type_id == callable_type)
+            .{ .parameter_types = &.{}, .return_type = .int, .is_fallible = false }
+        else
+            null;
     }
 };
 
@@ -100,7 +109,7 @@ test "single aligned function artifact builds and runs without borrowing code" {
     };
     defer executable.deinit(std.testing.allocator);
 
-    const artifact_code = [_]u8{0xC3};
+    const artifact_code = [_]u8{ 0xBA, 1, 0, 0, 0, 0xC3 };
     const artifact_file_offset = std.mem.indexOf(u8, executable.bytes, &artifact_code).?;
     try std.testing.expectEqual(@as(u64, 0), (0x400000 + artifact_file_offset) % 16);
 
@@ -123,10 +132,10 @@ test "ordinary function artifacts encode signed 32-bit literal returns" {
         var artifact = try codegen.compileFunction(&ssa, TestTypes{}, std.testing.allocator);
         defer artifact.deinit(std.testing.allocator);
 
-        try std.testing.expectEqual(@as(usize, 6), artifact.code.len);
+        try std.testing.expectEqual(@as(usize, 11), artifact.code.len);
         try std.testing.expectEqual(@as(u8, 0xB8), artifact.code[0]);
         try std.testing.expectEqual(return_value, std.mem.readInt(i32, artifact.code[1..5], .little));
-        try std.testing.expectEqual(@as(u8, 0xC3), artifact.code[5]);
+        try std.testing.expectEqualSlices(u8, &.{ 0xBA, 1, 0, 0, 0, 0xC3 }, artifact.code[5..]);
         try std.testing.expectEqual(@as(u32, 1), artifact.required_alignment);
         try std.testing.expectEqual(@as(usize, 0), artifact.relocations.len);
         try std.testing.expectEqual(@as(usize, 0), artifact.referenced_instances.len);
@@ -188,8 +197,42 @@ test "direct call artifacts own exact relocation metadata" {
     try std.testing.expect(!structures.CompiledFunction.eql(first, different_target));
 }
 
+test "function references relocate absolute addresses for indirect calls" {
+    const target: structures.InstanceId = .{ .item = @enumFromInt(0xabcdef01) };
+    var instructions = [_]structures.FunctionBodyAnalysis.Instruction{
+        .{ .function_ref = .{ .target = target.item, .type_id = callable_type } },
+        .{ .indirect_call = .{
+            .target = @enumFromInt(0),
+            .arguments = .{ .start = 0, .end = 0 },
+            .return_type = .int,
+        } },
+    };
+    var blocks = [_]structures.FunctionBodyAnalysis.Block{.{
+        .instruction_start = 0,
+        .instruction_end = instructions.len,
+        .terminator = .{ .return_value = .{ .value = @enumFromInt(1) } },
+    }};
+    const ssa: structures.FunctionBodyAnalysis = .{
+        .return_type = .int,
+        .block_argument_types = &.{},
+        .branch_arguments = &.{},
+        .call_arguments = &.{},
+        .instructions = &instructions,
+        .blocks = &blocks,
+        .entry = @enumFromInt(0),
+    };
+
+    var artifact = try codegen.compileFunction(&ssa, TestTypes{}, std.testing.allocator);
+    defer artifact.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, artifact.code, &.{ 0xFF, 0xD0 }) != null);
+    try std.testing.expectEqual(@as(usize, 1), artifact.relocations.len);
+    try std.testing.expectEqual(@as(u32, 9), artifact.relocations[0].offset);
+    try std.testing.expectEqual(structures.CompiledFunction.RelocationKind.address_absolute_64, artifact.relocations[0].kind);
+    try std.testing.expectEqualSlices(structures.InstanceId, &.{target}, artifact.referenced_instances);
+}
+
 fn expectDirectCallArtifact(artifact: structures.CompiledFunction, target: structures.InstanceId) !void {
-    try std.testing.expectEqualSlices(u8, &.{ 0xE8, 0, 0, 0, 0, 0xC3 }, artifact.code);
+    try std.testing.expectEqualSlices(u8, &.{ 0xE8, 0, 0, 0, 0, 0xBA, 1, 0, 0, 0, 0xC3 }, artifact.code);
     try std.testing.expectEqual(@as(u32, 1), artifact.required_alignment);
     try std.testing.expectEqual(@as(usize, 1), artifact.relocations.len);
     try std.testing.expectEqual(@as(u32, 1), artifact.relocations[0].offset);
@@ -220,6 +263,7 @@ test "multiple calls produce ordered relocations and deduplicate references" {
         0xE8, 0,  0, 0, 0,
         0xE8, 0,  0, 0, 0,
         0xB8, 42, 0, 0, 0,
+        0xBA, 1,  0, 0, 0,
         0xC3,
     }, artifact.code);
     try std.testing.expectEqual(@as(usize, 2), artifact.relocations.len);
