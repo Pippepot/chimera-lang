@@ -206,7 +206,7 @@ pub fn internCallableType(ctx: anytype, callable: structures.CallableType) !stru
     return .fromInterned(try ctx.intern(Types, .{ .callable = callable }));
 }
 
-fn TypeInterner(comptime Context: type) type {
+pub fn TypeInterner(comptime Context: type) type {
     return struct {
         ctx: Context,
         file_id: ?structures.FileId = null,

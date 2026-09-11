@@ -98,7 +98,8 @@ fn compileAndRun(
         std.debug.assert(emitted.len != 0);
         try output.flush();
         const debug_finished = std.Io.Clock.awake.now(io);
-        try diagnostics.renderDiagnostics(errors, input.source_path, input.source, emitted);
+        const type_interner: queries.TypeInterner(*query.Database) = .{ .ctx = db };
+        try diagnostics.renderDiagnostics(type_interner, errors, input.source_path, input.source, emitted);
         if (input.debug_flags.timing) {
             const finished = std.Io.Clock.awake.now(io);
             try printTimings(errors, &.{

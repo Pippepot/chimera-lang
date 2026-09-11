@@ -83,6 +83,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
         local_values: []?Value = &.{},
         states: std.ArrayList([]?Value) = .empty,
         block_argument_types: std.ArrayList(structures.TypeId) = .empty,
+        variant_coercion_tags: std.ArrayList(u32) = .empty,
         call_arguments: std.ArrayList(structures.FunctionValueUse) = .empty,
         branch_arguments: std.ArrayList(structures.FunctionValueUse) = .empty,
         instructions: std.ArrayList(structures.FunctionInstruction) = .empty,
@@ -110,6 +111,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             for (self.states.items) |state| gpa.free(state);
             self.states.deinit(gpa);
             self.block_argument_types.deinit(gpa);
+            self.variant_coercion_tags.deinit(gpa);
             self.call_arguments.deinit(gpa);
             self.branch_arguments.deinit(gpa);
             self.instructions.deinit(gpa);
@@ -123,15 +125,8 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             return error.SourceRejected;
         }
 
-        fn describeType(self: *Self, type_id: structures.TypeId) !structures.Diagnostic.TypeDescription {
-            return semantic.describeType(self.type_interner, type_id);
-        }
-
-        fn typeMismatch(self: *Self, expected: structures.TypeId, found: structures.TypeId) !structures.Diagnostic.TypeMismatch {
-            return .{
-                .expected = try self.describeType(expected),
-                .found = try self.describeType(found),
-            };
+        fn typeMismatch(_: *Self, expected: structures.TypeId, found: structures.TypeId) structures.Diagnostic.TypeMismatch {
+            return .{ .expected = expected, .found = found };
         }
 
         fn build(self: *Self) !void {
@@ -141,7 +136,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             if (self.return_type == .unit) {
                 self.terminate(.return_unit);
             } else {
-                return self.reject(root.span, .{ .missing_return_value = try self.describeType(self.return_type) });
+                return self.reject(root.span, .{ .missing_return_value = self.return_type });
             }
         }
 
@@ -193,8 +188,8 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 return;
             }
             const unit = try self.appendInstruction(.const_unit);
-            const use = try coerceValue(self.type_interner, unit.id, .unit, self.return_type) orelse
-                return self.reject(span, .{ .missing_return_value = try self.describeType(self.return_type) });
+            const use = try self.coerceValue(unit.id, .unit, self.return_type) orelse
+                return self.reject(span, .{ .missing_return_value = self.return_type });
             self.terminate(.{ .return_value = use });
         }
 
@@ -203,8 +198,8 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 std.debug.assert(self.current_block == null);
                 return;
             }
-            const use = try coerceValue(self.type_interner, value_to_return.id, value_to_return.type_id, self.return_type) orelse
-                return self.reject(span, .{ .return_type_mismatch = try self.typeMismatch(self.return_type, value_to_return.type_id) });
+            const use = try self.coerceValue(value_to_return.id, value_to_return.type_id, self.return_type) orelse
+                return self.reject(span, .{ .return_type_mismatch = self.typeMismatch(self.return_type, value_to_return.type_id) });
             self.terminate(if (self.return_type == .unit) .return_unit else .{ .return_value = use });
         }
 
@@ -334,7 +329,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             self.block_argument_types.items[exit_argument_start] = joined;
             for (breaks) |break_edge| {
                 self.branch_arguments.items[break_edge.branch.arguments.start] =
-                    (try coerceValue(self.type_interner, break_edge.value.id, break_edge.value.type_id, joined)) orelse unreachable;
+                    (try self.coerceValue(break_edge.value.id, break_edge.value.type_id, joined)) orelse unreachable;
             }
             self.loop_breaks.shrinkRetainingCapacity(break_start);
 
@@ -368,7 +363,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             for (self.states.items[@intFromEnum(context.baseline)], self.local_values) |initial, current| {
                 if (initial == null) continue;
                 const state = current.?;
-                const use = (try coerceValue(self.type_interner, state.id, state.type_id, self.block_argument_types.items[type_index])) orelse unreachable;
+                const use = (try self.coerceValue(state.id, state.type_id, self.block_argument_types.items[type_index])) orelse unreachable;
                 try self.branch_arguments.append(self.ctx.allocator(), use);
                 type_index += 1;
             }
@@ -379,18 +374,82 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
         fn annotate(self: *Self, annotation: @FieldType(Expression.Operation, "annotation")) !Value {
             const operand = try self.value(annotation.value.value);
             if (operand.type_id == .never) return operand;
-            const use = try coerceValue(self.type_interner, operand.id, operand.type_id, annotation.type_id) orelse
-                return self.reject(annotation.value.span, .{ .local_type_mismatch = try self.typeMismatch(annotation.type_id, operand.type_id) });
+            const use = try self.coerceValue(operand.id, operand.type_id, annotation.type_id) orelse
+                return self.reject(annotation.value.span, .{ .local_type_mismatch = self.typeMismatch(annotation.type_id, operand.type_id) });
             if (use.coerce_to == null) return operand;
-            return self.appendCoercion(operand.id, annotation.type_id);
+            return self.appendCoercion(use);
         }
 
-        fn appendCoercion(self: *Self, operand: structures.FunctionValueId, target_type: structures.TypeId) !Value {
+        fn appendCoercion(self: *Self, use: structures.FunctionValueUse) !Value {
+            const target_type = use.coerce_to.?;
             const operation: structures.FunctionInstruction = if (try self.type_interner.callable(target_type) != null)
-                .{ .callable_coerce = .{ .operand = operand, .target_type = target_type } }
+                .{ .callable_coerce = .{ .operand = use.value, .target_type = target_type } }
             else
-                .{ .variant_coerce = .{ .operand = operand, .target_type = target_type } };
+                .{ .variant_coerce = .{
+                    .operand = use.value,
+                    .target_type = target_type,
+                    .tag_mapping = use.variant_tag_mapping.?,
+                } };
             return self.appendInstruction(operation);
+        }
+
+        fn coerceValue(
+            self: *Self,
+            value_id: structures.FunctionValueId,
+            actual_type: structures.TypeId,
+            target_type: structures.TypeId,
+        ) !?structures.FunctionValueUse {
+            if (actual_type == target_type) return .{ .value = value_id };
+            if (actual_type == .never or !try semantic.canWidenTo(self.type_interner, actual_type, target_type)) return null;
+            const target_members = try self.type_interner.variantMembers(target_type) orelse
+                return .{ .value = value_id, .coerce_to = target_type };
+            const mapping_start: u32 = @intCast(self.variant_coercion_tags.items.len);
+            if (try self.type_interner.variantMembers(actual_type)) |actual_members| {
+                for (actual_members) |actual_member| try self.appendVariantTag(target_members, actual_member);
+            } else {
+                try self.appendVariantTag(target_members, actual_type);
+            }
+            return .{
+                .value = value_id,
+                .coerce_to = target_type,
+                .variant_tag_mapping = .{
+                    .start = mapping_start,
+                    .end = @intCast(self.variant_coercion_tags.items.len),
+                },
+            };
+        }
+
+        fn appendVariantTag(self: *Self, target_members: []const structures.TypeId, actual_member: structures.TypeId) !void {
+            for (target_members, 0..) |target_member, target_tag| {
+                if (actual_member == target_member) {
+                    try self.variant_coercion_tags.append(self.ctx.allocator(), @intCast(target_tag));
+                    return;
+                }
+            }
+            for (target_members, 0..) |target_member, target_tag| {
+                if (try semantic.canWidenTo(self.type_interner, actual_member, target_member)) {
+                    try self.variant_coercion_tags.append(self.ctx.allocator(), @intCast(target_tag));
+                    return;
+                }
+            }
+            unreachable;
+        }
+
+        fn appendExtractionTagMapping(
+            self: *Self,
+            source_type: structures.TypeId,
+            target_type: structures.TypeId,
+        ) !?structures.FunctionValueRange {
+            const target_members = try self.type_interner.variantMembers(target_type) orelse return null;
+            const source_members = (try self.type_interner.variantMembers(source_type)).?;
+            const start: u32 = @intCast(self.variant_coercion_tags.items.len);
+            for (source_members) |source_member| {
+                const target_tag: u32 = for (target_members, 0..) |target_member, index| {
+                    if (source_member == target_member) break @intCast(index);
+                } else structures.invalid_variant_tag;
+                try self.variant_coercion_tags.append(self.ctx.allocator(), target_tag);
+            }
+            return .{ .start = start, .end = @intCast(self.variant_coercion_tags.items.len) };
         }
 
         fn assignment(self: *Self, expression: Expression) !Value {
@@ -400,15 +459,15 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             const operand = try self.value(assignment_value.value.value);
             if (operand.type_id == .never) return operand;
             const result = if (assignment_value.operation == .replace) blk: {
-                const use = try coerceValue(self.type_interner, operand.id, operand.type_id, target.type_id) orelse
-                    return self.reject(assignment_value.value.span, .{ .assignment_type_mismatch = try self.typeMismatch(target.type_id, operand.type_id) });
+                const use = try self.coerceValue(operand.id, operand.type_id, target.type_id) orelse
+                    return self.reject(assignment_value.value.span, .{ .assignment_type_mismatch = self.typeMismatch(target.type_id, operand.type_id) });
                 break :blk if (use.coerce_to == null)
                     operand
                 else
-                    try self.appendCoercion(operand.id, target.type_id);
+                    try self.appendCoercion(use);
             } else blk: {
-                if (target.type_id != .int) return self.reject(assignment_value.target_span, .{ .arithmetic_operand_not_int = try self.describeType(target.type_id) });
-                if (operand.type_id != .int) return self.reject(assignment_value.value.span, .{ .arithmetic_operand_not_int = try self.describeType(operand.type_id) });
+                if (target.type_id != .int) return self.reject(assignment_value.target_span, .{ .arithmetic_operand_not_int = target.type_id });
+                if (operand.type_id != .int) return self.reject(assignment_value.value.span, .{ .arithmetic_operand_not_int = operand.type_id });
                 const operands: structures.BinaryOperands = .{ .lhs = target.id, .rhs = operand.id };
                 break :blk try self.appendInstruction(switch (assignment_value.operation) {
                     .replace => unreachable,
@@ -425,7 +484,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
         fn negate(self: *Self, operand_use: semantic.UnresolvedBody.ValueUse) !Value {
             const operand = try self.value(operand_use.value);
             if (operand.type_id == .never) return operand;
-            if (operand.type_id != .int) return self.reject(operand_use.span, .{ .negation_operand_not_int = try self.describeType(operand.type_id) });
+            if (operand.type_id != .int) return self.reject(operand_use.span, .{ .negation_operand_not_int = operand.type_id });
             return self.appendInstruction(.{ .negi = operand.id });
         }
 
@@ -438,8 +497,8 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             if (lhs.type_id == .never) return lhs;
             const rhs = try self.value(raw.rhs.value);
             if (rhs.type_id == .never) return rhs;
-            if (lhs.type_id != .int) return self.reject(raw.lhs.span, .{ .arithmetic_operand_not_int = try self.describeType(lhs.type_id) });
-            if (rhs.type_id != .int) return self.reject(raw.rhs.span, .{ .arithmetic_operand_not_int = try self.describeType(rhs.type_id) });
+            if (lhs.type_id != .int) return self.reject(raw.lhs.span, .{ .arithmetic_operand_not_int = lhs.type_id });
+            if (rhs.type_id != .int) return self.reject(raw.rhs.span, .{ .arithmetic_operand_not_int = rhs.type_id });
             const operands: structures.BinaryOperands = .{ .lhs = lhs.id, .rhs = rhs.id };
             const instruction: structures.FunctionInstruction = switch (expression.operation) {
                 .add => .{ .addi = operands },
@@ -451,42 +510,33 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             return self.appendInstruction(instruction);
         }
 
+        const CallOperation = union(enum) {
+            direct: structures.FunctionCall,
+            indirect: structures.IndirectFunctionCall,
+        };
         const ResolvedCall = union(enum) {
             diverged: Value,
-            direct: struct {
-                call: structures.FunctionCall,
-                is_fallible: bool,
-            },
-            indirect: struct {
-                call: structures.IndirectFunctionCall,
-                is_fallible: bool,
-            },
+            callable: struct { operation: CallOperation, is_fallible: bool },
         };
 
         fn resolveCall(self: *Self, call: semantic.UnresolvedBody.Call, span: structures.SourceSpan) !ResolvedCall {
             const raw_arguments = self.unresolved.call_arguments[call.arguments.start..call.arguments.end];
-            // Resolve nested argument expressions before the callee, preserving
-            // source evaluation and diagnostic order. Later reads reuse values.
-            for (raw_arguments) |argument| {
-                const resolved = try self.value(argument.value);
-                if (resolved.type_id == .never) return .{ .diverged = resolved };
-            }
-            var direct_target: ?structures.ItemId = null;
-            var indirect_target: ?structures.FunctionValueId = null;
-            var intrinsic = false;
+            const Target = union(enum) { intrinsic, direct: structures.ItemId, indirect: structures.FunctionValueId };
+            var target: Target = undefined;
             var signature: structures.CallableType = undefined;
             switch (call.target) {
                 .direct => |name| {
                     if (std.mem.eql(u8, name, "exit")) {
-                        intrinsic = true;
+                        target = .intrinsic;
                         signature = .{ .parameter_types = &.{.int}, .return_type = .never, .is_fallible = false };
                     } else {
                         if (self.scope == null) self.scope = (try self.ctx.get(ModuleScopeQuery, self.file_id)).* orelse return error.Unavailable;
-                        direct_target = self.scope.?.resolveFunction(name) orelse {
+                        const item = self.scope.?.resolveFunction(name) orelse {
                             if (self.scope.?.resolve(name) != null) return self.reject(span, .value_not_callable);
                             return self.reject(span, .unknown_function);
                         };
-                        const resolved_signature = (try self.ctx.get(FunctionSignatureQuery, direct_target.?)).* orelse return error.Unavailable;
+                        target = .{ .direct = item };
+                        const resolved_signature = (try self.ctx.get(FunctionSignatureQuery, item)).* orelse return error.Unavailable;
                         signature = .{
                             .parameter_types = resolved_signature.parameter_types,
                             .return_type = resolved_signature.return_type,
@@ -495,12 +545,19 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                     }
                 },
                 .value => |target_use| {
-                    const target = try self.value(target_use.value);
-                    if (target.type_id == .never) return .{ .diverged = target };
-                    signature = try self.type_interner.callable(target.type_id) orelse
+                    const callee = try self.value(target_use.value);
+                    if (callee.type_id == .never) return .{ .diverged = callee };
+                    signature = try self.type_interner.callable(callee.type_id) orelse
                         return self.reject(target_use.span, .value_not_callable);
-                    indirect_target = target.id;
+                    target = .{ .indirect = callee.id };
                 },
+            }
+            // The callee precedes its arguments in source evaluation order.
+            // Resolve all argument expressions before publishing operands so a
+            // diverging argument leaves no unused call-argument range behind.
+            for (raw_arguments) |argument| {
+                const resolved = try self.value(argument.value);
+                if (resolved.type_id == .never) return .{ .diverged = resolved };
             }
             if (raw_arguments.len != signature.parameter_types.len) return self.reject(span, .{ .call_argument_count_mismatch = .{
                 .expected = @intCast(signature.parameter_types.len),
@@ -510,83 +567,81 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             var intrinsic_argument: ?structures.FunctionValueId = null;
             for (raw_arguments, signature.parameter_types) |raw, expected| {
                 const operand = self.values[@intFromEnum(raw.value)].?;
-                const argument = try coerceValue(self.type_interner, operand.id, operand.type_id, expected) orelse
-                    return self.reject(raw.span, .{ .call_argument_type_mismatch = try self.typeMismatch(expected, operand.type_id) });
-                if (!intrinsic) {
-                    try self.call_arguments.append(self.ctx.allocator(), argument);
-                } else {
-                    std.debug.assert(intrinsic_argument == null);
-                    intrinsic_argument = argument.value;
+                const argument = try self.coerceValue(operand.id, operand.type_id, expected) orelse
+                    return self.reject(raw.span, .{ .call_argument_type_mismatch = self.typeMismatch(expected, operand.type_id) });
+                switch (target) {
+                    .intrinsic => {
+                        std.debug.assert(intrinsic_argument == null);
+                        intrinsic_argument = argument.value;
+                    },
+                    .direct, .indirect => try self.call_arguments.append(self.ctx.allocator(), argument),
                 }
             }
             const arguments: structures.FunctionValueRange = .{ .start = argument_start, .end = @intCast(self.call_arguments.items.len) };
-            if (direct_target) |item| return .{ .direct = .{
-                .call = .{ .target = item, .arguments = arguments, .return_type = signature.return_type },
-                .is_fallible = signature.is_fallible,
-            } };
-            if (indirect_target) |target| return .{ .indirect = .{
-                .call = .{ .target = target, .arguments = arguments, .return_type = signature.return_type },
-                .is_fallible = signature.is_fallible,
-            } };
-            std.debug.assert(intrinsic);
-            const result = try self.appendInstruction(.{ .exit = intrinsic_argument.? });
-            self.terminate(.diverge);
-            return .{ .diverged = result };
+            return switch (target) {
+                .direct => |item| .{ .callable = .{
+                    .operation = .{ .direct = .{ .target = item, .arguments = arguments, .return_type = signature.return_type } },
+                    .is_fallible = signature.is_fallible,
+                } },
+                .indirect => |callee| .{ .callable = .{
+                    .operation = .{ .indirect = .{ .target = callee, .arguments = arguments, .return_type = signature.return_type } },
+                    .is_fallible = signature.is_fallible,
+                } },
+                .intrinsic => blk: {
+                    const result = try self.appendInstruction(.{ .exit = intrinsic_argument.? });
+                    self.terminate(.diverge);
+                    break :blk .{ .diverged = result };
+                },
+            };
         }
 
         fn callFunction(self: *Self, call: semantic.UnresolvedBody.Call, span: structures.SourceSpan) !Value {
             const resolved = try self.resolveCall(call, span);
             return switch (resolved) {
                 .diverged => |value_to_return| value_to_return,
-                .direct => |direct| if (direct.is_fallible) blk: {
+                .callable => |callable| if (callable.is_fallible) blk: {
                     if (!self.is_fallible) return self.reject(span, .fallible_expression_outside_fallible_function);
-                    const flow = try self.lowerFallibleCall(direct.call);
+                    const flow = try self.lowerFallibleCall(callable.operation);
                     try self.enterFlowExit(flow.failure.?);
                     self.terminate(.return_failure);
                     try self.enterFlowExit(flow.success.?);
                     const success_block = self.blocks.items[@intFromEnum(flow.success.?.block)];
                     const value_to_return: Value = .{
                         .id = @enumFromInt(success_block.argument_start),
-                        .type_id = direct.call.return_type,
+                        .type_id = callReturnType(callable.operation),
                     };
                     if (value_to_return.type_id == .never) self.terminate(.diverge);
                     break :blk value_to_return;
                 } else blk: {
-                    const value_to_return = try self.appendInstruction(.{ .call = direct.call });
-                    if (value_to_return.type_id == .never) self.terminate(.diverge);
-                    break :blk value_to_return;
-                },
-                .indirect => |indirect| if (indirect.is_fallible) blk: {
-                    if (!self.is_fallible) return self.reject(span, .fallible_expression_outside_fallible_function);
-                    const flow = try self.lowerFallibleCall(indirect.call);
-                    try self.enterFlowExit(flow.failure.?);
-                    self.terminate(.return_failure);
-                    try self.enterFlowExit(flow.success.?);
-                    const success_block = self.blocks.items[@intFromEnum(flow.success.?.block)];
-                    const value_to_return: Value = .{
-                        .id = @enumFromInt(success_block.argument_start),
-                        .type_id = indirect.call.return_type,
-                    };
-                    if (value_to_return.type_id == .never) self.terminate(.diverge);
-                    break :blk value_to_return;
-                } else blk: {
-                    const value_to_return = try self.appendInstruction(.{ .indirect_call = indirect.call });
+                    const value_to_return = try self.appendCall(callable.operation);
                     if (value_to_return.type_id == .never) self.terminate(.diverge);
                     break :blk value_to_return;
                 },
             };
         }
 
-        fn lowerFallibleCall(self: *Self, call: anytype) !ConditionFlow {
+        fn appendCall(self: *Self, call: CallOperation) !Value {
+            return switch (call) {
+                .direct => |direct| self.appendInstruction(.{ .call = direct }),
+                .indirect => |indirect| self.appendInstruction(.{ .indirect_call = indirect }),
+            };
+        }
+
+        fn callReturnType(call: CallOperation) structures.TypeId {
+            return switch (call) {
+                inline else => |operation| operation.return_type,
+            };
+        }
+
+        fn lowerFallibleCall(self: *Self, call: CallOperation) !ConditionFlow {
             const argument_start: u32 = @intCast(self.block_argument_types.items.len);
-            try self.block_argument_types.append(self.ctx.allocator(), call.return_type);
+            try self.block_argument_types.append(self.ctx.allocator(), callReturnType(call));
             const success = try self.newBlock(argument_start, argument_start + 1);
             const failure = try self.newBlock(argument_start + 1, argument_start + 1);
-            if (@TypeOf(call) == structures.FunctionCall) {
-                self.terminate(.{ .fallible_call = .{ .call = call, .success = success, .failure = failure } });
-            } else {
-                self.terminate(.{ .fallible_indirect_call = .{ .call = call, .success = success, .failure = failure } });
-            }
+            self.terminate(switch (call) {
+                .direct => |direct| .{ .fallible_call = .{ .call = direct, .success = success, .failure = failure } },
+                .indirect => |indirect| .{ .fallible_indirect_call = .{ .call = indirect, .success = success, .failure = failure } },
+            });
             const state = try self.captureState();
             return .{
                 .success = .{ .block = success, .state = state },
@@ -610,12 +665,8 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             const resolved = try self.resolveCall(call, call.span);
             return switch (resolved) {
                 .diverged => |value_to_return| .{ .success = null, .failure = null, .diverged = value_to_return },
-                .direct => |direct| if (direct.is_fallible)
-                    self.lowerFallibleCall(direct.call)
-                else
-                    self.reject(call.span, .if_condition_not_fallible),
-                .indirect => |indirect| if (indirect.is_fallible)
-                    self.lowerFallibleCall(indirect.call)
+                .callable => |callable| if (callable.is_fallible)
+                    self.lowerFallibleCall(callable.operation)
                 else
                     self.reject(call.span, .if_condition_not_fallible),
             };
@@ -628,8 +679,8 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             if (rhs.type_id == .never) return .{ .success = null, .failure = null, .diverged = rhs };
             const operation: structures.PredicateOperation = switch (comparison.operation) {
                 .lt, .gt, .le, .ge => blk: {
-                    if (lhs.type_id != .int) return self.reject(comparison.operands.lhs.span, .{ .comparison_operand_not_int = try self.describeType(lhs.type_id) });
-                    if (rhs.type_id != .int) return self.reject(comparison.operands.rhs.span, .{ .comparison_operand_not_int = try self.describeType(rhs.type_id) });
+                    if (lhs.type_id != .int) return self.reject(comparison.operands.lhs.span, .{ .comparison_operand_not_int = lhs.type_id });
+                    if (rhs.type_id != .int) return self.reject(comparison.operands.rhs.span, .{ .comparison_operand_not_int = rhs.type_id });
                     break :blk switch (comparison.operation) {
                         .lt => .lti,
                         .gt => .gti,
@@ -640,10 +691,10 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 },
                 .eq, .ne => blk: {
                     if (lhs.type_id != .int and lhs.type_id != .bool) {
-                        return self.reject(comparison.operands.lhs.span, .{ .equality_operand_not_supported = try self.describeType(lhs.type_id) });
+                        return self.reject(comparison.operands.lhs.span, .{ .equality_operand_not_supported = lhs.type_id });
                     }
                     if (rhs.type_id != lhs.type_id) {
-                        return self.reject(comparison.operands.rhs.span, .{ .equality_operand_type_mismatch = try self.typeMismatch(lhs.type_id, rhs.type_id) });
+                        return self.reject(comparison.operands.rhs.span, .{ .equality_operand_type_mismatch = self.typeMismatch(lhs.type_id, rhs.type_id) });
                     }
                     break :blk switch (lhs.type_id) {
                         .int => if (comparison.operation == .eq) .eqi else .nei,
@@ -675,7 +726,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             const operand = try self.value(membership.operand.value);
             if (operand.type_id == .never) return .{ .success = null, .failure = null, .diverged = operand };
             const source_members = try self.type_interner.variantMembers(operand.type_id) orelse {
-                return self.reject(membership.operand.span, .{ .variant_inspection_operand_not_variant = try self.describeType(operand.type_id) });
+                return self.reject(membership.operand.span, .{ .variant_inspection_operand_not_variant = operand.type_id });
             };
             const target_members = try self.type_interner.variantMembers(membership.target_type);
             var matching_count: usize = 0;
@@ -764,16 +815,18 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             if (exit.extraction) |extraction| {
                 const index = @intFromEnum(extraction.result);
                 std.debug.assert(self.values[index] == null);
+                const tag_mapping = try self.appendExtractionTagMapping(extraction.operand.type_id, extraction.target_type);
                 var extracted = try self.appendInstruction(.{ .variant_extract = .{
                     .operand = extraction.operand.id,
                     .target_type = extraction.target_type,
+                    .tag_mapping = tag_mapping,
                 } });
                 if (extraction.target_type != .never and extraction.annotation_type != null) {
                     const expected = extraction.annotation_type.?;
-                    const use = try coerceValue(self.type_interner, extracted.id, extracted.type_id, expected) orelse
-                        return self.reject(extraction.span, .{ .local_type_mismatch = try self.typeMismatch(expected, extracted.type_id) });
+                    const use = try self.coerceValue(extracted.id, extracted.type_id, expected) orelse
+                        return self.reject(extraction.span, .{ .local_type_mismatch = self.typeMismatch(expected, extracted.type_id) });
                     if (use.coerce_to != null) {
-                        extracted = try self.appendInstruction(.{ .variant_coerce = .{ .operand = extracted.id, .target_type = expected } });
+                        extracted = try self.appendCoercion(use);
                     }
                 }
                 self.values[index] = extracted;
@@ -908,7 +961,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             changed_slots: []const u32,
         ) !structures.FunctionBranch {
             const start: u32 = @intCast(self.branch_arguments.items.len);
-            const result = (try coerceValue(self.type_interner, exit.value.id, exit.value.type_id, result_type)) orelse unreachable;
+            const result = (try self.coerceValue(exit.value.id, exit.value.type_id, result_type)) orelse unreachable;
             try self.branch_arguments.append(self.ctx.allocator(), result);
             const state = self.states.items[@intFromEnum(exit.state)];
             for (changed_slots) |slot| try self.branch_arguments.append(self.ctx.allocator(), .{ .value = state[slot].?.id });
@@ -995,6 +1048,8 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             normalizeTerminators(self.blocks.items, argument_count);
             const block_argument_types = try self.block_argument_types.toOwnedSlice(gpa);
             errdefer gpa.free(block_argument_types);
+            const variant_coercion_tags = try self.variant_coercion_tags.toOwnedSlice(gpa);
+            errdefer gpa.free(variant_coercion_tags);
             const call_arguments = try self.call_arguments.toOwnedSlice(gpa);
             errdefer gpa.free(call_arguments);
             const instructions = try self.instructions.toOwnedSlice(gpa);
@@ -1006,6 +1061,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 .return_type = self.return_type,
                 .is_fallible = self.is_fallible,
                 .block_argument_types = block_argument_types,
+                .variant_coercion_tags = variant_coercion_tags,
                 .call_arguments = call_arguments,
                 .branch_arguments = branches,
                 .instructions = instructions,
@@ -1105,17 +1161,6 @@ fn joinTypes(type_interner: anytype, left: structures.TypeId, right: structures.
         .type_id => |type_id| type_id,
         .duplicate => unreachable,
     };
-}
-
-fn coerceValue(
-    type_interner: anytype,
-    value: structures.FunctionValueId,
-    actual_type: structures.TypeId,
-    target_type: structures.TypeId,
-) !?structures.FunctionValueUse {
-    if (actual_type == target_type) return .{ .value = value };
-    if (actual_type == .never or !try semantic.canWidenTo(type_interner, actual_type, target_type)) return null;
-    return .{ .value = value, .coerce_to = target_type };
 }
 
 fn containsType(types: []const structures.TypeId, needle: structures.TypeId) bool {

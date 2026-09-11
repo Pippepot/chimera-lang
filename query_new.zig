@@ -436,7 +436,7 @@ pub const Database = struct {
                 return error.SchedulerStopped;
             }
 
-            if (db.takeWorkLocked(preferred_worker)) |work| {
+            if (db.takeEntryLocked(entry)) |work| {
                 db.unlock();
                 db.runEntry(work, preferred_worker);
                 continue;
@@ -595,6 +595,22 @@ pub const Database = struct {
         }
 
         return null;
+    }
+
+    fn takeEntryLocked(db: *Database, entry: *Entry) ?*Entry {
+        if (entry.state != .queued) return null;
+
+        for (db.workers) |*worker| {
+            var queued = worker.queue.head;
+            while (queued) |candidate| : (queued = candidate.queue_next) {
+                if (candidate != entry) continue;
+                worker.queue.remove(entry);
+                entry.state = .running;
+                return entry;
+            }
+        }
+
+        unreachable;
     }
 
     fn addDependencyLocked(db: *Database, parent: ?*Entry, child: *Entry) anyerror!void {

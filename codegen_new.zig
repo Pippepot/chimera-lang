@@ -43,16 +43,6 @@ const ValueLocation = union(enum) {
     return_buffer: u32,
 };
 
-fn typeIndex(types: []const structures.TypeId, needle: structures.TypeId) usize {
-    for (types, 0..) |type_id, index| if (type_id == needle) return index;
-    unreachable;
-}
-
-fn containsType(types: []const structures.TypeId, needle: structures.TypeId) bool {
-    for (types) |type_id| if (type_id == needle) return true;
-    return false;
-}
-
 fn alignForward32(value: u32, alignment: u32) error{FunctionTooLarge}!u32 {
     std.debug.assert(std.math.isPowerOfTwo(alignment));
     const with_padding = std.math.add(u32, value, alignment - 1) catch return error.FunctionTooLarge;
@@ -313,6 +303,7 @@ fn FunctionEmitter(comptime Types: type) type {
         types: Types,
         locations: []const ValueLocation,
         value_types: []const structures.TypeId,
+        variant_coercion_tags: []const u32,
         branch_arguments: []const structures.FunctionValueUse,
         call_arguments: []const structures.FunctionValueUse,
         block_offsets: []u32,
@@ -337,6 +328,7 @@ fn FunctionEmitter(comptime Types: type) type {
                 .types = types,
                 .locations = plan.locations,
                 .value_types = plan.value_types,
+                .variant_coercion_tags = ssa.variant_coercion_tags,
                 .branch_arguments = ssa.branch_arguments,
                 .call_arguments = ssa.call_arguments,
                 .block_offsets = block_offsets,
@@ -386,10 +378,18 @@ fn FunctionEmitter(comptime Types: type) type {
                         try self.loadComponent(self.locations[@intFromEnum(operand)], 0);
                         try self.storeResult(destination);
                     },
-                    .variant_coerce => |coercion| try self.emitCoercion(.{ .value = coercion.operand, .coerce_to = coercion.target_type }, destination),
+                    .variant_coerce => |coercion| try self.emitCoercion(.{
+                        .value = coercion.operand,
+                        .coerce_to = coercion.target_type,
+                        .variant_tag_mapping = coercion.tag_mapping.?,
+                    }, destination),
                     .variant_extract => |extraction| if (destination != .discarded) {
                         const source_type = self.valueType(extraction.operand);
-                        try self.convertVariant(source_type, extraction.target_type, self.locations[@intFromEnum(extraction.operand)], destination);
+                        const mapping = if (extraction.tag_mapping) |range| blk: {
+                            std.debug.assert(range.start <= range.end and range.end <= self.variant_coercion_tags.len);
+                            break :blk self.variant_coercion_tags[range.start..range.end];
+                        } else &.{};
+                        try self.convertVariant(source_type, extraction.target_type, mapping, self.locations[@intFromEnum(extraction.operand)], destination);
                     },
                     .callable_coerce => |coercion| try self.copyValue(coercion.target_type, self.locations[@intFromEnum(coercion.operand)], destination),
                     .call => |call| try self.emitDirectCall(call, destination),
@@ -695,34 +695,47 @@ fn FunctionEmitter(comptime Types: type) type {
             }
             std.debug.assert(use.coerce_to.? == target_type);
             if (try self.types.callable(target_type) != null) {
+                std.debug.assert(use.variant_tag_mapping == null);
                 return self.copyValue(target_type, self.locations[@intFromEnum(use.value)], destination);
             }
-            try self.convertVariant(actual_type, target_type, self.locations[@intFromEnum(use.value)], destination);
+            const mapping = use.variant_tag_mapping.?;
+            std.debug.assert(mapping.start <= mapping.end and mapping.end <= self.variant_coercion_tags.len);
+            try self.convertVariant(
+                actual_type,
+                target_type,
+                self.variant_coercion_tags[mapping.start..mapping.end],
+                self.locations[@intFromEnum(use.value)],
+                destination,
+            );
         }
 
         fn convertVariant(
             self: *Self,
             actual_type: structures.TypeId,
             target_type: structures.TypeId,
+            tag_mapping: []const u32,
             source: ValueLocation,
             destination: ValueLocation,
         ) !void {
             const actual_members = try self.types.variantMembers(actual_type);
             if (actual_members == null) {
-                const target_members = (try self.types.variantMembers(target_type)) orelse unreachable;
+                _ = (try self.types.variantMembers(target_type)) orelse unreachable;
+                std.debug.assert(tag_mapping.len == 1);
                 const target_payload_offset = (try self.types.variantLayout(target_type)).payload_offset;
                 const actual_layout = try self.types.layout(actual_type);
                 try self.copyRange(source, 0, destination, target_payload_offset, actual_layout.byte_size);
-                try self.encoder.movEaxImmediate32(@intCast(typeIndex(target_members, actual_type)));
+                try self.encoder.movEaxImmediate32(std.math.cast(i32, tag_mapping[0]) orelse return error.FunctionTooLarge);
                 try self.storeComponent(destination, 0);
                 return;
             }
 
-            const target_members = try self.types.variantMembers(target_type) orelse {
+            _ = try self.types.variantMembers(target_type) orelse {
+                std.debug.assert(tag_mapping.len == 0);
                 const target_layout = try self.types.layout(target_type);
                 const actual_payload_offset = (try self.types.variantLayout(actual_type)).payload_offset;
                 return self.copyRange(source, actual_payload_offset, destination, 0, target_layout.byte_size);
             };
+            std.debug.assert(tag_mapping.len == actual_members.?.len);
 
             const actual_layout = try self.types.layout(actual_type);
             const actual_payload_offset = (try self.types.variantLayout(actual_type)).payload_offset;
@@ -731,30 +744,30 @@ fn FunctionEmitter(comptime Types: type) type {
             const target_payload_size = target_layout.layout.byte_size - target_layout.payload_offset;
             try self.copyRange(source, actual_payload_offset, destination, target_layout.payload_offset, @min(actual_payload_size, target_payload_size));
             try self.loadComponent(source, 0);
-            try self.remapVariantTag(actual_members.?, target_members);
+            try self.remapVariantTag(tag_mapping);
             try self.storeComponent(destination, 0);
         }
 
-        fn remapVariantTag(self: *Self, source_members: []const structures.TypeId, target_members: []const structures.TypeId) !void {
+        fn remapVariantTag(self: *Self, tag_mapping: []const u32) !void {
             var matching_count: usize = 0;
-            for (source_members) |member| {
-                if (containsType(target_members, member)) matching_count += 1;
+            for (tag_mapping) |target_tag| {
+                if (target_tag != structures.invalid_variant_tag) matching_count += 1;
             }
             std.debug.assert(matching_count >= 2);
 
             var matched: usize = 0;
             var done_jumps: std.ArrayList(u32) = .empty;
             defer done_jumps.deinit(self.gpa);
-            for (source_members, 0..) |member, source_index| {
-                if (!containsType(target_members, member)) continue;
+            for (tag_mapping, 0..) |target_tag, source_tag| {
+                if (target_tag == structures.invalid_variant_tag) continue;
                 matched += 1;
                 if (matched == matching_count) {
-                    try self.encoder.movEaxImmediate32(@intCast(typeIndex(target_members, member)));
+                    try self.encoder.movEaxImmediate32(std.math.cast(i32, target_tag) orelse return error.FunctionTooLarge);
                     break;
                 }
-                try self.encoder.compareEax(.{ .immediate = @intCast(source_index) });
+                try self.encoder.compareEax(.{ .immediate = @intCast(source_tag) });
                 const next = try self.encoder.conditionalJumpRelative32(.nei, 0);
-                try self.encoder.movEaxImmediate32(@intCast(typeIndex(target_members, member)));
+                try self.encoder.movEaxImmediate32(std.math.cast(i32, target_tag) orelse return error.FunctionTooLarge);
                 try done_jumps.append(self.gpa, try self.encoder.jumpRelative32(0));
                 const next_offset = std.math.cast(u32, self.encoder.code.items.len) orelse return error.FunctionTooLarge;
                 try self.patchJump(next, next_offset);

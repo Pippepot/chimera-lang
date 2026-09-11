@@ -419,7 +419,6 @@ pub const ResolvedItem = struct {
 
 pub const CompileTimeValue = union(enum) {
     type: TypeId,
-    function_ref: FunctionReference,
     runtime: struct {
         type_id: TypeId,
         value: RuntimeValue,
@@ -430,6 +429,7 @@ pub const CompileTimeValue = union(enum) {
         bool: bool,
         unit,
         none,
+        function_ref: FunctionReference,
 
         pub fn typeId(self: @This()) TypeId {
             return switch (self) {
@@ -437,6 +437,7 @@ pub const CompileTimeValue = union(enum) {
                 .bool => .bool,
                 .unit => .unit,
                 .none => .none,
+                .function_ref => |reference| reference.type_id,
             };
         }
     };
@@ -517,6 +518,8 @@ pub const FunctionValueRange = struct {
     end: u32,
 };
 
+pub const invalid_variant_tag = std.math.maxInt(u32);
+
 pub fn functionInstructionValue(argument_count: usize, instruction_index: usize) FunctionValueId {
     return @enumFromInt(argument_count + instruction_index);
 }
@@ -529,6 +532,7 @@ pub const BinaryOperands = struct {
 pub const FunctionValueUse = struct {
     value: FunctionValueId,
     coerce_to: ?TypeId = null,
+    variant_tag_mapping: ?FunctionValueRange = null,
 };
 
 pub const PredicateOperation = enum {
@@ -616,6 +620,7 @@ pub const FunctionReference = struct {
 pub const VariantOperation = struct {
     operand: FunctionValueId,
     target_type: TypeId,
+    tag_mapping: ?FunctionValueRange = null,
 };
 
 pub const FunctionInstruction = union(enum) {
@@ -659,6 +664,7 @@ pub const FunctionBodyAnalysis = struct {
     return_type: TypeId,
     is_fallible: bool = false,
     block_argument_types: []TypeId,
+    variant_coercion_tags: []const u32 = &.{},
     branch_arguments: []FunctionValueUse,
     call_arguments: []FunctionValueUse,
     instructions: []Instruction,
@@ -685,6 +691,7 @@ pub const FunctionBodyAnalysis = struct {
             a.return_type != b.return_type or
             a.is_fallible != b.is_fallible or
             !std.mem.eql(TypeId, a.block_argument_types, b.block_argument_types) or
+            !std.mem.eql(u32, a.variant_coercion_tags, b.variant_coercion_tags) or
             !valueUsesEql(a.branch_arguments, b.branch_arguments) or
             !valueUsesEql(a.call_arguments, b.call_arguments) or
             a.instructions.len != b.instructions.len or
@@ -708,6 +715,7 @@ pub const FunctionBodyAnalysis = struct {
 
     pub fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
         gpa.free(self.block_argument_types);
+        gpa.free(self.variant_coercion_tags);
         gpa.free(self.branch_arguments);
         gpa.free(self.call_arguments);
         gpa.free(self.instructions);
@@ -800,19 +808,9 @@ pub const Diagnostic = struct {
     span: ?SourceSpan,
     kind: Kind,
 
-    pub const TypeDescription = packed struct(u8) {
-        int: bool = false,
-        bool: bool = false,
-        unit: bool = false,
-        none: bool = false,
-        never: bool = false,
-        callable: bool = false,
-        padding: u2 = 0,
-    };
-
     pub const TypeMismatch = struct {
-        expected: TypeDescription,
-        found: TypeDescription,
+        expected: TypeId,
+        found: TypeId,
     };
 
     pub const Kind = union(enum) {
@@ -849,18 +847,18 @@ pub const Diagnostic = struct {
         fallible_condition_not_supported,
         if_condition_not_fallible,
         inspection_type_not_supported,
-        variant_inspection_operand_not_variant: TypeDescription,
+        variant_inspection_operand_not_variant: TypeId,
         condition_binding_must_be_immutable,
         value_not_callable,
         duplicate_variant_member_type,
         local_type_mismatch: TypeMismatch,
-        negation_operand_not_int: TypeDescription,
-        arithmetic_operand_not_int: TypeDescription,
-        comparison_operand_not_int: TypeDescription,
-        equality_operand_not_supported: TypeDescription,
+        negation_operand_not_int: TypeId,
+        arithmetic_operand_not_int: TypeId,
+        comparison_operand_not_int: TypeId,
+        equality_operand_not_supported: TypeId,
         equality_operand_type_mismatch: TypeMismatch,
         fallible_expression_outside_fallible_function,
-        missing_return_value: TypeDescription,
+        missing_return_value: TypeId,
         return_type_mismatch: TypeMismatch,
         unknown_function,
         call_argument_count_mismatch: struct { expected: u32, found: u32 },

@@ -415,6 +415,7 @@ test "variant injection copies an arbitrary-size non-variant interned payload" {
     var instructions = [_]structures.FunctionBodyAnalysis.Instruction{.{ .variant_coerce = .{
         .operand = @enumFromInt(0),
         .target_type = payload_variant,
+        .tag_mapping = .{ .start = 0, .end = 1 },
     } }};
     var blocks = [_]structures.FunctionBodyAnalysis.Block{.{
         .argument_end = 1,
@@ -425,6 +426,7 @@ test "variant injection copies an arbitrary-size non-variant interned payload" {
     const ssa: structures.FunctionBodyAnalysis = .{
         .return_type = payload_variant,
         .block_argument_types = &block_argument_types,
+        .variant_coercion_tags = &.{1},
         .branch_arguments = &.{},
         .call_arguments = &.{},
         .instructions = &instructions,
@@ -440,7 +442,11 @@ test "variant injection copies an arbitrary-size non-variant interned payload" {
 
 fn testCompileVariantSubsetCallAllocations(gpa: std.mem.Allocator) !void {
     var block_argument_types = [_]structures.TypeId{small_variant};
-    var call_arguments = [_]structures.FunctionValueUse{.{ .value = @enumFromInt(0), .coerce_to = wide_variant }};
+    var call_arguments = [_]structures.FunctionValueUse{.{
+        .value = @enumFromInt(0),
+        .coerce_to = wide_variant,
+        .variant_tag_mapping = .{ .start = 0, .end = 2 },
+    }};
     var instructions = [_]structures.FunctionBodyAnalysis.Instruction{.{ .call = .{
         .target = @enumFromInt(0),
         .arguments = .{ .start = 0, .end = 1 },
@@ -455,6 +461,7 @@ fn testCompileVariantSubsetCallAllocations(gpa: std.mem.Allocator) !void {
     const ssa: structures.FunctionBodyAnalysis = .{
         .return_type = wide_variant,
         .block_argument_types = &block_argument_types,
+        .variant_coercion_tags = &.{ 0, 2 },
         .branch_arguments = &.{},
         .call_arguments = &call_arguments,
         .instructions = &instructions,

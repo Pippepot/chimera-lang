@@ -402,6 +402,39 @@ const CountedQuery = struct {
     }
 };
 
+const AwaitedLeaf = struct {
+    pub const Input = u32;
+    pub const Output = u32;
+
+    pub fn run(_: *Context, input_value: Input) anyerror!Output {
+        return input_value;
+    }
+};
+
+const WaitingParent = struct {
+    pub const Input = u32;
+    pub const Output = u32;
+
+    var started: std.atomic.Value(bool) = .init(false);
+    var may_wait: std.atomic.Value(bool) = .init(false);
+
+    pub fn run(ctx: *Context, input_value: Input) anyerror!Output {
+        const leaf = try ctx.spawn(AwaitedLeaf, input_value);
+        started.store(true, .release);
+        while (!may_wait.load(.acquire)) std.atomic.spinLoopHint();
+        return (try leaf.wait()).*;
+    }
+};
+
+const ParentDependentSibling = struct {
+    pub const Input = u32;
+    pub const Output = u32;
+
+    pub fn run(ctx: *Context, input_value: Input) anyerror!Output {
+        return (try ctx.get(WaitingParent, input_value)).*;
+    }
+};
+
 const InternItemLoc = struct {
     pub const Input = u32;
     pub const Output = structures.ItemId;
@@ -582,6 +615,21 @@ test "dependency cycles are reported" {
     defer db.deinit();
 
     try testing.expectError(error.QueryCycle, db.get(CycleA, 1));
+}
+
+test "waiting workers run the demanded dependency instead of unrelated queued work" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    WaitingParent.started.store(false, .monotonic);
+    WaitingParent.may_wait.store(false, .monotonic);
+    const parent = try db.spawn(WaitingParent, 42);
+    while (!WaitingParent.started.load(.acquire)) std.atomic.spinLoopHint();
+    const sibling = try db.spawn(ParentDependentSibling, 42);
+    WaitingParent.may_wait.store(true, .release);
+
+    try testing.expectEqual(@as(u32, 42), (try sibling.wait()).*);
+    try testing.expectEqual(@as(u32, 42), (try parent.wait()).*);
 }
 
 test "typed accumulators expose direct and transitive diagnostics" {
@@ -2076,8 +2124,8 @@ test "call type diagnostics point to the argument use rather than its definition
     defer freeDiagnostics(diagnostics);
     try testing.expectEqual(@as(usize, 1), diagnostics.len);
     try testing.expectEqual(structures.Diagnostic.Kind{ .call_argument_type_mismatch = .{
-        .expected = .{ .int = true },
-        .found = .{ .none = true },
+        .expected = .int,
+        .found = .none,
     } }, diagnostics[0].kind);
     const use = std.mem.lastIndexOf(u8, source, "b").?;
     try testing.expectEqual(structures.SourceSpan{ .start = use, .end = use + 1 }, diagnostics[0].span.?);
@@ -2251,13 +2299,98 @@ test "ordinary callables widen to fallible aliases and calls" {
     );
     const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
     const checked = (try db.get(query_structures.ResolveStatic, scope.resolve("checked").?)).*.?;
-    const checked_type = (try db.lookupInterned(query_structures.Types, checked.function_ref.type_id.interned().?)).callable;
+    const checked_type = (try db.lookupInterned(query_structures.Types, checked.runtime.type_id.interned().?)).callable;
     try testing.expectEqualSlices(structures.TypeId, &.{.int}, checked_type.parameter_types);
     try testing.expectEqual(structures.TypeId.int, checked_type.return_type);
     try testing.expect(checked_type.is_fallible);
     const entry = (try db.get(query_structures.AnalyzeFunctionBody, (try db.get(query_structures.SelectEntry, 1)).*.?)).*.?;
     try testing.expectEqual(.fallible_indirect_call, std.meta.activeTag(entry.blocks[0].terminator));
 
+    const executable = (try db.get(query_structures.BuildExecutable, 1)).*.?;
+    const io = testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    try runtime.writeProgram(io, executable.bytes);
+    try testing.expectEqual(@as(u8, 42), try runtime.runProg(io, testing.allocator, &.{}));
+}
+
+test "variant coercions map compatible callable members during typing" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\func identity(value: int) int -> value
+        \\func inject() none | fallible(int) int -> identity
+        \\func produce() none | func(int) int -> identity
+        \\func widen() unit | none | fallible(int) int -> produce()
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+
+    const inject_id = scope.resolve("inject").?;
+    const inject = (try db.get(query_structures.AnalyzeFunctionBody, inject_id)).*.?;
+    const inject_use = inject.blocks[0].terminator.return_value;
+    const inject_mapping = inject_use.variant_tag_mapping.?;
+    try testing.expectEqual(@as(u32, 1), inject_mapping.end - inject_mapping.start);
+    const inject_variant = (try db.lookupInterned(query_structures.Types, inject.return_type.interned().?)).variant;
+    const inject_target = inject_variant.members[inject.variant_coercion_tags[inject_mapping.start]];
+    const inject_callable = (try db.lookupInterned(query_structures.Types, inject_target.interned().?)).callable;
+    try testing.expect(inject_callable.is_fallible);
+    try testing.expect((try db.get(query_structures.CompileFunction, .{ .item = inject_id })).* != null);
+
+    const produce_id = scope.resolve("produce").?;
+    const produce_signature = (try db.get(query_structures.FunctionSignature, produce_id)).*.?;
+    const source_variant = (try db.lookupInterned(query_structures.Types, produce_signature.return_type.interned().?)).variant;
+    const widen_id = scope.resolve("widen").?;
+    const widen = (try db.get(query_structures.AnalyzeFunctionBody, widen_id)).*.?;
+    const widen_use = widen.blocks[0].terminator.return_value;
+    const widen_mapping = widen_use.variant_tag_mapping.?;
+    try testing.expectEqual(@as(u32, @intCast(source_variant.members.len)), widen_mapping.end - widen_mapping.start);
+    const target_variant = (try db.lookupInterned(query_structures.Types, widen.return_type.interned().?)).variant;
+    for (source_variant.members, 0..) |source_member, source_tag| {
+        const target_tag = widen.variant_coercion_tags[widen_mapping.start + source_tag];
+        const target_member = target_variant.members[target_tag];
+        if (source_member == .none) {
+            try testing.expectEqual(structures.TypeId.none, target_member);
+        } else {
+            const source_callable = (try db.lookupInterned(query_structures.Types, source_member.interned().?)).callable;
+            const target_callable = (try db.lookupInterned(query_structures.Types, target_member.interned().?)).callable;
+            try testing.expect(!source_callable.is_fallible);
+            try testing.expect(target_callable.is_fallible);
+        }
+    }
+    try testing.expect((try db.get(query_structures.CompileFunction, .{ .item = widen_id })).* != null);
+}
+
+test "variant injection prefers an exact callable member over a fallible widening" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static Plain: type = func(int) int
+        \\static Checked: type = fallible(int) int
+        \\func identity(value: int) int -> value
+        \\func inject() Checked | Plain | none -> identity
+        \\func answer() int
+        \\  const selected = inject()
+        \\  return if const operation = selected as Plain -> operation(42) else 1
+        \\exit(answer())
+    );
+    const executable = (try db.get(query_structures.BuildExecutable, 1)).*.?;
+    const io = testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    try runtime.writeProgram(io, executable.bytes);
+    try testing.expectEqual(@as(u8, 42), try runtime.runProg(io, testing.allocator, &.{}));
+}
+
+test "static callable variant annotations preserve the payload representation" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static Plain: type = func(int) int
+        \\func identity(value: int) int -> value
+        \\static selected: Plain | none = identity
+        \\if const operation = selected as Plain -> exit(operation(42)) else exit(1)
+    );
     const executable = (try db.get(query_structures.BuildExecutable, 1)).*.?;
     const io = testing.io;
     defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
@@ -2907,7 +3040,7 @@ test "return completeness accepts divergence and rejects reachable fallthrough" 
     const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, incomplete_id, structures.Diagnostic, testing.allocator);
     defer freeDiagnostics(diagnostics);
     try testing.expectEqual(@as(usize, 1), diagnostics.len);
-    try testing.expectEqual(structures.Diagnostic.Kind{ .missing_return_value = .{ .int = true } }, diagnostics[0].kind);
+    try testing.expectEqual(structures.Diagnostic.Kind{ .missing_return_value = .int }, diagnostics[0].kind);
     const incomplete_name = std.mem.indexOf(u8, incomplete_source, "incomplete").?;
     try testing.expectEqual(structures.SourceSpan{ .start = incomplete_name, .end = incomplete_name + "incomplete".len }, diagnostics[0].span.?);
 
@@ -2920,7 +3053,8 @@ test "return completeness accepts divergence and rejects reachable fallthrough" 
     const variant_diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, variant_id, structures.Diagnostic, testing.allocator);
     defer freeDiagnostics(variant_diagnostics);
     try testing.expectEqual(@as(usize, 1), variant_diagnostics.len);
-    try testing.expectEqual(structures.Diagnostic.Kind{ .missing_return_value = .{ .int = true, .unit = true } }, variant_diagnostics[0].kind);
+    const variant_signature = (try db.get(query_structures.FunctionSignature, variant_id)).*.?;
+    try testing.expectEqual(structures.Diagnostic.Kind{ .missing_return_value = variant_signature.return_type }, variant_diagnostics[0].kind);
 }
 
 test "edits that change return reachability update only reachable calls" {
@@ -3621,6 +3755,8 @@ test "entry analysis rejects top-level returns" {
     }{
         .{ .source = "return", .marker = "return" },
         .{ .source = "static ok = 1\nreturn 7\nprint(1)", .marker = "return" },
+        .{ .source = "if 1 < 2 -> return", .marker = "return" },
+        .{ .source = "loop\n  return", .marker = "return" },
     };
     const entry_kind: structures.Diagnostic.Kind = .top_level_return;
 
@@ -4082,7 +4218,7 @@ test "BuildExecutable surfaces a callee compile failure as null with its diagnos
     defer freeDiagnostics(diagnostics);
     try testing.expectEqual(@as(usize, 1), diagnostics.len);
     try testing.expectEqual(
-        structures.Diagnostic.Kind{ .return_type_mismatch = .{ .expected = .{ .int = true }, .found = .{ .bool = true } } },
+        structures.Diagnostic.Kind{ .return_type_mismatch = .{ .expected = .int, .found = .bool } },
         diagnostics[0].kind,
     );
 
@@ -4684,6 +4820,30 @@ test "expression graph preserves effects across statements arguments and selecte
         try runtime.writeProgram(io, executable.bytes);
         try testing.expectEqual(case.expected, try runtime.runProg(io, testing.allocator, &.{}));
     }
+}
+
+test "indirect calls evaluate the callee before their arguments" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\func first(value: int) int -> 1
+        \\func second(value: int) int -> 2
+        \\func answer() int
+        \\  var operation = first
+        \\  return operation(if 1 < 2
+        \\    operation = second
+        \\    0
+        \\  else
+        \\    0
+        \\  )
+        \\exit(answer())
+    );
+    const executable = (try db.get(query_structures.BuildExecutable, 1)).*.?;
+    const io = testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    try runtime.writeProgram(io, executable.bytes);
+    try testing.expectEqual(@as(u8, 1), try runtime.runProg(io, testing.allocator, &.{}));
 }
 
 test "redundant variant binding annotations retain typed and compiled results" {

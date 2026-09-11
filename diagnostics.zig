@@ -39,32 +39,45 @@ fn highlightLen(span: structures.SourceSpan, line_start: usize, line_end: usize)
     return if (end > start) end - start else 1;
 }
 
-fn writeType(writer: *std.Io.Writer, description: structures.Diagnostic.TypeDescription) !void {
+fn writeType(types: anytype, writer: *std.Io.Writer, type_id: structures.TypeId) !void {
     try writer.writeByte('`');
-    var needs_separator = false;
-    inline for (.{
-        .{ description.int, "int" },
-        .{ description.bool, "bool" },
-        .{ description.unit, "unit" },
-        .{ description.none, "none" },
-        .{ description.never, "never" },
-        .{ description.callable, "callable" },
-    }) |part| {
-        if (part[0]) {
-            if (needs_separator) try writer.writeAll(" | ");
-            try writer.writeAll(part[1]);
-            needs_separator = true;
-        }
-    }
-    std.debug.assert(needs_separator);
+    try writeTypeInner(types, writer, type_id);
     try writer.writeByte('`');
 }
 
-fn writeMismatch(writer: *std.Io.Writer, mismatch: structures.Diagnostic.TypeMismatch) !void {
+fn writeTypeInner(types: anytype, writer: *std.Io.Writer, type_id: structures.TypeId) !void {
+    switch (type_id) {
+        .int, .bool, .unit, .none, .never => return writer.writeAll(@tagName(type_id)),
+        _ => {},
+    }
+    if (try types.callable(type_id)) |callable| {
+        try writer.writeAll(if (callable.is_fallible) "fallible(" else "func(");
+        for (callable.parameter_types, 0..) |parameter_type, index| {
+            if (index != 0) try writer.writeAll(", ");
+            try writeTypeInner(types, writer, parameter_type);
+        }
+        try writer.writeAll(") ");
+        return writeTypeInner(types, writer, callable.return_type);
+    }
+
+    const members = (try types.variantMembers(type_id)) orelse unreachable;
+    for (members, 0..) |member, index| {
+        if (index != 0) try writer.writeAll(" | ");
+        if (try types.callable(member) != null) {
+            try writer.writeByte('(');
+            try writeTypeInner(types, writer, member);
+            try writer.writeByte(')');
+        } else {
+            try writeTypeInner(types, writer, member);
+        }
+    }
+}
+
+fn writeMismatch(types: anytype, writer: *std.Io.Writer, mismatch: structures.Diagnostic.TypeMismatch) !void {
     try writer.writeAll("expected ");
-    try writeType(writer, mismatch.expected);
+    try writeType(types, writer, mismatch.expected);
     try writer.writeAll(", found ");
-    try writeType(writer, mismatch.found);
+    try writeType(types, writer, mismatch.found);
 }
 
 fn writeToken(writer: *std.Io.Writer, tag: structures.Token.Tag) !void {
@@ -147,7 +160,7 @@ fn writeSourceLabel(writer: *std.Io.Writer, label: []const u8, source: []const u
     try writer.print(": `{s}`", .{source[start..end]});
 }
 
-fn writeKindMessage(writer: *std.Io.Writer, source: []const u8, span: ?structures.SourceSpan, kind: structures.Diagnostic.Kind) !void {
+fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, span: ?structures.SourceSpan, kind: structures.Diagnostic.Kind) !void {
     switch (kind) {
         .expected_token => |payload| {
             try writer.writeAll("expected ");
@@ -166,7 +179,7 @@ fn writeKindMessage(writer: *std.Io.Writer, source: []const u8, span: ?structure
         .static_initializer_not_supported => try writer.writeAll("this static initializer is not supported yet"),
         .static_initializer_type_mismatch => |mismatch| {
             try writer.writeAll("static initializer type mismatch: ");
-            try writeMismatch(writer, mismatch);
+            try writeMismatch(types, writer, mismatch);
         },
         .type_value_used_as_runtime_value => try writer.writeAll("a type cannot be used as a runtime value"),
         .value_used_as_type => try writer.writeAll("a runtime value cannot be used as a type"),
@@ -196,7 +209,7 @@ fn writeKindMessage(writer: *std.Io.Writer, source: []const u8, span: ?structure
         },
         .assignment_type_mismatch => |mismatch| {
             try writer.writeAll("assignment type mismatch: ");
-            try writeMismatch(writer, mismatch);
+            try writeMismatch(types, writer, mismatch);
         },
         .integer_literal_not_decimal => try writer.writeAll("integer literal must use decimal notation"),
         .integer_literal_out_of_range => try writer.writeAll("integer literal is outside the supported i32 range"),
@@ -205,7 +218,7 @@ fn writeKindMessage(writer: *std.Io.Writer, source: []const u8, span: ?structure
         .inspection_type_not_supported => try writer.writeAll("this inspection type is not supported yet"),
         .variant_inspection_operand_not_variant => |found| {
             try writer.writeAll("variant inspection requires a variant value, found ");
-            try writeType(writer, found);
+            try writeType(types, writer, found);
         },
         .condition_binding_must_be_immutable => try writer.writeAll("condition bindings must be immutable"),
         .value_not_callable => {
@@ -214,37 +227,37 @@ fn writeKindMessage(writer: *std.Io.Writer, source: []const u8, span: ?structure
         .duplicate_variant_member_type => try writer.writeAll("variant contains the same member type more than once"),
         .local_type_mismatch => |mismatch| {
             try writer.writeAll("initializer type mismatch: ");
-            try writeMismatch(writer, mismatch);
+            try writeMismatch(types, writer, mismatch);
         },
         .negation_operand_not_int => |found| {
             try writer.writeAll("negation requires `int`, found ");
-            try writeType(writer, found);
+            try writeType(types, writer, found);
         },
         .arithmetic_operand_not_int => |found| {
             try writer.writeAll("arithmetic requires `int`, found ");
-            try writeType(writer, found);
+            try writeType(types, writer, found);
         },
         .comparison_operand_not_int => |found| {
             try writer.writeAll("comparison requires `int`, found ");
-            try writeType(writer, found);
+            try writeType(types, writer, found);
         },
         .equality_operand_not_supported => |found| {
             try writer.writeAll("equality is not supported for ");
-            try writeType(writer, found);
+            try writeType(types, writer, found);
         },
         .equality_operand_type_mismatch => |mismatch| {
             try writer.writeAll("equality operand type mismatch: ");
-            try writeMismatch(writer, mismatch);
+            try writeMismatch(types, writer, mismatch);
         },
         .fallible_expression_outside_fallible_function => try writer.writeAll("fallible expression must be handled or used inside a fallible function"),
         .missing_return_value => |expected| {
             try writer.writeAll("function must return ");
-            try writeType(writer, expected);
+            try writeType(types, writer, expected);
             try writer.writeAll(" on every reachable path");
         },
         .return_type_mismatch => |mismatch| {
             try writer.writeAll("return type mismatch: ");
-            try writeMismatch(writer, mismatch);
+            try writeMismatch(types, writer, mismatch);
         },
         .unknown_function => {
             try writeSourceLabel(writer, "unknown function", source, span);
@@ -256,12 +269,13 @@ fn writeKindMessage(writer: *std.Io.Writer, source: []const u8, span: ?structure
         }),
         .call_argument_type_mismatch => |mismatch| {
             try writer.writeAll("argument type mismatch: ");
-            try writeMismatch(writer, mismatch);
+            try writeMismatch(types, writer, mismatch);
         },
     }
 }
 
 pub fn renderDiagnostic(
+    types: anytype,
     writer: *std.Io.Writer,
     source_path: []const u8,
     source: []const u8,
@@ -274,7 +288,7 @@ pub fn renderDiagnostic(
             info.line,
             info.column,
         });
-        try writeKindMessage(writer, source, diagnostic.span, diagnostic.kind);
+        try writeKindMessage(types, writer, source, diagnostic.span, diagnostic.kind);
         try writer.writeByte('\n');
         try writer.writeAll(source[info.line_start..info.line_end]);
         try writer.writeByte('\n');
@@ -287,20 +301,56 @@ pub fn renderDiagnostic(
     }
 
     try writer.print("\x1b[31merror:\x1b[0m {s}: ", .{source_path});
-    try writeKindMessage(writer, source, diagnostic.span, diagnostic.kind);
+    try writeKindMessage(types, writer, source, diagnostic.span, diagnostic.kind);
     try writer.writeByte('\n');
 }
 
 pub fn renderDiagnostics(
+    types: anytype,
     writer: *std.Io.Writer,
     source_path: []const u8,
     source: []const u8,
     diagnostics: []const structures.Diagnostic,
 ) !void {
     for (diagnostics) |diagnostic| {
-        try renderDiagnostic(writer, source_path, source, diagnostic);
+        try renderDiagnostic(types, writer, source_path, source, diagnostic);
     }
 }
+
+const PrimitiveTypes = struct {
+    fn callable(_: @This(), _: structures.TypeId) !?structures.CallableType {
+        return null;
+    }
+
+    fn variantMembers(_: @This(), _: structures.TypeId) !?[]const structures.TypeId {
+        return null;
+    }
+};
+
+const DetailedTypes = struct {
+    const int_callable = structures.TypeId.fromInterned(@enumFromInt(0));
+    const bool_callable = structures.TypeId.fromInterned(@enumFromInt(1));
+    const callable_variant = structures.TypeId.fromInterned(@enumFromInt(2));
+
+    fn callable(_: @This(), type_id: structures.TypeId) !?structures.CallableType {
+        if (type_id == int_callable) return .{
+            .parameter_types = &.{.int},
+            .return_type = .int,
+            .is_fallible = false,
+        };
+        if (type_id == bool_callable) return .{
+            .parameter_types = &.{.bool},
+            .return_type = .int,
+            .is_fallible = true,
+        };
+        return null;
+    }
+
+    fn variantMembers(_: @This(), type_id: structures.TypeId) !?[]const structures.TypeId {
+        if (type_id == callable_variant) return &.{ int_callable, .none };
+        return null;
+    }
+};
 
 test "render diagnostics with source spans and messages" {
     const source = "const x 1\nbeta gamma\n";
@@ -324,7 +374,7 @@ test "render diagnostics with source spans and messages" {
 
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
-    try renderDiagnostics(&output.writer, "test.star", source, &diagnostics);
+    try renderDiagnostics(PrimitiveTypes{}, &output.writer, "test.star", source, &diagnostics);
 
     try std.testing.expectEqualStrings(
         "\x1b[31merror:\x1b[0m test.star:1:9: expected `=`, found a number\n" ++
@@ -347,7 +397,7 @@ test "render diagnostic clamps locations past the source" {
 
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
-    try renderDiagnostic(&output.writer, "test.star", "line\n", diagnostic);
+    try renderDiagnostic(PrimitiveTypes{}, &output.writer, "test.star", "line\n", diagnostic);
 
     try std.testing.expectEqualStrings(
         "\x1b[31merror:\x1b[0m test.star:2:1: unknown value\n\n^\n",
@@ -362,8 +412,8 @@ test "render type mismatches and call counts with concrete facts" {
             .file_id = 1,
             .span = .{ .start = 5, .end = 6 },
             .kind = .{ .call_argument_type_mismatch = .{
-                .expected = .{ .int = true },
-                .found = .{ .none = true },
+                .expected = .int,
+                .found = .none,
             } },
         },
         .{
@@ -375,7 +425,7 @@ test "render type mismatches and call counts with concrete facts" {
 
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
-    try renderDiagnostics(&output.writer, "test.chi", source, &diagnostics);
+    try renderDiagnostics(PrimitiveTypes{}, &output.writer, "test.chi", source, &diagnostics);
 
     try std.testing.expectEqualStrings(
         "\x1b[31merror:\x1b[0m test.chi:1:6: argument type mismatch: expected `int`, found `none`\n" ++
@@ -384,6 +434,26 @@ test "render type mismatches and call counts with concrete facts" {
             "\x1b[31merror:\x1b[0m test.chi:1:1: expected 1 call argument, found 0\n" ++
             "exit(b)\n" ++
             "^~~~\n",
+        output.writer.buffered(),
+    );
+}
+
+test "render diagnostics preserve callable signatures and nested variants" {
+    const diagnostic: structures.Diagnostic = .{
+        .file_id = 1,
+        .span = null,
+        .kind = .{ .static_initializer_type_mismatch = .{
+            .expected = DetailedTypes.callable_variant,
+            .found = DetailedTypes.bool_callable,
+        } },
+    };
+
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try renderDiagnostic(DetailedTypes{}, &output.writer, "test.star", "", diagnostic);
+
+    try std.testing.expectEqualStrings(
+        "\x1b[31merror:\x1b[0m test.star: static initializer type mismatch: expected `(func(int) int) | none`, found `fallible(bool) int`\n",
         output.writer.buffered(),
     );
 }

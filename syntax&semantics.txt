@@ -170,6 +170,8 @@ static checked_identity: fallible(int) int = fallible(a: int) int -> a
 
 # Ordinary functions implicitly widen to compatible fallible functions,
 # but fallible functions never narrow implicitly to ordinary functions.
+# When a variant contains both the exact callable type and its fallible
+# widening, injection preserves the exact member.
 static identity: func(int) int = func(a: int) int -> a
 static widened_identity: fallible(int) int = identity
 

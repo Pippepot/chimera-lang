@@ -170,6 +170,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
         statements: std.ArrayList(UnresolvedBody.Statement) = .empty,
         call_arguments: std.ArrayList(UnresolvedBody.ValueUse) = .empty,
         loop_depth: u32 = 0,
+        can_return: bool = false,
         scratch: std.ArrayList(ValueId) = .empty,
         root_block: ?UnresolvedBody.BlockId = null,
         issue: ?Issue = null,
@@ -194,7 +195,10 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
         fn build(self: *Self, declaration: u32, kind: structures.ItemKind) anyerror!void {
             switch (kind) {
                 .top_level_entry => try self.buildEntry(declaration),
-                .function => try self.buildFunction(declaration),
+                .function => {
+                    self.can_return = true;
+                    try self.buildFunction(declaration);
+                },
                 .static => unreachable,
             }
         }
@@ -206,7 +210,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             defer body_statements.deinit(self.gpa);
             for (self.ast.node_refs[root.data.ref.start..root.data.ref.end]) |child| {
                 if (self.ast.nodes[child.index()].tag == .static_binding) continue;
-                try body_statements.append(self.gpa, try self.buildStatement(child, true));
+                try body_statements.append(self.gpa, try self.buildStatement(child));
             }
             self.root_block = try self.finishBlock(body_statements.items, null, tokenSpan(self.ast, root.token_index));
         }
@@ -229,24 +233,24 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             defer body_statements.deinit(self.gpa);
             if (body.tag == .block) {
                 for (self.ast.node_refs[body.data.ref.start..body.data.ref.end]) |statement| {
-                    try body_statements.append(self.gpa, try self.buildStatement(statement, false));
+                    try body_statements.append(self.gpa, try self.buildStatement(statement));
                 }
             } else {
-                try body_statements.append(self.gpa, try self.buildStatement(parts.body, false));
+                try body_statements.append(self.gpa, try self.buildStatement(parts.body));
             }
             self.root_block = try self.finishBlock(body_statements.items, null, tokenSpan(self.ast, binding.token_index));
         }
 
-        fn buildStatement(self: *Self, index: structures.Node.Index, comptime is_entry: bool) !UnresolvedBody.Statement {
+        fn buildStatement(self: *Self, index: structures.Node.Index) !UnresolvedBody.Statement {
             const node = self.ast.nodes[index.index()];
             const span = tokenSpan(self.ast, node.token_index);
             return switch (node.tag) {
                 .const_binding, .var_binding => try self.buildBinding(index),
-                .return_nothing => if (is_entry)
+                .return_nothing => if (!self.can_return)
                     self.reject(index, .top_level_return)
                 else
                     .{ .return_nothing = span },
-                .return_expr => if (is_entry)
+                .return_expr => if (!self.can_return)
                     self.reject(index, .top_level_return)
                 else
                     .{ .return_value = try self.appendUse(node.data.node) },
@@ -342,13 +346,13 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                     };
                     return switch (static_value) {
                         .type => self.reject(index, .type_value_used_as_runtime_value),
-                        .function_ref => |reference| self.appendExpression(index, .{ .function_ref = reference }),
                         .runtime => |runtime| blk: {
                             const primitive = switch (runtime.value) {
                                 .int => |value| try self.appendExpression(index, .{ .integer = value }),
                                 .bool => |value| try self.appendExpression(index, .{ .boolean = value }),
                                 .unit => try self.appendExpression(index, .unit),
                                 .none => try self.appendExpression(index, .none),
+                                .function_ref => |reference| try self.appendExpression(index, .{ .function_ref = reference }),
                             };
                             if (runtime.type_id == runtime.value.typeId()) break :blk primitive;
                             break :blk try self.appendExpression(index, .{ .annotation = .{
@@ -559,7 +563,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             const node = self.ast.nodes[index.index()];
             if (node.tag != .block) {
                 if (node.tag == .return_nothing or node.tag == .return_expr or node.tag == .break_nothing or node.tag == .break_expr or node.tag == .continue_expr) {
-                    var statements = [_]UnresolvedBody.Statement{try self.buildStatement(index, false)};
+                    var statements = [_]UnresolvedBody.Statement{try self.buildStatement(index)};
                     return self.finishBlock(&statements, null, tokenSpan(self.ast, node.token_index));
                 }
                 return self.finishBlock(&.{}, try self.append(index), tokenSpan(self.ast, node.token_index));
@@ -571,13 +575,13 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             var statements: std.ArrayList(UnresolvedBody.Statement) = .empty;
             defer statements.deinit(self.gpa);
             for (children[0 .. children.len - 1]) |statement| {
-                try statements.append(self.gpa, try self.buildStatement(statement, false));
+                try statements.append(self.gpa, try self.buildStatement(statement));
             }
             const last = children[children.len - 1];
             const last_node = self.ast.nodes[last.index()];
             const result: ?ValueId = switch (last_node.tag) {
                 .const_binding, .var_binding, .return_nothing, .return_expr, .break_nothing, .break_expr, .continue_expr => blk: {
-                    try statements.append(self.gpa, try self.buildStatement(last, false));
+                    try statements.append(self.gpa, try self.buildStatement(last));
                     break :blk null;
                 },
                 else => try self.append(last),
@@ -642,11 +646,21 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                     else => return err,
                 };
                 if (static_value) |value| switch (value) {
-                    .function_ref => |reference| {
-                        const expression = try self.appendExpression(callee_index, .{ .function_ref = reference });
-                        break :target_blk .{ .value = .{ .value = expression, .span = span } };
+                    .runtime => |runtime| switch (runtime.value) {
+                        .function_ref => |reference| {
+                            const expression = try self.appendExpression(callee_index, .{ .function_ref = reference });
+                            const target = if (runtime.type_id == reference.type_id)
+                                expression
+                            else
+                                try self.appendExpression(callee_index, .{ .annotation = .{
+                                    .value = .{ .value = expression, .span = span },
+                                    .type_id = runtime.type_id,
+                                } });
+                            break :target_blk .{ .value = .{ .value = target, .span = span } };
+                        },
+                        .int, .bool, .unit, .none => {},
                     },
-                    .type, .runtime => {},
+                    .type => {},
                 };
                 break :target_blk .{ .direct = name };
             };
@@ -764,8 +778,8 @@ pub fn analyzeFunctionSignature(
         if (expected != actual) return .{ .unsupported = .{
             .span = nodeFocusSpan(ast, binding.data.node_node.b),
             .kind = .{ .static_initializer_type_mismatch = .{
-                .expected = try describeType(type_interner, expected),
-                .found = try describeType(type_interner, actual),
+                .expected = expected,
+                .found = actual,
             } },
         } };
     }
@@ -808,7 +822,7 @@ fn analyzeType(
         const value = resolved orelse return .{ .unsupported = .{ .span = span, .kind = .unknown_type } };
         return switch (value) {
             .type => |type_id| .{ .success = type_id },
-            .function_ref, .runtime => .{ .unsupported = .{ .span = span, .kind = .value_used_as_type } },
+            .runtime => .{ .unsupported = .{ .span = span, .kind = .value_used_as_type } },
         };
     }
     if (node.tag == .type_func) {
@@ -891,27 +905,14 @@ pub fn analyzeStaticDeclaration(
     };
     const runtime = switch (value) {
         .type => return .{ .unsupported = issueAt(ast, initializer.index(), .static_initializer_not_supported) },
-        .function_ref => |reference| {
-            if (!try canWidenTo(type_interner, reference.type_id, expected)) {
-                return .{ .unsupported = .{
-                    .span = nodeFocusSpan(ast, initializer),
-                    .kind = .{ .static_initializer_type_mismatch = .{
-                        .expected = try describeType(type_interner, expected),
-                        .found = try describeType(type_interner, reference.type_id),
-                    } },
-                } };
-            }
-            value.function_ref.type_id = expected;
-            return .{ .success = value };
-        },
         .runtime => |runtime| runtime,
     };
     if (!try canWidenTo(type_interner, runtime.type_id, expected)) {
         return .{ .unsupported = .{
             .span = nodeFocusSpan(ast, initializer),
             .kind = .{ .static_initializer_type_mismatch = .{
-                .expected = try describeType(type_interner, expected),
-                .found = try describeType(type_interner, runtime.type_id),
+                .expected = expected,
+                .found = runtime.type_id,
             } },
         } };
     }
@@ -966,7 +967,7 @@ fn analyzeStaticInitializer(
                 else => return err,
             };
             break :blk if (reference) |value|
-                .{ .success = .{ .function_ref = value } }
+                .{ .success = .{ .runtime = .{ .type_id = value.type_id, .value = .{ .function_ref = value } } } }
             else
                 .{ .unsupported = .{ .span = span, .kind = .unknown_value } };
         },
@@ -1002,38 +1003,6 @@ fn canWidenMember(type_interner: anytype, actual: structures.TypeId, expected: s
     return actual_callable.return_type == expected_callable.return_type and
         std.mem.eql(structures.TypeId, actual_callable.parameter_types, expected_callable.parameter_types) and
         (!actual_callable.is_fallible or expected_callable.is_fallible);
-}
-
-pub fn describeType(type_interner: anytype, type_id: structures.TypeId) !structures.Diagnostic.TypeDescription {
-    var description: structures.Diagnostic.TypeDescription = .{};
-    if (type_id.isPrimitive()) {
-        addTypeDescriptionMember(&description, type_id);
-        return description;
-    }
-    if (try type_interner.callable(type_id) != null) {
-        description.callable = true;
-        return description;
-    }
-    const members = try type_interner.variantMembers(type_id) orelse unreachable;
-    for (members) |member| {
-        if (try type_interner.callable(member) != null) {
-            description.callable = true;
-        } else {
-            addTypeDescriptionMember(&description, member);
-        }
-    }
-    return description;
-}
-
-fn addTypeDescriptionMember(description: *structures.Diagnostic.TypeDescription, type_id: structures.TypeId) void {
-    switch (type_id) {
-        .int => description.int = true,
-        .bool => description.bool = true,
-        .unit => description.unit = true,
-        .none => description.none = true,
-        .never => description.never = true,
-        _ => unreachable,
-    }
 }
 
 fn functionParts(ast: *const structures.Ast, declaration: u32) FunctionParts {
