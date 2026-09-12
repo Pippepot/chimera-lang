@@ -127,6 +127,10 @@ const LocationPlan = struct {
                     }
                 },
                 .field_access => |operation| needed[@intFromEnum(operation.operand)] = true,
+                .field_update => |operation| {
+                    needed[@intFromEnum(operation.operand)] = true;
+                    needed[@intFromEnum(operation.value)] = true;
+                },
                 .call => |call| {
                     for (ssa.call_arguments[call.arguments.start..call.arguments.end]) |argument| needed[@intFromEnum(argument.value)] = true;
                 },
@@ -400,6 +404,7 @@ fn FunctionEmitter(comptime Types: type) type {
                     .callable_coerce => |coercion| try self.copyValue(coercion.target_type, self.locations[@intFromEnum(coercion.operand)], destination),
                     .struct_init => |operation| try self.emitStructInit(ssa, operation, destination),
                     .field_access => |operation| try self.emitFieldAccess(operation, destination),
+                    .field_update => |operation| try self.emitFieldUpdate(operation, destination),
                     .call => |call| try self.emitDirectCall(call, destination),
                     .indirect_call => |call| try self.emitIndirectCall(call, destination),
                     .exit => |operand| try self.emitExit(operand),
@@ -823,6 +828,22 @@ fn FunctionEmitter(comptime Types: type) type {
                 layout.field_offsets[operation.field_index],
                 destination,
                 0,
+                field_layout.byte_size,
+            );
+        }
+
+        fn emitFieldUpdate(self: *Self, operation: structures.FieldUpdateOperation, destination: ValueLocation) !void {
+            if (destination == .discarded) return;
+            const layout = (try self.types.structLayout(operation.type_id)) orelse return error.Unavailable;
+            std.debug.assert(operation.field_index < layout.field_offsets.len);
+            try self.copyValue(operation.type_id, self.locations[@intFromEnum(operation.operand)], destination);
+            const field_type = self.valueType(operation.value);
+            const field_layout = try self.types.layout(field_type);
+            try self.copyRange(
+                self.locations[@intFromEnum(operation.value)],
+                0,
+                destination,
+                layout.field_offsets[operation.field_index],
                 field_layout.byte_size,
             );
         }

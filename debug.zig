@@ -150,6 +150,12 @@ fn renderInstruction(
             @intFromEnum(operation.operand),
             operation.field_index,
         }),
+        .field_update => |operation| try writer.print("    %{d} = field_update %{d}, {d} = %{d}\n", .{
+            result,
+            @intFromEnum(operation.operand),
+            operation.field_index,
+            @intFromEnum(operation.value),
+        }),
         .call => |call| {
             const target = try db.lookupInterned(queries.ItemLocations, call.target);
             try writer.print("    %{d} = call @{s}(", .{ result, target.name });

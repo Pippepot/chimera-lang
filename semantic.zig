@@ -30,6 +30,7 @@ pub const UnresolvedBody = struct {
     statements: []Statement,
     call_arguments: []ValueUse,
     struct_field_values: []StructFieldValue,
+    assignment_fields: []FieldName,
     root_block: BlockId,
 
     pub const ValueId = enum(u32) { _ };
@@ -42,6 +43,10 @@ pub const UnresolvedBody = struct {
         name: []const u8,
         name_span: structures.SourceSpan,
         value: ValueUse,
+    };
+    pub const FieldName = struct {
+        name: []const u8,
+        span: structures.SourceSpan,
     };
     pub const ConditionBinding = struct {
         result: ValueId,
@@ -105,7 +110,13 @@ pub const UnresolvedBody = struct {
             annotation: struct { value: ValueUse, type_id: structures.TypeId },
             struct_init: struct { type_id: structures.TypeId, fields: structures.FunctionValueRange },
             field_access: struct { operand: ValueUse, name: []const u8 },
-            assignment: struct { target: LocalId, target_span: structures.SourceSpan, value: ValueUse, operation: AssignmentOperation },
+            assignment: struct {
+                target: LocalId,
+                target_span: structures.SourceSpan,
+                fields: structures.FunctionValueRange,
+                value: ValueUse,
+                operation: AssignmentOperation,
+            },
             call: Call,
             negate: ValueUse,
             add: BinaryOperands,
@@ -128,6 +139,7 @@ pub const UnresolvedBody = struct {
         gpa.free(self.statements);
         gpa.free(self.call_arguments);
         gpa.free(self.struct_field_values);
+        gpa.free(self.assignment_fields);
         self.* = undefined;
     }
 };
@@ -179,6 +191,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
         statements: std.ArrayList(UnresolvedBody.Statement) = .empty,
         call_arguments: std.ArrayList(UnresolvedBody.ValueUse) = .empty,
         struct_field_values: std.ArrayList(UnresolvedBody.StructFieldValue) = .empty,
+        assignment_fields: std.ArrayList(UnresolvedBody.FieldName) = .empty,
         loop_depth: u32 = 0,
         can_return: bool = false,
         scratch: std.ArrayList(ValueId) = .empty,
@@ -194,6 +207,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             self.statements.deinit(self.gpa);
             self.call_arguments.deinit(self.gpa);
             self.struct_field_values.deinit(self.gpa);
+            self.assignment_fields.deinit(self.gpa);
             self.scratch.deinit(self.gpa);
         }
 
@@ -473,19 +487,33 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
 
         fn appendAssignment(self: *Self, index: structures.Node.Index) !ValueId {
             const node = self.ast.nodes[index.index()];
-            const target_node = self.ast.nodes[node.data.node_node.a.index()];
+            const field_start: u32 = @intCast(self.assignment_fields.items.len);
+            var target_index = node.data.node_node.a;
+            var target_node = self.ast.nodes[target_index.index()];
+            while (target_node.tag == .field_access) {
+                const field_span = tokenSpan(self.ast, target_node.token_index);
+                try self.assignment_fields.append(self.gpa, .{
+                    .name = self.source[field_span.start..field_span.end],
+                    .span = field_span,
+                });
+                target_index = target_node.data.node;
+                target_node = self.ast.nodes[target_index.index()];
+            }
+            std.mem.reverse(UnresolvedBody.FieldName, self.assignment_fields.items[field_start..]);
             if (target_node.tag != .identifier) return self.reject(node.data.node_node.a, .assignment_target_not_local);
             const span = tokenSpan(self.ast, target_node.token_index);
             const name = self.source[span.start..span.end];
-            const local = self.locals.get(name) orelse return self.reject(node.data.node_node.a, .unknown_value);
+            const local = self.locals.get(name) orelse return self.reject(target_index, .unknown_value);
             const target = switch (local) {
-                .immutable => return self.reject(node.data.node_node.a, .assignment_to_immutable),
+                .immutable => return self.reject(target_index, .assignment_to_immutable),
                 .mutable => |mutable| mutable,
             };
+            const field_end: u32 = @intCast(self.assignment_fields.items.len);
             const value = try self.append(node.data.node_node.b);
             return self.appendExpression(index, .{ .assignment = .{
                 .target = target,
                 .target_span = span,
+                .fields = .{ .start = field_start, .end = field_end },
                 .value = .{ .value = value, .span = nodeFocusSpan(self.ast, node.data.node_node.b) },
                 .operation = switch (node.tag) {
                     .assign => .replace,
@@ -760,6 +788,8 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             const call_arguments = try self.call_arguments.toOwnedSlice(self.gpa);
             errdefer self.gpa.free(call_arguments);
             const struct_field_values = try self.struct_field_values.toOwnedSlice(self.gpa);
+            errdefer self.gpa.free(struct_field_values);
+            const assignment_fields = try self.assignment_fields.toOwnedSlice(self.gpa);
             return .{
                 .parameter_count = self.parameter_count,
                 .mutable_local_count = self.mutable_local_count,
@@ -769,6 +799,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 .statements = statements,
                 .call_arguments = call_arguments,
                 .struct_field_values = struct_field_values,
+                .assignment_fields = assignment_fields,
                 .root_block = self.root_block.?,
             };
         }
@@ -1252,6 +1283,8 @@ fn testUnresolvedFunctionBodyAllocations(gpa: std.mem.Allocator) !void {
         \\static target = func(a: int, b: int, c: int) int
         \\  first(a)
         \\  const aggregate = int{field = first(a)}
+        \\  var mutable_aggregate = aggregate
+        \\  mutable_aggregate.field = first(a)
         \\  aggregate.field
         \\  var value: int = a
         \\  const selected: int = if a < b and (if a < b -> value = second(b, c) else value = third(c, b)) > 0 -> value + 1 else value

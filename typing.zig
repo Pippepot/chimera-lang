@@ -511,18 +511,47 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
         fn assignment(self: *Self, expression: Expression) !Value {
             const assignment_value = expression.operation.assignment;
             const local_index = @intFromEnum(assignment_value.target);
-            const target = self.local_values[local_index].?;
+            const root = self.local_values[local_index].?;
+            const ResolvedField = struct {
+                parent: Value,
+                field_index: u32,
+                field_type: structures.TypeId,
+            };
+            var fields: std.ArrayList(ResolvedField) = .empty;
+            defer fields.deinit(self.ctx.allocator());
+            const source_fields = self.unresolved.assignment_fields[assignment_value.fields.start..assignment_value.fields.end];
+            var target = root;
+            for (source_fields, 0..) |source_field, index| {
+                const definition = (try self.type_interner.structDefinition(target.type_id)) orelse
+                    return self.reject(source_field.span, .{ .field_access_not_struct = target.type_id });
+                if (try self.type_interner.structLayout(target.type_id) == null) return error.Unavailable;
+                const field = definition.resolveField(source_field.name) orelse return self.reject(source_field.span, .unknown_field);
+                try fields.append(self.ctx.allocator(), .{
+                    .parent = target,
+                    .field_index = field.index,
+                    .field_type = field.type_id,
+                });
+                if (index + 1 < source_fields.len or assignment_value.operation != .replace) {
+                    target = try self.appendInstruction(.{ .field_access = .{
+                        .operand = target.id,
+                        .field_index = field.index,
+                        .field_type = field.type_id,
+                    } });
+                }
+            }
+            const target_type = if (fields.getLastOrNull()) |field| field.field_type else root.type_id;
+            const target_span = if (source_fields.len == 0) assignment_value.target_span else source_fields[source_fields.len - 1].span;
             const operand = try self.value(assignment_value.value.value);
             if (operand.type_id == .never) return operand;
             const result = if (assignment_value.operation == .replace) blk: {
-                const use = try self.coerceValue(operand.id, operand.type_id, target.type_id) orelse
-                    return self.reject(assignment_value.value.span, .{ .assignment_type_mismatch = self.typeMismatch(target.type_id, operand.type_id) });
+                const use = try self.coerceValue(operand.id, operand.type_id, target_type) orelse
+                    return self.reject(assignment_value.value.span, .{ .assignment_type_mismatch = self.typeMismatch(target_type, operand.type_id) });
                 break :blk if (use.coerce_to == null)
                     operand
                 else
                     try self.appendCoercion(use);
             } else blk: {
-                if (target.type_id != .int) return self.reject(assignment_value.target_span, .{ .arithmetic_operand_not_int = target.type_id });
+                if (target_type != .int) return self.reject(target_span, .{ .arithmetic_operand_not_int = target_type });
                 if (operand.type_id != .int) return self.reject(assignment_value.value.span, .{ .arithmetic_operand_not_int = operand.type_id });
                 const operands: structures.BinaryOperands = .{ .lhs = target.id, .rhs = operand.id };
                 break :blk try self.appendInstruction(switch (assignment_value.operation) {
@@ -533,7 +562,19 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                     .divide => .{ .divsi = operands },
                 });
             };
-            self.local_values[local_index] = result;
+            var updated = result;
+            var field_index = fields.items.len;
+            while (field_index > 0) {
+                field_index -= 1;
+                const field = fields.items[field_index];
+                updated = try self.appendInstruction(.{ .field_update = .{
+                    .operand = field.parent.id,
+                    .value = updated.id,
+                    .field_index = field.field_index,
+                    .type_id = field.parent.type_id,
+                } });
+            }
+            self.local_values[local_index] = updated;
             return result;
         }
 
@@ -1153,6 +1194,10 @@ fn normalizeInstructions(instructions: []structures.FunctionInstruction, argumen
         .consti, .constb, .const_unit, .const_none, .function_ref, .struct_init => {},
         .variant_coerce, .variant_extract, .callable_coerce => |*operation| operation.operand = normalizeValue(operation.operand, argument_count),
         .field_access => |*operation| operation.operand = normalizeValue(operation.operand, argument_count),
+        .field_update => |*operation| {
+            operation.operand = normalizeValue(operation.operand, argument_count);
+            operation.value = normalizeValue(operation.value, argument_count);
+        },
         .call => {},
         .indirect_call => |*call| call.target = normalizeValue(call.target, argument_count),
         .variant_tag, .exit, .negi => |*operand| operand.* = normalizeValue(operand.*, argument_count),

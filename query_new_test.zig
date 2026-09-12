@@ -580,6 +580,7 @@ const EntryCallParent = struct {
             .callable_coerce,
             .struct_init,
             .field_access,
+            .field_update,
             .indirect_call,
             .exit,
             .negi,
@@ -1051,6 +1052,136 @@ test "nested struct initializers keep independent field ranges" {
         \\func answer() int -> Outer{inner = Inner{value = 40}, bonus = 2}.inner.value + 2
     );
     try expectCompiledFunctionResult(db, 1, "answer", &.{"answer"}, 42);
+}
+
+test "mutable struct fields update the root value" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static Pair = struct
+        \\  left: int
+        \\  right: int
+        \\func answer() int
+        \\  var pair = Pair{left = 40, right = 1}
+        \\  pair.right += 1
+        \\  return pair.left + pair.right
+    );
+    try expectCompiledFunctionResult(db, 1, "answer", &.{"answer"}, 42);
+}
+
+test "nested field assignments keep independent target ranges" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static Pair = struct
+        \\  left: int
+        \\  right: int
+        \\func answer() int
+        \\  var outer = Pair{left = 0, right = 0}
+        \\  var inner = Pair{left = 0, right = 0}
+        \\  outer.left = inner.right = 42
+        \\  return outer.left + inner.right - 42
+    );
+    try expectCompiledFunctionResult(db, 1, "answer", &.{"answer"}, 42);
+}
+
+test "nested field updates flow through branch state" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static Inner = struct
+        \\  value: int
+        \\static Outer = struct
+        \\  inner: Inner
+        \\  bonus: int
+        \\func mutate(flag: int) int
+        \\  var outer = Outer{inner = Inner{value = 20}, bonus = 0}
+        \\  if flag == 0
+        \\    outer.inner.value += 1
+        \\  else
+        \\    outer.bonus = 1
+        \\  return outer.inner.value + outer.bonus
+        \\func answer() int -> mutate(0) + mutate(1)
+    );
+    try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "mutate" }, 42);
+}
+
+test "field assignment widens to the declared field type" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static Holder = struct
+        \\  value: int | none
+        \\func answer() int
+        \\  var holder = Holder{value = none}
+        \\  holder.value = 42
+        \\  return if const value = holder.value as int -> value else 0
+    );
+    try expectCompiledFunctionResult(db, 1, "answer", &.{"answer"}, 42);
+}
+
+test "field assignment diagnostics validate roots paths and values" {
+    const cases = [_]struct { source: []const u8, expected: DiagnosticKind }{
+        .{ .source = "static Pair = struct\n  value: int\nfunc bad() int\n  const pair = Pair{value = 1}\n  pair.value = 2\n  return pair.value", .expected = .assignment_to_immutable },
+        .{ .source = "static Pair = struct\n  value: int\nfunc bad(pair: Pair) int\n  pair.value = 2\n  return pair.value", .expected = .assignment_to_immutable },
+        .{ .source = "func bad() int\n  var value = 1\n  value.field = 2\n  return value", .expected = .field_access_not_struct },
+        .{ .source = "static Pair = struct\n  value: int\nfunc bad() int\n  var pair = Pair{value = 1}\n  pair.missing = 2\n  return pair.value", .expected = .unknown_field },
+        .{ .source = "static Pair = struct\n  value: int\nfunc bad() int\n  var pair = Pair{value = 1}\n  pair.value = none\n  return pair.value", .expected = .assignment_type_mismatch },
+        .{ .source = "static Pair = struct\n  value: int\nfunc bad() int\n  Pair{value = 1}.value = 2\n  return 0", .expected = .assignment_target_not_local },
+        .{ .source = "static Flags = struct\n  value: bool\nfunc bad() bool\n  var flags = Flags{value = true}\n  flags.value += 1\n  return flags.value", .expected = .arithmetic_operand_not_int },
+    };
+    for (cases, 1..) |case, file_id| {
+        const db = try testDatabase(1);
+        defer db.deinit();
+        try addSource(db, file_id, case.source);
+        const bad = (try db.get(query_structures.BuildModuleScope, file_id)).*.?.resolve("bad").?;
+        try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, bad)).* == null);
+        const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, bad, structures.Diagnostic, testing.allocator);
+        defer freeDiagnostics(diagnostics);
+        try testing.expectEqual(@as(usize, 1), diagnostics.len);
+        try testing.expectEqual(case.expected, std.meta.activeTag(diagnostics[0].kind));
+    }
+}
+
+test "field assignment tracks definition edits and recovers" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    const valid =
+        \\static Pair = struct
+        \\  value: int
+        \\func answer() int
+        \\  var pair = Pair{value = 1}
+        \\  pair.value = 42
+        \\  return pair.value
+    ;
+    try addSource(db, 1, valid);
+    const answer = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolve("answer").?;
+    try expectCompiledFunctionResult(db, 1, "answer", &.{"answer"}, 42);
+
+    try setSource(db, 1,
+        \\static Pair = struct
+        \\  renamed: int
+        \\func answer() int
+        \\  var pair = Pair{renamed = 1}
+        \\  pair.value = 42
+        \\  return pair.renamed
+    );
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, answer)).* == null);
+    var diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, answer, structures.Diagnostic, testing.allocator);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(DiagnosticKind.unknown_field, std.meta.activeTag(diagnostics[0].kind));
+    freeDiagnostics(diagnostics);
+
+    try setSource(db, 1, valid);
+    try expectCompiledFunctionResult(db, 1, "answer", &.{"answer"}, 42);
+    diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, answer, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 0), diagnostics.len);
 }
 
 test "struct value diagnostics reject invalid fields and targets" {

@@ -720,6 +720,13 @@ pub const FieldAccessOperation = struct {
     field_type: TypeId,
 };
 
+pub const FieldUpdateOperation = struct {
+    operand: FunctionValueId,
+    value: FunctionValueId,
+    field_index: u32,
+    type_id: TypeId,
+};
+
 pub const FunctionInstruction = union(enum) {
     consti: i32,
     constb: bool,
@@ -732,6 +739,7 @@ pub const FunctionInstruction = union(enum) {
     callable_coerce: VariantOperation,
     struct_init: StructOperation,
     field_access: FieldAccessOperation,
+    field_update: FieldUpdateOperation,
     call: FunctionCall,
     indirect_call: IndirectFunctionCall,
     exit: FunctionValueId,
@@ -752,6 +760,7 @@ pub const FunctionInstruction = union(enum) {
             .variant_coerce, .variant_extract, .callable_coerce => |operation| operation.target_type,
             .struct_init => |operation| operation.type_id,
             .field_access => |operation| operation.field_type,
+            .field_update => |operation| operation.type_id,
             .call => |call| call.return_type,
             .indirect_call => |call| call.return_type,
         };
