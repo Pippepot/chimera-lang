@@ -105,7 +105,10 @@ static S = struct
     a: int
     b: float
 
-# Every field name is required exactly once; order does not change the value.
+# The initializer head must resolve to a named struct type. Every field name is
+# required exactly once and is resolved against that nominal definition. Field
+# expressions evaluate exactly once in source order; order does not change the
+# resulting value.
 const s: S = S{a = 1, b = 2.5}
 const c: int = s.a
 

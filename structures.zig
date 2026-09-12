@@ -521,6 +521,21 @@ pub const StructField = struct {
 pub const StructDefinition = struct {
     fields: []StructField,
 
+    pub const ResolvedField = struct {
+        index: u32,
+        type_id: TypeId,
+    };
+
+    pub fn resolveField(self: StructDefinition, name: []const u8) ?ResolvedField {
+        for (self.fields, 0..) |field, index| {
+            if (std.mem.eql(u8, field.name, name)) return .{
+                .index = @intCast(index),
+                .type_id = field.type_id,
+            };
+        }
+        return null;
+    }
+
     pub fn eql(a: StructDefinition, b: StructDefinition) bool {
         if (a.fields.len != b.fields.len) return false;
         for (a.fields, b.fields) |left, right| {
@@ -689,6 +704,22 @@ pub const VariantOperation = struct {
     tag_mapping: ?FunctionValueRange = null,
 };
 
+pub const StructFieldValue = struct {
+    field_index: u32,
+    value: FunctionValueId,
+};
+
+pub const StructOperation = struct {
+    fields: FunctionValueRange,
+    type_id: TypeId,
+};
+
+pub const FieldAccessOperation = struct {
+    operand: FunctionValueId,
+    field_index: u32,
+    field_type: TypeId,
+};
+
 pub const FunctionInstruction = union(enum) {
     consti: i32,
     constb: bool,
@@ -699,6 +730,8 @@ pub const FunctionInstruction = union(enum) {
     variant_coerce: VariantOperation,
     variant_extract: VariantOperation,
     callable_coerce: VariantOperation,
+    struct_init: StructOperation,
+    field_access: FieldAccessOperation,
     call: FunctionCall,
     indirect_call: IndirectFunctionCall,
     exit: FunctionValueId,
@@ -717,6 +750,8 @@ pub const FunctionInstruction = union(enum) {
             .exit => .never,
             .function_ref => |reference| reference.type_id,
             .variant_coerce, .variant_extract, .callable_coerce => |operation| operation.target_type,
+            .struct_init => |operation| operation.type_id,
+            .field_access => |operation| operation.field_type,
             .call => |call| call.return_type,
             .indirect_call => |call| call.return_type,
         };
@@ -731,6 +766,7 @@ pub const FunctionBodyAnalysis = struct {
     is_fallible: bool = false,
     block_argument_types: []TypeId,
     variant_coercion_tags: []const u32 = &.{},
+    struct_field_values: []StructFieldValue = &.{},
     branch_arguments: []FunctionValueUse,
     call_arguments: []FunctionValueUse,
     instructions: []Instruction,
@@ -758,10 +794,14 @@ pub const FunctionBodyAnalysis = struct {
             a.is_fallible != b.is_fallible or
             !std.mem.eql(TypeId, a.block_argument_types, b.block_argument_types) or
             !std.mem.eql(u32, a.variant_coercion_tags, b.variant_coercion_tags) or
+            a.struct_field_values.len != b.struct_field_values.len or
             !valueUsesEql(a.branch_arguments, b.branch_arguments) or
             !valueUsesEql(a.call_arguments, b.call_arguments) or
             a.instructions.len != b.instructions.len or
             a.blocks.len != b.blocks.len) return false;
+        for (a.struct_field_values, b.struct_field_values) |left, right| {
+            if (!std.meta.eql(left, right)) return false;
+        }
         for (a.instructions, b.instructions) |left, right| {
             if (!std.meta.eql(left, right)) return false;
         }
@@ -782,6 +822,7 @@ pub const FunctionBodyAnalysis = struct {
     pub fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
         gpa.free(self.block_argument_types);
         gpa.free(self.variant_coercion_tags);
+        gpa.free(self.struct_field_values);
         gpa.free(self.branch_arguments);
         gpa.free(self.call_arguments);
         gpa.free(self.instructions);
@@ -905,6 +946,13 @@ pub const Diagnostic = struct {
         break_outside_loop,
         continue_outside_loop,
         expression_not_supported,
+        struct_initializer_not_struct: TypeId,
+        unknown_struct_field,
+        duplicate_struct_initializer_field,
+        missing_struct_initializer_field,
+        struct_initializer_field_type_mismatch: TypeMismatch,
+        field_access_not_struct: TypeId,
+        unknown_field,
         duplicate_local_binding,
         local_type_not_supported,
         unknown_type,

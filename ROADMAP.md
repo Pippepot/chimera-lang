@@ -6,7 +6,7 @@ Implementation audit: 2026-09-11, Zig 0.16.0.
 
 Preserve body-independent signatures, owned query results, stable declaration identities, and equal-result retention as the language grows.
 
-## Next: struct values
+## Next: mutable struct fields
 
 Structs are nominal; aliases preserve the original identity. Reject direct and
 indirect recursive by-value containment, including cycles through variants.
@@ -21,14 +21,17 @@ offsets while rejecting direct and variant-mediated containment cycles. Callable
 signatures terminate containment traversal. `OwnershipCapabilities` computes
 trivial primitive and callable behavior, fieldwise variant behavior, and default
 struct move/copy/drop behavior. Invalid recursive structs publish no capabilities.
+Named initialization now resolves fields nominally, requires every field exactly
+once, preserves source evaluation order, and supports field coercions. Read-only
+field access works through construction, bindings, parameters, calls, and returns.
 
 Continue in dependency order:
 
-1. Add named initialization and read-only field access. Preserve initializer
-   evaluation order, require every field exactly once, and transfer each field
-   only when its ownership capability permits it.
-2. Add field mutation through mutable roots.
-3. Expand passing, returns, assignment, joins, extraction, and custom hooks only
+1. Add field mutation through mutable roots without introducing independently
+   mutable fields.
+2. Enforce copy-versus-transfer behavior for struct values and fields, including
+   invalidation after explicit transfer.
+3. Expand assignment, joins, extraction, and custom hooks only
    as their ownership behavior is implemented.
 
 Reject nested declarations and unsupported ownership or transfer forms at their

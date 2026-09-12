@@ -200,6 +200,22 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
         .break_outside_loop => try writer.writeAll("break is only allowed inside a loop"),
         .continue_outside_loop => try writer.writeAll("continue is only allowed inside a loop"),
         .expression_not_supported => try writer.writeAll("this expression is not supported yet"),
+        .struct_initializer_not_struct => |found| {
+            try writer.writeAll("struct initializer requires a struct type, found ");
+            try writeType(types, writer, found);
+        },
+        .unknown_struct_field => try writeSourceLabel(writer, "unknown struct field", source, span),
+        .duplicate_struct_initializer_field => try writeSourceLabel(writer, "struct field is initialized more than once", source, span),
+        .missing_struct_initializer_field => try writer.writeAll("struct initializer is missing a required field"),
+        .struct_initializer_field_type_mismatch => |mismatch| {
+            try writer.writeAll("struct field initializer type mismatch: ");
+            try writeMismatch(types, writer, mismatch);
+        },
+        .field_access_not_struct => |found| {
+            try writer.writeAll("field access requires a struct value, found ");
+            try writeType(types, writer, found);
+        },
+        .unknown_field => try writeSourceLabel(writer, "unknown struct field", source, span),
         .duplicate_local_binding => {
             try writeSourceLabel(writer, "binding is already declared in this scope", source, span);
         },

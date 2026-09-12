@@ -84,6 +84,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
         states: std.ArrayList([]?Value) = .empty,
         block_argument_types: std.ArrayList(structures.TypeId) = .empty,
         variant_coercion_tags: std.ArrayList(u32) = .empty,
+        struct_field_values: std.ArrayList(structures.StructFieldValue) = .empty,
         call_arguments: std.ArrayList(structures.FunctionValueUse) = .empty,
         branch_arguments: std.ArrayList(structures.FunctionValueUse) = .empty,
         instructions: std.ArrayList(structures.FunctionInstruction) = .empty,
@@ -112,6 +113,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             self.states.deinit(gpa);
             self.block_argument_types.deinit(gpa);
             self.variant_coercion_tags.deinit(gpa);
+            self.struct_field_values.deinit(gpa);
             self.call_arguments.deinit(gpa);
             self.branch_arguments.deinit(gpa);
             self.instructions.deinit(gpa);
@@ -229,6 +231,8 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 .local_read => |local| self.local_values[@intFromEnum(local)] orelse unreachable,
                 .condition_extract => unreachable,
                 .annotation => |annotation| try self.annotate(annotation),
+                .struct_init => try self.structInit(expression),
+                .field_access => try self.fieldAccess(expression),
                 .assignment => try self.assignment(expression),
                 .call => |call| try self.callFunction(call, expression.span),
                 .negate => |operand| try self.negate(operand),
@@ -238,6 +242,58 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             };
             self.values[index] = resolved;
             return resolved;
+        }
+
+        fn structInit(self: *Self, expression: Expression) !Value {
+            const initializer = expression.operation.struct_init;
+            const definition = (try self.type_interner.structDefinition(initializer.type_id)) orelse
+                return self.reject(expression.span, .{ .struct_initializer_not_struct = initializer.type_id });
+            if (try self.type_interner.structLayout(initializer.type_id) == null) return error.Unavailable;
+
+            const seen = try self.ctx.allocator().alloc(bool, definition.fields.len);
+            defer self.ctx.allocator().free(seen);
+            @memset(seen, false);
+            var fields: std.ArrayList(structures.StructFieldValue) = .empty;
+            defer fields.deinit(self.ctx.allocator());
+            const source_fields = self.unresolved.struct_field_values[initializer.fields.start..initializer.fields.end];
+            for (source_fields) |source_field| {
+                const field = definition.resolveField(source_field.name) orelse
+                    return self.reject(source_field.name_span, .unknown_struct_field);
+                if (seen[field.index]) return self.reject(source_field.name_span, .duplicate_struct_initializer_field);
+                seen[field.index] = true;
+
+                const operand = try self.value(source_field.value.value);
+                if (operand.type_id == .never) return operand;
+                const use = try self.coerceValue(operand.id, operand.type_id, field.type_id) orelse
+                    return self.reject(source_field.value.span, .{ .struct_initializer_field_type_mismatch = self.typeMismatch(field.type_id, operand.type_id) });
+                const field_value = if (use.coerce_to) |_| try self.appendCoercion(use) else operand;
+                try fields.append(self.ctx.allocator(), .{
+                    .field_index = field.index,
+                    .value = field_value.id,
+                });
+            }
+            for (seen) |was_seen| if (!was_seen) return self.reject(expression.span, .missing_struct_initializer_field);
+            const start: u32 = @intCast(self.struct_field_values.items.len);
+            try self.struct_field_values.appendSlice(self.ctx.allocator(), fields.items);
+            return self.appendInstruction(.{ .struct_init = .{
+                .fields = .{ .start = start, .end = @intCast(self.struct_field_values.items.len) },
+                .type_id = initializer.type_id,
+            } });
+        }
+
+        fn fieldAccess(self: *Self, expression: Expression) !Value {
+            const access = expression.operation.field_access;
+            const operand = try self.value(access.operand.value);
+            if (operand.type_id == .never) return operand;
+            const definition = (try self.type_interner.structDefinition(operand.type_id)) orelse
+                return self.reject(access.operand.span, .{ .field_access_not_struct = operand.type_id });
+            if (try self.type_interner.structLayout(operand.type_id) == null) return error.Unavailable;
+            const field = definition.resolveField(access.name) orelse return self.reject(expression.span, .unknown_field);
+            return self.appendInstruction(.{ .field_access = .{
+                .operand = operand.id,
+                .field_index = field.index,
+                .field_type = field.type_id,
+            } });
         }
 
         fn captureState(self: *Self) !StateId {
@@ -1044,12 +1100,15 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             const argument_count: u32 = @intCast(std.math.cast(u31, self.block_argument_types.items.len) orelse return error.AnalysisTooLarge);
             normalizeInstructions(self.instructions.items, argument_count);
             normalizeValueUses(self.call_arguments.items, argument_count);
+            for (self.struct_field_values.items) |*field| field.value = normalizeValue(field.value, argument_count);
             normalizeValueUses(self.branch_arguments.items, argument_count);
             normalizeTerminators(self.blocks.items, argument_count);
             const block_argument_types = try self.block_argument_types.toOwnedSlice(gpa);
             errdefer gpa.free(block_argument_types);
             const variant_coercion_tags = try self.variant_coercion_tags.toOwnedSlice(gpa);
             errdefer gpa.free(variant_coercion_tags);
+            const struct_field_values = try self.struct_field_values.toOwnedSlice(gpa);
+            errdefer gpa.free(struct_field_values);
             const call_arguments = try self.call_arguments.toOwnedSlice(gpa);
             errdefer gpa.free(call_arguments);
             const instructions = try self.instructions.toOwnedSlice(gpa);
@@ -1062,6 +1121,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 .is_fallible = self.is_fallible,
                 .block_argument_types = block_argument_types,
                 .variant_coercion_tags = variant_coercion_tags,
+                .struct_field_values = struct_field_values,
                 .call_arguments = call_arguments,
                 .branch_arguments = branches,
                 .instructions = instructions,
@@ -1090,8 +1150,9 @@ fn normalizeValueUses(value_uses: []structures.FunctionValueUse, argument_count:
 
 fn normalizeInstructions(instructions: []structures.FunctionInstruction, argument_count: u32) void {
     for (instructions) |*instruction| switch (instruction.*) {
-        .consti, .constb, .const_unit, .const_none, .function_ref => {},
+        .consti, .constb, .const_unit, .const_none, .function_ref, .struct_init => {},
         .variant_coerce, .variant_extract, .callable_coerce => |*operation| operation.operand = normalizeValue(operation.operand, argument_count),
+        .field_access => |*operation| operation.operand = normalizeValue(operation.operand, argument_count),
         .call => {},
         .indirect_call => |*call| call.target = normalizeValue(call.target, argument_count),
         .variant_tag, .exit, .negi => |*operand| operand.* = normalizeValue(operand.*, argument_count),

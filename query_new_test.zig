@@ -578,6 +578,8 @@ const EntryCallParent = struct {
             .variant_coerce,
             .variant_extract,
             .callable_coerce,
+            .struct_init,
+            .field_access,
             .indirect_call,
             .exit,
             .negi,
@@ -789,6 +791,26 @@ test "struct declarations are nominal and aliases preserve identity" {
     try testing.expectEqual(left_type, alias_type);
 }
 
+test "struct declarations require meta-type annotations" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static Valid: type = struct
+        \\  value: int
+        \\static Invalid: int = struct
+        \\  value: int
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    try testing.expect((try db.get(query_structures.StructDefinition, scope.resolveStatic("Valid").?)).* != null);
+    const invalid = scope.resolveStatic("Invalid").?;
+    try testing.expect((try db.get(query_structures.StructDefinition, invalid)).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(query_structures.StructDefinition, invalid, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(DiagnosticKind.static_initializer_not_supported, std.meta.activeTag(diagnostics[0].kind));
+}
+
 test "struct definitions own ordered resolved fields" {
     const db = try testDatabase(1);
     defer db.deinit();
@@ -975,6 +997,119 @@ test "ownership capabilities reject recursive structs and recover incrementally"
     diagnostics = try db.transitiveAccumulatorValues(query_structures.OwnershipCapabilities, node_type, structures.Diagnostic, testing.allocator);
     defer freeDiagnostics(diagnostics);
     try testing.expectEqual(@as(usize, 0), diagnostics.len);
+}
+
+test "struct values initialize project pass return and execute" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static Pair = struct
+        \\  left: int
+        \\  right: int
+        \\static Outer = struct
+        \\  pair: Pair
+        \\  bonus: int
+        \\func make(value: int) Pair -> Pair{right = 2, left = value}
+        \\func sum(pair: Pair) int -> pair.left + pair.right
+        \\func answer() int
+        \\  const outer = Outer{bonus = 1, pair = make(39)}
+        \\  return sum(outer.pair) + outer.bonus
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const make = (try db.get(query_structures.AnalyzeFunctionBody, scope.resolve("make").?)).*.?;
+    try testing.expectEqual(@as(usize, 2), make.struct_field_values.len);
+    try testing.expectEqual(@as(u32, 1), make.struct_field_values[0].field_index);
+    try testing.expectEqual(@as(u32, 0), make.struct_field_values[1].field_index);
+    try testing.expectEqual(.struct_init, std.meta.activeTag(make.instructions[1]));
+    try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "make", "sum" }, 42);
+}
+
+test "struct initializer fields evaluate in source order" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static Pair = struct
+        \\  left: int
+        \\  right: int
+        \\func answer() int -> Pair{right = exit(42), left = exit(24)}.left
+    );
+    try expectCompiledFunctionResult(db, 1, "answer", &.{"answer"}, 42);
+}
+
+test "nested struct initializers keep independent field ranges" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static Inner = struct
+        \\  value: int
+        \\static Outer = struct
+        \\  inner: Inner
+        \\  bonus: int
+        \\func answer() int -> Outer{inner = Inner{value = 40}, bonus = 2}.inner.value + 2
+    );
+    try expectCompiledFunctionResult(db, 1, "answer", &.{"answer"}, 42);
+}
+
+test "struct value diagnostics reject invalid fields and targets" {
+    const cases = [_]struct { source: []const u8, expected: DiagnosticKind }{
+        .{ .source = "func bad() int -> int{}", .expected = .struct_initializer_not_struct },
+        .{ .source = "static Pair = struct\n  left: int\n  right: int\nfunc bad() Pair -> Pair{left = 1, nope = 2}", .expected = .unknown_struct_field },
+        .{ .source = "static Pair = struct\n  left: int\n  right: int\nfunc bad() Pair -> Pair{left = 1, left = 2, right = 3}", .expected = .duplicate_struct_initializer_field },
+        .{ .source = "static Pair = struct\n  left: int\n  right: int\nfunc bad() Pair -> Pair{left = 1}", .expected = .missing_struct_initializer_field },
+        .{ .source = "static Pair = struct\n  left: int\n  right: int\nfunc bad() Pair -> Pair{left = true, right = 2}", .expected = .struct_initializer_field_type_mismatch },
+        .{ .source = "func bad() int -> (1).value", .expected = .field_access_not_struct },
+        .{ .source = "static Pair = struct\n  left: int\n  right: int\nfunc bad() int -> Pair{left = 1, right = 2}.nope", .expected = .unknown_field },
+    };
+    for (cases, 1..) |case, file_id| {
+        const db = try testDatabase(1);
+        defer db.deinit();
+        try addSource(db, file_id, case.source);
+        const bad = (try db.get(query_structures.BuildModuleScope, file_id)).*.?.resolve("bad").?;
+        try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, bad)).* == null);
+        const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, bad, structures.Diagnostic, testing.allocator);
+        defer freeDiagnostics(diagnostics);
+        try testing.expectEqual(@as(usize, 1), diagnostics.len);
+        try testing.expectEqual(case.expected, std.meta.activeTag(diagnostics[0].kind));
+    }
+}
+
+test "struct value analysis tracks definition edits and recovers" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static Pair = struct
+        \\  value: int
+        \\func answer() int -> Pair{value = 42}.value
+    );
+    const answer = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolve("answer").?;
+    const first = try db.get(query_structures.AnalyzeFunctionBody, answer);
+    try testing.expect(first.* != null);
+
+    try setSource(db, 1,
+        \\static Pair = struct
+        \\  renamed: int
+        \\func answer() int -> Pair{value = 42}.value
+    );
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, answer)).* == null);
+    var diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, answer, structures.Diagnostic, testing.allocator);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(DiagnosticKind.unknown_struct_field, std.meta.activeTag(diagnostics[0].kind));
+    freeDiagnostics(diagnostics);
+
+    try setSource(db, 1,
+        \\static Pair = struct
+        \\  value: int
+        \\func answer() int -> Pair{value = 42}.value
+    );
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, answer)).* != null);
+    diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, answer, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 0), diagnostics.len);
+    try expectCompiledFunctionResult(db, 1, "answer", &.{"answer"}, 42);
 }
 
 test "struct identity definitions and layouts recompute incrementally" {

@@ -25,6 +25,10 @@ const TestTypes = struct {
         return .{ .layout = try self.layout(type_id), .payload_offset = 4 };
     }
 
+    pub fn structLayout(_: @This(), _: structures.TypeId) !?structures.StructLayout {
+        return null;
+    }
+
     pub fn variantMembers(_: @This(), type_id: structures.TypeId) !?[]const structures.TypeId {
         if (type_id == small_variant) return &.{ .int, .none };
         if (type_id == wide_variant) return &.{ .int, .unit, .none };

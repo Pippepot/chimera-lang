@@ -29,6 +29,7 @@ pub const UnresolvedBody = struct {
     blocks: []Block,
     statements: []Statement,
     call_arguments: []ValueUse,
+    struct_field_values: []StructFieldValue,
     root_block: BlockId,
 
     pub const ValueId = enum(u32) { _ };
@@ -37,6 +38,11 @@ pub const UnresolvedBody = struct {
     pub const BlockId = enum(u32) { _ };
     pub const ValueUse = struct { value: ValueId, span: structures.SourceSpan };
     pub const BinaryOperands = struct { lhs: ValueUse, rhs: ValueUse };
+    pub const StructFieldValue = struct {
+        name: []const u8,
+        name_span: structures.SourceSpan,
+        value: ValueUse,
+    };
     pub const ConditionBinding = struct {
         result: ValueId,
         annotation_type: ?structures.TypeId,
@@ -97,6 +103,8 @@ pub const UnresolvedBody = struct {
             local_read: LocalId,
             condition_extract,
             annotation: struct { value: ValueUse, type_id: structures.TypeId },
+            struct_init: struct { type_id: structures.TypeId, fields: structures.FunctionValueRange },
+            field_access: struct { operand: ValueUse, name: []const u8 },
             assignment: struct { target: LocalId, target_span: structures.SourceSpan, value: ValueUse, operation: AssignmentOperation },
             call: Call,
             negate: ValueUse,
@@ -119,6 +127,7 @@ pub const UnresolvedBody = struct {
         gpa.free(self.blocks);
         gpa.free(self.statements);
         gpa.free(self.call_arguments);
+        gpa.free(self.struct_field_values);
         self.* = undefined;
     }
 };
@@ -169,6 +178,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
         blocks: std.ArrayList(UnresolvedBody.Block) = .empty,
         statements: std.ArrayList(UnresolvedBody.Statement) = .empty,
         call_arguments: std.ArrayList(UnresolvedBody.ValueUse) = .empty,
+        struct_field_values: std.ArrayList(UnresolvedBody.StructFieldValue) = .empty,
         loop_depth: u32 = 0,
         can_return: bool = false,
         scratch: std.ArrayList(ValueId) = .empty,
@@ -183,6 +193,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             self.blocks.deinit(self.gpa);
             self.statements.deinit(self.gpa);
             self.call_arguments.deinit(self.gpa);
+            self.struct_field_values.deinit(self.gpa);
             self.scratch.deinit(self.gpa);
         }
 
@@ -324,6 +335,8 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 .unit_literal => return self.appendExpression(index, .unit),
                 .none_literal => return self.appendExpression(index, .none),
                 .call => return self.appendCall(index),
+                .struct_init => return self.appendStructInit(index),
+                .field_access => return self.appendFieldAccess(index),
                 .identifier => {
                     const span = tokenSpan(self.ast, node.token_index);
                     const name = self.source[span.start..span.end];
@@ -369,6 +382,52 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 .loop => return self.appendLoop(index),
                 else => return self.reject(index, .expression_not_supported),
             }
+        }
+
+        fn appendStructInit(self: *Self, index: structures.Node.Index) !ValueId {
+            const node = self.ast.nodes[index.index()];
+            const parts = self.ast.node_refs[node.data.ref.start..node.data.ref.end];
+            std.debug.assert(parts.len >= 1);
+            const type_id = switch (try analyzeType(self.ast, self.source, parts[0], self.type_interner, self.gpa, .local_type_not_supported)) {
+                .success => |resolved| resolved,
+                .unsupported => |issue| {
+                    self.issue = issue;
+                    return error.SourceRejected;
+                },
+            };
+            const scratch_start = self.scratch.items.len;
+            defer self.scratch.shrinkRetainingCapacity(scratch_start);
+            for (parts[1..]) |field_index| {
+                const field = self.ast.nodes[field_index.index()];
+                std.debug.assert(field.tag == .struct_init_field);
+                try self.scratch.append(self.gpa, try self.append(field.data.node));
+            }
+            const start: u32 = @intCast(self.struct_field_values.items.len);
+            for (parts[1..], self.scratch.items[scratch_start..]) |field_index, value| {
+                const field = self.ast.nodes[field_index.index()];
+                const name_span = tokenSpan(self.ast, field.token_index);
+                try self.struct_field_values.append(self.gpa, .{
+                    .name = self.source[name_span.start..name_span.end],
+                    .name_span = name_span,
+                    .value = .{
+                        .value = value,
+                        .span = nodeFocusSpan(self.ast, field.data.node),
+                    },
+                });
+            }
+            return self.appendExpression(index, .{ .struct_init = .{
+                .type_id = type_id,
+                .fields = .{ .start = start, .end = @intCast(self.struct_field_values.items.len) },
+            } });
+        }
+
+        fn appendFieldAccess(self: *Self, index: structures.Node.Index) !ValueId {
+            const node = self.ast.nodes[index.index()];
+            const name_span = tokenSpan(self.ast, node.token_index);
+            return self.appendExpression(index, .{ .field_access = .{
+                .operand = try self.appendUse(node.data.node),
+                .name = self.source[name_span.start..name_span.end],
+            } });
         }
 
         fn appendUse(self: *Self, index: structures.Node.Index) !UnresolvedBody.ValueUse {
@@ -699,6 +758,8 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             const statements = try self.statements.toOwnedSlice(self.gpa);
             errdefer self.gpa.free(statements);
             const call_arguments = try self.call_arguments.toOwnedSlice(self.gpa);
+            errdefer self.gpa.free(call_arguments);
+            const struct_field_values = try self.struct_field_values.toOwnedSlice(self.gpa);
             return .{
                 .parameter_count = self.parameter_count,
                 .mutable_local_count = self.mutable_local_count,
@@ -707,6 +768,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 .blocks = blocks,
                 .statements = statements,
                 .call_arguments = call_arguments,
+                .struct_field_values = struct_field_values,
                 .root_block = self.root_block.?,
             };
         }
@@ -805,7 +867,7 @@ fn analyzeType(
     unsupported_kind: structures.Diagnostic.Kind,
 ) anyerror!SemanticResult(structures.TypeId) {
     const node = ast.nodes[node_index.index()];
-    if (node.tag == .type) {
+    if (node.tag == .type or node.tag == .identifier) {
         const span = tokenSpan(ast, node.token_index);
         const name = source[span.start..span.end];
         if (std.mem.eql(u8, name, "int")) return .{ .success = .int };
@@ -884,9 +946,7 @@ pub fn analyzeStaticDeclaration(
     const initializer = binding.data.node_node.b.unwrap() orelse unreachable;
     const annotation = binding.data.node_node.a.unwrap();
     if (annotation) |annotation_index| {
-        const annotation_node = ast.nodes[annotation_index.index()];
-        const annotation_span = tokenSpan(ast, annotation_node.token_index);
-        if (annotation_node.tag == .type and std.mem.eql(u8, source[annotation_span.start..annotation_span.end], "type")) {
+        if (isMetaTypeAnnotation(ast, source, annotation_index)) {
             return switch (try analyzeType(ast, source, initializer, type_interner, gpa, .static_initializer_not_supported)) {
                 .success => |type_id| .{ .success = .{ .type = type_id } },
                 .unsupported => |issue| .{ .unsupported = issue },
@@ -931,6 +991,11 @@ pub fn analyzeStructDefinition(
     const initializer = binding.data.node_node.b.unwrap() orelse unreachable;
     const struct_node = ast.nodes[initializer.index()];
     std.debug.assert(struct_node.tag == .@"struct");
+    if (binding.data.node_node.a.unwrap()) |annotation| {
+        if (!isMetaTypeAnnotation(ast, source, annotation)) {
+            return .{ .unsupported = issueAt(ast, annotation.index(), .static_initializer_not_supported) };
+        }
+    }
 
     var fields: std.ArrayList(structures.StructField) = .empty;
     defer {
@@ -963,6 +1028,12 @@ pub fn analyzeStructDefinition(
     }
 
     return .{ .success = .{ .fields = try fields.toOwnedSlice(gpa) } };
+}
+
+fn isMetaTypeAnnotation(ast: *const structures.Ast, source: []const u8, annotation: structures.Node.Index) bool {
+    const node = ast.nodes[annotation.index()];
+    const span = tokenSpan(ast, node.token_index);
+    return node.tag == .type and std.mem.eql(u8, source[span.start..span.end], "type");
 }
 
 fn analyzeStaticInitializer(
@@ -1180,6 +1251,8 @@ fn testUnresolvedFunctionBodyAllocations(gpa: std.mem.Allocator) !void {
     const source =
         \\static target = func(a: int, b: int, c: int) int
         \\  first(a)
+        \\  const aggregate = int{field = first(a)}
+        \\  aggregate.field
         \\  var value: int = a
         \\  const selected: int = if a < b and (if a < b -> value = second(b, c) else value = third(c, b)) > 0 -> value + 1 else value
         \\  value = selected

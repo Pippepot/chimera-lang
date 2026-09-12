@@ -245,6 +245,24 @@ pub fn TypeInterner(comptime Context: type) type {
             return (try self.ctx.lookupInterned(ItemLocations, item_id)).name;
         }
 
+        pub fn structDefinition(self: @This(), type_id: structures.TypeId) !?structures.StructDefinition {
+            if (type_id.isPrimitive()) return null;
+            const data = (try self.ctx.lookupInternedAs(Types, type_id.interned().?)) orelse return error.Unavailable;
+            const item_id = switch (data.*) {
+                .structure => |item| item,
+                .variant, .callable => return null,
+            };
+            return (try self.ctx.get(StructDefinition, item_id)).* orelse return error.Unavailable;
+        }
+
+        pub fn structLayout(self: @This(), type_id: structures.TypeId) !?structures.StructLayout {
+            return (try self.ctx.get(StructLayout, type_id)).*;
+        }
+
+        pub fn ownershipCapabilities(self: @This(), type_id: structures.TypeId) !?structures.OwnershipCapabilities {
+            return (try self.ctx.get(OwnershipCapabilities, type_id)).*;
+        }
+
         pub fn variantLayout(self: @This(), type_id: structures.TypeId) !structures.VariantLayout {
             return (try self.ctx.get(VariantLayout, type_id)).*;
         }
@@ -382,10 +400,11 @@ pub const StructLayout = struct {
             byte_size = std.math.add(u32, field_offset.*, field_layout.byte_size) catch return error.TypeTooLarge;
             byte_alignment = @max(byte_alignment, field_layout.byte_alignment);
         }
+        const aligned_size = try alignForward(byte_size, byte_alignment);
         keep_offsets = true;
         return .{
             .layout = .{
-                .byte_size = try alignForward(byte_size, byte_alignment),
+                .byte_size = aligned_size,
                 .byte_alignment = byte_alignment,
             },
             .field_offsets = field_offsets,

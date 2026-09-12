@@ -135,6 +135,21 @@ fn renderInstruction(
             try writer.writeByte('\n');
         },
         .callable_coerce => |coercion| try writer.print("    %{d} = callable_coerce %{d}\n", .{ result, @intFromEnum(coercion.operand) }),
+        .struct_init => |operation| {
+            try writer.print("    %{d} = struct_init ", .{result});
+            try renderType(operation.type_id, writer);
+            try writer.writeByte('(');
+            for (ssa.struct_field_values[operation.fields.start..operation.fields.end], 0..) |field, index| {
+                if (index != 0) try writer.writeAll(", ");
+                try writer.print("{d} = %{d}", .{ field.field_index, @intFromEnum(field.value) });
+            }
+            try writer.writeAll(")\n");
+        },
+        .field_access => |operation| try writer.print("    %{d} = field_access %{d}, {d}\n", .{
+            result,
+            @intFromEnum(operation.operand),
+            operation.field_index,
+        }),
         .call => |call| {
             const target = try db.lookupInterned(queries.ItemLocations, call.target);
             try writer.print("    %{d} = call @{s}(", .{ result, target.name });

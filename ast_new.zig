@@ -301,7 +301,9 @@ fn parseBinding(parser: *ParserState) !Node.Index {
     const inferred_variant_type = type_annotation == .null and
         (parser.tokens[parser.index].tag == .identifier or parser.tokens[parser.index].tag == .keyword_none) and
         parser.tokens[parser.index + 1].tag == .pipe;
-    const value = if (binding_keyword.tag == .keyword_static and (explicit_type_value or inferred_variant_type))
+    const value = if (binding_keyword.tag == .keyword_static and
+        (explicit_type_value or inferred_variant_type) and
+        parser.tokens[parser.index].tag != .keyword_struct)
         try parseType(parser)
     else
         try parseRequiredExpression(parser);

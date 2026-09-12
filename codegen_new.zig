@@ -121,6 +121,12 @@ const LocationPlan = struct {
             switch (instruction) {
                 .consti, .constb, .const_unit, .const_none, .function_ref => {},
                 .variant_coerce, .variant_extract, .callable_coerce => |operation| needed[@intFromEnum(operation.operand)] = true,
+                .struct_init => |operation| {
+                    for (ssa.struct_field_values[operation.fields.start..operation.fields.end]) |field| {
+                        needed[@intFromEnum(field.value)] = true;
+                    }
+                },
+                .field_access => |operation| needed[@intFromEnum(operation.operand)] = true,
                 .call => |call| {
                     for (ssa.call_arguments[call.arguments.start..call.arguments.end]) |argument| needed[@intFromEnum(argument.value)] = true;
                 },
@@ -392,6 +398,8 @@ fn FunctionEmitter(comptime Types: type) type {
                         try self.convertVariant(source_type, extraction.target_type, mapping, self.locations[@intFromEnum(extraction.operand)], destination);
                     },
                     .callable_coerce => |coercion| try self.copyValue(coercion.target_type, self.locations[@intFromEnum(coercion.operand)], destination),
+                    .struct_init => |operation| try self.emitStructInit(ssa, operation, destination),
+                    .field_access => |operation| try self.emitFieldAccess(operation, destination),
                     .call => |call| try self.emitDirectCall(call, destination),
                     .indirect_call => |call| try self.emitIndirectCall(call, destination),
                     .exit => |operand| try self.emitExit(operand),
@@ -780,6 +788,43 @@ fn FunctionEmitter(comptime Types: type) type {
             if (destination == .discarded) return;
             const layout = try self.types.layout(type_id);
             try self.copyRange(source, 0, destination, 0, layout.byte_size);
+        }
+
+        fn emitStructInit(
+            self: *Self,
+            ssa: *const structures.FunctionBodyAnalysis,
+            operation: structures.StructOperation,
+            destination: ValueLocation,
+        ) !void {
+            if (destination == .discarded) return;
+            const layout = (try self.types.structLayout(operation.type_id)) orelse return error.Unavailable;
+            for (ssa.struct_field_values[operation.fields.start..operation.fields.end]) |field| {
+                std.debug.assert(field.field_index < layout.field_offsets.len);
+                const source_type = self.valueType(field.value);
+                const field_layout = try self.types.layout(source_type);
+                try self.copyRange(
+                    self.locations[@intFromEnum(field.value)],
+                    0,
+                    destination,
+                    layout.field_offsets[field.field_index],
+                    field_layout.byte_size,
+                );
+            }
+        }
+
+        fn emitFieldAccess(self: *Self, operation: structures.FieldAccessOperation, destination: ValueLocation) !void {
+            if (destination == .discarded) return;
+            const source_type = self.valueType(operation.operand);
+            const layout = (try self.types.structLayout(source_type)) orelse return error.Unavailable;
+            std.debug.assert(operation.field_index < layout.field_offsets.len);
+            const field_layout = try self.types.layout(operation.field_type);
+            try self.copyRange(
+                self.locations[@intFromEnum(operation.operand)],
+                layout.field_offsets[operation.field_index],
+                destination,
+                0,
+                field_layout.byte_size,
+            );
         }
 
         fn copyRange(self: *Self, source: ValueLocation, source_start: u32, destination: ValueLocation, destination_start: u32, byte_size: u32) !void {
