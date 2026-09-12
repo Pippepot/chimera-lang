@@ -50,6 +50,7 @@ fn writeTypeInner(types: anytype, writer: *std.Io.Writer, type_id: structures.Ty
         .int, .bool, .unit, .none, .never => return writer.writeAll(@tagName(type_id)),
         _ => {},
     }
+    if (try types.structName(type_id)) |name| return writer.writeAll(name);
     if (try types.callable(type_id)) |callable| {
         try writer.writeAll(if (callable.is_fallible) "fallible(" else "func(");
         for (callable.parameter_types, 0..) |parameter_type, index| {
@@ -177,6 +178,10 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
         },
         .declaration_cycle => try writeSourceLabel(writer, "declaration depends on itself", source, span),
         .static_initializer_not_supported => try writer.writeAll("this static initializer is not supported yet"),
+        .struct_member_not_supported => try writer.writeAll("this struct member is not supported yet"),
+        .duplicate_struct_field => try writeSourceLabel(writer, "struct field is already declared", source, span),
+        .struct_field_type_not_supported => try writer.writeAll("this struct field type is not supported yet"),
+        .recursive_struct_containment => try writeSourceLabel(writer, "struct recursively contains itself by value through field", source, span),
         .static_initializer_type_mismatch => |mismatch| {
             try writer.writeAll("static initializer type mismatch: ");
             try writeMismatch(types, writer, mismatch);
@@ -318,6 +323,10 @@ pub fn renderDiagnostics(
 }
 
 const PrimitiveTypes = struct {
+    fn structName(_: @This(), _: structures.TypeId) !?[]const u8 {
+        return null;
+    }
+
     fn callable(_: @This(), _: structures.TypeId) !?structures.CallableType {
         return null;
     }
@@ -331,6 +340,11 @@ const DetailedTypes = struct {
     const int_callable = structures.TypeId.fromInterned(@enumFromInt(0));
     const bool_callable = structures.TypeId.fromInterned(@enumFromInt(1));
     const callable_variant = structures.TypeId.fromInterned(@enumFromInt(2));
+    const structure = structures.TypeId.fromInterned(@enumFromInt(3));
+
+    fn structName(_: @This(), type_id: structures.TypeId) !?[]const u8 {
+        return if (type_id == structure) "Pair" else null;
+    }
 
     fn callable(_: @This(), type_id: structures.TypeId) !?structures.CallableType {
         if (type_id == int_callable) return .{
@@ -454,6 +468,26 @@ test "render diagnostics preserve callable signatures and nested variants" {
 
     try std.testing.expectEqualStrings(
         "\x1b[31merror:\x1b[0m test.star: static initializer type mismatch: expected `(func(int) int) | none`, found `fallible(bool) int`\n",
+        output.writer.buffered(),
+    );
+}
+
+test "render diagnostics use nominal struct names" {
+    const diagnostic: structures.Diagnostic = .{
+        .file_id = 1,
+        .span = null,
+        .kind = .{ .return_type_mismatch = .{
+            .expected = DetailedTypes.structure,
+            .found = .int,
+        } },
+    };
+
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try renderDiagnostic(DetailedTypes{}, &output.writer, "test.chi", "", diagnostic);
+
+    try std.testing.expectEqualStrings(
+        "\x1b[31merror:\x1b[0m test.chi: return type mismatch: expected `Pair`, found `int`\n",
         output.writer.buffered(),
     );
 }

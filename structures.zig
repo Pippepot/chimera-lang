@@ -296,6 +296,7 @@ pub const ItemId = enum(u32) { _ };
 
 pub const ItemKind = enum {
     function,
+    structure,
     static,
     top_level_entry,
 };
@@ -385,7 +386,7 @@ pub const ModuleScope = struct {
 
     pub fn resolveStatic(self: ModuleScope, name: []const u8) ?ItemId {
         const entry = self.resolveEntry(name) orelse return null;
-        return if (entry.kind == .static) entry.item_id else null;
+        return if (entry.kind == .static or entry.kind == .structure) entry.item_id else null;
     }
 
     fn resolveEntry(self: ModuleScope, name: []const u8) ?Entry {
@@ -491,6 +492,7 @@ pub const CallableType = struct {
 pub const TypeData = union(enum) {
     variant: VariantType,
     callable: CallableType,
+    structure: ItemId,
 };
 
 pub const InternVariantResult = union(enum) {
@@ -508,6 +510,70 @@ pub const TypeLayout = struct {
 pub const VariantLayout = struct {
     layout: TypeLayout,
     payload_offset: u32,
+};
+
+pub const StructField = struct {
+    name: []const u8,
+    type_id: TypeId,
+    span: SourceSpan,
+};
+
+pub const StructDefinition = struct {
+    fields: []StructField,
+
+    pub fn eql(a: StructDefinition, b: StructDefinition) bool {
+        if (a.fields.len != b.fields.len) return false;
+        for (a.fields, b.fields) |left, right| {
+            if (left.type_id != right.type_id or
+                !std.meta.eql(left.span, right.span) or
+                !std.mem.eql(u8, left.name, right.name)) return false;
+        }
+        return true;
+    }
+
+    pub fn deinit(self: *StructDefinition, gpa: std.mem.Allocator) void {
+        for (self.fields) |field| gpa.free(field.name);
+        gpa.free(self.fields);
+        self.* = undefined;
+    }
+};
+
+pub const StructLayout = struct {
+    layout: TypeLayout,
+    field_offsets: []u32,
+
+    pub fn eql(a: StructLayout, b: StructLayout) bool {
+        return std.meta.eql(a.layout, b.layout) and std.mem.eql(u32, a.field_offsets, b.field_offsets);
+    }
+
+    pub fn deinit(self: *StructLayout, gpa: std.mem.Allocator) void {
+        gpa.free(self.field_offsets);
+        self.* = undefined;
+    }
+};
+
+pub const MoveCapability = enum {
+    trivial,
+    fieldwise,
+    none,
+};
+
+pub const CopyCapability = enum {
+    trivial,
+    fieldwise,
+    none,
+};
+
+pub const DropCapability = enum {
+    trivial,
+    fieldwise,
+    explicit,
+};
+
+pub const OwnershipCapabilities = struct {
+    move: MoveCapability,
+    copy: CopyCapability,
+    drop: DropCapability,
 };
 
 pub const FunctionValueId = enum(u32) { _ };
@@ -822,6 +888,10 @@ pub const Diagnostic = struct {
         duplicate_top_level_declaration,
         declaration_cycle,
         static_initializer_not_supported,
+        struct_member_not_supported,
+        duplicate_struct_field,
+        struct_field_type_not_supported,
+        recursive_struct_containment,
         static_initializer_type_mismatch: TypeMismatch,
         type_value_used_as_runtime_value,
         value_used_as_type,

@@ -199,7 +199,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                     self.can_return = true;
                     try self.buildFunction(declaration);
                 },
-                .static => unreachable,
+                .static, .structure => unreachable,
             }
         }
 
@@ -919,6 +919,52 @@ pub fn analyzeStaticDeclaration(
     return .{ .success = value };
 }
 
+pub fn analyzeStructDefinition(
+    ast: *const structures.Ast,
+    source: []const u8,
+    declaration: u32,
+    type_interner: anytype,
+    gpa: std.mem.Allocator,
+) !SemanticResult(structures.StructDefinition) {
+    const binding = ast.nodes[declaration];
+    std.debug.assert(binding.tag == .static_binding);
+    const initializer = binding.data.node_node.b.unwrap() orelse unreachable;
+    const struct_node = ast.nodes[initializer.index()];
+    std.debug.assert(struct_node.tag == .@"struct");
+
+    var fields: std.ArrayList(structures.StructField) = .empty;
+    defer {
+        for (fields.items) |field| gpa.free(field.name);
+        fields.deinit(gpa);
+    }
+    var names = std.StringHashMap(void).init(gpa);
+    defer names.deinit();
+
+    for (ast.node_refs[struct_node.data.ref.start..struct_node.data.ref.end]) |member_index| {
+        const member = ast.nodes[member_index.index()];
+        if (member.tag != .struct_field) return .{ .unsupported = issueAt(ast, member_index.index(), .struct_member_not_supported) };
+
+        const name_span = tokenSpan(ast, member.token_index);
+        const name = source[name_span.start..name_span.end];
+        if ((try names.getOrPut(name)).found_existing) {
+            return .{ .unsupported = .{ .span = name_span, .kind = .duplicate_struct_field } };
+        }
+        const field_type = switch (try analyzeType(ast, source, member.data.node, type_interner, gpa, .struct_field_type_not_supported)) {
+            .success => |type_id| type_id,
+            .unsupported => |issue| return .{ .unsupported = issue },
+        };
+        try fields.ensureUnusedCapacity(gpa, 1);
+        const owned_name = try gpa.dupe(u8, name);
+        fields.appendAssumeCapacity(.{
+            .name = owned_name,
+            .type_id = field_type,
+            .span = name_span,
+        });
+    }
+
+    return .{ .success = .{ .fields = try fields.toOwnedSlice(gpa) } };
+}
+
 fn analyzeStaticInitializer(
     ast: *const structures.Ast,
     source: []const u8,
@@ -1047,7 +1093,11 @@ pub fn discoverItems(gpa: std.mem.Allocator, ast: *const structures.Ast, source:
 
         if (node.tag != .static_binding) continue;
         const value = node.data.node_node.b.unwrap() orelse unreachable;
-        const kind: structures.ItemKind = if (ast.nodes[value.index()].tag == .func) .function else .static;
+        const kind: structures.ItemKind = switch (ast.nodes[value.index()].tag) {
+            .func => .function,
+            .@"struct" => .structure,
+            else => .static,
+        };
 
         const token = ast.tokens[node.token_index];
         const name = source[token.loc.start..token.loc.end];
@@ -1080,6 +1130,32 @@ test "unresolved function body cleans up every allocation failure" {
 
 test "function signature cleans up every allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, testFunctionSignatureAllocations, .{});
+}
+
+test "struct definition cleans up every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testStructDefinitionAllocations, .{});
+}
+
+fn testStructDefinitionAllocations(gpa: std.mem.Allocator) !void {
+    const parser = @import("ast_new.zig");
+    const source =
+        \\static Record = struct
+        \\  first: int
+        \\  second: bool
+        \\  third: none
+    ;
+    var report = try parser.parseReport(std.testing.allocator, 1, source);
+    defer report.deinit(std.testing.allocator);
+    const parsed = &report.ast.?;
+    const declaration = parsed.node_refs[parsed.nodes[0].data.ref.start];
+    const result = try analyzeStructDefinition(parsed, source, declaration.index(), TestTypeInterner{}, gpa);
+    switch (result) {
+        .success => |definition_value| {
+            var definition = definition_value;
+            definition.deinit(gpa);
+        },
+        .unsupported => unreachable,
+    }
 }
 
 fn testFunctionSignatureAllocations(gpa: std.mem.Allocator) !void {

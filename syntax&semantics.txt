@@ -67,8 +67,9 @@ static double = func(a: int) int -> a * 2
 func double(a: int) int -> a * 2
 
 # Function references are values and may be bound, passed, returned, and called.
-# Callable types contain parameter types, return type, and fallibility; parameter
-# names are not part of type identity. Functions do not capture local bindings.
+# Callable types contain each parameter's access mode and type, the return type,
+# and fallibility. Parameter names are not part of type identity. Functions do
+# not capture local bindings.
 func choose() func(int) int -> double
 func apply(operation: func(int) int, value: int) int -> operation(value)
 const operation = choose()
@@ -84,6 +85,8 @@ exit(0)
 # mut: mutable access to a caller-owned variable.
 # var: function-owned variable, which may be stored or returned.
 # deinit: function-owned variable satisfying an explicit drop obligation.
+# A parameter's access mode is part of callable type identity. An omitted mode
+# is read. Source syntax for non-read modes in callable types remains open.
 func make(static T: type) type -> T
 
 func add1(mut a: int)
@@ -110,6 +113,15 @@ const c: int = s.a
 struct Q
     a: int
 
+# Every struct definition introduces a distinct nominal type. Static aliases
+# preserve that identity; equal field names and types do not make separately
+# defined structs compatible.
+static QAlias = Q
+
+# A struct cannot contain itself by value, directly or through other structs or
+# inline variants. Such cycles have no finite layout and are rejected. Callable
+# parameter and return types do not constitute by-value containment.
+
 # Fields have no mutability modifier; access through the struct governs mutation.
 var mutable_s = S{a = 1, b = 2.5}
 mutable_s.a = 2
@@ -125,14 +137,24 @@ func read_a(s: S) int
 # drop = trivial | fieldwise | explicit | func
 #        defaults to trivial if every field's drop is trivial, otherwise fieldwise.
 # 'trivial' invokes no field hooks; 'fieldwise' recurses through fields.
-# 'func' provides a custom, infallible operation. Potentially failing duplication
-# is an explicitly called fallible function, not an implicit copy operation.
+# 'func' means a complete function expression used as a custom, infallible hook.
+# Its sole parameter name is immaterial. The required signatures are:
+# copy = func(read self: S) S
+# move = func(var self: S) S
+# drop = func(deinit self: S) unit
+# Potentially failing duplication is an explicitly called fallible function,
+# not an implicit copy operation.
 # Without copy support, passing to an owned parameter requires transfer with '^'.
 # move = none requires construction in final storage and a stable address.
 # Directly containing an immovable value makes the containing struct immovable;
 # indirection does not.
 # drop = explicit requires every ownership path to transfer the value and its
 # obligation elsewhere or pass it to 'deinit' before its lifetime ends.
+
+# Primitive values and function references have trivial move, copy, and drop.
+# A variant moves or copies fieldwise when every member supports that operation,
+# and otherwise does not support it. A variant drops trivially when every member
+# does; otherwise it drops fieldwise according to its active member.
 
 
 # Variants

@@ -125,6 +125,7 @@ pub const Types = struct {
                 std.hash.autoHash(&hasher, callable.return_type);
                 std.hash.autoHash(&hasher, callable.is_fallible);
             },
+            .structure => |item_id| std.hash.autoHash(&hasher, item_id),
         }
         return hasher.final();
     }
@@ -134,6 +135,7 @@ pub const Types = struct {
         return switch (a) {
             .variant => |variant| std.mem.eql(structures.TypeId, variant.members, b.variant.members),
             .callable => |callable| structures.CallableType.eql(callable, b.callable),
+            .structure => |item_id| item_id == b.structure,
         };
     }
 
@@ -151,6 +153,7 @@ pub const Types = struct {
                 .return_type = callable.return_type,
                 .is_fallible = callable.is_fallible,
             } },
+            .structure => |item_id| .{ .structure = item_id },
         };
     }
 
@@ -158,6 +161,7 @@ pub const Types = struct {
         switch (value.*) {
             .variant => |variant| gpa.free(variant.members),
             .callable => |callable| gpa.free(callable.parameter_types),
+            .structure => {},
         }
         value.* = undefined;
     }
@@ -206,6 +210,10 @@ pub fn internCallableType(ctx: anytype, callable: structures.CallableType) !stru
     return .fromInterned(try ctx.intern(Types, .{ .callable = callable }));
 }
 
+pub fn internStructType(ctx: anytype, item_id: structures.ItemId) !structures.TypeId {
+    return .fromInterned(try ctx.intern(Types, .{ .structure = item_id }));
+}
+
 pub fn TypeInterner(comptime Context: type) type {
     return struct {
         ctx: Context,
@@ -225,6 +233,16 @@ pub fn TypeInterner(comptime Context: type) type {
 
         pub fn callable(self: @This(), type_id: structures.TypeId) !?structures.CallableType {
             return lookupCallable(self.ctx, type_id);
+        }
+
+        pub fn structName(self: @This(), type_id: structures.TypeId) !?[]const u8 {
+            if (type_id.isPrimitive()) return null;
+            const data = (try self.ctx.lookupInternedAs(Types, type_id.interned().?)) orelse return null;
+            const item_id = switch (data.*) {
+                .structure => |item| item,
+                .variant, .callable => return null,
+            };
+            return (try self.ctx.lookupInterned(ItemLocations, item_id)).name;
         }
 
         pub fn variantLayout(self: @This(), type_id: structures.TypeId) !structures.VariantLayout {
@@ -268,7 +286,7 @@ fn lookupVariantMembers(ctx: anytype, type_id: structures.TypeId) !?[]const stru
     const data = (try ctx.lookupInternedAs(Types, interned_id)) orelse return null;
     return switch (data.*) {
         .variant => |variant| variant.members,
-        .callable => null,
+        .callable, .structure => null,
     };
 }
 
@@ -277,7 +295,7 @@ fn lookupCallable(ctx: anytype, type_id: structures.TypeId) !?structures.Callabl
     const interned_id = type_id.interned() orelse unreachable;
     const data = (try ctx.lookupInternedAs(Types, interned_id)) orelse return null;
     return switch (data.*) {
-        .variant => null,
+        .variant, .structure => null,
         .callable => |callable| callable,
     };
 }
@@ -290,9 +308,15 @@ pub const TypeLayout = struct {
         if (type_id == .int or type_id == .bool) return .{ .byte_size = 4, .byte_alignment = 4 };
         if (type_id == .unit or type_id == .none or type_id == .never) return .{ .byte_size = 0, .byte_alignment = 1 };
 
-        if (try lookupCallable(ctx, type_id) != null) return .{ .byte_size = @sizeOf(u64), .byte_alignment = @alignOf(u64) };
-
-        return (try ctx.get(VariantLayout, type_id)).layout;
+        const data = (try ctx.lookupInternedAs(Types, type_id.interned().?)) orelse unreachable;
+        return switch (data.*) {
+            .callable => .{ .byte_size = @sizeOf(u64), .byte_alignment = @alignOf(u64) },
+            .variant => (try ctx.get(VariantLayout, type_id)).layout,
+            .structure => blk: {
+                const layout = (try ctx.get(StructLayout, type_id)).* orelse return error.Unavailable;
+                break :blk layout.layout;
+            },
+        };
     }
 };
 
@@ -326,6 +350,146 @@ pub const VariantLayout = struct {
         };
     }
 };
+
+pub const StructLayout = struct {
+    pub const Input = structures.TypeId;
+    pub const Output = ?structures.StructLayout;
+
+    pub fn run(ctx: anytype, type_id: Input) anyerror!Output {
+        if (type_id.isPrimitive()) return null;
+        const data = (try ctx.lookupInternedAs(Types, type_id.interned().?)) orelse return null;
+        const item_id = switch (data.*) {
+            .structure => |item| item,
+            .variant, .callable => return null,
+        };
+        const definition = (try ctx.get(StructDefinition, item_id)).* orelse return null;
+
+        var active: std.ArrayList(structures.ItemId) = .empty;
+        defer active.deinit(ctx.allocator());
+        if (!try validateStructContainment(ctx, item_id, &active)) return null;
+
+        const field_offsets = try ctx.allocator().alloc(u32, definition.fields.len);
+        var keep_offsets = false;
+        defer if (!keep_offsets) ctx.allocator().free(field_offsets);
+        var byte_size: u32 = 0;
+        var byte_alignment: u32 = 1;
+        for (definition.fields, field_offsets) |field, *field_offset| {
+            const field_layout = (ctx.get(TypeLayout, field.type_id) catch |err| switch (err) {
+                error.Unavailable => return null,
+                else => return err,
+            }).*;
+            field_offset.* = try alignForward(byte_size, field_layout.byte_alignment);
+            byte_size = std.math.add(u32, field_offset.*, field_layout.byte_size) catch return error.TypeTooLarge;
+            byte_alignment = @max(byte_alignment, field_layout.byte_alignment);
+        }
+        keep_offsets = true;
+        return .{
+            .layout = .{
+                .byte_size = try alignForward(byte_size, byte_alignment),
+                .byte_alignment = byte_alignment,
+            },
+            .field_offsets = field_offsets,
+        };
+    }
+};
+
+pub const OwnershipCapabilities = struct {
+    pub const Input = structures.TypeId;
+    pub const Output = ?structures.OwnershipCapabilities;
+
+    pub fn run(ctx: anytype, type_id: Input) anyerror!Output {
+        if (type_id.isPrimitive()) return trivialOwnership();
+
+        const data = (try ctx.lookupInternedAs(Types, type_id.interned().?)) orelse return null;
+        return switch (data.*) {
+            .callable => trivialOwnership(),
+            .variant => |variant| variantOwnership(ctx, variant.members),
+            .structure => |item_id| structOwnership(ctx, type_id, item_id),
+        };
+    }
+
+    fn trivialOwnership() structures.OwnershipCapabilities {
+        return .{ .move = .trivial, .copy = .trivial, .drop = .trivial };
+    }
+
+    fn variantOwnership(ctx: anytype, members: []const structures.TypeId) !?structures.OwnershipCapabilities {
+        var can_move = true;
+        var can_copy = true;
+        var drops_trivially = true;
+        for (members) |member| {
+            const capabilities = (try ctx.get(OwnershipCapabilities, member)).* orelse return null;
+            can_move = can_move and capabilities.move != .none;
+            can_copy = can_copy and capabilities.copy != .none;
+            drops_trivially = drops_trivially and capabilities.drop == .trivial;
+        }
+        return .{
+            .move = if (can_move) .fieldwise else .none,
+            .copy = if (can_copy) .fieldwise else .none,
+            .drop = if (drops_trivially) .trivial else .fieldwise,
+        };
+    }
+
+    fn structOwnership(ctx: anytype, type_id: structures.TypeId, item_id: structures.ItemId) !?structures.OwnershipCapabilities {
+        if ((try ctx.get(StructLayout, type_id)).* == null) return null;
+        const definition = (try ctx.get(StructDefinition, item_id)).* orelse return null;
+
+        var can_move = true;
+        var drops_trivially = true;
+        for (definition.fields) |field| {
+            const capabilities = (try ctx.get(OwnershipCapabilities, field.type_id)).* orelse return null;
+            can_move = can_move and capabilities.move != .none;
+            drops_trivially = drops_trivially and capabilities.drop == .trivial;
+        }
+        return .{
+            .move = if (can_move) .fieldwise else .none,
+            .copy = .none,
+            .drop = if (drops_trivially) .trivial else .fieldwise,
+        };
+    }
+};
+
+fn validateStructContainment(ctx: anytype, item_id: structures.ItemId, active: *std.ArrayList(structures.ItemId)) !bool {
+    try active.append(ctx.allocator(), item_id);
+    defer _ = active.pop();
+
+    const definition = (try ctx.get(StructDefinition, item_id)).* orelse return false;
+    const loc = try ctx.lookupInterned(ItemLocations, item_id);
+    for (definition.fields) |field| {
+        if (!try validateContainedType(ctx, field.type_id, loc.file_id, field.span, active)) return false;
+    }
+    return true;
+}
+
+fn validateContainedType(
+    ctx: anytype,
+    type_id: structures.TypeId,
+    file_id: structures.FileId,
+    span: structures.SourceSpan,
+    active: *std.ArrayList(structures.ItemId),
+) !bool {
+    if (type_id.isPrimitive()) return true;
+    const data = (try ctx.lookupInternedAs(Types, type_id.interned().?)) orelse unreachable;
+    return switch (data.*) {
+        .callable => true,
+        .variant => |variant| blk: {
+            for (variant.members) |member| {
+                if (!try validateContainedType(ctx, member, file_id, span, active)) break :blk false;
+            }
+            break :blk true;
+        },
+        .structure => |contained_item| blk: {
+            if (std.mem.indexOfScalar(structures.ItemId, active.items, contained_item) != null) {
+                try ctx.emit(structures.Diagnostic, .{
+                    .file_id = file_id,
+                    .span = span,
+                    .kind = .recursive_struct_containment,
+                });
+                break :blk false;
+            }
+            break :blk validateStructContainment(ctx, contained_item, active);
+        },
+    };
+}
 
 fn alignForward(value: u32, alignment: u32) error{TypeTooLarge}!u32 {
     std.debug.assert(std.math.isPowerOfTwo(alignment));
@@ -425,8 +589,9 @@ pub const ResolveStatic = struct {
 
     pub fn run(ctx: anytype, item_id: Input) anyerror!Output {
         const loc = try ctx.lookupInterned(ItemLocations, item_id);
-        if (loc.kind != .static) return null;
+        if (loc.kind != .static and loc.kind != .structure) return null;
         const resolved = (try ctx.get(ResolveItem, item_id)).* orelse return null;
+        if (loc.kind == .structure) return .{ .type = try internStructType(ctx, item_id) };
         const parsed = (try ctx.get(ParseFile, resolved.file_id)).* orelse return null;
         const source = (try ctx.input(SourceText, resolved.file_id)).*;
         const type_interner: TypeInterner(@TypeOf(ctx)) = .{ .ctx = ctx, .file_id = resolved.file_id };
@@ -444,13 +609,38 @@ pub const ResolveStatic = struct {
     }
 };
 
+pub const StructDefinition = struct {
+    pub const Input = structures.ItemId;
+    pub const Output = ?structures.StructDefinition;
+
+    pub fn run(ctx: anytype, item_id: Input) anyerror!Output {
+        const loc = try ctx.lookupInterned(ItemLocations, item_id);
+        if (loc.kind != .structure) return null;
+        const resolved = (try ctx.get(ResolveItem, item_id)).* orelse return null;
+        const parsed = (try ctx.get(ParseFile, resolved.file_id)).* orelse return null;
+        const source = (try ctx.input(SourceText, resolved.file_id)).*;
+        const type_interner: TypeInterner(@TypeOf(ctx)) = .{ .ctx = ctx, .file_id = resolved.file_id };
+        const result = semantic.analyzeStructDefinition(&parsed, source, resolved.declaration, type_interner, ctx.allocator()) catch |err| switch (err) {
+            error.Unavailable => return null,
+            else => return err,
+        };
+        return switch (result) {
+            .success => |definition| definition,
+            .unsupported => |issue| blk: {
+                try typing.emitSemanticIssue(ctx, resolved.file_id, issue);
+                break :blk null;
+            },
+        };
+    }
+};
+
 pub const AnalyzeFunctionBody = struct {
     pub const Input = structures.ItemId;
     pub const Output = ?structures.FunctionBodyAnalysis;
 
     pub fn run(ctx: anytype, item_id: Input) anyerror!Output {
         const loc = try ctx.lookupInterned(ItemLocations, item_id);
-        if (loc.kind == .static) return null;
+        if (loc.kind == .static or loc.kind == .structure) return null;
         var parameter_types: []const structures.TypeId = &.{};
         var return_type: structures.TypeId = .unit;
         var is_fallible = false;

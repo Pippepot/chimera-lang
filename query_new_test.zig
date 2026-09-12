@@ -753,6 +753,298 @@ test "DiscoverItems creates an entry for every parsed file" {
     try testing.expectEqual(structures.ItemKind.top_level_entry, static_only.?.items[1].loc.kind);
 }
 
+test "struct declarations are nominal and aliases preserve identity" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static Left = struct
+        \\  value: int
+        \\static Right = struct
+        \\  value: int
+        \\static Alias = Left
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const left_item = scope.resolveStatic("Left").?;
+    const right_item = scope.resolveStatic("Right").?;
+    const alias_item = scope.resolveStatic("Alias").?;
+    try testing.expectEqual(structures.ItemKind.structure, (try db.lookupInterned(query_structures.ItemLocations, left_item)).kind);
+
+    const left = (try db.get(query_structures.ResolveStatic, left_item)).*.?;
+    const right = (try db.get(query_structures.ResolveStatic, right_item)).*.?;
+    const alias = (try db.get(query_structures.ResolveStatic, alias_item)).*.?;
+    const left_type = switch (left) {
+        .type => |type_id| type_id,
+        .runtime => unreachable,
+    };
+    const right_type = switch (right) {
+        .type => |type_id| type_id,
+        .runtime => unreachable,
+    };
+    const alias_type = switch (alias) {
+        .type => |type_id| type_id,
+        .runtime => unreachable,
+    };
+    try testing.expect(left_type != right_type);
+    try testing.expectEqual(left_type, alias_type);
+}
+
+test "struct definitions own ordered resolved fields" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static Count = int
+        \\static Pair = struct
+        \\  right: Count
+        \\  left: bool
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const pair = scope.resolveStatic("Pair").?;
+    const definition = (try db.get(query_structures.StructDefinition, pair)).*.?;
+    try testing.expectEqual(@as(usize, 2), definition.fields.len);
+    try testing.expectEqualStrings("right", definition.fields[0].name);
+    try testing.expectEqual(structures.TypeId.int, definition.fields[0].type_id);
+    try testing.expectEqualStrings("left", definition.fields[1].name);
+    try testing.expectEqual(structures.TypeId.bool, definition.fields[1].type_id);
+}
+
+test "struct definitions reject duplicate and unsupported members" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static Duplicate = struct
+        \\  value: int
+        \\  value: bool
+        \\static Property = struct
+        \\  copy = trivial
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const duplicate = scope.resolveStatic("Duplicate").?;
+    try testing.expect((try db.get(query_structures.StructDefinition, duplicate)).* == null);
+    var diagnostics = try db.transitiveAccumulatorValues(query_structures.StructDefinition, duplicate, structures.Diagnostic, testing.allocator);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(DiagnosticKind.duplicate_struct_field, std.meta.activeTag(diagnostics[0].kind));
+    freeDiagnostics(diagnostics);
+
+    const property = scope.resolveStatic("Property").?;
+    try testing.expect((try db.get(query_structures.StructDefinition, property)).* == null);
+    diagnostics = try db.transitiveAccumulatorValues(query_structures.StructDefinition, property, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(DiagnosticKind.struct_member_not_supported, std.meta.activeTag(diagnostics[0].kind));
+}
+
+test "struct layouts preserve declaration order alignment and nesting" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static Pair = struct
+        \\  left: int
+        \\  right: bool
+        \\static Outer = struct
+        \\  prefix: bool
+        \\  pair: Pair
+        \\  callback: func() unit
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const pair_type = (try db.get(query_structures.ResolveStatic, scope.resolveStatic("Pair").?)).*.?.type;
+    const outer_type = (try db.get(query_structures.ResolveStatic, scope.resolveStatic("Outer").?)).*.?.type;
+
+    const pair = (try db.get(query_structures.StructLayout, pair_type)).*.?;
+    try testing.expectEqual(structures.TypeLayout{ .byte_size = 8, .byte_alignment = 4 }, pair.layout);
+    try testing.expectEqualSlices(u32, &.{ 0, 4 }, pair.field_offsets);
+
+    const outer = (try db.get(query_structures.StructLayout, outer_type)).*.?;
+    try testing.expectEqual(structures.TypeLayout{ .byte_size = 24, .byte_alignment = 8 }, outer.layout);
+    try testing.expectEqualSlices(u32, &.{ 0, 4, 16 }, outer.field_offsets);
+    try testing.expectEqual(outer.layout, (try db.get(query_structures.TypeLayout, outer_type)).*);
+}
+
+test "struct layouts reject direct and variant-mediated containment cycles" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static Direct = struct
+        \\  next: Direct
+        \\static First = struct
+        \\  second: Second | none
+        \\static Second = struct
+        \\  first: First
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const direct_type = (try db.get(query_structures.ResolveStatic, scope.resolveStatic("Direct").?)).*.?.type;
+    try testing.expect((try db.get(query_structures.StructLayout, direct_type)).* == null);
+    var diagnostics = try db.transitiveAccumulatorValues(query_structures.StructLayout, direct_type, structures.Diagnostic, testing.allocator);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(DiagnosticKind.recursive_struct_containment, std.meta.activeTag(diagnostics[0].kind));
+    freeDiagnostics(diagnostics);
+
+    const first_type = (try db.get(query_structures.ResolveStatic, scope.resolveStatic("First").?)).*.?.type;
+    try testing.expect((try db.get(query_structures.StructLayout, first_type)).* == null);
+    diagnostics = try db.transitiveAccumulatorValues(query_structures.StructLayout, first_type, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(DiagnosticKind.recursive_struct_containment, std.meta.activeTag(diagnostics[0].kind));
+}
+
+test "callable signatures do not recursively contain structs by value" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static Node = struct
+        \\  next: func() Node
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const node_type = (try db.get(query_structures.ResolveStatic, scope.resolveStatic("Node").?)).*.?.type;
+    const layout = (try db.get(query_structures.StructLayout, node_type)).*.?;
+    try testing.expectEqual(structures.TypeLayout{ .byte_size = 8, .byte_alignment = 8 }, layout.layout);
+    try testing.expectEqualSlices(u32, &.{0}, layout.field_offsets);
+}
+
+test "ownership capabilities compose across callable variant and struct types" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static Callback: type = func(int) int
+        \\static MaybeInt = int | none
+        \\static Pair = struct
+        \\  left: int
+        \\  right: bool
+        \\static Wrapped = struct
+        \\  pair: Pair
+        \\static MaybePair = Pair | none
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const callback_type = (try db.get(query_structures.ResolveStatic, scope.resolveStatic("Callback").?)).*.?.type;
+    const maybe_int_type = (try db.get(query_structures.ResolveStatic, scope.resolveStatic("MaybeInt").?)).*.?.type;
+    const pair_type = (try db.get(query_structures.ResolveStatic, scope.resolveStatic("Pair").?)).*.?.type;
+    const wrapped_type = (try db.get(query_structures.ResolveStatic, scope.resolveStatic("Wrapped").?)).*.?.type;
+    const maybe_pair_type = (try db.get(query_structures.ResolveStatic, scope.resolveStatic("MaybePair").?)).*.?.type;
+
+    const trivial = structures.OwnershipCapabilities{ .move = .trivial, .copy = .trivial, .drop = .trivial };
+    try testing.expectEqual(trivial, (try db.get(query_structures.OwnershipCapabilities, .int)).*.?);
+    try testing.expectEqual(trivial, (try db.get(query_structures.OwnershipCapabilities, callback_type)).*.?);
+    try testing.expectEqual(
+        structures.OwnershipCapabilities{ .move = .fieldwise, .copy = .fieldwise, .drop = .trivial },
+        (try db.get(query_structures.OwnershipCapabilities, maybe_int_type)).*.?,
+    );
+
+    const default_struct = structures.OwnershipCapabilities{ .move = .fieldwise, .copy = .none, .drop = .trivial };
+    try testing.expectEqual(default_struct, (try db.get(query_structures.OwnershipCapabilities, pair_type)).*.?);
+    try testing.expectEqual(default_struct, (try db.get(query_structures.OwnershipCapabilities, wrapped_type)).*.?);
+    try testing.expectEqual(default_struct, (try db.get(query_structures.OwnershipCapabilities, maybe_pair_type)).*.?);
+}
+
+test "ownership capabilities reject recursive structs and recover incrementally" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static Node = struct
+        \\  next: Node
+    );
+    const node_item = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveStatic("Node").?;
+    const node_type = (try db.get(query_structures.ResolveStatic, node_item)).*.?.type;
+    try testing.expect((try db.get(query_structures.OwnershipCapabilities, node_type)).* == null);
+    var diagnostics = try db.transitiveAccumulatorValues(query_structures.OwnershipCapabilities, node_type, structures.Diagnostic, testing.allocator);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(DiagnosticKind.recursive_struct_containment, std.meta.activeTag(diagnostics[0].kind));
+    freeDiagnostics(diagnostics);
+
+    try setSource(db, 1,
+        \\static Node = struct
+        \\  next: int
+    );
+    const first = try db.get(query_structures.OwnershipCapabilities, node_type);
+    try testing.expectEqual(
+        structures.OwnershipCapabilities{ .move = .fieldwise, .copy = .none, .drop = .trivial },
+        first.*.?,
+    );
+
+    try setSource(db, 1,
+        \\static Node = struct
+        \\  next: bool
+    );
+    try testing.expectEqual(first, try db.get(query_structures.OwnershipCapabilities, node_type));
+    diagnostics = try db.transitiveAccumulatorValues(query_structures.OwnershipCapabilities, node_type, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 0), diagnostics.len);
+}
+
+test "struct identity definitions and layouts recompute incrementally" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static Pair = struct
+        \\  left: int
+        \\  right: bool
+    );
+    const pair_item = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveStatic("Pair").?;
+    const first_identity = try db.get(query_structures.ResolveStatic, pair_item);
+    const pair_type = first_identity.*.?.type;
+    const first_definition = try db.get(query_structures.StructDefinition, pair_item);
+    const first_layout = try db.get(query_structures.StructLayout, pair_type);
+
+    try setSource(db, 1,
+        \\static Pair = struct
+        \\  left: int
+        \\  right: bool
+        \\func unrelated() int -> 1
+    );
+    try testing.expectEqual(pair_item, (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveStatic("Pair").?);
+    try testing.expectEqual(first_identity, try db.get(query_structures.ResolveStatic, pair_item));
+    try testing.expectEqual(first_definition, try db.get(query_structures.StructDefinition, pair_item));
+    try testing.expectEqual(first_layout, try db.get(query_structures.StructLayout, pair_type));
+
+    try setSource(db, 1,
+        \\static Pair = struct
+        \\  left: int
+        \\  right: int
+    );
+    try testing.expectEqual(first_identity, try db.get(query_structures.ResolveStatic, pair_item));
+    try testing.expect(first_definition != try db.get(query_structures.StructDefinition, pair_item));
+    try testing.expectEqual(first_layout, try db.get(query_structures.StructLayout, pair_type));
+
+    try setSource(db, 1,
+        \\static Pair = struct
+        \\  left: int
+        \\  right: func() unit
+    );
+    try testing.expect(first_layout != try db.get(query_structures.StructLayout, pair_type));
+}
+
+test "recursive struct layout recovers after a field edit" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static Node = struct
+        \\  next: Node
+    );
+    const node_item = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveStatic("Node").?;
+    const node_type = (try db.get(query_structures.ResolveStatic, node_item)).*.?.type;
+    try testing.expect((try db.get(query_structures.StructLayout, node_type)).* == null);
+
+    try setSource(db, 1,
+        \\static Node = struct
+        \\  next: int
+    );
+    try testing.expectEqual(node_item, (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveStatic("Node").?);
+    try testing.expectEqual(node_type, (try db.get(query_structures.ResolveStatic, node_item)).*.?.type);
+    const layout = (try db.get(query_structures.StructLayout, node_type)).*.?;
+    try testing.expectEqual(structures.TypeLayout{ .byte_size = 4, .byte_alignment = 4 }, layout.layout);
+    const diagnostics = try db.transitiveAccumulatorValues(query_structures.StructLayout, node_type, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 0), diagnostics.len);
+}
+
 test "item indexing handles empty malformed missing and duplicate inputs" {
     const db = try testDatabase(2);
     defer db.deinit();

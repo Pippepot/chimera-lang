@@ -1,3 +1,5 @@
-func identity(value: int) int -> value
-func choose() func(int) int -> identity
-exit(choose()(2))
+static S = struct
+  a: int
+var s: S = S{a = 1}
+s.a = 2
+exit(s.a)
