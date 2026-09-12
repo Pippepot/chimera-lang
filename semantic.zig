@@ -629,10 +629,9 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             const node = self.ast.nodes[index.index()];
             const callee_index = node.data.node_node.a;
             const callee = self.ast.nodes[callee_index.index()];
-            if (callee.tag != .identifier) return self.reject(index, .expression_not_supported);
-            const span = tokenSpan(self.ast, callee.token_index);
-            const name = self.source[span.start..span.end];
-            const target: UnresolvedBody.Call.Target = target_blk: {
+            const span = nodeFocusSpan(self.ast, callee_index);
+            const target: UnresolvedBody.Call.Target = if (callee.tag == .identifier) target_blk: {
+                const name = self.source[span.start..span.end];
                 if (std.mem.eql(u8, name, "exit")) break :target_blk .{ .direct = name };
                 if (self.locals.contains(name)) break :target_blk .{ .value = try self.appendUse(callee_index) };
                 const function = self.type_interner.resolveFunction(name) catch |err| switch (err) {
@@ -663,7 +662,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                     .type => {},
                 };
                 break :target_blk .{ .direct = name };
-            };
+            } else .{ .value = try self.appendUse(callee_index) };
             const scratch_start = self.scratch.items.len;
             defer self.scratch.shrinkRetainingCapacity(scratch_start);
             for (self.ast.nodeList(node.data.node_node.b)) |argument| {

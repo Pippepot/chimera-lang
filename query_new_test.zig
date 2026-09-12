@@ -2288,6 +2288,22 @@ test "callable values bind pass return and execute through indirect calls" {
     try testing.expectEqual(@as(u8, 42), try runtime.runProg(io, testing.allocator, &.{}));
 }
 
+test "call results can be called directly" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\func increment(value: int) int -> value + 1
+        \\func choose() func(int) int -> increment
+        \\exit(choose()(41))
+    );
+    const executable = (try db.get(query_structures.BuildExecutable, 1)).*.?;
+    const io = testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    try runtime.writeProgram(io, executable.bytes);
+    try testing.expectEqual(@as(u8, 42), try runtime.runProg(io, testing.allocator, &.{}));
+}
+
 test "ordinary callables widen to fallible aliases and calls" {
     const db = try testDatabase(2);
     defer db.deinit();
@@ -3857,7 +3873,7 @@ test "entry analysis validates all root syntax before resolving a call" {
         kind: structures.Diagnostic.Kind,
     }{
         .{ .source = "static bad = func() foo -> return 1\nbad()\nreturn", .marker = "return", .kind = .top_level_return },
-        .{ .source = "static f = func() int -> return 1\nf()()", .marker = "(", .kind = .expression_not_supported },
+        .{ .source = "static f = func() int -> return 1\nsizeof(int)\nf()", .marker = "sizeof", .kind = .expression_not_supported },
     };
 
     for (cases, 10..) |case, file_id| {

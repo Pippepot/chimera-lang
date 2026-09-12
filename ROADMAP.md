@@ -21,6 +21,13 @@ Do not assume every future type supports equality merely because literal pattern
 
 ## Later language slices
 
+### Captureless function literals
+
+After `match`, make `func` expressions produce callable values through stable
+nested declaration identities and the existing signature, body, reachability,
+and relocation queries. Reject references to enclosing local bindings. Keep
+closures and captures with the ownership work below.
+
 ### Float
 
 Specify representation, literal range, arithmetic, comparison domains, conversions, division behavior, and exceptional values before implementation. Then add float as a separate end-to-end scalar slice, including variants and calls.
