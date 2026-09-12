@@ -36,6 +36,10 @@ static Default = 40
 # right-hand side once, widens it to that type when permitted, updates the
 # variable, and evaluates to the updated value. Compound assignment uses the
 # current value as the left operand of the corresponding operation.
+# A field target denotes a path into its mutable root. Compound assignment reads
+# the old leaf before evaluating the right-hand side. The final update rebuilds
+# from the root's value after right-hand-side evaluation, so changes to sibling
+# fields made by that evaluation are preserved.
 c = 40
 c += 2
 

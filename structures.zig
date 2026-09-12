@@ -477,15 +477,45 @@ pub const VariantType = struct {
     members: []const TypeId,
 };
 
+pub const ParameterMode = enum {
+    read,
+    static,
+    mut,
+    @"var",
+    deinit,
+};
+
+pub const CallableParameter = struct {
+    mode: ParameterMode,
+    type_id: TypeId,
+};
+
+fn callableParametersEql(a: []const CallableParameter, b: []const CallableParameter) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (left.mode != right.mode or left.type_id != right.type_id) return false;
+    }
+    return true;
+}
+
 pub const CallableType = struct {
-    parameter_types: []const TypeId,
+    parameters: []const CallableParameter,
     return_type: TypeId,
     is_fallible: bool,
+
+    pub fn parametersEql(a: CallableType, b: CallableType) bool {
+        return callableParametersEql(a.parameters, b.parameters);
+    }
 
     pub fn eql(a: CallableType, b: CallableType) bool {
         return a.return_type == b.return_type and
             a.is_fallible == b.is_fallible and
-            std.mem.eql(TypeId, a.parameter_types, b.parameter_types);
+            a.parametersEql(b);
+    }
+
+    pub fn deinit(self: *CallableType, gpa: std.mem.Allocator) void {
+        gpa.free(self.parameters);
+        self.* = undefined;
     }
 };
 
@@ -664,22 +694,9 @@ pub const FunctionBlock = struct {
     terminator: FunctionTerminator,
 };
 
-pub const FunctionSignature = struct {
-    parameter_types: []const TypeId,
-    return_type: TypeId,
-    is_fallible: bool = false,
-
-    pub fn eql(a: FunctionSignature, b: FunctionSignature) bool {
-        return a.return_type == b.return_type and
-            a.is_fallible == b.is_fallible and
-            std.mem.eql(TypeId, a.parameter_types, b.parameter_types);
-    }
-
-    pub fn deinit(self: *FunctionSignature, gpa: std.mem.Allocator) void {
-        gpa.free(self.parameter_types);
-        self.* = undefined;
-    }
-};
+/// Function-signature query outputs own `parameters`; interned callable types
+/// clone the same value shape into session-stable storage.
+pub const FunctionSignature = CallableType;
 
 pub const FunctionCall = struct {
     target: ItemId,
@@ -954,6 +971,8 @@ pub const Diagnostic = struct {
         top_level_return,
         break_outside_loop,
         continue_outside_loop,
+        nested_declaration_not_supported,
+        ownership_transfer_not_supported,
         expression_not_supported,
         struct_initializer_not_struct: TypeId,
         unknown_struct_field,
@@ -964,12 +983,14 @@ pub const Diagnostic = struct {
         unknown_field,
         duplicate_local_binding,
         local_type_not_supported,
+        float_type_not_supported,
         unknown_type,
         unknown_value,
         assignment_target_not_local,
         assignment_to_immutable,
         assignment_type_mismatch: TypeMismatch,
         integer_literal_not_decimal,
+        float_literal_not_supported,
         integer_literal_out_of_range,
         fallible_condition_not_supported,
         if_condition_not_fallible,

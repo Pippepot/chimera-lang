@@ -303,11 +303,15 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             return .continue_loop;
         }
 
+        fn nameIsVisible(self: *Self, name: []const u8) !bool {
+            return self.locals.contains(name) or try self.type_interner.resolveItem(name) != null;
+        }
+
         fn buildBinding(self: *Self, index: structures.Node.Index) anyerror!UnresolvedBody.Statement {
             const node = self.ast.nodes[index.index()];
             const span = tokenSpan(self.ast, node.token_index);
             const name = self.source[span.start..span.end];
-            if (self.locals.contains(name)) return self.reject(index, .duplicate_local_binding);
+            if (try self.nameIsVisible(name)) return self.reject(index, .duplicate_local_binding);
             const annotation = node.data.node_node.a.unwrap();
             const expected = if (annotation) |type_node| try self.bindingType(type_node) else null;
             var value = try self.append(node.data.node_node.b);
@@ -394,6 +398,8 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 .assign, .add_assign, .sub_assign, .mul_assign, .div_assign => return self.appendAssignment(index),
                 .@"if", .if_else => return self.appendIf(index),
                 .loop => return self.appendLoop(index),
+                .static_binding => return self.reject(index, .nested_declaration_not_supported),
+                .move_expr => return self.reject(index, .ownership_transfer_not_supported),
                 else => return self.reject(index, .expression_not_supported),
             }
         }
@@ -462,11 +468,10 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
         fn appendInteger(self: *Self, index: structures.Node.Index) !ValueId {
             const span = tokenSpan(self.ast, self.ast.nodes[index.index()].token_index);
             const literal = self.source[span.start..span.end];
-            for (literal) |byte| {
-                if (!std.ascii.isDigit(byte)) return self.reject(index, .integer_literal_not_decimal);
-            }
-            const value = std.fmt.parseInt(i32, literal, 10) catch return self.reject(index, .integer_literal_out_of_range);
-            return self.appendExpression(index, .{ .integer = value });
+            return switch (parseIntegerLiteral(literal)) {
+                .value => |value| self.appendExpression(index, .{ .integer = value }),
+                .unsupported => |kind| self.reject(index, kind),
+            };
         }
 
         fn appendBinary(self: *Self, index: structures.Node.Index) !ValueId {
@@ -564,7 +569,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
 
             const span = tokenSpan(self.ast, node.token_index);
             const name = self.source[span.start..span.end];
-            if (self.locals.contains(name)) return self.reject(index, .duplicate_local_binding);
+            if (try self.nameIsVisible(name)) return self.reject(index, .duplicate_local_binding);
             const extracted = try self.appendExpression(value_index, .condition_extract);
             const annotation_type = if (node.data.node_node.a.unwrap()) |annotation| try self.bindingType(annotation) else null;
             const condition = try self.buildVariantMembership(value_node, .{
@@ -822,19 +827,23 @@ pub fn analyzeFunctionSignature(
     const parts = functionParts(ast, declaration);
     const signature = ast.nodes[parts.signature.index()];
 
-    var parameter_types: std.ArrayList(structures.TypeId) = .empty;
-    defer parameter_types.deinit(gpa);
+    var parameters: std.ArrayList(structures.CallableParameter) = .empty;
+    defer parameters.deinit(gpa);
     var names = std.StringHashMap(void).init(gpa);
     defer names.deinit();
     for (ast.nodeList(signature.data.node_node.a)) |parameter_index| {
         const parameter = ast.nodes[parameter_index.index()];
         std.debug.assert(parameter.tag == .param);
-        if (parameter.data.node_node.a.unwrap()) |access| {
-            return .{ .unsupported = issueAt(ast, access.index(), .parameter_mode_not_supported) };
-        }
+        const mode: structures.ParameterMode = if (parameter.data.node_node.a.unwrap()) |access|
+            if (ast.tokens[ast.nodes[access.index()].token_index].tag == .keyword_read)
+                .read
+            else
+                return .{ .unsupported = issueAt(ast, access.index(), .parameter_mode_not_supported) }
+        else
+            .read;
         const name_span = tokenSpan(ast, parameter.token_index);
         const name = source[name_span.start..name_span.end];
-        if ((try names.getOrPut(name)).found_existing) {
+        if ((try names.getOrPut(name)).found_existing or try type_interner.resolveItem(name) != null) {
             return .{ .unsupported = .{ .span = name_span, .kind = .duplicate_parameter } };
         }
         const annotation = parameter.data.node_node.b.unwrap() orelse
@@ -843,7 +852,7 @@ pub fn analyzeFunctionSignature(
             .success => |type_id| type_id,
             .unsupported => |issue| return .{ .unsupported = issue },
         };
-        try parameter_types.append(gpa, parameter_type);
+        try parameters.append(gpa, .{ .mode = mode, .type_id = parameter_type });
     }
 
     const return_type = if (signature.data.node_node.b.unwrap()) |return_type_index|
@@ -863,7 +872,7 @@ pub fn analyzeFunctionSignature(
             .unsupported => |issue| return .{ .unsupported = issue },
         };
         const actual = try type_interner.internCallable(.{
-            .parameter_types = parameter_types.items,
+            .parameters = parameters.items,
             .return_type = return_type,
             .is_fallible = is_fallible,
         });
@@ -876,7 +885,7 @@ pub fn analyzeFunctionSignature(
         } };
     }
     return .{ .success = .{
-        .parameter_types = try parameter_types.toOwnedSlice(gpa),
+        .parameters = try parameters.toOwnedSlice(gpa),
         .return_type = return_type,
         .is_fallible = is_fallible,
     } };
@@ -906,6 +915,7 @@ fn analyzeType(
         if (std.mem.eql(u8, name, "unit")) return .{ .success = .unit };
         if (std.mem.eql(u8, name, "none")) return .{ .success = .none };
         if (std.mem.eql(u8, name, "never")) return .{ .success = .never };
+        if (std.mem.eql(u8, name, "float")) return .{ .unsupported = .{ .span = span, .kind = .float_type_not_supported } };
         const resolved = type_interner.resolveStatic(name) catch |err| switch (err) {
             error.QueryCycle => return .{ .unsupported = .{ .span = span, .kind = .declaration_cycle } },
             error.Unavailable => return error.Unavailable,
@@ -918,21 +928,21 @@ fn analyzeType(
         };
     }
     if (node.tag == .type_func) {
-        var parameter_types: std.ArrayList(structures.TypeId) = .empty;
-        defer parameter_types.deinit(gpa);
+        var parameters: std.ArrayList(structures.CallableParameter) = .empty;
+        defer parameters.deinit(gpa);
         for (ast.nodeList(node.data.node_node.a)) |parameter_index| {
             const parameter_type = switch (try analyzeType(ast, source, parameter_index, type_interner, gpa, unsupported_kind)) {
                 .success => |type_id| type_id,
                 .unsupported => |issue| return .{ .unsupported = issue },
             };
-            try parameter_types.append(gpa, parameter_type);
+            try parameters.append(gpa, .{ .mode = .read, .type_id = parameter_type });
         }
         const return_type = switch (try analyzeType(ast, source, node.data.node_node.b, type_interner, gpa, unsupported_kind)) {
             .success => |type_id| type_id,
             .unsupported => |issue| return .{ .unsupported = issue },
         };
         return .{ .success = try type_interner.internCallable(.{
-            .parameter_types = parameter_types.items,
+            .parameters = parameters.items,
             .return_type = return_type,
             .is_fallible = ast.tokens[node.token_index].tag == .keyword_fallible,
         }) };
@@ -1067,6 +1077,28 @@ fn isMetaTypeAnnotation(ast: *const structures.Ast, source: []const u8, annotati
     return node.tag == .type and std.mem.eql(u8, source[span.start..span.end], "type");
 }
 
+const IntegerLiteralResult = union(enum) {
+    value: i32,
+    unsupported: structures.Diagnostic.Kind,
+};
+
+fn parseIntegerLiteral(literal: []const u8) IntegerLiteralResult {
+    const prefix = if (literal.len >= 2) literal[0..2] else "";
+    const is_hex = std.ascii.eqlIgnoreCase(prefix, "0x");
+    const is_other_base = std.ascii.eqlIgnoreCase(prefix, "0b") or std.ascii.eqlIgnoreCase(prefix, "0o");
+    for (literal) |byte| {
+        if (byte == '.' or (is_hex and (byte == 'p' or byte == 'P')) or
+            (!is_hex and !is_other_base and (byte == 'e' or byte == 'E')))
+        {
+            return .{ .unsupported = .float_literal_not_supported };
+        }
+    }
+    for (literal) |byte| {
+        if (!std.ascii.isDigit(byte)) return .{ .unsupported = .integer_literal_not_decimal };
+    }
+    return .{ .value = std.fmt.parseInt(i32, literal, 10) catch return .{ .unsupported = .integer_literal_out_of_range } };
+}
+
 fn analyzeStaticInitializer(
     ast: *const structures.Ast,
     source: []const u8,
@@ -1079,12 +1111,10 @@ fn analyzeStaticInitializer(
         .number_literal => blk: {
             const span = tokenSpan(ast, node.token_index);
             const literal = source[span.start..span.end];
-            for (literal) |byte| {
-                if (!std.ascii.isDigit(byte)) break :blk .{ .unsupported = .{ .span = span, .kind = .integer_literal_not_decimal } };
-            }
-            const value = std.fmt.parseInt(i32, literal, 10) catch
-                break :blk .{ .unsupported = .{ .span = span, .kind = .integer_literal_out_of_range } };
-            break :blk .{ .success = .{ .runtime = .{ .type_id = .int, .value = .{ .int = value } } } };
+            break :blk switch (parseIntegerLiteral(literal)) {
+                .value => |value| .{ .success = .{ .runtime = .{ .type_id = .int, .value = .{ .int = value } } } },
+                .unsupported => |kind| .{ .unsupported = .{ .span = span, .kind = kind } },
+            };
         },
         .bool_literal => .{ .success = .{ .runtime = .{
             .type_id = .bool,
@@ -1148,7 +1178,7 @@ fn canWidenMember(type_interner: anytype, actual: structures.TypeId, expected: s
     const expected_callable = try type_interner.callable(expected) orelse return false;
     const actual_callable = try type_interner.callable(actual) orelse return false;
     return actual_callable.return_type == expected_callable.return_type and
-        std.mem.eql(structures.TypeId, actual_callable.parameter_types, expected_callable.parameter_types) and
+        actual_callable.parametersEql(expected_callable) and
         (!actual_callable.is_fallible or expected_callable.is_fallible);
 }
 
@@ -1331,6 +1361,10 @@ const TestTypeInterner = struct {
     }
 
     pub fn resolveFunction(_: @This(), _: []const u8) !?structures.ItemId {
+        return null;
+    }
+
+    pub fn resolveItem(_: @This(), _: []const u8) !?structures.ItemId {
         return null;
     }
 

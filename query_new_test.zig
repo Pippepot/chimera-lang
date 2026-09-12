@@ -106,6 +106,14 @@ fn expectDirectValueUses(expected: []const structures.FunctionValueId, actual: [
     }
 }
 
+fn expectReadParameters(expected: []const structures.TypeId, actual: []const structures.CallableParameter) !void {
+    try testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |expected_type, parameter| {
+        try testing.expectEqual(structures.ParameterMode.read, parameter.mode);
+        try testing.expectEqual(expected_type, parameter.type_id);
+    }
+}
+
 fn expectUnitBody(body: structures.FunctionBodyAnalysis) !void {
     try testing.expectEqual(@as(usize, 0), body.instructions.len);
     try testing.expectEqual(@as(usize, 1), body.blocks.len);
@@ -552,7 +560,7 @@ const SignatureParent = struct {
     pub fn run(ctx: *Context, item_id: Input) anyerror!Output {
         executions.increment();
         const signature = (try ctx.get(query_structures.FunctionSignature, item_id)).* orelse return null;
-        return signature.parameter_types.len;
+        return signature.parameters.len;
     }
 };
 
@@ -1087,6 +1095,38 @@ test "nested field assignments keep independent target ranges" {
     try expectCompiledFunctionResult(db, 1, "answer", &.{"answer"}, 42);
 }
 
+test "nested field assignments rebuild from the latest root value" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static Pair = struct
+        \\  left: int
+        \\  right: int
+        \\func answer() int
+        \\  var pair = Pair{left = 0, right = 0}
+        \\  pair.left = pair.right = 21
+        \\  return pair.left + pair.right
+    );
+    try expectCompiledFunctionResult(db, 1, "answer", &.{"answer"}, 42);
+}
+
+test "compound field assignments read before and rebuild after the right hand side" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static Pair = struct
+        \\  left: int
+        \\  right: int
+        \\func answer() int
+        \\  var pair = Pair{left = 1, right = 0}
+        \\  pair.left += pair.right = 21
+        \\  return pair.left + pair.right
+    );
+    try expectCompiledFunctionResult(db, 1, "answer", &.{"answer"}, 43);
+}
+
 test "nested field updates flow through branch state" {
     const db = try testDatabase(1);
     defer db.deinit();
@@ -1107,6 +1147,25 @@ test "nested field updates flow through branch state" {
         \\func answer() int -> mutate(0) + mutate(1)
     );
     try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "mutate" }, 42);
+}
+
+test "field updates flow through loop state" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static Pair = struct
+        \\  left: int
+        \\  right: int
+        \\func answer() int
+        \\  var pair = Pair{left = 0, right = 0}
+        \\  loop
+        \\    pair.left += 1
+        \\    if pair.left == 21 -> break
+        \\    pair.right += 1
+        \\  return pair.left + pair.right
+    );
+    try expectCompiledFunctionResult(db, 1, "answer", &.{"answer"}, 41);
 }
 
 test "field assignment widens to the declared field type" {
@@ -1145,6 +1204,27 @@ test "field assignment diagnostics validate roots paths and values" {
         try testing.expectEqual(@as(usize, 1), diagnostics.len);
         try testing.expectEqual(case.expected, std.meta.activeTag(diagnostics[0].kind));
     }
+}
+
+test "nested field assignment highlights the non-struct parent" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    const source =
+        \\static Outer = struct
+        \\  count: int
+        \\func bad()
+        \\  var outer = Outer{count = 0}
+        \\  outer.count.value = 1
+    ;
+    try addSource(db, 1, source);
+    const bad = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolve("bad").?;
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, bad)).* == null);
+    const start = std.mem.lastIndexOf(u8, source, "count").?;
+    try expectSingleQueryDiagnostic(db, query_structures.AnalyzeFunctionBody, bad, true, 1, .{
+        .start = start,
+        .end = start + "count".len,
+    }, .{ .field_access_not_struct = .int });
 }
 
 test "field assignment tracks definition edits and recovers" {
@@ -2136,7 +2216,7 @@ test "function signatures intern canonical variant annotations" {
     const target_id = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolve("target").?;
     const first_signature = try db.get(query_structures.FunctionSignature, target_id);
     try testing.expect(first_signature.* != null);
-    const first_parameter = first_signature.*.?.parameter_types[0];
+    const first_parameter = first_signature.*.?.parameters[0].type_id;
     const first_return = first_signature.*.?.return_type;
     try testing.expectEqualSlices(
         structures.TypeId,
@@ -2154,7 +2234,7 @@ test "function signatures intern canonical variant annotations" {
     try setSource(db, 1, reordered_source);
     const reordered_signature = try db.get(query_structures.FunctionSignature, target_id);
     try testing.expectEqual(first_signature, reordered_signature);
-    try testing.expectEqual(first_parameter, reordered_signature.*.?.parameter_types[0]);
+    try testing.expectEqual(first_parameter, reordered_signature.*.?.parameters[0].type_id);
     try testing.expectEqual(first_return, reordered_signature.*.?.return_type);
     try testing.expectEqual(@as(?usize, 1), (try db.get(SignatureParent, target_id)).*);
     try SignatureParent.executions.expect(1);
@@ -2487,7 +2567,7 @@ test "function signature and body analysis support inline and block literal retu
     }) |case| {
         const function_id = (try db.get(query_structures.IndexItems, case.file_id)).*.?.ids()[0];
         const signature = (try db.get(query_structures.FunctionSignature, function_id)).*.?;
-        try testing.expectEqual(@as(usize, 0), signature.parameter_types.len);
+        try testing.expectEqual(@as(usize, 0), signature.parameters.len);
         try testing.expectEqual(structures.TypeId.int, signature.return_type);
         try expectIntegerReturnBody((try db.get(query_structures.AnalyzeFunctionBody, function_id)).*.?, case.expected);
     }
@@ -2557,9 +2637,9 @@ test "zero-sized values cross direct binding call and return boundaries" {
     const pass_none = scope.resolve("pass_none").?;
     const unit_signature = (try db.get(query_structures.FunctionSignature, pass_unit)).*.?;
     const none_signature = (try db.get(query_structures.FunctionSignature, pass_none)).*.?;
-    try testing.expectEqualSlices(structures.TypeId, &.{.unit}, unit_signature.parameter_types);
+    try expectReadParameters(&.{.unit}, unit_signature.parameters);
     try testing.expectEqual(structures.TypeId.unit, unit_signature.return_type);
-    try testing.expectEqualSlices(structures.TypeId, &.{.none}, none_signature.parameter_types);
+    try expectReadParameters(&.{.none}, none_signature.parameters);
     try testing.expectEqual(structures.TypeId.none, none_signature.return_type);
     try testing.expect((try db.get(query_structures.BuildExecutable, 1)).* != null);
 
@@ -2584,7 +2664,7 @@ test "declared unit functions analyze lower compile and execute as ordinary call
     const caller_id = scope.resolve("caller").?;
 
     const leaf_signature = (try db.get(query_structures.FunctionSignature, leaf_id)).*.?;
-    try testing.expectEqualSlices(structures.TypeId, &.{.int}, leaf_signature.parameter_types);
+    try expectReadParameters(&.{.int}, leaf_signature.parameters);
     try testing.expectEqual(structures.TypeId.unit, leaf_signature.return_type);
     const leaf_body = (try db.get(query_structures.AnalyzeFunctionBody, leaf_id)).*.?;
     try testing.expectEqualSlices(structures.TypeId, &.{.int}, leaf_body.block_argument_types);
@@ -2612,7 +2692,6 @@ test "exit is an unshadowable int to never intrinsic" {
     defer db.deinit();
 
     try addSource(db, 1,
-        \\static exit = func() unit -> return
         \\static caller = func(value: int) unit
         \\  const exit = 1
         \\  return exit(value)
@@ -2817,6 +2896,41 @@ test "fallible function signatures distinguish declarations" {
     try testing.expect(!structures.FunctionSignature.eql(ordinary, checked));
 }
 
+test "explicit read parameters use the default callable identity" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\func implicit(value: int) int -> value
+        \\func explicit(read value: int) int -> value
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const implicit = (try db.get(query_structures.FunctionSignature, scope.resolve("implicit").?)).*.?;
+    const explicit = (try db.get(query_structures.FunctionSignature, scope.resolve("explicit").?)).*.?;
+
+    try expectReadParameters(&.{.int}, explicit.parameters);
+    try testing.expect(structures.FunctionSignature.eql(implicit, explicit));
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, scope.resolve("explicit").?)).* != null);
+}
+
+test "callable identity includes parameter modes" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    const read_id = try db.intern(query_structures.Types, .{ .callable = .{
+        .parameters = &.{.{ .mode = .read, .type_id = .int }},
+        .return_type = .unit,
+        .is_fallible = false,
+    } });
+    const mutable_id = try db.intern(query_structures.Types, .{ .callable = .{
+        .parameters = &.{.{ .mode = .mut, .type_id = .int }},
+        .return_type = .unit,
+        .is_fallible = false,
+    } });
+
+    try testing.expect(read_id != mutable_id);
+}
+
 test "callable values bind pass return and execute through indirect calls" {
     const db = try testDatabase(2);
     defer db.deinit();
@@ -2874,7 +2988,7 @@ test "ordinary callables widen to fallible aliases and calls" {
     const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
     const checked = (try db.get(query_structures.ResolveStatic, scope.resolve("checked").?)).*.?;
     const checked_type = (try db.lookupInterned(query_structures.Types, checked.runtime.type_id.interned().?)).callable;
-    try testing.expectEqualSlices(structures.TypeId, &.{.int}, checked_type.parameter_types);
+    try expectReadParameters(&.{.int}, checked_type.parameters);
     try testing.expectEqual(structures.TypeId.int, checked_type.return_type);
     try testing.expect(checked_type.is_fallible);
     const entry = (try db.get(query_structures.AnalyzeFunctionBody, (try db.get(query_structures.SelectEntry, 1)).*.?)).*.?;
@@ -3679,7 +3793,7 @@ test "parameters and nested call arguments form one typed value graph" {
     const twice_id = scope.resolve("twice").?;
 
     const add_signature = (try db.get(query_structures.FunctionSignature, add_id)).*.?;
-    try testing.expectEqualSlices(structures.TypeId, &.{ .int, .int }, add_signature.parameter_types);
+    try expectReadParameters(&.{ .int, .int }, add_signature.parameters);
     const add = (try db.get(query_structures.AnalyzeFunctionBody, add_id)).*.?;
     try testing.expectEqualSlices(structures.TypeId, &.{ .int, .int }, add.block_argument_types);
     try testing.expectEqual(@as(u32, 0), add.blocks[0].argument_start);
@@ -3767,7 +3881,7 @@ test "parameter arity edits invalidate callers and recovery restores them" {
         \\static caller = func() int -> return target(7)
     );
     try testing.expectEqual(@as(?usize, 2), (try db.get(SignatureParent, target_id)).*);
-    try testing.expectEqualSlices(structures.TypeId, &.{ .int, .int }, (try db.get(query_structures.FunctionSignature, target_id)).*.?.parameter_types);
+    try expectReadParameters(&.{ .int, .int }, (try db.get(query_structures.FunctionSignature, target_id)).*.?.parameters);
     try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, caller_id)).* == null);
 
     try setSource(db, 1,
@@ -4126,7 +4240,7 @@ test "local binding diagnostics follow lexical scope and declared type" {
     }{
         .{ .file_id = 1, .source = "static f = func() int\n  const duplicate = 1\n  const duplicate = 2\n  return 1", .marker = "duplicate", .kind = .duplicate_local_binding },
         .{ .file_id = 2, .source = "static f = func() int\n  const x = missing\n  return x", .marker = "missing", .kind = .unknown_value },
-        .{ .file_id = 3, .source = "static f = func() int\n  const x: float = 1\n  return x", .marker = "float", .kind = .unknown_type },
+        .{ .file_id = 3, .source = "static f = func() int\n  const x: float = 1\n  return x", .marker = "float", .kind = .float_type_not_supported },
         .{ .file_id = 4, .source = "static f = func() int\n  const leaf = 1\n  return leaf()", .marker = "leaf", .kind = .value_not_callable },
     };
     for (cases) |case| {
@@ -4140,6 +4254,52 @@ test "local binding diagnostics follow lexical scope and declared type" {
         const start = std.mem.lastIndexOf(u8, case.source, case.marker).?;
         try testing.expectEqual(structures.SourceSpan{ .start = start, .end = start + case.marker.len }, diagnostics[0].span.?);
     }
+}
+
+test "declarations cannot shadow visible module names" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    const local_source =
+        \\func visible() int -> 1
+        \\func bad() int
+        \\  const visible = 2
+        \\  return visible
+    ;
+    try addSource(db, 1, local_source);
+    const bad = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolve("bad").?;
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, bad)).* == null);
+    const start = std.mem.indexOf(u8, local_source, "const visible").? + "const ".len;
+    try expectSingleQueryDiagnostic(db, query_structures.AnalyzeFunctionBody, bad, true, 1, .{
+        .start = start,
+        .end = start + "visible".len,
+    }, .duplicate_local_binding);
+
+    const parameter_source =
+        \\func visible() int -> 1
+        \\func bad(visible: int) int -> visible
+    ;
+    try addSource(db, 2, parameter_source);
+    const parameter = (try db.get(query_structures.BuildModuleScope, 2)).*.?.resolve("bad").?;
+    try testing.expect((try db.get(query_structures.FunctionSignature, parameter)).* == null);
+    const parameter_start = std.mem.indexOf(u8, parameter_source, "bad(visible").? + "bad(".len;
+    try expectSingleQueryDiagnostic(db, query_structures.FunctionSignature, parameter, true, 2, .{
+        .start = parameter_start,
+        .end = parameter_start + "visible".len,
+    }, .duplicate_parameter);
+
+    const entry_source =
+        \\func visible() int -> 1
+        \\const visible = 2
+    ;
+    try addSource(db, 3, entry_source);
+    const entry = (try db.get(query_structures.SelectEntry, 3)).*.?;
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, entry)).* == null);
+    const entry_start = std.mem.lastIndexOf(u8, entry_source, "visible").?;
+    try expectSingleQueryDiagnostic(db, query_structures.AnalyzeFunctionBody, entry, true, 3, .{
+        .start = entry_start,
+        .end = entry_start + "visible".len,
+    }, .duplicate_local_binding);
 }
 
 test "local initializer calls are typed through the callee signature" {
@@ -4158,7 +4318,7 @@ test "local initializer calls are typed through the callee signature" {
     const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, user_id, structures.Diagnostic, testing.allocator);
     defer freeDiagnostics(diagnostics);
     try testing.expectEqual(@as(usize, 1), diagnostics.len);
-    try testing.expectEqual(structures.Diagnostic.Kind.unknown_type, diagnostics[0].kind);
+    try testing.expectEqual(structures.Diagnostic.Kind.float_type_not_supported, diagnostics[0].kind);
 }
 
 test "body edits preserve signature consumers and update body analysis" {
@@ -4188,7 +4348,7 @@ test "function signature rejects invalid parameter and return types without dupl
     try addSource(db, 2, "static missing_param = func(x) int -> return 1");
     try addSource(db, 3, "static bad_param = func(x: float) int -> return 1");
     try addSource(db, 4, "static duplicate = func(x: int, x: int) int -> return 1");
-    try addSource(db, 5, "static mode = func(read x: int) int -> return 1");
+    try addSource(db, 5, "static mode = func(mut x: int) int -> return 1");
 
     for ([_]structures.FileId{ 1, 2, 3, 4, 5 }) |file_id| {
         const function_id = (try db.get(query_structures.IndexItems, file_id)).*.?.ids()[0];
@@ -4205,7 +4365,6 @@ test "function signature rejects invalid parameter and return types without dupl
 test "function body analysis rejects unsupported expressions and literals" {
     const db = try testDatabase(2);
     defer db.deinit();
-
     try addSource(db, 1, "static unsupported = func() int -> return sizeof(int)");
     try addSource(db, 2, "static bare_return = func() int -> return");
     try addSource(db, 4, "static float = func() int -> return 1.5");
@@ -4217,8 +4376,40 @@ test "function body analysis rejects unsupported expressions and literals" {
         const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, function_id, structures.Diagnostic, testing.allocator);
         defer freeDiagnostics(diagnostics);
         try testing.expectEqual(@as(usize, 1), diagnostics.len);
-        if (file_id == 4) try testing.expectEqual(structures.Diagnostic.Kind.integer_literal_not_decimal, diagnostics[0].kind);
+        if (file_id == 4) try testing.expectEqual(structures.Diagnostic.Kind.float_literal_not_supported, diagnostics[0].kind);
         if (file_id == 5) try testing.expectEqual(structures.Diagnostic.Kind.integer_literal_out_of_range, diagnostics[0].kind);
+    }
+}
+
+test "unsupported declarations and transfers are rejected at their owning boundary" {
+    const cases = [_]struct {
+        source: []const u8,
+        marker: []const u8,
+        kind: structures.Diagnostic.Kind,
+    }{
+        .{
+            .source = "func outer() int\n  func inner() int -> 1\n  return 0",
+            .marker = "inner",
+            .kind = .nested_declaration_not_supported,
+        },
+        .{
+            .source = "func transfer(value: int) int -> value^",
+            .marker = "^",
+            .kind = .ownership_transfer_not_supported,
+        },
+    };
+
+    for (cases, 1..) |case, file_id| {
+        const db = try testDatabase(1);
+        defer db.deinit();
+        try addSource(db, file_id, case.source);
+        const function_id = (try db.get(query_structures.BuildModuleScope, file_id)).*.?.resolve(if (file_id == 1) "outer" else "transfer").?;
+        try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, function_id)).* == null);
+        const start = std.mem.indexOf(u8, case.source, case.marker).?;
+        try expectSingleQueryDiagnostic(db, query_structures.AnalyzeFunctionBody, function_id, true, file_id, .{
+            .start = start,
+            .end = start + case.marker.len,
+        }, case.kind);
     }
 }
 

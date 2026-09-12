@@ -11,7 +11,7 @@ pub fn resolveAndTypeBody(
     comptime ModuleScopeQuery: type,
     comptime FunctionSignatureQuery: type,
     file_id: structures.FileId,
-    parameter_types: []const structures.TypeId,
+    parameters: []const structures.CallableParameter,
     return_type: structures.TypeId,
     is_fallible: bool,
     type_interner: anytype,
@@ -26,7 +26,7 @@ pub fn resolveAndTypeBody(
         .is_fallible = is_fallible,
     };
     defer builder.deinit();
-    try builder.init(parameter_types);
+    try builder.init(parameters);
     builder.build() catch |err| switch (err) {
         error.SourceRejected, error.Unavailable => return null,
         else => return err,
@@ -93,15 +93,19 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
         loop_breaks: std.ArrayList(LoopBreak) = .empty,
         current_block: ?structures.FunctionBlockId = null,
 
-        fn init(self: *Self, parameter_types: []const structures.TypeId) !void {
-            std.debug.assert(parameter_types.len == self.unresolved.parameter_count);
-            self.values = try self.ctx.allocator().alloc(?Value, parameter_types.len + self.unresolved.expressions.len);
+        fn init(self: *Self, parameters: []const structures.CallableParameter) !void {
+            std.debug.assert(parameters.len == self.unresolved.parameter_count);
+            self.values = try self.ctx.allocator().alloc(?Value, parameters.len + self.unresolved.expressions.len);
             @memset(self.values, null);
             self.local_values = try self.ctx.allocator().alloc(?Value, self.unresolved.mutable_local_count);
             @memset(self.local_values, null);
-            for (parameter_types, 0..) |type_id, index| self.values[index] = .{ .id = @enumFromInt(index), .type_id = type_id };
-            try self.block_argument_types.appendSlice(self.ctx.allocator(), parameter_types);
-            const entry = try self.newBlock(0, @intCast(parameter_types.len));
+            try self.block_argument_types.ensureUnusedCapacity(self.ctx.allocator(), parameters.len);
+            for (parameters, 0..) |parameter, index| {
+                std.debug.assert(parameter.mode == .read);
+                self.values[index] = .{ .id = @enumFromInt(index), .type_id = parameter.type_id };
+                self.block_argument_types.appendAssumeCapacity(parameter.type_id);
+            }
+            const entry = try self.newBlock(0, @intCast(parameters.len));
             self.enterBlock(entry);
         }
 
@@ -513,33 +517,35 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             const local_index = @intFromEnum(assignment_value.target);
             const root = self.local_values[local_index].?;
             const ResolvedField = struct {
-                parent: Value,
+                parent: Value = undefined,
                 field_index: u32,
                 field_type: structures.TypeId,
             };
             var fields: std.ArrayList(ResolvedField) = .empty;
             defer fields.deinit(self.ctx.allocator());
             const source_fields = self.unresolved.assignment_fields[assignment_value.fields.start..assignment_value.fields.end];
-            var target = root;
+            var target_type = root.type_id;
             for (source_fields, 0..) |source_field, index| {
-                const definition = (try self.type_interner.structDefinition(target.type_id)) orelse
-                    return self.reject(source_field.span, .{ .field_access_not_struct = target.type_id });
-                if (try self.type_interner.structLayout(target.type_id) == null) return error.Unavailable;
+                const definition = (try self.type_interner.structDefinition(target_type)) orelse
+                    return self.reject(if (index == 0) assignment_value.target_span else source_fields[index - 1].span, .{ .field_access_not_struct = target_type });
+                if (try self.type_interner.structLayout(target_type) == null) return error.Unavailable;
                 const field = definition.resolveField(source_field.name) orelse return self.reject(source_field.span, .unknown_field);
                 try fields.append(self.ctx.allocator(), .{
-                    .parent = target,
                     .field_index = field.index,
                     .field_type = field.type_id,
                 });
-                if (index + 1 < source_fields.len or assignment_value.operation != .replace) {
+                target_type = field.type_id;
+            }
+            var target = root;
+            if (assignment_value.operation != .replace) {
+                for (fields.items) |field| {
                     target = try self.appendInstruction(.{ .field_access = .{
                         .operand = target.id,
-                        .field_index = field.index,
-                        .field_type = field.type_id,
+                        .field_index = field.field_index,
+                        .field_type = field.field_type,
                     } });
                 }
             }
-            const target_type = if (fields.getLastOrNull()) |field| field.field_type else root.type_id;
             const target_span = if (source_fields.len == 0) assignment_value.target_span else source_fields[source_fields.len - 1].span;
             const operand = try self.value(assignment_value.value.value);
             if (operand.type_id == .never) return operand;
@@ -562,6 +568,17 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                     .divide => .{ .divsi = operands },
                 });
             };
+            var latest_parent = self.local_values[local_index].?;
+            for (fields.items, 0..) |*field, index| {
+                field.parent = latest_parent;
+                if (index + 1 < fields.items.len) {
+                    latest_parent = try self.appendInstruction(.{ .field_access = .{
+                        .operand = latest_parent.id,
+                        .field_index = field.field_index,
+                        .field_type = field.field_type,
+                    } });
+                }
+            }
             var updated = result;
             var field_index = fields.items.len;
             while (field_index > 0) {
@@ -625,7 +642,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 .direct => |name| {
                     if (std.mem.eql(u8, name, "exit")) {
                         target = .intrinsic;
-                        signature = .{ .parameter_types = &.{.int}, .return_type = .never, .is_fallible = false };
+                        signature = .{ .parameters = &.{.{ .mode = .read, .type_id = .int }}, .return_type = .never, .is_fallible = false };
                     } else {
                         if (self.scope == null) self.scope = (try self.ctx.get(ModuleScopeQuery, self.file_id)).* orelse return error.Unavailable;
                         const item = self.scope.?.resolveFunction(name) orelse {
@@ -635,7 +652,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                         target = .{ .direct = item };
                         const resolved_signature = (try self.ctx.get(FunctionSignatureQuery, item)).* orelse return error.Unavailable;
                         signature = .{
-                            .parameter_types = resolved_signature.parameter_types,
+                            .parameters = resolved_signature.parameters,
                             .return_type = resolved_signature.return_type,
                             .is_fallible = resolved_signature.is_fallible,
                         };
@@ -656,16 +673,17 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 const resolved = try self.value(argument.value);
                 if (resolved.type_id == .never) return .{ .diverged = resolved };
             }
-            if (raw_arguments.len != signature.parameter_types.len) return self.reject(span, .{ .call_argument_count_mismatch = .{
-                .expected = @intCast(signature.parameter_types.len),
+            if (raw_arguments.len != signature.parameters.len) return self.reject(span, .{ .call_argument_count_mismatch = .{
+                .expected = @intCast(signature.parameters.len),
                 .found = @intCast(raw_arguments.len),
             } });
             const argument_start: u32 = @intCast(self.call_arguments.items.len);
             var intrinsic_argument: ?structures.FunctionValueId = null;
-            for (raw_arguments, signature.parameter_types) |raw, expected| {
+            for (raw_arguments, signature.parameters) |raw, expected| {
+                std.debug.assert(expected.mode == .read);
                 const operand = self.values[@intFromEnum(raw.value)].?;
-                const argument = try self.coerceValue(operand.id, operand.type_id, expected) orelse
-                    return self.reject(raw.span, .{ .call_argument_type_mismatch = self.typeMismatch(expected, operand.type_id) });
+                const argument = try self.coerceValue(operand.id, operand.type_id, expected.type_id) orelse
+                    return self.reject(raw.span, .{ .call_argument_type_mismatch = self.typeMismatch(expected.type_id, operand.type_id) });
                 switch (target) {
                     .intrinsic => {
                         std.debug.assert(intrinsic_argument == null);

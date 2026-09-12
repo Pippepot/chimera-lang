@@ -120,8 +120,11 @@ pub const Types = struct {
                 for (variant.members) |member| std.hash.autoHash(&hasher, member);
             },
             .callable => |callable| {
-                std.hash.autoHash(&hasher, callable.parameter_types.len);
-                for (callable.parameter_types) |parameter_type| std.hash.autoHash(&hasher, parameter_type);
+                std.hash.autoHash(&hasher, callable.parameters.len);
+                for (callable.parameters) |parameter| {
+                    std.hash.autoHash(&hasher, parameter.mode);
+                    std.hash.autoHash(&hasher, parameter.type_id);
+                }
                 std.hash.autoHash(&hasher, callable.return_type);
                 std.hash.autoHash(&hasher, callable.is_fallible);
             },
@@ -149,7 +152,7 @@ pub const Types = struct {
                 break :blk .{ .variant = .{ .members = try gpa.dupe(structures.TypeId, variant.members) } };
             },
             .callable => |callable| .{ .callable = .{
-                .parameter_types = try gpa.dupe(structures.TypeId, callable.parameter_types),
+                .parameters = try gpa.dupe(structures.CallableParameter, callable.parameters),
                 .return_type = callable.return_type,
                 .is_fallible = callable.is_fallible,
             } },
@@ -160,7 +163,7 @@ pub const Types = struct {
     pub fn deinit(gpa: std.mem.Allocator, value: *Value) void {
         switch (value.*) {
             .variant => |variant| gpa.free(variant.members),
-            .callable => |callable| gpa.free(callable.parameter_types),
+            .callable => |callable| gpa.free(callable.parameters),
             .structure => {},
         }
         value.* = undefined;
@@ -282,6 +285,11 @@ pub fn TypeInterner(comptime Context: type) type {
             return scope.resolveFunction(name);
         }
 
+        pub fn resolveItem(self: @This(), name: []const u8) !?structures.ItemId {
+            const scope = (try self.ctx.get(BuildModuleScope, self.file_id.?)).* orelse return error.Unavailable;
+            return scope.resolve(name);
+        }
+
         pub fn functionReference(self: @This(), name: []const u8) !?structures.FunctionReference {
             const scope = (try self.ctx.get(BuildModuleScope, self.file_id.?)).* orelse return error.Unavailable;
             const item_id = scope.resolveFunction(name) orelse return null;
@@ -289,7 +297,7 @@ pub fn TypeInterner(comptime Context: type) type {
             return .{
                 .target = item_id,
                 .type_id = try self.internCallable(.{
-                    .parameter_types = signature.parameter_types,
+                    .parameters = signature.parameters,
                     .return_type = signature.return_type,
                     .is_fallible = signature.is_fallible,
                 }),
@@ -660,12 +668,12 @@ pub const AnalyzeFunctionBody = struct {
     pub fn run(ctx: anytype, item_id: Input) anyerror!Output {
         const loc = try ctx.lookupInterned(ItemLocations, item_id);
         if (loc.kind == .static or loc.kind == .structure) return null;
-        var parameter_types: []const structures.TypeId = &.{};
+        var parameters: []const structures.CallableParameter = &.{};
         var return_type: structures.TypeId = .unit;
         var is_fallible = false;
         if (loc.kind == .function) {
             const signature = (try ctx.get(FunctionSignature, item_id)).* orelse return null;
-            parameter_types = signature.parameter_types;
+            parameters = signature.parameters;
             return_type = signature.return_type;
             is_fallible = signature.is_fallible;
         }
@@ -673,7 +681,7 @@ pub const AnalyzeFunctionBody = struct {
         const parsed = (try ctx.get(ParseFile, resolved.file_id)).* orelse return null;
         const source = (try ctx.input(SourceText, resolved.file_id)).*;
         const type_interner: TypeInterner(@TypeOf(ctx)) = .{ .ctx = ctx, .file_id = resolved.file_id };
-        const result = semantic.buildUnresolvedBody(&parsed, source, resolved.declaration, loc.kind, parameter_types.len, type_interner, ctx.allocator()) catch |err| switch (err) {
+        const result = semantic.buildUnresolvedBody(&parsed, source, resolved.declaration, loc.kind, parameters.len, type_interner, ctx.allocator()) catch |err| switch (err) {
             error.Unavailable => return null,
             else => return err,
         };
@@ -685,7 +693,7 @@ pub const AnalyzeFunctionBody = struct {
             },
         };
         defer unresolved.deinit(ctx.allocator());
-        return typing.resolveAndTypeBody(ctx, BuildModuleScope, FunctionSignature, resolved.file_id, parameter_types, return_type, is_fallible, type_interner, unresolved);
+        return typing.resolveAndTypeBody(ctx, BuildModuleScope, FunctionSignature, resolved.file_id, parameters, return_type, is_fallible, type_interner, unresolved);
     }
 };
 

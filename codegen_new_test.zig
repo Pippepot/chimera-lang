@@ -38,7 +38,7 @@ const TestTypes = struct {
 
     pub fn callable(_: @This(), type_id: structures.TypeId) !?structures.CallableType {
         return if (type_id == callable_type)
-            .{ .parameter_types = &.{}, .return_type = .int, .is_fallible = false }
+            .{ .parameters = &.{}, .return_type = .int, .is_fallible = false }
         else
             null;
     }

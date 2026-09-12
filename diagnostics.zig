@@ -53,9 +53,9 @@ fn writeTypeInner(types: anytype, writer: *std.Io.Writer, type_id: structures.Ty
     if (try types.structName(type_id)) |name| return writer.writeAll(name);
     if (try types.callable(type_id)) |callable| {
         try writer.writeAll(if (callable.is_fallible) "fallible(" else "func(");
-        for (callable.parameter_types, 0..) |parameter_type, index| {
+        for (callable.parameters, 0..) |parameter, index| {
             if (index != 0) try writer.writeAll(", ");
-            try writeTypeInner(types, writer, parameter_type);
+            try writeTypeInner(types, writer, parameter.type_id);
         }
         try writer.writeAll(") ");
         return writeTypeInner(types, writer, callable.return_type);
@@ -189,7 +189,7 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
         .type_value_used_as_runtime_value => try writer.writeAll("a type cannot be used as a runtime value"),
         .value_used_as_type => try writer.writeAll("a runtime value cannot be used as a type"),
         .function_annotation_not_supported => try writer.writeAll("type annotations on function bindings are not supported yet"),
-        .parameter_mode_not_supported => try writer.writeAll("parameter access modes are not supported yet"),
+        .parameter_mode_not_supported => try writer.writeAll("this parameter access mode is not supported yet"),
         .duplicate_parameter => {
             try writeSourceLabel(writer, "parameter name is already declared", source, span);
         },
@@ -199,6 +199,8 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
         .top_level_return => try writer.writeAll("cannot return from top-level code"),
         .break_outside_loop => try writer.writeAll("break is only allowed inside a loop"),
         .continue_outside_loop => try writer.writeAll("continue is only allowed inside a loop"),
+        .nested_declaration_not_supported => try writer.writeAll("nested declarations are not supported yet"),
+        .ownership_transfer_not_supported => try writer.writeAll("ownership transfer is not supported yet"),
         .expression_not_supported => try writer.writeAll("this expression is not supported yet"),
         .struct_initializer_not_struct => |found| {
             try writer.writeAll("struct initializer requires a struct type, found ");
@@ -220,6 +222,7 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
             try writeSourceLabel(writer, "binding is already declared in this scope", source, span);
         },
         .local_type_not_supported => try writer.writeAll("this local binding type is not supported yet"),
+        .float_type_not_supported => try writer.writeAll("the `float` type is not supported yet"),
         .unknown_type => try writeSourceLabel(writer, "unknown type", source, span),
         .unknown_value => {
             try writeSourceLabel(writer, "unknown value", source, span);
@@ -233,6 +236,7 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
             try writeMismatch(types, writer, mismatch);
         },
         .integer_literal_not_decimal => try writer.writeAll("integer literal must use decimal notation"),
+        .float_literal_not_supported => try writer.writeAll("float literals are not supported yet"),
         .integer_literal_out_of_range => try writer.writeAll("integer literal is outside the supported i32 range"),
         .fallible_condition_not_supported => try writer.writeAll("this fallible condition form is not supported yet"),
         .if_condition_not_fallible => try writer.writeAll("condition must be a comparison or another fallible expression"),
@@ -364,12 +368,12 @@ const DetailedTypes = struct {
 
     fn callable(_: @This(), type_id: structures.TypeId) !?structures.CallableType {
         if (type_id == int_callable) return .{
-            .parameter_types = &.{.int},
+            .parameters = &.{.{ .mode = .read, .type_id = .int }},
             .return_type = .int,
             .is_fallible = false,
         };
         if (type_id == bool_callable) return .{
-            .parameter_types = &.{.bool},
+            .parameters = &.{.{ .mode = .read, .type_id = .bool }},
             .return_type = .int,
             .is_fallible = true,
         };
