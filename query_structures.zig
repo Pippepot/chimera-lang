@@ -57,7 +57,7 @@ pub const DiscoverItems = struct {
         defer names.deinit();
         var has_duplicates = false;
         for (tree.items) |item| {
-            if (item.loc.kind == .top_level_entry) continue;
+            if (item.loc.kind == .top_level_entry or item.parent != null) continue;
             if (!(try names.getOrPut(item.loc.name)).found_existing) continue;
             has_duplicates = true;
             const node = ast_value.nodes[item.declaration];
@@ -86,6 +86,7 @@ pub const ItemLocations = struct {
     pub fn hash(value: Value) u64 {
         var hasher = std.hash.Wyhash.init(0);
         std.hash.autoHash(&hasher, value.file_id);
+        std.hash.autoHash(&hasher, value.owner);
         std.hash.autoHash(&hasher, value.kind);
         hasher.update(value.name);
         return hasher.final();
@@ -266,6 +267,24 @@ pub fn TypeInterner(comptime Context: type) type {
             return (try self.ctx.get(OwnershipCapabilities, type_id)).*;
         }
 
+        pub fn ownedFunction(self: @This(), owner: structures.ItemId, name: []const u8) !?structures.ItemId {
+            const loc = try self.ctx.lookupInterned(ItemLocations, owner);
+            const index = (try self.ctx.get(IndexItems, loc.file_id)).* orelse return error.Unavailable;
+            for (index.ids()) |item_id| {
+                const item_loc = try self.ctx.lookupInterned(ItemLocations, item_id);
+                if (item_loc.owner == owner and item_loc.kind == .function and std.mem.eql(u8, item_loc.name, name)) return item_id;
+            }
+            return null;
+        }
+
+        pub fn functionSignature(self: @This(), item_id: structures.ItemId) !?structures.FunctionSignature {
+            return (try self.ctx.get(FunctionSignature, item_id)).*;
+        }
+
+        pub fn structType(self: @This(), item_id: structures.ItemId) !structures.TypeId {
+            return internStructType(self.ctx, item_id);
+        }
+
         pub fn variantLayout(self: @This(), type_id: structures.TypeId) !structures.VariantLayout {
             return (try self.ctx.get(VariantLayout, type_id)).*;
         }
@@ -443,16 +462,31 @@ pub const OwnershipCapabilities = struct {
         var can_move = true;
         var can_copy = true;
         var drops_trivially = true;
+        var fields_need_custom_move = false;
+        var fields_need_custom_copy = false;
+        var contains_custom_copy = false;
+        var needs_automatic_drop = false;
+        var requires_explicit_drop = false;
         for (members) |member| {
             const capabilities = (try ctx.get(OwnershipCapabilities, member)).* orelse return null;
             can_move = can_move and capabilities.move != .none;
             can_copy = can_copy and capabilities.copy != .none;
             drops_trivially = drops_trivially and capabilities.drop == .trivial;
+            fields_need_custom_move = fields_need_custom_move or capabilities.needs_custom_move;
+            fields_need_custom_copy = fields_need_custom_copy or capabilities.needs_custom_copy;
+            contains_custom_copy = contains_custom_copy or capabilities.contains_custom_copy;
+            needs_automatic_drop = needs_automatic_drop or capabilities.needs_automatic_drop;
+            requires_explicit_drop = requires_explicit_drop or capabilities.requires_explicit_drop;
         }
         return .{
             .move = if (can_move) .fieldwise else .none,
             .copy = if (can_copy) .fieldwise else .none,
             .drop = if (drops_trivially) .trivial else .fieldwise,
+            .needs_custom_move = can_move and fields_need_custom_move,
+            .needs_custom_copy = can_copy and fields_need_custom_copy,
+            .contains_custom_copy = contains_custom_copy,
+            .needs_automatic_drop = needs_automatic_drop,
+            .requires_explicit_drop = requires_explicit_drop,
         };
     }
 
@@ -461,17 +495,71 @@ pub const OwnershipCapabilities = struct {
         const definition = (try ctx.get(StructDefinition, item_id)).* orelse return null;
 
         var can_move = true;
+        var moves_trivially = true;
+        var can_copy = true;
+        var copies_trivially = true;
         var drops_trivially = true;
+        var fields_need_custom_move = false;
+        var fields_need_custom_copy = false;
+        var fields_need_automatic_drop = false;
+        var fields_require_explicit_drop = false;
         for (definition.fields) |field| {
             const capabilities = (try ctx.get(OwnershipCapabilities, field.type_id)).* orelse return null;
             can_move = can_move and capabilities.move != .none;
+            moves_trivially = moves_trivially and capabilities.move == .trivial;
+            can_copy = can_copy and capabilities.copy != .none;
+            copies_trivially = copies_trivially and capabilities.copy == .trivial;
             drops_trivially = drops_trivially and capabilities.drop == .trivial;
+            fields_need_custom_move = fields_need_custom_move or capabilities.needs_custom_move;
+            fields_need_custom_copy = fields_need_custom_copy or capabilities.needs_custom_copy;
+            fields_need_automatic_drop = fields_need_automatic_drop or capabilities.needs_automatic_drop;
+            fields_require_explicit_drop = fields_require_explicit_drop or capabilities.requires_explicit_drop;
         }
+
+        const move: structures.MoveCapability = if (definition.ownership.move) |property| blk: {
+            if ((property.capability == .trivial and !moves_trivially) or
+                (property.capability == .fieldwise and !can_move))
+            {
+                try emitIncompatibleOwnershipProperty(ctx, item_id, property.span);
+                return null;
+            }
+            break :blk property.capability;
+        } else if (can_move) .fieldwise else .none;
+        const copy: structures.CopyCapability = if (definition.ownership.copy) |property| blk: {
+            if ((property.capability == .trivial and !copies_trivially) or
+                (property.capability == .fieldwise and !can_copy))
+            {
+                try emitIncompatibleOwnershipProperty(ctx, item_id, property.span);
+                return null;
+            }
+            break :blk property.capability;
+        } else .none;
+        const drop: structures.DropCapability = if (definition.ownership.drop) |property| blk: {
+            if (property.capability == .trivial and !drops_trivially) {
+                try emitIncompatibleOwnershipProperty(ctx, item_id, property.span);
+                return null;
+            }
+            break :blk property.capability;
+        } else if (drops_trivially) .trivial else .fieldwise;
         return .{
-            .move = if (can_move) .fieldwise else .none,
-            .copy = .none,
-            .drop = if (drops_trivially) .trivial else .fieldwise,
+            .move = move,
+            .copy = copy,
+            .drop = drop,
+            .needs_custom_move = move == .custom or (move == .fieldwise and fields_need_custom_move),
+            .needs_custom_copy = copy == .custom or (copy == .fieldwise and fields_need_custom_copy),
+            .contains_custom_copy = copy == .custom or (copy == .fieldwise and fields_need_custom_copy),
+            .needs_automatic_drop = drop == .custom or (drop == .fieldwise and fields_need_automatic_drop),
+            .requires_explicit_drop = drop == .explicit or (drop == .fieldwise and fields_require_explicit_drop),
         };
+    }
+
+    fn emitIncompatibleOwnershipProperty(ctx: anytype, item_id: structures.ItemId, span: structures.SourceSpan) !void {
+        const loc = try ctx.lookupInterned(ItemLocations, item_id);
+        try ctx.emit(structures.Diagnostic, .{
+            .file_id = loc.file_id,
+            .span = span,
+            .kind = .struct_ownership_property_incompatible_with_fields,
+        });
     }
 };
 
@@ -535,8 +623,16 @@ pub const IndexItems = struct {
         var entries: std.AutoArrayHashMapUnmanaged(structures.ItemId, u32) = .empty;
         errdefer entries.deinit(ctx.allocator());
         try entries.ensureTotalCapacity(ctx.allocator(), tree.items.len);
-        for (tree.items) |item| {
-            const item_id = try ctx.intern(ItemLocations, item.loc);
+        const item_ids = try ctx.allocator().alloc(structures.ItemId, tree.items.len);
+        defer ctx.allocator().free(item_ids);
+        for (tree.items, 0..) |item, index| {
+            var loc = item.loc;
+            if (item.parent) |parent| {
+                std.debug.assert(parent < index);
+                loc.owner = item_ids[parent];
+            }
+            const item_id = try ctx.intern(ItemLocations, loc);
+            item_ids[index] = item_id;
             entries.putAssumeCapacityNoClobber(item_id, item.declaration);
         }
         return .{ .file_id = file_id, .entries = entries };
@@ -557,7 +653,7 @@ pub const BuildModuleScope = struct {
         }
         for (index.ids()) |item_id| {
             const loc = try ctx.lookupInterned(ItemLocations, item_id);
-            if (loc.kind == .top_level_entry) continue;
+            if (loc.kind == .top_level_entry or loc.owner != null) continue;
             std.debug.assert(loc.file_id == file_id);
 
             const name = try ctx.allocator().dupe(u8, loc.name);
@@ -647,7 +743,7 @@ pub const StructDefinition = struct {
         const parsed = (try ctx.get(ParseFile, resolved.file_id)).* orelse return null;
         const source = (try ctx.input(SourceText, resolved.file_id)).*;
         const type_interner: TypeInterner(@TypeOf(ctx)) = .{ .ctx = ctx, .file_id = resolved.file_id };
-        const result = semantic.analyzeStructDefinition(&parsed, source, resolved.declaration, type_interner, ctx.allocator()) catch |err| switch (err) {
+        const result = semantic.analyzeStructDefinition(&parsed, source, item_id, resolved.declaration, type_interner, ctx.allocator()) catch |err| switch (err) {
             error.Unavailable => return null,
             else => return err,
         };
@@ -681,7 +777,7 @@ pub const AnalyzeFunctionBody = struct {
         const parsed = (try ctx.get(ParseFile, resolved.file_id)).* orelse return null;
         const source = (try ctx.input(SourceText, resolved.file_id)).*;
         const type_interner: TypeInterner(@TypeOf(ctx)) = .{ .ctx = ctx, .file_id = resolved.file_id };
-        const result = semantic.buildUnresolvedBody(&parsed, source, resolved.declaration, loc.kind, parameters.len, type_interner, ctx.allocator()) catch |err| switch (err) {
+        const result = semantic.buildUnresolvedBody(&parsed, source, resolved.declaration, loc.kind, parameters, type_interner, ctx.allocator()) catch |err| switch (err) {
             error.Unavailable => return null,
             else => return err,
         };
@@ -693,7 +789,7 @@ pub const AnalyzeFunctionBody = struct {
             },
         };
         defer unresolved.deinit(ctx.allocator());
-        return typing.resolveAndTypeBody(ctx, BuildModuleScope, FunctionSignature, resolved.file_id, parameters, return_type, is_fallible, type_interner, unresolved);
+        return typing.resolveAndTypeBody(ctx, BuildModuleScope, FunctionSignature, item_id, resolved.file_id, parameters, return_type, is_fallible, type_interner, unresolved);
     }
 };
 

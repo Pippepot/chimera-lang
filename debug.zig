@@ -156,6 +156,11 @@ fn renderInstruction(
             operation.field_index,
             @intFromEnum(operation.value),
         }),
+        .mut_parameter_write => |operation| try writer.print("    mut_parameter_write {d}, %{d}\n", .{
+            operation.parameter_index,
+            @intFromEnum(operation.value),
+        }),
+        .call_mut_argument => |operation| try writer.print("    %{d} = call_mut_argument {d}\n", .{ result, operation.argument_index }),
         .call => |call| {
             const target = try db.lookupInterned(queries.ItemLocations, call.target);
             try writer.print("    %{d} = call @{s}(", .{ result, target.name });

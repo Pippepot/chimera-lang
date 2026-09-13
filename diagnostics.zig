@@ -55,6 +55,7 @@ fn writeTypeInner(types: anytype, writer: *std.Io.Writer, type_id: structures.Ty
         try writer.writeAll(if (callable.is_fallible) "fallible(" else "func(");
         for (callable.parameters, 0..) |parameter, index| {
             if (index != 0) try writer.writeAll(", ");
+            if (parameter.mode != .read) try writer.print("{s} ", .{@tagName(parameter.mode)});
             try writeTypeInner(types, writer, parameter.type_id);
         }
         try writer.writeAll(") ");
@@ -180,6 +181,14 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
         .static_initializer_not_supported => try writer.writeAll("this static initializer is not supported yet"),
         .struct_member_not_supported => try writer.writeAll("this struct member is not supported yet"),
         .duplicate_struct_field => try writeSourceLabel(writer, "struct field is already declared", source, span),
+        .duplicate_struct_property => try writeSourceLabel(writer, "struct ownership property is already declared", source, span),
+        .unknown_struct_property => try writeSourceLabel(writer, "unknown struct ownership property", source, span),
+        .invalid_struct_property_value => try writeSourceLabel(writer, "invalid struct ownership property value", source, span),
+        .struct_ownership_hook_signature_mismatch => |mismatch| {
+            try writer.writeAll("struct ownership hook signature mismatch: ");
+            try writeMismatch(types, writer, mismatch);
+        },
+        .struct_ownership_property_incompatible_with_fields => try writeSourceLabel(writer, "struct ownership property is incompatible with its fields", source, span),
         .struct_field_type_not_supported => try writer.writeAll("this struct field type is not supported yet"),
         .recursive_struct_containment => try writeSourceLabel(writer, "struct recursively contains itself by value through field", source, span),
         .static_initializer_type_mismatch => |mismatch| {
@@ -200,7 +209,28 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
         .break_outside_loop => try writer.writeAll("break is only allowed inside a loop"),
         .continue_outside_loop => try writer.writeAll("continue is only allowed inside a loop"),
         .nested_declaration_not_supported => try writer.writeAll("nested declarations are not supported yet"),
-        .ownership_transfer_not_supported => try writer.writeAll("ownership transfer is not supported yet"),
+        .ownership_transfer_requires_place => try writer.writeAll("ownership transfer requires a local binding"),
+        .ownership_transfer_requires_owned_place => try writer.writeAll("cannot transfer ownership from a borrowed value"),
+        .ownership_transfer_requires_owning_context => try writer.writeAll("ownership transfer is only allowed where a value is stored, passed as owned, or returned"),
+        .mutable_argument_requires_place => try writer.writeAll("mutable argument must be a local binding or one of its fields"),
+        .mutable_argument_requires_mutable_place => try writer.writeAll("mutable argument requires a mutable root binding"),
+        .overlapping_mutable_arguments => try writer.writeAll("mutable argument overlaps another borrowed argument"),
+        .use_after_transfer => try writer.writeAll("value was already transferred"),
+        .possibly_transferred => try writer.writeAll("value may have been transferred on another control-flow path"),
+        .transferred_value_not_restored_before_loop_backedge => try writer.writeAll("transferred value must be reassigned before the next loop iteration"),
+        .type_not_movable => |type_id| {
+            try writer.writeAll("cannot transfer value of immovable type ");
+            try writeType(types, writer, type_id);
+        },
+        .type_not_copyable => |type_id| {
+            try writer.writeAll("cannot implicitly copy value of non-copyable type ");
+            try writeType(types, writer, type_id);
+            try writer.writeAll("; use `^` to transfer ownership");
+        },
+        .value_requires_explicit_drop => |type_id| {
+            try writer.writeAll("value must be transferred or passed to a `deinit` parameter before leaving scope: ");
+            try writeType(types, writer, type_id);
+        },
         .expression_not_supported => try writer.writeAll("this expression is not supported yet"),
         .struct_initializer_not_struct => |found| {
             try writer.writeAll("struct initializer requires a struct type, found ");
@@ -373,7 +403,7 @@ const DetailedTypes = struct {
             .is_fallible = false,
         };
         if (type_id == bool_callable) return .{
-            .parameters = &.{.{ .mode = .read, .type_id = .bool }},
+            .parameters = &.{.{ .mode = .@"var", .type_id = .bool }},
             .return_type = .int,
             .is_fallible = true,
         };
@@ -487,7 +517,7 @@ test "render diagnostics preserve callable signatures and nested variants" {
     try renderDiagnostic(DetailedTypes{}, &output.writer, "test.star", "", diagnostic);
 
     try std.testing.expectEqualStrings(
-        "\x1b[31merror:\x1b[0m test.star: static initializer type mismatch: expected `(func(int) int) | none`, found `fallible(bool) int`\n",
+        "\x1b[31merror:\x1b[0m test.star: static initializer type mismatch: expected `(func(int) int) | none`, found `fallible(var bool) int`\n",
         output.writer.buffered(),
     );
 }

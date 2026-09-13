@@ -131,6 +131,8 @@ const LocationPlan = struct {
                     needed[@intFromEnum(operation.operand)] = true;
                     needed[@intFromEnum(operation.value)] = true;
                 },
+                .mut_parameter_write => |operation| needed[@intFromEnum(operation.value)] = true,
+                .call_mut_argument => {},
                 .call => |call| {
                     for (ssa.call_arguments[call.arguments.start..call.arguments.end]) |argument| needed[@intFromEnum(argument.value)] = true;
                 },
@@ -405,6 +407,8 @@ fn FunctionEmitter(comptime Types: type) type {
                     .struct_init => |operation| try self.emitStructInit(ssa, operation, destination),
                     .field_access => |operation| try self.emitFieldAccess(operation, destination),
                     .field_update => |operation| try self.emitFieldUpdate(operation, destination),
+                    .mut_parameter_write => |operation| try self.emitMutParameterWrite(ssa, operation),
+                    .call_mut_argument => |operation| try self.emitCallMutArgument(operation, destination),
                     .call => |call| try self.emitDirectCall(call, destination),
                     .indirect_call => |call| try self.emitIndirectCall(call, destination),
                     .exit => |operand| try self.emitExit(operand),
@@ -848,6 +852,35 @@ fn FunctionEmitter(comptime Types: type) type {
             );
         }
 
+        fn emitMutParameterWrite(self: *Self, ssa: *const structures.FunctionBodyAnalysis, operation: structures.MutParameterWrite) !void {
+            const entry = ssa.blocks[@intFromEnum(ssa.entry)];
+            std.debug.assert(operation.parameter_index < entry.argument_end - entry.argument_start);
+            var incoming_offset: u32 = 0;
+            const return_layout = try self.types.layout(ssa.return_type);
+            if (usesMemoryReturn(return_layout)) _ = try reserveStack(&incoming_offset, return_layout);
+            for (ssa.block_argument_types[entry.argument_start .. entry.argument_start + operation.parameter_index]) |type_id| {
+                _ = try reserveStack(&incoming_offset, try self.types.layout(type_id));
+            }
+            const parameter_offset = try reserveStack(&incoming_offset, try self.types.layout(operation.type_id));
+            const caller_stack_offset = std.math.add(u32, self.stack_size, @sizeOf(u64)) catch return error.FunctionTooLarge;
+            const destination_offset = std.math.add(u32, caller_stack_offset, parameter_offset) catch return error.FunctionTooLarge;
+            try self.copyValue(operation.type_id, self.locations[@intFromEnum(operation.value)], .{ .incoming_argument = destination_offset });
+        }
+
+        fn emitCallMutArgument(self: *Self, operation: structures.CallMutArgument, destination: ValueLocation) !void {
+            var argument_offset: u32 = 0;
+            const return_layout = try self.types.layout(operation.return_type);
+            if (usesMemoryReturn(return_layout)) _ = try reserveStack(&argument_offset, return_layout);
+            const arguments = self.call_arguments[operation.arguments.start..operation.arguments.end];
+            std.debug.assert(operation.argument_index < arguments.len);
+            for (arguments[0..operation.argument_index]) |argument| {
+                const type_id = argument.coerce_to orelse self.valueType(argument.value);
+                _ = try reserveStack(&argument_offset, try self.types.layout(type_id));
+            }
+            const source_offset = try reserveStack(&argument_offset, try self.types.layout(operation.type_id));
+            try self.copyValue(operation.type_id, .{ .stack = source_offset }, destination);
+        }
+
         fn copyRange(self: *Self, source: ValueLocation, source_start: u32, destination: ValueLocation, destination_start: u32, byte_size: u32) !void {
             var offset: u32 = 0;
             while (byte_size - offset >= @sizeOf(u32)) : (offset += @sizeOf(u32)) {
@@ -874,10 +907,10 @@ fn FunctionEmitter(comptime Types: type) type {
 
         fn storeComponent(self: *Self, location: ValueLocation, component_offset: u32) !void {
             switch (location) {
-                .stack, .return_buffer => |offset| try self.encoder.movRspFromEax(std.math.add(u32, offset, component_offset) catch return error.FunctionTooLarge),
+                .stack, .incoming_argument, .return_buffer => |offset| try self.encoder.movRspFromEax(std.math.add(u32, offset, component_offset) catch return error.FunctionTooLarge),
                 .eax => std.debug.assert(component_offset == 0),
                 .discarded => {},
-                .immediate, .incoming_argument => unreachable,
+                .immediate => unreachable,
             }
         }
 
@@ -896,10 +929,10 @@ fn FunctionEmitter(comptime Types: type) type {
 
         fn storeByte(self: *Self, location: ValueLocation, byte_offset: u32) !void {
             switch (location) {
-                .stack, .return_buffer => |offset| try self.encoder.movRspByteFromAl(std.math.add(u32, offset, byte_offset) catch return error.FunctionTooLarge),
+                .stack, .incoming_argument, .return_buffer => |offset| try self.encoder.movRspByteFromAl(std.math.add(u32, offset, byte_offset) catch return error.FunctionTooLarge),
                 .eax => std.debug.assert(byte_offset == 0),
                 .discarded => {},
-                .immediate, .incoming_argument => unreachable,
+                .immediate => unreachable,
             }
         }
 

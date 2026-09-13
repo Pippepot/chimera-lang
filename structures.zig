@@ -301,22 +301,24 @@ pub const ItemKind = enum {
     top_level_entry,
 };
 
-/// Stable within a file across edits that do not rename the item or change
-/// its kind. `ItemTree` and the item interner own their respective copies of
-/// `name`.
+/// Stable within an owner across edits that do not rename the item or change
+/// its kind. Top-level items have no owner. `ItemTree` and the item interner own
+/// their respective copies of `name`.
 pub const ItemLoc = struct {
     file_id: FileId,
+    owner: ?ItemId = null,
     kind: ItemKind,
     name: []const u8,
 
     pub fn eql(a: ItemLoc, b: ItemLoc) bool {
-        return a.file_id == b.file_id and a.kind == b.kind and std.mem.eql(u8, a.name, b.name);
+        return a.file_id == b.file_id and a.owner == b.owner and a.kind == b.kind and std.mem.eql(u8, a.name, b.name);
     }
 };
 
 pub const DiscoveredItem = struct {
     loc: ItemLoc,
     declaration: u32,
+    parent: ?u32 = null,
 };
 
 pub const ItemTree = struct {
@@ -326,7 +328,7 @@ pub const ItemTree = struct {
     pub fn eql(a: ItemTree, b: ItemTree) bool {
         if (a.file_id != b.file_id or a.items.len != b.items.len) return false;
         for (a.items, b.items) |left, right| {
-            if (!ItemLoc.eql(left.loc, right.loc) or left.declaration != right.declaration) return false;
+            if (!ItemLoc.eql(left.loc, right.loc) or left.declaration != right.declaration or left.parent != right.parent) return false;
         }
         return true;
     }
@@ -550,6 +552,7 @@ pub const StructField = struct {
 
 pub const StructDefinition = struct {
     fields: []StructField,
+    ownership: StructOwnershipProperties = .{},
 
     pub const ResolvedField = struct {
         index: u32,
@@ -567,7 +570,7 @@ pub const StructDefinition = struct {
     }
 
     pub fn eql(a: StructDefinition, b: StructDefinition) bool {
-        if (a.fields.len != b.fields.len) return false;
+        if (a.fields.len != b.fields.len or !std.meta.eql(a.ownership, b.ownership)) return false;
         for (a.fields, b.fields) |left, right| {
             if (left.type_id != right.type_id or
                 !std.meta.eql(left.span, right.span) or
@@ -580,6 +583,20 @@ pub const StructDefinition = struct {
         for (self.fields) |field| gpa.free(field.name);
         gpa.free(self.fields);
         self.* = undefined;
+    }
+};
+
+pub const StructOwnershipProperties = struct {
+    move: ?Property(MoveCapability) = null,
+    copy: ?Property(CopyCapability) = null,
+    drop: ?Property(DropCapability) = null,
+
+    pub fn Property(comptime Capability: type) type {
+        return struct {
+            capability: Capability,
+            hook: ?ItemId = null,
+            span: SourceSpan,
+        };
     }
 };
 
@@ -600,18 +617,21 @@ pub const StructLayout = struct {
 pub const MoveCapability = enum {
     trivial,
     fieldwise,
+    custom,
     none,
 };
 
 pub const CopyCapability = enum {
     trivial,
     fieldwise,
+    custom,
     none,
 };
 
 pub const DropCapability = enum {
     trivial,
     fieldwise,
+    custom,
     explicit,
 };
 
@@ -619,6 +639,11 @@ pub const OwnershipCapabilities = struct {
     move: MoveCapability,
     copy: CopyCapability,
     drop: DropCapability,
+    needs_custom_move: bool = false,
+    needs_custom_copy: bool = false,
+    contains_custom_copy: bool = false,
+    needs_automatic_drop: bool = false,
+    requires_explicit_drop: bool = false,
 };
 
 pub const FunctionValueId = enum(u32) { _ };
@@ -744,6 +769,19 @@ pub const FieldUpdateOperation = struct {
     type_id: TypeId,
 };
 
+pub const MutParameterWrite = struct {
+    parameter_index: u32,
+    value: FunctionValueId,
+    type_id: TypeId,
+};
+
+pub const CallMutArgument = struct {
+    arguments: FunctionValueRange,
+    return_type: TypeId,
+    argument_index: u32,
+    type_id: TypeId,
+};
+
 pub const FunctionInstruction = union(enum) {
     consti: i32,
     constb: bool,
@@ -757,6 +795,8 @@ pub const FunctionInstruction = union(enum) {
     struct_init: StructOperation,
     field_access: FieldAccessOperation,
     field_update: FieldUpdateOperation,
+    mut_parameter_write: MutParameterWrite,
+    call_mut_argument: CallMutArgument,
     call: FunctionCall,
     indirect_call: IndirectFunctionCall,
     exit: FunctionValueId,
@@ -778,6 +818,8 @@ pub const FunctionInstruction = union(enum) {
             .struct_init => |operation| operation.type_id,
             .field_access => |operation| operation.field_type,
             .field_update => |operation| operation.type_id,
+            .mut_parameter_write => .unit,
+            .call_mut_argument => |operation| operation.type_id,
             .call => |call| call.return_type,
             .indirect_call => |call| call.return_type,
         };
@@ -957,6 +999,11 @@ pub const Diagnostic = struct {
         static_initializer_not_supported,
         struct_member_not_supported,
         duplicate_struct_field,
+        duplicate_struct_property,
+        unknown_struct_property,
+        invalid_struct_property_value,
+        struct_ownership_hook_signature_mismatch: TypeMismatch,
+        struct_ownership_property_incompatible_with_fields,
         struct_field_type_not_supported,
         recursive_struct_containment,
         static_initializer_type_mismatch: TypeMismatch,
@@ -972,7 +1019,18 @@ pub const Diagnostic = struct {
         break_outside_loop,
         continue_outside_loop,
         nested_declaration_not_supported,
-        ownership_transfer_not_supported,
+        ownership_transfer_requires_place,
+        ownership_transfer_requires_owned_place,
+        ownership_transfer_requires_owning_context,
+        mutable_argument_requires_place,
+        mutable_argument_requires_mutable_place,
+        overlapping_mutable_arguments,
+        use_after_transfer,
+        possibly_transferred,
+        transferred_value_not_restored_before_loop_backedge,
+        type_not_movable: TypeId,
+        type_not_copyable: TypeId,
+        value_requires_explicit_drop: TypeId,
         expression_not_supported,
         struct_initializer_not_struct: TypeId,
         unknown_struct_field,

@@ -90,18 +90,63 @@ exit(0)
 # var: function-owned variable, which may be stored or returned.
 # deinit: function-owned variable satisfying an explicit drop obligation.
 # A parameter's access mode is part of callable type identity. An omitted mode
-# is read. Source syntax for non-read modes in callable types remains open.
+# is read. Function declarations currently support read, mut, var, and deinit.
+# Callable type annotations currently spell only read; inferred callable values
+# retain the exact declaration mode. Syntax for other modes in callable types
+# remains open.
+# Callable compatibility requires identical parameter modes. Ordinary-to-
+# fallible callable widening still applies when every parameter mode and type
+# and the return type match.
 func make(static T: type) type -> T
 
 func add1(mut a: int)
     a += 1
+
+# A mut argument must be a mutable local root or one of its fields and must have
+# exactly the parameter type. The borrow cannot escape the call. A mut place may
+# not overlap another read or mut argument in the same call; paths overlap when
+# they have the same root and either field path is a prefix of the other. Distinct
+# sibling fields do not overlap.
+var mutable_value = 41
+add1(mutable_value)
 
 func take(var a: int) int -> a
 
 var a = 10
 take(a)  # copy into an owned parameter, only if the type supports copy
 take(a^) # transfer ownership; any subsequent access to 'a' is an error
-# Passing to 'deinit' also transfers ownership and invalidates the value.
+# Inside the function, a var parameter is an owned mutable local. It follows the
+# same transfer, reassignment, branch, and loop availability rules as local var.
+# A deinit parameter is an owned mutable local authorized to satisfy explicit
+# drop obligations. Its arguments use the same ownership matrix: a bare place
+# copies when supported, `name^` transfers and invalidates the caller's root,
+# and a temporary is already owned. A deinit parameter may transfer its value
+# onward instead of consuming it locally.
+
+# Runtime const and var bindings both own their values; const controls mutation,
+# not ownership. A place is a local binding followed by zero or more fields.
+# Ordinary place expressions borrow. Binding initializers, replacement
+# assignments, struct fields, owned arguments, and returns require owned values:
+# a bare place is copied and must support copy, an explicitly transferred local
+# root (`name^`) is moved and must support move, and a temporary is moved or
+# constructed directly. Read arguments borrow through completion of the call.
+# Explicit transfer is invalid in a borrowing context and is currently limited
+# to whole local roots; partial-field transfer is not yet supported.
+#
+# Transfer makes the root unavailable on that path. Reading, transferring, or
+# updating a field of an unavailable or possibly unavailable root is an error.
+# Whole replacement assignment to a mutable root restores availability. At a
+# control-flow join the root is available only if it is available on every
+# incoming path. A root available on loop entry must be restored on every
+# reachable backedge.
+#
+# Locals end in reverse binding order on every normal or control-flow scope
+# exit. Transferred roots carry their drop obligation onward. An available or
+# possibly transferred value whose drop strategy is explicit, directly or in a
+# field or variant member, must be passed to deinit or transferred before its
+# lifetime ends. Borrowed temporaries obey the same rule. Replacing a value ends
+# the old value first; only a deinit-authorized root may replace an explicit-drop
+# value without first transferring it.
 
 
 # Structs
@@ -144,11 +189,22 @@ func read_a(s: S) int
 # drop = trivial | fieldwise | explicit | func
 #        defaults to trivial if every field's drop is trivial, otherwise fieldwise.
 # 'trivial' invokes no field hooks; 'fieldwise' recurses through fields.
+# An explicit trivial strategy requires every direct field to have the same
+# trivial capability. An explicit fieldwise move or copy requires every direct
+# field to support that operation. Function-valued hooks receive stable
+# owner-qualified compiler identities and their required signatures are
+# validated before use.
 # 'func' means a complete function expression used as a custom, infallible hook.
 # Its sole parameter name is immaterial. The required signatures are:
 # copy = func(read self: S) S
 # move = func(var self: S) S
 # drop = func(deinit self: S) unit
+# A custom hook replaces that operation for the complete struct. Fieldwise
+# strategies invoke nested custom hooks in declaration order for copy and move,
+# reverse declaration order for drop, and operate only on a variant's active
+# member. Compiler-generated argument, result, and lifetime plumbing does not
+# recursively invoke the hook currently being executed; explicit calls written
+# in the hook body remain ordinary calls.
 # Potentially failing duplication is an explicitly called fallible function,
 # not an implicit copy operation.
 # Without copy support, passing to an owned parameter requires transfer with '^'.
@@ -215,7 +271,8 @@ fallible accept(arg: int) int
 # and an empty intersection always fails.
 # A condition binding is immutable and visible only in the success body. Its
 # optional annotation follows ordinary widening rules. The original binding is
-# not refined or aliased by the extracted binding.
+# not refined or aliased by the extracted binding, so extraction requires copy
+# support for the narrowed type.
 func inspect(fi: float | int)
     if fi is float -> found_float()
     if const f = fi as float -> use_float(f)

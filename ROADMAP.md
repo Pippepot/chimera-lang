@@ -8,24 +8,21 @@ Implementation audit: 2026-09-12, Zig 0.16.0.
 
 - Incremental queries preserve stable declaration and type identities, owned results, diagnostics, and equal-result retention.
 - Typing publishes one SSA control-flow graph with fallible edges, joins, loops, calls, callable values, variants, and divergence.
-- Structs have nominal identity, cycle-checked layout, default ownership capabilities, source-ordered initialization, field access, and field updates through mutable local roots.
-- Callable declarations and types share ordered mode/type parameter records. Omitted and explicit `read` are supported; other modes are rejected before body analysis.
+- Structs have nominal identity, cycle-checked layout, source-ordered initialization, field access, field updates through mutable local roots, and validated move/copy/drop strategy overrides.
+- Function-valued struct properties receive stable owner-qualified item identities, reuse ordinary signature and body queries without entering module scope, and are validated against exact copy/move/drop signatures. Typing lowers custom hooks to ordinary direct calls, recursively composes fieldwise struct and active-variant operations, and suppresses redispatch only for compiler-generated plumbing inside the active hook.
+- Callable declarations and types share ordered mode/type parameter records. Function declarations support omitted or explicit `read`, borrowed `mut`, owned `var`, and cleanup-authorized `deinit`; inferred callable values retain exact modes. Mutable arguments require exact-typed mutable places and reject overlapping read or mutable argument paths.
+- Lexical const and var bindings have stable root-place identities. Typing tracks available, transferred, and possibly transferred states through branches and loops; whole assignment restores a mutable root.
+- Bare place values borrow in observation and `read` calls. Bindings, replacement assignments, struct fields, returns, and owned calls require copy support; `^` explicitly transfers movable local roots. Owned temporaries pass directly. `var` and `deinit` parameters are mutable owned roots, with only `deinit` authorized to satisfy explicit drop. Partial-field transfer remains rejected.
+- Lexical exits end owned roots in reverse order. Explicit-drop trees must transfer or reach a `deinit` parameter on every path; borrowed temporaries and replaced values obey the same obligation. Automatic custom drop runs for locals, replaced values, discarded temporaries, read-call temporaries, and temporary aggregate projections. Trivial and hook-free fieldwise cleanup require no runtime instruction.
 
-## Next: ownership uses
+## Next: ownership storage
 
-First specify the remaining ownership matrix: which bindings, assignments,
-arguments, returns, and field paths borrow, copy, or transfer; when reassignment
-restores an invalidated place; and how callable modes compare. Then implement in
-small end-to-end slices:
+The root-place use matrix, non-escaping `mut` borrows, owned `var` parameters,
+cleanup scheduling, explicit drop obligations, and `deinit` parameters are
+specified and implemented. Continue with:
 
-1. Represent local and field places once, and track available versus transferred
-   state through branches and loops.
-2. Enforce `OwnershipCapabilities` at copies and explicit `^` transfers, with
-   precise use-after-transfer, non-copyable, and non-movable diagnostics.
-3. Enable owned `var` and `deinit` parameters, custom copy/move/drop hooks, and
-   path-complete drop obligations.
-4. Add `mut` aliasing, partial-field transfer, and final storage for immovable
-   values only after their lifetime and call-convention rules are specified.
+1. Add partial-field transfer and final storage for immovable values only after
+   their lifetime and call-convention rules are specified.
 
 Each slice must cover diagnostics, execution, ownership paths, and incremental
 recomputation. Keep unsupported forms rejected at their owning boundary.

@@ -589,6 +589,8 @@ const EntryCallParent = struct {
             .struct_init,
             .field_access,
             .field_update,
+            .mut_parameter_write,
+            .call_mut_argument,
             .indirect_call,
             .exit,
             .negi,
@@ -764,6 +766,84 @@ test "DiscoverItems creates an entry for every parsed file" {
     try testing.expectEqual(structures.ItemKind.top_level_entry, static_only.?.items[1].loc.kind);
 }
 
+test "struct hook items have stable owner-qualified identities" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static Left = struct
+        \\  copy = func(read self: Left) Left -> self
+        \\  value: int
+        \\static Right = struct
+        \\  copy = func(read self: Right) Right -> self
+        \\  value: int
+    );
+    var scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const left = scope.resolveStatic("Left").?;
+    const right = scope.resolveStatic("Right").?;
+    const first_index = (try db.get(query_structures.IndexItems, 1)).*.?;
+    var left_copy: ?structures.ItemId = null;
+    var right_copy: ?structures.ItemId = null;
+    for (first_index.ids()) |item_id| {
+        const loc = try db.lookupInterned(query_structures.ItemLocations, item_id);
+        if (!std.mem.eql(u8, loc.name, "copy")) continue;
+        if (loc.owner == left) left_copy = item_id;
+        if (loc.owner == right) right_copy = item_id;
+    }
+    try testing.expect(left_copy != null and right_copy != null);
+    try testing.expect(left_copy.? != right_copy.?);
+    try testing.expect(scope.resolve("copy") == null);
+    const left_type = (try db.get(query_structures.ResolveStatic, left)).*.?.type;
+    const right_type = (try db.get(query_structures.ResolveStatic, right)).*.?.type;
+    const left_signature = (try db.get(query_structures.FunctionSignature, left_copy.?)).*.?;
+    try testing.expectEqual(@as(usize, 1), left_signature.parameters.len);
+    try testing.expectEqual(structures.CallableParameter{ .mode = .read, .type_id = left_type }, left_signature.parameters[0]);
+    try testing.expectEqual(left_type, left_signature.return_type);
+    const right_signature = (try db.get(query_structures.FunctionSignature, right_copy.?)).*.?;
+    try testing.expectEqual(structures.CallableParameter{ .mode = .read, .type_id = right_type }, right_signature.parameters[0]);
+    try testing.expectEqual(right_type, right_signature.return_type);
+
+    try setSource(db, 1,
+        \\static Left = struct
+        \\  prefix: bool
+        \\  copy = func(read self: Left) Left -> self
+        \\  value: int
+        \\static Right = struct
+        \\  copy = func(read self: Right) Right -> self
+        \\  value: int
+    );
+    scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    try testing.expectEqual(left, scope.resolveStatic("Left").?);
+    try testing.expectEqual(right, scope.resolveStatic("Right").?);
+    const relocated_index = (try db.get(query_structures.IndexItems, 1)).*.?;
+    try testing.expect(relocated_index.resolve(left_copy.?) != null);
+    try testing.expect(relocated_index.resolve(right_copy.?) != null);
+}
+
+test "captureless struct hook items reuse function queries" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\static Resource = struct
+        \\  drop = func(deinit self: Resource)
+        \\    return
+        \\  value: int
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const resource = scope.resolveStatic("Resource").?;
+    const resource_type = (try db.get(query_structures.ResolveStatic, resource)).*.?.type;
+    const index = (try db.get(query_structures.IndexItems, 1)).*.?;
+    const drop = for (index.ids()) |item_id| {
+        const loc = try db.lookupInterned(query_structures.ItemLocations, item_id);
+        if (loc.owner == resource and std.mem.eql(u8, loc.name, "drop")) break item_id;
+    } else unreachable;
+
+    const signature = (try db.get(query_structures.FunctionSignature, drop)).*.?;
+    try testing.expectEqualSlices(structures.CallableParameter, &.{.{ .mode = .deinit, .type_id = resource_type }}, signature.parameters);
+    try testing.expectEqual(structures.TypeId.unit, signature.return_type);
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, drop)).* != null);
+}
+
 test "struct declarations are nominal and aliases preserve identity" {
     const db = try testDatabase(1);
     defer db.deinit();
@@ -848,8 +928,8 @@ test "struct definitions reject duplicate and unsupported members" {
         \\static Duplicate = struct
         \\  value: int
         \\  value: bool
-        \\static Property = struct
-        \\  copy = trivial
+        \\static Unsupported = struct
+        \\  func nested() -> return
     );
     const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
     const duplicate = scope.resolveStatic("Duplicate").?;
@@ -859,12 +939,511 @@ test "struct definitions reject duplicate and unsupported members" {
     try testing.expectEqual(DiagnosticKind.duplicate_struct_field, std.meta.activeTag(diagnostics[0].kind));
     freeDiagnostics(diagnostics);
 
-    const property = scope.resolveStatic("Property").?;
-    try testing.expect((try db.get(query_structures.StructDefinition, property)).* == null);
-    diagnostics = try db.transitiveAccumulatorValues(query_structures.StructDefinition, property, structures.Diagnostic, testing.allocator);
+    const unsupported = scope.resolveStatic("Unsupported").?;
+    try testing.expect((try db.get(query_structures.StructDefinition, unsupported)).* == null);
+    diagnostics = try db.transitiveAccumulatorValues(query_structures.StructDefinition, unsupported, structures.Diagnostic, testing.allocator);
     defer freeDiagnostics(diagnostics);
     try testing.expectEqual(@as(usize, 1), diagnostics.len);
     try testing.expectEqual(DiagnosticKind.struct_member_not_supported, std.meta.activeTag(diagnostics[0].kind));
+}
+
+test "struct definitions own ownership property overrides" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static Configured = struct
+        \\  move = trivial
+        \\  copy = fieldwise
+        \\  drop = explicit
+        \\  value: int
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const definition = (try db.get(query_structures.StructDefinition, scope.resolveStatic("Configured").?)).*.?;
+    try testing.expectEqual(structures.MoveCapability.trivial, definition.ownership.move.?.capability);
+    try testing.expectEqual(structures.CopyCapability.fieldwise, definition.ownership.copy.?.capability);
+    try testing.expectEqual(structures.DropCapability.explicit, definition.ownership.drop.?.capability);
+}
+
+test "struct ownership properties have precise definition diagnostics" {
+    const cases = [_]struct {
+        member: []const u8,
+        kind: DiagnosticKind,
+    }{
+        .{ .member = "copy = trivial\n  copy = fieldwise", .kind = .duplicate_struct_property },
+        .{ .member = "clone = trivial", .kind = .unknown_struct_property },
+        .{ .member = "move = explicit", .kind = .invalid_struct_property_value },
+        .{ .member = "copy = func(read self: int) int -> self", .kind = .struct_ownership_hook_signature_mismatch },
+        .{ .member = "move = func(read self: Invalid) Invalid -> self", .kind = .struct_ownership_hook_signature_mismatch },
+        .{ .member = "drop = func(deinit self: Invalid) int -> return 0", .kind = .struct_ownership_hook_signature_mismatch },
+        .{ .member = "drop = fallible(deinit self: Invalid) -> return", .kind = .struct_ownership_hook_signature_mismatch },
+        .{ .member = "copy = func(read self: Invalid, other: int) Invalid -> self", .kind = .struct_ownership_hook_signature_mismatch },
+    };
+
+    for (cases, 1..) |case, file_id| {
+        const db = try testDatabase(1);
+        defer db.deinit();
+        const source = try std.fmt.allocPrint(testing.allocator, "static Invalid = struct\n  {s}\n  value: int", .{case.member});
+        defer testing.allocator.free(source);
+        try addSource(db, file_id, source);
+        const item = (try db.get(query_structures.BuildModuleScope, file_id)).*.?.resolveStatic("Invalid").?;
+        try testing.expect((try db.get(query_structures.StructDefinition, item)).* == null);
+        const diagnostics = try db.transitiveAccumulatorValues(query_structures.StructDefinition, item, structures.Diagnostic, testing.allocator);
+        defer freeDiagnostics(diagnostics);
+        try testing.expectEqual(@as(usize, 1), diagnostics.len);
+        try testing.expectEqual(case.kind, std.meta.activeTag(diagnostics[0].kind));
+    }
+}
+
+test "struct hook signature validation updates incrementally" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    const valid =
+        \\static Resource = struct
+        \\  drop = func(deinit self: Resource) -> return
+        \\  value: int
+    ;
+    try addSource(db, 1, valid);
+    var item = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveStatic("Resource").?;
+    var definition = (try db.get(query_structures.StructDefinition, item)).*.?;
+    try testing.expectEqual(structures.DropCapability.custom, definition.ownership.drop.?.capability);
+    try testing.expect(definition.ownership.drop.?.hook != null);
+    var diagnostics = try db.transitiveAccumulatorValues(query_structures.StructDefinition, item, structures.Diagnostic, testing.allocator);
+    try testing.expectEqual(@as(usize, 0), diagnostics.len);
+    freeDiagnostics(diagnostics);
+
+    try setSource(db, 1,
+        \\static Resource = struct
+        \\  drop = func(read self: Resource) -> return
+        \\  value: int
+    );
+    item = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveStatic("Resource").?;
+    try testing.expect((try db.get(query_structures.StructDefinition, item)).* == null);
+    diagnostics = try db.transitiveAccumulatorValues(query_structures.StructDefinition, item, structures.Diagnostic, testing.allocator);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(DiagnosticKind.struct_ownership_hook_signature_mismatch, std.meta.activeTag(diagnostics[0].kind));
+    freeDiagnostics(diagnostics);
+
+    try setSource(db, 1, valid);
+    item = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveStatic("Resource").?;
+    definition = (try db.get(query_structures.StructDefinition, item)).*.?;
+    try testing.expectEqual(structures.DropCapability.custom, definition.ownership.drop.?.capability);
+    diagnostics = try db.transitiveAccumulatorValues(query_structures.StructDefinition, item, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 0), diagnostics.len);
+}
+
+test "custom ownership hooks execute without active-hook redispatch" {
+    const cases = [_]struct {
+        source: []const u8,
+        expected: u8,
+    }{
+        .{
+            .source =
+            \\static Box = struct
+            \\  copy = func(read self: Box) Box -> Box{value = self.value + 1}
+            \\  value: int
+            \\func answer() int
+            \\  const source = Box{value = 41}
+            \\  const copied = source
+            \\  return copied.value
+            \\exit(answer())
+            ,
+            .expected = 42,
+        },
+        .{
+            .source =
+            \\static Box = struct
+            \\  copy = func(read self: Box) Box -> Box{value = self.value + 1}
+            \\  value: int
+            \\func answer() int
+            \\  const source = Box{value = 41}
+            \\  const selected = if 0 < 1 -> source else Box{value = 40}
+            \\  return selected.value
+            \\exit(answer())
+            ,
+            .expected = 42,
+        },
+        .{
+            .source =
+            \\static Box = struct
+            \\  copy = func(read self: Box) Box -> Box{value = self.value + 1}
+            \\  value: int
+            \\func answer() int
+            \\  const source = Box{value = 41}
+            \\  const selected = if 1 < 0 -> source else Box{value = 40}
+            \\  return selected.value
+            \\exit(answer())
+            ,
+            .expected = 40,
+        },
+        .{
+            .source =
+            \\static Box = struct
+            \\  copy = func(read self: Box) Box -> Box{value = self.value + 1}
+            \\  value: int
+            \\func answer() int
+            \\  const source = Box{value = 41}
+            \\  const selected = if 0 < 1 -> if 1 < 0 -> source else Box{value = 40} else Box{value = 39}
+            \\  return selected.value
+            \\exit(answer())
+            ,
+            .expected = 40,
+        },
+        .{
+            .source =
+            \\static Box = struct
+            \\  copy = func(read self: Box) Box -> exit(self.value)
+            \\  value: int
+            \\static Token = struct
+            \\  value: int
+            \\func answer()
+            \\  const source = Box{value = 42}
+            \\  const selected: Box | Token = if 0 < 1 -> source else Token{value = 40}
+            \\answer()
+            \\exit(40)
+            ,
+            .expected = 42,
+        },
+        .{
+            .source =
+            \\static Box = struct
+            \\  copy = func(read self: Box) Box -> exit(self.value)
+            \\  value: int
+            \\static Token = struct
+            \\  value: int
+            \\func answer()
+            \\  const source = Box{value = 42}
+            \\  const selected: Box | Token = if 1 < 0 -> source else Token{value = 40}
+            \\answer()
+            \\exit(40)
+            ,
+            .expected = 40,
+        },
+        .{
+            .source =
+            \\static Box = struct
+            \\  copy = func(read self: Box) Box -> Box{value = self.value + 1}
+            \\  value: int
+            \\func answer() int
+            \\  const source = Box{value = 41}
+            \\  const selected = loop
+            \\    if 0 < 1 -> break source
+            \\    break Box{value = 40}
+            \\  return selected.value
+            \\exit(answer())
+            ,
+            .expected = 42,
+        },
+        .{
+            .source =
+            \\static Box = struct
+            \\  copy = func(read self: Box) Box -> Box{value = self.value + 1}
+            \\  value: int
+            \\func answer() int
+            \\  const source = Box{value = 41}
+            \\  const selected = loop
+            \\    if 1 < 0 -> break source
+            \\    break Box{value = 40}
+            \\  return selected.value
+            \\exit(answer())
+            ,
+            .expected = 40,
+        },
+        .{
+            .source =
+            \\static Box = struct
+            \\  copy = func(read self: Box) Box -> exit(self.value)
+            \\  value: int
+            \\static Token = struct
+            \\  value: int
+            \\func answer()
+            \\  const source = Box{value = 42}
+            \\  const selected: Box | Token = loop
+            \\    if 0 < 1 -> break source
+            \\    break Token{value = 40}
+            \\answer()
+            \\exit(40)
+            ,
+            .expected = 42,
+        },
+        .{
+            .source =
+            \\static Box = struct
+            \\  copy = func(read self: Box) Box -> exit(self.value)
+            \\  value: int
+            \\static Token = struct
+            \\  value: int
+            \\func answer()
+            \\  const source = Box{value = 42}
+            \\  const selected: Box | Token = loop
+            \\    if 1 < 0 -> break source
+            \\    break Token{value = 40}
+            \\answer()
+            \\exit(40)
+            ,
+            .expected = 40,
+        },
+        .{
+            .source =
+            \\static Box = struct
+            \\  copy = func(read self: Box) Box -> self
+            \\  value: int
+            \\func answer() int
+            \\  const source = Box{value = 42}
+            \\  const copied = source
+            \\  return copied.value
+            \\exit(answer())
+            ,
+            .expected = 42,
+        },
+        .{
+            .source =
+            \\static Resource = struct
+            \\  drop = func(deinit self: Resource) -> return
+            \\  value: int
+            \\func answer() int
+            \\  const resource = Resource{value = 42}
+            \\  return resource.value
+            \\exit(answer())
+            ,
+            .expected = 42,
+        },
+        .{
+            .source =
+            \\static Box = struct
+            \\  move = func(var self: Box) Box
+            \\    self.value += 1
+            \\    return self^
+            \\  value: int
+            \\func answer() int
+            \\  const source = Box{value = 41}
+            \\  const moved = source^
+            \\  return moved.value
+            \\exit(answer())
+            ,
+            .expected = 42,
+        },
+        .{
+            .source =
+            \\static Resource = struct
+            \\  drop = func(deinit self: Resource) -> exit(self.value)
+            \\  value: int
+            \\func answer()
+            \\  const resource = Resource{value = 42}
+            \\answer()
+            ,
+            .expected = 42,
+        },
+        .{
+            .source =
+            \\static Leaf = struct
+            \\  copy = func(read self: Leaf) Leaf -> Leaf{value = self.value + 1}
+            \\  value: int
+            \\static Middle = struct
+            \\  copy = fieldwise
+            \\  leaf: Leaf
+            \\static Outer = struct
+            \\  copy = fieldwise
+            \\  first: Middle
+            \\  second: Middle
+            \\func answer() int
+            \\  const source = Outer{first = Middle{leaf = Leaf{value = 19}}, second = Middle{leaf = Leaf{value = 21}}}
+            \\  const copied = source
+            \\  return copied.first.leaf.value + copied.second.leaf.value
+            \\exit(answer())
+            ,
+            .expected = 42,
+        },
+        .{
+            .source =
+            \\static Resource = struct
+            \\  drop = func(deinit self: Resource) -> exit(self.value)
+            \\  value: int
+            \\static Pair = struct
+            \\  first: Resource
+            \\  second: Resource
+            \\func answer()
+            \\  const pair = Pair{first = Resource{value = 41}, second = Resource{value = 42}}
+            \\answer()
+            ,
+            .expected = 42,
+        },
+        .{
+            .source =
+            \\static Inner = struct
+            \\  copy = func(read self: Inner) Inner -> Inner{value = self.value + 1}
+            \\  value: int
+            \\static Outer = struct
+            \\  copy = fieldwise
+            \\  inner: Inner
+            \\func answer() int
+            \\  const source = Outer{inner = Inner{value = 41}}
+            \\  const copied = source
+            \\  return copied.inner.value
+            \\exit(answer())
+            ,
+            .expected = 42,
+        },
+        .{
+            .source =
+            \\static Inner = struct
+            \\  copy = func(read self: Inner) Inner -> exit(self.value)
+            \\  value: int
+            \\func answer()
+            \\  const source: Inner | int = Inner{value = 42}
+            \\  const copied = source
+            \\answer()
+            ,
+            .expected = 42,
+        },
+        .{
+            .source =
+            \\static Inner = struct
+            \\  move = func(var self: Inner) Inner -> exit(self.value)
+            \\  value: int
+            \\func answer()
+            \\  const source: Inner | int = Inner{value = 42}
+            \\  const moved = source^
+            \\answer()
+            ,
+            .expected = 42,
+        },
+        .{
+            .source =
+            \\static Inner = struct
+            \\  drop = func(deinit self: Inner) -> exit(self.value)
+            \\  value: int
+            \\func answer()
+            \\  const value: Inner | int = Inner{value = 42}
+            \\answer()
+            ,
+            .expected = 42,
+        },
+        .{
+            .source =
+            \\static Resource = struct
+            \\  drop = func(deinit self: Resource) -> exit(self.value)
+            \\  value: int
+            \\func answer()
+            \\  var resource = Resource{value = 42}
+            \\  resource = Resource{value = 43}
+            \\answer()
+            ,
+            .expected = 42,
+        },
+        .{
+            .source =
+            \\static Resource = struct
+            \\  drop = func(deinit self: Resource) -> exit(self.value)
+            \\  value: int
+            \\func answer()
+            \\  Resource{value = 42}
+            \\answer()
+            ,
+            .expected = 42,
+        },
+        .{
+            .source =
+            \\static Resource = struct
+            \\  drop = func(deinit self: Resource) -> exit(self.value)
+            \\  value: int
+            \\func inspect(read resource: Resource) -> return
+            \\func answer() -> inspect(Resource{value = 42})
+            \\answer()
+            ,
+            .expected = 42,
+        },
+        .{
+            .source =
+            \\static Resource = struct
+            \\  copy = trivial
+            \\  drop = func(deinit self: Resource) -> exit(self.value)
+            \\  value: int
+            \\func answer() int -> return Resource{value = 42}.value
+            \\exit(answer())
+            ,
+            .expected = 42,
+        },
+    };
+
+    for (cases, 1..) |case, file_id| {
+        const db = try testDatabase(1);
+        defer db.deinit();
+        try addSource(db, file_id, case.source);
+        const executable = (try db.get(query_structures.BuildExecutable, file_id)).*.?;
+        const io = testing.io;
+        try runtime.writeProgram(io, executable.bytes);
+        defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+        try testing.expectEqual(case.expected, try runtime.runProg(io, testing.allocator, &.{}));
+    }
+}
+
+test "custom hook body edits rebuild executable behavior" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    const initial =
+        \\static Box = struct
+        \\  copy = func(read self: Box) Box -> Box{value = self.value + 1}
+        \\  value: int
+        \\func answer() int
+        \\  const source = Box{value = 40}
+        \\  const copied = source
+        \\  return copied.value
+        \\exit(answer())
+    ;
+    try addSource(db, 1, initial);
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const owner = scope.resolveStatic("Box").?;
+    const index = (try db.get(query_structures.IndexItems, 1)).*.?;
+    const hook = for (index.ids()) |item_id| {
+        const loc = try db.lookupInterned(query_structures.ItemLocations, item_id);
+        if (loc.owner == owner and std.mem.eql(u8, loc.name, "copy")) break item_id;
+    } else unreachable;
+
+    const io = testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    var executable = (try db.get(query_structures.BuildExecutable, 1)).*.?;
+    try runtime.writeProgram(io, executable.bytes);
+    try testing.expectEqual(@as(u8, 41), try runtime.runProg(io, testing.allocator, &.{}));
+
+    try setSource(db, 1,
+        \\static Box = struct
+        \\  copy = func(read self: Box) Box -> Box{value = self.value + 2}
+        \\  value: int
+        \\func answer() int
+        \\  const source = Box{value = 40}
+        \\  const copied = source
+        \\  return copied.value
+        \\exit(answer())
+    );
+    const updated_scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    try testing.expectEqual(owner, updated_scope.resolveStatic("Box").?);
+    const updated_index = (try db.get(query_structures.IndexItems, 1)).*.?;
+    try testing.expect(updated_index.resolve(hook) != null);
+    executable = (try db.get(query_structures.BuildExecutable, 1)).*.?;
+    try runtime.writeProgram(io, executable.bytes);
+    try testing.expectEqual(@as(u8, 42), try runtime.runProg(io, testing.allocator, &.{}));
+}
+
+test "custom drop rejects cleanup after a partial transfer" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\static Resource = struct
+        \\  drop = func(deinit self: Resource) -> return
+        \\  value: int
+        \\func bad(flag: int)
+        \\  const resource = Resource{value = 42}
+        \\  if flag < 1
+        \\    const moved = resource^
+    );
+    const bad = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveFunction("bad").?;
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, bad)).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, bad, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(DiagnosticKind.possibly_transferred, std.meta.activeTag(diagnostics[0].kind));
 }
 
 test "struct layouts preserve declaration order alignment and nesting" {
@@ -970,6 +1549,43 @@ test "ownership capabilities compose across callable variant and struct types" {
     try testing.expectEqual(default_struct, (try db.get(query_structures.OwnershipCapabilities, pair_type)).*.?);
     try testing.expectEqual(default_struct, (try db.get(query_structures.OwnershipCapabilities, wrapped_type)).*.?);
     try testing.expectEqual(default_struct, (try db.get(query_structures.OwnershipCapabilities, maybe_pair_type)).*.?);
+}
+
+test "struct ownership properties override defaults and validate fields" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static Configured = struct
+        \\  move = trivial
+        \\  copy = fieldwise
+        \\  drop = explicit
+        \\  value: int
+        \\static Immovable = struct
+        \\  move = none
+        \\  value: int
+        \\static Invalid = struct
+        \\  move = fieldwise
+        \\  value: Immovable
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const configured = (try db.get(query_structures.ResolveStatic, scope.resolveStatic("Configured").?)).*.?.type;
+    try testing.expectEqual(
+        structures.OwnershipCapabilities{
+            .move = .trivial,
+            .copy = .fieldwise,
+            .drop = .explicit,
+            .requires_explicit_drop = true,
+        },
+        (try db.get(query_structures.OwnershipCapabilities, configured)).*.?,
+    );
+    const invalid_item = scope.resolveStatic("Invalid").?;
+    const invalid = (try db.get(query_structures.ResolveStatic, invalid_item)).*.?.type;
+    try testing.expect((try db.get(query_structures.OwnershipCapabilities, invalid)).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(query_structures.OwnershipCapabilities, invalid, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(DiagnosticKind.struct_ownership_property_incompatible_with_fields, std.meta.activeTag(diagnostics[0].kind));
 }
 
 test "ownership capabilities reject recursive structs and recover incrementally" {
@@ -4348,9 +4964,8 @@ test "function signature rejects invalid parameter and return types without dupl
     try addSource(db, 2, "static missing_param = func(x) int -> return 1");
     try addSource(db, 3, "static bad_param = func(x: float) int -> return 1");
     try addSource(db, 4, "static duplicate = func(x: int, x: int) int -> return 1");
-    try addSource(db, 5, "static mode = func(mut x: int) int -> return 1");
 
-    for ([_]structures.FileId{ 1, 2, 3, 4, 5 }) |file_id| {
+    for ([_]structures.FileId{ 1, 2, 3, 4 }) |file_id| {
         const function_id = (try db.get(query_structures.IndexItems, file_id)).*.?.ids()[0];
         try testing.expect((try db.get(query_structures.FunctionSignature, function_id)).* == null);
         try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, function_id)).* == null);
@@ -4360,6 +4975,191 @@ test "function signature rejects invalid parameter and return types without dupl
         defer freeDiagnostics(transitive);
         try testing.expectEqual(@as(usize, 1), transitive.len);
     }
+}
+
+test "function signatures retain mutable borrow parameter modes" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1, "func update(mut value: int) int -> value");
+
+    const function_id = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveFunction("update").?;
+    const signature = (try db.get(query_structures.FunctionSignature, function_id)).*.?;
+    try testing.expectEqual(@as(usize, 1), signature.parameters.len);
+    try testing.expectEqual(structures.ParameterMode.mut, signature.parameters[0].mode);
+    try testing.expectEqual(structures.TypeId.int, signature.parameters[0].type_id);
+}
+
+test "mutable borrow parameters publish their final value" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\func increment(mut value: int) int
+        \\  value += 1
+        \\  return value
+    );
+
+    const function_id = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveFunction("increment").?;
+    const body = (try db.get(query_structures.AnalyzeFunctionBody, function_id)).*.?;
+    var write_count: usize = 0;
+    for (body.instructions) |instruction| {
+        if (instruction == .mut_parameter_write) write_count += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), write_count);
+}
+
+test "mutable borrow calls update caller places" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\static Pair = struct
+        \\  left: int
+        \\  right: int
+        \\func increment(mut value: int)
+        \\  value += 1
+        \\func answer() int
+        \\  var value = 40
+        \\  var pair = Pair{left = 1, right = 1}
+        \\  increment(value)
+        \\  increment(pair.right)
+        \\  return value + pair.left + pair.right - 2
+    );
+
+    try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "increment" }, 42);
+}
+
+test "mutable borrows forward through indirect calls and disjoint fields" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\static Pair = struct
+        \\  left: int
+        \\  right: int
+        \\func increment(mut value: int)
+        \\  value += 1
+        \\func forward(mut value: int)
+        \\  const selected = increment
+        \\  selected(value)
+        \\func update_pair(mut left: int, mut right: int)
+        \\  left += 1
+        \\  right += 2
+        \\func update_whole(mut pair: Pair)
+        \\  pair.left += 1
+        \\  pair.right += 1
+        \\func answer() int
+        \\  var value = 39
+        \\  var pair = Pair{left = 0, right = 0}
+        \\  forward(value)
+        \\  update_pair(pair.left, pair.right)
+        \\  update_whole(pair)
+        \\  return value + pair.left
+    );
+
+    try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "forward", "increment", "update_pair", "update_whole" }, 42);
+}
+
+test "fallible mutable borrows update success and failure paths" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\fallible change(mut value: int, should_succeed: int) unit
+        \\  value += 1
+        \\  should_succeed > 0
+        \\func answer() int
+        \\  var succeeded = 20
+        \\  if change(succeeded, 1) -> succeeded += 0 else return 0
+        \\  var failed = 20
+        \\  if change(failed, 0) -> return 0
+        \\  return succeeded + failed
+    );
+
+    try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "change" }, 42);
+}
+
+test "mutable borrow copy-back follows memory return storage" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\static Pair = struct
+        \\  left: int
+        \\  right: int
+        \\func update(mut value: int) Pair
+        \\  value += 1
+        \\  return Pair{left = 1, right = 1}
+        \\func answer() int
+        \\  var value = 39
+        \\  const pair = update(value)
+        \\  return value + pair.left + pair.right
+    );
+
+    try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "update" }, 42);
+}
+
+test "mutable borrow arguments require non-overlapping mutable places" {
+    const cases = [_]struct {
+        source: []const u8,
+        kind: DiagnosticKind,
+    }{
+        .{
+            .source = "func update(mut value: int) -> value += 1\nfunc bad()\n  const value = 1\n  update(value)",
+            .kind = .mutable_argument_requires_mutable_place,
+        },
+        .{
+            .source = "func update(mut value: int) -> value += 1\nfunc bad() -> update(1)",
+            .kind = .mutable_argument_requires_place,
+        },
+        .{
+            .source = "func update(mut changed: int, read observed: int) -> changed += observed\nfunc bad()\n  var value = 1\n  update(value, value)",
+            .kind = .overlapping_mutable_arguments,
+        },
+        .{
+            .source = "static Pair = struct\n  left: int\n  right: int\nfunc update(mut pair: Pair, mut left: int) -> left += pair.right\nfunc bad()\n  var pair = Pair{left = 1, right = 2}\n  update(pair, pair.left)",
+            .kind = .overlapping_mutable_arguments,
+        },
+        .{
+            .source = "func bad(mut value: int) int -> value^",
+            .kind = .ownership_transfer_requires_owned_place,
+        },
+    };
+
+    for (cases, 1..) |case, file_id| {
+        const db = try testDatabase(1);
+        defer db.deinit();
+        try addSource(db, file_id, case.source);
+        const bad = (try db.get(query_structures.BuildModuleScope, file_id)).*.?.resolveFunction("bad").?;
+        try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, bad)).* == null);
+        const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, bad, structures.Diagnostic, testing.allocator);
+        defer freeDiagnostics(diagnostics);
+        try testing.expectEqual(@as(usize, 1), diagnostics.len);
+        try testing.expectEqual(case.kind, std.meta.activeTag(diagnostics[0].kind));
+    }
+}
+
+test "mutable borrow mode edits update callers incrementally" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\func update(mut value: int)
+        \\  value += 1
+        \\func answer() int
+        \\  var value = 41
+        \\  update(value)
+        \\  return value
+    );
+
+    const answer = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveFunction("answer").?;
+    const mut_body = try db.get(query_structures.AnalyzeFunctionBody, answer);
+    try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "update" }, 42);
+
+    try setSource(db, 1,
+        \\func update(read value: int) -> return
+        \\func answer() int
+        \\  var value = 41
+        \\  update(value)
+        \\  return value
+    );
+    const read_body = try db.get(query_structures.AnalyzeFunctionBody, answer);
+    try testing.expect(mut_body != read_body);
+    try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "update" }, 41);
 }
 
 test "function body analysis rejects unsupported expressions and literals" {
@@ -4395,7 +5195,7 @@ test "unsupported declarations and transfers are rejected at their owning bounda
         .{
             .source = "func transfer(value: int) int -> value^",
             .marker = "^",
-            .kind = .ownership_transfer_not_supported,
+            .kind = .ownership_transfer_requires_owned_place,
         },
     };
 
@@ -4411,6 +5211,666 @@ test "unsupported declarations and transfers are rejected at their owning bounda
             .end = start + case.marker.len,
         }, case.kind);
     }
+}
+
+test "ownership transfer invalidates const and mutable local roots" {
+    const cases = [_][]const u8{
+        "static Box = struct\n  value: int\nfunc bad() int\n  const box = Box{value = 42}\n  const moved = box^\n  return box.value",
+        "static Box = struct\n  value: int\nfunc bad() int\n  var box = Box{value = 42}\n  const moved = box^\n  return box.value",
+    };
+
+    for (cases, 1..) |source, file_id| {
+        const db = try testDatabase(1);
+        defer db.deinit();
+        try addSource(db, file_id, source);
+        const function_id = (try db.get(query_structures.BuildModuleScope, file_id)).*.?.resolveFunction("bad").?;
+        try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, function_id)).* == null);
+        const start = std.mem.lastIndexOf(u8, source, "box.value").?;
+        try expectSingleQueryDiagnostic(db, query_structures.AnalyzeFunctionBody, function_id, true, file_id, .{
+            .start = start,
+            .end = start + "box".len,
+        }, .use_after_transfer);
+    }
+}
+
+test "whole assignment restores a transferred mutable root" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\static Box = struct
+        \\  value: int
+        \\func answer() int
+        \\  var box = Box{value = 20}
+        \\  const moved = box^
+        \\  box = Box{value = moved.value + 22}
+        \\  return box.value
+    );
+    try expectCompiledFunctionResult(db, 1, "answer", &.{"answer"}, 42);
+}
+
+test "owning destinations require copy or explicit transfer" {
+    const cases = [_][]const u8{
+        "static Box = struct\n  value: int\nfunc bad() int\n  const box = Box{value = 42}\n  const copied = box\n  return copied.value",
+        "static Box = struct\n  value: int\nfunc bad() Box\n  const box = Box{value = 42}\n  return box",
+    };
+
+    for (cases, 1..) |source, file_id| {
+        const db = try testDatabase(1);
+        defer db.deinit();
+        try addSource(db, file_id, source);
+        const function_id = (try db.get(query_structures.BuildModuleScope, file_id)).*.?.resolveFunction("bad").?;
+        try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, function_id)).* == null);
+        const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, function_id, structures.Diagnostic, testing.allocator);
+        defer freeDiagnostics(diagnostics);
+        try testing.expectEqual(@as(usize, 1), diagnostics.len);
+        try testing.expectEqual(DiagnosticKind.type_not_copyable, std.meta.activeTag(diagnostics[0].kind));
+    }
+}
+
+test "ownership availability joins across branches" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    const source =
+        \\static Box = struct
+        \\  value: int
+        \\func bad(flag: int) int
+        \\  const box = Box{value = 42}
+        \\  if flag < 1
+        \\    const moved = box^
+        \\  return box.value
+    ;
+    try addSource(db, 1, source);
+    const function_id = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveFunction("bad").?;
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, function_id)).* == null);
+    const start = std.mem.lastIndexOf(u8, source, "box.value").?;
+    try expectSingleQueryDiagnostic(db, query_structures.AnalyzeFunctionBody, function_id, true, 1, .{
+        .start = start,
+        .end = start + "box".len,
+    }, .possibly_transferred);
+}
+
+test "ownership transfer must be restored before a loop backedge" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    const source =
+        \\static Box = struct
+        \\  value: int
+        \\func bad()
+        \\  var box = Box{value = 42}
+        \\  loop
+        \\    const moved = box^
+        \\    continue
+    ;
+    try addSource(db, 1, source);
+    const function_id = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveFunction("bad").?;
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, function_id)).* == null);
+    const start = std.mem.indexOf(u8, source, "continue").?;
+    try expectSingleQueryDiagnostic(db, query_structures.AnalyzeFunctionBody, function_id, true, 1, .{
+        .start = start,
+        .end = start + "continue".len,
+    }, .transferred_value_not_restored_before_loop_backedge);
+}
+
+test "read arguments borrow non-copyable values and reject transfers" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\static Box = struct
+        \\  value: int
+        \\func read_box(box: Box) int -> box.value
+        \\func answer() int
+        \\  const box = Box{value = 42}
+        \\  return read_box(box)
+        \\func bad() int
+        \\  const box = Box{value = 42}
+        \\  return read_box(box^)
+    );
+    try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "read_box" }, 42);
+
+    const bad = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveFunction("bad").?;
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, bad)).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, bad, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(DiagnosticKind.ownership_transfer_requires_owning_context, std.meta.activeTag(diagnostics[0].kind));
+}
+
+test "explicit transfers satisfy return and assignment ownership" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\static Box = struct
+        \\  value: int
+        \\func make() Box
+        \\  const box = Box{value = 20}
+        \\  return box^
+        \\func answer() int
+        \\  var target = Box{value = 0}
+        \\  const source = make()
+        \\  target = source^
+        \\  return target.value + 22
+    );
+    try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "make" }, 42);
+}
+
+test "restored ownership remains available through branches and loop backedges" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\static Box = struct
+        \\  value: int
+        \\func branch(flag: int) int
+        \\  var box = Box{value = 42}
+        \\  if flag < 1
+        \\    const moved = box^
+        \\    box = Box{value = moved.value}
+        \\  return box.value
+        \\func answer() int
+        \\  var box = Box{value = 40}
+        \\  var count = 0
+        \\  const result = loop
+        \\    const moved = box^
+        \\    box = Box{value = moved.value + 1}
+        \\    count += 1
+        \\    if count < 2 -> continue
+        \\    break box.value
+        \\  return result
+    );
+    const branch = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveFunction("branch").?;
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, branch)).* != null);
+    try expectCompiledFunctionResult(db, 1, "answer", &.{"answer"}, 42);
+}
+
+test "ownership diagnostics recover incrementally" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    const invalid =
+        \\static Box = struct
+        \\  value: int
+        \\func answer() int
+        \\  const box = Box{value = 42}
+        \\  const moved = box^
+        \\  return box.value
+    ;
+    try addSource(db, 1, invalid);
+    var answer = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveFunction("answer").?;
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, answer)).* == null);
+
+    try setSource(db, 1,
+        \\static Box = struct
+        \\  value: int
+        \\func answer() int
+        \\  const box = Box{value = 42}
+        \\  const moved = box^
+        \\  return moved.value
+    );
+    answer = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveFunction("answer").?;
+    try expectCompiledFunctionResult(db, 1, "answer", &.{"answer"}, 42);
+    const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, answer, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 0), diagnostics.len);
+}
+
+test "ownership transfers are rejected in borrowing contexts" {
+    const cases = [_][]const u8{
+        "func bad() int\n  const value = 20\n  return value^ + 22",
+        "static Box = struct\n  value: int\nfunc read_box(box: Box) int -> box.value\nfunc bad() int\n  const box = Box{value = 42}\n  return read_box(box^)",
+    };
+
+    for (cases, 1..) |source, file_id| {
+        const db = try testDatabase(1);
+        defer db.deinit();
+        try addSource(db, file_id, source);
+        const function_id = (try db.get(query_structures.BuildModuleScope, file_id)).*.?.resolveFunction("bad").?;
+        try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, function_id)).* == null);
+        const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, function_id, structures.Diagnostic, testing.allocator);
+        defer freeDiagnostics(diagnostics);
+        try testing.expectEqual(@as(usize, 1), diagnostics.len);
+        try testing.expectEqual(DiagnosticKind.ownership_transfer_requires_owning_context, std.meta.activeTag(diagnostics[0].kind));
+    }
+}
+
+test "field assignment cannot rebuild from a root transferred by its right hand side" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    const source =
+        \\static Box = struct
+        \\  value: int
+        \\func bad() int
+        \\  var box = Box{value = 42}
+        \\  box.value = box^
+        \\  return box.value
+    ;
+    try addSource(db, 1, source);
+    const function_id = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveFunction("bad").?;
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, function_id)).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, function_id, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(DiagnosticKind.use_after_transfer, std.meta.activeTag(diagnostics[0].kind));
+}
+
+test "condition bindings require copying the extracted value" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\static Box = struct
+        \\  value: int
+        \\func bad(value: Box | none) int
+        \\  if const box = value as Box -> return box.value
+        \\  return 0
+    );
+    const function_id = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveFunction("bad").?;
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, function_id)).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, function_id, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(DiagnosticKind.type_not_copyable, std.meta.activeTag(diagnostics[0].kind));
+}
+
+test "conditional ownership checks only place-backed result paths" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\static Box = struct
+        \\  value: int
+        \\func valid(flag: int)
+        \\  const scalar = 42
+        \\  const box = Box{value = 42}
+        \\  const selected = if flag < 1 -> scalar else box^
+        \\func bad(flag: int)
+        \\  const box = Box{value = 42}
+        \\  const selected = if flag < 1 -> box else Box{value = 0}
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, scope.resolveFunction("valid").?)).* != null);
+    const bad = scope.resolveFunction("bad").?;
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, bad)).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, bad, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(DiagnosticKind.type_not_copyable, std.meta.activeTag(diagnostics[0].kind));
+}
+
+test "var parameters own mutable values" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\static Box = struct
+        \\  value: int
+        \\func increment(var box: Box) Box
+        \\  box.value += 1
+        \\  return box^
+        \\func answer() int
+        \\  const source = Box{value = 41}
+        \\  const result = increment(source^)
+        \\  return result.value
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const signature = (try db.get(query_structures.FunctionSignature, scope.resolveFunction("increment").?)).*.?;
+    try testing.expectEqual(structures.ParameterMode.@"var", signature.parameters[0].mode);
+    try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "increment" }, 42);
+}
+
+test "interleaved var parameters precede body locals" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\static Box = struct
+        \\  value: int
+        \\func combine(read first: int, var left: Box, read second: int, var right: Box) int
+        \\  const moved = left^
+        \\  left = Box{value = moved.value + first}
+        \\  var result = left.value + right.value
+        \\  result += second
+        \\  return result
+        \\func answer() int -> combine(1, Box{value = 10}, 2, Box{value = 29})
+    );
+    try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "combine" }, 42);
+}
+
+test "var parameter availability flows through branches and loops" {
+    const cases = [_]struct {
+        source: []const u8,
+        kind: DiagnosticKind,
+    }{
+        .{
+            .source = "static Box = struct\n  value: int\nfunc bad(read flag: int, var box: Box) int\n  if flag < 1\n    const moved = box^\n  return box.value",
+            .kind = .possibly_transferred,
+        },
+        .{
+            .source = "static Box = struct\n  value: int\nfunc bad(var box: Box)\n  loop\n    const moved = box^\n    continue",
+            .kind = .transferred_value_not_restored_before_loop_backedge,
+        },
+    };
+
+    for (cases, 1..) |case, file_id| {
+        const db = try testDatabase(1);
+        defer db.deinit();
+        try addSource(db, file_id, case.source);
+        const bad = (try db.get(query_structures.BuildModuleScope, file_id)).*.?.resolveFunction("bad").?;
+        try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, bad)).* == null);
+        const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, bad, structures.Diagnostic, testing.allocator);
+        defer freeDiagnostics(diagnostics);
+        try testing.expectEqual(@as(usize, 1), diagnostics.len);
+        try testing.expectEqual(case.kind, std.meta.activeTag(diagnostics[0].kind));
+    }
+}
+
+test "bare var arguments copy without invalidating their source" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\func increment(var value: int) int
+        \\  value += 1
+        \\  return value^
+        \\func answer() int
+        \\  const source = 41
+        \\  const changed = increment(source)
+        \\  return changed + source - 41
+    );
+    try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "increment" }, 42);
+}
+
+test "var arguments require copy or explicit transfer" {
+    const cases = [_]struct {
+        source: []const u8,
+        kind: DiagnosticKind,
+    }{
+        .{
+            .source = "static Box = struct\n  value: int\nfunc take(var box: Box) int -> box.value\nfunc bad() int\n  const box = Box{value = 42}\n  return take(box)",
+            .kind = .type_not_copyable,
+        },
+        .{
+            .source = "static Box = struct\n  value: int\nfunc take(var box: Box) int -> box.value\nfunc bad() int\n  const box = Box{value = 42}\n  const result = take(box^)\n  return box.value",
+            .kind = .use_after_transfer,
+        },
+    };
+
+    for (cases, 1..) |case, file_id| {
+        const db = try testDatabase(1);
+        defer db.deinit();
+        try addSource(db, file_id, case.source);
+        const bad = (try db.get(query_structures.BuildModuleScope, file_id)).*.?.resolveFunction("bad").?;
+        try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, bad)).* == null);
+        const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, bad, structures.Diagnostic, testing.allocator);
+        defer freeDiagnostics(diagnostics);
+        try testing.expectEqual(@as(usize, 1), diagnostics.len);
+        try testing.expectEqual(case.kind, std.meta.activeTag(diagnostics[0].kind));
+    }
+}
+
+test "var parameters accept owned temporaries and inferred indirect calls" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\static Box = struct
+        \\  value: int
+        \\func read_box(var box: Box) int -> box.value
+        \\func direct() int -> read_box(Box{value = 42})
+        \\func answer() int
+        \\  const selected = read_box
+        \\  const box = Box{value = 42}
+        \\  return selected(box^)
+    );
+    try expectCompiledFunctionResult(db, 1, "direct", &.{ "direct", "read_box" }, 42);
+    try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "read_box" }, 42);
+}
+
+test "non-copyable var parameters must transfer when returned" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\static Box = struct
+        \\  value: int
+        \\func bad(var box: Box) Box -> box
+    );
+    const bad = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveFunction("bad").?;
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, bad)).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, bad, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(DiagnosticKind.type_not_copyable, std.meta.activeTag(diagnostics[0].kind));
+}
+
+test "var parameter mode edits invalidate and recover callers" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    const read_source =
+        \\static Box = struct
+        \\  value: int
+        \\func take(read box: Box) int -> box.value
+        \\func answer() int
+        \\  const box = Box{value = 42}
+        \\  return take(box^)
+    ;
+    try addSource(db, 1, read_source);
+    var answer = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveFunction("answer").?;
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, answer)).* == null);
+    var diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, answer, structures.Diagnostic, testing.allocator);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(DiagnosticKind.ownership_transfer_requires_owning_context, std.meta.activeTag(diagnostics[0].kind));
+    freeDiagnostics(diagnostics);
+
+    try setSource(db, 1,
+        \\static Box = struct
+        \\  value: int
+        \\func take(var box: Box) int -> box.value
+        \\func answer() int
+        \\  const box = Box{value = 42}
+        \\  return take(box^)
+    );
+    answer = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveFunction("answer").?;
+    try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "take" }, 42);
+    diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, answer, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 0), diagnostics.len);
+}
+
+test "struct copy and move properties control ownership uses" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\static Copyable = struct
+        \\  copy = trivial
+        \\  value: int
+        \\static Immovable = struct
+        \\  move = none
+        \\  value: int
+        \\func take(var value: Copyable) int -> value.value
+        \\func answer() int
+        \\  const source = Copyable{value = 42}
+        \\  const result = take(source)
+        \\  return result + source.value - 42
+        \\func bad() int
+        \\  const source = Immovable{value = 42}
+        \\  const moved = source^
+        \\  return moved.value
+    );
+    try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "take" }, 42);
+
+    const bad = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveFunction("bad").?;
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, bad)).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, bad, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(DiagnosticKind.type_not_movable, std.meta.activeTag(diagnostics[0].kind));
+}
+
+test "struct copy property edits invalidate and recover owning callers" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\static Box = struct
+        \\  value: int
+        \\func take(var box: Box) int -> box.value
+        \\func answer() int
+        \\  const box = Box{value = 42}
+        \\  return take(box)
+    );
+    var answer = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveFunction("answer").?;
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, answer)).* == null);
+    var diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, answer, structures.Diagnostic, testing.allocator);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(DiagnosticKind.type_not_copyable, std.meta.activeTag(diagnostics[0].kind));
+    freeDiagnostics(diagnostics);
+
+    try setSource(db, 1,
+        \\static Box = struct
+        \\  copy = trivial
+        \\  value: int
+        \\func take(var box: Box) int -> box.value
+        \\func answer() int
+        \\  const box = Box{value = 42}
+        \\  return take(box)
+    );
+    answer = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveFunction("answer").?;
+    try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "take" }, 42);
+    diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, answer, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 0), diagnostics.len);
+}
+
+test "explicit-drop struct obligations are checked at every lifetime end" {
+    const resource = "static Resource = struct\n  drop = explicit\n  value: int\n";
+    const cases = [_][]const u8{
+        "func bad()\n  const resource = Resource{value = 42}",
+        "func bad()\n  Resource{value = 42}",
+        "func bad()\n  var resource = Resource{value = 41}\n  resource = Resource{value = 42}",
+        "func inspect(read resource: Resource) int -> resource.value\nfunc bad() int -> inspect(Resource{value = 42})",
+        "func bad() int -> Resource{value = 42}.value",
+        "func bad(read flag: int)\n  const resource = Resource{value = 42}\n  if flag < 1\n    const moved = resource^",
+        "func bad()\n  loop\n    const resource = Resource{value = 42}\n    break",
+        "static Outer = struct\n  resource: Resource\nfunc bad()\n  const outer = Outer{resource = Resource{value = 42}}",
+        "static Outer = struct\n  resource: Resource\nfunc bad()\n  var outer = Outer{resource = Resource{value = 41}}\n  outer.resource = Resource{value = 42}",
+    };
+
+    for (cases, 1..) |body, file_id| {
+        const db = try testDatabase(1);
+        defer db.deinit();
+        const source = try std.mem.concat(testing.allocator, u8, &.{ resource, body });
+        defer testing.allocator.free(source);
+        try addSource(db, file_id, source);
+        const bad = (try db.get(query_structures.BuildModuleScope, file_id)).*.?.resolveFunction("bad").?;
+        try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, bad)).* == null);
+        const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, bad, structures.Diagnostic, testing.allocator);
+        defer freeDiagnostics(diagnostics);
+        try testing.expectEqual(@as(usize, 1), diagnostics.len);
+        try testing.expectEqual(DiagnosticKind.value_requires_explicit_drop, std.meta.activeTag(diagnostics[0].kind));
+    }
+}
+
+test "explicit-drop obligations move with transferred values" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\static Resource = struct
+        \\  drop = explicit
+        \\  value: int
+        \\func forward(var resource: Resource) Resource -> resource^
+    );
+    const forward = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveFunction("forward").?;
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, forward)).* != null);
+    const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, forward, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 0), diagnostics.len);
+}
+
+test "deinit parameters satisfy explicit-drop obligations" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\static Resource = struct
+        \\  drop = explicit
+        \\  value: int
+        \\func dispose(deinit resource: Resource) int
+        \\  resource = Resource{value = resource.value + 1}
+        \\  return resource.value
+        \\func direct() int -> dispose(Resource{value = 41})
+        \\func answer() int
+        \\  const selected = dispose
+        \\  const resource = Resource{value = 41}
+        \\  return selected(resource^)
+    );
+    try expectCompiledFunctionResult(db, 1, "direct", &.{ "direct", "dispose" }, 42);
+    try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "dispose" }, 42);
+}
+
+test "deinit arguments require ownership and invalidate transferred roots" {
+    const cases = [_]struct {
+        source: []const u8,
+        kind: DiagnosticKind,
+    }{
+        .{
+            .source = "static Resource = struct\n  drop = explicit\n  value: int\nfunc dispose(deinit resource: Resource) -> return\nfunc bad()\n  const resource = Resource{value = 42}\n  dispose(resource)",
+            .kind = .type_not_copyable,
+        },
+        .{
+            .source = "static Resource = struct\n  drop = explicit\n  value: int\nfunc dispose(deinit resource: Resource) -> return\nfunc bad() int\n  const resource = Resource{value = 42}\n  dispose(resource^)\n  return resource.value",
+            .kind = .use_after_transfer,
+        },
+    };
+
+    for (cases, 1..) |case, file_id| {
+        const db = try testDatabase(1);
+        defer db.deinit();
+        try addSource(db, file_id, case.source);
+        const bad = (try db.get(query_structures.BuildModuleScope, file_id)).*.?.resolveFunction("bad").?;
+        try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, bad)).* == null);
+        const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, bad, structures.Diagnostic, testing.allocator);
+        defer freeDiagnostics(diagnostics);
+        try testing.expectEqual(@as(usize, 1), diagnostics.len);
+        try testing.expectEqual(case.kind, std.meta.activeTag(diagnostics[0].kind));
+    }
+}
+
+test "deinit parameters can forward explicit-drop obligations" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\static Resource = struct
+        \\  drop = explicit
+        \\  value: int
+        \\func forward(deinit resource: Resource) Resource -> resource^
+    );
+    const forward = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveFunction("forward").?;
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, forward)).* != null);
+}
+
+test "drop property edits invalidate and recover function lifetimes" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    const trivial_source =
+        \\static Resource = struct
+        \\  drop = trivial
+        \\  value: int
+        \\func use()
+        \\  const resource = Resource{value = 42}
+    ;
+    try addSource(db, 1, trivial_source);
+    var use = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveFunction("use").?;
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, use)).* != null);
+
+    try setSource(db, 1,
+        \\static Resource = struct
+        \\  drop = explicit
+        \\  value: int
+        \\func use()
+        \\  const resource = Resource{value = 42}
+    );
+    use = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveFunction("use").?;
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, use)).* == null);
+    var diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, use, structures.Diagnostic, testing.allocator);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(DiagnosticKind.value_requires_explicit_drop, std.meta.activeTag(diagnostics[0].kind));
+    freeDiagnostics(diagnostics);
+
+    try setSource(db, 1, trivial_source);
+    use = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveFunction("use").?;
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, use)).* != null);
+    diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, use, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 0), diagnostics.len);
 }
 
 test "function analysis distinguishes entry stale restored and invalid identities" {

@@ -1,5 +1,10 @@
-static S = struct
+struct S
   a: int
-var s: S = S{a = 1}
-s.a = 2
-exit(s.a)
+  copy = trivial
+
+func foo(var b:S) int
+  b.a = 10
+  return b.a
+
+const s = S{a = 1}
+exit(s.a + foo(s) + s.a)
