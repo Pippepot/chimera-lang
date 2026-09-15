@@ -1,6 +1,21 @@
 const std = @import("std");
 const structures = @import("structures.zig");
 const semantic = @import("semantic.zig");
+const lifetime = @import("lifetime.zig");
+
+const GenerationId = lifetime.GenerationId;
+const BoundaryId = lifetime.BoundaryId;
+const Generation = lifetime.Generation;
+const LifetimeEffect = lifetime.LifetimeEffect;
+const OwnershipForward = lifetime.OwnershipForward;
+const OwnershipEdge = lifetime.OwnershipEdge;
+const PlannedCleanup = lifetime.PlannedCleanup;
+const ExplicitAbandonment = lifetime.ExplicitAbandonment;
+const Boundary = lifetime.Boundary;
+const BuildInstruction = lifetime.BuildInstruction;
+const BuildItem = lifetime.BuildItem;
+const BuildBlock = lifetime.BuildBlock;
+const LifetimeSolver = lifetime.Solver;
 
 pub fn emitSemanticIssue(ctx: anytype, file_id: structures.FileId, issue: semantic.Issue) !void {
     try ctx.emit(structures.Diagnostic, .{ .file_id = file_id, .span = issue.span, .kind = issue.kind });
@@ -34,13 +49,13 @@ pub fn resolveAndTypeBody(
         else => return err,
     };
     try builder.finishOwnershipMetadata();
+    try builder.analyzeLifetimes();
     return try builder.finish();
 }
 
 fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime FunctionSignatureQuery: type, comptime TypeInterner: type) type {
     return struct {
         const Self = @This();
-        const GenerationId = enum(u32) { _ };
         const Value = struct {
             id: structures.FunctionValueId,
             type_id: structures.TypeId,
@@ -106,49 +121,10 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             place: ArgumentPlace,
             argument_index: u32,
         };
-        const BuildInstruction = struct {
-            id: u31,
-            operation: structures.FunctionInstruction,
-        };
-        const Generation = struct {
-            type_id: structures.TypeId,
-            start_order: u32,
-            span: structures.SourceSpan,
-            needs_automatic_drop: bool,
-            requires_explicit_drop: bool,
-            can_deinit: bool,
-        };
-        const LifetimeEffect = union(enum) {
-            define: struct {
-                generation: GenerationId,
-                value: structures.FunctionValueId,
-            },
-            use: struct {
-                generation: GenerationId,
-                cleanup_value: structures.FunctionValueId,
-            },
-            update: struct {
-                generation: GenerationId,
-                cleanup_value: structures.FunctionValueId,
-            },
-            consume: GenerationId,
-        };
-        const OwnershipForward = union(enum) {
-            forward: struct {
-                source: GenerationId,
-                destination: GenerationId,
-            },
-            produce: GenerationId,
-        };
-        const OwnershipEdge = struct {
-            predecessor: structures.FunctionBlockId,
-            successor_ordinal: u2,
-            mappings: structures.FunctionValueRange,
-        };
         const OwnershipForwardHint = struct {
             predecessor: structures.FunctionBlockId,
             successor_ordinal: u2,
-            source: GenerationId,
+            source: ?GenerationId,
             destination: GenerationId,
         };
         const GenerationOnlyJoin = struct {
@@ -156,23 +132,6 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             destination: GenerationId,
         };
         const GenerationOrigin = enum { none, define, produce, phi };
-        const BoundaryId = enum(u32) { _ };
-        const Boundary = struct {
-            span: structures.SourceSpan,
-            effects: std.ArrayList(LifetimeEffect) = .empty,
-        };
-        const BuildItem = union(enum) {
-            instruction: BuildInstruction,
-            boundary: BoundaryId,
-        };
-        const BuildBlock = struct {
-            argument_start: u32,
-            argument_end: u32,
-            items: std.ArrayList(BuildItem) = .empty,
-            terminator_effects: std.ArrayList(LifetimeEffect) = .empty,
-            layout_index: ?u32 = null,
-            terminator: ?structures.FunctionTerminator = null,
-        };
 
         ctx: Context,
         type_interner: TypeInterner,
@@ -206,6 +165,8 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
         ownership_forwards: std.ArrayList(OwnershipForward) = .empty,
         ownership_edges: std.ArrayList(OwnershipEdge) = .empty,
         ownership_forward_hints: std.ArrayList(OwnershipForwardHint) = .empty,
+        planned_cleanups: std.ArrayList(PlannedCleanup) = .empty,
+        explicit_abandonments: std.ArrayList(ExplicitAbandonment) = .empty,
         boundaries: std.ArrayList(Boundary) = .empty,
         blocks: std.ArrayList(BuildBlock) = .empty,
         loop_stack: std.ArrayList(LoopContext) = .empty,
@@ -299,6 +260,8 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             self.ownership_forwards.deinit(gpa);
             self.ownership_edges.deinit(gpa);
             self.ownership_forward_hints.deinit(gpa);
+            self.planned_cleanups.deinit(gpa);
+            self.explicit_abandonments.deinit(gpa);
             for (self.boundaries.items) |*boundary| boundary.effects.deinit(gpa);
             self.boundaries.deinit(gpa);
             for (self.blocks.items) |*block_value| {
@@ -460,9 +423,20 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
         }
 
         fn finishFunctionExit(self: *Self, span: structures.SourceSpan, terminator: structures.FunctionTerminator) !void {
+            const boundary = try self.newBoundary(span);
+            const block_value = &self.blocks.items[@intFromEnum(self.current_block orelse unreachable)];
+            try self.boundaries.items[@intFromEnum(boundary)].effects.appendSlice(
+                self.ctx.allocator(),
+                block_value.terminator_effects.items,
+            );
+            block_value.terminator_effects.clearRetainingCapacity();
+            const parent_boundary = self.current_boundary;
+            self.current_boundary = boundary;
+            defer self.current_boundary = parent_boundary;
             try self.writeMutParameters();
             try self.endPendingTemporaries(span);
             try self.endAllLocals(span);
+            try self.appendBoundary(boundary);
             self.terminate(terminator);
         }
 
@@ -659,6 +633,15 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
         fn activeLifetimeSpan(self: *const Self) structures.SourceSpan {
             if (self.current_boundary) |boundary| return self.boundaries.items[@intFromEnum(boundary)].span;
             return self.unresolved.blocks[@intFromEnum(self.unresolved.root_block)].span;
+        }
+
+        fn withCleanupCondition(self: *Self, resolved: Value) Value {
+            const generation = resolved.owned_generation orelse return resolved;
+            const borrow_predicate = resolved.borrow_condition orelse return resolved;
+            const generation_data = &self.generations.items[@intFromEnum(generation)];
+            if (generation_data.cleanup_condition) |existing| std.debug.assert(existing == borrow_predicate);
+            generation_data.cleanup_condition = borrow_predicate;
+            return resolved;
         }
 
         fn moveCurrentBoundaryEffectsToTerminator(self: *Self) !void {
@@ -992,6 +975,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             try self.recordEffect(.{ .use = .{
                 .generation = generation,
                 .cleanup_value = cleanup_value,
+                .cleanup_condition = source.borrow_condition,
             } });
         }
 
@@ -1152,7 +1136,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             const joined_generation = try self.joinGenerations(field.type_id, span, null, owned_field.owned_generation);
             self.block_argument_generations.items[argument_start] = joined_generation;
             self.enterBlock(join);
-            return .{
+            return self.withCleanupCondition(.{
                 .id = @enumFromInt(argument_start),
                 .type_id = field.type_id,
                 .owned_generation = joined_generation,
@@ -1161,7 +1145,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 .borrowed_type = field.type_id,
                 .borrow_condition = borrow_condition,
                 .borrow_root = field.borrow_root,
-            };
+            });
         }
 
         fn captureState(self: *Self) !StateId {
@@ -1367,7 +1351,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             self.loop_breaks.shrinkRetainingCapacity(break_start);
             self.enterBlock(exit);
             self.restoreState(output_state);
-            return .{
+            return self.withCleanupCondition(.{
                 .id = @enumFromInt(exit_argument_start),
                 .type_id = joined,
                 .owned_generation = result_generation,
@@ -1380,7 +1364,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                     null,
                 .borrow_root = borrow_root,
                 .explicit_transfer = contains_transfer,
-            };
+            });
         }
 
         fn reconcileLoopHeaderGenerations(
@@ -1494,12 +1478,14 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                     if (use.generation == source) effect.* = .{ .use = .{
                         .generation = destination,
                         .cleanup_value = use.cleanup_value,
+                        .cleanup_condition = use.cleanup_condition,
                     } };
                 },
                 .update => |update| {
                     if (update.generation == source) effect.* = .{ .update = .{
                         .generation = destination,
                         .cleanup_value = update.cleanup_value,
+                        .cleanup_condition = update.cleanup_condition,
                     } };
                 },
                 .consume => |generation| {
@@ -2613,7 +2599,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             }
             self.enterBlock(merge_block);
             self.restoreState(output_state);
-            return .{
+            return self.withCleanupCondition(.{
                 .id = @enumFromInt(argument_start),
                 .type_id = joined,
                 .owned_generation = joined_generation,
@@ -2623,7 +2609,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 .borrow_condition = if (needs_borrow_condition) @enumFromInt(argument_start + 1) else null,
                 .borrow_root = borrow_root,
                 .explicit_transfer = contains_transfer,
-            };
+            });
         }
 
         fn valueExit(self: *Self, result: ?Value) !?ValueExit {
@@ -2853,6 +2839,21 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             try self.validateGenerationOrigins();
         }
 
+        fn analyzeLifetimes(self: *Self) !void {
+            var solver = try LifetimeSolver.init(
+                self.ctx.allocator(),
+                self.generations.items,
+                self.boundaries.items,
+                self.blocks.items,
+                self.block_argument_generations.items,
+                self.ownership_forwards.items,
+                self.ownership_edges.items,
+                @enumFromInt(0),
+            );
+            defer solver.deinit();
+            try solver.solve(&self.planned_cleanups, &self.explicit_abandonments);
+        }
+
         fn validateGenerationOrigins(self: *Self) !void {
             const origins = try self.ctx.allocator().alloc(GenerationOrigin, self.generations.items.len);
             defer self.ctx.allocator().free(origins);
@@ -2875,6 +2876,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                     const origin = &origins[@intFromEnum(forward.destination)];
                     if (origin.* == .none) origin.* = .phi else std.debug.assert(origin.* == .phi);
                 },
+                .unowned => {},
             };
             for (origins) |origin| std.debug.assert(origin != .none);
         }
@@ -2906,24 +2908,32 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             std.debug.assert(argument_count == target.argument_end - target.argument_start);
             const mapping_start: u32 = @intCast(self.ownership_forwards.items.len);
             for (branch.arguments.start..branch.arguments.end, target.argument_start..) |source_index, destination_index| {
-                const source = self.branch_argument_generations.items[source_index] orelse continue;
                 const destination = self.block_argument_generations.items[destination_index] orelse continue;
-                if (source == destination) continue;
-                try self.ownership_forwards.append(self.ctx.allocator(), .{ .forward = .{
-                    .source = source,
-                    .destination = destination,
-                } });
+                if (self.branch_argument_generations.items[source_index]) |source| {
+                    if (source == destination) continue;
+                    try self.ownership_forwards.append(self.ctx.allocator(), .{ .forward = .{
+                        .source = source,
+                        .destination = destination,
+                    } });
+                } else {
+                    try self.ownership_forwards.append(self.ctx.allocator(), .{ .unowned = destination });
+                }
             }
             for (self.ownership_forward_hints.items) |hint| {
                 if (hint.predecessor != predecessor or hint.successor_ordinal != successor_ordinal) continue;
-                try self.ownership_forwards.append(self.ctx.allocator(), .{ .forward = .{
-                    .source = hint.source,
-                    .destination = hint.destination,
-                } });
+                if (hint.source) |source| {
+                    try self.ownership_forwards.append(self.ctx.allocator(), .{ .forward = .{
+                        .source = source,
+                        .destination = hint.destination,
+                    } });
+                } else {
+                    try self.ownership_forwards.append(self.ctx.allocator(), .{ .unowned = hint.destination });
+                }
             }
             try self.ownership_edges.append(self.ctx.allocator(), .{
                 .predecessor = predecessor,
                 .successor_ordinal = successor_ordinal,
+                .successor = branch.target,
                 .mappings = .{ .start = mapping_start, .end = @intCast(self.ownership_forwards.items.len) },
             });
         }
@@ -2935,12 +2945,11 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             source: ?GenerationId,
             destination: GenerationId,
         ) !void {
-            const source_generation = source orelse return;
-            if (source_generation == destination) return;
+            if (source == destination) return;
             try self.ownership_forward_hints.append(self.ctx.allocator(), .{
                 .predecessor = predecessor,
                 .successor_ordinal = successor_ordinal,
-                .source = source_generation,
+                .source = source,
                 .destination = destination,
             });
         }
@@ -2960,6 +2969,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             try self.ownership_edges.append(self.ctx.allocator(), .{
                 .predecessor = predecessor,
                 .successor_ordinal = successor_ordinal,
+                .successor = target_id,
                 .mappings = .{ .start = mapping_start, .end = @intCast(self.ownership_forwards.items.len) },
             });
         }

@@ -35,6 +35,7 @@ zig test tokenizer.zig
 zig test ast_new.zig
 zig test semantic.zig
 zig test diagnostics.zig
+zig test lifetime.zig
 zig test query_new_test.zig
 zig test codegen_new_test.zig
 zig test main.zig
