@@ -88,7 +88,7 @@ pub const Token = struct {
         keyword_not,
         keyword_none,
         keyword_or,
-        keyword_read,
+        keyword_imm,
         keyword_return,
         keyword_sizeof,
         keyword_static,
@@ -119,7 +119,7 @@ pub const Token = struct {
         .{ "not", .keyword_not },
         .{ "none", .keyword_none },
         .{ "or", .keyword_or },
-        .{ "read", .keyword_read },
+        .{ "imm", .keyword_imm },
         .{ "return", .keyword_return },
         .{ "sizeof", .keyword_sizeof },
         .{ "static", .keyword_static },
@@ -480,7 +480,7 @@ pub const VariantType = struct {
 };
 
 pub const ParameterMode = enum {
-    read,
+    imm,
     static,
     mut,
     @"var",

@@ -106,10 +106,10 @@ fn expectDirectValueUses(expected: []const structures.FunctionValueId, actual: [
     }
 }
 
-fn expectReadParameters(expected: []const structures.TypeId, actual: []const structures.CallableParameter) !void {
+fn expectImmParameters(expected: []const structures.TypeId, actual: []const structures.CallableParameter) !void {
     try testing.expectEqual(expected.len, actual.len);
     for (expected, actual) |expected_type, parameter| {
-        try testing.expectEqual(structures.ParameterMode.read, parameter.mode);
+        try testing.expectEqual(structures.ParameterMode.imm, parameter.mode);
         try testing.expectEqual(expected_type, parameter.type_id);
     }
 }
@@ -772,10 +772,10 @@ test "struct hook items have stable owner-qualified identities" {
 
     try addSource(db, 1,
         \\static Left = struct
-        \\  copy = func(read self: Left) Left -> self
+        \\  copy = func(imm self: Left) Left -> self
         \\  value: int
         \\static Right = struct
-        \\  copy = func(read self: Right) Right -> self
+        \\  copy = func(imm self: Right) Right -> self
         \\  value: int
     );
     var scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
@@ -797,19 +797,19 @@ test "struct hook items have stable owner-qualified identities" {
     const right_type = (try db.get(query_structures.ResolveStatic, right)).*.?.type;
     const left_signature = (try db.get(query_structures.FunctionSignature, left_copy.?)).*.?;
     try testing.expectEqual(@as(usize, 1), left_signature.parameters.len);
-    try testing.expectEqual(structures.CallableParameter{ .mode = .read, .type_id = left_type }, left_signature.parameters[0]);
+    try testing.expectEqual(structures.CallableParameter{ .mode = .imm, .type_id = left_type }, left_signature.parameters[0]);
     try testing.expectEqual(left_type, left_signature.return_type);
     const right_signature = (try db.get(query_structures.FunctionSignature, right_copy.?)).*.?;
-    try testing.expectEqual(structures.CallableParameter{ .mode = .read, .type_id = right_type }, right_signature.parameters[0]);
+    try testing.expectEqual(structures.CallableParameter{ .mode = .imm, .type_id = right_type }, right_signature.parameters[0]);
     try testing.expectEqual(right_type, right_signature.return_type);
 
     try setSource(db, 1,
         \\static Left = struct
         \\  prefix: bool
-        \\  copy = func(read self: Left) Left -> self
+        \\  copy = func(imm self: Left) Left -> self
         \\  value: int
         \\static Right = struct
-        \\  copy = func(read self: Right) Right -> self
+        \\  copy = func(imm self: Right) Right -> self
         \\  value: int
     );
     scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
@@ -973,11 +973,11 @@ test "struct ownership properties have precise definition diagnostics" {
         .{ .member = "copy = trivial\n  copy = fieldwise", .kind = .duplicate_struct_property },
         .{ .member = "clone = trivial", .kind = .unknown_struct_property },
         .{ .member = "move = explicit", .kind = .invalid_struct_property_value },
-        .{ .member = "copy = func(read self: int) int -> self", .kind = .struct_ownership_hook_signature_mismatch },
-        .{ .member = "move = func(read self: Invalid) Invalid -> self", .kind = .struct_ownership_hook_signature_mismatch },
+        .{ .member = "copy = func(imm self: int) int -> self", .kind = .struct_ownership_hook_signature_mismatch },
+        .{ .member = "move = func(imm self: Invalid) Invalid -> self", .kind = .struct_ownership_hook_signature_mismatch },
         .{ .member = "drop = func(deinit self: Invalid) int -> return 0", .kind = .struct_ownership_hook_signature_mismatch },
         .{ .member = "drop = fallible(deinit self: Invalid) -> return", .kind = .struct_ownership_hook_signature_mismatch },
-        .{ .member = "copy = func(read self: Invalid, other: int) Invalid -> self", .kind = .struct_ownership_hook_signature_mismatch },
+        .{ .member = "copy = func(imm self: Invalid, other: int) Invalid -> self", .kind = .struct_ownership_hook_signature_mismatch },
     };
 
     for (cases, 1..) |case, file_id| {
@@ -1014,7 +1014,7 @@ test "struct hook signature validation updates incrementally" {
 
     try setSource(db, 1,
         \\static Resource = struct
-        \\  drop = func(read self: Resource) -> return
+        \\  drop = func(imm self: Resource) -> return
         \\  value: int
     );
     item = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveStatic("Resource").?;
@@ -1041,7 +1041,7 @@ test "custom ownership hooks execute without active-hook redispatch" {
         .{
             .source =
             \\static Box = struct
-            \\  copy = func(read self: Box) Box -> Box{value = self.value + 1}
+            \\  copy = func(imm self: Box) Box -> Box{value = self.value + 1}
             \\  value: int
             \\func answer() int
             \\  const source = Box{value = 41}
@@ -1054,7 +1054,7 @@ test "custom ownership hooks execute without active-hook redispatch" {
         .{
             .source =
             \\static Box = struct
-            \\  copy = func(read self: Box) Box -> Box{value = self.value + 1}
+            \\  copy = func(imm self: Box) Box -> Box{value = self.value + 1}
             \\  value: int
             \\func answer() int
             \\  const source = Box{value = 41}
@@ -1067,7 +1067,7 @@ test "custom ownership hooks execute without active-hook redispatch" {
         .{
             .source =
             \\static Box = struct
-            \\  copy = func(read self: Box) Box -> Box{value = self.value + 1}
+            \\  copy = func(imm self: Box) Box -> Box{value = self.value + 1}
             \\  value: int
             \\func answer() int
             \\  const source = Box{value = 41}
@@ -1080,7 +1080,7 @@ test "custom ownership hooks execute without active-hook redispatch" {
         .{
             .source =
             \\static Box = struct
-            \\  copy = func(read self: Box) Box -> Box{value = self.value + 1}
+            \\  copy = func(imm self: Box) Box -> Box{value = self.value + 1}
             \\  value: int
             \\func answer() int
             \\  const source = Box{value = 41}
@@ -1093,7 +1093,7 @@ test "custom ownership hooks execute without active-hook redispatch" {
         .{
             .source =
             \\static Box = struct
-            \\  copy = func(read self: Box) Box -> exit(self.value)
+            \\  copy = func(imm self: Box) Box -> exit(self.value)
             \\  value: int
             \\static Token = struct
             \\  value: int
@@ -1108,7 +1108,7 @@ test "custom ownership hooks execute without active-hook redispatch" {
         .{
             .source =
             \\static Box = struct
-            \\  copy = func(read self: Box) Box -> exit(self.value)
+            \\  copy = func(imm self: Box) Box -> exit(self.value)
             \\  value: int
             \\static Token = struct
             \\  value: int
@@ -1123,7 +1123,7 @@ test "custom ownership hooks execute without active-hook redispatch" {
         .{
             .source =
             \\static Box = struct
-            \\  copy = func(read self: Box) Box -> Box{value = self.value + 1}
+            \\  copy = func(imm self: Box) Box -> Box{value = self.value + 1}
             \\  value: int
             \\func answer() int
             \\  const source = Box{value = 41}
@@ -1138,7 +1138,7 @@ test "custom ownership hooks execute without active-hook redispatch" {
         .{
             .source =
             \\static Box = struct
-            \\  copy = func(read self: Box) Box -> Box{value = self.value + 1}
+            \\  copy = func(imm self: Box) Box -> Box{value = self.value + 1}
             \\  value: int
             \\func answer() int
             \\  const source = Box{value = 41}
@@ -1153,7 +1153,7 @@ test "custom ownership hooks execute without active-hook redispatch" {
         .{
             .source =
             \\static Box = struct
-            \\  copy = func(read self: Box) Box -> exit(self.value)
+            \\  copy = func(imm self: Box) Box -> exit(self.value)
             \\  value: int
             \\static Token = struct
             \\  value: int
@@ -1170,7 +1170,7 @@ test "custom ownership hooks execute without active-hook redispatch" {
         .{
             .source =
             \\static Box = struct
-            \\  copy = func(read self: Box) Box -> exit(self.value)
+            \\  copy = func(imm self: Box) Box -> exit(self.value)
             \\  value: int
             \\static Token = struct
             \\  value: int
@@ -1187,7 +1187,7 @@ test "custom ownership hooks execute without active-hook redispatch" {
         .{
             .source =
             \\static Box = struct
-            \\  copy = func(read self: Box) Box -> self
+            \\  copy = func(imm self: Box) Box -> self
             \\  value: int
             \\func answer() int
             \\  const source = Box{value = 42}
@@ -1238,7 +1238,7 @@ test "custom ownership hooks execute without active-hook redispatch" {
         .{
             .source =
             \\static Leaf = struct
-            \\  copy = func(read self: Leaf) Leaf -> Leaf{value = self.value + 1}
+            \\  copy = func(imm self: Leaf) Leaf -> Leaf{value = self.value + 1}
             \\  value: int
             \\static Middle = struct
             \\  copy = fieldwise
@@ -1272,7 +1272,7 @@ test "custom ownership hooks execute without active-hook redispatch" {
         .{
             .source =
             \\static Inner = struct
-            \\  copy = func(read self: Inner) Inner -> Inner{value = self.value + 1}
+            \\  copy = func(imm self: Inner) Inner -> Inner{value = self.value + 1}
             \\  value: int
             \\static Outer = struct
             \\  copy = fieldwise
@@ -1288,7 +1288,7 @@ test "custom ownership hooks execute without active-hook redispatch" {
         .{
             .source =
             \\static Inner = struct
-            \\  copy = func(read self: Inner) Inner -> exit(self.value)
+            \\  copy = func(imm self: Inner) Inner -> exit(self.value)
             \\  value: int
             \\func answer()
             \\  const source: Inner | int = Inner{value = 42}
@@ -1348,7 +1348,7 @@ test "custom ownership hooks execute without active-hook redispatch" {
             \\static Resource = struct
             \\  drop = func(deinit self: Resource) -> exit(self.value)
             \\  value: int
-            \\func inspect(read resource: Resource) -> return
+            \\func inspect(imm resource: Resource) -> return
             \\func answer() -> inspect(Resource{value = 42})
             \\answer()
             ,
@@ -1384,7 +1384,7 @@ test "ownership effects compose across calls joins scopes and partial aggregates
         .{
             .source =
             \\struct Box
-            \\  copy = func(read self: Box) Box -> Box{value = self.value + 1}
+            \\  copy = func(imm self: Box) Box -> Box{value = self.value + 1}
             \\  value: int
             \\func take(var box: Box) int -> box.value
             \\const box = Box{value = 41}
@@ -1410,7 +1410,7 @@ test "ownership effects compose across calls joins scopes and partial aggregates
         .{
             .source =
             \\struct Resource
-            \\  copy = func(read self: Resource) Resource -> exit(41)
+            \\  copy = func(imm self: Resource) Resource -> exit(41)
             \\  drop = func(deinit self: Resource) -> exit(42)
             \\const selected = if 1 < 2
             \\  const resource = Resource{}
@@ -1423,7 +1423,7 @@ test "ownership effects compose across calls joins scopes and partial aggregates
         .{
             .source =
             \\struct Resource
-            \\  copy = func(read self: Resource) Resource -> exit(41)
+            \\  copy = func(imm self: Resource) Resource -> exit(41)
             \\  drop = func(deinit self: Resource) -> exit(42)
             \\const outer = Resource{}
             \\const selected = if 1 < 2
@@ -1439,7 +1439,7 @@ test "ownership effects compose across calls joins scopes and partial aggregates
             \\struct Resource
             \\  copy = trivial
             \\  drop = func(deinit self: Resource) -> exit(42)
-            \\func inspect(read resource: Resource) -> return
+            \\func inspect(imm resource: Resource) -> return
             \\const resource = Resource{}
             \\inspect(if 1 < 2 -> resource else Resource{})
             \\exit(0)
@@ -1449,9 +1449,9 @@ test "ownership effects compose across calls joins scopes and partial aggregates
         .{
             .source =
             \\struct Resource
-            \\  copy = func(read self: Resource) Resource -> Resource{}
+            \\  copy = func(imm self: Resource) Resource -> Resource{}
             \\  drop = func(deinit self: Resource) -> exit(42)
-            \\func inspect(read resource: Resource) -> return
+            \\func inspect(imm resource: Resource) -> return
             \\const resource = Resource{}
             \\inspect(if 1 > 2 -> resource else Resource{})
             \\exit(0)
@@ -1502,7 +1502,7 @@ test "ownership effects compose across calls joins scopes and partial aggregates
         .{
             .source =
             \\struct Resource
-            \\  copy = func(read self: Resource) Resource -> exit(42)
+            \\  copy = func(imm self: Resource) Resource -> exit(42)
             \\func later() int -> exit(41)
             \\func take(var resource: Resource, value: int) -> return
             \\const resource = Resource{}
@@ -1528,7 +1528,7 @@ test "ownership effects compose across calls joins scopes and partial aggregates
             \\  copy = trivial
             \\  drop = func(deinit self: Wrap) -> exit(42)
             \\  leaf: Leaf
-            \\func inspect(read leaf: Leaf) -> return
+            \\func inspect(imm leaf: Leaf) -> return
             \\const wrap = Wrap{leaf = Leaf{value = 1}}
             \\inspect((if 1 > 2 -> wrap else Wrap{leaf = Leaf{value = 2}}).leaf)
             \\exit(0)
@@ -1584,7 +1584,7 @@ test "custom hook body edits rebuild executable behavior" {
     defer db.deinit();
     const initial =
         \\static Box = struct
-        \\  copy = func(read self: Box) Box -> Box{value = self.value + 1}
+        \\  copy = func(imm self: Box) Box -> Box{value = self.value + 1}
         \\  value: int
         \\func answer() int
         \\  const source = Box{value = 40}
@@ -1609,7 +1609,7 @@ test "custom hook body edits rebuild executable behavior" {
 
     try setSource(db, 1,
         \\static Box = struct
-        \\  copy = func(read self: Box) Box -> Box{value = self.value + 2}
+        \\  copy = func(imm self: Box) Box -> Box{value = self.value + 2}
         \\  value: int
         \\func answer() int
         \\  const source = Box{value = 40}
@@ -3453,9 +3453,9 @@ test "zero-sized values cross direct binding call and return boundaries" {
     const pass_none = scope.resolve("pass_none").?;
     const unit_signature = (try db.get(query_structures.FunctionSignature, pass_unit)).*.?;
     const none_signature = (try db.get(query_structures.FunctionSignature, pass_none)).*.?;
-    try expectReadParameters(&.{.unit}, unit_signature.parameters);
+    try expectImmParameters(&.{.unit}, unit_signature.parameters);
     try testing.expectEqual(structures.TypeId.unit, unit_signature.return_type);
-    try expectReadParameters(&.{.none}, none_signature.parameters);
+    try expectImmParameters(&.{.none}, none_signature.parameters);
     try testing.expectEqual(structures.TypeId.none, none_signature.return_type);
     try testing.expect((try db.get(query_structures.BuildExecutable, 1)).* != null);
 
@@ -3480,7 +3480,7 @@ test "declared unit functions analyze lower compile and execute as ordinary call
     const caller_id = scope.resolve("caller").?;
 
     const leaf_signature = (try db.get(query_structures.FunctionSignature, leaf_id)).*.?;
-    try expectReadParameters(&.{.int}, leaf_signature.parameters);
+    try expectImmParameters(&.{.int}, leaf_signature.parameters);
     try testing.expectEqual(structures.TypeId.unit, leaf_signature.return_type);
     const leaf_body = (try db.get(query_structures.AnalyzeFunctionBody, leaf_id)).*.?;
     try testing.expectEqualSlices(structures.TypeId, &.{.int}, leaf_body.block_argument_types);
@@ -3712,19 +3712,19 @@ test "fallible function signatures distinguish declarations" {
     try testing.expect(!structures.FunctionSignature.eql(ordinary, checked));
 }
 
-test "explicit read parameters use the default callable identity" {
+test "explicit imm parameters use the default callable identity" {
     const db = try testDatabase(1);
     defer db.deinit();
 
     try addSource(db, 1,
         \\func implicit(value: int) int -> value
-        \\func explicit(read value: int) int -> value
+        \\func explicit(imm value: int) int -> value
     );
     const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
     const implicit = (try db.get(query_structures.FunctionSignature, scope.resolve("implicit").?)).*.?;
     const explicit = (try db.get(query_structures.FunctionSignature, scope.resolve("explicit").?)).*.?;
 
-    try expectReadParameters(&.{.int}, explicit.parameters);
+    try expectImmParameters(&.{.int}, explicit.parameters);
     try testing.expect(structures.FunctionSignature.eql(implicit, explicit));
     try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, scope.resolve("explicit").?)).* != null);
 }
@@ -3733,8 +3733,8 @@ test "callable identity includes parameter modes" {
     const db = try testDatabase(1);
     defer db.deinit();
 
-    const read_id = try db.intern(query_structures.Types, .{ .callable = .{
-        .parameters = &.{.{ .mode = .read, .type_id = .int }},
+    const imm_id = try db.intern(query_structures.Types, .{ .callable = .{
+        .parameters = &.{.{ .mode = .imm, .type_id = .int }},
         .return_type = .unit,
         .is_fallible = false,
     } });
@@ -3744,7 +3744,7 @@ test "callable identity includes parameter modes" {
         .is_fallible = false,
     } });
 
-    try testing.expect(read_id != mutable_id);
+    try testing.expect(imm_id != mutable_id);
 }
 
 test "callable values bind pass return and execute through indirect calls" {
@@ -3804,7 +3804,7 @@ test "ordinary callables widen to fallible aliases and calls" {
     const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
     const checked = (try db.get(query_structures.ResolveStatic, scope.resolve("checked").?)).*.?;
     const checked_type = (try db.lookupInterned(query_structures.Types, checked.runtime.type_id.interned().?)).callable;
-    try expectReadParameters(&.{.int}, checked_type.parameters);
+    try expectImmParameters(&.{.int}, checked_type.parameters);
     try testing.expectEqual(structures.TypeId.int, checked_type.return_type);
     try testing.expect(checked_type.is_fallible);
     const entry = (try db.get(query_structures.AnalyzeFunctionBody, (try db.get(query_structures.SelectEntry, 1)).*.?)).*.?;
@@ -4609,7 +4609,7 @@ test "parameters and nested call arguments form one typed value graph" {
     const twice_id = scope.resolve("twice").?;
 
     const add_signature = (try db.get(query_structures.FunctionSignature, add_id)).*.?;
-    try expectReadParameters(&.{ .int, .int }, add_signature.parameters);
+    try expectImmParameters(&.{ .int, .int }, add_signature.parameters);
     const add = (try db.get(query_structures.AnalyzeFunctionBody, add_id)).*.?;
     try testing.expectEqualSlices(structures.TypeId, &.{ .int, .int }, add.block_argument_types);
     try testing.expectEqual(@as(u32, 0), add.blocks[0].argument_start);
@@ -4697,7 +4697,7 @@ test "parameter arity edits invalidate callers and recovery restores them" {
         \\static caller = func() int -> return target(7)
     );
     try testing.expectEqual(@as(?usize, 2), (try db.get(SignatureParent, target_id)).*);
-    try expectReadParameters(&.{ .int, .int }, (try db.get(query_structures.FunctionSignature, target_id)).*.?.parameters);
+    try expectImmParameters(&.{ .int, .int }, (try db.get(query_structures.FunctionSignature, target_id)).*.?.parameters);
     try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, caller_id)).* == null);
 
     try setSource(db, 1,
@@ -5308,7 +5308,7 @@ test "mutable borrow arguments require non-overlapping mutable places" {
             .kind = .mutable_argument_requires_place,
         },
         .{
-            .source = "func update(mut changed: int, read observed: int) -> changed += observed\nfunc bad()\n  var value = 1\n  update(value, value)",
+            .source = "func update(mut changed: int, imm observed: int) -> changed += observed\nfunc bad()\n  var value = 1\n  update(value, value)",
             .kind = .overlapping_mutable_arguments,
         },
         .{
@@ -5351,14 +5351,14 @@ test "mutable borrow mode edits update callers incrementally" {
     try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "update" }, 42);
 
     try setSource(db, 1,
-        \\func update(read value: int) -> return
+        \\func update(imm value: int) -> return
         \\func answer() int
         \\  var value = 41
         \\  update(value)
         \\  return value
     );
-    const read_body = try db.get(query_structures.AnalyzeFunctionBody, answer);
-    try testing.expect(mut_body != read_body);
+    const imm_body = try db.get(query_structures.AnalyzeFunctionBody, answer);
+    try testing.expect(mut_body != imm_body);
     try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "update" }, 41);
 }
 
@@ -5511,7 +5511,7 @@ test "ownership transfer must be restored before a loop backedge" {
     }, .transferred_value_not_restored_before_loop_backedge);
 }
 
-test "read arguments borrow non-copyable values and reject transfers" {
+test "imm arguments borrow non-copyable values and reject transfers" {
     const db = try testDatabase(1);
     defer db.deinit();
     try addSource(db, 1,
@@ -5718,7 +5718,7 @@ test "interleaved var parameters precede body locals" {
     try addSource(db, 1,
         \\static Box = struct
         \\  value: int
-        \\func combine(read first: int, var left: Box, read second: int, var right: Box) int
+        \\func combine(imm first: int, var left: Box, imm second: int, var right: Box) int
         \\  const moved = left^
         \\  left = Box{value = moved.value + first}
         \\  var result = left.value + right.value
@@ -5735,7 +5735,7 @@ test "var parameter availability flows through branches and loops" {
         kind: DiagnosticKind,
     }{
         .{
-            .source = "static Box = struct\n  value: int\nfunc bad(read flag: int, var box: Box) int\n  if flag < 1\n    const moved = box^\n  return box.value",
+            .source = "static Box = struct\n  value: int\nfunc bad(imm flag: int, var box: Box) int\n  if flag < 1\n    const moved = box^\n  return box.value",
             .kind = .possibly_transferred,
         },
         .{
@@ -5836,15 +5836,15 @@ test "non-copyable var parameters must transfer when returned" {
 test "var parameter mode edits invalidate and recover callers" {
     const db = try testDatabase(1);
     defer db.deinit();
-    const read_source =
+    const imm_source =
         \\static Box = struct
         \\  value: int
-        \\func take(read box: Box) int -> box.value
+        \\func take(imm box: Box) int -> box.value
         \\func answer() int
         \\  const box = Box{value = 42}
         \\  return take(box^)
     ;
-    try addSource(db, 1, read_source);
+    try addSource(db, 1, imm_source);
     var answer = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveFunction("answer").?;
     try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, answer)).* == null);
     var diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, answer, structures.Diagnostic, testing.allocator);
@@ -5937,9 +5937,9 @@ test "explicit-drop struct obligations are checked at every lifetime end" {
         "func bad()\n  const resource = Resource{value = 42}",
         "func bad()\n  Resource{value = 42}",
         "func bad()\n  var resource = Resource{value = 41}\n  resource = Resource{value = 42}",
-        "func inspect(read resource: Resource) int -> resource.value\nfunc bad() int -> inspect(Resource{value = 42})",
+        "func inspect(imm resource: Resource) int -> resource.value\nfunc bad() int -> inspect(Resource{value = 42})",
         "func bad() int -> Resource{value = 42}.value",
-        "func bad(read flag: int)\n  const resource = Resource{value = 42}\n  if flag < 1\n    const moved = resource^",
+        "func bad(imm flag: int)\n  const resource = Resource{value = 42}\n  if flag < 1\n    const moved = resource^",
         "func bad()\n  loop\n    const resource = Resource{value = 42}\n    break",
         "static Outer = struct\n  resource: Resource\nfunc bad()\n  const outer = Outer{resource = Resource{value = 42}}",
         "static Outer = struct\n  resource: Resource\nfunc bad()\n  var outer = Outer{resource = Resource{value = 41}}\n  outer.resource = Resource{value = 42}",
@@ -7292,7 +7292,7 @@ fn testTypedExpressionAllocations(gpa: std.mem.Allocator) !void {
     defer db.deinit();
     try addSource(db, 1,
         \\struct Box
-        \\  copy = func(read self: Box) Box -> Box{value = self.value}
+        \\  copy = func(imm self: Box) Box -> Box{value = self.value}
         \\  drop = func(deinit self: Box) -> return
         \\  value: int
         \\static identity = func(value: int) int -> return value

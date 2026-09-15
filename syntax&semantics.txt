@@ -18,6 +18,29 @@
 # Reordering is allowed only when unobservable.
 
 
+# Numeric conversions (open)
+# Explicit numeric conversion/cast syntax and behavior must be defined before
+# deciding implicit numeric coercions. Conversion failure, rounding, overflow,
+# and literal typing remain open. Existing variant widening and 'as' extraction
+# do not define numeric conversion behavior.
+
+
+# Structural tuples
+# A tuple is an ordered collection of unnamed elements, written (foo, bar).
+# Its structural type identity is determined by the ordered element types:
+# an int followed by a bool differs from a bool followed by an int. Named fields
+# belong to structs. Tuple type spelling, element access, destructuring, and
+# singleton syntax remain open; () already denotes unit.
+const pair = (1, true)
+
+
+# Standard library
+# The standard library is always included. A selected set of common functions,
+# including sqrt, is available without qualification or an explicit import.
+# Other library names remain qualified or require explicit imports. The full
+# automatically available name set, module paths, and conflict rules are open.
+
+
 # Bindings and compile-time execution
 static a: int = 10 # compile-time-known, immutable
 const b: int = 20  # immutable
@@ -84,14 +107,14 @@ exit(0)
 
 
 # Parameters and transfer
-# read: read-only access (default).
+# imm: read-only access (default).
 # static: value supplied at compile time.
 # mut: mutable access to a caller-owned variable.
 # var: function-owned variable, which may be stored or returned.
 # deinit: function-owned variable satisfying an explicit drop obligation.
 # A parameter's access mode is part of callable type identity. An omitted mode
-# is read. Function declarations currently support read, mut, var, and deinit.
-# Callable type annotations currently spell only read; inferred callable values
+# is imm. Function declarations currently support imm, mut, var, and deinit.
+# Callable type annotations currently spell only imm; inferred callable values
 # retain the exact declaration mode. Syntax for other modes in callable types
 # remains open.
 # Callable compatibility requires identical parameter modes. Ordinary-to-
@@ -104,7 +127,7 @@ func add1(mut a: int)
 
 # A mut argument must be a mutable local root or one of its fields and must have
 # exactly the parameter type. The borrow cannot escape the call. A mut place may
-# not overlap another read or mut argument in the same call; paths overlap when
+# not overlap another imm or mut argument in the same call; paths overlap when
 # they have the same root and either field path is a prefix of the other. Distinct
 # sibling fields do not overlap.
 var mutable_value = 41
@@ -129,7 +152,7 @@ take(a^) # transfer ownership; any subsequent access to 'a' is an error
 # assignments, struct fields, owned arguments, and returns require owned values:
 # a bare place is copied and must support copy, an explicitly transferred local
 # root (`name^`) is moved and must support move, and a temporary is moved or
-# constructed directly. Read arguments borrow through completion of the call.
+# constructed directly. `imm` arguments borrow through completion of the call.
 # Explicit transfer is invalid in a borrowing context and is currently limited
 # to whole local roots; partial-field transfer is not yet supported.
 #
@@ -140,13 +163,72 @@ take(a^) # transfer ownership; any subsequent access to 'a' is an error
 # incoming path. A root available on loop entry must be restored on every
 # reachable backedge.
 #
-# Locals end in reverse binding order on every normal or control-flow scope
-# exit. Transferred roots carry their drop obligation onward. An available or
-# possibly transferred value whose drop strategy is explicit, directly or in a
-# field or variant member, must be passed to deinit or transferred before its
-# lifetime ends. Borrowed temporaries obey the same rule. Replacing a value ends
-# the old value first; only a deinit-authorized root may replace an explicit-drop
-# value without first transferring it.
+# Automatic destruction follows Mojo's last-use (ASAP) timing: destroy a value
+# as soon as it has no remaining uses, including after a subexpression rather
+# than waiting for the enclosing statement or scope to end. Uses through
+# borrowed references and views, and uses needed by cleanup, keep the required
+# values alive. Lexical name visibility does not determine destruction timing.
+# Reference: https://mojolang.static.modular.com/docs/manual/lifecycle/death/
+#
+# Transferred roots carry their drop obligation onward. Explicit-drop values
+# are not automatically destroyed at last use: every ownership path must
+# transfer the obligation or reach a deinit parameter before leaving the scope.
+# This applies to explicit-drop fields, variant members, and borrowed
+# temporaries as well. Replacement ends any still-live old value; only a
+# deinit-authorized root may replace an explicit-drop value without first
+# transferring it.
+
+
+# Pointers
+# Pointer semantics follow Mojo 1.0's unified model. Pointer provides both
+# ordinary access and explicitly unsafe operations; there is no separate
+# UnsafePointer type. This adopts the semantic model, not Mojo's API spellings
+# or any future changes to Mojo.
+# Reference: https://mojolang.static.modular.com/docs/manual/pointers/
+#
+# Pointer is non-owning. Copying it preserves access to the same memory without
+# copying the pointee or acquiring ownership. Pointee type, mutability, and
+# origin are tracked separately. An origin records whose memory is accessed
+# so the compiler can enforce lifetime and aliasing rules. Creating a pointer
+# to an existing value preserves that relationship; safe uses cannot outlive
+# the value or bypass its access restrictions.
+#
+# Low-level access to buffers, uninitialized storage, and foreign memory uses
+# the same Pointer type. Unsafe operations are explicitly marked at the call
+# through unsafe_ names or keyword arguments. The caller must uphold their
+# validity, initialization, bounds, and ownership requirements; ordinary access
+# afterward does not repair a violated requirement.
+#
+# OwnedPointer owns one heap-allocated value exclusively. It can move but does
+# not support implicit copying. Explicit duplication, when the pointee supports
+# copy, creates a separate allocation and a separate value. Automatic cleanup
+# destroys the pointee and releases storage when the pointee supports automatic
+# destruction; explicit-drop pointees retain a consumption obligation.
+#
+# ArcPointer shares ownership of one heap-allocated value that supports move
+# and automatic destruction. Copying it increments an atomic reference count
+# without copying the pointee; ending an owner decrements the count. The last
+# owner destroys the pointee and releases storage.
+# Atomic reference counting does not synchronize reads or writes of the value.
+#
+# These pointer types are non-nullable. Absence must be represented explicitly
+# with an optional/variant value, not a null value of the pointer type.
+# Generic/origin syntax, pointer construction and dereference spelling, and
+# mapping Mojo's APIs to this language's parameter and drop modes remain open.
+
+
+# Borrowed views
+# Views provide non-owning access to existing data, including collection slices.
+# They may be returned from functions and stored in other values when their
+# origin dependencies remain valid. A view carries its backing-data origin and
+# permitted access; copying a view does not copy or acquire ownership of that
+# data. The backing owner must remain alive through every dependent use,
+# including uses through returned or stored views.
+# Lifetime tracking must also reject uses invalidated by changes to the backing
+# storage, such as collection reallocation. Keeping the owner alive alone is
+# insufficient. Origin relationships are inferred where possible and expressed
+# in borrowing API contracts when needed. View types and origin syntax remain
+# open; adopting these guarantees does not require Mojo's exact spelling.
 
 
 # Structs
@@ -170,6 +252,16 @@ struct Q
 # defined structs compatible.
 static QAlias = Q
 
+# Functions declared inside a struct namespace are namespace declarations,
+# not fields or part of the struct's data definition. A function declared in
+# S's namespace is addressed as S.function. For instance call syntax, the
+# receiver is an explicit first parameter in the function declaration, with an
+# ordinary parameter access mode.
+# value.function(args) desugars to S.function(value, args), where value has
+# type S. Both forms obey the same argument access and ownership rules, and
+# evaluate the receiver and remaining arguments exactly once, left to right.
+# Detailed namespace lookup and name-conflict rules remain open.
+
 # A struct cannot contain itself by value, directly or through other structs or
 # inline variants. Such cycles have no finite layout and are rejected. Callable
 # parameter and return types do not constitute by-value containment.
@@ -179,7 +271,7 @@ var mutable_s = S{a = 1, b = 2.5}
 mutable_s.a = 2
 
 func read_a(s: S) int
-    return s.a # default read access permits reading fields, not mutating them
+    return s.a # default immutable access permits reading fields, not mutating them
 
 # Ownership properties and defaults:
 # move = trivial | fieldwise | none | func
@@ -196,7 +288,7 @@ func read_a(s: S) int
 # validated before use.
 # 'func' means a complete function expression used as a custom, infallible hook.
 # Its sole parameter name is immaterial. The required signatures are:
-# copy = func(read self: S) S
+# copy = func(imm self: S) S
 # move = func(var self: S) S
 # drop = func(deinit self: S) unit
 # A custom hook replaces that operation for the complete struct. Fieldwise
@@ -365,3 +457,18 @@ loop
     a += 1
     if a < 10 -> continue # start the nearest loop's next iteration
     break a
+
+
+# Ranges and for iteration
+# a..b excludes b; a..^b includes b. These forms iterate upward; a start greater
+# than the end produces an empty range. Thus x..x is empty and x..^x contains
+# exactly x. Descending iteration requires an explicit operation whose spelling
+# remains open. Endpoint types, steps, and overflow behavior remain open.
+#
+# for x in iterable supports ranges, lists, other collections, and custom types
+# conforming to an iteration contract. The conformance mechanism remains open.
+# Plain iteration provides read-only access by default; modifying or consuming
+# collection elements through iteration requires explicit syntax, still TBD.
+# Item lifetime, binding representation, and loop result semantics remain open.
+for x in 0..20
+    use(x)

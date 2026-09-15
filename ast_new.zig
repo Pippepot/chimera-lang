@@ -386,7 +386,7 @@ fn parseParamList(parser: *ParserState) !Node.Index {
         if (parser.eat(.r_paren) != null) break;
 
         const access_token_index = parser.index;
-        const opt_access = parser.eatAny(&.{ .keyword_read, .keyword_mut, .keyword_var, .keyword_deinit, .keyword_static });
+        const opt_access = parser.eatAny(&.{ .keyword_imm, .keyword_mut, .keyword_var, .keyword_deinit, .keyword_static });
         _ = try parser.expect(.identifier);
         const identifier_index = parser.index - 1;
         const type_annotation = try parseTypeAnnotation(parser);
@@ -1168,7 +1168,7 @@ test "parse struct ownership hook functions" {
     try testParsing(
         \\static Box = struct
         \\  x: int
-        \\  copy = func(read self: Box) Box -> Box{x = self.x + 1}
+        \\  copy = func(imm self: Box) Box -> Box{x = self.x + 1}
         \\  move = func(var self: Box) Box -> Box{x = self.x + 10}
     ,
         \\static_binding
@@ -1180,7 +1180,7 @@ test "parse struct ownership hook functions" {
         \\  │   ├─signature
         \\  │   │ ├─param_list
         \\  │   │ │ └─param : self
-        \\  │   │ │   ├─access : read
+        \\  │   │ │   ├─access : imm
         \\  │   │ │   └─type : Box
         \\  │   │ └─type : Box
         \\  │   └─return_expr

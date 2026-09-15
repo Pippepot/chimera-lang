@@ -258,7 +258,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 const span = tokenSpan(self.ast, self.ast.nodes[parameter_index.index()].token_index);
                 const name = self.source[span.start..span.end];
                 const local: Local = switch (self.parameters[index].mode) {
-                    .read => .{ .value = @enumFromInt(index) },
+                    .imm => .{ .value = @enumFromInt(index) },
                     .mut, .@"var", .deinit => blk: {
                         const id: UnresolvedBody.LocalId = @enumFromInt(self.local_count);
                         self.local_count += 1;
@@ -869,12 +869,12 @@ pub fn analyzeFunctionSignature(
         const parameter = ast.nodes[parameter_index.index()];
         std.debug.assert(parameter.tag == .param);
         const mode: structures.ParameterMode = if (parameter.data.node_node.a.unwrap()) |access| switch (ast.tokens[ast.nodes[access.index()].token_index].tag) {
-            .keyword_read => .read,
+            .keyword_imm => .imm,
             .keyword_mut => .mut,
             .keyword_var => .@"var",
             .keyword_deinit => .deinit,
             else => return .{ .unsupported = issueAt(ast, access.index(), .parameter_mode_not_supported) },
-        } else .read;
+        } else .imm;
         const name_span = tokenSpan(ast, parameter.token_index);
         const name = source[name_span.start..name_span.end];
         if ((try names.getOrPut(name)).found_existing or try type_interner.resolveItem(name) != null) {
@@ -969,7 +969,7 @@ fn analyzeType(
                 .success => |type_id| type_id,
                 .unsupported => |issue| return .{ .unsupported = issue },
             };
-            try parameters.append(gpa, .{ .mode = .read, .type_id = parameter_type });
+            try parameters.append(gpa, .{ .mode = .imm, .type_id = parameter_type });
         }
         const return_type = switch (try analyzeType(ast, source, node.data.node_node.b, type_interner, gpa, unsupported_kind)) {
             .success => |type_id| type_id,
@@ -1098,7 +1098,7 @@ pub fn analyzeStructDefinition(
             if (value.tag == .func) {
                 const self_type = try type_interner.structType(item_id);
                 const mode: structures.ParameterMode, const return_type: structures.TypeId = switch (operation) {
-                    .copy => .{ .read, self_type },
+                    .copy => .{ .imm, self_type },
                     .move => .{ .@"var", self_type },
                     .drop => .{ .deinit, .unit },
                 };
@@ -1491,9 +1491,9 @@ fn testUnresolvedFunctionBodyAllocations(gpa: std.mem.Allocator) !void {
     const parsed = &report.ast.?;
     const declaration = parsed.node_refs[parsed.nodes[0].data.ref.start];
     const result = try buildUnresolvedBody(parsed, source, declaration.index(), .function, &.{
-        .{ .mode = .read, .type_id = .int },
-        .{ .mode = .read, .type_id = .int },
-        .{ .mode = .read, .type_id = .int },
+        .{ .mode = .imm, .type_id = .int },
+        .{ .mode = .imm, .type_id = .int },
+        .{ .mode = .imm, .type_id = .int },
     }, TestTypeInterner{}, gpa);
     switch (result) {
         .success => |unresolved_value| {

@@ -55,7 +55,7 @@ fn writeTypeInner(types: anytype, writer: *std.Io.Writer, type_id: structures.Ty
         try writer.writeAll(if (callable.is_fallible) "fallible(" else "func(");
         for (callable.parameters, 0..) |parameter, index| {
             if (index != 0) try writer.writeAll(", ");
-            if (parameter.mode != .read) try writer.print("{s} ", .{@tagName(parameter.mode)});
+            if (parameter.mode != .imm) try writer.print("{s} ", .{@tagName(parameter.mode)});
             try writeTypeInner(types, writer, parameter.type_id);
         }
         try writer.writeAll(") ");
@@ -398,7 +398,7 @@ const DetailedTypes = struct {
 
     fn callable(_: @This(), type_id: structures.TypeId) !?structures.CallableType {
         if (type_id == int_callable) return .{
-            .parameters = &.{.{ .mode = .read, .type_id = .int }},
+            .parameters = &.{.{ .mode = .imm, .type_id = .int }},
             .return_type = .int,
             .is_fallible = false,
         };

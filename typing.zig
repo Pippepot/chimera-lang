@@ -153,7 +153,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             for (parameters, 0..) |parameter, index| {
                 const entry_value: Value = .{ .id = @enumFromInt(index), .type_id = parameter.type_id };
                 switch (parameter.mode) {
-                    .read => self.values[index] = .{
+                    .imm => self.values[index] = .{
                         .id = entry_value.id,
                         .type_id = entry_value.type_id,
                         .borrowed_type = entry_value.type_id,
@@ -1321,7 +1321,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 .direct => |name| {
                     if (std.mem.eql(u8, name, "exit")) {
                         target = .intrinsic;
-                        signature = .{ .parameters = &.{.{ .mode = .read, .type_id = .int }}, .return_type = .never, .is_fallible = false };
+                        signature = .{ .parameters = &.{.{ .mode = .imm, .type_id = .int }}, .return_type = .never, .is_fallible = false };
                     } else {
                         if (self.scope == null) self.scope = (try self.ctx.get(ModuleScopeQuery, self.file_id)).* orelse return error.Unavailable;
                         const item = self.scope.?.resolveFunction(name) orelse {
@@ -1368,13 +1368,13 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             for (raw_arguments, signature.parameters, 0..) |raw, expected, argument_index| {
                 const raw_operand = try self.value(raw.value);
                 if (raw_operand.type_id == .never) return .{ .diverged = raw_operand };
-                const maybe_place = if (expected.mode == .read or expected.mode == .mut)
+                const maybe_place = if (expected.mode == .imm or expected.mode == .mut)
                     try self.resolveArgumentPlace(raw.value, &place_fields)
                 else
                     null;
                 try argument_places.append(self.ctx.allocator(), maybe_place);
                 const operand = switch (expected.mode) {
-                    .read => try self.borrowValue(raw_operand, raw.span),
+                    .imm => try self.borrowValue(raw_operand, raw.span),
                     .mut, .@"var", .deinit => raw_operand,
                     .static => unreachable,
                 };
@@ -1416,7 +1416,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                     .maybe_transferred => return self.reject(raw.span, .possibly_transferred),
                 }
                 for (signature.parameters, argument_places.items, 0..) |other_parameter, other_place, other_index| {
-                    if (argument_index == other_index or (other_parameter.mode != .read and other_parameter.mode != .mut)) continue;
+                    if (argument_index == other_index or (other_parameter.mode != .imm and other_parameter.mode != .mut)) continue;
                     if (other_place) |resolved_other| {
                         if (placesOverlap(place_fields.items, place, resolved_other)) {
                             return self.reject(raw.span, .overlapping_mutable_arguments);

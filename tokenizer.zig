@@ -535,12 +535,12 @@ pub const Tokenizer = struct {
 };
 
 test "keywords" {
-    try testTokenize("if else const var read mut deinit return true false comptime static func struct is as and or not none sizeof test loop break continue", &.{
+    try testTokenize("if else const var imm mut deinit return true false comptime static func struct is as and or not none sizeof test loop break continue", &.{
         .keyword_if,
         .keyword_else,
         .keyword_const,
         .keyword_var,
-        .keyword_read,
+        .keyword_imm,
         .keyword_mut,
         .keyword_deinit,
         .keyword_return,
@@ -562,6 +562,7 @@ test "keywords" {
         .keyword_break,
         .keyword_continue,
     });
+    try testTokenize("read", &.{.identifier});
 }
 
 test "function indentation" {
