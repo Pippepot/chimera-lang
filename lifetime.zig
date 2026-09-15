@@ -7,7 +7,6 @@ pub const Generation = struct {
     type_id: structures.TypeId,
     start_order: u32,
     span: structures.SourceSpan,
-    needs_automatic_drop: bool,
     requires_explicit_drop: bool,
     can_deinit: bool,
     cleanup_condition: ?structures.FunctionValueId = null,
@@ -48,10 +47,7 @@ pub const OwnershipEdge = struct {
 };
 
 pub const CleanupLocation = union(enum) {
-    boundary: struct {
-        block: structures.FunctionBlockId,
-        boundary: BoundaryId,
-    },
+    boundary: BoundaryId,
     edge: struct {
         predecessor: structures.FunctionBlockId,
         successor_ordinal: u2,
@@ -64,8 +60,6 @@ pub const PlannedCleanup = struct {
     cleanup_value: structures.FunctionValueId,
     cleanup_condition: ?structures.FunctionValueId = null,
     location: CleanupLocation,
-    start_order: u32,
-    can_deinit: bool,
 };
 
 pub const ExplicitAbandonment = struct {
@@ -361,7 +355,6 @@ pub const Solver = struct {
             .type_id = .unit,
             .start_order = start_order,
             .span = .{ .start = start_order, .end = start_order + 1 },
-            .needs_automatic_drop = !explicit,
             .requires_explicit_drop = explicit,
             .can_deinit = false,
         };
@@ -381,16 +374,12 @@ pub const Solver = struct {
             .{
                 .generation = @enumFromInt(0),
                 .cleanup_value = @enumFromInt(10),
-                .location = .{ .boundary = .{ .block = @enumFromInt(0), .boundary = @enumFromInt(0) } },
-                .start_order = 0,
-                .can_deinit = false,
+                .location = .{ .boundary = @enumFromInt(0) },
             },
             .{
                 .generation = @enumFromInt(1),
                 .cleanup_value = @enumFromInt(12),
-                .location = .{ .boundary = .{ .block = @enumFromInt(0), .boundary = @enumFromInt(1) } },
-                .start_order = 1,
-                .can_deinit = false,
+                .location = .{ .boundary = @enumFromInt(1) },
             },
         } });
     }
@@ -423,9 +412,7 @@ pub const Solver = struct {
             .generation = @enumFromInt(0),
             .cleanup_value = @enumFromInt(11),
             .cleanup_condition = @enumFromInt(99),
-            .location = .{ .boundary = .{ .block = @enumFromInt(1), .boundary = @enumFromInt(1) } },
-            .start_order = 0,
-            .can_deinit = false,
+            .location = .{ .boundary = @enumFromInt(1) },
         }} });
     }
 
@@ -464,9 +451,7 @@ pub const Solver = struct {
         try expectLifetimePlan(&generations, &boundaries, &blocks, &.{@enumFromInt(2)}, &forwards, &edges, .{ .cleanups = &.{.{
             .generation = @enumFromInt(2),
             .cleanup_value = @enumFromInt(0),
-            .location = .{ .boundary = .{ .block = @enumFromInt(3), .boundary = @enumFromInt(2) } },
-            .start_order = 2,
-            .can_deinit = false,
+            .location = .{ .boundary = @enumFromInt(2) },
         }} });
     }
 
@@ -497,8 +482,6 @@ pub const Solver = struct {
             .generation = @enumFromInt(0),
             .cleanup_value = @enumFromInt(10),
             .location = .{ .edge = .{ .predecessor = @enumFromInt(1), .successor_ordinal = 1 } },
-            .start_order = 0,
-            .can_deinit = false,
         }} });
     }
 
@@ -543,8 +526,6 @@ pub const Solver = struct {
             .generation = @enumFromInt(0),
             .cleanup_value = @enumFromInt(0),
             .location = .{ .block_entry = @enumFromInt(1) },
-            .start_order = 0,
-            .can_deinit = false,
         }} });
     }
 
@@ -591,16 +572,12 @@ pub const Solver = struct {
             .{
                 .generation = @enumFromInt(1),
                 .cleanup_value = @enumFromInt(11),
-                .location = .{ .boundary = .{ .block = @enumFromInt(0), .boundary = @enumFromInt(1) } },
-                .start_order = 1,
-                .can_deinit = false,
+                .location = .{ .boundary = @enumFromInt(1) },
             },
             .{
                 .generation = @enumFromInt(0),
                 .cleanup_value = @enumFromInt(10),
-                .location = .{ .boundary = .{ .block = @enumFromInt(0), .boundary = @enumFromInt(1) } },
-                .start_order = 0,
-                .can_deinit = false,
+                .location = .{ .boundary = @enumFromInt(1) },
             },
         } });
     }
@@ -1015,7 +992,7 @@ pub const Solver = struct {
                 generation,
                 cleanup_value,
                 cleanup_condition,
-                .{ .boundary = .{ .block = block, .boundary = boundary_id } },
+                .{ .boundary = boundary_id },
             );
             return;
         }
@@ -1042,7 +1019,7 @@ pub const Solver = struct {
     ) !void {
         const generation_data = self.generations[@intFromEnum(generation)];
         const effective_condition = cleanup_condition orelse generation_data.cleanup_condition;
-        if (generation_data.needs_automatic_drop or generation_data.can_deinit) {
+        if (!generation_data.requires_explicit_drop or generation_data.can_deinit) {
             for (planned_cleanups.items) |existing| {
                 if (existing.generation != generation or !std.meta.eql(existing.location, location)) continue;
                 std.debug.assert(existing.cleanup_value == cleanup_value);
@@ -1054,8 +1031,6 @@ pub const Solver = struct {
                 .cleanup_value = cleanup_value,
                 .cleanup_condition = effective_condition,
                 .location = location,
-                .start_order = generation_data.start_order,
-                .can_deinit = generation_data.can_deinit,
             });
             return;
         }
@@ -1092,12 +1067,7 @@ pub const Solver = struct {
         const right_tag = @intFromEnum(right);
         if (left_tag != right_tag) return compareU32(left_tag, right_tag);
         return switch (left) {
-            .boundary => |left_boundary| {
-                const right_boundary = right.boundary;
-                const block_order = compareU32(@intFromEnum(left_boundary.block), @intFromEnum(right_boundary.block));
-                if (block_order != 0) return block_order;
-                return compareU32(@intFromEnum(left_boundary.boundary), @intFromEnum(right_boundary.boundary));
-            },
+            .boundary => |left_boundary| compareU32(@intFromEnum(left_boundary), @intFromEnum(right.boundary)),
             .edge => |left_edge| {
                 const right_edge = right.edge;
                 const block_order = compareU32(@intFromEnum(left_edge.predecessor), @intFromEnum(right_edge.predecessor));
@@ -1167,7 +1137,7 @@ pub const Solver = struct {
                         self.scanEffectsForward(self.scratch, self.boundaries[@intFromEnum(boundary)].effects.items);
                         self.applyEndings(
                             self.scratch,
-                            .{ .boundary = .{ .block = block_id, .boundary = boundary } },
+                            .{ .boundary = boundary },
                             planned_cleanups,
                             explicit_abandonments,
                             false,
@@ -1209,7 +1179,7 @@ pub const Solver = struct {
                     self.scanEffectsForward(self.scratch, self.boundaries[@intFromEnum(boundary)].effects.items);
                     self.applyEndings(
                         self.scratch,
-                        .{ .boundary = .{ .block = block_id, .boundary = boundary } },
+                        .{ .boundary = boundary },
                         planned_cleanups,
                         explicit_abandonments,
                         true,

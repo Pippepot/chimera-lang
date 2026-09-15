@@ -568,12 +568,12 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             start_order: u32,
             capabilities: structures.OwnershipCapabilities,
         ) !GenerationId {
+            std.debug.assert(capabilities.needs_automatic_drop != capabilities.requires_explicit_drop);
             const id: GenerationId = @enumFromInt(self.generations.items.len);
             try self.generations.append(self.ctx.allocator(), .{
                 .type_id = type_id,
                 .start_order = start_order,
                 .span = span,
-                .needs_automatic_drop = capabilities.needs_automatic_drop,
                 .requires_explicit_drop = capabilities.requires_explicit_drop,
                 .can_deinit = can_deinit,
             });
@@ -1673,6 +1673,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 const owned = try self.ownValue(operand, assignment_value.value.span);
                 use.value = owned.id;
                 if (fields.items.len != 0) {
+                    // Partial-place lifetimes are not modeled yet, so a replaced field ends here.
                     const target_capabilities = (try self.type_interner.ownershipCapabilities(latest_target.type_id)) orelse return error.Unavailable;
                     if (self.local_availability[local_index] == .maybe_transferred and target_capabilities.needs_automatic_drop) {
                         return self.reject(target_span, .possibly_transferred);
@@ -2726,7 +2727,6 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 std.debug.assert(generation.start_order < start_orders.len);
                 std.debug.assert(!start_orders[generation.start_order]);
                 start_orders[generation.start_order] = true;
-                std.debug.assert(generation.needs_automatic_drop != generation.requires_explicit_drop);
             }
             for (self.boundaries.items) |boundary| {
                 for (boundary.effects.items) |effect| self.validateEffect(effect);
@@ -2788,10 +2788,6 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
         }
 
         fn materializeCleanups(self: *Self, cleanups: []const PlannedCleanup) !void {
-            try self.materializeCleanupsWith(cleanups, emitDropCleanup);
-        }
-
-        fn materializeCleanupsWith(self: *Self, cleanups: []const PlannedCleanup, comptime emit_cleanup: anytype) !void {
             std.debug.assert(self.current_block == null);
             const LocationTag = std.meta.Tag(CleanupLocation);
             inline for ([_]LocationTag{ .edge, .boundary, .block_entry }) |location_tag| {
@@ -2803,9 +2799,9 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                     }
                     const location_cleanups = cleanups[cleanup_start..cleanup_end];
                     if (std.meta.activeTag(location_cleanups[0].location) == location_tag) switch (location_cleanups[0].location) {
-                        .boundary => |location| try self.materializeBoundaryCleanups(location.boundary, location_cleanups, emit_cleanup),
-                        .edge => |location| try self.materializeEdgeCleanups(location.predecessor, location.successor_ordinal, location_cleanups, emit_cleanup),
-                        .block_entry => |block_id| try self.materializeBlockEntryCleanups(block_id, location_cleanups, emit_cleanup),
+                        .boundary => |boundary| try self.materializeBoundaryCleanups(boundary, location_cleanups),
+                        .edge => |location| try self.materializeEdgeCleanups(location.predecessor, location.successor_ordinal, location_cleanups),
+                        .block_entry => |block_id| try self.materializeBlockEntryCleanups(block_id, location_cleanups),
                     };
                     cleanup_start = cleanup_end;
                 }
@@ -2816,7 +2812,6 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             self: *Self,
             boundary: BoundaryId,
             cleanups: []const PlannedCleanup,
-            comptime emit_cleanup: anytype,
         ) !void {
             const location = self.findBoundary(boundary);
             const suffix = try self.splitCompletedBlock(location.block, location.item_index + 1);
@@ -2824,7 +2819,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             const cleanup_block = try self.newBlock(argument_index, argument_index);
             self.setBlockTerminator(location.block, .{ .branch = self.emptyBranch(cleanup_block) });
             self.enterBlock(cleanup_block);
-            try self.emitCleanupGroup(cleanups, emit_cleanup);
+            try self.emitCleanupGroup(cleanups);
             self.terminate(.{ .branch = self.emptyBranch(suffix) });
             self.assignBlockLayout(suffix);
         }
@@ -2833,11 +2828,10 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             self: *Self,
             block_id: structures.FunctionBlockId,
             cleanups: []const PlannedCleanup,
-            comptime emit_cleanup: anytype,
         ) !void {
             const suffix = try self.splitCompletedBlock(block_id, 0);
             self.resumeBlock(block_id);
-            try self.emitCleanupGroup(cleanups, emit_cleanup);
+            try self.emitCleanupGroup(cleanups);
             self.terminate(.{ .branch = self.emptyBranch(suffix) });
             self.assignBlockLayout(suffix);
         }
@@ -2847,22 +2841,21 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             predecessor: structures.FunctionBlockId,
             successor_ordinal: u2,
             cleanups: []const PlannedCleanup,
-            comptime emit_cleanup: anytype,
         ) !void {
             const target = self.edgeTarget(predecessor, successor_ordinal);
             const pass_through = try self.newPassThroughBlock(target);
             self.retargetEdge(predecessor, successor_ordinal, pass_through.block);
             self.enterBlock(pass_through.block);
-            try self.emitCleanupGroup(cleanups, emit_cleanup);
+            try self.emitCleanupGroup(cleanups);
             self.terminate(.{ .branch = pass_through.branch });
         }
 
-        fn emitCleanupGroup(self: *Self, cleanups: []const PlannedCleanup, comptime emit_cleanup: anytype) !void {
-            for (cleanups) |cleanup| try self.emitConditionalCleanup(cleanup, emit_cleanup);
+        fn emitCleanupGroup(self: *Self, cleanups: []const PlannedCleanup) !void {
+            for (cleanups) |cleanup| try self.emitConditionalCleanup(cleanup);
         }
 
-        fn emitConditionalCleanup(self: *Self, cleanup: PlannedCleanup, comptime emit_cleanup: anytype) !void {
-            const cleanup_condition = cleanup.cleanup_condition orelse return emit_cleanup(self, cleanup);
+        fn emitConditionalCleanup(self: *Self, cleanup: PlannedCleanup) !void {
+            const cleanup_condition = cleanup.cleanup_condition orelse return self.emitDropCleanup(cleanup);
             const argument_index: u32 = @intCast(self.block_argument_types.items.len);
             const borrowed = try self.newBlock(argument_index, argument_index);
             const owned = try self.newBlock(argument_index, argument_index);
@@ -2877,7 +2870,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             self.enterBlock(borrowed);
             self.terminate(.{ .branch = self.emptyBranch(join) });
             self.enterBlock(owned);
-            try emit_cleanup(self, cleanup);
+            try self.emitDropCleanup(cleanup);
             self.terminate(.{ .branch = self.emptyBranch(join) });
             self.enterBlock(join);
         }
@@ -2887,7 +2880,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             try self.dropValue(.{
                 .id = cleanup.cleanup_value,
                 .type_id = generation.type_id,
-            }, cleanup.can_deinit, generation.span);
+            }, generation.can_deinit, generation.span);
         }
 
         const BoundaryLocation = struct {
@@ -3408,7 +3401,6 @@ fn appendMaterializerTestGeneration(
         .type_id = type_id,
         .start_order = start_order,
         .span = MaterializerTestTypes.span,
-        .needs_automatic_drop = true,
         .requires_explicit_drop = false,
         .can_deinit = false,
     });
@@ -3435,16 +3427,12 @@ test "cleanup materializer inserts ordered custom drops at an interior boundary"
         .{
             .generation = second_generation,
             .cleanup_value = second.id,
-            .location = .{ .boundary = .{ .block = entry, .boundary = boundary } },
-            .start_order = 1,
-            .can_deinit = false,
+            .location = .{ .boundary = boundary },
         },
         .{
             .generation = first_generation,
             .cleanup_value = first.id,
-            .location = .{ .boundary = .{ .block = entry, .boundary = boundary } },
-            .start_order = 0,
-            .can_deinit = false,
+            .location = .{ .boundary = boundary },
         },
     });
 
@@ -3484,16 +3472,12 @@ test "cleanup materializer finds boundaries after earlier splits" {
         .{
             .generation = first_generation,
             .cleanup_value = first.id,
-            .location = .{ .boundary = .{ .block = entry, .boundary = first_boundary } },
-            .start_order = 0,
-            .can_deinit = false,
+            .location = .{ .boundary = first_boundary },
         },
         .{
             .generation = second_generation,
             .cleanup_value = second.id,
-            .location = .{ .boundary = .{ .block = entry, .boundary = second_boundary } },
-            .start_order = 1,
-            .can_deinit = false,
+            .location = .{ .boundary = second_boundary },
         },
     });
 
@@ -3525,8 +3509,6 @@ test "cleanup materializer emits produced cleanup at block entry" {
         .generation = generation,
         .cleanup_value = @enumFromInt(argument),
         .location = .{ .block_entry = target },
-        .start_order = 0,
-        .can_deinit = false,
     }});
 
     var body = try builder.finish();
@@ -3569,8 +3551,6 @@ test "cleanup materializer interposes only one predicate edge" {
         .generation = generation,
         .cleanup_value = value.id,
         .location = .{ .edge = .{ .predecessor = entry, .successor_ordinal = 0 } },
-        .start_order = 0,
-        .can_deinit = false,
     }});
 
     var body = try builder.finish();
@@ -3615,8 +3595,6 @@ test "cleanup materializer forwards fallible success payloads" {
         .generation = generation,
         .cleanup_value = value.id,
         .location = .{ .edge = .{ .predecessor = entry, .successor_ordinal = 0 } },
-        .start_order = 0,
-        .can_deinit = false,
     }});
 
     var body = try builder.finish();
@@ -3649,9 +3627,7 @@ test "cleanup materializer guards conditional ownership" {
         .generation = generation,
         .cleanup_value = value.id,
         .cleanup_condition = borrowed.id,
-        .location = .{ .boundary = .{ .block = entry, .boundary = boundary } },
-        .start_order = 0,
-        .can_deinit = false,
+        .location = .{ .boundary = boundary },
     }});
 
     var body = try builder.finish();
@@ -3683,9 +3659,7 @@ test "cleanup materializer rejoins variant cleanup with the suffix" {
     try builder.materializeCleanups(&.{.{
         .generation = generation,
         .cleanup_value = value.id,
-        .location = .{ .boundary = .{ .block = entry, .boundary = boundary } },
-        .start_order = 0,
-        .can_deinit = false,
+        .location = .{ .boundary = boundary },
     }});
 
     var body = try builder.finish();
@@ -3719,9 +3693,7 @@ fn testCleanupMaterializerAllocationFailures(gpa: std.mem.Allocator) !void {
     try builder.materializeCleanups(&.{.{
         .generation = generation,
         .cleanup_value = value.id,
-        .location = .{ .boundary = .{ .block = entry, .boundary = boundary } },
-        .start_order = 0,
-        .can_deinit = false,
+        .location = .{ .boundary = boundary },
     }});
     var body = try builder.finish();
     defer body.deinit(gpa);

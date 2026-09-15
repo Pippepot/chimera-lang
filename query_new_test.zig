@@ -1665,6 +1665,108 @@ test "last use cleanup runs before a later unrelated exit" {
     try testing.expectEqual(@as(u8, 42), try runtime.runProg(io, testing.allocator, &.{}));
 }
 
+test "last-use edits move cleanup and retain equivalent restored output" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    const initial =
+        \\static Resource = struct
+        \\  drop = func(deinit self: Resource) -> exit(self.value)
+        \\  value: int
+        \\func later() -> exit(41)
+        \\func answer()
+        \\  const resource = Resource{value = 42}
+        \\  _ = resource
+        \\  later()
+        \\answer()
+    ;
+    try addSource(db, 1, initial);
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const answer = scope.resolveFunction("answer").?;
+    const instance: structures.InstanceId = .{ .item = answer };
+    const initial_body = try db.get(query_structures.AnalyzeFunctionBody, answer);
+    const initial_artifact = try db.get(query_structures.CompileFunction, instance);
+
+    const io = testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    var executable = (try db.get(query_structures.BuildExecutable, 1)).*.?;
+    try runtime.writeProgram(io, executable.bytes);
+    try testing.expectEqual(@as(u8, 42), try runtime.runProg(io, testing.allocator, &.{}));
+
+    try setSource(db, 1,
+        \\static Resource = struct
+        \\  drop = func(deinit self: Resource) -> exit(self.value)
+        \\  value: int
+        \\func later() -> exit(41)
+        \\func answer()
+        \\  const resource = Resource{value = 42}
+        \\  later()
+        \\  _ = resource
+        \\answer()
+    );
+    try testing.expect(initial_body != try db.get(query_structures.AnalyzeFunctionBody, answer));
+    try testing.expect(initial_artifact != try db.get(query_structures.CompileFunction, instance));
+    executable = (try db.get(query_structures.BuildExecutable, 1)).*.?;
+    try runtime.writeProgram(io, executable.bytes);
+    try testing.expectEqual(@as(u8, 41), try runtime.runProg(io, testing.allocator, &.{}));
+
+    try setSource(db, 1, initial);
+    const restored_body = try db.get(query_structures.AnalyzeFunctionBody, answer);
+    const restored_artifact = try db.get(query_structures.CompileFunction, instance);
+    executable = (try db.get(query_structures.BuildExecutable, 1)).*.?;
+    try runtime.writeProgram(io, executable.bytes);
+    try testing.expectEqual(@as(u8, 42), try runtime.runProg(io, testing.allocator, &.{}));
+
+    try setSource(db, 1,
+        \\static Resource = struct
+        \\  drop = func(deinit self: Resource) -> exit(self.value)
+        \\  value: int
+        \\func later() -> exit(41)
+        \\func answer()
+        \\  const resource = Resource{value = 42}
+        \\  _ = (resource)
+        \\  later()
+        \\answer()
+    );
+    try testing.expectEqual(restored_body, try db.get(query_structures.AnalyzeFunctionBody, answer));
+    try testing.expectEqual(restored_artifact, try db.get(query_structures.CompileFunction, instance));
+}
+
+test "custom drop body edits update linking without changing caller analysis" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\static Resource = struct
+        \\  drop = func(deinit self: Resource) -> exit(41)
+        \\func answer()
+        \\  const resource = Resource{}
+        \\answer()
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const answer = scope.resolveFunction("answer").?;
+    const caller_body = try db.get(query_structures.AnalyzeFunctionBody, answer);
+    const reachable = try db.get(query_structures.CollectReachableInstances, 1);
+    const executable = try db.get(query_structures.BuildExecutable, 1);
+
+    const io = testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    try runtime.writeProgram(io, executable.*.?.bytes);
+    try testing.expectEqual(@as(u8, 41), try runtime.runProg(io, testing.allocator, &.{}));
+
+    try setSource(db, 1,
+        \\static Resource = struct
+        \\  drop = func(deinit self: Resource) -> exit(42)
+        \\func answer()
+        \\  const resource = Resource{}
+        \\answer()
+    );
+    try testing.expectEqual(caller_body, try db.get(query_structures.AnalyzeFunctionBody, answer));
+    try testing.expectEqual(reachable, try db.get(query_structures.CollectReachableInstances, 1));
+    const updated_executable = try db.get(query_structures.BuildExecutable, 1);
+    try testing.expect(executable != updated_executable);
+    try runtime.writeProgram(io, updated_executable.*.?.bytes);
+    try testing.expectEqual(@as(u8, 42), try runtime.runProg(io, testing.allocator, &.{}));
+}
+
 test "ASAP cleanup follows initialization replacement branches loops and returns" {
     const cases = [_]struct { source: []const u8, expected: u8 }{
         .{
@@ -6307,6 +6409,42 @@ test "explicit-drop obligations move with transferred values" {
     const forward = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveFunction("forward").?;
     try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, forward)).* != null);
     const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, forward, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 0), diagnostics.len);
+}
+
+test "explicit-drop abandonment diagnostics update and recover incrementally" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    const valid =
+        \\static Resource = struct
+        \\  drop = explicit
+        \\func dispose(deinit resource: Resource) -> return
+        \\func use()
+        \\  const resource = Resource{}
+        \\  dispose(resource^)
+    ;
+    try addSource(db, 1, valid);
+    const use = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveFunction("use").?;
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, use)).* != null);
+
+    try setSource(db, 1,
+        \\static Resource = struct
+        \\  drop = explicit
+        \\func dispose(deinit resource: Resource) -> return
+        \\func use()
+        \\  const resource = Resource{}
+        \\  _ = resource
+    );
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, use)).* == null);
+    var diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, use, structures.Diagnostic, testing.allocator);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(DiagnosticKind.value_requires_explicit_drop, std.meta.activeTag(diagnostics[0].kind));
+    freeDiagnostics(diagnostics);
+
+    try setSource(db, 1, valid);
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, use)).* != null);
+    diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, use, structures.Diagnostic, testing.allocator);
     defer freeDiagnostics(diagnostics);
     try testing.expectEqual(@as(usize, 0), diagnostics.len);
 }
