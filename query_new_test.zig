@@ -5630,6 +5630,183 @@ test "ownership transfers are rejected in borrowing contexts" {
     }
 }
 
+test "discard assignment borrows once without copy or move" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\static Box = struct
+        \\  copy = func(imm self: Box) Box -> self
+        \\  move = func(var self: Box) Box -> self^
+        \\  value: int
+        \\func increment(mut value: int) Box
+        \\  value += 1
+        \\  return Box{value = value}
+        \\func answer() int
+        \\  var calls = 0
+        \\  const box = Box{value = 41}
+        \\  _ = increment(calls)
+        \\  _ = box
+        \\  return box.value + calls
+    );
+
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const answer = scope.resolveFunction("answer").?;
+    const body = (try db.get(query_structures.AnalyzeFunctionBody, answer)).*.?;
+    const increment = scope.resolveFunction("increment").?;
+    var increment_calls: usize = 0;
+    var direct_calls: usize = 0;
+    for (body.instructions) |instruction| switch (instruction) {
+        .call => |call| {
+            direct_calls += 1;
+            if (call.target == increment) increment_calls += 1;
+        },
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, 1), increment_calls);
+    try testing.expectEqual(@as(usize, 1), direct_calls);
+    try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "increment" }, 42);
+}
+
+test "discard assignment rejects explicit transfer" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    const source =
+        \\static Box = struct
+        \\  value: int
+        \\func bad()
+        \\  const box = Box{value = 42}
+        \\  _ = box^
+    ;
+    try addSource(db, 1, source);
+    const bad = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveFunction("bad").?;
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, bad)).* == null);
+    const start = std.mem.indexOf(u8, source, "^").?;
+    try expectSingleQueryDiagnostic(db, query_structures.AnalyzeFunctionBody, bad, true, 1, .{
+        .start = start,
+        .end = start + 1,
+    }, .ownership_transfer_requires_owning_context);
+}
+
+test "trivial copy keeps distinct ownership generations for one SSA value" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\struct Resource
+        \\  copy = trivial
+        \\  drop = func(deinit self: Resource) -> return
+        \\  value: int
+        \\func answer() int
+        \\  const source = Resource{value = 42}
+        \\  const copied = source
+        \\  return copied.value + source.value - 42
+        \\exit(answer())
+    );
+
+    const executable = (try db.get(query_structures.BuildExecutable, 1)).*.?;
+    const io = testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    try runtime.writeProgram(io, executable.bytes);
+    try testing.expectEqual(@as(u8, 42), try runtime.runProg(io, testing.allocator, &.{}));
+}
+
+test "mutable copy-back preserves its ownership generation" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\struct Resource
+        \\  drop = func(deinit self: Resource) -> return
+        \\  value: int
+        \\func increment(mut resource: Resource)
+        \\  resource.value += 1
+        \\func answer() int
+        \\  var resource = Resource{value = 41}
+        \\  increment(resource)
+        \\  return resource.value
+        \\exit(answer())
+    );
+
+    const executable = (try db.get(query_structures.BuildExecutable, 1)).*.?;
+    const io = testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    try runtime.writeProgram(io, executable.bytes);
+    try testing.expectEqual(@as(u8, 42), try runtime.runProg(io, testing.allocator, &.{}));
+}
+
+test "conditional and loop joins reconcile ownership generations" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\struct Resource
+        \\  drop = func(deinit self: Resource) -> return
+        \\  value: int
+        \\func branch(flag: int) int
+        \\  var resource = Resource{value = 1}
+        \\  if flag < 1
+        \\    resource = Resource{value = 2}
+        \\  return resource.value
+        \\func looped() int
+        \\  var resource = Resource{value = 40}
+        \\  var count = 0
+        \\  loop
+        \\    const moved = resource^
+        \\    resource = Resource{value = moved.value + 1}
+        \\    count += 1
+        \\    if count < 2 -> continue
+        \\    break
+        \\  return resource.value
+        \\func answer() int -> branch(0) + branch(1) + looped() - 3
+        \\exit(answer())
+    );
+
+    const executable = (try db.get(query_structures.BuildExecutable, 1)).*.?;
+    const io = testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    try runtime.writeProgram(io, executable.bytes);
+    try testing.expectEqual(@as(u8, 42), try runtime.runProg(io, testing.allocator, &.{}));
+}
+
+test "fallible owned results originate only on success edges" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\struct Resource
+        \\  drop = func(deinit self: Resource) -> return
+        \\  value: int
+        \\fallible make(value: int) Resource
+        \\  value > 0
+        \\  return Resource{value = value}
+        \\fallible answer() int
+        \\  const resource = make(42)
+        \\  return resource.value
+        \\if answer() -> exit(42) else exit(1)
+    );
+
+    const executable = (try db.get(query_structures.BuildExecutable, 1)).*.?;
+    const io = testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    try runtime.writeProgram(io, executable.bytes);
+    try testing.expectEqual(@as(u8, 42), try runtime.runProg(io, testing.allocator, &.{}));
+}
+
+test "underscore remains ordinary outside discard assignment statements" {
+    const cases = [_][]const u8{
+        "func bad()\n  _ += 1",
+        "func bad() int\n  const value = _ = 1\n  return value",
+    };
+    for (cases, 1..) |source, file_id| {
+        const db = try testDatabase(1);
+        defer db.deinit();
+        try addSource(db, file_id, source);
+        const bad = (try db.get(query_structures.BuildModuleScope, file_id)).*.?.resolveFunction("bad").?;
+        try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, bad)).* == null);
+        const start = std.mem.indexOf(u8, source, "_").?;
+        try expectSingleQueryDiagnostic(db, query_structures.AnalyzeFunctionBody, bad, true, file_id, .{
+            .start = start,
+            .end = start + 1,
+        }, .unknown_value);
+    }
+}
+
 test "field assignment cannot rebuild from a root transferred by its right hand side" {
     const db = try testDatabase(1);
     defer db.deinit();

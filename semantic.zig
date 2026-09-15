@@ -61,6 +61,7 @@ pub const UnresolvedBody = struct {
     };
     pub const Statement = union(enum) {
         discard: ValueUse,
+        lifetime_extend: ValueUse,
         propagate: struct { condition: ConditionId, span: structures.SourceSpan },
         bind_local: struct {
             local: LocalId,
@@ -298,11 +299,23 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                     .{ .return_value = try self.appendUse(node.data.node) },
                 .break_nothing, .break_expr => try self.buildBreak(index),
                 .continue_expr => try self.buildContinue(index),
+                .assign => if (self.isDiscardAssignment(index))
+                    .{ .lifetime_extend = try self.appendUse(node.data.node_node.b) }
+                else
+                    .{ .discard = try self.appendUse(index) },
                 else => if (isFallibleExpression(node.tag))
                     .{ .propagate = .{ .condition = try self.buildCondition(index), .span = span } }
                 else
                     .{ .discard = try self.appendUse(index) },
             };
+        }
+
+        fn isDiscardAssignment(self: *const Self, index: structures.Node.Index) bool {
+            const target_index = self.ast.nodes[index.index()].data.node_node.a;
+            const target = self.ast.nodes[target_index.index()];
+            if (target.tag != .identifier) return false;
+            const span = tokenSpan(self.ast, target.token_index);
+            return std.mem.eql(u8, self.source[span.start..span.end], "_");
         }
 
         fn buildBreak(self: *Self, index: structures.Node.Index) !UnresolvedBody.Statement {
@@ -1419,6 +1432,30 @@ fn appendItem(
 
 test "unresolved function body cleans up every allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, testUnresolvedFunctionBodyAllocations, .{});
+}
+
+test "discard assignment has distinct unresolved statement" {
+    const parser = @import("ast_new.zig");
+    const source = "func inspect(imm value: int)\n  _ = value";
+    var report = try parser.parseReport(std.testing.allocator, 1, source);
+    defer report.deinit(std.testing.allocator);
+    const parsed = &report.ast.?;
+    const declaration = parsed.node_refs[parsed.nodes[0].data.ref.start];
+    const result = try buildUnresolvedBody(parsed, source, declaration.index(), .function, &.{.{
+        .mode = .imm,
+        .type_id = .int,
+    }}, TestTypeInterner{}, std.testing.allocator);
+    var unresolved = switch (result) {
+        .success => |value| value,
+        .unsupported => unreachable,
+    };
+    defer unresolved.deinit(std.testing.allocator);
+
+    const root = unresolved.blocks[@intFromEnum(unresolved.root_block)];
+    try std.testing.expectEqual(@as(u32, 1), root.statements.end - root.statements.start);
+    const statement = unresolved.statements[root.statements.start];
+    try std.testing.expectEqual(UnresolvedBody.ValueId, @TypeOf(statement.lifetime_extend.value));
+    try std.testing.expectEqual(@as(u32, 0), @intFromEnum(statement.lifetime_extend.value));
 }
 
 test "function signature cleans up every allocation failure" {
