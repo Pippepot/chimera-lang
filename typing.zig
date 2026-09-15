@@ -101,6 +101,17 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             place: ArgumentPlace,
             argument_index: u32,
         };
+        const BuildInstruction = struct {
+            id: u31,
+            operation: structures.FunctionInstruction,
+        };
+        const BuildBlock = struct {
+            argument_start: u32,
+            argument_end: u32,
+            instructions: std.ArrayList(BuildInstruction) = .empty,
+            layout_index: ?u32 = null,
+            terminator: ?structures.FunctionTerminator = null,
+        };
 
         ctx: Context,
         type_interner: TypeInterner,
@@ -128,11 +139,12 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
         mut_argument_fields: std.ArrayList(PlaceField) = .empty,
         pending_mut_arguments: std.ArrayList(PendingMutArgument) = .empty,
         branch_arguments: std.ArrayList(structures.FunctionValueUse) = .empty,
-        instructions: std.ArrayList(structures.FunctionInstruction) = .empty,
-        blocks: std.ArrayList(structures.FunctionBlock) = .empty,
+        blocks: std.ArrayList(BuildBlock) = .empty,
         loop_stack: std.ArrayList(LoopContext) = .empty,
         loop_breaks: std.ArrayList(LoopBreak) = .empty,
         current_block: ?structures.FunctionBlockId = null,
+        instruction_count: u32 = 0,
+        block_layout_count: u32 = 0,
 
         fn init(self: *Self, parameters: []const structures.CallableParameter) !void {
             std.debug.assert(parameters.len == self.unresolved.parameter_count);
@@ -196,7 +208,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             self.mut_argument_fields.deinit(gpa);
             self.pending_mut_arguments.deinit(gpa);
             self.branch_arguments.deinit(gpa);
-            self.instructions.deinit(gpa);
+            for (self.blocks.items) |*block_value| block_value.instructions.deinit(gpa);
             self.blocks.deinit(gpa);
             self.loop_stack.deinit(gpa);
             self.loop_breaks.deinit(gpa);
@@ -2072,12 +2084,17 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
 
         fn appendInstruction(self: *Self, instruction: structures.FunctionInstruction) !Value {
             std.debug.assert(self.current_block != null);
-            const instruction_index = std.math.cast(u31, self.instructions.items.len) orelse return error.AnalysisTooLarge;
-            // The final block-argument count is known only after CFG construction.
-            // Temporary high-bit IDs keep instruction and argument values distinct;
+            const instruction_id = std.math.cast(u31, self.instruction_count) orelse return error.AnalysisTooLarge;
+            self.instruction_count += 1;
+            try self.blocks.items[@intFromEnum(self.current_block.?)].instructions.append(self.ctx.allocator(), .{
+                .id = instruction_id,
+                .operation = instruction,
+            });
+            // The final block-argument count and instruction layout are known
+            // only after CFG construction and transformation. Temporary
+            // high-bit IDs remain stable while block instructions are edited;
             // finish() rewrites them into the published contiguous namespace.
-            const id: structures.FunctionValueId = @enumFromInt(@as(u32, 1) << 31 | @as(u32, instruction_index));
-            try self.instructions.append(self.ctx.allocator(), instruction);
+            const id: structures.FunctionValueId = @enumFromInt(@as(u32, 1) << 31 | @as(u32, instruction_id));
             return .{ .id = id, .type_id = instruction.resultType() };
         }
 
@@ -2086,16 +2103,16 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             try self.blocks.append(self.ctx.allocator(), .{
                 .argument_start = argument_start,
                 .argument_end = argument_end,
-                .instruction_start = undefined,
-                .instruction_end = undefined,
-                .terminator = undefined,
             });
             return id;
         }
 
         fn enterBlock(self: *Self, block_id: structures.FunctionBlockId) void {
             std.debug.assert(self.current_block == null);
-            self.blocks.items[@intFromEnum(block_id)].instruction_start = @intCast(self.instructions.items.len);
+            const block_value = &self.blocks.items[@intFromEnum(block_id)];
+            std.debug.assert(block_value.layout_index == null);
+            block_value.layout_index = self.block_layout_count;
+            self.block_layout_count += 1;
             self.current_block = block_id;
         }
 
@@ -2105,13 +2122,14 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
 
         fn suspendBlock(self: *Self) structures.FunctionBlockId {
             const block_id = self.current_block.?;
-            self.blocks.items[@intFromEnum(block_id)].instruction_end = @intCast(self.instructions.items.len);
             self.current_block = null;
             return block_id;
         }
 
         fn setBlockTerminator(self: *Self, block_id: structures.FunctionBlockId, terminator: structures.FunctionTerminator) void {
-            self.blocks.items[@intFromEnum(block_id)].terminator = terminator;
+            const block_value = &self.blocks.items[@intFromEnum(block_id)];
+            std.debug.assert(block_value.terminator == null);
+            block_value.terminator = terminator;
         }
 
         fn emptyBranch(self: *const Self, target: structures.FunctionBlockId) structures.FunctionBranch {
@@ -2123,11 +2141,43 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             std.debug.assert(self.current_block == null);
             const gpa = self.ctx.allocator();
             const argument_count: u32 = @intCast(std.math.cast(u31, self.block_argument_types.items.len) orelse return error.AnalysisTooLarge);
-            normalizeInstructions(self.instructions.items, argument_count);
-            normalizeValueUses(self.call_arguments.items, argument_count);
-            for (self.struct_field_values.items) |*field| field.value = normalizeValue(field.value, argument_count);
-            normalizeValueUses(self.branch_arguments.items, argument_count);
-            normalizeTerminators(self.blocks.items, argument_count);
+            const instruction_values = try gpa.alloc(structures.FunctionValueId, self.instruction_count);
+            defer gpa.free(instruction_values);
+            const block_layout = try gpa.alloc(structures.FunctionBlockId, self.blocks.items.len);
+            defer gpa.free(block_layout);
+            std.debug.assert(self.block_layout_count == self.blocks.items.len);
+            for (self.blocks.items, 0..) |block_value, block_index| {
+                const layout_index = block_value.layout_index orelse unreachable;
+                block_layout[layout_index] = @enumFromInt(block_index);
+            }
+            const instructions = try gpa.alloc(structures.FunctionInstruction, self.instruction_count);
+            errdefer gpa.free(instructions);
+            const blocks = try gpa.alloc(structures.FunctionBlock, self.blocks.items.len);
+            errdefer gpa.free(blocks);
+            var instruction_index: u32 = 0;
+            for (block_layout) |block_id| {
+                const block_index = @intFromEnum(block_id);
+                const build_block = self.blocks.items[block_index];
+                const instruction_start = instruction_index;
+                for (build_block.instructions.items) |build_instruction| {
+                    instructions[instruction_index] = build_instruction.operation;
+                    instruction_values[build_instruction.id] = @enumFromInt(argument_count + instruction_index);
+                    instruction_index += 1;
+                }
+                blocks[block_index] = .{
+                    .argument_start = build_block.argument_start,
+                    .argument_end = build_block.argument_end,
+                    .instruction_start = instruction_start,
+                    .instruction_end = instruction_index,
+                    .terminator = build_block.terminator orelse unreachable,
+                };
+            }
+            std.debug.assert(instruction_index == self.instruction_count);
+            normalizeInstructions(instructions, instruction_values);
+            normalizeValueUses(self.call_arguments.items, instruction_values);
+            for (self.struct_field_values.items) |*field| field.value = normalizeValue(field.value, instruction_values);
+            normalizeValueUses(self.branch_arguments.items, instruction_values);
+            normalizeTerminators(blocks, instruction_values);
             const block_argument_types = try self.block_argument_types.toOwnedSlice(gpa);
             errdefer gpa.free(block_argument_types);
             const variant_coercion_tags = try self.variant_coercion_tags.toOwnedSlice(gpa);
@@ -2136,10 +2186,6 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             errdefer gpa.free(struct_field_values);
             const call_arguments = try self.call_arguments.toOwnedSlice(gpa);
             errdefer gpa.free(call_arguments);
-            const instructions = try self.instructions.toOwnedSlice(gpa);
-            errdefer gpa.free(instructions);
-            const blocks = try self.blocks.toOwnedSlice(gpa);
-            errdefer gpa.free(blocks);
             const branches = try self.branch_arguments.toOwnedSlice(gpa);
             const body: structures.FunctionBodyAnalysis = .{
                 .return_type = self.return_type,
@@ -2158,51 +2204,51 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
     };
 }
 
-fn normalizeValue(value: structures.FunctionValueId, argument_count: u32) structures.FunctionValueId {
+fn normalizeValue(value: structures.FunctionValueId, instruction_values: []const structures.FunctionValueId) structures.FunctionValueId {
     const instruction_mask: u32 = 1 << 31;
     const raw = @intFromEnum(value);
     if (raw & instruction_mask == 0) return value;
-    return @enumFromInt(argument_count + (raw & ~instruction_mask));
+    return instruction_values[raw & ~instruction_mask];
 }
 
-fn normalizeValueUse(value_use: *structures.FunctionValueUse, argument_count: u32) void {
-    value_use.value = normalizeValue(value_use.value, argument_count);
+fn normalizeValueUse(value_use: *structures.FunctionValueUse, instruction_values: []const structures.FunctionValueId) void {
+    value_use.value = normalizeValue(value_use.value, instruction_values);
 }
 
-fn normalizeValueUses(value_uses: []structures.FunctionValueUse, argument_count: u32) void {
-    for (value_uses) |*value_use| normalizeValueUse(value_use, argument_count);
+fn normalizeValueUses(value_uses: []structures.FunctionValueUse, instruction_values: []const structures.FunctionValueId) void {
+    for (value_uses) |*value_use| normalizeValueUse(value_use, instruction_values);
 }
 
-fn normalizeInstructions(instructions: []structures.FunctionInstruction, argument_count: u32) void {
+fn normalizeInstructions(instructions: []structures.FunctionInstruction, instruction_values: []const structures.FunctionValueId) void {
     for (instructions) |*instruction| switch (instruction.*) {
         .consti, .constb, .const_unit, .const_none, .function_ref, .struct_init, .call_mut_argument => {},
-        .variant_coerce, .variant_extract, .callable_coerce => |*operation| operation.operand = normalizeValue(operation.operand, argument_count),
-        .field_access => |*operation| operation.operand = normalizeValue(operation.operand, argument_count),
+        .variant_coerce, .variant_extract, .callable_coerce => |*operation| operation.operand = normalizeValue(operation.operand, instruction_values),
+        .field_access => |*operation| operation.operand = normalizeValue(operation.operand, instruction_values),
         .field_update => |*operation| {
-            operation.operand = normalizeValue(operation.operand, argument_count);
-            operation.value = normalizeValue(operation.value, argument_count);
+            operation.operand = normalizeValue(operation.operand, instruction_values);
+            operation.value = normalizeValue(operation.value, instruction_values);
         },
-        .mut_parameter_write => |*operation| operation.value = normalizeValue(operation.value, argument_count),
+        .mut_parameter_write => |*operation| operation.value = normalizeValue(operation.value, instruction_values),
         .call => {},
-        .indirect_call => |*call| call.target = normalizeValue(call.target, argument_count),
-        .variant_tag, .exit, .negi => |*operand| operand.* = normalizeValue(operand.*, argument_count),
+        .indirect_call => |*call| call.target = normalizeValue(call.target, instruction_values),
+        .variant_tag, .exit, .negi => |*operand| operand.* = normalizeValue(operand.*, instruction_values),
         .addi, .subi, .muli, .divsi => |*operands| {
-            operands.lhs = normalizeValue(operands.lhs, argument_count);
-            operands.rhs = normalizeValue(operands.rhs, argument_count);
+            operands.lhs = normalizeValue(operands.lhs, instruction_values);
+            operands.rhs = normalizeValue(operands.rhs, instruction_values);
         },
     };
 }
 
-fn normalizeTerminators(blocks: []structures.FunctionBlock, argument_count: u32) void {
+fn normalizeTerminators(blocks: []structures.FunctionBlock, instruction_values: []const structures.FunctionValueId) void {
     for (blocks) |*block_value| switch (block_value.terminator) {
         .branch, .fallible_call, .return_failure, .diverge => {},
-        .fallible_indirect_call => |*fallible| fallible.call.target = normalizeValue(fallible.call.target, argument_count),
+        .fallible_indirect_call => |*fallible| fallible.call.target = normalizeValue(fallible.call.target, instruction_values),
         .predicate_branch => |*predicate| {
-            predicate.operands.lhs = normalizeValue(predicate.operands.lhs, argument_count);
-            predicate.operands.rhs = normalizeValue(predicate.operands.rhs, argument_count);
+            predicate.operands.lhs = normalizeValue(predicate.operands.lhs, instruction_values);
+            predicate.operands.rhs = normalizeValue(predicate.operands.rhs, instruction_values);
         },
         .return_unit => {},
-        .return_value => |*value_use| normalizeValueUse(value_use, argument_count),
+        .return_value => |*value_use| normalizeValueUse(value_use, instruction_values),
     };
 }
 

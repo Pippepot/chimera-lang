@@ -163,12 +163,57 @@ take(a^) # transfer ownership; any subsequent access to 'a' is an error
 # incoming path. A root available on loop entry must be restored on every
 # reachable backedge.
 #
-# Automatic destruction follows Mojo's last-use (ASAP) timing: destroy a value
-# as soon as it has no remaining uses, including after a subexpression rather
-# than waiting for the enclosing statement or scope to end. Uses through
-# borrowed references and views, and uses needed by cleanup, keep the required
-# values alive. Lexical name visibility does not determine destruction timing.
-# Reference: https://mojolang.static.modular.com/docs/manual/lifecycle/death/
+# Each successful initialization of an owning place starts a new ownership
+# generation. A transfer ends that generation without destroying it and carries
+# its destruction obligation to the destination. Reinitializing the place starts
+# another generation; lifetimes belong to generations, not lexical names.
+#
+# Automatic destruction follows Mojo's last-use (ASAP) timing. A generation is
+# destroyed at the earliest completed subexpression boundary after its final
+# use, rather than at the end of the enclosing statement or scope. A generation
+# with no uses is destroyed immediately after its initialization completes.
+# Evaluation order is unchanged: destruction is inserted only at boundaries
+# that do not move an operation ahead of an earlier source operation.
+#
+# Assignment does not extend the old generation to the assignment itself. The
+# old generation ends after its earlier final use, or after a final use in the
+# right-hand side and before the replacement completes. A borrow produced by
+# the right-hand side keeps every owner it may refer to alive.
+#
+# Lifetime analysis is path-sensitive. If a value is needed only on some branch
+# successors, it is destroyed on the other outgoing edges before those branches
+# begin. A conditional transfer consumes the generation only on the taken path;
+# remaining owned paths destroy it automatically, but the root is still not
+# usable after a join where it may have been transferred. A possible use in a
+# later loop iteration keeps the generation alive across every backedge from
+# which that use is reachable. Each loop exit ends it independently at the
+# earliest boundary on that path.
+#
+# Return, failure propagation, break, and continue are control-flow exits and
+# destroy every still-owned automatic generation that does not escape along that
+# edge. No destruction is sequenced after a no-return expression because that
+# continuation does not exist; values whose last uses precede it still end at
+# their earlier boundaries.
+#
+# Uses through borrowed references and views, and uses performed by cleanup,
+# keep every possible owner alive. When a borrowed result may refer to different
+# owners on different paths, all possible owners remain alive until the result's
+# final use.
+#
+# When several generations end at the same boundary, dependents are destroyed
+# before owners that their cleanup may access. Otherwise, destruction is in
+# reverse lifetime-start order. Consequently, operands and temporaries that
+# start during one expression are destroyed in reverse evaluation order when
+# their final-use boundary is shared. Aggregate field destruction remains in
+# reverse field declaration order.
+#
+# Assigning a value to `_` is a non-consuming use that explicitly extends its
+# lifetime to that point. The expression is evaluated once, but an owning value
+# is neither copied nor transferred merely to perform the discard.
+_ = resource
+#
+# Lexical name visibility does not determine destruction timing.
+# Reference: https://mojolang.org/docs/manual/lifecycle/death/
 #
 # Transferred roots carry their drop obligation onward. Explicit-drop values
 # are not automatically destroyed at last use: every ownership path must
