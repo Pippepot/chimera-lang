@@ -15,6 +15,7 @@ const Boundary = lifetime.Boundary;
 const BuildInstruction = lifetime.BuildInstruction;
 const BuildItem = lifetime.BuildItem;
 const BuildBlock = lifetime.BuildBlock;
+const CleanupLocation = lifetime.CleanupLocation;
 const LifetimeSolver = lifetime.Solver;
 
 pub fn emitSemanticIssue(ctx: anytype, file_id: structures.FileId, issue: semantic.Issue) !void {
@@ -2854,6 +2855,237 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             try solver.solve(&self.planned_cleanups, &self.explicit_abandonments);
         }
 
+        fn materializeCleanups(self: *Self, cleanups: []const PlannedCleanup) !void {
+            try self.materializeCleanupsWith(cleanups, emitDropCleanup);
+        }
+
+        fn materializeCleanupsWith(self: *Self, cleanups: []const PlannedCleanup, comptime emit_cleanup: anytype) !void {
+            std.debug.assert(self.current_block == null);
+            const LocationTag = std.meta.Tag(CleanupLocation);
+            inline for ([_]LocationTag{ .edge, .boundary, .block_entry }) |location_tag| {
+                var cleanup_start: usize = 0;
+                while (cleanup_start < cleanups.len) {
+                    var cleanup_end = cleanup_start + 1;
+                    while (cleanup_end < cleanups.len and std.meta.eql(cleanups[cleanup_start].location, cleanups[cleanup_end].location)) {
+                        cleanup_end += 1;
+                    }
+                    const location_cleanups = cleanups[cleanup_start..cleanup_end];
+                    if (std.meta.activeTag(location_cleanups[0].location) == location_tag) switch (location_cleanups[0].location) {
+                        .boundary => |location| try self.materializeBoundaryCleanups(location.boundary, location_cleanups, emit_cleanup),
+                        .edge => |location| try self.materializeEdgeCleanups(location.predecessor, location.successor_ordinal, location_cleanups, emit_cleanup),
+                        .block_entry => |block_id| try self.materializeBlockEntryCleanups(block_id, location_cleanups, emit_cleanup),
+                    };
+                    cleanup_start = cleanup_end;
+                }
+            }
+        }
+
+        fn materializeBoundaryCleanups(
+            self: *Self,
+            boundary: BoundaryId,
+            cleanups: []const PlannedCleanup,
+            comptime emit_cleanup: anytype,
+        ) !void {
+            const location = self.findBoundary(boundary);
+            const suffix = try self.splitCompletedBlock(location.block, location.item_index + 1);
+            const argument_index: u32 = @intCast(self.block_argument_types.items.len);
+            const cleanup_block = try self.newBlock(argument_index, argument_index);
+            self.setBlockTerminator(location.block, .{ .branch = self.emptyBranch(cleanup_block) });
+            self.enterBlock(cleanup_block);
+            try self.emitCleanupGroup(cleanups, emit_cleanup);
+            self.terminate(.{ .branch = self.emptyBranch(suffix) });
+            self.assignBlockLayout(suffix);
+        }
+
+        fn materializeBlockEntryCleanups(
+            self: *Self,
+            block_id: structures.FunctionBlockId,
+            cleanups: []const PlannedCleanup,
+            comptime emit_cleanup: anytype,
+        ) !void {
+            const suffix = try self.splitCompletedBlock(block_id, 0);
+            self.resumeBlock(block_id);
+            try self.emitCleanupGroup(cleanups, emit_cleanup);
+            self.terminate(.{ .branch = self.emptyBranch(suffix) });
+            self.assignBlockLayout(suffix);
+        }
+
+        fn materializeEdgeCleanups(
+            self: *Self,
+            predecessor: structures.FunctionBlockId,
+            successor_ordinal: u2,
+            cleanups: []const PlannedCleanup,
+            comptime emit_cleanup: anytype,
+        ) !void {
+            const target = self.edgeTarget(predecessor, successor_ordinal);
+            const pass_through = try self.newPassThroughBlock(target);
+            self.retargetEdge(predecessor, successor_ordinal, pass_through.block);
+            self.enterBlock(pass_through.block);
+            try self.emitCleanupGroup(cleanups, emit_cleanup);
+            self.terminate(.{ .branch = pass_through.branch });
+        }
+
+        fn emitCleanupGroup(self: *Self, cleanups: []const PlannedCleanup, comptime emit_cleanup: anytype) !void {
+            for (cleanups) |cleanup| try self.emitConditionalCleanup(cleanup, emit_cleanup);
+        }
+
+        fn emitConditionalCleanup(self: *Self, cleanup: PlannedCleanup, comptime emit_cleanup: anytype) !void {
+            const cleanup_condition = cleanup.cleanup_condition orelse return emit_cleanup(self, cleanup);
+            const argument_index: u32 = @intCast(self.block_argument_types.items.len);
+            const borrowed = try self.newBlock(argument_index, argument_index);
+            const owned = try self.newBlock(argument_index, argument_index);
+            const join = try self.newBlock(argument_index, argument_index);
+            const expected = try self.appendInstruction(.{ .constb = true });
+            self.terminate(.{ .predicate_branch = .{
+                .operation = .eqb,
+                .operands = .{ .lhs = cleanup_condition, .rhs = expected.id },
+                .then_branch = self.emptyBranch(borrowed),
+                .else_branch = self.emptyBranch(owned),
+            } });
+            self.enterBlock(borrowed);
+            self.terminate(.{ .branch = self.emptyBranch(join) });
+            self.enterBlock(owned);
+            try emit_cleanup(self, cleanup);
+            self.terminate(.{ .branch = self.emptyBranch(join) });
+            self.enterBlock(join);
+        }
+
+        fn emitDropCleanup(self: *Self, cleanup: PlannedCleanup) !void {
+            const generation = self.generations.items[@intFromEnum(cleanup.generation)];
+            try self.dropValue(.{
+                .id = cleanup.cleanup_value,
+                .type_id = generation.type_id,
+            }, cleanup.can_deinit, generation.span);
+        }
+
+        const BoundaryLocation = struct {
+            block: structures.FunctionBlockId,
+            item_index: usize,
+        };
+
+        fn findBoundary(self: *const Self, boundary: BoundaryId) BoundaryLocation {
+            var result: ?BoundaryLocation = null;
+            for (self.blocks.items, 0..) |block_value, block_index| {
+                for (block_value.items.items, 0..) |item, item_index| switch (item) {
+                    .instruction => {},
+                    .boundary => |candidate| if (candidate == boundary) {
+                        std.debug.assert(result == null);
+                        result = .{ .block = @enumFromInt(block_index), .item_index = item_index };
+                    },
+                };
+            }
+            return result orelse unreachable;
+        }
+
+        fn splitCompletedBlock(self: *Self, block_id: structures.FunctionBlockId, suffix_item_start: usize) !structures.FunctionBlockId {
+            const block_index = @intFromEnum(block_id);
+            const original = self.blocks.items[block_index];
+            std.debug.assert(original.layout_index != null);
+            std.debug.assert(original.terminator != null);
+            std.debug.assert(suffix_item_start <= original.items.items.len);
+            const argument_index: u32 = @intCast(self.block_argument_types.items.len);
+            const suffix = try self.newBlock(argument_index, argument_index);
+            const suffix_index = @intFromEnum(suffix);
+            try self.blocks.items[suffix_index].items.appendSlice(
+                self.ctx.allocator(),
+                self.blocks.items[block_index].items.items[suffix_item_start..],
+            );
+            try self.blocks.items[suffix_index].terminator_effects.appendSlice(
+                self.ctx.allocator(),
+                self.blocks.items[block_index].terminator_effects.items,
+            );
+            self.blocks.items[suffix_index].terminator = self.blocks.items[block_index].terminator;
+            self.blocks.items[block_index].items.shrinkRetainingCapacity(suffix_item_start);
+            self.blocks.items[block_index].terminator_effects.clearRetainingCapacity();
+            self.blocks.items[block_index].terminator = null;
+            return suffix;
+        }
+
+        const PassThroughBlock = struct {
+            block: structures.FunctionBlockId,
+            branch: structures.FunctionBranch,
+        };
+
+        fn newPassThroughBlock(self: *Self, target: structures.FunctionBlockId) !PassThroughBlock {
+            const target_block = self.blocks.items[@intFromEnum(target)];
+            const argument_start: u32 = @intCast(self.block_argument_types.items.len);
+            for (target_block.argument_start..target_block.argument_end) |target_argument| {
+                _ = try self.appendBlockArgument(
+                    self.block_argument_types.items[target_argument],
+                    self.block_argument_generations.items[target_argument],
+                );
+            }
+            const argument_end: u32 = @intCast(self.block_argument_types.items.len);
+            const pass_through_block = try self.newBlock(argument_start, argument_end);
+            const branch_start: u32 = @intCast(self.branch_arguments.items.len);
+            for (argument_start..argument_end) |argument| {
+                try self.appendBranchArgument(
+                    .{ .value = @enumFromInt(argument) },
+                    self.block_argument_generations.items[argument],
+                );
+            }
+            return .{
+                .block = pass_through_block,
+                .branch = .{
+                    .target = target,
+                    .arguments = .{ .start = branch_start, .end = @intCast(self.branch_arguments.items.len) },
+                },
+            };
+        }
+
+        fn edgeTarget(self: *const Self, predecessor: structures.FunctionBlockId, successor_ordinal: u2) structures.FunctionBlockId {
+            const terminator = self.blocks.items[@intFromEnum(predecessor)].terminator orelse unreachable;
+            return switch (terminator) {
+                .branch => |branch| if (successor_ordinal == 0) branch.target else unreachable,
+                .predicate_branch => |branch| switch (successor_ordinal) {
+                    0 => branch.then_branch.target,
+                    1 => branch.else_branch.target,
+                    else => unreachable,
+                },
+                .fallible_call => |call| switch (successor_ordinal) {
+                    0 => call.success,
+                    1 => call.failure,
+                    else => unreachable,
+                },
+                .fallible_indirect_call => |call| switch (successor_ordinal) {
+                    0 => call.success,
+                    1 => call.failure,
+                    else => unreachable,
+                },
+                .return_unit, .return_value, .return_failure, .diverge => unreachable,
+            };
+        }
+
+        fn retargetEdge(
+            self: *Self,
+            predecessor: structures.FunctionBlockId,
+            successor_ordinal: u2,
+            target: structures.FunctionBlockId,
+        ) void {
+            const terminator = &self.blocks.items[@intFromEnum(predecessor)].terminator.?;
+            switch (terminator.*) {
+                .branch => |*branch| if (successor_ordinal == 0) {
+                    branch.target = target;
+                } else unreachable,
+                .predicate_branch => |*branch| switch (successor_ordinal) {
+                    0 => branch.then_branch.target = target,
+                    1 => branch.else_branch.target = target,
+                    else => unreachable,
+                },
+                .fallible_call => |*call| switch (successor_ordinal) {
+                    0 => call.success = target,
+                    1 => call.failure = target,
+                    else => unreachable,
+                },
+                .fallible_indirect_call => |*call| switch (successor_ordinal) {
+                    0 => call.success = target,
+                    1 => call.failure = target,
+                    else => unreachable,
+                },
+                .return_unit, .return_value, .return_failure, .diverge => unreachable,
+            }
+        }
+
         fn validateGenerationOrigins(self: *Self) !void {
             const origins = try self.ctx.allocator().alloc(GenerationOrigin, self.generations.items.len);
             defer self.ctx.allocator().free(origins);
@@ -2997,10 +3229,22 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
 
         fn enterBlock(self: *Self, block_id: structures.FunctionBlockId) void {
             std.debug.assert(self.current_block == null);
+            self.assignBlockLayout(block_id);
+            self.current_block = block_id;
+        }
+
+        fn assignBlockLayout(self: *Self, block_id: structures.FunctionBlockId) void {
             const block_value = &self.blocks.items[@intFromEnum(block_id)];
             std.debug.assert(block_value.layout_index == null);
             block_value.layout_index = self.block_layout_count;
             self.block_layout_count += 1;
+        }
+
+        fn resumeBlock(self: *Self, block_id: structures.FunctionBlockId) void {
+            std.debug.assert(self.current_block == null);
+            const block_value = self.blocks.items[@intFromEnum(block_id)];
+            std.debug.assert(block_value.layout_index != null);
+            std.debug.assert(block_value.terminator == null);
             self.current_block = block_id;
         }
 
@@ -3143,6 +3387,416 @@ fn normalizeTerminators(blocks: []structures.FunctionBlock, instruction_values: 
         .return_unit => {},
         .return_value => |*value_use| normalizeValueUse(value_use, instruction_values),
     };
+}
+
+const MaterializerTestContext = struct {
+    gpa: std.mem.Allocator,
+
+    fn allocator(self: *@This()) std.mem.Allocator {
+        return self.gpa;
+    }
+
+    fn emit(_: *@This(), comptime Accumulator: type, _: Accumulator) !void {
+        unreachable;
+    }
+};
+
+const MaterializerTestTypes = struct {
+    const custom_type = structures.TypeId.fromInterned(@enumFromInt(0));
+    const variant_type = structures.TypeId.fromInterned(@enumFromInt(1));
+    const second_custom_type = structures.TypeId.fromInterned(@enumFromInt(2));
+    const custom_drop_hook: structures.ItemId = @enumFromInt(1);
+    const second_custom_drop_hook: structures.ItemId = @enumFromInt(2);
+    const span: structures.SourceSpan = .{ .start = 0, .end = 0 };
+    const variant_members = [_]structures.TypeId{ custom_type, .int };
+
+    fn ownershipCapabilities(_: @This(), type_id: structures.TypeId) !?structures.OwnershipCapabilities {
+        if (type_id == custom_type or type_id == second_custom_type or type_id == variant_type) return .{
+            .move = .none,
+            .copy = .none,
+            .drop = if (type_id == variant_type) .fieldwise else .custom,
+            .needs_automatic_drop = true,
+        };
+        return .{ .move = .trivial, .copy = .trivial, .drop = .trivial };
+    }
+
+    fn structDefinition(_: @This(), type_id: structures.TypeId) !?structures.StructDefinition {
+        if (type_id != custom_type and type_id != second_custom_type) return null;
+        return .{
+            .fields = &.{},
+            .ownership = .{ .drop = .{
+                .capability = .custom,
+                .hook = if (type_id == custom_type) custom_drop_hook else second_custom_drop_hook,
+                .span = span,
+            } },
+        };
+    }
+
+    pub fn variantMembers(_: @This(), type_id: structures.TypeId) !?[]const structures.TypeId {
+        return if (type_id == variant_type) &variant_members else null;
+    }
+
+    pub fn callable(_: @This(), _: structures.TypeId) !?structures.CallableType {
+        return null;
+    }
+};
+
+const MaterializerTestBuilder = BodyBuilder(*MaterializerTestContext, void, void, MaterializerTestTypes);
+
+fn initMaterializerTestBuilder(context: *MaterializerTestContext) MaterializerTestBuilder {
+    return .{
+        .ctx = context,
+        .type_interner = .{},
+        .item_id = @enumFromInt(0),
+        .file_id = 1,
+        .unresolved = .{
+            .parameter_count = 0,
+            .local_count = 0,
+            .expressions = &.{},
+            .conditions = &.{},
+            .blocks = &.{},
+            .statements = &.{},
+            .call_arguments = &.{},
+            .struct_field_values = &.{},
+            .assignment_fields = &.{},
+            .root_block = @enumFromInt(0),
+        },
+        .return_type = .unit,
+        .is_fallible = false,
+    };
+}
+
+fn appendMaterializerTestGeneration(
+    builder: *MaterializerTestBuilder,
+    type_id: structures.TypeId,
+    start_order: u32,
+) !GenerationId {
+    const generation: GenerationId = @enumFromInt(builder.generations.items.len);
+    try builder.generations.append(builder.ctx.allocator(), .{
+        .type_id = type_id,
+        .start_order = start_order,
+        .span = MaterializerTestTypes.span,
+        .needs_automatic_drop = true,
+        .requires_explicit_drop = false,
+        .can_deinit = false,
+    });
+    return generation;
+}
+
+test "cleanup materializer inserts ordered custom drops at an interior boundary" {
+    var context: MaterializerTestContext = .{ .gpa = std.testing.allocator };
+    var builder = initMaterializerTestBuilder(&context);
+    defer builder.deinit();
+
+    const entry = try builder.newBlock(0, 0);
+    builder.enterBlock(entry);
+    const first = try builder.appendInstruction(.{ .consti = 40 });
+    const second = try builder.appendInstruction(.{ .consti = 41 });
+    const boundary = try builder.newBoundary(MaterializerTestTypes.span);
+    try builder.appendBoundary(boundary);
+    _ = try builder.appendInstruction(.{ .consti = 42 });
+    builder.terminate(.return_unit);
+    const first_generation = try appendMaterializerTestGeneration(&builder, MaterializerTestTypes.custom_type, 0);
+    const second_generation = try appendMaterializerTestGeneration(&builder, MaterializerTestTypes.second_custom_type, 1);
+
+    try builder.materializeCleanups(&.{
+        .{
+            .generation = second_generation,
+            .cleanup_value = second.id,
+            .location = .{ .boundary = .{ .block = entry, .boundary = boundary } },
+            .start_order = 1,
+            .can_deinit = false,
+        },
+        .{
+            .generation = first_generation,
+            .cleanup_value = first.id,
+            .location = .{ .boundary = .{ .block = entry, .boundary = boundary } },
+            .start_order = 0,
+            .can_deinit = false,
+        },
+    });
+
+    var body = try builder.finish();
+    defer body.deinit(context.gpa);
+    try std.testing.expectEqual(@as(usize, 3), body.blocks.len);
+    try std.testing.expectEqual(@as(usize, 5), body.instructions.len);
+    try std.testing.expectEqual(structures.FunctionInstruction.consti, std.meta.activeTag(body.instructions[0]));
+    try std.testing.expectEqual(structures.FunctionInstruction.consti, std.meta.activeTag(body.instructions[1]));
+    try std.testing.expectEqual(MaterializerTestTypes.second_custom_drop_hook, body.instructions[2].call.target);
+    try std.testing.expectEqual(MaterializerTestTypes.custom_drop_hook, body.instructions[3].call.target);
+    try std.testing.expectEqual(structures.FunctionInstruction.consti, std.meta.activeTag(body.instructions[4]));
+    try std.testing.expectEqual(@as(structures.FunctionBlockId, @enumFromInt(2)), body.blocks[@intFromEnum(entry)].terminator.branch.target);
+    try std.testing.expectEqual(@as(structures.FunctionBlockId, @enumFromInt(1)), body.blocks[2].terminator.branch.target);
+    try std.testing.expectEqual(structures.FunctionTerminator.return_unit, body.blocks[1].terminator);
+}
+
+test "cleanup materializer finds boundaries after earlier splits" {
+    var context: MaterializerTestContext = .{ .gpa = std.testing.allocator };
+    var builder = initMaterializerTestBuilder(&context);
+    defer builder.deinit();
+
+    const entry = try builder.newBlock(0, 0);
+    builder.enterBlock(entry);
+    const first = try builder.appendInstruction(.{ .consti = 40 });
+    const first_boundary = try builder.newBoundary(MaterializerTestTypes.span);
+    try builder.appendBoundary(first_boundary);
+    const second = try builder.appendInstruction(.{ .consti = 41 });
+    const second_boundary = try builder.newBoundary(MaterializerTestTypes.span);
+    try builder.appendBoundary(second_boundary);
+    _ = try builder.appendInstruction(.{ .consti = 42 });
+    builder.terminate(.return_unit);
+    const first_generation = try appendMaterializerTestGeneration(&builder, MaterializerTestTypes.custom_type, 0);
+    const second_generation = try appendMaterializerTestGeneration(&builder, MaterializerTestTypes.second_custom_type, 1);
+
+    try builder.materializeCleanups(&.{
+        .{
+            .generation = first_generation,
+            .cleanup_value = first.id,
+            .location = .{ .boundary = .{ .block = entry, .boundary = first_boundary } },
+            .start_order = 0,
+            .can_deinit = false,
+        },
+        .{
+            .generation = second_generation,
+            .cleanup_value = second.id,
+            .location = .{ .boundary = .{ .block = entry, .boundary = second_boundary } },
+            .start_order = 1,
+            .can_deinit = false,
+        },
+    });
+
+    var body = try builder.finish();
+    defer body.deinit(context.gpa);
+    try std.testing.expectEqual(@as(usize, 5), body.blocks.len);
+    try std.testing.expectEqual(MaterializerTestTypes.custom_drop_hook, body.instructions[1].call.target);
+    try std.testing.expectEqual(MaterializerTestTypes.second_custom_drop_hook, body.instructions[3].call.target);
+    try std.testing.expectEqual(structures.FunctionTerminator.return_unit, body.blocks[3].terminator);
+}
+
+test "cleanup materializer emits produced cleanup at block entry" {
+    var context: MaterializerTestContext = .{ .gpa = std.testing.allocator };
+    var builder = initMaterializerTestBuilder(&context);
+    defer builder.deinit();
+
+    const argument = try builder.appendBlockArgument(MaterializerTestTypes.custom_type, null);
+    const entry = try builder.newBlock(0, 0);
+    const target = try builder.newBlock(argument, argument + 1);
+    builder.enterBlock(entry);
+    const source = try builder.appendInstruction(.{ .consti = 42 });
+    try builder.appendBranchArgument(.{ .value = source.id }, null);
+    builder.terminate(.{ .branch = .{ .target = target, .arguments = .{ .start = 0, .end = 1 } } });
+    builder.enterBlock(target);
+    builder.terminate(.return_unit);
+    const generation = try appendMaterializerTestGeneration(&builder, MaterializerTestTypes.custom_type, 0);
+
+    try builder.materializeCleanups(&.{.{
+        .generation = generation,
+        .cleanup_value = @enumFromInt(argument),
+        .location = .{ .block_entry = target },
+        .start_order = 0,
+        .can_deinit = false,
+    }});
+
+    var body = try builder.finish();
+    defer body.deinit(context.gpa);
+    const target_block = body.blocks[@intFromEnum(target)];
+    try std.testing.expectEqual(@as(u32, 1), target_block.argument_end - target_block.argument_start);
+    try std.testing.expectEqual(@as(u32, 1), target_block.instruction_end - target_block.instruction_start);
+    try std.testing.expectEqual(MaterializerTestTypes.custom_drop_hook, body.instructions[target_block.instruction_start].call.target);
+    const suffix = target_block.terminator.branch.target;
+    try std.testing.expectEqual(structures.FunctionTerminator.return_unit, body.blocks[@intFromEnum(suffix)].terminator);
+}
+
+test "cleanup materializer interposes only one predicate edge" {
+    var context: MaterializerTestContext = .{ .gpa = std.testing.allocator };
+    var builder = initMaterializerTestBuilder(&context);
+    defer builder.deinit();
+
+    const entry = try builder.newBlock(0, 0);
+    builder.enterBlock(entry);
+    const value = try builder.appendInstruction(.{ .consti = 42 });
+    const condition = try builder.appendInstruction(.{ .constb = true });
+    const expected = try builder.appendInstruction(.{ .constb = true });
+    const argument = try builder.appendBlockArgument(.int, null);
+    const then_block = try builder.newBlock(argument, argument + 1);
+    const else_block = try builder.newBlock(argument + 1, argument + 1);
+    try builder.appendBranchArgument(.{ .value = value.id }, null);
+    builder.terminate(.{ .predicate_branch = .{
+        .operation = .eqb,
+        .operands = .{ .lhs = condition.id, .rhs = expected.id },
+        .then_branch = .{ .target = then_block, .arguments = .{ .start = 0, .end = 1 } },
+        .else_branch = builder.emptyBranch(else_block),
+    } });
+    builder.enterBlock(then_block);
+    builder.terminate(.return_unit);
+    builder.enterBlock(else_block);
+    builder.terminate(.return_unit);
+    const generation = try appendMaterializerTestGeneration(&builder, MaterializerTestTypes.custom_type, 0);
+
+    try builder.materializeCleanups(&.{.{
+        .generation = generation,
+        .cleanup_value = value.id,
+        .location = .{ .edge = .{ .predecessor = entry, .successor_ordinal = 0 } },
+        .start_order = 0,
+        .can_deinit = false,
+    }});
+
+    var body = try builder.finish();
+    defer body.deinit(context.gpa);
+    const predicate = body.blocks[@intFromEnum(entry)].terminator.predicate_branch;
+    try std.testing.expect(predicate.then_branch.target != then_block);
+    try std.testing.expectEqual(else_block, predicate.else_branch.target);
+    const cleanup_block = predicate.then_branch.target;
+    const cleanup_range = body.blocks[@intFromEnum(cleanup_block)];
+    try std.testing.expectEqual(@as(u32, 1), cleanup_range.argument_end - cleanup_range.argument_start);
+    try std.testing.expectEqual(then_block, cleanup_range.terminator.branch.target);
+    const forwarded = cleanup_range.terminator.branch.arguments;
+    try std.testing.expectEqual(@as(u32, 1), forwarded.end - forwarded.start);
+    try std.testing.expectEqual(@as(structures.FunctionValueId, @enumFromInt(cleanup_range.argument_start)), body.branch_arguments[forwarded.start].value);
+    try std.testing.expectEqual(@as(u32, 1), cleanup_range.instruction_end - cleanup_range.instruction_start);
+    try std.testing.expectEqual(MaterializerTestTypes.custom_drop_hook, body.instructions[cleanup_range.instruction_start].call.target);
+}
+
+test "cleanup materializer forwards fallible success payloads" {
+    var context: MaterializerTestContext = .{ .gpa = std.testing.allocator };
+    var builder = initMaterializerTestBuilder(&context);
+    defer builder.deinit();
+
+    const entry = try builder.newBlock(0, 0);
+    builder.enterBlock(entry);
+    const value = try builder.appendInstruction(.{ .consti = 42 });
+    _ = try builder.appendBlockArgument(.int, null);
+    const success = try builder.newBlock(0, 1);
+    const failure = try builder.newBlock(1, 1);
+    builder.terminate(.{ .fallible_call = .{
+        .call = .{ .target = @enumFromInt(3), .arguments = .{ .start = 0, .end = 0 }, .return_type = .int },
+        .success = success,
+        .failure = failure,
+    } });
+    builder.enterBlock(success);
+    builder.terminate(.{ .return_value = .{ .value = @enumFromInt(0) } });
+    builder.enterBlock(failure);
+    builder.terminate(.return_failure);
+    const generation = try appendMaterializerTestGeneration(&builder, MaterializerTestTypes.custom_type, 0);
+
+    try builder.materializeCleanups(&.{.{
+        .generation = generation,
+        .cleanup_value = value.id,
+        .location = .{ .edge = .{ .predecessor = entry, .successor_ordinal = 0 } },
+        .start_order = 0,
+        .can_deinit = false,
+    }});
+
+    var body = try builder.finish();
+    defer body.deinit(context.gpa);
+    const cleanup_block = body.blocks[@intFromEnum(entry)].terminator.fallible_call.success;
+    const cleanup = body.blocks[@intFromEnum(cleanup_block)];
+    try std.testing.expectEqual(@as(u32, 1), cleanup.argument_end - cleanup.argument_start);
+    try std.testing.expectEqual(success, cleanup.terminator.branch.target);
+    const forwarded = cleanup.terminator.branch.arguments;
+    try std.testing.expectEqual(@as(u32, 1), forwarded.end - forwarded.start);
+    try std.testing.expectEqual(@as(structures.FunctionValueId, @enumFromInt(cleanup.argument_start)), body.branch_arguments[forwarded.start].value);
+    try std.testing.expectEqual(failure, body.blocks[@intFromEnum(entry)].terminator.fallible_call.failure);
+}
+
+test "cleanup materializer guards conditional ownership" {
+    var context: MaterializerTestContext = .{ .gpa = std.testing.allocator };
+    var builder = initMaterializerTestBuilder(&context);
+    defer builder.deinit();
+
+    const entry = try builder.newBlock(0, 0);
+    builder.enterBlock(entry);
+    const value = try builder.appendInstruction(.{ .consti = 42 });
+    const borrowed = try builder.appendInstruction(.{ .constb = true });
+    const boundary = try builder.newBoundary(MaterializerTestTypes.span);
+    try builder.appendBoundary(boundary);
+    builder.terminate(.return_unit);
+    const generation = try appendMaterializerTestGeneration(&builder, MaterializerTestTypes.custom_type, 0);
+
+    try builder.materializeCleanups(&.{.{
+        .generation = generation,
+        .cleanup_value = value.id,
+        .cleanup_condition = borrowed.id,
+        .location = .{ .boundary = .{ .block = entry, .boundary = boundary } },
+        .start_order = 0,
+        .can_deinit = false,
+    }});
+
+    var body = try builder.finish();
+    defer body.deinit(context.gpa);
+    const cleanup_block = body.blocks[@intFromEnum(entry)].terminator.branch.target;
+    const predicate = body.blocks[@intFromEnum(cleanup_block)].terminator.predicate_branch;
+    try std.testing.expectEqual(body.instructionValue(1), predicate.operands.lhs);
+    const borrowed_block = body.blocks[@intFromEnum(predicate.then_branch.target)];
+    const owned_block = body.blocks[@intFromEnum(predicate.else_branch.target)];
+    try std.testing.expectEqual(@as(u32, 0), borrowed_block.instruction_end - borrowed_block.instruction_start);
+    try std.testing.expectEqual(@as(u32, 1), owned_block.instruction_end - owned_block.instruction_start);
+    try std.testing.expectEqual(MaterializerTestTypes.custom_drop_hook, body.instructions[owned_block.instruction_start].call.target);
+    try std.testing.expectEqual(borrowed_block.terminator.branch.target, owned_block.terminator.branch.target);
+}
+
+test "cleanup materializer rejoins variant cleanup with the suffix" {
+    var context: MaterializerTestContext = .{ .gpa = std.testing.allocator };
+    var builder = initMaterializerTestBuilder(&context);
+    defer builder.deinit();
+
+    const entry = try builder.newBlock(0, 0);
+    builder.enterBlock(entry);
+    const value = try builder.appendInstruction(.{ .consti = 42 });
+    const boundary = try builder.newBoundary(MaterializerTestTypes.span);
+    try builder.appendBoundary(boundary);
+    builder.terminate(.return_unit);
+    const generation = try appendMaterializerTestGeneration(&builder, MaterializerTestTypes.variant_type, 0);
+
+    try builder.materializeCleanups(&.{.{
+        .generation = generation,
+        .cleanup_value = value.id,
+        .location = .{ .boundary = .{ .block = entry, .boundary = boundary } },
+        .start_order = 0,
+        .can_deinit = false,
+    }});
+
+    var body = try builder.finish();
+    defer body.deinit(context.gpa);
+    const suffix: structures.FunctionBlockId = @enumFromInt(1);
+    var custom_drop_count: usize = 0;
+    var rejoins_suffix = false;
+    for (body.instructions) |instruction| {
+        if (instruction == .call and instruction.call.target == MaterializerTestTypes.custom_drop_hook) custom_drop_count += 1;
+    }
+    for (body.blocks) |block_value| switch (block_value.terminator) {
+        .branch => |branch| rejoins_suffix = rejoins_suffix or branch.target == suffix,
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 1), custom_drop_count);
+    try std.testing.expect(rejoins_suffix);
+    try std.testing.expectEqual(structures.FunctionTerminator.return_unit, body.blocks[@intFromEnum(suffix)].terminator);
+}
+
+fn testCleanupMaterializerAllocationFailures(gpa: std.mem.Allocator) !void {
+    var context: MaterializerTestContext = .{ .gpa = gpa };
+    var builder = initMaterializerTestBuilder(&context);
+    defer builder.deinit();
+    const entry = try builder.newBlock(0, 0);
+    builder.enterBlock(entry);
+    const value = try builder.appendInstruction(.{ .consti = 42 });
+    const boundary = try builder.newBoundary(MaterializerTestTypes.span);
+    try builder.appendBoundary(boundary);
+    builder.terminate(.return_unit);
+    const generation = try appendMaterializerTestGeneration(&builder, MaterializerTestTypes.variant_type, 0);
+    try builder.materializeCleanups(&.{.{
+        .generation = generation,
+        .cleanup_value = value.id,
+        .location = .{ .boundary = .{ .block = entry, .boundary = boundary } },
+        .start_order = 0,
+        .can_deinit = false,
+    }});
+    var body = try builder.finish();
+    defer body.deinit(gpa);
+}
+
+test "cleanup materializer releases partial CFG mutations on allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testCleanupMaterializerAllocationFailures, .{});
 }
 
 fn intersectTypes(
