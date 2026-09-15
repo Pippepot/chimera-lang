@@ -51,6 +51,8 @@ pub fn resolveAndTypeBody(
     };
     try builder.finishOwnershipMetadata();
     try builder.analyzeLifetimes();
+    if (try builder.emitExplicitAbandonmentDiagnostics()) return null;
+    try builder.materializeCleanups(builder.planned_cleanups.items);
     return try builder.finish();
 }
 
@@ -89,7 +91,6 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             block: structures.FunctionBlockId,
             state: StateId,
             extraction: ?PendingExtraction = null,
-            temporary: ?Value = null,
         };
         const ValueExit = struct {
             block: structures.FunctionBlockId,
@@ -154,10 +155,6 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
         variant_coercion_tags: std.ArrayList(u32) = .empty,
         struct_field_values: std.ArrayList(structures.StructFieldValue) = .empty,
         call_arguments: std.ArrayList(structures.FunctionValueUse) = .empty,
-        call_temporary_drops: std.ArrayList(Value) = .empty,
-        // Values constructed inside the expression currently being evaluated.
-        // A propagated failure ends them before it ends named locals.
-        pending_temporaries: std.ArrayList(Value) = .empty,
         mut_argument_fields: std.ArrayList(PlaceField) = .empty,
         pending_mut_arguments: std.ArrayList(PendingMutArgument) = .empty,
         branch_arguments: std.ArrayList(structures.FunctionValueUse) = .empty,
@@ -251,8 +248,6 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             self.variant_coercion_tags.deinit(gpa);
             self.struct_field_values.deinit(gpa);
             self.call_arguments.deinit(gpa);
-            self.call_temporary_drops.deinit(gpa);
-            self.pending_temporaries.deinit(gpa);
             self.mut_argument_fields.deinit(gpa);
             self.pending_mut_arguments.deinit(gpa);
             self.branch_arguments.deinit(gpa);
@@ -310,8 +305,15 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             if (self.current_block == null) return null;
             var result = if (unresolved_block.result) |result_id| try self.value(result_id) else null;
             if (self.current_block == null) return null;
-            if (result) |value_to_exit| result = try self.ownValueEscapingSince(value_to_exit, baseline, unresolved_block.span);
-            try self.endLocalsSince(baseline, unresolved_block.span);
+            if (result) |value_to_exit| {
+                const parent_boundary = self.current_boundary;
+                const boundary = try self.newBoundary(unresolved_block.span);
+                self.current_boundary = boundary;
+                result = try self.ownValueEscapingSince(value_to_exit, baseline, unresolved_block.span);
+                self.current_boundary = parent_boundary;
+                try self.appendBoundary(boundary);
+            }
+            self.unbindLocalsSince(baseline);
             return result;
         }
 
@@ -346,7 +348,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
         }
 
         fn discardValue(self: *Self, value_to_discard: Value, span: structures.SourceSpan) !void {
-            try self.endTemporary(try self.borrowValue(value_to_discard, span), span);
+            _ = try self.borrowValue(value_to_discard, span);
         }
 
         fn breakLoop(self: *Self, value_id: semantic.UnresolvedBody.ValueId) !void {
@@ -354,7 +356,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             if (value_to_break.type_id == .never) return;
             const context = self.loop_stack.getLast();
             value_to_break = try self.ownValueEscapingSince(value_to_break, context.baseline, self.unresolved.blocks[@intFromEnum(self.unresolved.root_block)].span);
-            try self.endLocalsSince(context.baseline, self.unresolved.blocks[@intFromEnum(self.unresolved.root_block)].span);
+            self.unbindLocalsSince(context.baseline);
             const branch = try self.loopBranch(context, context.exit, value_to_break);
             self.terminate(.{ .branch = branch });
             try self.loop_breaks.append(self.ctx.allocator(), .{ .branch = branch, .state = try self.captureState(), .value = value_to_break });
@@ -362,7 +364,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
 
         fn continueLoop(self: *Self, span: structures.SourceSpan) !void {
             const context = self.loop_stack.getLast();
-            try self.endLocalsSince(context.baseline, span);
+            self.unbindLocalsSince(context.baseline);
             try self.validateLoopBackedge(context, span);
             const branch = try self.loopBranch(context, context.header, null);
             self.terminate(.{ .branch = branch });
@@ -406,20 +408,20 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             }
         }
 
-        fn endLocalsSince(self: *Self, baseline: StateId, span: structures.SourceSpan) !void {
+        fn unbindLocalsSince(self: *Self, baseline: StateId) void {
             const initial = self.states.items[@intFromEnum(baseline)].availability;
             var index = self.local_availability.len;
             while (index > 0) {
                 index -= 1;
-                if (initial[index] == .unbound and self.local_availability[index] != .unbound) try self.endLocal(index, span);
+                if (initial[index] == .unbound and self.local_availability[index] != .unbound) self.unbindLocal(index);
             }
         }
 
-        fn endAllLocals(self: *Self, span: structures.SourceSpan) !void {
+        fn unbindAllLocals(self: *Self) void {
             var index = self.local_availability.len;
             while (index > 0) {
                 index -= 1;
-                if (self.local_availability[index] != .unbound) try self.endLocal(index, span);
+                if (self.local_availability[index] != .unbound) self.unbindLocal(index);
             }
         }
 
@@ -435,8 +437,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             self.current_boundary = boundary;
             defer self.current_boundary = parent_boundary;
             try self.writeMutParameters();
-            try self.endPendingTemporaries(span);
-            try self.endAllLocals(span);
+            self.unbindAllLocals();
             try self.appendBoundary(boundary);
             self.terminate(terminator);
         }
@@ -444,18 +445,13 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
         fn ownValueEscapingSince(self: *Self, result: Value, baseline: StateId, span: structures.SourceSpan) !Value {
             const root = result.borrow_root orelse return result;
             if (self.states.items[@intFromEnum(baseline)].availability[@intFromEnum(root)] != .unbound) return result;
+            if (result.borrowed_generation == null) {
+                if (self.local_values[@intFromEnum(root)]) |owner| try self.recordUse(owner);
+            }
             return self.ownValue(result, span);
         }
 
-        fn endLocal(self: *Self, index: usize, span: structures.SourceSpan) !void {
-            const availability = self.local_availability[index];
-            const capabilities = (try self.type_interner.ownershipCapabilities(self.local_values[index].?.type_id)) orelse return error.Unavailable;
-            if (availability == .maybe_transferred and capabilities.needs_automatic_drop) {
-                return self.reject(span, .possibly_transferred);
-            }
-            if (availability != .transferred and self.local_mut_parameter[index] == null) {
-                try self.dropValue(self.local_values[index].?, self.local_can_deinit[index], span);
-            }
+        fn unbindLocal(self: *Self, index: usize) void {
             self.local_values[index] = null;
             self.local_availability[index] = .unbound;
         }
@@ -990,36 +986,6 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             return if (@intFromEnum(left_id) >= @intFromEnum(right_id)) left_id else right_id;
         }
 
-        fn endTemporary(self: *Self, temporary: Value, span: structures.SourceSpan) !void {
-            if (temporary.borrowed_type == null) return self.dropValue(temporary, false, span);
-            const predicate = temporary.borrow_condition orelse return;
-            const argument_start: u32 = @intCast(self.block_argument_types.items.len);
-            const borrowed = try self.newBlock(argument_start, argument_start);
-            const owned = try self.newBlock(argument_start, argument_start);
-            const join = try self.newBlock(argument_start, argument_start);
-            const expected = try self.appendInstruction(.{ .constb = true });
-            self.terminate(.{ .predicate_branch = .{
-                .operation = .eqb,
-                .operands = .{ .lhs = predicate, .rhs = expected.id },
-                .then_branch = self.emptyBranch(borrowed),
-                .else_branch = self.emptyBranch(owned),
-            } });
-            self.enterBlock(borrowed);
-            self.terminate(.{ .branch = self.emptyBranch(join) });
-            self.enterBlock(owned);
-            try self.dropValue(withoutOwnershipSource(temporary), false, span);
-            self.terminate(.{ .branch = self.emptyBranch(join) });
-            self.enterBlock(join);
-        }
-
-        fn endPendingTemporaries(self: *Self, span: structures.SourceSpan) !void {
-            var index = self.pending_temporaries.items.len;
-            while (index > 0) {
-                index -= 1;
-                try self.endTemporary(self.pending_temporaries.items[index], span);
-            }
-        }
-
         fn structInit(self: *Self, expression: Expression) !Value {
             const initializer = expression.operation.struct_init;
             const definition = (try self.type_interner.structDefinition(initializer.type_id)) orelse
@@ -1031,8 +997,8 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             @memset(seen, false);
             var fields: std.ArrayList(structures.StructFieldValue) = .empty;
             defer fields.deinit(self.ctx.allocator());
-            const pending_start = self.pending_temporaries.items.len;
-            defer self.pending_temporaries.shrinkRetainingCapacity(pending_start);
+            var field_values: std.ArrayList(Value) = .empty;
+            defer field_values.deinit(self.ctx.allocator());
             const source_fields = self.unresolved.struct_field_values[initializer.fields.start..initializer.fields.end];
             for (source_fields) |source_field| {
                 const field = definition.resolveField(source_field.name) orelse
@@ -1050,14 +1016,14 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                     try self.coerceOwnedRepresentation(owned, use, source_field.value.span)
                 else
                     owned;
-                try self.pending_temporaries.append(self.ctx.allocator(), field_value);
+                try field_values.append(self.ctx.allocator(), field_value);
                 try fields.append(self.ctx.allocator(), .{
                     .field_index = field.index,
                     .value = field_value.id,
                 });
             }
             for (seen) |was_seen| if (!was_seen) return self.reject(expression.span, .missing_struct_initializer_field);
-            for (self.pending_temporaries.items[pending_start..]) |field_value| try self.recordConsume(field_value);
+            for (field_values.items) |field_value| try self.recordConsume(field_value);
             const start: u32 = @intCast(self.struct_field_values.items.len);
             try self.struct_field_values.appendSlice(self.ctx.allocator(), fields.items);
             const result = try self.appendInstruction(.{ .struct_init = .{
@@ -1093,7 +1059,6 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 result.borrowed_generation = operand.owned_generation;
                 result.borrowed_cleanup_value = operand.id;
                 result = try self.ownValue(result, expression.span);
-                try self.dropValue(operand, false, access.operand.span);
             }
             return result;
         }
@@ -1130,7 +1095,6 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                     .borrowed_cleanup_value = operand.id,
                     .borrow_root = field.borrow_root,
                 }, span);
-                try self.dropValue(withoutOwnershipSource(operand), false, span);
                 break :blk copied;
             } else withoutOwnershipSource(field);
             self.terminate(.{ .branch = try self.valuesBranch(join, &.{owned_field}) });
@@ -1708,12 +1672,20 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                     return self.reject(assignment_value.value.span, .{ .assignment_type_mismatch = self.typeMismatch(target_type, operand.type_id) });
                 const owned = try self.ownValue(operand, assignment_value.value.span);
                 use.value = owned.id;
-                if (fields.items.len != 0 or self.local_availability[local_index] != .transferred) {
+                if (fields.items.len != 0) {
                     const target_capabilities = (try self.type_interner.ownershipCapabilities(latest_target.type_id)) orelse return error.Unavailable;
                     if (self.local_availability[local_index] == .maybe_transferred and target_capabilities.needs_automatic_drop) {
                         return self.reject(target_span, .possibly_transferred);
                     }
                     try self.dropValue(latest_target, self.local_can_deinit[local_index], target_span);
+                } else if (self.local_availability[local_index] != .transferred) {
+                    const parent_boundary = self.current_boundary;
+                    const transition_boundary = try self.newBoundary(target_span);
+                    self.current_boundary = transition_boundary;
+                    try self.recordUse(latest_target);
+                    self.current_boundary = parent_boundary;
+                    try self.appendBoundary(transition_boundary);
+                    try self.recordUse(owned);
                 }
                 break :blk if (use.coerce_to == null)
                     owned
@@ -1790,7 +1762,6 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             callable: struct {
                 operation: CallOperation,
                 is_fallible: bool,
-                temporary_drops: structures.FunctionValueRange,
                 mut_arguments: structures.FunctionValueRange,
             },
         };
@@ -1887,15 +1858,10 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             defer argument_places.deinit(self.ctx.allocator());
             var arguments_to_publish: std.ArrayList(structures.FunctionValueUse) = .empty;
             defer arguments_to_publish.deinit(self.ctx.allocator());
-            var temporary_drops_to_publish: std.ArrayList(Value) = .empty;
-            defer temporary_drops_to_publish.deinit(self.ctx.allocator());
             var arguments_to_consume: std.ArrayList(Value) = .empty;
             defer arguments_to_consume.deinit(self.ctx.allocator());
             var mut_arguments_to_publish: std.ArrayList(PendingMutArgument) = .empty;
             defer mut_arguments_to_publish.deinit(self.ctx.allocator());
-            const pending_start = self.pending_temporaries.items.len;
-            defer self.pending_temporaries.shrinkRetainingCapacity(pending_start);
-
             // Finish each argument before evaluating the next one. Nested copy
             // hooks may publish their own calls, so the outer operands stay in
             // local storage until their complete contiguous range is known.
@@ -1920,7 +1886,6 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 if (expected.mode == .@"var" or expected.mode == .deinit) {
                     const owned = try self.ownValue(operand, raw.span);
                     argument.value = owned.id;
-                    try self.pending_temporaries.append(self.ctx.allocator(), owned);
                     try arguments_to_consume.append(self.ctx.allocator(), owned);
                 } else if (expected.mode == .mut) {
                     const place = maybe_place orelse return self.reject(raw.span, .mutable_argument_requires_place);
@@ -1933,9 +1898,6 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                         },
                         .argument_index = @intCast(argument_index),
                     });
-                } else if (operand.borrowed_type == null or operand.borrow_condition != null) {
-                    try temporary_drops_to_publish.append(self.ctx.allocator(), operand);
-                    try self.pending_temporaries.append(self.ctx.allocator(), operand);
                 }
                 try arguments_to_publish.append(self.ctx.allocator(), argument);
             }
@@ -1966,12 +1928,6 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 .direct, .indirect => try self.call_arguments.appendSlice(self.ctx.allocator(), arguments_to_publish.items),
             }
             const arguments: structures.FunctionValueRange = .{ .start = argument_start, .end = @intCast(self.call_arguments.items.len) };
-            const temporary_drop_start: u32 = @intCast(self.call_temporary_drops.items.len);
-            try self.call_temporary_drops.appendSlice(self.ctx.allocator(), temporary_drops_to_publish.items);
-            const temporary_drops: structures.FunctionValueRange = .{
-                .start = temporary_drop_start,
-                .end = @intCast(self.call_temporary_drops.items.len),
-            };
             const mut_argument_start: u32 = @intCast(self.pending_mut_arguments.items.len);
             try self.pending_mut_arguments.appendSlice(self.ctx.allocator(), mut_arguments_to_publish.items);
             const mut_arguments: structures.FunctionValueRange = .{
@@ -1982,13 +1938,11 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 .direct => |item| .{ .callable = .{
                     .operation = .{ .direct = .{ .target = item, .arguments = arguments, .return_type = signature.return_type } },
                     .is_fallible = signature.is_fallible,
-                    .temporary_drops = temporary_drops,
                     .mut_arguments = mut_arguments,
                 } },
                 .indirect => |callee| .{ .callable = .{
                     .operation = .{ .indirect = .{ .target = callee, .arguments = arguments, .return_type = signature.return_type } },
                     .is_fallible = signature.is_fallible,
-                    .temporary_drops = temporary_drops,
                     .mut_arguments = mut_arguments,
                 } },
                 .intrinsic => blk: {
@@ -2027,19 +1981,10 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                     } else {
                         value_to_return = try self.defineOwnedValue(value_to_return, span, false);
                         try self.applyCallMutArguments(callable.operation, callable.mut_arguments);
-                        try self.dropCallTemporaries(callable.temporary_drops, span);
                     }
                     break :blk value_to_return;
                 },
             };
-        }
-
-        fn dropCallTemporaries(self: *Self, range: structures.FunctionValueRange, span: structures.SourceSpan) !void {
-            var index = @as(usize, range.end);
-            while (index > range.start) {
-                index -= 1;
-                try self.endTemporary(self.call_temporary_drops.items[index], span);
-            }
         }
 
         fn finishCallExits(
@@ -2064,7 +2009,6 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             self.current_boundary = boundary;
             defer self.current_boundary = parent_boundary;
             try self.applyCallMutArguments(callable.operation, callable.mut_arguments);
-            try self.dropCallTemporaries(callable.temporary_drops, span);
             try self.appendBoundary(boundary);
             flow_exit.state = try self.captureState();
             const source = self.blocks.items[@intFromEnum(flow_exit.block)];
@@ -2204,14 +2148,6 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 .callable => |callable| if (callable.is_fallible) blk: {
                     var flow = try self.lowerFallibleCall(callable.operation, call.span);
                     try self.finishCallExits(&flow, callable, call.span);
-                    if (flow.success) |*success| {
-                        const success_block = self.blocks.items[@intFromEnum(success.block)];
-                        success.temporary = .{
-                            .id = @enumFromInt(success_block.argument_start),
-                            .type_id = callReturnType(callable.operation),
-                            .owned_generation = self.block_argument_generations.items[success_block.argument_start],
-                        };
-                    }
                     break :blk flow;
                 } else self.reject(call.span, .if_condition_not_fallible),
             };
@@ -2311,10 +2247,9 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 .annotation_type = binding.annotation_type,
                 .span = binding.span,
             } else null;
-            const temporary = if (operand.borrowed_type == null or operand.borrow_condition != null) operand else null;
             return .{
-                .success = .{ .block = success, .state = state, .extraction = extraction, .temporary = temporary },
-                .failure = .{ .block = failure, .state = state, .temporary = temporary },
+                .success = .{ .block = success, .state = state, .extraction = extraction },
+                .failure = .{ .block = failure, .state = state },
             };
         }
 
@@ -2386,16 +2321,11 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 self.local_availability[index] = .available;
                 if (extraction.target_type == .never) self.terminate(.diverge);
             }
-            if (self.current_block != null) if (exit.temporary) |temporary| {
-                try self.endTemporary(temporary, self.unresolved.blocks[@intFromEnum(self.unresolved.root_block)].span);
-            };
         }
 
         fn mergeFlowExits(self: *Self, first_exit: ?FlowExit, second_exit: ?FlowExit) !?FlowExit {
-            var first = first_exit orelse return second_exit;
-            var second = second_exit orelse return first;
-            try self.finishFlowExitEffects(&first);
-            try self.finishFlowExitEffects(&second);
+            const first = first_exit orelse return second_exit;
+            const second = second_exit orelse return first;
             std.debug.assert(first.extraction == null and second.extraction == null);
             const first_state = self.states.items[@intFromEnum(first.state)];
             const second_state = self.states.items[@intFromEnum(second.state)];
@@ -2470,15 +2400,6 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             return .{ .block = merged, .state = state_id };
         }
 
-        fn finishFlowExitEffects(self: *Self, flow_exit: *FlowExit) !void {
-            if (flow_exit.temporary == null) return;
-            std.debug.assert(flow_exit.extraction == null);
-            try self.enterFlowExit(flow_exit.*);
-            flow_exit.state = try self.captureState();
-            flow_exit.block = self.suspendBlock();
-            flow_exit.temporary = null;
-        }
-
         fn conditional(self: *Self, expression: @FieldType(Expression.Operation, "if_else")) !Value {
             const baseline = try self.captureState();
             const flow = try self.condition(expression.condition);
@@ -2491,7 +2412,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 try self.enterFlowExit(success);
                 const result = try self.block(expression.then_block);
                 if (self.current_block != null) if (success.extraction) |extraction| {
-                    try self.endLocal(@intFromEnum(extraction.local), extraction.span);
+                    self.unbindLocal(@intFromEnum(extraction.local));
                 };
                 break :blk try self.valueExit(result);
             } else null;
@@ -2853,6 +2774,17 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             );
             defer solver.deinit();
             try solver.solve(&self.planned_cleanups, &self.explicit_abandonments);
+        }
+
+        fn emitExplicitAbandonmentDiagnostics(self: *Self) !bool {
+            if (self.explicit_abandonments.items.len == 0) return false;
+            const abandonment = self.explicit_abandonments.items[0];
+            const generation = self.generations.items[@intFromEnum(abandonment.generation)];
+            try emitSemanticIssue(self.ctx, self.file_id, .{
+                .span = generation.span,
+                .kind = .{ .value_requires_explicit_drop = generation.type_id },
+            });
+            return true;
         }
 
         fn materializeCleanups(self: *Self, cleanups: []const PlannedCleanup) !void {

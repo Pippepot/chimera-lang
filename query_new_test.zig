@@ -1626,7 +1626,7 @@ test "custom hook body edits rebuild executable behavior" {
     try testing.expectEqual(@as(u8, 42), try runtime.runProg(io, testing.allocator, &.{}));
 }
 
-test "custom drop rejects cleanup after a partial transfer" {
+test "conditional transfer drops the remaining owned path" {
     const db = try testDatabase(1);
     defer db.deinit();
     try addSource(db, 1,
@@ -1639,11 +1639,168 @@ test "custom drop rejects cleanup after a partial transfer" {
         \\    const moved = resource^
     );
     const bad = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveFunction("bad").?;
-    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, bad)).* == null);
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, bad)).* != null);
     const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, bad, structures.Diagnostic, testing.allocator);
     defer freeDiagnostics(diagnostics);
-    try testing.expectEqual(@as(usize, 1), diagnostics.len);
-    try testing.expectEqual(DiagnosticKind.possibly_transferred, std.meta.activeTag(diagnostics[0].kind));
+    try testing.expectEqual(@as(usize, 0), diagnostics.len);
+}
+
+test "last use cleanup runs before a later unrelated exit" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\static Resource = struct
+        \\  drop = func(deinit self: Resource) -> exit(self.value)
+        \\  value: int
+        \\func answer()
+        \\  const resource = Resource{value = 42}
+        \\  _ = resource
+        \\  exit(1)
+        \\answer()
+    );
+    const executable = (try db.get(query_structures.BuildExecutable, 1)).*.?;
+    const io = testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    try runtime.writeProgram(io, executable.bytes);
+    try testing.expectEqual(@as(u8, 42), try runtime.runProg(io, testing.allocator, &.{}));
+}
+
+test "ASAP cleanup follows initialization replacement branches loops and returns" {
+    const cases = [_]struct { source: []const u8, expected: u8 }{
+        .{
+            .source =
+            \\static Resource = struct
+            \\  drop = func(deinit self: Resource) -> exit(self.value)
+            \\  value: int
+            \\func answer()
+            \\  const resource = Resource{value = 42}
+            \\  exit(1)
+            \\answer()
+            ,
+            .expected = 42,
+        },
+        .{
+            .source =
+            \\static Resource = struct
+            \\  copy = trivial
+            \\  drop = func(deinit self: Resource) -> exit(self.value)
+            \\  value: int
+            \\func answer()
+            \\  var resource = Resource{value = 41}
+            \\  resource = Resource{value = resource.value + 1}
+            \\  exit(1)
+            \\answer()
+            ,
+            .expected = 41,
+        },
+        .{
+            .source =
+            \\static Resource = struct
+            \\  drop = func(deinit self: Resource) -> exit(self.value)
+            \\  value: int
+            \\func inspect(imm resource: Resource) -> return
+            \\func answer()
+            \\  const resource = Resource{value = 42}
+            \\  if 1 > 2
+            \\    inspect(resource)
+            \\  else exit(41)
+            \\answer()
+            ,
+            .expected = 42,
+        },
+        .{
+            .source =
+            \\static Resource = struct
+            \\  drop = func(deinit self: Resource) -> exit(self.value)
+            \\  value: int
+            \\func answer()
+            \\  var resource = Resource{value = 41}
+            \\  var iteration = 0
+            \\  loop
+            \\    if iteration < 1
+            \\      iteration += 1
+            \\      continue
+            \\    resource.value += 1
+            \\    break
+            \\  exit(1)
+            \\answer()
+            ,
+            .expected = 42,
+        },
+        .{
+            .source =
+            \\static Resource = struct
+            \\  drop = func(deinit self: Resource) -> exit(self.value)
+            \\  value: int
+            \\func answer()
+            \\  loop
+            \\    const resource = Resource{value = 42}
+            \\    break
+            \\  exit(1)
+            \\answer()
+            ,
+            .expected = 42,
+        },
+        .{
+            .source =
+            \\static Resource = struct
+            \\  drop = func(deinit self: Resource) -> exit(self.value)
+            \\  value: int
+            \\func answer()
+            \\  var iteration = 0
+            \\  loop
+            \\    const resource = Resource{value = 41}
+            \\    if iteration < 1
+            \\      iteration += 1
+            \\      continue
+            \\    _ = resource
+            \\    break
+            \\  exit(1)
+            \\answer()
+            ,
+            .expected = 41,
+        },
+        .{
+            .source =
+            \\static Resource = struct
+            \\  drop = func(deinit self: Resource) -> exit(self.value)
+            \\  value: int
+            \\func answer() int
+            \\  const resource = Resource{value = 42}
+            \\  return resource.value
+            \\exit(answer())
+            ,
+            .expected = 42,
+        },
+        .{
+            .source =
+            \\static Resource = struct
+            \\  drop = func(deinit self: Resource)
+            \\    if self.value == 42 -> exit(42)
+            \\    return
+            \\  value: int
+            \\func inspect(imm first: Resource, imm second: Resource) -> return
+            \\func answer()
+            \\  const first = Resource{value = 41}
+            \\  const second = Resource{value = 42}
+            \\  inspect(first, second)
+            \\  exit(1)
+            \\answer()
+            ,
+            .expected = 42,
+        },
+    };
+
+    const io = testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    for (cases, 1..) |case, file_id| {
+        const db = try testDatabase(1);
+        defer db.deinit();
+        try addSource(db, file_id, case.source);
+        const executable = (try db.get(query_structures.BuildExecutable, file_id)).*.?;
+        try runtime.writeProgram(io, executable.bytes);
+        try testing.expectEqual(case.expected, try runtime.runProg(io, testing.allocator, &.{}));
+    }
 }
 
 test "struct layouts preserve declaration order alignment and nesting" {
@@ -6113,6 +6270,7 @@ test "explicit-drop struct obligations are checked at every lifetime end" {
     const cases = [_][]const u8{
         "func bad()\n  const resource = Resource{value = 42}",
         "func bad()\n  Resource{value = 42}",
+        "func bad()\n  _ = Resource{value = 42}",
         "func bad()\n  var resource = Resource{value = 41}\n  resource = Resource{value = 42}",
         "func inspect(imm resource: Resource) int -> resource.value\nfunc bad() int -> inspect(Resource{value = 42})",
         "func bad() int -> Resource{value = 42}.value",
