@@ -1379,6 +1379,206 @@ test "custom ownership hooks execute without active-hook redispatch" {
     }
 }
 
+test "ownership effects compose across calls joins scopes and partial aggregates" {
+    const cases = [_]struct { source: []const u8, expected: u8 }{
+        .{
+            .source =
+            \\struct Box
+            \\  copy = func(read self: Box) Box -> Box{value = self.value + 1}
+            \\  value: int
+            \\func take(var box: Box) int -> box.value
+            \\const box = Box{value = 41}
+            \\exit(take(box))
+            ,
+            .expected = 42,
+        },
+        .{
+            .source =
+            \\struct Resource
+            \\  drop = func(deinit self: Resource) -> exit(42)
+            \\fallible fail() int
+            \\  1 < 0
+            \\  return 1
+            \\fallible attempt() int
+            \\  const resource = Resource{}
+            \\  const value = fail()
+            \\  return value
+            \\if attempt() -> exit(1) else exit(0)
+            ,
+            .expected = 42,
+        },
+        .{
+            .source =
+            \\struct Resource
+            \\  copy = func(read self: Resource) Resource -> exit(41)
+            \\  drop = func(deinit self: Resource) -> exit(42)
+            \\const selected = if 1 < 2
+            \\  const resource = Resource{}
+            \\  resource
+            \\else Resource{}
+            \\exit(0)
+            ,
+            .expected = 41,
+        },
+        .{
+            .source =
+            \\struct Resource
+            \\  copy = func(read self: Resource) Resource -> exit(41)
+            \\  drop = func(deinit self: Resource) -> exit(42)
+            \\const outer = Resource{}
+            \\const selected = if 1 < 2
+            \\  const inner = Resource{}
+            \\  if 1 < 2 -> inner else outer
+            \\else outer
+            \\exit(0)
+            ,
+            .expected = 41,
+        },
+        .{
+            .source =
+            \\struct Resource
+            \\  copy = trivial
+            \\  drop = func(deinit self: Resource) -> exit(42)
+            \\func inspect(read resource: Resource) -> return
+            \\const resource = Resource{}
+            \\inspect(if 1 < 2 -> resource else Resource{})
+            \\exit(0)
+            ,
+            .expected = 0,
+        },
+        .{
+            .source =
+            \\struct Resource
+            \\  copy = func(read self: Resource) Resource -> Resource{}
+            \\  drop = func(deinit self: Resource) -> exit(42)
+            \\func inspect(read resource: Resource) -> return
+            \\const resource = Resource{}
+            \\inspect(if 1 > 2 -> resource else Resource{})
+            \\exit(0)
+            ,
+            .expected = 42,
+        },
+        .{
+            .source =
+            \\struct Resource
+            \\  value: int
+            \\  copy = trivial
+            \\  drop = func(deinit self: Resource)
+            \\    if self.value == 2 -> exit(42)
+            \\    return
+            \\var resource = Resource{value = 1}
+            \\resource = if 1 < 2
+            \\  resource = Resource{value = 2}
+            \\  Resource{value = 3}
+            \\else Resource{value = 4}
+            \\exit(0)
+            ,
+            .expected = 42,
+        },
+        .{
+            .source =
+            \\struct Resource
+            \\  drop = func(deinit self: Resource) -> exit(42)
+            \\fallible make() Resource -> Resource{}
+            \\if make() -> exit(0) else exit(1)
+            ,
+            .expected = 42,
+        },
+        .{
+            .source =
+            \\struct Resource
+            \\  drop = func(deinit self: Resource) -> exit(42)
+            \\struct Pair
+            \\  first: Resource
+            \\  second: int
+            \\fallible fail() int
+            \\  1 < 0
+            \\  return 1
+            \\fallible attempt() Pair -> Pair{first = Resource{}, second = fail()}
+            \\if attempt() -> exit(1) else exit(0)
+            ,
+            .expected = 42,
+        },
+        .{
+            .source =
+            \\struct Resource
+            \\  copy = func(read self: Resource) Resource -> exit(42)
+            \\func later() int -> exit(41)
+            \\func take(var resource: Resource, value: int) -> return
+            \\const resource = Resource{}
+            \\take(resource, later())
+            ,
+            .expected = 42,
+        },
+        .{
+            .source =
+            \\struct Resource
+            \\  drop = func(deinit self: Resource) -> exit(42)
+            \\func make() Resource | int -> Resource{}
+            \\if make() is Resource -> exit(0) else exit(1)
+            ,
+            .expected = 42,
+        },
+        .{
+            .source =
+            \\struct Leaf
+            \\  copy = trivial
+            \\  value: int
+            \\struct Wrap
+            \\  copy = trivial
+            \\  drop = func(deinit self: Wrap) -> exit(42)
+            \\  leaf: Leaf
+            \\func inspect(read leaf: Leaf) -> return
+            \\const wrap = Wrap{leaf = Leaf{value = 1}}
+            \\inspect((if 1 > 2 -> wrap else Wrap{leaf = Leaf{value = 2}}).leaf)
+            \\exit(0)
+            ,
+            .expected = 42,
+        },
+    };
+    const io = testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    for (cases, 1..) |case, file_id| {
+        const db = try testDatabase(1);
+        defer db.deinit();
+        try addSource(db, file_id, case.source);
+        const executable = (try db.get(query_structures.BuildExecutable, file_id)).*.?;
+        try runtime.writeProgram(io, executable.bytes);
+        try testing.expectEqual(case.expected, try runtime.runProg(io, testing.allocator, &.{}));
+    }
+}
+
+test "failure and condition results enforce explicit drop" {
+    const cases = [_][]const u8{
+        \\struct Resource
+        \\  drop = explicit
+        \\fallible fail() int
+        \\  1 < 0
+        \\  return 1
+        \\fallible attempt() int
+        \\  const resource = Resource{}
+        \\  const value = fail()
+        \\  return value
+        \\if attempt() -> exit(1) else exit(0)
+        ,
+        \\struct Resource
+        \\  drop = explicit
+        \\fallible make() Resource -> Resource{}
+        \\if make() -> exit(0) else exit(1)
+        ,
+    };
+    for (cases, 1..) |source, file_id| {
+        const db = try testDatabase(1);
+        defer db.deinit();
+        try addSource(db, file_id, source);
+        try testing.expect((try db.get(query_structures.BuildExecutable, file_id)).* == null);
+        const diagnostics = try db.transitiveAccumulatorValues(query_structures.BuildExecutable, file_id, structures.Diagnostic, testing.allocator);
+        defer freeDiagnostics(diagnostics);
+        try testing.expectEqual(@as(usize, 1), diagnostics.len);
+        try testing.expectEqual(DiagnosticKind.value_requires_explicit_drop, std.meta.activeTag(diagnostics[0].kind));
+    }
+}
+
 test "custom hook body edits rebuild executable behavior" {
     const db = try testDatabase(1);
     defer db.deinit();
@@ -7091,8 +7291,15 @@ fn testTypedExpressionAllocations(gpa: std.mem.Allocator) !void {
     const db = try Database.init(gpa, .{ .worker_count = 1 });
     defer db.deinit();
     try addSource(db, 1,
+        \\struct Box
+        \\  copy = func(read self: Box) Box -> Box{value = self.value}
+        \\  drop = func(deinit self: Box) -> return
+        \\  value: int
         \\static identity = func(value: int) int -> return value
         \\static choose = func(flag: int) int | none
+        \\  const box = Box{value = flag}
+        \\  const copied = box
+        \\  copied.value
         \\  const saved = identity(flag)
         \\  const alias: int = saved
         \\  identity(alias)

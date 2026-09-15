@@ -42,8 +42,12 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
         const Value = struct {
             id: structures.FunctionValueId,
             type_id: structures.TypeId,
-            copy_source: ?structures.TypeId = null,
-            copy_condition: ?structures.FunctionValueId = null,
+            // `borrow_condition` is true on paths where ownership still belongs
+            // to `borrowed_type`; `borrow_root` is the youngest possible local
+            // source and therefore the first lexical lifetime that can end.
+            borrowed_type: ?structures.TypeId = null,
+            borrow_condition: ?structures.FunctionValueId = null,
+            borrow_root: ?semantic.UnresolvedBody.LocalId = null,
             explicit_transfer: bool = false,
         };
         const Availability = enum { unbound, available, transferred, maybe_transferred };
@@ -64,6 +68,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             block: structures.FunctionBlockId,
             state: StateId,
             extraction: ?PendingExtraction = null,
+            temporary: ?Value = null,
         };
         const ValueExit = struct {
             block: structures.FunctionBlockId,
@@ -117,6 +122,9 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
         struct_field_values: std.ArrayList(structures.StructFieldValue) = .empty,
         call_arguments: std.ArrayList(structures.FunctionValueUse) = .empty,
         call_temporary_drops: std.ArrayList(Value) = .empty,
+        // Values constructed inside the expression currently being evaluated.
+        // A propagated failure ends them before it ends named locals.
+        pending_temporaries: std.ArrayList(Value) = .empty,
         mut_argument_fields: std.ArrayList(PlaceField) = .empty,
         pending_mut_arguments: std.ArrayList(PendingMutArgument) = .empty,
         branch_arguments: std.ArrayList(structures.FunctionValueUse) = .empty,
@@ -148,7 +156,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                     .read => self.values[index] = .{
                         .id = entry_value.id,
                         .type_id = entry_value.type_id,
-                        .copy_source = entry_value.type_id,
+                        .borrowed_type = entry_value.type_id,
                     },
                     .mut, .@"var", .deinit => {
                         self.local_values[parameter_local] = entry_value;
@@ -184,6 +192,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             self.struct_field_values.deinit(gpa);
             self.call_arguments.deinit(gpa);
             self.call_temporary_drops.deinit(gpa);
+            self.pending_temporaries.deinit(gpa);
             self.mut_argument_fields.deinit(gpa);
             self.pending_mut_arguments.deinit(gpa);
             self.branch_arguments.deinit(gpa);
@@ -207,9 +216,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             if (self.current_block == null) return;
             const root = self.unresolved.blocks[@intFromEnum(self.unresolved.root_block)];
             if (self.return_type == .unit) {
-                try self.writeMutParameters();
-                try self.endAllLocals(root.span);
-                self.terminate(.return_unit);
+                try self.finishFunctionExit(root.span, .return_unit);
             } else {
                 return self.reject(root.span, .{ .missing_return_value = self.return_type });
             }
@@ -231,8 +238,9 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 }
             }
             if (self.current_block == null) return null;
-            const result = if (unresolved_block.result) |result_id| try self.value(result_id) else null;
+            var result = if (unresolved_block.result) |result_id| try self.value(result_id) else null;
             if (self.current_block == null) return null;
+            if (result) |value_to_exit| result = try self.ownValueEscapingSince(value_to_exit, baseline, unresolved_block.span);
             try self.endLocalsSince(baseline, unresolved_block.span);
             return result;
         }
@@ -248,14 +256,14 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
         }
 
         fn discardValue(self: *Self, value_to_discard: Value, span: structures.SourceSpan) !void {
-            const borrowed = try self.borrowValue(value_to_discard, span);
-            if (borrowed.copy_source == null) try self.dropValue(borrowed, false, span);
+            try self.endTemporary(try self.borrowValue(value_to_discard, span), span);
         }
 
         fn breakLoop(self: *Self, value_id: semantic.UnresolvedBody.ValueId) !void {
-            const value_to_break = try self.value(value_id);
+            var value_to_break = try self.value(value_id);
             if (value_to_break.type_id == .never) return;
             const context = self.loop_stack.getLast();
+            value_to_break = try self.ownValueEscapingSince(value_to_break, context.baseline, self.unresolved.blocks[@intFromEnum(self.unresolved.root_block)].span);
             try self.endLocalsSince(context.baseline, self.unresolved.blocks[@intFromEnum(self.unresolved.root_block)].span);
             const branch = try self.loopBranch(context, context.exit, value_to_break);
             self.terminate(.{ .branch = branch });
@@ -272,17 +280,13 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
 
         fn returnNothing(self: *Self, span: structures.SourceSpan) !void {
             if (self.return_type == .unit) {
-                try self.writeMutParameters();
-                try self.endAllLocals(span);
-                self.terminate(.return_unit);
+                try self.finishFunctionExit(span, .return_unit);
                 return;
             }
             const unit = try self.appendInstruction(.const_unit);
             const use = try self.coerceValue(unit.id, .unit, self.return_type) orelse
                 return self.reject(span, .{ .missing_return_value = self.return_type });
-            try self.writeMutParameters();
-            try self.endAllLocals(span);
-            self.terminate(.{ .return_value = use });
+            try self.finishFunctionExit(span, .{ .return_value = use });
         }
 
         fn returnValue(self: *Self, value_to_return: Value, span: structures.SourceSpan) !void {
@@ -294,9 +298,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 return self.reject(span, .{ .return_type_mismatch = self.typeMismatch(self.return_type, value_to_return.type_id) });
             const owned = try self.ownValue(value_to_return, span);
             use.value = owned.id;
-            try self.writeMutParameters();
-            try self.endAllLocals(span);
-            self.terminate(if (self.return_type == .unit) .return_unit else .{ .return_value = use });
+            try self.finishFunctionExit(span, if (self.return_type == .unit) .return_unit else .{ .return_value = use });
         }
 
         fn propagateCondition(self: *Self, condition_id: semantic.UnresolvedBody.ConditionId, span: structures.SourceSpan) !void {
@@ -304,9 +306,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             const flow = try self.condition(condition_id);
             if (flow.failure) |failure| {
                 try self.enterFlowExit(failure);
-                try self.writeMutParameters();
-                try self.endAllLocals(span);
-                self.terminate(.return_failure);
+                try self.finishFunctionExit(span, .return_failure);
             }
             if (flow.success) |success| {
                 try self.enterFlowExit(success);
@@ -328,6 +328,19 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 index -= 1;
                 if (self.local_availability[index] != .unbound) try self.endLocal(index, span);
             }
+        }
+
+        fn finishFunctionExit(self: *Self, span: structures.SourceSpan, terminator: structures.FunctionTerminator) !void {
+            try self.writeMutParameters();
+            try self.endPendingTemporaries(span);
+            try self.endAllLocals(span);
+            self.terminate(terminator);
+        }
+
+        fn ownValueEscapingSince(self: *Self, result: Value, baseline: StateId, span: structures.SourceSpan) !Value {
+            const root = result.borrow_root orelse return result;
+            if (self.states.items[@intFromEnum(baseline)].availability[@intFromEnum(root)] != .unbound) return result;
+            return self.ownValue(result, span);
         }
 
         fn endLocal(self: *Self, index: usize, span: structures.SourceSpan) !void {
@@ -379,7 +392,8 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 .maybe_transferred => return self.reject(span, .possibly_transferred),
             }
             var value_to_read = self.local_values[index].?;
-            value_to_read.copy_source = value_to_read.type_id;
+            value_to_read.borrowed_type = value_to_read.type_id;
+            value_to_read.borrow_root = local;
             return value_to_read;
         }
 
@@ -407,16 +421,16 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
         }
 
         fn ownValue(self: *Self, value_to_own: Value, span: structures.SourceSpan) !Value {
-            if (try self.nonCopyableSource(value_to_own)) |source_type| return self.reject(span, .{ .type_not_copyable = source_type });
-            if (value_to_own.copy_source == null) return withoutOwnershipSource(value_to_own);
+            if (try self.nonCopyableBorrow(value_to_own)) |source_type| return self.reject(span, .{ .type_not_copyable = source_type });
+            if (value_to_own.borrowed_type == null) return withoutOwnershipSource(value_to_own);
             const source = withoutOwnershipSource(value_to_own);
-            return if (value_to_own.copy_condition) |copy_predicate|
-                self.copyValueConditionally(source, copy_predicate)
+            return if (value_to_own.borrow_condition) |borrow_predicate|
+                self.copyValueConditionally(source, borrow_predicate)
             else
                 self.copyValue(source);
         }
 
-        fn copyValueConditionally(self: *Self, source: Value, copy_predicate: structures.FunctionValueId) !Value {
+        fn copyValueConditionally(self: *Self, source: Value, borrow_predicate: structures.FunctionValueId) !Value {
             const argument_start: u32 = @intCast(self.block_argument_types.items.len);
             try self.block_argument_types.append(self.ctx.allocator(), source.type_id);
             const copy_block = try self.newBlock(argument_start, argument_start);
@@ -425,7 +439,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             const expected = try self.appendInstruction(.{ .constb = true });
             self.terminate(.{ .predicate_branch = .{
                 .operation = .eqb,
-                .operands = .{ .lhs = copy_predicate, .rhs = expected.id },
+                .operands = .{ .lhs = borrow_predicate, .rhs = expected.id },
                 .then_branch = self.emptyBranch(copy_block),
                 .else_branch = self.emptyBranch(owned_block),
             } });
@@ -538,38 +552,11 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             members: []const structures.TypeId,
             operation: OwnershipOperation,
         ) anyerror!Value {
-            std.debug.assert(members.len != 0);
-            const tag = try self.appendInstruction(.{ .variant_tag = source.id });
-            const result_argument: u32 = @intCast(self.block_argument_types.items.len);
-            try self.block_argument_types.append(self.ctx.allocator(), source.type_id);
-            const join = try self.newBlock(result_argument, result_argument + 1);
-
-            for (members, 0..) |member, member_index| {
-                const case = try self.newBlock(result_argument, result_argument);
-                if (member_index + 1 == members.len) {
-                    self.terminate(.{ .branch = self.emptyBranch(case) });
-                } else {
-                    const next = try self.newBlock(result_argument, result_argument);
-                    const expected = try self.appendInstruction(.{ .consti = @intCast(member_index) });
-                    self.terminate(.{ .predicate_branch = .{
-                        .operation = .eqi,
-                        .operands = .{ .lhs = tag.id, .rhs = expected.id },
-                        .then_branch = self.emptyBranch(case),
-                        .else_branch = self.emptyBranch(next),
-                    } });
-                    self.enterBlock(case);
-                    const result = try self.mapExtractedVariantMember(source, member, operation);
-                    self.terminate(.{ .branch = try self.valuesBranch(join, &.{result}) });
-                    self.enterBlock(next);
-                    continue;
-                }
-
-                self.enterBlock(case);
-                const result = try self.mapExtractedVariantMember(source, member, operation);
-                self.terminate(.{ .branch = try self.valuesBranch(join, &.{result}) });
-            }
-            self.enterBlock(join);
-            return .{ .id = @enumFromInt(result_argument), .type_id = source.type_id };
+            return (try self.operateOnVariantMember(source, members, switch (operation) {
+                .copy => .copy,
+                .move => .move,
+                .drop => unreachable,
+            })).?;
         }
 
         fn mapExtractedVariantMember(self: *Self, source: Value, member: structures.TypeId, operation: OwnershipOperation) anyerror!Value {
@@ -596,44 +583,79 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             can_deinit: bool,
             span: structures.SourceSpan,
         ) anyerror!void {
+            _ = try self.operateOnVariantMember(source, members, .{ .drop = .{
+                .can_deinit = can_deinit,
+                .span = span,
+            } });
+        }
+
+        const VariantOwnershipOperation = union(enum) {
+            copy,
+            move,
+            drop: struct {
+                can_deinit: bool,
+                span: structures.SourceSpan,
+            },
+        };
+
+        fn operateOnVariantMember(
+            self: *Self,
+            source: Value,
+            members: []const structures.TypeId,
+            operation: VariantOwnershipOperation,
+        ) anyerror!?Value {
             std.debug.assert(members.len != 0);
             const tag = try self.appendInstruction(.{ .variant_tag = source.id });
             const argument_start: u32 = @intCast(self.block_argument_types.items.len);
-            const join = try self.newBlock(argument_start, argument_start);
+            switch (operation) {
+                .copy, .move => try self.block_argument_types.append(self.ctx.allocator(), source.type_id),
+                .drop => {},
+            }
+            const join = try self.newBlock(argument_start, @intCast(self.block_argument_types.items.len));
 
             for (members, 0..) |member, member_index| {
                 const case = try self.newBlock(argument_start, argument_start);
-                if (member_index + 1 == members.len) {
-                    self.terminate(.{ .branch = self.emptyBranch(case) });
-                } else {
-                    const next = try self.newBlock(argument_start, argument_start);
+                const next = if (member_index + 1 == members.len)
+                    null
+                else
+                    try self.newBlock(argument_start, argument_start);
+                if (next) |next_block| {
                     const expected = try self.appendInstruction(.{ .consti = @intCast(member_index) });
                     self.terminate(.{ .predicate_branch = .{
                         .operation = .eqi,
                         .operands = .{ .lhs = tag.id, .rhs = expected.id },
                         .then_branch = self.emptyBranch(case),
-                        .else_branch = self.emptyBranch(next),
+                        .else_branch = self.emptyBranch(next_block),
                     } });
-                    self.enterBlock(case);
-                    const extracted = try self.appendInstruction(.{ .variant_extract = .{
-                        .operand = source.id,
-                        .target_type = member,
-                    } });
-                    try self.dropValue(extracted, can_deinit, span);
-                    self.terminate(.{ .branch = self.emptyBranch(join) });
-                    self.enterBlock(next);
-                    continue;
+                } else {
+                    self.terminate(.{ .branch = self.emptyBranch(case) });
                 }
-
                 self.enterBlock(case);
-                const extracted = try self.appendInstruction(.{ .variant_extract = .{
-                    .operand = source.id,
-                    .target_type = member,
-                } });
-                try self.dropValue(extracted, can_deinit, span);
-                self.terminate(.{ .branch = self.emptyBranch(join) });
+                switch (operation) {
+                    .drop => |drop| {
+                        const extracted = try self.appendInstruction(.{ .variant_extract = .{
+                            .operand = source.id,
+                            .target_type = member,
+                        } });
+                        try self.dropValue(extracted, drop.can_deinit, drop.span);
+                        self.terminate(.{ .branch = self.emptyBranch(join) });
+                    },
+                    .copy => {
+                        const result = try self.mapExtractedVariantMember(source, member, .copy);
+                        self.terminate(.{ .branch = try self.valuesBranch(join, &.{result}) });
+                    },
+                    .move => {
+                        const result = try self.mapExtractedVariantMember(source, member, .move);
+                        self.terminate(.{ .branch = try self.valuesBranch(join, &.{result}) });
+                    },
+                }
+                if (next) |next_block| self.enterBlock(next_block);
             }
             self.enterBlock(join);
+            return switch (operation) {
+                .drop => null,
+                .copy, .move => .{ .id = @enumFromInt(argument_start), .type_id = source.type_id },
+            };
         }
 
         fn dropValue(self: *Self, value_to_drop: Value, can_deinit: bool, span: structures.SourceSpan) anyerror!void {
@@ -664,8 +686,8 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             }
         }
 
-        fn nonCopyableSource(self: *Self, value_to_check: Value) !?structures.TypeId {
-            const source_type = value_to_check.copy_source orelse return null;
+        fn nonCopyableBorrow(self: *Self, value_to_check: Value) !?structures.TypeId {
+            const source_type = value_to_check.borrowed_type orelse return null;
             const capabilities = (try self.type_interner.ownershipCapabilities(source_type)) orelse return error.Unavailable;
             return if (capabilities.copy == .none) source_type else null;
         }
@@ -673,7 +695,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
         fn borrowValue(self: *Self, borrowed: Value, span: structures.SourceSpan) !Value {
             if (borrowed.explicit_transfer) return self.reject(span, .ownership_transfer_requires_owning_context);
             const capabilities = (try self.type_interner.ownershipCapabilities(borrowed.type_id)) orelse return error.Unavailable;
-            if (borrowed.copy_source == null and capabilities.requires_explicit_drop) {
+            if (borrowed.borrowed_type == null and capabilities.requires_explicit_drop) {
                 return self.reject(span, .{ .value_requires_explicit_drop = borrowed.type_id });
             }
             return borrowed;
@@ -681,6 +703,42 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
 
         fn withoutOwnershipSource(resolved: Value) Value {
             return .{ .id = resolved.id, .type_id = resolved.type_id };
+        }
+
+        fn laterBorrowRoot(left: ?semantic.UnresolvedBody.LocalId, right: ?semantic.UnresolvedBody.LocalId) ?semantic.UnresolvedBody.LocalId {
+            const left_id = left orelse return right;
+            const right_id = right orelse return left;
+            return if (@intFromEnum(left_id) >= @intFromEnum(right_id)) left_id else right_id;
+        }
+
+        fn endTemporary(self: *Self, temporary: Value, span: structures.SourceSpan) !void {
+            if (temporary.borrowed_type == null) return self.dropValue(temporary, false, span);
+            const predicate = temporary.borrow_condition orelse return;
+            const argument_start: u32 = @intCast(self.block_argument_types.items.len);
+            const borrowed = try self.newBlock(argument_start, argument_start);
+            const owned = try self.newBlock(argument_start, argument_start);
+            const join = try self.newBlock(argument_start, argument_start);
+            const expected = try self.appendInstruction(.{ .constb = true });
+            self.terminate(.{ .predicate_branch = .{
+                .operation = .eqb,
+                .operands = .{ .lhs = predicate, .rhs = expected.id },
+                .then_branch = self.emptyBranch(borrowed),
+                .else_branch = self.emptyBranch(owned),
+            } });
+            self.enterBlock(borrowed);
+            self.terminate(.{ .branch = self.emptyBranch(join) });
+            self.enterBlock(owned);
+            try self.dropValue(withoutOwnershipSource(temporary), false, span);
+            self.terminate(.{ .branch = self.emptyBranch(join) });
+            self.enterBlock(join);
+        }
+
+        fn endPendingTemporaries(self: *Self, span: structures.SourceSpan) !void {
+            var index = self.pending_temporaries.items.len;
+            while (index > 0) {
+                index -= 1;
+                try self.endTemporary(self.pending_temporaries.items[index], span);
+            }
         }
 
         fn structInit(self: *Self, expression: Expression) !Value {
@@ -694,6 +752,8 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             @memset(seen, false);
             var fields: std.ArrayList(structures.StructFieldValue) = .empty;
             defer fields.deinit(self.ctx.allocator());
+            const pending_start = self.pending_temporaries.items.len;
+            defer self.pending_temporaries.shrinkRetainingCapacity(pending_start);
             const source_fields = self.unresolved.struct_field_values[initializer.fields.start..initializer.fields.end];
             for (source_fields) |source_field| {
                 const field = definition.resolveField(source_field.name) orelse
@@ -706,6 +766,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 var use = try self.coerceValue(operand.id, operand.type_id, field.type_id) orelse
                     return self.reject(source_field.value.span, .{ .struct_initializer_field_type_mismatch = self.typeMismatch(field.type_id, operand.type_id) });
                 const owned = try self.ownValue(operand, source_field.value.span);
+                try self.pending_temporaries.append(self.ctx.allocator(), owned);
                 use.value = owned.id;
                 const field_value = if (use.coerce_to) |_| try self.appendCoercion(use) else owned;
                 try fields.append(self.ctx.allocator(), .{
@@ -735,15 +796,62 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 .field_index = field.index,
                 .field_type = field.type_id,
             } });
-            if (operand.copy_source != null) {
-                result.copy_source = field.type_id;
-                result.copy_condition = operand.copy_condition;
+            if (operand.borrowed_type != null) {
+                result.borrowed_type = field.type_id;
+                result.borrow_root = operand.borrow_root;
+                if (operand.borrow_condition) |borrow_condition| {
+                    return self.accessConditionalTemporary(operand, result, borrow_condition, expression.span);
+                }
             } else if ((try self.type_interner.ownershipCapabilities(operand.type_id) orelse return error.Unavailable).needs_automatic_drop) {
-                result.copy_source = field.type_id;
+                result.borrowed_type = field.type_id;
                 result = try self.ownValue(result, expression.span);
                 try self.dropValue(operand, false, access.operand.span);
             }
             return result;
+        }
+
+        fn accessConditionalTemporary(
+            self: *Self,
+            operand: Value,
+            field: Value,
+            borrow_condition: structures.FunctionValueId,
+            span: structures.SourceSpan,
+        ) !Value {
+            const argument_start: u32 = @intCast(self.block_argument_types.items.len);
+            try self.block_argument_types.append(self.ctx.allocator(), field.type_id);
+            const borrowed = try self.newBlock(argument_start, argument_start);
+            const owned = try self.newBlock(argument_start, argument_start);
+            const join = try self.newBlock(argument_start, argument_start + 1);
+            const expected = try self.appendInstruction(.{ .constb = true });
+            self.terminate(.{ .predicate_branch = .{
+                .operation = .eqb,
+                .operands = .{ .lhs = borrow_condition, .rhs = expected.id },
+                .then_branch = self.emptyBranch(borrowed),
+                .else_branch = self.emptyBranch(owned),
+            } });
+            self.enterBlock(borrowed);
+            self.terminate(.{ .branch = try self.valuesBranch(join, &.{field}) });
+            self.enterBlock(owned);
+            const capabilities = (try self.type_interner.ownershipCapabilities(operand.type_id)) orelse return error.Unavailable;
+            const owned_field = if (capabilities.needs_automatic_drop or capabilities.requires_explicit_drop) blk: {
+                const copied = try self.ownValue(.{
+                    .id = field.id,
+                    .type_id = field.type_id,
+                    .borrowed_type = field.borrowed_type,
+                    .borrow_root = field.borrow_root,
+                }, span);
+                try self.dropValue(withoutOwnershipSource(operand), false, span);
+                break :blk copied;
+            } else withoutOwnershipSource(field);
+            self.terminate(.{ .branch = try self.valuesBranch(join, &.{owned_field}) });
+            self.enterBlock(join);
+            return .{
+                .id = @enumFromInt(argument_start),
+                .type_id = field.type_id,
+                .borrowed_type = field.type_id,
+                .borrow_condition = borrow_condition,
+                .borrow_root = field.borrow_root,
+            };
         }
 
         fn captureState(self: *Self) !StateId {
@@ -856,35 +964,39 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                     availability.* = joinAvailability(availability.*, self.states.items[@intFromEnum(break_edge.state)].availability[index]);
                 }
             }
-            var copy_source: ?structures.TypeId = null;
-            var any_copy_source = false;
-            var all_copy_sources = true;
-            var has_conditional_copy = false;
-            var available_copy_source: ?structures.TypeId = null;
+            var any_borrowed = false;
+            var all_borrowed = true;
+            var has_conditional_borrow = false;
             var contains_transfer = false;
+            var borrow_root: ?semantic.UnresolvedBody.LocalId = null;
+            var borrowed_source: ?structures.TypeId = null;
             for (breaks) |break_edge| {
-                if (copy_source == null) copy_source = try self.nonCopyableSource(break_edge.value);
-                any_copy_source = any_copy_source or break_edge.value.copy_source != null;
-                all_copy_sources = all_copy_sources and break_edge.value.copy_source != null;
-                has_conditional_copy = has_conditional_copy or break_edge.value.copy_condition != null;
-                if (available_copy_source == null) available_copy_source = break_edge.value.copy_source;
+                any_borrowed = any_borrowed or break_edge.value.borrowed_type != null;
+                all_borrowed = all_borrowed and break_edge.value.borrowed_type != null;
+                has_conditional_borrow = has_conditional_borrow or break_edge.value.borrow_condition != null;
+                if (break_edge.value.borrowed_type != null) {
+                    if (borrowed_source) |source_type| {
+                        if (source_type != break_edge.value.borrowed_type.?) borrowed_source = joined;
+                    } else {
+                        borrowed_source = break_edge.value.borrowed_type.?;
+                    }
+                    borrow_root = laterBorrowRoot(borrow_root, break_edge.value.borrow_root);
+                }
                 contains_transfer = contains_transfer or break_edge.value.explicit_transfer;
             }
-            const joined_capabilities = (try self.type_interner.ownershipCapabilities(joined)) orelse return error.Unavailable;
-            const needs_copy_condition = joined_capabilities.contains_custom_copy and any_copy_source and
-                (has_conditional_copy or !all_copy_sources or joined_capabilities.copy == .none);
-            if (copy_source == null and any_copy_source and joined_capabilities.contains_custom_copy) copy_source = available_copy_source orelse joined;
+            const needs_borrow_condition = any_borrowed and (has_conditional_borrow or !all_borrowed);
             self.loop_breaks.shrinkRetainingCapacity(break_start);
             self.enterBlock(exit);
             self.restoreState(output_state);
             return .{
                 .id = @enumFromInt(exit_argument_start),
                 .type_id = joined,
-                .copy_source = copy_source,
-                .copy_condition = if (needs_copy_condition)
+                .borrowed_type = borrowed_source,
+                .borrow_condition = if (needs_borrow_condition)
                     @enumFromInt(exit_argument_start + 1)
                 else
                     null,
+                .borrow_root = borrow_root,
                 .explicit_transfer = contains_transfer,
             };
         }
@@ -904,10 +1016,10 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             const start: u32 = @intCast(self.branch_arguments.items.len);
             if (result) |result_value| {
                 try self.branch_arguments.append(self.ctx.allocator(), .{ .value = result_value.id });
-                const copy_required = result_value.copy_condition orelse (try self.appendInstruction(.{
-                    .constb = result_value.copy_source != null,
+                const borrowed_on_path = result_value.borrow_condition orelse (try self.appendInstruction(.{
+                    .constb = result_value.borrowed_type != null,
                 })).id;
-                try self.branch_arguments.append(self.ctx.allocator(), .{ .value = copy_required });
+                try self.branch_arguments.append(self.ctx.allocator(), .{ .value = borrowed_on_path });
             }
             const type_start = if (target == context.header)
                 context.state_type_start
@@ -943,8 +1055,9 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 return self.reject(annotation.value.span, .{ .local_type_mismatch = self.typeMismatch(annotation.type_id, operand.type_id) });
             if (use.coerce_to == null) return operand;
             var result = try self.appendCoercion(use);
-            result.copy_source = operand.copy_source;
-            result.copy_condition = operand.copy_condition;
+            result.borrowed_type = operand.borrowed_type;
+            result.borrow_condition = operand.borrow_condition;
+            result.borrow_root = operand.borrow_root;
             return result;
         }
 
@@ -1027,12 +1140,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 return self.reject(assignment_value.target_span, if (self.local_availability[local_index] == .maybe_transferred) .possibly_transferred else .use_after_transfer);
             }
             const root = self.local_values[local_index].?;
-            const ResolvedField = struct {
-                parent: Value = undefined,
-                field_index: u32,
-                field_type: structures.TypeId,
-            };
-            var fields: std.ArrayList(ResolvedField) = .empty;
+            var fields: std.ArrayList(PlaceField) = .empty;
             defer fields.deinit(self.ctx.allocator());
             const source_fields = self.unresolved.assignment_fields[assignment_value.fields.start..assignment_value.fields.end];
             var target_type = root.type_id;
@@ -1042,8 +1150,8 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 if (try self.type_interner.structLayout(target_type) == null) return error.Unavailable;
                 const field = definition.resolveField(source_field.name) orelse return self.reject(source_field.span, .unknown_field);
                 try fields.append(self.ctx.allocator(), .{
-                    .field_index = field.index,
-                    .field_type = field.type_id,
+                    .index = field.index,
+                    .type_id = field.type_id,
                 });
                 target_type = field.type_id;
             }
@@ -1051,8 +1159,8 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             for (fields.items) |field| {
                 target = try self.appendInstruction(.{ .field_access = .{
                     .operand = target.id,
-                    .field_index = field.field_index,
-                    .field_type = field.field_type,
+                    .field_index = field.index,
+                    .field_type = field.type_id,
                 } });
             }
             const target_span = if (source_fields.len == 0) assignment_value.target_span else source_fields[source_fields.len - 1].span;
@@ -1066,16 +1174,24 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 return self.reject(assignment_value.target_span, if (self.local_availability[local_index] == .maybe_transferred) .possibly_transferred else .use_after_transfer);
             }
             const result = if (assignment_value.operation == .replace) blk: {
+                var latest_target = self.local_values[local_index].?;
+                for (fields.items) |field| {
+                    latest_target = try self.appendInstruction(.{ .field_access = .{
+                        .operand = latest_target.id,
+                        .field_index = field.index,
+                        .field_type = field.type_id,
+                    } });
+                }
                 var use = try self.coerceValue(operand.id, operand.type_id, target_type) orelse
                     return self.reject(assignment_value.value.span, .{ .assignment_type_mismatch = self.typeMismatch(target_type, operand.type_id) });
                 const owned = try self.ownValue(operand, assignment_value.value.span);
                 use.value = owned.id;
                 if (fields.items.len != 0 or self.local_availability[local_index] != .transferred) {
-                    const target_capabilities = (try self.type_interner.ownershipCapabilities(target.type_id)) orelse return error.Unavailable;
+                    const target_capabilities = (try self.type_interner.ownershipCapabilities(latest_target.type_id)) orelse return error.Unavailable;
                     if (self.local_availability[local_index] == .maybe_transferred and target_capabilities.needs_automatic_drop) {
                         return self.reject(target_span, .possibly_transferred);
                     }
-                    try self.dropValue(target, self.local_can_deinit[local_index], target_span);
+                    try self.dropValue(latest_target, self.local_can_deinit[local_index], target_span);
                 }
                 break :blk if (use.coerce_to == null)
                     owned
@@ -1093,32 +1209,15 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                     .divide => .{ .divsi = operands },
                 });
             };
-            var latest_parent = self.local_values[local_index].?;
-            for (fields.items, 0..) |*field, index| {
-                field.parent = latest_parent;
-                if (index + 1 < fields.items.len) {
-                    latest_parent = try self.appendInstruction(.{ .field_access = .{
-                        .operand = latest_parent.id,
-                        .field_index = field.field_index,
-                        .field_type = field.field_type,
-                    } });
-                }
-            }
-            var updated = result;
-            var field_index = fields.items.len;
-            while (field_index > 0) {
-                field_index -= 1;
-                const field = fields.items[field_index];
-                updated = try self.appendInstruction(.{ .field_update = .{
-                    .operand = field.parent.id,
-                    .value = updated.id,
-                    .field_index = field.field_index,
-                    .type_id = field.parent.type_id,
-                } });
-            }
+            const updated = try self.updateFields(self.local_values[local_index].?, fields.items, result);
             self.local_values[local_index] = withoutOwnershipSource(updated);
             self.local_availability[local_index] = .available;
-            return .{ .id = result.id, .type_id = result.type_id, .copy_source = result.type_id };
+            return .{
+                .id = result.id,
+                .type_id = result.type_id,
+                .borrowed_type = result.type_id,
+                .borrow_root = assignment_value.target,
+            };
         }
 
         fn negate(self: *Self, operand_use: semantic.UnresolvedBody.ValueUse) !Value {
@@ -1246,13 +1345,6 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                     target = .{ .indirect = callee.id };
                 },
             }
-            // The callee precedes its arguments in source evaluation order.
-            // Resolve all argument expressions before publishing operands so a
-            // diverging argument leaves no unused call-argument range behind.
-            for (raw_arguments) |argument| {
-                const resolved = try self.value(argument.value);
-                if (resolved.type_id == .never) return .{ .diverged = resolved };
-            }
             if (raw_arguments.len != signature.parameters.len) return self.reject(span, .{ .call_argument_count_mismatch = .{
                 .expected = @intCast(signature.parameters.len),
                 .found = @intCast(raw_arguments.len),
@@ -1261,11 +1353,56 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             defer place_fields.deinit(self.ctx.allocator());
             var argument_places: std.ArrayList(?ArgumentPlace) = .empty;
             defer argument_places.deinit(self.ctx.allocator());
-            for (raw_arguments, signature.parameters) |raw, parameter| {
-                try argument_places.append(self.ctx.allocator(), if (parameter.mode == .read or parameter.mode == .mut)
+            var arguments_to_publish: std.ArrayList(structures.FunctionValueUse) = .empty;
+            defer arguments_to_publish.deinit(self.ctx.allocator());
+            var temporary_drops_to_publish: std.ArrayList(Value) = .empty;
+            defer temporary_drops_to_publish.deinit(self.ctx.allocator());
+            var mut_arguments_to_publish: std.ArrayList(PendingMutArgument) = .empty;
+            defer mut_arguments_to_publish.deinit(self.ctx.allocator());
+            const pending_start = self.pending_temporaries.items.len;
+            defer self.pending_temporaries.shrinkRetainingCapacity(pending_start);
+
+            // Finish each argument before evaluating the next one. Nested copy
+            // hooks may publish their own calls, so the outer operands stay in
+            // local storage until their complete contiguous range is known.
+            for (raw_arguments, signature.parameters, 0..) |raw, expected, argument_index| {
+                const raw_operand = try self.value(raw.value);
+                if (raw_operand.type_id == .never) return .{ .diverged = raw_operand };
+                const maybe_place = if (expected.mode == .read or expected.mode == .mut)
                     try self.resolveArgumentPlace(raw.value, &place_fields)
                 else
-                    null);
+                    null;
+                try argument_places.append(self.ctx.allocator(), maybe_place);
+                const operand = switch (expected.mode) {
+                    .read => try self.borrowValue(raw_operand, raw.span),
+                    .mut, .@"var", .deinit => raw_operand,
+                    .static => unreachable,
+                };
+                if (expected.mode == .mut and operand.type_id != expected.type_id) {
+                    return self.reject(raw.span, .{ .call_argument_type_mismatch = self.typeMismatch(expected.type_id, operand.type_id) });
+                }
+                var argument = try self.coerceValue(operand.id, operand.type_id, expected.type_id) orelse
+                    return self.reject(raw.span, .{ .call_argument_type_mismatch = self.typeMismatch(expected.type_id, operand.type_id) });
+                if (expected.mode == .@"var" or expected.mode == .deinit) {
+                    const owned = try self.ownValue(operand, raw.span);
+                    argument.value = owned.id;
+                    try self.pending_temporaries.append(self.ctx.allocator(), owned);
+                } else if (expected.mode == .mut) {
+                    const place = maybe_place orelse return self.reject(raw.span, .mutable_argument_requires_place);
+                    const field_start: u32 = @intCast(self.mut_argument_fields.items.len);
+                    try self.mut_argument_fields.appendSlice(self.ctx.allocator(), place_fields.items[place.fields.start..place.fields.end]);
+                    try mut_arguments_to_publish.append(self.ctx.allocator(), .{
+                        .place = .{
+                            .local = place.local,
+                            .fields = .{ .start = field_start, .end = @intCast(self.mut_argument_fields.items.len) },
+                        },
+                        .argument_index = @intCast(argument_index),
+                    });
+                } else if (operand.borrowed_type == null or operand.borrow_condition != null) {
+                    try temporary_drops_to_publish.append(self.ctx.allocator(), operand);
+                    try self.pending_temporaries.append(self.ctx.allocator(), operand);
+                }
+                try arguments_to_publish.append(self.ctx.allocator(), argument);
             }
             for (raw_arguments, signature.parameters, argument_places.items, 0..) |raw, parameter, maybe_place, argument_index| {
                 if (parameter.mode != .mut) continue;
@@ -1288,52 +1425,19 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 }
             }
             const argument_start: u32 = @intCast(self.call_arguments.items.len);
-            const temporary_drop_start: u32 = @intCast(self.call_temporary_drops.items.len);
-            const mut_argument_start: u32 = @intCast(self.pending_mut_arguments.items.len);
-            var intrinsic_argument: ?structures.FunctionValueId = null;
-            for (raw_arguments, signature.parameters, argument_places.items, 0..) |raw, expected, maybe_place, argument_index| {
-                const raw_operand = self.values[@intFromEnum(raw.value)].?;
-                const operand = switch (expected.mode) {
-                    .read => try self.borrowValue(raw_operand, raw.span),
-                    .mut => raw_operand,
-                    .@"var", .deinit => raw_operand,
-                    .static => unreachable,
-                };
-                if (expected.mode == .mut and operand.type_id != expected.type_id) {
-                    return self.reject(raw.span, .{ .call_argument_type_mismatch = self.typeMismatch(expected.type_id, operand.type_id) });
-                }
-                var argument = try self.coerceValue(operand.id, operand.type_id, expected.type_id) orelse
-                    return self.reject(raw.span, .{ .call_argument_type_mismatch = self.typeMismatch(expected.type_id, operand.type_id) });
-                if (expected.mode == .@"var" or expected.mode == .deinit) {
-                    const owned = try self.ownValue(operand, raw.span);
-                    argument.value = owned.id;
-                } else if (expected.mode == .mut) {
-                    const place = maybe_place.?;
-                    const field_start: u32 = @intCast(self.mut_argument_fields.items.len);
-                    try self.mut_argument_fields.appendSlice(self.ctx.allocator(), place_fields.items[place.fields.start..place.fields.end]);
-                    try self.pending_mut_arguments.append(self.ctx.allocator(), .{
-                        .place = .{
-                            .local = place.local,
-                            .fields = .{ .start = field_start, .end = @intCast(self.mut_argument_fields.items.len) },
-                        },
-                        .argument_index = @intCast(argument_index),
-                    });
-                } else if (operand.copy_source == null) {
-                    try self.call_temporary_drops.append(self.ctx.allocator(), operand);
-                }
-                switch (target) {
-                    .intrinsic => {
-                        std.debug.assert(intrinsic_argument == null);
-                        intrinsic_argument = argument.value;
-                    },
-                    .direct, .indirect => try self.call_arguments.append(self.ctx.allocator(), argument),
-                }
+            switch (target) {
+                .intrinsic => {},
+                .direct, .indirect => try self.call_arguments.appendSlice(self.ctx.allocator(), arguments_to_publish.items),
             }
             const arguments: structures.FunctionValueRange = .{ .start = argument_start, .end = @intCast(self.call_arguments.items.len) };
+            const temporary_drop_start: u32 = @intCast(self.call_temporary_drops.items.len);
+            try self.call_temporary_drops.appendSlice(self.ctx.allocator(), temporary_drops_to_publish.items);
             const temporary_drops: structures.FunctionValueRange = .{
                 .start = temporary_drop_start,
                 .end = @intCast(self.call_temporary_drops.items.len),
             };
+            const mut_argument_start: u32 = @intCast(self.pending_mut_arguments.items.len);
+            try self.pending_mut_arguments.appendSlice(self.ctx.allocator(), mut_arguments_to_publish.items);
             const mut_arguments: structures.FunctionValueRange = .{
                 .start = mut_argument_start,
                 .end = @intCast(self.pending_mut_arguments.items.len),
@@ -1352,7 +1456,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                     .mut_arguments = mut_arguments,
                 } },
                 .intrinsic => blk: {
-                    const result = try self.appendInstruction(.{ .exit = intrinsic_argument.? });
+                    const result = try self.appendInstruction(.{ .exit = arguments_to_publish.items[0].value });
                     self.terminate(.diverge);
                     break :blk .{ .diverged = result };
                 },
@@ -1368,8 +1472,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                     var flow = try self.lowerFallibleCall(callable.operation);
                     try self.finishCallExits(&flow, callable, span);
                     try self.enterFlowExit(flow.failure.?);
-                    try self.writeMutParameters();
-                    self.terminate(.return_failure);
+                    try self.finishFunctionExit(span, .return_failure);
                     try self.enterFlowExit(flow.success.?);
                     const success_block = self.blocks.items[@intFromEnum(flow.success.?.block)];
                     const value_to_return: Value = .{
@@ -1395,7 +1498,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             var index = @as(usize, range.end);
             while (index > range.start) {
                 index -= 1;
-                try self.dropValue(self.call_temporary_drops.items[index], false, span);
+                try self.endTemporary(self.call_temporary_drops.items[index], span);
             }
         }
 
@@ -1465,14 +1568,15 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
         fn updateMutArgumentPlace(self: *Self, place: ArgumentPlace, updated_leaf: Value) !void {
             const local_index = @intFromEnum(place.local);
             const fields = self.mut_argument_fields.items[place.fields.start..place.fields.end];
-            if (fields.len == 0) {
-                self.local_values[local_index] = withoutOwnershipSource(updated_leaf);
-                return;
-            }
+            self.local_values[local_index] = withoutOwnershipSource(try self.updateFields(self.local_values[local_index].?, fields, updated_leaf));
+        }
+
+        fn updateFields(self: *Self, root: Value, fields: []const PlaceField, updated_leaf: Value) !Value {
+            if (fields.len == 0) return updated_leaf;
 
             var parents: std.ArrayList(Value) = .empty;
             defer parents.deinit(self.ctx.allocator());
-            var current = self.local_values[local_index].?;
+            var current = root;
             for (fields) |field| {
                 try parents.append(self.ctx.allocator(), current);
                 current = try self.appendInstruction(.{ .field_access = .{
@@ -1492,7 +1596,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                     .type_id = parents.items[field_index].type_id,
                 } });
             }
-            self.local_values[local_index] = withoutOwnershipSource(updated);
+            return updated;
         }
 
         fn callReturnType(call: CallOperation) structures.TypeId {
@@ -1536,6 +1640,13 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 .callable => |callable| if (callable.is_fallible) blk: {
                     var flow = try self.lowerFallibleCall(callable.operation);
                     try self.finishCallExits(&flow, callable, call.span);
+                    if (flow.success) |*success| {
+                        const success_block = self.blocks.items[@intFromEnum(success.block)];
+                        success.temporary = .{
+                            .id = @enumFromInt(success_block.argument_start),
+                            .type_id = callReturnType(callable.operation),
+                        };
+                    }
                     break :blk flow;
                 } else self.reject(call.span, .if_condition_not_fallible),
             };
@@ -1635,9 +1746,10 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 .annotation_type = binding.annotation_type,
                 .span = binding.span,
             } else null;
+            const temporary = if (operand.borrowed_type == null or operand.borrow_condition != null) operand else null;
             return .{
-                .success = .{ .block = success, .state = state, .extraction = extraction },
-                .failure = .{ .block = failure, .state = state },
+                .success = .{ .block = success, .state = state, .extraction = extraction, .temporary = temporary },
+                .failure = .{ .block = failure, .state = state, .temporary = temporary },
             };
         }
 
@@ -1689,7 +1801,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                     .tag_mapping = tag_mapping,
                 } });
                 if (extraction.target_type != .never) {
-                    extracted.copy_source = extracted.type_id;
+                    extracted.borrowed_type = extracted.type_id;
                     extracted = try self.ownValue(extracted, extraction.span);
                 }
                 if (extraction.target_type != .never and extraction.annotation_type != null) {
@@ -1707,11 +1819,16 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 self.local_availability[index] = .available;
                 if (extraction.target_type == .never) self.terminate(.diverge);
             }
+            if (self.current_block != null) if (exit.temporary) |temporary| {
+                try self.endTemporary(temporary, self.unresolved.blocks[@intFromEnum(self.unresolved.root_block)].span);
+            };
         }
 
         fn mergeFlowExits(self: *Self, first_exit: ?FlowExit, second_exit: ?FlowExit) !?FlowExit {
-            const first = first_exit orelse return second_exit;
-            const second = second_exit orelse return first;
+            var first = first_exit orelse return second_exit;
+            var second = second_exit orelse return first;
+            try self.finishFlowExitEffects(&first);
+            try self.finishFlowExitEffects(&second);
             std.debug.assert(first.extraction == null and second.extraction == null);
             const first_state = self.states.items[@intFromEnum(first.state)];
             const second_state = self.states.items[@intFromEnum(second.state)];
@@ -1754,6 +1871,15 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             return .{ .block = merged, .state = state_id };
         }
 
+        fn finishFlowExitEffects(self: *Self, flow_exit: *FlowExit) !void {
+            if (flow_exit.temporary == null) return;
+            std.debug.assert(flow_exit.extraction == null);
+            try self.enterFlowExit(flow_exit.*);
+            flow_exit.state = try self.captureState();
+            flow_exit.block = self.suspendBlock();
+            flow_exit.temporary = null;
+        }
+
         fn conditional(self: *Self, expression: @FieldType(Expression.Operation, "if_else")) !Value {
             const baseline = try self.captureState();
             const flow = try self.condition(expression.condition);
@@ -1791,17 +1917,15 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                     then_result.value.type_id
             else
                 else_exit.?.value.type_id;
-            const then_requires_copy = if (then_exit) |exit| exit.value.copy_source != null else false;
-            const else_requires_copy = if (else_exit) |exit| exit.value.copy_source != null else false;
-            const any_copy_source = then_requires_copy or else_requires_copy;
-            const all_copy_sources = (then_exit == null or then_requires_copy) and (else_exit == null or else_requires_copy);
-            const has_conditional_copy = (then_exit != null and then_exit.?.value.copy_condition != null) or
-                (else_exit != null and else_exit.?.value.copy_condition != null);
-            const joined_capabilities = (try self.type_interner.ownershipCapabilities(joined)) orelse return error.Unavailable;
-            const needs_copy_condition = joined_capabilities.contains_custom_copy and any_copy_source and
-                (has_conditional_copy or !all_copy_sources or joined_capabilities.copy == .none);
+            const then_is_borrowed = if (then_exit) |exit| exit.value.borrowed_type != null else false;
+            const else_is_borrowed = if (else_exit) |exit| exit.value.borrowed_type != null else false;
+            const any_borrowed = then_is_borrowed or else_is_borrowed;
+            const all_borrowed = (then_exit == null or then_is_borrowed) and (else_exit == null or else_is_borrowed);
+            const has_conditional_borrow = (then_exit != null and then_exit.?.value.borrow_condition != null) or
+                (else_exit != null and else_exit.?.value.borrow_condition != null);
+            const needs_borrow_condition = any_borrowed and (has_conditional_borrow or !all_borrowed);
             try self.block_argument_types.append(self.ctx.allocator(), joined);
-            if (needs_copy_condition) try self.block_argument_types.append(self.ctx.allocator(), .bool);
+            if (needs_borrow_condition) try self.block_argument_types.append(self.ctx.allocator(), .bool);
             var changed_slots = try self.changedStateSlots(baseline, then_exit, else_exit);
             defer changed_slots.deinit(self.ctx.allocator());
             for (changed_slots.items) |slot| {
@@ -1809,26 +1933,29 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 try self.block_argument_types.append(self.ctx.allocator(), source.type_id);
             }
             const merge_block = try self.newBlock(argument_start, @intCast(self.block_argument_types.items.len));
-            if (then_exit) |exit| try self.setConditionalTerminator(merge_block, exit, joined, changed_slots.items, needs_copy_condition);
-            if (else_exit) |exit| try self.setConditionalTerminator(merge_block, exit, joined, changed_slots.items, needs_copy_condition);
+            if (then_exit) |exit| try self.setConditionalTerminator(merge_block, exit, joined, changed_slots.items, needs_borrow_condition);
+            if (else_exit) |exit| try self.setConditionalTerminator(merge_block, exit, joined, changed_slots.items, needs_borrow_condition);
 
-            const output_state = try self.conditionalState(baseline, then_exit, else_exit, changed_slots.items, argument_start + 1 + @intFromBool(needs_copy_condition));
-            var copy_source: ?structures.TypeId = null;
+            const output_state = try self.conditionalState(baseline, then_exit, else_exit, changed_slots.items, argument_start + 1 + @intFromBool(needs_borrow_condition));
             var contains_transfer = false;
+            var borrow_root: ?semantic.UnresolvedBody.LocalId = null;
+            var borrowed_source: ?structures.TypeId = null;
             if (then_exit) |exit| {
-                copy_source = try self.nonCopyableSource(exit.value);
                 contains_transfer = exit.value.explicit_transfer;
+                if (exit.value.borrowed_type) |source_type| {
+                    borrowed_source = source_type;
+                    borrow_root = exit.value.borrow_root;
+                }
             }
             if (else_exit) |exit| {
-                if (copy_source == null) copy_source = try self.nonCopyableSource(exit.value);
                 contains_transfer = contains_transfer or exit.value.explicit_transfer;
-            }
-            if (copy_source == null and any_copy_source and joined_capabilities.contains_custom_copy) {
-                if (then_exit) |exit| {
-                    if (exit.value.copy_source) |source_type| copy_source = source_type;
-                }
-                if (copy_source == null) {
-                    if (else_exit) |exit| copy_source = exit.value.copy_source;
+                if (exit.value.borrowed_type) |source_type| {
+                    if (borrowed_source) |previous| {
+                        if (previous != source_type) borrowed_source = joined;
+                    } else {
+                        borrowed_source = source_type;
+                    }
+                    borrow_root = laterBorrowRoot(borrow_root, exit.value.borrow_root);
                 }
             }
             self.enterBlock(merge_block);
@@ -1836,8 +1963,9 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             return .{
                 .id = @enumFromInt(argument_start),
                 .type_id = joined,
-                .copy_source = copy_source,
-                .copy_condition = if (needs_copy_condition) @enumFromInt(argument_start + 1) else null,
+                .borrowed_type = borrowed_source,
+                .borrow_condition = if (needs_borrow_condition) @enumFromInt(argument_start + 1) else null,
+                .borrow_root = borrow_root,
                 .explicit_transfer = contains_transfer,
             };
         }
@@ -1875,9 +2003,9 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             exit: ValueExit,
             result_type: structures.TypeId,
             changed_slots: []const u32,
-            include_copy_condition: bool,
+            include_borrow_condition: bool,
         ) !void {
-            if (!include_copy_condition) {
+            if (!include_borrow_condition) {
                 self.setBlockTerminator(exit.block, .{ .branch = try self.conditionalBranch(target, exit, result_type, changed_slots, null) });
                 return;
             }
@@ -1885,10 +2013,10 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             const edge = try self.newBlock(argument_start, argument_start);
             self.setBlockTerminator(exit.block, .{ .branch = self.emptyBranch(edge) });
             self.enterBlock(edge);
-            const copy_required = exit.value.copy_condition orelse (try self.appendInstruction(.{
-                .constb = exit.value.copy_source != null,
+            const borrowed_on_path = exit.value.borrow_condition orelse (try self.appendInstruction(.{
+                .constb = exit.value.borrowed_type != null,
             })).id;
-            self.terminate(.{ .branch = try self.conditionalBranch(target, exit, result_type, changed_slots, copy_required) });
+            self.terminate(.{ .branch = try self.conditionalBranch(target, exit, result_type, changed_slots, borrowed_on_path) });
         }
 
         fn conditionalBranch(
@@ -1897,12 +2025,12 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             exit: ValueExit,
             result_type: structures.TypeId,
             changed_slots: []const u32,
-            copy_condition: ?structures.FunctionValueId,
+            borrow_condition: ?structures.FunctionValueId,
         ) !structures.FunctionBranch {
             const start: u32 = @intCast(self.branch_arguments.items.len);
             const result = (try self.coerceValue(exit.value.id, exit.value.type_id, result_type)) orelse unreachable;
             try self.branch_arguments.append(self.ctx.allocator(), result);
-            if (copy_condition) |copy_predicate| try self.branch_arguments.append(self.ctx.allocator(), .{ .value = copy_predicate });
+            if (borrow_condition) |borrow_predicate| try self.branch_arguments.append(self.ctx.allocator(), .{ .value = borrow_predicate });
             const state = self.states.items[@intFromEnum(exit.state)].values;
             for (changed_slots) |slot| try self.branch_arguments.append(self.ctx.allocator(), .{ .value = state[slot].?.id });
             return .{ .target = target, .arguments = .{ .start = start, .end = @intCast(self.branch_arguments.items.len) } };

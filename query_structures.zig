@@ -411,7 +411,9 @@ pub const StructLayout = struct {
 
         var active: std.ArrayList(structures.ItemId) = .empty;
         defer active.deinit(ctx.allocator());
-        if (!try validateStructContainment(ctx, item_id, &active)) return null;
+        var completed: std.ArrayList(structures.ItemId) = .empty;
+        defer completed.deinit(ctx.allocator());
+        if (!try validateStructContainment(ctx, item_id, &active, &completed)) return null;
 
         const field_offsets = try ctx.allocator().alloc(u32, definition.fields.len);
         var keep_offsets = false;
@@ -563,15 +565,22 @@ pub const OwnershipCapabilities = struct {
     }
 };
 
-fn validateStructContainment(ctx: anytype, item_id: structures.ItemId, active: *std.ArrayList(structures.ItemId)) !bool {
+fn validateStructContainment(
+    ctx: anytype,
+    item_id: structures.ItemId,
+    active: *std.ArrayList(structures.ItemId),
+    completed: *std.ArrayList(structures.ItemId),
+) !bool {
+    if (std.mem.indexOfScalar(structures.ItemId, completed.items, item_id) != null) return true;
     try active.append(ctx.allocator(), item_id);
     defer _ = active.pop();
 
     const definition = (try ctx.get(StructDefinition, item_id)).* orelse return false;
     const loc = try ctx.lookupInterned(ItemLocations, item_id);
     for (definition.fields) |field| {
-        if (!try validateContainedType(ctx, field.type_id, loc.file_id, field.span, active)) return false;
+        if (!try validateContainedType(ctx, field.type_id, loc.file_id, field.span, active, completed)) return false;
     }
+    try completed.append(ctx.allocator(), item_id);
     return true;
 }
 
@@ -581,6 +590,7 @@ fn validateContainedType(
     file_id: structures.FileId,
     span: structures.SourceSpan,
     active: *std.ArrayList(structures.ItemId),
+    completed: *std.ArrayList(structures.ItemId),
 ) !bool {
     if (type_id.isPrimitive()) return true;
     const data = (try ctx.lookupInternedAs(Types, type_id.interned().?)) orelse unreachable;
@@ -588,7 +598,7 @@ fn validateContainedType(
         .callable => true,
         .variant => |variant| blk: {
             for (variant.members) |member| {
-                if (!try validateContainedType(ctx, member, file_id, span, active)) break :blk false;
+                if (!try validateContainedType(ctx, member, file_id, span, active, completed)) break :blk false;
             }
             break :blk true;
         },
@@ -601,7 +611,7 @@ fn validateContainedType(
                 });
                 break :blk false;
             }
-            break :blk validateStructContainment(ctx, contained_item, active);
+            break :blk validateStructContainment(ctx, contained_item, active, completed);
         },
     };
 }
