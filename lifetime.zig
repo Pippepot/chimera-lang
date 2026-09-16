@@ -17,17 +17,15 @@ pub const LifetimeEffect = union(enum) {
         generation: GenerationId,
         value: structures.FunctionValueId,
     },
-    use: struct {
-        generation: GenerationId,
-        cleanup_value: structures.FunctionValueId,
-        cleanup_condition: ?structures.FunctionValueId = null,
-    },
-    update: struct {
-        generation: GenerationId,
-        cleanup_value: structures.FunctionValueId,
-        cleanup_condition: ?structures.FunctionValueId = null,
-    },
+    use: Use,
+    update: Use,
     consume: GenerationId,
+
+    const Use = struct {
+        generation: GenerationId,
+        cleanup_value: structures.FunctionValueId,
+        cleanup_condition: ?structures.FunctionValueId = null,
+    };
 };
 
 pub const OwnershipForward = union(enum) {
@@ -132,6 +130,11 @@ const GenerationBits = struct {
 };
 
 pub const Solver = struct {
+    const BlockEdges = struct {
+        outgoing: [2]?usize = .{ null, null },
+        first_incoming: ?usize = null,
+    };
+
     gpa: std.mem.Allocator,
     generations: []const Generation,
     boundaries: []const Boundary,
@@ -139,6 +142,8 @@ pub const Solver = struct {
     block_argument_generations: []const ?GenerationId,
     ownership_forwards: []const OwnershipForward,
     ownership_edges: []const OwnershipEdge,
+    block_edges: []BlockEdges,
+    previous_incoming: []?usize,
     entry: structures.FunctionBlockId,
     reachable: []bool,
     available_in: []u64,
@@ -163,10 +168,18 @@ pub const Solver = struct {
         ownership_edges: []const OwnershipEdge,
         entry: structures.FunctionBlockId,
     ) !Solver {
-        for (blocks, 0..) |block, block_index| {
-            const layout_index = block.layout_index orelse unreachable;
-            std.debug.assert(layout_index < blocks.len);
-            for (blocks[0..block_index]) |previous| std.debug.assert(previous.layout_index.? != layout_index);
+        const block_edges = try gpa.alloc(BlockEdges, blocks.len);
+        errdefer gpa.free(block_edges);
+        @memset(block_edges, .{});
+        const previous_incoming = try gpa.alloc(?usize, ownership_edges.len);
+        errdefer gpa.free(previous_incoming);
+        for (ownership_edges, 0..) |edge, edge_index| {
+            const predecessor = &block_edges[@intFromEnum(edge.predecessor)];
+            std.debug.assert(predecessor.outgoing[edge.successor_ordinal] == null);
+            predecessor.outgoing[edge.successor_ordinal] = edge_index;
+            const successor = &block_edges[@intFromEnum(edge.successor)];
+            previous_incoming[edge_index] = successor.first_incoming;
+            successor.first_incoming = edge_index;
         }
         const words_per_block = GenerationBits.wordCount(generations.len);
         const matrix_len = std.math.mul(usize, blocks.len, words_per_block) catch return error.AnalysisTooLarge;
@@ -208,6 +221,8 @@ pub const Solver = struct {
             .block_argument_generations = block_argument_generations,
             .ownership_forwards = ownership_forwards,
             .ownership_edges = ownership_edges,
+            .block_edges = block_edges,
+            .previous_incoming = previous_incoming,
             .entry = entry,
             .reachable = reachable,
             .available_in = available_in,
@@ -225,6 +240,8 @@ pub const Solver = struct {
     }
 
     pub fn deinit(self: *Solver) void {
+        self.gpa.free(self.block_edges);
+        self.gpa.free(self.previous_incoming);
         self.gpa.free(self.reachable);
         self.gpa.free(self.available_in);
         self.gpa.free(self.available_out);
@@ -274,312 +291,6 @@ pub const Solver = struct {
                 try worklist.append(self.gpa, edge.successor);
             }
         }
-    }
-
-    const SolverTestBlock = struct {
-        boundaries: []const u32 = &.{},
-        terminator_effects: []const LifetimeEffect = &.{},
-        terminator: structures.FunctionTerminator,
-        argument_start: u32 = 0,
-        argument_end: u32 = 0,
-    };
-
-    const SolverTestExpected = struct {
-        cleanups: []const PlannedCleanup = &.{},
-        abandonments: []const ExplicitAbandonment = &.{},
-    };
-
-    fn expectLifetimePlan(
-        generations: []const Generation,
-        boundary_effects: []const []const LifetimeEffect,
-        block_descriptions: []const SolverTestBlock,
-        block_argument_generations: []const ?GenerationId,
-        ownership_forwards: []const OwnershipForward,
-        ownership_edges: []const OwnershipEdge,
-        expected: SolverTestExpected,
-    ) !void {
-        const gpa = std.testing.allocator;
-        const boundaries = try gpa.alloc(Boundary, boundary_effects.len);
-        defer gpa.free(boundaries);
-        for (boundaries, boundary_effects) |*boundary, effects| {
-            boundary.* = .{ .span = .{ .start = 0, .end = 0 } };
-            try boundary.effects.appendSlice(gpa, effects);
-        }
-        defer for (boundaries) |*boundary| boundary.effects.deinit(gpa);
-
-        const blocks = try gpa.alloc(BuildBlock, block_descriptions.len);
-        defer gpa.free(blocks);
-        for (blocks, block_descriptions, 0..) |*block, description, index| {
-            block.* = .{
-                .argument_start = description.argument_start,
-                .argument_end = description.argument_end,
-                .layout_index = @intCast(index),
-                .terminator = description.terminator,
-            };
-            for (description.boundaries) |boundary| try block.items.append(gpa, .{ .boundary = @enumFromInt(boundary) });
-            try block.terminator_effects.appendSlice(gpa, description.terminator_effects);
-        }
-        defer for (blocks) |*block| {
-            block.items.deinit(gpa);
-            block.terminator_effects.deinit(gpa);
-        };
-
-        var planned_cleanups: std.ArrayList(PlannedCleanup) = .empty;
-        defer planned_cleanups.deinit(gpa);
-        var explicit_abandonments: std.ArrayList(ExplicitAbandonment) = .empty;
-        defer explicit_abandonments.deinit(gpa);
-        var solver = try Solver.init(
-            gpa,
-            generations,
-            boundaries,
-            blocks,
-            block_argument_generations,
-            ownership_forwards,
-            ownership_edges,
-            @enumFromInt(0),
-        );
-        defer solver.deinit();
-        try solver.solve(&planned_cleanups, &explicit_abandonments);
-        try std.testing.expectEqual(expected.cleanups.len, planned_cleanups.items.len);
-        for (expected.cleanups, planned_cleanups.items) |expected_cleanup, actual| {
-            try std.testing.expect(std.meta.eql(expected_cleanup, actual));
-        }
-        try std.testing.expectEqual(expected.abandonments.len, explicit_abandonments.items.len);
-        for (expected.abandonments, explicit_abandonments.items) |expected_abandonment, actual| {
-            try std.testing.expect(std.meta.eql(expected_abandonment, actual));
-        }
-    }
-
-    fn solverTestGeneration(start_order: u32, explicit: bool) Generation {
-        return .{
-            .type_id = .unit,
-            .start_order = start_order,
-            .span = .{ .start = start_order, .end = start_order + 1 },
-            .requires_explicit_drop = explicit,
-            .can_deinit = false,
-        };
-    }
-
-    fn testStraightLineLastAndZeroUses() !void {
-        const generations = [_]Generation{ solverTestGeneration(0, false), solverTestGeneration(1, false) };
-        const boundaries = [_][]const LifetimeEffect{
-            &.{
-                .{ .define = .{ .generation = @enumFromInt(0), .value = @enumFromInt(10) } },
-                .{ .define = .{ .generation = @enumFromInt(1), .value = @enumFromInt(11) } },
-            },
-            &.{.{ .use = .{ .generation = @enumFromInt(1), .cleanup_value = @enumFromInt(12) } }},
-        };
-        const blocks = [_]SolverTestBlock{.{ .boundaries = &.{ 0, 1 }, .terminator = .return_unit }};
-        try expectLifetimePlan(&generations, &boundaries, &blocks, &.{}, &.{}, &.{}, .{ .cleanups = &.{
-            .{
-                .generation = @enumFromInt(0),
-                .cleanup_value = @enumFromInt(10),
-                .location = .{ .boundary = @enumFromInt(0) },
-            },
-            .{
-                .generation = @enumFromInt(1),
-                .cleanup_value = @enumFromInt(12),
-                .location = .{ .boundary = @enumFromInt(1) },
-            },
-        } });
-    }
-
-    fn testBranchUseAndConsume() !void {
-        const generations = [_]Generation{solverTestGeneration(0, false)};
-        const boundaries = [_][]const LifetimeEffect{
-            &.{.{ .define = .{ .generation = @enumFromInt(0), .value = @enumFromInt(10) } }},
-            &.{.{ .use = .{
-                .generation = @enumFromInt(0),
-                .cleanup_value = @enumFromInt(11),
-                .cleanup_condition = @enumFromInt(99),
-            } }},
-        };
-        const blocks = [_]SolverTestBlock{
-            .{ .boundaries = &.{0}, .terminator = .{ .predicate_branch = .{
-                .operation = .eqb,
-                .operands = .{ .lhs = @enumFromInt(0), .rhs = @enumFromInt(1) },
-                .then_branch = .{ .target = @enumFromInt(1), .arguments = .{ .start = 0, .end = 0 } },
-                .else_branch = .{ .target = @enumFromInt(2), .arguments = .{ .start = 0, .end = 0 } },
-            } } },
-            .{ .boundaries = &.{1}, .terminator = .return_unit },
-            .{ .terminator_effects = &.{.{ .consume = @enumFromInt(0) }}, .terminator = .return_unit },
-        };
-        const edges = [_]OwnershipEdge{
-            .{ .predecessor = @enumFromInt(0), .successor_ordinal = 0, .successor = @enumFromInt(1), .mappings = .{ .start = 0, .end = 0 } },
-            .{ .predecessor = @enumFromInt(0), .successor_ordinal = 1, .successor = @enumFromInt(2), .mappings = .{ .start = 0, .end = 0 } },
-        };
-        try expectLifetimePlan(&generations, &boundaries, &blocks, &.{}, &.{}, &edges, .{ .cleanups = &.{.{
-            .generation = @enumFromInt(0),
-            .cleanup_value = @enumFromInt(11),
-            .cleanup_condition = @enumFromInt(99),
-            .location = .{ .boundary = @enumFromInt(1) },
-        }} });
-    }
-
-    fn testOwnershipJoins() !void {
-        const generations = [_]Generation{
-            solverTestGeneration(0, false),
-            solverTestGeneration(1, false),
-            solverTestGeneration(2, false),
-        };
-        const boundaries = [_][]const LifetimeEffect{
-            &.{.{ .define = .{ .generation = @enumFromInt(0), .value = @enumFromInt(10) } }},
-            &.{.{ .define = .{ .generation = @enumFromInt(1), .value = @enumFromInt(11) } }},
-            &.{.{ .use = .{ .generation = @enumFromInt(2), .cleanup_value = @enumFromInt(0) } }},
-        };
-        const blocks = [_]SolverTestBlock{
-            .{ .terminator = .{ .predicate_branch = .{
-                .operation = .eqb,
-                .operands = .{ .lhs = @enumFromInt(1), .rhs = @enumFromInt(2) },
-                .then_branch = .{ .target = @enumFromInt(1), .arguments = .{ .start = 0, .end = 0 } },
-                .else_branch = .{ .target = @enumFromInt(2), .arguments = .{ .start = 0, .end = 0 } },
-            } } },
-            .{ .boundaries = &.{0}, .terminator = .{ .branch = .{ .target = @enumFromInt(3), .arguments = .{ .start = 0, .end = 0 } } } },
-            .{ .boundaries = &.{1}, .terminator = .{ .branch = .{ .target = @enumFromInt(3), .arguments = .{ .start = 0, .end = 0 } } } },
-            .{ .boundaries = &.{2}, .terminator = .return_unit, .argument_start = 0, .argument_end = 1 },
-        };
-        const forwards = [_]OwnershipForward{
-            .{ .forward = .{ .source = @enumFromInt(0), .destination = @enumFromInt(2) } },
-            .{ .forward = .{ .source = @enumFromInt(1), .destination = @enumFromInt(2) } },
-        };
-        const edges = [_]OwnershipEdge{
-            .{ .predecessor = @enumFromInt(0), .successor_ordinal = 0, .successor = @enumFromInt(1), .mappings = .{ .start = 0, .end = 0 } },
-            .{ .predecessor = @enumFromInt(0), .successor_ordinal = 1, .successor = @enumFromInt(2), .mappings = .{ .start = 0, .end = 0 } },
-            .{ .predecessor = @enumFromInt(1), .successor_ordinal = 0, .successor = @enumFromInt(3), .mappings = .{ .start = 0, .end = 1 } },
-            .{ .predecessor = @enumFromInt(2), .successor_ordinal = 0, .successor = @enumFromInt(3), .mappings = .{ .start = 1, .end = 2 } },
-        };
-        try expectLifetimePlan(&generations, &boundaries, &blocks, &.{@enumFromInt(2)}, &forwards, &edges, .{ .cleanups = &.{.{
-            .generation = @enumFromInt(2),
-            .cleanup_value = @enumFromInt(0),
-            .location = .{ .boundary = @enumFromInt(2) },
-        }} });
-    }
-
-    fn testContinueAndBreak() !void {
-        const generations = [_]Generation{solverTestGeneration(0, false)};
-        const boundaries = [_][]const LifetimeEffect{
-            &.{.{ .define = .{ .generation = @enumFromInt(0), .value = @enumFromInt(10) } }},
-            &.{.{ .use = .{ .generation = @enumFromInt(0), .cleanup_value = @enumFromInt(11) } }},
-        };
-        const blocks = [_]SolverTestBlock{
-            .{ .boundaries = &.{0}, .terminator = .{ .branch = .{ .target = @enumFromInt(1), .arguments = .{ .start = 0, .end = 0 } } } },
-            .{ .terminator = .{ .predicate_branch = .{
-                .operation = .eqb,
-                .operands = .{ .lhs = @enumFromInt(1), .rhs = @enumFromInt(2) },
-                .then_branch = .{ .target = @enumFromInt(2), .arguments = .{ .start = 0, .end = 0 } },
-                .else_branch = .{ .target = @enumFromInt(3), .arguments = .{ .start = 0, .end = 0 } },
-            } } },
-            .{ .boundaries = &.{1}, .terminator = .{ .branch = .{ .target = @enumFromInt(1), .arguments = .{ .start = 0, .end = 0 } } } },
-            .{ .terminator = .return_unit },
-        };
-        const edges = [_]OwnershipEdge{
-            .{ .predecessor = @enumFromInt(0), .successor_ordinal = 0, .successor = @enumFromInt(1), .mappings = .{ .start = 0, .end = 0 } },
-            .{ .predecessor = @enumFromInt(1), .successor_ordinal = 0, .successor = @enumFromInt(2), .mappings = .{ .start = 0, .end = 0 } },
-            .{ .predecessor = @enumFromInt(1), .successor_ordinal = 1, .successor = @enumFromInt(3), .mappings = .{ .start = 0, .end = 0 } },
-            .{ .predecessor = @enumFromInt(2), .successor_ordinal = 0, .successor = @enumFromInt(1), .mappings = .{ .start = 0, .end = 0 } },
-        };
-        try expectLifetimePlan(&generations, &boundaries, &blocks, &.{}, &.{}, &edges, .{ .cleanups = &.{.{
-            .generation = @enumFromInt(0),
-            .cleanup_value = @enumFromInt(10),
-            .location = .{ .edge = .{ .predecessor = @enumFromInt(1), .successor_ordinal = 1 } },
-        }} });
-    }
-
-    fn testTerminalEffectsAndProduction() !void {
-        const consumed_generation = [_]Generation{solverTestGeneration(0, false)};
-        const consumed_boundaries = [_][]const LifetimeEffect{&.{.{ .define = .{
-            .generation = @enumFromInt(0),
-            .value = @enumFromInt(10),
-        } }}};
-        const consumed_blocks = [_]SolverTestBlock{.{
-            .boundaries = &.{0},
-            .terminator_effects = &.{.{ .consume = @enumFromInt(0) }},
-            .terminator = .return_failure,
-        }};
-        try expectLifetimePlan(&consumed_generation, &consumed_boundaries, &consumed_blocks, &.{}, &.{}, &.{}, .{});
-
-        const diverging_boundaries = [_][]const LifetimeEffect{&.{
-            .{ .define = .{ .generation = @enumFromInt(0), .value = @enumFromInt(10) } },
-            .{ .use = .{ .generation = @enumFromInt(0), .cleanup_value = @enumFromInt(10) } },
-        }};
-        const diverging_blocks = [_]SolverTestBlock{.{
-            .terminator_effects = diverging_boundaries[0],
-            .terminator = .diverge,
-        }};
-        try expectLifetimePlan(&consumed_generation, &.{}, &diverging_blocks, &.{}, &.{}, &.{}, .{});
-
-        const produced_blocks = [_]SolverTestBlock{
-            .{ .terminator = .{ .fallible_call = .{
-                .call = .{ .target = @enumFromInt(0), .arguments = .{ .start = 0, .end = 0 }, .return_type = .unit },
-                .success = @enumFromInt(1),
-                .failure = @enumFromInt(2),
-            } } },
-            .{ .terminator = .return_unit, .argument_start = 0, .argument_end = 1 },
-            .{ .terminator = .return_failure, .argument_start = 1, .argument_end = 1 },
-        };
-        const produced_forwards = [_]OwnershipForward{.{ .produce = @enumFromInt(0) }};
-        const produced_edges = [_]OwnershipEdge{
-            .{ .predecessor = @enumFromInt(0), .successor_ordinal = 0, .successor = @enumFromInt(1), .mappings = .{ .start = 0, .end = 1 } },
-            .{ .predecessor = @enumFromInt(0), .successor_ordinal = 1, .successor = @enumFromInt(2), .mappings = .{ .start = 1, .end = 1 } },
-        };
-        try expectLifetimePlan(&consumed_generation, &.{}, &produced_blocks, &.{@enumFromInt(0)}, &produced_forwards, &produced_edges, .{ .cleanups = &.{.{
-            .generation = @enumFromInt(0),
-            .cleanup_value = @enumFromInt(0),
-            .location = .{ .block_entry = @enumFromInt(1) },
-        }} });
-    }
-
-    fn testExplicitAbandonment() !void {
-        const generations = [_]Generation{solverTestGeneration(0, true)};
-        const boundaries = [_][]const LifetimeEffect{&.{.{ .define = .{
-            .generation = @enumFromInt(0),
-            .value = @enumFromInt(10),
-        } }}};
-        const blocks = [_]SolverTestBlock{
-            .{ .boundaries = &.{0}, .terminator = .{ .predicate_branch = .{
-                .operation = .eqb,
-                .operands = .{ .lhs = @enumFromInt(1), .rhs = @enumFromInt(2) },
-                .then_branch = .{ .target = @enumFromInt(1), .arguments = .{ .start = 0, .end = 0 } },
-                .else_branch = .{ .target = @enumFromInt(2), .arguments = .{ .start = 0, .end = 0 } },
-            } } },
-            .{ .terminator_effects = &.{.{ .consume = @enumFromInt(0) }}, .terminator = .return_unit },
-            .{ .terminator = .return_unit },
-        };
-        const edges = [_]OwnershipEdge{
-            .{ .predecessor = @enumFromInt(0), .successor_ordinal = 0, .successor = @enumFromInt(1), .mappings = .{ .start = 0, .end = 0 } },
-            .{ .predecessor = @enumFromInt(0), .successor_ordinal = 1, .successor = @enumFromInt(2), .mappings = .{ .start = 0, .end = 0 } },
-        };
-        try expectLifetimePlan(&generations, &boundaries, &blocks, &.{}, &.{}, &edges, .{ .abandonments = &.{.{
-            .generation = @enumFromInt(0),
-            .location = .{ .edge = .{ .predecessor = @enumFromInt(0), .successor_ordinal = 1 } },
-        }} });
-    }
-
-    fn testReverseStartOrder() !void {
-        const generations = [_]Generation{ solverTestGeneration(0, false), solverTestGeneration(1, false) };
-        const boundaries = [_][]const LifetimeEffect{
-            &.{
-                .{ .define = .{ .generation = @enumFromInt(0), .value = @enumFromInt(10) } },
-                .{ .define = .{ .generation = @enumFromInt(1), .value = @enumFromInt(11) } },
-            },
-            &.{
-                .{ .use = .{ .generation = @enumFromInt(0), .cleanup_value = @enumFromInt(10) } },
-                .{ .use = .{ .generation = @enumFromInt(1), .cleanup_value = @enumFromInt(11) } },
-            },
-        };
-        const blocks = [_]SolverTestBlock{.{ .boundaries = &.{ 0, 1 }, .terminator = .return_unit }};
-        try expectLifetimePlan(&generations, &boundaries, &blocks, &.{}, &.{}, &.{}, .{ .cleanups = &.{
-            .{
-                .generation = @enumFromInt(1),
-                .cleanup_value = @enumFromInt(11),
-                .location = .{ .boundary = @enumFromInt(1) },
-            },
-            .{
-                .generation = @enumFromInt(0),
-                .cleanup_value = @enumFromInt(10),
-                .location = .{ .boundary = @enumFromInt(1) },
-            },
-        } });
     }
 
     fn solveDemand(self: *Solver) void {
@@ -635,8 +346,10 @@ pub const Solver = struct {
                 const block_id: structures.FunctionBlockId = @enumFromInt(block_index);
                 GenerationBits.clear(self.scratch);
                 if (block_id != self.entry) {
-                    for (self.ownership_edges) |*edge| {
-                        if (edge.successor != block_id or !self.reachable[@intFromEnum(edge.predecessor)]) continue;
+                    var incoming = self.block_edges[block_index].first_incoming;
+                    while (incoming) |edge_index| : (incoming = self.previous_incoming[edge_index]) {
+                        const edge = &self.ownership_edges[edge_index];
+                        if (!self.reachable[@intFromEnum(edge.predecessor)]) continue;
                         GenerationBits.copy(self.edge_scratch, self.blockSet(self.available_out, edge.predecessor));
                         self.remapEdgeAvailability(self.edge_scratch, edge);
                         GenerationBits.unionWith(self.scratch, self.edge_scratch);
@@ -671,8 +384,10 @@ pub const Solver = struct {
                 const block_id: structures.FunctionBlockId = @enumFromInt(block_index);
                 @memset(self.representation_scratch, null);
                 if (block_id != self.entry) {
-                    for (self.ownership_edges) |*edge| {
-                        if (edge.successor != block_id or !self.reachable[@intFromEnum(edge.predecessor)]) continue;
+                    var incoming = self.block_edges[block_index].first_incoming;
+                    while (incoming) |edge_index| : (incoming = self.previous_incoming[edge_index]) {
+                        const edge = &self.ownership_edges[edge_index];
+                        if (!self.reachable[@intFromEnum(edge.predecessor)]) continue;
                         @memcpy(self.edge_representation_scratch, self.blockRepresentations(self.representations_out, edge.predecessor));
                         self.remapEdgeRepresentations(self.edge_representation_scratch, edge);
                         GenerationBits.copy(self.edge_scratch, self.blockSet(self.available_out, edge.predecessor));
@@ -821,11 +536,9 @@ pub const Solver = struct {
         planned_cleanups: *std.ArrayList(PlannedCleanup),
         explicit_abandonments: *std.ArrayList(ExplicitAbandonment),
     ) !void {
-        var layout_index: u32 = 0;
-        while (layout_index < self.blocks.len) : (layout_index += 1) {
-            const block_id = self.blockAtLayoutIndex(layout_index);
-            if (!self.reachable[@intFromEnum(block_id)]) continue;
-            const block_value = self.blocks[@intFromEnum(block_id)];
+        for (self.blocks, 0..) |block_value, block_index| {
+            if (!self.reachable[block_index]) continue;
+            const block_id: structures.FunctionBlockId = @enumFromInt(block_index);
             try self.planEdges(block_id, block_value.terminator orelse unreachable, planned_cleanups, explicit_abandonments);
             GenerationBits.copy(self.scratch, self.blockSet(self.live_out, block_id));
             try self.planEffectsBackward(
@@ -855,7 +568,7 @@ pub const Solver = struct {
             }
             std.debug.assert(std.mem.eql(u64, self.scratch, self.blockSet(self.live_in, block_id)));
         }
-        self.sortEndings(planned_cleanups.items, explicit_abandonments.items);
+        self.finishEndings(planned_cleanups, explicit_abandonments);
     }
 
     fn planEdges(
@@ -939,7 +652,7 @@ pub const Solver = struct {
                         );
                     }
                 },
-                .use => |use| {
+                .use, .update => |use| {
                     if (!GenerationBits.contains(demand, use.generation)) {
                         try self.recordAfterEffect(
                             planned_cleanups,
@@ -953,21 +666,6 @@ pub const Solver = struct {
                         );
                     }
                     GenerationBits.insert(demand, use.generation);
-                },
-                .update => |update| {
-                    if (!GenerationBits.contains(demand, update.generation)) {
-                        try self.recordAfterEffect(
-                            planned_cleanups,
-                            explicit_abandonments,
-                            update.generation,
-                            update.cleanup_value,
-                            update.cleanup_condition,
-                            boundary,
-                            block,
-                            terminator,
-                        );
-                    }
-                    GenerationBits.insert(demand, update.generation);
                 },
                 .consume => |generation| GenerationBits.insert(demand, generation),
             }
@@ -1020,12 +718,6 @@ pub const Solver = struct {
         const generation_data = self.generations[@intFromEnum(generation)];
         const effective_condition = cleanup_condition orelse generation_data.cleanup_condition;
         if (!generation_data.requires_explicit_drop or generation_data.can_deinit) {
-            for (planned_cleanups.items) |existing| {
-                if (existing.generation != generation or !std.meta.eql(existing.location, location)) continue;
-                std.debug.assert(existing.cleanup_value == cleanup_value);
-                std.debug.assert(existing.cleanup_condition == effective_condition);
-                return;
-            }
             try planned_cleanups.append(self.gpa, .{
                 .generation = generation,
                 .cleanup_value = cleanup_value,
@@ -1035,31 +727,41 @@ pub const Solver = struct {
             return;
         }
         std.debug.assert(generation_data.requires_explicit_drop);
-        for (explicit_abandonments.items) |existing| {
-            if (existing.generation == generation and std.meta.eql(existing.location, location)) return;
-        }
         try explicit_abandonments.append(self.gpa, .{ .generation = generation, .location = location });
     }
 
-    fn sortEndings(
+    fn finishEndings(
         self: *const Solver,
-        planned_cleanups: []PlannedCleanup,
-        explicit_abandonments: []ExplicitAbandonment,
+        planned_cleanups: *std.ArrayList(PlannedCleanup),
+        explicit_abandonments: *std.ArrayList(ExplicitAbandonment),
     ) void {
-        std.mem.sort(PlannedCleanup, planned_cleanups, self.generations, struct {
-            fn lessThan(generations: []const Generation, left: PlannedCleanup, right: PlannedCleanup) bool {
-                const location_order = compareLocations(left.location, right.location);
-                if (location_order != 0) return location_order < 0;
-                return generations[@intFromEnum(left.generation)].start_order > generations[@intFromEnum(right.generation)].start_order;
+        inline for (.{ planned_cleanups, explicit_abandonments }) |endings| {
+            const Ending = @TypeOf(endings.items[0]);
+            std.mem.sort(Ending, endings.items, self.generations, struct {
+                fn lessThan(generations: []const Generation, left: Ending, right: Ending) bool {
+                    const location_order = compareLocations(left.location, right.location);
+                    if (location_order != 0) return location_order < 0;
+                    return generations[@intFromEnum(left.generation)].start_order > generations[@intFromEnum(right.generation)].start_order;
+                }
+            }.lessThan);
+            // Start orders are unique, so repeated generation/location pairs are adjacent.
+            var unique_count: usize = 0;
+            for (endings.items) |ending| {
+                if (unique_count > 0) {
+                    const previous = endings.items[unique_count - 1];
+                    if (previous.generation == ending.generation and std.meta.eql(previous.location, ending.location)) {
+                        if (Ending == PlannedCleanup) {
+                            std.debug.assert(previous.cleanup_value == ending.cleanup_value);
+                            std.debug.assert(previous.cleanup_condition == ending.cleanup_condition);
+                        }
+                        continue;
+                    }
+                }
+                endings.items[unique_count] = ending;
+                unique_count += 1;
             }
-        }.lessThan);
-        std.mem.sort(ExplicitAbandonment, explicit_abandonments, self.generations, struct {
-            fn lessThan(generations: []const Generation, left: ExplicitAbandonment, right: ExplicitAbandonment) bool {
-                const location_order = compareLocations(left.location, right.location);
-                if (location_order != 0) return location_order < 0;
-                return generations[@intFromEnum(left.generation)].start_order > generations[@intFromEnum(right.generation)].start_order;
-            }
-        }.lessThan);
+            endings.shrinkRetainingCapacity(unique_count);
+        }
     }
 
     fn compareLocations(left: CleanupLocation, right: CleanupLocation) i2 {
@@ -1082,32 +784,27 @@ pub const Solver = struct {
         return if (left < right) -1 else if (left > right) 1 else 0;
     }
 
-    fn blockAtLayoutIndex(self: *const Solver, layout_index: u32) structures.FunctionBlockId {
-        for (self.blocks, 0..) |block, block_index| {
-            if (block.layout_index == layout_index) return @enumFromInt(block_index);
-        }
-        unreachable;
-    }
-
     fn validatePathComplete(
         self: *Solver,
         planned_cleanups: []const PlannedCleanup,
         explicit_abandonments: []const ExplicitAbandonment,
     ) void {
+        // This pass checks compiler invariants; source obligations were planned above.
+        if (!std.debug.runtime_safety) return;
         @memset(self.live_in, 0);
         @memset(self.live_out, 0);
         var changed = true;
         while (changed) {
             changed = false;
-            var layout_index: u32 = 0;
-            while (layout_index < self.blocks.len) : (layout_index += 1) {
-                const block_id = self.blockAtLayoutIndex(layout_index);
-                if (!self.reachable[@intFromEnum(block_id)]) continue;
-                const block_value = self.blocks[@intFromEnum(block_id)];
+            for (self.blocks, 0..) |block_value, block_index| {
+                if (!self.reachable[block_index]) continue;
+                const block_id: structures.FunctionBlockId = @enumFromInt(block_index);
                 GenerationBits.clear(self.scratch);
                 if (block_id != self.entry) {
-                    for (self.ownership_edges) |*edge| {
-                        if (edge.successor != block_id or !self.reachable[@intFromEnum(edge.predecessor)]) continue;
+                    var incoming = self.block_edges[block_index].first_incoming;
+                    while (incoming) |edge_index| : (incoming = self.previous_incoming[edge_index]) {
+                        const edge = &self.ownership_edges[edge_index];
+                        if (!self.reachable[@intFromEnum(edge.predecessor)]) continue;
                         GenerationBits.copy(self.edge_scratch, self.blockSet(self.live_out, edge.predecessor));
                         self.remapOpenEdge(self.edge_scratch, edge, planned_cleanups, explicit_abandonments);
                         self.applyEndings(
@@ -1278,21 +975,15 @@ pub const Solver = struct {
             effect_index -= 1;
             switch (effects[effect_index]) {
                 .define => |definition| GenerationBits.remove(demand, definition.generation),
-                .use => |use| GenerationBits.insert(demand, use.generation),
-                .update => |update| GenerationBits.insert(demand, update.generation),
+                .use, .update => |use| GenerationBits.insert(demand, use.generation),
                 .consume => |generation| GenerationBits.insert(demand, generation),
             }
         }
     }
 
     fn findEdge(self: *const Solver, predecessor: structures.FunctionBlockId, successor_ordinal: u2) *const OwnershipEdge {
-        var result: ?*const OwnershipEdge = null;
-        for (self.ownership_edges) |*edge| {
-            if (edge.predecessor != predecessor or edge.successor_ordinal != successor_ordinal) continue;
-            std.debug.assert(result == null);
-            result = edge;
-        }
-        return result orelse unreachable;
+        const edge_index = self.block_edges[@intFromEnum(predecessor)].outgoing[successor_ordinal] orelse unreachable;
+        return &self.ownership_edges[edge_index];
     }
 
     fn blockSet(self: *const Solver, matrix: []u64, block: structures.FunctionBlockId) []u64 {
@@ -1318,30 +1009,368 @@ pub const Solver = struct {
     }
 };
 
+const TestSolverBlock = struct {
+    boundaries: []const u32 = &.{},
+    terminator_effects: []const LifetimeEffect = &.{},
+    terminator: structures.FunctionTerminator,
+    argument_start: u32 = 0,
+    argument_end: u32 = 0,
+};
+
+const TestSolverExpected = struct {
+    cleanups: []const PlannedCleanup = &.{},
+    abandonments: []const ExplicitAbandonment = &.{},
+};
+
+fn testExpectLifetimePlan(
+    gpa: std.mem.Allocator,
+    generations: []const Generation,
+    boundary_effects: []const []const LifetimeEffect,
+    block_descriptions: []const TestSolverBlock,
+    block_argument_generations: []const ?GenerationId,
+    ownership_forwards: []const OwnershipForward,
+    ownership_edges: []const OwnershipEdge,
+    expected: TestSolverExpected,
+) !void {
+    const boundaries = try gpa.alloc(Boundary, boundary_effects.len);
+    defer gpa.free(boundaries);
+    @memset(boundaries, .{ .span = .{ .start = 0, .end = 0 } });
+    defer for (boundaries) |*boundary| boundary.effects.deinit(gpa);
+    for (boundaries, boundary_effects) |*boundary, effects| try boundary.effects.appendSlice(gpa, effects);
+
+    const blocks = try gpa.alloc(BuildBlock, block_descriptions.len);
+    defer gpa.free(blocks);
+    for (blocks, block_descriptions, 0..) |*block, description, index| {
+        block.* = .{
+            .argument_start = description.argument_start,
+            .argument_end = description.argument_end,
+            // Publication order must not affect lifetime analysis.
+            .layout_index = @intCast(block_descriptions.len - 1 - index),
+            .terminator = description.terminator,
+        };
+    }
+    defer for (blocks) |*block| {
+        block.items.deinit(gpa);
+        block.terminator_effects.deinit(gpa);
+    };
+    for (blocks, block_descriptions) |*block, description| {
+        for (description.boundaries) |boundary| try block.items.append(gpa, .{ .boundary = @enumFromInt(boundary) });
+        try block.terminator_effects.appendSlice(gpa, description.terminator_effects);
+    }
+
+    var planned_cleanups: std.ArrayList(PlannedCleanup) = .empty;
+    defer planned_cleanups.deinit(gpa);
+    var explicit_abandonments: std.ArrayList(ExplicitAbandonment) = .empty;
+    defer explicit_abandonments.deinit(gpa);
+    var solver = try Solver.init(
+        gpa,
+        generations,
+        boundaries,
+        blocks,
+        block_argument_generations,
+        ownership_forwards,
+        ownership_edges,
+        @enumFromInt(0),
+    );
+    defer solver.deinit();
+    try solver.solve(&planned_cleanups, &explicit_abandonments);
+    try std.testing.expectEqual(expected.cleanups.len, planned_cleanups.items.len);
+    for (expected.cleanups, planned_cleanups.items) |expected_cleanup, actual| {
+        try std.testing.expect(std.meta.eql(expected_cleanup, actual));
+    }
+    try std.testing.expectEqual(expected.abandonments.len, explicit_abandonments.items.len);
+    for (expected.abandonments, explicit_abandonments.items) |expected_abandonment, actual| {
+        try std.testing.expect(std.meta.eql(expected_abandonment, actual));
+    }
+}
+
+fn testSolverGeneration(start_order: u32, explicit: bool) Generation {
+    return .{
+        .type_id = .unit,
+        .start_order = start_order,
+        .span = .{ .start = start_order, .end = start_order + 1 },
+        .requires_explicit_drop = explicit,
+        .can_deinit = false,
+    };
+}
+
 test "lifetime solver plans straight-line last and zero uses" {
-    try Solver.testStraightLineLastAndZeroUses();
+    const generations = [_]Generation{ testSolverGeneration(0, false), testSolverGeneration(1, false) };
+    const boundaries = [_][]const LifetimeEffect{
+        &.{
+            .{ .define = .{ .generation = @enumFromInt(0), .value = @enumFromInt(10) } },
+            .{ .define = .{ .generation = @enumFromInt(1), .value = @enumFromInt(11) } },
+        },
+        &.{.{ .use = .{ .generation = @enumFromInt(1), .cleanup_value = @enumFromInt(12) } }},
+    };
+    const blocks = [_]TestSolverBlock{.{ .boundaries = &.{ 0, 1 }, .terminator = .return_unit }};
+    try testExpectLifetimePlan(std.testing.allocator, &generations, &boundaries, &blocks, &.{}, &.{}, &.{}, .{ .cleanups = &.{
+        .{
+            .generation = @enumFromInt(0),
+            .cleanup_value = @enumFromInt(10),
+            .location = .{ .boundary = @enumFromInt(0) },
+        },
+        .{
+            .generation = @enumFromInt(1),
+            .cleanup_value = @enumFromInt(12),
+            .location = .{ .boundary = @enumFromInt(1) },
+        },
+    } });
 }
 
 test "lifetime solver distinguishes branch use and consume" {
-    try Solver.testBranchUseAndConsume();
+    const generations = [_]Generation{testSolverGeneration(0, false)};
+    const boundaries = [_][]const LifetimeEffect{
+        &.{.{ .define = .{ .generation = @enumFromInt(0), .value = @enumFromInt(10) } }},
+        &.{.{ .use = .{
+            .generation = @enumFromInt(0),
+            .cleanup_value = @enumFromInt(11),
+            .cleanup_condition = @enumFromInt(99),
+        } }},
+    };
+    const blocks = [_]TestSolverBlock{
+        .{ .boundaries = &.{0}, .terminator = .{ .predicate_branch = .{
+            .operation = .eqb,
+            .operands = .{ .lhs = @enumFromInt(0), .rhs = @enumFromInt(1) },
+            .then_branch = .{ .target = @enumFromInt(1), .arguments = .{ .start = 0, .end = 0 } },
+            .else_branch = .{ .target = @enumFromInt(2), .arguments = .{ .start = 0, .end = 0 } },
+        } } },
+        .{ .boundaries = &.{1}, .terminator = .return_unit },
+        .{ .terminator_effects = &.{.{ .consume = @enumFromInt(0) }}, .terminator = .return_unit },
+    };
+    const edges = [_]OwnershipEdge{
+        .{ .predecessor = @enumFromInt(0), .successor_ordinal = 0, .successor = @enumFromInt(1), .mappings = .{ .start = 0, .end = 0 } },
+        .{ .predecessor = @enumFromInt(0), .successor_ordinal = 1, .successor = @enumFromInt(2), .mappings = .{ .start = 0, .end = 0 } },
+    };
+    try testExpectLifetimePlan(std.testing.allocator, &generations, &boundaries, &blocks, &.{}, &.{}, &edges, .{ .cleanups = &.{.{
+        .generation = @enumFromInt(0),
+        .cleanup_value = @enumFromInt(11),
+        .cleanup_condition = @enumFromInt(99),
+        .location = .{ .boundary = @enumFromInt(1) },
+    }} });
 }
 
-test "lifetime solver follows ownership joins" {
-    try Solver.testOwnershipJoins();
+test "lifetime solver follows ownership joins and releases every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testExpectOwnershipJoinPlan, .{});
+}
+
+fn testExpectOwnershipJoinPlan(gpa: std.mem.Allocator) !void {
+    const generations = [_]Generation{
+        testSolverGeneration(0, false),
+        testSolverGeneration(1, false),
+        testSolverGeneration(2, false),
+    };
+    const boundaries = [_][]const LifetimeEffect{
+        &.{.{ .define = .{ .generation = @enumFromInt(0), .value = @enumFromInt(10) } }},
+        &.{.{ .define = .{ .generation = @enumFromInt(1), .value = @enumFromInt(11) } }},
+        &.{.{ .use = .{ .generation = @enumFromInt(2), .cleanup_value = @enumFromInt(0) } }},
+    };
+    const blocks = [_]TestSolverBlock{
+        .{ .terminator = .{ .predicate_branch = .{
+            .operation = .eqb,
+            .operands = .{ .lhs = @enumFromInt(1), .rhs = @enumFromInt(2) },
+            .then_branch = .{ .target = @enumFromInt(1), .arguments = .{ .start = 0, .end = 0 } },
+            .else_branch = .{ .target = @enumFromInt(2), .arguments = .{ .start = 0, .end = 0 } },
+        } } },
+        .{ .boundaries = &.{0}, .terminator = .{ .branch = .{ .target = @enumFromInt(3), .arguments = .{ .start = 0, .end = 0 } } } },
+        .{ .boundaries = &.{1}, .terminator = .{ .branch = .{ .target = @enumFromInt(3), .arguments = .{ .start = 0, .end = 0 } } } },
+        .{ .boundaries = &.{2}, .terminator = .return_unit, .argument_start = 0, .argument_end = 1 },
+    };
+    const forwards = [_]OwnershipForward{
+        .{ .forward = .{ .source = @enumFromInt(0), .destination = @enumFromInt(2) } },
+        .{ .forward = .{ .source = @enumFromInt(1), .destination = @enumFromInt(2) } },
+    };
+    const edges = [_]OwnershipEdge{
+        .{ .predecessor = @enumFromInt(2), .successor_ordinal = 0, .successor = @enumFromInt(3), .mappings = .{ .start = 1, .end = 2 } },
+        .{ .predecessor = @enumFromInt(1), .successor_ordinal = 0, .successor = @enumFromInt(3), .mappings = .{ .start = 0, .end = 1 } },
+        .{ .predecessor = @enumFromInt(0), .successor_ordinal = 1, .successor = @enumFromInt(2), .mappings = .{ .start = 0, .end = 0 } },
+        .{ .predecessor = @enumFromInt(0), .successor_ordinal = 0, .successor = @enumFromInt(1), .mappings = .{ .start = 0, .end = 0 } },
+    };
+    try testExpectLifetimePlan(gpa, &generations, &boundaries, &blocks, &.{@enumFromInt(2)}, &forwards, &edges, .{ .cleanups = &.{.{
+        .generation = @enumFromInt(2),
+        .cleanup_value = @enumFromInt(0),
+        .location = .{ .boundary = @enumFromInt(2) },
+    }} });
 }
 
 test "lifetime solver reaches a fixed point across continue and break" {
-    try Solver.testContinueAndBreak();
+    const generations = [_]Generation{testSolverGeneration(0, false)};
+    const boundaries = [_][]const LifetimeEffect{
+        &.{.{ .define = .{ .generation = @enumFromInt(0), .value = @enumFromInt(10) } }},
+        &.{.{ .use = .{ .generation = @enumFromInt(0), .cleanup_value = @enumFromInt(11) } }},
+    };
+    const blocks = [_]TestSolverBlock{
+        .{ .boundaries = &.{0}, .terminator = .{ .branch = .{ .target = @enumFromInt(1), .arguments = .{ .start = 0, .end = 0 } } } },
+        .{ .terminator = .{ .predicate_branch = .{
+            .operation = .eqb,
+            .operands = .{ .lhs = @enumFromInt(1), .rhs = @enumFromInt(2) },
+            .then_branch = .{ .target = @enumFromInt(2), .arguments = .{ .start = 0, .end = 0 } },
+            .else_branch = .{ .target = @enumFromInt(3), .arguments = .{ .start = 0, .end = 0 } },
+        } } },
+        .{ .boundaries = &.{1}, .terminator = .{ .branch = .{ .target = @enumFromInt(1), .arguments = .{ .start = 0, .end = 0 } } } },
+        .{ .terminator = .return_unit },
+    };
+    const edges = [_]OwnershipEdge{
+        .{ .predecessor = @enumFromInt(0), .successor_ordinal = 0, .successor = @enumFromInt(1), .mappings = .{ .start = 0, .end = 0 } },
+        .{ .predecessor = @enumFromInt(1), .successor_ordinal = 0, .successor = @enumFromInt(2), .mappings = .{ .start = 0, .end = 0 } },
+        .{ .predecessor = @enumFromInt(1), .successor_ordinal = 1, .successor = @enumFromInt(3), .mappings = .{ .start = 0, .end = 0 } },
+        .{ .predecessor = @enumFromInt(2), .successor_ordinal = 0, .successor = @enumFromInt(1), .mappings = .{ .start = 0, .end = 0 } },
+    };
+    try testExpectLifetimePlan(std.testing.allocator, &generations, &boundaries, &blocks, &.{}, &.{}, &edges, .{ .cleanups = &.{.{
+        .generation = @enumFromInt(0),
+        .cleanup_value = @enumFromInt(10),
+        .location = .{ .edge = .{ .predecessor = @enumFromInt(1), .successor_ordinal = 1 } },
+    }} });
 }
 
 test "lifetime solver handles terminal consumes divergence and fallible production" {
-    try Solver.testTerminalEffectsAndProduction();
+    const consumed_generation = [_]Generation{testSolverGeneration(0, false)};
+    const consumed_boundaries = [_][]const LifetimeEffect{&.{.{ .define = .{
+        .generation = @enumFromInt(0),
+        .value = @enumFromInt(10),
+    } }}};
+    const consumed_blocks = [_]TestSolverBlock{.{
+        .boundaries = &.{0},
+        .terminator_effects = &.{.{ .consume = @enumFromInt(0) }},
+        .terminator = .return_failure,
+    }};
+    try testExpectLifetimePlan(std.testing.allocator, &consumed_generation, &consumed_boundaries, &consumed_blocks, &.{}, &.{}, &.{}, .{});
+
+    const diverging_boundaries = [_][]const LifetimeEffect{&.{
+        .{ .define = .{ .generation = @enumFromInt(0), .value = @enumFromInt(10) } },
+        .{ .use = .{ .generation = @enumFromInt(0), .cleanup_value = @enumFromInt(10) } },
+    }};
+    const diverging_blocks = [_]TestSolverBlock{.{
+        .terminator_effects = diverging_boundaries[0],
+        .terminator = .diverge,
+    }};
+    try testExpectLifetimePlan(std.testing.allocator, &consumed_generation, &.{}, &diverging_blocks, &.{}, &.{}, &.{}, .{});
+
+    const produced_blocks = [_]TestSolverBlock{
+        .{ .terminator = .{ .fallible_call = .{
+            .call = .{ .target = @enumFromInt(0), .arguments = .{ .start = 0, .end = 0 }, .return_type = .unit },
+            .success = @enumFromInt(1),
+            .failure = @enumFromInt(2),
+        } } },
+        .{ .terminator = .return_unit, .argument_start = 0, .argument_end = 1 },
+        .{ .terminator = .return_failure, .argument_start = 1, .argument_end = 1 },
+    };
+    const produced_forwards = [_]OwnershipForward{.{ .produce = @enumFromInt(0) }};
+    const produced_edges = [_]OwnershipEdge{
+        .{ .predecessor = @enumFromInt(0), .successor_ordinal = 0, .successor = @enumFromInt(1), .mappings = .{ .start = 0, .end = 1 } },
+        .{ .predecessor = @enumFromInt(0), .successor_ordinal = 1, .successor = @enumFromInt(2), .mappings = .{ .start = 1, .end = 1 } },
+    };
+    try testExpectLifetimePlan(std.testing.allocator, &consumed_generation, &.{}, &produced_blocks, &.{@enumFromInt(0)}, &produced_forwards, &produced_edges, .{ .cleanups = &.{.{
+        .generation = @enumFromInt(0),
+        .cleanup_value = @enumFromInt(0),
+        .location = .{ .block_entry = @enumFromInt(1) },
+    }} });
 }
 
 test "lifetime solver reports explicit abandonment on only one branch" {
-    try Solver.testExplicitAbandonment();
+    const generations = [_]Generation{testSolverGeneration(0, true)};
+    const boundaries = [_][]const LifetimeEffect{&.{.{ .define = .{
+        .generation = @enumFromInt(0),
+        .value = @enumFromInt(10),
+    } }}};
+    const blocks = [_]TestSolverBlock{
+        .{ .boundaries = &.{0}, .terminator = .{ .predicate_branch = .{
+            .operation = .eqb,
+            .operands = .{ .lhs = @enumFromInt(1), .rhs = @enumFromInt(2) },
+            .then_branch = .{ .target = @enumFromInt(1), .arguments = .{ .start = 0, .end = 0 } },
+            .else_branch = .{ .target = @enumFromInt(2), .arguments = .{ .start = 0, .end = 0 } },
+        } } },
+        .{ .terminator_effects = &.{.{ .consume = @enumFromInt(0) }}, .terminator = .return_unit },
+        .{ .terminator = .return_unit },
+    };
+    const edges = [_]OwnershipEdge{
+        .{ .predecessor = @enumFromInt(0), .successor_ordinal = 0, .successor = @enumFromInt(1), .mappings = .{ .start = 0, .end = 0 } },
+        .{ .predecessor = @enumFromInt(0), .successor_ordinal = 1, .successor = @enumFromInt(2), .mappings = .{ .start = 0, .end = 0 } },
+    };
+    try testExpectLifetimePlan(std.testing.allocator, &generations, &boundaries, &blocks, &.{}, &.{}, &edges, .{ .abandonments = &.{.{
+        .generation = @enumFromInt(0),
+        .location = .{ .edge = .{ .predecessor = @enumFromInt(0), .successor_ordinal = 1 } },
+    }} });
 }
 
 test "lifetime solver reverses simultaneous generation start order" {
-    try Solver.testReverseStartOrder();
+    const generations = [_]Generation{ testSolverGeneration(0, false), testSolverGeneration(1, false) };
+    const boundaries = [_][]const LifetimeEffect{
+        &.{
+            .{ .define = .{ .generation = @enumFromInt(0), .value = @enumFromInt(10) } },
+            .{ .define = .{ .generation = @enumFromInt(1), .value = @enumFromInt(11) } },
+        },
+        &.{
+            .{ .use = .{ .generation = @enumFromInt(0), .cleanup_value = @enumFromInt(10) } },
+            .{ .use = .{ .generation = @enumFromInt(1), .cleanup_value = @enumFromInt(11) } },
+        },
+    };
+    const blocks = [_]TestSolverBlock{.{ .boundaries = &.{ 0, 1 }, .terminator = .return_unit }};
+    try testExpectLifetimePlan(std.testing.allocator, &generations, &boundaries, &blocks, &.{}, &.{}, &.{}, .{ .cleanups = &.{
+        .{
+            .generation = @enumFromInt(1),
+            .cleanup_value = @enumFromInt(11),
+            .location = .{ .boundary = @enumFromInt(1) },
+        },
+        .{
+            .generation = @enumFromInt(0),
+            .cleanup_value = @enumFromInt(10),
+            .location = .{ .boundary = @enumFromInt(1) },
+        },
+    } });
+}
+
+test "lifetime endings deduplicate requests while preserving order locations and conditions" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testEndingDeduplication, .{});
+}
+
+fn testEndingDeduplication(gpa: std.mem.Allocator) !void {
+    for ([_]bool{ false, true }) |explicit| {
+        var generations = [_]Generation{ testSolverGeneration(1, explicit), testSolverGeneration(0, explicit) };
+        generations[0].cleanup_condition = @enumFromInt(99);
+        // Exercise plan finalization directly, including requests from separate planning sites.
+        var solver = try Solver.init(gpa, &generations, &.{}, &.{}, &.{}, &.{}, &.{}, @enumFromInt(0));
+        defer solver.deinit();
+        var cleanups: std.ArrayList(PlannedCleanup) = .empty;
+        defer cleanups.deinit(gpa);
+        var abandonments: std.ArrayList(ExplicitAbandonment) = .empty;
+        defer abandonments.deinit(gpa);
+        const expected = [_]struct { generation: GenerationId, location: CleanupLocation }{
+            .{ .generation = @enumFromInt(0), .location = .{ .boundary = @enumFromInt(0) } },
+            .{ .generation = @enumFromInt(1), .location = .{ .boundary = @enumFromInt(0) } },
+            .{ .generation = @enumFromInt(0), .location = .{ .boundary = @enumFromInt(1) } },
+            .{ .generation = @enumFromInt(0), .location = .{ .edge = .{ .predecessor = @enumFromInt(0), .successor_ordinal = 0 } } },
+            .{ .generation = @enumFromInt(0), .location = .{ .edge = .{ .predecessor = @enumFromInt(0), .successor_ordinal = 1 } } },
+            .{ .generation = @enumFromInt(0), .location = .{ .block_entry = @enumFromInt(1) } },
+        };
+        for ([_]usize{ 4, 1, 3, 0, 4, 5, 2, 5, 1, 0, 2, 3 }) |index| {
+            const ending = expected[index];
+            try solver.recordEnding(
+                &cleanups,
+                &abandonments,
+                ending.generation,
+                @enumFromInt(10 + @intFromEnum(ending.generation)),
+                null,
+                ending.location,
+            );
+        }
+        solver.finishEndings(&cleanups, &abandonments);
+        try std.testing.expectEqual(if (explicit) @as(usize, 0) else expected.len, cleanups.items.len);
+        try std.testing.expectEqual(if (explicit) expected.len else @as(usize, 0), abandonments.items.len);
+        for (expected, 0..) |ending, index| {
+            if (explicit) {
+                try std.testing.expectEqualDeep(ExplicitAbandonment{
+                    .generation = ending.generation,
+                    .location = ending.location,
+                }, abandonments.items[index]);
+            } else {
+                try std.testing.expectEqualDeep(PlannedCleanup{
+                    .generation = ending.generation,
+                    .cleanup_value = @enumFromInt(10 + @intFromEnum(ending.generation)),
+                    .cleanup_condition = generations[@intFromEnum(ending.generation)].cleanup_condition,
+                    .location = ending.location,
+                }, cleanups.items[index]);
+            }
+        }
+    }
 }

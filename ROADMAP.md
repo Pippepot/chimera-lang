@@ -32,14 +32,16 @@ recomputation. Keep unsupported forms rejected at their owning boundary.
 
 ### 1. Lifetime analysis, control flow, and callable expressions
 
-- **Last-use destruction:** replace scope-exit scheduling with Mojo-style ASAP
-  destruction, including subexpression boundaries. Start with supported values
-  and non-escaping borrows, then extend the same analysis to origins and views
-  in milestone 6. Account for cleanup uses, reassignment, branches, loops, and
-  every exit path. Specify ordering when several lifetimes end together and
-  explicit lifetime-extension syntax. Test observable destructor order and
-  preserve explicit-drop obligations; this is a semantic change, not an
-  optional optimization.
+- **Last-use destruction (complete for the current value model):** query-local
+  generation analysis has replaced scope-exit scheduling with path-sensitive
+  ASAP destruction at completed-expression boundaries and control-flow edges.
+  Cleanup uses, reassignment, branches, loops, returns, failures, `break`, and
+  `continue` are covered; simultaneous endings use reverse generation-start
+  order, and `_ = value` explicitly extends a lifetime. Observable destructor
+  timing, explicit-drop obligations, ownership-hook dependencies, and
+  incremental recomputation are tested. Origins, escaping borrowed views,
+  independent partial-place lifetimes, and stable immovable storage extend this
+  analysis in milestone 6.
 - **Match:** evaluate the subject once; support literal, wildcard, binding,
   `pattern as name`, and `is Type` patterns; diagnose redundancy and
   non-exhaustiveness; reuse existing branch joins and variant mappings.
