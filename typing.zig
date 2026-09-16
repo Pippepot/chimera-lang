@@ -531,7 +531,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
         }
 
         fn ownValue(self: *Self, value_to_own: Value, span: structures.SourceSpan) !Value {
-            if (try self.nonCopyableBorrow(value_to_own)) |source_type| return self.reject(span, .{ .type_not_copyable = source_type });
+            if (try self.nonCopyableBorrow(value_to_own)) |details| return self.reject(span, .{ .type_not_copyable = details });
             if (value_to_own.borrowed_type == null) return withoutOwnershipSource(value_to_own);
             return if (value_to_own.borrow_condition) |borrow_predicate|
                 self.copyValueConditionally(value_to_own, borrow_predicate, span)
@@ -932,10 +932,13 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             }
         }
 
-        fn nonCopyableBorrow(self: *Self, value_to_check: Value) !?structures.TypeId {
+        fn nonCopyableBorrow(self: *Self, value_to_check: Value) !?structures.Diagnostic.TypeNotCopyable {
             const source_type = value_to_check.borrowed_type orelse return null;
             const capabilities = (try self.type_interner.ownershipCapabilities(source_type)) orelse return error.Unavailable;
-            return if (capabilities.copy == .none) source_type else null;
+            return if (capabilities.copy == .none) .{
+                .type_id = source_type,
+                .is_movable = capabilities.move != .none,
+            } else null;
         }
 
         fn borrowValue(self: *Self, borrowed: Value, span: structures.SourceSpan) !Value {

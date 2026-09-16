@@ -988,6 +988,11 @@ pub const Diagnostic = struct {
         found: TypeId,
     };
 
+    pub const TypeNotCopyable = struct {
+        type_id: TypeId,
+        is_movable: bool,
+    };
+
     pub const Kind = union(enum) {
         expected_token: struct {
             expected: Token.Tag,
@@ -1029,7 +1034,7 @@ pub const Diagnostic = struct {
         possibly_transferred,
         transferred_value_not_restored_before_loop_backedge,
         type_not_movable: TypeId,
-        type_not_copyable: TypeId,
+        type_not_copyable: TypeNotCopyable,
         value_requires_explicit_drop: TypeId,
         expression_not_supported,
         struct_initializer_not_struct: TypeId,

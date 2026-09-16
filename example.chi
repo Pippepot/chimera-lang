@@ -1,10 +1,10 @@
-struct S
-  a: int
-  copy = trivial
+struct File
+  id: int
+  move = none
 
-func foo(var b:S) int
-  b.a = 10
-  return b.a
+const f = File{id = 1}
 
-const s = S{a = 1}
-exit(s.a + foo(s) + s.a)
+func take(var file: File)
+  exit(file.id)
+
+take(f)

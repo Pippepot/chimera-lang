@@ -6314,6 +6314,7 @@ test "struct copy and move properties control ownership uses" {
         \\  move = none
         \\  value: int
         \\func take(var value: Copyable) int -> value.value
+        \\func take_immovable(var value: Immovable) int -> value.value
         \\func answer() int
         \\  const source = Copyable{value = 42}
         \\  const result = take(source)
@@ -6322,6 +6323,9 @@ test "struct copy and move properties control ownership uses" {
         \\  const source = Immovable{value = 42}
         \\  const moved = source^
         \\  return moved.value
+        \\func bad_copy() int
+        \\  const source = Immovable{value = 42}
+        \\  return take_immovable(source)
     );
     try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "take" }, 42);
 
@@ -6331,6 +6335,15 @@ test "struct copy and move properties control ownership uses" {
     defer freeDiagnostics(diagnostics);
     try testing.expectEqual(@as(usize, 1), diagnostics.len);
     try testing.expectEqual(DiagnosticKind.type_not_movable, std.meta.activeTag(diagnostics[0].kind));
+
+    const bad_copy = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveFunction("bad_copy").?;
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, bad_copy)).* == null);
+    const copy_diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, bad_copy, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(copy_diagnostics);
+    try testing.expectEqual(@as(usize, 1), copy_diagnostics.len);
+    const details = copy_diagnostics[0].kind.type_not_copyable;
+    try testing.expectEqual(diagnostics[0].kind.type_not_movable, details.type_id);
+    try testing.expect(!details.is_movable);
 }
 
 test "struct copy property edits invalidate and recover owning callers" {
@@ -6348,7 +6361,7 @@ test "struct copy property edits invalidate and recover owning callers" {
     try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, answer)).* == null);
     var diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, answer, structures.Diagnostic, testing.allocator);
     try testing.expectEqual(@as(usize, 1), diagnostics.len);
-    try testing.expectEqual(DiagnosticKind.type_not_copyable, std.meta.activeTag(diagnostics[0].kind));
+    try testing.expect(diagnostics[0].kind.type_not_copyable.is_movable);
     freeDiagnostics(diagnostics);
 
     try setSource(db, 1,
