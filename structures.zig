@@ -993,6 +993,24 @@ pub const Diagnostic = struct {
         is_movable: bool,
     };
 
+    pub const InvalidStructPropertyValue = enum {
+        move,
+        copy,
+        drop,
+    };
+
+    pub const IncompatibleStructOwnershipProperty = enum {
+        trivial_move,
+        fieldwise_move,
+        trivial_copy,
+        fieldwise_copy,
+        trivial_drop,
+    };
+
+    pub const MissingStructInitializerField = struct {
+        name_span: SourceSpan,
+    };
+
     pub const Kind = union(enum) {
         expected_token: struct {
             expected: Token.Tag,
@@ -1006,9 +1024,9 @@ pub const Diagnostic = struct {
         duplicate_struct_field,
         duplicate_struct_property,
         unknown_struct_property,
-        invalid_struct_property_value,
+        invalid_struct_property_value: InvalidStructPropertyValue,
         struct_ownership_hook_signature_mismatch: TypeMismatch,
-        struct_ownership_property_incompatible_with_fields,
+        struct_ownership_property_incompatible_with_fields: IncompatibleStructOwnershipProperty,
         struct_field_type_not_supported,
         recursive_struct_containment,
         static_initializer_type_mismatch: TypeMismatch,
@@ -1040,7 +1058,7 @@ pub const Diagnostic = struct {
         struct_initializer_not_struct: TypeId,
         unknown_struct_field,
         duplicate_struct_initializer_field,
-        missing_struct_initializer_field,
+        missing_struct_initializer_field: MissingStructInitializerField,
         struct_initializer_field_type_mismatch: TypeMismatch,
         field_access_not_struct: TypeId,
         unknown_field,

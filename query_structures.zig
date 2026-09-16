@@ -522,7 +522,7 @@ pub const OwnershipCapabilities = struct {
             if ((property.capability == .trivial and !moves_trivially) or
                 (property.capability == .fieldwise and !can_move))
             {
-                try emitIncompatibleOwnershipProperty(ctx, item_id, property.span);
+                try emitIncompatibleOwnershipProperty(ctx, item_id, property.span, if (property.capability == .trivial) .trivial_move else .fieldwise_move);
                 return null;
             }
             break :blk property.capability;
@@ -531,14 +531,14 @@ pub const OwnershipCapabilities = struct {
             if ((property.capability == .trivial and !copies_trivially) or
                 (property.capability == .fieldwise and !can_copy))
             {
-                try emitIncompatibleOwnershipProperty(ctx, item_id, property.span);
+                try emitIncompatibleOwnershipProperty(ctx, item_id, property.span, if (property.capability == .trivial) .trivial_copy else .fieldwise_copy);
                 return null;
             }
             break :blk property.capability;
         } else .none;
         const drop: structures.DropCapability = if (definition.ownership.drop) |property| blk: {
             if (property.capability == .trivial and !drops_trivially) {
-                try emitIncompatibleOwnershipProperty(ctx, item_id, property.span);
+                try emitIncompatibleOwnershipProperty(ctx, item_id, property.span, .trivial_drop);
                 return null;
             }
             break :blk property.capability;
@@ -555,12 +555,17 @@ pub const OwnershipCapabilities = struct {
         };
     }
 
-    fn emitIncompatibleOwnershipProperty(ctx: anytype, item_id: structures.ItemId, span: structures.SourceSpan) !void {
+    fn emitIncompatibleOwnershipProperty(
+        ctx: anytype,
+        item_id: structures.ItemId,
+        span: structures.SourceSpan,
+        reason: structures.Diagnostic.IncompatibleStructOwnershipProperty,
+    ) !void {
         const loc = try ctx.lookupInterned(ItemLocations, item_id);
         try ctx.emit(structures.Diagnostic, .{
             .file_id = loc.file_id,
             .span = span,
-            .kind = .struct_ownership_property_incompatible_with_fields,
+            .kind = .{ .struct_ownership_property_incompatible_with_fields = reason },
         });
     }
 };

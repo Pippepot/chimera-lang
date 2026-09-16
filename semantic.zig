@@ -23,6 +23,7 @@ pub const SignatureResult = SemanticResult(structures.FunctionSignature);
 /// remain structural until typing; CFG blocks belong to typed IR.
 pub const UnresolvedBody = struct {
     parameter_count: u32,
+    parameter_spans: []structures.SourceSpan,
     local_count: u32,
     expressions: []Expression,
     conditions: []Condition,
@@ -114,7 +115,11 @@ pub const UnresolvedBody = struct {
             local_read: LocalId,
             local_transfer: LocalId,
             annotation: struct { value: ValueUse, type_id: structures.TypeId },
-            struct_init: struct { type_id: structures.TypeId, fields: structures.FunctionValueRange },
+            struct_init: struct {
+                type_id: structures.TypeId,
+                type_span: structures.SourceSpan,
+                fields: structures.FunctionValueRange,
+            },
             field_access: struct { operand: ValueUse, name: []const u8 },
             assignment: struct {
                 target: LocalId,
@@ -139,6 +144,7 @@ pub const UnresolvedBody = struct {
     };
 
     pub fn deinit(self: *UnresolvedBody, gpa: std.mem.Allocator) void {
+        gpa.free(self.parameter_spans);
         gpa.free(self.expressions);
         gpa.free(self.conditions);
         gpa.free(self.blocks);
@@ -194,6 +200,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
         local_count: u32 = 0,
         locals: std.StringHashMapUnmanaged(Local) = .empty,
         local_names: std.ArrayList([]const u8) = .empty,
+        parameter_spans: std.ArrayList(structures.SourceSpan) = .empty,
         expressions: std.ArrayList(UnresolvedBody.Expression) = .empty,
         conditions: std.ArrayList(UnresolvedBody.Condition) = .empty,
         blocks: std.ArrayList(UnresolvedBody.Block) = .empty,
@@ -210,6 +217,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
         fn deinit(self: *Self) void {
             self.locals.deinit(self.gpa);
             self.local_names.deinit(self.gpa);
+            self.parameter_spans.deinit(self.gpa);
             self.expressions.deinit(self.gpa);
             self.conditions.deinit(self.gpa);
             self.blocks.deinit(self.gpa);
@@ -258,6 +266,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             for (parameters, 0..) |parameter_index, index| {
                 const span = tokenSpan(self.ast, self.ast.nodes[parameter_index.index()].token_index);
                 const name = self.source[span.start..span.end];
+                try self.parameter_spans.append(self.gpa, span);
                 const local: Local = switch (self.parameters[index].mode) {
                     .imm => .{ .value = @enumFromInt(index) },
                     .mut, .@"var", .deinit => blk: {
@@ -482,6 +491,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             }
             return self.appendExpression(index, .{ .struct_init = .{
                 .type_id = type_id,
+                .type_span = nodeFocusSpan(self.ast, parts[0]),
                 .fields = .{ .start = start, .end = @intCast(self.struct_field_values.items.len) },
             } });
         }
@@ -828,6 +838,8 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
         }
 
         fn finish(self: *Self) !UnresolvedBody {
+            const parameter_spans = try self.parameter_spans.toOwnedSlice(self.gpa);
+            errdefer self.gpa.free(parameter_spans);
             const expressions = try self.expressions.toOwnedSlice(self.gpa);
             errdefer self.gpa.free(expressions);
             const conditions = try self.conditions.toOwnedSlice(self.gpa);
@@ -843,6 +855,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             const assignment_fields = try self.assignment_fields.toOwnedSlice(self.gpa);
             return .{
                 .parameter_count = @intCast(self.parameters.len),
+                .parameter_spans = parameter_spans,
                 .local_count = self.local_count,
                 .expressions = expressions,
                 .conditions = conditions,
@@ -1151,7 +1164,7 @@ pub fn analyzeStructDefinition(
                     else if (value.tag == .none_literal)
                         .none
                     else
-                        return .{ .unsupported = .{ .span = value_span, .kind = .invalid_struct_property_value } };
+                        return .{ .unsupported = .{ .span = value_span, .kind = .{ .invalid_struct_property_value = .move } } };
                     ownership.move = .{ .capability = capability, .span = property_span };
                 },
                 .copy => {
@@ -1162,7 +1175,7 @@ pub fn analyzeStructDefinition(
                     else if (value.tag == .none_literal)
                         .none
                     else
-                        return .{ .unsupported = .{ .span = value_span, .kind = .invalid_struct_property_value } };
+                        return .{ .unsupported = .{ .span = value_span, .kind = .{ .invalid_struct_property_value = .copy } } };
                     ownership.copy = .{ .capability = capability, .span = property_span };
                 },
                 .drop => {
@@ -1173,7 +1186,7 @@ pub fn analyzeStructDefinition(
                     else if (std.mem.eql(u8, value_name, "explicit"))
                         .explicit
                     else
-                        return .{ .unsupported = .{ .span = value_span, .kind = .invalid_struct_property_value } };
+                        return .{ .unsupported = .{ .span = value_span, .kind = .{ .invalid_struct_property_value = .drop } } };
                     ownership.drop = .{ .capability = capability, .span = property_span };
                 },
             }

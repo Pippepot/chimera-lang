@@ -179,6 +179,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
 
         fn init(self: *Self, parameters: []const structures.CallableParameter) !void {
             std.debug.assert(parameters.len == self.unresolved.parameter_count);
+            std.debug.assert(parameters.len == self.unresolved.parameter_spans.len);
             self.values = try self.ctx.allocator().alloc(?Value, parameters.len + self.unresolved.expressions.len);
             @memset(self.values, null);
             self.local_values = try self.ctx.allocator().alloc(?Value, self.unresolved.local_count);
@@ -198,7 +199,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             for (parameters, 0..) |parameter, index| {
                 var entry_value: Value = .{ .id = @enumFromInt(index), .type_id = parameter.type_id };
                 if (parameter.mode == .@"var" or parameter.mode == .deinit) {
-                    entry_value.owned_generation = try self.allocateGeneration(parameter.type_id, root_span, parameter.mode == .deinit);
+                    entry_value.owned_generation = try self.allocateGeneration(parameter.type_id, self.unresolved.parameter_spans[index], parameter.mode == .deinit);
                 }
                 switch (parameter.mode) {
                     .imm => self.values[index] = .{
@@ -994,7 +995,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
         fn structInit(self: *Self, expression: Expression) !Value {
             const initializer = expression.operation.struct_init;
             const definition = (try self.type_interner.structDefinition(initializer.type_id)) orelse
-                return self.reject(expression.span, .{ .struct_initializer_not_struct = initializer.type_id });
+                return self.reject(initializer.type_span, .{ .struct_initializer_not_struct = initializer.type_id });
             if (try self.type_interner.structLayout(initializer.type_id) == null) return error.Unavailable;
 
             const seen = try self.ctx.allocator().alloc(bool, definition.fields.len);
@@ -1027,7 +1028,9 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                     .value = field_value.id,
                 });
             }
-            for (seen) |was_seen| if (!was_seen) return self.reject(expression.span, .missing_struct_initializer_field);
+            for (seen, 0..) |was_seen, field_index| if (!was_seen) return self.reject(initializer.type_span, .{ .missing_struct_initializer_field = .{
+                .name_span = definition.fields[field_index].span,
+            } });
             for (field_values.items) |field_value| try self.recordConsume(field_value);
             const start: u32 = @intCast(self.struct_field_values.items.len);
             try self.struct_field_values.appendSlice(self.ctx.allocator(), fields.items);
@@ -3424,6 +3427,7 @@ fn testInitMaterializerBuilder(context: *TestMaterializerContext) TestMaterializ
         .file_id = 1,
         .unresolved = .{
             .parameter_count = 0,
+            .parameter_spans = &.{},
             .local_count = 0,
             .expressions = &.{},
             .conditions = &.{},

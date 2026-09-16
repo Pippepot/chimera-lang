@@ -7,4 +7,10 @@ const f = File{id = 1}
 func take(var file: File)
   exit(file.id)
 
-take(f)
+struct S
+  drop = explicit
+
+const s = S{}
+foo(s^)
+func foo(var s: S)
+  return

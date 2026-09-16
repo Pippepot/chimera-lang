@@ -969,10 +969,13 @@ test "struct ownership properties have precise definition diagnostics" {
     const cases = [_]struct {
         member: []const u8,
         kind: DiagnosticKind,
+        invalid_property: ?structures.Diagnostic.InvalidStructPropertyValue = null,
     }{
         .{ .member = "copy = trivial\n  copy = fieldwise", .kind = .duplicate_struct_property },
         .{ .member = "clone = trivial", .kind = .unknown_struct_property },
-        .{ .member = "move = explicit", .kind = .invalid_struct_property_value },
+        .{ .member = "move = explicit", .kind = .invalid_struct_property_value, .invalid_property = .move },
+        .{ .member = "copy = explicit", .kind = .invalid_struct_property_value, .invalid_property = .copy },
+        .{ .member = "drop = none", .kind = .invalid_struct_property_value, .invalid_property = .drop },
         .{ .member = "copy = func(imm self: int) int -> self", .kind = .struct_ownership_hook_signature_mismatch },
         .{ .member = "move = func(imm self: Invalid) Invalid -> self", .kind = .struct_ownership_hook_signature_mismatch },
         .{ .member = "drop = func(deinit self: Invalid) int -> return 0", .kind = .struct_ownership_hook_signature_mismatch },
@@ -992,6 +995,9 @@ test "struct ownership properties have precise definition diagnostics" {
         defer freeDiagnostics(diagnostics);
         try testing.expectEqual(@as(usize, 1), diagnostics.len);
         try testing.expectEqual(case.kind, std.meta.activeTag(diagnostics[0].kind));
+        if (case.invalid_property) |property| {
+            try testing.expectEqual(property, diagnostics[0].kind.invalid_struct_property_value);
+        }
     }
 }
 
@@ -2044,7 +2050,36 @@ test "struct ownership properties override defaults and validate fields" {
     const diagnostics = try db.transitiveAccumulatorValues(query_structures.OwnershipCapabilities, invalid, structures.Diagnostic, testing.allocator);
     defer freeDiagnostics(diagnostics);
     try testing.expectEqual(@as(usize, 1), diagnostics.len);
-    try testing.expectEqual(DiagnosticKind.struct_ownership_property_incompatible_with_fields, std.meta.activeTag(diagnostics[0].kind));
+    try testing.expectEqual(
+        structures.Diagnostic.Kind{ .struct_ownership_property_incompatible_with_fields = .fieldwise_move },
+        diagnostics[0].kind,
+    );
+}
+
+test "incompatible ownership diagnostics retain the failed field rule" {
+    const cases = [_]struct {
+        source: []const u8,
+        reason: structures.Diagnostic.IncompatibleStructOwnershipProperty,
+    }{
+        .{ .source = "static Field = struct\n  move = fieldwise\n  value: int\nstatic Invalid = struct\n  move = trivial\n  value: Field", .reason = .trivial_move },
+        .{ .source = "static Field = struct\n  move = none\n  value: int\nstatic Invalid = struct\n  move = fieldwise\n  value: Field", .reason = .fieldwise_move },
+        .{ .source = "static Field = struct\n  value: int\nstatic Invalid = struct\n  copy = trivial\n  value: Field", .reason = .trivial_copy },
+        .{ .source = "static Field = struct\n  value: int\nstatic Invalid = struct\n  copy = fieldwise\n  value: Field", .reason = .fieldwise_copy },
+        .{ .source = "static Field = struct\n  drop = explicit\nstatic Invalid = struct\n  drop = trivial\n  value: Field", .reason = .trivial_drop },
+    };
+
+    for (cases, 1..) |case, file_id| {
+        const db = try testDatabase(1);
+        defer db.deinit();
+        try addSource(db, file_id, case.source);
+        const item = (try db.get(query_structures.BuildModuleScope, file_id)).*.?.resolveStatic("Invalid").?;
+        const type_id = (try db.get(query_structures.ResolveStatic, item)).*.?.type;
+        try testing.expect((try db.get(query_structures.OwnershipCapabilities, type_id)).* == null);
+        const diagnostics = try db.transitiveAccumulatorValues(query_structures.OwnershipCapabilities, type_id, structures.Diagnostic, testing.allocator);
+        defer freeDiagnostics(diagnostics);
+        try testing.expectEqual(@as(usize, 1), diagnostics.len);
+        try testing.expectEqual(case.reason, diagnostics[0].kind.struct_ownership_property_incompatible_with_fields);
+    }
 }
 
 test "ownership capabilities reject recursive structs and recover incrementally" {
@@ -2359,6 +2394,22 @@ test "struct value diagnostics reject invalid fields and targets" {
         defer freeDiagnostics(diagnostics);
         try testing.expectEqual(@as(usize, 1), diagnostics.len);
         try testing.expectEqual(case.expected, std.meta.activeTag(diagnostics[0].kind));
+        switch (case.expected) {
+            .struct_initializer_not_struct => {
+                const start = std.mem.lastIndexOf(u8, case.source, "int").?;
+                try testing.expectEqual(structures.SourceSpan{ .start = start, .end = start + "int".len }, diagnostics[0].span.?);
+            },
+            .missing_struct_initializer_field => {
+                const start = std.mem.lastIndexOf(u8, case.source, "Pair").?;
+                try testing.expectEqual(structures.SourceSpan{ .start = start, .end = start + "Pair".len }, diagnostics[0].span.?);
+                const field_start = std.mem.indexOf(u8, case.source, "right").?;
+                try testing.expectEqual(
+                    structures.SourceSpan{ .start = field_start, .end = field_start + "right".len },
+                    diagnostics[0].kind.missing_struct_initializer_field.name_span,
+                );
+            },
+            else => {},
+        }
     }
 }
 
@@ -6408,6 +6459,26 @@ test "explicit-drop struct obligations are checked at every lifetime end" {
         try testing.expectEqual(@as(usize, 1), diagnostics.len);
         try testing.expectEqual(DiagnosticKind.value_requires_explicit_drop, std.meta.activeTag(diagnostics[0].kind));
     }
+}
+
+test "unconsumed var parameter diagnostic points to the parameter name" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    const source =
+        \\static S = struct
+        \\  drop = explicit
+        \\func foo(var s: S)
+        \\  return
+    ;
+    try addSource(db, 1, source);
+    const foo = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveFunction("foo").?;
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, foo)).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, foo, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(DiagnosticKind.value_requires_explicit_drop, std.meta.activeTag(diagnostics[0].kind));
+    const start = std.mem.indexOf(u8, source, "s: S").?;
+    try testing.expectEqual(structures.SourceSpan{ .start = start, .end = start + 1 }, diagnostics[0].span.?);
 }
 
 test "explicit-drop obligations move with transferred values" {
