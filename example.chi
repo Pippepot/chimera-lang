@@ -1,16 +1,3 @@
-struct File
-  id: int
-  move = none
-
-const f = File{id = 1}
-
-func take(var file: File)
-  exit(file.id)
-
-struct S
-  drop = explicit
-
-const s = S{}
-foo(s^)
-func foo(var s: S)
-  return
+func foo(static T: type) type -> T
+const i: foo(int) = 1
+exit(i)

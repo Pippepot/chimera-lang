@@ -26,7 +26,10 @@ pub fn renderReachableSsa(
 
     try writer.writeAll("SSA\n");
     for (reachable.instances) |instance| {
-        const body = (try db.get(queries.AnalyzeFunctionBody, instance.item)).* orelse unreachable;
+        const body = if (instance.specialization == null)
+            (try db.get(queries.AnalyzeFunctionBody, instance.item)).* orelse unreachable
+        else
+            (try db.get(queries.AnalyzeFunctionInstance, instance)).* orelse unreachable;
         try renderSsaFunction(db, instance, &body, writer);
     }
 }
@@ -38,7 +41,11 @@ fn renderSsaFunction(
     writer: *std.Io.Writer,
 ) !void {
     const location = try db.lookupInterned(queries.ItemLocations, instance.item);
-    try writer.print("fn {s}\n", .{location.name});
+    if (instance.specialization) |specialization| {
+        try writer.print("fn {s}[{d}]\n", .{ location.name, @intFromEnum(specialization) });
+    } else {
+        try writer.print("fn {s}\n", .{location.name});
+    }
     for (ssa.blocks, 0..) |block, block_index| {
         try writer.print("  b{d}(", .{block_index});
         for (block.argument_start..block.argument_end) |argument_index| {

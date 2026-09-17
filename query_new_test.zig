@@ -7115,6 +7115,180 @@ test "CollectReachableInstances publishes stable breadth-first order" {
     try testing.expectEqual(initial, try db.get(query_structures.CollectReachableInstances, 1));
 }
 
+test "static type and value parameters produce canonical reachable instances" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static Whole: type = int
+        \\func identity(static T: type, static N: int, value: T) T
+        \\  _ = N
+        \\  return value
+        \\exit(identity(int, 1, 40) + identity(Whole, 1, 1) + identity(int, 2, 1))
+    );
+
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const identity = scope.resolveFunction("identity").?;
+    const reachable = (try db.get(query_structures.CollectReachableInstances, 1)).*.?;
+    try testing.expectEqual(@as(usize, 3), reachable.instances.len);
+    try testing.expect(reachable.instances[0].specialization == null);
+    try testing.expectEqual(identity, reachable.instances[1].item);
+    try testing.expectEqual(identity, reachable.instances[2].item);
+    try testing.expect(reachable.instances[1].specialization != null);
+    try testing.expect(reachable.instances[2].specialization != null);
+    try testing.expect(reachable.instances[1].specialization != reachable.instances[2].specialization);
+
+    const first_arguments = try db.lookupInterned(query_structures.Specializations, reachable.instances[1].specialization.?);
+    const second_arguments = try db.lookupInterned(query_structures.Specializations, reachable.instances[2].specialization.?);
+    try testing.expectEqual(structures.CompileTimeValue{ .type = .int }, first_arguments.values[0]);
+    try testing.expectEqual(structures.CompileTimeValue{ .runtime = .{ .type_id = .int, .value = .{ .int = 1 } } }, first_arguments.values[1]);
+    try testing.expectEqual(structures.CompileTimeValue{ .runtime = .{ .type_id = .int, .value = .{ .int = 2 } } }, second_arguments.values[1]);
+
+    const first_signature = (try db.get(query_structures.FunctionInstanceSignature, reachable.instances[1])).*.?;
+    try expectImmParameters(&.{.int}, first_signature.parameters);
+    try testing.expectEqual(structures.TypeId.int, first_signature.return_type);
+    const retained_instance = reachable.instances[1];
+    const replaced_specialization = reachable.instances[2].specialization;
+    const retained_artifact = try db.get(query_structures.CompileFunction, retained_instance);
+
+    const executable = (try db.get(query_structures.BuildExecutable, 1)).*.?;
+    const io = testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    try runtime.writeProgram(io, executable.bytes);
+    try testing.expectEqual(@as(u8, 42), runtime.runProg(io, testing.allocator, &.{}));
+
+    try setSource(db, 1,
+        \\static Whole: type = int
+        \\func identity(static T: type, static N: int, value: T) T
+        \\  _ = N
+        \\  return value
+        \\exit(identity(int, 1, 40) + identity(Whole, 1, 1) + identity(int, 3, 1))
+    );
+    const updated = (try db.get(query_structures.CollectReachableInstances, 1)).*.?;
+    try testing.expectEqual(@as(usize, 3), updated.instances.len);
+    try testing.expectEqual(retained_instance, updated.instances[1]);
+    try testing.expect(updated.instances[2].specialization != replaced_specialization);
+    try testing.expectEqual(retained_artifact, try db.get(query_structures.CompileFunction, retained_instance));
+}
+
+test "static specialization validates compile-time and dependent runtime arguments" {
+    const cases = [_]struct {
+        source: []const u8,
+        expected: DiagnosticKind,
+    }{
+        .{
+            .source =
+            \\func identity(static T: type, value: T) T -> value
+            \\exit(identity(bool, 42))
+            ,
+            .expected = .call_argument_type_mismatch,
+        },
+        .{
+            .source =
+            \\func identity(static T: type, value: T) T -> value
+            \\exit(identity(1, 42))
+            ,
+            .expected = .static_argument_not_supported,
+        },
+        .{
+            .source =
+            \\func identity(static N: int, value: int) int -> value
+            \\exit(identity(true, 42))
+            ,
+            .expected = .static_argument_type_mismatch,
+        },
+        .{
+            .source =
+            \\func identity(static T: type, value: T) T -> value
+            \\const unspecialized = identity
+            ,
+            .expected = .static_parameter_requires_specialization,
+        },
+    };
+
+    for (cases, 1..) |case, file_id| {
+        const db = try testDatabase(1);
+        defer db.deinit();
+        try addSource(db, file_id, case.source);
+        try testing.expect((try db.get(query_structures.BuildExecutable, file_id)).* == null);
+        const diagnostics = try db.transitiveAccumulatorValues(
+            query_structures.BuildExecutable,
+            file_id,
+            structures.Diagnostic,
+            testing.allocator,
+        );
+        defer freeDiagnostics(diagnostics);
+        try testing.expectEqual(@as(usize, 1), diagnostics.len);
+        try testing.expectEqual(case.expected, std.meta.activeTag(diagnostics[0].kind));
+    }
+}
+
+test "static primitive values dominate every specialized control-flow path" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\func choose(static N: int, value: int) int
+        \\  if value < 1
+        \\    return N
+        \\  return N + value
+        \\exit(choose(42, 0))
+    );
+    const executable = (try db.get(query_structures.BuildExecutable, 1)).*.?;
+    const io = testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    try runtime.writeProgram(io, executable.bytes);
+    try testing.expectEqual(@as(u8, 42), runtime.runProg(io, testing.allocator, &.{}));
+}
+
+test "static type positions disambiguate unit and none type values" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\func identity(static T: type, value: T) T -> value
+        \\_ = identity(unit, unit)
+        \\_ = identity(none, none)
+        \\exit(42)
+    );
+    const executable = (try db.get(query_structures.BuildExecutable, 1)).*.?;
+    const io = testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    try runtime.writeProgram(io, executable.bytes);
+    try testing.expectEqual(@as(u8, 42), runtime.runProg(io, testing.allocator, &.{}));
+}
+
+test "stale specialization arity is unavailable across edits and recovers" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    const original =
+        \\func identity(static T: type, value: T) T -> value
+        \\exit(identity(int, 42))
+    ;
+    try addSource(db, 1, original);
+    const initial_reachable = (try db.get(query_structures.CollectReachableInstances, 1)).*.?;
+    const old_instance = initial_reachable.instances[1];
+    try testing.expect((try db.get(query_structures.CompileFunction, old_instance)).* != null);
+
+    try setSource(db, 1,
+        \\func identity(static T: type, static N: int, value: T) T -> value
+        \\exit(identity(int, 1, 42))
+    );
+    try testing.expect((try db.get(query_structures.CompileFunction, old_instance)).* == null);
+    const stale_diagnostics = try db.transitiveAccumulatorValues(
+        query_structures.CompileFunction,
+        old_instance,
+        structures.Diagnostic,
+        testing.allocator,
+    );
+    defer freeDiagnostics(stale_diagnostics);
+    try testing.expectEqual(@as(usize, 0), stale_diagnostics.len);
+    try testing.expect((try db.get(query_structures.BuildExecutable, 1)).* != null);
+
+    try setSource(db, 1, original);
+    const restored = (try db.get(query_structures.CollectReachableInstances, 1)).*.?;
+    try testing.expectEqual(old_instance, restored.instances[1]);
+    try testing.expect((try db.get(query_structures.CompileFunction, old_instance)).* != null);
+}
+
 test "BuildExecutable collects cyclic reachability without recursive compilation" {
     const db = try testDatabase(2);
     defer db.deinit();
@@ -7853,6 +8027,9 @@ fn testTypedExpressionAllocations(gpa: std.mem.Allocator) !void {
         \\  drop = func(deinit self: Box) -> return
         \\  value: int
         \\static identity = func(value: int) int -> return value
+        \\func specialize(static N: int, value: int) int
+        \\  _ = N
+        \\  return value
         \\static choose = func(flag: int) int | none
         \\  const box = Box{value = flag}
         \\  const copied = box
@@ -7860,6 +8037,7 @@ fn testTypedExpressionAllocations(gpa: std.mem.Allocator) !void {
         \\  const saved = identity(flag)
         \\  const alias: int = saved
         \\  identity(alias)
+        \\  specialize(1, alias)
         \\  const selected: int | none = if saved < 0 -> if saved < -1 -> none else identity(alias) else identity(saved)
         \\  var mutable: int | none = selected
         \\  var count = 0

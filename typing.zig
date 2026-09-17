@@ -222,6 +222,9 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             }
             const entry = try self.newBlock(0, @intCast(parameters.len));
             self.enterBlock(entry);
+            for (0..self.unresolved.static_expression_count) |static_index| {
+                _ = try self.value(@enumFromInt(parameters.len + static_index));
+            }
             const parameter_boundary = try self.newBoundary(root_span);
             for (self.local_values) |local_value| {
                 const parameter_value = local_value orelse continue;
@@ -1826,28 +1829,34 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
 
         fn resolveCall(self: *Self, call: semantic.UnresolvedBody.Call, span: structures.SourceSpan) !ResolvedCall {
             const raw_arguments = self.unresolved.call_arguments[call.arguments.start..call.arguments.end];
-            const Target = union(enum) { intrinsic, direct: structures.ItemId, indirect: structures.FunctionValueId };
+            const Target = union(enum) { intrinsic, direct: structures.InstanceId, indirect: structures.FunctionValueId };
             var target: Target = undefined;
             var signature: structures.CallableType = undefined;
             switch (call.target) {
-                .direct => |name| {
-                    if (std.mem.eql(u8, name, "exit")) {
-                        target = .intrinsic;
-                        signature = .{ .parameters = &.{.{ .mode = .imm, .type_id = .int }}, .return_type = .never, .is_fallible = false };
-                    } else {
-                        if (self.scope == null) self.scope = (try self.ctx.get(ModuleScopeQuery, self.file_id)).* orelse return error.Unavailable;
-                        const item = self.scope.?.resolveFunction(name) orelse {
-                            if (self.scope.?.resolve(name) != null) return self.reject(span, .value_not_callable);
-                            return self.reject(span, .unknown_function);
-                        };
-                        target = .{ .direct = item };
-                        const resolved_signature = (try self.ctx.get(FunctionSignatureQuery, item)).* orelse return error.Unavailable;
-                        signature = .{
-                            .parameters = resolved_signature.parameters,
-                            .return_type = resolved_signature.return_type,
-                            .is_fallible = resolved_signature.is_fallible,
-                        };
-                    }
+                .intrinsic => {
+                    target = .intrinsic;
+                    signature = .{ .parameters = &.{.{ .mode = .imm, .type_id = .int }}, .return_type = .never, .is_fallible = false };
+                },
+                .direct, .unresolved_direct => {
+                    const instance: structures.InstanceId = switch (call.target) {
+                        .direct => |instance| instance,
+                        .unresolved_direct => |name| blk: {
+                            if (self.scope == null) self.scope = (try self.ctx.get(ModuleScopeQuery, self.file_id)).* orelse return error.Unavailable;
+                            const item = self.scope.?.resolveFunction(name) orelse {
+                                if (self.scope.?.resolve(name) != null) return self.reject(span, .value_not_callable);
+                                return self.reject(span, .unknown_function);
+                            };
+                            break :blk .{ .item = item };
+                        },
+                        else => unreachable,
+                    };
+                    target = .{ .direct = instance };
+                    const resolved_signature = (try self.ctx.get(FunctionSignatureQuery, instance)).* orelse return error.Unavailable;
+                    signature = .{
+                        .parameters = resolved_signature.parameters,
+                        .return_type = resolved_signature.return_type,
+                        .is_fallible = resolved_signature.is_fallible,
+                    };
                 },
                 .value => |target_use| {
                     const callee = try self.borrowValue(try self.value(target_use.value), target_use.span);
@@ -1944,8 +1953,13 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 .end = @intCast(self.pending_mut_arguments.items.len),
             };
             return switch (target) {
-                .direct => |item| .{ .callable = .{
-                    .operation = .{ .direct = .{ .target = item, .arguments = arguments, .return_type = signature.return_type } },
+                .direct => |instance| .{ .callable = .{
+                    .operation = .{ .direct = .{
+                        .target = instance.item,
+                        .specialization = instance.specialization,
+                        .arguments = arguments,
+                        .return_type = signature.return_type,
+                    } },
                     .is_fallible = signature.is_fallible,
                     .mut_arguments = mut_arguments,
                 } },

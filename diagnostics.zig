@@ -214,6 +214,9 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
         .value_used_as_type => try writeSourceLabel(writer, "expected a type, found a value", source, span),
         .function_annotation_not_supported => try writer.writeAll("type annotations on function bindings are not supported yet"),
         .parameter_mode_not_supported => try writer.writeAll("this parameter access mode is not supported yet"),
+        .static_parameter_requires_specialization => try writer.writeAll("a function with static parameters must be called with compile-time arguments"),
+        .static_argument_not_supported => try writer.writeAll("this static argument is not supported yet"),
+        .static_argument_type_mismatch => try writer.writeAll("static argument does not match the parameter type"),
         .duplicate_parameter => {
             try writeSourceLabel(writer, "parameter name is already declared", source, span);
         },

@@ -9,6 +9,7 @@
 - Structs have nominal identity, cycle-checked layout, source-ordered initialization, field access, field updates through mutable local roots, and validated move/copy/drop strategy overrides.
 - Function-valued struct properties receive stable owner-qualified item identities, reuse ordinary signature and body queries without entering module scope, and are validated against exact copy/move/drop signatures. Typing lowers custom hooks to ordinary direct calls, recursively composes fieldwise struct and active-variant operations, and suppresses redispatch only for compiler-generated plumbing inside the active hook.
 - Callable declarations and types share ordered mode/type parameter records. Function declarations support omitted or explicit `imm`, borrowed `mut`, owned `var`, and cleanup-authorized `deinit`; inferred callable values retain exact modes. Mutable arguments require exact-typed mutable places and reject overlapping immutable or mutable argument paths.
+- Direct calls support explicit `static` type and exact-typed primitive value parameters. Canonical static argument tuples extend `InstanceId`; signatures and bodies are instantiated per tuple, static arguments are omitted from the runtime ABI, and equal instances retain analysis and code across incremental recomputation. Unbound generic function values and general compile-time execution remain unsupported.
 - Lexical const and var bindings have stable root-place identities. Typing tracks available, transferred, and possibly transferred states through branches and loops; whole assignment restores a mutable root.
 - Bare place values borrow in observation and `imm` calls. Bindings, replacement assignments, struct fields, returns, and owned calls require copy support; `^` explicitly transfers movable local roots. Owned temporaries pass directly. `var` and `deinit` parameters are mutable owned roots, with only `deinit` authorized to satisfy explicit drop. Partial-field transfer remains rejected.
 - ASAP destruction is implemented through semantic cutover, incremental recomputation, and cleanup review for the current value model. Query-local generation analysis materializes path-sensitive cleanup at the earliest completed boundary after each final use across roots, parameters, temporaries, calls, projections, conditional ownership, control-flow edges, and whole-root replacement. Explicit-drop trees must transfer or reach a `deinit` parameter on every path. Automatic custom drop lowers to ordinary typed IR, while trivial and hook-free fieldwise cleanup require no runtime instruction. Origin dependencies for pointers and views, independent partial-place lifetimes, and stable storage for immovable values remain future work; field-target replacement stays boundary-local until partial places are implemented.
@@ -101,10 +102,12 @@ recomputation. Keep unsupported forms rejected at their owning boundary.
 
 ### 5. Specialization and structural tuples
 
-- **Compile-time specialization:** use generic pointer and collection APIs as
-  the concrete requirements for `static` parameters, general `comptime`, and
-  specialization arguments in `InstanceId`. Specify the supported compile-time
-  operations and failure behavior; preserve incremental instance reuse.
+- **Compile-time specialization:** explicit direct-call specialization for
+  static type and exact-typed primitive values is complete, including
+  `InstanceId` arguments and incremental instance reuse. Use generic pointer
+  and collection APIs as the concrete requirements for inference, bound and
+  first-class generic function values, general `comptime`, additional
+  compile-time operations, and their failure behavior.
 - **Structural tuples**, such as `(foo, bar)`: implement the specified ordered,
   unnamed structural identity. Specify type spelling, element access,
   destructuring, layout, and elementwise ownership.

@@ -571,14 +571,14 @@ fn FunctionEmitter(comptime Types: type) type {
 
             var reference_index: ?usize = null;
             for (self.referenced_instances.items, 0..) |existing, index| {
-                if (existing.item == call.target) {
+                if (std.meta.eql(existing, call.instance())) {
                     reference_index = index;
                     break;
                 }
             }
             if (reference_index == null) {
                 reference_index = self.referenced_instances.items.len;
-                try self.referenced_instances.append(self.gpa, .{ .item = call.target });
+                try self.referenced_instances.append(self.gpa, call.instance());
             }
             const reference = std.math.cast(u32, reference_index.?) orelse return error.FunctionTooLarge;
             try self.relocations.append(self.gpa, .{

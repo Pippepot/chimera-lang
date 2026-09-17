@@ -112,15 +112,31 @@ exit(0)
 # mut: mutable access to a caller-owned variable.
 # var: function-owned variable, which may be stored or returned.
 # deinit: function-owned variable satisfying an explicit drop obligation.
-# A parameter's access mode is part of callable type identity. An omitted mode
-# is imm. Function declarations currently support imm, mut, var, and deinit.
+# A runtime parameter's access mode is part of callable type identity. An
+# omitted mode is imm. Function declarations support static, imm, mut, var, and
+# deinit. Static parameters belong to the declaration and specialization key,
+# not to the specialized function's runtime callable type or calling convention.
 # Callable type annotations currently spell only imm; inferred callable values
 # retain the exact declaration mode. Syntax for other modes in callable types
 # remains open.
 # Callable compatibility requires identical parameter modes. Ordinary-to-
 # fallible callable widening still applies when every parameter mode and type
 # and the return type match.
-func make(static T: type) type -> T
+#
+# A direct call supplies every static argument explicitly in its declared
+# position. Type values and exact-typed primitive compile-time values are
+# supported. Each canonical tuple of static arguments identifies one function
+# instance; aliases of the same type therefore reuse an instance. Runtime
+# parameter and return types may refer to static type parameters. Static
+# arguments are available as constants in the instantiated body but are not
+# evaluated or passed at runtime. An unspecialized function with static
+# parameters is not a value; inference, partial application, indirect generic
+# calls, arbitrary compile-time expressions, and compile-time-returning
+# functions remain open.
+func identity(static T: type, static N: int, value: T) T
+    _ = N
+    return value
+const answer = identity(int, 1, 42)
 
 func add1(mut a: int)
     a += 1

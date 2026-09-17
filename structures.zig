@@ -446,6 +446,12 @@ pub const CompileTimeValue = union(enum) {
     };
 };
 
+pub const SpecializationId = enum(u32) { _ };
+
+pub const SpecializationArguments = struct {
+    values: []const CompileTimeValue,
+};
+
 /// Database interner index carried inside a non-primitive TypeId. The remaining
 /// TypeId bit distinguishes interned identities from reserved primitive IDs.
 pub const InternedTypeId = enum(u31) { _ };
@@ -723,10 +729,40 @@ pub const FunctionBlock = struct {
 /// clone the same value shape into session-stable storage.
 pub const FunctionSignature = CallableType;
 
+pub const FunctionParameterShape = struct {
+    mode: ParameterMode,
+    is_meta_type: bool,
+};
+
+/// Declaration-level parameter modes. Unlike `FunctionSignature`, this keeps
+/// static parameters and does not require dependent runtime types to have been
+/// substituted yet.
+pub const FunctionShape = struct {
+    parameters: []const FunctionParameterShape,
+
+    pub fn eql(a: FunctionShape, b: FunctionShape) bool {
+        if (a.parameters.len != b.parameters.len) return false;
+        for (a.parameters, b.parameters) |left, right| {
+            if (!std.meta.eql(left, right)) return false;
+        }
+        return true;
+    }
+
+    pub fn deinit(self: *FunctionShape, gpa: std.mem.Allocator) void {
+        gpa.free(self.parameters);
+        self.* = undefined;
+    }
+};
+
 pub const FunctionCall = struct {
     target: ItemId,
+    specialization: ?SpecializationId = null,
     arguments: FunctionValueRange,
     return_type: TypeId,
+
+    pub fn instance(self: FunctionCall) InstanceId {
+        return .{ .item = self.target, .specialization = self.specialization };
+    }
 };
 
 pub const IndirectFunctionCall = struct {
@@ -899,10 +935,11 @@ pub const FunctionBodyAnalysis = struct {
     }
 };
 
-/// Structural non-generic instance key. Future generic substitutions extend
-/// this identity without changing declaration identity.
+/// Callable-instance key. Static argument tuples are interned separately so
+/// query keys remain small and pointer-free.
 pub const InstanceId = struct {
     item: ItemId,
+    specialization: ?SpecializationId = null,
 };
 
 /// Owned deterministic breadth-first order of instances reachable from an entry.
@@ -1034,6 +1071,9 @@ pub const Diagnostic = struct {
         value_used_as_type,
         function_annotation_not_supported,
         parameter_mode_not_supported,
+        static_parameter_requires_specialization,
+        static_argument_not_supported,
+        static_argument_type_mismatch,
         duplicate_parameter,
         parameter_type_missing,
         parameter_type_not_supported,
