@@ -30,8 +30,15 @@ const EntryResult = union(enum) {
     failure: anyerror,
 };
 
+/// Work a caller is about to wait for stays unpublished: any thread that needs
+/// it can still claim it, but no worker wakes up to race for a task the caller
+/// is about to run itself.
+const Publish = enum { deferred, immediate };
+
 const Computation = struct {
     deps: std.ArrayList(*Entry) = .empty,
+    // Scratch dedupe set; only the ordered deps list is kept after commit.
+    dep_set: std.AutoHashMapUnmanaged(*Entry, void) = .empty,
     input_deps: std.ArrayList(*InputEntry) = .empty,
     accums: ?*AccumBucket = null,
 };
@@ -47,12 +54,12 @@ pub const Context = struct {
     }
 
     pub fn get(ctx: *Context, comptime Q: type, input_value: Q.Input) anyerror!*const Q.Output {
-        const handle = try ctx.spawn(Q, input_value);
+        const handle = try ctx.db.scheduleInternal(Q, input_value, ctx, .deferred);
         return handle.wait();
     }
 
     pub fn spawn(ctx: *Context, comptime Q: type, input_value: Q.Input) anyerror!Handle(Q) {
-        return ctx.db.scheduleInternal(Q, input_value, ctx);
+        return ctx.db.scheduleInternal(Q, input_value, ctx, .immediate);
     }
 
     pub fn emit(ctx: *Context, comptime A: type, value: A) anyerror!void {
@@ -94,6 +101,7 @@ pub const Database = struct {
     io_runtime: std.Io.Threaded,
     mutex: std.Io.Mutex = .init,
     work_available: std.Io.Condition = .init,
+    entry_finished: std.Io.Condition = .init,
     stopping: bool = false,
     workers: []Worker,
     entries: EntryMap,
@@ -227,12 +235,12 @@ pub const Database = struct {
     }
 
     pub fn get(db: *Database, comptime Q: type, input_value: Q.Input) anyerror!*const Q.Output {
-        const handle = try db.spawn(Q, input_value);
+        const handle = try db.scheduleInternal(Q, input_value, null, .deferred);
         return handle.wait();
     }
 
     pub fn spawn(db: *Database, comptime Q: type, input_value: Q.Input) anyerror!Handle(Q) {
-        return db.scheduleInternal(Q, input_value, null);
+        return db.scheduleInternal(Q, input_value, null, .immediate);
     }
 
     pub fn intern(db: *Database, comptime I: type, value: I.Value) anyerror!I.Id {
@@ -313,12 +321,12 @@ pub const Database = struct {
     }
 
     fn completedEntry(db: *Database, comptime Q: type, input_value: Q.Input) anyerror!*Entry {
-        const handle = try db.spawn(Q, input_value);
+        const handle = try db.scheduleInternal(Q, input_value, null, .deferred);
         _ = try handle.wait();
         return handle.entry;
     }
 
-    fn scheduleInternal(db: *Database, comptime Q: type, input_value: Q.Input, waiter: ?*Context) anyerror!Handle(Q) {
+    fn scheduleInternal(db: *Database, comptime Q: type, input_value: Q.Input, waiter: ?*Context, publish: Publish) anyerror!Handle(Q) {
         validateQuery(Q);
 
         const input_copy = input_value;
@@ -332,7 +340,7 @@ pub const Database = struct {
         if (db.stopping) return error.SchedulerStopped;
 
         if (db.entries.get(lookup_key)) |existing| {
-            db.enqueueForCurrentRevisionLocked(existing);
+            db.enqueueForCurrentRevisionLocked(existing, publish);
             try db.addDependencyLocked(parent, existing);
             return .{
                 .db = db,
@@ -348,8 +356,7 @@ pub const Database = struct {
         }
 
         try db.addDependencyLocked(parent, entry);
-        db.enqueueLocked(entry);
-        db.signalWork();
+        db.enqueueLocked(entry, publish);
 
         return .{
             .db = db,
@@ -375,9 +382,6 @@ pub const Database = struct {
         const input_box = try db.allocator.create(Q.Input);
         errdefer db.allocator.destroy(input_box);
         input_box.* = input_value;
-        errdefer deinitTypedValue(Q.Input, db.allocator, input_box);
-
-        const key = queryCacheKey(Q, input_box, input_hash);
 
         const entry = try db.allocator.create(Entry);
         errdefer db.allocator.destroy(entry);
@@ -396,13 +400,15 @@ pub const Database = struct {
             .deps = .empty,
             .input_deps = .empty,
             .accums = null,
+            .accums_in_subtree = false,
             .computation = null,
+            .queue_owner = null,
             .queue_prev = null,
             .queue_next = null,
             .visit_token = 0,
         };
 
-        try db.entries.put(key, entry);
+        try db.entries.put(queryCacheKey(Q, input_box, input_hash), entry);
         return entry;
     }
 
@@ -442,7 +448,7 @@ pub const Database = struct {
                 continue;
             }
 
-            db.waitWork();
+            db.waitEntryFinished();
             db.unlock();
         }
     }
@@ -493,7 +499,7 @@ pub const Database = struct {
             entry.err = null;
             entry.state = .complete;
         }
-        db.broadcastWork();
+        db.entry_finished.broadcast(db.io());
         db.unlock();
     }
 
@@ -514,11 +520,11 @@ pub const Database = struct {
             db.lock();
             defer db.unlock();
             std.debug.assert(entry.verification_dependency == null);
-            if (db.reachesLocked(dep, entry)) return error.QueryCycle;
+            if (!settledLocked(db, dep) and db.reachesLocked(dep, entry)) return error.QueryCycle;
             // Only the dependency currently being verified is an active wait.
             // Other old edges may disappear when this entry recomputes.
             entry.verification_dependency = dep;
-            db.enqueueForCurrentRevisionLocked(dep);
+            db.enqueueForCurrentRevisionLocked(dep, .deferred);
         }
         defer {
             db.lock();
@@ -528,14 +534,13 @@ pub const Database = struct {
         try db.waitForEntry(dep, worker_index);
     }
 
-    fn enqueueForCurrentRevisionLocked(db: *Database, entry: *Entry) void {
+    fn enqueueForCurrentRevisionLocked(db: *Database, entry: *Entry, publish: Publish) void {
         const needs_work = entry.state == .failed or
             (entry.state == .complete and entry.verified_at != db.revision);
         if (!needs_work) return;
         entry.err = null;
         entry.state = .queued;
-        db.enqueueLocked(entry);
-        db.signalWork();
+        db.enqueueLocked(entry, publish);
     }
 
     fn commitComputationLocked(db: *Database, entry: *Entry, output: *anyopaque) void {
@@ -561,14 +566,26 @@ pub const Database = struct {
         entry.input_deps = computation.input_deps;
         computation.deps = .empty;
         computation.input_deps = .empty;
+        computation.dep_set.deinit(db.allocator);
+        computation.dep_set = .empty;
         entry.computation = null;
         entry.verified_at = db.revision;
+        entry.accums_in_subtree = entry.accums != null;
+        for (entry.deps.items) |dep| {
+            if (dep.accums_in_subtree) {
+                entry.accums_in_subtree = true;
+                break;
+            }
+        }
     }
 
-    fn enqueueLocked(db: *Database, entry: *Entry) void {
+    fn enqueueLocked(db: *Database, entry: *Entry, publish: Publish) void {
+        if (publish == .deferred) return;
         const index = db.next_worker % db.workers.len;
         db.next_worker = (index + 1) % db.workers.len;
+        entry.queue_owner = index;
         db.workers[index].queue.pushBack(entry);
+        db.signalWork();
     }
 
     fn takeWorkLocked(db: *Database, preferred_worker: ?usize) ?*Entry {
@@ -599,30 +616,28 @@ pub const Database = struct {
 
     fn takeEntryLocked(db: *Database, entry: *Entry) ?*Entry {
         if (entry.state != .queued) return null;
-
-        for (db.workers) |*worker| {
-            var queued = worker.queue.head;
-            while (queued) |candidate| : (queued = candidate.queue_next) {
-                if (candidate != entry) continue;
-                worker.queue.remove(entry);
-                entry.state = .running;
-                return entry;
-            }
-        }
-
-        unreachable;
+        if (entry.queue_owner) |index| db.workers[index].queue.remove(entry);
+        entry.state = .running;
+        return entry;
     }
 
     fn addDependencyLocked(db: *Database, parent: ?*Entry, child: *Entry) anyerror!void {
         const parent_entry = parent orelse return;
         if (parent_entry == child) return error.QueryCycle;
-        if (db.reachesLocked(child, parent_entry)) return error.QueryCycle;
 
-        const deps = &parent_entry.computation.?.deps;
-        for (deps.items) |dep| {
-            if (dep == child) return;
-        }
-        try deps.append(db.allocator, child);
+        const computation = &parent_entry.computation.?;
+        const existing = try computation.dep_set.getOrPut(db.allocator, child);
+        if (existing.found_existing) return;
+        errdefer _ = computation.dep_set.remove(child);
+
+        if (!settledLocked(db, child) and db.reachesLocked(child, parent_entry)) return error.QueryCycle;
+        try computation.deps.append(db.allocator, child);
+    }
+
+    // Everything reachable from an entry completed in this revision is itself
+    // complete, so such a subgraph cannot reach a still-running entry.
+    fn settledLocked(db: *Database, entry: *Entry) bool {
+        return entry.state == .complete and entry.verified_at == db.revision;
     }
 
     fn addInputDependencyLocked(db: *Database, parent: *Entry, input: *InputEntry) !void {
@@ -687,6 +702,7 @@ pub const Database = struct {
         seen: *std.AutoHashMap(*Entry, void),
         gpa: std.mem.Allocator,
     ) !void {
+        if (!entry.accums_in_subtree) return;
         if ((try seen.getOrPut(entry)).found_existing) return;
 
         const direct = directAccumulatorValuesEntry(entry, A);
@@ -738,6 +754,7 @@ pub const Database = struct {
 
     fn deinitComputation(db: *Database, computation: *Computation) void {
         computation.deps.deinit(db.allocator);
+        computation.dep_set.deinit(db.allocator);
         computation.input_deps.deinit(db.allocator);
         db.destroyAccumBuckets(computation.accums);
         computation.* = .{};
@@ -790,12 +807,17 @@ pub const Database = struct {
         db.work_available.waitUncancelable(db.io(), &db.mutex);
     }
 
+    fn waitEntryFinished(db: *Database) void {
+        db.entry_finished.waitUncancelable(db.io(), &db.mutex);
+    }
+
     fn signalWork(db: *Database) void {
         db.work_available.signal(db.io());
     }
 
     fn broadcastWork(db: *Database) void {
         db.work_available.broadcast(db.io());
+        db.entry_finished.broadcast(db.io());
     }
 };
 
@@ -842,8 +864,11 @@ const Entry = struct {
     deps: std.ArrayList(*Entry),
     input_deps: std.ArrayList(*InputEntry),
     accums: ?*AccumBucket,
+    // Set at commit so accumulator collection can skip clean subtrees.
+    accums_in_subtree: bool,
     computation: ?Computation,
     verification_dependency: ?*Entry = null,
+    queue_owner: ?usize,
     queue_prev: ?*Entry,
     queue_next: ?*Entry,
     visit_token: usize,
@@ -923,6 +948,7 @@ const WorkQueue = struct {
 
         entry.queue_prev = null;
         entry.queue_next = null;
+        entry.queue_owner = null;
     }
 };
 

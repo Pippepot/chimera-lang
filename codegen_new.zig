@@ -311,6 +311,8 @@ fn FunctionEmitter(comptime Types: type) type {
         encoder: X86Encoder,
         relocations: std.ArrayList(structures.CompiledFunction.Relocation) = .empty,
         referenced_instances: std.ArrayList(structures.InstanceId) = .empty,
+        // Scratch inverse of referenced_instances; relocations index the slice.
+        reference_indices: std.AutoHashMapUnmanaged(structures.InstanceId, u32) = .empty,
         jump_patches: std.ArrayList(JumpPatch) = .empty,
         types: Types,
         locations: []const ValueLocation,
@@ -355,6 +357,7 @@ fn FunctionEmitter(comptime Types: type) type {
             self.gpa.free(self.block_offsets);
             self.jump_patches.deinit(self.gpa);
             self.referenced_instances.deinit(self.gpa);
+            self.reference_indices.deinit(self.gpa);
             self.relocations.deinit(self.gpa);
             self.encoder.deinit();
             self.* = undefined;
@@ -494,6 +497,12 @@ fn FunctionEmitter(comptime Types: type) type {
             const target = ssa.blocks[@intFromEnum(branch.target)];
             const arguments = self.branch_arguments[branch.arguments.start..branch.arguments.end];
             std.debug.assert(arguments.len == target.argument_end - target.argument_start);
+            if (arguments.len == 1) {
+                const type_id = ssa.block_argument_types[target.argument_start];
+                const destination = self.locations[target.argument_start];
+                if (destination != .discarded) try self.emitUse(arguments[0], type_id, destination);
+                return;
+            }
             var scratch_end = self.edge_scratch_offset;
             for (arguments, 0..) |argument, argument_offset| {
                 const type_id = ssa.block_argument_types[target.argument_start + argument_offset];
@@ -569,24 +578,14 @@ fn FunctionEmitter(comptime Types: type) type {
             const offset = std.math.cast(u32, offset_usize) orelse return error.FunctionTooLarge;
             try self.encoder.callRelative32(0);
 
-            var reference_index: ?usize = null;
-            for (self.referenced_instances.items, 0..) |existing, index| {
-                if (std.meta.eql(existing, call.instance())) {
-                    reference_index = index;
-                    break;
-                }
-            }
-            if (reference_index == null) {
-                reference_index = self.referenced_instances.items.len;
-                try self.referenced_instances.append(self.gpa, call.instance());
-            }
-            const reference = std.math.cast(u32, reference_index.?) orelse return error.FunctionTooLarge;
+            const reference = try self.referenceIndex(call.instance());
             try self.relocations.append(self.gpa, .{
                 .offset = offset,
                 .kind = .call_relative_32,
                 .reference = @enumFromInt(reference),
                 .addend = 0,
             });
+
             if (usesMemoryReturn(return_layout)) {
                 try self.copyValue(call.return_type, .{ .stack = 0 }, destination);
             } else {
@@ -631,24 +630,23 @@ fn FunctionEmitter(comptime Types: type) type {
         }
 
         fn appendRelocation(self: *Self, target: structures.ItemId, offset: u32, kind: structures.CompiledFunction.RelocationKind) !void {
-            var reference_index: ?usize = null;
-            for (self.referenced_instances.items, 0..) |existing, index| {
-                if (existing.item == target) {
-                    reference_index = index;
-                    break;
-                }
-            }
-            if (reference_index == null) {
-                reference_index = self.referenced_instances.items.len;
-                try self.referenced_instances.append(self.gpa, .{ .item = target });
-            }
-            const reference = std.math.cast(u32, reference_index.?) orelse return error.FunctionTooLarge;
+            const reference = try self.referenceIndex(.{ .item = target });
             try self.relocations.append(self.gpa, .{
                 .offset = offset,
                 .kind = kind,
                 .reference = @enumFromInt(reference),
                 .addend = 0,
             });
+        }
+
+        fn referenceIndex(self: *Self, instance: structures.InstanceId) !u32 {
+            const existing = try self.reference_indices.getOrPut(self.gpa, instance);
+            if (existing.found_existing) return existing.value_ptr.*;
+            errdefer _ = self.reference_indices.remove(instance);
+            const index = std.math.cast(u32, self.referenced_instances.items.len) orelse return error.FunctionTooLarge;
+            try self.referenced_instances.append(self.gpa, instance);
+            existing.value_ptr.* = index;
+            return index;
         }
 
         fn loadAddress(self: *Self, location: ValueLocation) !void {

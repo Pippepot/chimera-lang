@@ -1,6 +1,201 @@
 const std = @import("std");
 const structures = @import("structures.zig");
 
+pub const TimingLog = struct {
+    const Stage = struct {
+        label: []const u8,
+        duration: std.Io.Duration,
+    };
+
+    started: std.Io.Timestamp,
+    previous: std.Io.Timestamp,
+    stages: [16]Stage = undefined,
+    count: usize = 0,
+
+    pub fn init(started: std.Io.Timestamp) TimingLog {
+        return .{ .started = started, .previous = started };
+    }
+
+    pub fn mark(self: *TimingLog, io: std.Io, label: []const u8) void {
+        std.debug.assert(self.count < self.stages.len);
+        const now = std.Io.Clock.awake.now(io);
+        self.stages[self.count] = .{ .label = label, .duration = self.previous.durationTo(now) };
+        self.count += 1;
+        self.previous = now;
+    }
+
+    pub fn print(self: *const TimingLog, io: std.Io, writer: *std.Io.Writer) !void {
+        const finished = std.Io.Clock.awake.now(io);
+        const total = self.started.durationTo(finished);
+        var buffer: [32]u8 = undefined;
+
+        var label_width: usize = "total".len;
+        var value_width = displayWidth(try formatDuration(&buffer, total));
+        for (self.stages[0..self.count]) |stage| {
+            label_width = @max(label_width, stage.label.len);
+            value_width = @max(value_width, displayWidth(try formatDuration(&buffer, stage.duration)));
+        }
+
+        try writer.writeAll("timing\n");
+        for (self.stages[0..self.count]) |stage| {
+            try writeRow(writer, stage.label, label_width, try formatDuration(&buffer, stage.duration), value_width);
+            const share = fractionOf(stage.duration, total);
+            try writer.print("  {d:>5.1}%  ", .{share * 100});
+            try writeShareBar(writer, share);
+            try writer.writeByte('\n');
+        }
+        try writeRow(writer, "total", label_width, try formatDuration(&buffer, total), value_width);
+        try writer.writeByte('\n');
+    }
+};
+
+// Wraps the backing allocator to report peak and total heap usage.
+pub const MemoryTracker = struct {
+    backing: std.mem.Allocator,
+    live: std.atomic.Value(usize) = .init(0),
+    peak: std.atomic.Value(usize) = .init(0),
+    total: std.atomic.Value(usize) = .init(0),
+    allocations: std.atomic.Value(usize) = .init(0),
+
+    pub fn allocator(self: *MemoryTracker) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = alloc,
+            .resize = resize,
+            .remap = remap,
+            .free = free,
+        } };
+    }
+
+    pub fn print(self: *const MemoryTracker, writer: *std.Io.Writer) !void {
+        const rows = [_]struct { label: []const u8, bytes: usize }{
+            .{ .label = "peak live", .bytes = self.peak.load(.monotonic) },
+            .{ .label = "total allocated", .bytes = self.total.load(.monotonic) },
+            .{ .label = "still live", .bytes = self.live.load(.monotonic) },
+        };
+        var buffer: [32]u8 = undefined;
+
+        var label_width: usize = 0;
+        var value_width: usize = 0;
+        for (rows) |row| {
+            label_width = @max(label_width, row.label.len);
+            value_width = @max(value_width, displayWidth(try formatByteSize(&buffer, row.bytes)));
+        }
+
+        try writer.writeAll("memory\n");
+        for (rows) |row| {
+            try writeRow(writer, row.label, label_width, try formatByteSize(&buffer, row.bytes), value_width);
+            try writer.writeByte('\n');
+        }
+        const allocations = try std.fmt.bufPrint(&buffer, "{d}", .{self.allocations.load(.monotonic)});
+        try writeRow(writer, "allocations", label_width, allocations, value_width);
+        try writer.writeByte('\n');
+    }
+
+    fn grow(self: *MemoryTracker, bytes: usize) void {
+        _ = self.total.fetchAdd(bytes, .monotonic);
+        const live = self.live.fetchAdd(bytes, .monotonic) + bytes;
+        _ = self.peak.fetchMax(live, .monotonic);
+    }
+
+    fn shrink(self: *MemoryTracker, bytes: usize) void {
+        _ = self.live.fetchSub(bytes, .monotonic);
+    }
+
+    fn resized(self: *MemoryTracker, old_len: usize, new_len: usize) void {
+        if (new_len >= old_len) self.grow(new_len - old_len) else self.shrink(old_len - new_len);
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *MemoryTracker = @ptrCast(@alignCast(ctx));
+        const result = self.backing.rawAlloc(len, alignment, ret_addr) orelse return null;
+        _ = self.allocations.fetchAdd(1, .monotonic);
+        self.grow(len);
+        return result;
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *MemoryTracker = @ptrCast(@alignCast(ctx));
+        if (!self.backing.rawResize(memory, alignment, new_len, ret_addr)) return false;
+        self.resized(memory.len, new_len);
+        return true;
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *MemoryTracker = @ptrCast(@alignCast(ctx));
+        const result = self.backing.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
+        self.resized(memory.len, new_len);
+        return result;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *MemoryTracker = @ptrCast(@alignCast(ctx));
+        self.backing.rawFree(memory, alignment, ret_addr);
+        self.shrink(memory.len);
+    }
+};
+
+const share_bar_width = 24;
+
+fn formatDuration(buffer: []u8, duration: std.Io.Duration) ![]const u8 {
+    const nanoseconds = duration.toNanoseconds();
+    if (nanoseconds < 1_000) return std.fmt.bufPrint(buffer, "{d} ns", .{nanoseconds});
+    const scale: struct { divisor: f64, unit: []const u8 } = if (nanoseconds < 1_000_000)
+        .{ .divisor = 1_000.0, .unit = "µs" }
+    else if (nanoseconds < 1_000_000_000)
+        .{ .divisor = 1_000_000.0, .unit = "ms" }
+    else
+        .{ .divisor = 1_000_000_000.0, .unit = "s" };
+    return std.fmt.bufPrint(buffer, "{d:.2} {s}", .{ @as(f64, @floatFromInt(nanoseconds)) / scale.divisor, scale.unit });
+}
+
+fn formatByteSize(buffer: []u8, bytes: usize) ![]const u8 {
+    const units = [_][]const u8{ "KiB", "MiB", "GiB", "TiB" };
+    if (bytes < 1024) return std.fmt.bufPrint(buffer, "{d} B", .{bytes});
+    var scaled: f64 = @as(f64, @floatFromInt(bytes)) / 1024.0;
+    var unit: usize = 0;
+    while (scaled >= 1024.0 and unit + 1 < units.len) : (unit += 1) scaled /= 1024.0;
+    return std.fmt.bufPrint(buffer, "{d:.2} {s}", .{ scaled, units[unit] });
+}
+
+fn fractionOf(part: std.Io.Duration, whole: std.Io.Duration) f64 {
+    const whole_ns = whole.toNanoseconds();
+    if (whole_ns <= 0) return 0;
+    const fraction = @as(f64, @floatFromInt(part.toNanoseconds())) / @as(f64, @floatFromInt(whole_ns));
+    return std.math.clamp(fraction, 0, 1);
+}
+
+fn writeShareBar(writer: *std.Io.Writer, share: f64) !void {
+    const filled: usize = @intFromFloat(@round(share * share_bar_width));
+    try writer.splatBytesAll("█", filled);
+    try writer.splatBytesAll("░", share_bar_width - filled);
+}
+
+fn writeRow(
+    writer: *std.Io.Writer,
+    label: []const u8,
+    label_width: usize,
+    value: []const u8,
+    value_width: usize,
+) !void {
+    try writer.writeAll("  ");
+    try writePadded(writer, label, label_width, .left);
+    try writer.writeAll("  ");
+    try writePadded(writer, value, value_width, .right);
+}
+
+fn writePadded(writer: *std.Io.Writer, text: []const u8, width: usize, alignment: enum { left, right }) !void {
+    const text_width = displayWidth(text);
+    const padding = if (text_width < width) width - text_width else 0;
+    if (alignment == .right) try writer.splatByteAll(' ', padding);
+    try writer.writeAll(text);
+    if (alignment == .left) try writer.splatByteAll(' ', padding);
+}
+
+// Multi-byte units such as 'µs' occupy fewer columns than bytes.
+fn displayWidth(text: []const u8) usize {
+    return std.unicode.utf8CountCodepoints(text) catch text.len;
+}
+
 const LineInfo = struct {
     line: usize,
     column: usize,

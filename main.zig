@@ -13,6 +13,7 @@ const DebugFlags = struct {
     ssa: bool = false,
     @"asm": bool = false,
     timing: bool = false,
+    memory: bool = false,
 };
 
 const RunInput = struct {
@@ -21,11 +22,6 @@ const RunInput = struct {
     program_args: []const []const u8,
     debug_flags: DebugFlags,
     started: std.Io.Timestamp,
-};
-
-const StageTiming = struct {
-    label: []const u8,
-    duration: std.Io.Duration,
 };
 
 fn trySetDebugFlag(flags: *DebugFlags, name: []const u8) bool {
@@ -46,21 +42,28 @@ fn printError(writer: *std.Io.Writer, comptime format: []const u8, args: anytype
 
 fn printUsage(writer: *std.Io.Writer, executable_name: []const u8) !void {
     try writer.print(
-        "usage: {s} [--debug=ast,ssa,asm,timing] <source-file> [program-args...]\n",
+        "usage: {s} [--debug=ast,ssa,asm,timing,memory] <source-file> [program-args...]\n",
         .{executable_name},
     );
 }
 
-fn printTimings(
-    writer: *std.Io.Writer,
-    stages: []const StageTiming,
-    total: std.Io.Duration,
-) !void {
-    try writer.writeAll("timing\n");
-    for (stages) |stage| {
-        try writer.print("  {s}: {d} us\n", .{ stage.label, stage.duration.toMicroseconds() });
+fn buildWithStageTimings(db: *query.Database, io: std.Io, timings: *diagnostics.TimingLog) !void {
+    _ = try db.get(queries.ParseFile, file_id);
+    timings.mark(io, "parse");
+    const index = try db.get(queries.IndexItems, file_id);
+    timings.mark(io, "discover items");
+    if (index.*) |items| {
+        for (items.ids()) |item_id| _ = try db.get(queries.ResolveItem, item_id);
+        timings.mark(io, "resolve items");
+        for (items.ids()) |item_id| _ = try db.get(queries.FunctionShape, item_id);
+        timings.mark(io, "function shapes");
+        for (items.ids()) |item_id| _ = try db.get(queries.FunctionSignature, item_id);
+        timings.mark(io, "signatures");
+        for (items.ids()) |item_id| _ = try db.get(queries.AnalyzeFunctionBody, item_id);
     }
-    try writer.print("  total: {d} us\n", .{total.toMicroseconds()});
+    timings.mark(io, "analyze bodies");
+    _ = try db.get(queries.CollectReachableInstances, file_id);
+    timings.mark(io, "compile functions");
 }
 
 fn compileAndRun(
@@ -70,15 +73,17 @@ fn compileAndRun(
     output: *std.Io.Writer,
     errors: *std.Io.Writer,
 ) !?u8 {
-    const database_started = std.Io.Clock.awake.now(io);
+    var timings: diagnostics.TimingLog = .init(input.started);
+    timings.mark(io, "load source");
     const db = try query.Database.init(gpa, .{ .worker_count = 1 });
     defer db.deinit();
-    const database_initialized = std.Io.Clock.awake.now(io);
+    timings.mark(io, "database init");
     try db.addInput(queries.SourceText, file_id, input.source);
-    const source_added = std.Io.Clock.awake.now(io);
+    timings.mark(io, "add source");
 
+    if (input.debug_flags.timing) try buildWithStageTimings(db, io, &timings);
     const executable_result = try db.get(queries.BuildExecutable, file_id);
-    const executable_built = std.Io.Clock.awake.now(io);
+    timings.mark(io, "link executable");
     const emitted = try db.transitiveAccumulatorValues(
         queries.BuildExecutable,
         file_id,
@@ -86,9 +91,8 @@ fn compileAndRun(
         gpa,
     );
     defer gpa.free(emitted);
-    const diagnostics_collected = std.Io.Clock.awake.now(io);
+    timings.mark(io, "collect diagnostics");
 
-    const debug_started = diagnostics_collected;
     if (input.debug_flags.ast) {
         if ((try db.get(queries.ParseFile, file_id)).*) |parsed| {
             try debug.renderAst(gpa, &parsed, input.source, output);
@@ -97,20 +101,10 @@ fn compileAndRun(
     if (executable_result.* == null) {
         std.debug.assert(emitted.len != 0);
         try output.flush();
-        const debug_finished = std.Io.Clock.awake.now(io);
+        timings.mark(io, "debug output");
         const type_interner: queries.TypeInterner(*query.Database) = .{ .ctx = db };
         try diagnostics.renderDiagnostics(type_interner, errors, input.source_path, input.source, emitted);
-        if (input.debug_flags.timing) {
-            const finished = std.Io.Clock.awake.now(io);
-            try printTimings(errors, &.{
-                .{ .label = "load source", .duration = input.started.durationTo(database_started) },
-                .{ .label = "database init", .duration = database_started.durationTo(database_initialized) },
-                .{ .label = "add source", .duration = database_initialized.durationTo(source_added) },
-                .{ .label = "build executable", .duration = source_added.durationTo(executable_built) },
-                .{ .label = "collect diagnostics", .duration = executable_built.durationTo(diagnostics_collected) },
-                .{ .label = "debug output", .duration = debug_started.durationTo(debug_finished) },
-            }, input.started.durationTo(finished));
-        }
+        if (input.debug_flags.timing) try timings.print(io, errors);
         try errors.flush();
         return null;
     }
@@ -120,24 +114,15 @@ fn compileAndRun(
     if (input.debug_flags.ssa) try debug.renderReachableSsa(db, file_id, output);
     if (input.debug_flags.@"asm") try debug.renderAssembly(executable, gpa, output);
     try output.flush();
-    const debug_finished = std.Io.Clock.awake.now(io);
+    timings.mark(io, "debug output");
 
     try runtime.writeProgram(io, executable.bytes);
-    const write_finished = std.Io.Clock.awake.now(io);
+    timings.mark(io, "write program");
     const exit_code = try runtime.runProg(io, gpa, input.program_args);
-    const run_finished = std.Io.Clock.awake.now(io);
+    timings.mark(io, "run program");
 
     if (input.debug_flags.timing) {
-        try printTimings(errors, &.{
-            .{ .label = "load source", .duration = input.started.durationTo(database_started) },
-            .{ .label = "database init", .duration = database_started.durationTo(database_initialized) },
-            .{ .label = "add source", .duration = database_initialized.durationTo(source_added) },
-            .{ .label = "build executable", .duration = source_added.durationTo(executable_built) },
-            .{ .label = "collect diagnostics", .duration = executable_built.durationTo(diagnostics_collected) },
-            .{ .label = "debug output", .duration = debug_started.durationTo(debug_finished) },
-            .{ .label = "write program", .duration = debug_finished.durationTo(write_finished) },
-            .{ .label = "run program", .duration = write_finished.durationTo(run_finished) },
-        }, input.started.durationTo(run_finished));
+        try timings.print(io, errors);
         try errors.flush();
     }
     return exit_code;
@@ -145,7 +130,7 @@ fn compileAndRun(
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
-    const gpa = init.gpa;
+    const arena = init.arena.allocator();
 
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
@@ -155,11 +140,10 @@ pub fn main(init: std.process.Init) !void {
     const errors = &stderr_writer.interface;
 
     var positional: std.ArrayList([]const u8) = .empty;
-    defer positional.deinit(gpa);
     var debug_flags: DebugFlags = .{};
     var valid_arguments = true;
 
-    const args = try init.minimal.args.toSlice(init.arena.allocator());
+    const args = try init.minimal.args.toSlice(arena);
     for (args[1..]) |arg| {
         if (std.mem.startsWith(u8, arg, "--debug=")) {
             var names = std.mem.splitScalar(u8, arg["--debug=".len..], ',');
@@ -170,7 +154,7 @@ pub fn main(init: std.process.Init) !void {
                 }
             }
         } else {
-            try positional.append(gpa, arg);
+            try positional.append(arena, arg);
         }
     }
 
@@ -179,6 +163,10 @@ pub fn main(init: std.process.Init) !void {
         try errors.flush();
         std.process.exit(1);
     }
+
+    // Tracking allocates nothing but adds per-allocation bookkeeping.
+    var tracker: diagnostics.MemoryTracker = .{ .backing = init.gpa };
+    const gpa = if (debug_flags.memory) tracker.allocator() else init.gpa;
 
     const started = std.Io.Clock.awake.now(io);
     const source_path = positional.items[0];
@@ -205,6 +193,10 @@ pub fn main(init: std.process.Init) !void {
         try errors.flush();
         return run_error;
     };
+    if (debug_flags.memory) {
+        try tracker.print(errors);
+        try errors.flush();
+    }
     if (exit_code) |code| {
         try output.print("exit code: {d}\n", .{code});
         try output.flush();
@@ -242,9 +234,12 @@ test "CLI core renders debug output and runs the compiled program" {
     try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "ASM\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "db 0x") == null);
     try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "timing\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "database init:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "build executable:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "collect diagnostics:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "database init") != null);
+    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "parse") != null);
+    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "analyze bodies") != null);
+    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "compile functions") != null);
+    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "link executable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "collect diagnostics") != null);
 }
 
 test "CLI core renders source diagnostics without running" {
