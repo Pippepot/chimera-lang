@@ -224,56 +224,19 @@ _ = resource
 # transferring it.
 
 
-# Pointers
-# Pointer semantics follow Mojo 1.0's unified model. Pointer provides both
-# ordinary access and explicitly unsafe operations; there is no separate
-# UnsafePointer type. This adopts the semantic model, not Mojo's API spellings
-# or any future changes to Mojo.
-# Reference: https://mojolang.static.modular.com/docs/manual/pointers/
-#
-# Pointer is non-owning. Copying it preserves access to the same memory without
-# copying the pointee or acquiring ownership. Pointee type, mutability, and
-# origin are tracked separately. An origin records whose memory is accessed
-# so the compiler can enforce lifetime and aliasing rules. Creating a pointer
-# to an existing value preserves that relationship; safe uses cannot outlive
-# the value or bypass its access restrictions.
-#
-# Low-level access to buffers, uninitialized storage, and foreign memory uses
-# the same Pointer type. Unsafe operations are explicitly marked at the call
-# through unsafe_ names or keyword arguments. The caller must uphold their
-# validity, initialization, bounds, and ownership requirements; ordinary access
-# afterward does not repair a violated requirement.
-#
-# OwnedPointer owns one heap-allocated value exclusively. It can move but does
-# not support implicit copying. Explicit duplication, when the pointee supports
-# copy, creates a separate allocation and a separate value. Automatic cleanup
-# destroys the pointee and releases storage when the pointee supports automatic
-# destruction; explicit-drop pointees retain a consumption obligation.
-#
-# ArcPointer shares ownership of one heap-allocated value that supports move
-# and automatic destruction. Copying it increments an atomic reference count
-# without copying the pointee; ending an owner decrements the count. The last
-# owner destroys the pointee and releases storage.
-# Atomic reference counting does not synchronize reads or writes of the value.
-#
-# These pointer types are non-nullable. Absence must be represented explicitly
-# with an optional/variant value, not a null value of the pointer type.
-# Generic/origin syntax, pointer construction and dereference spelling, and
-# mapping Mojo's APIs to this language's parameter and drop modes remain open.
-
-
 # Borrowed views
 # Views provide non-owning access to existing data, including collection slices.
 # They may be returned from functions and stored in other values when their
-# origin dependencies remain valid. A view carries its backing-data origin and
-# permitted access; copying a view does not copy or acquire ownership of that
-# data. The backing owner must remain alive through every dependent use,
-# including uses through returned or stored views.
+# lifetime and access dependencies remain valid. Copying a view does not copy or
+# acquire ownership of its backing data. Every possible backing owner must
+# remain alive through each dependent use, including uses through returned or
+# stored views.
 # Lifetime tracking must also reject uses invalidated by changes to the backing
 # storage, such as collection reallocation. Keeping the owner alive alone is
-# insufficient. Origin relationships are inferred where possible and expressed
-# in borrowing API contracts when needed. View types and origin syntax remain
-# open; adopting these guarantees does not require Mojo's exact spelling.
+# insufficient. Lifetime and access dependencies are inferred where possible
+# and expressed in borrowing API contracts when needed. View types and borrowing
+# contract syntax remain open; adopting these guarantees does not require
+# Mojo's exact spelling.
 
 
 # Structs

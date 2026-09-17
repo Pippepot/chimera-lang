@@ -21,6 +21,7 @@ Top-level code is the entry point; a function named `main` is ordinary. The CLI 
 | [ROADMAP.md](ROADMAP.md) | Verified implementation status, gaps, and ordered next steps |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Compiler boundaries, ownership, and representation contracts |
 | [PROGRAM_FLOW.md](PROGRAM_FLOW.md) | Current query flow, invalidation, and result lifetimes |
+| [STORAGE_AND_REFERENCES.md](STORAGE_AND_REFERENCES.md) | Allocation/reference research and API design proposal |
 | [AGENTS.md](AGENTS.md) | Contribution and review rules |
 
 Language examples describe the target, not a promise of compiler support. Parser support alone does not establish semantics. Resolve missing language decisions in `syntax&semantics.txt` before implementing them; neither legacy behavior nor an old test overrides it.
