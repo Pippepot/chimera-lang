@@ -73,6 +73,7 @@ pub const Boundary = struct {
 pub const BuildInstruction = struct {
     id: u31,
     operation: structures.FunctionInstruction,
+    span: structures.SourceSpan,
 };
 
 pub const BuildItem = union(enum) {

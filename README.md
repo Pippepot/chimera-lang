@@ -11,7 +11,7 @@ zig run main.zig -- --debug=ast,ssa,asm,timing example.chi
 
 The CLI compiles one source file, writes `./prog`, runs it, and reports its exit code. Extra arguments after the source path are passed to the generated program.
 
-Top-level code is the entry point; a function named `main` is ordinary. The CLI itself exits with 0 after a normal program exit, or 1 on invalid arguments, source-read failure, source rejection, or compiler failure. It reports the program's status separately.
+Top-level code is the entry point; a function named `main` is ordinary. The CLI itself exits with 0 after a normal program exit, or 1 on invalid arguments, source-read failure, source rejection, or compiler failure. It reports the program's status separately. A compile-time `exit(code)` is compiler control instead: it produces no executable and becomes the CLI's own process status.
 
 ## Documentation
 

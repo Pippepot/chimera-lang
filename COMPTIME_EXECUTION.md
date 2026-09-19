@@ -213,6 +213,8 @@ Each slice includes diagnostics and incremental tests before the next begins.
    - Replace specialization tuples of copied value payloads with value IDs.
 
 2. **Typed thunks and scalar interpreter**
+   - Status: scalar vertical path implemented; fallible expressions and full
+     terminator/call-site source maps remain.
    - Generalize body typing to publish an inferred-result comptime thunk.
    - Add source maps and interpret constants, integer operations, predicates,
      blocks, joins, loops, returns, and fallible control flow.

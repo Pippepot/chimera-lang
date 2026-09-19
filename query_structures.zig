@@ -2,6 +2,7 @@ const std = @import("std");
 const structures = @import("structures.zig");
 const ast = @import("ast_new.zig");
 const codegen = @import("codegen_new.zig");
+const comptime_interpreter = @import("comptime_interpreter.zig");
 const semantic = @import("semantic.zig");
 const typing = @import("typing.zig");
 
@@ -277,6 +278,7 @@ pub fn TypeInterner(comptime Context: type) type {
     return struct {
         ctx: Context,
         file_id: ?structures.FileId = null,
+        instance: ?structures.InstanceId = null,
         specialization: ?SpecializationEnvironment = null,
 
         pub fn internVariant(self: @This(), members: []const structures.TypeId) !structures.InternVariantResult {
@@ -359,6 +361,15 @@ pub fn TypeInterner(comptime Context: type) type {
 
         pub fn lookupCompileTimeValue(self: @This(), value_id: structures.CompileTimeValueId) !structures.CompileTimeValue {
             return (try self.ctx.lookupInterned(CompileTimeValues, value_id)).*;
+        }
+
+        pub fn executeComptime(self: @This(), node: structures.Node.Index) !?structures.CompileTimeValueId {
+            const owner = self.instance orelse unreachable;
+            const outcome = (try self.ctx.get(ExecuteComptimeThunk, .{ .owner = owner, .node = node })).* orelse return null;
+            return switch (outcome) {
+                .returned => |value| value,
+                .failure, .exit => null,
+            };
         }
 
         pub fn structType(self: @This(), item_id: structures.ItemId) !structures.TypeId {
@@ -912,15 +923,178 @@ pub const ResolveStatic = struct {
             error.Unavailable => return null,
             else => return err,
         };
-        return switch (result) {
-            .success => |value| try ctx.intern(CompileTimeValues, value),
-            .unsupported => |issue| blk: {
+        switch (result) {
+            .success => |value| return try ctx.intern(CompileTimeValues, value),
+            .unsupported => |issue| switch (issue.kind) {
+                .static_initializer_not_supported => {},
+                else => {
+                    try typing.emitSemanticIssue(ctx, resolved.file_id, issue);
+                    return null;
+                },
+            },
+        }
+
+        const binding = parsed.nodes[resolved.declaration];
+        const initializer = binding.data.node_node.b.unwrap() orelse unreachable;
+        const site: structures.CompileTimeSite = .{
+            .owner = .{ .item = item_id },
+            .node = initializer,
+        };
+        const outcome = (try ctx.get(ExecuteComptimeThunk, site)).* orelse return null;
+        const value_id = switch (outcome) {
+            .returned => |returned| returned,
+            .failure => {
+                try typing.emitSemanticIssue(ctx, resolved.file_id, .{
+                    .span = nodeSpan(&parsed, initializer),
+                    .kind = .static_initializer_not_supported,
+                });
+                return null;
+            },
+            .exit => return null,
+        };
+        const annotation_result = try semantic.analyzeStaticRuntimeAnnotation(
+            &parsed,
+            source,
+            resolved.declaration,
+            type_interner,
+            ctx.allocator(),
+        );
+        const expected = switch (annotation_result) {
+            .success => |annotation| annotation orelse return value_id,
+            .unsupported => |issue| {
                 try typing.emitSemanticIssue(ctx, resolved.file_id, issue);
+                return null;
+            },
+        };
+        var value = (try ctx.lookupInterned(CompileTimeValues, value_id)).*;
+        const runtime = switch (value) {
+            .type => unreachable,
+            .runtime => |runtime| runtime,
+        };
+        if (!try semantic.canWidenTo(type_interner, runtime.type_id, expected)) {
+            try typing.emitSemanticIssue(ctx, resolved.file_id, .{
+                .span = nodeSpan(&parsed, initializer),
+                .kind = .{ .static_initializer_type_mismatch = .{
+                    .expected = expected,
+                    .found = runtime.type_id,
+                } },
+            });
+            return null;
+        }
+        value.runtime.type_id = expected;
+        return try ctx.intern(CompileTimeValues, value);
+    }
+};
+
+pub const AnalyzeComptimeThunk = struct {
+    pub const Input = structures.CompileTimeSite;
+    pub const Output = ?structures.FunctionBodyAnalysis;
+
+    pub fn run(ctx: anytype, site: Input) anyerror!Output {
+        const loc = try ctx.lookupInterned(ItemLocations, site.owner.item);
+        if (loc.kind != .static and loc.kind != .function) return null;
+        if (loc.kind == .static and site.owner.specialization != null) return null;
+        const resolved = (try ctx.get(ResolveItem, site.owner.item)).* orelse return null;
+        const parsed = (try ctx.get(ParseFile, resolved.file_id)).* orelse return null;
+        if (site.node.index() >= parsed.nodes.len) return null;
+        if (loc.kind == .static) {
+            const binding = parsed.nodes[resolved.declaration];
+            if (binding.data.node_node.b.unwrap() != site.node) return null;
+        } else if (parsed.nodes[site.node.index()].tag != .comptime_expr) return null;
+        const source = (try ctx.input(SourceText, resolved.file_id)).*;
+        const specialization = if (site.owner.specialization) |specialization_id|
+            (try ctx.lookupInterned(CompileTimeValueTuples, specialization_id)).values
+        else
+            &.{};
+        const type_interner: TypeInterner(@TypeOf(ctx)) = .{
+            .ctx = ctx,
+            .file_id = resolved.file_id,
+            .instance = site.owner,
+            .specialization = if (site.owner.specialization != null) .{
+                .ast = &parsed,
+                .source = source,
+                .declaration = resolved.declaration,
+                .arguments = specialization,
+            } else null,
+        };
+        const result = semantic.buildUnresolvedComptimeThunk(
+            &parsed,
+            source,
+            site.node,
+            type_interner,
+            ctx.allocator(),
+        ) catch |err| switch (err) {
+            error.Unavailable => return null,
+            else => return err,
+        };
+        var unresolved = switch (result) {
+            .success => |body| body,
+            .unsupported => |issue| {
+                try typing.emitSemanticIssue(ctx, resolved.file_id, issue);
+                return null;
+            },
+        };
+        defer unresolved.deinit(ctx.allocator());
+        return typing.resolveAndTypeComptimeThunk(
+            ctx,
+            BuildModuleScope,
+            FunctionInstanceSignature,
+            site.owner.item,
+            resolved.file_id,
+            type_interner,
+            unresolved,
+        );
+    }
+};
+
+pub const ExecuteComptimeThunk = struct {
+    pub const Input = structures.CompileTimeSite;
+    pub const Output = ?structures.CompileTimeOutcome;
+
+    pub fn run(ctx: anytype, site: Input) anyerror!Output {
+        const body = (try ctx.get(AnalyzeComptimeThunk, site)).* orelse return null;
+        const result = try comptime_interpreter.execute(&body, ctx.allocator());
+        return switch (result) {
+            .returned => |value| .{ .returned = try ctx.intern(CompileTimeValues, .{ .runtime = .{
+                .type_id = body.return_type,
+                .value = value,
+            } }) },
+            .failure => .failure,
+            .exit => |status| blk: {
+                try ctx.emit(structures.CompilerControl, .{ .exit = status });
+                break :blk .{ .exit = status };
+            },
+            .unsupported => |unsupported| blk: {
+                const loc = try ctx.lookupInterned(ItemLocations, site.owner.item);
+                const resolved = (try ctx.get(ResolveItem, site.owner.item)).* orelse return null;
+                const parsed = (try ctx.get(ParseFile, resolved.file_id)).* orelse return null;
+                const span = if (unsupported.instruction_index) |instruction_index|
+                    if (body.instruction_spans.len == body.instructions.len)
+                        body.instruction_spans[instruction_index]
+                    else
+                        nodeSpan(&parsed, site.node)
+                else
+                    nodeSpan(&parsed, site.node);
+                try ctx.emit(structures.Diagnostic, .{
+                    .file_id = loc.file_id,
+                    .span = span,
+                    .kind = switch (unsupported.reason) {
+                        .division_by_zero => .compile_time_division_by_zero,
+                        .integer_overflow => .compile_time_integer_overflow,
+                        .resource_limit => .compile_time_resource_limit,
+                        .instruction, .coercion => .static_initializer_not_supported,
+                    },
+                });
                 break :blk null;
             },
         };
     }
 };
+
+fn nodeSpan(parsed: *const structures.Ast, node_index: structures.Node.Index) structures.SourceSpan {
+    const token = parsed.tokens[parsed.nodes[node_index.index()].token_index];
+    return .{ .start = token.loc.start, .end = token.loc.end };
+}
 
 pub const StructDefinition = struct {
     pub const Input = structures.ItemId;
@@ -992,6 +1166,7 @@ fn analyzeFunctionBody(ctx: anytype, instance: structures.InstanceId) !?structur
     const type_interner: TypeInterner(@TypeOf(ctx)) = .{
         .ctx = ctx,
         .file_id = resolved.file_id,
+        .instance = instance,
         .specialization = if (instance.specialization != null) .{
             .ast = &parsed,
             .source = source,

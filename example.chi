@@ -1,3 +1,11 @@
-func foo(static T: type) type -> T
-const i: foo(int) = 1
-exit(i)
+struct S
+    a: int
+    b: int | unit
+
+const s = S{a = 1, b = ()}
+
+func foo(s: S) int
+    return if const b = s.b as int -> b else s.a
+
+const c = foo(s)
+exit(c)

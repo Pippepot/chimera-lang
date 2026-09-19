@@ -6,7 +6,10 @@
 
 
 # Types and evaluation
-# int: signed 32-bit integer; +, -, *, and negation wrap modulo 2^32.
+# int: signed 32-bit integer; +, -, *, and negation wrap modulo 2^32. Signed
+# division truncates toward zero. Division by zero or the unrepresentable
+# min-int / -1 quotient is an execution error; at compile time it is a source
+# error at the executed division.
 # float: floating-point number.
 # bool: true or false.
 # type: the type of compile-time type values.

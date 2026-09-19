@@ -24,6 +24,12 @@ const RunInput = struct {
     started: std.Io.Timestamp,
 };
 
+const RunOutcome = union(enum) {
+    program_exit: u8,
+    compiler_exit: u8,
+    rejected,
+};
+
 fn trySetDebugFlag(flags: *DebugFlags, name: []const u8) bool {
     inline for (@typeInfo(DebugFlags).@"struct".fields) |field| {
         if (std.mem.eql(u8, name, field.name)) {
@@ -72,7 +78,7 @@ fn compileAndRun(
     input: RunInput,
     output: *std.Io.Writer,
     errors: *std.Io.Writer,
-) !?u8 {
+) !RunOutcome {
     var timings: diagnostics.TimingLog = .init(input.started);
     timings.mark(io, "load source");
     const db = try query.Database.init(gpa, .{ .worker_count = 1 });
@@ -91,6 +97,13 @@ fn compileAndRun(
         gpa,
     );
     defer gpa.free(emitted);
+    const compiler_controls = try db.transitiveAccumulatorValues(
+        queries.BuildExecutable,
+        file_id,
+        structures.CompilerControl,
+        gpa,
+    );
+    defer gpa.free(compiler_controls);
     timings.mark(io, "collect diagnostics");
 
     if (input.debug_flags.ast) {
@@ -99,6 +112,12 @@ fn compileAndRun(
         }
     }
     if (executable_result.* == null) {
+        if (compiler_controls.len != 0) {
+            const status = switch (compiler_controls[0]) {
+                .exit => |value| value,
+            };
+            return .{ .compiler_exit = @truncate(@as(u32, @bitCast(status))) };
+        }
         std.debug.assert(emitted.len != 0);
         try output.flush();
         timings.mark(io, "debug output");
@@ -106,7 +125,7 @@ fn compileAndRun(
         try diagnostics.renderDiagnostics(type_interner, errors, input.source_path, input.source, emitted);
         if (input.debug_flags.timing) try timings.print(io, errors);
         try errors.flush();
-        return null;
+        return .rejected;
     }
     std.debug.assert(emitted.len == 0);
     const executable = executable_result.*.?;
@@ -125,7 +144,7 @@ fn compileAndRun(
         try timings.print(io, errors);
         try errors.flush();
     }
-    return exit_code;
+    return .{ .program_exit = exit_code };
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -182,7 +201,7 @@ pub fn main(init: std.process.Init) !void {
     };
     defer gpa.free(source);
 
-    const exit_code = compileAndRun(io, gpa, .{
+    const outcome = compileAndRun(io, gpa, .{
         .source_path = source_path,
         .source = source,
         .program_args = positional.items[1..],
@@ -197,13 +216,17 @@ pub fn main(init: std.process.Init) !void {
         try tracker.print(errors);
         try errors.flush();
     }
-    if (exit_code) |code| {
-        try output.print("exit code: {d}\n", .{code});
-        try output.flush();
-    } else {
-        // Rejected source is an expected user error: exit quietly so the
-        // caller sees status 1 without the runtime's error trace.
-        std.process.exit(1);
+    switch (outcome) {
+        .program_exit => |code| {
+            try output.print("exit code: {d}\n", .{code});
+            try output.flush();
+        },
+        .compiler_exit => |code| std.process.exit(code),
+        .rejected => {
+            // Rejected source is an expected user error: exit quietly so the
+            // caller sees status 1 without the runtime's error trace.
+            std.process.exit(1);
+        },
     }
 }
 
@@ -228,7 +251,7 @@ test "CLI core renders debug output and runs the compiled program" {
         .started = std.Io.Clock.awake.now(io),
     }, &output.writer, &errors.writer);
 
-    try std.testing.expectEqual(@as(?u8, 42), exit_code);
+    try std.testing.expectEqual(RunOutcome{ .program_exit = 42 }, exit_code);
     try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "AST\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "SSA\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "ASM\n") != null);
@@ -259,7 +282,7 @@ test "CLI core renders source diagnostics without running" {
         .started = std.Io.Clock.awake.now(io),
     }, &output.writer, &errors.writer);
 
-    try std.testing.expectEqual(@as(?u8, null), exit_code);
+    try std.testing.expectEqual(RunOutcome.rejected, exit_code);
     try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "AST\n") != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
@@ -267,6 +290,31 @@ test "CLI core renders source diagnostics without running" {
         "broken.chi:1:1: expected 1 call argument, found 0",
     ) != null);
     try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "timing\n") != null);
+}
+
+test "CLI core handles compile-time exit without producing an artifact" {
+    const io = std.testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var errors: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer errors.deinit();
+
+    const exit_code = try compileAndRun(io, std.testing.allocator, .{
+        .source_path = "comptime-exit.chi",
+        .source =
+        \\static stopped = exit(42)
+        \\exit(stopped)
+        ,
+        .program_args = &.{},
+        .debug_flags = .{},
+        .started = std.Io.Clock.awake.now(io),
+    }, &output.writer, &errors.writer);
+
+    try std.testing.expectEqual(RunOutcome{ .compiler_exit = 42 }, exit_code);
+    try std.testing.expectEqual(@as(usize, 0), output.writer.buffered().len);
+    try std.testing.expectEqual(@as(usize, 0), errors.writer.buffered().len);
 }
 
 test "CLI core rejects duplicate top-level names without running" {
@@ -290,7 +338,7 @@ test "CLI core rejects duplicate top-level names without running" {
         .started = std.Io.Clock.awake.now(io),
     }, &output.writer, &errors.writer);
 
-    try std.testing.expectEqual(@as(?u8, null), exit_code);
+    try std.testing.expectEqual(RunOutcome.rejected, exit_code);
     try std.testing.expectEqual(@as(usize, 0), output.writer.buffered().len);
     try std.testing.expect(std.mem.indexOf(
         u8,

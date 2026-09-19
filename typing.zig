@@ -34,6 +34,58 @@ pub fn resolveAndTypeBody(
     type_interner: anytype,
     unresolved: semantic.UnresolvedBody,
 ) !?structures.FunctionBodyAnalysis {
+    return resolveAndType(
+        ctx,
+        ModuleScopeQuery,
+        FunctionSignatureQuery,
+        item_id,
+        file_id,
+        parameters,
+        return_type,
+        is_fallible,
+        false,
+        type_interner,
+        unresolved,
+    );
+}
+
+pub fn resolveAndTypeComptimeThunk(
+    ctx: anytype,
+    comptime ModuleScopeQuery: type,
+    comptime FunctionSignatureQuery: type,
+    item_id: structures.ItemId,
+    file_id: structures.FileId,
+    type_interner: anytype,
+    unresolved: semantic.UnresolvedBody,
+) !?structures.FunctionBodyAnalysis {
+    return resolveAndType(
+        ctx,
+        ModuleScopeQuery,
+        FunctionSignatureQuery,
+        item_id,
+        file_id,
+        &.{},
+        .unit,
+        false,
+        true,
+        type_interner,
+        unresolved,
+    );
+}
+
+fn resolveAndType(
+    ctx: anytype,
+    comptime ModuleScopeQuery: type,
+    comptime FunctionSignatureQuery: type,
+    item_id: structures.ItemId,
+    file_id: structures.FileId,
+    parameters: []const structures.CallableParameter,
+    return_type: structures.TypeId,
+    is_fallible: bool,
+    infer_return_type: bool,
+    type_interner: anytype,
+    unresolved: semantic.UnresolvedBody,
+) !?structures.FunctionBodyAnalysis {
     var builder: BodyBuilder(@TypeOf(ctx), ModuleScopeQuery, FunctionSignatureQuery, @TypeOf(type_interner)) = .{
         .ctx = ctx,
         .type_interner = type_interner,
@@ -42,6 +94,7 @@ pub fn resolveAndTypeBody(
         .unresolved = unresolved,
         .return_type = return_type,
         .is_fallible = is_fallible,
+        .infer_return_type = infer_return_type,
     };
     defer builder.deinit();
     try builder.init(parameters);
@@ -144,6 +197,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
         unresolved: semantic.UnresolvedBody,
         return_type: structures.TypeId,
         is_fallible: bool,
+        infer_return_type: bool = false,
         scope: ?structures.ModuleScope = null,
         values: []?Value = &.{},
         local_values: []?Value = &.{},
@@ -285,9 +339,18 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
         }
 
         fn build(self: *Self) !void {
-            _ = try self.block(self.unresolved.root_block);
+            const result = try self.block(self.unresolved.root_block);
             if (self.current_block == null) return;
             const root = self.unresolved.blocks[@intFromEnum(self.unresolved.root_block)];
+            if (self.infer_return_type) {
+                if (result) |value_to_return| {
+                    self.return_type = value_to_return.type_id;
+                    try self.returnValue(value_to_return, root.span);
+                } else {
+                    try self.finishFunctionExit(root.span, .return_unit);
+                }
+                return;
+            }
             if (self.return_type == .unit) {
                 try self.finishFunctionExit(root.span, .return_unit);
             } else {
@@ -2712,6 +2775,10 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 .instruction = .{
                     .id = instruction_id,
                     .operation = instruction,
+                    .span = if (self.infer_return_type)
+                        self.activeLifetimeSpan()
+                    else
+                        .{ .start = 0, .end = 0 },
                 },
             });
             // The final block-argument count and instruction layout are known
@@ -3222,6 +3289,11 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             }
             const instructions = try gpa.alloc(structures.FunctionInstruction, self.instruction_count);
             errdefer gpa.free(instructions);
+            const instruction_spans = try gpa.alloc(
+                structures.SourceSpan,
+                if (self.infer_return_type) self.instruction_count else 0,
+            );
+            errdefer gpa.free(instruction_spans);
             const blocks = try gpa.alloc(structures.FunctionBlock, self.blocks.items.len);
             errdefer gpa.free(blocks);
             var instruction_index: u32 = 0;
@@ -3232,6 +3304,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 for (build_block.items.items) |item| switch (item) {
                     .instruction => |build_instruction| {
                         instructions[instruction_index] = build_instruction.operation;
+                        if (self.infer_return_type) instruction_spans[instruction_index] = build_instruction.span;
                         instruction_values[build_instruction.id] = @enumFromInt(argument_count + instruction_index);
                         instruction_index += 1;
                     },
@@ -3269,6 +3342,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 .call_arguments = call_arguments,
                 .branch_arguments = branches,
                 .instructions = instructions,
+                .instruction_spans = instruction_spans,
                 .blocks = blocks,
                 .entry = @enumFromInt(0),
             };

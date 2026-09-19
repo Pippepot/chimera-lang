@@ -183,6 +183,30 @@ pub fn buildUnresolvedBody(
     return .{ .success = try builder.finish() };
 }
 
+/// Build one expression as a zero-parameter body. Its result type is inferred
+/// by typing, so this graph is suitable for demand-driven compile-time thunks.
+pub fn buildUnresolvedComptimeThunk(
+    ast: *const structures.Ast,
+    source: []const u8,
+    expression: structures.Node.Index,
+    type_interner: anytype,
+    gpa: std.mem.Allocator,
+) !SemanticResult(UnresolvedBody) {
+    var builder: ExpressionBuilder(@TypeOf(type_interner)) = .{
+        .ast = ast,
+        .source = source,
+        .parameters = &.{},
+        .type_interner = type_interner,
+        .gpa = gpa,
+    };
+    defer builder.deinit();
+    builder.buildComptimeThunk(expression) catch |err| switch (err) {
+        error.SourceRejected => return .{ .unsupported = builder.issue.? },
+        else => return err,
+    };
+    return .{ .success = try builder.finish() };
+}
+
 fn ExpressionBuilder(comptime TypeInterner: type) type {
     return struct {
         const Self = @This();
@@ -248,6 +272,12 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 },
                 .static, .structure => unreachable,
             }
+        }
+
+        fn buildComptimeThunk(self: *Self, expression: structures.Node.Index) !void {
+            const node = self.ast.nodes[expression.index()];
+            const body = if (node.tag == .comptime_expr) node.data.node else expression;
+            self.root_block = try self.buildBranch(body);
         }
 
         fn buildEntry(self: *Self, declaration: u32) !void {
@@ -437,6 +467,25 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 .bool_literal => return self.appendExpression(index, .{ .boolean = self.ast.tokens[node.token_index].tag == .keyword_true }),
                 .unit_literal => return self.appendExpression(index, .unit),
                 .none_literal => return self.appendExpression(index, .none),
+                .comptime_expr => {
+                    const value_id = self.type_interner.executeComptime(index) catch |err| switch (err) {
+                        error.QueryCycle => return self.reject(index, .declaration_cycle),
+                        error.Unavailable => return error.Unavailable,
+                        else => return err,
+                    } orelse return error.Unavailable;
+                    const value = try self.type_interner.lookupCompileTimeValue(value_id);
+                    return switch (value) {
+                        .type => self.reject(index, .type_value_used_as_runtime_value),
+                        .runtime => |runtime| blk: {
+                            const primitive = try self.appendCompileTimeValue(index, runtime.value);
+                            if (runtime.type_id == runtime.value.typeId()) break :blk primitive;
+                            break :blk try self.appendExpression(index, .{ .annotation = .{
+                                .value = .{ .value = primitive, .span = nodeFocusSpan(self.ast, index) },
+                                .type_id = runtime.type_id,
+                            } });
+                        },
+                    };
+                },
                 .call => return self.appendCall(index),
                 .struct_init => return self.appendStructInit(index),
                 .field_access => return self.appendFieldAccess(index),
@@ -1275,6 +1324,25 @@ pub fn analyzeStaticDeclaration(
     return .{ .success = value };
 }
 
+pub fn analyzeStaticRuntimeAnnotation(
+    ast: *const structures.Ast,
+    source: []const u8,
+    declaration: u32,
+    type_interner: anytype,
+    gpa: std.mem.Allocator,
+) !SemanticResult(?structures.TypeId) {
+    const binding = ast.nodes[declaration];
+    std.debug.assert(binding.tag == .static_binding);
+    const annotation = binding.data.node_node.a.unwrap() orelse return .{ .success = null };
+    if (isMetaTypeAnnotation(ast, source, annotation)) {
+        return .{ .unsupported = issueAt(ast, annotation.index(), .static_initializer_not_supported) };
+    }
+    return switch (try analyzeType(ast, source, annotation, type_interner, gpa, .static_initializer_not_supported)) {
+        .success => |type_id| .{ .success = type_id },
+        .unsupported => |issue| .{ .unsupported = issue },
+    };
+}
+
 pub fn analyzeStructDefinition(
     ast: *const structures.Ast,
     source: []const u8,
@@ -1826,6 +1894,10 @@ const TestTypeInterner = struct {
     }
 
     pub fn lookupCompileTimeValue(_: @This(), _: structures.CompileTimeValueId) !structures.CompileTimeValue {
+        unreachable;
+    }
+
+    pub fn executeComptime(_: @This(), _: structures.Node.Index) !?structures.CompileTimeValueId {
         unreachable;
     }
 

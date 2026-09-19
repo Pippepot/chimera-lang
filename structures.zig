@@ -457,6 +457,21 @@ pub const CompileTimeValueTuple = struct {
     values: []const CompileTimeValueId,
 };
 
+/// Result of evaluating one typed compile-time thunk. A returned value is
+/// canonical before it crosses the query boundary; failure and compiler
+/// control remain execution outcomes rather than value kinds.
+pub const CompileTimeOutcome = union(enum) {
+    returned: CompileTimeValueId,
+    failure,
+    exit: i32,
+};
+
+/// Uncatchable control requested by compile-time execution and handled by the
+/// embedding compiler driver rather than rendered as a source diagnostic.
+pub const CompilerControl = union(enum) {
+    exit: i32,
+};
+
 /// Database interner index carried inside a non-primitive TypeId. The remaining
 /// TypeId bit distinguishes interned identities from reserved primitive IDs.
 pub const InternedTypeId = enum(u31) { _ };
@@ -880,6 +895,7 @@ pub const FunctionBodyAnalysis = struct {
     branch_arguments: []FunctionValueUse,
     call_arguments: []FunctionValueUse,
     instructions: []Instruction,
+    instruction_spans: []SourceSpan = &.{},
     blocks: []Block,
     entry: BlockId,
 
@@ -908,6 +924,7 @@ pub const FunctionBodyAnalysis = struct {
             !valueUsesEql(a.branch_arguments, b.branch_arguments) or
             !valueUsesEql(a.call_arguments, b.call_arguments) or
             a.instructions.len != b.instructions.len or
+            !sourceSpansEql(a.instruction_spans, b.instruction_spans) or
             a.blocks.len != b.blocks.len) return false;
         for (a.struct_field_values, b.struct_field_values) |left, right| {
             if (!std.meta.eql(left, right)) return false;
@@ -929,6 +946,14 @@ pub const FunctionBodyAnalysis = struct {
         return true;
     }
 
+    fn sourceSpansEql(left: []const SourceSpan, right: []const SourceSpan) bool {
+        if (left.len != right.len) return false;
+        for (left, right) |left_span, right_span| {
+            if (!std.meta.eql(left_span, right_span)) return false;
+        }
+        return true;
+    }
+
     pub fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
         gpa.free(self.block_argument_types);
         gpa.free(self.variant_coercion_tags);
@@ -936,6 +961,7 @@ pub const FunctionBodyAnalysis = struct {
         gpa.free(self.branch_arguments);
         gpa.free(self.call_arguments);
         gpa.free(self.instructions);
+        gpa.free(self.instruction_spans);
         gpa.free(self.blocks);
         self.* = undefined;
     }
@@ -1080,6 +1106,9 @@ pub const Diagnostic = struct {
         duplicate_top_level_declaration,
         declaration_cycle,
         static_initializer_not_supported,
+        compile_time_division_by_zero,
+        compile_time_integer_overflow,
+        compile_time_resource_limit,
         struct_member_not_supported,
         duplicate_struct_field,
         duplicate_struct_property,

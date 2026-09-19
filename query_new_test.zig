@@ -2878,7 +2878,7 @@ test "static annotations widen values and reject mismatches when demanded" {
     try testing.expectEqual(DiagnosticKind.static_initializer_type_mismatch, std.meta.activeTag(diagnostics[0].kind));
 }
 
-test "unsupported statics stay dormant until demanded" {
+test "scalar static expressions stay dormant and execute as typed thunks when demanded" {
     const db = try testDatabase(1);
     defer db.deinit();
 
@@ -2889,11 +2889,145 @@ test "unsupported statics stay dormant until demanded" {
     try expectCompiledFunctionResult(db, 1, "answer", &.{"answer"}, 42);
 
     const unused = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveStatic("unused").?;
-    try testing.expect((try db.get(query_structures.ResolveStatic, unused)).* == null);
+    try testing.expectEqual(
+        structures.CompileTimeValue{ .runtime = .{ .type_id = .int, .value = .{ .int = 3 } } },
+        try resolvedStaticValue(db, unused),
+    );
     const diagnostics = try db.transitiveAccumulatorValues(query_structures.ResolveStatic, unused, structures.Diagnostic, testing.allocator);
     defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 0), diagnostics.len);
+}
+
+test "compile-time scalar interpreter executes control flow, locals, loops, and wrapping arithmetic" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static selected = if 2 < 3 -> 40 + 2 else 0
+        \\static wrapped = 2147483647 + 1
+        \\static looped = comptime
+        \\  var value = 0
+        \\  loop
+        \\    value += 1
+        \\    if value == 42 -> break value
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    try testing.expectEqual(
+        structures.CompileTimeValue{ .runtime = .{ .type_id = .int, .value = .{ .int = 42 } } },
+        try resolvedStaticValue(db, scope.resolveStatic("selected").?),
+    );
+    try testing.expectEqual(
+        structures.CompileTimeValue{ .runtime = .{ .type_id = .int, .value = .{ .int = std.math.minInt(i32) } } },
+        try resolvedStaticValue(db, scope.resolveStatic("wrapped").?),
+    );
+    try testing.expectEqual(
+        structures.CompileTimeValue{ .runtime = .{ .type_id = .int, .value = .{ .int = 42 } } },
+        try resolvedStaticValue(db, scope.resolveStatic("looped").?),
+    );
+}
+
+test "scalar thunk results retain equal identities and invalidate on value changes" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static computed = 40 + 2
+        \\func answer() int -> computed
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const computed = scope.resolveStatic("computed").?;
+    const first = try db.get(query_structures.ResolveStatic, computed);
+
+    try setSource(db, 1,
+        \\static computed = 41 + 1
+        \\func answer() int -> computed
+    );
+    try testing.expectEqual(computed, (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveStatic("computed").?);
+    try testing.expectEqual(first, try db.get(query_structures.ResolveStatic, computed));
+
+    try setSource(db, 1,
+        \\static computed = 41 + 2
+        \\func answer() int -> computed
+    );
+    try testing.expect(first != try db.get(query_structures.ResolveStatic, computed));
+}
+
+test "explicit comptime expressions publish constants into runtime bodies" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\func answer() int
+        \\  const base = comptime
+        \\    var value = 39
+        \\    value += 2
+        \\    value
+        \\  return base + 1
+    );
+    try expectCompiledFunctionResult(db, 1, "answer", &.{"answer"}, 42);
+}
+
+test "comptime thunks inherit enclosing static specialization arguments" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static increment = func(static N: int) int -> comptime -> N + 1
+        \\func answer() int -> increment(41)
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const answer = scope.resolveFunction("answer").?;
+    const answer_body = (try db.get(query_structures.AnalyzeFunctionBody, answer)).*.?;
+    const increment = answer_body.instructions[0].call.instance();
+    const increment_body = (try db.get(query_structures.AnalyzeFunctionInstance, increment)).*.?;
+    try testing.expectEqual(@as(usize, 2), increment_body.instructions.len);
+    try testing.expectEqual(@as(i32, 42), increment_body.instructions[1].consti);
+    try testing.expectEqual(@as(u32, 1), @intFromEnum(increment_body.blocks[0].terminator.return_value.value));
+}
+
+test "comptime expressions cannot capture runtime locals" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1, "func bad(value: int) int -> comptime -> value + 1");
+    const bad = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveFunction("bad").?;
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, bad)).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, bad, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
     try testing.expectEqual(@as(usize, 1), diagnostics.len);
-    try testing.expectEqual(DiagnosticKind.static_initializer_not_supported, std.meta.activeTag(diagnostics[0].kind));
+    try testing.expectEqual(DiagnosticKind.unknown_value, std.meta.activeTag(diagnostics[0].kind));
+}
+
+test "compile-time division errors point at the executed instruction" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1, "static bad = 42 / 0");
+    const bad = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveStatic("bad").?;
+    try testing.expect((try db.get(query_structures.ResolveStatic, bad)).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(query_structures.ResolveStatic, bad, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(DiagnosticKind.compile_time_division_by_zero, std.meta.activeTag(diagnostics[0].kind));
+    try testing.expectEqual(structures.SourceSpan{ .start = 16, .end = 17 }, diagnostics[0].span);
+}
+
+test "compile-time exit is a structured compiler-control outcome" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static stopped = exit(42)
+        \\func answer() int -> stopped
+    );
+    const stopped = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveStatic("stopped").?;
+    try testing.expect((try db.get(query_structures.ResolveStatic, stopped)).* == null);
+    const controls = try db.transitiveAccumulatorValues(query_structures.ResolveStatic, stopped, structures.CompilerControl, testing.allocator);
+    defer testing.allocator.free(controls);
+    try testing.expectEqualSlices(structures.CompilerControl, &.{.{ .exit = 42 }}, controls);
+    const diagnostics = try db.transitiveAccumulatorValues(query_structures.ResolveStatic, stopped, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 0), diagnostics.len);
 }
 
 test "static declaration cycles are diagnosed and recover after edits" {
@@ -2976,8 +3110,9 @@ fn testStaticDeclarationAllocations(gpa: std.mem.Allocator) !void {
         \\static Result = int | Empty
         \\static value: Result = 40
         \\static enabled = true
+        \\static computed = 1 + 2
         \\func answer() int -> return if enabled == true
-        \\  if const number = value as int -> number + 2 else 1
+        \\  if const number = value as int -> number + computed - 1 else 1
         \\else 0
     );
     try testing.expect((try db.get(query_structures.BuildExecutable, 1)).* != null);
