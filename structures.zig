@@ -422,10 +422,12 @@ pub const ResolvedItem = struct {
 
 pub const CompileTimeValue = union(enum) {
     type: TypeId,
-    runtime: struct {
+    runtime: Runtime,
+
+    pub const Runtime = struct {
         type_id: TypeId,
         value: RuntimeValue,
-    },
+    };
 
     pub const RuntimeValue = union(enum) {
         int: i32,
@@ -433,14 +435,20 @@ pub const CompileTimeValue = union(enum) {
         unit,
         none,
         function_ref: FunctionReference,
+        structure: CompileTimeValueTupleId,
+        variant: struct {
+            member_type: TypeId,
+            payload: CompileTimeValueId,
+        },
 
-        pub fn typeId(self: @This()) TypeId {
+        pub fn scalarTypeId(self: @This()) ?TypeId {
             return switch (self) {
                 .int => .int,
                 .bool => .bool,
                 .unit => .unit,
                 .none => .none,
                 .function_ref => |reference| reference.type_id,
+                .structure, .variant => null,
             };
         }
     };
@@ -464,6 +472,13 @@ pub const CompileTimeOutcome = union(enum) {
     returned: CompileTimeValueId,
     failure,
     exit: i32,
+};
+
+/// Result of one memoized interpreted call. Updated ordinary arguments are
+/// canonicalized separately so mutable copy-back uses the same query result.
+pub const CompileTimeCallOutcome = struct {
+    outcome: CompileTimeOutcome,
+    arguments: CompileTimeValueTupleId,
 };
 
 /// Uncatchable control requested by compile-time execution and handled by the
@@ -1106,6 +1121,8 @@ pub const Diagnostic = struct {
         duplicate_top_level_declaration,
         declaration_cycle,
         static_initializer_not_supported,
+        compile_time_call_cycle,
+        compile_time_unhandled_failure,
         compile_time_division_by_zero,
         compile_time_integer_overflow,
         compile_time_resource_limit,

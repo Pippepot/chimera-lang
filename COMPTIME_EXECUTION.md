@@ -213,20 +213,23 @@ Each slice includes diagnostics and incremental tests before the next begins.
    - Replace specialization tuples of copied value payloads with value IDs.
 
 2. **Typed thunks and scalar interpreter**
-   - Status: scalar vertical path implemented; fallible expressions and full
-     terminator/call-site source maps remain.
+   - Status: scalar vertical path implemented; full terminator source maps
+     remain.
    - Generalize body typing to publish an inferred-result comptime thunk.
    - Add source maps and interpret constants, integer operations, predicates,
      blocks, joins, loops, returns, and fallible control flow.
    - Route arbitrary static initializers and `comptime` expressions through it.
 
 3. **Calls and specialization**
+   - Status: implemented except for call traces and global execution and
+     aggregate-storage accounting.
    - Interpret direct calls, concrete callable values, and indirect calls.
    - Route every static argument expression through thunk execution.
    - Add call memoization, cycle diagnostics, deterministic limits, and call
      traces.
 
 4. **Aggregates and ownership**
+   - Status: implemented.
    - Add struct and variant values, field operations, coercions, mutable call
      plumbing, and custom ownership hooks.
    - Verify left-to-right evaluation and path-specific cleanup behavior against

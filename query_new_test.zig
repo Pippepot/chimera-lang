@@ -2952,6 +2952,335 @@ test "scalar thunk results retain equal identities and invalidate on value chang
     try testing.expect(first != try db.get(query_structures.ResolveStatic, computed));
 }
 
+test "compile-time interpreter memoizes direct and recursive scalar calls" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static add = func(left: int, right: int) int -> left + right
+        \\static sum_to = func(value: int) int -> if value == 0 -> 0 else value + sum_to(value - 1)
+        \\static first = add(20, 22)
+        \\static second = add(20, 22)
+        \\static recursive = sum_to(6)
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    try testing.expectEqual(
+        structures.CompileTimeValue{ .runtime = .{ .type_id = .int, .value = .{ .int = 42 } } },
+        try resolvedStaticValue(db, scope.resolveStatic("first").?),
+    );
+    try testing.expectEqual(
+        (try db.get(query_structures.ResolveStatic, scope.resolveStatic("first").?)).*,
+        (try db.get(query_structures.ResolveStatic, scope.resolveStatic("second").?)).*,
+    );
+    try testing.expectEqual(
+        structures.CompileTimeValue{ .runtime = .{ .type_id = .int, .value = .{ .int = 21 } } },
+        try resolvedStaticValue(db, scope.resolveStatic("recursive").?),
+    );
+}
+
+test "compile-time call results retain across unrelated edits and invalidate with callees" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static add = func(left: int, right: int) int -> left + right
+        \\static result = add(20, 22)
+        \\func unrelated() int -> 1
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const result = scope.resolveStatic("result").?;
+    const first = try db.get(query_structures.ResolveStatic, result);
+
+    try setSource(db, 1,
+        \\static add = func(left: int, right: int) int -> left + right
+        \\static result = add(20, 22)
+        \\func unrelated() int -> 2
+    );
+    try testing.expectEqual(first, try db.get(query_structures.ResolveStatic, result));
+
+    try setSource(db, 1,
+        \\static add = func(left: int, right: int) int -> left + right + 1
+        \\static result = add(20, 22)
+        \\func unrelated() int -> 2
+    );
+    const changed = try db.get(query_structures.ResolveStatic, result);
+    try testing.expect(first != changed);
+    try testing.expectEqual(
+        structures.CompileTimeValue{ .runtime = .{ .type_id = .int, .value = .{ .int = 43 } } },
+        (try db.lookupInterned(query_structures.CompileTimeValues, changed.*.?)).*,
+    );
+}
+
+test "compile-time interpreter executes concrete callable values" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static increment = func(value: int) int -> value + 1
+        \\static apply = func(operation: func(int) int, value: int) int -> operation(value)
+        \\static result = apply(increment, 41)
+    );
+    const result = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveStatic("result").?;
+    try testing.expectEqual(
+        structures.CompileTimeValue{ .runtime = .{ .type_id = .int, .value = .{ .int = 42 } } },
+        try resolvedStaticValue(db, result),
+    );
+}
+
+test "compile-time interpreter propagates fallible call outcomes" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\fallible positive(value: int) int
+        \\  value > 0
+        \\  return value
+        \\static identity = func(value: int) int -> value
+        \\static checked: fallible(int) int = identity
+        \\static good = positive(42)
+        \\static bad = positive(0)
+        \\static indirect = checked(42)
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    try testing.expectEqual(
+        structures.CompileTimeValue{ .runtime = .{ .type_id = .int, .value = .{ .int = 42 } } },
+        try resolvedStaticValue(db, scope.resolveStatic("good").?),
+    );
+    try testing.expectEqual(
+        structures.CompileTimeValue{ .runtime = .{ .type_id = .int, .value = .{ .int = 42 } } },
+        try resolvedStaticValue(db, scope.resolveStatic("indirect").?),
+    );
+    const bad = scope.resolveStatic("bad").?;
+    try testing.expect((try db.get(query_structures.ResolveStatic, bad)).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(query_structures.ResolveStatic, bad, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(DiagnosticKind.compile_time_unhandled_failure, std.meta.activeTag(diagnostics[0].kind));
+}
+
+test "compile-time call cycles diagnose the reached call site" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    const source =
+        \\static recurse = func(value: int) int -> recurse(value)
+        \\static result = recurse(1)
+    ;
+    try addSource(db, 1, source);
+    const result = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveStatic("result").?;
+    try testing.expect((try db.get(query_structures.ResolveStatic, result)).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(query_structures.ResolveStatic, result, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(DiagnosticKind.compile_time_call_cycle, std.meta.activeTag(diagnostics[0].kind));
+    try testing.expectEqualStrings("recurse", source[diagnostics[0].span.?.start..diagnostics[0].span.?.end]);
+}
+
+test "changing compile-time recursion is bounded by deterministic call depth" {
+    const db = try testDatabase(4);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static recurse = func(value: int) int -> recurse(value + 1)
+        \\static result = recurse(0)
+    );
+    const result = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveStatic("result").?;
+    try testing.expect((try db.get(query_structures.ResolveStatic, result)).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(query_structures.ResolveStatic, result, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(DiagnosticKind.compile_time_resource_limit, std.meta.activeTag(diagnostics[0].kind));
+}
+
+test "static value arguments execute arbitrary scalar thunks" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static select = func(static value: int) int -> value
+        \\static add = func(left: int, right: int) int -> left + right
+        \\static result = select(add(20, 22))
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const result_item = scope.resolveStatic("result").?;
+    try testing.expectEqual(
+        structures.CompileTimeValue{ .runtime = .{ .type_id = .int, .value = .{ .int = 42 } } },
+        try resolvedStaticValue(db, result_item),
+    );
+}
+
+test "compile-time interpreter executes structs variants and mutable aggregate calls" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static Pair = struct
+        \\  left: int
+        \\  right: int
+        \\static sum = func(pair: Pair) int -> pair.left + pair.right
+        \\static increment = func(mut pair: Pair)
+        \\  pair.left += 1
+        \\static adjust = fallible(mut value: int) int
+        \\  value += 1
+        \\  value > 0
+        \\  return value
+        \\static Maybe = int | none
+        \\static unwrap = func(value: Maybe) int -> return if const number = value as int -> number else 0
+        \\static aggregate = sum(Pair{right = 2, left = 40})
+        \\static narrowed = unwrap(42)
+        \\static mutated = comptime
+        \\  var pair = Pair{left = 40, right = 1}
+        \\  increment(pair)
+        \\  pair.left + pair.right
+        \\static mutable_success = comptime
+        \\  var value = 0
+        \\  if adjust(value) -> value + 41 else 0
+        \\static mutable_failure = comptime
+        \\  var value = -1
+        \\  if adjust(value) -> 0 else value + 42
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    for ([_][]const u8{ "aggregate", "narrowed", "mutated", "mutable_success", "mutable_failure" }) |name| {
+        try testing.expectEqual(
+            structures.CompileTimeValue{ .runtime = .{ .type_id = .int, .value = .{ .int = 42 } } },
+            try resolvedStaticValue(db, scope.resolveStatic(name).?),
+        );
+    }
+}
+
+test "compile-time interpreter executes custom aggregate ownership hooks" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static Box = struct
+        \\  copy = func(imm self: Box) Box -> Box{value = self.value + 1}
+        \\  value: int
+        \\static MovedBox = struct
+        \\  move = func(var self: MovedBox) MovedBox
+        \\    self.value += 1
+        \\    return self^
+        \\  value: int
+        \\static result = comptime
+        \\  const source = Box{value = 41}
+        \\  const copied = source
+        \\  copied.value
+        \\static moved = comptime
+        \\  const source = MovedBox{value = 41}
+        \\  const destination = source^
+        \\  destination.value
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    for ([_][]const u8{ "result", "moved" }) |name| try testing.expectEqual(
+        structures.CompileTimeValue{ .runtime = .{ .type_id = .int, .value = .{ .int = 42 } } },
+        try resolvedStaticValue(db, scope.resolveStatic(name).?),
+    );
+}
+
+test "compile-time aggregate results are canonical and cleanup preserves reverse field order" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static Pair = struct
+        \\  copy = trivial
+        \\  left: int
+        \\  right: int
+        \\static pair = Pair{right = 2, left = 40}
+        \\static sum = func(value: Pair) int -> value.left + value.right
+        \\static select = func(static value: Pair) int -> value.left + value.right
+        \\static reused = sum(pair)
+        \\static specialized = select(pair)
+        \\static Maybe = int | none
+        \\static direct: Maybe = 42
+        \\static interpreted: Maybe = if 0 < 1 -> 42 else none
+        \\static MaybePair = Pair | none
+        \\static boxed: MaybePair = Pair{left = 40, right = 2}
+        \\static boxed_alias: MaybePair = pair
+        \\static unbox = func(value: MaybePair) int -> return if const pair_value = value as Pair -> sum(pair_value) else 0
+        \\static boxed_sum = unbox(boxed)
+        \\static boxed_alias_sum = unbox(boxed_alias)
+        \\func answer() int -> sum(pair)
+        \\static Resource = struct
+        \\  drop = func(deinit self: Resource) -> exit(self.value)
+        \\  value: int
+        \\static Resources = struct
+        \\  first: Resource
+        \\  second: Resource
+        \\static stopped = comptime
+        \\  const resources = Resources{first = Resource{value = 41}, second = Resource{value = 42}}
+        \\  unit
+        \\static safe = comptime
+        \\  const selected: Resource | int = if 1 < 0 -> Resource{value = 42} else 0
+        \\  unit
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const pair = try resolvedStaticValue(db, scope.resolveStatic("pair").?);
+    const fields = try db.lookupInterned(query_structures.CompileTimeValueTuples, pair.runtime.value.structure);
+    try testing.expectEqual(@as(usize, 2), fields.values.len);
+    try testing.expectEqual(@as(i32, 40), (try lookupCompileTimeValue(db, fields.values[0])).runtime.value.int);
+    try testing.expectEqual(@as(i32, 2), (try lookupCompileTimeValue(db, fields.values[1])).runtime.value.int);
+    try testing.expectEqual(
+        (try db.get(query_structures.ResolveStatic, scope.resolveStatic("direct").?)).*.?,
+        (try db.get(query_structures.ResolveStatic, scope.resolveStatic("interpreted").?)).*.?,
+    );
+    for ([_][]const u8{ "reused", "specialized", "boxed_sum", "boxed_alias_sum" }) |name| try testing.expectEqual(
+        structures.CompileTimeValue{ .runtime = .{ .type_id = .int, .value = .{ .int = 42 } } },
+        try resolvedStaticValue(db, scope.resolveStatic(name).?),
+    );
+    try testing.expectEqual(
+        structures.CompileTimeValue{ .runtime = .{ .type_id = .unit, .value = .unit } },
+        try resolvedStaticValue(db, scope.resolveStatic("safe").?),
+    );
+    try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "sum" }, 42);
+
+    const stopped = scope.resolveStatic("stopped").?;
+    try testing.expect((try db.get(query_structures.ResolveStatic, stopped)).* == null);
+    const controls = try db.transitiveAccumulatorValues(query_structures.ResolveStatic, stopped, structures.CompilerControl, testing.allocator);
+    defer testing.allocator.free(controls);
+    try testing.expectEqualSlices(structures.CompilerControl, &.{.{ .exit = 42 }}, controls);
+}
+
+test "compile-time aggregate results retain across unrelated edits and invalidate with constructors" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static Pair = struct
+        \\  left: int
+        \\  right: int
+        \\static make = func(value: int) Pair -> Pair{left = value, right = 2}
+        \\static result = make(40)
+        \\func unrelated() int -> 1
+    );
+    const result = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveStatic("result").?;
+    const first = try db.get(query_structures.ResolveStatic, result);
+
+    try setSource(db, 1,
+        \\static Pair = struct
+        \\  left: int
+        \\  right: int
+        \\static make = func(value: int) Pair -> Pair{left = value, right = 2}
+        \\static result = make(40)
+        \\func unrelated() int -> 2
+    );
+    try testing.expectEqual(first, try db.get(query_structures.ResolveStatic, result));
+
+    try setSource(db, 1,
+        \\static Pair = struct
+        \\  left: int
+        \\  right: int
+        \\static make = func(value: int) Pair -> Pair{left = value, right = 3}
+        \\static result = make(40)
+        \\func unrelated() int -> 2
+    );
+    const changed = try db.get(query_structures.ResolveStatic, result);
+    try testing.expect(first != changed);
+    const value = (try db.lookupInterned(query_structures.CompileTimeValues, changed.*.?)).*.runtime;
+    const fields = try db.lookupInterned(query_structures.CompileTimeValueTuples, value.value.structure);
+    try testing.expectEqual(@as(i32, 3), (try lookupCompileTimeValue(db, fields.values[1])).runtime.value.int);
+}
+
 test "explicit comptime expressions publish constants into runtime bodies" {
     const db = try testDatabase(1);
     defer db.deinit();
@@ -3012,12 +3341,13 @@ test "compile-time division errors point at the executed instruction" {
     try testing.expectEqual(structures.SourceSpan{ .start = 16, .end = 17 }, diagnostics[0].span);
 }
 
-test "compile-time exit is a structured compiler-control outcome" {
+test "compile-time exit propagates through interpreted calls as compiler control" {
     const db = try testDatabase(1);
     defer db.deinit();
 
     try addSource(db, 1,
-        \\static stopped = exit(42)
+        \\static stop = func() int -> exit(42)
+        \\static stopped = stop()
         \\func answer() int -> stopped
     );
     const stopped = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveStatic("stopped").?;
@@ -3110,7 +3440,15 @@ fn testStaticDeclarationAllocations(gpa: std.mem.Allocator) !void {
         \\static Result = int | Empty
         \\static value: Result = 40
         \\static enabled = true
-        \\static computed = 1 + 2
+        \\static Pair = struct
+        \\  copy = trivial
+        \\  left: int
+        \\  right: int
+        \\static MaybePair = Pair | none
+        \\static boxed: MaybePair = Pair{left = 1, right = 2}
+        \\static sum = func(pair: Pair) int -> pair.left + pair.right
+        \\static unbox = func(value: MaybePair) int -> return if const pair = value as Pair -> sum(pair) else 0
+        \\static computed = unbox(boxed)
         \\func answer() int -> return if enabled == true
         \\  if const number = value as int -> number + computed - 1 else 1
         \\else 0

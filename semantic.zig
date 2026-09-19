@@ -309,7 +309,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                     const local: Local = switch (value) {
                         .type => .type,
                         .runtime => |runtime| blk: {
-                            const static_value = try self.appendCompileTimeValue(parameter_index, runtime.value);
+                            const static_value = try self.appendCompileTimeValue(parameter_index, runtime);
                             self.static_expression_count += 1;
                             break :blk .{ .value = static_value };
                         },
@@ -446,18 +446,61 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             }
         }
 
-        fn appendCompileTimeValue(
-            self: *Self,
-            index: structures.Node.Index,
-            value: structures.CompileTimeValue.RuntimeValue,
-        ) !ValueId {
-            return switch (value) {
+        fn appendCompileTimeValue(self: *Self, index: structures.Node.Index, runtime: structures.CompileTimeValue.Runtime) !ValueId {
+            const primitive = try switch (runtime.value) {
                 .int => |integer| self.appendExpression(index, .{ .integer = integer }),
                 .bool => |boolean| self.appendExpression(index, .{ .boolean = boolean }),
                 .unit => self.appendExpression(index, .unit),
                 .none => self.appendExpression(index, .none),
-                .function_ref => self.reject(index, .static_argument_not_supported),
+                .function_ref => |reference| self.appendExpression(index, .{ .function_ref = reference }),
+                .structure => |tuple_id| blk: {
+                    const definition = (try self.type_interner.structDefinition(runtime.type_id)) orelse return error.Unavailable;
+                    const values = try self.type_interner.lookupCompileTimeTuple(tuple_id);
+                    std.debug.assert(values.len == definition.fields.len);
+                    var fields: std.ArrayList(UnresolvedBody.StructFieldValue) = .empty;
+                    defer fields.deinit(self.gpa);
+                    for (definition.fields, values) |field, value_id| {
+                        const value = switch (try self.type_interner.lookupCompileTimeValue(value_id)) {
+                            .runtime => |value| value,
+                            .type => unreachable,
+                        };
+                        try fields.append(self.gpa, .{
+                            .name = field.name,
+                            .name_span = field.span,
+                            .value = .{ .value = try self.appendCompileTimeValue(index, value), .span = nodeFocusSpan(self.ast, index) },
+                        });
+                    }
+                    const start: u32 = @intCast(self.struct_field_values.items.len);
+                    try self.struct_field_values.appendSlice(self.gpa, fields.items);
+                    break :blk self.appendExpression(index, .{ .struct_init = .{
+                        .type_id = runtime.type_id,
+                        .type_span = nodeFocusSpan(self.ast, index),
+                        .fields = .{ .start = start, .end = @intCast(self.struct_field_values.items.len) },
+                    } });
+                },
+                .variant => |variant| blk: {
+                    const payload = switch (try self.type_interner.lookupCompileTimeValue(variant.payload)) {
+                        .runtime => |value| value,
+                        .type => unreachable,
+                    };
+                    var value = try self.appendCompileTimeValue(index, payload);
+                    if (payload.type_id != variant.member_type) value = try self.appendExpression(index, .{ .annotation = .{
+                        .value = .{ .value = value, .span = nodeFocusSpan(self.ast, index) },
+                        .type_id = variant.member_type,
+                    } });
+                    break :blk value;
+                },
             };
+            const representation_type = runtime.value.scalarTypeId() orelse switch (runtime.value) {
+                .structure => runtime.type_id,
+                .variant => |variant| variant.member_type,
+                else => unreachable,
+            };
+            if (runtime.type_id == representation_type) return primitive;
+            return self.appendExpression(index, .{ .annotation = .{
+                .value = .{ .value = primitive, .span = nodeFocusSpan(self.ast, index) },
+                .type_id = runtime.type_id,
+            } });
         }
 
         fn append(self: *Self, index: structures.Node.Index) anyerror!ValueId {
@@ -477,12 +520,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                     return switch (value) {
                         .type => self.reject(index, .type_value_used_as_runtime_value),
                         .runtime => |runtime| blk: {
-                            const primitive = try self.appendCompileTimeValue(index, runtime.value);
-                            if (runtime.type_id == runtime.value.typeId()) break :blk primitive;
-                            break :blk try self.appendExpression(index, .{ .annotation = .{
-                                .value = .{ .value = primitive, .span = nodeFocusSpan(self.ast, index) },
-                                .type_id = runtime.type_id,
-                            } });
+                            break :blk try self.appendCompileTimeValue(index, runtime);
                         },
                     };
                 },
@@ -520,20 +558,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                     const static_value = try self.type_interner.lookupCompileTimeValue(static_value_id);
                     return switch (static_value) {
                         .type => self.reject(index, .type_value_used_as_runtime_value),
-                        .runtime => |runtime| blk: {
-                            const primitive = switch (runtime.value) {
-                                .int => |value| try self.appendExpression(index, .{ .integer = value }),
-                                .bool => |value| try self.appendExpression(index, .{ .boolean = value }),
-                                .unit => try self.appendExpression(index, .unit),
-                                .none => try self.appendExpression(index, .none),
-                                .function_ref => |reference| try self.appendExpression(index, .{ .function_ref = reference }),
-                            };
-                            if (runtime.type_id == runtime.value.typeId()) break :blk primitive;
-                            break :blk try self.appendExpression(index, .{ .annotation = .{
-                                .value = .{ .value = primitive, .span = span },
-                                .type_id = runtime.type_id,
-                            } });
-                        },
+                        .runtime => |runtime| self.appendCompileTimeValue(index, runtime),
                     };
                 },
                 .neg => return self.appendExpression(index, .{ .negate = try self.appendUse(node.data.node) }),
@@ -920,7 +945,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                                 } });
                             break :target_blk .{ .value = .{ .value = target, .span = span } };
                         },
-                        .int, .bool, .unit, .none => {},
+                        .int, .bool, .unit, .none, .structure, .variant => {},
                     },
                     .type => {},
                 };
@@ -945,8 +970,16 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 if (parameter_shapes) |parameters| if (parameters[argument_index].mode == .static) {
                     const result = if (parameters[argument_index].is_meta_type)
                         try analyzeStaticTypeArgument(self.ast, self.source, argument, self.type_interner, self.gpa)
-                    else
-                        try analyzeStaticInitializer(self.ast, self.source, argument, self.type_interner, self.gpa);
+                    else result_blk: {
+                        const value_id = self.type_interner.executeComptime(argument) catch |err| switch (err) {
+                            error.QueryCycle => return self.reject(argument, .declaration_cycle),
+                            error.Unavailable => return error.Unavailable,
+                            else => return err,
+                        } orelse return error.Unavailable;
+                        break :result_blk SemanticResult(structures.CompileTimeValue){
+                            .success = try self.type_interner.lookupCompileTimeValue(value_id),
+                        };
+                    };
                     const value = switch (result) {
                         .success => |value| value,
                         .unsupported => |issue| return self.reject(argument, issue.kind),
@@ -1119,7 +1152,7 @@ pub fn analyzeFunctionInstanceSignature(
                     .success => |type_id| type_id,
                     .unsupported => |issue| return .{ .unsupported = issue },
                 };
-                if (!expected.isPrimitive() or expected == .never) return .{ .unsupported = .{
+                if (expected == .never or expected == .type) return .{ .unsupported = .{
                     .span = name_span,
                     .kind = .static_argument_type_mismatch,
                 } };
@@ -1319,6 +1352,9 @@ pub fn analyzeStaticDeclaration(
                 .found = runtime.type_id,
             } },
         } };
+    }
+    if (runtime.type_id != expected and runtime.value == .structure) {
+        return .{ .unsupported = issueAt(ast, initializer.index(), .static_initializer_not_supported) };
     }
     value.runtime.type_id = expected;
     return .{ .success = value };
@@ -1873,6 +1909,10 @@ const TestTypeInterner = struct {
         return null;
     }
 
+    pub fn structDefinition(_: @This(), _: structures.TypeId) !?structures.StructDefinition {
+        return null;
+    }
+
     pub fn ownedFunction(_: @This(), _: structures.ItemId, _: []const u8) !?structures.ItemId {
         unreachable;
     }
@@ -1894,6 +1934,10 @@ const TestTypeInterner = struct {
     }
 
     pub fn lookupCompileTimeValue(_: @This(), _: structures.CompileTimeValueId) !structures.CompileTimeValue {
+        unreachable;
+    }
+
+    pub fn lookupCompileTimeTuple(_: @This(), _: structures.CompileTimeValueTupleId) ![]const structures.CompileTimeValueId {
         unreachable;
     }
 

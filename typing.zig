@@ -44,6 +44,35 @@ pub fn resolveAndTypeBody(
         return_type,
         is_fallible,
         false,
+        false,
+        type_interner,
+        unresolved,
+    );
+}
+
+pub fn resolveAndTypeBodyForComptime(
+    ctx: anytype,
+    comptime ModuleScopeQuery: type,
+    comptime FunctionSignatureQuery: type,
+    item_id: structures.ItemId,
+    file_id: structures.FileId,
+    parameters: []const structures.CallableParameter,
+    return_type: structures.TypeId,
+    is_fallible: bool,
+    type_interner: anytype,
+    unresolved: semantic.UnresolvedBody,
+) !?structures.FunctionBodyAnalysis {
+    return resolveAndType(
+        ctx,
+        ModuleScopeQuery,
+        FunctionSignatureQuery,
+        item_id,
+        file_id,
+        parameters,
+        return_type,
+        is_fallible,
+        false,
+        true,
         type_interner,
         unresolved,
     );
@@ -66,7 +95,8 @@ pub fn resolveAndTypeComptimeThunk(
         file_id,
         &.{},
         .unit,
-        false,
+        true,
+        true,
         true,
         type_interner,
         unresolved,
@@ -83,6 +113,7 @@ fn resolveAndType(
     return_type: structures.TypeId,
     is_fallible: bool,
     infer_return_type: bool,
+    publish_instruction_spans: bool,
     type_interner: anytype,
     unresolved: semantic.UnresolvedBody,
 ) !?structures.FunctionBodyAnalysis {
@@ -95,6 +126,7 @@ fn resolveAndType(
         .return_type = return_type,
         .is_fallible = is_fallible,
         .infer_return_type = infer_return_type,
+        .publish_instruction_spans = publish_instruction_spans,
     };
     defer builder.deinit();
     try builder.init(parameters);
@@ -198,6 +230,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
         return_type: structures.TypeId,
         is_fallible: bool,
         infer_return_type: bool = false,
+        publish_instruction_spans: bool = false,
         scope: ?structures.ModuleScope = null,
         values: []?Value = &.{},
         local_values: []?Value = &.{},
@@ -2775,7 +2808,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 .instruction = .{
                     .id = instruction_id,
                     .operation = instruction,
-                    .span = if (self.infer_return_type)
+                    .span = if (self.publish_instruction_spans)
                         self.activeLifetimeSpan()
                     else
                         .{ .start = 0, .end = 0 },
@@ -3291,7 +3324,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             errdefer gpa.free(instructions);
             const instruction_spans = try gpa.alloc(
                 structures.SourceSpan,
-                if (self.infer_return_type) self.instruction_count else 0,
+                if (self.publish_instruction_spans) self.instruction_count else 0,
             );
             errdefer gpa.free(instruction_spans);
             const blocks = try gpa.alloc(structures.FunctionBlock, self.blocks.items.len);
@@ -3304,7 +3337,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 for (build_block.items.items) |item| switch (item) {
                     .instruction => |build_instruction| {
                         instructions[instruction_index] = build_instruction.operation;
-                        if (self.infer_return_type) instruction_spans[instruction_index] = build_instruction.span;
+                        if (self.publish_instruction_spans) instruction_spans[instruction_index] = build_instruction.span;
                         instruction_values[build_instruction.id] = @enumFromInt(argument_count + instruction_index);
                         instruction_index += 1;
                     },
