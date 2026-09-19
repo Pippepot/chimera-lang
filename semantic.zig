@@ -274,7 +274,8 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 const name = self.source[span.start..span.end];
                 const mode = parameterMode(self.ast, parameter) orelse unreachable;
                 if (mode == .static) {
-                    const value = (try self.type_interner.resolveStatic(name)) orelse unreachable;
+                    const value_id = (try self.type_interner.resolveStatic(name)) orelse unreachable;
+                    const value = try self.type_interner.lookupCompileTimeValue(value_id);
                     const local: Local = switch (value) {
                         .type => .type,
                         .runtime => |runtime| blk: {
@@ -404,7 +405,10 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
         fn bindingType(self: *Self, node: structures.Node.Index) !structures.TypeId {
             const result = try analyzeType(self.ast, self.source, node, self.type_interner, self.gpa, .local_type_not_supported);
             switch (result) {
-                .success => |type_id| return type_id,
+                .success => |type_id| if (type_id == .type) {
+                    self.issue = issueAt(self.ast, node.index(), .local_type_not_supported);
+                    return error.SourceRejected;
+                } else return type_id,
                 .unsupported => |issue| {
                     self.issue = issue;
                     return error.SourceRejected;
@@ -450,7 +454,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                         error.Unavailable => return error.Unavailable,
                         else => return err,
                     };
-                    const static_value = resolved orelse {
+                    const static_value_id = resolved orelse {
                         const function = self.type_interner.functionReference(name) catch |err| switch (err) {
                             error.Unavailable => return error.Unavailable,
                             else => return err,
@@ -464,6 +468,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                         }
                         return self.reject(index, .unknown_value);
                     };
+                    const static_value = try self.type_interner.lookupCompileTimeValue(static_value_id);
                     return switch (static_value) {
                         .type => self.reject(index, .type_value_used_as_runtime_value),
                         .runtime => |runtime| blk: {
@@ -853,7 +858,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                     error.Unavailable => return error.Unavailable,
                     else => return err,
                 };
-                if (static_value) |value| switch (value) {
+                if (static_value) |value_id| switch (try self.type_interner.lookupCompileTimeValue(value_id)) {
                     .runtime => |runtime| switch (runtime.value) {
                         .function_ref => |reference| {
                             const expression = try self.appendExpression(callee_index, .{ .function_ref = reference });
@@ -885,7 +890,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             }
             const scratch_start = self.scratch.items.len;
             defer self.scratch.shrinkRetainingCapacity(scratch_start);
-            var static_arguments: std.ArrayList(structures.CompileTimeValue) = .empty;
+            var static_arguments: std.ArrayList(structures.CompileTimeValueId) = .empty;
             defer static_arguments.deinit(self.gpa);
             for (argument_nodes, 0..) |argument, argument_index| {
                 if (parameter_shapes) |parameters| if (parameters[argument_index].mode == .static) {
@@ -901,7 +906,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                         .runtime => |runtime| if (runtime.value == .function_ref) return self.reject(argument, .static_argument_not_supported),
                         .type => {},
                     }
-                    try static_arguments.append(self.gpa, value);
+                    try static_arguments.append(self.gpa, try self.type_interner.internCompileTimeValue(value));
                     continue;
                 };
                 const value = try self.append(argument);
@@ -1024,7 +1029,7 @@ pub fn analyzeFunctionInstanceSignature(
     ast: *const structures.Ast,
     source: []const u8,
     declaration: u32,
-    specialization: []const structures.CompileTimeValue,
+    specialization: []const structures.CompileTimeValueId,
     type_interner: anytype,
     gpa: std.mem.Allocator,
 ) !SignatureResult {
@@ -1053,7 +1058,7 @@ pub fn analyzeFunctionInstanceSignature(
             if (specialization_index >= specialization.len) {
                 return .{ .unsupported = .{ .span = name_span, .kind = .static_parameter_requires_specialization } };
             }
-            const argument = specialization[specialization_index];
+            const argument = try type_interner.lookupCompileTimeValue(specialization[specialization_index]);
             specialization_index += 1;
             if (isMetaTypeAnnotation(ast, source, annotation)) {
                 if (argument != .type) return .{ .unsupported = .{
@@ -1084,6 +1089,7 @@ pub fn analyzeFunctionInstanceSignature(
             .success => |type_id| type_id,
             .unsupported => |issue| return .{ .unsupported = issue },
         };
+        if (parameter_type == .type) return .{ .unsupported = issueAt(ast, annotation.index(), .parameter_type_not_supported) };
         try parameters.append(gpa, .{ .mode = mode, .type_id = parameter_type });
     }
     if (specialization_index != specialization.len) unreachable;
@@ -1160,13 +1166,15 @@ fn analyzeType(
         if (std.mem.eql(u8, name, "unit")) return .{ .success = .unit };
         if (std.mem.eql(u8, name, "none")) return .{ .success = .none };
         if (std.mem.eql(u8, name, "never")) return .{ .success = .never };
+        if (std.mem.eql(u8, name, "type")) return .{ .success = .type };
         if (std.mem.eql(u8, name, "float")) return .{ .unsupported = .{ .span = span, .kind = .float_type_not_supported } };
         const resolved = type_interner.resolveStatic(name) catch |err| switch (err) {
             error.QueryCycle => return .{ .unsupported = .{ .span = span, .kind = .declaration_cycle } },
             error.Unavailable => return error.Unavailable,
             else => return err,
         };
-        const value = resolved orelse return .{ .unsupported = .{ .span = span, .kind = .unknown_type } };
+        const value_id = resolved orelse return .{ .unsupported = .{ .span = span, .kind = .unknown_type } };
+        const value = try type_interner.lookupCompileTimeValue(value_id);
         return switch (value) {
             .type => |type_id| .{ .success = type_id },
             .runtime => .{ .unsupported = .{ .span = span, .kind = .value_used_as_type } },
@@ -1180,6 +1188,7 @@ fn analyzeType(
                 .success => |type_id| type_id,
                 .unsupported => |issue| return .{ .unsupported = issue },
             };
+            if (parameter_type == .type) return .{ .unsupported = issueAt(ast, parameter_index.index(), unsupported_kind) };
             try parameters.append(gpa, .{ .mode = .imm, .type_id = parameter_type });
         }
         const return_type = switch (try analyzeType(ast, source, node.data.node_node.b, type_interner, gpa, unsupported_kind)) {
@@ -1201,6 +1210,7 @@ fn analyzeType(
             .success => |type_id| type_id,
             .unsupported => |issue| return .{ .unsupported = issue },
         };
+        if (member_type == .type) return .{ .unsupported = issueAt(ast, member_index.index(), unsupported_kind) };
         try member_types.append(gpa, member_type);
     }
     std.debug.assert(member_types.items.len >= 2);
@@ -1388,6 +1398,7 @@ pub fn analyzeStructDefinition(
             .success => |type_id| type_id,
             .unsupported => |issue| return .{ .unsupported = issue },
         };
+        if (field_type == .type) return .{ .unsupported = issueAt(ast, member.data.node.index(), .struct_field_type_not_supported) };
         try fields.ensureUnusedCapacity(gpa, 1);
         const owned_name = try gpa.dupe(u8, name);
         fields.appendAssumeCapacity(.{
@@ -1488,7 +1499,7 @@ fn analyzeStaticInitializer(
                 error.Unavailable => return error.Unavailable,
                 else => return err,
             };
-            if (resolved) |value| break :blk .{ .success = value };
+            if (resolved) |value_id| break :blk .{ .success = try type_interner.lookupCompileTimeValue(value_id) };
             const reference = type_interner.functionReference(name) catch |err| switch (err) {
                 error.Unavailable => return error.Unavailable,
                 else => return err,
@@ -1566,9 +1577,9 @@ pub fn resolveSpecializationArgument(
     ast: *const structures.Ast,
     source: []const u8,
     declaration: u32,
-    arguments: []const structures.CompileTimeValue,
+    arguments: []const structures.CompileTimeValueId,
     name: []const u8,
-) ?structures.CompileTimeValue {
+) ?structures.CompileTimeValueId {
     const parts = functionParts(ast, declaration);
     const signature = ast.nodes[parts.signature.index()];
     var static_index: usize = 0;
@@ -1806,7 +1817,15 @@ const TestTypeInterner = struct {
         unreachable;
     }
 
-    pub fn internFunctionInstance(_: @This(), _: structures.ItemId, _: []const structures.CompileTimeValue) !structures.InstanceId {
+    pub fn internFunctionInstance(_: @This(), _: structures.ItemId, _: []const structures.CompileTimeValueId) !structures.InstanceId {
+        unreachable;
+    }
+
+    pub fn internCompileTimeValue(_: @This(), _: structures.CompileTimeValue) !structures.CompileTimeValueId {
+        unreachable;
+    }
+
+    pub fn lookupCompileTimeValue(_: @This(), _: structures.CompileTimeValueId) !structures.CompileTimeValue {
         unreachable;
     }
 
@@ -1814,7 +1833,7 @@ const TestTypeInterner = struct {
         unreachable;
     }
 
-    pub fn resolveStatic(_: @This(), _: []const u8) !?structures.CompileTimeValue {
+    pub fn resolveStatic(_: @This(), _: []const u8) !?structures.CompileTimeValueId {
         return null;
     }
 

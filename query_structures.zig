@@ -171,9 +171,32 @@ pub const Types = struct {
     }
 };
 
-pub const Specializations = struct {
-    pub const Value = structures.SpecializationArguments;
-    pub const Id = structures.SpecializationId;
+pub const CompileTimeValues = struct {
+    pub const Value = structures.CompileTimeValue;
+    pub const Id = structures.CompileTimeValueId;
+
+    pub fn hash(value: Value) u64 {
+        var hasher = std.hash.Wyhash.init(0);
+        std.hash.autoHash(&hasher, value);
+        return hasher.final();
+    }
+
+    pub fn eql(a: Value, b: Value) bool {
+        return std.meta.eql(a, b);
+    }
+
+    pub fn clone(_: std.mem.Allocator, value: Value) !Value {
+        return value;
+    }
+
+    pub fn deinit(_: std.mem.Allocator, value: *Value) void {
+        value.* = undefined;
+    }
+};
+
+pub const CompileTimeValueTuples = struct {
+    pub const Value = structures.CompileTimeValueTuple;
+    pub const Id = structures.CompileTimeValueTupleId;
 
     pub fn hash(value: Value) u64 {
         var hasher = std.hash.Wyhash.init(0);
@@ -183,15 +206,11 @@ pub const Specializations = struct {
     }
 
     pub fn eql(a: Value, b: Value) bool {
-        if (a.values.len != b.values.len) return false;
-        for (a.values, b.values) |left, right| {
-            if (!std.meta.eql(left, right)) return false;
-        }
-        return true;
+        return std.mem.eql(structures.CompileTimeValueId, a.values, b.values);
     }
 
     pub fn clone(gpa: std.mem.Allocator, value: Value) !Value {
-        return .{ .values = try gpa.dupe(structures.CompileTimeValue, value.values) };
+        return .{ .values = try gpa.dupe(structures.CompileTimeValueId, value.values) };
     }
 
     pub fn deinit(gpa: std.mem.Allocator, value: *Value) void {
@@ -251,7 +270,7 @@ const SpecializationEnvironment = struct {
     ast: *const structures.Ast,
     source: []const u8,
     declaration: u32,
-    arguments: []const structures.CompileTimeValue,
+    arguments: []const structures.CompileTimeValueId,
 };
 
 pub fn TypeInterner(comptime Context: type) type {
@@ -325,13 +344,21 @@ pub fn TypeInterner(comptime Context: type) type {
         pub fn internFunctionInstance(
             self: @This(),
             item_id: structures.ItemId,
-            arguments: []const structures.CompileTimeValue,
+            arguments: []const structures.CompileTimeValueId,
         ) !structures.InstanceId {
             if (arguments.len == 0) return .{ .item = item_id };
             return .{
                 .item = item_id,
-                .specialization = try self.ctx.intern(Specializations, .{ .values = arguments }),
+                .specialization = try self.ctx.intern(CompileTimeValueTuples, .{ .values = arguments }),
             };
+        }
+
+        pub fn internCompileTimeValue(self: @This(), value: structures.CompileTimeValue) !structures.CompileTimeValueId {
+            return self.ctx.intern(CompileTimeValues, value);
+        }
+
+        pub fn lookupCompileTimeValue(self: @This(), value_id: structures.CompileTimeValueId) !structures.CompileTimeValue {
+            return (try self.ctx.lookupInterned(CompileTimeValues, value_id)).*;
         }
 
         pub fn structType(self: @This(), item_id: structures.ItemId) !structures.TypeId {
@@ -346,7 +373,7 @@ pub fn TypeInterner(comptime Context: type) type {
             return (try self.ctx.get(TypeLayout, type_id)).*;
         }
 
-        pub fn resolveStatic(self: @This(), name: []const u8) !?structures.CompileTimeValue {
+        pub fn resolveStatic(self: @This(), name: []const u8) !?structures.CompileTimeValueId {
             if (self.specialization) |specialization| {
                 if (semantic.resolveSpecializationArgument(
                     specialization.ast,
@@ -377,6 +404,7 @@ pub fn TypeInterner(comptime Context: type) type {
             const shape = (try self.ctx.get(FunctionShape, item_id)).* orelse return error.Unavailable;
             for (shape.parameters) |parameter| if (parameter.mode == .static) return null;
             const signature = (try self.ctx.get(FunctionSignature, item_id)).* orelse return error.Unavailable;
+            if (signature.return_type == .type) return null;
             return .{
                 .target = item_id,
                 .type_id = try self.internCallable(.{
@@ -416,6 +444,7 @@ pub const TypeLayout = struct {
     pub fn run(ctx: anytype, type_id: Input) anyerror!Output {
         if (type_id == .int or type_id == .bool) return .{ .byte_size = 4, .byte_alignment = 4 };
         if (type_id == .unit or type_id == .none or type_id == .never) return .{ .byte_size = 0, .byte_alignment = 1 };
+        if (type_id == .type) unreachable;
 
         const data = (try ctx.lookupInternedAs(Types, type_id.interned().?)) orelse unreachable;
         return switch (data.*) {
@@ -510,6 +539,7 @@ pub const OwnershipCapabilities = struct {
     pub const Output = ?structures.OwnershipCapabilities;
 
     pub fn run(ctx: anytype, type_id: Input) anyerror!Output {
+        if (type_id == .type) unreachable;
         if (type_id.isPrimitive()) return trivialOwnership();
 
         const data = (try ctx.lookupInternedAs(Types, type_id.interned().?)) orelse return null;
@@ -793,7 +823,7 @@ pub const FunctionInstanceSignature = struct {
         const parsed = (try ctx.get(ParseFile, resolved.file_id)).* orelse return null;
         const source = (try ctx.input(SourceText, resolved.file_id)).*;
         const specialization = if (instance.specialization) |specialization_id|
-            (try ctx.lookupInterned(Specializations, specialization_id)).values
+            (try ctx.lookupInterned(CompileTimeValueTuples, specialization_id)).values
         else
             &.{};
         var static_parameter_count: usize = 0;
@@ -868,13 +898,13 @@ pub const FunctionSignature = struct {
 
 pub const ResolveStatic = struct {
     pub const Input = structures.ItemId;
-    pub const Output = ?structures.CompileTimeValue;
+    pub const Output = ?structures.CompileTimeValueId;
 
     pub fn run(ctx: anytype, item_id: Input) anyerror!Output {
         const loc = try ctx.lookupInterned(ItemLocations, item_id);
         if (loc.kind != .static and loc.kind != .structure) return null;
         const resolved = (try ctx.get(ResolveItem, item_id)).* orelse return null;
-        if (loc.kind == .structure) return .{ .type = try internStructType(ctx, item_id) };
+        if (loc.kind == .structure) return try ctx.intern(CompileTimeValues, .{ .type = try internStructType(ctx, item_id) });
         const parsed = (try ctx.get(ParseFile, resolved.file_id)).* orelse return null;
         const source = (try ctx.input(SourceText, resolved.file_id)).*;
         const type_interner: TypeInterner(@TypeOf(ctx)) = .{ .ctx = ctx, .file_id = resolved.file_id };
@@ -883,7 +913,7 @@ pub const ResolveStatic = struct {
             else => return err,
         };
         return switch (result) {
-            .success => |value| value,
+            .success => |value| try ctx.intern(CompileTimeValues, value),
             .unsupported => |issue| blk: {
                 try typing.emitSemanticIssue(ctx, resolved.file_id, issue);
                 break :blk null;
@@ -956,7 +986,7 @@ fn analyzeFunctionBody(ctx: anytype, instance: structures.InstanceId) !?structur
     const parsed = (try ctx.get(ParseFile, resolved.file_id)).* orelse return null;
     const source = (try ctx.input(SourceText, resolved.file_id)).*;
     const specialization = if (instance.specialization) |specialization_id|
-        (try ctx.lookupInterned(Specializations, specialization_id)).values
+        (try ctx.lookupInterned(CompileTimeValueTuples, specialization_id)).values
     else
         &.{};
     const type_interner: TypeInterner(@TypeOf(ctx)) = .{

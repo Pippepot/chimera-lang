@@ -446,10 +446,15 @@ pub const CompileTimeValue = union(enum) {
     };
 };
 
-pub const SpecializationId = enum(u32) { _ };
+/// Session-stable identity of one canonical compile-time value.
+pub const CompileTimeValueId = enum(u32) { _ };
 
-pub const SpecializationArguments = struct {
-    values: []const CompileTimeValue,
+/// Session-stable identity of one ordered tuple of canonical compile-time
+/// values. Specializations and interpreted calls share this representation.
+pub const CompileTimeValueTupleId = enum(u32) { _ };
+
+pub const CompileTimeValueTuple = struct {
+    values: []const CompileTimeValueId,
 };
 
 /// Database interner index carried inside a non-primitive TypeId. The remaining
@@ -462,6 +467,7 @@ pub const TypeId = enum(u32) {
     unit,
     none,
     never,
+    type,
     _,
 
     const interned_mask: u32 = 1 << 31;
@@ -477,7 +483,7 @@ pub const TypeId = enum(u32) {
     }
 
     pub fn isPrimitive(self: TypeId) bool {
-        return self == .int or self == .bool or self == .unit or self == .none or self == .never;
+        return self == .int or self == .bool or self == .unit or self == .none or self == .never or self == .type;
     }
 };
 
@@ -756,7 +762,7 @@ pub const FunctionShape = struct {
 
 pub const FunctionCall = struct {
     target: ItemId,
-    specialization: ?SpecializationId = null,
+    specialization: ?CompileTimeValueTupleId = null,
     arguments: FunctionValueRange,
     return_type: TypeId,
 
@@ -939,7 +945,24 @@ pub const FunctionBodyAnalysis = struct {
 /// query keys remain small and pointer-free.
 pub const InstanceId = struct {
     item: ItemId,
-    specialization: ?SpecializationId = null,
+    specialization: ?CompileTimeValueTupleId = null,
+};
+
+/// Pointer-free identity of a source expression evaluated at compile time. The
+/// owning instance supplies its static environment; the node identifies the
+/// expression in the current parsed source. Runtime lexical captures are not
+/// part of a site identity and are rejected semantically.
+pub const CompileTimeSite = struct {
+    owner: InstanceId,
+    node: Node.Index,
+};
+
+/// Identity of one concrete compile-time function invocation. Ordinary
+/// parameters are supplied in `arguments`; static parameters are already part
+/// of `instance.specialization`.
+pub const CompileTimeCallKey = struct {
+    instance: InstanceId,
+    arguments: CompileTimeValueTupleId,
 };
 
 /// Owned deterministic breadth-first order of instances reachable from an entry.

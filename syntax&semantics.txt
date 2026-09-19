@@ -72,6 +72,43 @@ const computed_block = comptime
     const value = 40
     value + 2
 
+# Compile-time execution is demand-driven. Static initializers, static call
+# arguments, direct calls used in type positions, and explicit 'comptime'
+# expressions are evaluated only when a consumer needs their result. They use
+# the same typed operations, control flow, calls, evaluation order, coercions,
+# and ownership behavior as runtime code.
+#
+# A compile-time function call may supply ordinary parameters with interpreted
+# values. These interpreted arguments are distinct from static parameters:
+# static parameters form the specialized function identity and do not occupy
+# parameter slots, while interpreted arguments are passed through the function's
+# ordinary typed parameter slots for that evaluation.
+#
+# A comptime expression may reference module statics and functions, the
+# enclosing function's static parameters, and bindings declared inside its own
+# body. It cannot capture an enclosing runtime parameter or local, including an
+# immutable local whose current value happens to be known by the compiler.
+# Its result must be representable as a compile-time value.
+#
+# Compile-time execution is deterministic and has no ambient foreign calls,
+# filesystem or console I/O, clocks, randomness, environment access, or target
+# machine addresses. A future compiler service must be introduced explicitly;
+# host functions are never implicitly callable. An unavailable operation is an
+# error only when execution reaches it.
+#
+# A compile-time value consumer requires successful evaluation. An unhandled
+# fallible failure is a source error; fallible calls handled within the executed
+# code retain their ordinary control-flow behavior. Query/declaration cycles are
+# source errors. Recursion with continually changing arguments and nonterminating
+# loops are bounded by deterministic call-depth, execution-fuel, and aggregate-
+# storage limits, never by a wall-clock timeout. Exceeding a limit is a source
+# error at the active compile-time call site.
+#
+# A direct call may appear in a type position when its declared return type is
+# 'type'. It is evaluated at compile time and the consumer receives its canonical
+# type value. This is not return-type inference. 'type' values and functions
+# returning 'type' are compile-time-only and have no runtime storage layout.
+
 
 # Functions
 static identity = func(a: int) int
@@ -102,7 +139,13 @@ func apply(operation: func(int) int, value: int) int -> operation(value)
 const operation = choose()
 exit(apply(operation, 21))
 
-# exit(exit_code: int) is compiler-known for now and returns never.
+# exit(exit_code: int) is compiler-known for now and returns never. At runtime it
+# terminates the program. During compile-time execution it produces an
+# uncatchable compiler-control exit carrying the i32 code. The effect propagates
+# through compile-time calls and queries, stops the active compilation request,
+# and produces no executable. It is not a source diagnostic or a fallible
+# failure. An embedding compiler receives the structured exit result; the CLI
+# maps it to its own process exit status using the host status convention.
 exit(0)
 
 

@@ -1870,6 +1870,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 .expected = @intCast(signature.parameters.len),
                 .found = @intCast(raw_arguments.len),
             } });
+            if (signature.return_type == .type) return self.reject(span, .type_value_used_as_runtime_value);
             var place_fields: std.ArrayList(PlaceField) = .empty;
             defer place_fields.deinit(self.ctx.allocator());
             var argument_places: std.ArrayList(?ArgumentPlace) = .empty;

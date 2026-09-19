@@ -21,6 +21,7 @@ Top-level code is the entry point; a function named `main` is ordinary. The CLI 
 | [ROADMAP.md](ROADMAP.md) | Verified implementation status, gaps, and ordered next steps |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Compiler boundaries, ownership, and representation contracts |
 | [PROGRAM_FLOW.md](PROGRAM_FLOW.md) | Current query flow, invalidation, and result lifetimes |
+| [COMPTIME_EXECUTION.md](COMPTIME_EXECUTION.md) | Planned compile-time execution architecture and delivery slices |
 | [STORAGE_AND_REFERENCES.md](STORAGE_AND_REFERENCES.md) | Allocation/reference research and API design proposal |
 | [AGENTS.md](AGENTS.md) | Contribution and review rules |
 

@@ -39,6 +39,22 @@ fn setSource(db: *Database, file_id: structures.FileId, source: []const u8) !voi
     try db.setInput(query_structures.SourceText, file_id, source);
 }
 
+fn lookupCompileTimeValue(db: *Database, value_id: structures.CompileTimeValueId) !structures.CompileTimeValue {
+    return (try db.lookupInterned(query_structures.CompileTimeValues, value_id)).*;
+}
+
+fn resolvedStaticValue(db: *Database, item_id: structures.ItemId) !structures.CompileTimeValue {
+    const value_id = (try db.get(query_structures.ResolveStatic, item_id)).*.?;
+    return lookupCompileTimeValue(db, value_id);
+}
+
+fn resolvedStaticType(db: *Database, item_id: structures.ItemId) !structures.TypeId {
+    return switch (try resolvedStaticValue(db, item_id)) {
+        .type => |type_id| type_id,
+        .runtime => unreachable,
+    };
+}
+
 fn freeDiagnostics(diagnostics: []structures.Diagnostic) void {
     testing.allocator.free(diagnostics);
 }
@@ -793,8 +809,8 @@ test "struct hook items have stable owner-qualified identities" {
     try testing.expect(left_copy != null and right_copy != null);
     try testing.expect(left_copy.? != right_copy.?);
     try testing.expect(scope.resolve("copy") == null);
-    const left_type = (try db.get(query_structures.ResolveStatic, left)).*.?.type;
-    const right_type = (try db.get(query_structures.ResolveStatic, right)).*.?.type;
+    const left_type = try resolvedStaticType(db, left);
+    const right_type = try resolvedStaticType(db, right);
     const left_signature = (try db.get(query_structures.FunctionSignature, left_copy.?)).*.?;
     try testing.expectEqual(@as(usize, 1), left_signature.parameters.len);
     try testing.expectEqual(structures.CallableParameter{ .mode = .imm, .type_id = left_type }, left_signature.parameters[0]);
@@ -831,7 +847,7 @@ test "captureless struct hook items reuse function queries" {
     );
     const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
     const resource = scope.resolveStatic("Resource").?;
-    const resource_type = (try db.get(query_structures.ResolveStatic, resource)).*.?.type;
+    const resource_type = try resolvedStaticType(db, resource);
     const index = (try db.get(query_structures.IndexItems, 1)).*.?;
     const drop = for (index.ids()) |item_id| {
         const loc = try db.lookupInterned(query_structures.ItemLocations, item_id);
@@ -861,9 +877,9 @@ test "struct declarations are nominal and aliases preserve identity" {
     const alias_item = scope.resolveStatic("Alias").?;
     try testing.expectEqual(structures.ItemKind.structure, (try db.lookupInterned(query_structures.ItemLocations, left_item)).kind);
 
-    const left = (try db.get(query_structures.ResolveStatic, left_item)).*.?;
-    const right = (try db.get(query_structures.ResolveStatic, right_item)).*.?;
-    const alias = (try db.get(query_structures.ResolveStatic, alias_item)).*.?;
+    const left = try resolvedStaticValue(db, left_item);
+    const right = try resolvedStaticValue(db, right_item);
+    const alias = try resolvedStaticValue(db, alias_item);
     const left_type = switch (left) {
         .type => |type_id| type_id,
         .runtime => unreachable,
@@ -1925,8 +1941,8 @@ test "struct layouts preserve declaration order alignment and nesting" {
         \\  callback: func() unit
     );
     const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
-    const pair_type = (try db.get(query_structures.ResolveStatic, scope.resolveStatic("Pair").?)).*.?.type;
-    const outer_type = (try db.get(query_structures.ResolveStatic, scope.resolveStatic("Outer").?)).*.?.type;
+    const pair_type = try resolvedStaticType(db, scope.resolveStatic("Pair").?);
+    const outer_type = try resolvedStaticType(db, scope.resolveStatic("Outer").?);
 
     const pair = (try db.get(query_structures.StructLayout, pair_type)).*.?;
     try testing.expectEqual(structures.TypeLayout{ .byte_size = 8, .byte_alignment = 4 }, pair.layout);
@@ -1951,14 +1967,14 @@ test "struct layouts reject direct and variant-mediated containment cycles" {
         \\  first: First
     );
     const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
-    const direct_type = (try db.get(query_structures.ResolveStatic, scope.resolveStatic("Direct").?)).*.?.type;
+    const direct_type = try resolvedStaticType(db, scope.resolveStatic("Direct").?);
     try testing.expect((try db.get(query_structures.StructLayout, direct_type)).* == null);
     var diagnostics = try db.transitiveAccumulatorValues(query_structures.StructLayout, direct_type, structures.Diagnostic, testing.allocator);
     try testing.expectEqual(@as(usize, 1), diagnostics.len);
     try testing.expectEqual(DiagnosticKind.recursive_struct_containment, std.meta.activeTag(diagnostics[0].kind));
     freeDiagnostics(diagnostics);
 
-    const first_type = (try db.get(query_structures.ResolveStatic, scope.resolveStatic("First").?)).*.?.type;
+    const first_type = try resolvedStaticType(db, scope.resolveStatic("First").?);
     try testing.expect((try db.get(query_structures.StructLayout, first_type)).* == null);
     diagnostics = try db.transitiveAccumulatorValues(query_structures.StructLayout, first_type, structures.Diagnostic, testing.allocator);
     defer freeDiagnostics(diagnostics);
@@ -1975,7 +1991,7 @@ test "callable signatures do not recursively contain structs by value" {
         \\  next: func() Node
     );
     const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
-    const node_type = (try db.get(query_structures.ResolveStatic, scope.resolveStatic("Node").?)).*.?.type;
+    const node_type = try resolvedStaticType(db, scope.resolveStatic("Node").?);
     const layout = (try db.get(query_structures.StructLayout, node_type)).*.?;
     try testing.expectEqual(structures.TypeLayout{ .byte_size = 8, .byte_alignment = 8 }, layout.layout);
     try testing.expectEqualSlices(u32, &.{0}, layout.field_offsets);
@@ -1996,11 +2012,11 @@ test "ownership capabilities compose across callable variant and struct types" {
         \\static MaybePair = Pair | none
     );
     const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
-    const callback_type = (try db.get(query_structures.ResolveStatic, scope.resolveStatic("Callback").?)).*.?.type;
-    const maybe_int_type = (try db.get(query_structures.ResolveStatic, scope.resolveStatic("MaybeInt").?)).*.?.type;
-    const pair_type = (try db.get(query_structures.ResolveStatic, scope.resolveStatic("Pair").?)).*.?.type;
-    const wrapped_type = (try db.get(query_structures.ResolveStatic, scope.resolveStatic("Wrapped").?)).*.?.type;
-    const maybe_pair_type = (try db.get(query_structures.ResolveStatic, scope.resolveStatic("MaybePair").?)).*.?.type;
+    const callback_type = try resolvedStaticType(db, scope.resolveStatic("Callback").?);
+    const maybe_int_type = try resolvedStaticType(db, scope.resolveStatic("MaybeInt").?);
+    const pair_type = try resolvedStaticType(db, scope.resolveStatic("Pair").?);
+    const wrapped_type = try resolvedStaticType(db, scope.resolveStatic("Wrapped").?);
+    const maybe_pair_type = try resolvedStaticType(db, scope.resolveStatic("MaybePair").?);
 
     const trivial = structures.OwnershipCapabilities{ .move = .trivial, .copy = .trivial, .drop = .trivial };
     try testing.expectEqual(trivial, (try db.get(query_structures.OwnershipCapabilities, .int)).*.?);
@@ -2034,7 +2050,7 @@ test "struct ownership properties override defaults and validate fields" {
         \\  value: Immovable
     );
     const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
-    const configured = (try db.get(query_structures.ResolveStatic, scope.resolveStatic("Configured").?)).*.?.type;
+    const configured = try resolvedStaticType(db, scope.resolveStatic("Configured").?);
     try testing.expectEqual(
         structures.OwnershipCapabilities{
             .move = .trivial,
@@ -2045,7 +2061,7 @@ test "struct ownership properties override defaults and validate fields" {
         (try db.get(query_structures.OwnershipCapabilities, configured)).*.?,
     );
     const invalid_item = scope.resolveStatic("Invalid").?;
-    const invalid = (try db.get(query_structures.ResolveStatic, invalid_item)).*.?.type;
+    const invalid = try resolvedStaticType(db, invalid_item);
     try testing.expect((try db.get(query_structures.OwnershipCapabilities, invalid)).* == null);
     const diagnostics = try db.transitiveAccumulatorValues(query_structures.OwnershipCapabilities, invalid, structures.Diagnostic, testing.allocator);
     defer freeDiagnostics(diagnostics);
@@ -2073,7 +2089,7 @@ test "incompatible ownership diagnostics retain the failed field rule" {
         defer db.deinit();
         try addSource(db, file_id, case.source);
         const item = (try db.get(query_structures.BuildModuleScope, file_id)).*.?.resolveStatic("Invalid").?;
-        const type_id = (try db.get(query_structures.ResolveStatic, item)).*.?.type;
+        const type_id = try resolvedStaticType(db, item);
         try testing.expect((try db.get(query_structures.OwnershipCapabilities, type_id)).* == null);
         const diagnostics = try db.transitiveAccumulatorValues(query_structures.OwnershipCapabilities, type_id, structures.Diagnostic, testing.allocator);
         defer freeDiagnostics(diagnostics);
@@ -2091,7 +2107,7 @@ test "ownership capabilities reject recursive structs and recover incrementally"
         \\  next: Node
     );
     const node_item = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveStatic("Node").?;
-    const node_type = (try db.get(query_structures.ResolveStatic, node_item)).*.?.type;
+    const node_type = try resolvedStaticType(db, node_item);
     try testing.expect((try db.get(query_structures.OwnershipCapabilities, node_type)).* == null);
     var diagnostics = try db.transitiveAccumulatorValues(query_structures.OwnershipCapabilities, node_type, structures.Diagnostic, testing.allocator);
     try testing.expectEqual(@as(usize, 1), diagnostics.len);
@@ -2460,7 +2476,7 @@ test "struct identity definitions and layouts recompute incrementally" {
     );
     const pair_item = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveStatic("Pair").?;
     const first_identity = try db.get(query_structures.ResolveStatic, pair_item);
-    const pair_type = first_identity.*.?.type;
+    const pair_type = try resolvedStaticType(db, pair_item);
     const first_definition = try db.get(query_structures.StructDefinition, pair_item);
     const first_layout = try db.get(query_structures.StructLayout, pair_type);
 
@@ -2501,7 +2517,7 @@ test "recursive struct layout recovers after a field edit" {
         \\  next: Node
     );
     const node_item = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveStatic("Node").?;
-    const node_type = (try db.get(query_structures.ResolveStatic, node_item)).*.?.type;
+    const node_type = try resolvedStaticType(db, node_item);
     try testing.expect((try db.get(query_structures.StructLayout, node_type)).* == null);
 
     try setSource(db, 1,
@@ -2509,7 +2525,7 @@ test "recursive struct layout recovers after a field edit" {
         \\  next: int
     );
     try testing.expectEqual(node_item, (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveStatic("Node").?);
-    try testing.expectEqual(node_type, (try db.get(query_structures.ResolveStatic, node_item)).*.?.type);
+    try testing.expectEqual(node_type, try resolvedStaticType(db, node_item));
     const layout = (try db.get(query_structures.StructLayout, node_type)).*.?;
     try testing.expectEqual(structures.TypeLayout{ .byte_size = 4, .byte_alignment = 4 }, layout.layout);
     const diagnostics = try db.transitiveAccumulatorValues(query_structures.StructLayout, node_type, structures.Diagnostic, testing.allocator);
@@ -2569,6 +2585,7 @@ test "variant types are structurally interned in canonical member order" {
     try testing.expect(structures.TypeId.unit.interned() == null);
     try testing.expect(structures.TypeId.none.interned() == null);
     try testing.expect(structures.TypeId.never.interned() == null);
+    try testing.expect(structures.TypeId.type.interned() == null);
 
     const variant = try db.lookupInterned(query_structures.Types, int_or_unit.interned().?);
     try testing.expectEqualSlices(structures.TypeId, &.{ .int, .unit }, variant.variant.members);
@@ -2605,6 +2622,34 @@ test "variant types are structurally interned in canonical member order" {
         structures.InternVariantResult{ .type_id = .int },
         (try db.get(InternVariantPair, .{ .int, .never })).*,
     );
+}
+
+test "compile-time values and ordered tuples have canonical identities" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    const type_int = try db.intern(query_structures.CompileTimeValues, structures.CompileTimeValue{ .type = .int });
+    const same_type_int = try db.intern(query_structures.CompileTimeValues, structures.CompileTimeValue{ .type = .int });
+    const value_int = try db.intern(query_structures.CompileTimeValues, structures.CompileTimeValue{ .runtime = .{
+        .type_id = .int,
+        .value = .{ .int = 1 },
+    } });
+    try testing.expectEqual(type_int, same_type_int);
+    try testing.expect(type_int != value_int);
+
+    var values = [_]structures.CompileTimeValueId{ type_int, value_int };
+    const tuple = try db.intern(query_structures.CompileTimeValueTuples, .{ .values = &values });
+    try testing.expectEqual(tuple, try db.intern(query_structures.CompileTimeValueTuples, .{ .values = &values }));
+    values[0] = value_int;
+    const retained = try db.lookupInterned(query_structures.CompileTimeValueTuples, tuple);
+    try testing.expectEqualSlices(structures.CompileTimeValueId, &.{ type_int, value_int }, retained.values);
+    try testing.expect(tuple != try db.intern(query_structures.CompileTimeValueTuples, .{ .values = &values }));
+
+    const instance: structures.InstanceId = .{ .item = @enumFromInt(7), .specialization = tuple };
+    const site: structures.CompileTimeSite = .{ .owner = instance, .node = @enumFromInt(11) };
+    const call: structures.CompileTimeCallKey = .{ .instance = instance, .arguments = tuple };
+    try testing.expectEqual(instance, site.owner);
+    try testing.expectEqual(tuple, call.arguments);
 }
 
 test "variant interning owns canonical members" {
@@ -2719,14 +2764,14 @@ test "named type aliases and integer statics resolve on demand" {
     );
 
     const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
-    const empty = (try db.get(query_structures.ResolveStatic, scope.resolveStatic("Empty").?)).*.?;
+    const empty = try resolvedStaticValue(db, scope.resolveStatic("Empty").?);
     try testing.expectEqual(structures.CompileTimeValue{ .type = .none }, empty);
-    const result = (try db.get(query_structures.ResolveStatic, scope.resolveStatic("Result").?)).*.?;
+    const result = try resolvedStaticValue(db, scope.resolveStatic("Result").?);
     const result_type = result.type;
     const members = (try db.lookupInterned(query_structures.Types, result_type.interned().?)).variant.members;
     try testing.expectEqualSlices(structures.TypeId, &.{ .int, .none }, members);
 
-    const default_value = (try db.get(query_structures.ResolveStatic, scope.resolveStatic("default_value").?)).*.?;
+    const default_value = try resolvedStaticValue(db, scope.resolveStatic("default_value").?);
     try testing.expectEqual(structures.CompileTimeValue{ .runtime = .{
         .type_id = .int,
         .value = .{ .int = 40 },
@@ -2759,15 +2804,15 @@ test "bool values cross static local call return and variant boundaries" {
     const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
     try testing.expectEqual(
         structures.CompileTimeValue{ .type = .bool },
-        (try db.get(query_structures.ResolveStatic, scope.resolveStatic("Flag").?)).*.?,
+        try resolvedStaticValue(db, scope.resolveStatic("Flag").?),
     );
     try testing.expectEqual(
         structures.CompileTimeValue{ .runtime = .{ .type_id = .bool, .value = .{ .bool = true } } },
-        (try db.get(query_structures.ResolveStatic, scope.resolveStatic("enabled").?)).*.?,
+        try resolvedStaticValue(db, scope.resolveStatic("enabled").?),
     );
     try testing.expectEqual(
         structures.CompileTimeValue{ .runtime = .{ .type_id = .bool, .value = .{ .bool = false } } },
-        (try db.get(query_structures.ResolveStatic, scope.resolveStatic("disabled").?)).*.?,
+        try resolvedStaticValue(db, scope.resolveStatic("disabled").?),
     );
     try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "identity", "score" }, 42);
 }
@@ -4112,7 +4157,7 @@ test "ordinary callables widen to fallible aliases and calls" {
         \\if checked(42) -> exit(42) else exit(1)
     );
     const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
-    const checked = (try db.get(query_structures.ResolveStatic, scope.resolve("checked").?)).*.?;
+    const checked = try resolvedStaticValue(db, scope.resolve("checked").?);
     const checked_type = (try db.lookupInterned(query_structures.Types, checked.runtime.type_id.interned().?)).callable;
     try expectImmParameters(&.{.int}, checked_type.parameters);
     try testing.expectEqual(structures.TypeId.int, checked_type.return_type);
@@ -7138,11 +7183,11 @@ test "static type and value parameters produce canonical reachable instances" {
     try testing.expect(reachable.instances[2].specialization != null);
     try testing.expect(reachable.instances[1].specialization != reachable.instances[2].specialization);
 
-    const first_arguments = try db.lookupInterned(query_structures.Specializations, reachable.instances[1].specialization.?);
-    const second_arguments = try db.lookupInterned(query_structures.Specializations, reachable.instances[2].specialization.?);
-    try testing.expectEqual(structures.CompileTimeValue{ .type = .int }, first_arguments.values[0]);
-    try testing.expectEqual(structures.CompileTimeValue{ .runtime = .{ .type_id = .int, .value = .{ .int = 1 } } }, first_arguments.values[1]);
-    try testing.expectEqual(structures.CompileTimeValue{ .runtime = .{ .type_id = .int, .value = .{ .int = 2 } } }, second_arguments.values[1]);
+    const first_arguments = try db.lookupInterned(query_structures.CompileTimeValueTuples, reachable.instances[1].specialization.?);
+    const second_arguments = try db.lookupInterned(query_structures.CompileTimeValueTuples, reachable.instances[2].specialization.?);
+    try testing.expectEqual(structures.CompileTimeValue{ .type = .int }, try lookupCompileTimeValue(db, first_arguments.values[0]));
+    try testing.expectEqual(structures.CompileTimeValue{ .runtime = .{ .type_id = .int, .value = .{ .int = 1 } } }, try lookupCompileTimeValue(db, first_arguments.values[1]));
+    try testing.expectEqual(structures.CompileTimeValue{ .runtime = .{ .type_id = .int, .value = .{ .int = 2 } } }, try lookupCompileTimeValue(db, second_arguments.values[1]));
 
     const first_signature = (try db.get(query_structures.FunctionInstanceSignature, reachable.instances[1])).*.?;
     try expectImmParameters(&.{.int}, first_signature.parameters);
@@ -7169,6 +7214,42 @@ test "static type and value parameters produce canonical reachable instances" {
     try testing.expectEqual(retained_instance, updated.instances[1]);
     try testing.expect(updated.instances[2].specialization != replaced_specialization);
     try testing.expectEqual(retained_artifact, try db.get(query_structures.CompileFunction, retained_instance));
+}
+
+test "type-valued signatures use canonical specialization values and stay compile-time-only" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\func choose(static T: type) type -> T
+        \\func invalid(value: type) -> ()
+        \\choose(int)
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const choose = scope.resolveFunction("choose").?;
+    const type_int = try db.intern(query_structures.CompileTimeValues, structures.CompileTimeValue{ .type = .int });
+    const arguments = [_]structures.CompileTimeValueId{type_int};
+    const specialization = try db.intern(query_structures.CompileTimeValueTuples, .{ .values = &arguments });
+    const signature = (try db.get(query_structures.FunctionInstanceSignature, .{
+        .item = choose,
+        .specialization = specialization,
+    })).*.?;
+    try testing.expectEqual(@as(usize, 0), signature.parameters.len);
+    try testing.expectEqual(structures.TypeId.type, signature.return_type);
+
+    const invalid = scope.resolveFunction("invalid").?;
+    try testing.expect((try db.get(query_structures.FunctionSignature, invalid)).* == null);
+    var diagnostics = try db.transitiveAccumulatorValues(query_structures.FunctionSignature, invalid, structures.Diagnostic, testing.allocator);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(DiagnosticKind.parameter_type_not_supported, std.meta.activeTag(diagnostics[0].kind));
+    freeDiagnostics(diagnostics);
+
+    const entry = (try db.get(query_structures.SelectEntry, 1)).*.?;
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, entry)).* == null);
+    diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, entry, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(DiagnosticKind.type_value_used_as_runtime_value, std.meta.activeTag(diagnostics[0].kind));
 }
 
 test "static specialization validates compile-time and dependent runtime arguments" {

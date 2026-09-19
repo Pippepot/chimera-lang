@@ -242,7 +242,7 @@ fn writeType(types: anytype, writer: *std.Io.Writer, type_id: structures.TypeId)
 
 fn writeTypeInner(types: anytype, writer: *std.Io.Writer, type_id: structures.TypeId) !void {
     switch (type_id) {
-        .int, .bool, .unit, .none, .never => return writer.writeAll(@tagName(type_id)),
+        .int, .bool, .unit, .none, .never, .type => return writer.writeAll(@tagName(type_id)),
         _ => {},
     }
     if (try types.structName(type_id)) |name| return writer.writeAll(name);
