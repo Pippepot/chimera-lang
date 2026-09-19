@@ -545,6 +545,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 .call => return self.appendCall(index),
                 .struct_init => return self.appendStructInit(index),
                 .field_access => return self.appendFieldAccess(index),
+                .@"struct" => return self.appendExpression(index, .{ .type_value = try self.type_interner.generatedStructType(index) }),
                 .identifier => {
                     const span = tokenSpan(self.ast, node.token_index);
                     const name = self.source[span.start..span.end];
@@ -1388,13 +1389,34 @@ pub fn analyzeStructDefinition(
     const binding = ast.nodes[declaration];
     std.debug.assert(binding.tag == .static_binding);
     const initializer = binding.data.node_node.b.unwrap() orelse unreachable;
-    const struct_node = ast.nodes[initializer.index()];
-    std.debug.assert(struct_node.tag == .@"struct");
     if (binding.data.node_node.a.unwrap()) |annotation| {
         if (!isMetaTypeAnnotation(ast, source, annotation)) {
             return .{ .unsupported = issueAt(ast, annotation.index(), .static_initializer_not_supported) };
         }
     }
+    return analyzeStructMembers(ast, source, initializer, item_id, type_interner, gpa);
+}
+
+pub fn analyzeGeneratedStructDefinition(
+    ast: *const structures.Ast,
+    source: []const u8,
+    struct_index: structures.Node.Index,
+    type_interner: anytype,
+    gpa: std.mem.Allocator,
+) !SemanticResult(structures.StructDefinition) {
+    return analyzeStructMembers(ast, source, struct_index, null, type_interner, gpa);
+}
+
+fn analyzeStructMembers(
+    ast: *const structures.Ast,
+    source: []const u8,
+    struct_index: structures.Node.Index,
+    declared_item: ?structures.ItemId,
+    type_interner: anytype,
+    gpa: std.mem.Allocator,
+) !SemanticResult(structures.StructDefinition) {
+    const struct_node = ast.nodes[struct_index.index()];
+    std.debug.assert(struct_node.tag == .@"struct");
 
     var fields: std.ArrayList(structures.StructField) = .empty;
     defer {
@@ -1408,6 +1430,7 @@ pub fn analyzeStructDefinition(
     for (ast.node_refs[struct_node.data.ref.start..struct_node.data.ref.end]) |member_index| {
         const member = ast.nodes[member_index.index()];
         if (member.tag == .struct_property) {
+            const item_id = declared_item orelse return .{ .unsupported = issueAt(ast, member_index.index(), .struct_member_not_supported) };
             const property_span = tokenSpan(ast, member.token_index);
             const property_name = source[property_span.start..property_span.end];
             const operation = StructOwnershipOperation.fromName(property_name) orelse
@@ -1856,6 +1879,10 @@ const TestTypeInterner = struct {
 
     pub fn structDefinition(_: @This(), _: structures.TypeId) !?structures.StructDefinition {
         return null;
+    }
+
+    pub fn generatedStructType(_: @This(), _: structures.Node.Index) !structures.TypeId {
+        unreachable;
     }
 
     pub fn ownedFunction(_: @This(), _: structures.ItemId, _: []const u8) !?structures.ItemId {

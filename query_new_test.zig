@@ -3393,6 +3393,180 @@ test "type-valued functions execute in aliases signatures and struct fields" {
     try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "zero", "take" }, 42);
 }
 
+test "type-valued functions generate canonical specialized nominal structs" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static Count = int
+        \\static makeBox = func(static T: type) type
+        \\  return struct
+        \\    value: T
+        \\    count: Count
+        \\static IntBox: type = makeBox(int)
+        \\static Same = makeBox(int)
+        \\static BoolBox: type = makeBox(bool)
+        \\static makeValueBox = func(flag: bool) type
+        \\  return struct
+        \\    value: int
+        \\static FirstValueBox = makeValueBox(true)
+        \\static SecondValueBox = makeValueBox(false)
+        \\func add(left: IntBox, right: Same) int -> left.value + left.count + right.value + right.count
+        \\func answer() int -> add(makeBox(int){value = 19, count = 1}, Same{value = 21, count = 1})
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const int_box = (try resolvedStaticValue(db, scope.resolveStatic("IntBox").?)).type;
+    const same = (try resolvedStaticValue(db, scope.resolveStatic("Same").?)).type;
+    const bool_box = (try resolvedStaticValue(db, scope.resolveStatic("BoolBox").?)).type;
+    try testing.expectEqual(int_box, same);
+    try testing.expect(int_box != bool_box);
+    try testing.expectEqual(
+        (try resolvedStaticValue(db, scope.resolveStatic("FirstValueBox").?)).type,
+        (try resolvedStaticValue(db, scope.resolveStatic("SecondValueBox").?)).type,
+    );
+
+    const int_identity = (try db.lookupInterned(query_structures.Types, int_box.interned().?)).structure;
+    const bool_identity = (try db.lookupInterned(query_structures.Types, bool_box.interned().?)).structure;
+    const int_definition = (try db.get(query_structures.GeneratedStructDefinition, int_identity.generated)).*.?;
+    const bool_definition = (try db.get(query_structures.GeneratedStructDefinition, bool_identity.generated)).*.?;
+    try testing.expectEqual(@as(usize, 2), int_definition.fields.len);
+    try testing.expectEqualStrings("value", int_definition.fields[0].name);
+    try testing.expectEqual(structures.TypeId.int, int_definition.fields[0].type_id);
+    try testing.expectEqual(structures.TypeId.bool, bool_definition.fields[0].type_id);
+    try testing.expectEqual(structures.TypeId.int, int_definition.fields[1].type_id);
+    try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "add" }, 42);
+}
+
+test "generated struct identity survives relocation and changes with specialization" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static makeBox = func(static T: type) type
+        \\  return struct
+        \\    value: T
+        \\static Box = makeBox(int)
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const box = scope.resolveStatic("Box").?;
+    const initial = try db.get(query_structures.ResolveStatic, box);
+    const initial_type = (try db.lookupInterned(query_structures.CompileTimeValues, initial.*.?)).type;
+    const identity = (try db.lookupInterned(query_structures.Types, initial_type.interned().?)).structure.generated;
+
+    try setSource(db, 1,
+        \\static unrelated = 42
+        \\static makeBox = func(static T: type) type
+        \\  return struct
+        \\    value: T
+        \\static Box = makeBox(int)
+    );
+    try testing.expectEqual(initial, try db.get(query_structures.ResolveStatic, box));
+    const relocated_definition = try db.get(query_structures.GeneratedStructDefinition, identity);
+    try testing.expectEqual(structures.TypeId.int, relocated_definition.*.?.fields[0].type_id);
+
+    try setSource(db, 1,
+        \\static unrelated = 42
+        \\static makeBox = func(static T: type) type
+        \\  return struct
+        \\    value: bool
+        \\static Box = makeBox(int)
+    );
+    try testing.expectEqual(initial, try db.get(query_structures.ResolveStatic, box));
+    const changed_definition = try db.get(query_structures.GeneratedStructDefinition, identity);
+    try testing.expect(relocated_definition != changed_definition);
+    try testing.expectEqual(structures.TypeId.bool, changed_definition.*.?.fields[0].type_id);
+
+    try setSource(db, 1,
+        \\static unrelated = 42
+        \\static makeBox = func(static T: type) type
+        \\  return struct
+        \\    value: bool
+        \\static Box = makeBox(bool)
+    );
+    const changed = try db.get(query_structures.ResolveStatic, box);
+    try testing.expect(initial != changed);
+    try testing.expect(initial_type != (try db.lookupInterned(query_structures.CompileTimeValues, changed.*.?)).type);
+}
+
+test "generated structs do not capture comptime locals" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    const source =
+        \\static makeBox = func() type
+        \\  const Local = int
+        \\  return struct
+        \\    value: Local
+        \\const value = makeBox(){value = 1}
+        \\exit(value.value)
+    ;
+    try addSource(db, 1, source);
+    try testing.expect((try db.get(query_structures.BuildExecutable, 1)).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(query_structures.BuildExecutable, 1, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(DiagnosticKind.unknown_type, std.meta.activeTag(diagnostics[0].kind));
+    try testing.expectEqualStrings("Local", source[diagnostics[0].span.?.start..diagnostics[0].span.?.end]);
+}
+
+test "generated structs reject ownership properties" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    const source =
+        \\static makeBox = func() type
+        \\  return struct
+        \\    copy = trivial
+        \\    value: int
+        \\const value = makeBox(){value = 1}
+        \\exit(value.value)
+    ;
+    try addSource(db, 1, source);
+    try testing.expect((try db.get(query_structures.BuildExecutable, 1)).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(query_structures.BuildExecutable, 1, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(DiagnosticKind.struct_member_not_supported, std.meta.activeTag(diagnostics[0].kind));
+    try testing.expectEqualStrings("copy", source[diagnostics[0].span.?.start..diagnostics[0].span.?.end]);
+}
+
+test "anonymous struct expressions are compile-time-only" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    const source =
+        \\const invalid = struct
+        \\  value: int
+        \\exit(0)
+    ;
+    try addSource(db, 1, source);
+    try testing.expect((try db.get(query_structures.BuildExecutable, 1)).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(query_structures.BuildExecutable, 1, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(DiagnosticKind.type_value_used_as_runtime_value, std.meta.activeTag(diagnostics[0].kind));
+    try testing.expectEqualStrings("struct", source[diagnostics[0].span.?.start..diagnostics[0].span.?.end]);
+}
+
+test "generated struct containment rejects recursive nominal identity" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static makeNode = func() type
+        \\  return struct
+        \\    next: makeNode()
+        \\static Node = makeNode()
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const node_type = (try resolvedStaticValue(db, scope.resolveStatic("Node").?)).type;
+    try testing.expect((try db.get(query_structures.OwnershipCapabilities, node_type)).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(query_structures.OwnershipCapabilities, node_type, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(DiagnosticKind.recursive_struct_containment, std.meta.activeTag(diagnostics[0].kind));
+}
+
 test "type-valued calls are compile-time-only" {
     const db = try testDatabase(1);
     defer db.deinit();
@@ -3600,6 +3774,11 @@ fn testStaticDeclarationAllocations(gpa: std.mem.Allocator) !void {
         \\static enabled = true
         \\static selectedType = func() type -> int
         \\static Selected: type = selectedType()
+        \\static generatedBox = func(static T: type) type
+        \\  return struct
+        \\    value: T
+        \\static GeneratedBox = generatedBox(int)
+        \\static generated = GeneratedBox{value = 1}
         \\static Pair = struct
         \\  copy = trivial
         \\  left: int
@@ -3610,7 +3789,7 @@ fn testStaticDeclarationAllocations(gpa: std.mem.Allocator) !void {
         \\static unbox = func(value: MaybePair) int -> return if const pair = value as Pair -> sum(pair) else 0
         \\static computed = unbox(boxed)
         \\func answer() int -> return if enabled == true
-        \\  if const number = value as int -> number + computed - 1 else 1
+        \\  if const number = value as int -> number + computed + generated.value - 2 else 1
         \\else 0
     );
     const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;

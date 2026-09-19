@@ -563,10 +563,20 @@ pub const CallableType = struct {
     }
 };
 
+pub const GeneratedStructIdentity = struct {
+    owner: InstanceId,
+    node_offset: i64,
+};
+
+pub const StructIdentity = union(enum) {
+    declared: ItemId,
+    generated: GeneratedStructIdentity,
+};
+
 pub const TypeData = union(enum) {
     variant: VariantType,
     callable: CallableType,
-    structure: ItemId,
+    structure: StructIdentity,
 };
 
 pub const InternVariantResult = union(enum) {

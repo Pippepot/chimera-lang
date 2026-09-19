@@ -193,13 +193,13 @@ type resolver:
   argument and instance identity.
 - Calling a type-returning function from runtime code is a source error.
 
-Anonymous nominal structs produced by a type-valued function need an identity
-separate from their field shape. Key that identity by the struct source site and
-the canonical invocation/static environment, and resolve its field definition
-through a query. Do not intern it by fields, which would accidentally make
-nominal structs structural. The exact source syntax and which surrounding
-compile-time locals a generated definition may capture must be settled in
-`syntax&semantics.txt` before this slice.
+Anonymous nominal structs produced by a type-valued function have an identity
+separate from their field shape. The identity combines an owner-relative source
+site with the enclosing static specialization; ordinary interpreted arguments
+do not participate. The field-definition query may resolve module statics and
+static parameters but rejects function-local captures. This preserves nominal
+identity, keeps the query key complete, and lets unrelated declaration
+relocation retain the canonical type.
 
 ## Implementation slices
 
@@ -236,12 +236,11 @@ Each slice includes diagnostics and incremental tests before the next begins.
      runtime execution.
 
 5. **Type-valued functions**
-   - Status: implemented for existing canonical types; generated nominal types
-     remain deferred until their capture semantics are specified.
+   - Status: implemented, including generated nominal structs with field-only
+     definitions.
    - Add `type` constants/results and calls in type positions.
    - Add canonical type operations required by real generic examples.
-   - Add generated nominal type identity only after its capture semantics are
-     specified.
+   - Generated ownership properties and hooks remain future work.
 
 6. **Cutover and cleanup**
    - Status: implemented for the current language surface.

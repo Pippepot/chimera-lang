@@ -113,6 +113,14 @@ const computed_block = comptime
 # returning 'type' are compile-time-only and have no runtime storage layout.
 # During compile-time execution, equality and inequality compare type values by
 # canonical type identity. They are unavailable as runtime operations.
+# An anonymous struct expression evaluated at compile time produces a nominal
+# type. Its identity is its source site plus the enclosing function's static
+# specialization, so repeated evaluation of one site with equal static arguments
+# returns the same type, while distinct sites or static arguments produce
+# distinct types. Ordinary interpreted arguments do not affect this identity.
+# Generated struct field types may reference module statics and enclosing static
+# parameters. They cannot capture function-local bindings. Ownership properties
+# and hooks on generated structs are not supported yet.
 
 
 # Functions
