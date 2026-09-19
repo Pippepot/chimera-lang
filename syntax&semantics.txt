@@ -111,6 +111,8 @@ const computed_block = comptime
 # 'type'. It is evaluated at compile time and the consumer receives its canonical
 # type value. This is not return-type inference. 'type' values and functions
 # returning 'type' are compile-time-only and have no runtime storage layout.
+# During compile-time execution, equality and inequality compare type values by
+# canonical type identity. They are unavailable as runtime operations.
 
 
 # Functions

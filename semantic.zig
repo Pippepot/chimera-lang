@@ -112,6 +112,7 @@ pub const UnresolvedBody = struct {
         pub const Operation = union(enum) {
             integer: i32,
             boolean: bool,
+            type_value: structures.TypeId,
             unit,
             none,
             function_ref: structures.FunctionReference,
@@ -213,7 +214,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
         const ValueId = UnresolvedBody.ValueId;
         const Local = union(enum) {
             value: ValueId,
-            type,
+            type_value: structures.TypeId,
             place: struct {
                 id: UnresolvedBody.LocalId,
                 mutable: bool,
@@ -239,6 +240,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
         assignment_fields: std.ArrayList(UnresolvedBody.FieldName) = .empty,
         loop_depth: u32 = 0,
         can_return: bool = false,
+        returns_type: bool = false,
         scratch: std.ArrayList(ValueId) = .empty,
         root_block: ?UnresolvedBody.BlockId = null,
         issue: ?Issue = null,
@@ -296,6 +298,10 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             const function = self.ast.nodes[declaration];
             const parts = functionParts(self.ast, declaration);
             const signature = self.ast.nodes[parts.signature.index()];
+            self.returns_type = if (signature.data.node_node.b.unwrap()) |return_type|
+                isMetaTypeAnnotation(self.ast, self.source, return_type)
+            else
+                false;
             const parameters = self.ast.nodeList(signature.data.node_node.a);
             var runtime_index: usize = 0;
             for (parameters) |parameter_index| {
@@ -307,7 +313,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                     const value_id = (try self.type_interner.resolveStatic(name)) orelse unreachable;
                     const value = try self.type_interner.lookupCompileTimeValue(value_id);
                     const local: Local = switch (value) {
-                        .type => .type,
+                        .type => |type_id| .{ .type_value = type_id },
                         .runtime => |runtime| blk: {
                             const static_value = try self.appendCompileTimeValue(parameter_index, runtime);
                             self.static_expression_count += 1;
@@ -503,13 +509,25 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             } });
         }
 
+        fn appendTypeValue(self: *Self, index: structures.Node.Index) !ValueId {
+            const result = try analyzeType(self.ast, self.source, index, self.type_interner, self.gpa, .type_value_used_as_runtime_value);
+            return switch (result) {
+                .success => |type_id| self.appendExpression(index, .{ .type_value = type_id }),
+                .unsupported => |issue| {
+                    self.issue = issue;
+                    return error.SourceRejected;
+                },
+            };
+        }
+
         fn append(self: *Self, index: structures.Node.Index) anyerror!ValueId {
             const node = self.ast.nodes[index.index()];
             switch (node.tag) {
                 .number_literal => return self.appendInteger(index),
                 .bool_literal => return self.appendExpression(index, .{ .boolean = self.ast.tokens[node.token_index].tag == .keyword_true }),
-                .unit_literal => return self.appendExpression(index, .unit),
-                .none_literal => return self.appendExpression(index, .none),
+                .unit_literal => return self.appendExpression(index, if (self.returns_type) .{ .type_value = .unit } else .unit),
+                .none_literal => return self.appendExpression(index, if (self.returns_type) .{ .type_value = .none } else .none),
+                .type, .type_func, .type_variant => return self.appendTypeValue(index),
                 .comptime_expr => {
                     const value_id = self.type_interner.executeComptime(index) catch |err| switch (err) {
                         error.QueryCycle => return self.reject(index, .declaration_cycle),
@@ -518,7 +536,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                     } orelse return error.Unavailable;
                     const value = try self.type_interner.lookupCompileTimeValue(value_id);
                     return switch (value) {
-                        .type => self.reject(index, .type_value_used_as_runtime_value),
+                        .type => |type_id| self.appendExpression(index, .{ .type_value = type_id }),
                         .runtime => |runtime| blk: {
                             break :blk try self.appendCompileTimeValue(index, runtime);
                         },
@@ -530,12 +548,16 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 .identifier => {
                     const span = tokenSpan(self.ast, node.token_index);
                     const name = self.source[span.start..span.end];
+                    if (std.mem.eql(u8, name, "int")) return self.appendExpression(index, .{ .type_value = .int });
+                    if (std.mem.eql(u8, name, "bool")) return self.appendExpression(index, .{ .type_value = .bool });
+                    if (std.mem.eql(u8, name, "never")) return self.appendExpression(index, .{ .type_value = .never });
+                    if (std.mem.eql(u8, name, "type")) return self.appendExpression(index, .{ .type_value = .type });
                     if (self.locals.get(name)) |local| return switch (local) {
                         .value => |value| value,
-                        .type => self.reject(index, .type_value_used_as_runtime_value),
+                        .type_value => |type_id| self.appendExpression(index, .{ .type_value = type_id }),
                         .place => |place| self.appendExpression(index, .{ .local_read = place.id }),
                     };
-                    if (std.mem.eql(u8, name, "unit")) return self.appendExpression(index, .unit);
+                    if (std.mem.eql(u8, name, "unit")) return self.appendExpression(index, if (self.returns_type) .{ .type_value = .unit } else .unit);
                     const resolved = self.type_interner.resolveStatic(name) catch |err| switch (err) {
                         error.QueryCycle => return self.reject(index, .declaration_cycle),
                         error.Unavailable => return error.Unavailable,
@@ -557,7 +579,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                     };
                     const static_value = try self.type_interner.lookupCompileTimeValue(static_value_id);
                     return switch (static_value) {
-                        .type => self.reject(index, .type_value_used_as_runtime_value),
+                        .type => |type_id| self.appendExpression(index, .{ .type_value = type_id }),
                         .runtime => |runtime| self.appendCompileTimeValue(index, runtime),
                     };
                 },
@@ -580,7 +602,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             const name = self.source[span.start..span.end];
             const local = self.locals.get(name) orelse return self.reject(operand_index, .unknown_value);
             return switch (local) {
-                .value, .type => self.reject(index, .ownership_transfer_requires_owned_place),
+                .value, .type_value => self.reject(index, .ownership_transfer_requires_owned_place),
                 .place => |place| self.appendExpression(index, .{ .local_transfer = place.id }),
             };
         }
@@ -692,7 +714,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             const name = self.source[span.start..span.end];
             const local = self.locals.get(name) orelse return self.reject(target_index, .unknown_value);
             const target = switch (local) {
-                .value, .type => return self.reject(target_index, .assignment_to_immutable),
+                .value, .type_value => return self.reject(target_index, .assignment_to_immutable),
                 .place => |place| if (place.mutable) place.id else return self.reject(target_index, .assignment_to_immutable),
             };
             const field_end: u32 = @intCast(self.assignment_fields.items.len);
@@ -1240,6 +1262,17 @@ fn analyzeType(
     unsupported_kind: structures.Diagnostic.Kind,
 ) anyerror!SemanticResult(structures.TypeId) {
     const node = ast.nodes[node_index.index()];
+    if (node.tag == .call) {
+        const value_id = type_interner.executeComptime(node_index) catch |err| switch (err) {
+            error.QueryCycle => return .{ .unsupported = issueAt(ast, node_index.index(), .declaration_cycle) },
+            error.Unavailable => return error.Unavailable,
+            else => return err,
+        } orelse return error.Unavailable;
+        return switch (try type_interner.lookupCompileTimeValue(value_id)) {
+            .type => |type_id| .{ .success = type_id },
+            .runtime => .{ .unsupported = issueAt(ast, node_index.index(), .value_used_as_type) },
+        };
+    }
     if (node.tag == .type or node.tag == .identifier) {
         const span = tokenSpan(ast, node.token_index);
         const name = source[span.start..span.end];
@@ -1312,71 +1345,36 @@ fn analyzeType(
     };
 }
 
+pub const StaticInitializerPlan = union(enum) {
+    type_value: structures.TypeId,
+    interpret: ?structures.TypeId,
+};
+
 pub fn analyzeStaticDeclaration(
     ast: *const structures.Ast,
     source: []const u8,
     declaration: u32,
     type_interner: anytype,
     gpa: std.mem.Allocator,
-) !SemanticResult(structures.CompileTimeValue) {
+) !SemanticResult(StaticInitializerPlan) {
     const binding = ast.nodes[declaration];
     std.debug.assert(binding.tag == .static_binding);
     const initializer = binding.data.node_node.b.unwrap() orelse unreachable;
-    const annotation = binding.data.node_node.a.unwrap();
-    if (annotation) |annotation_index| {
-        if (isMetaTypeAnnotation(ast, source, annotation_index)) {
-            return switch (try analyzeType(ast, source, initializer, type_interner, gpa, .static_initializer_not_supported)) {
-                .success => |type_id| .{ .success = .{ .type = type_id } },
-                .unsupported => |issue| .{ .unsupported = issue },
-            };
-        }
+    const annotation = binding.data.node_node.a.unwrap() orelse return .{ .success = .{ .interpret = null } };
+    if (isMetaTypeAnnotation(ast, source, annotation)) {
+        return switch (try analyzeType(ast, source, initializer, type_interner, gpa, .static_initializer_not_supported)) {
+            .success => |type_id| .{ .success = .{ .type_value = type_id } },
+            .unsupported => |issue| .{ .unsupported = issue },
+        };
     }
-    var value = switch (try analyzeStaticInitializer(ast, source, initializer, type_interner, gpa)) {
-        .success => |resolved| resolved,
-        .unsupported => |issue| return .{ .unsupported = issue },
-    };
-    const runtime_annotation = annotation orelse return .{ .success = value };
-    const expected = switch (try analyzeType(ast, source, runtime_annotation, type_interner, gpa, .static_initializer_not_supported)) {
+    const expected = switch (try analyzeType(ast, source, annotation, type_interner, gpa, .static_initializer_not_supported)) {
         .success => |type_id| type_id,
         .unsupported => |issue| return .{ .unsupported = issue },
     };
-    const runtime = switch (value) {
-        .type => return .{ .unsupported = issueAt(ast, initializer.index(), .static_initializer_not_supported) },
-        .runtime => |runtime| runtime,
-    };
-    if (!try canWidenTo(type_interner, runtime.type_id, expected)) {
-        return .{ .unsupported = .{
-            .span = nodeFocusSpan(ast, initializer),
-            .kind = .{ .static_initializer_type_mismatch = .{
-                .expected = expected,
-                .found = runtime.type_id,
-            } },
-        } };
-    }
-    if (runtime.type_id != expected and runtime.value == .structure) {
-        return .{ .unsupported = issueAt(ast, initializer.index(), .static_initializer_not_supported) };
-    }
-    value.runtime.type_id = expected;
-    return .{ .success = value };
-}
-
-pub fn analyzeStaticRuntimeAnnotation(
-    ast: *const structures.Ast,
-    source: []const u8,
-    declaration: u32,
-    type_interner: anytype,
-    gpa: std.mem.Allocator,
-) !SemanticResult(?structures.TypeId) {
-    const binding = ast.nodes[declaration];
-    std.debug.assert(binding.tag == .static_binding);
-    const annotation = binding.data.node_node.a.unwrap() orelse return .{ .success = null };
-    if (isMetaTypeAnnotation(ast, source, annotation)) {
+    if (expected == .type) {
         return .{ .unsupported = issueAt(ast, annotation.index(), .static_initializer_not_supported) };
     }
-    return switch (try analyzeType(ast, source, annotation, type_interner, gpa, .static_initializer_not_supported)) {
-        .success => |type_id| .{ .success = type_id },
-        .unsupported => |issue| .{ .unsupported = issue },
-    };
+    return .{ .success = .{ .interpret = expected } };
 }
 
 pub fn analyzeStructDefinition(
@@ -1562,59 +1560,6 @@ fn parseIntegerLiteral(literal: []const u8) IntegerLiteralResult {
         if (!std.ascii.isDigit(byte)) return .{ .unsupported = .integer_literal_not_decimal };
     }
     return .{ .value = std.fmt.parseInt(i32, literal, 10) catch return .{ .unsupported = .integer_literal_out_of_range } };
-}
-
-fn analyzeStaticInitializer(
-    ast: *const structures.Ast,
-    source: []const u8,
-    initializer: structures.Node.Index,
-    type_interner: anytype,
-    gpa: std.mem.Allocator,
-) !SemanticResult(structures.CompileTimeValue) {
-    const node = ast.nodes[initializer.index()];
-    return switch (node.tag) {
-        .number_literal => blk: {
-            const span = tokenSpan(ast, node.token_index);
-            const literal = source[span.start..span.end];
-            break :blk switch (parseIntegerLiteral(literal)) {
-                .value => |value| .{ .success = .{ .runtime = .{ .type_id = .int, .value = .{ .int = value } } } },
-                .unsupported => |kind| .{ .unsupported = .{ .span = span, .kind = kind } },
-            };
-        },
-        .bool_literal => .{ .success = .{ .runtime = .{
-            .type_id = .bool,
-            .value = .{ .bool = ast.tokens[node.token_index].tag == .keyword_true },
-        } } },
-        .unit_literal => .{ .success = .{ .runtime = .{ .type_id = .unit, .value = .unit } } },
-        .none_literal => .{ .success = .{ .runtime = .{ .type_id = .none, .value = .none } } },
-        .type_variant => switch (try analyzeType(ast, source, initializer, type_interner, gpa, .static_initializer_not_supported)) {
-            .success => |type_id| .{ .success = .{ .type = type_id } },
-            .unsupported => |issue| .{ .unsupported = issue },
-        },
-        .identifier => blk: {
-            const span = tokenSpan(ast, node.token_index);
-            const name = source[span.start..span.end];
-            if (std.mem.eql(u8, name, "int")) break :blk .{ .success = .{ .type = .int } };
-            if (std.mem.eql(u8, name, "bool")) break :blk .{ .success = .{ .type = .bool } };
-            if (std.mem.eql(u8, name, "never")) break :blk .{ .success = .{ .type = .never } };
-            if (std.mem.eql(u8, name, "unit")) break :blk .{ .success = .{ .runtime = .{ .type_id = .unit, .value = .unit } } };
-            const resolved = type_interner.resolveStatic(name) catch |err| switch (err) {
-                error.QueryCycle => break :blk .{ .unsupported = .{ .span = span, .kind = .declaration_cycle } },
-                error.Unavailable => return error.Unavailable,
-                else => return err,
-            };
-            if (resolved) |value_id| break :blk .{ .success = try type_interner.lookupCompileTimeValue(value_id) };
-            const reference = type_interner.functionReference(name) catch |err| switch (err) {
-                error.Unavailable => return error.Unavailable,
-                else => return err,
-            };
-            break :blk if (reference) |value|
-                .{ .success = .{ .runtime = .{ .type_id = value.type_id, .value = .{ .function_ref = value } } } }
-            else
-                .{ .unsupported = .{ .span = span, .kind = .unknown_value } };
-        },
-        else => .{ .unsupported = issueAt(ast, initializer.index(), .static_initializer_not_supported) },
-    };
 }
 
 fn analyzeStaticTypeArgument(

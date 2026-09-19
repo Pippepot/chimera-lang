@@ -15,8 +15,13 @@ pub const Unsupported = struct {
     instruction_index: ?u32 = null,
 };
 
+pub const Value = union(enum) {
+    runtime: structures.CompileTimeValue.RuntimeValue,
+    type: structures.TypeId,
+};
+
 pub const Result = union(enum) {
-    returned: structures.CompileTimeValue.RuntimeValue,
+    returned: Value,
     failure,
     exit: i32,
     unsupported: Unsupported,
@@ -30,21 +35,18 @@ const default_aggregate_fuel: u32 = 1_000_000;
 /// aggregate components are interned only when they cross value boundaries.
 pub fn execute(
     body: *const structures.FunctionBodyAnalysis,
-    arguments: []structures.CompileTimeValue.RuntimeValue,
+    arguments: []Value,
     executor: anytype,
     gpa: std.mem.Allocator,
 ) !Result {
     const slot_count = body.valueCount();
     const branch_scratch_count = body.block_argument_types.len;
-    const frame = try gpa.alloc(
-        structures.CompileTimeValue.RuntimeValue,
-        slot_count + branch_scratch_count + body.call_arguments.len,
-    );
+    const frame = try gpa.alloc(Value, slot_count + branch_scratch_count + body.call_arguments.len);
     defer gpa.free(frame);
     const slots = frame[0..slot_count];
     const scratch = frame[slot_count .. slot_count + branch_scratch_count];
     const call_scratch = frame[slot_count + branch_scratch_count ..];
-    @memset(slots, .unit);
+    @memset(slots, .{ .runtime = .unit });
 
     var block_id = body.entry;
     const entry = body.blocks[@intFromEnum(block_id)];
@@ -62,42 +64,43 @@ pub fn execute(
             const instruction = body.instructions[instruction_index];
             const destination = @intFromEnum(body.instructionValue(instruction_index));
             switch (instruction) {
-                .consti => |value| slots[destination] = .{ .int = value },
-                .constb => |value| slots[destination] = .{ .bool = value },
-                .const_unit => slots[destination] = .unit,
-                .const_none => slots[destination] = .none,
-                .function_ref => |reference| slots[destination] = .{ .function_ref = reference },
+                .consti => |value| slots[destination] = .{ .runtime = .{ .int = value } },
+                .constb => |value| slots[destination] = .{ .runtime = .{ .bool = value } },
+                .const_type => |type_id| slots[destination] = .{ .type = type_id },
+                .const_unit => slots[destination] = .{ .runtime = .unit },
+                .const_none => slots[destination] = .{ .runtime = .none },
+                .function_ref => |reference| slots[destination] = .{ .runtime = .{ .function_ref = reference } },
                 .callable_coerce => |operation| {
-                    var reference = slots[@intFromEnum(operation.operand)].function_ref;
+                    var reference = slots[@intFromEnum(operation.operand)].runtime.function_ref;
                     reference.type_id = operation.target_type;
-                    slots[destination] = .{ .function_ref = reference };
+                    slots[destination] = .{ .runtime = .{ .function_ref = reference } };
                 },
-                .negi => |operand| slots[destination] = .{ .int = -%integer(slots, operand) },
-                .addi => |operands| slots[destination] = .{ .int = integer(slots, operands.lhs) +% integer(slots, operands.rhs) },
-                .subi => |operands| slots[destination] = .{ .int = integer(slots, operands.lhs) -% integer(slots, operands.rhs) },
-                .muli => |operands| slots[destination] = .{ .int = integer(slots, operands.lhs) *% integer(slots, operands.rhs) },
+                .negi => |operand| slots[destination] = .{ .runtime = .{ .int = -%integer(slots, operand) } },
+                .addi => |operands| slots[destination] = .{ .runtime = .{ .int = integer(slots, operands.lhs) +% integer(slots, operands.rhs) } },
+                .subi => |operands| slots[destination] = .{ .runtime = .{ .int = integer(slots, operands.lhs) -% integer(slots, operands.rhs) } },
+                .muli => |operands| slots[destination] = .{ .runtime = .{ .int = integer(slots, operands.lhs) *% integer(slots, operands.rhs) } },
                 .divsi => |operands| {
                     const lhs = integer(slots, operands.lhs);
                     const rhs = integer(slots, operands.rhs);
                     if (rhs == 0) return unsupported(.division_by_zero, instruction_index);
                     if (lhs == std.math.minInt(i32) and rhs == -1) return unsupported(.integer_overflow, instruction_index);
-                    slots[destination] = .{ .int = @divTrunc(lhs, rhs) };
+                    slots[destination] = .{ .runtime = .{ .int = @divTrunc(lhs, rhs) } };
                 },
                 .exit => |operand| return .{ .exit = integer(slots, operand) },
                 .call => |call| if (try executeReturningCall(body, slots, call_scratch, destination, instruction_index, call.instance(), call.arguments, executor, &aggregate_fuel)) |result| return result,
                 .indirect_call => |call| {
-                    const reference = slots[@intFromEnum(call.target)].function_ref;
+                    const reference = slots[@intFromEnum(call.target)].runtime.function_ref;
                     if (try executeReturningCall(body, slots, call_scratch, destination, instruction_index, .{ .item = reference.target }, call.arguments, executor, &aggregate_fuel)) |result| return result;
                 },
-                .variant_tag => |operand| switch (try variantTag(body, slots[@intFromEnum(operand)], operand, executor)) {
+                .variant_tag => |operand| switch (try variantTag(body, slots[@intFromEnum(operand)].runtime, operand, executor)) {
                     .returned => |value| slots[destination] = value,
                     else => |result| return atInstruction(result, instruction_index),
                 },
-                .variant_coerce => |operation| switch (try coerceVariant(body, slots[@intFromEnum(operation.operand)], operation, executor, &aggregate_fuel)) {
+                .variant_coerce => |operation| switch (try coerceVariant(body, slots[@intFromEnum(operation.operand)].runtime, operation, executor, &aggregate_fuel)) {
                     .returned => |value| slots[destination] = value,
                     else => |result| return atInstruction(result, instruction_index),
                 },
-                .variant_extract => |operation| switch (try extractVariant(body, slots[@intFromEnum(operation.operand)], operation, executor, &aggregate_fuel)) {
+                .variant_extract => |operation| switch (try extractVariant(body, slots[@intFromEnum(operation.operand)].runtime, operation, executor, &aggregate_fuel)) {
                     .returned => |value| slots[destination] = value,
                     else => |result| return atInstruction(result, instruction_index),
                 },
@@ -105,7 +108,7 @@ pub fn execute(
                     .returned => |value| slots[destination] = value,
                     else => |result| return atInstruction(result, instruction_index),
                 },
-                .field_access => |operation| switch (try accessField(slots[@intFromEnum(operation.operand)], operation, executor)) {
+                .field_access => |operation| switch (try accessField(slots[@intFromEnum(operation.operand)].runtime, operation, executor)) {
                     .returned => |value| slots[destination] = value,
                     else => |result| return atInstruction(result, instruction_index),
                 },
@@ -116,7 +119,7 @@ pub fn execute(
                 .mut_parameter_write => |operation| {
                     std.debug.assert(operation.parameter_index < arguments.len);
                     arguments[operation.parameter_index] = slots[@intFromEnum(operation.value)];
-                    slots[destination] = .unit;
+                    slots[destination] = .{ .runtime = .unit };
                 },
                 .call_mut_argument => |operation| {
                     const index = operation.arguments.start + operation.argument_index;
@@ -141,7 +144,7 @@ pub fn execute(
                     .result => |result| return result,
                 }
             },
-            .return_unit => return .{ .returned = .unit },
+            .return_unit => return .{ .returned = .{ .runtime = .unit } },
             .return_value => |value_use| return valueUse(body, slots, value_use, executor, &aggregate_fuel),
             .return_failure => return .failure,
             .diverge => return .{ .unsupported = .{ .reason = .instruction } },
@@ -150,7 +153,7 @@ pub fn execute(
                 .result => |result| return result,
             },
             .fallible_indirect_call => |fallible| {
-                const reference = slots[@intFromEnum(fallible.call.target)].function_ref;
+                const reference = slots[@intFromEnum(fallible.call.target)].runtime.function_ref;
                 switch (try executeFallibleCall(body, slots, call_scratch, .{ .item = reference.target }, fallible.call.arguments, fallible.success, fallible.failure, executor, &aggregate_fuel)) {
                     .next => |next| block_id = next,
                     .result => |result| return result,
@@ -167,12 +170,12 @@ fn unsupported(reason: UnsupportedReason, instruction_index: usize) Result {
     } };
 }
 
-fn integer(slots: []const structures.CompileTimeValue.RuntimeValue, value: structures.FunctionValueId) i32 {
-    return slots[@intFromEnum(value)].int;
+fn integer(slots: []const Value, value: structures.FunctionValueId) i32 {
+    return slots[@intFromEnum(value)].runtime.int;
 }
 
 fn predicateValue(
-    slots: []const structures.CompileTimeValue.RuntimeValue,
+    slots: []const Value,
     operation: structures.PredicateOperation,
     operands: structures.BinaryOperands,
 ) bool {
@@ -183,15 +186,17 @@ fn predicateValue(
         .gei => integer(slots, operands.lhs) >= integer(slots, operands.rhs),
         .eqi => integer(slots, operands.lhs) == integer(slots, operands.rhs),
         .nei => integer(slots, operands.lhs) != integer(slots, operands.rhs),
-        .eqb => slots[@intFromEnum(operands.lhs)].bool == slots[@intFromEnum(operands.rhs)].bool,
-        .neb => slots[@intFromEnum(operands.lhs)].bool != slots[@intFromEnum(operands.rhs)].bool,
+        .eqb => slots[@intFromEnum(operands.lhs)].runtime.bool == slots[@intFromEnum(operands.rhs)].runtime.bool,
+        .neb => slots[@intFromEnum(operands.lhs)].runtime.bool != slots[@intFromEnum(operands.rhs)].runtime.bool,
+        .eqt => slots[@intFromEnum(operands.lhs)].type == slots[@intFromEnum(operands.rhs)].type,
+        .net => slots[@intFromEnum(operands.lhs)].type != slots[@intFromEnum(operands.rhs)].type,
     };
 }
 
 fn executeCall(
     body: *const structures.FunctionBodyAnalysis,
-    slots: []const structures.CompileTimeValue.RuntimeValue,
-    scratch: []structures.CompileTimeValue.RuntimeValue,
+    slots: []const Value,
+    scratch: []Value,
     instance: structures.InstanceId,
     argument_range: structures.FunctionValueRange,
     executor: anytype,
@@ -210,8 +215,8 @@ fn executeCall(
 
 fn executeReturningCall(
     body: *const structures.FunctionBodyAnalysis,
-    slots: []structures.CompileTimeValue.RuntimeValue,
-    scratch: []structures.CompileTimeValue.RuntimeValue,
+    slots: []Value,
+    scratch: []Value,
     destination: usize,
     instruction_index: usize,
     instance: structures.InstanceId,
@@ -241,8 +246,8 @@ const FallibleCallStep = union(enum) {
 
 fn executeFallibleCall(
     body: *const structures.FunctionBodyAnalysis,
-    slots: []structures.CompileTimeValue.RuntimeValue,
-    scratch: []structures.CompileTimeValue.RuntimeValue,
+    slots: []Value,
+    scratch: []Value,
     instance: structures.InstanceId,
     argument_range: structures.FunctionValueRange,
     success_id: structures.FunctionBlockId,
@@ -279,7 +284,7 @@ fn chargeAggregate(fuel: *u32, amount: usize) bool {
 
 fn initializeStruct(
     body: *const structures.FunctionBodyAnalysis,
-    slots: []const structures.CompileTimeValue.RuntimeValue,
+    slots: []const Value,
     operation: structures.StructOperation,
     executor: anytype,
     gpa: std.mem.Allocator,
@@ -291,9 +296,9 @@ fn initializeStruct(
     defer gpa.free(values);
     for (fields) |field| {
         std.debug.assert(field.field_index < values.len);
-        values[field.field_index] = try executor.internRuntime(valueType(body, field.value), slots[@intFromEnum(field.value)]);
+        values[field.field_index] = try executor.internRuntime(valueType(body, field.value), slots[@intFromEnum(field.value)].runtime);
     }
-    return .{ .returned = .{ .structure = try executor.internTuple(values) } };
+    return .{ .returned = .{ .runtime = .{ .structure = try executor.internTuple(values) } } };
 }
 
 fn accessField(
@@ -305,24 +310,24 @@ fn accessField(
     std.debug.assert(operation.field_index < fields.len);
     const field = (try executor.lookupRuntime(fields[operation.field_index])) orelse return .unavailable;
     std.debug.assert(field.type_id == operation.field_type);
-    return .{ .returned = field.value };
+    return .{ .returned = .{ .runtime = field.value } };
 }
 
 fn updateField(
     body: *const structures.FunctionBodyAnalysis,
-    slots: []const structures.CompileTimeValue.RuntimeValue,
+    slots: []const Value,
     operation: structures.FieldUpdateOperation,
     executor: anytype,
     gpa: std.mem.Allocator,
     aggregate_fuel: *u32,
 ) !Result {
-    const source = try executor.lookupTuple(slots[@intFromEnum(operation.operand)].structure);
+    const source = try executor.lookupTuple(slots[@intFromEnum(operation.operand)].runtime.structure);
     if (!chargeAggregate(aggregate_fuel, source.len + 1)) return .{ .unsupported = .{ .reason = .resource_limit } };
     const fields = try gpa.dupe(structures.CompileTimeValueId, source);
     defer gpa.free(fields);
     std.debug.assert(operation.field_index < fields.len);
-    fields[operation.field_index] = try executor.internRuntime(valueType(body, operation.value), slots[@intFromEnum(operation.value)]);
-    return .{ .returned = .{ .structure = try executor.internTuple(fields) } };
+    fields[operation.field_index] = try executor.internRuntime(valueType(body, operation.value), slots[@intFromEnum(operation.value)].runtime);
+    return .{ .returned = .{ .runtime = .{ .structure = try executor.internTuple(fields) } } };
 }
 
 const ActiveVariant = struct {
@@ -356,7 +361,7 @@ fn variantTag(
 ) !Result {
     const active = (try activeVariant(body, value, operand, executor)) orelse return .{ .unsupported = .{ .reason = .coercion } };
     const members = (try executor.variantMembers(valueType(body, operand))) orelse return .{ .unsupported = .{ .reason = .coercion } };
-    for (members, 0..) |member, tag| if (member == active.member_type) return .{ .returned = .{ .int = @intCast(tag) } };
+    for (members, 0..) |member, tag| if (member == active.member_type) return .{ .returned = .{ .runtime = .{ .int = @intCast(tag) } } };
     return .{ .unsupported = .{ .reason = .coercion } };
 }
 
@@ -393,7 +398,7 @@ fn coerceVariant(
     const target_members = (try executor.variantMembers(operation.target_type)) orelse return .{ .unsupported = .{ .reason = .coercion } };
     std.debug.assert(target_tag < target_members.len);
     if (!chargeAggregate(aggregate_fuel, 1)) return .{ .unsupported = .{ .reason = .resource_limit } };
-    return .{ .returned = (try variantValue(target_members[target_tag], payload, executor)) orelse return .unavailable };
+    return .{ .returned = .{ .runtime = (try variantValue(target_members[target_tag], payload, executor)) orelse return .unavailable } };
 }
 
 fn extractVariant(
@@ -414,13 +419,13 @@ fn extractVariant(
         if (target_tag == structures.invalid_variant_tag) return .{ .unsupported = .{ .reason = .coercion } };
         std.debug.assert(target_tag < target_members.len);
         if (!chargeAggregate(aggregate_fuel, 1)) return .{ .unsupported = .{ .reason = .resource_limit } };
-        return .{ .returned = (try variantValue(target_members[target_tag], active.payload, executor)) orelse return .unavailable };
+        return .{ .returned = .{ .runtime = (try variantValue(target_members[target_tag], active.payload, executor)) orelse return .unavailable } };
     }
     const payload = (try executor.lookupRuntime(active.payload)) orelse return .unavailable;
-    if (payload.type_id == operation.target_type) return .{ .returned = payload.value };
+    if (payload.type_id == operation.target_type) return .{ .returned = .{ .runtime = payload.value } };
     var reference = payload.value.function_ref;
     reference.type_id = operation.target_type;
-    return .{ .returned = .{ .function_ref = reference } };
+    return .{ .returned = .{ .runtime = .{ .function_ref = reference } } };
 }
 
 fn atInstruction(result: Result, instruction_index: usize) Result {
@@ -435,21 +440,21 @@ fn atInstruction(result: Result, instruction_index: usize) Result {
 
 fn valueUse(
     body: *const structures.FunctionBodyAnalysis,
-    slots: []const structures.CompileTimeValue.RuntimeValue,
+    slots: []const Value,
     use: structures.FunctionValueUse,
     executor: anytype,
     aggregate_fuel: *u32,
 ) !Result {
     const value = slots[@intFromEnum(use.value)];
     const target = use.coerce_to orelse return .{ .returned = value };
-    if (use.variant_tag_mapping) |mapping| return coerceVariant(body, value, .{
+    if (use.variant_tag_mapping) |mapping| return coerceVariant(body, value.runtime, .{
         .operand = use.value,
         .target_type = target,
         .tag_mapping = mapping,
     }, executor, aggregate_fuel);
-    var reference = value.function_ref;
+    var reference = value.runtime.function_ref;
     reference.type_id = target;
-    return .{ .returned = .{ .function_ref = reference } };
+    return .{ .returned = .{ .runtime = .{ .function_ref = reference } } };
 }
 
 const BranchStep = union(enum) {
@@ -459,8 +464,8 @@ const BranchStep = union(enum) {
 
 fn branchTarget(
     body: *const structures.FunctionBodyAnalysis,
-    slots: []structures.CompileTimeValue.RuntimeValue,
-    scratch: []structures.CompileTimeValue.RuntimeValue,
+    slots: []Value,
+    scratch: []Value,
     branch: structures.FunctionBranch,
     executor: anytype,
     aggregate_fuel: *u32,

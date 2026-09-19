@@ -595,6 +595,7 @@ const EntryCallParent = struct {
             .call => |call| call.target,
             .consti,
             .constb,
+            .const_type,
             .const_unit,
             .const_none,
             .function_ref,
@@ -2898,6 +2899,54 @@ test "scalar static expressions stay dormant and execute as typed thunks when de
     try testing.expectEqual(@as(usize, 0), diagnostics.len);
 }
 
+test "inferred statics share the typed thunk publication path" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static base = 40
+        \\static alias = base
+        \\static Int = int
+        \\static identity = func(value: int) int -> value
+        \\static callable = identity
+        \\func answer() int -> callable(alias + 2)
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const parsed = (try db.get(query_structures.ParseFile, 1)).*.?;
+    for ([_]struct { name: []const u8, instruction: std.meta.Tag(structures.FunctionInstruction) }{
+        .{ .name = "base", .instruction = .consti },
+        .{ .name = "alias", .instruction = .consti },
+        .{ .name = "Int", .instruction = .const_type },
+        .{ .name = "callable", .instruction = .function_ref },
+    }) |expected| {
+        const item = scope.resolveStatic(expected.name).?;
+        const resolved = (try db.get(query_structures.ResolveItem, item)).*.?;
+        const initializer = parsed.nodes[resolved.declaration].data.node_node.b.unwrap() orelse unreachable;
+        const body = (try db.get(query_structures.AnalyzeComptimeThunk, .{ .owner = .{ .item = item }, .node = initializer })).*.?;
+        try testing.expectEqual(@as(usize, 1), body.instructions.len);
+        try testing.expectEqual(expected.instruction, std.meta.activeTag(body.instructions[0]));
+    }
+    try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "identity" }, 42);
+}
+
+test "runtime static annotations reject interpreted type values" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    const source =
+        \\static makeType = func() type -> int
+        \\static invalid: int = makeType()
+    ;
+    try addSource(db, 1, source);
+    const invalid = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveStatic("invalid").?;
+    try testing.expect((try db.get(query_structures.ResolveStatic, invalid)).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(query_structures.ResolveStatic, invalid, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(DiagnosticKind.type_value_used_as_runtime_value, std.meta.activeTag(diagnostics[0].kind));
+    try testing.expectEqualStrings("makeType", source[diagnostics[0].span.?.start..diagnostics[0].span.?.end]);
+}
+
 test "compile-time scalar interpreter executes control flow, locals, loops, and wrapping arithmetic" {
     const db = try testDatabase(1);
     defer db.deinit();
@@ -3080,16 +3129,20 @@ test "changing compile-time recursion is bounded by deterministic call depth" {
     const db = try testDatabase(4);
     defer db.deinit();
 
-    try addSource(db, 1,
+    const source =
         \\static recurse = func(value: int) int -> recurse(value + 1)
         \\static result = recurse(0)
-    );
+    ;
+    try addSource(db, 1, source);
     const result = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveStatic("result").?;
     try testing.expect((try db.get(query_structures.ResolveStatic, result)).* == null);
     const diagnostics = try db.transitiveAccumulatorValues(query_structures.ResolveStatic, result, structures.Diagnostic, testing.allocator);
     defer freeDiagnostics(diagnostics);
     try testing.expectEqual(@as(usize, 1), diagnostics.len);
     try testing.expectEqual(DiagnosticKind.compile_time_resource_limit, std.meta.activeTag(diagnostics[0].kind));
+    const declaration_name = std.mem.indexOf(u8, source, "recurse").?;
+    const recursive_call = std.mem.indexOfPos(u8, source, declaration_name + "recurse".len, "recurse").?;
+    try testing.expectEqual(structures.SourceSpan{ .start = @intCast(recursive_call), .end = @intCast(recursive_call + "recurse".len) }, diagnostics[0].span);
 }
 
 test "static value arguments execute arbitrary scalar thunks" {
@@ -3281,6 +3334,111 @@ test "compile-time aggregate results retain across unrelated edits and invalidat
     try testing.expectEqual(@as(i32, 3), (try lookupCompileTimeValue(db, fields.values[1])).runtime.value.int);
 }
 
+test "type-valued functions execute in aliases signatures and struct fields" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static choose = func(flag: bool) type
+        \\  const selected = if flag == true -> int else bool
+        \\  return selected
+        \\static select = func(static T: type) type -> if T == int -> bool else int
+        \\static primitiveType = func() type -> int
+        \\static Primitive: type = primitiveType()
+        \\static unitType = func() type -> unit
+        \\static noneType = func() type -> none
+        \\static Unit: type = unitType()
+        \\static None: type = noneType()
+        \\static Selected: type = choose(true)
+        \\static Inferred = choose(false)
+        \\static Maybe = int | none
+        \\static maybeType = func() type -> Maybe
+        \\static Callback: type = func(int) int
+        \\static callbackType = func() type -> Callback
+        \\static Box = struct
+        \\  value: select(bool)
+        \\func take(value: Selected, box: Box) int -> value + box.value
+        \\func takeBool(value: Inferred) bool -> value
+        \\func inspect(value: maybeType(), callback: callbackType()) int -> 0
+        \\func zero(value: Primitive) int -> value
+        \\func answer() int -> zero(take(40, Box{value = 2}))
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const canonical_int = try db.intern(query_structures.CompileTimeValues, structures.CompileTimeValue{ .type = .int });
+    try testing.expectEqual(canonical_int, (try db.get(query_structures.ResolveStatic, scope.resolveStatic("Selected").?)).*.?);
+    try testing.expectEqual(structures.CompileTimeValue{ .type = .unit }, try resolvedStaticValue(db, scope.resolveStatic("Unit").?));
+    try testing.expectEqual(structures.CompileTimeValue{ .type = .none }, try resolvedStaticValue(db, scope.resolveStatic("None").?));
+    const primitive_type = scope.resolveFunction("primitiveType").?;
+    try testing.expect((try db.get(query_structures.CompileFunction, .{ .item = primitive_type })).* == null);
+    const compile_diagnostics = try db.transitiveAccumulatorValues(query_structures.CompileFunction, .{ .item = primitive_type }, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(compile_diagnostics);
+    try testing.expectEqual(@as(usize, 0), compile_diagnostics.len);
+
+    const box_type = (try resolvedStaticValue(db, scope.resolveStatic("Box").?)).type;
+    const box = (try db.get(query_structures.StructDefinition, scope.resolveStatic("Box").?)).*.?;
+    try testing.expectEqual(structures.TypeId.int, box.fields[0].type_id);
+    const take = (try db.get(query_structures.FunctionSignature, scope.resolveFunction("take").?)).*.?;
+    try testing.expectEqualSlices(structures.CallableParameter, &.{
+        .{ .mode = .imm, .type_id = .int },
+        .{ .mode = .imm, .type_id = box_type },
+    }, take.parameters);
+    const take_bool = (try db.get(query_structures.FunctionSignature, scope.resolveFunction("takeBool").?)).*.?;
+    try testing.expectEqual(structures.TypeId.bool, take_bool.parameters[0].type_id);
+
+    const maybe = (try resolvedStaticValue(db, scope.resolveStatic("Maybe").?)).type;
+    const callback = (try resolvedStaticValue(db, scope.resolveStatic("Callback").?)).type;
+    const inspect = (try db.get(query_structures.FunctionSignature, scope.resolveFunction("inspect").?)).*.?;
+    try testing.expectEqual(maybe, inspect.parameters[0].type_id);
+    try testing.expectEqual(callback, inspect.parameters[1].type_id);
+    try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "zero", "take" }, 42);
+}
+
+test "type-valued calls are compile-time-only" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    const source =
+        \\static choose = func() type -> int
+        \\func invalid() int -> choose()
+    ;
+    try addSource(db, 1, source);
+    const invalid = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveFunction("invalid").?;
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, invalid)).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, invalid, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(DiagnosticKind.type_value_used_as_runtime_value, std.meta.activeTag(diagnostics[0].kind));
+    try testing.expectEqualStrings("choose", source[diagnostics[0].span.?.start..diagnostics[0].span.?.end]);
+}
+
+test "type-valued call results retain equal signatures and invalidate on type changes" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static selected = func() type -> int
+        \\func consume(value: selected()) int -> 1
+    );
+    const consume = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveFunction("consume").?;
+    const initial = try db.get(query_structures.FunctionSignature, consume);
+    try testing.expectEqual(structures.TypeId.int, initial.*.?.parameters[0].type_id);
+
+    try setSource(db, 1,
+        \\static selected = func() type
+        \\  return int
+        \\func consume(value: selected()) int -> 1
+    );
+    try testing.expectEqual(initial, try db.get(query_structures.FunctionSignature, consume));
+
+    try setSource(db, 1,
+        \\static selected = func() type -> bool
+        \\func consume(value: selected()) int -> 1
+    );
+    const changed = try db.get(query_structures.FunctionSignature, consume);
+    try testing.expect(initial != changed);
+    try testing.expectEqual(structures.TypeId.bool, changed.*.?.parameters[0].type_id);
+}
+
 test "explicit comptime expressions publish constants into runtime bodies" {
     const db = try testDatabase(1);
     defer db.deinit();
@@ -3440,6 +3598,8 @@ fn testStaticDeclarationAllocations(gpa: std.mem.Allocator) !void {
         \\static Result = int | Empty
         \\static value: Result = 40
         \\static enabled = true
+        \\static selectedType = func() type -> int
+        \\static Selected: type = selectedType()
         \\static Pair = struct
         \\  copy = trivial
         \\  left: int
@@ -3453,6 +3613,8 @@ fn testStaticDeclarationAllocations(gpa: std.mem.Allocator) !void {
         \\  if const number = value as int -> number + computed - 1 else 1
         \\else 0
     );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    try testing.expect((try db.get(query_structures.ResolveStatic, scope.resolveStatic("Selected").?)).* != null);
     try testing.expect((try db.get(query_structures.BuildExecutable, 1)).* != null);
 }
 

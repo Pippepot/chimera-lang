@@ -236,12 +236,15 @@ Each slice includes diagnostics and incremental tests before the next begins.
      runtime execution.
 
 5. **Type-valued functions**
+   - Status: implemented for existing canonical types; generated nominal types
+     remain deferred until their capture semantics are specified.
    - Add `type` constants/results and calls in type positions.
    - Add canonical type operations required by real generic examples.
    - Add generated nominal type identity only after its capture semantics are
      specified.
 
 6. **Cutover and cleanup**
+   - Status: implemented for the current language surface.
    - Remove the simple static initializer evaluator and unsupported paths it
      replaces.
    - Keep one value representation, one call-key construction path, and one

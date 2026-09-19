@@ -124,6 +124,11 @@ fn renderInstruction(
     switch (ssa.instructions[instruction_index]) {
         .consti => |value| try writer.print("    %{d} = consti {d}\n", .{ result, value }),
         .constb => |value| try writer.print("    %{d} = constb {s}\n", .{ result, if (value) "true" else "false" }),
+        .const_type => |type_id| {
+            try writer.print("    %{d} = const_type ", .{result});
+            try renderType(type_id, writer);
+            try writer.writeByte('\n');
+        },
         .const_unit => try writer.print("    %{d} = const_unit\n", .{result}),
         .const_none => try writer.print("    %{d} = const_none\n", .{result}),
         .function_ref => |reference| {

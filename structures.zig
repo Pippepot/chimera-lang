@@ -722,6 +722,8 @@ pub const PredicateOperation = enum {
     nei,
     eqb,
     neb,
+    eqt,
+    net,
 };
 
 pub const FunctionBranch = struct {
@@ -857,6 +859,7 @@ pub const CallMutArgument = struct {
 pub const FunctionInstruction = union(enum) {
     consti: i32,
     constb: bool,
+    const_type: TypeId,
     const_unit,
     const_none,
     function_ref: FunctionReference,
@@ -882,6 +885,7 @@ pub const FunctionInstruction = union(enum) {
         return switch (self) {
             .consti, .variant_tag, .negi, .addi, .subi, .muli, .divsi => .int,
             .constb => .bool,
+            .const_type => .type,
             .const_unit => .unit,
             .const_none => .none,
             .exit => .never,

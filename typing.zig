@@ -45,6 +45,7 @@ pub fn resolveAndTypeBody(
         is_fallible,
         false,
         false,
+        false,
         type_interner,
         unresolved,
     );
@@ -73,6 +74,7 @@ pub fn resolveAndTypeBodyForComptime(
         is_fallible,
         false,
         true,
+        true,
         type_interner,
         unresolved,
     );
@@ -98,6 +100,7 @@ pub fn resolveAndTypeComptimeThunk(
         true,
         true,
         true,
+        true,
         type_interner,
         unresolved,
     );
@@ -114,6 +117,7 @@ fn resolveAndType(
     is_fallible: bool,
     infer_return_type: bool,
     publish_instruction_spans: bool,
+    allow_type_values: bool,
     type_interner: anytype,
     unresolved: semantic.UnresolvedBody,
 ) !?structures.FunctionBodyAnalysis {
@@ -127,6 +131,7 @@ fn resolveAndType(
         .is_fallible = is_fallible,
         .infer_return_type = infer_return_type,
         .publish_instruction_spans = publish_instruction_spans,
+        .allow_type_values = allow_type_values,
     };
     defer builder.deinit();
     try builder.init(parameters);
@@ -231,6 +236,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
         is_fallible: bool,
         infer_return_type: bool = false,
         publish_instruction_spans: bool = false,
+        allow_type_values: bool = false,
         scope: ?structures.ModuleScope = null,
         values: []?Value = &.{},
         local_values: []?Value = &.{},
@@ -570,6 +576,10 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             const resolved: Value = switch (expression.operation) {
                 .integer => |integer| try self.appendInstruction(.{ .consti = integer }),
                 .boolean => |boolean| try self.appendInstruction(.{ .constb = boolean }),
+                .type_value => |type_id| if (self.allow_type_values)
+                    try self.appendInstruction(.{ .const_type = type_id })
+                else
+                    return self.reject(expression.span, .type_value_used_as_runtime_value),
                 .unit => try self.appendInstruction(.const_unit),
                 .none => try self.appendInstruction(.const_none),
                 .function_ref => |reference| try self.appendInstruction(.{ .function_ref = reference }),
@@ -1966,7 +1976,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 .expected = @intCast(signature.parameters.len),
                 .found = @intCast(raw_arguments.len),
             } });
-            if (signature.return_type == .type) return self.reject(span, .type_value_used_as_runtime_value);
+            if (signature.return_type == .type and !self.allow_type_values) return self.reject(span, .type_value_used_as_runtime_value);
             var place_fields: std.ArrayList(PlaceField) = .empty;
             defer place_fields.deinit(self.ctx.allocator());
             var argument_places: std.ArrayList(?ArgumentPlace) = .empty;
@@ -2291,7 +2301,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                     };
                 },
                 .eq, .ne => blk: {
-                    if (lhs.type_id != .int and lhs.type_id != .bool) {
+                    if (lhs.type_id != .int and lhs.type_id != .bool and lhs.type_id != .type) {
                         return self.reject(comparison.operands.lhs.span, .{ .equality_operand_not_supported = lhs.type_id });
                     }
                     if (rhs.type_id != lhs.type_id) {
@@ -2300,6 +2310,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                     break :blk switch (lhs.type_id) {
                         .int => if (comparison.operation == .eq) .eqi else .nei,
                         .bool => if (comparison.operation == .eq) .eqb else .neb,
+                        .type => if (comparison.operation == .eq) .eqt else .net,
                         else => unreachable,
                     };
                 },
@@ -3401,7 +3412,7 @@ fn normalizeValueUses(value_uses: []structures.FunctionValueUse, instruction_val
 
 fn normalizeInstructions(instructions: []structures.FunctionInstruction, instruction_values: []const structures.FunctionValueId) void {
     for (instructions) |*instruction| switch (instruction.*) {
-        .consti, .constb, .const_unit, .const_none, .function_ref, .struct_init, .call_mut_argument => {},
+        .consti, .constb, .const_type, .const_unit, .const_none, .function_ref, .struct_init, .call_mut_argument => {},
         .variant_coerce, .variant_extract, .callable_coerce => |*operation| operation.operand = normalizeValue(operation.operand, instruction_values),
         .field_access => |*operation| operation.operand = normalizeValue(operation.operand, instruction_values),
         .field_update => |*operation| {

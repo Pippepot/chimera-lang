@@ -120,6 +120,7 @@ const LocationPlan = struct {
             value_types[value_index] = instruction.resultType();
             switch (instruction) {
                 .consti, .constb, .const_unit, .const_none, .function_ref => {},
+                .const_type => unreachable,
                 .variant_coerce, .variant_extract, .callable_coerce => |operation| needed[@intFromEnum(operation.operand)] = true,
                 .struct_init => |operation| {
                     for (ssa.struct_field_values[operation.fields.start..operation.fields.end]) |field| {
@@ -220,6 +221,7 @@ const LocationPlan = struct {
                 switch (instruction) {
                     .consti => |value| break :location_blk .{ .immediate = value },
                     .constb => |value| break :location_blk .{ .immediate = @intFromBool(value) },
+                    .const_type => unreachable,
                     .const_unit, .const_none => break :location_blk .discarded,
                     .call => |call| if (call.return_type == .unit) {
                         break :location_blk .discarded;
@@ -388,6 +390,7 @@ fn FunctionEmitter(comptime Types: type) type {
                 const destination = self.locations[@intFromEnum(ssa.instructionValue(instruction_index))];
                 switch (instruction) {
                     .consti, .constb, .const_unit, .const_none => {},
+                    .const_type => unreachable,
                     .function_ref => |reference| try self.emitFunctionReference(reference, destination),
                     .variant_tag => |operand| {
                         try self.loadComponent(self.locations[@intFromEnum(operand)], 0);
@@ -1178,6 +1181,7 @@ const X86Encoder = struct {
             .gei => 0x8D,
             .eqi, .eqb => 0x84,
             .nei, .neb => 0x85,
+            .eqt, .net => unreachable,
         };
         const field_offset = std.math.cast(u32, self.code.items.len + 2) orelse return error.FunctionTooLarge;
         try self.appendBits32(&.{ 0x0F, opcode }, @bitCast(displacement));

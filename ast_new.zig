@@ -428,7 +428,16 @@ fn parseType(parser: *ParserState) ParseError!Node.Index {
 
 fn parseTypePrimary(parser: *ParserState) ParseError!Node.Index {
     return switch (parser.tokens[parser.index].tag) {
-        .identifier => try parseTokenNode(parser, .identifier, .type),
+        .identifier => blk: {
+            const is_call = parser.tokens[parser.index + 1].tag == .l_paren;
+            var value = try parseTokenNode(parser, .identifier, if (is_call) .identifier else .type);
+            if (is_call) {
+                const token_index = parser.index;
+                const arguments = try parseCallArgList(parser);
+                value = try parser.addNode(.{ .tag = .call, .token_index = token_index, .data = .{ .node_node = .{ .a = value, .b = arguments } } });
+            }
+            break :blk value;
+        },
         .keyword_none => try parseTokenNode(parser, .keyword_none, .type),
         .keyword_func, .keyword_fallible => try parseFunctionType(parser),
         else => {
@@ -1075,6 +1084,22 @@ test "parse function signatures with compound types" {
         \\    └─return_expr
         \\      └─none_literal : none
     );
+}
+
+test "parse direct calls in type positions" {
+    const source = "func use(value: choose(true)) int -> value";
+    var report = try parseReport(std.testing.allocator, 1, source);
+    defer report.deinit(std.testing.allocator);
+    const ast = &report.ast.?;
+    const binding = ast.nodes[ast.node_refs[ast.nodes[0].data.ref.start].index()];
+    const function = ast.nodes[binding.data.node_node.b.index()];
+    const signature = ast.nodes[function.data.node_node.a.index()];
+    const parameters = ast.nodes[signature.data.node_node.a.index()];
+    const parameter = ast.nodes[ast.node_refs[parameters.data.ref.start].index()];
+    const call = ast.nodes[parameter.data.node_node.b.index()];
+    try std.testing.expectEqual(Node.Tag.call, call.tag);
+    try std.testing.expectEqual(Node.Tag.identifier, ast.nodes[call.data.node_node.a.index()].tag);
+    try std.testing.expectEqual(Node.Tag.bool_literal, ast.nodes[ast.node_refs[ast.nodes[call.data.node_node.b.index()].data.ref.start].index()].tag);
 }
 
 test "parse struct declaration" {
