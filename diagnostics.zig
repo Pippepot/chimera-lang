@@ -380,7 +380,7 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
         .compile_time_integer_overflow => try writer.writeAll("integer overflow during compile-time execution"),
         .compile_time_call_trace => try writer.writeAll("called at compile time from here"),
         .struct_member_not_supported => try writer.writeAll("struct bodies currently support only fields and `move`, `copy`, or `drop` properties"),
-        .duplicate_struct_field => try writeSourceLabel(writer, "struct field is already declared", source, span),
+        .duplicate_struct_member => try writeSourceLabel(writer, "struct member is already declared", source, span),
         .duplicate_struct_property => try writeSourceLabel(writer, "struct ownership property is already declared", source, span),
         .unknown_struct_property => {
             try writeSourceLabel(writer, "unknown struct ownership property", source, span);
@@ -415,6 +415,7 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
         .function_annotation_not_supported => try writer.writeAll("type annotations on function bindings are not supported yet"),
         .parameter_mode_not_supported => try writer.writeAll("this parameter access mode is not supported yet"),
         .static_parameter_requires_specialization => try writer.writeAll("a function with static parameters must be called with compile-time arguments"),
+        .comptime_runtime_capture => try writer.writeAll("compile-time expressions cannot capture runtime locals"),
         .static_argument_not_supported => try writer.writeAll("this static argument is not supported yet"),
         .static_argument_type_mismatch => try writer.writeAll("static argument does not match the parameter type"),
         .duplicate_parameter => {
@@ -428,6 +429,12 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
         .continue_outside_loop => try writer.writeAll("continue is only allowed inside a loop"),
         .import_outside_top_level => try writer.writeAll("import is only allowed at the top level"),
         .misplaced_pub => try writer.writeAll("pub is only allowed on top-level static, function, struct, and import declarations"),
+        .namespace_used_as_value => try writer.writeAll("a module namespace is not a value"),
+        .unknown_namespace_member => try writeSourceLabel(writer, "unknown struct namespace member", source, span),
+        .unknown_module => try writeSourceLabel(writer, "unknown module", source, span),
+        .unknown_imported_name => try writeSourceLabel(writer, "unknown imported name", source, span),
+        .private_access => try writeSourceLabel(writer, "declaration is not public", source, span),
+        .import_conflict => try writeSourceLabel(writer, "imported name is already declared", source, span),
         .nested_declaration_not_supported => try writer.writeAll("nested declarations are not supported yet; move this declaration to the top level"),
         .ownership_transfer_requires_place => try writer.writeAll("`^` can only transfer a whole local binding"),
         .ownership_transfer_requires_owned_place => try writer.writeAll("cannot transfer this borrowed value; ownership remains with the caller"),
@@ -552,13 +559,26 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
     }
 }
 
+pub const DiagnosticSource = struct {
+    file_id: structures.FileId,
+    path: []const u8,
+    source: []const u8,
+};
+
+fn sourceFor(sources: []const DiagnosticSource, file_id: structures.FileId) DiagnosticSource {
+    for (sources) |candidate| if (candidate.file_id == file_id) return candidate;
+    unreachable; // Every diagnostic must have a registered source.
+}
+
 pub fn renderDiagnostic(
     types: anytype,
     writer: *std.Io.Writer,
-    source_path: []const u8,
-    source: []const u8,
+    sources: []const DiagnosticSource,
     diagnostic: structures.Diagnostic,
 ) !void {
+    const file = sourceFor(sources, diagnostic.file_id);
+    const source_path = file.path;
+    const source = file.source;
     const is_note = std.meta.activeTag(diagnostic.kind) == .compile_time_call_trace;
     const label = if (is_note) "\x1b[36mnote:\x1b[0m" else "\x1b[31merror:\x1b[0m";
     if (diagnostic.span) |span| {
@@ -589,19 +609,18 @@ pub fn renderDiagnostic(
 pub fn renderDiagnostics(
     types: anytype,
     writer: *std.Io.Writer,
-    source_path: []const u8,
-    source: []const u8,
+    sources: []const DiagnosticSource,
     diagnostics: []const structures.Diagnostic,
 ) !void {
     for (diagnostics) |diagnostic| {
         if (std.meta.activeTag(diagnostic.kind) == .compile_time_call_trace) continue;
-        try renderDiagnostic(types, writer, source_path, source, diagnostic);
+        try renderDiagnostic(types, writer, sources, diagnostic);
     }
     var index = diagnostics.len;
     while (index > 0) {
         index -= 1;
         const diagnostic = diagnostics[index];
         if (std.meta.activeTag(diagnostic.kind) != .compile_time_call_trace) continue;
-        try renderDiagnostic(types, writer, source_path, source, diagnostic);
+        try renderDiagnostic(types, writer, sources, diagnostic);
     }
 }

@@ -72,7 +72,9 @@ import physics.{Body as PhysicsBody}
 # importing them, so combining imports that share a prefix is harmless.
 # An alias replaces the qualification. A selective import introduces the
 # named declarations directly into file scope; an empty selective list is the
-# empty import.
+# empty import. A file may import its own module; the same visibility rules
+# apply. A selective item that resolves to a module binds its namespace for
+# qualification; namespaces never become values.
 # Module-qualified lookup is valid wherever the target is valid (type, value,
 # call, initializer head) and shares `.` syntax with struct namespaces. The
 # first identifier resolves normally, so a local shadows a module name with no
@@ -83,7 +85,7 @@ var body: physics.Body
 # import or alias must not collide with another visible non-import declaration
 # at the same file scope; locals inside functions may shadow imports. An exact
 # duplicate import is harmless; one name bound to different declarations is an
-# error.
+# error. A repeated binding to the same target merges, preserving an export.
 # Declarations are module-private by default: visible from every file of the
 # same module, inaccessible elsewhere. `pub` opens a top-level static,
 # function, struct, or import to importing modules; it is rejected on
@@ -417,7 +419,13 @@ static QAlias = Q
 # value.function(args) desugars to S.function(value, args), where value has
 # type S. Both forms obey the same argument access and ownership rules, and
 # evaluate the receiver and remaining arguments exactly once, left to right.
-# Detailed namespace lookup and name-conflict rules remain open.
+# Fields and ordinary namespace declarations share one name scope; duplicate
+# names are errors. Ownership properties use a separate hook scope. Within a
+# namespace declaration, unqualified names search its enclosing struct
+# namespaces before module declarations and the defining file's imports.
+# Generated namespaces retain the enclosing factory's static arguments; member
+# functions may also declare their own static parameters. Namespace declarations
+# do not contribute fields or execute when a struct value is initialized.
 
 # A struct cannot contain itself by value, directly or through other structs or
 # inline variants. Such cycles have no finite layout and are rejected. Callable

@@ -9,7 +9,11 @@ zig run main.zig -- example.chi
 zig run main.zig -- --debug=ast,ssa,asm,timing example.chi
 ```
 
-The CLI compiles one source file, writes `./prog`, runs it, and reports its exit code. Extra arguments after the source path are passed to the generated program.
+The CLI loads the entry directory tree, shares declarations within each module,
+compiles the designated entry file, writes `./prog`, runs it, and reports its exit
+code. Imports are file-scoped; qualified and selective names work in types,
+values, calls, and compile-time expressions. Only the designated file's top-level
+statements execute. Extra arguments after the source path are passed to the generated program.
 
 Top-level code is the entry point; a function named `main` is ordinary. The CLI itself exits with 0 after a normal program exit, or 1 on invalid arguments, source-read failure, source rejection, or compiler failure. It reports the program's status separately. A compile-time `exit(code)` is compiler control instead: it produces no executable and becomes the CLI's own process status.
 
@@ -40,6 +44,8 @@ zig test typing.zig
 zig test query_new_test.zig
 zig test codegen_new_test.zig
 zig test main.zig
+zig test modules.zig
+zig test modules_test.zig
 git diff --check
 ```
 

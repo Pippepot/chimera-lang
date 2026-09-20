@@ -629,11 +629,11 @@ fn FunctionEmitter(comptime Types: type) type {
             const offset = std.math.cast(u32, offset_usize) orelse return error.FunctionTooLarge;
             try self.encoder.movRaxImmediate64(0);
             try self.storeAddress(destination);
-            try self.appendRelocation(reference.target, offset, .address_absolute_64);
+            try self.appendRelocation(reference.instance(), offset, .address_absolute_64);
         }
 
-        fn appendRelocation(self: *Self, target: structures.ItemId, offset: u32, kind: structures.CompiledFunction.RelocationKind) !void {
-            const reference = try self.referenceIndex(.{ .item = target });
+        fn appendRelocation(self: *Self, target: structures.InstanceId, offset: u32, kind: structures.CompiledFunction.RelocationKind) !void {
+            const reference = try self.referenceIndex(target);
             try self.relocations.append(self.gpa, .{
                 .offset = offset,
                 .kind = kind,

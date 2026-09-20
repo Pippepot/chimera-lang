@@ -5,6 +5,8 @@
 ## Current foundation
 
 - Incremental queries preserve stable declaration and type identities, owned results, diagnostics, and equal-result retention.
+- Folder modules support shared declarations, file-scoped imports, public re-exports, qualified type/value/call lookup, entry-only execution, directory refresh, and file-aware CLI output. All module-spec slices are complete.
+- Struct namespace declarations support qualified calls and constants without affecting instance layout. Generated namespaces retain inherited static arguments; fields and ordinary declarations share a name scope, separate from ownership hooks.
 - Typing publishes one SSA control-flow graph with fallible edges, joins, loops, calls, callable values, variants, and divergence.
 - Structs have nominal identity, cycle-checked layout, source-ordered initialization, field access, field updates through mutable local roots, and validated move/copy/drop strategy overrides.
 - Function-valued struct properties receive stable owner-qualified item identities, reuse ordinary signature and body queries without entering module scope, and are validated against exact copy/move/drop signatures. Typing lowers custom hooks to ordinary direct calls, recursively composes fieldwise struct and active-variant operations, and suppresses redispatch only for compiler-generated plumbing inside the active hook.
@@ -58,19 +60,11 @@ recomputation. Keep unsupported forms rejected at their owning boundary.
 
 ## Ordered milestones
 
-### 1. Modules and struct namespaces
+### 1. Instance method calls
 
-- **Modules:** specify cross-file declarations, imports, qualified lookup,
-  visibility, and cycle rules. Preserve declaration identity and track source
-  dependencies across files. Start with the module support needed to organize
-  the standard library; package distribution can wait.
-- **Functions defined inside a struct namespace:** these are namespace
-  declarations; functions used with instance call syntax declare an explicit
-  receiver parameter. Implement the specified qualified-call desugaring and
-  ordinary argument modes. Resolve lookup and name conflicts before
-  implementation. Reuse owner-qualified
-  function identities while keeping ordinary namespace functions separate
-  from validated copy/move/drop properties and instance layout.
+- Qualified struct namespace calls are implemented. Add `value.function(args)`
+  desugaring to the existing namespace call with an explicit receiver parameter,
+  preserving argument modes, ownership, and evaluation order.
 
 ### 2. External declarations and standard-library bootstrap
 

@@ -80,7 +80,7 @@ pub fn execute(
                 .call => |call| if (try executeReturningCall(body, slots, call_scratch, destination, instruction_index, call.instance(), call.arguments, executor)) |result| return result,
                 .indirect_call => |call| {
                     const reference = slots[@intFromEnum(call.target)].runtime.function_ref;
-                    if (try executeReturningCall(body, slots, call_scratch, destination, instruction_index, .{ .item = reference.target }, call.arguments, executor)) |result| return result;
+                    if (try executeReturningCall(body, slots, call_scratch, destination, instruction_index, reference.instance(), call.arguments, executor)) |result| return result;
                 },
                 .variant_tag => |operand| switch (try variantTag(body, slots[@intFromEnum(operand)].runtime, operand, executor)) {
                     .returned => |value| slots[destination] = value,
@@ -144,7 +144,7 @@ pub fn execute(
             },
             .fallible_indirect_call => |fallible| {
                 const reference = slots[@intFromEnum(fallible.call.target)].runtime.function_ref;
-                switch (try executeFallibleCall(body, slots, call_scratch, .{ .item = reference.target }, fallible.call.arguments, fallible.success, fallible.failure, terminatorSpan(body, block_id), executor)) {
+                switch (try executeFallibleCall(body, slots, call_scratch, reference.instance(), fallible.call.arguments, fallible.success, fallible.failure, terminatorSpan(body, block_id), executor)) {
                     .next => |next| block_id = next,
                     .result => |result| return result,
                 }

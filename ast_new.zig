@@ -351,22 +351,22 @@ fn parseImport(parser: *ParserState) !Node.Index {
         target = try parser.addNode(.{ .tag = .as, .token_index = as_index, .data = .{ .node_node = .{ .a = target, .b = alias } } });
     }
     try parser.scratch_stack.append(parser.gpa, target);
-    if (!aliased and parser.eat(.period) != null) {
+    const selective = !aliased and parser.eat(.period) != null;
+    if (selective) {
         _ = try parser.expect(.l_brace);
         while (true) {
             if (parser.eat(.r_brace) != null) break;
-            try parser.scratch_stack.append(parser.gpa, try parseImportTarget(parser));
+            try parser.scratch_stack.append(parser.gpa, try parseImportName(parser));
             if (parser.eat(.comma) != null) continue;
             _ = try parser.expect(.r_brace);
             break;
         }
     }
-    return parser.addNode(.{ .tag = .import, .token_index = token_index, .data = try parser.listToSpan(parser.scratch_stack.items[stack_top..]) });
+    return parser.addNode(.{ .tag = if (selective) .selective_import else .import, .token_index = token_index, .data = try parser.listToSpan(parser.scratch_stack.items[stack_top..]) });
 }
 
-fn parseImportTarget(parser: *ParserState) !Node.Index {
+fn parseImportName(parser: *ParserState) !Node.Index {
     var target = try parseTokenNode(parser, .identifier, .identifier);
-    while (parser.tokens[parser.index].tag == .period) target = try parseFieldAccess(parser, target);
     if (parser.eat(.keyword_as) != null) {
         const as_index = parser.index - 1;
         const alias = try parseTokenNode(parser, .identifier, .identifier);
@@ -884,7 +884,7 @@ fn renderNode(gpa: std.mem.Allocator, node_index: Node.Index, ast: *const Ast, s
                 try renderNode(gpa, b, ast, source, writer, seen, new_indent, true, false);
             }
         },
-        .block, .call_arg_list, .param_list, .type_list, .type_variant, .if_else, .@"struct", .struct_init, .import => {
+        .block, .call_arg_list, .param_list, .type_list, .type_variant, .if_else, .@"struct", .struct_init, .import, .selective_import => {
             try writer.writeByte('\n');
             for (node.data.ref.start..node.data.ref.end) |i| {
                 try renderNode(gpa, ast.node_refs[i], ast, source, writer, seen, new_indent, i == node.data.ref.end - 1, false);
@@ -1913,7 +1913,7 @@ test "parse selective module import" {
     try testParsing(
         \\import physics.{Body, World}
     ,
-        \\import
+        \\selective_import
         \\├─identifier : physics
         \\├─identifier : Body
         \\└─identifier : World
@@ -1935,11 +1935,20 @@ test "parse selective module import with alias" {
     try testParsing(
         \\import physics.{Body as PhysicsBody}
     ,
-        \\import
+        \\selective_import
         \\├─identifier : physics
         \\└─as
         \\  ├─identifier : Body
         \\  └─identifier : PhysicsBody
+    );
+}
+
+test "parse empty selective import" {
+    try testParsing(
+        \\import physics.{}
+    ,
+        \\selective_import
+        \\└─identifier : physics
     );
 }
 
@@ -2020,6 +2029,16 @@ test "diagnostic tag for malformed struct item" {
         \\static S = struct
         \\  x int
     , .{ .expected_token = .{ .expected = .colon, .found = .identifier } });
+    try testExpectDiagnosticTag(
+        \\static S = struct
+        \\  pub x: int
+    , .{ .expected_token = .{ .expected = .identifier, .found = .keyword_pub } });
+}
+
+test "diagnostic tag for dotted selective imports" {
+    try testExpectDiagnosticTag(
+        \\import physics.{a.b}
+    , .{ .expected_token = .{ .expected = .r_brace, .found = .period } });
 }
 
 test "required expression failures stop at one diagnostic" {

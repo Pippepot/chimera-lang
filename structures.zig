@@ -219,6 +219,7 @@ pub const Node = struct {
         type_list,
         type_variant,
         import,
+        selective_import,
         @"pub",
         _,
     };
@@ -268,7 +269,7 @@ pub const Ast = struct {
                 .add, .sub, .mul, .div, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .@"and", .@"or", .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .call, .const_binding, .var_binding, .static_binding, .func, .param, .signature, .type_func, .@"if" => {
                     if (left.data.node_node.a != right.data.node_node.a or left.data.node_node.b != right.data.node_node.b) return false;
                 },
-                .block, .call_arg_list, .param_list, .type_list, .type_variant, .if_else, .@"struct", .struct_init, .import => {
+                .block, .call_arg_list, .param_list, .type_list, .type_variant, .if_else, .@"struct", .struct_init, .import, .selective_import => {
                     if (left.data.ref.start != right.data.ref.start or left.data.ref.end != right.data.ref.end) return false;
                 },
                 else => return false,
@@ -315,22 +316,18 @@ pub const ItemKind = enum {
     top_level_entry,
 };
 
-/// Identity is the owning module, owner, kind, and name. The current file
-/// is identity only for synthetic `$entry` items, which stay file-specific;
-/// for declared items it is a discovery hint and `ResolveItem` consults the
-/// per-file indexes for the current location.
+/// Interned identities contain no replaceable source locations.
 pub const ItemLoc = struct {
-    module: ModuleId,
-    file_id: FileId,
+    origin: union(enum) { module: ModuleId, entry: FileId },
     owner: ?ItemId = null,
     source_site: ?i64 = null,
+    is_hook: bool = false,
     kind: ItemKind,
     name: []const u8,
 
     pub fn eql(a: ItemLoc, b: ItemLoc) bool {
-        if (a.kind != b.kind or !std.mem.eql(u8, a.name, b.name)) return false;
-        if (a.kind == .top_level_entry) return a.file_id == b.file_id;
-        return a.module == b.module and a.owner == b.owner and a.source_site == b.source_site;
+        return std.meta.eql(a.origin, b.origin) and a.owner == b.owner and
+            a.source_site == b.source_site and a.is_hook == b.is_hook and a.kind == b.kind and std.mem.eql(u8, a.name, b.name);
     }
 };
 
@@ -338,6 +335,7 @@ pub const DiscoveredItem = struct {
     loc: ItemLoc,
     declaration: u32,
     parent: ?u32 = null,
+    is_public: bool = false,
 };
 
 pub const ItemTree = struct {
@@ -347,7 +345,7 @@ pub const ItemTree = struct {
     pub fn eql(a: ItemTree, b: ItemTree) bool {
         if (a.file_id != b.file_id or a.items.len != b.items.len) return false;
         for (a.items, b.items) |left, right| {
-            if (!ItemLoc.eql(left.loc, right.loc) or left.declaration != right.declaration or left.parent != right.parent) return false;
+            if (!ItemLoc.eql(left.loc, right.loc) or left.declaration != right.declaration or left.parent != right.parent or left.is_public != right.is_public) return false;
         }
         return true;
     }
@@ -394,6 +392,7 @@ pub const ModuleScope = struct {
         name: []const u8,
         item_id: ItemId,
         kind: ItemKind,
+        is_public: bool = false,
     };
 
     pub fn resolve(self: ModuleScope, name: []const u8) ?ItemId {
@@ -410,7 +409,7 @@ pub const ModuleScope = struct {
         return if (entry.kind == .static or entry.kind == .structure) entry.item_id else null;
     }
 
-    fn resolveEntry(self: ModuleScope, name: []const u8) ?Entry {
+    pub fn resolveEntry(self: ModuleScope, name: []const u8) ?Entry {
         const index = std.sort.binarySearch(Entry, self.entries, name, struct {
             fn compare(target: []const u8, entry: Entry) std.math.Order {
                 return std.mem.order(u8, target, entry.name);
@@ -422,7 +421,7 @@ pub const ModuleScope = struct {
     pub fn eql(a: ModuleScope, b: ModuleScope) bool {
         if (a.entries.len != b.entries.len) return false;
         for (a.entries, b.entries) |left, right| {
-            if (left.item_id != right.item_id or left.kind != right.kind or !std.mem.eql(u8, left.name, right.name)) return false;
+            if (left.item_id != right.item_id or left.kind != right.kind or left.is_public != right.is_public or !std.mem.eql(u8, left.name, right.name)) return false;
         }
         return true;
     }
@@ -430,6 +429,135 @@ pub const ModuleScope = struct {
     pub fn deinit(self: *ModuleScope, gpa: std.mem.Allocator) void {
         for (self.entries) |entry| gpa.free(entry.name);
         gpa.free(self.entries);
+        self.* = undefined;
+    }
+};
+
+pub const ModuleItemIndex = struct {
+    entries: []Entry,
+
+    pub const Entry = struct { item: ItemId, location: ResolvedItem };
+
+    pub fn resolve(self: ModuleItemIndex, item: ItemId) ?ResolvedItem {
+        const index = std.sort.binarySearch(Entry, self.entries, item, struct {
+            fn compare(target: ItemId, entry: Entry) std.math.Order {
+                return std.math.order(@intFromEnum(target), @intFromEnum(entry.item));
+            }
+        }.compare) orelse return null;
+        return self.entries[index].location;
+    }
+
+    pub fn eql(a: ModuleItemIndex, b: ModuleItemIndex) bool {
+        if (a.entries.len != b.entries.len) return false;
+        for (a.entries, b.entries) |left, right| if (!std.meta.eql(left, right)) return false;
+        return true;
+    }
+
+    pub fn deinit(self: *ModuleItemIndex, gpa: std.mem.Allocator) void {
+        gpa.free(self.entries);
+        self.* = undefined;
+    }
+};
+
+pub const ImportName = struct {
+    spelling: []const u8,
+    span: SourceSpan,
+
+    pub fn eql(a: ImportName, b: ImportName) bool {
+        return std.mem.eql(u8, a.spelling, b.spelling) and std.meta.eql(a.span, b.span);
+    }
+};
+
+/// Collected syntax owns every spelling; null and empty selections are distinct.
+pub const ImportDeclaration = struct {
+    path: ImportName,
+    alias: ?ImportName,
+    selective: ?[]Selection,
+    is_public: bool,
+
+    pub const Selection = struct { original: ImportName, bound: ImportName };
+
+    pub fn deinit(self: *ImportDeclaration, gpa: std.mem.Allocator) void {
+        gpa.free(self.path.spelling);
+        if (self.alias) |alias| gpa.free(alias.spelling);
+        if (self.selective) |items| {
+            for (items) |item| {
+                gpa.free(item.original.spelling);
+                gpa.free(item.bound.spelling);
+            }
+            gpa.free(items);
+        }
+        self.* = undefined;
+    }
+
+    pub fn eql(a: ImportDeclaration, b: ImportDeclaration) bool {
+        if (!ImportName.eql(a.path, b.path) or a.is_public != b.is_public) return false;
+        if ((a.alias == null) != (b.alias == null)) return false;
+        if (a.alias) |alias| if (!ImportName.eql(alias, b.alias.?)) return false;
+        if ((a.selective == null) != (b.selective == null)) return false;
+        if (a.selective) |items| {
+            if (items.len != b.selective.?.len) return false;
+            for (items, b.selective.?) |left, right| {
+                if (!ImportName.eql(left.original, right.original) or !ImportName.eql(left.bound, right.bound)) return false;
+            }
+        }
+        return true;
+    }
+};
+
+pub const ImportDeclarations = struct {
+    entries: []ImportDeclaration,
+
+    pub fn eql(a: ImportDeclarations, b: ImportDeclarations) bool {
+        if (a.entries.len != b.entries.len) return false;
+        for (a.entries, b.entries) |left, right| if (!ImportDeclaration.eql(left, right)) return false;
+        return true;
+    }
+
+    pub fn deinit(self: *ImportDeclarations, gpa: std.mem.Allocator) void {
+        for (self.entries) |*entry| entry.deinit(gpa);
+        gpa.free(self.entries);
+        self.* = undefined;
+    }
+};
+
+pub const NamespaceBinding = struct { module: ModuleId, members_visible: bool = true };
+
+pub const NameReference = union(enum) {
+    namespace: NamespaceBinding,
+    declaration: InstanceId,
+    constant: CompileTimeValueId,
+};
+
+pub const ImportTarget = union(enum) {
+    namespace: NamespaceBinding,
+    declaration: ItemId,
+};
+
+pub const FileImport = struct {
+    name: []const u8,
+    target: ImportTarget,
+    reexport: bool,
+};
+
+pub const FileImports = struct {
+    // Full unaliased paths permit child navigation; prefix bindings alone do not.
+    modules: []ModuleId,
+    imports: []FileImport,
+
+    pub fn eql(a: FileImports, b: FileImports) bool {
+        if (!std.mem.eql(ModuleId, a.modules, b.modules)) return false;
+        if (a.imports.len != b.imports.len) return false;
+        for (a.imports, b.imports) |left, right| {
+            if (!std.mem.eql(u8, left.name, right.name) or left.reexport != right.reexport or !std.meta.eql(left.target, right.target)) return false;
+        }
+        return true;
+    }
+
+    pub fn deinit(self: *FileImports, gpa: std.mem.Allocator) void {
+        for (self.imports) |binding| gpa.free(binding.name);
+        gpa.free(self.imports);
+        gpa.free(self.modules);
         self.* = undefined;
     }
 };
@@ -808,9 +936,11 @@ pub const FunctionParameterShape = struct {
 /// static parameters and does not require dependent runtime types to have been
 /// substituted yet.
 pub const FunctionShape = struct {
+    returns_type: bool = false,
     parameters: []const FunctionParameterShape,
 
     pub fn eql(a: FunctionShape, b: FunctionShape) bool {
+        if (a.returns_type != b.returns_type) return false;
         if (a.parameters.len != b.parameters.len) return false;
         for (a.parameters, b.parameters) |left, right| {
             if (!std.meta.eql(left, right)) return false;
@@ -843,7 +973,12 @@ pub const IndirectFunctionCall = struct {
 
 pub const FunctionReference = struct {
     target: ItemId,
+    specialization: ?CompileTimeValueTupleId = null,
     type_id: TypeId,
+
+    pub fn instance(self: FunctionReference) InstanceId {
+        return .{ .item = self.target, .specialization = self.specialization };
+    }
 };
 
 pub const VariantOperation = struct {
@@ -1166,7 +1301,7 @@ pub const Diagnostic = struct {
         compile_time_integer_overflow,
         compile_time_call_trace,
         struct_member_not_supported,
-        duplicate_struct_field,
+        duplicate_struct_member,
         duplicate_struct_property,
         unknown_struct_property,
         invalid_struct_property_value: InvalidStructPropertyValue,
@@ -1181,6 +1316,7 @@ pub const Diagnostic = struct {
         parameter_mode_not_supported,
         static_parameter_requires_specialization,
         static_argument_not_supported,
+        comptime_runtime_capture,
         static_argument_type_mismatch,
         duplicate_parameter,
         parameter_type_missing,
@@ -1191,6 +1327,12 @@ pub const Diagnostic = struct {
         continue_outside_loop,
         import_outside_top_level,
         misplaced_pub,
+        namespace_used_as_value,
+        unknown_namespace_member,
+        unknown_module,
+        unknown_imported_name,
+        private_access,
+        import_conflict,
         nested_declaration_not_supported,
         ownership_transfer_requires_place,
         ownership_transfer_requires_owned_place,

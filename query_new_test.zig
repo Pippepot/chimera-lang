@@ -47,8 +47,39 @@ fn addModuleFile(db: *Database, file_id: structures.FileId, module_path: []const
     return module;
 }
 
+const ReadModuleCatalog = struct {
+    pub const Input = void;
+    pub const Output = struct {
+        modules: []structures.ModuleId,
+
+        pub fn eql(a: @This(), b: @This()) bool {
+            return std.mem.eql(structures.ModuleId, a.modules, b.modules);
+        }
+
+        pub fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
+            gpa.free(self.modules);
+            self.* = undefined;
+        }
+    };
+
+    pub fn run(ctx: anytype, _: void) !Output {
+        return .{ .modules = try ctx.allocator().dupe(structures.ModuleId, (try ctx.input(query_structures.ModuleCatalog, {})).*) };
+    }
+};
+
 fn addModuleMembers(db: *Database, module: structures.ModuleId, files: []const structures.FileId) !void {
     try db.addInput(query_structures.ModuleMembers, module, files);
+    db.addInput(query_structures.ModuleCatalog, {}, &.{module}) catch |err| switch (err) {
+        error.DuplicateInput => {
+            const catalog = (try db.get(ReadModuleCatalog, {})).modules;
+            const updated = try db.allocator.alloc(structures.ModuleId, catalog.len + 1);
+            defer db.allocator.free(updated);
+            @memcpy(updated[0..catalog.len], catalog);
+            updated[catalog.len] = module;
+            try db.setInput(query_structures.ModuleCatalog, {}, updated);
+        },
+        else => return err,
+    };
 }
 
 fn setSource(db: *Database, file_id: structures.FileId, source: []const u8) !void {
@@ -520,8 +551,7 @@ const InternItemLoc = struct {
     pub fn run(ctx: *Context, input_value: Input) anyerror!Output {
         const module = try ctx.intern(query_structures.ModulePaths, .{ .path = "" });
         return ctx.intern(query_structures.ItemLocations, .{
-            .module = module,
-            .file_id = 1,
+            .origin = .{ .module = module },
             .kind = .function,
             .name = if (input_value % 2 == 0) "even" else "odd",
         });
@@ -769,6 +799,20 @@ test "relocating a declaration between files preserves identity" {
     try testing.expectEqual(@as(usize, 0), diagnostics.len);
 }
 
+test "removed files stop resolving declarations" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    const module = try addModuleFile(db, 1, "physics", "static answer = 40");
+    _ = try addModuleFile(db, 2, "physics", "exit(answer)");
+    try addModuleMembers(db, module, &.{ 1, 2 });
+    const answer = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolve("answer").?;
+    try testing.expectEqual(@as(structures.FileId, 1), (try db.get(query_structures.ResolveItem, answer)).*.?.file_id);
+
+    try db.setInput(query_structures.ModuleMembers, module, &.{});
+    try testing.expect((try db.get(query_structures.ResolveItem, answer)).* == null);
+}
+
 test "module membership updates change the visible scope" {
     const db = try testDatabase(1);
     defer db.deinit();
@@ -807,6 +851,409 @@ test "registered empty modules exist without members" {
 
     const missing = try db.intern(query_structures.ModulePaths, .{ .path = "missing" });
     try testing.expectError(error.InputNotFound, db.get(query_structures.ModuleDeclarations, missing));
+}
+
+test "import forms bind namespaces and declarations" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    const physics = try addModuleFile(db, 1, "physics",
+        \\pub static Pub = 1
+        \\static Priv = 2
+    );
+    const entry = try addModuleFile(db, 2, "",
+        \\import physics
+        \\import physics as phys
+        \\import physics.{Pub}
+        \\import physics.{Pub as Renamed}
+    );
+    try addModuleMembers(db, physics, &.{1});
+    try addModuleMembers(db, entry, &.{2});
+    const bindings = (try db.get(query_structures.ResolveFileImports, 2)).*.?;
+    try testing.expectEqual(@as(usize, 1), bindings.modules.len);
+    try testing.expectEqual(physics, bindings.modules[0]);
+    try testing.expectEqual(@as(usize, 4), bindings.imports.len);
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const pub_id = scope.resolve("Pub").?;
+    try testing.expectEqualStrings("phys", bindings.imports[2].name);
+    try testing.expectEqual(structures.ImportTarget{ .namespace = .{ .module = physics } }, bindings.imports[2].target);
+    try testing.expectEqualStrings("Pub", bindings.imports[0].name);
+    try testing.expectEqual(structures.ImportTarget{ .declaration = pub_id }, bindings.imports[0].target);
+    try testing.expectEqualStrings("Renamed", bindings.imports[1].name);
+    try testing.expectEqual(structures.ImportTarget{ .declaration = pub_id }, bindings.imports[1].target);
+    for (bindings.imports) |binding| try testing.expect(!binding.reexport);
+    const diagnostics = try db.transitiveAccumulatorValues(query_structures.ResolveFileImports, 2, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 0), diagnostics.len);
+}
+
+test "unknown modules and names are rejected at the import" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    const physics = try addModuleFile(db, 1, "physics", "pub static Pub = 1");
+    const entry = try addModuleFile(db, 2, "", "import nosuch");
+    try addModuleMembers(db, physics, &.{1});
+    try addModuleMembers(db, entry, &.{2});
+    try testing.expect((try db.get(query_structures.ResolveFileImports, 2)).* == null);
+    try expectSingleQueryDiagnostic(db, query_structures.ResolveFileImports, 2, true, 2, .{
+        .start = "import ".len,
+        .end = "import nosuch".len,
+    }, .unknown_module);
+
+    try setSource(db, 2, "import physics.{Nope}");
+    try testing.expect((try db.get(query_structures.ResolveFileImports, 2)).* == null);
+    const source = "import physics.{Nope}";
+    const start = std.mem.indexOf(u8, source, "Nope").?;
+    try expectSingleQueryDiagnostic(db, query_structures.ResolveFileImports, 2, true, 2, .{
+        .start = start,
+        .end = start + "Nope".len,
+    }, .unknown_imported_name);
+}
+
+test "private declarations are rejected at the import" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    const physics = try addModuleFile(db, 1, "physics", "static Priv = 2");
+    const entry = try addModuleFile(db, 2, "", "import physics.{Priv}");
+    try addModuleMembers(db, physics, &.{1});
+    try addModuleMembers(db, entry, &.{2});
+    try testing.expect((try db.get(query_structures.ResolveFileImports, 2)).* == null);
+    const source = "import physics.{Priv}";
+    const start = std.mem.indexOf(u8, source, "Priv").?;
+    try expectSingleQueryDiagnostic(db, query_structures.ResolveFileImports, 2, true, 2, .{
+        .start = start,
+        .end = start + "Priv".len,
+    }, .private_access);
+}
+
+test "conflicting imports are rejected" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    const physics = try addModuleFile(db, 1, "physics", "pub static Pub = 1");
+    const other = try addModuleFile(db, 2, "other", "pub static Pub = 2");
+    const entry = try addModuleFile(db, 3, "", "static Pub = 0\nimport physics.{Pub}");
+    try addModuleMembers(db, physics, &.{1});
+    try addModuleMembers(db, other, &.{2});
+    try addModuleMembers(db, entry, &.{3});
+    try testing.expect((try db.get(query_structures.ResolveFileImports, 3)).* == null);
+    const start = ("static Pub = 0\n").len + std.mem.indexOf(u8, "import physics.{Pub}", "Pub").?;
+    try expectSingleQueryDiagnostic(db, query_structures.ResolveFileImports, 3, true, 3, .{
+        .start = start,
+        .end = start + "Pub".len,
+    }, .import_conflict);
+
+    try setSource(db, 3, "import physics.{Pub}\nimport other.{Pub}");
+    try testing.expect((try db.get(query_structures.ResolveFileImports, 3)).* == null);
+    const second = "import other.{Pub}";
+    const other_start = ("import physics.{Pub}\n").len + std.mem.indexOf(u8, second, "Pub").?;
+    try expectSingleQueryDiagnostic(db, query_structures.ResolveFileImports, 3, true, 3, .{
+        .start = other_start,
+        .end = other_start + "Pub".len,
+    }, .import_conflict);
+}
+
+test "exact duplicate imports merge harmlessly" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    const physics = try addModuleFile(db, 1, "physics", "pub static Pub = 1");
+    const entry = try addModuleFile(db, 2, "",
+        \\import physics
+        \\import physics
+        \\import physics.{Pub}
+        \\import physics.{Pub}
+        \\pub import physics.{Pub}
+    );
+    try addModuleMembers(db, physics, &.{1});
+    try addModuleMembers(db, entry, &.{2});
+    const bindings = (try db.get(query_structures.ResolveFileImports, 2)).*.?;
+    try testing.expectEqual(@as(usize, 1), bindings.modules.len);
+    try testing.expectEqual(@as(usize, 2), bindings.imports.len);
+    try testing.expectEqualStrings("Pub", bindings.imports[0].name);
+    try testing.expect(bindings.imports[0].reexport);
+    const diagnostics = try db.transitiveAccumulatorValues(query_structures.ResolveFileImports, 2, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 0), diagnostics.len);
+}
+
+test "reexport chains share declaration identity" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    const inner = try addModuleFile(db, 1, "inner", "pub static X = 1");
+    const middle = try addModuleFile(db, 2, "middle", "pub import inner.{X}");
+    const entry = try addModuleFile(db, 3, "", "import middle.{X}");
+    try addModuleMembers(db, inner, &.{1});
+    try addModuleMembers(db, middle, &.{2});
+    try addModuleMembers(db, entry, &.{3});
+    const bindings = (try db.get(query_structures.ResolveFileImports, 3)).*.?;
+    const expected = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolve("X").?;
+    try testing.expectEqual(@as(usize, 1), bindings.imports.len);
+    try testing.expectEqual(structures.ImportTarget{ .declaration = expected }, bindings.imports[0].target);
+}
+
+test "reexported modules bind namespaces" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    const inner = try addModuleFile(db, 1, "inner", "pub static X = 1");
+    const middle = try addModuleFile(db, 2, "middle", "pub import inner\npub import inner as See");
+    const entry = try addModuleFile(db, 3, "", "import middle.{inner}\nimport middle.{See}");
+    try addModuleMembers(db, inner, &.{1});
+    try addModuleMembers(db, middle, &.{2});
+    try addModuleMembers(db, entry, &.{3});
+    const bindings = (try db.get(query_structures.ResolveFileImports, 3)).*.?;
+    try testing.expectEqual(@as(usize, 2), bindings.imports.len);
+    try testing.expectEqual(structures.ImportTarget{ .namespace = .{ .module = inner } }, bindings.imports[0].target);
+    try testing.expectEqual(structures.ImportTarget{ .namespace = .{ .module = inner } }, bindings.imports[1].target);
+}
+
+test "cyclic module imports resolve without semantic cycles" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    const first = try addModuleFile(db, 1, "first", "import second\npub static X = 1");
+    const second = try addModuleFile(db, 2, "second", "import first\npub static Y = 2");
+    try addModuleMembers(db, first, &.{1});
+    try addModuleMembers(db, second, &.{2});
+    const first_bindings = (try db.get(query_structures.ResolveFileImports, 1)).*.?;
+    try testing.expectEqual(@as(usize, 1), first_bindings.modules.len);
+    try testing.expectEqual(second, first_bindings.modules[0]);
+    const second_bindings = (try db.get(query_structures.ResolveFileImports, 2)).*.?;
+    try testing.expectEqual(first, second_bindings.modules[0]);
+    for ([2]structures.FileId{ 1, 2 }) |file_id| {
+        const diagnostics = try db.transitiveAccumulatorValues(query_structures.ResolveFileImports, file_id, structures.Diagnostic, testing.allocator);
+        defer freeDiagnostics(diagnostics);
+        try testing.expectEqual(@as(usize, 0), diagnostics.len);
+    }
+}
+
+test "conflicting reexports from different files are rejected" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    const a = try addModuleFile(db, 1, "a", "pub static X = 1");
+    const b = try addModuleFile(db, 2, "b", "pub static X = 2");
+    const middle = try addModuleFile(db, 3, "middle", "pub import a.{X}");
+    _ = try addModuleFile(db, 4, "middle", "pub import b.{X}");
+    const entry = try addModuleFile(db, 5, "", "import middle.{X}");
+    try addModuleMembers(db, a, &.{1});
+    try addModuleMembers(db, b, &.{2});
+    try addModuleMembers(db, middle, &.{ 3, 4 });
+    try addModuleMembers(db, entry, &.{5});
+    const source = "import middle.{X}";
+    const start = std.mem.indexOf(u8, source, "X}").?;
+    const span = structures.SourceSpan{ .start = start, .end = start + 1 };
+    try testing.expect((try db.get(query_structures.ResolveFileImports, 5)).* == null);
+    try expectSingleQueryDiagnostic(db, query_structures.ResolveFileImports, 5, true, 5, span, .import_conflict);
+
+    try db.setInput(query_structures.ModuleMembers, middle, &.{ 4, 3 });
+    try testing.expect((try db.get(query_structures.ResolveFileImports, 5)).* == null);
+    try expectSingleQueryDiagnostic(db, query_structures.ResolveFileImports, 5, true, 5, span, .import_conflict);
+}
+
+test "reexport loops are declaration cycles" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    const cycle = try addModuleFile(db, 1, "cycle", "pub import cycle.{X}");
+    _ = try addModuleFile(db, 2, "cycle", "import cycle.{X}");
+    try addModuleMembers(db, cycle, &.{ 1, 2 });
+    try testing.expect((try db.get(query_structures.ResolveFileImports, 2)).* == null);
+    const source = "import cycle.{X}";
+    const start = std.mem.indexOf(u8, source, "X}").?;
+    try expectSingleQueryDiagnostic(db, query_structures.ResolveFileImports, 2, true, 2, .{
+        .start = start,
+        .end = start + 1,
+    }, .declaration_cycle);
+}
+
+test "self imports bind uniformly" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    const physics = try addModuleFile(db, 1, "physics", "import physics\npub static Pub = 1");
+    try addModuleMembers(db, physics, &.{1});
+    const bindings = (try db.get(query_structures.ResolveFileImports, 1)).*.?;
+    try testing.expectEqual(@as(usize, 1), bindings.modules.len);
+    try testing.expectEqual(physics, bindings.modules[0]);
+    try testing.expectEqual(@as(usize, 1), bindings.imports.len);
+}
+
+test "module catalog additions and removals invalidate missing imports" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    const entry = try addModuleFile(db, 1, "", "import missing");
+    try addModuleMembers(db, entry, &.{1});
+    try testing.expect((try db.get(query_structures.ResolveFileImports, 1)).* == null);
+    const missing = try db.intern(query_structures.ModulePaths, .{ .path = "missing" });
+    try addModuleMembers(db, missing, &.{});
+    try testing.expect((try db.get(query_structures.ResolveFileImports, 1)).* != null);
+    try db.setInput(query_structures.ModuleCatalog, {}, &.{entry});
+    try testing.expect((try db.get(query_structures.ResolveFileImports, 1)).* == null);
+    try expectSingleQueryDiagnostic(db, query_structures.ResolveFileImports, 1, true, 1, .{ .start = 7, .end = 14 }, .unknown_module);
+}
+
+test "empty selective imports neither bind nor reexport a namespace" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    const a = try addModuleFile(db, 1, "a", "");
+    const middle = try addModuleFile(db, 2, "middle", "pub import a.{}");
+    const entry = try addModuleFile(db, 3, "", "import middle.{a}");
+    try addModuleMembers(db, a, &.{1});
+    try addModuleMembers(db, middle, &.{2});
+    try addModuleMembers(db, entry, &.{3});
+    const empty = (try db.get(query_structures.ResolveFileImports, 2)).*.?;
+    try testing.expectEqual(@as(usize, 0), empty.modules.len);
+    try testing.expectEqual(@as(usize, 0), empty.imports.len);
+    try testing.expect((try db.get(query_structures.ResolveFileImports, 3)).* == null);
+    try expectSingleQueryDiagnostic(db, query_structures.ResolveFileImports, 3, true, 3, .{ .start = 15, .end = 16 }, .unknown_imported_name);
+}
+
+test "whole module imports obey the same conflicts as aliases" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    const a = try addModuleFile(db, 1, "a", "");
+    const b = try addModuleFile(db, 2, "b", "");
+    const entry = try addModuleFile(db, 3, "", "");
+    try addModuleMembers(db, a, &.{1});
+    try addModuleMembers(db, b, &.{2});
+    try addModuleMembers(db, entry, &.{3});
+    for ([_][]const u8{
+        "import a\nimport b as a",
+        "import b as a\nimport a",
+        "static a = 1\nimport a",
+    }) |source| {
+        try setSource(db, 3, source);
+        try testing.expect((try db.get(query_structures.ResolveFileImports, 3)).* == null);
+        const diagnostics = try db.transitiveAccumulatorValues(query_structures.ResolveFileImports, 3, structures.Diagnostic, testing.allocator);
+        defer freeDiagnostics(diagnostics);
+        try testing.expectEqual(@as(usize, 1), diagnostics.len);
+        try testing.expectEqual(DiagnosticKind.import_conflict, std.meta.activeTag(diagnostics[0].kind));
+    }
+}
+
+test "namespace prefixes do not grant parent members and imports merge permissions" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+    const physics = try db.intern(query_structures.ModulePaths, .{ .path = "physics" });
+    const collision = try db.intern(query_structures.ModulePaths, .{ .path = "physics.collision" });
+    const world = try db.intern(query_structures.ModulePaths, .{ .path = "physics.world" });
+    const entry = try addModuleFile(db, 1, "", "pub import physics.collision\nimport physics.world");
+    try addModuleMembers(db, physics, &.{});
+    try addModuleMembers(db, collision, &.{});
+    try addModuleMembers(db, world, &.{});
+    try addModuleMembers(db, entry, &.{1});
+    const before = (try db.get(query_structures.ResolveFileImports, 1)).*.?;
+    try testing.expectEqual(@as(usize, 2), before.modules.len);
+    try testing.expectEqual(@as(usize, 1), before.imports.len);
+    try testing.expectEqualStrings("physics", before.imports[0].name);
+    try testing.expectEqual(structures.ImportTarget{ .namespace = .{ .module = physics, .members_visible = false } }, before.imports[0].target);
+    // A namespace alias to the same root explicitly grants its members.
+    try setSource(db, 1, "import physics.collision\nimport physics as physics");
+    const after = (try db.get(query_structures.ResolveFileImports, 1)).*.?;
+    try testing.expectEqual(structures.ImportTarget{ .namespace = .{ .module = physics } }, after.imports[0].target);
+    try testing.expectEqual(@as(usize, 1), after.imports.len);
+}
+
+test "equivalent import order retains the resolved allocation" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    const a = try addModuleFile(db, 1, "a", "pub static X = 1\npub static Y = 2");
+    const entry = try addModuleFile(db, 2, "", "import a\nimport a.{X, Y}");
+    try addModuleMembers(db, a, &.{1});
+    try addModuleMembers(db, entry, &.{2});
+    const before = try db.get(query_structures.ResolveFileImports, 2);
+    try setSource(db, 2, "import a.{Y}\nimport a.{X}\nimport a\nimport a");
+    try testing.expectEqual(before, try db.get(query_structures.ResolveFileImports, 2));
+}
+
+test "reexport diamonds merge equal identities without false cycles" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+    const a = try addModuleFile(db, 1, "a", "pub struct X\n  value: int");
+    const b = try addModuleFile(db, 2, "b", "pub import a.{X}");
+    const c = try addModuleFile(db, 3, "c", "pub import a.{X}");
+    const middle = try addModuleFile(db, 4, "middle", "pub import b.{X}\npub import c.{X}");
+    const entry = try addModuleFile(db, 5, "", "import middle.{X}");
+    try addModuleMembers(db, a, &.{1});
+    try addModuleMembers(db, b, &.{2});
+    try addModuleMembers(db, c, &.{3});
+    try addModuleMembers(db, middle, &.{4});
+    try addModuleMembers(db, entry, &.{5});
+    const expected = (try db.get(query_structures.ModuleDeclarations, a)).*.?.resolve("X").?;
+    const resolved = (try db.get(query_structures.ResolveFileImports, 5)).*.?;
+    try testing.expectEqual(structures.ImportTarget{ .declaration = expected }, resolved.imports[0].target);
+}
+
+test "reexport failures never publish a successful partial binding" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    const a = try addModuleFile(db, 1, "a", "pub static X = 1\npub static Y = 2");
+    const middle = try addModuleFile(db, 2, "middle", "");
+    const entry = try addModuleFile(db, 3, "", "import middle.{X}");
+    try addModuleMembers(db, a, &.{1});
+    try addModuleMembers(db, middle, &.{2});
+    try addModuleMembers(db, entry, &.{3});
+    for ([_]struct { source: []const u8, kind: DiagnosticKind }{
+        .{ .source = "pub import a.{X as X, Y as X}", .kind = .import_conflict },
+        .{ .source = "pub static X = 0\npub import a.{X}", .kind = .import_conflict },
+        .{ .source = "pub import a.{X}\npub import middle.{X}", .kind = .declaration_cycle },
+        .{ .source = "pub import middle.{X}\npub import a.{X}", .kind = .declaration_cycle },
+        .{ .source = "pub import a.{X}\npub import absent.{X}", .kind = .unknown_module },
+        .{ .source = "pub import a.{Missing as X}", .kind = .unknown_imported_name },
+    }) |case| {
+        try setSource(db, 2, case.source);
+        try testing.expect((try db.get(query_structures.ResolveFileImports, 3)).* == null);
+        const diagnostics = try db.transitiveAccumulatorValues(query_structures.ResolveFileImports, 3, structures.Diagnostic, testing.allocator);
+        defer freeDiagnostics(diagnostics);
+        try testing.expectEqual(@as(usize, 1), diagnostics.len);
+        try testing.expectEqual(case.kind, std.meta.activeTag(diagnostics[0].kind));
+    }
+}
+
+test "item relocation drops dependencies on removed source files" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    const module = try addModuleFile(db, 1, "a", "static X = 1");
+    _ = try addModuleFile(db, 2, "a", "");
+    try addModuleMembers(db, module, &.{1});
+    const item = (try db.get(query_structures.ModuleDeclarations, module)).*.?.resolve("X").?;
+    try testing.expectEqual(@as(structures.FileId, 1), (try db.get(query_structures.ResolveItem, item)).*.?.file_id);
+    try setSource(db, 1, "static =");
+    try setSource(db, 2, "static X = 1");
+    try db.setInput(query_structures.ModuleMembers, module, &.{2});
+    try testing.expectEqual(@as(structures.FileId, 2), (try db.get(query_structures.ResolveItem, item)).*.?.file_id);
+    const diagnostics = try db.transitiveAccumulatorValues(query_structures.ResolveItem, item, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 0), diagnostics.len);
+    const other = try db.intern(query_structures.ModulePaths, .{ .path = "other" });
+    try db.setInput(query_structures.FileModule, 2, other);
+    try db.setInput(query_structures.ModuleMembers, module, &.{});
+    try addModuleMembers(db, other, &.{2});
+    try testing.expect((try db.get(query_structures.ResolveItem, item)).* == null);
+    const moved = (try db.get(query_structures.ModuleDeclarations, other)).*.?.resolve("X").?;
+    try testing.expect(item != moved);
+}
+
+test "import resolution cleans up every allocation failure" {
+    try testing.checkAllAllocationFailures(testing.allocator, testImportAllocations, .{});
+}
+
+fn testImportAllocations(gpa: std.mem.Allocator) !void {
+    const db = try Database.init(gpa, .{ .worker_count = 1 });
+    defer db.deinit();
+    const a = try addModuleFile(db, 1, "a", "pub static X = 1");
+    const middle = try addModuleFile(db, 2, "middle", "pub import a.{X}");
+    const entry = try addModuleFile(db, 3, "", "import a\nimport a as Alias\nimport middle.{X as Value}");
+    try db.addInput(query_structures.ModuleMembers, a, &.{1});
+    try db.addInput(query_structures.ModuleMembers, middle, &.{2});
+    try db.addInput(query_structures.ModuleMembers, entry, &.{3});
+    try db.addInput(query_structures.ModuleCatalog, {}, &.{ a, middle, entry });
+    try testing.expect((try db.get(query_structures.ResolveFileImports, 3)).* != null);
 }
 
 test "dependency cycles are reported" {
@@ -1143,14 +1590,14 @@ test "struct definitions reject duplicate and unsupported members" {
         \\  value: int
         \\  value: bool
         \\static Unsupported = struct
-        \\  func nested() -> return
+        \\  const nested = 1
     );
     const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
     const duplicate = scope.resolveStatic("Duplicate").?;
     try testing.expect((try db.get(query_structures.StructDefinition, duplicate)).* == null);
     var diagnostics = try db.transitiveAccumulatorValues(query_structures.StructDefinition, duplicate, structures.Diagnostic, testing.allocator);
     try testing.expectEqual(@as(usize, 1), diagnostics.len);
-    try testing.expectEqual(DiagnosticKind.duplicate_struct_field, std.meta.activeTag(diagnostics[0].kind));
+    try testing.expectEqual(DiagnosticKind.duplicate_struct_member, std.meta.activeTag(diagnostics[0].kind));
     freeDiagnostics(diagnostics);
 
     const unsupported = scope.resolveStatic("Unsupported").?;
@@ -2758,16 +3205,16 @@ test "item indexing handles empty malformed missing and duplicate inputs" {
 
     const entry_module = try db.intern(query_structures.ModulePaths, .{ .path = "" });
     const other_module = try db.intern(query_structures.ModulePaths, .{ .path = "other" });
-    const base: structures.ItemLoc = .{ .module = entry_module, .file_id = 8, .kind = .function, .name = "same" };
+    const base: structures.ItemLoc = .{ .origin = .{ .module = entry_module }, .kind = .function, .name = "same" };
     const base_id = try db.intern(query_structures.ItemLocations, base);
     try testing.expectEqual(base_id, try db.intern(query_structures.ItemLocations, base));
-    try testing.expectEqual(base_id, try db.intern(query_structures.ItemLocations, .{ .module = entry_module, .file_id = 9, .kind = .function, .name = "same" }));
-    try testing.expect(base_id != try db.intern(query_structures.ItemLocations, .{ .module = other_module, .file_id = 8, .kind = .function, .name = "same" }));
-    try testing.expect(base_id != try db.intern(query_structures.ItemLocations, .{ .module = entry_module, .file_id = 8, .kind = .top_level_entry, .name = "same" }));
-    try testing.expect(base_id != try db.intern(query_structures.ItemLocations, .{ .module = entry_module, .file_id = 8, .kind = .function, .name = "other" }));
-    const entry_id = try db.intern(query_structures.ItemLocations, .{ .module = entry_module, .file_id = 8, .kind = .top_level_entry, .name = "$entry" });
-    try testing.expectEqual(entry_id, try db.intern(query_structures.ItemLocations, .{ .module = other_module, .file_id = 8, .kind = .top_level_entry, .name = "$entry" }));
-    try testing.expect(entry_id != try db.intern(query_structures.ItemLocations, .{ .module = entry_module, .file_id = 9, .kind = .top_level_entry, .name = "$entry" }));
+    try testing.expectEqual(base_id, try db.intern(query_structures.ItemLocations, .{ .origin = .{ .module = entry_module }, .kind = .function, .name = "same" }));
+    try testing.expect(base_id != try db.intern(query_structures.ItemLocations, .{ .origin = .{ .module = other_module }, .kind = .function, .name = "same" }));
+    try testing.expect(base_id != try db.intern(query_structures.ItemLocations, .{ .origin = .{ .entry = 8 }, .kind = .top_level_entry, .name = "same" }));
+    try testing.expect(base_id != try db.intern(query_structures.ItemLocations, .{ .origin = .{ .module = entry_module }, .kind = .function, .name = "other" }));
+    const entry_id = try db.intern(query_structures.ItemLocations, .{ .origin = .{ .entry = 8 }, .kind = .top_level_entry, .name = "$entry" });
+    try testing.expectEqual(entry_id, try db.intern(query_structures.ItemLocations, .{ .origin = .{ .entry = 8 }, .kind = .top_level_entry, .name = "$entry" }));
+    try testing.expect(entry_id != try db.intern(query_structures.ItemLocations, .{ .origin = .{ .entry = 9 }, .kind = .top_level_entry, .name = "$entry" }));
     try testing.expectError(error.InvalidInternId, db.lookupInterned(query_structures.ItemLocations, @enumFromInt(std.math.maxInt(u32))));
 }
 
@@ -4027,7 +4474,7 @@ test "comptime expressions cannot capture runtime locals" {
     const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, bad, structures.Diagnostic, testing.allocator);
     defer freeDiagnostics(diagnostics);
     try testing.expectEqual(@as(usize, 1), diagnostics.len);
-    try testing.expectEqual(DiagnosticKind.unknown_value, std.meta.activeTag(diagnostics[0].kind));
+    try testing.expectEqual(DiagnosticKind.comptime_runtime_capture, std.meta.activeTag(diagnostics[0].kind));
 }
 
 test "compile-time division errors point at the executed instruction" {
@@ -8115,6 +8562,12 @@ test "top-level imports and public markers leave entry analysis unchanged" {
     const db = try testDatabase(1);
     defer db.deinit();
 
+    const physics_module = try db.intern(query_structures.ModulePaths, .{ .path = "physics" });
+    const math_module = try db.intern(query_structures.ModulePaths, .{ .path = "math" });
+    _ = try addModuleFile(db, 2, "physics", "pub struct Body\n  x: int");
+    _ = try addModuleFile(db, 3, "math", "pub struct Vec3\n  x: int");
+    try addModuleMembers(db, physics_module, &.{2});
+    try addModuleMembers(db, math_module, &.{3});
     try addSource(db, 1,
         \\import physics
         \\import physics.{Body}
@@ -8185,7 +8638,7 @@ test "public runtime bindings are rejected" {
     }, .misplaced_pub);
 }
 
-test "qualified types need module resolution" {
+test "qualified types require a visible namespace" {
     const db = try testDatabase(1);
     defer db.deinit();
 
@@ -8196,7 +8649,7 @@ test "qualified types need module resolution" {
     const diagnostics = try db.transitiveAccumulatorValues(query_structures.FunctionSignature, function, structures.Diagnostic, testing.allocator);
     defer freeDiagnostics(diagnostics);
     try testing.expectEqual(@as(usize, 1), diagnostics.len);
-    try testing.expectEqual(DiagnosticKind.parameter_type_not_supported, std.meta.activeTag(diagnostics[0].kind));
+    try testing.expectEqual(DiagnosticKind.unknown_type, std.meta.activeTag(diagnostics[0].kind));
 }
 
 test "entry call lookup reports only the demanded resolution failure" {
@@ -9051,8 +9504,7 @@ test "item locations survive body and unrelated-index edits but not renames" {
     const initial_name = try testing.allocator.dupe(u8, initial_tree.items[0].loc.name);
     defer testing.allocator.free(initial_name);
     const initial_loc: structures.ItemLoc = .{
-        .module = initial_tree.items[0].loc.module,
-        .file_id = initial_tree.items[0].loc.file_id,
+        .origin = initial_tree.items[0].loc.origin,
         .kind = initial_tree.items[0].loc.kind,
         .name = initial_name,
     };
@@ -9258,7 +9710,7 @@ test "failed interning publishes no partial identity" {
 
     const module: structures.ModuleId = @enumFromInt(0);
     failing.fail_index = failing.alloc_index + 3;
-    const loc: structures.ItemLoc = .{ .module = module, .file_id = 1, .kind = .function, .name = "owned" };
+    const loc: structures.ItemLoc = .{ .origin = .{ .module = module }, .kind = .function, .name = "owned" };
     try testing.expectError(error.OutOfMemory, db.intern(query_structures.ItemLocations, loc));
     try testing.expect(failing.has_induced_failure);
     try testing.expectError(error.InvalidInternId, db.lookupInterned(query_structures.ItemLocations, @enumFromInt(0)));

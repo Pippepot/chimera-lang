@@ -59,17 +59,13 @@ fn printUsage(writer: *std.Io.Writer, executable_name: []const u8) !void {
 fn buildWithStageTimings(db: *query.Database, io: std.Io, timings: *diagnostics.TimingLog) !void {
     _ = try db.get(queries.ParseFile, file_id);
     timings.mark(io, "parse");
-    const index = try db.get(queries.IndexItems, file_id);
+    // Debug timing follows the same demand roots as an ordinary build.
+    _ = try db.get(queries.IndexItems, file_id);
     timings.mark(io, "discover items");
-    if (index.*) |items| {
-        for (items.ids()) |item_id| _ = try db.get(queries.ResolveItem, item_id);
-        timings.mark(io, "resolve items");
-        for (items.ids()) |item_id| _ = try db.get(queries.FunctionShape, item_id);
-        timings.mark(io, "function shapes");
-        for (items.ids()) |item_id| _ = try db.get(queries.FunctionSignature, item_id);
-        timings.mark(io, "signatures");
-        for (items.ids()) |item_id| _ = try db.get(queries.AnalyzeFunctionBody, item_id);
-    }
+    const root = try db.intern(queries.ModulePaths, .{ .path = "" });
+    if (!(try db.get(queries.ValidateModuleGraph, root)).*) return;
+    if ((try db.get(queries.SelectEntry, file_id)).*) |entry|
+        _ = try db.get(queries.AnalyzeFunctionBody, entry);
     timings.mark(io, "analyze bodies");
     _ = try db.get(queries.CollectReachableInstances, file_id);
     timings.mark(io, "compile functions");
@@ -109,9 +105,25 @@ fn compileAndRun(
     defer gpa.free(compiler_controls);
     timings.mark(io, "collect diagnostics");
 
+    var render_sources: std.ArrayList(diagnostics.DiagnosticSource) = .empty;
+    defer {
+        for (render_sources.items, 0..) |source, index| {
+            if (index != 0) gpa.free(source.path);
+        }
+        render_sources.deinit(gpa);
+    }
+    try render_sources.append(gpa, .{ .file_id = file_id, .path = input.source_path, .source = input.source });
+    for (input.source_files, 0..) |file, index| {
+        const path = try std.fs.path.join(gpa, &.{ std.fs.path.dirname(input.source_path) orelse ".", file.path });
+        errdefer gpa.free(path);
+        try render_sources.append(gpa, .{ .file_id = @intCast(index + 1), .path = path, .source = file.source });
+    }
     if (input.debug_flags.ast) {
-        if ((try db.get(queries.ParseFile, file_id)).*) |parsed| {
-            try debug.renderAst(gpa, &parsed, input.source, output);
+        for (render_sources.items) |source| {
+            if ((try db.get(queries.ParseFile, source.file_id)).*) |parsed| {
+                try output.print("source {s}\n", .{source.path});
+                try debug.renderAst(gpa, &parsed, source.source, output);
+            }
         }
     }
     if (executable_result.* == null) {
@@ -125,7 +137,7 @@ fn compileAndRun(
         try output.flush();
         timings.mark(io, "debug output");
         const type_interner: queries.TypeInterner(*query.Database) = .{ .ctx = db };
-        try diagnostics.renderDiagnostics(type_interner, errors, input.source_path, input.source, emitted);
+        try diagnostics.renderDiagnostics(type_interner, errors, render_sources.items, emitted);
         if (input.debug_flags.timing) try timings.print(io, errors);
         try errors.flush();
         return .rejected;
@@ -133,8 +145,8 @@ fn compileAndRun(
     std.debug.assert(emitted.len == 0);
     const executable = executable_result.*.?;
 
-    if (input.debug_flags.ssa) try debug.renderReachableSsa(db, file_id, output);
-    if (input.debug_flags.@"asm") try debug.renderAssembly(executable, gpa, output);
+    if (input.debug_flags.ssa) try debug.renderReachableSsa(db, file_id, render_sources.items, output);
+    if (input.debug_flags.@"asm") try debug.renderAssembly(db, file_id, render_sources.items, executable, gpa, output);
     try output.flush();
     timings.mark(io, "debug output");
 
@@ -421,7 +433,7 @@ test "source files load without changing the entry program" {
         \\exit(a)
         ,
         .source_files = &.{
-            .{ .source = "exit(0)", .module_path = "physics" },
+            .{ .path = "physics/body.chi", .source = "exit(0)", .module_path = "physics" },
         },
         .program_args = &.{},
         .debug_flags = .{},
@@ -429,4 +441,76 @@ test "source files load without changing the entry program" {
     }, &output.writer, &errors.writer);
 
     try std.testing.expectEqual(RunOutcome{ .program_exit = 42 }, exit_code);
+}
+
+test "diagnostics render with their own file paths" {
+    const db = try query.Database.init(std.testing.allocator, .{ .worker_count = 1 });
+    defer db.deinit();
+    const physics_source = "exit()";
+    const entry_source = "exit(0)";
+    try modules.registerSources(db, std.testing.allocator, entry_source, &.{
+        .{ .path = "physics/body.chi", .source = physics_source, .module_path = "physics" },
+    }, &.{ "", "physics" });
+    const physics_entry = (try db.get(queries.SelectEntry, 1)).*.?;
+    try std.testing.expect((try db.get(queries.AnalyzeFunctionBody, physics_entry)).* == null);
+    const held = try db.transitiveAccumulatorValues(queries.AnalyzeFunctionBody, physics_entry, structures.Diagnostic, std.testing.allocator);
+    defer std.testing.allocator.free(held);
+    try std.testing.expectEqual(@as(usize, 1), held.len);
+
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    const type_interner: queries.TypeInterner(*query.Database) = .{ .ctx = db };
+    try diagnostics.renderDiagnostics(type_interner, &output.writer, &.{
+        .{ .file_id = 0, .path = "main.chi", .source = entry_source },
+        .{ .file_id = 1, .path = "physics/body.chi", .source = physics_source },
+    }, held);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        output.writer.buffered(),
+        "physics/body.chi:1:1: expected 1 call argument, found 0",
+    ) != null);
+}
+
+test "CLI debug labels sources across modules and timing preserves unused code" {
+    const io = std.testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var errors: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer errors.deinit();
+    const outcome = try compileAndRun(io, std.testing.allocator, .{
+        .source_path = "/project/main.chi",
+        .source = "import lib\nfunc unused() -> exit(comptime -> exit(99))\nexit(lib.answer())",
+        .source_files = &.{.{ .path = "lib/a.chi", .module_path = "lib", .source = "pub func answer() int -> return 42\nexit(comptime -> exit(98))" }},
+        .program_args = &.{},
+        .debug_flags = .{ .ast = true, .ssa = true, .@"asm" = true, .timing = true },
+        .started = std.Io.Clock.awake.now(io),
+    }, &output.writer, &errors.writer);
+    try std.testing.expectEqual(RunOutcome{ .program_exit = 42 }, outcome);
+    const rendered = output.writer.buffered();
+    for ([_][]const u8{ "source /project/main.chi", "source /project/lib/a.chi", "SSA\n", "ASM\n", ":: lib.answer" }) |expected|
+        try std.testing.expect(std.mem.indexOf(u8, rendered, expected) != null);
+    const ssa = rendered[std.mem.indexOf(u8, rendered, "SSA\n").?..];
+    try std.testing.expect(std.mem.indexOf(u8, ssa, "unused") == null);
+}
+
+test "CLI qualified access diagnostics identify the defining dependency file" {
+    const io = std.testing.io;
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var errors: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer errors.deinit();
+    const outcome = try compileAndRun(io, std.testing.allocator, .{
+        .source_path = "/project/main.chi",
+        .source = "import api\nexit(api.answer())",
+        .source_files = &.{
+            .{ .path = "lib/a.chi", .module_path = "lib", .source = "static secret = 42" },
+            .{ .path = "api/a.chi", .module_path = "api", .source = "import lib\npub func answer() int -> return lib.secret" },
+        },
+        .program_args = &.{},
+        .debug_flags = .{},
+        .started = std.Io.Clock.awake.now(io),
+    }, &output.writer, &errors.writer);
+    try std.testing.expectEqual(RunOutcome.rejected, outcome);
+    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "/project/api/a.chi:2:") != null);
 }

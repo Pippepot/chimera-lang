@@ -5,6 +5,7 @@ const disasm = @import("legacy/disasm.zig");
 const query = @import("query_new.zig");
 const queries = @import("query_structures.zig");
 const structures = @import("structures.zig");
+const diagnostics = @import("diagnostics.zig");
 
 pub fn renderAst(
     gpa: std.mem.Allocator,
@@ -20,6 +21,7 @@ pub fn renderAst(
 pub fn renderReachableSsa(
     db: *query.Database,
     file_id: structures.FileId,
+    sources: []const diagnostics.DiagnosticSource,
     writer: *std.Io.Writer,
 ) !void {
     const reachable = (try db.get(queries.CollectReachableInstances, file_id)).* orelse unreachable;
@@ -30,8 +32,34 @@ pub fn renderReachableSsa(
             (try db.get(queries.AnalyzeFunctionBody, instance.item)).* orelse unreachable
         else
             (try db.get(queries.AnalyzeFunctionInstance, instance)).* orelse unreachable;
+        try renderFunctionSource(db, instance, sources, writer);
         try renderSsaFunction(db, instance, &body, writer);
     }
+}
+
+fn renderFunctionSource(db: *query.Database, instance: structures.InstanceId, sources: []const diagnostics.DiagnosticSource, writer: *std.Io.Writer) !void {
+    const resolved = (try db.get(queries.ResolveItem, instance.item)).* orelse unreachable;
+    for (sources) |source| {
+        if (source.file_id != resolved.file_id) continue;
+        try writer.print("source {s} :: ", .{source.path});
+        try renderItemName(db, instance.item, writer);
+        if (instance.specialization) |specialization| try writer.print("[{d}]", .{@intFromEnum(specialization)});
+        try writer.writeByte('\n');
+        return;
+    }
+    unreachable; // The driver supplies every registered source.
+}
+
+fn renderItemName(db: *query.Database, item: structures.ItemId, writer: *std.Io.Writer) anyerror!void {
+    const loc = try db.lookupInterned(queries.ItemLocations, item);
+    if (loc.owner) |owner| {
+        try renderItemName(db, owner, writer);
+        try writer.writeByte('.');
+    } else if (loc.origin == .module) {
+        const module = try db.lookupInterned(queries.ModulePaths, loc.origin.module);
+        try writer.print("{s}.", .{if (module.path.len == 0) "$entry" else module.path});
+    }
+    try writer.writeAll(loc.name);
 }
 
 fn renderSsaFunction(
@@ -225,6 +253,9 @@ fn renderBinary(
 }
 
 pub fn renderAssembly(
+    db: *query.Database,
+    file_id: structures.FileId,
+    sources: []const diagnostics.DiagnosticSource,
     executable: structures.Executable,
     gpa: std.mem.Allocator,
     writer: *std.Io.Writer,
@@ -232,6 +263,8 @@ pub fn renderAssembly(
     const assembly = try disasm.disassemble(codegen.executableCode(executable), gpa);
     defer gpa.free(assembly);
     try writer.writeAll("ASM\n");
+    const reachable = (try db.get(queries.CollectReachableInstances, file_id)).* orelse unreachable;
+    for (reachable.instances) |instance| try renderFunctionSource(db, instance, sources, writer);
     try writer.writeAll(assembly);
     try writer.writeByte('\n');
 }
