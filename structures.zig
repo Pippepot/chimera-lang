@@ -1018,6 +1018,10 @@ pub const CompileTimeSite = struct {
 pub const CompileTimeCallKey = struct {
     instance: InstanceId,
     arguments: CompileTimeValueTupleId,
+    // Temporary per-call context until execution uses one cross-frame budget.
+    // A resource-limited result must not alias the same call reached with more
+    // depth available.
+    remaining_call_depth: u16,
 };
 
 /// Owned deterministic breadth-first order of instances reachable from an entry.

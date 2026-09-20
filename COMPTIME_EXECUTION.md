@@ -111,7 +111,9 @@ implemented:
 - `ExecuteComptimeCall(CallKey) -> ?CompileTimeOutcome` executes a concrete
   function instance with an interned tuple of interpreted arguments. These are
   ordinary parameters supplied during interpretation, not static parameters in
-  the instance's specialization identity.
+  the instance's specialization identity. Until resource accounting uses one
+  cross-frame budget, the key also carries remaining call depth so exhaustion
+  cannot be reused by the same call reached with a larger budget.
 - `ExecuteComptimeThunk(ThunkKey) -> ?CompileTimeOutcome` executes a typed
   thunk. Its key includes the site and enclosing specialization.
 

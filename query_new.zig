@@ -480,7 +480,10 @@ pub const Database = struct {
     fn finishEntry(db: *Database, entry: *Entry, result: EntryResult) void {
         db.lock();
         switch (result) {
-            .verified => entry.verified_at = db.revision,
+            .verified => {
+                entry.verified_at = db.revision;
+                updateAccumsInSubtreeLocked(entry);
+            },
             .success => |output| {
                 db.commitComputationLocked(entry, output);
             },
@@ -570,6 +573,10 @@ pub const Database = struct {
         computation.dep_set = .empty;
         entry.computation = null;
         entry.verified_at = db.revision;
+        updateAccumsInSubtreeLocked(entry);
+    }
+
+    fn updateAccumsInSubtreeLocked(entry: *Entry) void {
         entry.accums_in_subtree = entry.accums != null;
         for (entry.deps.items) |dep| {
             if (dep.accums_in_subtree) {

@@ -351,6 +351,35 @@ const DiagnosticParent = struct {
     }
 };
 
+const ConditionalControlLeaf = struct {
+    pub const Input = u32;
+    pub const Output = u32;
+
+    pub fn run(ctx: *Context, input_value: Input) !Output {
+        const value = (try ctx.input(NumberInput, input_value)).*;
+        if (value != 0) try ctx.emit(structures.CompilerControl, .{ .exit = @intCast(value) });
+        return 1;
+    }
+};
+
+const ConditionalControlMiddle = struct {
+    pub const Input = u32;
+    pub const Output = u32;
+
+    pub fn run(ctx: *Context, input_value: Input) !Output {
+        return (try ctx.get(ConditionalControlLeaf, input_value)).*;
+    }
+};
+
+const ConditionalControlRoot = struct {
+    pub const Input = u32;
+    pub const Output = u32;
+
+    pub fn run(ctx: *Context, input_value: Input) !Output {
+        return (try ctx.get(ConditionalControlMiddle, input_value)).*;
+    }
+};
+
 const SelectedNumber = struct {
     pub const Input = u32;
     pub const Output = u32;
@@ -677,6 +706,34 @@ test "typed accumulators expose direct and transitive diagnostics" {
     try testing.expectEqual(@as(usize, 2), all.len);
     try testing.expectEqualStrings("root", all[0].message);
     try testing.expectEqualStrings("leaf", all[1].message);
+}
+
+test "verified ancestors expose newly emitted transitive accumulators" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try db.addInput(NumberInput, 1, 0);
+    try testing.expectEqual(@as(u32, 1), (try db.get(ConditionalControlRoot, 1)).*);
+    try db.setInput(NumberInput, 1, 42);
+
+    const controls = try db.transitiveAccumulatorValues(
+        ConditionalControlRoot,
+        1,
+        structures.CompilerControl,
+        testing.allocator,
+    );
+    defer testing.allocator.free(controls);
+    try testing.expectEqualSlices(structures.CompilerControl, &.{.{ .exit = 42 }}, controls);
+
+    try db.setInput(NumberInput, 1, 0);
+    const cleared = try db.transitiveAccumulatorValues(
+        ConditionalControlRoot,
+        1,
+        structures.CompilerControl,
+        testing.allocator,
+    );
+    defer testing.allocator.free(cleared);
+    try testing.expectEqual(@as(usize, 0), cleared.len);
 }
 
 // Compiler pipeline query behavior.
@@ -2648,7 +2705,11 @@ test "compile-time values and ordered tuples have canonical identities" {
 
     const instance: structures.InstanceId = .{ .item = @enumFromInt(7), .specialization = tuple };
     const site: structures.CompileTimeSite = .{ .owner = instance, .node = @enumFromInt(11) };
-    const call: structures.CompileTimeCallKey = .{ .instance = instance, .arguments = tuple };
+    const call: structures.CompileTimeCallKey = .{
+        .instance = instance,
+        .arguments = tuple,
+        .remaining_call_depth = 128,
+    };
     try testing.expectEqual(instance, site.owner);
     try testing.expectEqual(tuple, call.arguments);
 }
@@ -3145,6 +3206,23 @@ test "changing compile-time recursion is bounded by deterministic call depth" {
     try testing.expectEqual(structures.SourceSpan{ .start = @intCast(recursive_call), .end = @intCast(recursive_call + "recurse".len) }, diagnostics[0].span);
 }
 
+test "deep compile-time recursion does not poison a shallower cached call" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static down = func(value: int) int -> if value == 0 -> 42 else down(value - 1)
+        \\static deep = down(130)
+        \\static shallow = down(3)
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    try testing.expect((try db.get(query_structures.ResolveStatic, scope.resolveStatic("deep").?)).* == null);
+    try testing.expectEqual(
+        structures.CompileTimeValue{ .runtime = .{ .type_id = .int, .value = .{ .int = 42 } } },
+        try resolvedStaticValue(db, scope.resolveStatic("shallow").?),
+    );
+}
+
 test "static value arguments execute arbitrary scalar thunks" {
     const db = try testDatabase(1);
     defer db.deinit();
@@ -3391,6 +3469,41 @@ test "type-valued functions execute in aliases signatures and struct fields" {
     try testing.expectEqual(maybe, inspect.parameters[0].type_id);
     try testing.expectEqual(callback, inspect.parameters[1].type_id);
     try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "zero", "take" }, 42);
+}
+
+test "type-valued functions keep unit literals in runtime argument context" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static consume = func(value: unit) int -> 42
+        \\static make = func() type
+        \\  const result = consume(unit)
+        \\  return int
+        \\static T = make()
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    try testing.expectEqual(
+        structures.CompileTimeValue{ .type = .int },
+        try resolvedStaticValue(db, scope.resolveStatic("T").?),
+    );
+}
+
+test "callable widening has one canonical compile-time representation" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static identity = func(value: int) int -> value
+        \\static direct: fallible(int) int = identity
+        \\static make = func() fallible(int) int -> identity
+        \\static computed = make()
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    try testing.expectEqual(
+        (try db.get(query_structures.ResolveStatic, scope.resolveStatic("direct").?)).*.?,
+        (try db.get(query_structures.ResolveStatic, scope.resolveStatic("computed").?)).*.?,
+    );
 }
 
 test "type-valued functions generate canonical specialized nominal structs" {

@@ -7,7 +7,14 @@ const semantic = @import("semantic.zig");
 const typing = @import("typing.zig");
 
 const max_comptime_call_depth: u16 = 128;
-threadlocal var comptime_call_depth: u16 = 0;
+const ActiveComptimeCall = struct {
+    instance: structures.InstanceId,
+    arguments: structures.CompileTimeValueTupleId,
+};
+// Call depth is part of the memo key, but logical recursion ignores that
+// resource context and closes when an instance-and-argument pair repeats.
+threadlocal var active_comptime_calls: [max_comptime_call_depth]ActiveComptimeCall = undefined;
+threadlocal var active_comptime_call_count: u16 = 0;
 
 pub const SourceText = struct {
     pub const Key = structures.FileId;
@@ -1007,9 +1014,16 @@ pub const ResolveStatic = struct {
             });
             return null;
         }
-        if (runtime.type_id != expected_type and runtime.value == .structure) {
-            const payload = try ctx.intern(CompileTimeValues, value);
-            value.runtime.value = .{ .variant = .{ .member_type = runtime.type_id, .payload = payload } };
+        if (runtime.type_id != expected_type) {
+            if (try lookupVariantMembers(ctx, expected_type) != null) {
+                const payload = try ctx.intern(CompileTimeValues, value);
+                value.runtime.value = .{ .variant = .{ .member_type = runtime.type_id, .payload = payload } };
+            } else {
+                std.debug.assert(try lookupCallable(ctx, expected_type) != null);
+                var reference = value.runtime.value.function_ref;
+                reference.type_id = expected_type;
+                value.runtime.value = .{ .function_ref = reference };
+            }
         }
         value.runtime.type_id = expected_type;
         return try ctx.intern(CompileTimeValues, value);
@@ -1081,7 +1095,10 @@ pub const ExecuteComptimeThunk = struct {
 
     pub fn run(ctx: anytype, site: Input) anyerror!Output {
         const body = (try ctx.get(AnalyzeComptimeThunk, site)).* orelse return null;
-        var executor: ComptimeCallExecutor(@TypeOf(ctx)) = .{ .ctx = ctx };
+        var executor: ComptimeCallExecutor(@TypeOf(ctx)) = .{
+            .ctx = ctx,
+            .remaining_call_depth = max_comptime_call_depth,
+        };
         var arguments: [0]comptime_interpreter.Value = .{};
         const result = try comptime_interpreter.execute(&body, &arguments, &executor, ctx.allocator());
         return switch (result) {
@@ -1101,8 +1118,8 @@ pub const ExecuteComptimeThunk = struct {
                 try ctx.emit(structures.CompilerControl, .{ .exit = status });
                 break :blk .{ .exit = status };
             },
-            .unsupported => |unsupported| blk: {
-                try emitComptimeExecutionIssue(ctx, site.owner.item, site.node, &body, unsupported);
+            .execution_error => |execution_error| blk: {
+                try emitComptimeExecutionIssue(ctx, site.owner.item, site.node, &body, execution_error);
                 break :blk null;
             },
             .unavailable => null,
@@ -1125,9 +1142,14 @@ pub const ExecuteComptimeCall = struct {
     pub const Output = ?structures.CompileTimeCallOutcome;
 
     pub fn run(ctx: anytype, key: Input) anyerror!Output {
-        if (comptime_call_depth == max_comptime_call_depth) return error.CompileTimeCallDepthExceeded;
-        comptime_call_depth += 1;
-        defer comptime_call_depth -= 1;
+        std.debug.assert(key.remaining_call_depth <= max_comptime_call_depth);
+        std.debug.assert(active_comptime_call_count < active_comptime_calls.len);
+        active_comptime_calls[active_comptime_call_count] = .{
+            .instance = key.instance,
+            .arguments = key.arguments,
+        };
+        active_comptime_call_count += 1;
+        defer active_comptime_call_count -= 1;
 
         const signature = if (key.instance.specialization) |_|
             (try ctx.get(FunctionInstanceSignature, key.instance)).* orelse return null
@@ -1151,14 +1173,18 @@ pub const ExecuteComptimeCall = struct {
         }
 
         const body = (try ctx.get(AnalyzeComptimeFunctionBody, key.instance)).* orelse return null;
-        var executor: ComptimeCallExecutor(@TypeOf(ctx)) = .{ .ctx = ctx };
+        std.debug.assert(key.remaining_call_depth > 0);
+        var executor: ComptimeCallExecutor(@TypeOf(ctx)) = .{
+            .ctx = ctx,
+            .remaining_call_depth = key.remaining_call_depth - 1,
+        };
         const result = try comptime_interpreter.execute(&body, arguments, &executor, ctx.allocator());
         const outcome: structures.CompileTimeOutcome = switch (result) {
             .returned => |value| structures.CompileTimeOutcome{ .returned = try internInterpretedValue(ctx, body.return_type, value) },
             .failure => structures.CompileTimeOutcome.failure,
             .exit => |status| structures.CompileTimeOutcome{ .exit = status },
-            .unsupported => |unsupported| blk: {
-                try emitComptimeExecutionIssue(ctx, key.instance.item, null, &body, unsupported);
+            .execution_error => |execution_error| blk: {
+                try emitComptimeExecutionIssue(ctx, key.instance.item, null, &body, execution_error);
                 break :blk null;
             },
             .unavailable => null,
@@ -1176,8 +1202,10 @@ pub const ExecuteComptimeCall = struct {
 fn ComptimeCallExecutor(comptime Context: type) type {
     return struct {
         ctx: Context,
+        remaining_call_depth: u16,
 
         pub fn call(self: *@This(), instance: structures.InstanceId, arguments: []comptime_interpreter.Value) !comptime_interpreter.Result {
+            if (self.remaining_call_depth == 0) return .{ .execution_error = .{ .reason = .resource_limit } };
             const signature = if (instance.specialization == null)
                 (try self.ctx.get(FunctionSignature, instance.item)).* orelse return .unavailable
             else
@@ -1195,12 +1223,17 @@ fn ComptimeCallExecutor(comptime Context: type) type {
                 } });
             }
             const tuple = try self.ctx.intern(CompileTimeValueTuples, .{ .values = value_ids });
+            for (active_comptime_calls[0..active_comptime_call_count]) |active| {
+                if (std.meta.eql(active.instance, instance) and active.arguments == tuple) {
+                    return .{ .execution_error = .{ .reason = .call_cycle } };
+                }
+            }
             const outcome = self.ctx.get(ExecuteComptimeCall, .{
                 .instance = instance,
                 .arguments = tuple,
+                .remaining_call_depth = self.remaining_call_depth,
             }) catch |err| switch (err) {
-                error.QueryCycle => return .{ .unsupported = .{ .reason = .call_cycle } },
-                error.CompileTimeCallDepthExceeded => return .{ .unsupported = .{ .reason = .resource_limit } },
+                error.QueryCycle => return .{ .execution_error = .{ .reason = .call_cycle } },
                 else => return err,
             };
             const call_outcome = outcome.* orelse return .unavailable;
@@ -1248,11 +1281,6 @@ fn ComptimeCallExecutor(comptime Context: type) type {
         pub fn variantMembers(self: *@This(), type_id: structures.TypeId) !?[]const structures.TypeId {
             return lookupVariantMembers(self.ctx, type_id);
         }
-
-        pub fn canWidenTo(self: *@This(), actual: structures.TypeId, expected: structures.TypeId) !bool {
-            const type_interner: TypeInterner(Context) = .{ .ctx = self.ctx };
-            return semantic.canWidenTo(type_interner, actual, expected);
-        }
     };
 }
 
@@ -1268,13 +1296,13 @@ fn emitComptimeExecutionIssue(
     owner: structures.ItemId,
     fallback_node: ?structures.Node.Index,
     body: *const structures.FunctionBodyAnalysis,
-    unsupported: comptime_interpreter.Unsupported,
+    execution_error: comptime_interpreter.ExecutionError,
 ) !void {
     const loc = try ctx.lookupInterned(ItemLocations, owner);
     const resolved = (try ctx.get(ResolveItem, owner)).* orelse return;
     const parsed = (try ctx.get(ParseFile, resolved.file_id)).* orelse return;
     const fallback_span = nodeSpan(&parsed, fallback_node orelse @enumFromInt(resolved.declaration));
-    const span = if (unsupported.instruction_index) |instruction_index|
+    const span = if (execution_error.instruction_index) |instruction_index|
         if (body.instruction_spans.len == body.instructions.len)
             body.instruction_spans[instruction_index]
         else
@@ -1284,12 +1312,11 @@ fn emitComptimeExecutionIssue(
     try ctx.emit(structures.Diagnostic, .{
         .file_id = loc.file_id,
         .span = span,
-        .kind = switch (unsupported.reason) {
+        .kind = switch (execution_error.reason) {
             .call_cycle => .compile_time_call_cycle,
             .division_by_zero => .compile_time_division_by_zero,
             .integer_overflow => .compile_time_integer_overflow,
             .resource_limit => .compile_time_resource_limit,
-            .instruction, .coercion => .static_initializer_not_supported,
         },
     });
 }

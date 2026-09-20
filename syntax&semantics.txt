@@ -15,6 +15,10 @@
 # type: the type of compile-time type values.
 # unit: single-valued type; its value is unit, also written ().
 # none: distinct single-valued type; its value is none.
+# In ordinary expression contexts, unit and none denote their values. A `type`
+# annotation or the result expression of a function returning `type` interprets
+# them as type values; the enclosing function's return type does not change
+# their meaning in arguments, local initializers, or other nested expressions.
 # never: bottom type for expressions that never return.
 # Subexpressions evaluate exactly once, left to right in source order.
 # Struct initializers evaluate in initializer order, not field declaration order.

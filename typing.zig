@@ -18,6 +18,12 @@ const BuildBlock = lifetime.BuildBlock;
 const CleanupLocation = lifetime.CleanupLocation;
 const LifetimeSolver = lifetime.Solver;
 
+const BodyOptions = struct {
+    infer_return_type: bool = false,
+    publish_instruction_spans: bool = false,
+    allow_type_values: bool = false,
+};
+
 pub fn emitSemanticIssue(ctx: anytype, file_id: structures.FileId, issue: semantic.Issue) !void {
     try ctx.emit(structures.Diagnostic, .{ .file_id = file_id, .span = issue.span, .kind = issue.kind });
 }
@@ -43,9 +49,7 @@ pub fn resolveAndTypeBody(
         parameters,
         return_type,
         is_fallible,
-        false,
-        false,
-        false,
+        .{},
         type_interner,
         unresolved,
     );
@@ -72,9 +76,10 @@ pub fn resolveAndTypeBodyForComptime(
         parameters,
         return_type,
         is_fallible,
-        false,
-        true,
-        true,
+        .{
+            .publish_instruction_spans = true,
+            .allow_type_values = true,
+        },
         type_interner,
         unresolved,
     );
@@ -98,9 +103,11 @@ pub fn resolveAndTypeComptimeThunk(
         &.{},
         .unit,
         true,
-        true,
-        true,
-        true,
+        .{
+            .infer_return_type = true,
+            .publish_instruction_spans = true,
+            .allow_type_values = true,
+        },
         type_interner,
         unresolved,
     );
@@ -115,9 +122,7 @@ fn resolveAndType(
     parameters: []const structures.CallableParameter,
     return_type: structures.TypeId,
     is_fallible: bool,
-    infer_return_type: bool,
-    publish_instruction_spans: bool,
-    allow_type_values: bool,
+    options: BodyOptions,
     type_interner: anytype,
     unresolved: semantic.UnresolvedBody,
 ) !?structures.FunctionBodyAnalysis {
@@ -129,9 +134,9 @@ fn resolveAndType(
         .unresolved = unresolved,
         .return_type = return_type,
         .is_fallible = is_fallible,
-        .infer_return_type = infer_return_type,
-        .publish_instruction_spans = publish_instruction_spans,
-        .allow_type_values = allow_type_values,
+        .infer_return_type = options.infer_return_type,
+        .publish_instruction_spans = options.publish_instruction_spans,
+        .allow_type_values = options.allow_type_values,
     };
     defer builder.deinit();
     try builder.init(parameters);

@@ -1,17 +1,15 @@
 const std = @import("std");
 const structures = @import("structures.zig");
 
-pub const UnsupportedReason = enum {
-    instruction,
-    coercion,
+pub const ExecutionErrorReason = enum {
     call_cycle,
     division_by_zero,
     integer_overflow,
     resource_limit,
 };
 
-pub const Unsupported = struct {
-    reason: UnsupportedReason,
+pub const ExecutionError = struct {
+    reason: ExecutionErrorReason,
     instruction_index: ?u32 = null,
 };
 
@@ -24,7 +22,7 @@ pub const Result = union(enum) {
     returned: Value,
     failure,
     exit: i32,
-    unsupported: Unsupported,
+    execution_error: ExecutionError,
     unavailable,
 };
 
@@ -56,7 +54,7 @@ pub fn execute(
     var fuel = default_block_fuel;
     var aggregate_fuel = default_aggregate_fuel;
     while (true) {
-        if (fuel == 0) return .{ .unsupported = .{ .reason = .resource_limit } };
+        if (fuel == 0) return .{ .execution_error = .{ .reason = .resource_limit } };
         fuel -= 1;
 
         const block = body.blocks[@intFromEnum(block_id)];
@@ -82,8 +80,8 @@ pub fn execute(
                 .divsi => |operands| {
                     const lhs = integer(slots, operands.lhs);
                     const rhs = integer(slots, operands.rhs);
-                    if (rhs == 0) return unsupported(.division_by_zero, instruction_index);
-                    if (lhs == std.math.minInt(i32) and rhs == -1) return unsupported(.integer_overflow, instruction_index);
+                    if (rhs == 0) return executionError(.division_by_zero, instruction_index);
+                    if (lhs == std.math.minInt(i32) and rhs == -1) return executionError(.integer_overflow, instruction_index);
                     slots[destination] = .{ .runtime = .{ .int = @divTrunc(lhs, rhs) } };
                 },
                 .exit => |operand| return .{ .exit = integer(slots, operand) },
@@ -147,7 +145,7 @@ pub fn execute(
             .return_unit => return .{ .returned = .{ .runtime = .unit } },
             .return_value => |value_use| return valueUse(body, slots, value_use, executor, &aggregate_fuel),
             .return_failure => return .failure,
-            .diverge => return .{ .unsupported = .{ .reason = .instruction } },
+            .diverge => unreachable,
             .fallible_call => |fallible| switch (try executeFallibleCall(body, slots, call_scratch, fallible.call.instance(), fallible.call.arguments, fallible.success, fallible.failure, executor, &aggregate_fuel)) {
                 .next => |next| block_id = next,
                 .result => |result| return result,
@@ -163,8 +161,8 @@ pub fn execute(
     }
 }
 
-fn unsupported(reason: UnsupportedReason, instruction_index: usize) Result {
-    return .{ .unsupported = .{
+fn executionError(reason: ExecutionErrorReason, instruction_index: usize) Result {
+    return .{ .execution_error = .{
         .reason = reason,
         .instruction_index = @intCast(instruction_index),
     } };
@@ -232,14 +230,14 @@ fn executeReturningCall(
             slots[destination] = value;
             break :blk null;
         },
-        .failure => unsupported(.instruction, instruction_index),
+        .failure => unreachable,
         .exit => |status| .{ .exit = status },
-        .unsupported => |value| .{ .unsupported = value },
+        .execution_error => |value| .{ .execution_error = value },
         .unavailable => .unavailable,
     };
 }
 
-const FallibleCallStep = union(enum) {
+const Step = union(enum) {
     next: structures.FunctionBlockId,
     result: Result,
 };
@@ -254,7 +252,7 @@ fn executeFallibleCall(
     failure_id: structures.FunctionBlockId,
     executor: anytype,
     aggregate_fuel: *u32,
-) !FallibleCallStep {
+) !Step {
     return switch (try executeCall(body, slots, scratch, instance, argument_range, executor, aggregate_fuel)) {
         .returned => |value| blk: {
             const success = body.blocks[@intFromEnum(success_id)];
@@ -264,7 +262,7 @@ fn executeFallibleCall(
         },
         .failure => .{ .next = failure_id },
         .exit => |status| .{ .result = .{ .exit = status } },
-        .unsupported => |value| .{ .result = .{ .unsupported = value } },
+        .execution_error => |value| .{ .result = .{ .execution_error = value } },
         .unavailable => .{ .result = .unavailable },
     };
 }
@@ -291,7 +289,7 @@ fn initializeStruct(
     aggregate_fuel: *u32,
 ) !Result {
     const fields = body.struct_field_values[operation.fields.start..operation.fields.end];
-    if (!chargeAggregate(aggregate_fuel, fields.len + 1)) return .{ .unsupported = .{ .reason = .resource_limit } };
+    if (!chargeAggregate(aggregate_fuel, fields.len + 1)) return .{ .execution_error = .{ .reason = .resource_limit } };
     const values = try gpa.alloc(structures.CompileTimeValueId, fields.len);
     defer gpa.free(values);
     for (fields) |field| {
@@ -322,7 +320,7 @@ fn updateField(
     aggregate_fuel: *u32,
 ) !Result {
     const source = try executor.lookupTuple(slots[@intFromEnum(operation.operand)].runtime.structure);
-    if (!chargeAggregate(aggregate_fuel, source.len + 1)) return .{ .unsupported = .{ .reason = .resource_limit } };
+    if (!chargeAggregate(aggregate_fuel, source.len + 1)) return .{ .execution_error = .{ .reason = .resource_limit } };
     const fields = try gpa.dupe(structures.CompileTimeValueId, source);
     defer gpa.free(fields);
     std.debug.assert(operation.field_index < fields.len);
@@ -340,17 +338,11 @@ fn activeVariant(
     value: structures.CompileTimeValue.RuntimeValue,
     operand: structures.FunctionValueId,
     executor: anytype,
-) !?ActiveVariant {
+) !ActiveVariant {
     if (value == .variant) return .{ .member_type = value.variant.member_type, .payload = value.variant.payload };
     const source_type = valueType(body, operand);
-    const representation_type = value.scalarTypeId() orelse return null;
-    const members = (try executor.variantMembers(source_type)) orelse return null;
-    const member_type = for (members) |member| {
-        if (member == representation_type) break member;
-    } else for (members) |member| {
-        if (try executor.canWidenTo(representation_type, member)) break member;
-    } else return null;
-    return .{ .member_type = member_type, .payload = try executor.internRuntime(representation_type, value) };
+    std.debug.assert(try executor.variantMembers(source_type) == null);
+    return .{ .member_type = source_type, .payload = try executor.internRuntime(source_type, value) };
 }
 
 fn variantTag(
@@ -359,15 +351,13 @@ fn variantTag(
     operand: structures.FunctionValueId,
     executor: anytype,
 ) !Result {
-    const active = (try activeVariant(body, value, operand, executor)) orelse return .{ .unsupported = .{ .reason = .coercion } };
-    const members = (try executor.variantMembers(valueType(body, operand))) orelse return .{ .unsupported = .{ .reason = .coercion } };
+    const active = try activeVariant(body, value, operand, executor);
+    const members = (try executor.variantMembers(valueType(body, operand))) orelse unreachable;
     for (members, 0..) |member, tag| if (member == active.member_type) return .{ .returned = .{ .runtime = .{ .int = @intCast(tag) } } };
-    return .{ .unsupported = .{ .reason = .coercion } };
+    unreachable;
 }
 
-fn variantValue(member_type: structures.TypeId, payload: structures.CompileTimeValueId, executor: anytype) !?structures.CompileTimeValue.RuntimeValue {
-    const runtime = (try executor.lookupRuntime(payload)) orelse return null;
-    if (runtime.type_id == member_type and runtime.value.scalarTypeId() != null) return runtime.value;
+fn variantValue(member_type: structures.TypeId, payload: structures.CompileTimeValueId) structures.CompileTimeValue.RuntimeValue {
     return .{ .variant = .{ .member_type = member_type, .payload = payload } };
 }
 
@@ -383,22 +373,22 @@ fn coerceVariant(
     const source_members = try executor.variantMembers(source_type);
     var payload: structures.CompileTimeValueId = undefined;
     const source_tag: usize = if (source_members) |members| blk: {
-        const active = (try activeVariant(body, value, operation.operand, executor)) orelse return .{ .unsupported = .{ .reason = .coercion } };
+        const active = try activeVariant(body, value, operation.operand, executor);
         payload = active.payload;
         break :blk for (members, 0..) |member, tag| {
             if (member == active.member_type) break tag;
-        } else return .{ .unsupported = .{ .reason = .coercion } };
+        } else unreachable;
     } else blk: {
         payload = try executor.internRuntime(source_type, value);
         break :blk 0;
     };
     std.debug.assert(source_tag < mapping.len);
     const target_tag = mapping[source_tag];
-    if (target_tag == structures.invalid_variant_tag) return .{ .unsupported = .{ .reason = .coercion } };
-    const target_members = (try executor.variantMembers(operation.target_type)) orelse return .{ .unsupported = .{ .reason = .coercion } };
+    std.debug.assert(target_tag != structures.invalid_variant_tag);
+    const target_members = (try executor.variantMembers(operation.target_type)) orelse unreachable;
     std.debug.assert(target_tag < target_members.len);
-    if (!chargeAggregate(aggregate_fuel, 1)) return .{ .unsupported = .{ .reason = .resource_limit } };
-    return .{ .returned = .{ .runtime = (try variantValue(target_members[target_tag], payload, executor)) orelse return .unavailable } };
+    if (!chargeAggregate(aggregate_fuel, 1)) return .{ .execution_error = .{ .reason = .resource_limit } };
+    return .{ .returned = .{ .runtime = variantValue(target_members[target_tag], payload) } };
 }
 
 fn extractVariant(
@@ -408,18 +398,18 @@ fn extractVariant(
     executor: anytype,
     aggregate_fuel: *u32,
 ) !Result {
-    const active = (try activeVariant(body, value, operation.operand, executor)) orelse return .{ .unsupported = .{ .reason = .coercion } };
+    const active = try activeVariant(body, value, operation.operand, executor);
     if (try executor.variantMembers(operation.target_type)) |target_members| {
         const source_members = (try executor.variantMembers(valueType(body, operation.operand))).?;
         const source_tag = for (source_members, 0..) |member, tag| {
             if (member == active.member_type) break tag;
-        } else return .{ .unsupported = .{ .reason = .coercion } };
+        } else unreachable;
         const mapping = body.variant_coercion_tags[operation.tag_mapping.?.start..operation.tag_mapping.?.end];
         const target_tag = mapping[source_tag];
-        if (target_tag == structures.invalid_variant_tag) return .{ .unsupported = .{ .reason = .coercion } };
+        std.debug.assert(target_tag != structures.invalid_variant_tag);
         std.debug.assert(target_tag < target_members.len);
-        if (!chargeAggregate(aggregate_fuel, 1)) return .{ .unsupported = .{ .reason = .resource_limit } };
-        return .{ .returned = .{ .runtime = (try variantValue(target_members[target_tag], active.payload, executor)) orelse return .unavailable } };
+        if (!chargeAggregate(aggregate_fuel, 1)) return .{ .execution_error = .{ .reason = .resource_limit } };
+        return .{ .returned = .{ .runtime = variantValue(target_members[target_tag], active.payload) } };
     }
     const payload = (try executor.lookupRuntime(active.payload)) orelse return .unavailable;
     if (payload.type_id == operation.target_type) return .{ .returned = .{ .runtime = payload.value } };
@@ -430,8 +420,8 @@ fn extractVariant(
 
 fn atInstruction(result: Result, instruction_index: usize) Result {
     return switch (result) {
-        .unsupported => |value| if (value.instruction_index == null)
-            unsupported(value.reason, instruction_index)
+        .execution_error => |value| if (value.instruction_index == null)
+            executionError(value.reason, instruction_index)
         else
             result,
         else => result,
@@ -457,11 +447,6 @@ fn valueUse(
     return .{ .returned = .{ .runtime = .{ .function_ref = reference } } };
 }
 
-const BranchStep = union(enum) {
-    next: structures.FunctionBlockId,
-    result: Result,
-};
-
 fn branchTarget(
     body: *const structures.FunctionBodyAnalysis,
     slots: []Value,
@@ -469,7 +454,7 @@ fn branchTarget(
     branch: structures.FunctionBranch,
     executor: anytype,
     aggregate_fuel: *u32,
-) !BranchStep {
+) !Step {
     const target = body.blocks[@intFromEnum(branch.target)];
     const arguments = body.branch_arguments[branch.arguments.start..branch.arguments.end];
     std.debug.assert(arguments.len == target.argument_end - target.argument_start);
