@@ -71,8 +71,8 @@ import physics.{Body as PhysicsBody}
 # children. Shared leading segments navigate parent namespaces without
 # importing them, so combining imports that share a prefix is harmless.
 # An alias replaces the qualification. A selective import introduces the
-# named declarations directly into file scope; an empty selective list is
-# rejected.
+# named declarations directly into file scope; an empty selective list is the
+# empty import.
 # Module-qualified lookup is valid wherever the target is valid (type, value,
 # call, initializer head) and shares `.` syntax with struct namespaces. The
 # first identifier resolves normally, so a local shadows a module name with no

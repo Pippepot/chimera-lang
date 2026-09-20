@@ -354,6 +354,7 @@ fn parseImport(parser: *ParserState) !Node.Index {
     if (!aliased and parser.eat(.period) != null) {
         _ = try parser.expect(.l_brace);
         while (true) {
+            if (parser.eat(.r_brace) != null) break;
             try parser.scratch_stack.append(parser.gpa, try parseImportTarget(parser));
             if (parser.eat(.comma) != null) continue;
             _ = try parser.expect(.r_brace);
@@ -1969,9 +1970,6 @@ test "diagnostic tag for malformed imports" {
     try testExpectDiagnosticTag(
         \\pub 42
     , .{ .invalid_expression = .number_literal });
-    try testExpectDiagnosticTag(
-        \\import physics.{}
-    , .{ .expected_token = .{ .expected = .identifier, .found = .r_brace } });
 }
 
 test "parse CRLF line endings" {

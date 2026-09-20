@@ -20,16 +20,11 @@ const DebugFlags = struct {
 const RunInput = struct {
     source_path: []const u8,
     source: []const u8,
-    source_files: []const SourceFile = &.{},
+    source_files: []const modules.SourceFile = &.{},
+    module_paths: []const []const u8 = &.{},
     program_args: []const []const u8,
     debug_flags: DebugFlags,
     started: std.Io.Timestamp,
-};
-
-const SourceFile = struct {
-    path: []const u8,
-    source: []const u8,
-    module_path: []const u8,
 };
 
 const RunOutcome = union(enum) {
@@ -92,15 +87,7 @@ fn compileAndRun(
     const db = try query.Database.init(gpa, .{ .worker_count = 1 });
     defer db.deinit();
     timings.mark(io, "database init");
-    const entry_module = try db.intern(queries.ModulePaths, .{ .path = "" });
-    try db.addInput(queries.FileModule, file_id, entry_module);
-    for (input.source_files, 0..) |file, index| {
-        const id: structures.FileId = @intCast(index + 1);
-        const module = try db.intern(queries.ModulePaths, .{ .path = file.module_path });
-        try db.addInput(queries.FileModule, id, module);
-        try db.addInput(queries.SourceText, id, file.source);
-    }
-    try db.addInput(queries.SourceText, file_id, input.source);
+    try modules.registerSources(db, gpa, input.source, input.source_files, input.module_paths);
     timings.mark(io, "add source");
 
     if (input.debug_flags.timing) try buildWithStageTimings(db, io, &timings);
@@ -225,30 +212,22 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
     defer entry_dir.close(io);
-    const discovered = modules.collectModuleFiles(arena, io, entry_dir, entry_name) catch |walk_error| {
+    const catalog = modules.collectModuleFiles(arena, io, entry_dir, entry_name) catch |walk_error| {
         try printError(errors, "failed to list '{s}': {s}", .{ entry_dir_path, @errorName(walk_error) });
         try errors.flush();
         std.process.exit(1);
     };
-    var source_files: std.ArrayList(SourceFile) = .empty;
-    for (discovered) |file| {
-        const file_source = entry_dir.readFileAlloc(
-            io,
-            file.path,
-            arena,
-            .limited(std.math.maxInt(usize)),
-        ) catch |read_error| {
-            try printError(errors, "failed to read '{s}': {s}", .{ file.path, @errorName(read_error) });
-            try errors.flush();
-            std.process.exit(1);
-        };
-        try source_files.append(arena, .{ .path = file.path, .source = file_source, .module_path = file.module_path });
-    }
+    const source_files = modules.readSources(io, arena, entry_dir, catalog.files) catch |read_error| {
+        try printError(errors, "failed to read sources under '{s}': {s}", .{ entry_dir_path, @errorName(read_error) });
+        try errors.flush();
+        std.process.exit(1);
+    };
 
     const outcome = compileAndRun(io, gpa, .{
         .source_path = source_path,
         .source = source,
-        .source_files = source_files.items,
+        .source_files = source_files,
+        .module_paths = catalog.modules,
         .program_args = positional.items[1..],
         .debug_flags = debug_flags,
         .started = started,
@@ -442,7 +421,7 @@ test "source files load without changing the entry program" {
         \\exit(a)
         ,
         .source_files = &.{
-            .{ .path = "physics/body.chi", .source = "exit(0)", .module_path = "physics" },
+            .{ .source = "exit(0)", .module_path = "physics" },
         },
         .program_args = &.{},
         .debug_flags = .{},

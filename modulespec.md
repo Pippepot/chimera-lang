@@ -79,7 +79,7 @@ import physics.{Body as PhysicsBody}
   imports that share a prefix is harmless.
 * `import physics as phys` replaces the qualification: `phys.Body`.
 * `import physics.{Body}` introduces `Body` directly into file scope.
-  An empty selective list is rejected.
+  An empty selective list is the empty import.
 
 ## 4. Qualified lookup
 
@@ -235,22 +235,27 @@ requirement); `ROADMAP.md` module item tracks status. No compiler change.
 * AST: one `import` node (`[path, selective…]`, struct-init-style) reusing
   `field_access`/`.as` shapes, plus a `pub` wrapper on top-level
   declarations. Imports allowed anywhere among top-level declarations,
-  order-independent; empty selective lists rejected at the parser.
+  order-independent.
 * `.` needs no new expression form: the first identifier resolves normally
   (locals shadow modules, §4); module-qualified use parses in type, value,
-  callee, and initializer-head positions, with resolution deferred.
+  callee, and initializer-head positions, with resolution deferred. An
+  empty selective list parses as the empty import.
 * Misplaced imports and `pub` are rejected (`import_outside_top_level`,
   `misplaced_pub`); hook source offsets are computed from the unwrapped
   declaration.
 
-### Slice 3 — Cross-file discovery, identity, and membership
+### Slice 3 — Cross-file discovery, identity, and membership (done)
 
 * Split declaration identity from source location. Identity is
   `{module, owner, kind, name}`; the current file and AST position move
-  into a replaceable index result that `ResolveItem` consults. Relocating
-  a declaration between files of one module preserves identity while
-  updating its location and file-scoped imports; same-folder renames are
-  no-ops; cross-folder moves change the module and the identity, including
+  into a replaceable index result that `ResolveItem` consults, trying the
+  discovery hint first and scanning member indexes on relocation. Missing
+  membership is an infrastructure failure, never a silent fallback:
+  `addSource` isolates legacy test files in per-file modules and the
+  driver always registers complete membership. Relocating a declaration
+  between files of one module preserves identity while updating its
+  location and file-scoped imports; same-folder renames are no-ops;
+  cross-folder moves change the module and the identity, including
   nominal type identity. Replacing `ItemLoc.file_id` with `module_id`
   alone is insufficient.
 * Keep synthetic `$entry` identities file-specific: one per file, never
@@ -260,11 +265,15 @@ requirement); `ROADMAP.md` module item tracks status. No compiler change.
   modules and parents containing only child modules; interning a path
   never establishes existence. `FileModule` answers which module owns a
   file; it cannot enumerate a module's files.
-* `DiscoverItems` collects import decls without entering value scope.
-  Duplicate detection merges all files of one module: a repeated name
-  rejects the module; equal names in different modules are independent.
-* `BuildModuleScope` moves from per-`FileId` to per-`ModuleId` (union of
-  member files, still sorted). Hook items stay excluded as today.
+* `DiscoverItems` leaves import decls out of value scope without collecting
+  them; slice 4 reads imports from the AST. Duplicate detection merges all
+  files of one module: a repeated name rejects the module; equal names in
+  different modules are independent.
+* `BuildModuleScope` stays `FileId`-keyed and becomes module-aware: it
+  serves the merged `ModuleDeclarations` set (union of member files, still
+  sorted) through the file's module. Hook items stay excluded as today.
+  File keys are kept because slice 4 adds file-scoped imports to the
+  effective file scope.
 * Cross-file declaration errors render with correct files immediately.
   Membership changes and declaration relocation get recomputation tests
   here, not in slice 7.

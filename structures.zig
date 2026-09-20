@@ -315,10 +315,12 @@ pub const ItemKind = enum {
     top_level_entry,
 };
 
-/// Stable within an owner across edits that do not rename the item or change
-/// its kind. Top-level items have no owner. `ItemTree` and the item interner own
-/// their respective copies of `name`.
+/// Identity is the owning module, owner, kind, and name. The current file
+/// is identity only for synthetic `$entry` items, which stay file-specific;
+/// for declared items it is a discovery hint and `ResolveItem` consults the
+/// per-file indexes for the current location.
 pub const ItemLoc = struct {
+    module: ModuleId,
     file_id: FileId,
     owner: ?ItemId = null,
     source_site: ?i64 = null,
@@ -326,7 +328,9 @@ pub const ItemLoc = struct {
     name: []const u8,
 
     pub fn eql(a: ItemLoc, b: ItemLoc) bool {
-        return a.file_id == b.file_id and a.owner == b.owner and a.source_site == b.source_site and a.kind == b.kind and std.mem.eql(u8, a.name, b.name);
+        if (a.kind != b.kind or !std.mem.eql(u8, a.name, b.name)) return false;
+        if (a.kind == .top_level_entry) return a.file_id == b.file_id;
+        return a.module == b.module and a.owner == b.owner and a.source_site == b.source_site;
     }
 };
 

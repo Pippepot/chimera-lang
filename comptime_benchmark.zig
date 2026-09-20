@@ -61,6 +61,8 @@ fn benchmarkCase(gpa: std.mem.Allocator, io: std.Io, writer: *std.Io.Writer, cas
     const db = try query.Database.init(gpa, .{ .worker_count = 1 });
     defer db.deinit();
     try db.addInput(queries.SourceText, 1, case.source);
+    try db.addInput(queries.FileModule, 1, try db.intern(queries.ModulePaths, .{ .path = "" }));
+    try db.addInput(queries.ModuleMembers, try db.intern(queries.ModulePaths, .{ .path = "" }), &.{1});
 
     const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
     const result = scope.resolveStatic("result").?;
@@ -96,6 +98,8 @@ fn benchmarkIncremental(gpa: std.mem.Allocator, io: std.Io, writer: *std.Io.Writ
         \\static result = increment(41)
     ;
     try db.addInput(queries.SourceText, 1, original);
+    try db.addInput(queries.FileModule, 1, try db.intern(queries.ModulePaths, .{ .path = "" }));
+    try db.addInput(queries.ModuleMembers, try db.intern(queries.ModulePaths, .{ .path = "" }), &.{1});
     const result = (try db.get(queries.BuildModuleScope, 1)).*.?.resolveStatic("result").?;
     _ = (try db.get(queries.ResolveStatic, result)).*.?;
 

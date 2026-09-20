@@ -1692,7 +1692,7 @@ fn nodeFocusSpan(ast: *const structures.Ast, node_index: structures.Node.Index) 
     return tokenSpan(ast, node.token_index);
 }
 
-pub fn discoverItems(gpa: std.mem.Allocator, ast: *const structures.Ast, source: []const u8) !structures.ItemTree {
+pub fn discoverItems(gpa: std.mem.Allocator, ast: *const structures.Ast, source: []const u8, module: structures.ModuleId) !structures.ItemTree {
     var items: std.ArrayList(structures.DiscoveredItem) = .empty;
     errdefer {
         for (items.items) |item| gpa.free(item.loc.name);
@@ -1721,21 +1721,21 @@ pub fn discoverItems(gpa: std.mem.Allocator, ast: *const structures.Ast, source:
 
         const token = ast.tokens[target_node.token_index];
         const name = source[token.loc.start..token.loc.end];
-        const parent = try appendItem(gpa, &items, kind, ast.file_id, name, target.index(), null, null);
+        const parent = try appendItem(gpa, &items, kind, ast.file_id, module, name, target.index(), null, null);
         if (kind == .structure) {
-            try discoverStructHooks(gpa, &items, ast, source, value, parent, null);
+            try discoverStructHooks(gpa, &items, ast, source, module, value, parent, null);
         } else {
             for (declaration_node_start..target.index()) |candidate_index| {
                 const candidate = ast.nodes[candidate_index];
                 if (candidate.tag != .@"struct") continue;
                 const source_site = @as(i64, @intCast(candidate_index)) - @as(i64, target.index());
-                try discoverStructHooks(gpa, &items, ast, source, @enumFromInt(candidate_index), parent, source_site);
+                try discoverStructHooks(gpa, &items, ast, source, module, @enumFromInt(candidate_index), parent, source_site);
             }
         }
         declaration_node_start = declaration.index() + 1;
     }
 
-    _ = try appendItem(gpa, &items, .top_level_entry, ast.file_id, "$entry", 0, null, null);
+    _ = try appendItem(gpa, &items, .top_level_entry, ast.file_id, module, "$entry", 0, null, null);
     return .{ .file_id = ast.file_id, .items = try items.toOwnedSlice(gpa) };
 }
 
@@ -1744,6 +1744,7 @@ fn discoverStructHooks(
     items: *std.ArrayList(structures.DiscoveredItem),
     ast: *const structures.Ast,
     source: []const u8,
+    module: structures.ModuleId,
     struct_index: structures.Node.Index,
     parent: u32,
     source_site: ?i64,
@@ -1762,7 +1763,7 @@ fn discoverStructHooks(
         // Struct-definition analysis owns duplicate-property diagnostics. Keep
         // discovery indexable until that semantic boundary is demanded.
         if ((try hook_names.getOrPut(property_name)).found_existing) continue;
-        _ = try appendItem(gpa, items, .function, ast.file_id, property_name, property_value.index(), parent, source_site);
+        _ = try appendItem(gpa, items, .function, ast.file_id, module, property_name, property_value.index(), parent, source_site);
     }
 }
 
@@ -1771,6 +1772,7 @@ fn appendItem(
     items: *std.ArrayList(structures.DiscoveredItem),
     kind: structures.ItemKind,
     file_id: structures.FileId,
+    module: structures.ModuleId,
     name: []const u8,
     declaration: u32,
     parent: ?u32,
@@ -1780,7 +1782,7 @@ fn appendItem(
     errdefer gpa.free(owned_name);
     const index: u32 = @intCast(items.items.len);
     try items.append(gpa, .{
-        .loc = .{ .file_id = file_id, .source_site = source_site, .kind = kind, .name = owned_name },
+        .loc = .{ .module = module, .file_id = file_id, .source_site = source_site, .kind = kind, .name = owned_name },
         .declaration = declaration,
         .parent = parent,
     });

@@ -33,6 +33,22 @@ fn testDatabase(worker_count: usize) !*Database {
 
 fn addSource(db: *Database, file_id: structures.FileId, source: []const u8) !void {
     try db.addInput(query_structures.SourceText, file_id, source);
+    const name = try std.fmt.allocPrint(testing.allocator, "test-module-{d}", .{file_id});
+    defer testing.allocator.free(name);
+    const module = try db.intern(query_structures.ModulePaths, .{ .path = name });
+    try db.addInput(query_structures.FileModule, file_id, module);
+    try db.addInput(query_structures.ModuleMembers, module, &.{file_id});
+}
+
+fn addModuleFile(db: *Database, file_id: structures.FileId, module_path: []const u8, source: []const u8) !structures.ModuleId {
+    const module = try db.intern(query_structures.ModulePaths, .{ .path = module_path });
+    try db.addInput(query_structures.FileModule, file_id, module);
+    try db.addInput(query_structures.SourceText, file_id, source);
+    return module;
+}
+
+fn addModuleMembers(db: *Database, module: structures.ModuleId, files: []const structures.FileId) !void {
+    try db.addInput(query_structures.ModuleMembers, module, files);
 }
 
 fn setSource(db: *Database, file_id: structures.FileId, source: []const u8) !void {
@@ -502,7 +518,9 @@ const InternItemLoc = struct {
     pub const Output = structures.ItemId;
 
     pub fn run(ctx: *Context, input_value: Input) anyerror!Output {
+        const module = try ctx.intern(query_structures.ModulePaths, .{ .path = "" });
         return ctx.intern(query_structures.ItemLocations, .{
+            .module = module,
             .file_id = 1,
             .kind = .function,
             .name = if (input_value % 2 == 0) "even" else "odd",
@@ -696,6 +714,99 @@ test "module paths intern by contents and files map to modules" {
     try testing.expectEqual(entry, (try db.get(ReadFileModule, 1)).*);
     try testing.expectEqual(physics, (try db.get(ReadFileModule, 2)).*);
     try testing.expectError(error.InputNotFound, db.get(ReadFileModule, 3));
+}
+
+test "same-module declarations are visible across files" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    const module = try addModuleFile(db, 1, "physics", "static answer = 40");
+    _ = try addModuleFile(db, 2, "physics", "exit(answer)");
+    try addModuleMembers(db, module, &.{ 1, 2 });
+    const entry_id = (try db.get(query_structures.SelectEntry, 2)).*.?;
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, entry_id)).* != null);
+    const executable = (try db.get(query_structures.BuildExecutable, 2)).*.?;
+    const io = testing.io;
+    try runtime.writeProgram(io, executable.bytes);
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    try testing.expectEqual(@as(u8, 40), runtime.runProg(io, testing.allocator, &.{}));
+}
+
+test "cross-file duplicates blame the second file" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    const module = try addModuleFile(db, 1, "physics", "static dup = 1");
+    _ = try addModuleFile(db, 2, "physics", "static dup = 2");
+    try addModuleMembers(db, module, &.{ 1, 2 });
+    try testing.expect((try db.get(query_structures.BuildModuleScope, 1)).* == null);
+    const source = "static dup = 2";
+    const start = std.mem.indexOf(u8, source, "dup").?;
+    try expectSingleQueryDiagnostic(db, query_structures.BuildModuleScope, 1, false, 2, .{
+        .start = start,
+        .end = start + "dup".len,
+    }, .duplicate_top_level_declaration);
+}
+
+test "relocating a declaration between files preserves identity" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    const module = try addModuleFile(db, 1, "physics", "static answer = 40");
+    _ = try addModuleFile(db, 2, "physics", "exit(answer)");
+    try addModuleMembers(db, module, &.{ 1, 2 });
+    const before = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolve("answer").?;
+    const entry_id = (try db.get(query_structures.SelectEntry, 2)).*.?;
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, entry_id)).* != null);
+
+    try setSource(db, 1, "static filler = 0");
+    try setSource(db, 2, "static answer = 40\nexit(answer)");
+    const after = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolve("answer").?;
+    try testing.expectEqual(before, after);
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, entry_id)).* != null);
+    const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, entry_id, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 0), diagnostics.len);
+}
+
+test "module membership updates change the visible scope" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    const module = try addModuleFile(db, 1, "physics", "static answer = 40");
+    _ = try addModuleFile(db, 2, "physics", "exit(answer)");
+    const entry_id = (try db.get(query_structures.SelectEntry, 2)).*.?;
+    try testing.expectError(error.InputNotFound, db.get(query_structures.AnalyzeFunctionBody, entry_id));
+
+    try addModuleMembers(db, module, &.{ 1, 2 });
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, entry_id)).* != null);
+}
+
+test "entries stay file-specific within one module" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    const module = try addModuleFile(db, 1, "physics", "exit(1)");
+    _ = try addModuleFile(db, 2, "physics", "exit(2)");
+    try addModuleMembers(db, module, &.{ 1, 2 });
+    const first = (try db.get(query_structures.SelectEntry, 1)).*.?;
+    const second = (try db.get(query_structures.SelectEntry, 2)).*.?;
+    try testing.expect(first != second);
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, first)).* != null);
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, second)).* != null);
+}
+
+test "registered empty modules exist without members" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    const empty = try db.intern(query_structures.ModulePaths, .{ .path = "empty" });
+    try addModuleMembers(db, empty, &.{});
+    const declarations = (try db.get(query_structures.ModuleDeclarations, empty)).*.?;
+    try testing.expectEqual(@as(usize, 0), declarations.entries.len);
+
+    const missing = try db.intern(query_structures.ModulePaths, .{ .path = "missing" });
+    try testing.expectError(error.InputNotFound, db.get(query_structures.ModuleDeclarations, missing));
 }
 
 test "dependency cycles are reported" {
@@ -2645,12 +2756,18 @@ test "item indexing handles empty malformed missing and duplicate inputs" {
     const other_file = (try db.get(query_structures.IndexItems, 5)).*.?;
     try testing.expect(first_file.ids()[0] != other_file.ids()[0]);
 
-    const base: structures.ItemLoc = .{ .file_id = 8, .kind = .function, .name = "same" };
+    const entry_module = try db.intern(query_structures.ModulePaths, .{ .path = "" });
+    const other_module = try db.intern(query_structures.ModulePaths, .{ .path = "other" });
+    const base: structures.ItemLoc = .{ .module = entry_module, .file_id = 8, .kind = .function, .name = "same" };
     const base_id = try db.intern(query_structures.ItemLocations, base);
     try testing.expectEqual(base_id, try db.intern(query_structures.ItemLocations, base));
-    try testing.expect(base_id != try db.intern(query_structures.ItemLocations, .{ .file_id = 9, .kind = .function, .name = "same" }));
-    try testing.expect(base_id != try db.intern(query_structures.ItemLocations, .{ .file_id = 8, .kind = .top_level_entry, .name = "same" }));
-    try testing.expect(base_id != try db.intern(query_structures.ItemLocations, .{ .file_id = 8, .kind = .function, .name = "other" }));
+    try testing.expectEqual(base_id, try db.intern(query_structures.ItemLocations, .{ .module = entry_module, .file_id = 9, .kind = .function, .name = "same" }));
+    try testing.expect(base_id != try db.intern(query_structures.ItemLocations, .{ .module = other_module, .file_id = 8, .kind = .function, .name = "same" }));
+    try testing.expect(base_id != try db.intern(query_structures.ItemLocations, .{ .module = entry_module, .file_id = 8, .kind = .top_level_entry, .name = "same" }));
+    try testing.expect(base_id != try db.intern(query_structures.ItemLocations, .{ .module = entry_module, .file_id = 8, .kind = .function, .name = "other" }));
+    const entry_id = try db.intern(query_structures.ItemLocations, .{ .module = entry_module, .file_id = 8, .kind = .top_level_entry, .name = "$entry" });
+    try testing.expectEqual(entry_id, try db.intern(query_structures.ItemLocations, .{ .module = other_module, .file_id = 8, .kind = .top_level_entry, .name = "$entry" }));
+    try testing.expect(entry_id != try db.intern(query_structures.ItemLocations, .{ .module = entry_module, .file_id = 9, .kind = .top_level_entry, .name = "$entry" }));
     try testing.expectError(error.InvalidInternId, db.lookupInterned(query_structures.ItemLocations, @enumFromInt(std.math.maxInt(u32))));
 }
 
@@ -4237,10 +4354,10 @@ test "resolution requested before interning retries after identity issuance" {
     defer db.deinit();
 
     try addSource(db, 1, "static target = func() int -> return 1");
-    const first_id: structures.ItemId = @enumFromInt(0);
-    try testing.expectError(error.InvalidInternId, db.get(query_structures.ResolveItem, first_id));
-    try testing.expectEqual(first_id, (try db.get(query_structures.IndexItems, 1)).*.?.ids()[0]);
-    try testing.expect((try db.get(query_structures.ResolveItem, first_id)).* != null);
+    const unissued: structures.ItemId = @enumFromInt(std.math.maxInt(u32));
+    try testing.expectError(error.InvalidInternId, db.get(query_structures.ResolveItem, unissued));
+    const issued = (try db.get(query_structures.IndexItems, 1)).*.?.ids()[0];
+    try testing.expect((try db.get(query_structures.ResolveItem, issued)).* != null);
 }
 
 test "item identity survives relocation and restoration" {
@@ -8934,6 +9051,7 @@ test "item locations survive body and unrelated-index edits but not renames" {
     const initial_name = try testing.allocator.dupe(u8, initial_tree.items[0].loc.name);
     defer testing.allocator.free(initial_name);
     const initial_loc: structures.ItemLoc = .{
+        .module = initial_tree.items[0].loc.module,
         .file_id = initial_tree.items[0].loc.file_id,
         .kind = initial_tree.items[0].loc.kind,
         .name = initial_name,
@@ -9138,8 +9256,9 @@ test "failed interning publishes no partial identity" {
     var db_live = true;
     defer if (db_live) db.deinit();
 
+    const module: structures.ModuleId = @enumFromInt(0);
     failing.fail_index = failing.alloc_index + 3;
-    const loc: structures.ItemLoc = .{ .file_id = 1, .kind = .function, .name = "owned" };
+    const loc: structures.ItemLoc = .{ .module = module, .file_id = 1, .kind = .function, .name = "owned" };
     try testing.expectError(error.OutOfMemory, db.intern(query_structures.ItemLocations, loc));
     try testing.expect(failing.has_induced_failure);
     try testing.expectError(error.InvalidInternId, db.lookupInterned(query_structures.ItemLocations, @enumFromInt(0)));
