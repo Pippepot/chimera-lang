@@ -43,6 +43,35 @@ pub const ParseFile = struct {
     }
 };
 
+pub const FileModule = struct {
+    pub const Key = structures.FileId;
+    pub const Value = structures.ModuleId;
+};
+
+pub const ModulePaths = struct {
+    pub const Value = structures.ModulePath;
+    pub const Id = structures.ModuleId;
+
+    pub fn hash(value: Value) u64 {
+        var hasher = std.hash.Wyhash.init(0);
+        hasher.update(value.path);
+        return hasher.final();
+    }
+
+    pub fn eql(a: Value, b: Value) bool {
+        return std.mem.eql(u8, a.path, b.path);
+    }
+
+    pub fn clone(gpa: std.mem.Allocator, value: Value) !Value {
+        return .{ .path = try gpa.dupe(u8, value.path) };
+    }
+
+    pub fn deinit(gpa: std.mem.Allocator, value: *Value) void {
+        gpa.free(value.path);
+        value.* = undefined;
+    }
+};
+
 pub const DiscoverItems = struct {
     pub const Input = structures.FileId;
     pub const Output = ?structures.ItemTree;

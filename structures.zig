@@ -294,6 +294,12 @@ pub const Executable = struct {
 
 pub const FileId = u64;
 
+pub const ModuleId = enum(u32) { _ };
+
+pub const ModulePath = struct {
+    path: []const u8,
+};
+
 pub const ItemId = enum(u32) { _ };
 
 pub const ItemKind = enum {

@@ -298,6 +298,15 @@ const ReadNumber = struct {
     }
 };
 
+const ReadFileModule = struct {
+    pub const Input = structures.FileId;
+    pub const Output = structures.ModuleId;
+
+    pub fn run(ctx: *Context, input_value: Input) anyerror!Output {
+        return (try ctx.input(query_structures.FileModule, input_value)).*;
+    }
+};
+
 const Parity = struct {
     pub const Input = u32;
     pub const Output = u32;
@@ -667,6 +676,26 @@ test "append-only inputs can be read by queries" {
     try testing.expectError(error.DuplicateInput, db.addInput(NumberInput, 7, 99));
     try testing.expectEqual(@as(u32, 42), (try db.get(ReadNumber, 7)).*);
     try testing.expectError(error.InputNotFound, db.get(ReadNumber, 8));
+}
+
+test "module paths intern by contents and files map to modules" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    const entry = try db.intern(query_structures.ModulePaths, .{ .path = "" });
+    try testing.expectEqual(entry, try db.intern(query_structures.ModulePaths, .{ .path = "" }));
+    const physics = try db.intern(query_structures.ModulePaths, .{ .path = "physics" });
+    const collision = try db.intern(query_structures.ModulePaths, .{ .path = "physics.collision" });
+    try testing.expect(entry != physics);
+    try testing.expect(physics != collision);
+    try testing.expectEqualStrings("", (try db.lookupInterned(query_structures.ModulePaths, entry)).path);
+    try testing.expectEqualStrings("physics.collision", (try db.lookupInterned(query_structures.ModulePaths, collision)).path);
+
+    try db.addInput(query_structures.FileModule, 1, entry);
+    try db.addInput(query_structures.FileModule, 2, physics);
+    try testing.expectEqual(entry, (try db.get(ReadFileModule, 1)).*);
+    try testing.expectEqual(physics, (try db.get(ReadFileModule, 2)).*);
+    try testing.expectError(error.InputNotFound, db.get(ReadFileModule, 3));
 }
 
 test "dependency cycles are reported" {

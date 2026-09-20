@@ -1,6 +1,7 @@
 const std = @import("std");
 const debug = @import("debug.zig");
 const diagnostics = @import("diagnostics.zig");
+const modules = @import("modules.zig");
 const query = @import("query_new.zig");
 const queries = @import("query_structures.zig");
 const runtime = @import("runtime.zig");
@@ -19,9 +20,16 @@ const DebugFlags = struct {
 const RunInput = struct {
     source_path: []const u8,
     source: []const u8,
+    source_files: []const SourceFile = &.{},
     program_args: []const []const u8,
     debug_flags: DebugFlags,
     started: std.Io.Timestamp,
+};
+
+const SourceFile = struct {
+    path: []const u8,
+    source: []const u8,
+    module_path: []const u8,
 };
 
 const RunOutcome = union(enum) {
@@ -84,6 +92,14 @@ fn compileAndRun(
     const db = try query.Database.init(gpa, .{ .worker_count = 1 });
     defer db.deinit();
     timings.mark(io, "database init");
+    const entry_module = try db.intern(queries.ModulePaths, .{ .path = "" });
+    try db.addInput(queries.FileModule, file_id, entry_module);
+    for (input.source_files, 0..) |file, index| {
+        const id: structures.FileId = @intCast(index + 1);
+        const module = try db.intern(queries.ModulePaths, .{ .path = file.module_path });
+        try db.addInput(queries.FileModule, id, module);
+        try db.addInput(queries.SourceText, id, file.source);
+    }
     try db.addInput(queries.SourceText, file_id, input.source);
     timings.mark(io, "add source");
 
@@ -201,9 +217,38 @@ pub fn main(init: std.process.Init) !void {
     };
     defer gpa.free(source);
 
+    const entry_dir_path = std.fs.path.dirname(source_path) orelse ".";
+    const entry_name = std.fs.path.basename(source_path);
+    var entry_dir = std.Io.Dir.cwd().openDir(io, entry_dir_path, .{ .iterate = true }) catch |dir_error| {
+        try printError(errors, "failed to open '{s}': {s}", .{ entry_dir_path, @errorName(dir_error) });
+        try errors.flush();
+        std.process.exit(1);
+    };
+    defer entry_dir.close(io);
+    const discovered = modules.collectModuleFiles(arena, io, entry_dir, entry_name) catch |walk_error| {
+        try printError(errors, "failed to list '{s}': {s}", .{ entry_dir_path, @errorName(walk_error) });
+        try errors.flush();
+        std.process.exit(1);
+    };
+    var source_files: std.ArrayList(SourceFile) = .empty;
+    for (discovered) |file| {
+        const file_source = entry_dir.readFileAlloc(
+            io,
+            file.path,
+            arena,
+            .limited(std.math.maxInt(usize)),
+        ) catch |read_error| {
+            try printError(errors, "failed to read '{s}': {s}", .{ file.path, @errorName(read_error) });
+            try errors.flush();
+            std.process.exit(1);
+        };
+        try source_files.append(arena, .{ .path = file.path, .source = file_source, .module_path = file.module_path });
+    }
+
     const outcome = compileAndRun(io, gpa, .{
         .source_path = source_path,
         .source = source,
+        .source_files = source_files.items,
         .program_args = positional.items[1..],
         .debug_flags = debug_flags,
         .started = started,
@@ -378,4 +423,31 @@ test "CLI core rejects duplicate top-level names without running" {
         errors.writer.buffered(),
         "duplicates.chi:2:8: top-level name is already declared: `duplicate`",
     ) != null);
+}
+
+test "source files load without changing the entry program" {
+    const io = std.testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var errors: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer errors.deinit();
+
+    const exit_code = try compileAndRun(io, std.testing.allocator, .{
+        .source_path = "test.chi",
+        .source =
+        \\static status = func(value: int) int -> return value * 2
+        \\const a = status(21)
+        \\exit(a)
+        ,
+        .source_files = &.{
+            .{ .path = "physics/body.chi", .source = "exit(0)", .module_path = "physics" },
+        },
+        .program_args = &.{},
+        .debug_flags = .{},
+        .started = std.Io.Clock.awake.now(io),
+    }, &output.writer, &errors.writer);
+
+    try std.testing.expectEqual(RunOutcome{ .program_exit = 42 }, exit_code);
 }
