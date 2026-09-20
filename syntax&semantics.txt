@@ -106,10 +106,11 @@ const computed_block = comptime
 # A compile-time value consumer requires successful evaluation. An unhandled
 # fallible failure is a source error; fallible calls handled within the executed
 # code retain their ordinary control-flow behavior. Query/declaration cycles are
-# source errors. Recursion with continually changing arguments and nonterminating
-# loops are bounded by deterministic call-depth, execution-fuel, and aggregate-
-# storage limits, never by a wall-clock timeout. Exceeding a limit is a source
-# error at the active compile-time call site.
+# source errors. A recursive call that repeats the same function instance and
+# arguments is also an exact cycle and therefore a source error. Other compile-
+# time computations run until they finish or the compiler process is interrupted.
+# The language defines no call-depth, execution-fuel, storage, or time limit;
+# interruption and machine resource exhaustion do not make the source invalid.
 #
 # A direct call may appear in a type position when its declared return type is
 # 'type'. It is evaluated at compile time and the consumer receives its canonical
@@ -330,6 +331,18 @@ const c: int = s.a
 # Named declarations are sugar for 'static name = struct'.
 struct Q
     a: int
+
+# A named struct with parameters declares a type-valued factory. It is sugar for
+# a function with the same name that returns the anonymous struct in its body;
+# every listed parameter is implicitly static. Names remain case-sensitive.
+struct Box(T: type)
+    copy = trivial
+    value: T
+# Equivalent to: func Box(static T: type) type -> struct ...
+const boxed = Box(int){value = 42}
+# Generated struct definitions accept the same move, copy, and drop ownership
+# declarations as non-parameterized structs. A custom hook may refer to the
+# factory's static parameters and is specialized with that generated type.
 
 # Every struct definition introduces a distinct nominal type. Static aliases
 # preserve that identity; equal field names and types do not make separately

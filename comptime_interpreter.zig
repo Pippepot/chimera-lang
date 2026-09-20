@@ -5,12 +5,11 @@ pub const ExecutionErrorReason = enum {
     call_cycle,
     division_by_zero,
     integer_overflow,
-    resource_limit,
 };
 
 pub const ExecutionError = struct {
     reason: ExecutionErrorReason,
-    instruction_index: ?u32 = null,
+    span: ?structures.SourceSpan = null,
 };
 
 pub const Value = union(enum) {
@@ -23,11 +22,9 @@ pub const Result = union(enum) {
     failure,
     exit: i32,
     execution_error: ExecutionError,
+    reported_error,
     unavailable,
 };
-
-const default_block_fuel: u32 = 1_000_000;
-const default_aggregate_fuel: u32 = 1_000_000;
 
 /// Execute the supported subset of a typed body. Slots are dense and frame-local;
 /// aggregate components are interned only when they cross value boundaries.
@@ -51,12 +48,7 @@ pub fn execute(
     std.debug.assert(entry.argument_start == 0);
     std.debug.assert(entry.argument_end == arguments.len);
     @memcpy(slots[entry.argument_start..entry.argument_end], arguments);
-    var fuel = default_block_fuel;
-    var aggregate_fuel = default_aggregate_fuel;
     while (true) {
-        if (fuel == 0) return .{ .execution_error = .{ .reason = .resource_limit } };
-        fuel -= 1;
-
         const block = body.blocks[@intFromEnum(block_id)];
         for (block.instruction_start..block.instruction_end) |instruction_index| {
             const instruction = body.instructions[instruction_index];
@@ -80,39 +72,39 @@ pub fn execute(
                 .divsi => |operands| {
                     const lhs = integer(slots, operands.lhs);
                     const rhs = integer(slots, operands.rhs);
-                    if (rhs == 0) return executionError(.division_by_zero, instruction_index);
-                    if (lhs == std.math.minInt(i32) and rhs == -1) return executionError(.integer_overflow, instruction_index);
+                    if (rhs == 0) return executionError(.division_by_zero, instructionSpan(body, instruction_index));
+                    if (lhs == std.math.minInt(i32) and rhs == -1) return executionError(.integer_overflow, instructionSpan(body, instruction_index));
                     slots[destination] = .{ .runtime = .{ .int = @divTrunc(lhs, rhs) } };
                 },
                 .exit => |operand| return .{ .exit = integer(slots, operand) },
-                .call => |call| if (try executeReturningCall(body, slots, call_scratch, destination, instruction_index, call.instance(), call.arguments, executor, &aggregate_fuel)) |result| return result,
+                .call => |call| if (try executeReturningCall(body, slots, call_scratch, destination, instruction_index, call.instance(), call.arguments, executor)) |result| return result,
                 .indirect_call => |call| {
                     const reference = slots[@intFromEnum(call.target)].runtime.function_ref;
-                    if (try executeReturningCall(body, slots, call_scratch, destination, instruction_index, .{ .item = reference.target }, call.arguments, executor, &aggregate_fuel)) |result| return result;
+                    if (try executeReturningCall(body, slots, call_scratch, destination, instruction_index, .{ .item = reference.target }, call.arguments, executor)) |result| return result;
                 },
                 .variant_tag => |operand| switch (try variantTag(body, slots[@intFromEnum(operand)].runtime, operand, executor)) {
                     .returned => |value| slots[destination] = value,
-                    else => |result| return atInstruction(result, instruction_index),
+                    else => |result| return atSpan(result, instructionSpan(body, instruction_index)),
                 },
-                .variant_coerce => |operation| switch (try coerceVariant(body, slots[@intFromEnum(operation.operand)].runtime, operation, executor, &aggregate_fuel)) {
+                .variant_coerce => |operation| switch (try coerceVariant(body, slots[@intFromEnum(operation.operand)].runtime, operation, executor)) {
                     .returned => |value| slots[destination] = value,
-                    else => |result| return atInstruction(result, instruction_index),
+                    else => |result| return atSpan(result, instructionSpan(body, instruction_index)),
                 },
-                .variant_extract => |operation| switch (try extractVariant(body, slots[@intFromEnum(operation.operand)].runtime, operation, executor, &aggregate_fuel)) {
+                .variant_extract => |operation| switch (try extractVariant(body, slots[@intFromEnum(operation.operand)].runtime, operation, executor)) {
                     .returned => |value| slots[destination] = value,
-                    else => |result| return atInstruction(result, instruction_index),
+                    else => |result| return atSpan(result, instructionSpan(body, instruction_index)),
                 },
-                .struct_init => |operation| switch (try initializeStruct(body, slots, operation, executor, gpa, &aggregate_fuel)) {
+                .struct_init => |operation| switch (try initializeStruct(body, slots, operation, executor, gpa)) {
                     .returned => |value| slots[destination] = value,
-                    else => |result| return atInstruction(result, instruction_index),
+                    else => |result| return atSpan(result, instructionSpan(body, instruction_index)),
                 },
                 .field_access => |operation| switch (try accessField(slots[@intFromEnum(operation.operand)].runtime, operation, executor)) {
                     .returned => |value| slots[destination] = value,
-                    else => |result| return atInstruction(result, instruction_index),
+                    else => |result| return atSpan(result, instructionSpan(body, instruction_index)),
                 },
-                .field_update => |operation| switch (try updateField(body, slots, operation, executor, gpa, &aggregate_fuel)) {
+                .field_update => |operation| switch (try updateField(body, slots, operation, executor, gpa)) {
                     .returned => |value| slots[destination] = value,
-                    else => |result| return atInstruction(result, instruction_index),
+                    else => |result| return atSpan(result, instructionSpan(body, instruction_index)),
                 },
                 .mut_parameter_write => |operation| {
                     std.debug.assert(operation.parameter_index < arguments.len);
@@ -128,7 +120,7 @@ pub fn execute(
         }
 
         switch (block.terminator) {
-            .branch => |branch| switch (try branchTarget(body, slots, scratch, branch, executor, &aggregate_fuel)) {
+            .branch => |branch| switch (try branchTarget(body, slots, scratch, branch, executor)) {
                 .next => |next| block_id = next,
                 .result => |result| return result,
             },
@@ -137,22 +129,22 @@ pub fn execute(
                     predicate.then_branch
                 else
                     predicate.else_branch;
-                switch (try branchTarget(body, slots, scratch, branch, executor, &aggregate_fuel)) {
+                switch (try branchTarget(body, slots, scratch, branch, executor)) {
                     .next => |next| block_id = next,
                     .result => |result| return result,
                 }
             },
             .return_unit => return .{ .returned = .{ .runtime = .unit } },
-            .return_value => |value_use| return valueUse(body, slots, value_use, executor, &aggregate_fuel),
+            .return_value => |value_use| return valueUse(body, slots, value_use, executor),
             .return_failure => return .failure,
             .diverge => unreachable,
-            .fallible_call => |fallible| switch (try executeFallibleCall(body, slots, call_scratch, fallible.call.instance(), fallible.call.arguments, fallible.success, fallible.failure, executor, &aggregate_fuel)) {
+            .fallible_call => |fallible| switch (try executeFallibleCall(body, slots, call_scratch, fallible.call.instance(), fallible.call.arguments, fallible.success, fallible.failure, terminatorSpan(body, block_id), executor)) {
                 .next => |next| block_id = next,
                 .result => |result| return result,
             },
             .fallible_indirect_call => |fallible| {
                 const reference = slots[@intFromEnum(fallible.call.target)].runtime.function_ref;
-                switch (try executeFallibleCall(body, slots, call_scratch, .{ .item = reference.target }, fallible.call.arguments, fallible.success, fallible.failure, executor, &aggregate_fuel)) {
+                switch (try executeFallibleCall(body, slots, call_scratch, .{ .item = reference.target }, fallible.call.arguments, fallible.success, fallible.failure, terminatorSpan(body, block_id), executor)) {
                     .next => |next| block_id = next,
                     .result => |result| return result,
                 }
@@ -161,11 +153,19 @@ pub fn execute(
     }
 }
 
-fn executionError(reason: ExecutionErrorReason, instruction_index: usize) Result {
+fn executionError(reason: ExecutionErrorReason, span: ?structures.SourceSpan) Result {
     return .{ .execution_error = .{
         .reason = reason,
-        .instruction_index = @intCast(instruction_index),
+        .span = span,
     } };
+}
+
+fn instructionSpan(body: *const structures.FunctionBodyAnalysis, instruction_index: usize) ?structures.SourceSpan {
+    return if (body.instruction_spans.len == body.instructions.len) body.instruction_spans[instruction_index] else null;
+}
+
+fn terminatorSpan(body: *const structures.FunctionBodyAnalysis, block_id: structures.FunctionBlockId) ?structures.SourceSpan {
+    return if (body.terminator_spans.len == body.blocks.len) body.terminator_spans[@intFromEnum(block_id)] else null;
 }
 
 fn integer(slots: []const Value, value: structures.FunctionValueId) i32 {
@@ -197,18 +197,18 @@ fn executeCall(
     scratch: []Value,
     instance: structures.InstanceId,
     argument_range: structures.FunctionValueRange,
+    call_span: ?structures.SourceSpan,
     executor: anytype,
-    aggregate_fuel: *u32,
 ) !Result {
     const arguments = body.call_arguments[argument_range.start..argument_range.end];
     const interpreted = scratch[argument_range.start..argument_range.end];
     for (arguments, interpreted) |argument, *destination| {
-        switch (try valueUse(body, slots, argument, executor, aggregate_fuel)) {
+        switch (try valueUse(body, slots, argument, executor)) {
             .returned => |value| destination.* = value,
             else => |result| return result,
         }
     }
-    return executor.call(instance, interpreted);
+    return executor.call(instance, interpreted, call_span);
 }
 
 fn executeReturningCall(
@@ -220,11 +220,10 @@ fn executeReturningCall(
     instance: structures.InstanceId,
     argument_range: structures.FunctionValueRange,
     executor: anytype,
-    aggregate_fuel: *u32,
 ) !?Result {
-    return switch (atInstruction(
-        try executeCall(body, slots, scratch, instance, argument_range, executor, aggregate_fuel),
-        instruction_index,
+    return switch (atSpan(
+        try executeCall(body, slots, scratch, instance, argument_range, instructionSpan(body, instruction_index), executor),
+        instructionSpan(body, instruction_index),
     )) {
         .returned => |value| blk: {
             slots[destination] = value;
@@ -233,6 +232,7 @@ fn executeReturningCall(
         .failure => unreachable,
         .exit => |status| .{ .exit = status },
         .execution_error => |value| .{ .execution_error = value },
+        .reported_error => .reported_error,
         .unavailable => .unavailable,
     };
 }
@@ -250,10 +250,10 @@ fn executeFallibleCall(
     argument_range: structures.FunctionValueRange,
     success_id: structures.FunctionBlockId,
     failure_id: structures.FunctionBlockId,
+    call_span: ?structures.SourceSpan,
     executor: anytype,
-    aggregate_fuel: *u32,
 ) !Step {
-    return switch (try executeCall(body, slots, scratch, instance, argument_range, executor, aggregate_fuel)) {
+    return switch (try executeCall(body, slots, scratch, instance, argument_range, call_span, executor)) {
         .returned => |value| blk: {
             const success = body.blocks[@intFromEnum(success_id)];
             std.debug.assert(success.argument_end - success.argument_start == 1);
@@ -263,6 +263,7 @@ fn executeFallibleCall(
         .failure => .{ .next = failure_id },
         .exit => |status| .{ .result = .{ .exit = status } },
         .execution_error => |value| .{ .result = .{ .execution_error = value } },
+        .reported_error => .{ .result = .reported_error },
         .unavailable => .{ .result = .unavailable },
     };
 }
@@ -273,23 +274,14 @@ fn valueType(body: *const structures.FunctionBodyAnalysis, value: structures.Fun
     return body.instructions[index - body.block_argument_types.len].resultType();
 }
 
-fn chargeAggregate(fuel: *u32, amount: usize) bool {
-    const charged = std.math.cast(u32, amount) orelse return false;
-    if (fuel.* < charged) return false;
-    fuel.* -= charged;
-    return true;
-}
-
 fn initializeStruct(
     body: *const structures.FunctionBodyAnalysis,
     slots: []const Value,
     operation: structures.StructOperation,
     executor: anytype,
     gpa: std.mem.Allocator,
-    aggregate_fuel: *u32,
 ) !Result {
     const fields = body.struct_field_values[operation.fields.start..operation.fields.end];
-    if (!chargeAggregate(aggregate_fuel, fields.len + 1)) return .{ .execution_error = .{ .reason = .resource_limit } };
     const values = try gpa.alloc(structures.CompileTimeValueId, fields.len);
     defer gpa.free(values);
     for (fields) |field| {
@@ -317,10 +309,8 @@ fn updateField(
     operation: structures.FieldUpdateOperation,
     executor: anytype,
     gpa: std.mem.Allocator,
-    aggregate_fuel: *u32,
 ) !Result {
     const source = try executor.lookupTuple(slots[@intFromEnum(operation.operand)].runtime.structure);
-    if (!chargeAggregate(aggregate_fuel, source.len + 1)) return .{ .execution_error = .{ .reason = .resource_limit } };
     const fields = try gpa.dupe(structures.CompileTimeValueId, source);
     defer gpa.free(fields);
     std.debug.assert(operation.field_index < fields.len);
@@ -366,7 +356,6 @@ fn coerceVariant(
     value: structures.CompileTimeValue.RuntimeValue,
     operation: structures.VariantOperation,
     executor: anytype,
-    aggregate_fuel: *u32,
 ) !Result {
     const mapping = body.variant_coercion_tags[operation.tag_mapping.?.start..operation.tag_mapping.?.end];
     const source_type = valueType(body, operation.operand);
@@ -387,7 +376,6 @@ fn coerceVariant(
     std.debug.assert(target_tag != structures.invalid_variant_tag);
     const target_members = (try executor.variantMembers(operation.target_type)) orelse unreachable;
     std.debug.assert(target_tag < target_members.len);
-    if (!chargeAggregate(aggregate_fuel, 1)) return .{ .execution_error = .{ .reason = .resource_limit } };
     return .{ .returned = .{ .runtime = variantValue(target_members[target_tag], payload) } };
 }
 
@@ -396,7 +384,6 @@ fn extractVariant(
     value: structures.CompileTimeValue.RuntimeValue,
     operation: structures.VariantOperation,
     executor: anytype,
-    aggregate_fuel: *u32,
 ) !Result {
     const active = try activeVariant(body, value, operation.operand, executor);
     if (try executor.variantMembers(operation.target_type)) |target_members| {
@@ -408,7 +395,6 @@ fn extractVariant(
         const target_tag = mapping[source_tag];
         std.debug.assert(target_tag != structures.invalid_variant_tag);
         std.debug.assert(target_tag < target_members.len);
-        if (!chargeAggregate(aggregate_fuel, 1)) return .{ .execution_error = .{ .reason = .resource_limit } };
         return .{ .returned = .{ .runtime = variantValue(target_members[target_tag], active.payload) } };
     }
     const payload = (try executor.lookupRuntime(active.payload)) orelse return .unavailable;
@@ -418,10 +404,10 @@ fn extractVariant(
     return .{ .returned = .{ .runtime = .{ .function_ref = reference } } };
 }
 
-fn atInstruction(result: Result, instruction_index: usize) Result {
+fn atSpan(result: Result, span: ?structures.SourceSpan) Result {
     return switch (result) {
-        .execution_error => |value| if (value.instruction_index == null)
-            executionError(value.reason, instruction_index)
+        .execution_error => |value| if (value.span == null)
+            executionError(value.reason, span)
         else
             result,
         else => result,
@@ -433,7 +419,6 @@ fn valueUse(
     slots: []const Value,
     use: structures.FunctionValueUse,
     executor: anytype,
-    aggregate_fuel: *u32,
 ) !Result {
     const value = slots[@intFromEnum(use.value)];
     const target = use.coerce_to orelse return .{ .returned = value };
@@ -441,7 +426,7 @@ fn valueUse(
         .operand = use.value,
         .target_type = target,
         .tag_mapping = mapping,
-    }, executor, aggregate_fuel);
+    }, executor);
     var reference = value.runtime.function_ref;
     reference.type_id = target;
     return .{ .returned = .{ .runtime = .{ .function_ref = reference } } };
@@ -453,13 +438,12 @@ fn branchTarget(
     scratch: []Value,
     branch: structures.FunctionBranch,
     executor: anytype,
-    aggregate_fuel: *u32,
 ) !Step {
     const target = body.blocks[@intFromEnum(branch.target)];
     const arguments = body.branch_arguments[branch.arguments.start..branch.arguments.end];
     std.debug.assert(arguments.len == target.argument_end - target.argument_start);
     for (arguments, scratch[0..arguments.len]) |argument, *temporary| {
-        switch (try valueUse(body, slots, argument, executor, aggregate_fuel)) {
+        switch (try valueUse(body, slots, argument, executor)) {
             .returned => |value| temporary.* = value,
             else => |result| return .{ .result = result },
         }

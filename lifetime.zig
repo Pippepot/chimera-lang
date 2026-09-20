@@ -88,6 +88,7 @@ pub const BuildBlock = struct {
     terminator_effects: std.ArrayList(LifetimeEffect) = .empty,
     layout_index: ?u32 = null,
     terminator: ?structures.FunctionTerminator = null,
+    terminator_span: ?structures.SourceSpan = null,
 };
 
 const GenerationBits = struct {

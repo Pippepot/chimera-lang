@@ -97,8 +97,7 @@ Runtime codegen never accepts those instructions in a reachable runtime body.
 
 The typed body also needs a compact source map for instructions, terminators,
 and call sites. This is execution metadata, not another IR, and is necessary for
-division errors, unavailable operations, resource exhaustion, and compile-time
-call traces.
+reached execution errors and compile-time call traces.
 
 ## Queries and reuse
 
@@ -111,9 +110,7 @@ implemented:
 - `ExecuteComptimeCall(CallKey) -> ?CompileTimeOutcome` executes a concrete
   function instance with an interned tuple of interpreted arguments. These are
   ordinary parameters supplied during interpretation, not static parameters in
-  the instance's specialization identity. Until resource accounting uses one
-  cross-frame budget, the key also carries remaining call depth so exhaustion
-  cannot be reused by the same call reached with a larger budget.
+  the instance's specialization identity.
 - `ExecuteComptimeThunk(ThunkKey) -> ?CompileTimeOutcome` executes a typed
   thunk. Its key includes the site and enclosing specialization.
 
@@ -138,11 +135,15 @@ Changing a callee body should invalidate only executions that depended on it.
 Top-level statics should use this path instead of retaining a second “simple
 static initializer” evaluator.
 
-Recursion whose arguments continually change is not a query cycle. Bound it with
-deterministic resource limits: call depth, executed block/instruction fuel, and
-aggregate bytes. Do not use a wall-clock timeout. Charge fuel once per block
-range where possible so the safety check is not a branch on every scalar
-instruction.
+A recursive call that repeats the same concrete instance and interpreted
+arguments is an exact cycle in the deterministic execution model and is a source
+error. Recursion with changing arguments and loops otherwise run until they
+finish or the compiler process is interrupted. Compile-time execution has no
+language-defined call-depth, fuel, storage, or wall-clock limit. Interruption and
+machine resource exhaustion are operational failures, not source diagnostics,
+and must not be cached as evaluation results. The CLI relies on normal process
+interruption such as Ctrl-C; this milestone adds no cancellation protocol or
+configurable budget.
 
 ## Interpreter
 
@@ -210,25 +211,24 @@ Each slice includes diagnostics and incremental tests before the next begins.
 1. **Semantics and identity**
    - Status: implemented.
    - Specify visibility, purity, evaluation order, fallible outcomes, recursion,
-     limits, and type-position calls.
+     exact cycles, and type-position calls.
    - Add `type`, canonical value IDs, value tuples, and source-site keys.
    - Replace specialization tuples of copied value payloads with value IDs.
 
 2. **Typed thunks and scalar interpreter**
-   - Status: scalar vertical path implemented; full terminator source maps
-     remain.
+   - Status: implemented, including instruction and terminator source maps.
    - Generalize body typing to publish an inferred-result comptime thunk.
    - Add source maps and interpret constants, integer operations, predicates,
      blocks, joins, loops, returns, and fallible control flow.
    - Route arbitrary static initializers and `comptime` expressions through it.
 
 3. **Calls and specialization**
-   - Status: implemented except for call traces and global execution and
-     aggregate-storage accounting.
+   - Status: implemented.
    - Interpret direct calls, concrete callable values, and indirect calls.
    - Route every static argument expression through thunk execution.
-   - Add call memoization, cycle diagnostics, deterministic limits, and call
-     traces.
+   - Add call memoization, exact cycle diagnostics, and call traces.
+   - The call key has no budget dimension, and execution has no fixed depth,
+     block, or aggregate rejection path.
 
 4. **Aggregates and ownership**
    - Status: implemented.
@@ -238,11 +238,10 @@ Each slice includes diagnostics and incremental tests before the next begins.
      runtime execution.
 
 5. **Type-valued functions**
-   - Status: implemented, including generated nominal structs with field-only
-     definitions.
+   - Status: implemented, including generated nominal structs with ownership
+     declarations and specialization-aware custom hooks.
    - Add `type` constants/results and calls in type positions.
    - Add canonical type operations required by real generic examples.
-   - Generated ownership properties and hooks remain future work.
 
 6. **Cutover and cleanup**
    - Status: implemented for the current language surface.
@@ -253,7 +252,8 @@ Each slice includes diagnostics and incremental tests before the next begins.
 
 ## Performance gates
 
-Add comptime benchmarks before optimizing the interpreter:
+`comptime_benchmark.zig` records the following workloads before optimizing the
+interpreter:
 
 - cold constant and short-expression evaluation;
 - a tight arithmetic loop;
@@ -263,16 +263,15 @@ Add comptime benchmarks before optimizing the interpreter:
 - type-valued specialization with repeated and distinct arguments;
 - no-op rebuild, unrelated edit, callee-body edit, and static-argument edit.
 
-Record separately the time for thunk analysis, interpretation, value interning,
-and query validation. The intended hot path has one instruction dispatch per SSA
+Record separately the time for thunk analysis, interpretation, result
+publication, and query validation. The intended hot path has one instruction dispatch per SSA
 instruction, no scalar heap allocation, one pre-sized slot array per frame, and
 no target layout or machine-code work.
 
-The milestone is not complete merely because evaluation is correct. Profiles
-must show that query scheduling, value interning, source maps, and resource
-accounting are not dominant. Optimize the measured component while preserving
-the single typed-SSA execution path. Do not add a JIT as an unmeasured escape
-hatch.
+Use profiles to determine whether query scheduling, value interning, source maps,
+or interpretation dominate representative builds. Optimize the measured
+component while preserving the single typed-SSA execution path. Do not add a JIT
+as an unmeasured escape hatch.
 
 ## Rejected alternatives
 

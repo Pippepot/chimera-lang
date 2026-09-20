@@ -45,3 +45,12 @@ git diff --check
 ```
 
 Run suites that write `./prog` sequentially. Check modified Zig files with `zig fmt --check <files>`. Keep temporary verification files outside the repository.
+
+## Benchmark
+
+The compile-time execution benchmark reports analysis, execution, publication,
+cached lookup, and incremental recomputation times in CSV form:
+
+```sh
+zig run -O ReleaseFast comptime_benchmark.zig
+```

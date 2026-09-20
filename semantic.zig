@@ -527,7 +527,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 .bool_literal => return self.appendExpression(index, .{ .boolean = self.ast.tokens[node.token_index].tag == .keyword_true }),
                 .unit_literal => return self.appendExpression(index, if (result_is_type) .{ .type_value = .unit } else .unit),
                 .none_literal => return self.appendExpression(index, if (result_is_type) .{ .type_value = .none } else .none),
-                .type, .type_func, .type_variant => return self.appendTypeValue(index),
+                .type, .implicit_type, .type_func, .type_variant => return self.appendTypeValue(index),
                 .comptime_expr => {
                     const value_id = self.type_interner.executeComptime(index) catch |err| switch (err) {
                         error.QueryCycle => return self.reject(index, .declaration_cycle),
@@ -1240,6 +1240,7 @@ pub fn analyzeFunctionInstanceSignature(
 
 fn parameterMode(ast: *const structures.Ast, parameter: structures.Node) ?structures.ParameterMode {
     const access = parameter.data.node_node.a.unwrap() orelse return .imm;
+    if (ast.nodes[access.index()].tag == .implicit_static) return .static;
     return switch (ast.tokens[ast.nodes[access.index()].token_index].tag) {
         .keyword_imm => .imm,
         .keyword_static => .static,
@@ -1266,6 +1267,7 @@ fn analyzeType(
     unsupported_kind: structures.Diagnostic.Kind,
 ) anyerror!SemanticResult(structures.TypeId) {
     const node = ast.nodes[node_index.index()];
+    if (node.tag == .implicit_type) return .{ .success = .type };
     if (node.tag == .call) {
         const value_id = type_interner.executeComptime(node_index) catch |err| switch (err) {
             error.QueryCycle => return .{ .unsupported = issueAt(ast, node_index.index(), .declaration_cycle) },
@@ -1397,24 +1399,25 @@ pub fn analyzeStructDefinition(
             return .{ .unsupported = issueAt(ast, annotation.index(), .static_initializer_not_supported) };
         }
     }
-    return analyzeStructMembers(ast, source, initializer, item_id, type_interner, gpa);
+    return analyzeStructMembers(ast, source, initializer, .{ .declared = item_id }, type_interner, gpa);
 }
 
 pub fn analyzeGeneratedStructDefinition(
     ast: *const structures.Ast,
     source: []const u8,
     struct_index: structures.Node.Index,
+    identity: structures.GeneratedStructIdentity,
     type_interner: anytype,
     gpa: std.mem.Allocator,
 ) !SemanticResult(structures.StructDefinition) {
-    return analyzeStructMembers(ast, source, struct_index, null, type_interner, gpa);
+    return analyzeStructMembers(ast, source, struct_index, .{ .generated = identity }, type_interner, gpa);
 }
 
 fn analyzeStructMembers(
     ast: *const structures.Ast,
     source: []const u8,
     struct_index: structures.Node.Index,
-    declared_item: ?structures.ItemId,
+    identity: structures.StructIdentity,
     type_interner: anytype,
     gpa: std.mem.Allocator,
 ) !SemanticResult(structures.StructDefinition) {
@@ -1433,7 +1436,6 @@ fn analyzeStructMembers(
     for (ast.node_refs[struct_node.data.ref.start..struct_node.data.ref.end]) |member_index| {
         const member = ast.nodes[member_index.index()];
         if (member.tag == .struct_property) {
-            const item_id = declared_item orelse return .{ .unsupported = issueAt(ast, member_index.index(), .struct_member_not_supported) };
             const property_span = tokenSpan(ast, member.token_index);
             const property_name = source[property_span.start..property_span.end];
             const operation = StructOwnershipOperation.fromName(property_name) orelse
@@ -1445,13 +1447,13 @@ fn analyzeStructMembers(
             const value_span = tokenSpan(ast, value.token_index);
             const value_name = source[value_span.start..value_span.end];
             if (value.tag == .func) {
-                const self_type = try type_interner.structType(item_id);
+                const self_type = try type_interner.structIdentityType(identity);
                 const mode: structures.ParameterMode, const return_type: structures.TypeId = switch (operation) {
                     .copy => .{ .imm, self_type },
                     .move => .{ .@"var", self_type },
                     .drop => .{ .deinit, .unit },
                 };
-                const hook = (try type_interner.ownedFunction(item_id, property_name)) orelse return error.Unavailable;
+                const hook = (try type_interner.ownedFunction(identity, property_name)) orelse return error.Unavailable;
                 const actual = (try type_interner.functionSignature(hook)) orelse return error.Unavailable;
                 const expected_parameter = [_]structures.CallableParameter{.{ .mode = mode, .type_id = self_type }};
                 const expected_type = try type_interner.internCallable(.{
@@ -1562,6 +1564,7 @@ const StructOwnershipOperation = enum {
 
 fn isMetaTypeAnnotation(ast: *const structures.Ast, source: []const u8, annotation: structures.Node.Index) bool {
     const node = ast.nodes[annotation.index()];
+    if (node.tag == .implicit_type) return true;
     const span = tokenSpan(ast, node.token_index);
     return node.tag == .type and std.mem.eql(u8, source[span.start..span.end], "type");
 }
@@ -1694,11 +1697,15 @@ pub fn discoverItems(gpa: std.mem.Allocator, ast: *const structures.Ast, source:
 
     const root = ast.nodes[0];
     std.debug.assert(root.tag == .block);
+    var declaration_node_start: u32 = 1;
     for (root.data.ref.start..root.data.ref.end) |ref_index| {
         const declaration = ast.node_refs[ref_index];
         const node = ast.nodes[declaration.index()];
 
-        if (node.tag != .static_binding) continue;
+        if (node.tag != .static_binding) {
+            declaration_node_start = declaration.index() + 1;
+            continue;
+        }
         const value = node.data.node_node.b.unwrap() orelse unreachable;
         const kind: structures.ItemKind = switch (ast.nodes[value.index()].tag) {
             .func => .function,
@@ -1708,28 +1715,49 @@ pub fn discoverItems(gpa: std.mem.Allocator, ast: *const structures.Ast, source:
 
         const token = ast.tokens[node.token_index];
         const name = source[token.loc.start..token.loc.end];
-        const parent = try appendItem(gpa, &items, kind, ast.file_id, name, declaration.index(), null);
+        const parent = try appendItem(gpa, &items, kind, ast.file_id, name, declaration.index(), null, null);
         if (kind == .structure) {
-            const struct_node = ast.nodes[value.index()];
-            var hook_names = std.StringHashMap(void).init(gpa);
-            defer hook_names.deinit();
-            for (ast.node_refs[struct_node.data.ref.start..struct_node.data.ref.end]) |member_index| {
-                const member = ast.nodes[member_index.index()];
-                if (member.tag != .struct_property) continue;
-                const property_value = member.data.node;
-                if (ast.nodes[property_value.index()].tag != .func) continue;
-                const property_token = ast.tokens[member.token_index];
-                const property_name = source[property_token.loc.start..property_token.loc.end];
-                // StructDefinition owns duplicate-property diagnostics. Keep
-                // discovery indexable until that semantic boundary is demanded.
-                if ((try hook_names.getOrPut(property_name)).found_existing) continue;
-                _ = try appendItem(gpa, &items, .function, ast.file_id, property_name, property_value.index(), parent);
+            try discoverStructHooks(gpa, &items, ast, source, value, parent, null);
+        } else {
+            for (declaration_node_start..declaration.index()) |candidate_index| {
+                const candidate = ast.nodes[candidate_index];
+                if (candidate.tag != .@"struct") continue;
+                const source_site = @as(i64, @intCast(candidate_index)) - @as(i64, declaration.index());
+                try discoverStructHooks(gpa, &items, ast, source, @enumFromInt(candidate_index), parent, source_site);
             }
         }
+        declaration_node_start = declaration.index() + 1;
     }
 
-    _ = try appendItem(gpa, &items, .top_level_entry, ast.file_id, "$entry", 0, null);
+    _ = try appendItem(gpa, &items, .top_level_entry, ast.file_id, "$entry", 0, null, null);
     return .{ .file_id = ast.file_id, .items = try items.toOwnedSlice(gpa) };
+}
+
+fn discoverStructHooks(
+    gpa: std.mem.Allocator,
+    items: *std.ArrayList(structures.DiscoveredItem),
+    ast: *const structures.Ast,
+    source: []const u8,
+    struct_index: structures.Node.Index,
+    parent: u32,
+    source_site: ?i64,
+) !void {
+    const struct_node = ast.nodes[struct_index.index()];
+    std.debug.assert(struct_node.tag == .@"struct");
+    var hook_names = std.StringHashMap(void).init(gpa);
+    defer hook_names.deinit();
+    for (ast.node_refs[struct_node.data.ref.start..struct_node.data.ref.end]) |member_index| {
+        const member = ast.nodes[member_index.index()];
+        if (member.tag != .struct_property) continue;
+        const property_value = member.data.node;
+        if (ast.nodes[property_value.index()].tag != .func) continue;
+        const property_token = ast.tokens[member.token_index];
+        const property_name = source[property_token.loc.start..property_token.loc.end];
+        // Struct-definition analysis owns duplicate-property diagnostics. Keep
+        // discovery indexable until that semantic boundary is demanded.
+        if ((try hook_names.getOrPut(property_name)).found_existing) continue;
+        _ = try appendItem(gpa, items, .function, ast.file_id, property_name, property_value.index(), parent, source_site);
+    }
 }
 
 fn appendItem(
@@ -1740,12 +1768,13 @@ fn appendItem(
     name: []const u8,
     declaration: u32,
     parent: ?u32,
+    source_site: ?i64,
 ) !u32 {
     const owned_name = try gpa.dupe(u8, name);
     errdefer gpa.free(owned_name);
     const index: u32 = @intCast(items.items.len);
     try items.append(gpa, .{
-        .loc = .{ .file_id = file_id, .kind = kind, .name = owned_name },
+        .loc = .{ .file_id = file_id, .source_site = source_site, .kind = kind, .name = owned_name },
         .declaration = declaration,
         .parent = parent,
     });
@@ -1888,11 +1917,15 @@ const TestTypeInterner = struct {
         unreachable;
     }
 
-    pub fn ownedFunction(_: @This(), _: structures.ItemId, _: []const u8) !?structures.ItemId {
+    pub fn structIdentityType(_: @This(), _: structures.StructIdentity) !structures.TypeId {
         unreachable;
     }
 
-    pub fn functionSignature(_: @This(), _: structures.ItemId) !?structures.FunctionSignature {
+    pub fn ownedFunction(_: @This(), _: structures.StructIdentity, _: []const u8) !?structures.InstanceId {
+        unreachable;
+    }
+
+    pub fn functionSignature(_: @This(), _: structures.InstanceId) !?structures.FunctionSignature {
         unreachable;
     }
 

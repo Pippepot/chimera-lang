@@ -6,16 +6,6 @@ const comptime_interpreter = @import("comptime_interpreter.zig");
 const semantic = @import("semantic.zig");
 const typing = @import("typing.zig");
 
-const max_comptime_call_depth: u16 = 128;
-const ActiveComptimeCall = struct {
-    instance: structures.InstanceId,
-    arguments: structures.CompileTimeValueTupleId,
-};
-// Call depth is part of the memo key, but logical recursion ignores that
-// resource context and closes when an instance-and-argument pair repeats.
-threadlocal var active_comptime_calls: [max_comptime_call_depth]ActiveComptimeCall = undefined;
-threadlocal var active_comptime_call_count: u16 = 0;
-
 pub const SourceText = struct {
     pub const Key = structures.FileId;
     pub const Value = []const u8;
@@ -98,6 +88,7 @@ pub const ItemLocations = struct {
         var hasher = std.hash.Wyhash.init(0);
         std.hash.autoHash(&hasher, value.file_id);
         std.hash.autoHash(&hasher, value.owner);
+        std.hash.autoHash(&hasher, value.source_site);
         std.hash.autoHash(&hasher, value.kind);
         hasher.update(value.name);
         return hasher.final();
@@ -342,18 +333,27 @@ pub fn TypeInterner(comptime Context: type) type {
             return (try self.ctx.get(OwnershipCapabilities, type_id)).*;
         }
 
-        pub fn ownedFunction(self: @This(), owner: structures.ItemId, name: []const u8) !?structures.ItemId {
+        pub fn ownedFunction(self: @This(), identity: structures.StructIdentity, name: []const u8) !?structures.InstanceId {
+            const owner, const source_site, const specialization = switch (identity) {
+                .declared => |item_id| .{ item_id, @as(?i64, null), @as(?structures.CompileTimeValueTupleId, null) },
+                .generated => |generated| .{ generated.owner.item, generated.node_offset, generated.owner.specialization },
+            };
             const loc = try self.ctx.lookupInterned(ItemLocations, owner);
             const index = (try self.ctx.get(IndexItems, loc.file_id)).* orelse return error.Unavailable;
             for (index.ids()) |item_id| {
                 const item_loc = try self.ctx.lookupInterned(ItemLocations, item_id);
-                if (item_loc.owner == owner and item_loc.kind == .function and std.mem.eql(u8, item_loc.name, name)) return item_id;
+                if (item_loc.owner == owner and item_loc.source_site == source_site and item_loc.kind == .function and std.mem.eql(u8, item_loc.name, name)) {
+                    return .{ .item = item_id, .specialization = specialization };
+                }
             }
             return null;
         }
 
-        pub fn functionSignature(self: @This(), item_id: structures.ItemId) !?structures.FunctionSignature {
-            return (try self.ctx.get(FunctionSignature, item_id)).*;
+        pub fn functionSignature(self: @This(), instance: structures.InstanceId) !?structures.FunctionSignature {
+            return if (instance.specialization) |_|
+                (try self.ctx.get(FunctionInstanceSignature, instance)).*
+            else
+                (try self.ctx.get(FunctionSignature, instance.item)).*;
         }
 
         pub fn functionShape(self: @This(), item_id: structures.ItemId) !?structures.FunctionShape {
@@ -393,8 +393,11 @@ pub fn TypeInterner(comptime Context: type) type {
             };
         }
 
-        pub fn structType(self: @This(), item_id: structures.ItemId) !structures.TypeId {
-            return internStructType(self.ctx, item_id);
+        pub fn structIdentityType(self: @This(), identity: structures.StructIdentity) !structures.TypeId {
+            return switch (identity) {
+                .declared => |item_id| internStructType(self.ctx, item_id),
+                .generated => |generated| internGeneratedStructType(self.ctx, generated),
+            };
         }
 
         pub fn generatedStructType(self: @This(), node: structures.Node.Index) !structures.TypeId {
@@ -694,10 +697,7 @@ pub const OwnershipCapabilities = struct {
         span: structures.SourceSpan,
         reason: structures.Diagnostic.IncompatibleStructOwnershipProperty,
     ) !void {
-        const item_id = switch (identity) {
-            .declared => |declared| declared,
-            .generated => unreachable,
-        };
+        const item_id = structOwnerItem(identity);
         const loc = try ctx.lookupInterned(ItemLocations, item_id);
         try ctx.emit(structures.Diagnostic, .{
             .file_id = loc.file_id,
@@ -873,7 +873,7 @@ pub const FunctionInstanceSignature = struct {
     pub fn run(ctx: anytype, instance: Input) anyerror!Output {
         const loc = try ctx.lookupInterned(ItemLocations, instance.item);
         if (loc.kind != .function) return null;
-        const shape = (try ctx.get(FunctionShape, instance.item)).* orelse return null;
+        _ = (try ctx.get(FunctionShape, instance.item)).* orelse return null;
         const resolved = (try ctx.get(ResolveItem, instance.item)).* orelse return null;
         const parsed = (try ctx.get(ParseFile, resolved.file_id)).* orelse return null;
         const source = (try ctx.input(SourceText, resolved.file_id)).*;
@@ -881,8 +881,11 @@ pub const FunctionInstanceSignature = struct {
             (try ctx.lookupInterned(CompileTimeValueTuples, specialization_id)).values
         else
             &.{};
+        const specialization_owner = if (loc.source_site != null) loc.owner.? else instance.item;
+        const specialization_shape = (try ctx.get(FunctionShape, specialization_owner)).* orelse return null;
+        const specialization_resolved = (try ctx.get(ResolveItem, specialization_owner)).* orelse return null;
         var static_parameter_count: usize = 0;
-        for (shape.parameters) |parameter| {
+        for (specialization_shape.parameters) |parameter| {
             if (parameter.mode == .static) static_parameter_count += 1;
         }
         // An instance can outlive the declaration shape that created it across
@@ -895,18 +898,27 @@ pub const FunctionInstanceSignature = struct {
             .specialization = .{
                 .ast = &parsed,
                 .source = source,
-                .declaration = resolved.declaration,
+                .declaration = specialization_resolved.declaration,
                 .arguments = specialization,
             },
         };
-        const result = semantic.analyzeFunctionInstanceSignature(
-            &parsed,
-            source,
-            resolved.declaration,
-            specialization,
-            type_interner,
-            ctx.allocator(),
-        ) catch |err| switch (err) {
+        const result = (if (loc.source_site != null)
+            semantic.analyzeFunctionSignature(
+                &parsed,
+                source,
+                resolved.declaration,
+                type_interner,
+                ctx.allocator(),
+            )
+        else
+            semantic.analyzeFunctionInstanceSignature(
+                &parsed,
+                source,
+                resolved.declaration,
+                specialization,
+                type_interner,
+                ctx.allocator(),
+            )) catch |err| switch (err) {
             error.Unavailable => return null,
             else => return err,
         };
@@ -1048,6 +1060,10 @@ pub const AnalyzeComptimeThunk = struct {
             (try ctx.lookupInterned(CompileTimeValueTuples, specialization_id)).values
         else
             &.{};
+        const specialization_declaration = if (loc.source_site != null) blk: {
+            const owner = (try ctx.get(ResolveItem, loc.owner.?)).* orelse return null;
+            break :blk owner.declaration;
+        } else resolved.declaration;
         const type_interner: TypeInterner(@TypeOf(ctx)) = .{
             .ctx = ctx,
             .file_id = resolved.file_id,
@@ -1055,7 +1071,7 @@ pub const AnalyzeComptimeThunk = struct {
             .specialization = if (site.owner.specialization != null) .{
                 .ast = &parsed,
                 .source = source,
-                .declaration = resolved.declaration,
+                .declaration = specialization_declaration,
                 .arguments = specialization,
             } else null,
         };
@@ -1095,10 +1111,7 @@ pub const ExecuteComptimeThunk = struct {
 
     pub fn run(ctx: anytype, site: Input) anyerror!Output {
         const body = (try ctx.get(AnalyzeComptimeThunk, site)).* orelse return null;
-        var executor: ComptimeCallExecutor(@TypeOf(ctx)) = .{
-            .ctx = ctx,
-            .remaining_call_depth = max_comptime_call_depth,
-        };
+        var executor: ComptimeCallExecutor(@TypeOf(ctx)) = .{ .ctx = ctx, .owner = site.owner.item };
         var arguments: [0]comptime_interpreter.Value = .{};
         const result = try comptime_interpreter.execute(&body, &arguments, &executor, ctx.allocator());
         return switch (result) {
@@ -1119,9 +1132,10 @@ pub const ExecuteComptimeThunk = struct {
                 break :blk .{ .exit = status };
             },
             .execution_error => |execution_error| blk: {
-                try emitComptimeExecutionIssue(ctx, site.owner.item, site.node, &body, execution_error);
+                try emitComptimeExecutionIssue(ctx, site.owner.item, site.node, execution_error);
                 break :blk null;
             },
+            .reported_error => null,
             .unavailable => null,
         };
     }
@@ -1142,15 +1156,6 @@ pub const ExecuteComptimeCall = struct {
     pub const Output = ?structures.CompileTimeCallOutcome;
 
     pub fn run(ctx: anytype, key: Input) anyerror!Output {
-        std.debug.assert(key.remaining_call_depth <= max_comptime_call_depth);
-        std.debug.assert(active_comptime_call_count < active_comptime_calls.len);
-        active_comptime_calls[active_comptime_call_count] = .{
-            .instance = key.instance,
-            .arguments = key.arguments,
-        };
-        active_comptime_call_count += 1;
-        defer active_comptime_call_count -= 1;
-
         const signature = if (key.instance.specialization) |_|
             (try ctx.get(FunctionInstanceSignature, key.instance)).* orelse return null
         else
@@ -1173,39 +1178,38 @@ pub const ExecuteComptimeCall = struct {
         }
 
         const body = (try ctx.get(AnalyzeComptimeFunctionBody, key.instance)).* orelse return null;
-        std.debug.assert(key.remaining_call_depth > 0);
-        var executor: ComptimeCallExecutor(@TypeOf(ctx)) = .{
-            .ctx = ctx,
-            .remaining_call_depth = key.remaining_call_depth - 1,
-        };
+        var executor: ComptimeCallExecutor(@TypeOf(ctx)) = .{ .ctx = ctx, .owner = key.instance.item };
         const result = try comptime_interpreter.execute(&body, arguments, &executor, ctx.allocator());
         const outcome: structures.CompileTimeOutcome = switch (result) {
             .returned => |value| structures.CompileTimeOutcome{ .returned = try internInterpretedValue(ctx, body.return_type, value) },
             .failure => structures.CompileTimeOutcome.failure,
             .exit => |status| structures.CompileTimeOutcome{ .exit = status },
-            .execution_error => |execution_error| blk: {
-                try emitComptimeExecutionIssue(ctx, key.instance.item, null, &body, execution_error);
-                break :blk null;
+            .execution_error => |execution_error| {
+                try emitComptimeExecutionIssue(ctx, key.instance.item, null, execution_error);
+                return .execution_error;
             },
+            .reported_error => return .execution_error,
             .unavailable => null,
         } orelse return null;
 
-        if (!has_mut_arguments) return .{ .outcome = outcome, .arguments = key.arguments };
+        if (!has_mut_arguments) return .{ .completed = .{ .outcome = outcome, .arguments = key.arguments } };
         const final_argument_ids = try ctx.allocator().alloc(structures.CompileTimeValueId, arguments.len);
         defer ctx.allocator().free(final_argument_ids);
         for (arguments, signature.parameters, final_argument_ids) |argument, parameter, *value_id| value_id.* =
             try ctx.intern(CompileTimeValues, .{ .runtime = .{ .type_id = parameter.type_id, .value = argument.runtime } });
-        return .{ .outcome = outcome, .arguments = try ctx.intern(CompileTimeValueTuples, .{ .values = final_argument_ids }) };
+        return .{ .completed = .{
+            .outcome = outcome,
+            .arguments = try ctx.intern(CompileTimeValueTuples, .{ .values = final_argument_ids }),
+        } };
     }
 };
 
 fn ComptimeCallExecutor(comptime Context: type) type {
     return struct {
         ctx: Context,
-        remaining_call_depth: u16,
+        owner: structures.ItemId,
 
-        pub fn call(self: *@This(), instance: structures.InstanceId, arguments: []comptime_interpreter.Value) !comptime_interpreter.Result {
-            if (self.remaining_call_depth == 0) return .{ .execution_error = .{ .reason = .resource_limit } };
+        pub fn call(self: *@This(), instance: structures.InstanceId, arguments: []comptime_interpreter.Value, call_span: ?structures.SourceSpan) !comptime_interpreter.Result {
             const signature = if (instance.specialization == null)
                 (try self.ctx.get(FunctionSignature, instance.item)).* orelse return .unavailable
             else
@@ -1223,20 +1227,21 @@ fn ComptimeCallExecutor(comptime Context: type) type {
                 } });
             }
             const tuple = try self.ctx.intern(CompileTimeValueTuples, .{ .values = value_ids });
-            for (active_comptime_calls[0..active_comptime_call_count]) |active| {
-                if (std.meta.eql(active.instance, instance) and active.arguments == tuple) {
-                    return .{ .execution_error = .{ .reason = .call_cycle } };
-                }
-            }
             const outcome = self.ctx.get(ExecuteComptimeCall, .{
                 .instance = instance,
                 .arguments = tuple,
-                .remaining_call_depth = self.remaining_call_depth,
             }) catch |err| switch (err) {
-                error.QueryCycle => return .{ .execution_error = .{ .reason = .call_cycle } },
+                error.QueryCycle => return .{ .execution_error = .{ .reason = .call_cycle, .span = call_span } },
                 else => return err,
             };
-            const call_outcome = outcome.* orelse return .unavailable;
+            const call_result = outcome.* orelse return .unavailable;
+            const call_outcome = switch (call_result) {
+                .completed => |completed| completed,
+                .execution_error => {
+                    try emitComptimeCallTrace(self.ctx, self.owner, call_span);
+                    return .reported_error;
+                },
+            };
             if (has_mut_arguments and call_outcome.outcome != .exit) {
                 const final_arguments = try self.ctx.lookupInterned(CompileTimeValueTuples, call_outcome.arguments);
                 std.debug.assert(final_arguments.values.len == arguments.len);
@@ -1295,20 +1300,13 @@ fn emitComptimeExecutionIssue(
     ctx: anytype,
     owner: structures.ItemId,
     fallback_node: ?structures.Node.Index,
-    body: *const structures.FunctionBodyAnalysis,
     execution_error: comptime_interpreter.ExecutionError,
 ) !void {
     const loc = try ctx.lookupInterned(ItemLocations, owner);
     const resolved = (try ctx.get(ResolveItem, owner)).* orelse return;
     const parsed = (try ctx.get(ParseFile, resolved.file_id)).* orelse return;
     const fallback_span = nodeSpan(&parsed, fallback_node orelse @enumFromInt(resolved.declaration));
-    const span = if (execution_error.instruction_index) |instruction_index|
-        if (body.instruction_spans.len == body.instructions.len)
-            body.instruction_spans[instruction_index]
-        else
-            fallback_span
-    else
-        fallback_span;
+    const span = execution_error.span orelse fallback_span;
     try ctx.emit(structures.Diagnostic, .{
         .file_id = loc.file_id,
         .span = span,
@@ -1316,8 +1314,17 @@ fn emitComptimeExecutionIssue(
             .call_cycle => .compile_time_call_cycle,
             .division_by_zero => .compile_time_division_by_zero,
             .integer_overflow => .compile_time_integer_overflow,
-            .resource_limit => .compile_time_resource_limit,
         },
+    });
+}
+
+fn emitComptimeCallTrace(ctx: anytype, owner: structures.ItemId, span: ?structures.SourceSpan) !void {
+    const call_span = span orelse return;
+    const loc = try ctx.lookupInterned(ItemLocations, owner);
+    try ctx.emit(structures.Diagnostic, .{
+        .file_id = loc.file_id,
+        .span = call_span,
+        .kind = .compile_time_call_trace,
     });
 }
 
@@ -1375,7 +1382,7 @@ pub const GeneratedStructDefinition = struct {
                 .arguments = specialization,
             } else null,
         };
-        const result = semantic.analyzeGeneratedStructDefinition(&parsed, source, struct_node, type_interner, ctx.allocator()) catch |err| switch (err) {
+        const result = semantic.analyzeGeneratedStructDefinition(&parsed, source, struct_node, identity, type_interner, ctx.allocator()) catch |err| switch (err) {
             error.Unavailable => return null,
             else => return err,
         };
@@ -1448,6 +1455,10 @@ fn analyzeFunctionBody(ctx: anytype, instance: structures.InstanceId, publish_in
         (try ctx.lookupInterned(CompileTimeValueTuples, specialization_id)).values
     else
         &.{};
+    const specialization_declaration = if (loc.source_site != null) blk: {
+        const owner = (try ctx.get(ResolveItem, loc.owner.?)).* orelse return null;
+        break :blk owner.declaration;
+    } else resolved.declaration;
     const type_interner: TypeInterner(@TypeOf(ctx)) = .{
         .ctx = ctx,
         .file_id = resolved.file_id,
@@ -1455,7 +1466,7 @@ fn analyzeFunctionBody(ctx: anytype, instance: structures.InstanceId, publish_in
         .specialization = if (instance.specialization != null) .{
             .ast = &parsed,
             .source = source,
-            .declaration = resolved.declaration,
+            .declaration = specialization_declaration,
             .arguments = specialization,
         } else null,
     };

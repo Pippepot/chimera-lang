@@ -368,7 +368,7 @@ fn parseFunction(parser: *ParserState) !Node.Index {
 
 fn parseFuncSignature(parser: *ParserState) !Node.Index {
     const token_index = parser.index;
-    const params = try parseParamList(parser);
+    const params = try parseParamList(parser, false);
     const return_type: Node.Index = switch (parser.tokens[parser.index].tag) {
         .identifier, .keyword_func, .keyword_fallible, .keyword_none => try parseType(parser),
         else => .null,
@@ -376,7 +376,7 @@ fn parseFuncSignature(parser: *ParserState) !Node.Index {
     return parser.addNode(.{ .tag = .signature, .token_index = token_index, .data = .{ .node_node = .{ .a = params, .b = return_type } } });
 }
 
-fn parseParamList(parser: *ParserState) !Node.Index {
+fn parseParamList(parser: *ParserState, parameters_are_static: bool) !Node.Index {
     const token_index = parser.index;
     _ = try parser.expect(.l_paren);
     const stack_top = parser.scratch_stack.items.len;
@@ -386,12 +386,17 @@ fn parseParamList(parser: *ParserState) !Node.Index {
         if (parser.eat(.r_paren) != null) break;
 
         const access_token_index = parser.index;
-        const opt_access = parser.eatAny(&.{ .keyword_imm, .keyword_mut, .keyword_var, .keyword_deinit, .keyword_static });
+        const opt_access = if (parameters_are_static) null else parser.eatAny(&.{ .keyword_imm, .keyword_mut, .keyword_var, .keyword_deinit, .keyword_static });
         _ = try parser.expect(.identifier);
         const identifier_index = parser.index - 1;
         const type_annotation = try parseTypeAnnotation(parser);
 
-        const access_idx: Node.Index = if (opt_access != null) try parser.addNode(.{ .tag = .access, .token_index = access_token_index, .data = .{ .none = {} } }) else .null;
+        const access_idx: Node.Index = if (parameters_are_static)
+            try parser.addNode(.{ .tag = .implicit_static, .token_index = access_token_index, .data = .{ .none = {} } })
+        else if (opt_access != null)
+            try parser.addNode(.{ .tag = .access, .token_index = access_token_index, .data = .{ .none = {} } })
+        else
+            .null;
         const param = try parser.addNode(.{ .tag = .param, .token_index = identifier_index, .data = .{ .node_node = .{ .a = access_idx, .b = type_annotation } } });
 
         try parser.scratch_stack.append(parser.gpa, param);
@@ -615,6 +620,20 @@ fn parseStruct(parser: *ParserState) ParseError!Node.Index {
     const token_index = parser.index;
     _ = try parser.expect(.keyword_struct);
     const name_token_index: ?u32 = if (parser.eat(.identifier) != null) parser.index - 1 else null;
+    if (name_token_index != null and parser.tokens[parser.index].tag == .l_paren) {
+        const parameters = try parseParamList(parser, true);
+        const value = try parseStructValue(parser, token_index);
+        const return_type = try parser.addNode(.{ .tag = .implicit_type, .token_index = token_index, .data = .{ .none = {} } });
+        const signature = try parser.addNode(.{ .tag = .signature, .token_index = token_index, .data = .{ .node_node = .{ .a = parameters, .b = return_type } } });
+        const body = try parser.addNode(.{ .tag = .return_expr, .token_index = token_index, .data = .{ .node = value } });
+        const function = try parser.addNode(.{ .tag = .func, .token_index = token_index, .data = .{ .node_node = .{ .a = signature, .b = body } } });
+        return finishNamedDeclaration(parser, name_token_index, function);
+    }
+    const value = try parseStructValue(parser, token_index);
+    return finishNamedDeclaration(parser, name_token_index, value);
+}
+
+fn parseStructValue(parser: *ParserState, token_index: u32) ParseError!Node.Index {
     _ = try parser.expect(.indent);
     const stack_top = parser.scratch_stack.items.len;
     defer parser.scratch_stack.shrinkRetainingCapacity(stack_top);
@@ -627,8 +646,7 @@ fn parseStruct(parser: *ParserState) ParseError!Node.Index {
         try parser.scratch_stack.append(parser.gpa, item);
     }
 
-    const value = try parser.addNode(.{ .tag = .@"struct", .token_index = token_index, .data = try parser.listToSpan(parser.scratch_stack.items[stack_top..]) });
-    return finishNamedDeclaration(parser, name_token_index, value);
+    return parser.addNode(.{ .tag = .@"struct", .token_index = token_index, .data = try parser.listToSpan(parser.scratch_stack.items[stack_top..]) });
 }
 
 fn parseStructItem(parser: *ParserState) ParseError!Node.Index {
@@ -784,6 +802,7 @@ fn renderNode(gpa: std.mem.Allocator, node_index: Node.Index, ast: *const Ast, s
             try writer.print(" : {s}\n", .{source[loc.start..loc.end]});
         },
         .unit_literal => try writer.writeAll(" : ()\n"),
+        .implicit_static, .implicit_type => try writer.writeByte('\n'),
         .break_expr, .return_expr, .loop, .not, .neg, .query_op, .move_expr, .comptime_expr, .sizeof_expr, .field_access, .struct_field, .struct_property, .struct_init_field => {
             if (node.tag == .field_access or node.tag == .struct_field or node.tag == .struct_property or node.tag == .struct_init_field) {
                 const loc = ast.tokens[node.token_index].loc;
@@ -1247,6 +1266,32 @@ test "parse named struct declaration through common declaration sugar" {
         \\  │ └─type : int
         \\  └─struct_field : right
         \\    └─type : int
+    );
+}
+
+test "parse parameterized struct declaration as a type factory" {
+    try testParsing(
+        \\struct Box(T: type, N: int)
+        \\  value: T
+        \\  count: int
+    ,
+        \\static_binding
+        \\└─func
+        \\  ├─signature
+        \\  │ ├─param_list
+        \\  │ │ ├─param : T
+        \\  │ │ │ ├─implicit_static
+        \\  │ │ │ └─type : type
+        \\  │ │ └─param : N
+        \\  │ │   ├─implicit_static
+        \\  │ │   └─type : int
+        \\  │ └─implicit_type
+        \\  └─return_expr
+        \\    └─struct
+        \\      ├─struct_field : value
+        \\      │ └─type : T
+        \\      └─struct_field : count
+        \\        └─type : int
     );
 }
 

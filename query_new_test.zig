@@ -2708,7 +2708,6 @@ test "compile-time values and ordered tuples have canonical identities" {
     const call: structures.CompileTimeCallKey = .{
         .instance = instance,
         .arguments = tuple,
-        .remaining_call_depth = 128,
     };
     try testing.expectEqual(instance, site.owner);
     try testing.expectEqual(tuple, call.arguments);
@@ -3181,32 +3180,17 @@ test "compile-time call cycles diagnose the reached call site" {
     try testing.expect((try db.get(query_structures.ResolveStatic, result)).* == null);
     const diagnostics = try db.transitiveAccumulatorValues(query_structures.ResolveStatic, result, structures.Diagnostic, testing.allocator);
     defer freeDiagnostics(diagnostics);
-    try testing.expectEqual(@as(usize, 1), diagnostics.len);
-    try testing.expectEqual(DiagnosticKind.compile_time_call_cycle, std.meta.activeTag(diagnostics[0].kind));
-    try testing.expectEqualStrings("recurse", source[diagnostics[0].span.?.start..diagnostics[0].span.?.end]);
+    try testing.expectEqual(@as(usize, 2), diagnostics.len);
+    const primary = if (std.meta.activeTag(diagnostics[0].kind) == .compile_time_call_cycle) diagnostics[0] else diagnostics[1];
+    const trace = if (std.meta.activeTag(diagnostics[0].kind) == .compile_time_call_trace) diagnostics[0] else diagnostics[1];
+    try testing.expectEqual(DiagnosticKind.compile_time_call_cycle, std.meta.activeTag(primary.kind));
+    try testing.expectEqualStrings("recurse", source[primary.span.?.start..primary.span.?.end]);
+    try testing.expectEqual(DiagnosticKind.compile_time_call_trace, std.meta.activeTag(trace.kind));
+    const initial_call = std.mem.lastIndexOf(u8, source, "recurse").?;
+    try testing.expectEqual(structures.SourceSpan{ .start = initial_call, .end = initial_call + "recurse".len }, trace.span);
 }
 
-test "changing compile-time recursion is bounded by deterministic call depth" {
-    const db = try testDatabase(4);
-    defer db.deinit();
-
-    const source =
-        \\static recurse = func(value: int) int -> recurse(value + 1)
-        \\static result = recurse(0)
-    ;
-    try addSource(db, 1, source);
-    const result = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveStatic("result").?;
-    try testing.expect((try db.get(query_structures.ResolveStatic, result)).* == null);
-    const diagnostics = try db.transitiveAccumulatorValues(query_structures.ResolveStatic, result, structures.Diagnostic, testing.allocator);
-    defer freeDiagnostics(diagnostics);
-    try testing.expectEqual(@as(usize, 1), diagnostics.len);
-    try testing.expectEqual(DiagnosticKind.compile_time_resource_limit, std.meta.activeTag(diagnostics[0].kind));
-    const declaration_name = std.mem.indexOf(u8, source, "recurse").?;
-    const recursive_call = std.mem.indexOfPos(u8, source, declaration_name + "recurse".len, "recurse").?;
-    try testing.expectEqual(structures.SourceSpan{ .start = @intCast(recursive_call), .end = @intCast(recursive_call + "recurse".len) }, diagnostics[0].span);
-}
-
-test "deep compile-time recursion does not poison a shallower cached call" {
+test "deep terminating compile-time recursion has no fixed depth limit" {
     const db = try testDatabase(1);
     defer db.deinit();
 
@@ -3216,7 +3200,10 @@ test "deep compile-time recursion does not poison a shallower cached call" {
         \\static shallow = down(3)
     );
     const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
-    try testing.expect((try db.get(query_structures.ResolveStatic, scope.resolveStatic("deep").?)).* == null);
+    try testing.expectEqual(
+        structures.CompileTimeValue{ .runtime = .{ .type_id = .int, .value = .{ .int = 42 } } },
+        try resolvedStaticValue(db, scope.resolveStatic("deep").?),
+    );
     try testing.expectEqual(
         structures.CompileTimeValue{ .runtime = .{ .type_id = .int, .value = .{ .int = 42 } } },
         try resolvedStaticValue(db, scope.resolveStatic("shallow").?),
@@ -3550,6 +3537,58 @@ test "type-valued functions generate canonical specialized nominal structs" {
     try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "add" }, 42);
 }
 
+test "parameterized struct declarations are static type factories" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\struct Box(T: type, Tag: int)
+        \\  value: T
+        \\static IntBox = Box(int, 1)
+        \\static Same = Box(int, 1)
+        \\static OtherTag = Box(int, 2)
+        \\static BoolBox = Box(bool, 1)
+        \\const boxed = Box(int, 1){value = 42}
+        \\exit(boxed.value)
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const int_box_item = scope.resolveStatic("IntBox").?;
+    const int_box_result = try db.get(query_structures.ResolveStatic, int_box_item);
+    const int_box = (try lookupCompileTimeValue(db, int_box_result.*.?)).type;
+    const same = try resolvedStaticType(db, scope.resolveStatic("Same").?);
+    const other_tag = try resolvedStaticType(db, scope.resolveStatic("OtherTag").?);
+    const bool_box = try resolvedStaticType(db, scope.resolveStatic("BoolBox").?);
+    try testing.expectEqual(int_box, same);
+    try testing.expect(int_box != other_tag);
+    try testing.expect(int_box != bool_box);
+
+    const int_identity = (try db.lookupInterned(query_structures.Types, int_box.interned().?)).structure;
+    const bool_identity = (try db.lookupInterned(query_structures.Types, bool_box.interned().?)).structure;
+    const int_definition = (try db.get(query_structures.GeneratedStructDefinition, int_identity.generated)).*.?;
+    const bool_definition = (try db.get(query_structures.GeneratedStructDefinition, bool_identity.generated)).*.?;
+    try testing.expectEqual(structures.TypeId.int, int_definition.fields[0].type_id);
+    try testing.expectEqual(structures.TypeId.bool, bool_definition.fields[0].type_id);
+
+    const executable = (try db.get(query_structures.BuildExecutable, 1)).*.?;
+    const io = testing.io;
+    try runtime.writeProgram(io, executable.bytes);
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    try testing.expectEqual(@as(u8, 42), runtime.runProg(io, testing.allocator, &.{}));
+
+    try setSource(db, 1,
+        \\static unrelated = 0
+        \\struct Box(T: type, Tag: int)
+        \\  value: T
+        \\static IntBox = Box(int, 1)
+        \\static Same = Box(int, 1)
+        \\static OtherTag = Box(int, 2)
+        \\static BoolBox = Box(bool, 1)
+        \\const boxed = Box(int, 1){value = 42}
+        \\exit(boxed.value)
+    );
+    try testing.expectEqual(int_box_result, try db.get(query_structures.ResolveStatic, int_box_item));
+}
+
 test "generated struct identity survives relocation and changes with specialization" {
     const db = try testDatabase(1);
     defer db.deinit();
@@ -3622,7 +3661,7 @@ test "generated structs do not capture comptime locals" {
     try testing.expectEqualStrings("Local", source[diagnostics[0].span.?.start..diagnostics[0].span.?.end]);
 }
 
-test "generated structs reject ownership properties" {
+test "generated structs accept ownership properties" {
     const db = try testDatabase(1);
     defer db.deinit();
 
@@ -3635,12 +3674,66 @@ test "generated structs reject ownership properties" {
         \\exit(value.value)
     ;
     try addSource(db, 1, source);
-    try testing.expect((try db.get(query_structures.BuildExecutable, 1)).* == null);
+    try testing.expect((try db.get(query_structures.BuildExecutable, 1)).* != null);
     const diagnostics = try db.transitiveAccumulatorValues(query_structures.BuildExecutable, 1, structures.Diagnostic, testing.allocator);
     defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 0), diagnostics.len);
+}
+
+test "generated struct ownership hooks inherit the type specialization" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    const initial =
+        \\struct Box(T: type)
+        \\  copy = func(imm self: Box(T)) Box(T) -> Box(T){value = self.value + 1}
+        \\  value: T
+        \\const original = Box(int){value = 41}
+        \\const copied = original
+        \\exit(copied.value)
+    ;
+    try addSource(db, 1, initial);
+    var executable = (try db.get(query_structures.BuildExecutable, 1)).*.?;
+    const io = testing.io;
+    try runtime.writeProgram(io, executable.bytes);
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    try testing.expectEqual(@as(u8, 42), runtime.runProg(io, testing.allocator, &.{}));
+
+    try setSource(db, 1,
+        \\struct Box(T: type)
+        \\  copy = func(imm self: Box(T)) Box(T) -> Box(T){value = self.value + 2}
+        \\  value: T
+        \\const original = Box(int){value = 41}
+        \\const copied = original
+        \\exit(copied.value)
+    );
+    executable = (try db.get(query_structures.BuildExecutable, 1)).*.?;
+    try runtime.writeProgram(io, executable.bytes);
+    try testing.expectEqual(@as(u8, 43), runtime.runProg(io, testing.allocator, &.{}));
+}
+
+test "generated struct ownership declarations validate field capabilities" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static Field = struct
+        \\  value: int
+        \\static makeInvalid = func() type
+        \\  return struct
+        \\    copy = trivial
+        \\    value: Field
+        \\static Invalid = makeInvalid()
+    );
+    const invalid = try resolvedStaticType(db, (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveStatic("Invalid").?);
+    try testing.expect((try db.get(query_structures.OwnershipCapabilities, invalid)).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(query_structures.OwnershipCapabilities, invalid, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
     try testing.expectEqual(@as(usize, 1), diagnostics.len);
-    try testing.expectEqual(DiagnosticKind.struct_member_not_supported, std.meta.activeTag(diagnostics[0].kind));
-    try testing.expectEqualStrings("copy", source[diagnostics[0].span.?.start..diagnostics[0].span.?.end]);
+    try testing.expectEqual(
+        structures.Diagnostic.Kind{ .struct_ownership_property_incompatible_with_fields = .trivial_copy },
+        diagnostics[0].kind,
+    );
 }
 
 test "anonymous struct expressions are compile-time-only" {
@@ -3784,6 +3877,33 @@ test "compile-time division errors point at the executed instruction" {
     try testing.expectEqual(@as(usize, 1), diagnostics.len);
     try testing.expectEqual(DiagnosticKind.compile_time_division_by_zero, std.meta.activeTag(diagnostics[0].kind));
     try testing.expectEqual(structures.SourceSpan{ .start = 16, .end = 17 }, diagnostics[0].span);
+}
+
+test "compile-time execution errors include every call site" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    const source =
+        \\static fail = func() int -> 42 / 0
+        \\static middle = func() int -> fail()
+        \\static bad = middle()
+    ;
+    try addSource(db, 1, source);
+    const bad = (try db.get(query_structures.BuildModuleScope, 1)).*.?.resolveStatic("bad").?;
+    try testing.expect((try db.get(query_structures.ResolveStatic, bad)).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(query_structures.ResolveStatic, bad, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 3), diagnostics.len);
+
+    var primary_count: usize = 0;
+    var trace_count: usize = 0;
+    for (diagnostics) |diagnostic| switch (std.meta.activeTag(diagnostic.kind)) {
+        .compile_time_division_by_zero => primary_count += 1,
+        .compile_time_call_trace => trace_count += 1,
+        else => return error.UnexpectedDiagnostic,
+    };
+    try testing.expectEqual(@as(usize, 1), primary_count);
+    try testing.expectEqual(@as(usize, 2), trace_count);
 }
 
 test "compile-time exit propagates through interpreted calls as compiler control" {

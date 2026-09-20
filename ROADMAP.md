@@ -19,8 +19,9 @@
   returns, fallible control flow, and `exit`. Direct and concrete indirect
   calls are cached by specialized instance plus canonical interpreted arguments;
   repeated calls share results, identical-key recursion is diagnosed, changing-
-  argument recursion is call-depth bounded, and value static arguments execute
-  as thunks. Canonical struct and variant values, field operations, coercions,
+  argument recursion and loops run without compiler-defined execution limits,
+  and value static arguments execute as thunks. Canonical struct and variant values,
+  field operations, coercions,
   mutable copy-back, and custom ownership hooks now execute through the same
   typed IR, including path-specific aggregate cleanup. Type-valued functions
   return canonical primitive, variant, callable, alias, and nominal identities;
@@ -29,9 +30,13 @@
   runtime-annotated static initializers now use the same typed-thunk evaluator,
   with one execution-failure diagnostic boundary. Anonymous structs returned by
   type-valued functions have source-site-and-specialization nominal identity,
-  lazily resolved fields, and shared runtime struct lowering. Complete
-  cross-frame resource accounting and call traces are the remaining execution
-  work; generated ownership properties and local captures remain unsupported.
+  lazily resolved fields, and shared runtime struct lowering. Parameterized
+  named struct declarations lower to these type-valued functions with implicit
+  static parameters. Generated definitions use the same validated ownership
+  declarations as declared structs, with custom hooks specialized by the
+  enclosing type factory. Instruction and terminator source maps report the
+  reached execution error followed by its compile-time call trace. Local
+  captures remain unsupported.
 - Lexical const and var bindings have stable root-place identities. Typing tracks available, transferred, and possibly transferred states through branches and loops; whole assignment restores a mutable root.
 - Bare place values borrow in observation and `imm` calls. Bindings, replacement assignments, struct fields, returns, and owned calls require copy support; `^` explicitly transfers movable local roots. Owned temporaries pass directly. `var` and `deinit` parameters are mutable owned roots, with only `deinit` authorized to satisfy explicit drop. Partial-field transfer remains rejected.
 - ASAP destruction is implemented through semantic cutover, incremental recomputation, and cleanup review for the current value model. Query-local generation analysis materializes path-sensitive cleanup at the earliest completed boundary after each final use across roots, parameters, temporaries, calls, projections, conditional ownership, control-flow edges, and whole-root replacement. Explicit-drop trees must transfer or reach a `deinit` parameter on every path. Automatic custom drop lowers to ordinary typed IR, while trivial and hook-free fieldwise cleanup require no runtime instruction. Origin dependencies for pointers and views, independent partial-place lifetimes, and stable storage for immovable values remain future work; field-target replacement stays boundary-local until partial places are implemented.

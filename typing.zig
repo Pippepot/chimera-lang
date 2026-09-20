@@ -849,11 +849,12 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 .move => definition.ownership.move.?.hook.?,
                 .drop => definition.ownership.drop.?.hook.?,
             };
-            if (hook == self.item_id) return source;
+            if (hook.item == self.item_id) return source;
             const argument_start: u32 = @intCast(self.call_arguments.items.len);
             try self.call_arguments.append(self.ctx.allocator(), .{ .value = source.id });
             return self.appendInstruction(.{ .call = .{
-                .target = hook,
+                .target = hook.item,
+                .specialization = hook.specialization,
                 .arguments = .{ .start = argument_start, .end = argument_start + 1 },
                 .return_type = if (operation == .drop) .unit else source.type_id,
             } });
@@ -3047,9 +3048,11 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 self.blocks.items[block_index].terminator_effects.items,
             );
             self.blocks.items[suffix_index].terminator = self.blocks.items[block_index].terminator;
+            self.blocks.items[suffix_index].terminator_span = self.blocks.items[block_index].terminator_span;
             self.blocks.items[block_index].items.shrinkRetainingCapacity(suffix_item_start);
             self.blocks.items[block_index].terminator_effects.clearRetainingCapacity();
             self.blocks.items[block_index].terminator = null;
+            self.blocks.items[block_index].terminator_span = null;
             return suffix;
         }
 
@@ -3313,7 +3316,12 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
         fn setBlockTerminator(self: *Self, block_id: structures.FunctionBlockId, terminator: structures.FunctionTerminator) void {
             const block_value = &self.blocks.items[@intFromEnum(block_id)];
             std.debug.assert(block_value.terminator == null);
+            std.debug.assert(block_value.terminator_span == null);
             block_value.terminator = terminator;
+            block_value.terminator_span = if (self.publish_instruction_spans)
+                self.activeLifetimeSpan()
+            else
+                .{ .start = 0, .end = 0 };
         }
 
         fn emptyBranch(self: *const Self, target: structures.FunctionBlockId) structures.FunctionBranch {
@@ -3343,6 +3351,11 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 if (self.publish_instruction_spans) self.instruction_count else 0,
             );
             errdefer gpa.free(instruction_spans);
+            const terminator_spans = try gpa.alloc(
+                structures.SourceSpan,
+                if (self.publish_instruction_spans) self.blocks.items.len else 0,
+            );
+            errdefer gpa.free(terminator_spans);
             const blocks = try gpa.alloc(structures.FunctionBlock, self.blocks.items.len);
             errdefer gpa.free(blocks);
             var instruction_index: u32 = 0;
@@ -3366,6 +3379,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                     .instruction_end = instruction_index,
                     .terminator = build_block.terminator orelse unreachable,
                 };
+                if (self.publish_instruction_spans) terminator_spans[block_index] = build_block.terminator_span orelse unreachable;
             }
             std.debug.assert(instruction_index == self.instruction_count);
             normalizeInstructions(instructions, instruction_values);
@@ -3392,6 +3406,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 .branch_arguments = branches,
                 .instructions = instructions,
                 .instruction_spans = instruction_spans,
+                .terminator_spans = terminator_spans,
                 .blocks = blocks,
                 .entry = @enumFromInt(0),
             };
@@ -3540,7 +3555,7 @@ const TestMaterializerTypes = struct {
             .fields = &.{},
             .ownership = .{ .drop = .{
                 .capability = .custom,
-                .hook = if (type_id == custom_type) custom_drop_hook else second_custom_drop_hook,
+                .hook = .{ .item = if (type_id == custom_type) custom_drop_hook else second_custom_drop_hook },
                 .span = span,
             } },
         };

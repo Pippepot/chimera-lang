@@ -173,6 +173,7 @@ pub const Node = struct {
         not,
         neg,
         access,
+        implicit_static,
         assign,
         add_assign,
         sub_assign,
@@ -209,6 +210,7 @@ pub const Node = struct {
         struct_init,
         struct_init_field,
         type,
+        implicit_type,
         type_func,
         type_list,
         type_variant,
@@ -253,7 +255,7 @@ pub const Ast = struct {
         for (a.nodes, b.nodes) |left, right| {
             if (left.tag != right.tag or left.token_index != right.token_index) return false;
             switch (left.tag) {
-                .break_nothing, .continue_expr, .return_nothing, .access, .bool_literal, .identifier, .none_literal, .number_literal, .unit_literal, .type => {},
+                .break_nothing, .continue_expr, .return_nothing, .access, .implicit_static, .bool_literal, .identifier, .none_literal, .number_literal, .unit_literal, .type, .implicit_type => {},
                 .break_expr, .return_expr, .loop, .not, .neg, .query_op, .move_expr, .comptime_expr, .sizeof_expr, .field_access, .struct_field, .struct_property, .struct_init_field => {
                     if (left.data.node != right.data.node) return false;
                 },
@@ -307,11 +309,12 @@ pub const ItemKind = enum {
 pub const ItemLoc = struct {
     file_id: FileId,
     owner: ?ItemId = null,
+    source_site: ?i64 = null,
     kind: ItemKind,
     name: []const u8,
 
     pub fn eql(a: ItemLoc, b: ItemLoc) bool {
-        return a.file_id == b.file_id and a.owner == b.owner and a.kind == b.kind and std.mem.eql(u8, a.name, b.name);
+        return a.file_id == b.file_id and a.owner == b.owner and a.source_site == b.source_site and a.kind == b.kind and std.mem.eql(u8, a.name, b.name);
     }
 };
 
@@ -476,9 +479,12 @@ pub const CompileTimeOutcome = union(enum) {
 
 /// Result of one memoized interpreted call. Updated ordinary arguments are
 /// canonicalized separately so mutable copy-back uses the same query result.
-pub const CompileTimeCallOutcome = struct {
-    outcome: CompileTimeOutcome,
-    arguments: CompileTimeValueTupleId,
+pub const CompileTimeCallOutcome = union(enum) {
+    completed: struct {
+        outcome: CompileTimeOutcome,
+        arguments: CompileTimeValueTupleId,
+    },
+    execution_error,
 };
 
 /// Uncatchable control requested by compile-time execution and handled by the
@@ -646,7 +652,7 @@ pub const StructOwnershipProperties = struct {
     pub fn Property(comptime Capability: type) type {
         return struct {
             capability: Capability,
-            hook: ?ItemId = null,
+            hook: ?InstanceId = null,
             span: SourceSpan,
         };
     }
@@ -925,6 +931,7 @@ pub const FunctionBodyAnalysis = struct {
     call_arguments: []FunctionValueUse,
     instructions: []Instruction,
     instruction_spans: []SourceSpan = &.{},
+    terminator_spans: []SourceSpan = &.{},
     blocks: []Block,
     entry: BlockId,
 
@@ -954,6 +961,7 @@ pub const FunctionBodyAnalysis = struct {
             !valueUsesEql(a.call_arguments, b.call_arguments) or
             a.instructions.len != b.instructions.len or
             !sourceSpansEql(a.instruction_spans, b.instruction_spans) or
+            !sourceSpansEql(a.terminator_spans, b.terminator_spans) or
             a.blocks.len != b.blocks.len) return false;
         for (a.struct_field_values, b.struct_field_values) |left, right| {
             if (!std.meta.eql(left, right)) return false;
@@ -991,6 +999,7 @@ pub const FunctionBodyAnalysis = struct {
         gpa.free(self.call_arguments);
         gpa.free(self.instructions);
         gpa.free(self.instruction_spans);
+        gpa.free(self.terminator_spans);
         gpa.free(self.blocks);
         self.* = undefined;
     }
@@ -1018,10 +1027,6 @@ pub const CompileTimeSite = struct {
 pub const CompileTimeCallKey = struct {
     instance: InstanceId,
     arguments: CompileTimeValueTupleId,
-    // Temporary per-call context until execution uses one cross-frame budget.
-    // A resource-limited result must not alias the same call reached with more
-    // depth available.
-    remaining_call_depth: u16,
 };
 
 /// Owned deterministic breadth-first order of instances reachable from an entry.
@@ -1143,7 +1148,7 @@ pub const Diagnostic = struct {
         compile_time_unhandled_failure,
         compile_time_division_by_zero,
         compile_time_integer_overflow,
-        compile_time_resource_limit,
+        compile_time_call_trace,
         struct_member_not_supported,
         duplicate_struct_field,
         duplicate_struct_property,

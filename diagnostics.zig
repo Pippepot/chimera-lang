@@ -378,7 +378,7 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
         .compile_time_unhandled_failure => try writer.writeAll("compile-time expression failed without handling the failure"),
         .compile_time_division_by_zero => try writer.writeAll("division by zero during compile-time execution"),
         .compile_time_integer_overflow => try writer.writeAll("integer overflow during compile-time execution"),
-        .compile_time_resource_limit => try writer.writeAll("compile-time execution exceeded its deterministic resource limit"),
+        .compile_time_call_trace => try writer.writeAll("called at compile time from here"),
         .struct_member_not_supported => try writer.writeAll("struct bodies currently support only fields and `move`, `copy`, or `drop` properties"),
         .duplicate_struct_field => try writeSourceLabel(writer, "struct field is already declared", source, span),
         .duplicate_struct_property => try writeSourceLabel(writer, "struct ownership property is already declared", source, span),
@@ -557,9 +557,12 @@ pub fn renderDiagnostic(
     source: []const u8,
     diagnostic: structures.Diagnostic,
 ) !void {
+    const is_note = std.meta.activeTag(diagnostic.kind) == .compile_time_call_trace;
+    const label = if (is_note) "\x1b[36mnote:\x1b[0m" else "\x1b[31merror:\x1b[0m";
     if (diagnostic.span) |span| {
         const info = lineInfoForOffset(source, span.start);
-        try writer.print("\x1b[31merror:\x1b[0m {s}:{d}:{d}: ", .{
+        try writer.print("{s} {s}:{d}:{d}: ", .{
+            label,
             source_path,
             info.line,
             info.column,
@@ -576,7 +579,7 @@ pub fn renderDiagnostic(
         return;
     }
 
-    try writer.print("\x1b[31merror:\x1b[0m {s}: ", .{source_path});
+    try writer.print("{s} {s}: ", .{ label, source_path });
     try writeKindMessage(types, writer, source, diagnostic.span, diagnostic.kind);
     try writer.writeByte('\n');
 }
@@ -589,6 +592,14 @@ pub fn renderDiagnostics(
     diagnostics: []const structures.Diagnostic,
 ) !void {
     for (diagnostics) |diagnostic| {
+        if (std.meta.activeTag(diagnostic.kind) == .compile_time_call_trace) continue;
+        try renderDiagnostic(types, writer, source_path, source, diagnostic);
+    }
+    var index = diagnostics.len;
+    while (index > 0) {
+        index -= 1;
+        const diagnostic = diagnostics[index];
+        if (std.meta.activeTag(diagnostic.kind) != .compile_time_call_trace) continue;
         try renderDiagnostic(types, writer, source_path, source, diagnostic);
     }
 }

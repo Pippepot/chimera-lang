@@ -292,6 +292,39 @@ test "CLI core renders source diagnostics without running" {
     try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "timing\n") != null);
 }
 
+test "CLI core renders compile-time call traces from the failure outward" {
+    const io = std.testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var errors: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer errors.deinit();
+
+    const exit_code = try compileAndRun(io, std.testing.allocator, .{
+        .source_path = "trace.chi",
+        .source =
+        \\static fail = func() int -> 42 / 0
+        \\static middle = func() int -> fail()
+        \\static bad = middle()
+        \\exit(bad)
+        ,
+        .program_args = &.{},
+        .debug_flags = .{},
+        .started = std.Io.Clock.awake.now(io),
+    }, &output.writer, &errors.writer);
+
+    try std.testing.expectEqual(RunOutcome.rejected, exit_code);
+    try std.testing.expectEqual(@as(usize, 0), output.writer.buffered().len);
+    const rendered = errors.writer.buffered();
+    const failure = std.mem.indexOf(u8, rendered, "division by zero during compile-time execution").?;
+    const inner_call = std.mem.indexOf(u8, rendered, "trace.chi:2:").?;
+    const outer_call = std.mem.indexOf(u8, rendered, "trace.chi:3:").?;
+    try std.testing.expect(failure < inner_call);
+    try std.testing.expect(inner_call < outer_call);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, rendered, "called at compile time from here"));
+}
+
 test "CLI core handles compile-time exit without producing an artifact" {
     const io = std.testing.io;
     defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
