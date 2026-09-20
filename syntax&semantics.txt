@@ -48,14 +48,63 @@ const pair = (1, true)
 # automatically available name set, module paths, and conflict rules are open.
 
 
+# Modules
+# A folder is a module: every `.chi` file directly inside it contributes
+# declarations to that module. Files create no namespace; subfolders create
+# child modules. Filenames and the extension never participate in module or
+# declaration identity. Module paths derive from the entry file's directory,
+# which is `$entry`; subfolders append dotted segments. Parent and sibling
+# folders are invisible.
+# All files in one module share a single declaration scope with no import
+# between them. File, declaration, and import order have no meaning.
+# Imports are file-scoped and top level only: each file states its own external
+# dependencies, and sharing a module does not share imports.
+import physics
+import physics.collision
+import physics.{Body, World}
+import physics as phys
+import physics.{Body as PhysicsBody}
+# A whole-module import introduces its qualified namespace without implicitly
+# importing children. An alias replaces the qualification. A selective import
+# introduces the named declarations directly into file scope.
+# Module-qualified lookup is valid wherever the target is valid (type, value,
+# call, initializer head) and shares `.` syntax with struct namespaces. The
+# first identifier resolves normally, so a local shadows a module name with no
+# fallback to module lookup.
+var body: physics.Body
+# Unqualified lookup considers locals, then parameters, then current-module
+# declarations, then the file's selective imports and aliases. A selective
+# import or alias must not collide with another visible non-import declaration
+# at the same file scope; locals inside functions may shadow imports. An exact
+# duplicate import is harmless; one name bound to different declarations is an
+# error.
+# Declarations are module-private by default: visible from every file of the
+# same module, inaccessible elsewhere. `pub` opens a top-level declaration or
+# import to importing modules. Struct-field visibility is out of scope.
+pub struct Body
+    a: int
+# Imports are private by default and never create declarations. `pub import`
+# re-exports under the importing module's namespace; chains share one identity,
+# including nominal type identity.
+pub import math.{Vec3}
+# Module import cycles are allowed. Only a real semantic dependency cycle is an
+# error, via the declaration-cycle rule.
+# Any file may contain executable top-level statements, but only the file
+# passed to the compiler executes them. Imported files never run on import;
+# imports have no runtime side effects.
+# Renaming a file within its folder has no effect. Moving a declaration across
+# folders changes its module and identity, including nominal type identity; a
+# re-export preserves the old path but never the old identity.
+
+
 # Bindings and compile-time execution
 static a: int = 10 # compile-time-known, immutable
 const b: int = 20  # immutable
 var c: int = 30    # mutable
 const d = 30      # inferred annotation
 
-# Top-level static declarations share one namespace and are evaluated when a
-# consumer demands them. A declaration cycle is an error. A static type value
+# Top-level static declarations share one namespace within their module and are
+# evaluated when a consumer demands them. A declaration cycle is an error. A static type value
 # introduces an alias, not a distinct nominal type; aliases preserve canonical
 # structural identity when used within variants.
 static Result = int | none
