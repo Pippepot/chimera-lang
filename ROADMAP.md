@@ -44,10 +44,10 @@
 ## Priority and dependencies
 
 Build toward small programs that use an always-included standard library,
-generic collections, and ordinary iteration. Prioritize compile-time execution,
-type-valued functions, modules, external declarations, and specialization as
-foundations for that library. Specify advanced ownership storage alongside the
-pointer and collection operations that need it.
+generic collections, and ordinary iteration. Prioritize modules, external
+declarations, and specialization as foundations for that library. Specify
+advanced ownership storage alongside the pointer and collection operations
+that need it.
 
 The order below is the default implementation priority, not a requirement to
 finish every item in one milestone before starting independent work. Proposed
@@ -58,25 +58,7 @@ recomputation. Keep unsupported forms rejected at their owning boundary.
 
 ## Ordered milestones
 
-### 1. Compile-time execution and type-valued functions
-
-- Follow [COMPTIME_EXECUTION.md](COMPTIME_EXECUTION.md): interpret the published
-  typed SSA on the host, reuse it for typed comptime thunks, and cache concrete
-  calls through queries. Do not add target-code execution, a second bytecode,
-  or a JIT for this milestone.
-- Extend explicit direct-call specialization into **compile-time execution**.
-  Define the supported compile-time values and operations, evaluation of
-  `comptime` expressions and blocks, diagnostics and cycles, and incremental
-  reuse. Keep unbound generic function values unsupported until their use case
-  is concrete.
-- Support functions that **return `type` values**, so a compile-time function
-  can compute a type and its direct call can appear wherever a type is required.
-  Define type-valued parameters and results, evaluation order, recursion and
-  cycle rules, and how the resulting canonical `TypeId` participates in static
-  argument tuples and instance identity. This is type computation, not
-  return-type inference.
-
-### 2. Modules and struct namespaces
+### 1. Modules and struct namespaces
 
 - **Modules:** specify cross-file declarations, imports, qualified lookup,
   visibility, and cycle rules. Preserve declaration identity and track source
@@ -90,7 +72,7 @@ recomputation. Keep unsupported forms rejected at their owning boundary.
   function identities while keeping ordinary namespace functions separate
   from validated copy/move/drop properties and instance layout.
 
-### 3. External declarations and standard-library bootstrap
+### 2. External declarations and standard-library bootstrap
 
 - Add **external** for compiler-defined functions and externally defined
   functions, including **C ABI** calls. Specify how declarations identify their
@@ -107,7 +89,7 @@ recomputation. Keep unsupported forms rejected at their owning boundary.
   permits; define allocation and release services for later pointers and
   collections. Exact APIs and compiler/library placement remain open.
 
-### 4. Storage, origins, pointers, and borrowed views
+### 3. Storage, origins, pointers, and borrowed views
 
 - Specify **partial-field transfer** and **final storage for immovable values**,
   including partial initialization, cleanup, stable addresses, and calling
@@ -139,7 +121,7 @@ recomputation. Keep unsupported forms rejected at their owning boundary.
   Preserve the chosen non-nullability, unique ownership, and atomic shared
   ownership guarantees while settling those details.
 
-### 5. Ranges, List, and iteration
+### 4. Ranges, List, and iteration
 
 - **Ranges:** implement the specified exclusive/inclusive bounds and ascending
   empty-range behavior. Specify endpoint types, explicit descending iteration,
@@ -158,7 +140,7 @@ recomputation. Keep unsupported forms rejected at their owning boundary.
   and reuse the existing control-flow and ownership machinery. A range-only
   slice can precede List, but must fit the same intended iteration contract.
 
-### 6. Collection and algorithm library
+### 5. Collection and algorithm library
 
 - Add **Map**, **Set**, **Queue**, and **Stack**. Decide representations and
   whether Queue/Stack reuse List storage; do not assume each needs a compiler
@@ -173,7 +155,7 @@ recomputation. Keep unsupported forms rejected at their owning boundary.
   or collection examples. Coordinate with coercions and namespace functions;
   ordinary named functions can support the initial library.
 
-### 7. Structural tuples
+### 6. Structural tuples
 
 - **Structural tuples**, such as `(foo, bar)`: implement the specified ordered,
   unnamed structural identity. Specify type spelling, element access,
@@ -181,13 +163,13 @@ recomputation. Keep unsupported forms rejected at their owning boundary.
   singleton syntax consistently with the existing `()` unit value. Tuples
   support multiple values and later map iteration.
 
-### 8. Match
+### 7. Match
 
 - **Match:** evaluate the subject once; support literal, wildcard, binding,
   `pattern as name`, and `is Type` patterns; diagnose redundancy and
   non-exhaustiveness; reuse existing branch joins and variant mappings.
 
-### 9. Numeric foundations
+### 8. Numeric foundations
 
 - Define **explicit numeric conversions/casts first**: syntax, supported source
   and destination types, failure behavior, rounding, and overflow. Existing

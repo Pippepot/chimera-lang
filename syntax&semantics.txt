@@ -124,8 +124,9 @@ const computed_block = comptime
 # returns the same type, while distinct sites or static arguments produce
 # distinct types. Ordinary interpreted arguments do not affect this identity.
 # Generated struct field types may reference module statics and enclosing static
-# parameters. They cannot capture function-local bindings. Ownership properties
-# and hooks on generated structs are not supported yet.
+# parameters. They cannot capture function-local bindings. Generated definitions
+# accept the same ownership declarations as declared structs, with custom hooks
+# specialized by the enclosing type factory.
 
 
 # Functions
