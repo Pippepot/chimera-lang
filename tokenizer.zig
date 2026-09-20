@@ -535,7 +535,7 @@ pub const Tokenizer = struct {
 };
 
 test "keywords" {
-    try testTokenize("if else const var imm mut deinit return true false comptime static func struct is as and or not none sizeof test loop break continue", &.{
+    try testTokenize("if else const var imm mut deinit return true false comptime static func struct is as and or not none sizeof test loop break continue import pub", &.{
         .keyword_if,
         .keyword_else,
         .keyword_const,
@@ -561,6 +561,8 @@ test "keywords" {
         .keyword_loop,
         .keyword_break,
         .keyword_continue,
+        .keyword_import,
+        .keyword_pub,
     });
     try testTokenize("read", &.{.identifier});
 }

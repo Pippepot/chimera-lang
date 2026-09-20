@@ -96,6 +96,8 @@ pub const Token = struct {
         keyword_test,
         keyword_true,
         keyword_var,
+        keyword_import,
+        keyword_pub,
     };
 
     pub const keywords = std.StaticStringMap(Tag).initComptime(.{
@@ -127,6 +129,8 @@ pub const Token = struct {
         .{ "test", .keyword_test },
         .{ "true", .keyword_true },
         .{ "var", .keyword_var },
+        .{ "import", .keyword_import },
+        .{ "pub", .keyword_pub },
     });
 
     pub fn getKeyword(bytes: []const u8) ?Tag {
@@ -214,6 +218,8 @@ pub const Node = struct {
         type_func,
         type_list,
         type_variant,
+        import,
+        @"pub",
         _,
     };
 
@@ -256,13 +262,13 @@ pub const Ast = struct {
             if (left.tag != right.tag or left.token_index != right.token_index) return false;
             switch (left.tag) {
                 .break_nothing, .continue_expr, .return_nothing, .access, .implicit_static, .bool_literal, .identifier, .none_literal, .number_literal, .unit_literal, .type, .implicit_type => {},
-                .break_expr, .return_expr, .loop, .not, .neg, .query_op, .move_expr, .comptime_expr, .sizeof_expr, .field_access, .struct_field, .struct_property, .struct_init_field => {
+                .break_expr, .return_expr, .loop, .not, .neg, .query_op, .move_expr, .comptime_expr, .sizeof_expr, .field_access, .struct_field, .struct_property, .struct_init_field, .@"pub" => {
                     if (left.data.node != right.data.node) return false;
                 },
                 .add, .sub, .mul, .div, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .@"and", .@"or", .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .call, .const_binding, .var_binding, .static_binding, .func, .param, .signature, .type_func, .@"if" => {
                     if (left.data.node_node.a != right.data.node_node.a or left.data.node_node.b != right.data.node_node.b) return false;
                 },
-                .block, .call_arg_list, .param_list, .type_list, .type_variant, .if_else, .@"struct", .struct_init => {
+                .block, .call_arg_list, .param_list, .type_list, .type_variant, .if_else, .@"struct", .struct_init, .import => {
                     if (left.data.ref.start != right.data.ref.start or left.data.ref.end != right.data.ref.end) return false;
                 },
                 else => return false,
@@ -1179,6 +1185,8 @@ pub const Diagnostic = struct {
         top_level_return,
         break_outside_loop,
         continue_outside_loop,
+        import_outside_top_level,
+        misplaced_pub,
         nested_declaration_not_supported,
         ownership_transfer_requires_place,
         ownership_transfer_requires_owned_place,

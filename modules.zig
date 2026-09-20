@@ -16,6 +16,19 @@ pub fn modulePath(gpa: std.mem.Allocator, dir_path: []const u8) ![]u8 {
     return std.mem.join(gpa, ".", segments.items);
 }
 
+fn isModuleSegment(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name, 0..) |c, i| {
+        const valid = switch (c) {
+            'a'...'z', 'A'...'Z', '_' => true,
+            '0'...'9' => i != 0,
+            else => false,
+        };
+        if (!valid) return false;
+    }
+    return true;
+}
+
 pub fn collectModuleFiles(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -33,6 +46,10 @@ pub fn collectModuleFiles(
         files.deinit(gpa);
     }
     while (try walker.next(io)) |entry| {
+        if (entry.kind == .directory) {
+            if (!isModuleSegment(entry.basename)) walker.leave(io);
+            continue;
+        }
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.path, ".chi")) continue;
         if (std.mem.eql(u8, entry.path, entry_name)) continue;
@@ -108,4 +125,33 @@ test "module discovery collects nested sources and skips the entry file" {
     try std.testing.expectEqualStrings("physics.collision", root_discovered[2].module_path);
     try std.testing.expectEqualStrings("sibling/other.chi", root_discovered[3].path);
     try std.testing.expectEqualStrings("sibling", root_discovered[3].module_path);
+}
+
+test "module discovery ignores directories without spellable names" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "physics/collision");
+    try tmp.dir.createDirPath(io, "physics.collision");
+    try tmp.dir.createDirPath(io, "with-dash");
+    try tmp.dir.createDirPath(io, "_priv");
+    try tmp.dir.writeFile(io, .{ .sub_path = "main.chi", .data = "exit(0)" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "physics/collision/raycast.chi", .data = "exit(0)" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "physics.collision/flat.chi", .data = "exit(0)" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "with-dash/other.chi", .data = "exit(0)" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "_priv/ok.chi", .data = "exit(0)" });
+
+    const discovered = try collectModuleFiles(std.testing.allocator, io, tmp.dir, "main.chi");
+    defer {
+        for (discovered) |file| {
+            std.testing.allocator.free(file.path);
+            std.testing.allocator.free(file.module_path);
+        }
+        std.testing.allocator.free(discovered);
+    }
+    try std.testing.expectEqual(@as(usize, 2), discovered.len);
+    try std.testing.expectEqualStrings("_priv/ok.chi", discovered[0].path);
+    try std.testing.expectEqualStrings("_priv", discovered[0].module_path);
+    try std.testing.expectEqualStrings("physics/collision/raycast.chi", discovered[1].path);
+    try std.testing.expectEqualStrings("physics.collision", discovered[1].module_path);
 }

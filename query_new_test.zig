@@ -3741,6 +3741,25 @@ test "generated struct ownership hooks inherit the type specialization" {
     try testing.expectEqual(@as(u8, 43), runtime.runProg(io, testing.allocator, &.{}));
 }
 
+test "public parameterized struct hooks execute" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\pub struct Box(T: type)
+        \\  copy = func(imm self: Box(T)) Box(T) -> Box(T){value = self.value + 1}
+        \\  value: T
+        \\const original = Box(int){value = 41}
+        \\const copied = original
+        \\exit(copied.value)
+    );
+    const executable = (try db.get(query_structures.BuildExecutable, 1)).*.?;
+    const io = testing.io;
+    try runtime.writeProgram(io, executable.bytes);
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    try testing.expectEqual(@as(u8, 42), runtime.runProg(io, testing.allocator, &.{}));
+}
+
 test "generated struct ownership declarations validate field capabilities" {
     const db = try testDatabase(1);
     defer db.deinit();
@@ -7973,6 +7992,94 @@ test "entry analysis validates all root syntax before resolving a call" {
             .end = start + case.marker.len,
         }, case.kind);
     }
+}
+
+test "top-level imports and public markers leave entry analysis unchanged" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\import physics
+        \\import physics.{Body}
+        \\pub import math.{Vec3}
+        \\pub static doubled = func(value: int) int -> return value * 2
+        \\const a = doubled(21)
+        \\exit(a)
+    );
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    try testing.expect(scope.resolve("doubled") != null);
+    const entry_id = (try db.get(query_structures.SelectEntry, 1)).*.?;
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, entry_id)).* != null);
+    const diagnostics = try db.transitiveAccumulatorValues(query_structures.AnalyzeFunctionBody, entry_id, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 0), diagnostics.len);
+}
+
+test "imports outside the top level are rejected" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    const source =
+        \\static f = func() int
+        \\  import physics
+        \\  return 1
+    ;
+    try addSource(db, 1, source);
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const function = scope.resolveFunction("f").?;
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, function)).* == null);
+    const start = std.mem.indexOf(u8, source, "import").?;
+    try expectSingleQueryDiagnostic(db, query_structures.AnalyzeFunctionBody, function, true, 1, .{
+        .start = start,
+        .end = start + "import".len,
+    }, .import_outside_top_level);
+}
+
+test "nested public markers are rejected" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    const source =
+        \\static f = func() int
+        \\  pub static x = 1
+        \\  return x
+    ;
+    try addSource(db, 1, source);
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const function = scope.resolveFunction("f").?;
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, function)).* == null);
+    const start = std.mem.indexOf(u8, source, "pub").?;
+    try expectSingleQueryDiagnostic(db, query_structures.AnalyzeFunctionBody, function, true, 1, .{
+        .start = start,
+        .end = start + "pub".len,
+    }, .misplaced_pub);
+}
+
+test "public runtime bindings are rejected" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1, "pub const x = 1\nexit(0)");
+    const entry_id = (try db.get(query_structures.SelectEntry, 1)).*.?;
+    try testing.expect((try db.get(query_structures.AnalyzeFunctionBody, entry_id)).* == null);
+    try expectSingleQueryDiagnostic(db, query_structures.AnalyzeFunctionBody, entry_id, true, 1, .{
+        .start = 0,
+        .end = "pub".len,
+    }, .misplaced_pub);
+}
+
+test "qualified types need module resolution" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1, "static f = func(body: physics.Body) int -> return 1");
+    const scope = (try db.get(query_structures.BuildModuleScope, 1)).*.?;
+    const function = scope.resolveFunction("f").?;
+    try testing.expect((try db.get(query_structures.FunctionSignature, function)).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(query_structures.FunctionSignature, function, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(DiagnosticKind.parameter_type_not_supported, std.meta.activeTag(diagnostics[0].kind));
 }
 
 test "entry call lookup reports only the demanded resolution failure" {

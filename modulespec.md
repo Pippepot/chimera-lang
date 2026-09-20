@@ -10,7 +10,10 @@
 
 Module paths derive from the entry file's directory. There is no
 folder-root flag. That directory is `$entry`; subfolders append dotted
-segments. Parent and sibling folders are invisible.
+segments. Parent and sibling folders are invisible. Directory segments must
+be spellable identifiers; other directories and their subtrees are invisible
+to module discovery, so `physics/collision` and a literal `physics.collision`
+folder never merge.
 
 ```text
 main.chi
@@ -30,8 +33,10 @@ with the entry file in the top directory:
 
 ## 2. Same-module visibility
 
-All files in one module share a single declaration scope. No import is
-needed between them. File and declaration order have no meaning.
+Static, function, and struct declarations are shared across every file of
+one module. No import is needed between them. Top-level `const` and `var`
+bindings are entry-body locals, not shared declarations. File and
+declaration order have no meaning.
 
 ```text
 // physics/body.chi
@@ -68,8 +73,13 @@ import physics.{Body as PhysicsBody}
 * `import physics` introduces the qualified namespace: `physics.Body`,
   `physics.simulate()`. It never implicitly imports children, so
   `import physics` does not provide `physics.collision`.
+* An unaliased import exposes its full path: `import physics.collision`
+  provides `physics.collision.X` but not `collision.X`. Shared leading
+  segments navigate parent namespaces without importing them, so combining
+  imports that share a prefix is harmless.
 * `import physics as phys` replaces the qualification: `phys.Body`.
 * `import physics.{Body}` introduces `Body` directly into file scope.
+  An empty selective list is rejected.
 
 ## 4. Qualified lookup
 
@@ -124,7 +134,9 @@ func helper() {}
 static state = ...
 ```
 
-`pub` opens a top-level declaration or import to importing modules:
+`pub` opens a top-level static, function, struct, or import to importing
+modules. It is rejected on runtime `const`/`var` bindings and anywhere
+inside a body:
 
 ```text
 pub struct Body {}
@@ -146,6 +158,8 @@ pub import math.{Vec3} // consumers use physics.Vec3
 
 * Re-export chains share one identity: `A.X`, `B.X`, `C.X` are the same
   declaration, including nominal type identity.
+* A re-export never enters the unqualified scope of sibling files: each
+  file sees its module's declarations plus its own imports only.
 * Module-alias re-exports (`pub import physics.collision [as collision]`)
   follow the normal conflict rules.
 
@@ -187,15 +201,14 @@ contents and prelude names.
 
 ## 12. Implementation plan
 
-Baseline: `main.zig` compiles one `FileId` (`SourceText` input);
-`ParseFile → DiscoverItems → IndexItems → BuildModuleScope` are per-file
-(`query_structures.zig`); `DiscoverItems` synthesizes `$entry` per file
-(`semantic.zig`); `ItemLoc` keys identity by `file_id` and
-`BuildModuleScope` is a per-file sorted table (`structures.zig`).
-`Token.Tag`/`Node.Tag` have no import/`pub` forms and there is no
-directory walk, `ModuleId`, visibility, or prelude. Each slice below is one
-coherent diff and covers diagnostics, ownership paths, and incremental
-recomputation; unsupported forms are rejected at their owning boundary.
+Baseline: slices 0–2 are done. `main.zig` loads every `.chi` file under the
+entry directory (`SourceText` + `FileModule` inputs, entry fixed at `FileId`
+0); `Token.Tag`/`Node.Tag` have `import`/`pub` forms with `pub` as a
+transparent wrapper; imports are skipped by `$entry`, misplaced imports and
+`pub` are rejected, and qualified types parse with resolution deferred.
+Each slice below is one coherent diff and covers diagnostics, ownership
+paths, and incremental recomputation; unsupported forms are rejected at
+their owning boundary.
 
 Note on §5: the plan adopts module-declarations-before-file-imports, with
 collisions as errors, so the order is rarely observable.
@@ -205,7 +218,7 @@ collisions as errors, so the order is rarely observable.
 Port settled §§1–11 decisions there before coding (working-rules
 requirement); `ROADMAP.md` module item tracks status. No compiler change.
 
-### Slice 1 — Module identity and file loading
+### Slice 1 — Module identity and file loading (done)
 
 * Add `ModuleId` (entry-dir-relative folder path; pointer-free query key).
   `FileModule(FileId) → ModuleId` input/query; `$entry` = entry file's
@@ -216,39 +229,68 @@ requirement); `ROADMAP.md` module item tracks status. No compiler change.
 * Tests (`*_test.zig` helpers): folder grouping, child paths
   (`physics`, `physics.collision`), outside-tree invisibility.
 
-### Slice 2 — Syntax: `import`, `pub`, qualified paths
+### Slice 2 — Syntax: `import`, `pub`, qualified paths (done)
 
 * Tokenizer: `keyword_import`, `keyword_pub` (`as` exists).
-* AST: top-level `import` node (dotted path, optional selective list,
-  optional alias, `pub` flag) plus `pub` marker on top-level bindings.
-  Imports allowed anywhere among top-level declarations, order-independent.
+* AST: one `import` node (`[path, selective…]`, struct-init-style) reusing
+  `field_access`/`.as` shapes, plus a `pub` wrapper on top-level
+  declarations. Imports allowed anywhere among top-level declarations,
+  order-independent; empty selective lists rejected at the parser.
 * `.` needs no new expression form: the first identifier resolves normally
-  (locals shadow modules, §4); module-qualified use is valid in type, value,
-  callee, and initializer-head positions.
-* Tests: tokenizer/parser round-trips for all five import forms, `pub`
-  bindings/imports, top-level-only rejection.
+  (locals shadow modules, §4); module-qualified use parses in type, value,
+  callee, and initializer-head positions, with resolution deferred.
+* Misplaced imports and `pub` are rejected (`import_outside_top_level`,
+  `misplaced_pub`); hook source offsets are computed from the unwrapped
+  declaration.
 
-### Slice 3 — Cross-file discovery and identity
+### Slice 3 — Cross-file discovery, identity, and membership
 
-* `DiscoverItems` also collects import decls (kept out of value scope).
-  Duplicate top-level detection merges all files of one module: same name
-  twice in one module (even across files) rejects the module; same name in
-  different modules is fine.
-* Re-key declaration identity by owning module, not filename: filenames
-  must not affect identity (§§1, 10). Same-folder rename preserves
-  identity; cross-folder move changes it, including nominal type identity.
+* Split declaration identity from source location. Identity is
+  `{module, owner, kind, name}`; the current file and AST position move
+  into a replaceable index result that `ResolveItem` consults. Relocating
+  a declaration between files of one module preserves identity while
+  updating its location and file-scoped imports; same-folder renames are
+  no-ops; cross-folder moves change the module and the identity, including
+  nominal type identity. Replacing `ItemLoc.file_id` with `module_id`
+  alone is insufficient.
+* Keep synthetic `$entry` identities file-specific: one per file, never
+  merged by module.
+* Add explicit module membership: a per-module membership input enumerating
+  member files, fed by the directory catalog. The catalog represents empty
+  modules and parents containing only child modules; interning a path
+  never establishes existence. `FileModule` answers which module owns a
+  file; it cannot enumerate a module's files.
+* `DiscoverItems` collects import decls without entering value scope.
+  Duplicate detection merges all files of one module: a repeated name
+  rejects the module; equal names in different modules are independent.
 * `BuildModuleScope` moves from per-`FileId` to per-`ModuleId` (union of
   member files, still sorted). Hook items stay excluded as today.
-* Tests: cross-file duplicate, cross-module independence, rename-vs-move
-  identity behavior.
+* Cross-file declaration errors render with correct files immediately.
+  Membership changes and declaration relocation get recomputation tests
+  here, not in slice 7.
+* Tests: identity/location split (move preserves, cross-folder changes),
+  file-specific entries, membership incl. empty modules, cross-file
+  duplicates, relocation recomputation.
 
 ### Slice 4 — Import resolution, visibility, re-exports
 
 * New query `ResolveFileImports(FileId)`: resolves the file's imports
   against module paths, filters by `pub`, binds whole-module namespaces,
   aliases, and selective names; follows `pub import` chains without
-  creating identities. Import-graph cycles are allowed; only semantic
-  cycles fail via `declaration_cycle`.
+  creating identities. Whole-module imports bind namespace identities
+  without resolving imported contents, so cyclic module graphs never
+  deadlock: exported names resolve on demand through declarations and
+  re-exports, independently of body and type evaluation. A binding
+  distinguishes a module namespace from a declaration; no new runtime
+  value type. Import-graph cycles are allowed; only semantic cycles fail
+  via `declaration_cycle`.
+* Effective file scope = current-module declarations + file imports (§5
+  order). Enforce `pub` at the use site; private stays module-local.
+  Diagnostics spanning files render with correct paths in this slice.
+* New `Diagnostic.Kind`s: `unknown_module`, `unknown_imported_name`,
+  `private_access`, `import_conflict`. Duplicate exact imports harmless;
+  one name to different declarations errors. `pub` on struct fields
+  rejected at its owning boundary.
 * Effective file scope = current-module declarations + file imports (§5
   order). Enforce `pub` at the use site; private stays module-local.
 * New `Diagnostic.Kind`s: `unknown_module`, `unknown_imported_name`,
@@ -280,9 +322,9 @@ requirement); `ROADMAP.md` module item tracks status. No compiler change.
 
 ### Slice 7 — Incremental, CLI, docs
 
-* Dependency edges file→module and module→module; equal results retain
-  allocations/`changed_at`; file add/remove/move invalidates only the
-  affected modules (counter/recomputation tests).
+* Slice-3-level recomputation is covered at introduction; here: remaining
+  dependency edges file→module and module→module, equal results retaining
+  allocations/`changed_at`, and driver-level file add/remove invalidation.
 * CLI debug (`ast,ssa,asm`) and diagnostics render multi-file paths;
   `git diff --check`, `zig fmt --check`, README suites
   (`query_new_test`, `codegen_new_test`, `main`, tokenizer/AST/semantic).

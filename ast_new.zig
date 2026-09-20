@@ -197,6 +197,8 @@ fn parseExpression(parser: *ParserState) ParseError!Node.Index {
     return switch (parser.tokens[parser.index].tag) {
         .keyword_comptime => try parseComptime(parser),
         .keyword_const, .keyword_var, .keyword_static => try parseBinding(parser),
+        .keyword_pub => try parsePublic(parser),
+        .keyword_import => try parseImport(parser),
         .keyword_func, .keyword_fallible => try parseFunction(parser),
         .keyword_return => try parseReturn(parser),
         .keyword_break => try parseBreak(parser),
@@ -315,6 +317,61 @@ fn parseBinding(parser: *ParserState) !Node.Index {
     };
 
     return parser.addNode(.{ .tag = tag, .token_index = identifier_index, .data = .{ .node_node = .{ .a = type_annotation, .b = value } } });
+}
+
+fn parsePublic(parser: *ParserState) !Node.Index {
+    const token_index = parser.index;
+    _ = try parser.expect(.keyword_pub);
+    const inner = switch (parser.tokens[parser.index].tag) {
+        .keyword_const, .keyword_var, .keyword_static => try parseBinding(parser),
+        .keyword_func, .keyword_fallible => try parseFunction(parser),
+        .keyword_struct => try parseStruct(parser),
+        .keyword_import => try parseImport(parser),
+        else => {
+            try parser.addError(.{ .invalid_expression = parser.tokens[parser.index].tag });
+            return error.ParseError;
+        },
+    };
+    return parser.addNode(.{ .tag = .@"pub", .token_index = token_index, .data = .{ .node = inner } });
+}
+
+fn parseImport(parser: *ParserState) !Node.Index {
+    const token_index = parser.index;
+    _ = try parser.expect(.keyword_import);
+    const stack_top = parser.scratch_stack.items.len;
+    defer parser.scratch_stack.shrinkRetainingCapacity(stack_top);
+
+    var target = try parseTokenNode(parser, .identifier, .identifier);
+    while (parser.tokens[parser.index].tag == .period and parser.tokens[parser.index + 1].tag != .l_brace)
+        target = try parseFieldAccess(parser, target);
+    const aliased = parser.eat(.keyword_as) != null;
+    if (aliased) {
+        const as_index = parser.index - 1;
+        const alias = try parseTokenNode(parser, .identifier, .identifier);
+        target = try parser.addNode(.{ .tag = .as, .token_index = as_index, .data = .{ .node_node = .{ .a = target, .b = alias } } });
+    }
+    try parser.scratch_stack.append(parser.gpa, target);
+    if (!aliased and parser.eat(.period) != null) {
+        _ = try parser.expect(.l_brace);
+        while (true) {
+            try parser.scratch_stack.append(parser.gpa, try parseImportTarget(parser));
+            if (parser.eat(.comma) != null) continue;
+            _ = try parser.expect(.r_brace);
+            break;
+        }
+    }
+    return parser.addNode(.{ .tag = .import, .token_index = token_index, .data = try parser.listToSpan(parser.scratch_stack.items[stack_top..]) });
+}
+
+fn parseImportTarget(parser: *ParserState) !Node.Index {
+    var target = try parseTokenNode(parser, .identifier, .identifier);
+    while (parser.tokens[parser.index].tag == .period) target = try parseFieldAccess(parser, target);
+    if (parser.eat(.keyword_as) != null) {
+        const as_index = parser.index - 1;
+        const alias = try parseTokenNode(parser, .identifier, .identifier);
+        target = try parser.addNode(.{ .tag = .as, .token_index = as_index, .data = .{ .node_node = .{ .a = target, .b = alias } } });
+    }
+    return target;
 }
 
 fn parseAssign(parser: *ParserState, target: Node.Index) !Node.Index {
@@ -436,7 +493,8 @@ fn parseTypePrimary(parser: *ParserState) ParseError!Node.Index {
         .identifier => blk: {
             const is_call = parser.tokens[parser.index + 1].tag == .l_paren;
             var value = try parseTokenNode(parser, .identifier, if (is_call) .identifier else .type);
-            if (is_call) {
+            while (parser.tokens[parser.index].tag == .period) value = try parseFieldAccess(parser, value);
+            if (parser.tokens[parser.index].tag == .l_paren) {
                 const token_index = parser.index;
                 const arguments = try parseCallArgList(parser);
                 value = try parser.addNode(.{ .tag = .call, .token_index = token_index, .data = .{ .node_node = .{ .a = value, .b = arguments } } });
@@ -803,7 +861,7 @@ fn renderNode(gpa: std.mem.Allocator, node_index: Node.Index, ast: *const Ast, s
         },
         .unit_literal => try writer.writeAll(" : ()\n"),
         .implicit_static, .implicit_type => try writer.writeByte('\n'),
-        .break_expr, .return_expr, .loop, .not, .neg, .query_op, .move_expr, .comptime_expr, .sizeof_expr, .field_access, .struct_field, .struct_property, .struct_init_field => {
+        .break_expr, .return_expr, .loop, .not, .neg, .query_op, .move_expr, .comptime_expr, .sizeof_expr, .field_access, .struct_field, .struct_property, .struct_init_field, .@"pub" => {
             if (node.tag == .field_access or node.tag == .struct_field or node.tag == .struct_property or node.tag == .struct_init_field) {
                 const loc = ast.tokens[node.token_index].loc;
                 try writer.print(" : {s}", .{source[loc.start..loc.end]});
@@ -825,7 +883,7 @@ fn renderNode(gpa: std.mem.Allocator, node_index: Node.Index, ast: *const Ast, s
                 try renderNode(gpa, b, ast, source, writer, seen, new_indent, true, false);
             }
         },
-        .block, .call_arg_list, .param_list, .type_list, .type_variant, .if_else, .@"struct", .struct_init => {
+        .block, .call_arg_list, .param_list, .type_list, .type_variant, .if_else, .@"struct", .struct_init, .import => {
             try writer.writeByte('\n');
             for (node.data.ref.start..node.data.ref.end) |i| {
                 try renderNode(gpa, ast.node_refs[i], ast, source, writer, seen, new_indent, i == node.data.ref.end - 1, false);
@@ -1119,6 +1177,22 @@ test "parse direct calls in type positions" {
     try std.testing.expectEqual(Node.Tag.call, call.tag);
     try std.testing.expectEqual(Node.Tag.identifier, ast.nodes[call.data.node_node.a.index()].tag);
     try std.testing.expectEqual(Node.Tag.bool_literal, ast.nodes[ast.node_refs[ast.nodes[call.data.node_node.b.index()].data.ref.start].index()].tag);
+}
+
+test "parse qualified types and factory calls" {
+    const source = "func use(value: physics.Box(int)) physics.Body -> value";
+    var report = try parseReport(std.testing.allocator, 1, source);
+    defer report.deinit(std.testing.allocator);
+    const ast = &report.ast.?;
+    const binding = ast.nodes[ast.node_refs[ast.nodes[0].data.ref.start].index()];
+    const function = ast.nodes[binding.data.node_node.b.index()];
+    const signature = ast.nodes[function.data.node_node.a.index()];
+    const parameters = ast.nodes[signature.data.node_node.a.index()];
+    const parameter = ast.nodes[ast.node_refs[parameters.data.ref.start].index()];
+    const call = ast.nodes[parameter.data.node_node.b.index()];
+    try std.testing.expectEqual(Node.Tag.call, call.tag);
+    try std.testing.expectEqual(Node.Tag.field_access, ast.nodes[call.data.node_node.a.index()].tag);
+    try std.testing.expectEqual(Node.Tag.field_access, ast.nodes[signature.data.node_node.b.index()].tag);
 }
 
 test "parse struct declaration" {
@@ -1813,6 +1887,91 @@ test "parse with precedence" {
         \\        ├─number_literal : 8
         \\        └─number_literal : 9
     );
+}
+
+test "parse module import" {
+    try testParsing(
+        \\import physics
+    ,
+        \\import
+        \\└─identifier : physics
+    );
+}
+
+test "parse nested module import" {
+    try testParsing(
+        \\import physics.collision
+    ,
+        \\import
+        \\└─field_access : collision
+        \\  └─identifier : physics
+    );
+}
+
+test "parse selective module import" {
+    try testParsing(
+        \\import physics.{Body, World}
+    ,
+        \\import
+        \\├─identifier : physics
+        \\├─identifier : Body
+        \\└─identifier : World
+    );
+}
+
+test "parse aliased module import" {
+    try testParsing(
+        \\import physics as phys
+    ,
+        \\import
+        \\└─as
+        \\  ├─identifier : physics
+        \\  └─identifier : phys
+    );
+}
+
+test "parse selective module import with alias" {
+    try testParsing(
+        \\import physics.{Body as PhysicsBody}
+    ,
+        \\import
+        \\├─identifier : physics
+        \\└─as
+        \\  ├─identifier : Body
+        \\  └─identifier : PhysicsBody
+    );
+}
+
+test "parse public import" {
+    try testParsing(
+        \\pub import physics
+    ,
+        \\pub
+        \\└─import
+        \\  └─identifier : physics
+    );
+}
+
+test "parse public static binding" {
+    try testParsing(
+        \\pub static gravity = 1
+    ,
+        \\pub
+        \\└─static_binding
+        \\  └─number_literal : 1
+    );
+}
+
+test "diagnostic tag for malformed imports" {
+    try testExpectDiagnosticTag(
+        \\import 42
+    , .{ .expected_token = .{ .expected = .identifier, .found = .number_literal } });
+    try testExpectDiagnosticTag(
+        \\pub 42
+    , .{ .invalid_expression = .number_literal });
+    try testExpectDiagnosticTag(
+        \\import physics.{}
+    , .{ .expected_token = .{ .expected = .identifier, .found = .r_brace } });
 }
 
 test "parse CRLF line endings" {

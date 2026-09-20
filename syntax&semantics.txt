@@ -54,9 +54,12 @@ const pair = (1, true)
 # child modules. Filenames and the extension never participate in module or
 # declaration identity. Module paths derive from the entry file's directory,
 # which is `$entry`; subfolders append dotted segments. Parent and sibling
-# folders are invisible.
-# All files in one module share a single declaration scope with no import
-# between them. File, declaration, and import order have no meaning.
+# folders are invisible. Directory segments must be spellable identifiers;
+# other directories and their subtrees are invisible to module discovery.
+# Static, function, and struct declarations are shared across every file of
+# one module with no import between them. Top-level const and var bindings
+# are entry-body locals, not shared declarations. File, declaration, and
+# import order have no meaning.
 # Imports are file-scoped and top level only: each file states its own external
 # dependencies, and sharing a module does not share imports.
 import physics
@@ -64,9 +67,12 @@ import physics.collision
 import physics.{Body, World}
 import physics as phys
 import physics.{Body as PhysicsBody}
-# A whole-module import introduces its qualified namespace without implicitly
-# importing children. An alias replaces the qualification. A selective import
-# introduces the named declarations directly into file scope.
+# A whole-module import exposes its full path without implicitly importing
+# children. Shared leading segments navigate parent namespaces without
+# importing them, so combining imports that share a prefix is harmless.
+# An alias replaces the qualification. A selective import introduces the
+# named declarations directly into file scope; an empty selective list is
+# rejected.
 # Module-qualified lookup is valid wherever the target is valid (type, value,
 # call, initializer head) and shares `.` syntax with struct namespaces. The
 # first identifier resolves normally, so a local shadows a module name with no
@@ -79,13 +85,17 @@ var body: physics.Body
 # duplicate import is harmless; one name bound to different declarations is an
 # error.
 # Declarations are module-private by default: visible from every file of the
-# same module, inaccessible elsewhere. `pub` opens a top-level declaration or
-# import to importing modules. Struct-field visibility is out of scope.
+# same module, inaccessible elsewhere. `pub` opens a top-level static,
+# function, struct, or import to importing modules; it is rejected on
+# runtime const/var bindings and anywhere inside a body. Struct-field
+# visibility is out of scope.
 pub struct Body
     a: int
 # Imports are private by default and never create declarations. `pub import`
 # re-exports under the importing module's namespace; chains share one identity,
-# including nominal type identity.
+# including nominal type identity. A re-export never enters the unqualified
+# scope of sibling files: each file sees its module's declarations plus its
+# own imports only.
 pub import math.{Vec3}
 # Module import cycles are allowed. Only a real semantic dependency cycle is an
 # error, via the declaration-cycle rule.

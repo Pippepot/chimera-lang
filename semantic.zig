@@ -288,7 +288,9 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             var body_statements: std.ArrayList(UnresolvedBody.Statement) = .empty;
             defer body_statements.deinit(self.gpa);
             for (self.ast.node_refs[root.data.ref.start..root.data.ref.end]) |child| {
-                if (self.ast.nodes[child.index()].tag == .static_binding) continue;
+                const child_node = self.ast.nodes[child.index()];
+                const inner = if (child_node.tag == .@"pub") self.ast.nodes[child_node.data.node.index()] else child_node;
+                if (inner.tag == .static_binding or inner.tag == .import) continue;
                 try body_statements.append(self.gpa, try self.buildStatement(child, false));
             }
             self.root_block = try self.finishBlock(body_statements.items, null, tokenSpan(self.ast, root.token_index));
@@ -361,6 +363,8 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             const span = tokenSpan(self.ast, node.token_index);
             return switch (node.tag) {
                 .const_binding, .var_binding => try self.buildBinding(index),
+                .@"pub" => return self.reject(index, .misplaced_pub),
+                .import => return self.reject(index, .import_outside_top_level),
                 .return_nothing => if (!self.can_return)
                     self.reject(index, .top_level_return)
                 else
@@ -1701,28 +1705,30 @@ pub fn discoverItems(gpa: std.mem.Allocator, ast: *const structures.Ast, source:
     for (root.data.ref.start..root.data.ref.end) |ref_index| {
         const declaration = ast.node_refs[ref_index];
         const node = ast.nodes[declaration.index()];
+        const target = if (node.tag == .@"pub") node.data.node else declaration;
+        const target_node = ast.nodes[target.index()];
 
-        if (node.tag != .static_binding) {
+        if (target_node.tag != .static_binding) {
             declaration_node_start = declaration.index() + 1;
             continue;
         }
-        const value = node.data.node_node.b.unwrap() orelse unreachable;
+        const value = target_node.data.node_node.b.unwrap() orelse unreachable;
         const kind: structures.ItemKind = switch (ast.nodes[value.index()].tag) {
             .func => .function,
             .@"struct" => .structure,
             else => .static,
         };
 
-        const token = ast.tokens[node.token_index];
+        const token = ast.tokens[target_node.token_index];
         const name = source[token.loc.start..token.loc.end];
-        const parent = try appendItem(gpa, &items, kind, ast.file_id, name, declaration.index(), null, null);
+        const parent = try appendItem(gpa, &items, kind, ast.file_id, name, target.index(), null, null);
         if (kind == .structure) {
             try discoverStructHooks(gpa, &items, ast, source, value, parent, null);
         } else {
-            for (declaration_node_start..declaration.index()) |candidate_index| {
+            for (declaration_node_start..target.index()) |candidate_index| {
                 const candidate = ast.nodes[candidate_index];
                 if (candidate.tag != .@"struct") continue;
-                const source_site = @as(i64, @intCast(candidate_index)) - @as(i64, declaration.index());
+                const source_site = @as(i64, @intCast(candidate_index)) - @as(i64, target.index());
                 try discoverStructHooks(gpa, &items, ast, source, @enumFromInt(candidate_index), parent, source_site);
             }
         }
