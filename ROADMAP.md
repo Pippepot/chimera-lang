@@ -5,7 +5,7 @@
 ## Current foundation
 
 - Incremental queries preserve stable declaration and type identities, owned results, diagnostics, and equal-result retention.
-- Folder modules support shared declarations, file-scoped imports, public re-exports, qualified type/value/call lookup, entry-only execution, directory refresh, and file-aware CLI output. All module-spec slices are complete.
+- Folder modules support shared declarations, file-scoped imports, public re-exports, qualified type/value/call lookup, entry-only execution, directory refresh, file-aware CLI output, and an embedded `std.prelude` resolved once and included by default in user files with an explicit-import override. Compiler-owned standard modules are exempt. All module-spec slices are complete.
 - Struct namespace declarations support qualified calls and constants without affecting instance layout. Generated namespaces retain inherited static arguments; fields and ordinary declarations share a name scope, separate from ownership hooks.
 - Typing publishes one SSA control-flow graph with fallible edges, joins, loops, calls, callable values, variants, and divergence.
 - Structs have nominal identity, cycle-checked layout, source-ordered initialization, field access, field updates through mutable local roots, and validated move/copy/drop strategy overrides.

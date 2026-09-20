@@ -42,10 +42,17 @@ const pair = (1, true)
 
 
 # Standard library
-# The standard library is always included. A selected set of common functions,
-# including sqrt, is available without qualification or an explicit import.
-# Other library names remain qualified or require explicit imports. The full
-# automatically available name set, module paths, and conflict rules are open.
+# The compiler embeds the standard library. Each top-level `.chi` file in its
+# `std` directory defines the reserved module `std.<filename>`; unlike ordinary
+# user modules, this reserved mapping includes the filename without `.chi`.
+# Every user file implicitly imports every public export of `std.prelude` into
+# its unqualified scope. Compiler-owned standard-library files do not receive
+# this implicit import. Current-module declarations take precedence over the
+# defaults. Any explicit import whose path is exactly `std.prelude` replaces
+# the implicit import for a user file, so this opts out of every prelude name:
+import std.prelude.{}
+# A non-empty selective import opts into only its listed names. Other standard
+# library modules remain qualified or require explicit imports.
 
 
 # Modules

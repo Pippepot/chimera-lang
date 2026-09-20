@@ -1,4 +1,5 @@
 const std = @import("std");
+const standard_library = @import("standard_library");
 const query = @import("query_new.zig");
 const queries = @import("query_structures.zig");
 const structures = @import("structures.zig");
@@ -12,6 +13,31 @@ pub const SourceFile = struct {
     path: []const u8,
     source: []const u8,
     module_path: []const u8,
+};
+
+pub const StandardSource = struct {
+    registry_path: []const u8,
+    display_path: []const u8,
+    source: []const u8,
+    module_path: []const u8,
+};
+
+/// Standard-library files have reserved `std.<filename>` module identities.
+/// They are embedded so compilation does not depend on the process working
+/// directory or an adjacent source checkout.
+pub const standard_sources = [_]StandardSource{
+    .{
+        .registry_path = "$std/example.chi",
+        .display_path = "std/example.chi",
+        .source = standard_library.example,
+        .module_path = "std.example",
+    },
+    .{
+        .registry_path = "$std/prelude.chi",
+        .display_path = "std/prelude.chi",
+        .source = standard_library.prelude,
+        .module_path = "std.prelude",
+    },
 };
 
 pub const Catalog = struct {
@@ -188,6 +214,23 @@ pub const SourceRegistry = struct {
             if (!slot.found_existing) slot.value_ptr.* = .empty;
             try slot.value_ptr.append(gpa, id);
         }
+        for (standard_sources) |file| {
+            const id = self.paths.get(file.registry_path) orelse new: {
+                try self.paths.ensureUnusedCapacity(gpa, 1);
+                const owned = try gpa.dupe(u8, file.registry_path);
+                const id: structures.FileId = @intCast(self.paths.count() + 1);
+                self.paths.putAssumeCapacityNoClobber(owned, id);
+                break :new id;
+            };
+            const module = try db.intern(queries.ModulePaths, .{ .path = file.module_path });
+            try putInput(db, queries.SourceText, id, file.source);
+            try putInput(db, queries.FileModule, id, module);
+            const slot = try current.getOrPut(gpa, module);
+            if (!slot.found_existing) slot.value_ptr.* = .empty;
+            try slot.value_ptr.append(gpa, id);
+        }
+        const prelude_module = try db.intern(queries.ModulePaths, .{ .path = "std.prelude" });
+        try putInput(db, queries.StandardPreludeModule, {}, prelude_module);
         for (current.keys(), current.values()) |module, *members| {
             std.mem.sort(structures.FileId, members.items, {}, std.sort.asc(structures.FileId));
             if (std.mem.indexOfScalar(structures.ModuleId, self.known_modules.items, module) == null)

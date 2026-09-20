@@ -6,7 +6,7 @@ shopt -s nullglob
 if (($#)); then
     zig_files=("$@")
 else
-    zig_files=( *.zig )
+    zig_files=( src/*.zig )
 fi
 
 python3 - "${zig_files[@]}" <<'PY'

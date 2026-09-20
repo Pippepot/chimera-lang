@@ -1,9 +1,0 @@
-func Foo(static T: type) type
-  return struct
-    t: T
-
-struct Bar(T: type) # syntax sugar - same as above. Parameters are only ever static in this form and is implicit, just like read is implicit normally
-  t: T
-
-const c = Bar(int){t = 2}
-exit(c.t)

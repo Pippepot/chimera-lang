@@ -55,6 +55,46 @@ const physics = modules.SourceFile{ .path = "physics/body.chi", .module_path = "
     \\exit(99)
 };
 
+test "standard prelude exports are available without an explicit import" {
+    const f = try Fixture.init("exit(example())", &.{});
+    defer f.deinit();
+    try f.expectExit(0, 42);
+}
+
+test "an explicit empty prelude import suppresses the default inclusion" {
+    const f = try Fixture.init("import std.prelude.{}\nexit(example())", &.{});
+    defer f.deinit();
+    try f.expectDiagnostic(0, .unknown_function);
+}
+
+test "an explicit prelude import replaces the default selection" {
+    const f = try Fixture.init("import std.prelude.{example}\nexit(example())", &.{});
+    defer f.deinit();
+    try f.expectExit(0, 42);
+}
+
+test "current module declarations shadow default prelude exports" {
+    const f = try Fixture.init("func example() int -> return 7\nexit(example())", &.{});
+    defer f.deinit();
+    try f.expectExit(0, 7);
+}
+
+test "prelude resolution is retained across user source and module changes" {
+    const db = try query.Database.init(testing.allocator, .{ .worker_count = 2 });
+    defer db.deinit();
+    var registry: modules.SourceRegistry = .{};
+    defer registry.deinit(testing.allocator);
+    try registry.update(db, testing.allocator, "exit(example())", &.{}, &.{});
+    const resolved = try db.get(queries.ResolvePreludeImports, {});
+
+    try registry.update(db, testing.allocator, "import user\nexit(example())", &.{.{
+        .path = "user/a.chi",
+        .module_path = "user",
+        .source = "pub static value = 1",
+    }}, &.{"user"});
+    try testing.expectEqual(resolved, try db.get(queries.ResolvePreludeImports, {}));
+}
+
 test "qualified module types calls initializer heads generics and compile time values" {
     const f = try Fixture.init(
         \\import physics

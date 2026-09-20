@@ -84,6 +84,13 @@ pub const ModuleCatalog = struct {
     }
 };
 
+/// Identifies the compiler-owned prelude independently of the user module
+/// catalog, so user module additions cannot invalidate its resolution.
+pub const StandardPreludeModule = struct {
+    pub const Key = void;
+    pub const Value = structures.ModuleId;
+};
+
 pub const ModulePaths = struct {
     pub const Value = structures.ModulePath;
     pub const Id = structures.ModuleId;
@@ -1097,6 +1104,22 @@ pub const ResolveFileImports = struct {
         var bound: std.StringHashMap(u32) = .init(ctx.allocator());
         defer bound.deinit();
         var failed = false;
+        const module_path = (try ctx.lookupInterned(ModulePaths, module)).path;
+        const standard_module = std.mem.eql(u8, module_path, "std") or std.mem.startsWith(u8, module_path, "std.");
+        if (!standard_module and !explicitlyImportsPrelude(collected.entries)) {
+            const configured = ctx.input(StandardPreludeModule, {}) catch |err| switch (err) {
+                error.InputNotFound => null,
+                else => return err,
+            };
+            if (configured != null) {
+                const defaults = (try ctx.get(ResolvePreludeImports, {})).* orelse return null;
+                for (defaults.imports) |binding| {
+                    if (declarations.resolve(binding.name) != null) continue;
+                    const origin: ImportOrigin = .{ .file_id = file_id, .span = .{ .start = 0, .end = 0 } };
+                    if (!try bindImport(ctx, origin, declarations, binding.name, binding.target, false, &imports, &bound)) failed = true;
+                }
+            }
+        }
         for (collected.entries) |entry| {
             if (!try resolveImportStatement(ctx, file_id, module, declarations, entry, &modules, &imports, &bound)) failed = true;
         }
@@ -1126,6 +1149,14 @@ pub const ResolveFileImports = struct {
 
 const ExportVisit = struct { module: structures.ModuleId, name: []const u8 };
 const ImportOrigin = struct { file_id: structures.FileId, span: structures.SourceSpan };
+const prelude_module_path = "std.prelude";
+
+fn explicitlyImportsPrelude(entries: []const structures.ImportDeclaration) bool {
+    for (entries) |entry| {
+        if (std.mem.eql(u8, entry.path.spelling, prelude_module_path)) return true;
+    }
+    return false;
+}
 
 fn rejectImport(ctx: anytype, origin: ImportOrigin, kind: structures.Diagnostic.Kind) !void {
     try ctx.emit(structures.Diagnostic, .{ .file_id = origin.file_id, .span = origin.span, .kind = kind });
@@ -1169,6 +1200,18 @@ fn resolveModuleExport(
     origin: ImportOrigin,
     visited: *std.ArrayList(ExportVisit),
 ) anyerror!?structures.ImportTarget {
+    return resolveModuleExportInternal(ctx, importer, target, name, origin, visited, true);
+}
+
+fn resolveModuleExportInternal(
+    ctx: anytype,
+    importer: structures.ModuleId,
+    target: structures.ModuleId,
+    name: []const u8,
+    origin: ImportOrigin,
+    visited: *std.ArrayList(ExportVisit),
+    validate_module_catalog: bool,
+) anyerror!?structures.ImportTarget {
     for (visited.items) |seen| {
         if (seen.module != target or !std.mem.eql(u8, seen.name, name)) continue;
         try rejectImport(ctx, origin, .declaration_cycle);
@@ -1189,8 +1232,11 @@ fn resolveModuleExport(
                 for (items) |item| {
                     if (!std.mem.eql(u8, item.bound.spelling, name)) continue;
                     const path_origin: ImportOrigin = .{ .file_id = file_id, .span = entry.path.span };
-                    const reexported = (try resolveImportedModule(ctx, path_origin, entry.path.spelling)) orelse return null;
-                    const candidate = (try resolveModuleExport(ctx, target, reexported, item.original.spelling, origin, visited)) orelse return null;
+                    const reexported = if (validate_module_catalog)
+                        (try resolveImportedModule(ctx, path_origin, entry.path.spelling)) orelse return null
+                    else
+                        try ctx.intern(ModulePaths, .{ .path = entry.path.spelling });
+                    const candidate = (try resolveModuleExportInternal(ctx, target, reexported, item.original.spelling, origin, visited, validate_module_catalog)) orelse return null;
                     if (!try mergeExport(ctx, origin, &result, candidate, declaration != null)) return null;
                 }
                 continue;
@@ -1200,7 +1246,10 @@ fn resolveModuleExport(
             const bound_name = if (leaf) |dot| exported_name[dot + 1 ..] else exported_name;
             if (!std.mem.eql(u8, bound_name, name)) continue;
             const path_origin: ImportOrigin = .{ .file_id = file_id, .span = entry.path.span };
-            const reexported = (try resolveImportedModule(ctx, path_origin, entry.path.spelling)) orelse return null;
+            const reexported = if (validate_module_catalog)
+                (try resolveImportedModule(ctx, path_origin, entry.path.spelling)) orelse return null
+            else
+                try ctx.intern(ModulePaths, .{ .path = entry.path.spelling });
             if (!try mergeExport(ctx, origin, &result, .{ .namespace = .{ .module = reexported } }, declaration != null)) return null;
         }
     }
@@ -1245,6 +1294,63 @@ fn bindImport(
     bound.putAssumeCapacity(owned, index);
     return true;
 }
+
+pub const ResolvePreludeImports = struct {
+    pub const Input = void;
+    pub const Output = ?structures.FileImports;
+
+    pub fn run(ctx: anytype, _: Input) anyerror!Output {
+        const prelude = (try ctx.input(StandardPreludeModule, {})).*;
+        const importer = try ctx.intern(ModulePaths, .{ .path = "$default-prelude" });
+        const members = (try ctx.input(ModuleMembers, prelude)).*;
+        std.debug.assert(members.len != 0);
+
+        var imports: std.ArrayList(structures.FileImport) = .empty;
+        defer {
+            for (imports.items) |binding| ctx.allocator().free(binding.name);
+            imports.deinit(ctx.allocator());
+        }
+        var names = std.StringHashMap(void).init(ctx.allocator());
+        defer names.deinit();
+        const prelude_declarations = (try ctx.get(ModuleDeclarations, prelude)).* orelse return null;
+        for (prelude_declarations.entries) |entry| {
+            if (entry.is_public) try names.put(entry.name, {});
+        }
+        for (members) |prelude_file| {
+            const collected = (try ctx.get(CollectFileImports, prelude_file)).* orelse return null;
+            for (collected.entries) |entry| {
+                if (!entry.is_public) continue;
+                if (entry.selective) |selections| {
+                    for (selections) |selection| try names.put(selection.bound.spelling, {});
+                    continue;
+                }
+                const exported_name = if (entry.alias) |alias| alias.spelling else entry.path.spelling;
+                const leaf = std.mem.lastIndexOfScalar(u8, exported_name, '.');
+                try names.put(if (leaf) |dot| exported_name[dot + 1 ..] else exported_name, {});
+            }
+        }
+
+        var iterator = names.keyIterator();
+        while (iterator.next()) |name_ptr| {
+            const name = name_ptr.*;
+            var visited: std.ArrayList(ExportVisit) = .empty;
+            defer visited.deinit(ctx.allocator());
+            const origin: ImportOrigin = .{ .file_id = members[0], .span = .{ .start = 0, .end = 0 } };
+            const exported = (try resolveModuleExportInternal(ctx, importer, prelude, name, origin, &visited, false)) orelse return null;
+            const owned = try ctx.allocator().dupe(u8, name);
+            errdefer ctx.allocator().free(owned);
+            try imports.append(ctx.allocator(), .{ .name = owned, .target = exported, .reexport = false });
+        }
+        std.mem.sort(structures.FileImport, imports.items, {}, struct {
+            fn lessThan(_: void, left: structures.FileImport, right: structures.FileImport) bool {
+                return std.mem.order(u8, left.name, right.name) == .lt;
+            }
+        }.lessThan);
+        const modules = try ctx.allocator().alloc(structures.ModuleId, 0);
+        errdefer ctx.allocator().free(modules);
+        return .{ .modules = modules, .imports = try imports.toOwnedSlice(ctx.allocator()) };
+    }
+};
 
 fn resolveImportStatement(
     ctx: anytype,

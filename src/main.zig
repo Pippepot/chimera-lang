@@ -83,7 +83,9 @@ fn compileAndRun(
     const db = try query.Database.init(gpa, .{ .worker_count = 1 });
     defer db.deinit();
     timings.mark(io, "database init");
-    try modules.registerSources(db, gpa, input.source, input.source_files, input.module_paths);
+    var source_registry: modules.SourceRegistry = .{};
+    defer source_registry.deinit(gpa);
+    try source_registry.update(db, gpa, input.source, input.source_files, input.module_paths);
     timings.mark(io, "add source");
 
     if (input.debug_flags.timing) try buildWithStageTimings(db, io, &timings);
@@ -108,7 +110,7 @@ fn compileAndRun(
     var render_sources: std.ArrayList(diagnostics.DiagnosticSource) = .empty;
     defer {
         for (render_sources.items, 0..) |source, index| {
-            if (index != 0) gpa.free(source.path);
+            if (index != 0 and index <= input.source_files.len) gpa.free(source.path);
         }
         render_sources.deinit(gpa);
     }
@@ -117,6 +119,13 @@ fn compileAndRun(
         const path = try std.fs.path.join(gpa, &.{ std.fs.path.dirname(input.source_path) orelse ".", file.path });
         errdefer gpa.free(path);
         try render_sources.append(gpa, .{ .file_id = @intCast(index + 1), .path = path, .source = file.source });
+    }
+    for (modules.standard_sources) |source| {
+        try render_sources.append(gpa, .{
+            .file_id = source_registry.fileId(source.registry_path).?,
+            .path = source.display_path,
+            .source = source.source,
+        });
     }
     if (input.debug_flags.ast) {
         for (render_sources.items) |source| {
