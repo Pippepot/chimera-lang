@@ -1,7 +1,7 @@
 const std = @import("std");
 const structures = @import("structures.zig");
-const ast = @import("ast_new.zig");
-const codegen = @import("codegen_new.zig");
+const ast = @import("parser.zig");
+const codegen = @import("codegen.zig");
 const comptime_interpreter = @import("comptime_interpreter.zig");
 const semantic = @import("semantic.zig");
 const typing = @import("typing.zig");
@@ -131,7 +131,7 @@ pub const DiscoverItems = struct {
         defer names.deinit();
         var has_duplicates = false;
         for (tree.items) |item| {
-            if (item.loc.kind == .top_level_entry or item.parent != null) continue;
+            if (item.loc.kind == .top_level_entry or item.parent != null or item.qualified_owner != null) continue;
             if (!(try names.getOrPut(item.loc.name)).found_existing) continue;
             has_duplicates = true;
             const node = ast_value.nodes[item.declaration];
@@ -382,13 +382,44 @@ pub fn TypeInterner(comptime Context: type) type {
         }
 
         pub fn structDefinition(self: @This(), type_id: structures.TypeId) !?structures.StructDefinition {
+            const identity = (try self.structIdentity(type_id)) orelse return null;
+            return (try getStructDefinition(self.ctx, identity)) orelse return error.Unavailable;
+        }
+
+        pub fn structIdentity(self: @This(), type_id: structures.TypeId) !?structures.StructIdentity {
             if (type_id.isPrimitive()) return null;
             const data = (try self.ctx.lookupInternedAs(Types, type_id.interned().?)) orelse return error.Unavailable;
-            const identity = switch (data.*) {
-                .structure => |structure| structure,
-                .variant, .callable => return null,
+            return switch (data.*) {
+                .structure => |identity| identity,
+                .variant, .callable => null,
             };
-            return (try getStructDefinition(self.ctx, identity)) orelse return error.Unavailable;
+        }
+
+        pub fn structNamespaceMember(self: @This(), type_id: structures.TypeId, name: []const u8) !?structures.InstanceId {
+            const identity = (try self.structIdentity(type_id)) orelse return null;
+            const namespace = (try self.ctx.get(StructNamespace, identity)).* orelse return error.Unavailable;
+            return .{
+                .item = namespace.resolve(name) orelse return null,
+                .specialization = switch (identity) {
+                    .declared => null,
+                    .generated => |generated| generated.owner.specialization,
+                },
+            };
+        }
+
+        pub fn staticCallArgument(self: @This(), node: structures.Node.Index, is_meta_type: bool) !?structures.CompileTimeValueId {
+            if (!is_meta_type) return self.executeComptime(node);
+            const file_id = self.file_id orelse unreachable;
+            const parsed = (try self.ctx.get(ParseFile, file_id)).* orelse return null;
+            const source = (try self.ctx.input(SourceText, file_id)).*;
+            const result = try semantic.analyzeStaticTypeArgument(&parsed, source, node, self, self.ctx.allocator());
+            return switch (result) {
+                .success => |value| try self.internCompileTimeValue(value),
+                .unsupported => |issue| blk: {
+                    try typing.emitSemanticIssue(self.ctx, file_id, issue);
+                    break :blk null;
+                },
+            };
         }
 
         pub fn structLayout(self: @This(), type_id: structures.TypeId) !?structures.StructLayout {
@@ -554,17 +585,8 @@ pub fn TypeInterner(comptime Context: type) type {
 
         fn constantMember(self: @This(), value_id: structures.CompileTimeValueId, name: []const u8, span: structures.SourceSpan) !?structures.NameReference {
             const value = try self.lookupCompileTimeValue(value_id);
-            if (value != .type or value.type.isPrimitive()) return null;
-            const data = try self.ctx.lookupInterned(Types, value.type.interned().?);
-            if (data.* != .structure) return null;
-            const scope = (try self.ctx.get(StructNamespace, data.structure)).* orelse return error.Unavailable;
-            if (scope.resolve(name)) |item| return .{ .declaration = .{
-                .item = item,
-                .specialization = switch (data.structure) {
-                    .declared => null,
-                    .generated => |generated| generated.owner.specialization,
-                },
-            } };
+            if (value != .type or try self.structIdentity(value.type) == null) return null;
+            if (try self.structNamespaceMember(value.type, name)) |instance| return .{ .declaration = instance };
             try rejectImport(self.ctx, .{ .file_id = self.file_id.?, .span = span }, .unknown_namespace_member);
             return error.Unavailable;
         }
@@ -735,11 +757,9 @@ pub const StructLayout = struct {
         };
         const definition = (try getStructDefinition(ctx, identity)) orelse return null;
 
-        var active: std.ArrayList(structures.StructIdentity) = .empty;
-        defer active.deinit(ctx.allocator());
-        var completed: std.ArrayList(structures.StructIdentity) = .empty;
-        defer completed.deinit(ctx.allocator());
-        if (!try validateStructContainment(ctx, identity, &active, &completed)) return null;
+        var visited: StructVisits = .empty;
+        defer visited.deinit(ctx.allocator());
+        if (!try validateStructContainment(ctx, identity, &visited)) return null;
 
         const field_offsets = try ctx.allocator().alloc(u32, definition.fields.len);
         var keep_offsets = false;
@@ -772,7 +792,6 @@ pub const OwnershipCapabilities = struct {
     pub const Output = ?structures.OwnershipCapabilities;
 
     pub fn run(ctx: anytype, type_id: Input) anyerror!Output {
-        if (type_id == .type) return trivialOwnership();
         if (type_id.isPrimitive()) return trivialOwnership();
 
         const data = (try ctx.lookupInternedAs(Types, type_id.interned().?)) orelse return null;
@@ -793,7 +812,6 @@ pub const OwnershipCapabilities = struct {
         var drops_trivially = true;
         var fields_need_custom_move = false;
         var fields_need_custom_copy = false;
-        var contains_custom_copy = false;
         var needs_automatic_drop = false;
         var requires_explicit_drop = false;
         for (members) |member| {
@@ -803,7 +821,6 @@ pub const OwnershipCapabilities = struct {
             drops_trivially = drops_trivially and capabilities.drop == .trivial;
             fields_need_custom_move = fields_need_custom_move or capabilities.needs_custom_move;
             fields_need_custom_copy = fields_need_custom_copy or capabilities.needs_custom_copy;
-            contains_custom_copy = contains_custom_copy or capabilities.contains_custom_copy;
             needs_automatic_drop = needs_automatic_drop or capabilities.needs_automatic_drop;
             requires_explicit_drop = requires_explicit_drop or capabilities.requires_explicit_drop;
         }
@@ -813,7 +830,6 @@ pub const OwnershipCapabilities = struct {
             .drop = if (drops_trivially) .trivial else .fieldwise,
             .needs_custom_move = can_move and fields_need_custom_move,
             .needs_custom_copy = can_copy and fields_need_custom_copy,
-            .contains_custom_copy = contains_custom_copy,
             .needs_automatic_drop = needs_automatic_drop,
             .requires_explicit_drop = requires_explicit_drop,
         };
@@ -852,6 +868,10 @@ pub const OwnershipCapabilities = struct {
                 try emitIncompatibleOwnershipProperty(ctx, identity, property.span, if (property.capability == .trivial) .trivial_move else .fieldwise_move);
                 return null;
             }
+            if (property.capability == .custom and !can_move) {
+                try emitIncompatibleOwnershipProperty(ctx, identity, property.span, .custom_move);
+                return null;
+            }
             break :blk property.capability;
         } else if (can_move) .fieldwise else .none;
         const copy: structures.CopyCapability = if (definition.ownership.copy) |property| blk: {
@@ -876,7 +896,6 @@ pub const OwnershipCapabilities = struct {
             .drop = drop,
             .needs_custom_move = move == .custom or (move == .fieldwise and fields_need_custom_move),
             .needs_custom_copy = copy == .custom or (copy == .fieldwise and fields_need_custom_copy),
-            .contains_custom_copy = copy == .custom or (copy == .fieldwise and fields_need_custom_copy),
             .needs_automatic_drop = drop == .custom or (drop == .fieldwise and fields_need_automatic_drop),
             .requires_explicit_drop = drop == .explicit or (drop == .fieldwise and fields_require_explicit_drop),
         };
@@ -898,22 +917,25 @@ pub const OwnershipCapabilities = struct {
     }
 };
 
+const StructVisits = std.AutoHashMapUnmanaged(structures.StructIdentity, enum { active, complete });
+
 fn validateStructContainment(
     ctx: anytype,
     identity: structures.StructIdentity,
-    active: *std.ArrayList(structures.StructIdentity),
-    completed: *std.ArrayList(structures.StructIdentity),
+    visited: *StructVisits,
 ) !bool {
-    if (containsStructIdentity(completed.items, identity)) return true;
-    try active.append(ctx.allocator(), identity);
-    defer _ = active.pop();
+    if (visited.get(identity)) |state| {
+        std.debug.assert(state == .complete);
+        return true;
+    }
+    try visited.put(ctx.allocator(), identity, .active);
 
     const definition = (try getStructDefinition(ctx, identity)) orelse return false;
     const resolved = (try ctx.get(ResolveItem, structOwnerItem(identity))).* orelse return error.Unavailable;
     for (definition.fields) |field| {
-        if (!try validateContainedType(ctx, field.type_id, resolved.file_id, field.span, active, completed)) return false;
+        if (!try validateContainedType(ctx, field.type_id, resolved.file_id, field.span, visited)) return false;
     }
-    try completed.append(ctx.allocator(), identity);
+    visited.getPtr(identity).?.* = .complete;
     return true;
 }
 
@@ -924,18 +946,12 @@ fn structOwnerItem(identity: structures.StructIdentity) structures.ItemId {
     };
 }
 
-fn containsStructIdentity(identities: []const structures.StructIdentity, target: structures.StructIdentity) bool {
-    for (identities) |identity| if (std.meta.eql(identity, target)) return true;
-    return false;
-}
-
 fn validateContainedType(
     ctx: anytype,
     type_id: structures.TypeId,
     file_id: structures.FileId,
     span: structures.SourceSpan,
-    active: *std.ArrayList(structures.StructIdentity),
-    completed: *std.ArrayList(structures.StructIdentity),
+    visited: *StructVisits,
 ) !bool {
     if (type_id.isPrimitive()) return true;
     const data = (try ctx.lookupInternedAs(Types, type_id.interned().?)) orelse unreachable;
@@ -943,12 +959,12 @@ fn validateContainedType(
         .callable => true,
         .variant => |variant| blk: {
             for (variant.members) |member| {
-                if (!try validateContainedType(ctx, member, file_id, span, active, completed)) break :blk false;
+                if (!try validateContainedType(ctx, member, file_id, span, visited)) break :blk false;
             }
             break :blk true;
         },
         .structure => |contained_identity| blk: {
-            if (containsStructIdentity(active.items, contained_identity)) {
+            if (visited.get(contained_identity) == .active) {
                 try ctx.emit(structures.Diagnostic, .{
                     .file_id = file_id,
                     .span = span,
@@ -956,7 +972,7 @@ fn validateContainedType(
                 });
                 break :blk false;
             }
-            break :blk validateStructContainment(ctx, contained_identity, active, completed);
+            break :blk validateStructContainment(ctx, contained_identity, visited);
         },
     };
 }
@@ -975,6 +991,7 @@ pub const IndexItems = struct {
     pub fn run(ctx: anytype, file_id: Input) anyerror!Output {
         const discovered = try ctx.get(DiscoverItems, file_id);
         const tree = discovered.* orelse return null;
+        const parsed = (try ctx.get(ParseFile, file_id)).* orelse return null;
         var entries: std.AutoArrayHashMapUnmanaged(structures.ItemId, u32) = .empty;
         errdefer entries.deinit(ctx.allocator());
         try entries.ensureTotalCapacity(ctx.allocator(), tree.items.len);
@@ -985,9 +1002,36 @@ pub const IndexItems = struct {
             if (item.parent) |parent| {
                 std.debug.assert(parent < index);
                 loc.owner = item_ids[parent];
+            } else if (item.qualified_owner) |owner_path| {
+                const module = switch (loc.origin) {
+                    .module => |value| value,
+                    .entry => unreachable,
+                };
+                var segments = std.mem.splitScalar(u8, owner_path, '.');
+                var owner: ?structures.ItemId = null;
+                while (segments.next()) |segment| {
+                    std.debug.assert(segment.len != 0);
+                    owner = try ctx.intern(ItemLocations, .{
+                        .origin = .{ .module = module },
+                        .owner = owner,
+                        .kind = .structure,
+                        .name = segment,
+                    });
+                }
+                loc.owner = owner orelse unreachable;
             }
             const item_id = try ctx.intern(ItemLocations, loc);
             item_ids[index] = item_id;
+            if (entries.contains(item_id)) {
+                const token = parsed.tokens[parsed.nodes[item.declaration].token_index];
+                try ctx.emit(structures.Diagnostic, .{
+                    .file_id = file_id,
+                    .span = .{ .start = token.loc.start, .end = token.loc.end },
+                    .kind = .duplicate_struct_member,
+                });
+                entries.deinit(ctx.allocator());
+                return null;
+            }
             entries.putAssumeCapacityNoClobber(item_id, item.declaration);
         }
         return .{ .file_id = file_id, .entries = entries };
@@ -1015,7 +1059,7 @@ pub const ModuleDeclarations = struct {
             const index = (try ctx.get(IndexItems, file_id)).* orelse return null;
             std.debug.assert(tree.items.len == index.count());
             for (tree.items, index.ids()) |item, item_id| {
-                if (item.loc.kind == .top_level_entry or item.parent != null) continue;
+                if (item.loc.kind == .top_level_entry or item.parent != null or item.qualified_owner != null) continue;
                 std.debug.assert(item.loc.origin.module == module);
                 if ((try names.getOrPut(item.loc.name)).found_existing) {
                     const token = parsed.tokens[parsed.nodes[item.declaration].token_index];
@@ -1408,7 +1452,26 @@ pub const IndexModuleItems = struct {
                 return @intFromEnum(left.item) < @intFromEnum(right.item);
             }
         }.lessThan);
+        const index: structures.ModuleItemIndex = .{ .entries = entries.items };
+        for (entries.items, 0..) |entry, position| {
+            if (position != 0 and entries.items[position - 1].item == entry.item)
+                return rejectItem(ctx, entry.location, .duplicate_struct_member);
+            const loc = try ctx.lookupInterned(ItemLocations, entry.item);
+            if (loc.owner) |owner| {
+                if (index.resolve(owner) == null)
+                    return rejectItem(ctx, entry.location, .invalid_namespace_owner);
+            }
+        }
         return .{ .entries = try entries.toOwnedSlice(ctx.allocator()) };
+    }
+
+    fn rejectItem(ctx: anytype, location: structures.ResolvedItem, kind: structures.Diagnostic.Kind) !Output {
+        const parsed = (try ctx.get(ParseFile, location.file_id)).* orelse return null;
+        try typing.emitSemanticIssue(ctx, location.file_id, .{
+            .span = nodeSpan(&parsed, @enumFromInt(location.declaration)),
+            .kind = kind,
+        });
+        return null;
     }
 };
 
@@ -1642,9 +1705,11 @@ pub const ResolveStaticInstance = struct {
             return null;
         }
         if (runtime.type_id != expected_type) {
-            if (try lookupVariantMembers(ctx, expected_type) != null) {
-                const payload = try ctx.intern(CompileTimeValues, value);
-                value.runtime.value = .{ .variant = .{ .member_type = runtime.type_id, .payload = payload } };
+            if (try lookupVariantMembers(ctx, expected_type)) |members| {
+                const active_type = if (runtime.value == .variant) runtime.value.variant.member_type else runtime.type_id;
+                const payload = if (runtime.value == .variant) runtime.value.variant.payload else value_id;
+                const tag = (try semantic.widenedVariantTag(type_interner, active_type, members)) orelse unreachable;
+                value.runtime.value = .{ .variant = .{ .member_type = members[tag], .payload = payload } };
             } else {
                 std.debug.assert(try lookupCallable(ctx, expected_type) != null);
                 var reference = value.runtime.value.function_ref;
@@ -1693,12 +1758,14 @@ pub const AnalyzeComptimeThunk = struct {
             },
         };
         defer unresolved.deinit(ctx.allocator());
-        return typing.resolveAndTypeComptimeThunk(
+        return typing.resolveAndTypeBody(
             ctx,
-            BuildModuleScope,
-            FunctionInstanceSignature,
             site.owner.item,
             resolved.file_id,
+            &.{},
+            .unit,
+            true,
+            .{ .infer_return_type = true, .publish_instruction_spans = true, .allow_type_values = true },
             type_interner,
             unresolved,
         );
@@ -1939,28 +2006,56 @@ pub const StructNamespace = struct {
             .declared => null,
             .generated => |generated| generated.node_offset,
         };
-        const struct_index: structures.Node.Index = if (site) |offset|
-            @enumFromInt(@as(u32, @intCast(@as(i64, resolved.declaration) + offset)))
-        else
-            parsed.nodes[resolved.declaration].data.node_node.b;
+        const struct_index: structures.Node.Index = if (site) |offset| generated: {
+            const position = std.math.cast(u32, @as(i64, resolved.declaration) + offset) orelse return null;
+            if (position >= parsed.nodes.len or parsed.nodes[position].tag != .@"struct") return null;
+            break :generated @enumFromInt(position);
+        } else parsed.nodes[resolved.declaration].data.node_node.b;
         if (try semantic.validateStructNamespace(&parsed, source, struct_index, ctx.allocator())) |issue| {
             try typing.emitSemanticIssue(ctx, resolved.file_id, issue);
             return null;
         }
         const owner_loc = try ctx.lookupInterned(ItemLocations, owner);
         const member_site = if (owner_loc.kind == .structure) null else site;
-        const index = (try ctx.get(IndexItems, resolved.file_id)).* orelse return null;
         var entries: std.ArrayList(structures.ModuleScope.Entry) = .empty;
         defer {
             for (entries.items) |entry| ctx.allocator().free(entry.name);
             entries.deinit(ctx.allocator());
         }
-        for (index.ids()) |item| {
-            const loc = try ctx.lookupInterned(ItemLocations, item);
-            if (loc.owner != owner or loc.source_site != member_site or loc.is_hook) continue;
-            const name = try ctx.allocator().dupe(u8, loc.name);
-            errdefer ctx.allocator().free(name);
-            try entries.append(ctx.allocator(), .{ .name = name, .item_id = item, .kind = loc.kind, .is_public = false });
+        var names = std.StringHashMap(void).init(ctx.allocator());
+        defer names.deinit();
+        const struct_node = parsed.nodes[struct_index.index()];
+        for (parsed.node_refs[struct_node.data.ref.start..struct_node.data.ref.end]) |member_index| {
+            const member = parsed.nodes[member_index.index()];
+            if (member.tag != .struct_field) continue;
+            const token = parsed.tokens[member.token_index];
+            try names.put(source[token.loc.start..token.loc.end], {});
+        }
+        const module = switch (owner_loc.origin) {
+            .module => |value| value,
+            .entry => unreachable,
+        };
+        const files = (try ctx.input(ModuleMembers, module)).*;
+        for (files) |file_id| {
+            const index = (try ctx.get(IndexItems, file_id)).* orelse return null;
+            for (index.ids()) |item| {
+                const loc = try ctx.lookupInterned(ItemLocations, item);
+                if (loc.owner != owner or loc.source_site != member_site or loc.is_hook) continue;
+                if ((try names.getOrPut(loc.name)).found_existing) {
+                    const member_parsed = (try ctx.get(ParseFile, file_id)).* orelse return null;
+                    const declaration = index.resolve(item) orelse unreachable;
+                    const token = member_parsed.tokens[member_parsed.nodes[declaration].token_index];
+                    try ctx.emit(structures.Diagnostic, .{
+                        .file_id = file_id,
+                        .span = .{ .start = token.loc.start, .end = token.loc.end },
+                        .kind = .duplicate_struct_member,
+                    });
+                    return null;
+                }
+                const name = try ctx.allocator().dupe(u8, loc.name);
+                errdefer ctx.allocator().free(name);
+                try entries.append(ctx.allocator(), .{ .name = name, .item_id = item, .kind = loc.kind, .is_public = false });
+            }
         }
         std.mem.sort(structures.ModuleScope.Entry, entries.items, {}, struct {
             fn lessThan(_: void, a: structures.ModuleScope.Entry, b: structures.ModuleScope.Entry) bool {
@@ -1979,6 +2074,8 @@ pub const StructDefinition = struct {
         const loc = try ctx.lookupInterned(ItemLocations, item_id);
         if (loc.kind != .structure) return null;
         const resolved = (try ctx.get(ResolveItem, item_id)).* orelse return null;
+        // Validate the complete member scope, including qualified declarations.
+        _ = (try ctx.get(StructNamespace, .{ .declared = item_id })).* orelse return null;
         const parsed = (try ctx.get(ParseFile, resolved.file_id)).* orelse return null;
         const source = (try ctx.input(SourceText, resolved.file_id)).*;
         const type_interner: TypeInterner(@TypeOf(ctx)) = .{ .ctx = ctx, .file_id = resolved.file_id, .instance = .{ .item = item_id } };
@@ -2102,32 +2199,17 @@ fn analyzeFunctionBody(ctx: anytype, instance: structures.InstanceId, publish_in
         },
     };
     defer unresolved.deinit(ctx.allocator());
-    return if (publish_instruction_spans)
-        typing.resolveAndTypeBodyForComptime(
-            ctx,
-            BuildModuleScope,
-            FunctionInstanceSignature,
-            instance.item,
-            resolved.file_id,
-            parameters,
-            return_type,
-            is_fallible,
-            type_interner,
-            unresolved,
-        )
-    else
-        typing.resolveAndTypeBody(
-            ctx,
-            BuildModuleScope,
-            FunctionInstanceSignature,
-            instance.item,
-            resolved.file_id,
-            parameters,
-            return_type,
-            is_fallible,
-            type_interner,
-            unresolved,
-        );
+    return typing.resolveAndTypeBody(
+        ctx,
+        instance.item,
+        resolved.file_id,
+        parameters,
+        return_type,
+        is_fallible,
+        .{ .publish_instruction_spans = publish_instruction_spans, .allow_type_values = publish_instruction_spans },
+        type_interner,
+        unresolved,
+    );
 }
 
 pub const SelectEntry = struct {
@@ -2198,20 +2280,21 @@ pub const ValidateModuleGraph = struct {
     pub const Output = bool;
 
     pub fn run(ctx: anytype, root: Input) anyerror!Output {
-        var modules: std.ArrayList(structures.ModuleId) = .empty;
+        var modules: std.AutoArrayHashMapUnmanaged(structures.ModuleId, void) = .empty;
         defer modules.deinit(ctx.allocator());
-        try modules.append(ctx.allocator(), root);
+        try modules.put(ctx.allocator(), root, {});
         var next: usize = 0;
-        while (next < modules.items.len) : (next += 1) {
-            const module = modules.items[next];
+        while (next < modules.count()) : (next += 1) {
+            const module = modules.keys()[next];
+            // Validate declaration ownership even when no item is referenced.
+            _ = (try ctx.get(IndexModuleItems, module)).* orelse return false;
             const members = (try ctx.input(ModuleMembers, module)).*;
             for (members) |file| {
                 if ((try ctx.get(ResolveFileImports, file)).* == null) return false;
                 const imports = (try ctx.get(CollectFileImports, file)).* orelse return false;
                 for (imports.entries) |entry| {
                     const imported = (try resolveImportedModule(ctx, .{ .file_id = file, .span = entry.path.span }, entry.path.spelling)) orelse return false;
-                    if (std.mem.indexOfScalar(structures.ModuleId, modules.items, imported) == null)
-                        try modules.append(ctx.allocator(), imported);
+                    try modules.put(ctx.allocator(), imported, {});
                     if (entry.is_public and !try validateExport(ctx, module, file, entry)) return false;
                 }
             }

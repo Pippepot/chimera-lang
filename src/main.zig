@@ -2,8 +2,8 @@ const std = @import("std");
 const debug = @import("debug.zig");
 const diagnostics = @import("diagnostics.zig");
 const modules = @import("modules.zig");
-const query = @import("query_new.zig");
-const queries = @import("query_structures.zig");
+const query = @import("query.zig");
+const queries = @import("queries.zig");
 const runtime = @import("runtime.zig");
 const structures = @import("structures.zig");
 
@@ -54,6 +54,27 @@ fn printUsage(writer: *std.Io.Writer, executable_name: []const u8) !void {
         "usage: {s} [--debug=ast,ssa,asm,timing,memory] <source-file> [program-args...]\n",
         .{executable_name},
     );
+}
+
+const CommandLine = struct {
+    debug_flags: DebugFlags,
+    positional: []const []const u8,
+};
+
+fn parseCommandLine(args: []const []const u8, errors: *std.Io.Writer) !?CommandLine {
+    var flags: DebugFlags = .{};
+    var valid = true;
+    var index: usize = 0;
+    while (index < args.len and std.mem.startsWith(u8, args[index], "--debug=")) : (index += 1) {
+        var names = std.mem.splitScalar(u8, args[index]["--debug=".len..], ',');
+        while (names.next()) |name| {
+            if (trySetDebugFlag(&flags, name)) continue;
+            try printError(errors, "unknown debug flag '{s}'", .{name});
+            valid = false;
+        }
+    }
+    if (!valid or index == args.len) return null;
+    return .{ .debug_flags = flags, .positional = args[index..] };
 }
 
 fn buildWithStageTimings(db: *query.Database, io: std.Io, timings: *diagnostics.TimingLog) !void {
@@ -182,37 +203,20 @@ pub fn main(init: std.process.Init) !void {
     var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buffer);
     const errors = &stderr_writer.interface;
 
-    var positional: std.ArrayList([]const u8) = .empty;
-    var debug_flags: DebugFlags = .{};
-    var valid_arguments = true;
-
     const args = try init.minimal.args.toSlice(arena);
-    for (args[1..]) |arg| {
-        if (std.mem.startsWith(u8, arg, "--debug=")) {
-            var names = std.mem.splitScalar(u8, arg["--debug=".len..], ',');
-            while (names.next()) |name| {
-                if (!trySetDebugFlag(&debug_flags, name)) {
-                    try printError(errors, "unknown debug flag '{s}'", .{name});
-                    valid_arguments = false;
-                }
-            }
-        } else {
-            try positional.append(arena, arg);
-        }
-    }
-
-    if (!valid_arguments or positional.items.len == 0) {
+    const command_line = (try parseCommandLine(args[1..], errors)) orelse {
         try printUsage(errors, args[0]);
         try errors.flush();
         std.process.exit(1);
-    }
+    };
+    const debug_flags = command_line.debug_flags;
 
     // Tracking allocates nothing but adds per-allocation bookkeeping.
     var tracker: diagnostics.MemoryTracker = .{ .backing = init.gpa };
     const gpa = if (debug_flags.memory) tracker.allocator() else init.gpa;
 
     const started = std.Io.Clock.awake.now(io);
-    const source_path = positional.items[0];
+    const source_path = command_line.positional[0];
     const source = std.Io.Dir.cwd().readFileAlloc(
         io,
         source_path,
@@ -249,7 +253,7 @@ pub fn main(init: std.process.Init) !void {
         .source = source,
         .source_files = source_files,
         .module_paths = catalog.modules,
-        .program_args = positional.items[1..],
+        .program_args = command_line.positional[1..],
         .debug_flags = debug_flags,
         .started = started,
     }, output, errors) catch |run_error| {
@@ -273,6 +277,20 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         },
     }
+}
+
+test "CLI options stop at the source path and preserve program arguments" {
+    var errors: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer errors.deinit();
+    const args = [_][]const u8{ "--debug=ast,memory", "main.chi", "--debug=child", "argument" };
+    const parsed = (try parseCommandLine(&args, &errors.writer)).?;
+    try std.testing.expect(parsed.debug_flags.ast);
+    try std.testing.expect(parsed.debug_flags.memory);
+    try std.testing.expectEqualSlices([]const u8, args[1..], parsed.positional);
+    try std.testing.expectEqual(@as(usize, 0), errors.writer.buffered().len);
+    try std.testing.expect(try parseCommandLine(&.{"--debug=ssa"}, &errors.writer) == null);
+    try std.testing.expect(try parseCommandLine(&.{ "--debug=unknown", "main.chi" }, &errors.writer) == null);
+    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "unknown debug flag 'unknown'") != null);
 }
 
 test "CLI core renders debug output and runs the compiled program" {
@@ -522,4 +540,21 @@ test "CLI qualified access diagnostics identify the defining dependency file" {
     }, &output.writer, &errors.writer);
     try std.testing.expectEqual(RunOutcome.rejected, outcome);
     try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "/project/api/a.chi:2:") != null);
+}
+
+test "missing field diagnostics use the struct definition's source file" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var errors: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer errors.deinit();
+    const outcome = try compileAndRun(std.testing.io, std.testing.allocator, .{
+        .source_path = "/project/main.chi",
+        .source = "import lib\nconst s = lib.S{}",
+        .source_files = &.{.{ .path = "lib/s.chi", .module_path = "lib", .source = "pub struct S\n  required: int" }},
+        .program_args = &.{},
+        .debug_flags = .{},
+        .started = std.Io.Clock.awake.now(std.testing.io),
+    }, &output.writer, &errors.writer);
+    try std.testing.expectEqual(RunOutcome.rejected, outcome);
+    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "missing required field `required`") != null);
 }

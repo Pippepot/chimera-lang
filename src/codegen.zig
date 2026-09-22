@@ -98,19 +98,21 @@ const LocationPlan = struct {
     edge_scratch_offset: u32,
     return_buffer_offset: ?u32,
 
+    const Usage = enum { unused, used, returned };
+
     fn markBranchArguments(
         ssa: *const structures.FunctionBodyAnalysis,
         branch: structures.FunctionBranch,
-        needed: []bool,
+        needed: []Usage,
     ) void {
         const arguments = ssa.branch_arguments[branch.arguments.start..branch.arguments.end];
-        for (arguments) |argument| needed[@intFromEnum(argument.value)] = true;
+        for (arguments) |argument| needed[@intFromEnum(argument.value)] = .used;
     }
 
     fn init(ssa: *const structures.FunctionBodyAnalysis, types: anytype, gpa: std.mem.Allocator) !LocationPlan {
-        const needed = try gpa.alloc(bool, ssa.valueCount());
+        const needed = try gpa.alloc(Usage, ssa.valueCount());
         defer gpa.free(needed);
-        @memset(needed, false);
+        @memset(needed, .unused);
         const value_types = try gpa.alloc(structures.TypeId, ssa.valueCount());
         errdefer gpa.free(value_types);
         @memcpy(value_types[0..ssa.block_argument_types.len], ssa.block_argument_types);
@@ -121,55 +123,65 @@ const LocationPlan = struct {
             switch (instruction) {
                 .consti, .constb, .const_unit, .const_none, .function_ref => {},
                 .const_type => unreachable,
-                .variant_coerce, .variant_extract, .callable_coerce => |operation| needed[@intFromEnum(operation.operand)] = true,
+                .variant_coerce, .variant_extract, .callable_coerce => |operation| needed[@intFromEnum(operation.operand)] = .used,
                 .struct_init => |operation| {
                     for (ssa.struct_field_values[operation.fields.start..operation.fields.end]) |field| {
-                        needed[@intFromEnum(field.value)] = true;
+                        needed[@intFromEnum(field.value)] = .used;
                     }
                 },
-                .field_access => |operation| needed[@intFromEnum(operation.operand)] = true,
+                .field_access => |operation| needed[@intFromEnum(operation.operand)] = .used,
                 .field_update => |operation| {
-                    needed[@intFromEnum(operation.operand)] = true;
-                    needed[@intFromEnum(operation.value)] = true;
+                    needed[@intFromEnum(operation.operand)] = .used;
+                    needed[@intFromEnum(operation.value)] = .used;
                 },
-                .mut_parameter_write => |operation| needed[@intFromEnum(operation.value)] = true,
+                .mut_parameter_write => |operation| needed[@intFromEnum(operation.value)] = .used,
                 .call_mut_argument => {},
                 .call => |call| {
-                    for (ssa.call_arguments[call.arguments.start..call.arguments.end]) |argument| needed[@intFromEnum(argument.value)] = true;
+                    for (ssa.call_arguments[call.arguments.start..call.arguments.end]) |argument| needed[@intFromEnum(argument.value)] = .used;
                 },
                 .indirect_call => |call| {
-                    needed[@intFromEnum(call.target)] = true;
-                    for (ssa.call_arguments[call.arguments.start..call.arguments.end]) |argument| needed[@intFromEnum(argument.value)] = true;
+                    needed[@intFromEnum(call.target)] = .used;
+                    for (ssa.call_arguments[call.arguments.start..call.arguments.end]) |argument| needed[@intFromEnum(argument.value)] = .used;
                 },
-                .variant_tag, .exit, .negi => |operand| needed[@intFromEnum(operand)] = true,
+                .variant_tag, .exit, .negi => |operand| needed[@intFromEnum(operand)] = .used,
                 .addi, .subi, .muli, .divsi => |operands| {
-                    needed[@intFromEnum(operands.lhs)] = true;
-                    needed[@intFromEnum(operands.rhs)] = true;
+                    needed[@intFromEnum(operands.lhs)] = .used;
+                    needed[@intFromEnum(operands.rhs)] = .used;
                 },
             }
         }
         for (ssa.blocks) |block| switch (block.terminator) {
             .branch => |branch| markBranchArguments(ssa, branch, needed),
             .predicate_branch => |predicate| {
-                needed[@intFromEnum(predicate.operands.lhs)] = true;
-                needed[@intFromEnum(predicate.operands.rhs)] = true;
+                needed[@intFromEnum(predicate.operands.lhs)] = .used;
+                needed[@intFromEnum(predicate.operands.rhs)] = .used;
                 markBranchArguments(ssa, predicate.then_branch, needed);
                 markBranchArguments(ssa, predicate.else_branch, needed);
             },
             .fallible_call => |fallible| {
                 for (ssa.call_arguments[fallible.call.arguments.start..fallible.call.arguments.end]) |argument| {
-                    needed[@intFromEnum(argument.value)] = true;
+                    needed[@intFromEnum(argument.value)] = .used;
                 }
             },
             .fallible_indirect_call => |fallible| {
-                needed[@intFromEnum(fallible.call.target)] = true;
+                needed[@intFromEnum(fallible.call.target)] = .used;
                 for (ssa.call_arguments[fallible.call.arguments.start..fallible.call.arguments.end]) |argument| {
-                    needed[@intFromEnum(argument.value)] = true;
+                    needed[@intFromEnum(argument.value)] = .used;
                 }
             },
-            .return_value => |value| needed[@intFromEnum(value.value)] = true,
+            .return_value => |value| needed[@intFromEnum(value.value)] = .used,
             .return_unit, .return_failure, .diverge => {},
         };
+        for (ssa.blocks) |block| {
+            if (block.instruction_start == block.instruction_end) continue;
+            const value = ssa.instructionValue(block.instruction_end - 1);
+            switch (block.terminator) {
+                .return_value => |returned| if (returned.value == value and returned.coerce_to == null) {
+                    needed[@intFromEnum(value)] = .returned;
+                },
+                else => {},
+            }
+        }
         // One reusable area handles every call this function makes. After the
         // prologue, this function's own incoming arguments remain above its
         // frame, past its return address:
@@ -209,7 +221,7 @@ const LocationPlan = struct {
             std.debug.assert(block.argument_end <= ssa.block_argument_types.len);
             if (block_index == entry_index) continue;
             for (block.argument_start..block.argument_end) |argument_index| {
-                if (!needed[argument_index]) continue;
+                if (needed[argument_index] == .unused) continue;
                 const layout = try types.layout(value_types[argument_index]);
                 if (layout.byte_size == 0) continue;
                 locations[argument_index] = .{ .stack = try reserveStack(&local_end, layout) };
@@ -235,10 +247,10 @@ const LocationPlan = struct {
                     else => {},
                 }
                 const layout = try types.layout(value_types[value_index]);
-                if (isDirectReturn(ssa, instruction_index) and layout.byte_size == @sizeOf(u32)) {
+                if (needed[value_index] == .returned and layout.byte_size == @sizeOf(u32)) {
                     break :location_blk .eax;
                 }
-                if (needed[value_index]) {
+                if (needed[value_index] != .unused) {
                     if (layout.byte_size == 0) break :location_blk .discarded;
                     break :location_blk .{ .stack = try reserveStack(&local_end, layout) };
                 }
@@ -264,7 +276,7 @@ const LocationPlan = struct {
             const argument_stack_offset = try reserveStack(&incoming_argument_offset, layout);
             const offset = std.math.add(u32, caller_stack_offset, argument_stack_offset) catch return error.FunctionTooLarge;
             try ensureAddressableStackRange(offset, layout.byte_size);
-            if (needed[argument_index] and layout.byte_size != 0) location.* = .{ .incoming_argument = offset };
+            if (needed[argument_index] != .unused and layout.byte_size != 0) location.* = .{ .incoming_argument = offset };
         }
         return .{
             .locations = locations,
@@ -281,18 +293,6 @@ const LocationPlan = struct {
         self.* = undefined;
     }
 };
-
-fn isDirectReturn(ssa: *const structures.FunctionBodyAnalysis, instruction_index: usize) bool {
-    const value = ssa.instructionValue(instruction_index);
-    for (ssa.blocks) |block| {
-        if (block.instruction_end != instruction_index + 1) continue;
-        switch (block.terminator) {
-            .return_value => |returned| if (returned.value == value and returned.coerce_to == null) return true,
-            else => {},
-        }
-    }
-    return false;
-}
 
 const IntegerBinaryOperation = enum {
     add,
@@ -415,8 +415,8 @@ fn FunctionEmitter(comptime Types: type) type {
                     .field_update => |operation| try self.emitFieldUpdate(operation, destination),
                     .mut_parameter_write => |operation| try self.emitMutParameterWrite(ssa, operation),
                     .call_mut_argument => |operation| try self.emitCallMutArgument(operation, destination),
-                    .call => |call| try self.emitDirectCall(call, destination),
-                    .indirect_call => |call| try self.emitIndirectCall(call, destination),
+                    .call => |call| try self.emitCall(call, destination),
+                    .indirect_call => |call| try self.emitCall(call, destination),
                     .exit => |operand| try self.emitExit(operand),
                     .negi => |operand| {
                         try self.loadValue(self.locations[@intFromEnum(operand)]);
@@ -440,7 +440,7 @@ fn FunctionEmitter(comptime Types: type) type {
                 },
                 .predicate_branch => |predicate| try self.emitPredicateBranch(ssa, predicate),
                 .fallible_call => |fallible| try self.emitFallibleCall(ssa, fallible),
-                .fallible_indirect_call => |fallible| try self.emitFallibleIndirectCall(ssa, fallible),
+                .fallible_indirect_call => |fallible| try self.emitFallibleCall(ssa, fallible),
                 .return_unit => try self.emitReturn(null, .unit),
                 .return_value => |value| try self.emitReturn(value, ssa.return_type),
                 .return_failure => try self.emitFailureReturn(),
@@ -448,30 +448,10 @@ fn FunctionEmitter(comptime Types: type) type {
             }
         }
 
-        fn emitFallibleCall(
-            self: *Self,
-            ssa: *const structures.FunctionBodyAnalysis,
-            fallible: @FieldType(structures.FunctionTerminator, "fallible_call"),
-        ) !void {
+        fn emitFallibleCall(self: *Self, ssa: *const structures.FunctionBodyAnalysis, fallible: anytype) !void {
             const success = ssa.blocks[@intFromEnum(fallible.success)];
             std.debug.assert(success.argument_end - success.argument_start == 1);
-            try self.emitDirectCall(fallible.call, self.locations[success.argument_start]);
-            try self.encoder.compareEdxZero();
-            const success_field = try self.encoder.conditionalJumpRelative32(.nei, 0);
-            try self.emitJump(fallible.failure);
-            const success_offset = std.math.cast(u32, self.encoder.code.items.len) orelse return error.FunctionTooLarge;
-            try self.patchJump(success_field, success_offset);
-            try self.emitJump(fallible.success);
-        }
-
-        fn emitFallibleIndirectCall(
-            self: *Self,
-            ssa: *const structures.FunctionBodyAnalysis,
-            fallible: @FieldType(structures.FunctionTerminator, "fallible_indirect_call"),
-        ) !void {
-            const success = ssa.blocks[@intFromEnum(fallible.success)];
-            std.debug.assert(success.argument_end - success.argument_start == 1);
-            try self.emitIndirectCall(fallible.call, self.locations[success.argument_start]);
+            try self.emitCall(fallible.call, self.locations[success.argument_start]);
             try self.encoder.compareEdxZero();
             const success_field = try self.encoder.conditionalJumpRelative32(.nei, 0);
             try self.emitJump(fallible.failure);
@@ -560,46 +540,16 @@ fn FunctionEmitter(comptime Types: type) type {
             try self.encoder.ret();
         }
 
-        fn emitDirectCall(
-            self: *Self,
-            call: structures.FunctionCall,
-            destination: ValueLocation,
-        ) !void {
-            var argument_end: u32 = 0;
-            const return_layout = try self.types.layout(call.return_type);
-            if (usesMemoryReturn(return_layout)) {
-                const return_offset = try reserveStack(&argument_end, return_layout);
-                std.debug.assert(return_offset == 0);
-            }
-            for (self.call_arguments[call.arguments.start..call.arguments.end]) |argument| {
-                const type_id = argument.coerce_to orelse self.valueType(argument.value);
-                const layout = try self.types.layout(type_id);
-                const argument_offset = try reserveStack(&argument_end, layout);
-                try self.emitUseToMemory(argument, argument_offset);
-            }
-            const offset_usize = std.math.add(usize, self.encoder.code.items.len, 1) catch return error.FunctionTooLarge;
-            const offset = std.math.cast(u32, offset_usize) orelse return error.FunctionTooLarge;
-            try self.encoder.callRelative32(0);
-
-            const reference = try self.referenceIndex(call.instance());
-            try self.relocations.append(self.gpa, .{
-                .offset = offset,
-                .kind = .call_relative_32,
-                .reference = @enumFromInt(reference),
-                .addend = 0,
-            });
-
-            if (usesMemoryReturn(return_layout)) {
-                try self.copyValue(call.return_type, .{ .stack = 0 }, destination);
-            } else {
-                try self.storeResult(destination);
-            }
-        }
-
-        fn emitIndirectCall(self: *Self, call: structures.IndirectFunctionCall, destination: ValueLocation) !void {
+        fn emitCall(self: *Self, call: anytype, destination: ValueLocation) !void {
             try self.emitCallArguments(call);
-            try self.loadAddress(self.locations[@intFromEnum(call.target)]);
-            try self.encoder.callRax();
+            if (@TypeOf(call) == structures.FunctionCall) {
+                const offset = std.math.cast(u32, self.encoder.code.items.len + 1) orelse return error.FunctionTooLarge;
+                try self.encoder.callRelative32(0);
+                try self.appendRelocation(call.instance(), offset, .call_relative_32);
+            } else {
+                try self.loadAddress(self.locations[@intFromEnum(call.target)]);
+                try self.encoder.callRax();
+            }
             const return_layout = try self.types.layout(call.return_type);
             if (usesMemoryReturn(return_layout)) {
                 try self.copyValue(call.return_type, .{ .stack = 0 }, destination);

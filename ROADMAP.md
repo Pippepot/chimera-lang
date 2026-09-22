@@ -7,6 +7,7 @@
 - Incremental queries preserve stable declaration and type identities, owned results, diagnostics, and equal-result retention.
 - Folder modules support shared declarations, file-scoped imports, public re-exports, qualified type/value/call lookup, entry-only execution, directory refresh, file-aware CLI output, and an embedded `std.prelude` resolved once and included by default in user files with an explicit-import override. Compiler-owned standard modules are exempt. All module-spec slices are complete.
 - Struct namespace declarations support qualified calls and constants without affecting instance layout. Generated namespaces retain inherited static arguments; fields and ordinary declarations share a name scope, separate from ownership hooks.
+- Same-module qualified declarations can extend a named struct namespace across files. Instance calls insert an explicit receiver into the corresponding namespace function after resolving its nominal type, preserving static specialization, parameter modes, ownership, mutable copy-back, callable-field behavior, and left-to-right evaluation.
 - Typing publishes one SSA control-flow graph with fallible edges, joins, loops, calls, callable values, variants, and divergence.
 - Structs have nominal identity, cycle-checked layout, source-ordered initialization, field access, field updates through mutable local roots, and validated move/copy/drop strategy overrides.
 - Function-valued struct properties receive stable owner-qualified item identities, reuse ordinary signature and body queries without entering module scope, and are validated against exact copy/move/drop signatures. Typing lowers custom hooks to ordinary direct calls, recursively composes fieldwise struct and active-variant operations, and suppresses redispatch only for compiler-generated plumbing inside the active hook.
@@ -60,13 +61,7 @@ recomputation. Keep unsupported forms rejected at their owning boundary.
 
 ## Ordered milestones
 
-### 1. Instance method calls
-
-- Qualified struct namespace calls are implemented. Add `value.function(args)`
-  desugaring to the existing namespace call with an explicit receiver parameter,
-  preserving argument modes, ownership, and evaluation order.
-
-### 2. External declarations and standard-library bootstrap
+### 1. External declarations and standard-library bootstrap
 
 - Add **external** for compiler-defined functions and externally defined
   functions, including **C ABI** calls. Specify how declarations identify their
@@ -77,13 +72,13 @@ recomputation. Keep unsupported forms rejected at their owning boundary.
   not a C ABI. Expand supported foreign signatures in explicit slices.
 - Replace dedicated `exit` handling with a runtime declaration as part of this
   work; remove the temporary intrinsic machinery.
-- Bootstrap an **always-included standard library** using modules and external
-  declarations where needed. Settle the automatically available name set,
-  module paths, and conflict rules. Add math functions only as numeric support
-  permits; define allocation and release services for later pointers and
-  collections. Exact APIs and compiler/library placement remain open.
+- Expand the embedded **standard library** and its always-included
+  `std.prelude` using modules and external declarations. Add math functions as
+  numeric support permits, and define allocation and release services for
+  pointers and collections. Exact APIs and compiler/library placement remain
+  open.
 
-### 3. Storage, origins, pointers, and borrowed views
+### 2. Storage, origins, pointers, and borrowed views
 
 - Specify **partial-field transfer** and **final storage for immovable values**,
   including partial initialization, cleanup, stable addresses, and calling
@@ -115,7 +110,7 @@ recomputation. Keep unsupported forms rejected at their owning boundary.
   Preserve the chosen non-nullability, unique ownership, and atomic shared
   ownership guarantees while settling those details.
 
-### 4. Ranges, List, and iteration
+### 3. Ranges, List, and iteration
 
 - **Ranges:** implement the specified exclusive/inclusive bounds and ascending
   empty-range behavior. Specify endpoint types, explicit descending iteration,
@@ -134,7 +129,7 @@ recomputation. Keep unsupported forms rejected at their owning boundary.
   and reuse the existing control-flow and ownership machinery. A range-only
   slice can precede List, but must fit the same intended iteration contract.
 
-### 5. Collection and algorithm library
+### 4. Collection and algorithm library
 
 - Add **Map**, **Set**, **Queue**, and **Stack**. Decide representations and
   whether Queue/Stack reuse List storage; do not assume each needs a compiler
@@ -149,7 +144,7 @@ recomputation. Keep unsupported forms rejected at their owning boundary.
   or collection examples. Coordinate with coercions and namespace functions;
   ordinary named functions can support the initial library.
 
-### 6. Structural tuples
+### 5. Structural tuples
 
 - **Structural tuples**, such as `(foo, bar)`: implement the specified ordered,
   unnamed structural identity. Specify type spelling, element access,
@@ -157,18 +152,18 @@ recomputation. Keep unsupported forms rejected at their owning boundary.
   singleton syntax consistently with the existing `()` unit value. Tuples
   support multiple values and later map iteration.
 
-### 7. Match
+### 6. Match
 
 - **Match:** evaluate the subject once; support literal, wildcard, binding,
   `pattern as name`, and `is Type` patterns; diagnose redundancy and
   non-exhaustiveness; reuse existing branch joins and variant mappings.
 
-### 8. Numeric foundations
+### 7. Numeric foundations
 
 - Define **explicit numeric conversions/casts first**: syntax, supported source
   and destination types, failure behavior, rounding, and overflow. Existing
   variant extraction with `as` does not provide numeric conversion semantics.
-- Specify integer division and add **byte**, deciding its arithmetic behavior,
+- Add **byte**, deciding its arithmetic behavior,
   literal typing, and relationship to integer types.
 - Then specify **numeric coercions (TBD)**: whether conversions may be implicit,
   mixed numeric operations, and their interaction with literal typing. Publish
@@ -192,4 +187,3 @@ recomputation. Keep unsupported forms rejected at their owning boundary.
 - Decide whether the CLI should validate unreachable declarations; current
   compilation intentionally diagnoses only demanded signatures, bodies, and values.
 - Specify postfix `?`, `sizeof`, and return-type inference before implementation.
-- Remove `legacy/` only after active tooling has replacement regressions.

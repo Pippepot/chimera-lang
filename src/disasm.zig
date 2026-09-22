@@ -4,149 +4,77 @@ const Operand = enum { none, i32, u32, u64, rel };
 
 const Pattern = struct {
     prefix: []const u8,
-    total_len: u8,
-    operand: Operand,
+    operand: Operand = .none,
     asm_prefix: []const u8,
-    asm_suffix: []const u8,
+    asm_suffix: []const u8 = "",
+
+    fn length(self: Pattern) usize {
+        return self.prefix.len + @as(usize, switch (self.operand) {
+            .none => 0,
+            .i32, .u32, .rel => 4,
+            .u64 => 8,
+        });
+    }
 };
 
-const PATTERNS = blk: {
-    const fixed = [_]Pattern{
-        .{ .prefix = &.{0x55}, .total_len = 1, .operand = .none, .asm_prefix = "push rbp", .asm_suffix = "" },
-        .{ .prefix = &.{0x53}, .total_len = 1, .operand = .none, .asm_prefix = "push rbx", .asm_suffix = "" },
-        .{ .prefix = &.{0x5B}, .total_len = 1, .operand = .none, .asm_prefix = "pop rbx", .asm_suffix = "" },
-        .{ .prefix = &.{0x5D}, .total_len = 1, .operand = .none, .asm_prefix = "pop rbp", .asm_suffix = "" },
-        .{ .prefix = &.{0xC9}, .total_len = 1, .operand = .none, .asm_prefix = "leave", .asm_suffix = "" },
-        .{ .prefix = &.{0xC3}, .total_len = 1, .operand = .none, .asm_prefix = "ret", .asm_suffix = "" },
-        .{ .prefix = &.{ 0x48, 0x89, 0xE5 }, .total_len = 3, .operand = .none, .asm_prefix = "mov rbp, rsp", .asm_suffix = "" },
-        .{ .prefix = &.{ 0x48, 0x89, 0xEC }, .total_len = 3, .operand = .none, .asm_prefix = "mov rsp, rbp", .asm_suffix = "" },
-        .{ .prefix = &.{ 0x4C, 0x8D, 0x7C, 0x24, 0x08 }, .total_len = 5, .operand = .none, .asm_prefix = "lea r15, [rsp+8]", .asm_suffix = "" },
-        .{ .prefix = &.{ 0x01, 0xD8 }, .total_len = 2, .operand = .none, .asm_prefix = "add eax, ebx", .asm_suffix = "" },
-        .{ .prefix = &.{ 0x31, 0xFF }, .total_len = 2, .operand = .none, .asm_prefix = "xor edi, edi", .asm_suffix = "" },
-        .{ .prefix = &.{ 0x29, 0xD8 }, .total_len = 2, .operand = .none, .asm_prefix = "sub eax, ebx", .asm_suffix = "" },
-        .{ .prefix = &.{ 0x0F, 0xAF, 0xC3 }, .total_len = 3, .operand = .none, .asm_prefix = "imul eax, ebx", .asm_suffix = "" },
-        .{ .prefix = &.{0x99}, .total_len = 1, .operand = .none, .asm_prefix = "cdq", .asm_suffix = "" },
-        .{ .prefix = &.{ 0xF7, 0xFB }, .total_len = 2, .operand = .none, .asm_prefix = "idiv ebx", .asm_suffix = "" },
-        .{ .prefix = &.{ 0xF7, 0xF9 }, .total_len = 2, .operand = .none, .asm_prefix = "idiv ecx", .asm_suffix = "" },
-        .{ .prefix = &.{ 0xF7, 0xD8 }, .total_len = 2, .operand = .none, .asm_prefix = "neg eax", .asm_suffix = "" },
-        .{ .prefix = &.{ 0x39, 0xD8 }, .total_len = 2, .operand = .none, .asm_prefix = "cmp eax, ebx", .asm_suffix = "" },
-        .{ .prefix = &.{ 0x83, 0xF8, 0x00 }, .total_len = 3, .operand = .none, .asm_prefix = "cmp eax, 0", .asm_suffix = "" },
-        .{ .prefix = &.{ 0x0F, 0x2E, 0xC1 }, .total_len = 3, .operand = .none, .asm_prefix = "ucomiss xmm0, xmm1", .asm_suffix = "" },
-        .{ .prefix = &.{ 0xFF, 0xD0 }, .total_len = 2, .operand = .none, .asm_prefix = "call rax", .asm_suffix = "" },
-        .{ .prefix = &.{ 0x0F, 0xB6, 0xC0 }, .total_len = 3, .operand = .none, .asm_prefix = "movzx eax, al", .asm_suffix = "" },
-        .{ .prefix = &.{ 0x20, 0xD8 }, .total_len = 2, .operand = .none, .asm_prefix = "and al, bl", .asm_suffix = "" },
-        .{ .prefix = &.{ 0x08, 0xD8 }, .total_len = 2, .operand = .none, .asm_prefix = "or al, bl", .asm_suffix = "" },
-        .{ .prefix = &.{ 0x89, 0xC7 }, .total_len = 2, .operand = .none, .asm_prefix = "mov edi, eax", .asm_suffix = "" },
-        .{ .prefix = &.{ 0x0F, 0x05 }, .total_len = 2, .operand = .none, .asm_prefix = "syscall", .asm_suffix = "" },
-        .{ .prefix = &.{ 0xF3, 0x0F, 0x58, 0xC1 }, .total_len = 4, .operand = .none, .asm_prefix = "addss xmm0, xmm1", .asm_suffix = "" },
-        .{ .prefix = &.{ 0xF3, 0x0F, 0x5C, 0xC1 }, .total_len = 4, .operand = .none, .asm_prefix = "subss xmm0, xmm1", .asm_suffix = "" },
-        .{ .prefix = &.{ 0xF3, 0x0F, 0x59, 0xC1 }, .total_len = 4, .operand = .none, .asm_prefix = "mulss xmm0, xmm1", .asm_suffix = "" },
-        .{ .prefix = &.{ 0xF3, 0x0F, 0x5E, 0xC1 }, .total_len = 4, .operand = .none, .asm_prefix = "divss xmm0, xmm1", .asm_suffix = "" },
-        .{ .prefix = &.{ 0x8B, 0x84, 0x24 }, .total_len = 7, .operand = .u32, .asm_prefix = "mov eax, [rsp+", .asm_suffix = "]" },
-        .{ .prefix = &.{ 0x89, 0x84, 0x24 }, .total_len = 7, .operand = .u32, .asm_prefix = "mov [rsp+", .asm_suffix = "], eax" },
-        .{ .prefix = &.{ 0x03, 0x84, 0x24 }, .total_len = 7, .operand = .u32, .asm_prefix = "add eax, [rsp+", .asm_suffix = "]" },
-        .{ .prefix = &.{ 0x2B, 0x84, 0x24 }, .total_len = 7, .operand = .u32, .asm_prefix = "sub eax, [rsp+", .asm_suffix = "]" },
-        .{ .prefix = &.{ 0xF7, 0xBC, 0x24 }, .total_len = 7, .operand = .u32, .asm_prefix = "idiv dword [rsp+", .asm_suffix = "]" },
-        .{ .prefix = &.{ 0x0F, 0xAF, 0x84, 0x24 }, .total_len = 8, .operand = .u32, .asm_prefix = "imul eax, [rsp+", .asm_suffix = "]" },
-        .{ .prefix = &.{ 0x8B, 0x9C, 0x24 }, .total_len = 7, .operand = .u32, .asm_prefix = "mov ebx, [rsp+", .asm_suffix = "]" },
-        .{ .prefix = &.{ 0x48, 0x8B, 0x84, 0x24 }, .total_len = 8, .operand = .u32, .asm_prefix = "mov rax, [rsp+", .asm_suffix = "]" },
-        .{ .prefix = &.{ 0x48, 0x8B, 0xBC, 0x24 }, .total_len = 8, .operand = .u32, .asm_prefix = "mov rdi, [rsp+", .asm_suffix = "]" },
-        .{ .prefix = &.{ 0x48, 0x8B, 0xB4, 0x24 }, .total_len = 8, .operand = .u32, .asm_prefix = "mov rsi, [rsp+", .asm_suffix = "]" },
-        .{ .prefix = &.{ 0x48, 0x8B, 0x94, 0x24 }, .total_len = 8, .operand = .u32, .asm_prefix = "mov rdx, [rsp+", .asm_suffix = "]" },
-        .{ .prefix = &.{ 0x48, 0x8B, 0x8C, 0x24 }, .total_len = 8, .operand = .u32, .asm_prefix = "mov rcx, [rsp+", .asm_suffix = "]" },
-        .{ .prefix = &.{ 0x4C, 0x8B, 0x84, 0x24 }, .total_len = 8, .operand = .u32, .asm_prefix = "mov r8, [rsp+", .asm_suffix = "]" },
-        .{ .prefix = &.{ 0x4C, 0x8B, 0x8C, 0x24 }, .total_len = 8, .operand = .u32, .asm_prefix = "mov r9, [rsp+", .asm_suffix = "]" },
-        .{ .prefix = &.{ 0x48, 0x89, 0x84, 0x24 }, .total_len = 8, .operand = .u32, .asm_prefix = "mov [rsp+", .asm_suffix = "], rax" },
-        .{ .prefix = &.{ 0x48, 0x89, 0xBC, 0x24 }, .total_len = 8, .operand = .u32, .asm_prefix = "mov [rsp+", .asm_suffix = "], rdi" },
-        .{ .prefix = &.{ 0x48, 0x89, 0xB4, 0x24 }, .total_len = 8, .operand = .u32, .asm_prefix = "mov [rsp+", .asm_suffix = "], rsi" },
-        .{ .prefix = &.{ 0x48, 0x89, 0x94, 0x24 }, .total_len = 8, .operand = .u32, .asm_prefix = "mov [rsp+", .asm_suffix = "], rdx" },
-        .{ .prefix = &.{ 0x48, 0x89, 0x8C, 0x24 }, .total_len = 8, .operand = .u32, .asm_prefix = "mov [rsp+", .asm_suffix = "], rcx" },
-        .{ .prefix = &.{ 0x4C, 0x89, 0x84, 0x24 }, .total_len = 8, .operand = .u32, .asm_prefix = "mov [rsp+", .asm_suffix = "], r8" },
-        .{ .prefix = &.{ 0x4C, 0x89, 0x8C, 0x24 }, .total_len = 8, .operand = .u32, .asm_prefix = "mov [rsp+", .asm_suffix = "], r9" },
-        .{ .prefix = &.{ 0xF3, 0x0F, 0x10, 0x84, 0x24 }, .total_len = 9, .operand = .u32, .asm_prefix = "movss xmm0, [rsp+", .asm_suffix = "]" },
-        .{ .prefix = &.{ 0xF3, 0x0F, 0x10, 0x8C, 0x24 }, .total_len = 9, .operand = .u32, .asm_prefix = "movss xmm1, [rsp+", .asm_suffix = "]" },
-        .{ .prefix = &.{ 0xF3, 0x0F, 0x11, 0x84, 0x24 }, .total_len = 9, .operand = .u32, .asm_prefix = "movss [rsp+", .asm_suffix = "], xmm0" },
-        .{ .prefix = &.{ 0x48, 0x8D, 0x84, 0x24 }, .total_len = 8, .operand = .u32, .asm_prefix = "lea rax, [rsp+", .asm_suffix = "]" },
-        .{ .prefix = &.{ 0x4C, 0x8D, 0x94, 0x24 }, .total_len = 8, .operand = .u32, .asm_prefix = "lea r10, [rsp+", .asm_suffix = "]" },
-        .{ .prefix = &.{ 0x48, 0x8B, 0x80 }, .total_len = 7, .operand = .u32, .asm_prefix = "mov rax, [rax+", .asm_suffix = "]" },
-        .{ .prefix = &.{ 0x49, 0x89, 0x82 }, .total_len = 7, .operand = .u32, .asm_prefix = "mov [r10+", .asm_suffix = "], rax" },
-        .{ .prefix = &.{ 0x48, 0x89, 0x82 }, .total_len = 7, .operand = .u32, .asm_prefix = "mov [rdx+", .asm_suffix = "], rax" },
-        .{ .prefix = &.{0xB8}, .total_len = 5, .operand = .i32, .asm_prefix = "mov eax, ", .asm_suffix = "" },
-        .{ .prefix = &.{0xB9}, .total_len = 5, .operand = .i32, .asm_prefix = "mov ecx, ", .asm_suffix = "" },
-        .{ .prefix = &.{0xBA}, .total_len = 5, .operand = .i32, .asm_prefix = "mov edx, ", .asm_suffix = "" },
-        .{ .prefix = &.{ 0x48, 0xB8 }, .total_len = 10, .operand = .u64, .asm_prefix = "mov rax, ", .asm_suffix = "" },
-        .{ .prefix = &.{ 0x69, 0xC0 }, .total_len = 6, .operand = .i32, .asm_prefix = "imul eax, eax, ", .asm_suffix = "" },
-        .{ .prefix = &.{0x2D}, .total_len = 5, .operand = .i32, .asm_prefix = "sub eax, ", .asm_suffix = "" },
-        .{ .prefix = &.{0x05}, .total_len = 5, .operand = .i32, .asm_prefix = "add eax, ", .asm_suffix = "" },
-        .{ .prefix = &.{0x3D}, .total_len = 5, .operand = .i32, .asm_prefix = "cmp eax, ", .asm_suffix = "" },
-        .{ .prefix = &.{ 0x89, 0xC3 }, .total_len = 2, .operand = .none, .asm_prefix = "mov ebx, eax", .asm_suffix = "" },
-        .{ .prefix = &.{ 0x89, 0xD8 }, .total_len = 2, .operand = .none, .asm_prefix = "mov eax, ebx", .asm_suffix = "" },
-        .{ .prefix = &.{ 0x85, 0xC0 }, .total_len = 2, .operand = .none, .asm_prefix = "test eax, eax", .asm_suffix = "" },
-        .{ .prefix = &.{ 0x48, 0x89, 0xC7 }, .total_len = 3, .operand = .none, .asm_prefix = "mov rdi, rax", .asm_suffix = "" },
-        .{ .prefix = &.{ 0x48, 0x89, 0xC6 }, .total_len = 3, .operand = .none, .asm_prefix = "mov rsi, rax", .asm_suffix = "" },
-        .{ .prefix = &.{ 0x48, 0x89, 0xC2 }, .total_len = 3, .operand = .none, .asm_prefix = "mov rdx, rax", .asm_suffix = "" },
-        .{ .prefix = &.{ 0x48, 0x89, 0xC1 }, .total_len = 3, .operand = .none, .asm_prefix = "mov rcx, rax", .asm_suffix = "" },
-        .{ .prefix = &.{ 0x4C, 0x89, 0xC0 }, .total_len = 3, .operand = .none, .asm_prefix = "mov r8, rax", .asm_suffix = "" },
-        .{ .prefix = &.{ 0x4C, 0x89, 0xC8 }, .total_len = 3, .operand = .none, .asm_prefix = "mov r9, rax", .asm_suffix = "" },
-        .{ .prefix = &.{ 0x48, 0x81, 0xEC }, .total_len = 7, .operand = .u32, .asm_prefix = "sub rsp, ", .asm_suffix = "" },
-        .{ .prefix = &.{ 0x48, 0x81, 0xC4 }, .total_len = 7, .operand = .u32, .asm_prefix = "add rsp, ", .asm_suffix = "" },
-        .{ .prefix = &.{ 0x49, 0x8B, 0xBF }, .total_len = 7, .operand = .u32, .asm_prefix = "mov rdi, [r15+", .asm_suffix = "]" },
-        .{ .prefix = &.{0xE8}, .total_len = 5, .operand = .rel, .asm_prefix = "call ", .asm_suffix = "" },
-        .{ .prefix = &.{0xE9}, .total_len = 5, .operand = .rel, .asm_prefix = "jmp ", .asm_suffix = "" },
-        .{ .prefix = &.{ 0x0F, 0x84 }, .total_len = 6, .operand = .rel, .asm_prefix = "je ", .asm_suffix = "" },
-        .{ .prefix = &.{ 0x0F, 0x85 }, .total_len = 6, .operand = .rel, .asm_prefix = "jne ", .asm_suffix = "" },
-        .{ .prefix = &.{ 0x0F, 0x8C }, .total_len = 6, .operand = .rel, .asm_prefix = "jl ", .asm_suffix = "" },
-        .{ .prefix = &.{ 0x0F, 0x8F }, .total_len = 6, .operand = .rel, .asm_prefix = "jg ", .asm_suffix = "" },
-        .{ .prefix = &.{ 0x0F, 0x8E }, .total_len = 6, .operand = .rel, .asm_prefix = "jle ", .asm_suffix = "" },
-        .{ .prefix = &.{ 0x0F, 0x8D }, .total_len = 6, .operand = .rel, .asm_prefix = "jge ", .asm_suffix = "" },
-        .{ .prefix = &.{ 0x48, 0x8D, 0x05 }, .total_len = 7, .operand = .rel, .asm_prefix = "lea rax, [rip+", .asm_suffix = "]" },
-    };
-    const setcc_conds = [_]struct { code: u8, name: []const u8 }{
-        .{ .code = 0x92, .name = "b" },
-        .{ .code = 0x96, .name = "be" },
-        .{ .code = 0x97, .name = "a" },
-        .{ .code = 0x93, .name = "ae" },
-        .{ .code = 0x9C, .name = "l" },
-        .{ .code = 0x9F, .name = "g" },
-        .{ .code = 0x9E, .name = "le" },
-        .{ .code = 0x9D, .name = "ge" },
-        .{ .code = 0x94, .name = "e" },
-        .{ .code = 0x95, .name = "ne" },
-        .{ .code = 0x9A, .name = "p" },
-        .{ .code = 0x9B, .name = "np" },
-    };
-    const setcc_regs = [_]struct { name: []const u8, code: u8 }{
-        .{ .name = "al", .code = 0xC0 },
-        .{ .name = "bl", .code = 0xC3 },
-    };
-    var result: [fixed.len + setcc_conds.len * setcc_regs.len]Pattern = undefined;
-    for (fixed, 0..) |p, i| result[i] = p;
-    var idx: usize = fixed.len;
-    for (setcc_regs) |reg| {
-        for (setcc_conds) |cond| {
-            result[idx] = .{
-                .prefix = &[_]u8{ 0x0F, cond.code, reg.code },
-                .total_len = 3,
-                .operand = .none,
-                .asm_prefix = "set" ++ cond.name ++ " " ++ reg.name,
-                .asm_suffix = "",
-            };
-            idx += 1;
-        }
-    }
-    break :blk result;
+// Instructions emitted by the x86 backend, including linker padding.
+const patterns = [_]Pattern{
+    .{ .prefix = &.{0xC3}, .asm_prefix = "ret" },
+    .{ .prefix = &.{ 0x31, 0xFF }, .asm_prefix = "xor edi, edi" },
+    .{ .prefix = &.{0x99}, .asm_prefix = "cdq" },
+    .{ .prefix = &.{ 0xF7, 0xF9 }, .asm_prefix = "idiv ecx" },
+    .{ .prefix = &.{ 0xF7, 0xD8 }, .asm_prefix = "neg eax" },
+    .{ .prefix = &.{ 0xFF, 0xD0 }, .asm_prefix = "call rax" },
+    .{ .prefix = &.{ 0x89, 0xC7 }, .asm_prefix = "mov edi, eax" },
+    .{ .prefix = &.{ 0x0F, 0x05 }, .asm_prefix = "syscall" },
+    .{ .prefix = &.{ 0x8B, 0x84, 0x24 }, .operand = .u32, .asm_prefix = "mov eax, [rsp+", .asm_suffix = "]" },
+    .{ .prefix = &.{ 0x89, 0x84, 0x24 }, .operand = .u32, .asm_prefix = "mov [rsp+", .asm_suffix = "], eax" },
+    .{ .prefix = &.{ 0x03, 0x84, 0x24 }, .operand = .u32, .asm_prefix = "add eax, [rsp+", .asm_suffix = "]" },
+    .{ .prefix = &.{ 0x2B, 0x84, 0x24 }, .operand = .u32, .asm_prefix = "sub eax, [rsp+", .asm_suffix = "]" },
+    .{ .prefix = &.{ 0xF7, 0xBC, 0x24 }, .operand = .u32, .asm_prefix = "idiv dword [rsp+", .asm_suffix = "]" },
+    .{ .prefix = &.{ 0x0F, 0xAF, 0x84, 0x24 }, .operand = .u32, .asm_prefix = "imul eax, [rsp+", .asm_suffix = "]" },
+    .{ .prefix = &.{ 0x48, 0x8B, 0x84, 0x24 }, .operand = .u32, .asm_prefix = "mov rax, [rsp+", .asm_suffix = "]" },
+    .{ .prefix = &.{ 0x48, 0x89, 0x84, 0x24 }, .operand = .u32, .asm_prefix = "mov [rsp+", .asm_suffix = "], rax" },
+    .{ .prefix = &.{0xB8}, .operand = .i32, .asm_prefix = "mov eax, " },
+    .{ .prefix = &.{0xB9}, .operand = .i32, .asm_prefix = "mov ecx, " },
+    .{ .prefix = &.{0xBA}, .operand = .i32, .asm_prefix = "mov edx, " },
+    .{ .prefix = &.{ 0x48, 0xB8 }, .operand = .u64, .asm_prefix = "mov rax, " },
+    .{ .prefix = &.{ 0x69, 0xC0 }, .operand = .i32, .asm_prefix = "imul eax, eax, " },
+    .{ .prefix = &.{0x2D}, .operand = .i32, .asm_prefix = "sub eax, " },
+    .{ .prefix = &.{0x05}, .operand = .i32, .asm_prefix = "add eax, " },
+    .{ .prefix = &.{0x3D}, .operand = .i32, .asm_prefix = "cmp eax, " },
+    .{ .prefix = &.{ 0x48, 0x81, 0xEC }, .operand = .u32, .asm_prefix = "sub rsp, " },
+    .{ .prefix = &.{ 0x48, 0x81, 0xC4 }, .operand = .u32, .asm_prefix = "add rsp, " },
+    .{ .prefix = &.{0xE8}, .operand = .rel, .asm_prefix = "call " },
+    .{ .prefix = &.{0xE9}, .operand = .rel, .asm_prefix = "jmp " },
+    .{ .prefix = &.{ 0x0F, 0x84 }, .operand = .rel, .asm_prefix = "je " },
+    .{ .prefix = &.{ 0x0F, 0x85 }, .operand = .rel, .asm_prefix = "jne " },
+    .{ .prefix = &.{ 0x0F, 0x8C }, .operand = .rel, .asm_prefix = "jl " },
+    .{ .prefix = &.{ 0x0F, 0x8F }, .operand = .rel, .asm_prefix = "jg " },
+    .{ .prefix = &.{ 0x0F, 0x8E }, .operand = .rel, .asm_prefix = "jle " },
+    .{ .prefix = &.{ 0x0F, 0x8D }, .operand = .rel, .asm_prefix = "jge " },
+    .{ .prefix = &.{0x90}, .asm_prefix = "nop" },
+    .{ .prefix = &.{ 0x85, 0xD2 }, .asm_prefix = "test edx, edx" },
+    .{ .prefix = &.{ 0x3B, 0x84, 0x24 }, .operand = .u32, .asm_prefix = "cmp eax, [rsp+", .asm_suffix = "]" },
+    .{ .prefix = &.{ 0x0F, 0xB6, 0x84, 0x24 }, .operand = .u32, .asm_prefix = "movzx eax, byte [rsp+", .asm_suffix = "]" },
+    .{ .prefix = &.{ 0x88, 0x84, 0x24 }, .operand = .u32, .asm_prefix = "mov [rsp+", .asm_suffix = "], al" },
 };
 
 fn matchPattern(code: []const u8) ?Pattern {
-    for (PATTERNS) |pat| {
-        if (code.len < pat.prefix.len) continue;
+    for (patterns) |pat| {
+        if (code.len < pat.length()) continue;
         if (std.mem.eql(u8, code[0..pat.prefix.len], pat.prefix)) return pat;
     }
     return null;
 }
 
-fn collectTargets(code: []const u8, gpa: std.mem.Allocator) !std.AutoHashMap(usize, usize) {
-    var targets = std.AutoHashMap(usize, usize).init(gpa);
+fn relativeTarget(code: []const u8, cursor: usize, pattern: Pattern) i64 {
+    const relative = std.mem.readInt(i32, code[cursor + pattern.prefix.len ..][0..4], .little);
+    return @as(i64, @intCast(cursor + pattern.length())) + relative;
+}
+
+fn collectTargets(code: []const u8, gpa: std.mem.Allocator) !std.AutoHashMap(i64, usize) {
+    var targets = std.AutoHashMap(i64, usize).init(gpa);
     errdefer targets.deinit();
     var next_label: usize = 0;
     var cursor: usize = 0;
@@ -156,14 +84,13 @@ fn collectTargets(code: []const u8, gpa: std.mem.Allocator) !std.AutoHashMap(usi
             continue;
         };
         if (pat.operand == .rel) {
-            const rel = std.mem.readInt(i32, code[cursor + pat.prefix.len ..][0..4], .little);
-            const target: usize = @intCast(@as(i64, @intCast(cursor)) + @as(i64, @intCast(pat.total_len)) + @as(i64, rel));
-            if (!targets.contains(target)) {
+            const target = relativeTarget(code, cursor, pat);
+            if (target >= 0 and target < code.len and !targets.contains(target)) {
                 try targets.put(target, next_label);
                 next_label += 1;
             }
         }
-        cursor += pat.total_len;
+        cursor += pat.length();
     }
     return targets;
 }
@@ -175,7 +102,7 @@ pub fn disassemble(code: []const u8, gpa: std.mem.Allocator) ![]const u8 {
     defer targets.deinit();
     var cursor: usize = 0;
     while (cursor < code.len) {
-        if (targets.get(cursor)) |label_idx| {
+        if (targets.get(@intCast(cursor))) |label_idx| {
             try out.print(gpa, "L{d}:\n", .{label_idx});
         }
         const pat = matchPattern(code[cursor..]) orelse {
@@ -198,8 +125,7 @@ pub fn disassemble(code: []const u8, gpa: std.mem.Allocator) ![]const u8 {
                 try out.print(gpa, "  {s}0x{x}{s}\n", .{ pat.asm_prefix, val, pat.asm_suffix });
             },
             .rel => {
-                const rel = std.mem.readInt(i32, code[cursor + pat.prefix.len ..][0..4], .little);
-                const target: usize = @intCast(@as(i64, @intCast(cursor)) + @as(i64, @intCast(pat.total_len)) + @as(i64, rel));
+                const target = relativeTarget(code, cursor, pat);
                 if (targets.get(target)) |label_idx| {
                     try out.print(gpa, "  {s}L{d}{s}\n", .{ pat.asm_prefix, label_idx, pat.asm_suffix });
                 } else {
@@ -207,7 +133,37 @@ pub fn disassemble(code: []const u8, gpa: std.mem.Allocator) ![]const u8 {
                 }
             },
         }
-        cursor += pat.total_len;
+        cursor += pat.length();
     }
     return out.toOwnedSlice(gpa);
+}
+
+test "disassembly handles truncated instructions and external branch targets" {
+    const cases = [_]struct { code: []const u8, expected: []const u8 }{
+        .{ .code = &.{0xB8}, .expected = "  db 0xb8\n" },
+        .{ .code = &.{ 0xE8, 0x00 }, .expected = "  db 0xe8\n  db 0x00\n" },
+        .{ .code = &.{ 0xE9, 0xFA, 0xFF, 0xFF, 0xFF }, .expected = "  jmp -1\n" },
+        .{ .code = &.{ 0xE9, 0x00, 0x00, 0x00, 0x00 }, .expected = "  jmp 5\n" },
+        .{ .code = &.{ 0xE9, 0xFB, 0xFF, 0xFF, 0xFF }, .expected = "L0:\n  jmp L0\n" },
+    };
+    for (cases) |case| {
+        const rendered = try disassemble(case.code, std.testing.allocator);
+        defer std.testing.allocator.free(rendered);
+        try std.testing.expectEqualStrings(case.expected, rendered);
+    }
+}
+
+test "disassembly decodes stack comparisons byte copies and fallible status" {
+    const code = [_]u8{
+        0x3B, 0x84, 0x24, 4,    0, 0, 0,
+        0x0F, 0xB6, 0x84, 0x24, 8, 0, 0,
+        0,    0x88, 0x84, 0x24, 9, 0, 0,
+        0,    0x85, 0xD2, 0x90,
+    };
+    const rendered = try disassemble(&code, std.testing.allocator);
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expectEqualStrings(
+        "  cmp eax, [rsp+4]\n  movzx eax, byte [rsp+8]\n  mov [rsp+9], al\n  test edx, edx\n  nop\n",
+        rendered,
+    );
 }

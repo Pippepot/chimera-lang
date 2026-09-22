@@ -40,13 +40,14 @@ Use the suites relevant to the change. Query tests cover execution and increment
 
 ```sh
 zig test src/tokenizer.zig
-zig test src/ast_new.zig
+zig test src/parser.zig
 zig test src/semantic.zig
 zig test src/diagnostics.zig
 zig test src/lifetime.zig
 zig test src/typing.zig
-zig test src/query_new_test.zig
-zig test src/codegen_new_test.zig
+zig test src/query_test.zig
+zig test src/codegen_test.zig
+zig test src/disasm.zig
 zig test --dep standard_library -Mroot=src/main.zig -Mstandard_library=std/library.zig
 zig test --dep standard_library -Mroot=src/modules.zig -Mstandard_library=std/library.zig
 zig test --dep standard_library -Mroot=src/modules_test.zig -Mstandard_library=std/library.zig

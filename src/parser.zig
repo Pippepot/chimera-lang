@@ -13,6 +13,11 @@ const ParseDiagnostic = struct {
 
 const ParseError = std.mem.Allocator.Error || error{ParseError};
 
+const DeclarationName = struct {
+    namespace: Node.Index,
+    token_index: u32,
+};
+
 pub const ParseReport = struct {
     ast: ?Ast,
     diagnostics: []structures.Diagnostic,
@@ -291,8 +296,7 @@ fn parseComptime(parser: *ParserState) !Node.Index {
 
 fn parseBinding(parser: *ParserState) !Node.Index {
     const binding_keyword = parser.eat(.keyword_const) orelse parser.eat(.keyword_var) orelse parser.eat(.keyword_static) orelse return .null;
-    _ = try parser.expect(.identifier);
-    const identifier_index = parser.index - 1;
+    const name = try parseDeclarationName(parser, binding_keyword.tag == .keyword_static);
     const type_annotation = try parseTypeAnnotation(parser);
     _ = try parser.expect(.equal);
     const explicit_type_value = if (type_annotation.unwrap()) |annotation| blk: {
@@ -316,7 +320,22 @@ fn parseBinding(parser: *ParserState) !Node.Index {
         else => unreachable,
     };
 
-    return parser.addNode(.{ .tag = tag, .token_index = identifier_index, .data = .{ .node_node = .{ .a = type_annotation, .b = value } } });
+    const binding = try parser.addNode(.{ .tag = tag, .token_index = name.token_index, .data = .{ .node_node = .{ .a = type_annotation, .b = value } } });
+    return finishQualifiedDeclaration(parser, name, binding);
+}
+
+fn parseDeclarationName(parser: *ParserState, allow_qualified: bool) !DeclarationName {
+    _ = try parser.expect(.identifier);
+    var name: DeclarationName = .{ .namespace = .null, .token_index = parser.index - 1 };
+    if (!allow_qualified or parser.eat(.period) == null) return name;
+
+    name.namespace = try parser.addNode(.{ .tag = .identifier, .token_index = name.token_index, .data = .{ .none = {} } });
+    while (true) {
+        _ = try parser.expect(.identifier);
+        name.token_index = parser.index - 1;
+        if (parser.eat(.period) == null) return name;
+        name.namespace = try parser.addNode(.{ .tag = .field_access, .token_index = name.token_index, .data = .{ .node = name.namespace } });
+    }
 }
 
 fn parsePublic(parser: *ParserState) !Node.Index {
@@ -417,11 +436,16 @@ fn parseIfExpr(parser: *ParserState) ParseError!Node.Index {
 fn parseFunction(parser: *ParserState) !Node.Index {
     const token_index = parser.index;
     _ = parser.eatAny(&.{ .keyword_func, .keyword_fallible }).?;
-    const name_token_index: ?u32 = if (parser.eat(.identifier) != null) parser.index - 1 else null;
+    const name: ?DeclarationName = if (parser.tokens[parser.index].tag == .identifier)
+        try parseDeclarationName(parser, true)
+    else
+        null;
     const signature = try parseFuncSignature(parser);
     const body = try parseCallableBody(parser);
     const value = try parser.addNode(.{ .tag = .func, .token_index = token_index, .data = .{ .node_node = .{ .a = signature, .b = body } } });
-    return finishNamedDeclaration(parser, name_token_index, value);
+    const declared_name = name orelse return value;
+    const declaration = try finishNamedDeclaration(parser, declared_name.token_index, value);
+    return finishQualifiedDeclaration(parser, declared_name, declaration);
 }
 
 fn parseFuncSignature(parser: *ParserState) !Node.Index {
@@ -808,6 +832,15 @@ fn finishNamedDeclaration(parser: *ParserState, name_token_index: ?u32, value: N
     });
 }
 
+fn finishQualifiedDeclaration(parser: *ParserState, name: DeclarationName, declaration: Node.Index) !Node.Index {
+    if (name.namespace == .null) return declaration;
+    return parser.addNode(.{
+        .tag = .namespace_declaration,
+        .token_index = name.token_index,
+        .data = .{ .node_node = .{ .a = name.namespace, .b = declaration } },
+    });
+}
+
 fn parseTokenNode(parser: *ParserState, token: Token.Tag, tag: Node.Tag) !Node.Index {
     _ = try parser.expect(token);
     return parser.addNode(.{ .tag = tag, .token_index = parser.index - 1, .data = .{ .none = {} } });
@@ -870,7 +903,7 @@ fn renderNode(gpa: std.mem.Allocator, node_index: Node.Index, ast: *const Ast, s
             try writer.writeByte('\n');
             try renderNode(gpa, node.data.node, ast, source, writer, seen, new_indent, true, false);
         },
-        .add, .sub, .mul, .div, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .@"and", .@"or", .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .call, .const_binding, .var_binding, .static_binding, .func, .param, .signature, .type_func, .@"if" => {
+        .add, .sub, .mul, .div, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .@"and", .@"or", .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .call, .const_binding, .var_binding, .static_binding, .namespace_declaration, .func, .param, .signature, .type_func, .@"if" => {
             if (node.tag == .param) {
                 const loc = ast.tokens[node.token_index].loc;
                 try writer.print(" : {s}", .{source[loc.start..loc.end]});
@@ -937,6 +970,26 @@ test "parse named function declaration and implicit inline return" {
         \\    └─mul
         \\      ├─identifier : x
         \\      └─number_literal : 2
+    );
+}
+
+test "parse qualified named function declaration" {
+    try testParsing(
+        \\func S.id(imm self: S) int -> self.i
+    ,
+        \\namespace_declaration
+        \\├─identifier : S
+        \\└─static_binding
+        \\  └─func
+        \\    ├─signature
+        \\    │ ├─param_list
+        \\    │ │ └─param : self
+        \\    │ │   ├─access : imm
+        \\    │ │   └─type : S
+        \\    │ └─type : int
+        \\    └─return_expr
+        \\      └─field_access : i
+        \\        └─identifier : self
     );
 }
 
@@ -1280,6 +1333,26 @@ test "parse function defined inside struct" {
         \\  │           └─identifier : v
         \\  └─struct_field : y
         \\    └─type : int
+    );
+}
+
+test "parse qualified namespace declaration" {
+    try testParsing(
+        \\static S.id = func(imm self: S) int -> self.i
+    ,
+        \\namespace_declaration
+        \\├─identifier : S
+        \\└─static_binding
+        \\  └─func
+        \\    ├─signature
+        \\    │ ├─param_list
+        \\    │ │ └─param : self
+        \\    │ │   ├─access : imm
+        \\    │ │   └─type : S
+        \\    │ └─type : int
+        \\    └─return_expr
+        \\      └─field_access : i
+        \\        └─identifier : self
     );
 }
 

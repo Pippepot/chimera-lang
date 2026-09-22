@@ -190,6 +190,7 @@ pub const Node = struct {
         const_binding,
         var_binding,
         static_binding,
+        namespace_declaration,
         comptime_expr,
         field_access,
         func,
@@ -266,7 +267,7 @@ pub const Ast = struct {
                 .break_expr, .return_expr, .loop, .not, .neg, .query_op, .move_expr, .comptime_expr, .sizeof_expr, .field_access, .struct_field, .struct_property, .struct_init_field, .@"pub" => {
                     if (left.data.node != right.data.node) return false;
                 },
-                .add, .sub, .mul, .div, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .@"and", .@"or", .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .call, .const_binding, .var_binding, .static_binding, .func, .param, .signature, .type_func, .@"if" => {
+                .add, .sub, .mul, .div, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .@"and", .@"or", .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .call, .const_binding, .var_binding, .static_binding, .namespace_declaration, .func, .param, .signature, .type_func, .@"if" => {
                     if (left.data.node_node.a != right.data.node_node.a or left.data.node_node.b != right.data.node_node.b) return false;
                 },
                 .block, .call_arg_list, .param_list, .type_list, .type_variant, .if_else, .@"struct", .struct_init, .import, .selective_import => {
@@ -335,6 +336,7 @@ pub const DiscoveredItem = struct {
     loc: ItemLoc,
     declaration: u32,
     parent: ?u32 = null,
+    qualified_owner: ?[]const u8 = null,
     is_public: bool = false,
 };
 
@@ -345,17 +347,26 @@ pub const ItemTree = struct {
     pub fn eql(a: ItemTree, b: ItemTree) bool {
         if (a.file_id != b.file_id or a.items.len != b.items.len) return false;
         for (a.items, b.items) |left, right| {
-            if (!ItemLoc.eql(left.loc, right.loc) or left.declaration != right.declaration or left.parent != right.parent or left.is_public != right.is_public) return false;
+            if (!ItemLoc.eql(left.loc, right.loc) or left.declaration != right.declaration or left.parent != right.parent or
+                !optionalStringEql(left.qualified_owner, right.qualified_owner) or left.is_public != right.is_public) return false;
         }
         return true;
     }
 
     pub fn deinit(self: *ItemTree, gpa: std.mem.Allocator) void {
-        for (self.items) |item| gpa.free(item.loc.name);
+        for (self.items) |item| {
+            gpa.free(item.loc.name);
+            if (item.qualified_owner) |owner| gpa.free(owner);
+        }
         gpa.free(self.items);
         self.* = undefined;
     }
 };
+
+fn optionalStringEql(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.mem.eql(u8, a.?, b.?);
+}
 
 pub const ItemIndex = struct {
     file_id: FileId,
@@ -843,7 +854,6 @@ pub const OwnershipCapabilities = struct {
     drop: DropCapability,
     needs_custom_move: bool = false,
     needs_custom_copy: bool = false,
-    contains_custom_copy: bool = false,
     needs_automatic_drop: bool = false,
     requires_explicit_drop: bool = false,
 };
@@ -1277,13 +1287,15 @@ pub const Diagnostic = struct {
     pub const IncompatibleStructOwnershipProperty = enum {
         trivial_move,
         fieldwise_move,
+        custom_move,
         trivial_copy,
         fieldwise_copy,
         trivial_drop,
     };
 
     pub const MissingStructInitializerField = struct {
-        name_span: SourceSpan,
+        type_id: TypeId,
+        field_index: u32,
     };
 
     pub const Kind = union(enum) {
@@ -1329,6 +1341,7 @@ pub const Diagnostic = struct {
         misplaced_pub,
         namespace_used_as_value,
         unknown_namespace_member,
+        invalid_namespace_owner,
         unknown_module,
         unknown_imported_name,
         private_access,

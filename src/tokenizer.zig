@@ -8,14 +8,13 @@ pub const Tokenizer = struct {
     buffer: []const u8,
     index: u32,
     at_line_start: bool,
-    indent: u16,
-    indent_levels: std.ArrayList(u16),
+    indent: u32,
+    indent_levels: std.ArrayList(u32),
 
     pub fn init(gpa: std.mem.Allocator, buffer: []const u8) !Tokenizer {
-        var indent_levels = try std.ArrayList(u16).initCapacity(gpa, 8);
-        errdefer indent_levels.deinit(gpa);
-        // Start with indentation level 0, such that previous indentation can be checked against
-        try indent_levels.append(gpa, 0);
+        if (buffer.len > std.math.maxInt(u32)) return error.SourceTooLarge;
+        var indent_levels = try std.ArrayList(u32).initCapacity(gpa, 8);
+        indent_levels.appendAssumeCapacity(0);
 
         return .{
             .gpa = gpa,
@@ -30,16 +29,15 @@ pub const Tokenizer = struct {
 
     pub fn deinit(self: *Tokenizer) void {
         self.indent_levels.deinit(self.gpa);
+        self.* = undefined;
     }
 
     const State = enum {
         start,
         expect_newline,
         identifier,
-        string_literal,
-        string_literal_backslash,
-        char_literal,
-        char_literal_backslash,
+        quoted_literal,
+        quoted_literal_backslash,
         equal,
         minus,
         line_comment,
@@ -69,7 +67,7 @@ pub const Tokenizer = struct {
         return .{ .tag = .eof, .loc = .{ .start = self.index, .end = self.index } };
     }
 
-    fn binary_op(self: *Tokenizer, tag: Token.Tag, equal_tag: Token.Tag) Token.Tag {
+    fn binaryOperator(self: *Tokenizer, tag: Token.Tag, equal_tag: Token.Tag) Token.Tag {
         self.index += 1;
         if (self.current() == '=') {
             self.index += 1;
@@ -78,7 +76,7 @@ pub const Tokenizer = struct {
         return tag;
     }
 
-    fn getNewLineTokens(self: *Tokenizer) ?u32 {
+    fn newlineLength(self: *Tokenizer) ?u32 {
         if (self.current() == '\n') return 1;
         // A CR directly preceding NL is part of the newline sequence
         if (self.current() == '\r' and self.index + 1 < self.buffer.len and self.buffer[self.index + 1] == '\n') return 2;
@@ -93,7 +91,7 @@ pub const Tokenizer = struct {
             }
 
             // Reset indentation counting on newline. This avoids bloating with dedent/indent that cancel out
-            if (getNewLineTokens(self)) |token_count| {
+            if (newlineLength(self)) |token_count| {
                 self.index += token_count;
                 self.indent = 0;
                 continue :line_start;
@@ -152,7 +150,7 @@ pub const Tokenizer = struct {
                     }
                 },
                 '\n', '\r' => {
-                    if (getNewLineTokens(self)) |token_count| {
+                    if (newlineLength(self)) |token_count| {
                         self.index += token_count;
                         self.indent = 0;
                         self.at_line_start = true;
@@ -168,11 +166,11 @@ pub const Tokenizer = struct {
                 },
                 '"' => {
                     result.tag = .string_literal;
-                    continue :state .string_literal;
+                    continue :state .quoted_literal;
                 },
                 '\'' => {
                     result.tag = .char_literal;
-                    continue :state .char_literal;
+                    continue :state .quoted_literal;
                 },
                 'a'...'z', 'A'...'Z', '_' => {
                     result.tag = .identifier;
@@ -182,7 +180,7 @@ pub const Tokenizer = struct {
                     result.tag = .equal;
                     continue :state .equal;
                 },
-                '|' => result.tag = self.binary_op(.pipe, .pipe_equal),
+                '|' => result.tag = self.binaryOperator(.pipe, .pipe_equal),
                 '(' => {
                     result.tag = .l_paren;
                     self.index += 1;
@@ -215,12 +213,12 @@ pub const Tokenizer = struct {
                     result.tag = .colon;
                     self.index += 1;
                 },
-                '%' => result.tag = self.binary_op(.percent, .percent_equal),
-                '*' => result.tag = self.binary_op(.asterisk, .asterisk_equal),
-                '+' => result.tag = self.binary_op(.plus, .plus_equal),
+                '%' => result.tag = self.binaryOperator(.percent, .percent_equal),
+                '*' => result.tag = self.binaryOperator(.asterisk, .asterisk_equal),
+                '+' => result.tag = self.binaryOperator(.plus, .plus_equal),
                 '<' => continue :state .angle_bracket_left,
                 '>' => continue :state .angle_bracket_right,
-                '^' => result.tag = self.binary_op(.caret, .caret_equal),
+                '^' => result.tag = self.binaryOperator(.caret, .caret_equal),
                 '{' => {
                     result.tag = .l_brace;
                     self.index += 1;
@@ -238,8 +236,8 @@ pub const Tokenizer = struct {
                     result.tag = .minus;
                     continue :state .minus;
                 },
-                '/' => result.tag = self.binary_op(.slash, .slash_equal),
-                '&' => result.tag = self.binary_op(.ampersand, .ampersand_equal),
+                '/' => result.tag = self.binaryOperator(.slash, .slash_equal),
+                '&' => result.tag = self.binaryOperator(.ampersand, .ampersand_equal),
                 '0'...'9' => {
                     result.tag = .number_literal;
                     self.index += 1;
@@ -297,72 +295,34 @@ pub const Tokenizer = struct {
                 }
             },
 
-            .string_literal => {
+            .quoted_literal => {
                 self.index += 1;
                 switch (self.current()) {
                     0 => {
-                        if (self.index != self.buffer.len) {
-                            continue :state .invalid;
-                        } else {
-                            result.tag = .invalid;
-                        }
+                        if (self.index != self.buffer.len) continue :state .invalid;
+                        result.tag = .invalid;
                     },
                     '\n' => result.tag = .invalid,
-                    '\\' => continue :state .string_literal_backslash,
-                    '"' => self.index += 1,
-                    0x01...0x09, 0x0b...0x1f, 0x7f => {
-                        continue :state .invalid;
+                    '\\' => continue :state .quoted_literal_backslash,
+                    '\'', '"' => {
+                        if (self.current() != self.buffer[result.loc.start]) continue :state .quoted_literal;
+                        self.index += 1;
                     },
-                    else => continue :state .string_literal,
+                    0x01...0x09, 0x0b...0x1f, 0x7f => continue :state .invalid,
+                    else => continue :state .quoted_literal,
                 }
             },
 
-            .string_literal_backslash => {
-                self.index += 1;
-                switch (self.current()) {
-                    0, '\n' => result.tag = .invalid,
-                    0x01...0x09, 0x0b...0x1f, 0x7f => {
-                        continue :state .invalid;
-                    },
-                    else => continue :state .string_literal,
-                }
-            },
-
-            .char_literal => {
+            .quoted_literal_backslash => {
                 self.index += 1;
                 switch (self.current()) {
                     0 => {
-                        if (self.index != self.buffer.len) {
-                            continue :state .invalid;
-                        } else {
-                            result.tag = .invalid;
-                        }
+                        if (self.index != self.buffer.len) continue :state .invalid;
+                        result.tag = .invalid;
                     },
                     '\n' => result.tag = .invalid,
-                    '\\' => continue :state .char_literal_backslash,
-                    '\'' => self.index += 1,
-                    0x01...0x09, 0x0b...0x1f, 0x7f => {
-                        continue :state .invalid;
-                    },
-                    else => continue :state .char_literal,
-                }
-            },
-
-            .char_literal_backslash => {
-                self.index += 1;
-                switch (self.current()) {
-                    0 => {
-                        if (self.index != self.buffer.len) {
-                            continue :state .invalid;
-                        } else {
-                            result.tag = .invalid;
-                        }
-                    },
-                    '\n' => result.tag = .invalid,
-                    0x01...0x09, 0x0b...0x1f, 0x7f => {
-                        continue :state .invalid;
-                    },
-                    else => continue :state .char_literal,
+                    0x01...0x09, 0x0b...0x1f, 0x7f => continue :state .invalid,
+                    else => continue :state .quoted_literal,
                 }
             },
 
@@ -399,7 +359,7 @@ pub const Tokenizer = struct {
             .angle_bracket_left => {
                 self.index += 1;
                 switch (self.current()) {
-                    '<' => result.tag = self.binary_op(
+                    '<' => result.tag = self.binaryOperator(
                         .angle_bracket_angle_bracket_left,
                         .angle_bracket_angle_bracket_left_equal,
                     ),
@@ -418,7 +378,7 @@ pub const Tokenizer = struct {
             .angle_bracket_right => {
                 self.index += 1;
                 switch (self.current()) {
-                    '>' => result.tag = self.binary_op(
+                    '>' => result.tag = self.binaryOperator(
                         .angle_bracket_angle_bracket_right,
                         .angle_bracket_angle_bracket_right_equal,
                     ),
@@ -1141,4 +1101,12 @@ test "comment indentation and trailing blank lines do not change blocks" {
     });
     try testTokenize("a\n    ", &.{.identifier});
     try testTokenize("a\n  # comment at eof", &.{.identifier});
+}
+
+test "large indentation does not overflow the indentation counter" {
+    const source = try std.testing.allocator.allocSentinel(u8, 65_537, 0);
+    defer std.testing.allocator.free(source);
+    @memset(source[0..65_536], ' ');
+    source[65_536] = 'x';
+    try testTokenize(source, &.{ .indent, .identifier, .dedent });
 }

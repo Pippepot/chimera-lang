@@ -1,0 +1,9 @@
+struct S
+  i: int
+
+static S.id = func(s: S) int -> s.i
+
+func S.foo(s: S) int -> s.i
+
+const s = S{i = 3}
+exit(s.foo())

@@ -1,6 +1,6 @@
 const std = @import("std");
-const query = @import("query_new.zig");
-const queries = @import("query_structures.zig");
+const query = @import("query.zig");
+const queries = @import("queries.zig");
 const structures = @import("structures.zig");
 
 const Case = struct {

@@ -1,12 +1,23 @@
 const std = @import("std");
 
 pub fn writeProgram(io: std.Io, prog_bytes: []const u8) !void {
-    const cwd = std.Io.Dir.cwd();
-    try cwd.writeFile(io, .{
-        .sub_path = "prog",
-        .data = prog_bytes,
-        .flags = .{ .permissions = .executable_file },
-    });
+    const file = try std.Io.Dir.cwd().createFile(io, "prog", .{ .permissions = .executable_file });
+    defer file.close(io);
+    try file.writeStreamingAll(io, prog_bytes);
+    // Creation permissions do not update an existing output file.
+    try file.setPermissions(io, .executable_file);
+}
+
+test "replacing a non-executable output makes the new program runnable" {
+    const io = std.testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    {
+        const file = try std.Io.Dir.cwd().createFile(io, "prog", .{});
+        defer file.close(io);
+        try file.setPermissions(io, .default_file);
+    }
+    try writeProgram(io, "#!/bin/sh\nexit 42\n");
+    try std.testing.expectEqual(@as(u8, 42), try runProg(io, std.testing.allocator, &.{}));
 }
 
 pub fn runProg(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !u8 {

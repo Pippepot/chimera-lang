@@ -1,9 +1,9 @@
 const std = @import("std");
-const ast = @import("ast_new.zig");
-const codegen = @import("codegen_new.zig");
+const ast = @import("parser.zig");
+const codegen = @import("codegen.zig");
 const disasm = @import("disasm.zig");
-const query = @import("query_new.zig");
-const queries = @import("query_structures.zig");
+const query = @import("query.zig");
+const queries = @import("queries.zig");
 const structures = @import("structures.zig");
 const diagnostics = @import("diagnostics.zig");
 

@@ -423,9 +423,20 @@ static QAlias = Q
 # S's namespace is addressed as S.function. For instance call syntax, the
 # receiver is an explicit first parameter in the function declaration, with an
 # ordinary parameter access mode.
+static S.read_a = func(imm value: S) int -> value.a
+# Equivalently, using named-function declaration sugar:
+func S.read_a(imm value: S) int -> value.a
+# This qualified declaration form extends a non-parameterized named struct in
+# the same module. The struct and declaration may be in different files. Each
+# qualifier must name a declared struct namespace; imported types cannot be
+# extended. A function written lexically inside a struct has the same namespace
+# meaning as this qualified form. Lexical declarations remain necessary for a
+# generated namespace because its identity includes the factory specialization.
 # value.function(args) desugars to S.function(value, args), where value has
 # type S. Both forms obey the same argument access and ownership rules, and
 # evaluate the receiver and remaining arguments exactly once, left to right.
+# Callable values stored in the namespace also support this receiver insertion;
+# callable instance fields are called directly without inserting the receiver.
 # Fields and ordinary namespace declarations share one name scope; duplicate
 # names are errors. Ownership properties use a separate hook scope. Within a
 # namespace declaration, unqualified names search its enclosing struct

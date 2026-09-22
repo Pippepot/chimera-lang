@@ -18,7 +18,7 @@ const BuildBlock = lifetime.BuildBlock;
 const CleanupLocation = lifetime.CleanupLocation;
 const LifetimeSolver = lifetime.Solver;
 
-const BodyOptions = struct {
+pub const BodyOptions = struct {
     infer_return_type: bool = false,
     publish_instruction_spans: bool = false,
     allow_type_values: bool = false,
@@ -30,93 +30,6 @@ pub fn emitSemanticIssue(ctx: anytype, file_id: structures.FileId, issue: semant
 
 pub fn resolveAndTypeBody(
     ctx: anytype,
-    comptime ModuleScopeQuery: type,
-    comptime FunctionSignatureQuery: type,
-    item_id: structures.ItemId,
-    file_id: structures.FileId,
-    parameters: []const structures.CallableParameter,
-    return_type: structures.TypeId,
-    is_fallible: bool,
-    type_interner: anytype,
-    unresolved: semantic.UnresolvedBody,
-) !?structures.FunctionBodyAnalysis {
-    return resolveAndType(
-        ctx,
-        ModuleScopeQuery,
-        FunctionSignatureQuery,
-        item_id,
-        file_id,
-        parameters,
-        return_type,
-        is_fallible,
-        .{},
-        type_interner,
-        unresolved,
-    );
-}
-
-pub fn resolveAndTypeBodyForComptime(
-    ctx: anytype,
-    comptime ModuleScopeQuery: type,
-    comptime FunctionSignatureQuery: type,
-    item_id: structures.ItemId,
-    file_id: structures.FileId,
-    parameters: []const structures.CallableParameter,
-    return_type: structures.TypeId,
-    is_fallible: bool,
-    type_interner: anytype,
-    unresolved: semantic.UnresolvedBody,
-) !?structures.FunctionBodyAnalysis {
-    return resolveAndType(
-        ctx,
-        ModuleScopeQuery,
-        FunctionSignatureQuery,
-        item_id,
-        file_id,
-        parameters,
-        return_type,
-        is_fallible,
-        .{
-            .publish_instruction_spans = true,
-            .allow_type_values = true,
-        },
-        type_interner,
-        unresolved,
-    );
-}
-
-pub fn resolveAndTypeComptimeThunk(
-    ctx: anytype,
-    comptime ModuleScopeQuery: type,
-    comptime FunctionSignatureQuery: type,
-    item_id: structures.ItemId,
-    file_id: structures.FileId,
-    type_interner: anytype,
-    unresolved: semantic.UnresolvedBody,
-) !?structures.FunctionBodyAnalysis {
-    return resolveAndType(
-        ctx,
-        ModuleScopeQuery,
-        FunctionSignatureQuery,
-        item_id,
-        file_id,
-        &.{},
-        .unit,
-        true,
-        .{
-            .infer_return_type = true,
-            .publish_instruction_spans = true,
-            .allow_type_values = true,
-        },
-        type_interner,
-        unresolved,
-    );
-}
-
-fn resolveAndType(
-    ctx: anytype,
-    comptime ModuleScopeQuery: type,
-    comptime FunctionSignatureQuery: type,
     item_id: structures.ItemId,
     file_id: structures.FileId,
     parameters: []const structures.CallableParameter,
@@ -126,7 +39,7 @@ fn resolveAndType(
     type_interner: anytype,
     unresolved: semantic.UnresolvedBody,
 ) !?structures.FunctionBodyAnalysis {
-    var builder: BodyBuilder(@TypeOf(ctx), ModuleScopeQuery, FunctionSignatureQuery, @TypeOf(type_interner)) = .{
+    var builder: BodyBuilder(@TypeOf(ctx), @TypeOf(type_interner)) = .{
         .ctx = ctx,
         .type_interner = type_interner,
         .item_id = item_id,
@@ -139,8 +52,7 @@ fn resolveAndType(
         .allow_type_values = options.allow_type_values,
     };
     defer builder.deinit();
-    try builder.init(parameters);
-    builder.build() catch |err| switch (err) {
+    builder.build(parameters) catch |err| switch (err) {
         error.SourceRejected, error.Unavailable => return null,
         else => return err,
     };
@@ -153,7 +65,7 @@ fn resolveAndType(
     return try builder.finish();
 }
 
-fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime FunctionSignatureQuery: type, comptime TypeInterner: type) type {
+fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
     return struct {
         const Self = @This();
         const Value = struct {
@@ -169,6 +81,11 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             borrow_condition: ?structures.FunctionValueId = null,
             borrow_root: ?semantic.UnresolvedBody.LocalId = null,
             explicit_transfer: bool = false,
+        };
+        const CallTarget = union(enum) {
+            intrinsic,
+            direct: structures.InstanceId,
+            indirect: structures.FunctionValueId,
         };
         const Availability = enum { unbound, available, transferred, maybe_transferred };
         const State = struct {
@@ -242,7 +159,6 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
         infer_return_type: bool = false,
         publish_instruction_spans: bool = false,
         allow_type_values: bool = false,
-        scope: ?structures.ModuleScope = null,
         values: []?Value = &.{},
         local_values: []?Value = &.{},
         local_mutable: []bool = &.{},
@@ -382,7 +298,8 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             return .{ .expected = expected, .found = found };
         }
 
-        fn build(self: *Self) !void {
+        fn build(self: *Self, parameters: []const structures.CallableParameter) !void {
+            try self.init(parameters);
             const result = try self.block(self.unresolved.root_block);
             if (self.current_block == null) return;
             const root = self.unresolved.blocks[@intFromEnum(self.unresolved.root_block)];
@@ -685,7 +602,7 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
             start_order: u32,
             capabilities: structures.OwnershipCapabilities,
         ) !GenerationId {
-            std.debug.assert(capabilities.needs_automatic_drop != capabilities.requires_explicit_drop);
+            std.debug.assert(capabilities.needs_automatic_drop or capabilities.requires_explicit_drop);
             const id: GenerationId = @enumFromInt(self.generations.items.len);
             try self.generations.append(self.ctx.allocator(), .{
                 .type_id = type_id,
@@ -1144,7 +1061,8 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 });
             }
             for (seen, 0..) |was_seen, field_index| if (!was_seen) return self.reject(initializer.type_span, .{ .missing_struct_initializer_field = .{
-                .name_span = definition.fields[field_index].span,
+                .type_id = initializer.type_id,
+                .field_index = @intCast(field_index),
             } });
             for (field_values.items) |field_value| try self.recordConsume(field_value);
             const start: u32 = @intCast(self.struct_field_values.items.len);
@@ -1158,12 +1076,16 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
 
         fn fieldAccess(self: *Self, expression: Expression) !Value {
             const access = expression.operation.field_access;
-            const operand = try self.borrowValue(try self.value(access.operand.value), access.operand.span);
+            return self.accessField(access.operand, access.name, expression.span);
+        }
+
+        fn accessField(self: *Self, operand_use: semantic.UnresolvedBody.ValueUse, name: []const u8, span: structures.SourceSpan) !Value {
+            const operand = try self.borrowValue(try self.value(operand_use.value), operand_use.span);
             if (operand.type_id == .never) return operand;
             const definition = (try self.type_interner.structDefinition(operand.type_id)) orelse
-                return self.reject(access.operand.span, .{ .field_access_not_struct = operand.type_id });
+                return self.reject(operand_use.span, .{ .field_access_not_struct = operand.type_id });
             if (try self.type_interner.structLayout(operand.type_id) == null) return error.Unavailable;
-            const field = definition.resolveField(access.name) orelse return self.reject(expression.span, .unknown_field);
+            const field = definition.resolveField(name) orelse return self.reject(span, .unknown_field);
             var result = try self.appendInstruction(.{ .field_access = .{
                 .operand = operand.id,
                 .field_index = field.index,
@@ -1175,13 +1097,13 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                 result.borrowed_cleanup_value = operand.borrowed_cleanup_value;
                 result.borrow_root = operand.borrow_root;
                 if (operand.borrow_condition) |borrow_condition| {
-                    return self.accessConditionalTemporary(operand, result, borrow_condition, expression.span);
+                    return self.accessConditionalTemporary(operand, result, borrow_condition, span);
                 }
             } else if ((try self.type_interner.ownershipCapabilities(operand.type_id) orelse return error.Unavailable).needs_automatic_drop) {
                 result.borrowed_type = field.type_id;
                 result.borrowed_generation = operand.owned_generation;
                 result.borrowed_cleanup_value = operand.id;
-                result = try self.ownValue(result, expression.span);
+                result = try self.ownValue(result, span);
             }
             return result;
         }
@@ -1710,19 +1632,8 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
         }
 
         fn appendVariantTag(self: *Self, target_members: []const structures.TypeId, actual_member: structures.TypeId) !void {
-            for (target_members, 0..) |target_member, target_tag| {
-                if (actual_member == target_member) {
-                    try self.variant_coercion_tags.append(self.ctx.allocator(), @intCast(target_tag));
-                    return;
-                }
-            }
-            for (target_members, 0..) |target_member, target_tag| {
-                if (try semantic.canWidenTo(self.type_interner, actual_member, target_member)) {
-                    try self.variant_coercion_tags.append(self.ctx.allocator(), @intCast(target_tag));
-                    return;
-                }
-            }
-            unreachable;
+            const tag = (try semantic.widenedVariantTag(self.type_interner, actual_member, target_members)) orelse unreachable;
+            try self.variant_coercion_tags.append(self.ctx.allocator(), tag);
         }
 
         fn appendExtractionTagMapping(
@@ -1802,14 +1713,6 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                         return self.reject(target_span, .possibly_transferred);
                     }
                     try self.dropValue(latest_target, self.local_can_deinit[local_index], target_span);
-                } else if (self.local_availability[local_index] != .transferred) {
-                    const parent_boundary = self.current_boundary;
-                    const transition_boundary = try self.newBoundary(target_span);
-                    self.current_boundary = transition_boundary;
-                    try self.recordUse(latest_target);
-                    self.current_boundary = parent_boundary;
-                    try self.appendBoundary(transition_boundary);
-                    try self.recordUse(owned);
                 }
                 break :blk if (use.coerce_to == null)
                     owned
@@ -1940,42 +1843,35 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
         }
 
         fn resolveCall(self: *Self, call: semantic.UnresolvedBody.Call, span: structures.SourceSpan) !ResolvedCall {
-            const raw_arguments = self.unresolved.call_arguments[call.arguments.start..call.arguments.end];
-            const Target = union(enum) { intrinsic, direct: structures.InstanceId, indirect: structures.FunctionValueId };
-            var target: Target = undefined;
+            var target: CallTarget = undefined;
             var signature: structures.CallableType = undefined;
+            var argument_storage: std.ArrayList(semantic.UnresolvedBody.ValueUse) = .empty;
+            defer argument_storage.deinit(self.ctx.allocator());
+            var raw_arguments: []const semantic.UnresolvedBody.ValueUse = &.{};
             switch (call.target) {
                 .intrinsic => {
+                    raw_arguments = self.unresolved.call_arguments[call.arguments.start..call.arguments.end];
                     target = .intrinsic;
                     signature = .{ .parameters = &.{.{ .mode = .imm, .type_id = .int }}, .return_type = .never, .is_fallible = false };
                 },
-                .direct, .unresolved_direct => {
-                    const instance: structures.InstanceId = switch (call.target) {
-                        .direct => |instance| instance,
-                        .unresolved_direct => |name| blk: {
-                            if (self.scope == null) self.scope = (try self.ctx.get(ModuleScopeQuery, self.file_id)).* orelse return error.Unavailable;
-                            const item = self.scope.?.resolveFunction(name) orelse {
-                                if (self.scope.?.resolve(name) != null) return self.reject(span, .value_not_callable);
-                                return self.reject(span, .unknown_function);
-                            };
-                            break :blk .{ .item = item };
-                        },
-                        else => unreachable,
-                    };
+                .unknown_function => return self.reject(span, .unknown_function),
+                .direct => |instance| {
+                    raw_arguments = self.unresolved.call_arguments[call.arguments.start..call.arguments.end];
                     target = .{ .direct = instance };
-                    const resolved_signature = (try self.ctx.get(FunctionSignatureQuery, instance)).* orelse return error.Unavailable;
-                    signature = .{
-                        .parameters = resolved_signature.parameters,
-                        .return_type = resolved_signature.return_type,
-                        .is_fallible = resolved_signature.is_fallible,
-                    };
+                    signature = try self.type_interner.functionSignature(instance) orelse return error.Unavailable;
                 },
                 .value => |target_use| {
+                    raw_arguments = self.unresolved.call_arguments[call.arguments.start..call.arguments.end];
                     const callee = try self.borrowValue(try self.value(target_use.value), target_use.span);
                     if (callee.type_id == .never) return .{ .diverged = callee };
                     signature = try self.type_interner.callable(callee.type_id) orelse
                         return self.reject(target_use.span, .value_not_callable);
                     target = .{ .indirect = callee.id };
+                },
+                .member => |member| {
+                    if (try self.resolveMemberCall(call, member, &argument_storage, &target, &signature)) |diverged|
+                        return .{ .diverged = diverged };
+                    raw_arguments = argument_storage.items;
                 },
             }
             if (raw_arguments.len != signature.parameters.len) return self.reject(span, .{ .call_argument_count_mismatch = .{
@@ -2088,6 +1984,69 @@ fn BodyBuilder(comptime Context: type, comptime ModuleScopeQuery: type, comptime
                     break :blk .{ .diverged = result };
                 },
             };
+        }
+
+        fn resolveMemberCall(
+            self: *Self,
+            call: semantic.UnresolvedBody.Call,
+            member: semantic.UnresolvedBody.MemberCall,
+            arguments: *std.ArrayList(semantic.UnresolvedBody.ValueUse),
+            target: *CallTarget,
+            signature: *structures.CallableType,
+        ) !?Value {
+            const receiver = try self.value(member.receiver.value);
+            if (receiver.type_id == .never) return receiver;
+            const definition = (try self.type_interner.structDefinition(receiver.type_id)) orelse
+                return self.reject(member.receiver.span, .{ .field_access_not_struct = receiver.type_id });
+            const method_arguments = self.unresolved.method_call_arguments[call.arguments.start..call.arguments.end];
+            if (definition.resolveField(member.name) != null) {
+                const callee = try self.borrowValue(try self.accessField(member.receiver, member.name, call.span), call.span);
+                signature.* = try self.type_interner.callable(callee.type_id) orelse
+                    return self.reject(call.span, .value_not_callable);
+                target.* = .{ .indirect = callee.id };
+                try arguments.ensureTotalCapacity(self.ctx.allocator(), method_arguments.len);
+                for (method_arguments) |argument| arguments.appendAssumeCapacity(argument.value);
+                return null;
+            }
+            const instance = (try self.type_interner.structNamespaceMember(receiver.type_id, member.name)) orelse
+                return self.reject(call.span, .unknown_namespace_member);
+            try arguments.append(self.ctx.allocator(), member.receiver);
+            const shape = (try self.type_interner.functionShape(instance.item)) orelse {
+                const value_id = (try self.type_interner.staticItem(instance)) orelse return error.Unavailable;
+                const value_to_call = try self.type_interner.lookupCompileTimeValue(value_id);
+                if (value_to_call != .runtime) return self.reject(call.span, .value_not_callable);
+                signature.* = (try self.type_interner.callable(value_to_call.runtime.type_id)) orelse
+                    return self.reject(call.span, .value_not_callable);
+                const callee = try self.appendInstruction(.{ .function_ref = value_to_call.runtime.value.function_ref });
+                target.* = .{ .indirect = callee.id };
+                for (method_arguments) |argument| try arguments.append(self.ctx.allocator(), argument.value);
+                return null;
+            };
+            if (shape.parameters.len == 0 or shape.parameters[0].mode == .static)
+                return self.reject(call.span, .static_argument_not_supported);
+            if (method_arguments.len + 1 != shape.parameters.len) return self.reject(call.span, .{ .call_argument_count_mismatch = .{
+                .expected = @intCast(shape.parameters.len - 1),
+                .found = @intCast(method_arguments.len),
+            } });
+            var static_arguments: std.ArrayList(structures.CompileTimeValueId) = .empty;
+            defer static_arguments.deinit(self.ctx.allocator());
+            for (method_arguments, shape.parameters[1..]) |argument, parameter| {
+                if (parameter.mode != .static) {
+                    try arguments.append(self.ctx.allocator(), argument.value);
+                    continue;
+                }
+                if (argument.runtime_reference) |reference_span|
+                    return self.reject(reference_span, .comptime_runtime_capture);
+                const value_id = (try self.type_interner.staticCallArgument(argument.node, parameter.is_meta_type)) orelse return error.Unavailable;
+                const compile_time_value = try self.type_interner.lookupCompileTimeValue(value_id);
+                if (compile_time_value == .runtime and compile_time_value.runtime.value == .function_ref)
+                    return self.reject(argument.value.span, .static_argument_not_supported);
+                try static_arguments.append(self.ctx.allocator(), value_id);
+            }
+            const specialized = try self.type_interner.specializeFunction(instance, static_arguments.items);
+            target.* = .{ .direct = specialized };
+            signature.* = try self.type_interner.functionSignature(specialized) orelse return error.Unavailable;
+            return null;
         }
 
         fn callFunction(self: *Self, call: semantic.UnresolvedBody.Call, span: structures.SourceSpan) !Value {
@@ -3570,7 +3529,7 @@ const TestMaterializerTypes = struct {
     }
 };
 
-const TestMaterializerBuilder = BodyBuilder(*TestMaterializerContext, void, void, TestMaterializerTypes);
+const TestMaterializerBuilder = BodyBuilder(*TestMaterializerContext, TestMaterializerTypes);
 
 fn testInitMaterializerBuilder(context: *TestMaterializerContext) TestMaterializerBuilder {
     return .{
@@ -3587,6 +3546,7 @@ fn testInitMaterializerBuilder(context: *TestMaterializerContext) TestMaterializ
             .blocks = &.{},
             .statements = &.{},
             .call_arguments = &.{},
+            .method_call_arguments = &.{},
             .struct_field_values = &.{},
             .assignment_fields = &.{},
             .root_block = @enumFromInt(0),

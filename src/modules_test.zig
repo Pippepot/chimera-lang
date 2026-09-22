@@ -1,6 +1,6 @@
 const std = @import("std");
-const query = @import("query_new.zig");
-const queries = @import("query_structures.zig");
+const query = @import("query.zig");
+const queries = @import("queries.zig");
 const structures = @import("structures.zig");
 const modules = @import("modules.zig");
 const runtime = @import("runtime.zig");
@@ -149,6 +149,271 @@ test "struct namespace declarations and instance fields dispatch separately" {
     }});
     defer f.deinit();
     try f.expectExit(0, 42);
+}
+
+test "qualified struct namespace declarations support instance calls" {
+    const f = try Fixture.init(
+        \\struct S
+        \\  i: int
+        \\func S.id(imm self: S, static T: type, imm value: T) T -> return self.i + value
+        \\var s = S{i = 2}
+        \\exit(S.id(s, int, 20) + s.id(int, 18))
+    , &.{});
+    defer f.deinit();
+    try f.expectExit(0, 42);
+}
+
+test "instance calls preserve receiver modes and namespace lookup" {
+    const f = try Fixture.init(
+        \\struct S
+        \\  i: int
+        \\static S.bump = func(mut self: S, imm amount: int)
+        \\  self.i += amount
+        \\var s = S{i = 40}
+        \\s.bump(2)
+        \\exit(s.i)
+    , &.{});
+    defer f.deinit();
+    try f.expectExit(0, 42);
+}
+
+test "instance calls evaluate the receiver before remaining arguments" {
+    const f = try Fixture.init(
+        \\struct S
+        \\  i: int
+        \\static S.combine = func(imm self: S, imm value: int) int -> return self.i * 10 + value
+        \\func receiver(mut state: int) S
+        \\  state = state * 10 + 1
+        \\  return S{i = state}
+        \\func argument(mut state: int) int
+        \\  state = state * 10 + 2
+        \\  return state
+        \\var state = 0
+        \\const result = receiver(state).combine(argument(state))
+        \\exit(result)
+    , &.{});
+    defer f.deinit();
+    try f.expectExit(0, 22);
+}
+
+test "owned instance receivers use ordinary transfer rules" {
+    const f = try Fixture.init(
+        \\struct S
+        \\  i: int
+        \\static S.take = func(var self: S) int -> return self.i
+        \\var s = S{i = 42}
+        \\exit(s^.take())
+    , &.{});
+    defer f.deinit();
+    try f.expectExit(0, 42);
+}
+
+test "qualified namespace declarations attach across module files" {
+    const f = try Fixture.init(
+        \\struct S
+        \\  i: int
+        \\const s = S{i = 42}
+        \\exit(s.id())
+    , &.{.{
+        .path = "methods.chi",
+        .module_path = "",
+        .source = "static S.id = func(imm self: S) int -> return self.i",
+    }});
+    defer f.deinit();
+    try f.expectExit(0, 42);
+}
+
+test "qualified namespace declarations recompute across edits" {
+    const entry =
+        \\struct S
+        \\  i: int
+        \\const s = S{i = 42}
+        \\exit(s.id())
+    ;
+    const original = "static S.id = func(imm self: S) int -> return self.i";
+    const f = try Fixture.init(entry, &.{.{
+        .path = "methods.chi",
+        .module_path = "",
+        .source = original,
+    }});
+    defer f.deinit();
+    try f.expectExit(0, 42);
+
+    try f.db.setInput(queries.SourceText, 1, "static S.id = func(imm self: S) int -> return self.i + 1");
+    try f.expectExit(0, 43);
+    try f.db.setInput(queries.SourceText, 1, "static S.other = func(imm self: S) int -> return self.i");
+    try f.expectDiagnostic(0, .unknown_namespace_member);
+    try f.db.setInput(queries.SourceText, 1, original);
+    try f.expectExit(0, 42);
+}
+
+test "lexical struct namespace functions support instance calls" {
+    const f = try Fixture.init(
+        \\struct S
+        \\  i: int
+        \\  func add(imm self: S, imm amount: int) int -> return self.i + amount
+        \\const s = S{i = 2}
+        \\exit(s.add(40))
+    , &.{});
+    defer f.deinit();
+    try f.expectExit(0, 42);
+}
+
+test "generated namespace functions support specialized instance calls" {
+    const f = try Fixture.init(
+        \\struct Box(T: type)
+        \\  value: T
+        \\  func get(imm self: Box(T)) T -> return self.value
+        \\const box = Box(int){value = 42}
+        \\exit(box.get())
+    , &.{});
+    defer f.deinit();
+    try f.expectExit(0, 42);
+}
+
+test "qualified namespace declarations share the struct member scope" {
+    const f = try Fixture.init(
+        \\struct S
+        \\  id: func() int
+        \\static S.id = func(imm self: S) int -> return 42
+        \\func answer() int -> return 1
+        \\const s = S{id = answer}
+        \\exit(s.id())
+    , &.{});
+    defer f.deinit();
+    try f.expectDiagnostic(0, .duplicate_struct_member);
+}
+
+test "nested instance and callable field calls retain contiguous arguments" {
+    const f = try Fixture.init(
+        \\struct S
+        \\  i: int
+        \\  callback: func(int) int
+        \\func S.add(imm self: S, imm n: int) int -> self.i + n
+        \\func S.id(imm self: S, static T: type, imm n: T) T -> n
+        \\func identity(imm n: int) int -> n
+        \\const s = S{i = 20, callback = identity}
+        \\exit(s.id(int, s.add(s.callback(s.add(2)))))
+    , &.{});
+    defer f.deinit();
+    try f.expectExit(0, 42);
+}
+
+test "namespace callable aliases preserve receiver modes and exposed signatures" {
+    const f = try Fixture.init(
+        \\struct S
+        \\  i: int
+        \\func bumpValue(mut self: S, imm n: int)
+        \\  self.i += n
+        \\func readValue(imm self: S) int -> self.i
+        \\func takeValue(var self: S) int -> self.i
+        \\static S.bump = bumpValue
+        \\static S.read: fallible(S) int = readValue
+        \\static S.take = takeValue
+        \\var s = S{i = 20}
+        \\s.bump(1)
+        \\const n = if s.read() -> s.i else 0
+        \\exit(n + s^.take())
+    , &.{});
+    defer f.deinit();
+    try f.expectExit(0, 42);
+}
+
+test "generated namespace callable aliases retain inherited specialization" {
+    const f = try Fixture.init(
+        \\struct Box(T: type)
+        \\  value: T
+        \\  func get(imm self: Box(T)) T -> self.value
+        \\  static read = get
+        \\const box = Box(int){value = 42}
+        \\exit(box.read())
+    , &.{});
+    defer f.deinit();
+    try f.expectExit(0, 42);
+}
+
+test "namespace values must be callable for instance syntax" {
+    for ([_][]const u8{ "42", "int" }) |value| {
+        const source = try std.fmt.allocPrint(testing.allocator, "struct S\n  i: int\nstatic S.bad = {s}\nconst s = S{{i = 1}}\nexit(s.bad())", .{value});
+        defer testing.allocator.free(source);
+        const f = try Fixture.init(source, &.{});
+        defer f.deinit();
+        try f.expectDiagnostic(0, .value_not_callable);
+    }
+}
+
+test "qualified declaration owners require current same module struct declarations" {
+    const cases = [_][]const u8{
+        "func Missing.id() int -> 1\nexit(42)",
+        "static S = 1\nfunc S.id() int -> 1\nexit(42)",
+        "struct S(T: type)\n  i: T\nfunc S.id() int -> 1\nexit(42)",
+        "struct S\n  i: int\nstatic Alias = S\nfunc Alias.id() int -> 1\nexit(42)",
+        "struct S\n  i: int\nfunc S.Missing.id() int -> 1\nexit(42)",
+        "static Missing.Inner = struct\n  i: int\nfunc Missing.Inner.id() int -> 1\nexit(42)",
+        "import physics.{Body}\nfunc Body.id() int -> 1\nexit(42)",
+    };
+    for (cases) |source| {
+        const f = try Fixture.init(source, &.{physics});
+        defer f.deinit();
+        try f.expectDiagnostic(0, .invalid_namespace_owner);
+    }
+}
+
+test "nested qualified owners resolve independently of declaration order" {
+    const f = try Fixture.init(
+        \\func S.Inner.get(imm self: S.Inner) int -> self.i
+        \\const s = S.Inner{i = 42}
+        \\exit(s.get())
+    , &.{.{ .path = "types.chi", .module_path = "", .source =
+        \\struct S
+        \\  struct Inner
+        \\    i: int
+    }});
+    defer f.deinit();
+    try f.expectExit(0, 42);
+}
+
+test "qualified owner validation invalidates and recovers after owner edits" {
+    const original = "struct S\n  i: int";
+    const f = try Fixture.init("func S.id() int -> 1\nexit(42)", &.{.{
+        .path = "types.chi",
+        .module_path = "",
+        .source = original,
+    }});
+    defer f.deinit();
+    try f.expectExit(0, 42);
+    for ([_][]const u8{ "", "static S = 1", "struct Other\n  i: int" }) |source| {
+        try f.db.setInput(queries.SourceText, 1, source);
+        try f.expectDiagnostic(0, .invalid_namespace_owner);
+        try f.db.setInput(queries.SourceText, 1, original);
+        try f.expectExit(0, 42);
+    }
+}
+
+test "struct field access validates qualified member collisions across edits" {
+    const f = try Fixture.init(
+        \\struct S
+        \\  i: int
+        \\const s = S{i = 42}
+        \\exit(s.i)
+    , &.{.{ .path = "members.chi", .module_path = "", .source = "static S.other = 7" }});
+    defer f.deinit();
+    try f.expectExit(0, 42);
+    try f.db.setInput(queries.SourceText, 1, "static S.i = 7");
+    try f.expectDiagnostic(1, .duplicate_struct_member);
+    try f.db.setInput(queries.SourceText, 1, "static S.other = 7");
+    try f.expectExit(0, 42);
+}
+
+test "module item locations reject unused duplicate qualified declarations" {
+    const f = try Fixture.init(
+        \\struct S
+        \\  i: int
+        \\func S.get(imm self: S) int -> self.i
+        \\exit(42)
+    , &.{.{ .path = "members.chi", .module_path = "", .source = "func S.get(imm self: S) int -> self.i" }});
+    defer f.deinit();
+    try f.expectDiagnostic(1, .duplicate_struct_member);
 }
 
 test "locals and parameters shadow imports without module fallback" {
@@ -451,16 +716,8 @@ test "factories inside struct namespaces discover their generated namespace memb
 }
 
 fn refreshDirectory(db: *query.Database, registry: *modules.SourceRegistry, directory: std.Io.Dir) !void {
-    const catalog = try modules.collectModuleFiles(testing.allocator, testing.io, directory, "main.chi");
-    defer {
-        for (catalog.files) |file| {
-            testing.allocator.free(file.path);
-            testing.allocator.free(file.module_path);
-        }
-        testing.allocator.free(catalog.files);
-        for (catalog.modules) |module| testing.allocator.free(module);
-        testing.allocator.free(catalog.modules);
-    }
+    var catalog = try modules.collectModuleFiles(testing.allocator, testing.io, directory, "main.chi");
+    defer catalog.deinit(testing.allocator);
     const files = try modules.readSources(testing.io, testing.allocator, directory, catalog.files);
     defer {
         for (files) |file| testing.allocator.free(file.source);

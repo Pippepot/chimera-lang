@@ -1,7 +1,7 @@
 const std = @import("std");
 const standard_library = @import("standard_library");
-const query = @import("query_new.zig");
-const queries = @import("query_structures.zig");
+const query = @import("query.zig");
+const queries = @import("queries.zig");
 const structures = @import("structures.zig");
 
 pub const DiscoveredFile = struct {
@@ -43,6 +43,17 @@ pub const standard_sources = [_]StandardSource{
 pub const Catalog = struct {
     files: []DiscoveredFile,
     modules: [][]u8,
+
+    pub fn deinit(self: *Catalog, gpa: std.mem.Allocator) void {
+        for (self.files) |file| {
+            gpa.free(file.path);
+            gpa.free(file.module_path);
+        }
+        gpa.free(self.files);
+        for (self.modules) |module| gpa.free(module);
+        gpa.free(self.modules);
+        self.* = undefined;
+    }
 };
 
 pub fn modulePath(gpa: std.mem.Allocator, dir_path: []const u8) ![]u8 {
@@ -129,16 +140,6 @@ pub fn collectModuleFiles(
     return .{ .files = owned_files, .modules = try modules.toOwnedSlice(gpa) };
 }
 
-fn freeCatalog(gpa: std.mem.Allocator, catalog: Catalog) void {
-    for (catalog.files) |file| {
-        gpa.free(file.path);
-        gpa.free(file.module_path);
-    }
-    gpa.free(catalog.files);
-    for (catalog.modules) |module| gpa.free(module);
-    gpa.free(catalog.modules);
-}
-
 pub fn readSources(
     io: std.Io,
     gpa: std.mem.Allocator,
@@ -167,7 +168,7 @@ pub fn readSources(
 /// membership and the catalog are the authorities for current existence.
 pub const SourceRegistry = struct {
     paths: std.StringHashMapUnmanaged(structures.FileId) = .empty,
-    known_modules: std.ArrayList(structures.ModuleId) = .empty,
+    known_modules: std.AutoHashMapUnmanaged(structures.ModuleId, void) = .empty,
 
     pub fn deinit(self: *SourceRegistry, gpa: std.mem.Allocator) void {
         var paths = self.paths.keyIterator();
@@ -199,46 +200,22 @@ pub const SourceRegistry = struct {
             const slot = try current.getOrPut(gpa, module);
             if (!slot.found_existing) slot.value_ptr.* = .empty;
         }
-        for (files) |file| {
-            const id = self.paths.get(file.path) orelse new: {
-                try self.paths.ensureUnusedCapacity(gpa, 1);
-                const owned = try gpa.dupe(u8, file.path);
-                const id: structures.FileId = @intCast(self.paths.count() + 1);
-                self.paths.putAssumeCapacityNoClobber(owned, id);
-                break :new id;
-            };
-            const module = try db.intern(queries.ModulePaths, .{ .path = file.module_path });
-            try putInput(db, queries.SourceText, id, file.source);
-            try putInput(db, queries.FileModule, id, module);
-            const slot = try current.getOrPut(gpa, module);
-            if (!slot.found_existing) slot.value_ptr.* = .empty;
-            try slot.value_ptr.append(gpa, id);
-        }
-        for (standard_sources) |file| {
-            const id = self.paths.get(file.registry_path) orelse new: {
-                try self.paths.ensureUnusedCapacity(gpa, 1);
-                const owned = try gpa.dupe(u8, file.registry_path);
-                const id: structures.FileId = @intCast(self.paths.count() + 1);
-                self.paths.putAssumeCapacityNoClobber(owned, id);
-                break :new id;
-            };
-            const module = try db.intern(queries.ModulePaths, .{ .path = file.module_path });
-            try putInput(db, queries.SourceText, id, file.source);
-            try putInput(db, queries.FileModule, id, module);
-            const slot = try current.getOrPut(gpa, module);
-            if (!slot.found_existing) slot.value_ptr.* = .empty;
-            try slot.value_ptr.append(gpa, id);
-        }
+        for (files) |file| try self.registerFile(db, gpa, &current, file);
+        for (standard_sources) |file| try self.registerFile(db, gpa, &current, .{
+            .path = file.registry_path,
+            .module_path = file.module_path,
+            .source = file.source,
+        });
         const prelude_module = try db.intern(queries.ModulePaths, .{ .path = "std.prelude" });
         try putInput(db, queries.StandardPreludeModule, {}, prelude_module);
         for (current.keys(), current.values()) |module, *members| {
             std.mem.sort(structures.FileId, members.items, {}, std.sort.asc(structures.FileId));
-            if (std.mem.indexOfScalar(structures.ModuleId, self.known_modules.items, module) == null)
-                try self.known_modules.append(gpa, module);
+            try self.known_modules.put(gpa, module, {});
             try putInput(db, queries.ModuleMembers, module, members.items);
         }
-        for (self.known_modules.items) |module| {
-            if (!current.contains(module)) try putInput(db, queries.ModuleMembers, module, &.{});
+        var previous_modules = self.known_modules.keyIterator();
+        while (previous_modules.next()) |module| {
+            if (!current.contains(module.*)) try putInput(db, queries.ModuleMembers, module.*, &.{});
         }
         const catalog = try gpa.dupe(structures.ModuleId, current.keys());
         defer gpa.free(catalog);
@@ -248,6 +225,31 @@ pub const SourceRegistry = struct {
             }
         }.lessThan);
         try putInput(db, queries.ModuleCatalog, {}, catalog);
+        // Keep partially updated memberships until a refresh fully commits.
+        self.known_modules.clearRetainingCapacity();
+        for (current.keys()) |module| self.known_modules.putAssumeCapacity(module, {});
+    }
+
+    fn registerFile(
+        self: *SourceRegistry,
+        db: *query.Database,
+        gpa: std.mem.Allocator,
+        current: *std.AutoArrayHashMapUnmanaged(structures.ModuleId, std.ArrayList(structures.FileId)),
+        file: SourceFile,
+    ) !void {
+        const id = self.paths.get(file.path) orelse new: {
+            try self.paths.ensureUnusedCapacity(gpa, 1);
+            const owned = try gpa.dupe(u8, file.path);
+            const id: structures.FileId = @intCast(self.paths.count() + 1);
+            self.paths.putAssumeCapacityNoClobber(owned, id);
+            break :new id;
+        };
+        const module = try db.intern(queries.ModulePaths, .{ .path = file.module_path });
+        try putInput(db, queries.SourceText, id, file.source);
+        try putInput(db, queries.FileModule, id, module);
+        const slot = try current.getOrPut(gpa, module);
+        if (!slot.found_existing) slot.value_ptr.* = .empty;
+        try slot.value_ptr.append(gpa, id);
     }
 };
 
@@ -293,13 +295,13 @@ test "module discovery collects nested sources and skips the entry file" {
 
     var entry_dir = try tmp.dir.openDir(io, "sibling", .{ .iterate = true });
     defer entry_dir.close(io);
-    const discovered = try collectModuleFiles(std.testing.allocator, io, entry_dir, "other.chi");
-    defer freeCatalog(std.testing.allocator, discovered);
+    var discovered = try collectModuleFiles(std.testing.allocator, io, entry_dir, "other.chi");
+    defer discovered.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), discovered.files.len);
     try std.testing.expectEqual(@as(usize, 1), discovered.modules.len);
 
-    const root_discovered = try collectModuleFiles(std.testing.allocator, io, tmp.dir, "main.chi");
-    defer freeCatalog(std.testing.allocator, root_discovered);
+    var root_discovered = try collectModuleFiles(std.testing.allocator, io, tmp.dir, "main.chi");
+    defer root_discovered.deinit(std.testing.allocator);
     const root_files = root_discovered.files;
     try std.testing.expectEqual(@as(usize, 4), root_files.len);
     try std.testing.expectEqualStrings("helpers.chi", root_files[0].path);
@@ -329,8 +331,8 @@ test "module discovery ignores directories without spellable names" {
     try tmp.dir.writeFile(io, .{ .sub_path = "with-dash/other.chi", .data = "exit(0)" });
     try tmp.dir.writeFile(io, .{ .sub_path = "_priv/ok.chi", .data = "exit(0)" });
 
-    const discovered = try collectModuleFiles(std.testing.allocator, io, tmp.dir, "main.chi");
-    defer freeCatalog(std.testing.allocator, discovered);
+    var discovered = try collectModuleFiles(std.testing.allocator, io, tmp.dir, "main.chi");
+    defer discovered.deinit(std.testing.allocator);
     const files = discovered.files;
     try std.testing.expectEqual(@as(usize, 2), files.len);
     try std.testing.expectEqualStrings("_priv/ok.chi", files[0].path);
@@ -377,8 +379,8 @@ test "module discovery and loading clean up every allocation failure" {
 }
 
 fn testCatalogAllocations(gpa: std.mem.Allocator, directory: std.Io.Dir) !void {
-    const catalog = try collectModuleFiles(gpa, std.testing.io, directory, "main.chi");
-    defer freeCatalog(gpa, catalog);
+    var catalog = try collectModuleFiles(gpa, std.testing.io, directory, "main.chi");
+    defer catalog.deinit(gpa);
     try std.testing.expectEqual(@as(usize, 2), catalog.files.len);
 }
 

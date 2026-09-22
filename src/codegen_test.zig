@@ -1,5 +1,5 @@
 const std = @import("std");
-const codegen = @import("codegen_new.zig");
+const codegen = @import("codegen.zig");
 const runtime = @import("runtime.zig");
 const structures = @import("structures.zig");
 

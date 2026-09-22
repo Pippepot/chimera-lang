@@ -379,7 +379,7 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
         .compile_time_division_by_zero => try writer.writeAll("division by zero during compile-time execution"),
         .compile_time_integer_overflow => try writer.writeAll("integer overflow during compile-time execution"),
         .compile_time_call_trace => try writer.writeAll("called at compile time from here"),
-        .struct_member_not_supported => try writer.writeAll("struct bodies currently support only fields and `move`, `copy`, or `drop` properties"),
+        .struct_member_not_supported => try writer.writeAll("struct bodies support fields, namespace declarations, and `move`, `copy`, or `drop` properties"),
         .duplicate_struct_member => try writeSourceLabel(writer, "struct member is already declared", source, span),
         .duplicate_struct_property => try writeSourceLabel(writer, "struct ownership property is already declared", source, span),
         .unknown_struct_property => {
@@ -400,6 +400,7 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
         .struct_ownership_property_incompatible_with_fields => |reason| switch (reason) {
             .trivial_move => try writer.writeAll("`move = trivial` requires every field to be trivially movable"),
             .fieldwise_move => try writer.writeAll("`move = fieldwise` requires every field to be movable"),
+            .custom_move => try writer.writeAll("a custom move hook requires every field to be movable"),
             .trivial_copy => try writer.writeAll("`copy = trivial` requires every field to be trivially copyable"),
             .fieldwise_copy => try writer.writeAll("`copy = fieldwise` requires every field to be copyable"),
             .trivial_drop => try writer.writeAll("`drop = trivial` requires every field to have trivial drop behavior"),
@@ -431,6 +432,7 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
         .misplaced_pub => try writer.writeAll("pub is only allowed on top-level static, function, struct, and import declarations"),
         .namespace_used_as_value => try writer.writeAll("a module namespace is not a value"),
         .unknown_namespace_member => try writeSourceLabel(writer, "unknown struct namespace member", source, span),
+        .invalid_namespace_owner => try writer.writeAll("qualified declaration owner must be a declared struct in the same module"),
         .unknown_module => try writeSourceLabel(writer, "unknown module", source, span),
         .unknown_imported_name => try writeSourceLabel(writer, "unknown imported name", source, span),
         .private_access => try writeSourceLabel(writer, "declaration is not public", source, span),
@@ -465,9 +467,8 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
         .unknown_struct_field => try writeSourceLabel(writer, "unknown struct field", source, span),
         .duplicate_struct_initializer_field => try writeSourceLabel(writer, "struct field is initialized more than once", source, span),
         .missing_struct_initializer_field => |details| {
-            const start = @min(details.name_span.start, source.len);
-            const end = @min(@max(details.name_span.end, start), source.len);
-            try writer.print("struct initializer is missing required field `{s}`", .{source[start..end]});
+            const definition = (try types.structDefinition(details.type_id)) orelse unreachable;
+            try writer.print("struct initializer is missing required field `{s}`", .{definition.fields[details.field_index].name});
         },
         .struct_initializer_field_type_mismatch => |mismatch| {
             try writer.writeAll("struct field initializer type mismatch: ");
