@@ -83,7 +83,6 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             explicit_transfer: bool = false,
         };
         const CallTarget = union(enum) {
-            intrinsic,
             direct: structures.InstanceId,
             indirect: structures.FunctionValueId,
         };
@@ -1849,11 +1848,6 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             defer argument_storage.deinit(self.ctx.allocator());
             var raw_arguments: []const semantic.UnresolvedBody.ValueUse = &.{};
             switch (call.target) {
-                .intrinsic => {
-                    raw_arguments = self.unresolved.call_arguments[call.arguments.start..call.arguments.end];
-                    target = .intrinsic;
-                    signature = .{ .parameters = &.{.{ .mode = .imm, .type_id = .int }}, .return_type = .never, .is_fallible = false };
-                },
                 .unknown_function => return self.reject(span, .unknown_function),
                 .direct => |instance| {
                     raw_arguments = self.unresolved.call_arguments[call.arguments.start..call.arguments.end];
@@ -1950,10 +1944,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             }
             const argument_start: u32 = @intCast(self.call_arguments.items.len);
             for (arguments_to_consume.items) |owned_argument| try self.recordConsume(owned_argument);
-            switch (target) {
-                .intrinsic => {},
-                .direct, .indirect => try self.call_arguments.appendSlice(self.ctx.allocator(), arguments_to_publish.items),
-            }
+            try self.call_arguments.appendSlice(self.ctx.allocator(), arguments_to_publish.items);
             const arguments: structures.FunctionValueRange = .{ .start = argument_start, .end = @intCast(self.call_arguments.items.len) };
             const mut_argument_start: u32 = @intCast(self.pending_mut_arguments.items.len);
             try self.pending_mut_arguments.appendSlice(self.ctx.allocator(), mut_arguments_to_publish.items);
@@ -1977,12 +1968,6 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     .is_fallible = signature.is_fallible,
                     .mut_arguments = mut_arguments,
                 } },
-                .intrinsic => blk: {
-                    const result = try self.appendInstruction(.{ .exit = arguments_to_publish.items[0].value });
-                    try self.moveCurrentBoundaryEffectsToTerminator();
-                    self.terminate(.diverge);
-                    break :blk .{ .diverged = result };
-                },
             };
         }
 
@@ -3401,7 +3386,7 @@ fn normalizeInstructions(instructions: []structures.FunctionInstruction, instruc
         .mut_parameter_write => |*operation| operation.value = normalizeValue(operation.value, instruction_values),
         .call => {},
         .indirect_call => |*call| call.target = normalizeValue(call.target, instruction_values),
-        .variant_tag, .exit, .negi => |*operand| operand.* = normalizeValue(operand.*, instruction_values),
+        .variant_tag, .negi => |*operand| operand.* = normalizeValue(operand.*, instruction_values),
         .addi, .subi, .muli, .divsi => |*operands| {
             operands.lhs = normalizeValue(operands.lhs, instruction_values);
             operands.rhs = normalizeValue(operands.rhs, instruction_values);

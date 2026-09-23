@@ -1,4 +1,5 @@
 const std = @import("std");
+const standard_library = @import("standard_library");
 const query = @import("query.zig");
 const queries = @import("queries.zig");
 const structures = @import("structures.zig");
@@ -67,10 +68,76 @@ test "an explicit empty prelude import suppresses the default inclusion" {
     try f.expectDiagnostic(0, .unknown_function);
 }
 
+test "an explicit empty prelude import also suppresses exit" {
+    const f = try Fixture.init("import std.prelude.{}\nexit(42)", &.{});
+    defer f.deinit();
+    try f.expectDiagnostic(0, .unknown_function);
+}
+
 test "an explicit prelude import replaces the default selection" {
-    const f = try Fixture.init("import std.prelude.{example}\nexit(example())", &.{});
+    const f = try Fixture.init("import std.prelude.{example}\nimport std.exit.{exit}\nexit(example())", &.{});
     defer f.deinit();
     try f.expectExit(0, 42);
+}
+
+test "exit is an imported function, not a reserved call name" {
+    const f = try Fixture.init(
+        \\import std.prelude.{}
+        \\import std.exit
+        \\func exit(imm code: int) int -> code + 1
+        \\const terminate: func(int) never = std.exit.exit
+        \\terminate(exit(41))
+    , &.{});
+    defer f.deinit();
+    try f.expectExit(0, 42);
+}
+
+test "an unsupported external declaration is rejected at signature lookup" {
+    const f = try Fixture.init("extern func goodbye(code: int) never\ngoodbye(42)", &.{});
+    defer f.deinit();
+    try f.expectDiagnostic(0, .unsupported_external_declaration);
+}
+
+test "compiler-owned exit signature invalidates and recovers" {
+    const db = try query.Database.init(testing.allocator, .{ .worker_count = 2 });
+    defer db.deinit();
+    var registry: modules.SourceRegistry = .{};
+    defer registry.deinit(testing.allocator);
+    try registry.update(db, testing.allocator, "exit(42)", &.{}, &.{});
+    const exit_file = registry.fileId("$std/exit.chi").?;
+    try db.setInput(queries.SourceText, exit_file, "pub extern func exit(code: bool) never");
+    try testing.expect((try db.get(queries.BuildExecutable, 0)).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(queries.BuildExecutable, 0, structures.Diagnostic, testing.allocator);
+    defer testing.allocator.free(diagnostics);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(exit_file, diagnostics[0].file_id);
+    try testing.expectEqual(structures.Diagnostic.Kind.invalid_external_signature, diagnostics[0].kind);
+
+    try db.setInput(queries.SourceText, exit_file, standard_library.exit);
+    const f: Fixture = .{ .db = db };
+    try f.expectExit(0, 42);
+}
+
+test "compile-time std exit emits compiler control without an executable" {
+    const f = try Fixture.init("const result = comptime -> exit(42)", &.{});
+    defer f.deinit();
+    try testing.expect((try f.db.get(queries.BuildExecutable, 0)).* == null);
+    const controls = try f.db.transitiveAccumulatorValues(queries.BuildExecutable, 0, structures.CompilerControl, testing.allocator);
+    defer testing.allocator.free(controls);
+    try testing.expectEqualSlices(structures.CompilerControl, &.{.{ .exit = 42 }}, controls);
+}
+
+test "indirect compile-time std exit preserves compiler control" {
+    const f = try Fixture.init(
+        \\const result = comptime
+        \\  const terminate = exit
+        \\  terminate(42)
+    , &.{});
+    defer f.deinit();
+    try testing.expect((try f.db.get(queries.BuildExecutable, 0)).* == null);
+    const controls = try f.db.transitiveAccumulatorValues(queries.BuildExecutable, 0, structures.CompilerControl, testing.allocator);
+    defer testing.allocator.free(controls);
+    try testing.expectEqualSlices(structures.CompilerControl, &.{.{ .exit = 42 }}, controls);
 }
 
 test "current module declarations shadow default prelude exports" {

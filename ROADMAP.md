@@ -1,189 +1,124 @@
 # Roadmap
 
-[syntax&semantics.txt](syntax&semantics.txt) is authoritative but incomplete. Make missing language decisions before implementing dependent behavior; legacy parity is not a goal.
+[syntax&semantics.txt](syntax&semantics.txt) owns language rules; this document tracks the implemented foundation and next priorities. Settle missing semantics there before implementation. Legacy parity is not a goal.
 
 ## Current foundation
 
-- Incremental queries preserve stable declaration and type identities, owned results, diagnostics, and equal-result retention.
-- Folder modules support shared declarations, file-scoped imports, public re-exports, qualified type/value/call lookup, entry-only execution, directory refresh, file-aware CLI output, and an embedded `std.prelude` resolved once and included by default in user files with an explicit-import override. Compiler-owned standard modules are exempt. All module-spec slices are complete.
-- Struct namespace declarations support qualified calls and constants without affecting instance layout. Generated namespaces retain inherited static arguments; fields and ordinary declarations share a name scope, separate from ownership hooks.
-- Same-module qualified declarations can extend a named struct namespace across files. Instance calls insert an explicit receiver into the corresponding namespace function after resolving its nominal type, preserving static specialization, parameter modes, ownership, mutable copy-back, callable-field behavior, and left-to-right evaluation.
-- Typing publishes one SSA control-flow graph with fallible edges, joins, loops, calls, callable values, variants, and divergence.
-- Structs have nominal identity, cycle-checked layout, source-ordered initialization, field access, field updates through mutable local roots, and validated move/copy/drop strategy overrides.
-- Function-valued struct properties receive stable owner-qualified item identities, reuse ordinary signature and body queries without entering module scope, and are validated against exact copy/move/drop signatures. Typing lowers custom hooks to ordinary direct calls, recursively composes fieldwise struct and active-variant operations, and suppresses redispatch only for compiler-generated plumbing inside the active hook.
-- Callable declarations and types share ordered mode/type parameter records. Function declarations support omitted or explicit `imm`, borrowed `mut`, owned `var`, and cleanup-authorized `deinit`; inferred callable values retain exact modes. Mutable arguments require exact-typed mutable places and reject overlapping immutable or mutable argument paths.
-- Direct calls support explicit `static` type and exact-typed value parameters. Canonical static argument tuples extend `InstanceId`; signatures and bodies are instantiated per tuple, static arguments are omitted from the runtime ABI, and equal instances retain analysis and code across incremental recomputation. Unbound generic function values remain unsupported.
-- Compile-time values and ordered value tuples have canonical session identities;
-  specialization keys contain value IDs rather than copied payloads. The
-  compiler-only `type` identity and source/call keys establish the execution
-  query boundary. Demanded static initializers and explicit `comptime`
-  expressions now use inferred-result typed SSA thunks and a host interpreter
-  for constants, integer operations, predicates, joins, mutable locals, loops,
-  returns, fallible control flow, and `exit`. Direct and concrete indirect
-  calls are cached by specialized instance plus canonical interpreted arguments;
-  repeated calls share results, identical-key recursion is diagnosed, changing-
-  argument recursion and loops run without compiler-defined execution limits,
-  and value static arguments execute as thunks. Canonical struct and variant values,
-  field operations, coercions,
-  mutable copy-back, and custom ownership hooks now execute through the same
-  typed IR, including path-specific aggregate cleanup. Type-valued functions
-  return canonical primitive, variant, callable, alias, and nominal identities;
-  direct calls execute in type positions, canonical type equality supports
-  specialization logic, and runtime use remains rejected. All inferred and
-  runtime-annotated static initializers now use the same typed-thunk evaluator,
-  with one execution-failure diagnostic boundary. Anonymous structs returned by
-  type-valued functions have source-site-and-specialization nominal identity,
-  lazily resolved fields, and shared runtime struct lowering. Parameterized
-  named struct declarations lower to these type-valued functions with implicit
-  static parameters. Generated definitions use the same validated ownership
-  declarations as declared structs, with custom hooks specialized by the
-  enclosing type factory. Instruction and terminator source maps report the
-  reached execution error followed by its compile-time call trace. Local
-  captures remain unsupported.
-- Lexical const and var bindings have stable root-place identities. Typing tracks available, transferred, and possibly transferred states through branches and loops; whole assignment restores a mutable root.
-- Bare place values borrow in observation and `imm` calls. Bindings, replacement assignments, struct fields, returns, and owned calls require copy support; `^` explicitly transfers movable local roots. Owned temporaries pass directly. `var` and `deinit` parameters are mutable owned roots, with only `deinit` authorized to satisfy explicit drop. Partial-field transfer remains rejected.
-- ASAP destruction is implemented through semantic cutover, incremental recomputation, and cleanup review for the current value model. Query-local generation analysis materializes path-sensitive cleanup at the earliest completed boundary after each final use across roots, parameters, temporaries, calls, projections, conditional ownership, control-flow edges, and whole-root replacement. Explicit-drop trees must transfer or reach a `deinit` parameter on every path. Automatic custom drop lowers to ordinary typed IR, while trivial and hook-free fieldwise cleanup require no runtime instruction. Origin dependencies for pointers and views, independent partial-place lifetimes, and stable storage for immovable values remain future work; field-target replacement stays boundary-local until partial places are implemented.
+- Incremental queries retain stable declaration and type identities, diagnostics, owned results, and equal-result reuse.
+- Folder modules, file-scoped imports, re-exports, qualified lookup, entry-only execution, and directory refresh are implemented. The embedded `std.prelude` is implicitly imported by user files, with an explicit-import override.
+- Named and generated structs have nominal identity, namespace members and instance calls, layout, field operations, and validated move/copy/drop hooks.
+- Typed SSA covers calls, static specialization, callable values, variants, joins, loops, divergence, and fallible control flow. Compile-time thunks and specialized calls evaluate through typed IR, including structs, hooks, and type-valued functions; local captures remain unsupported.
+- Ownership tracks whole-root transfers, borrowed and owned parameters, mutable copy-back, and path-sensitive ASAP cleanup. Partial-field transfer, stable storage for immovable values, and origin-aware pointers/views remain open.
+- Compiler-provided `extern func` declarations use named std identities and ordinary calls. `std.exit.exit` is exported by the prelude, with distinct runtime termination and compile-time compiler control.
 
 ## Priority and dependencies
 
-Build toward small programs that use an always-included standard library,
-generic collections, and ordinary iteration. Prioritize modules, external
-declarations, and specialization as foundations for that library. Specify
-advanced ownership storage alongside the pointer and collection operations
-that need it.
-
-The order below is the default implementation priority, not a requirement to
-finish every item in one milestone before starting independent work. Proposed
-features and decisions marked TBD are planning commitments, not settled language
-rules. Record their semantics in `syntax&semantics.txt` before implementation.
-Each slice must cover diagnostics, execution, ownership paths, and incremental
-recomputation. Keep unsupported forms rejected at their owning boundary.
+Make incremental compilation durable and parallel before expanding the language
+toward generic collections and ordinary iteration. Independent slices can
+proceed earlier. Each language slice covers diagnostics, execution, ownership,
+and incremental recomputation; reject unsupported forms at their owning boundary.
 
 ## Ordered milestones
 
-### 1. External declarations and standard-library bootstrap
+### 1. Persistent and parallel incremental compilation
 
-- Add **external** for compiler-defined functions and externally defined
-  functions, including **C ABI** calls. Specify how declarations identify their
-  implementation, symbol, and calling convention; compiler-defined behavior and
-  foreign ABI calls have distinct implementation requirements.
-- Establish runtime-symbol linking and the supported foreign argument, return,
-  layout, and ownership boundary. The current internal calling convention is
-  not a C ABI. Expand supported foreign signatures in explicit slices.
-- Replace dedicated `exit` handling with a runtime declaration as part of this
-  work; remove the temporary intrinsic machinery.
-- Expand the embedded **standard library** and its always-included
-  `std.prelude` using modules and external declarations. Add math functions as
-  numeric support permits, and define allocation and release services for
-  pointers and collections. Exact APIs and compiler/library placement remain
-  open.
+- Cache reusable query results and dependencies on disk across compiler runs.
+  Define stable serialized identities for session-local IDs, cache versioning,
+  validation against changed or removed inputs, and safe recovery from stale or
+  corrupt files. Reuse unchanged analysis and code without sacrificing diagnostics
+  or equal-result invalidation behavior.
+- Run independent CLI queries on multiple workers instead of forcing one worker.
+  Preserve query ownership, failure recovery, and deterministic diagnostics and
+  artifacts; test cold/warm caches, source edits, corrupt caches, and one versus
+  multiple workers.
 
-### 2. Storage, origins, pointers, and borrowed views
+### 2. Storage and pointer foundations
 
-- Specify **partial-field transfer** and **final storage for immovable values**,
-  including partial initialization, cleanup, stable addresses, and calling
-  conventions. Implement each when required by a concrete operation rather
-  than making all storage work a prerequisite for unrelated language features.
-- Implement **Pointer**, **OwnedPointer**, and **ArcPointer** with the Mojo 1.0
-  semantics recorded in `syntax&semantics.txt`. The requested **UnsafePointers**
-  capability belongs to unified Pointer's explicitly unsafe operations, rather
-  than a separate type. [Mojo's pointer guide](https://mojolang.static.modular.com/docs/manual/pointers/)
-  and [1.0 release notes](https://mojolang.static.modular.com/releases/v1.0.0/)
-  are the versioned design reference.
-- Before choosing representations, separate pointee type, mutability, origin,
-  ownership, and allocation policy. Implement origin-based lifetime and aliasing
-  checks and connect them to last-use destruction. Track dependencies through
-  returned and stored borrows, including multiple possible origins and
-  collection element invalidation. Define construction, dereference, and origin
-  syntax; map pointer APIs and foreign memory access to this language's parameter
-  and ownership rules. Existing non-escaping `mut` calls do not provide the
-  required lifetime tracking.
-- **Borrowed views:** support non-owning views that can be returned and stored
-  while preserving backing-data lifetime and access restrictions. Define the
-  first view API alongside List slices and iteration; infer origins where
-  possible and expose them in borrowing contracts when needed. Test owner
-  destruction timing, escaping views, and invalidation by storage changes.
-- Establish low-level storage and **Pointer**, then **OwnedPointer** and the
-  collection operations that use it; add **ArcPointer** afterward. Decide the
-  compiler/standard-library boundary and specify API details for shared mutation,
-  cycles/weak references, and explicit-drop compatibility using Mojo's contracts.
-  Preserve the chosen non-nullability, unique ownership, and atomic shared
-  ownership guarantees while settling those details.
+- Define **byte** representation, literals, and its relationship to `int`
+  before byte-oriented storage and I/O; leave mixed numeric coercions for
+  milestone 7.
+- Specify partial-field transfer and stable storage for immovable values as
+  concrete pointer/collection operations require them, including initialization,
+  cleanup, and address stability.
+- Separate pointee type, mutability, origin, ownership, and allocation policy.
+  Implement origin-based lifetime and aliasing checks across returned/stored
+  borrows and last-use destruction; current non-escaping `mut` calls are
+  insufficient.
+- Implement non-null **Pointer** (including explicitly unsafe operations), then
+  unique **OwnedPointer** and allocation/release for collections. Add borrowed
+  views for text and List slices, including storage-change invalidation. Add atomic
+  **ArcPointer** later, after shared mutation and weak/cycle behavior are
+  specified. Record the chosen language contracts in
+  [syntax&semantics.txt](syntax&semantics.txt), using Mojo 1.0 as the versioned
+  design reference; see the
+  [pointer guide](https://mojolang.static.modular.com/docs/manual/pointers/)
+  and [release notes](https://mojolang.static.modular.com/releases/v1.0.0/).
 
-### 3. Ranges, List, and iteration
+### 3. Text and basic I/O
 
-- **Ranges:** implement the specified exclusive/inclusive bounds and ascending
-  empty-range behavior. Specify endpoint types, explicit descending iteration,
-  steps, and overflow-safe termination.
-  Decide whether `Range` is a library type with language syntax support.
-- Implement a generic **List** as the first collection using the established
-  allocation, ownership, and specialization contracts. Specify indexing,
-  bounds failures, growth, element replacement/removal, and cleanup.
-- Add **`for x in iterable`** for a Range, List, other collections, and custom
-  types conforming to an iteration contract. **How a type conforms is TBD**;
-  do not assume a trait system or hard-code a closed set of iterable types.
-- Implement read-only iteration by default; specify explicit mutation and
-  consumption syntax. Specify iterable evaluation, item binding lifetimes,
-  iterator state, exhaustion, mutation during iteration, and cleanup on normal
-  exit, `break`, `continue`, return, and failure. Decide loop result semantics
-  and reuse the existing control-flow and ownership machinery. A range-only
-  slice can precede List, but must fit the same intended iteration contract.
+- Define UTF-8 string literals and a `std` **String** exported through
+  `std.prelude`. Specify its representation and ownership on the pointer/storage
+  foundation: literal bytes can have static storage, while growing owned text
+  needs allocation. Do not require every string value to be heap-allocated.
+- Add compiler-provided runtime text output and fallible byte input/output
+  through ordinary declarations; specify write failures, UTF-8 validation,
+  borrowing for slices, and cleanup. Compile-time execution retains no ambient
+  I/O.
 
-### 4. Collection and algorithm library
+### 4. Ranges, List, and iteration
 
-- Add **Map**, **Set**, **Queue**, and **Stack**. Decide representations and
-  whether Queue/Stack reuse List storage; do not assume each needs a compiler
-  type. Specify equality/hash requirements for Map/Set and iteration order,
-  mutation, and ownership behavior for every collection.
-- Add standard-library **reverse**, **sort**, and **swap**, and expand **math
-  functions**. Specify mutating versus value-returning APIs, comparator and
-  ordering contracts, sort stability, and ownership/aliasing requirements.
-  Ship individual functions as soon as their prerequisites exist.
-- **Operator functions (TBD):** decide declaration syntax, lookup, admissible
-  operators, operand modes, result types, and fallibility using concrete numeric
-  or collection examples. Coordinate with coercions and namespace functions;
-  ordinary named functions can support the initial library.
+- Implement exclusive/inclusive ascending ranges and empty-range behavior.
+  Decide endpoint types, descending iteration, steps, overflow-safe termination,
+  and whether `Range` is a library type with syntax support.
+- Implement generic **List** with allocation, indexing/bounds behavior, growth,
+  replacement/removal, and cleanup.
+- Define an open iteration contract for Range, List, and user types before
+  implementing `for x in iterable`; do not hard-code iterable types or assume
+  traits. Start with read-only items, then specify mutation/consumption,
+  iterator state and invalidation, loop results, and cleanup on every exit path.
+  Range-only iteration may precede List if it uses that contract.
 
 ### 5. Structural tuples
 
-- **Structural tuples**, such as `(foo, bar)`: implement the specified ordered,
-  unnamed structural identity. Specify type spelling, element access,
-  destructuring, layout, and elementwise ownership. Resolve grouping and
-  singleton syntax consistently with the existing `()` unit value. Tuples
-  support multiple values and later map iteration.
+- Implement ordered structural identity for `(foo, bar)` with type spelling,
+  access, destructuring, layout, and elementwise ownership. Resolve grouping
+  and singleton syntax alongside `()`; tuples support multiple results and
+  later Map iteration.
 
 ### 6. Match
 
-- **Match:** evaluate the subject once; support literal, wildcard, binding,
-  `pattern as name`, and `is Type` patterns; diagnose redundancy and
-  non-exhaustiveness; reuse existing branch joins and variant mappings.
+- Evaluate the subject once; add literal, wildcard, binding, `pattern as name`,
+  and `is Type` patterns. Diagnose redundancy and non-exhaustiveness using
+  existing branch joins and variant mappings.
 
 ### 7. Numeric foundations
 
-- Define **explicit numeric conversions/casts first**: syntax, supported source
-  and destination types, failure behavior, rounding, and overflow. Existing
-  variant extraction with `as` does not provide numeric conversion semantics.
-- Add **byte**, deciding its arithmetic behavior,
-  literal typing, and relationship to integer types.
-- Then specify **numeric coercions (TBD)**: whether conversions may be implicit,
-  mixed numeric operations, and their interaction with literal typing. Publish
-  accepted conversions in typed IR rather than rediscovering them in codegen.
-- Specify the full **float** model (representation, literals, conversions,
-  arithmetic, comparison, and exceptional values), then implement it as one
-  scalar slice. This supports the standard library's floating-point math.
-- Evaluate additional integer widths, including **u31** and **i128**, and whether
-  custom bit/byte lengths are supported. Exact widths, storage layout, alignment,
-  arithmetic, and ABI behavior are TBD; these optional extensions need not block
-  byte, float, or the first library.
+- Define explicit conversions first: syntax, supported types, overflow,
+  rounding, and failure. Settle implicit coercions and mixed operations
+  separately, publishing conversions in typed IR.
+- Specify and implement **float** representation, literals, arithmetic,
+  comparisons, conversions, and exceptional values before floating-point
+  library math. Additional widths (`u31`, `i128`, custom widths) are optional
+  follow-ups.
+- Specify operator-function declarations and lookup using `int.+` as the first
+  case: operand modes, precedence, result and failure types, and whether
+  compiler-owned primitive types can have `std`-defined namespace functions.
+  Extend to float and user structs after their semantics are settled; do not
+  assume general overloading follows from operator lookup.
 
-## Other open or deferred work
+### 8. Collections and algorithms
 
-- General overloading, function literals, and closures need separate semantic
-  decisions and a concrete use case; namespace calls, iteration conformance,
-  and operator functions do not implicitly settle any of them.
-- Persistent caching and extra targets need an explicit use case.
-- Finer-grained source invalidation and parallel CLI compilation require measured
-  evidence that current whole-file dependencies or scheduling are limiting.
-- Decide whether the CLI should validate unreachable declarations; current
-  compilation intentionally diagnoses only demanded signatures, bodies, and values.
-- Specify postfix `?`, `sizeof`, and return-type inference before implementation.
+- Add **Map**, **Set**, **Queue**, and **Stack** on established storage and
+  iteration contracts. Specify hashing/equality, ordering, mutation, and
+  ownership; Queue/Stack may reuse List.
+- Grow the standard library as prerequisites land: **swap**, **reverse**,
+  **sort**, and numeric **math**. Decide comparator, stability, fallibility,
+  and mutating/value-returning APIs for each.
+
+## Deferred or independent work
+
+- General overloading, function literals, closures, postfix `?`, `sizeof`,
+  and return-type inference need separate language decisions.
+- Extra targets need use cases; finer-grained invalidation needs measurements.
+  Decide separately whether unreachable declarations should be validated
+  (currently only demanded signatures, bodies, and values are diagnosed).

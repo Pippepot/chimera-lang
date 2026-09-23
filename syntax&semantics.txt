@@ -226,8 +226,14 @@ func apply(operation: func(int) int, value: int) int -> operation(value)
 const operation = choose()
 exit(apply(operation, 21))
 
-# exit(exit_code: int) is compiler-known for now and returns never. At runtime it
-# terminates the program. During compile-time execution it produces an
+# A named `extern func` has a signature but no source body. It is a compiler-
+# provided declaration, not a general foreign-function interface. Only
+# `std.exit.exit` currently has an implementation; other extern declarations
+# are rejected when their signatures are demanded. The compiler requires its
+# exact signature, `extern func exit(code: int) never`. `std.prelude` exports it
+# to user files by default; an explicit prelude import may exclude it. Normal
+# lexical lookup and callable references apply, including shadowing.
+# At runtime exit terminates the program. During compile-time execution it produces an
 # uncatchable compiler-control exit carrying the i32 code. The effect propagates
 # through compile-time calls and queries, stops the active compilation request,
 # and produces no executable. It is not a source diagnostic or a fallible

@@ -143,7 +143,7 @@ const LocationPlan = struct {
                     needed[@intFromEnum(call.target)] = .used;
                     for (ssa.call_arguments[call.arguments.start..call.arguments.end]) |argument| needed[@intFromEnum(argument.value)] = .used;
                 },
-                .variant_tag, .exit, .negi => |operand| needed[@intFromEnum(operand)] = .used,
+                .variant_tag, .negi => |operand| needed[@intFromEnum(operand)] = .used,
                 .addi, .subi, .muli, .divsi => |operands| {
                     needed[@intFromEnum(operands.lhs)] = .used;
                     needed[@intFromEnum(operands.rhs)] = .used;
@@ -239,9 +239,6 @@ const LocationPlan = struct {
                         break :location_blk .discarded;
                     },
                     .indirect_call => |call| if (call.return_type == .unit) {
-                        break :location_blk .discarded;
-                    },
-                    .exit => {
                         break :location_blk .discarded;
                     },
                     else => {},
@@ -417,7 +414,6 @@ fn FunctionEmitter(comptime Types: type) type {
                     .call_mut_argument => |operation| try self.emitCallMutArgument(operation, destination),
                     .call => |call| try self.emitCall(call, destination),
                     .indirect_call => |call| try self.emitCall(call, destination),
-                    .exit => |operand| try self.emitExit(operand),
                     .negi => |operand| {
                         try self.loadValue(self.locations[@intFromEnum(operand)]);
                         try self.encoder.negateEax();
@@ -615,13 +611,6 @@ fn FunctionEmitter(comptime Types: type) type {
                 .discarded => {},
                 .immediate, .eax, .incoming_argument => unreachable,
             }
-        }
-
-        fn emitExit(self: *Self, operand: structures.FunctionValueId) !void {
-            try self.loadValue(self.locations[@intFromEnum(operand)]);
-            try self.encoder.movEdiFromEax();
-            try self.encoder.movEaxImmediate32(linux_exit_syscall);
-            try self.encoder.syscall();
         }
 
         fn emitIntegerBinary(
@@ -929,6 +918,25 @@ pub fn compileFunction(ssa: *const structures.FunctionBodyAnalysis, types: anyty
     defer emitter.deinit();
     try emitter.emit(ssa);
     return emitter.finish();
+}
+
+pub fn compileExternalExit(gpa: std.mem.Allocator) !structures.CompiledFunction {
+    var encoder = try X86Encoder.init(gpa);
+    defer encoder.deinit();
+    try encoder.movEaxFromRsp(8);
+    try encoder.movEdiFromEax();
+    try encoder.movEaxImmediate32(linux_exit_syscall);
+    try encoder.syscall();
+    const code = try encoder.code.toOwnedSlice(gpa);
+    errdefer gpa.free(code);
+    const relocations = try gpa.alloc(structures.CompiledFunction.Relocation, 0);
+    errdefer gpa.free(relocations);
+    return .{
+        .code = code,
+        .required_alignment = 1,
+        .relocations = relocations,
+        .referenced_instances = try gpa.alloc(structures.InstanceId, 0),
+    };
 }
 
 pub const ReachableFunction = struct {

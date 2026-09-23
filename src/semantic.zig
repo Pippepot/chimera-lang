@@ -89,7 +89,6 @@ pub const UnresolvedBody = struct {
         span: structures.SourceSpan,
 
         pub const Target = union(enum) {
-            intrinsic,
             direct: structures.InstanceId,
             unknown_function,
             value: ValueUse,
@@ -988,13 +987,11 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 shape: structures.FunctionShape,
             };
             const PendingTarget = union(enum) {
-                intrinsic,
                 direct: DirectTarget,
                 unknown_function,
                 value: UnresolvedBody.ValueUse,
             };
             const pending_target: PendingTarget = target: {
-                if (callee.tag == .identifier and std.mem.eql(u8, self.source[span.start..span.end], "exit")) break :target .intrinsic;
                 if (try self.namedExpression(callee_index)) |reference| {
                     if (reference == .declaration) {
                         if (try self.type_interner.functionShape(reference.declaration.item)) |shape|
@@ -1011,7 +1008,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             const argument_nodes = self.ast.nodeList(node.data.node_node.b);
             const parameter_shapes: ?[]const structures.FunctionParameterShape = switch (pending_target) {
                 .direct => |direct| direct.shape.parameters,
-                .intrinsic, .unknown_function, .value => null,
+                .unknown_function, .value => null,
             };
             if (parameter_shapes) |parameters| {
                 if (argument_nodes.len != parameters.len) return self.reject(callee_index, .{ .call_argument_count_mismatch = .{
@@ -1064,7 +1061,6 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 });
             }
             const target: UnresolvedBody.Call.Target = switch (pending_target) {
-                .intrinsic => .intrinsic,
                 .unknown_function => .unknown_function,
                 .value => |value| .{ .value = value },
                 .direct => |direct| .{ .direct = try self.type_interner.specializeFunction(direct.instance, static_arguments.items) },
@@ -1152,6 +1148,11 @@ const FunctionParts = struct {
     signature: structures.Node.Index,
     body: structures.Node.Index,
 };
+
+pub fn isExternalFunction(ast: *const structures.Ast, declaration: u32) bool {
+    const parts = functionParts(ast, declaration);
+    return parts.body == .null;
+}
 
 pub fn analyzeFunctionSignature(
     ast: *const structures.Ast,
@@ -1795,7 +1796,7 @@ fn functionParts(ast: *const structures.Ast, declaration: u32) FunctionParts {
     } else declaration_node;
     std.debug.assert(function.tag == .func);
     const signature = function.data.node_node.a.unwrap() orelse unreachable;
-    const body = function.data.node_node.b.unwrap() orelse unreachable;
+    const body = function.data.node_node.b;
     std.debug.assert(ast.nodes[signature.index()].tag == .signature);
     return .{ .function = if (declaration_node.tag == .static_binding) declaration_node.data.node_node.b else @enumFromInt(declaration), .signature = signature, .body = body };
 }

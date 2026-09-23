@@ -146,24 +146,14 @@ test "ordinary function artifacts encode signed 32-bit literal returns" {
     }
 }
 
-test "exit emits an inline syscall without references" {
-    var instructions = [_]structures.FunctionBodyAnalysis.Instruction{
-        integerConstant(42),
-        .{ .exit = @enumFromInt(0) },
-    };
-    var blocks = [_]structures.FunctionBodyAnalysis.Block{.{
-        .instruction_start = 0,
-        .instruction_end = instructions.len,
-        .terminator = .diverge,
-    }};
-    const ssa = functionSsa(&instructions, &blocks);
-    var artifact = try codegen.compileFunction(&ssa, TestTypes{}, std.testing.allocator);
+test "external exit artifact reads its argument from the call stack" {
+    var artifact = try codegen.compileExternalExit(std.testing.allocator);
     defer artifact.deinit(std.testing.allocator);
 
     try std.testing.expectEqualSlices(u8, &.{
-        0xB8, 42,   0,    0,    0,
-        0x89, 0xC7, 0xB8, 60,   0,
-        0,    0,    0x0F, 0x05,
+        0x8B, 0x84, 0x24, 8,  0, 0, 0,
+        0x89, 0xC7, 0xB8, 60, 0, 0, 0,
+        0x0F, 0x05,
     }, artifact.code);
     try std.testing.expectEqual(@as(usize, 0), artifact.relocations.len);
     try std.testing.expectEqual(@as(usize, 0), artifact.referenced_instances.len);

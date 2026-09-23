@@ -29,11 +29,12 @@ pub fn renderReachableSsa(
     try writer.writeAll("SSA\n");
     for (reachable.instances) |instance| {
         const body = if (instance.specialization == null)
-            (try db.get(queries.AnalyzeFunctionBody, instance.item)).* orelse unreachable
+            (try db.get(queries.AnalyzeFunctionBody, instance.item)).*
         else
-            (try db.get(queries.AnalyzeFunctionInstance, instance)).* orelse unreachable;
+            (try db.get(queries.AnalyzeFunctionInstance, instance)).*;
+        if (body == null) continue;
         try renderFunctionSource(db, instance, sources, writer);
-        try renderSsaFunction(db, instance, &body, writer);
+        try renderSsaFunction(db, instance, &body.?, writer);
     }
 }
 
@@ -213,7 +214,6 @@ fn renderInstruction(
             try writer.writeByte('\n');
         },
         .indirect_call => |call| try writer.print("    %{d} = call %{d}\n", .{ result, @intFromEnum(call.target) }),
-        .exit => |operand| try writer.print("    %{d} = exit %{d}\n", .{ result, @intFromEnum(operand) }),
         .negi => |operand| try writer.print("    %{d} = negi %{d}\n", .{ result, @intFromEnum(operand) }),
         .addi => |operands| try renderBinary(writer, result, "addi", operands),
         .subi => |operands| try renderBinary(writer, result, "subi", operands),

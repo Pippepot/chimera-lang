@@ -1,1 +1,2 @@
 pub import std.example.{example}
+pub import std.exit.{exit}

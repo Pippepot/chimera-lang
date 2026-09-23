@@ -204,7 +204,7 @@ fn parseExpression(parser: *ParserState) ParseError!Node.Index {
         .keyword_const, .keyword_var, .keyword_static => try parseBinding(parser),
         .keyword_pub => try parsePublic(parser),
         .keyword_import => try parseImport(parser),
-        .keyword_func, .keyword_fallible => try parseFunction(parser),
+        .keyword_func, .keyword_fallible, .keyword_extern => try parseFunction(parser),
         .keyword_return => try parseReturn(parser),
         .keyword_break => try parseBreak(parser),
         .keyword_continue => try parseTokenNode(parser, .keyword_continue, .continue_expr),
@@ -343,7 +343,7 @@ fn parsePublic(parser: *ParserState) !Node.Index {
     _ = try parser.expect(.keyword_pub);
     const inner = switch (parser.tokens[parser.index].tag) {
         .keyword_const, .keyword_var, .keyword_static => try parseBinding(parser),
-        .keyword_func, .keyword_fallible => try parseFunction(parser),
+        .keyword_func, .keyword_fallible, .keyword_extern => try parseFunction(parser),
         .keyword_struct => try parseStruct(parser),
         .keyword_import => try parseImport(parser),
         else => {
@@ -435,13 +435,18 @@ fn parseIfExpr(parser: *ParserState) ParseError!Node.Index {
 
 fn parseFunction(parser: *ParserState) !Node.Index {
     const token_index = parser.index;
-    _ = parser.eatAny(&.{ .keyword_func, .keyword_fallible }).?;
-    const name: ?DeclarationName = if (parser.tokens[parser.index].tag == .identifier)
+    const external = parser.eat(.keyword_extern) != null;
+    if (external) {
+        _ = try parser.expect(.keyword_func);
+    } else {
+        _ = parser.eatAny(&.{ .keyword_func, .keyword_fallible }).?;
+    }
+    const name: ?DeclarationName = if (external or parser.tokens[parser.index].tag == .identifier)
         try parseDeclarationName(parser, true)
     else
         null;
     const signature = try parseFuncSignature(parser);
-    const body = try parseCallableBody(parser);
+    const body = if (external) Node.Index.null else try parseCallableBody(parser);
     const value = try parser.addNode(.{ .tag = .func, .token_index = token_index, .data = .{ .node_node = .{ .a = signature, .b = body } } });
     const declared_name = name orelse return value;
     const declaration = try finishNamedDeclaration(parser, declared_name.token_index, value);
@@ -2112,6 +2117,13 @@ test "diagnostic tag for dotted selective imports" {
     try testExpectDiagnosticTag(
         \\import physics.{a.b}
     , .{ .expected_token = .{ .expected = .r_brace, .found = .period } });
+}
+
+test "external functions require a name" {
+    try testExpectDiagnosticTag(
+        "extern func (code: int) never",
+        .{ .expected_token = .{ .expected = .identifier, .found = .l_paren } },
+    );
 }
 
 test "required expression failures stop at one diagnostic" {

@@ -28,10 +28,25 @@ const Counter = struct {
 };
 
 fn testDatabase(worker_count: usize) !*Database {
-    return Database.init(testing.allocator, .{ .worker_count = worker_count });
+    const db = try Database.init(testing.allocator, .{ .worker_count = worker_count });
+    errdefer db.deinit();
+    const sources = [_]struct { path: []const u8, text: []const u8 }{
+        .{ .path = "std.exit", .text = "pub extern func exit(code: int) never" },
+        .{ .path = "std.prelude", .text = "pub import std.exit.{exit}" },
+    };
+    for (sources, 0..) |source, index| {
+        const file_id: structures.FileId = 100_000 + index;
+        const module = try db.intern(queries.ModulePaths, .{ .path = source.path });
+        try db.addInput(queries.FileModule, file_id, module);
+        try db.addInput(queries.SourceText, file_id, source.text);
+        try db.addInput(queries.ModuleMembers, module, &.{file_id});
+        if (index == 0) try db.addInput(queries.StandardExitFile, {}, file_id);
+    }
+    return db;
 }
 
 fn addSource(db: *Database, file_id: structures.FileId, source: []const u8) !void {
+    try enableExitPrelude(db, source);
     try db.addInput(queries.SourceText, file_id, source);
     const name = try std.fmt.allocPrint(testing.allocator, "test-module-{d}", .{file_id});
     defer testing.allocator.free(name);
@@ -40,7 +55,18 @@ fn addSource(db: *Database, file_id: structures.FileId, source: []const u8) !voi
     try db.addInput(queries.ModuleMembers, module, &.{file_id});
 }
 
+fn enableExitPrelude(db: *Database, source: []const u8) !void {
+    if (std.mem.indexOf(u8, source, "exit(") != null) {
+        const prelude = try db.intern(queries.ModulePaths, .{ .path = "std.prelude" });
+        db.addInput(queries.StandardPreludeModule, {}, prelude) catch |err| switch (err) {
+            error.DuplicateInput => {},
+            else => return err,
+        };
+    }
+}
+
 fn addModuleFile(db: *Database, file_id: structures.FileId, module_path: []const u8, source: []const u8) !structures.ModuleId {
+    try enableExitPrelude(db, source);
     const module = try db.intern(queries.ModulePaths, .{ .path = module_path });
     try db.addInput(queries.FileModule, file_id, module);
     try db.addInput(queries.SourceText, file_id, source);
@@ -83,6 +109,7 @@ fn addModuleMembers(db: *Database, module: structures.ModuleId, files: []const s
 }
 
 fn setSource(db: *Database, file_id: structures.FileId, source: []const u8) !void {
+    try enableExitPrelude(db, source);
     try db.setInput(queries.SourceText, file_id, source);
 }
 
@@ -222,6 +249,18 @@ fn expectCompiledFunctionResult(
         const instance: structures.InstanceId = .{ .item = scope.resolve(name).? };
         const artifact = (try db.get(queries.CompileFunction, instance)).*.?;
         try functions.append(testing.allocator, .{ .instance = instance, .artifact = artifact });
+    }
+
+    var next: usize = 1;
+    while (next < functions.items.len) : (next += 1) {
+        for (functions.items[next].artifact.referenced_instances) |instance| {
+            for (functions.items) |function| {
+                if (std.meta.eql(function.instance, instance)) break;
+            } else {
+                const artifact = (try db.get(queries.CompileFunction, instance)).*.?;
+                try functions.append(testing.allocator, .{ .instance = instance, .artifact = artifact });
+            }
+        }
     }
 
     var executable = try codegen.buildExecutable(entry_id, functions.items, testing.allocator);
@@ -5487,7 +5526,7 @@ test "declared unit functions analyze lower compile and execute as ordinary call
     try testing.expectEqual(@as(u8, 0), runtime.runProg(io, testing.allocator, &.{}));
 }
 
-test "exit is an unshadowable int to never intrinsic" {
+test "a local exit shadows the prelude function" {
     const db = try testDatabase(2);
     defer db.deinit();
 
@@ -5499,23 +5538,10 @@ test "exit is an unshadowable int to never intrinsic" {
     );
     const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
     const caller_id = scope.resolve("caller").?;
-    const body = (try db.get(queries.AnalyzeFunctionBody, caller_id)).*.?;
-
-    try testing.expectEqualSlices(structures.TypeId, &.{.int}, body.block_argument_types);
-    try testing.expectEqual(@as(usize, 2), body.instructions.len);
-    try testing.expectEqual(@as(i32, 1), body.instructions[0].consti);
-    try testing.expectEqual(@as(u32, 0), @intFromEnum(body.instructions[1].exit));
-    try testing.expectEqual(structures.FunctionBodyAnalysis.Terminator.diverge, body.blocks[0].terminator);
-
-    const artifact = (try db.get(queries.CompileFunction, .{ .item = caller_id })).*.?;
-    try testing.expectEqual(@as(usize, 0), artifact.relocations.len);
-    try testing.expectEqual(@as(usize, 0), artifact.referenced_instances.len);
-
-    const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
-    const io = testing.io;
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
-    try runtime.writeProgram(io, executable.bytes);
-    try testing.expectEqual(@as(u8, 42), runtime.runProg(io, testing.allocator, &.{}));
+    const diagnostics = try db.transitiveAccumulatorValues(queries.AnalyzeFunctionBody, caller_id, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(structures.Diagnostic.Kind.value_not_callable, diagnostics[0].kind);
 }
 
 test "exit validates its one int argument at the typed boundary" {
@@ -5568,26 +5594,26 @@ test "call type diagnostics point to the argument use rather than its definition
     try testing.expectEqual(structures.SourceSpan{ .start = use, .end = use + 1 }, diagnostics[0].span.?);
 }
 
-test "exit callers retain equal results across same-name declaration edits" {
+test "exit callers recompute when a shadowing declaration changes" {
     const db = try testDatabase(1);
     defer db.deinit();
 
     try addSource(db, 1, "static exit = func() int -> return 1\nexit(42)");
     const entry_id = (try db.get(queries.SelectEntry, 1)).*.?;
     const instance: structures.InstanceId = .{ .item = entry_id };
-    const body = try db.get(queries.AnalyzeFunctionBody, entry_id);
-    const artifact = try db.get(queries.CompileFunction, instance);
-    const executable = try db.get(queries.BuildExecutable, 1);
+    try testing.expect((try db.get(queries.AnalyzeFunctionBody, entry_id)).* == null);
+    try testing.expect((try db.get(queries.CompileFunction, instance)).* == null);
+    try testing.expect((try db.get(queries.BuildExecutable, 1)).* == null);
 
     try setSource(db, 1, "static exit = func(value: int) unit -> return\nexit(42)");
-    try testing.expectEqual(body, try db.get(queries.AnalyzeFunctionBody, entry_id));
-    try testing.expectEqual(artifact, try db.get(queries.CompileFunction, instance));
-    try testing.expectEqual(executable, try db.get(queries.BuildExecutable, 1));
+    try testing.expect((try db.get(queries.AnalyzeFunctionBody, entry_id)).* != null);
+    try testing.expect((try db.get(queries.CompileFunction, instance)).* != null);
+    const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
 
     const io = testing.io;
     defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
-    try runtime.writeProgram(io, executable.*.?.bytes);
-    try testing.expectEqual(@as(u8, 42), runtime.runProg(io, testing.allocator, &.{}));
+    try runtime.writeProgram(io, executable.bytes);
+    try testing.expectEqual(@as(u8, 0), runtime.runProg(io, testing.allocator, &.{}));
 }
 
 test "unit values are rejected at int boundaries" {
@@ -8449,7 +8475,7 @@ test "entry const bindings name typed values and execute" {
     try testing.expectEqual(@as(usize, 3), body.instructions.len);
     try testing.expectEqual(@as(i32, 21), body.instructions[0].consti);
     try testing.expectEqual(status_id, body.instructions[1].call.target);
-    try testing.expectEqual(@as(u32, 1), @intFromEnum(body.instructions[2].exit));
+    try testing.expectEqual(structures.TypeId.never, body.instructions[2].resultType());
 
     const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
     const io = testing.io;
@@ -8900,7 +8926,7 @@ test "static type and value parameters produce canonical reachable instances" {
     const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
     const identity = scope.resolveFunction("identity").?;
     const reachable = (try db.get(queries.CollectReachableInstances, 1)).*.?;
-    try testing.expectEqual(@as(usize, 3), reachable.instances.len);
+    try testing.expectEqual(@as(usize, 4), reachable.instances.len);
     try testing.expect(reachable.instances[0].specialization == null);
     try testing.expectEqual(identity, reachable.instances[1].item);
     try testing.expectEqual(identity, reachable.instances[2].item);
@@ -8935,7 +8961,7 @@ test "static type and value parameters produce canonical reachable instances" {
         \\exit(identity(int, 1, 40) + identity(Whole, 1, 1) + identity(int, 3, 1))
     );
     const updated = (try db.get(queries.CollectReachableInstances, 1)).*.?;
-    try testing.expectEqual(@as(usize, 3), updated.instances.len);
+    try testing.expectEqual(@as(usize, 4), updated.instances.len);
     try testing.expectEqual(retained_instance, updated.instances[1]);
     try testing.expect(updated.instances[2].specialization != replaced_specialization);
     try testing.expectEqual(retained_artifact, try db.get(queries.CompileFunction, retained_instance));

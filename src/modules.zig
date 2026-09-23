@@ -33,6 +33,12 @@ pub const standard_sources = [_]StandardSource{
         .module_path = "std.example",
     },
     .{
+        .registry_path = "$std/exit.chi",
+        .display_path = "std/exit.chi",
+        .source = standard_library.exit,
+        .module_path = "std.exit",
+    },
+    .{
         .registry_path = "$std/prelude.chi",
         .display_path = "std/prelude.chi",
         .source = standard_library.prelude,
@@ -206,6 +212,7 @@ pub const SourceRegistry = struct {
             .module_path = file.module_path,
             .source = file.source,
         });
+        try putInput(db, queries.StandardExitFile, {}, self.fileId("$std/exit.chi").?);
         const prelude_module = try db.intern(queries.ModulePaths, .{ .path = "std.prelude" });
         try putInput(db, queries.StandardPreludeModule, {}, prelude_module);
         for (current.keys(), current.values()) |module, *members| {

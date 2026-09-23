@@ -91,6 +91,11 @@ pub const StandardPreludeModule = struct {
     pub const Value = structures.ModuleId;
 };
 
+pub const StandardExitFile = struct {
+    pub const Key = void;
+    pub const Value = structures.FileId;
+};
+
 pub const ModulePaths = struct {
     pub const Value = structures.ModulePath;
     pub const Id = structures.ModuleId;
@@ -1495,6 +1500,32 @@ pub const ResolveItem = struct {
     }
 };
 
+const ExternalSymbol = struct {
+    const Symbol = enum { exit };
+    pub const Input = structures.ItemId;
+    pub const Output = ?Symbol;
+
+    pub fn run(ctx: anytype, item: Input) anyerror!Output {
+        const loc = try ctx.lookupInterned(ItemLocations, item);
+        if (loc.kind != .function or loc.owner != null) return null;
+        const resolved = (try ctx.get(ResolveItem, item)).* orelse return null;
+        const parsed = (try ctx.get(ParseFile, resolved.file_id)).* orelse return null;
+        if (!semantic.isExternalFunction(&parsed, resolved.declaration)) return null;
+        const registered = ctx.input(StandardExitFile, {}) catch |err| switch (err) {
+            error.InputNotFound => return null,
+            else => return err,
+        };
+        if (registered.* != resolved.file_id) return null;
+        const module = switch (loc.origin) {
+            .module => |module_id| module_id,
+            .entry => return null,
+        };
+        const path = (try ctx.lookupInterned(ModulePaths, module)).path;
+        if (std.mem.eql(u8, path, "std.exit") and std.mem.eql(u8, loc.name, "exit")) return .exit;
+        return null;
+    }
+};
+
 pub const FunctionShape = struct {
     pub const Input = structures.ItemId;
     pub const Output = ?structures.FunctionShape;
@@ -1505,6 +1536,14 @@ pub const FunctionShape = struct {
         const resolved = (try ctx.get(ResolveItem, item_id)).* orelse return null;
         const parsed = (try ctx.get(ParseFile, resolved.file_id)).* orelse return null;
         const source = (try ctx.input(SourceText, resolved.file_id)).*;
+        if (semantic.isExternalFunction(&parsed, resolved.declaration) and (try ctx.get(ExternalSymbol, item_id)).* == null) {
+            try ctx.emit(structures.Diagnostic, .{
+                .file_id = resolved.file_id,
+                .span = nodeSpan(&parsed, @enumFromInt(resolved.declaration)),
+                .kind = .unsupported_external_declaration,
+            });
+            return null;
+        }
         const result = try semantic.analyzeFunctionShape(&parsed, source, resolved.declaration, ctx.allocator());
         return switch (result) {
             .success => |shape| shape,
@@ -1580,7 +1619,7 @@ pub const FunctionInstanceSignature = struct {
             else => return err,
         };
         return switch (result) {
-            .success => |signature| signature,
+            .success => |signature| try validateExternalSignature(ctx, instance.item, resolved.file_id, &parsed, resolved.declaration, signature),
             .unsupported => |issue| blk: {
                 try typing.emitSemanticIssue(ctx, resolved.file_id, issue);
                 break :blk null;
@@ -1612,7 +1651,7 @@ pub const FunctionSignature = struct {
             else => return err,
         };
         return switch (result) {
-            .success => |signature| signature,
+            .success => |signature| try validateExternalSignature(ctx, item_id, resolved.file_id, &parsed, resolved.declaration, signature),
             .unsupported => |issue| blk: {
                 try typing.emitSemanticIssue(ctx, resolved.file_id, issue);
                 break :blk null;
@@ -1620,6 +1659,23 @@ pub const FunctionSignature = struct {
         };
     }
 };
+
+fn validateExternalSignature(ctx: anytype, item: structures.ItemId, file_id: structures.FileId, parsed: *const structures.Ast, declaration: u32, signature: structures.FunctionSignature) !?structures.FunctionSignature {
+    if (!semantic.isExternalFunction(parsed, declaration)) return signature;
+    const symbol = (try ctx.get(ExternalSymbol, item)).* orelse return null;
+    const valid = switch (symbol) {
+        .exit => !signature.is_fallible and signature.return_type == .never and
+            signature.parameters.len == 1 and signature.parameters[0].mode == .imm and signature.parameters[0].type_id == .int,
+    };
+    if (valid) return signature;
+    ctx.allocator().free(signature.parameters);
+    try ctx.emit(structures.Diagnostic, .{
+        .file_id = file_id,
+        .span = nodeSpan(parsed, @enumFromInt(declaration)),
+        .kind = .invalid_external_signature,
+    });
+    return null;
+}
 
 pub const ResolveStatic = struct {
     pub const Input = structures.ItemId;
@@ -1841,6 +1897,15 @@ pub const ExecuteComptimeCall = struct {
             };
             if (runtime.type_id != parameter.type_id) return null;
             argument.* = .{ .runtime = runtime.value };
+        }
+
+        if ((try ctx.get(ExternalSymbol, key.instance.item)).*) |symbol| {
+            return switch (symbol) {
+                .exit => .{ .completed = .{
+                    .outcome = .{ .exit = arguments[0].runtime.int },
+                    .arguments = key.arguments,
+                } },
+            };
         }
 
         const body = (try ctx.get(AnalyzeComptimeFunctionBody, key.instance)).* orelse return null;
@@ -2181,6 +2246,7 @@ fn analyzeFunctionBody(ctx: anytype, instance: structures.InstanceId, publish_in
     const resolved = (try ctx.get(ResolveItem, instance.item)).* orelse return null;
     if ((try ctx.get(BuildModuleScope, resolved.file_id)).* == null) return null;
     const parsed = (try ctx.get(ParseFile, resolved.file_id)).* orelse return null;
+    if (loc.kind == .function and semantic.isExternalFunction(&parsed, resolved.declaration)) return null;
     const source = (try ctx.input(SourceText, resolved.file_id)).*;
     const type_interner: TypeInterner(@TypeOf(ctx)) = .{
         .ctx = ctx,
@@ -2234,6 +2300,16 @@ pub const CompileFunction = struct {
     pub const Output = ?structures.CompiledFunction;
 
     pub fn run(ctx: anytype, instance_id: Input) anyerror!Output {
+        if ((try ctx.get(ExternalSymbol, instance_id.item)).*) |symbol| {
+            // Only publish code for a declaration with the implementation's signature.
+            _ = if (instance_id.specialization == null)
+                (try ctx.get(FunctionSignature, instance_id.item)).* orelse return null
+            else
+                (try ctx.get(FunctionInstanceSignature, instance_id)).* orelse return null;
+            return switch (symbol) {
+                .exit => try codegen.compileExternalExit(ctx.allocator()),
+            };
+        }
         const body = if (instance_id.specialization == null)
             (try ctx.get(AnalyzeFunctionBody, instance_id.item)).* orelse return null
         else

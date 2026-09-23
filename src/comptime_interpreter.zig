@@ -76,7 +76,6 @@ pub fn execute(
                     if (lhs == std.math.minInt(i32) and rhs == -1) return executionError(.integer_overflow, instructionSpan(body, instruction_index));
                     slots[destination] = .{ .runtime = .{ .int = @divTrunc(lhs, rhs) } };
                 },
-                .exit => |operand| return .{ .exit = integer(slots, operand) },
                 .call => |call| if (try executeReturningCall(body, slots, call_scratch, destination, instruction_index, call.instance(), call.arguments, executor)) |result| return result,
                 .indirect_call => |call| {
                     const reference = slots[@intFromEnum(call.target)].runtime.function_ref;
