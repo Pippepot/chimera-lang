@@ -260,7 +260,7 @@ fn validFunctionBody(body: structures.FunctionBodyAnalysis) bool {
     if (entry.argument_start > entry.argument_end or entry.argument_end > body.block_argument_types.len) return false;
     for (body.instructions) |instruction| {
         const valid = switch (instruction) {
-            .consti, .constb, .const_type, .const_unit, .const_none, .function_ref => true,
+            .const_int, .const_byte, .const_bool, .const_type, .const_unit, .const_none, .function_ref => true,
             .variant_tag, .negi => |value| validValue(value, body),
             .variant_coerce, .variant_extract, .callable_coerce => |operation| validVariantOperation(operation, body),
             .struct_init => |operation| validRange(operation.fields, body.struct_field_values.len),

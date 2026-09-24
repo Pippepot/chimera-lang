@@ -589,6 +589,7 @@ pub const CompileTimeValue = union(enum) {
 
     pub const RuntimeValue = union(enum) {
         int: i32,
+        byte: u8,
         bool: bool,
         unit,
         none,
@@ -602,6 +603,7 @@ pub const CompileTimeValue = union(enum) {
         pub fn scalarTypeId(self: @This()) ?TypeId {
             return switch (self) {
                 .int => .int,
+                .byte => .byte,
                 .bool => .bool,
                 .unit => .unit,
                 .none => .none,
@@ -654,6 +656,7 @@ pub const InternedTypeId = enum(u31) { _ };
 
 pub const TypeId = enum(u32) {
     int,
+    byte,
     bool,
     unit,
     none,
@@ -674,7 +677,7 @@ pub const TypeId = enum(u32) {
     }
 
     pub fn isPrimitive(self: TypeId) bool {
-        return self == .int or self == .bool or self == .unit or self == .none or self == .never or self == .type;
+        return self == .int or self == .bool or self == .unit or self == .none or self == .never or self == .type or self == .byte;
     }
 };
 
@@ -1034,8 +1037,9 @@ pub const CallMutArgument = struct {
 };
 
 pub const FunctionInstruction = union(enum) {
-    consti: i32,
-    constb: bool,
+    const_int: i32,
+    const_byte: u8,
+    const_bool: bool,
     const_type: TypeId,
     const_unit,
     const_none,
@@ -1059,8 +1063,9 @@ pub const FunctionInstruction = union(enum) {
 
     pub fn resultType(self: FunctionInstruction) TypeId {
         return switch (self) {
-            .consti, .variant_tag, .negi, .addi, .subi, .muli, .divsi => .int,
-            .constb => .bool,
+            .const_int, .variant_tag, .negi, .addi, .subi, .muli, .divsi => .int,
+            .const_byte => .byte,
+            .const_bool => .bool,
             .const_type => .type,
             .const_unit => .unit,
             .const_none => .none,
@@ -1178,6 +1183,7 @@ pub const InstanceId = struct {
 pub const CompileTimeSite = struct {
     owner: InstanceId,
     node: Node.Index,
+    expected_type: ?TypeId = null,
 };
 
 /// Identity of one concrete compile-time function invocation. Ordinary

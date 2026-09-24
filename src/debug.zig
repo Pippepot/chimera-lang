@@ -151,8 +151,9 @@ fn renderInstruction(
 ) !void {
     const result = @intFromEnum(ssa.instructionValue(instruction_index));
     switch (ssa.instructions[instruction_index]) {
-        .consti => |value| try writer.print("    %{d} = consti {d}\n", .{ result, value }),
-        .constb => |value| try writer.print("    %{d} = constb {s}\n", .{ result, if (value) "true" else "false" }),
+        .const_int => |value| try writer.print("    %{d} = const_int {d}\n", .{ result, value }),
+        .const_byte => |value| try writer.print("    %{d} = const_byte {d}\n", .{ result, value }),
+        .const_bool => |value| try writer.print("    %{d} = const_bool {s}\n", .{ result, if (value) "true" else "false" }),
         .const_type => |type_id| {
             try writer.print("    %{d} = const_type ", .{result});
             try renderType(type_id, writer);

@@ -120,7 +120,9 @@ pub const UnresolvedBody = struct {
         span: structures.SourceSpan,
 
         pub const Operation = union(enum) {
+            integer_literal: i32,
             integer: i32,
+            byte: u8,
             boolean: bool,
             type_value: structures.TypeId,
             unit,
@@ -474,6 +476,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
         fn appendCompileTimeValue(self: *Self, index: structures.Node.Index, runtime: structures.CompileTimeValue.Runtime) !ValueId {
             const primitive = try switch (runtime.value) {
                 .int => |integer| self.appendExpression(index, .{ .integer = integer }),
+                .byte => |byte| self.appendExpression(index, .{ .byte = byte }),
                 .bool => |boolean| self.appendExpression(index, .{ .boolean = boolean }),
                 .unit => self.appendExpression(index, .unit),
                 .none => self.appendExpression(index, .none),
@@ -583,6 +586,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             const span = tokenSpan(self.ast, node.token_index);
             const name = self.source[span.start..span.end];
             if (std.mem.eql(u8, name, "int")) return self.appendExpression(index, .{ .type_value = .int });
+            if (std.mem.eql(u8, name, "byte")) return self.appendExpression(index, .{ .type_value = .byte });
             if (std.mem.eql(u8, name, "bool")) return self.appendExpression(index, .{ .type_value = .bool });
             if (std.mem.eql(u8, name, "never")) return self.appendExpression(index, .{ .type_value = .never });
             if (std.mem.eql(u8, name, "type")) return self.appendExpression(index, .{ .type_value = .type });
@@ -725,7 +729,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             const span = tokenSpan(self.ast, self.ast.nodes[index.index()].token_index);
             const literal = self.source[span.start..span.end];
             return switch (parseIntegerLiteral(literal)) {
-                .value => |value| self.appendExpression(index, .{ .integer = value }),
+                .value => |value| self.appendExpression(index, .{ .integer_literal = value }),
                 .unsupported => |kind| self.reject(index, kind),
             };
         }
@@ -1026,7 +1030,9 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                     const result = if (parameters[argument_index].is_meta_type)
                         try analyzeStaticTypeArgument(self.ast, self.source, argument, self.type_interner, self.gpa)
                     else result_blk: {
-                        const value_id = self.type_interner.executeComptime(argument) catch |err| switch (err) {
+                        const instance = pending_target.direct.instance;
+                        const expected_type = try self.type_interner.staticParameterType(instance, argument_index, static_arguments.items);
+                        const value_id = self.type_interner.executeComptimeWithType(argument, expected_type) catch |err| switch (err) {
                             error.QueryCycle => return self.reject(argument, .declaration_cycle),
                             error.Unavailable => return error.Unavailable,
                             else => return err,
@@ -1198,6 +1204,27 @@ pub fn analyzeFunctionShape(
         .parameters = try parameters.toOwnedSlice(gpa),
         .returns_type = if (signature.data.node_node.b.unwrap()) |annotation| isMetaTypeAnnotation(ast, source, annotation) else false,
     } };
+}
+
+pub fn analyzeStaticParameterType(
+    ast: *const structures.Ast,
+    source: []const u8,
+    declaration: u32,
+    parameter_index: usize,
+    type_interner: anytype,
+    gpa: std.mem.Allocator,
+) !SemanticResult(structures.TypeId) {
+    const parts = functionParts(ast, declaration);
+    const signature = ast.nodes[parts.signature.index()];
+    const parameters = ast.nodeList(signature.data.node_node.a);
+    std.debug.assert(parameter_index < parameters.len);
+    const parameter = ast.nodes[parameters[parameter_index].index()];
+    std.debug.assert(parameterMode(ast, parameter).? == .static);
+    const annotation = parameter.data.node_node.b.unwrap() orelse unreachable;
+    const runtime_parameters: RuntimeParameters = .{ .ast = ast, .source = source, .parameters = parameters };
+    if (runtimeReference(ast, source, annotation, runtime_parameters)) |reference|
+        return .{ .unsupported = issueAt(ast, reference.index(), .value_used_as_type) };
+    return analyzeType(ast, source, annotation, type_interner, gpa, .parameter_type_not_supported);
 }
 
 pub fn analyzeFunctionInstanceSignature(
@@ -1412,6 +1439,7 @@ fn analyzeType(
         const span = tokenSpan(ast, node.token_index);
         const name = source[span.start..span.end];
         if (std.mem.eql(u8, name, "int")) return .{ .success = .int };
+        if (std.mem.eql(u8, name, "byte")) return .{ .success = .byte };
         if (std.mem.eql(u8, name, "bool")) return .{ .success = .bool };
         if (std.mem.eql(u8, name, "unit")) return .{ .success = .unit };
         if (std.mem.eql(u8, name, "none")) return .{ .success = .none };
@@ -1814,7 +1842,7 @@ pub fn resolveSpecializationArgument(
     for (ast.nodeList(signature.data.node_node.a)) |parameter_index| {
         const parameter = ast.nodes[parameter_index.index()];
         if (parameterMode(ast, parameter).? != .static) continue;
-        std.debug.assert(static_index < arguments.len);
+        if (static_index == arguments.len) break;
         const span = tokenSpan(ast, parameter.token_index);
         if (std.mem.eql(u8, source[span.start..span.end], name)) return arguments[static_index];
         static_index += 1;
@@ -2266,6 +2294,14 @@ const TestTypeInterner = struct {
     }
 
     pub fn executeComptime(_: @This(), _: structures.Node.Index) !?structures.CompileTimeValueId {
+        unreachable;
+    }
+
+    pub fn executeComptimeWithType(_: @This(), _: structures.Node.Index, _: ?structures.TypeId) !?structures.CompileTimeValueId {
+        unreachable;
+    }
+
+    pub fn staticParameterType(_: @This(), _: structures.InstanceId, _: usize, _: []const structures.CompileTimeValueId) !structures.TypeId {
         unreachable;
     }
 

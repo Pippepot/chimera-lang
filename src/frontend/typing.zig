@@ -22,6 +22,7 @@ pub const BodyOptions = struct {
     infer_return_type: bool = false,
     publish_instruction_spans: bool = false,
     allow_type_values: bool = false,
+    expected_result_type: ?structures.TypeId = null,
 };
 
 pub fn emitSemanticIssue(ctx: anytype, file_id: structures.FileId, issue: semantic.Issue) !void {
@@ -50,6 +51,7 @@ pub fn resolveAndTypeBody(
         .infer_return_type = options.infer_return_type,
         .publish_instruction_spans = options.publish_instruction_spans,
         .allow_type_values = options.allow_type_values,
+        .expected_result_type = options.expected_result_type,
     };
     defer builder.deinit();
     builder.build(parameters) catch |err| switch (err) {
@@ -156,6 +158,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         return_type: structures.TypeId,
         is_fallible: bool,
         infer_return_type: bool = false,
+        expected_result_type: ?structures.TypeId = null,
         publish_instruction_spans: bool = false,
         allow_type_values: bool = false,
         values: []?Value = &.{},
@@ -299,7 +302,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
 
         fn build(self: *Self, parameters: []const structures.CallableParameter) !void {
             try self.init(parameters);
-            const result = try self.block(self.unresolved.root_block);
+            const result = try self.block(self.unresolved.root_block, self.expected_result_type);
             if (self.current_block == null) return;
             const root = self.unresolved.blocks[@intFromEnum(self.unresolved.root_block)];
             if (self.infer_return_type) {
@@ -318,7 +321,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             }
         }
 
-        fn block(self: *Self, block_id: semantic.UnresolvedBody.BlockId) !?Value {
+        fn block(self: *Self, block_id: semantic.UnresolvedBody.BlockId, expected_type: ?structures.TypeId) !?Value {
             const unresolved_block = self.unresolved.blocks[@intFromEnum(block_id)];
             const baseline = try self.captureState();
             for (self.unresolved.statements[unresolved_block.statements.start..unresolved_block.statements.end]) |statement| {
@@ -328,11 +331,11 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     .break_loop => |value_id| try self.breakLoop(value_id),
                     .continue_loop => |span| try self.continueLoop(span),
                     .return_nothing => |span| try self.returnNothing(span),
-                    .return_value => |returned| try self.returnValue(try self.value(returned.value), returned.span),
+                    .return_value => |returned| try self.returnValue(try self.valueWithType(returned.value, self.return_type), returned.span),
                 }
             }
             if (self.current_block == null) return null;
-            var result = if (unresolved_block.result) |result_id| try self.value(result_id) else null;
+            var result = if (unresolved_block.result) |result_id| try self.valueWithType(result_id, expected_type) else null;
             if (self.current_block == null) return null;
             if (result) |value_to_exit| {
                 const parent_boundary = self.current_boundary;
@@ -486,6 +489,10 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         }
 
         fn value(self: *Self, id: semantic.UnresolvedBody.ValueId) anyerror!Value {
+            return self.valueWithType(id, null);
+        }
+
+        fn valueWithType(self: *Self, id: semantic.UnresolvedBody.ValueId, expected_type: ?structures.TypeId) anyerror!Value {
             const index = @intFromEnum(id);
             if (self.values[index]) |resolved| return resolved;
             std.debug.assert(index >= self.unresolved.parameter_count);
@@ -495,8 +502,13 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             self.current_boundary = boundary;
             defer self.current_boundary = parent_boundary;
             const resolved: Value = switch (expression.operation) {
-                .integer => |integer| try self.appendInstruction(.{ .consti = integer }),
-                .boolean => |boolean| try self.appendInstruction(.{ .constb = boolean }),
+                .integer_literal => |integer| if (expected_type == .byte) blk: {
+                    const byte = std.math.cast(u8, integer) orelse return self.reject(expression.span, .integer_literal_out_of_range);
+                    break :blk try self.appendInstruction(.{ .const_byte = byte });
+                } else try self.appendInstruction(.{ .const_int = integer }),
+                .integer => |integer| try self.appendInstruction(.{ .const_int = integer }),
+                .byte => |byte| try self.appendInstruction(.{ .const_byte = byte }),
+                .boolean => |boolean| try self.appendInstruction(.{ .const_bool = boolean }),
                 .type_value => |type_id| if (self.allow_type_values)
                     try self.appendInstruction(.{ .const_type = type_id })
                 else
@@ -692,7 +704,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             const copy_block = try self.newBlock(argument_start, argument_start);
             const owned_block = try self.newBlock(argument_start, argument_start);
             const join = try self.newBlock(argument_start, argument_start + 1);
-            const expected = try self.appendInstruction(.{ .constb = true });
+            const expected = try self.appendInstruction(.{ .const_bool = true });
             self.terminate(.{ .predicate_branch = .{
                 .operation = .eqb,
                 .operands = .{ .lhs = borrow_predicate, .rhs = expected.id },
@@ -898,7 +910,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 else
                     try self.newBlock(argument_start, argument_start);
                 if (next) |next_block| {
-                    const expected = try self.appendInstruction(.{ .consti = @intCast(member_index) });
+                    const expected = try self.appendInstruction(.{ .const_int = @intCast(member_index) });
                     self.terminate(.{ .predicate_branch = .{
                         .operation = .eqi,
                         .operands = .{ .lhs = tag.id, .rhs = expected.id },
@@ -1043,7 +1055,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 if (seen[field.index]) return self.reject(source_field.name_span, .duplicate_struct_initializer_field);
                 seen[field.index] = true;
 
-                const operand = try self.value(source_field.value.value);
+                const operand = try self.valueWithType(source_field.value.value, field.type_id);
                 if (operand.type_id == .never) return operand;
                 var use = try self.coerceValue(operand.id, operand.type_id, field.type_id) orelse
                     return self.reject(source_field.value.span, .{ .struct_initializer_field_type_mismatch = self.typeMismatch(field.type_id, operand.type_id) });
@@ -1119,7 +1131,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             const borrowed = try self.newBlock(argument_start, argument_start);
             const owned = try self.newBlock(argument_start, argument_start);
             const join = try self.newBlock(argument_start, argument_start + 1);
-            const expected = try self.appendInstruction(.{ .constb = true });
+            const expected = try self.appendInstruction(.{ .const_bool = true });
             self.terminate(.{ .predicate_branch = .{
                 .operation = .eqb,
                 .operands = .{ .lhs = borrow_condition, .rhs = expected.id },
@@ -1255,7 +1267,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             });
             self.enterBlock(header);
             self.restoreState(header_state);
-            const body_value = try self.block(body);
+            const body_value = try self.block(body, null);
             if (body_value != null) {
                 try self.validateLoopBackedge(self.loop_stack.getLast(), self.unresolved.blocks[@intFromEnum(body)].span);
                 const repeat = try self.loopBranch(self.loop_stack.getLast(), header, null);
@@ -1519,7 +1531,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             if (result) |result_value| {
                 try self.appendBranchArgument(.{ .value = result_value.id }, result_value.owned_generation);
                 const borrowed_on_path = result_value.borrow_condition orelse (try self.appendInstruction(.{
-                    .constb = result_value.borrowed_type != null,
+                    .const_bool = result_value.borrowed_type != null,
                 })).id;
                 try self.appendBranchArgument(.{ .value = borrowed_on_path }, null);
             }
@@ -1551,7 +1563,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         }
 
         fn annotate(self: *Self, annotation: @FieldType(Expression.Operation, "annotation")) !Value {
-            const operand = try self.value(annotation.value.value);
+            const operand = try self.valueWithType(annotation.value.value, annotation.type_id);
             if (operand.type_id == .never) return operand;
             const use = try self.coerceValue(operand.id, operand.type_id, annotation.type_id) orelse
                 return self.reject(annotation.value.span, .{ .local_type_mismatch = self.typeMismatch(annotation.type_id, operand.type_id) });
@@ -1683,7 +1695,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 } });
             }
             const target_span = if (source_fields.len == 0) assignment_value.target_span else source_fields[source_fields.len - 1].span;
-            const raw_operand = try self.value(assignment_value.value.value);
+            const raw_operand = try self.valueWithType(assignment_value.value.value, if (assignment_value.operation == .replace) target_type else null);
             const operand = if (assignment_value.operation == .replace)
                 raw_operand
             else
@@ -1887,7 +1899,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             // hooks may publish their own calls, so the outer operands stay in
             // local storage until their complete contiguous range is known.
             for (raw_arguments, signature.parameters, 0..) |raw, expected, argument_index| {
-                const raw_operand = try self.value(raw.value);
+                const raw_operand = try self.valueWithType(raw.value, expected.type_id);
                 if (raw_operand.type_id == .never) return .{ .diverged = raw_operand };
                 const maybe_place = if (expected.mode == .imm or expected.mode == .mut)
                     try self.resolveArgumentPlace(raw.value, &place_fields)
@@ -2015,14 +2027,15 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             } });
             var static_arguments: std.ArrayList(structures.CompileTimeValueId) = .empty;
             defer static_arguments.deinit(self.ctx.allocator());
-            for (method_arguments, shape.parameters[1..]) |argument, parameter| {
+            for (method_arguments, shape.parameters[1..], 1..) |argument, parameter, parameter_index| {
                 if (parameter.mode != .static) {
                     try arguments.append(self.ctx.allocator(), argument.value);
                     continue;
                 }
                 if (argument.runtime_reference) |reference_span|
                     return self.reject(reference_span, .comptime_runtime_capture);
-                const value_id = (try self.type_interner.staticCallArgument(argument.node, parameter.is_meta_type)) orelse return error.Unavailable;
+                const expected_type = if (parameter.is_meta_type) null else try self.type_interner.staticParameterType(instance, parameter_index, static_arguments.items);
+                const value_id = (try self.type_interner.staticCallArgument(argument.node, parameter.is_meta_type, expected_type)) orelse return error.Unavailable;
                 const compile_time_value = try self.type_interner.lookupCompileTimeValue(value_id);
                 if (compile_time_value == .runtime and compile_time_value.runtime.value == .function_ref)
                     return self.reject(argument.value.span, .static_argument_not_supported);
@@ -2310,7 +2323,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                         failure
                     else
                         try self.newBlock(argument_start, argument_start);
-                    const expected = try self.appendInstruction(.{ .consti = @intCast(member_index) });
+                    const expected = try self.appendInstruction(.{ .const_int = @intCast(member_index) });
                     self.terminate(.{ .predicate_branch = .{
                         .operation = .eqi,
                         .operands = .{ .lhs = tag.id, .rhs = expected.id },
@@ -2491,7 +2504,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
 
             const then_exit = if (flow.success) |success| blk: {
                 try self.enterFlowExit(success);
-                const result = try self.block(expression.then_block);
+                const result = try self.block(expression.then_block, null);
                 if (self.current_block != null) if (success.extraction) |extraction| {
                     self.unbindLocal(@intFromEnum(extraction.local));
                 };
@@ -2499,7 +2512,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             } else null;
             const else_exit = if (flow.failure) |failure| blk: {
                 try self.enterFlowExit(failure);
-                break :blk try self.valueExit(try self.block(expression.else_block));
+                break :blk try self.valueExit(try self.block(expression.else_block, null));
             } else null;
 
             const argument_start: u32 = @intCast(self.block_argument_types.items.len);
@@ -2700,7 +2713,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             self.setBlockTerminator(exit.block, .{ .branch = self.emptyBranch(edge) });
             self.enterBlock(edge);
             const borrowed_on_path = exit.value.borrow_condition orelse (try self.appendInstruction(.{
-                .constb = exit.value.borrowed_type != null,
+                .const_bool = exit.value.borrowed_type != null,
             })).id;
             self.terminate(.{ .branch = try self.conditionalBranch(target, exit, result_type, changed_slots, borrowed_on_path) });
             return edge;
@@ -2932,7 +2945,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             const borrowed = try self.newBlock(argument_index, argument_index);
             const owned = try self.newBlock(argument_index, argument_index);
             const join = try self.newBlock(argument_index, argument_index);
-            const expected = try self.appendInstruction(.{ .constb = true });
+            const expected = try self.appendInstruction(.{ .const_bool = true });
             self.terminate(.{ .predicate_branch = .{
                 .operation = .eqb,
                 .operands = .{ .lhs = cleanup_condition, .rhs = expected.id },
@@ -3376,7 +3389,7 @@ fn normalizeValueUses(value_uses: []structures.FunctionValueUse, instruction_val
 
 fn normalizeInstructions(instructions: []structures.FunctionInstruction, instruction_values: []const structures.FunctionValueId) void {
     for (instructions) |*instruction| switch (instruction.*) {
-        .consti, .constb, .const_type, .const_unit, .const_none, .function_ref, .struct_init, .call_mut_argument => {},
+        .const_int, .const_byte, .const_bool, .const_type, .const_unit, .const_none, .function_ref, .struct_init, .call_mut_argument => {},
         .variant_coerce, .variant_extract, .callable_coerce => |*operation| operation.operand = normalizeValue(operation.operand, instruction_values),
         .field_access => |*operation| operation.operand = normalizeValue(operation.operand, instruction_values),
         .field_update => |*operation| {
@@ -3564,11 +3577,11 @@ test "cleanup materializer inserts ordered custom drops at an interior boundary"
 
     const entry = try builder.newBlock(0, 0);
     builder.enterBlock(entry);
-    const first = try builder.appendInstruction(.{ .consti = 40 });
-    const second = try builder.appendInstruction(.{ .consti = 41 });
+    const first = try builder.appendInstruction(.{ .const_int = 40 });
+    const second = try builder.appendInstruction(.{ .const_int = 41 });
     const boundary = try builder.newBoundary(TestMaterializerTypes.span);
     try builder.appendBoundary(boundary);
-    _ = try builder.appendInstruction(.{ .consti = 42 });
+    _ = try builder.appendInstruction(.{ .const_int = 42 });
     builder.terminate(.return_unit);
     const first_generation = try testAppendMaterializerGeneration(&builder, TestMaterializerTypes.custom_type, 0);
     const second_generation = try testAppendMaterializerGeneration(&builder, TestMaterializerTypes.second_custom_type, 1);
@@ -3590,11 +3603,11 @@ test "cleanup materializer inserts ordered custom drops at an interior boundary"
     defer body.deinit(context.gpa);
     try std.testing.expectEqual(@as(usize, 2), body.blocks.len);
     try std.testing.expectEqual(@as(usize, 5), body.instructions.len);
-    try std.testing.expectEqual(structures.FunctionInstruction.consti, std.meta.activeTag(body.instructions[0]));
-    try std.testing.expectEqual(structures.FunctionInstruction.consti, std.meta.activeTag(body.instructions[1]));
+    try std.testing.expectEqual(structures.FunctionInstruction.const_int, std.meta.activeTag(body.instructions[0]));
+    try std.testing.expectEqual(structures.FunctionInstruction.const_int, std.meta.activeTag(body.instructions[1]));
     try std.testing.expectEqual(TestMaterializerTypes.second_custom_drop_hook, body.instructions[2].call.target);
     try std.testing.expectEqual(TestMaterializerTypes.custom_drop_hook, body.instructions[3].call.target);
-    try std.testing.expectEqual(structures.FunctionInstruction.consti, std.meta.activeTag(body.instructions[4]));
+    try std.testing.expectEqual(structures.FunctionInstruction.const_int, std.meta.activeTag(body.instructions[4]));
     try std.testing.expectEqual(@as(structures.FunctionBlockId, @enumFromInt(1)), body.blocks[@intFromEnum(entry)].terminator.branch.target);
     try std.testing.expectEqual(structures.FunctionTerminator.return_unit, body.blocks[1].terminator);
 }
@@ -3606,13 +3619,13 @@ test "cleanup materializer finds boundaries after earlier splits" {
 
     const entry = try builder.newBlock(0, 0);
     builder.enterBlock(entry);
-    const first = try builder.appendInstruction(.{ .consti = 40 });
+    const first = try builder.appendInstruction(.{ .const_int = 40 });
     const first_boundary = try builder.newBoundary(TestMaterializerTypes.span);
     try builder.appendBoundary(first_boundary);
-    const second = try builder.appendInstruction(.{ .consti = 41 });
+    const second = try builder.appendInstruction(.{ .const_int = 41 });
     const second_boundary = try builder.newBoundary(TestMaterializerTypes.span);
     try builder.appendBoundary(second_boundary);
-    _ = try builder.appendInstruction(.{ .consti = 42 });
+    _ = try builder.appendInstruction(.{ .const_int = 42 });
     builder.terminate(.return_unit);
     const first_generation = try testAppendMaterializerGeneration(&builder, TestMaterializerTypes.custom_type, 0);
     const second_generation = try testAppendMaterializerGeneration(&builder, TestMaterializerTypes.second_custom_type, 1);
@@ -3647,7 +3660,7 @@ test "cleanup materializer emits produced cleanup at block entry" {
     const entry = try builder.newBlock(0, 0);
     const target = try builder.newBlock(argument, argument + 1);
     builder.enterBlock(entry);
-    const source = try builder.appendInstruction(.{ .consti = 42 });
+    const source = try builder.appendInstruction(.{ .const_int = 42 });
     try builder.appendBranchArgument(.{ .value = source.id }, null);
     builder.terminate(.{ .branch = .{ .target = target, .arguments = .{ .start = 0, .end = 1 } } });
     builder.enterBlock(target);
@@ -3677,9 +3690,9 @@ test "cleanup materializer interposes only one predicate edge" {
 
     const entry = try builder.newBlock(0, 0);
     builder.enterBlock(entry);
-    const value = try builder.appendInstruction(.{ .consti = 42 });
-    const condition = try builder.appendInstruction(.{ .constb = true });
-    const expected = try builder.appendInstruction(.{ .constb = true });
+    const value = try builder.appendInstruction(.{ .const_int = 42 });
+    const condition = try builder.appendInstruction(.{ .const_bool = true });
+    const expected = try builder.appendInstruction(.{ .const_bool = true });
     const argument = try builder.appendBlockArgument(.int, null);
     const then_block = try builder.newBlock(argument, argument + 1);
     const else_block = try builder.newBlock(argument + 1, argument + 1);
@@ -3725,7 +3738,7 @@ test "cleanup materializer forwards fallible success payloads" {
 
     const entry = try builder.newBlock(0, 0);
     builder.enterBlock(entry);
-    const value = try builder.appendInstruction(.{ .consti = 42 });
+    const value = try builder.appendInstruction(.{ .const_int = 42 });
     _ = try builder.appendBlockArgument(.int, null);
     const success = try builder.newBlock(0, 1);
     const failure = try builder.newBlock(1, 1);
@@ -3765,8 +3778,8 @@ test "cleanup materializer guards conditional ownership" {
 
     const entry = try builder.newBlock(0, 0);
     builder.enterBlock(entry);
-    const value = try builder.appendInstruction(.{ .consti = 42 });
-    const borrowed = try builder.appendInstruction(.{ .constb = true });
+    const value = try builder.appendInstruction(.{ .const_int = 42 });
+    const borrowed = try builder.appendInstruction(.{ .const_bool = true });
     const boundary = try builder.newBoundary(TestMaterializerTypes.span);
     try builder.appendBoundary(boundary);
     builder.terminate(.return_unit);
@@ -3798,7 +3811,7 @@ test "cleanup materializer rejoins variant cleanup with the suffix" {
 
     const entry = try builder.newBlock(0, 0);
     builder.enterBlock(entry);
-    const value = try builder.appendInstruction(.{ .consti = 42 });
+    const value = try builder.appendInstruction(.{ .const_int = 42 });
     const boundary = try builder.newBoundary(TestMaterializerTypes.span);
     try builder.appendBoundary(boundary);
     builder.terminate(.return_unit);
@@ -3833,7 +3846,7 @@ fn testCleanupMaterializerAllocationFailures(gpa: std.mem.Allocator) !void {
     defer builder.deinit();
     const entry = try builder.newBlock(0, 0);
     builder.enterBlock(entry);
-    const value = try builder.appendInstruction(.{ .consti = 42 });
+    const value = try builder.appendInstruction(.{ .const_int = 42 });
     const boundary = try builder.newBoundary(TestMaterializerTypes.span);
     try builder.appendBoundary(boundary);
     builder.terminate(.return_unit);

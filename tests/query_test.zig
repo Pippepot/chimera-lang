@@ -184,7 +184,7 @@ fn expectDirectCallArtifact(artifact: structures.CompiledFunction, target: struc
 
 fn expectIntegerReturnBody(body: structures.FunctionBodyAnalysis, expected: i32) !void {
     try testing.expectEqual(@as(usize, 1), body.instructions.len);
-    try testing.expectEqual(expected, body.instructions[0].consti);
+    try testing.expectEqual(expected, body.instructions[0].const_int);
     try testing.expectEqual(@as(usize, 1), body.blocks.len);
     try testing.expectEqual(@as(u32, 0), @intFromEnum(body.blocks[0].terminator.return_value.value));
 }
@@ -2618,6 +2618,178 @@ test "struct layouts preserve declaration order alignment and nesting" {
     try testing.expectEqual(outer.layout, (try db.get(queries.TypeLayout, outer_type)).*);
 }
 
+test "byte literals, layout, calls, fields and static values" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\static Byte = byte
+        \\static high: byte = 255
+        \\static Pair = struct
+        \\  left: byte
+        \\  middle: int
+        \\  right: byte
+        \\func identity(value: byte) byte -> return value
+        \\func answer() byte
+        \\  var pair = Pair{left = 0, middle = 3, right = high}
+        \\  pair.left = identity(255)
+        \\  return pair.left
+    );
+    const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
+    try testing.expectEqual(structures.TypeId.byte, try resolvedStaticType(db, scope.resolveStatic("Byte").?));
+    const high = try resolvedStaticValue(db, scope.resolveStatic("high").?);
+    try testing.expectEqual(structures.TypeId.byte, high.runtime.type_id);
+    try testing.expectEqual(@as(u8, 255), high.runtime.value.byte);
+    try testing.expectEqual(structures.TypeLayout{ .byte_size = 1, .byte_alignment = 1 }, (try db.get(queries.TypeLayout, .byte)).*);
+    const pair_type = try resolvedStaticType(db, scope.resolveStatic("Pair").?);
+    const pair_layout = (try db.get(queries.StructLayout, pair_type)).*.?;
+    try testing.expectEqual(structures.TypeLayout{ .byte_size = 12, .byte_alignment = 4 }, pair_layout.layout);
+    try testing.expectEqualSlices(u32, &.{ 0, 4, 8 }, pair_layout.field_offsets);
+    try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "identity" }, 255);
+}
+
+test "byte literals reject out of range and int values do not convert implicitly" {
+    const cases = [_]struct { source: []const u8, kind: DiagnosticKind }{
+        .{ .source = "func answer() byte -> return 256", .kind = .integer_literal_out_of_range },
+        .{ .source = "func answer() byte\n  var value: byte = 256\n  return value", .kind = .integer_literal_out_of_range },
+        .{ .source = "func identity(value: byte) byte -> return value\nfunc answer() byte -> return identity(256)", .kind = .integer_literal_out_of_range },
+        .{ .source = "static Pair = struct\n  field: byte\nfunc answer() byte -> return Pair{field = 256}.field", .kind = .integer_literal_out_of_range },
+        .{ .source = "func answer() byte\n  const value = 255\n  return value", .kind = .return_type_mismatch },
+        .{ .source = "func answer() byte -> return -1", .kind = .return_type_mismatch },
+    };
+    for (cases) |case| {
+        const db = try testDatabase(1);
+        defer db.deinit();
+        try addSource(db, 1, case.source);
+        const answer = (try db.get(queries.BuildModuleScope, 1)).*.?.resolveFunction("answer").?;
+        try testing.expect((try db.get(queries.AnalyzeFunctionBody, answer)).* == null);
+        const diagnostics = try db.transitiveAccumulatorValues(queries.AnalyzeFunctionBody, answer, structures.Diagnostic, testing.allocator);
+        defer freeDiagnostics(diagnostics);
+        try testing.expectEqual(@as(usize, 1), diagnostics.len);
+        try testing.expectEqual(case.kind, std.meta.activeTag(diagnostics[0].kind));
+    }
+}
+
+test "static byte literal edits invalidate and recover" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1, "static high: byte = 255");
+    const high = (try db.get(queries.BuildModuleScope, 1)).*.?.resolveStatic("high").?;
+    try testing.expectEqual(@as(u8, 255), (try resolvedStaticValue(db, high)).runtime.value.byte);
+
+    try setSource(db, 1, "static high: byte = 256");
+    try testing.expect((try db.get(queries.ResolveStatic, high)).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(queries.ResolveStatic, high, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(structures.Diagnostic.Kind.integer_literal_out_of_range, diagnostics[0].kind);
+
+    try setSource(db, 1, "static high: byte = 0");
+    try testing.expectEqual(@as(u8, 0), (try resolvedStaticValue(db, high)).runtime.value.byte);
+}
+
+test "compile-time literal thunks distinguish expected types" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1, "static high: byte = 255");
+    const high = (try db.get(queries.BuildModuleScope, 1)).*.?.resolveStatic("high").?;
+    const resolved = (try db.get(queries.ResolveItem, high)).*.?;
+    const parsed = (try db.get(queries.ParseFile, 1)).*.?;
+    const initializer = parsed.nodes[resolved.declaration].data.node_node.b.unwrap().?;
+    const site: structures.CompileTimeSite = .{ .owner = .{ .item = high }, .node = initializer };
+    const inferred = (try db.get(queries.AnalyzeComptimeThunk, site)).*.?;
+    const expected = (try db.get(queries.AnalyzeComptimeThunk, .{ .owner = site.owner, .node = site.node, .expected_type = .byte })).*.?;
+    try testing.expectEqual(structures.TypeId.int, inferred.return_type);
+    try testing.expectEqual(structures.TypeId.byte, expected.return_type);
+}
+
+test "static byte parameter accepts a context-typed literal" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\func select(static value: byte) byte -> return value
+        \\func answer() byte -> return select(255)
+    );
+    try expectCompiledFunctionResult(db, 1, "answer", &.{"answer"}, 255);
+}
+
+test "static literal types resolve aliases and prior type arguments" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\static Byte = byte
+        \\static high: Byte = 255
+        \\func select(static T: type, static value: T) T -> return value
+        \\func answer() byte -> return select(Byte, high)
+        \\func literal() byte -> return select(Byte, 254)
+    );
+    try expectCompiledFunctionResult(db, 1, "answer", &.{"answer"}, 255);
+    try expectCompiledFunctionResult(db, 1, "literal", &.{"literal"}, 254);
+}
+
+test "static literal typing uses the callee file scope" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    const library = try addModuleFile(db, 1, "library",
+        \\static LocalByte = byte
+        \\pub func select(static value: LocalByte) byte -> return value
+    );
+    const root = try addModuleFile(db, 2, "",
+        \\import library.{select}
+        \\func answer() byte -> return select(255)
+    );
+    try addModuleMembers(db, library, &.{1});
+    try addModuleMembers(db, root, &.{2});
+    try expectCompiledFunctionResult(db, 2, "answer", &.{"answer"}, 255);
+}
+
+test "static byte parameter rejects an out-of-range literal" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\func select(static value: byte) byte -> return value
+        \\func answer() byte -> return select(256)
+    );
+    const answer = (try db.get(queries.BuildModuleScope, 1)).*.?.resolveFunction("answer").?;
+    try testing.expect((try db.get(queries.AnalyzeFunctionBody, answer)).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(queries.AnalyzeFunctionBody, answer, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(structures.Diagnostic.Kind.integer_literal_out_of_range, diagnostics[0].kind);
+}
+
+test "static byte parameter does not convert an int value" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\static number: int = 255
+        \\func select(static value: byte) byte -> return value
+        \\func answer() byte -> return select(number)
+    );
+    const answer = (try db.get(queries.BuildModuleScope, 1)).*.?.resolveFunction("answer").?;
+    try testing.expect((try db.get(queries.AnalyzeFunctionBody, answer)).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(queries.AnalyzeFunctionBody, answer, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(structures.Diagnostic.Kind.static_argument_type_mismatch, diagnostics[0].kind);
+}
+
+test "static alias parameter does not retype a named int" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\static Byte = byte
+        \\static number: int = 255
+        \\func select(static value: Byte) Byte -> return value
+        \\func answer() Byte -> return select(number)
+    );
+    const answer = (try db.get(queries.BuildModuleScope, 1)).*.?.resolveFunction("answer").?;
+    try testing.expect((try db.get(queries.AnalyzeFunctionBody, answer)).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(queries.AnalyzeFunctionBody, answer, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(structures.Diagnostic.Kind.static_argument_type_mismatch, diagnostics[0].kind);
+}
+
 test "struct layouts reject direct and variant-mediated containment cycles" {
     const db = try testDatabase(1);
     defer db.deinit();
@@ -3577,8 +3749,8 @@ test "inferred statics share the typed thunk publication path" {
     const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
     const parsed = (try db.get(queries.ParseFile, 1)).*.?;
     for ([_]struct { name: []const u8, instruction: std.meta.Tag(structures.FunctionInstruction) }{
-        .{ .name = "base", .instruction = .consti },
-        .{ .name = "alias", .instruction = .consti },
+        .{ .name = "base", .instruction = .const_int },
+        .{ .name = "alias", .instruction = .const_int },
         .{ .name = "Int", .instruction = .const_type },
         .{ .name = "callable", .instruction = .function_ref },
     }) |expected| {
@@ -4470,7 +4642,7 @@ test "comptime thunks inherit enclosing static specialization arguments" {
     const increment = answer_body.instructions[0].call.instance();
     const increment_body = (try db.get(queries.AnalyzeFunctionInstance, increment)).*.?;
     try testing.expectEqual(@as(usize, 2), increment_body.instructions.len);
-    try testing.expectEqual(@as(i32, 42), increment_body.instructions[1].consti);
+    try testing.expectEqual(@as(i32, 42), increment_body.instructions[1].const_int);
     try testing.expectEqual(@as(u32, 1), @intFromEnum(increment_body.blocks[0].terminator.return_value.value));
 }
 
@@ -5512,7 +5684,7 @@ test "declared unit functions analyze lower compile and execute as ordinary call
 
     const caller_body = (try db.get(queries.AnalyzeFunctionBody, caller_id)).*.?;
     try testing.expectEqual(@as(usize, 2), caller_body.instructions.len);
-    try testing.expectEqual(@as(i32, 7), caller_body.instructions[0].consti);
+    try testing.expectEqual(@as(i32, 7), caller_body.instructions[0].const_int);
     try testing.expectEqual(leaf_id, caller_body.instructions[1].call.target);
     try testing.expectEqual(structures.TypeId.unit, caller_body.instructions[1].call.return_type);
     try testing.expectEqual(structures.FunctionBodyAnalysis.Terminator.return_unit, caller_body.blocks[0].terminator);
@@ -5659,12 +5831,12 @@ test "function expressions analyze nested arithmetic and calls as one typed valu
     const body = (try db.get(queries.AnalyzeFunctionBody, expression_id)).*.?;
 
     try testing.expectEqual(@as(usize, 11), body.instructions.len);
-    try testing.expectEqual(@as(i32, 120), body.instructions[0].consti);
+    try testing.expectEqual(@as(i32, 120), body.instructions[0].const_int);
     try testing.expectEqual(scope.resolve("leaf").?, body.instructions[1].call.target);
     try testing.expectEqual(@as(u32, 0), @intFromEnum(body.instructions[2].divsi.lhs));
     try testing.expectEqual(@as(u32, 1), @intFromEnum(body.instructions[2].divsi.rhs));
-    try testing.expectEqual(@as(i32, 2), body.instructions[3].consti);
-    try testing.expectEqual(@as(i32, 3), body.instructions[4].consti);
+    try testing.expectEqual(@as(i32, 2), body.instructions[3].const_int);
+    try testing.expectEqual(@as(i32, 3), body.instructions[4].const_int);
     try testing.expectEqual(@as(u32, 3), @intFromEnum(body.instructions[5].addi.lhs));
     try testing.expectEqual(@as(u32, 4), @intFromEnum(body.instructions[5].addi.rhs));
     try testing.expectEqual(@as(u32, 5), @intFromEnum(body.instructions[7].muli.lhs));
@@ -6747,8 +6919,8 @@ test "immutable locals name typed values without adding binding instructions" {
     try testing.expectEqual(@as(usize, 7), body.instructions.len);
     try testing.expectEqual(scope.resolve("leaf").?, body.instructions[0].call.target);
     try testing.expectEqual(scope.resolve("leaf").?, body.instructions[1].call.target);
-    try testing.expectEqual(@as(i32, 2), body.instructions[2].consti);
-    try testing.expectEqual(@as(i32, 1), body.instructions[3].consti);
+    try testing.expectEqual(@as(i32, 2), body.instructions[2].const_int);
+    try testing.expectEqual(@as(i32, 1), body.instructions[3].const_int);
     try testing.expectEqual(@as(u32, 2), @intFromEnum(body.instructions[4].addi.lhs));
     try testing.expectEqual(@as(u32, 3), @intFromEnum(body.instructions[4].addi.rhs));
     try testing.expectEqual(@as(u32, 0), @intFromEnum(body.instructions[5].muli.lhs));
@@ -8474,7 +8646,7 @@ test "entry const bindings name typed values and execute" {
     const body = (try db.get(queries.AnalyzeFunctionBody, entry_id)).*.?;
 
     try testing.expectEqual(@as(usize, 3), body.instructions.len);
-    try testing.expectEqual(@as(i32, 21), body.instructions[0].consti);
+    try testing.expectEqual(@as(i32, 21), body.instructions[0].const_int);
     try testing.expectEqual(status_id, body.instructions[1].call.target);
     try testing.expectEqual(structures.TypeId.never, body.instructions[2].resultType());
 

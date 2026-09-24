@@ -10,6 +10,13 @@
 # division truncates toward zero. Division by zero or the unrepresentable
 # min-int / -1 quotient is an execution error; at compile time it is a source
 # error at the executed division.
+# byte: distinct unsigned 8-bit integer, values 0 through 255, size and
+# alignment 1. It has trivial move, copy, and drop, but no arithmetic or
+# comparison operations yet.
+# Decimal integer literals default to int. In an expected byte position, a
+# direct integer literal has type byte; values outside 0 through 255 are source
+# errors. A value already typed int does not implicitly convert to byte, nor
+# does a byte value implicitly convert to int.
 # float: floating-point number.
 # bool: true or false.
 # type: the type of compile-time type values.
@@ -28,8 +35,8 @@
 # Numeric conversions (open)
 # Explicit numeric conversion/cast syntax and behavior must be defined before
 # deciding implicit numeric coercions. Conversion failure, rounding, overflow,
-# and literal typing remain open. Existing variant widening and 'as' extraction
-# do not define numeric conversion behavior.
+# and literal typing for other numeric types remain open. Existing variant
+# widening and 'as' extraction do not define numeric conversion behavior.
 
 
 # Structural tuples

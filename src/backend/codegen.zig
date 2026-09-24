@@ -121,7 +121,7 @@ const LocationPlan = struct {
             const value_index = @intFromEnum(ssa.instructionValue(instruction_index));
             value_types[value_index] = instruction.resultType();
             switch (instruction) {
-                .consti, .constb, .const_unit, .const_none, .function_ref => {},
+                .const_int, .const_byte, .const_bool, .const_unit, .const_none, .function_ref => {},
                 .const_type => unreachable,
                 .variant_coerce, .variant_extract, .callable_coerce => |operation| needed[@intFromEnum(operation.operand)] = .used,
                 .struct_init => |operation| {
@@ -231,8 +231,9 @@ const LocationPlan = struct {
             const value_index = @intFromEnum(ssa.instructionValue(instruction_index));
             location.* = location_blk: {
                 switch (instruction) {
-                    .consti => |value| break :location_blk .{ .immediate = value },
-                    .constb => |value| break :location_blk .{ .immediate = @intFromBool(value) },
+                    .const_int => |value| break :location_blk .{ .immediate = value },
+                    .const_byte => |value| break :location_blk .{ .immediate = value },
+                    .const_bool => |value| break :location_blk .{ .immediate = @intFromBool(value) },
                     .const_type => unreachable,
                     .const_unit, .const_none => break :location_blk .discarded,
                     .call => |call| if (call.return_type == .unit) {
@@ -386,7 +387,7 @@ fn FunctionEmitter(comptime Types: type) type {
                 const instruction = ssa.instructions[instruction_index];
                 const destination = self.locations[@intFromEnum(ssa.instructionValue(instruction_index))];
                 switch (instruction) {
-                    .consti, .constb, .const_unit, .const_none => {},
+                    .const_int, .const_byte, .const_bool, .const_unit, .const_none => {},
                     .const_type => unreachable,
                     .function_ref => |reference| try self.emitFunctionReference(reference, destination),
                     .variant_tag => |operand| {

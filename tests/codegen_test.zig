@@ -46,7 +46,7 @@ const TestTypes = struct {
 };
 
 fn integerConstant(value: i32) structures.FunctionBodyAnalysis.Instruction {
-    return .{ .consti = value };
+    return .{ .const_int = value };
 }
 
 fn directCall(target: structures.InstanceId) structures.FunctionBodyAnalysis.Instruction {

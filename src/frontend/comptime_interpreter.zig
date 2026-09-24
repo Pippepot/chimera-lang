@@ -54,8 +54,9 @@ pub fn execute(
             const instruction = body.instructions[instruction_index];
             const destination = @intFromEnum(body.instructionValue(instruction_index));
             switch (instruction) {
-                .consti => |value| slots[destination] = .{ .runtime = .{ .int = value } },
-                .constb => |value| slots[destination] = .{ .runtime = .{ .bool = value } },
+                .const_int => |value| slots[destination] = .{ .runtime = .{ .int = value } },
+                .const_byte => |value| slots[destination] = .{ .runtime = .{ .byte = value } },
+                .const_bool => |value| slots[destination] = .{ .runtime = .{ .bool = value } },
                 .const_type => |type_id| slots[destination] = .{ .type = type_id },
                 .const_unit => slots[destination] = .{ .runtime = .unit },
                 .const_none => slots[destination] = .{ .runtime = .none },

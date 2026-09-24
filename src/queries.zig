@@ -356,6 +356,7 @@ pub fn TypeInterner(comptime Context: type) type {
         ctx: Context,
         file_id: ?structures.FileId = null,
         instance: ?structures.InstanceId = null,
+        prior_static_arguments: ?[]const structures.CompileTimeValueId = null,
 
         pub fn internVariant(self: @This(), members: []const structures.TypeId) !structures.InternVariantResult {
             return internVariantType(self.ctx, members);
@@ -412,8 +413,8 @@ pub fn TypeInterner(comptime Context: type) type {
             };
         }
 
-        pub fn staticCallArgument(self: @This(), node: structures.Node.Index, is_meta_type: bool) !?structures.CompileTimeValueId {
-            if (!is_meta_type) return self.executeComptime(node);
+        pub fn staticCallArgument(self: @This(), node: structures.Node.Index, is_meta_type: bool, expected_type: ?structures.TypeId) !?structures.CompileTimeValueId {
+            if (!is_meta_type) return self.executeComptimeWithType(node, expected_type);
             const file_id = self.file_id orelse unreachable;
             const parsed = (try self.ctx.get(ParseFile, file_id)).* orelse return null;
             const source = (try self.ctx.input(SourceText, file_id)).*;
@@ -423,6 +424,25 @@ pub fn TypeInterner(comptime Context: type) type {
                 .unsupported => |issue| blk: {
                     try typing.emitSemanticIssue(self.ctx, file_id, issue);
                     break :blk null;
+                },
+            };
+        }
+
+        pub fn staticParameterType(self: @This(), instance: structures.InstanceId, parameter_index: usize, prior: []const structures.CompileTimeValueId) !structures.TypeId {
+            const resolved = (try self.ctx.get(ResolveItem, instance.item)).* orelse return error.Unavailable;
+            const parsed = (try self.ctx.get(ParseFile, resolved.file_id)).* orelse return error.Unavailable;
+            const source = (try self.ctx.input(SourceText, resolved.file_id)).*;
+            const type_interner: @This() = .{
+                .ctx = self.ctx,
+                .file_id = resolved.file_id,
+                .instance = instance,
+                .prior_static_arguments = prior,
+            };
+            return switch (try semantic.analyzeStaticParameterType(&parsed, source, resolved.declaration, parameter_index, type_interner, self.ctx.allocator())) {
+                .success => |type_id| type_id,
+                .unsupported => |issue| {
+                    try typing.emitSemanticIssue(self.ctx, resolved.file_id, issue);
+                    return error.Unavailable;
                 },
             };
         }
@@ -489,8 +509,12 @@ pub fn TypeInterner(comptime Context: type) type {
         }
 
         pub fn executeComptime(self: @This(), node: structures.Node.Index) !?structures.CompileTimeValueId {
+            return self.executeComptimeWithType(node, null);
+        }
+
+        pub fn executeComptimeWithType(self: @This(), node: structures.Node.Index, expected_type: ?structures.TypeId) !?structures.CompileTimeValueId {
             const owner = self.instance orelse unreachable;
-            const outcome = (try self.ctx.get(ExecuteComptimeThunk, .{ .owner = owner, .node = node })).* orelse return null;
+            const outcome = (try self.ctx.get(ExecuteComptimeThunk, .{ .owner = owner, .node = node, .expected_type = expected_type })).* orelse return null;
             return switch (outcome) {
                 .returned => |value| value,
                 .failure, .exit => null,
@@ -521,8 +545,21 @@ pub fn TypeInterner(comptime Context: type) type {
 
         fn staticParameter(self: @This(), name: []const u8) !?structures.CompileTimeValueId {
             var instance = self.instance orelse return null;
-            const specialization = instance.specialization orelse return null;
-            var arguments = (try self.ctx.lookupInterned(CompileTimeValueTuples, specialization)).values;
+            var arguments: []const structures.CompileTimeValueId = if (instance.specialization) |tuple|
+                (try self.ctx.lookupInterned(CompileTimeValueTuples, tuple)).values
+            else if (self.prior_static_arguments != null)
+                &.{}
+            else
+                return null;
+            if (self.prior_static_arguments) |prior| {
+                const resolved = (try self.ctx.get(ResolveItem, instance.item)).* orelse return error.Unavailable;
+                const parsed = (try self.ctx.get(ParseFile, resolved.file_id)).* orelse return error.Unavailable;
+                const source = (try self.ctx.input(SourceText, resolved.file_id)).*;
+                if (semantic.resolveSpecializationArgument(&parsed, source, resolved.declaration, prior, name)) |value| return value;
+                const loc = try self.ctx.lookupInterned(ItemLocations, instance.item);
+                instance.item = loc.owner orelse return null;
+                if (arguments.len == 0) return null;
+            }
             while (true) {
                 const arity = (try self.ctx.get(SpecializationArity, instance.item)).* orelse return error.Unavailable;
                 if (arguments.len != arity.total()) return error.Unavailable;
@@ -703,6 +740,7 @@ pub const TypeLayout = struct {
 
     pub fn run(ctx: anytype, type_id: Input) anyerror!Output {
         if (type_id == .int or type_id == .bool) return .{ .byte_size = 4, .byte_alignment = 4 };
+        if (type_id == .byte) return .{ .byte_size = 1, .byte_alignment = 1 };
         if (type_id == .unit or type_id == .none or type_id == .never) return .{ .byte_size = 0, .byte_alignment = 1 };
         if (type_id == .type) unreachable;
 
@@ -1737,6 +1775,7 @@ pub const ResolveStaticInstance = struct {
         const site: structures.CompileTimeSite = .{
             .owner = instance,
             .node = initializer,
+            .expected_type = runtime_annotation,
         };
         const outcome = (try ctx.get(ExecuteComptimeThunk, site)).* orelse return null;
         const value_id = switch (outcome) {
@@ -1746,7 +1785,7 @@ pub const ResolveStaticInstance = struct {
         };
         const expected_type = runtime_annotation orelse return value_id;
         var value = (try ctx.lookupInterned(CompileTimeValues, value_id)).*;
-        const runtime = switch (value) {
+        switch (value) {
             .type => {
                 try typing.emitSemanticIssue(ctx, resolved.file_id, .{
                     .span = nodeSpan(&parsed, initializer),
@@ -1754,22 +1793,23 @@ pub const ResolveStaticInstance = struct {
                 });
                 return null;
             },
-            .runtime => |runtime| runtime,
-        };
-        if (!try semantic.canWidenTo(type_interner, runtime.type_id, expected_type)) {
+            .runtime => {},
+        }
+        const typed_runtime = value.runtime;
+        if (!try semantic.canWidenTo(type_interner, typed_runtime.type_id, expected_type)) {
             try typing.emitSemanticIssue(ctx, resolved.file_id, .{
                 .span = nodeSpan(&parsed, initializer),
                 .kind = .{ .static_initializer_type_mismatch = .{
                     .expected = expected_type,
-                    .found = runtime.type_id,
+                    .found = typed_runtime.type_id,
                 } },
             });
             return null;
         }
-        if (runtime.type_id != expected_type) {
+        if (typed_runtime.type_id != expected_type) {
             if (try lookupVariantMembers(ctx, expected_type)) |members| {
-                const active_type = if (runtime.value == .variant) runtime.value.variant.member_type else runtime.type_id;
-                const payload = if (runtime.value == .variant) runtime.value.variant.payload else value_id;
+                const active_type = if (typed_runtime.value == .variant) typed_runtime.value.variant.member_type else typed_runtime.type_id;
+                const payload = if (typed_runtime.value == .variant) typed_runtime.value.variant.payload else value_id;
                 const tag = (try semantic.widenedVariantTag(type_interner, active_type, members)) orelse unreachable;
                 value.runtime.value = .{ .variant = .{ .member_type = members[tag], .payload = payload } };
             } else {
@@ -1827,7 +1867,7 @@ pub const AnalyzeComptimeThunk = struct {
             &.{},
             .unit,
             true,
-            .{ .infer_return_type = true, .publish_instruction_spans = true, .allow_type_values = true },
+            .{ .infer_return_type = true, .publish_instruction_spans = true, .allow_type_values = true, .expected_result_type = site.expected_type },
             type_interner,
             unresolved,
         );
