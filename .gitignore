@@ -3,6 +3,8 @@ main
 chimera.asm
 chimera.o
 .zig-cache/
+.chi-cache/
+.chi-run-*
 *.qcache
 *.o
 agentloop

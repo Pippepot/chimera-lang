@@ -129,10 +129,15 @@ pub fn collectModuleFiles(
         errdefer gpa.free(module_path);
         try files.append(gpa, .{ .path = path, .module_path = module_path });
     }
-    // Walker order is undefined; sort for deterministic FileIds.
+    // Walker order is undefined; both lists determine stable cache identities.
     std.mem.sort(DiscoveredFile, files.items, {}, struct {
         fn lessThan(_: void, left: DiscoveredFile, right: DiscoveredFile) bool {
             return std.mem.order(u8, left.path, right.path) == .lt;
+        }
+    }.lessThan);
+    std.mem.sort([]u8, modules.items, {}, struct {
+        fn lessThan(_: void, left: []u8, right: []u8) bool {
+            return std.mem.order(u8, left, right) == .lt;
         }
     }.lessThan);
     const owned_files = try files.toOwnedSlice(gpa);

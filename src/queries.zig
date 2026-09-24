@@ -1044,6 +1044,7 @@ pub const IndexItems = struct {
 };
 
 pub const ModuleDeclarations = struct {
+    pub const disk_boundary = true;
     pub const Input = structures.ModuleId;
     pub const Output = ?structures.ModuleScope;
 
@@ -1090,6 +1091,7 @@ pub const ModuleDeclarations = struct {
 };
 
 pub const BuildModuleScope = struct {
+    pub const disk_boundary = true;
     pub const Input = structures.FileId;
     pub const Output = ?structures.ModuleScope;
 
@@ -1435,6 +1437,7 @@ fn resolveImportStatement(
 }
 
 pub const IndexModuleItems = struct {
+    pub const disk_boundary = true;
     pub const Input = structures.ModuleId;
     pub const Output = ?structures.ModuleItemIndex;
 
@@ -1481,6 +1484,7 @@ pub const IndexModuleItems = struct {
 };
 
 pub const ResolveItem = struct {
+    pub const disk_boundary = true;
     pub const Input = structures.ItemId;
     pub const Output = ?structures.ResolvedItem;
 
@@ -1599,6 +1603,7 @@ fn enclosingInstance(ctx: anytype, instance: structures.InstanceId) !?structures
 }
 
 pub const FunctionInstanceSignature = struct {
+    pub const disk_boundary = true;
     pub const Input = structures.InstanceId;
     pub const Output = ?structures.FunctionSignature;
 
@@ -1629,6 +1634,7 @@ pub const FunctionInstanceSignature = struct {
 };
 
 pub const FunctionSignature = struct {
+    pub const disk_boundary = true;
     pub const Input = structures.ItemId;
     pub const Output = ?structures.FunctionSignature;
 
@@ -2199,6 +2205,7 @@ fn getStructDefinition(ctx: anytype, identity: structures.StructIdentity) !?stru
 }
 
 pub const AnalyzeFunctionBody = struct {
+    pub const disk_boundary = true;
     pub const Input = structures.ItemId;
     pub const Output = ?structures.FunctionBodyAnalysis;
 
@@ -2208,6 +2215,7 @@ pub const AnalyzeFunctionBody = struct {
 };
 
 pub const AnalyzeFunctionInstance = struct {
+    pub const disk_boundary = true;
     pub const Input = structures.InstanceId;
     pub const Output = ?structures.FunctionBodyAnalysis;
 
@@ -2340,7 +2348,10 @@ pub const CollectReachableInstances = struct {
             const artifact = (try ctx.get(CompileFunction, instance)).* orelse return null;
             for (artifact.referenced_instances) |referenced| {
                 const result = try seen.getOrPut(referenced);
-                if (!result.found_existing) try instances.append(ctx.allocator(), referenced);
+                if (!result.found_existing) {
+                    try instances.append(ctx.allocator(), referenced);
+                    if (ctx.hasParallelWorkers()) _ = try ctx.spawn(CompileFunction, referenced);
+                }
             }
         }
 
@@ -2362,9 +2373,17 @@ pub const ValidateModuleGraph = struct {
         var next: usize = 0;
         while (next < modules.count()) : (next += 1) {
             const module = modules.keys()[next];
+            const members = (try ctx.input(ModuleMembers, module)).*;
+            if (ctx.hasParallelWorkers()) {
+                _ = try ctx.spawn(IndexModuleItems, module);
+                for (members) |file| {
+                    _ = try ctx.spawn(IndexItems, file);
+                    _ = try ctx.spawn(ResolveFileImports, file);
+                    _ = try ctx.spawn(CollectFileImports, file);
+                }
+            }
             // Validate declaration ownership even when no item is referenced.
             _ = (try ctx.get(IndexModuleItems, module)).* orelse return false;
-            const members = (try ctx.input(ModuleMembers, module)).*;
             for (members) |file| {
                 if ((try ctx.get(ResolveFileImports, file)).* == null) return false;
                 const imports = (try ctx.get(CollectFileImports, file)).* orelse return false;

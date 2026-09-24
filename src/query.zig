@@ -1,6 +1,11 @@
 const std = @import("std");
+const disk_codec = @import("disk_codec.zig");
 
 const Revision = u64;
+const Sha256 = std.crypto.hash.sha2.Sha256;
+
+pub const PersistedInputRef = *InputEntry;
+pub const PersistedQueryRef = *Entry;
 
 pub const QueryError = error{
     DuplicateInput,
@@ -67,6 +72,10 @@ pub const Context = struct {
 
     pub fn allocator(ctx: *Context) std.mem.Allocator {
         return ctx.db.allocator;
+    }
+
+    pub fn hasParallelWorkers(ctx: *Context) bool {
+        return ctx.db.workers.len > 1;
     }
 
     pub fn intern(ctx: *Context, comptime I: type, value: I.Value) anyerror!I.Id {
@@ -213,8 +222,11 @@ pub const Database = struct {
             .key_ptr = @ptrCast(key_box),
             .value_ptr = null,
             .changed_at = db.revision,
+            .type_name = @typeName(I),
             .destroy_key_fn = destroyInputKeyFn(I),
             .destroy_value_fn = destroyInputValueFn(I),
+            .write_key_fn = writeInputKeyFn(I),
+            .fingerprint_fn = fingerprintInputFn(I),
         };
         try db.inputs.put(inputCacheKey(I, key_box, key_hash), entry);
         return entry;
@@ -277,9 +289,164 @@ pub const Database = struct {
             .type_name = @typeName(I),
             .value_ptr = @ptrCast(value_box),
             .destroy_value_fn = destroyInternedValueFn(I),
+            .write_value_fn = writeInternedValueFn(I),
         });
         db.interns.putAssumeCapacityNoClobber(internCacheKey(I, value_box, value_hash), index);
         return internId(I, index);
+    }
+
+    pub fn writeInternedValues(db: *Database, writer: *disk_codec.Writer) !void {
+        db.lock();
+        defer db.unlock();
+        try writer.write(u64, @intCast(db.interned_values.items.len));
+        for (db.interned_values.items) |entry| {
+            try writer.write([]const u8, entry.type_name);
+            try entry.write_value_fn(writer, entry.value_ptr);
+        }
+    }
+
+    pub fn matchPersistedInput(db: *Database, comptime I: type, key: I.Key, digest: [32]u8) !?PersistedInputRef {
+        validateInput(I);
+        const key_copy = key;
+        const lookup_key = inputCacheKey(I, &key_copy, inputKeyHash(I, key_copy));
+        db.lock();
+        defer db.unlock();
+        if (db.pending_queries != 0) return error.InputUpdateDuringQuery;
+        const entry = db.inputs.get(lookup_key) orelse try db.insertInputLocked(I, key_copy, lookup_key.hash);
+        const actual = try inputFingerprint(I, db.allocator, entry.value_ptr);
+        return if (std.mem.eql(u8, &actual, &digest)) entry else null;
+    }
+
+    pub fn matchPersistedQuery(db: *Database, comptime Q: type, input_value: Q.Input, digest: [32]u8) !?PersistedQueryRef {
+        const handle = try db.scheduleInternal(Q, input_value, null, .deferred);
+        _ = handle.wait() catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const entry = handle.entry;
+        var clean: std.AutoHashMap(*Entry, bool) = .init(db.allocator);
+        defer clean.deinit();
+        if (!(try db.persistedSubtreeClean(entry, &clean))) return null;
+        const actual = try entry.fingerprint_output_fn.?(db.allocator, entry.output_ptr.?);
+        return if (std.mem.eql(u8, &actual, &digest)) entry else null;
+    }
+
+    pub fn importCompletedQuery(db: *Database, comptime Q: type, input_value: Q.Input, output_value: Q.Output, inputs: []const PersistedInputRef, queries: []const PersistedQueryRef) !void {
+        validateQuery(Q);
+        const input_copy = input_value;
+        const input_hash = queryInputHash(Q, input_copy);
+        db.lock();
+        defer db.unlock();
+        if (db.pending_queries != 0) return error.InputUpdateDuringQuery;
+        if (db.entries.contains(queryCacheKey(Q, &input_copy, input_hash))) return error.InvalidCache;
+        const entry = try db.insertEntryLocked(Q, input_copy, input_hash);
+        errdefer {
+            _ = db.entries.remove(queryCacheKey(Q, &input_copy, input_hash));
+            db.destroyEntry(entry);
+        }
+        try entry.input_deps.appendSlice(db.allocator, inputs);
+        try entry.deps.appendSlice(db.allocator, queries);
+        const output_box = try db.allocator.create(Q.Output);
+        output_box.* = output_value;
+        entry.output_ptr = @ptrCast(output_box);
+        entry.state = .complete;
+    }
+
+    /// Persist only successful, diagnostic-free subgraphs. Query boundaries
+    /// retain equal-result invalidation, while the remaining edges terminate
+    /// at the exact inputs observed by the computation.
+    pub fn writeCompletedQueries(db: *Database, comptime Q: type, writer: *disk_codec.Writer) !void {
+        validateQuery(Q);
+        comptime if (@typeInfo(Q.Output) != .optional) @compileError("persisted query output must be optional");
+        db.lock();
+        defer db.unlock();
+        if (db.pending_queries != 0) return error.InputUpdateDuringQuery;
+
+        const Record = struct { entry: *Entry, inputs: []*InputEntry, queries: []*Entry };
+        var records: std.ArrayList(Record) = .empty;
+        defer {
+            for (records.items) |record| {
+                db.allocator.free(record.inputs);
+                db.allocator.free(record.queries);
+            }
+            records.deinit(db.allocator);
+        }
+        var clean: std.AutoHashMap(*Entry, bool) = .init(db.allocator);
+        defer clean.deinit();
+        var entries = db.entries.iterator();
+        while (entries.next()) |slot| {
+            if (!std.mem.eql(u8, slot.key_ptr.type_name, @typeName(Q))) continue;
+            const entry = slot.value_ptr.*;
+            if (entry.state != .complete or entry.verified_at != db.revision) continue;
+            const output: *const Q.Output = @ptrCast(@alignCast(entry.output_ptr orelse continue));
+            if (output.* == null) continue;
+            var seen_entries = std.AutoHashMap(*Entry, void).init(db.allocator);
+            defer seen_entries.deinit();
+            var seen_inputs = std.AutoHashMap(*InputEntry, void).init(db.allocator);
+            defer seen_inputs.deinit();
+            var inputs: std.ArrayList(*InputEntry) = .empty;
+            defer inputs.deinit(db.allocator);
+            var query_deps: std.ArrayList(*Entry) = .empty;
+            defer query_deps.deinit(db.allocator);
+            if (!(try db.persistedSubtreeClean(entry, &clean))) continue;
+            try db.collectPersistedDependencies(entry, &seen_entries, &seen_inputs, &inputs, &query_deps);
+            const owned_inputs = try inputs.toOwnedSlice(db.allocator);
+            errdefer db.allocator.free(owned_inputs);
+            const owned_queries = try query_deps.toOwnedSlice(db.allocator);
+            errdefer db.allocator.free(owned_queries);
+            try records.append(db.allocator, .{ .entry = entry, .inputs = owned_inputs, .queries = owned_queries });
+        }
+        try writer.write(u64, @intCast(records.items.len));
+        for (records.items) |record| {
+            const input: *const Q.Input = @ptrCast(@alignCast(record.entry.input_ptr));
+            const output: *const Q.Output = @ptrCast(@alignCast(record.entry.output_ptr.?));
+            try writer.write(Q.Input, input.*);
+            try writer.write(Q.Output, output.*);
+            try writer.write(u64, @intCast(record.inputs.len));
+            for (record.inputs) |dep| {
+                try writer.write([]const u8, dep.type_name);
+                try dep.write_key_fn(writer, dep.key_ptr);
+                const digest = try dep.fingerprint_fn(db.allocator, dep.value_ptr);
+                try writer.bytes.appendSlice(writer.allocator, &digest);
+            }
+            try writer.write(u64, @intCast(record.queries.len));
+            for (record.queries) |dep| {
+                try writer.write([]const u8, dep.type_name);
+                try dep.write_input_fn(writer, dep.input_ptr);
+                const digest = try dep.fingerprint_output_fn.?(db.allocator, dep.output_ptr.?);
+                try writer.bytes.appendSlice(writer.allocator, &digest);
+            }
+        }
+    }
+
+    fn persistedSubtreeClean(db: *Database, entry: *Entry, clean: *std.AutoHashMap(*Entry, bool)) !bool {
+        if (clean.get(entry)) |result| return result;
+        var result = entry.state == .complete and entry.verified_at == db.revision and !entry.accums_in_subtree;
+        if (result) {
+            for (entry.deps.items) |dep| {
+                if (!(try db.persistedSubtreeClean(dep, clean))) {
+                    result = false;
+                    break;
+                }
+            }
+        }
+        try clean.put(entry, result);
+        return result;
+    }
+
+    fn collectPersistedDependencies(db: *Database, entry: *Entry, seen_entries: *std.AutoHashMap(*Entry, void), seen_inputs: *std.AutoHashMap(*InputEntry, void), inputs: *std.ArrayList(*InputEntry), query_deps: *std.ArrayList(*Entry)) !void {
+        if ((try seen_entries.getOrPut(entry)).found_existing) return;
+        for (entry.input_deps.items) |input| {
+            if (!(try seen_inputs.getOrPut(input)).found_existing) try inputs.append(db.allocator, input);
+        }
+        for (entry.deps.items) |dep| {
+            if (dep.fingerprint_output_fn != null) {
+                if (!(try seen_entries.getOrPut(dep)).found_existing)
+                    try query_deps.append(db.allocator, dep);
+            } else {
+                try db.collectPersistedDependencies(dep, seen_entries, seen_inputs, inputs, query_deps);
+            }
+        }
     }
 
     pub fn lookupInterned(db: *Database, comptime I: type, id: I.Id) QueryError!*const I.Value {
@@ -398,6 +565,7 @@ pub const Database = struct {
         entry.* = .{
             .input_ptr = @ptrCast(input_box),
             .output_ptr = null,
+            .type_name = @typeName(Q),
             .err = null,
             .state = .queued,
             .verified_at = db.revision,
@@ -406,6 +574,8 @@ pub const Database = struct {
             .destroy_input_fn = destroyBoxFn(Q.Input),
             .destroy_output_fn = destroyBoxFn(Q.Output),
             .output_eql_fn = outputEqlFn(Q),
+            .write_input_fn = writeQueryInputFn(Q),
+            .fingerprint_output_fn = if (@hasDecl(Q, "disk_boundary") and Q.disk_boundary) fingerprintQueryOutputFn(Q) else null,
             .deps = .empty,
             .input_deps = .empty,
             .accums = null,
@@ -858,10 +1028,14 @@ const InternMap = std.HashMap(ErasedKey, u32, ErasedKeyContext, 80);
 const ComputeFn = *const fn (*Database, *Entry, ?usize) anyerror!*anyopaque;
 const DestroyOpaqueFn = *const fn (std.mem.Allocator, *anyopaque) void;
 const EqlOpaqueFn = *const fn (*const anyopaque, *const anyopaque) bool;
+const WriteOpaqueFn = *const fn (*disk_codec.Writer, *const anyopaque) anyerror!void;
+const FingerprintFn = *const fn (std.mem.Allocator, ?*anyopaque) anyerror![32]u8;
+const FingerprintQueryFn = *const fn (std.mem.Allocator, *const anyopaque) anyerror![32]u8;
 
 const Entry = struct {
     input_ptr: *anyopaque,
     output_ptr: ?*anyopaque,
+    type_name: []const u8,
     err: ?anyerror,
     state: EntryState,
     verified_at: Revision,
@@ -871,6 +1045,8 @@ const Entry = struct {
     destroy_input_fn: DestroyOpaqueFn,
     destroy_output_fn: DestroyOpaqueFn,
     output_eql_fn: EqlOpaqueFn,
+    write_input_fn: WriteOpaqueFn,
+    fingerprint_output_fn: ?FingerprintQueryFn,
     deps: std.ArrayList(*Entry),
     input_deps: std.ArrayList(*InputEntry),
     accums: ?*AccumBucket,
@@ -888,14 +1064,18 @@ const InputEntry = struct {
     key_ptr: *anyopaque,
     value_ptr: ?*anyopaque,
     changed_at: Revision,
+    type_name: []const u8,
     destroy_key_fn: DestroyOpaqueFn,
     destroy_value_fn: DestroyOpaqueFn,
+    write_key_fn: WriteOpaqueFn,
+    fingerprint_fn: FingerprintFn,
 };
 
 const InternEntry = struct {
     type_name: []const u8,
     value_ptr: *anyopaque,
     destroy_value_fn: DestroyOpaqueFn,
+    write_value_fn: WriteOpaqueFn,
 };
 
 const AccumBucket = struct {
@@ -1119,6 +1299,68 @@ fn destroyInternedValueFn(comptime I: type) DestroyOpaqueFn {
             gpa.destroy(value);
         }
     }.destroy;
+}
+
+fn writeInternedValueFn(comptime I: type) WriteOpaqueFn {
+    return struct {
+        fn write(writer: *disk_codec.Writer, ptr: *const anyopaque) anyerror!void {
+            const value: *const I.Value = @ptrCast(@alignCast(ptr));
+            try writer.write(I.Value, value.*);
+        }
+    }.write;
+}
+
+fn writeInputKeyFn(comptime I: type) WriteOpaqueFn {
+    return struct {
+        fn write(writer: *disk_codec.Writer, ptr: *const anyopaque) anyerror!void {
+            const key: *const I.Key = @ptrCast(@alignCast(ptr));
+            try writer.write(I.Key, key.*);
+        }
+    }.write;
+}
+
+fn writeQueryInputFn(comptime Q: type) WriteOpaqueFn {
+    return struct {
+        fn write(writer: *disk_codec.Writer, ptr: *const anyopaque) anyerror!void {
+            const input: *const Q.Input = @ptrCast(@alignCast(ptr));
+            try writer.write(Q.Input, input.*);
+        }
+    }.write;
+}
+
+fn fingerprintQueryOutputFn(comptime Q: type) FingerprintQueryFn {
+    return struct {
+        fn fingerprint(allocator: std.mem.Allocator, ptr: *const anyopaque) anyerror![32]u8 {
+            const output: *const Q.Output = @ptrCast(@alignCast(ptr));
+            var writer: disk_codec.Writer = .{ .allocator = allocator };
+            defer writer.deinit();
+            try writer.write(Q.Output, output.*);
+            var digest: [32]u8 = undefined;
+            Sha256.hash(writer.bytes.items, &digest, .{});
+            return digest;
+        }
+    }.fingerprint;
+}
+
+fn inputFingerprint(comptime I: type, allocator: std.mem.Allocator, value_ptr: ?*anyopaque) ![32]u8 {
+    var writer: disk_codec.Writer = .{ .allocator = allocator };
+    defer writer.deinit();
+    try writer.write(bool, value_ptr != null);
+    if (value_ptr) |ptr| {
+        const value: *const I.Value = @ptrCast(@alignCast(ptr));
+        try writer.write(I.Value, value.*);
+    }
+    var digest: [32]u8 = undefined;
+    Sha256.hash(writer.bytes.items, &digest, .{});
+    return digest;
+}
+
+fn fingerprintInputFn(comptime I: type) FingerprintFn {
+    return struct {
+        fn fingerprint(allocator: std.mem.Allocator, value_ptr: ?*anyopaque) anyerror![32]u8 {
+            return inputFingerprint(I, allocator, value_ptr);
+        }
+    }.fingerprint;
 }
 
 fn queryCacheKey(comptime Q: type, input_ptr: *const Q.Input, input_hash: u64) ErasedKey {

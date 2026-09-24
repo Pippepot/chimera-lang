@@ -10,6 +10,7 @@
 - Typed SSA covers calls, static specialization, callable values, variants, joins, loops, divergence, and fallible control flow. Compile-time thunks and specialized calls evaluate through typed IR, including structs, hooks, and type-valued functions; local captures remain unsupported.
 - Ownership tracks whole-root transfers, borrowed and owned parameters, mutable copy-back, and path-sensitive ASAP cleanup. Partial-field transfer, stable storage for immovable values, and origin-aware pointers/views remain open.
 - Compiler-provided `extern func` declarations use named std identities and ordinary calls. `std.exit.exit` is exported by the prelude, with distinct runtime termination and compile-time compiler control.
+- Successful whole-program executables, typed runtime function bodies, and compiled functions persist in a content-addressed cache. Query snapshots restore interned identities and validate observed source inputs and equal-result query boundaries before reuse. Cache publication is atomic across compiler processes. Independent file and function queries use multiple workers.
 
 ## Priority and dependencies
 
@@ -20,17 +21,19 @@ and incremental recomputation; reject unsupported forms at their owning boundary
 
 ## Ordered milestones
 
-### 1. Persistent and parallel incremental compilation
+### 1. Persistent and parallel incremental compilation — complete
 
-- Cache reusable query results and dependencies on disk across compiler runs.
-  Define stable serialized identities for session-local IDs, cache versioning,
-  validation against changed or removed inputs, and safe recovery from stale or
-  corrupt files. Reuse unchanged analysis and code without sacrificing diagnostics
-  or equal-result invalidation behavior.
-- Run independent CLI queries on multiple workers instead of forcing one worker.
-  Preserve query ownership, failure recovery, and deterministic diagnostics and
-  artifacts; test cold/warm caches, source edits, corrupt caches, and one versus
-  multiple workers.
+- The executable cache checks every loaded source byte and module path. Runtime
+  function analysis and machine code snapshots retain the exact interned-ID
+  table and each result's observed
+  input and query dependencies. Changed inputs or changed query outputs trigger
+  recomputation; successful, diagnostic-free results alone are persisted.
+- Cache files use checksums and atomic replacement so concurrent compiler
+  processes can read and write them. Query workers compile independent files and
+  functions in parallel. The multi-file benchmark must show more than one worker
+  beating one worker; concurrent compiler processes must safely read and save
+  the same cache. Cold, warm, edited, corrupt-cache, and concurrent-run tests
+  cover these paths.
 
 ### 2. Storage and pointer foundations
 

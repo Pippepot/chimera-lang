@@ -7,6 +7,8 @@ An experimental language compiler written in Zig 0.16, targeting Linux x86-64. T
 ```sh
 zig build run -- program.chi
 zig build run -- --debug=ast,ssa,asm,timing program.chi
+zig build run -- --workers=2 program.chi
+zig build run -- --incremental program.chi
 ```
 
 The CLI loads the entry directory tree, shares declarations within each module,
@@ -18,6 +20,22 @@ standard-library files do not implicitly import the prelude. An explicit
 `import std.prelude.{}` disables the defaults for a user file. Only the
 designated file's top-level statements execute. Extra arguments after the
 source path are passed to the generated program.
+
+The CLI uses two query workers by default on machines with at least two CPUs;
+`--workers=N` selects 1 through 64 workers. `--incremental` caches successful
+builds in `.chi-cache/` beside the entry source. Without it, the CLI does not
+read or write the disk cache. A whole-program cache hit skips analysis
+and linking; on a changed program, unchanged functions can reuse typed bodies
+and machine code.
+In-memory queries and worker scheduling operate normally in either mode.
+The key includes the complete contents and paths of every loaded source, the
+module directory list, and the linked compiler build ID (or the running binary
+digest when no build ID is available). The
+compiler validates cached bytes and query dependencies before use and rebuilds
+on damage or relevant input changes. AST, SSA, and assembly debug views always
+run the normal queries.
+Concurrent compiler processes can share the cache and working directory; each
+runs its own executable while `./prog` is replaced atomically.
 
 Top-level code is the entry point; a function named `main` is ordinary. The CLI itself exits with 0 after a normal program exit, or 1 on invalid arguments, source-read failure, source rejection, or compiler failure. It reports the program's status separately. A compile-time `exit(code)` is compiler control instead: it produces no executable and becomes the CLI's own process status.
 
@@ -51,6 +69,8 @@ zig test src/disasm.zig
 zig test --dep standard_library -Mroot=src/main.zig -Mstandard_library=std/library.zig
 zig test --dep standard_library -Mroot=src/modules.zig -Mstandard_library=std/library.zig
 zig test --dep standard_library -Mroot=src/modules_test.zig -Mstandard_library=std/library.zig
+zig test --dep standard_library -Mroot=src/cache.zig -Mstandard_library=std/library.zig
+zig test --dep standard_library -Mroot=src/query_disk_cache.zig -Mstandard_library=std/library.zig
 git diff --check
 ```
 
@@ -63,4 +83,15 @@ cached lookup, and incremental recomputation times in CSV form:
 
 ```sh
 zig run -O ReleaseFast src/comptime_benchmark.zig
+```
+
+For cold multi-file worker scaling and warm and edited disk cache reuse against
+uncached runs, build an optimized compiler and run the generated benchmark fixture.
+ReleaseFast strips debug symbols; the linker build ID keeps compiler identity
+checks cheap:
+
+```sh
+zig build -Doptimize=ReleaseFast
+python3 benchmarks/parallel.py zig-out/bin/chi
+python3 benchmarks/parallel.py zig-out/bin/chi --temp-dir .
 ```

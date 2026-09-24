@@ -7,6 +7,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = optimize == .ReleaseFast or optimize == .ReleaseSmall,
     });
     const standard_library = b.createModule(.{
         .root_source_file = b.path("std/library.zig"),
@@ -17,6 +18,7 @@ pub fn build(b: *std.Build) void {
         .name = "chi",
         .root_module = root_module,
     });
+    compiler.build_id = .sha1;
     b.installArtifact(compiler);
 
     const run = b.addRunArtifact(compiler);

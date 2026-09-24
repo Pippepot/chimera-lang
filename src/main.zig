@@ -1,8 +1,10 @@
 const std = @import("std");
+const cache = @import("cache.zig");
 const debug = @import("debug.zig");
 const diagnostics = @import("diagnostics.zig");
 const modules = @import("modules.zig");
 const query = @import("query.zig");
+const query_disk_cache = @import("query_disk_cache.zig");
 const queries = @import("queries.zig");
 const runtime = @import("runtime.zig");
 const structures = @import("structures.zig");
@@ -25,6 +27,8 @@ const RunInput = struct {
     program_args: []const []const u8,
     debug_flags: DebugFlags,
     started: std.Io.Timestamp,
+    cache_directory: ?[]const u8 = null,
+    worker_count: usize = 0,
 };
 
 const RunOutcome = union(enum) {
@@ -51,30 +55,46 @@ fn printError(writer: *std.Io.Writer, comptime format: []const u8, args: anytype
 
 fn printUsage(writer: *std.Io.Writer, executable_name: []const u8) !void {
     try writer.print(
-        "usage: {s} [--debug=ast,ssa,asm,timing,memory] <source-file> [program-args...]\n",
+        "usage: {s} [--debug=ast,ssa,asm,timing,memory] [--workers=N] [--incremental] <source-file> [program-args...]\n",
         .{executable_name},
     );
 }
 
 const CommandLine = struct {
     debug_flags: DebugFlags,
+    worker_count: usize,
+    incremental: bool,
     positional: []const []const u8,
 };
 
 fn parseCommandLine(args: []const []const u8, errors: *std.Io.Writer) !?CommandLine {
     var flags: DebugFlags = .{};
+    var worker_count: usize = 0;
+    var incremental = false;
     var valid = true;
     var index: usize = 0;
-    while (index < args.len and std.mem.startsWith(u8, args[index], "--debug=")) : (index += 1) {
-        var names = std.mem.splitScalar(u8, args[index]["--debug=".len..], ',');
-        while (names.next()) |name| {
-            if (trySetDebugFlag(&flags, name)) continue;
-            try printError(errors, "unknown debug flag '{s}'", .{name});
-            valid = false;
+    while (index < args.len) : (index += 1) {
+        if (std.mem.startsWith(u8, args[index], "--debug=")) {
+            var names = std.mem.splitScalar(u8, args[index]["--debug=".len..], ',');
+            while (names.next()) |name| {
+                if (trySetDebugFlag(&flags, name)) continue;
+                try printError(errors, "unknown debug flag '{s}'", .{name});
+                valid = false;
+            }
+        } else if (std.mem.startsWith(u8, args[index], "--workers=")) {
+            worker_count = std.fmt.parseUnsigned(usize, args[index]["--workers=".len..], 10) catch 0;
+            if (worker_count == 0 or worker_count > 64) {
+                try printError(errors, "worker count must be between 1 and 64", .{});
+                valid = false;
+            }
+        } else if (std.mem.eql(u8, args[index], "--incremental")) {
+            incremental = true;
+        } else {
+            break;
         }
     }
     if (!valid or index == args.len) return null;
-    return .{ .debug_flags = flags, .positional = args[index..] };
+    return .{ .debug_flags = flags, .worker_count = worker_count, .incremental = incremental, .positional = args[index..] };
 }
 
 fn buildWithStageTimings(db: *query.Database, io: std.Io, timings: *diagnostics.TimingLog) !void {
@@ -101,13 +121,80 @@ fn compileAndRun(
 ) !RunOutcome {
     var timings: diagnostics.TimingLog = .init(input.started);
     timings.mark(io, "load source");
-    const db = try query.Database.init(gpa, .{ .worker_count = 1 });
+    const use_cache = input.cache_directory != null and !input.debug_flags.ast and
+        !input.debug_flags.ssa and !input.debug_flags.@"asm";
+    const compiler_digest = if (use_cache) cache.compilerDigest(io) catch null else null;
+    const cache_key = if (compiler_digest) |digest|
+        cache.key(digest, input.source_path, input.source, input.source_files, input.module_paths)
+    else
+        null;
+    if (cache_key) |digest| {
+        if (try cache.load(io, gpa, input.cache_directory.?, digest)) |bytes| {
+            defer gpa.free(bytes);
+            timings.mark(io, "cache hit");
+            var prepared = try runtime.prepareProgram(io, gpa, bytes);
+            defer prepared.deinit(io);
+            timings.mark(io, "write program");
+            const status = try prepared.run(io, input.program_args);
+            timings.mark(io, "run program");
+            if (input.debug_flags.timing) {
+                try timings.print(io, errors);
+                try errors.flush();
+            }
+            return .{ .program_exit = status };
+        }
+    }
+    const worker_count = if (input.worker_count == 0)
+        @min(2, std.Thread.getCpuCount() catch 1)
+    else
+        input.worker_count;
+    const snapshot_key = if (compiler_digest) |digest|
+        cache.querySnapshotKey(digest, input.source_path, input.source_files)
+    else
+        null;
+    const snapshot = if (snapshot_key) |digest|
+        try cache.load(io, gpa, input.cache_directory.?, digest)
+    else
+        null;
+    defer if (snapshot) |bytes| gpa.free(bytes);
+
+    const database_options: query.Options = .{
+        .worker_count = worker_count,
+    };
+    var db = try query.Database.init(gpa, database_options);
     defer db.deinit();
     timings.mark(io, "database init");
     var source_registry: modules.SourceRegistry = .{};
     defer source_registry.deinit(gpa);
+    var restored_offset: ?usize = null;
+    if (snapshot) |bytes| {
+        restored_offset = query_disk_cache.restoreInterns(db, gpa, bytes) catch |err| switch (err) {
+            error.InvalidCache, error.InvalidInternId => invalid: {
+                const fresh = try query.Database.init(gpa, database_options);
+                db.deinit();
+                db = fresh;
+                break :invalid null;
+            },
+            else => return err,
+        };
+    }
+    timings.mark(io, "restore identities");
     try source_registry.update(db, gpa, input.source, input.source_files, input.module_paths);
     timings.mark(io, "add source");
+    if (restored_offset) |offset| {
+        _ = query_disk_cache.restoreQueries(db, snapshot.?, offset) catch |err| switch (err) {
+            error.InvalidCache, error.InvalidInternId => {
+                const fresh = try query.Database.init(gpa, database_options);
+                source_registry.deinit(gpa);
+                source_registry = .{};
+                db.deinit();
+                db = fresh;
+                try source_registry.update(db, gpa, input.source, input.source_files, input.module_paths);
+            },
+            else => return err,
+        };
+    }
+    timings.mark(io, "restore queries");
 
     if (input.debug_flags.timing) try buildWithStageTimings(db, io, &timings);
     const executable_result = try db.get(queries.BuildExecutable, file_id);
@@ -180,9 +267,15 @@ fn compileAndRun(
     try output.flush();
     timings.mark(io, "debug output");
 
-    try runtime.writeProgram(io, executable.bytes);
+    // A cache write failure cannot invalidate a completed compilation.
+    if (snapshot_key) |digest| query_disk_cache.save(io, gpa, input.cache_directory.?, digest, db) catch {};
+    timings.mark(io, "save queries");
+    if (cache_key) |digest| cache.save(io, gpa, input.cache_directory.?, digest, executable.bytes) catch {};
+
+    var prepared = try runtime.prepareProgram(io, gpa, executable.bytes);
+    defer prepared.deinit(io);
     timings.mark(io, "write program");
-    const exit_code = try runtime.runProg(io, gpa, input.program_args);
+    const exit_code = try prepared.run(io, input.program_args);
     timings.mark(io, "run program");
 
     if (input.debug_flags.timing) {
@@ -247,6 +340,10 @@ pub fn main(init: std.process.Init) !void {
         try errors.flush();
         std.process.exit(1);
     };
+    const cache_directory = if (command_line.incremental)
+        try std.fs.path.join(arena, &.{ entry_dir_path, ".chi-cache" })
+    else
+        null;
 
     const outcome = compileAndRun(io, gpa, .{
         .source_path = source_path,
@@ -256,6 +353,8 @@ pub fn main(init: std.process.Init) !void {
         .program_args = command_line.positional[1..],
         .debug_flags = debug_flags,
         .started = started,
+        .cache_directory = cache_directory,
+        .worker_count = command_line.worker_count,
     }, output, errors) catch |run_error| {
         try printError(errors, "compiler execution failed: {s}", .{@errorName(run_error)});
         try errors.flush();
@@ -288,9 +387,140 @@ test "CLI options stop at the source path and preserve program arguments" {
     try std.testing.expect(parsed.debug_flags.memory);
     try std.testing.expectEqualSlices([]const u8, args[1..], parsed.positional);
     try std.testing.expectEqual(@as(usize, 0), errors.writer.buffered().len);
+    try std.testing.expect(!parsed.incremental);
     try std.testing.expect(try parseCommandLine(&.{"--debug=ssa"}, &errors.writer) == null);
     try std.testing.expect(try parseCommandLine(&.{ "--debug=unknown", "main.chi" }, &errors.writer) == null);
     try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "unknown debug flag 'unknown'") != null);
+    const workers = (try parseCommandLine(&.{ "--workers=4", "main.chi" }, &errors.writer)).?;
+    try std.testing.expectEqual(@as(usize, 4), workers.worker_count);
+    try std.testing.expect(try parseCommandLine(&.{ "--workers=0", "main.chi" }, &errors.writer) == null);
+    const incremental = (try parseCommandLine(&.{ "--incremental", "--workers=2", "main.chi", "--incremental" }, &errors.writer)).?;
+    try std.testing.expect(incremental.incremental);
+    try std.testing.expectEqualSlices([]const u8, &.{ "main.chi", "--incremental" }, incremental.positional);
+}
+
+test "CLI reuses a complete disk cache entry and invalidates changed source" {
+    const io = std.testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cache_directory = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(cache_directory);
+
+    for ([_]struct { source: []const u8, expected: u8, hit: bool, corrupt_before: bool = false }{
+        .{ .source = "exit(17)", .expected = 17, .hit = false },
+        .{ .source = "exit(17)", .expected = 17, .hit = true },
+        .{ .source = "exit(17)", .expected = 17, .hit = false, .corrupt_before = true },
+        .{ .source = "exit(18)", .expected = 18, .hit = false },
+    }) |case| {
+        if (case.corrupt_before) {
+            const digest = cache.key(try cache.compilerDigest(io), "test.chi", case.source, &[_]modules.SourceFile{}, &.{});
+            const name = std.fmt.bytesToHex(digest, .lower);
+            try tmp.dir.writeFile(io, .{ .sub_path = &name, .data = "damaged" });
+        }
+        var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer output.deinit();
+        var errors: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer errors.deinit();
+        const result = try compileAndRun(io, std.testing.allocator, .{
+            .source_path = "test.chi",
+            .source = case.source,
+            .program_args = &.{},
+            .debug_flags = .{ .timing = true },
+            .started = std.Io.Clock.awake.now(io),
+            .cache_directory = cache_directory,
+            .worker_count = 2,
+        }, &output.writer, &errors.writer);
+        try std.testing.expectEqual(RunOutcome{ .program_exit = case.expected }, result);
+        try std.testing.expectEqual(case.hit, std.mem.indexOf(u8, errors.writer.buffered(), "cache hit") != null);
+    }
+
+    var uncached_output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer uncached_output.deinit();
+    var uncached_errors: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer uncached_errors.deinit();
+    const uncached_result = try compileAndRun(io, std.testing.allocator, .{
+        .source_path = "test.chi",
+        .source = "exit(18)",
+        .program_args = &.{},
+        .debug_flags = .{ .timing = true },
+        .started = std.Io.Clock.awake.now(io),
+        .worker_count = 2,
+    }, &uncached_output.writer, &uncached_errors.writer);
+    try std.testing.expectEqual(RunOutcome{ .program_exit = 18 }, uncached_result);
+    try std.testing.expect(std.mem.indexOf(u8, uncached_errors.writer.buffered(), "cache hit") == null);
+
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var errors: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer errors.deinit();
+    const rejected = try compileAndRun(io, std.testing.allocator, .{
+        .source_path = "test.chi",
+        .source = "exit(",
+        .program_args = &.{},
+        .debug_flags = .{},
+        .started = std.Io.Clock.awake.now(io),
+        .cache_directory = cache_directory,
+        .worker_count = 2,
+    }, &output.writer, &errors.writer);
+    try std.testing.expectEqual(RunOutcome.rejected, rejected);
+    try std.testing.expect(errors.writer.buffered().len != 0);
+
+    const snapshot_key = cache.querySnapshotKey(try cache.compilerDigest(io), "test.chi", &[_]modules.SourceFile{});
+    const snapshot = (try cache.load(io, std.testing.allocator, cache_directory, snapshot_key)).?;
+    defer std.testing.allocator.free(snapshot);
+    snapshot[0] ^= 1;
+    try cache.save(io, std.testing.allocator, cache_directory, snapshot_key, snapshot);
+    var recovered_output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer recovered_output.deinit();
+    var recovered_errors: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer recovered_errors.deinit();
+    const recovered = try compileAndRun(io, std.testing.allocator, .{
+        .source_path = "test.chi",
+        .source = "exit(19)",
+        .program_args = &.{},
+        .debug_flags = .{},
+        .started = std.Io.Clock.awake.now(io),
+        .cache_directory = cache_directory,
+        .worker_count = 2,
+    }, &recovered_output.writer, &recovered_errors.writer);
+    try std.testing.expectEqual(RunOutcome{ .program_exit = 19 }, recovered);
+    try std.testing.expectEqual(@as(usize, 0), recovered_errors.writer.buffered().len);
+}
+
+test "one and four workers produce identical multi-file artifacts" {
+    const io = std.testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    const source_files = [_]modules.SourceFile{
+        .{ .path = "a.chi", .module_path = "", .source = "static a = func() int -> return 10" },
+        .{ .path = "b.chi", .module_path = "", .source = "static b = func() int -> return 11" },
+    };
+    var first_artifact: ?[]u8 = null;
+    defer if (first_artifact) |bytes| std.testing.allocator.free(bytes);
+    for ([_]usize{ 1, 4 }) |workers| {
+        var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer output.deinit();
+        var errors: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer errors.deinit();
+        const result = try compileAndRun(io, std.testing.allocator, .{
+            .source_path = "main.chi",
+            .source = "exit(a() + b())",
+            .source_files = &source_files,
+            .program_args = &.{},
+            .debug_flags = .{},
+            .started = std.Io.Clock.awake.now(io),
+            .worker_count = workers,
+        }, &output.writer, &errors.writer);
+        try std.testing.expectEqual(RunOutcome{ .program_exit = 21 }, result);
+        try std.testing.expectEqual(@as(usize, 0), errors.writer.buffered().len);
+        const artifact = try std.Io.Dir.cwd().readFileAlloc(io, "prog", std.testing.allocator, .limited(1024 * 1024));
+        if (first_artifact) |first| {
+            defer std.testing.allocator.free(artifact);
+            try std.testing.expectEqualSlices(u8, first, artifact);
+        } else {
+            first_artifact = artifact;
+        }
+    }
 }
 
 test "CLI core renders debug output and runs the compiled program" {
