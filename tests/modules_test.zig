@@ -1,10 +1,11 @@
 const std = @import("std");
 const standard_library = @import("standard_library");
-const query = @import("query.zig");
-const queries = @import("queries.zig");
-const structures = @import("structures.zig");
-const modules = @import("modules.zig");
-const runtime = @import("runtime.zig");
+const test_sources = @import("test_sources");
+const query = test_sources.query;
+const queries = test_sources.queries;
+const structures = test_sources.structures;
+const modules = test_sources.modules;
+const runtime = test_sources.runtime;
 const testing = std.testing;
 
 const Fixture = struct {

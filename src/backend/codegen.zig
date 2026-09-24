@@ -1,5 +1,5 @@
 const std = @import("std");
-const structures = @import("structures.zig");
+const structures = @import("../structures.zig");
 
 const image_base: u64 = 0x400000;
 const linux_exit_syscall: i32 = 60;

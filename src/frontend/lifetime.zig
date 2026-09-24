@@ -1,5 +1,5 @@
 const std = @import("std");
-const structures = @import("structures.zig");
+const structures = @import("../structures.zig");
 pub const GenerationId = enum(u32) { _ };
 pub const BoundaryId = enum(u32) { _ };
 

@@ -1,7 +1,8 @@
 const std = @import("std");
-const codegen = @import("codegen.zig");
-const runtime = @import("runtime.zig");
-const structures = @import("structures.zig");
+const test_sources = @import("test_sources");
+const codegen = test_sources.codegen;
+const runtime = test_sources.runtime;
+const structures = test_sources.structures;
 
 const small_variant = structures.TypeId.fromInterned(@enumFromInt(0));
 const wide_variant = structures.TypeId.fromInterned(@enumFromInt(1));

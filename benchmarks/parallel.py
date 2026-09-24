@@ -19,7 +19,7 @@ def run(
 ) -> float:
     started = time.perf_counter()
     result = subprocess.run(
-        [str(compiler), f"--workers={workers}", *(["--incremental"] if cache_enabled else []), "main.chi"],
+        [str(compiler), f"--workers={workers}", *(["--disk-cache"] if cache_enabled else []), "main.chi"],
         cwd=project,
         capture_output=True,
         text=True,

@@ -1,5 +1,5 @@
 const std = @import("std");
-const structures = @import("structures.zig");
+const structures = @import("../structures.zig");
 const semantic = @import("semantic.zig");
 const lifetime = @import("lifetime.zig");
 

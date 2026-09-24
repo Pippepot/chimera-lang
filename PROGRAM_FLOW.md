@@ -1,6 +1,6 @@
 # Program flow
 
-The current compiler is demand-driven. `src/main.zig` inserts owned source into a query database and requests `BuildExecutable`. Query definitions live in `src/queries.zig`; the concurrent engine lives in `src/query.zig`.
+The current compiler is demand-driven. `src/main.zig` inserts owned source into a query database and requests `BuildExecutable`. Query definitions live in `src/queries.zig`; the concurrent engine lives in `src/query/engine.zig`.
 
 ## Compilation
 

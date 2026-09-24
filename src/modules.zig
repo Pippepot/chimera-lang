@@ -1,6 +1,6 @@
 const std = @import("std");
 const standard_library = @import("standard_library");
-const query = @import("query.zig");
+const query = @import("query/engine.zig");
 const queries = @import("queries.zig");
 const structures = @import("structures.zig");
 

@@ -1,10 +1,10 @@
 const std = @import("std");
 const structures = @import("structures.zig");
-const ast = @import("parser.zig");
-const codegen = @import("codegen.zig");
-const comptime_interpreter = @import("comptime_interpreter.zig");
-const semantic = @import("semantic.zig");
-const typing = @import("typing.zig");
+const ast = @import("frontend/parser.zig");
+const codegen = @import("backend/codegen.zig");
+const comptime_interpreter = @import("frontend/comptime_interpreter.zig");
+const semantic = @import("frontend/semantic.zig");
+const typing = @import("frontend/typing.zig");
 
 pub const SourceText = struct {
     pub const Key = structures.FileId;

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Count Zig source and embedded test code.
+# Count Zig source and test code.
 set -euo pipefail
-shopt -s nullglob
+shopt -s nullglob globstar
 
 if (($#)); then
     zig_files=("$@")
 else
-    zig_files=( src/*.zig )
+    zig_files=( test_sources.zig src/**/*.zig tests/**/*.zig )
 fi
 
 python3 - "${zig_files[@]}" <<'PY'

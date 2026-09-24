@@ -3,7 +3,7 @@ const cache = @import("cache.zig");
 const debug = @import("debug.zig");
 const diagnostics = @import("diagnostics.zig");
 const modules = @import("modules.zig");
-const query = @import("query.zig");
+const query = @import("query/engine.zig");
 const query_disk_cache = @import("query_disk_cache.zig");
 const queries = @import("queries.zig");
 const runtime = @import("runtime.zig");
@@ -55,7 +55,7 @@ fn printError(writer: *std.Io.Writer, comptime format: []const u8, args: anytype
 
 fn printUsage(writer: *std.Io.Writer, executable_name: []const u8) !void {
     try writer.print(
-        "usage: {s} [--debug=ast,ssa,asm,timing,memory] [--workers=N] [--incremental] <source-file> [program-args...]\n",
+        "usage: {s} [--debug=ast,ssa,asm,timing,memory] [--workers=N] [--disk-cache] <source-file> [program-args...]\n",
         .{executable_name},
     );
 }
@@ -63,14 +63,14 @@ fn printUsage(writer: *std.Io.Writer, executable_name: []const u8) !void {
 const CommandLine = struct {
     debug_flags: DebugFlags,
     worker_count: usize,
-    incremental: bool,
+    disk_cache_enabled: bool,
     positional: []const []const u8,
 };
 
 fn parseCommandLine(args: []const []const u8, errors: *std.Io.Writer) !?CommandLine {
     var flags: DebugFlags = .{};
     var worker_count: usize = 0;
-    var incremental = false;
+    var disk_cache_enabled = false;
     var valid = true;
     var index: usize = 0;
     while (index < args.len) : (index += 1) {
@@ -87,14 +87,14 @@ fn parseCommandLine(args: []const []const u8, errors: *std.Io.Writer) !?CommandL
                 try printError(errors, "worker count must be between 1 and 64", .{});
                 valid = false;
             }
-        } else if (std.mem.eql(u8, args[index], "--incremental")) {
-            incremental = true;
+        } else if (std.mem.eql(u8, args[index], "--disk-cache")) {
+            disk_cache_enabled = true;
         } else {
             break;
         }
     }
     if (!valid or index == args.len) return null;
-    return .{ .debug_flags = flags, .worker_count = worker_count, .incremental = incremental, .positional = args[index..] };
+    return .{ .debug_flags = flags, .worker_count = worker_count, .disk_cache_enabled = disk_cache_enabled, .positional = args[index..] };
 }
 
 fn buildWithStageTimings(db: *query.Database, io: std.Io, timings: *diagnostics.TimingLog) !void {
@@ -340,7 +340,7 @@ pub fn main(init: std.process.Init) !void {
         try errors.flush();
         std.process.exit(1);
     };
-    const cache_directory = if (command_line.incremental)
+    const cache_directory = if (command_line.disk_cache_enabled)
         try std.fs.path.join(arena, &.{ entry_dir_path, ".chi-cache" })
     else
         null;
@@ -387,16 +387,16 @@ test "CLI options stop at the source path and preserve program arguments" {
     try std.testing.expect(parsed.debug_flags.memory);
     try std.testing.expectEqualSlices([]const u8, args[1..], parsed.positional);
     try std.testing.expectEqual(@as(usize, 0), errors.writer.buffered().len);
-    try std.testing.expect(!parsed.incremental);
+    try std.testing.expect(!parsed.disk_cache_enabled);
     try std.testing.expect(try parseCommandLine(&.{"--debug=ssa"}, &errors.writer) == null);
     try std.testing.expect(try parseCommandLine(&.{ "--debug=unknown", "main.chi" }, &errors.writer) == null);
     try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "unknown debug flag 'unknown'") != null);
     const workers = (try parseCommandLine(&.{ "--workers=4", "main.chi" }, &errors.writer)).?;
     try std.testing.expectEqual(@as(usize, 4), workers.worker_count);
     try std.testing.expect(try parseCommandLine(&.{ "--workers=0", "main.chi" }, &errors.writer) == null);
-    const incremental = (try parseCommandLine(&.{ "--incremental", "--workers=2", "main.chi", "--incremental" }, &errors.writer)).?;
-    try std.testing.expect(incremental.incremental);
-    try std.testing.expectEqualSlices([]const u8, &.{ "main.chi", "--incremental" }, incremental.positional);
+    const disk_cached = (try parseCommandLine(&.{ "--disk-cache", "--workers=2", "main.chi", "--disk-cache" }, &errors.writer)).?;
+    try std.testing.expect(disk_cached.disk_cache_enabled);
+    try std.testing.expectEqualSlices([]const u8, &.{ "main.chi", "--disk-cache" }, disk_cached.positional);
 }
 
 test "CLI reuses a complete disk cache entry and invalidates changed source" {

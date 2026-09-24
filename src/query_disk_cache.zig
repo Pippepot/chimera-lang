@@ -1,7 +1,7 @@
 const std = @import("std");
 const cache = @import("cache.zig");
-const codec = @import("disk_codec.zig");
-const query = @import("query.zig");
+const codec = @import("query/codec.zig");
+const query = @import("query/engine.zig");
 const queries = @import("queries.zig");
 const structures = @import("structures.zig");
 

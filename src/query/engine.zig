@@ -1,5 +1,5 @@
 const std = @import("std");
-const disk_codec = @import("disk_codec.zig");
+const disk_codec = @import("codec.zig");
 
 const Revision = u64;
 const Sha256 = std.crypto.hash.sha2.Sha256;

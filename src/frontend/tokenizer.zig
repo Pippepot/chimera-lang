@@ -1,5 +1,5 @@
 const std = @import("std");
-const structures = @import("structures.zig");
+const structures = @import("../structures.zig");
 
 pub const Token = structures.Token;
 

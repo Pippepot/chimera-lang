@@ -1,9 +1,10 @@
 const std = @import("std");
-const codegen = @import("codegen.zig");
-const query = @import("query.zig");
-const queries = @import("queries.zig");
-const runtime = @import("runtime.zig");
-const structures = @import("structures.zig");
+const test_sources = @import("test_sources");
+const codegen = test_sources.codegen;
+const query = test_sources.query;
+const queries = test_sources.queries;
+const runtime = test_sources.runtime;
+const structures = test_sources.structures;
 
 const Context = query.Context;
 const Database = query.Database;

@@ -8,7 +8,7 @@ An experimental language compiler written in Zig 0.16, targeting Linux x86-64. T
 zig build run -- program.chi
 zig build run -- --debug=ast,ssa,asm,timing program.chi
 zig build run -- --workers=2 program.chi
-zig build run -- --incremental program.chi
+zig build run -- --disk-cache program.chi
 ```
 
 The CLI loads the entry directory tree, shares declarations within each module,
@@ -22,7 +22,7 @@ designated file's top-level statements execute. Extra arguments after the
 source path are passed to the generated program.
 
 The CLI uses two query workers by default on machines with at least two CPUs;
-`--workers=N` selects 1 through 64 workers. `--incremental` caches successful
+`--workers=N` selects 1 through 64 workers. `--disk-cache` caches successful
 builds in `.chi-cache/` beside the entry source. Without it, the CLI does not
 read or write the disk cache. A whole-program cache hit skips analysis
 and linking; on a changed program, unchanged functions can reuse typed bodies
@@ -52,29 +52,22 @@ Top-level code is the entry point; a function named `main` is ordinary. The CLI 
 
 Language examples describe the target, not a promise of compiler support. Parser support alone does not establish semantics. Resolve missing language decisions in `syntax&semantics.txt` before implementing them; neither legacy behavior nor an old test overrides it.
 
+## Layout
+
+`src/frontend/` owns parsing, semantic analysis, typing, compile-time interpretation, and lifetime planning. `src/backend/` owns code generation and disassembly. `src/query/` contains the compiler-independent query engine and its codec. Shared types, compiler query definitions, module registration, caching, diagnostics, and the CLI remain directly under `src/`; `std/` contains the embedded standard library.
+
+Standalone integration and backend suites live in `tests/`. Local tests that need private declarations remain beside their implementations. The project-root `test_sources.zig` collects inline stage tests and exposes one shared source module to the out-of-tree suites; Zig cannot import outside a module's root directory.
+
 ## Verify
 
-Use the suites relevant to the change. Query tests cover execution and incremental recomputation; backend tests also exercise graphs the frontend cannot yet produce.
+Run the complete suite with:
 
 ```sh
-zig test src/tokenizer.zig
-zig test src/parser.zig
-zig test src/semantic.zig
-zig test src/diagnostics.zig
-zig test src/lifetime.zig
-zig test src/typing.zig
-zig test src/query_test.zig
-zig test src/codegen_test.zig
-zig test src/disasm.zig
-zig test --dep standard_library -Mroot=src/main.zig -Mstandard_library=std/library.zig
-zig test --dep standard_library -Mroot=src/modules.zig -Mstandard_library=std/library.zig
-zig test --dep standard_library -Mroot=src/modules_test.zig -Mstandard_library=std/library.zig
-zig test --dep standard_library -Mroot=src/cache.zig -Mstandard_library=std/library.zig
-zig test --dep standard_library -Mroot=src/query_disk_cache.zig -Mstandard_library=std/library.zig
+zig build test
 git diff --check
 ```
 
-Run suites that write `./prog` sequentially. Check modified Zig files with `zig fmt --check <files>`. Keep temporary verification files outside the repository.
+The runner includes inline tests and standalone suites, and runs them sequentially because some write `./prog`. For focused stage checks, use `zig test test_sources.zig --test-filter <name>`; the standalone suites need the build-provided `test_sources` module. Check modified Zig files with `zig fmt --check <files>`. Keep temporary verification files outside the repository.
 
 ## Benchmark
 

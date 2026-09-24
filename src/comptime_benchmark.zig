@@ -1,5 +1,5 @@
 const std = @import("std");
-const query = @import("query.zig");
+const query = @import("query/engine.zig");
 const queries = @import("queries.zig");
 const structures = @import("structures.zig");
 
