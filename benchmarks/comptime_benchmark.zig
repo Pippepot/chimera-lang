@@ -1,7 +1,8 @@
 const std = @import("std");
-const query = @import("query/engine.zig");
-const queries = @import("queries.zig");
-const structures = @import("structures.zig");
+const compiler = @import("compiler");
+const query = compiler.query;
+const queries = compiler.queries;
+const structures = compiler.structures;
 
 const Case = struct {
     name: []const u8,

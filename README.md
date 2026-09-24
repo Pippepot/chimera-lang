@@ -5,11 +5,15 @@ An experimental language compiler written in Zig 0.16, targeting Linux x86-64. T
 ## Run
 
 ```sh
+zig build run -- --help
 zig build run -- program.chi
 zig build run -- --debug=ast,ssa,asm,timing program.chi
 zig build run -- --workers=2 program.chi
 zig build run -- --disk-cache program.chi
 ```
+
+`-h` and `--help` print usage and exit successfully when given before the source
+path. Options after the source path are passed to the generated program instead.
 
 The CLI loads the entry directory tree, shares declarations within each module,
 compiles the designated entry file, writes `./prog`, runs it, and reports its exit
@@ -75,7 +79,7 @@ The compile-time execution benchmark reports analysis, execution, publication,
 cached lookup, and incremental recomputation times in CSV form:
 
 ```sh
-zig run -O ReleaseFast src/comptime_benchmark.zig
+zig build benchmark -Doptimize=ReleaseFast
 ```
 
 For cold multi-file worker scaling and warm and edited disk cache reuse against

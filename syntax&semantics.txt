@@ -266,20 +266,38 @@ exit(0)
 # fallible callable widening still applies when every parameter mode and type
 # and the return type match.
 #
-# A direct call supplies every static argument explicitly in its declared
-# position. Type values and exact-typed primitive compile-time values are
+# A direct call may supply all parameters in declared order, including every
+# static argument, or supply only runtime arguments in their declared order and
+# infer every static argument. This is determined by argument count; partial
+# positional lists of static arguments are not supported. An omitted static
+# parameter between runtime parameters consumes no call argument. Inference
+# uses runtime argument types, not runtime values or the call's result context.
+# A parameter annotated with a static type parameter T infers T from its
+# argument's type. A parameter annotated with a declared parameterized struct
+# factory applied to static parameter names (for example Box(T, N)) infers
+# those parameters from the same factory's nominal type specialization. Other
+# type-valued functions are not inverted. Multiple uses of an inferred static
+# parameter must agree on its canonical value; absent or conflicting evidence
+# is an error. Inference cannot depend on an expected parameter type that itself
+# requires the missing static arguments. Type-valued call annotations are
+# checked after inference and do not provide an expected type while inferring.
+# Explicit type values and exact-typed primitive compile-time values are
 # supported. Each canonical tuple of static arguments identifies one function
 # instance; aliases of the same type therefore reuse an instance. Runtime
 # parameter and return types may refer to static type parameters. Static
 # arguments are available as constants in the instantiated body but are not
 # evaluated or passed at runtime. An unspecialized function with static
-# parameters is not a value; inference, partial application, indirect generic
-# calls, arbitrary compile-time expressions, and compile-time-returning
-# functions remain open.
+# parameters is not a value; partial application, indirect generic calls,
+# arbitrary compile-time expressions, and compile-time-returning functions
+# remain open.
 func identity(static T: type, static N: int, value: T) T
     _ = N
     return value
 const answer = identity(int, 1, 42)
+func echo(static T: type, value: T) T -> value
+const inferred = echo(42)             # T is int
+func between(a: int, static T: type, value: T) T -> value
+const middle = between(1, 42)         # T is int
 
 func add1(mut a: int)
     a += 1

@@ -189,6 +189,10 @@ fn parseBlock(parser: *ParserState) ParseError!Node.Index {
     while (true) {
         if (parser.eat(.dedent) != null) break;
         if (parser.tokens[parser.index].tag == .eof) break;
+        if (parser.tokens[parser.index].tag == .indent) {
+            try parser.addError(.unexpected_indented_block);
+            return error.ParseError;
+        }
 
         const expr = try parseExpression(parser);
         if (expr == .null) break;
@@ -242,6 +246,10 @@ fn parseCallableBody(parser: *ParserState) !Node.Index {
     }
 
     const expression = try parseRequiredExpression(parser);
+    if (parser.tokens[parser.index].tag == .indent) {
+        try parser.addError(.indented_block_after_inline_body);
+        return error.ParseError;
+    }
     return switch (parser.nodes.items[expression.index()].tag) {
         .break_nothing, .break_expr, .continue_expr, .return_nothing, .return_expr => expression,
         else => parser.addNode(.{
@@ -2089,6 +2097,21 @@ test "diagnostic tag for invalid call argument expression" {
     try testExpectDiagnosticTag(
         \\print(,)
     , .{ .invalid_expression = .comma });
+}
+
+test "diagnostic for an indented block following an inline function body" {
+    const source = "func foo(static T: type, mut t: T) -> T\n  return t\n\nexit(foo(1))";
+    var report = try parseReport(std.testing.allocator, 42, source);
+    defer report.deinit(std.testing.allocator);
+
+    try std.testing.expect(report.ast == null);
+    try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len);
+    try std.testing.expectEqual(structures.Diagnostic.Kind.indented_block_after_inline_body, report.diagnostics[0].kind);
+    try std.testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, source, "  return t").?)), report.diagnostics[0].span.?.start);
+}
+
+test "diagnostic for an unexpected indented block" {
+    try testExpectDiagnosticTag("exit(0)\n  exit(1)", .unexpected_indented_block);
 }
 
 test "diagnostic tag for stray carriage return" {

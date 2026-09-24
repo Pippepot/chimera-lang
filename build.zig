@@ -26,6 +26,18 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Compile and run a Chi program");
     run_step.dependOn(&run.step);
 
+    const benchmark_module = b.createModule(.{
+        .root_source_file = b.path("benchmarks/comptime_benchmark.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    benchmark_module.addImport("compiler", b.createModule(.{
+        .root_source_file = b.path("src/benchmark_deps.zig"),
+    }));
+    const benchmark = b.addExecutable(.{ .name = "comptime_benchmark", .root_module = benchmark_module });
+    const benchmark_step = b.step("benchmark", "Run the compile-time execution benchmark");
+    benchmark_step.dependOn(&b.addRunArtifact(benchmark).step);
+
     const test_step = b.step("test", "Run all compiler tests");
     const test_sources_module = b.createModule(.{
         .root_source_file = b.path("test_sources.zig"),

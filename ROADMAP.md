@@ -14,31 +14,54 @@
 
 ## Priority and dependencies
 
-Establish storage and pointer foundations before expanding the language toward
+Establish storage and reference foundations before expanding the language toward
 text, generic collections, and ordinary iteration. Independent slices can
 proceed earlier. Each language slice covers diagnostics, execution, ownership,
 and incremental recomputation; reject unsupported forms at their owning boundary.
 
 ## Ordered milestones
 
-### 1. Storage and pointer foundations
+### 1. Storage, allocation, and references
 
-- Specify partial-field transfer and stable storage for immovable values as
-  concrete pointer/collection operations require them, including initialization,
-  cleanup, and address stability.
-- Separate pointee type, mutability, origin, ownership, and allocation policy.
-  Implement origin-based lifetime and aliasing checks across returned/stored
-  borrows and last-use destruction; current non-escaping `mut` calls are
-  insufficient.
-- Implement non-null **Pointer** (including explicitly unsafe operations), then
-  unique **OwnedPointer** and allocation/release for collections. Add borrowed
-  views for text and List slices, including storage-change invalidation. Add atomic
-  **ArcPointer** later, after shared mutation and weak/cycle behavior are
-  specified. Record the chosen language contracts in
-  [syntax&semantics.txt](syntax&semantics.txt), using Mojo 1.0 as the versioned
-  design reference; see the
-  [pointer guide](https://mojolang.static.modular.com/docs/manual/pointers/)
-  and [release notes](https://mojolang.static.modular.com/releases/v1.0.0/).
+Use [STORAGE_AND_REFERENCES.md](STORAGE_AND_REFERENCES.md) as the design note;
+record accepted contracts in [syntax&semantics.txt](syntax&semantics.txt) before
+implementing them. Value construction and binding do not choose allocation.
+Keep value type, allocation provider, memory location, target-aware layout,
+address space, lifetime origin, and access mutability distinct.
+
+- Define layout and raw storage first: resolve size and alignment for the
+  target location, reject count/size overflow, and make allocation fallible.
+  Implement host-accessible storage first while preserving the distinction
+  between provider, location, and address space for later device storage.
+  `Allocation(T)` owns uninitialized storage and the authority needed to free
+  it; `deallocate` consumes the handle but does not destroy initialized values.
+  Specify initialization and destruction obligations before exposing safe access.
+- Make `Ref(T)` the unique owner of one initialized `T` in separately allocated
+  storage. Construction is fallible; moving the owner preserves the allocation,
+  destruction destroys `T` and deallocates it, and explicit duplication requires
+  copying `T` into a new allocation. Provide construction directly in final
+  storage for immovable values.
+- Make `Borrow(T)` the non-owning, non-null reference. Copying a `Borrow` does
+  not copy `T` or acquire ownership. It retains the location and lifetime
+  dependencies of its source; mutation depends on the access path and aliasing
+  rules. Define safe initialized access and the explicitly unsafe operations
+  for raw or uninitialized storage.
+- Extend generation-based lifetime and aliasing checks to borrows from locals,
+  allocations, owners, and collections, including returned/stored borrows,
+  transfers, last-use destruction, and invalidation when storage changes.
+  Specify partial-field transfer, initialization, cleanup, and address stability
+  where they affect these operations; today's non-escaping `mut` calls do not
+  establish the needed lifetime guarantees.
+- Build collection storage on `Allocation(T)` with initialized length and
+  capacity. Borrowed text and List views must follow the same lifetime and
+  storage-change invalidation rules. Defer atomic shared ownership until its
+  supported locations, mutation, weak references, and cycle behavior are set.
+
+Resolve the remaining layout, zero-size, provider/location, address-space, and
+reference API decisions in the design note before freezing their language
+contracts. Mojo 1.0 is a design reference, not the naming contract; see its
+[pointer guide](https://mojolang.static.modular.com/docs/manual/pointers/) and
+[release notes](https://mojolang.static.modular.com/releases/v1.0.0/).
 
 ### 2. Text and basic I/O
 

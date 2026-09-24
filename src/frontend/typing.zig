@@ -86,6 +86,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         };
         const CallTarget = union(enum) {
             direct: structures.InstanceId,
+            inferred: structures.InstanceId,
             indirect: structures.FunctionValueId,
         };
         const Availability = enum { unbound, available, transferred, maybe_transferred };
@@ -1866,6 +1867,10 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     target = .{ .direct = instance };
                     signature = try self.type_interner.functionSignature(instance) orelse return error.Unavailable;
                 },
+                .inferred => |instance| {
+                    raw_arguments = self.unresolved.call_arguments[call.arguments.start..call.arguments.end];
+                    target = .{ .inferred = instance };
+                },
                 .value => |target_use| {
                     raw_arguments = self.unresolved.call_arguments[call.arguments.start..call.arguments.end];
                     const callee = try self.borrowValue(try self.value(target_use.value), target_use.span);
@@ -1879,6 +1884,47 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                         return .{ .diverged = diverged };
                     raw_arguments = argument_storage.items;
                 },
+            }
+            var inferred_call = false;
+            const PreparedArgument = struct { operand: Value, owned: ?Value };
+            var prepared_arguments: std.ArrayList(PreparedArgument) = .empty;
+            defer prepared_arguments.deinit(self.ctx.allocator());
+            if (target == .inferred) {
+                inferred_call = true;
+                const instance = target.inferred;
+                const shape = (try self.type_interner.functionShape(instance.item)) orelse return error.Unavailable;
+                var argument_types: std.ArrayList(structures.TypeId) = .empty;
+                defer argument_types.deinit(self.ctx.allocator());
+                var runtime_index: usize = 0;
+                for (shape.parameters) |parameter| {
+                    if (parameter.mode == .static) continue;
+                    const raw = raw_arguments[runtime_index];
+                    const expected_type = try self.type_interner.independentParameterType(instance, runtime_index);
+                    const raw_value = try self.valueWithType(raw.value, expected_type);
+                    if (raw_value.type_id == .never) return .{ .diverged = raw_value };
+                    const operand = if (parameter.mode == .imm or parameter.mode == .mut)
+                        try self.borrowValue(raw_value, raw.span)
+                    else
+                        raw_value;
+                    const owned = if (parameter.mode == .@"var" or parameter.mode == .deinit)
+                        try self.ownValue(operand, raw.span)
+                    else
+                        null;
+                    try prepared_arguments.append(self.ctx.allocator(), .{ .operand = operand, .owned = owned });
+                    try argument_types.append(self.ctx.allocator(), operand.type_id);
+                    runtime_index += 1;
+                }
+                std.debug.assert(runtime_index == raw_arguments.len);
+                const result = try self.type_interner.inferStaticArguments(instance, argument_types.items);
+                const inferred = switch (result) {
+                    .arguments => |arguments| arguments,
+                    .missing => return self.reject(span, .static_argument_cannot_be_inferred),
+                    .conflict => return self.reject(span, .static_argument_inference_conflict),
+                };
+                defer self.ctx.allocator().free(inferred);
+                const specialized = try self.type_interner.specializeFunction(instance, inferred);
+                target = .{ .direct = specialized };
+                signature = try self.type_interner.functionSignature(specialized) orelse return error.Unavailable;
             }
             if (raw_arguments.len != signature.parameters.len) return self.reject(span, .{ .call_argument_count_mismatch = .{
                 .expected = @intCast(signature.parameters.len),
@@ -1899,7 +1945,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             // hooks may publish their own calls, so the outer operands stay in
             // local storage until their complete contiguous range is known.
             for (raw_arguments, signature.parameters, 0..) |raw, expected, argument_index| {
-                const raw_operand = try self.valueWithType(raw.value, expected.type_id);
+                const raw_operand = if (inferred_call) prepared_arguments.items[argument_index].operand else try self.valueWithType(raw.value, expected.type_id);
                 if (raw_operand.type_id == .never) return .{ .diverged = raw_operand };
                 const maybe_place = if (expected.mode == .imm or expected.mode == .mut)
                     try self.resolveArgumentPlace(raw.value, &place_fields)
@@ -1907,7 +1953,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     null;
                 try argument_places.append(self.ctx.allocator(), maybe_place);
                 const operand = switch (expected.mode) {
-                    .imm, .mut => try self.borrowValue(raw_operand, raw.span),
+                    .imm, .mut => if (inferred_call) raw_operand else try self.borrowValue(raw_operand, raw.span),
                     .@"var", .deinit => raw_operand,
                     .static => unreachable,
                 };
@@ -1917,7 +1963,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 var argument = try self.coerceValue(operand.id, operand.type_id, expected.type_id) orelse
                     return self.reject(raw.span, .{ .call_argument_type_mismatch = self.typeMismatch(expected.type_id, operand.type_id) });
                 if (expected.mode == .@"var" or expected.mode == .deinit) {
-                    const owned = try self.ownValue(operand, raw.span);
+                    const owned = if (inferred_call) prepared_arguments.items[argument_index].owned.? else try self.ownValue(operand, raw.span);
                     argument.value = owned.id;
                     try arguments_to_consume.append(self.ctx.allocator(), owned);
                 } else if (expected.mode == .mut) {
@@ -1965,6 +2011,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 .end = @intCast(self.pending_mut_arguments.items.len),
             };
             return switch (target) {
+                .inferred => unreachable,
                 .direct => |instance| .{ .callable = .{
                     .operation = .{ .direct = .{
                         .target = instance.item,
@@ -2021,6 +2068,15 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             };
             if (shape.parameters.len == 0 or shape.parameters[0].mode == .static)
                 return self.reject(call.span, .static_argument_not_supported);
+            var runtime_count: usize = 0;
+            for (shape.parameters) |parameter| if (parameter.mode != .static) {
+                runtime_count += 1;
+            };
+            if (method_arguments.len + 1 == runtime_count and runtime_count != shape.parameters.len) {
+                for (method_arguments) |argument| try arguments.append(self.ctx.allocator(), argument.value);
+                target.* = .{ .inferred = instance };
+                return null;
+            }
             if (method_arguments.len + 1 != shape.parameters.len) return self.reject(call.span, .{ .call_argument_count_mismatch = .{
                 .expected = @intCast(shape.parameters.len - 1),
                 .found = @intCast(method_arguments.len),

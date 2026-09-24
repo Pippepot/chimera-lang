@@ -447,6 +447,59 @@ pub fn TypeInterner(comptime Context: type) type {
             };
         }
 
+        pub fn independentParameterType(self: @This(), instance: structures.InstanceId, runtime_index: usize) !?structures.TypeId {
+            const resolved = (try self.ctx.get(ResolveItem, instance.item)).* orelse return error.Unavailable;
+            const parsed = (try self.ctx.get(ParseFile, resolved.file_id)).* orelse return error.Unavailable;
+            const source = (try self.ctx.input(SourceText, resolved.file_id)).*;
+            const type_interner: @This() = .{
+                .ctx = self.ctx,
+                .file_id = resolved.file_id,
+                .instance = instance,
+                .prior_static_arguments = &.{},
+            };
+            return switch (try semantic.analyzeIndependentParameterType(&parsed, source, resolved.declaration, runtime_index, type_interner, self.ctx.allocator())) {
+                .success => |type_id| type_id,
+                .unsupported => |issue| {
+                    try typing.emitSemanticIssue(self.ctx, resolved.file_id, issue);
+                    return error.Unavailable;
+                },
+            };
+        }
+
+        pub fn inferStaticArguments(self: @This(), instance: structures.InstanceId, argument_types: []const structures.TypeId) !semantic.StaticInference {
+            const resolved = (try self.ctx.get(ResolveItem, instance.item)).* orelse return error.Unavailable;
+            const parsed = (try self.ctx.get(ParseFile, resolved.file_id)).* orelse return error.Unavailable;
+            const source = (try self.ctx.input(SourceText, resolved.file_id)).*;
+            const type_interner: @This() = .{
+                .ctx = self.ctx,
+                .file_id = resolved.file_id,
+                .instance = instance,
+                .prior_static_arguments = &.{},
+            };
+            return semantic.inferStaticArguments(&parsed, source, resolved.declaration, argument_types, type_interner, self.ctx.allocator());
+        }
+
+        pub fn structFactoryArguments(self: @This(), factory: structures.InstanceId, type_id: structures.TypeId) !?[]const structures.CompileTimeValueId {
+            const identity = (try self.structIdentity(type_id)) orelse return null;
+            if (identity != .generated or identity.generated.owner.item != factory.item) return null;
+            const resolved = (try self.ctx.get(ResolveItem, factory.item)).* orelse return error.Unavailable;
+            const parsed = (try self.ctx.get(ParseFile, resolved.file_id)).* orelse return error.Unavailable;
+            const site = semantic.parameterizedStructSite(&parsed, resolved.declaration) orelse return null;
+            if (identity.generated.node_offset != site) return null;
+            const arity = (try self.ctx.get(SpecializationArity, factory.item)).* orelse return error.Unavailable;
+            const values = if (identity.generated.owner.specialization) |tuple|
+                (try self.ctx.lookupInterned(CompileTimeValueTuples, tuple)).values
+            else
+                &.{};
+            if (values.len != arity.total()) return null;
+            const inherited = if (factory.specialization) |tuple|
+                (try self.ctx.lookupInterned(CompileTimeValueTuples, tuple)).values
+            else
+                &.{};
+            if (inherited.len != arity.inherited or !std.mem.eql(structures.CompileTimeValueId, values[0..arity.inherited], inherited)) return null;
+            return values[arity.inherited..];
+        }
+
         pub fn structLayout(self: @This(), type_id: structures.TypeId) !?structures.StructLayout {
             return (try self.ctx.get(StructLayout, type_id)).*;
         }
@@ -676,7 +729,8 @@ pub fn TypeInterner(comptime Context: type) type {
             var current = self.instance;
             while (current) |instance| {
                 const loc = try self.ctx.lookupInterned(ItemLocations, instance.item);
-                const parent = (try enclosingInstance(self.ctx, instance)) orelse break;
+                const inferring = self.prior_static_arguments != null and std.meta.eql(instance, self.instance.?);
+                const parent = (try enclosingInstance(self.ctx, instance, inferring)) orelse break;
                 const parent_loc = try self.ctx.lookupInterned(ItemLocations, parent.item);
                 const identity: ?structures.StructIdentity = if (loc.source_site) |site|
                     .{ .generated = .{ .owner = parent, .node_offset = site } }
@@ -1628,15 +1682,18 @@ pub const SpecializationArity = struct {
     }
 };
 
-fn enclosingInstance(ctx: anytype, instance: structures.InstanceId) !?structures.InstanceId {
+fn enclosingInstance(ctx: anytype, instance: structures.InstanceId, inferring: bool) !?structures.InstanceId {
     const loc = try ctx.lookupInterned(ItemLocations, instance.item);
     const owner = loc.owner orelse return null;
     const arity = (try ctx.get(SpecializationArity, instance.item)).* orelse return error.Unavailable;
     const arguments = if (instance.specialization) |tuple| (try ctx.lookupInterned(CompileTimeValueTuples, tuple)).values else &.{};
-    if (arguments.len != arity.total()) return error.Unavailable;
+    if (arguments.len != (if (inferring) arity.inherited else arity.total())) return error.Unavailable;
     return .{
         .item = owner,
-        .specialization = if (arity.inherited == 0) null else try ctx.intern(CompileTimeValueTuples, .{ .values = arguments[0..arity.inherited] }),
+        .specialization = if (arity.inherited == 0) null else if (inferring)
+            instance.specialization
+        else
+            try ctx.intern(CompileTimeValueTuples, .{ .values = arguments[0..arity.inherited] }),
     };
 }
 

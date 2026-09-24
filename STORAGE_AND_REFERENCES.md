@@ -71,11 +71,11 @@ not erase the distinction. In particular, a device context can be both the
 location authority and the provider-facing resource without making "device" an
 allocation strategy.
 
-Device allocation is initially a host-side operation. Support for allocating
-device global memory does not imply that ordinary allocation is callable from a
-kernel. Workgroup and private storage have different lifetime and scheduling
-rules and should use explicit kernel storage constructs rather than the dynamic
-allocation API.
+Implement host-accessible allocation first. Device allocation comes later and
+would be a host-side operation: allocating device global memory does not imply
+that ordinary allocation is callable from a kernel. Workgroup and private
+storage have different lifetime and scheduling rules and should use explicit
+kernel storage constructs rather than the dynamic allocation API.
 
 Moving data between locations is a separate explicit operation. Device copies
 may eventually be queued or asynchronous, but the first API should remain
@@ -97,33 +97,33 @@ The low-level handle need not maintain a runtime initialization bitmap: access
 to possibly uninitialized elements is unsafe, while higher-level containers
 track their initialized range as part of their own invariants.
 
-A reference borrowed from an allocation has a lifetime dependency on the
-allocation and retains its location. Consuming the allocation invalidates all
-such references. Safe access is rejected when the current execution context
+A `Borrow` from an allocation has a lifetime dependency on the allocation and
+retains its location. Consuming the allocation invalidates all such borrows.
+Safe access is rejected when the current execution context
 cannot access the location.
 
 ### Reference types
 
-`Ref(T)` is non-owning and non-nullable. Copying it preserves access to the same
+`Borrow(T)` is non-owning and non-nullable. Copying it preserves access to the same
 value without copying the value or acquiring ownership. Absence uses an explicit
 variant rather than a null reference. Its lifetime depends on every owner and
 resource needed for access. Mutation is permitted only when the borrowed access
-path is mutable and the aliasing rules permit it; there is no separate `MutRef`
+path is mutable and the aliasing rules permit it; there is no separate `MutBorrow`
 type.
 
-Address space belongs on `Ref`, not on `T`. A future spelling such as
-`Ref(T, S)` may use a static address-space parameter to distinguish generic,
+Address space belongs on `Borrow`, not on `T`. A future spelling such as
+`Borrow(T, S)` may use a static address-space parameter to distinguish generic,
 global, workgroup, private, and constant access. The concrete device identity
 remains runtime state owned by a host-side allocation or device resource; it
 should not become a distinct value type for every device.
 
-The same `Ref` abstraction may expose explicitly unsafe operations for raw
+The same `Borrow` abstraction may expose explicitly unsafe operations for raw
 addresses, arithmetic, foreign memory, and possibly uninitialized storage; a
 separate `Pointer` name is not required. Safe dereference still requires a live,
-initialized `T`. An allocation should expose only an unsafe reference until the
+initialized `T`. An allocation should expose only an unsafe borrow until the
 caller or a higher-level owner has established initialization.
 
-`OwnedRef(T)` exclusively owns one initialized `T` in separately allocated
+`Ref(T)` exclusively owns one initialized `T` in separately allocated
 storage. It does not copy implicitly. Construction combines allocation and
 initialization and is therefore fallible; destruction destroys `T` and
 deallocates the storage. Moving the owner preserves the allocation and its
@@ -183,16 +183,16 @@ Mojo's unified
 is parameterized by pointee type, mutability, origin, and address space. It is
 non-nullable; unsafe operations cover arithmetic, raw addresses, initialization,
 and destruction. `UnsafePointer` is now only a deprecated alias of `Pointer`.
-This supports keeping one `Ref` abstraction here, although this language should
-derive mutation permission from the borrowed access path rather than duplicating
-it as a type parameter.
+This supports keeping one non-owning `Borrow` abstraction here, although this
+language should derive mutation permission from the borrowed access path rather
+than duplicating it as a type parameter.
 
 Mojo's
 [`OwnedPointer`](https://github.com/modular/modular/blob/975baa793c02665a36194c285496e133c9452068/Mojo/stdlib/std/memory/owned_pointer.mojo)
 allocates a single-element layout, moves or copies a value into it, and on
 destruction destroys the value before deallocating storage. Its interior
 reference receives a lifetime tied to the owner. This is the direct model for
-`OwnedRef(T)`, but retaining the complete allocation initially is simpler than
+`Ref(T)`, but retaining the complete allocation initially is simpler than
 Mojo's `ThinAllocation` plus reconstructed layout.
 
 Mojo's
@@ -256,27 +256,27 @@ func deallocate(static T: type, deinit allocation: Allocation(T))
 ```text
 allocation.layout()
 allocation.location()
-allocation.unsafe_ref(index)  # may address uninitialized storage
+allocation.unsafe_borrow(index)  # may address uninitialized storage
 ```
 
-The exact generic and method syntax remains open. `unsafe_ref` borrows from the
+The exact generic and method syntax remains open. `unsafe_borrow` borrows from the
 allocation and does not transfer storage ownership. Initialization, element
 destruction, and bounds are the caller's obligation at this low level.
 
 Build the first safe owner directly on that core:
 
 ```text
-fallible owned_ref(
+fallible make_ref(
     static T: type,
     var value: T,
     mut provider,
     location,
-) OwnedRef(T)
+) Ref(T)
 
-func ref(static T: type, owner: OwnedRef(T)) Ref(T)
-func value(static T: type, deinit owner: OwnedRef(T)) T
+func borrow(static T: type, owner: Ref(T)) Borrow(T)
+func value(static T: type, deinit owner: Ref(T)) T
 
-const borrowed = ref(T, owner)
+const borrowed = borrow(T, owner)
 const extracted = value(T, owner^)
 ```
 
@@ -284,7 +284,7 @@ const extracted = value(T, owner^)
 `owner^`; its name does not need an `into_` prefix to restate that transfer.
 `get_value` would not distinguish borrowing, copying, and transfer.
 
-`OwnedRef(T)` uses a one-element target-aware layout, initializes exactly once,
+`Ref(T)` uses a one-element target-aware layout, initializes exactly once,
 and makes destruction plus deallocation automatic. A host convenience
 constructor may default the provider and location, but the low-level API should
 not. An additional in-place form is required for immovable `T`; do not force it
@@ -307,7 +307,7 @@ copy(source, mut destination)
 
 Here `device` is a runtime resource identifying a particular device, not an
 enum case. Its allocation result retains that identity. Passing it to a kernel
-produces a `Ref(T, global)` or view whose device representation is validated for
+produces a `Borrow(T, global)` or view whose device representation is validated for
 that target; host code cannot safely dereference it. Workgroup and private
 storage remain kernel declarations rather than calls to this API.
 
@@ -317,7 +317,7 @@ storage remain kernel declarations rather than calls to this API.
 - Whether `AllocationLayout` stores resolved bytes only or also typed count.
 - Zero-sized allocation identity and deallocation behavior.
 - How target-specific representation compatibility is declared.
-- Static spelling for address spaces and lifetime contracts on `Ref`.
+- Static spelling for address spaces and lifetime contracts on `Borrow`.
 - Whether device transfers are initially synchronous or introduce an explicit
   completion resource.
 - Which locations support `SharedRef` control blocks and atomic reference

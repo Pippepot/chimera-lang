@@ -90,6 +90,7 @@ pub const UnresolvedBody = struct {
 
         pub const Target = union(enum) {
             direct: structures.InstanceId,
+            inferred: structures.InstanceId,
             unknown_function,
             value: ValueUse,
             member: MemberCall,
@@ -1014,18 +1015,27 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 .direct => |direct| direct.shape.parameters,
                 .unknown_function, .value => null,
             };
+            var infer_static = false;
             if (parameter_shapes) |parameters| {
-                if (argument_nodes.len != parameters.len) return self.reject(callee_index, .{ .call_argument_count_mismatch = .{
-                    .expected = @intCast(parameters.len),
-                    .found = @intCast(argument_nodes.len),
-                } });
+                var runtime_count: usize = 0;
+                for (parameters) |parameter| if (parameter.mode != .static) {
+                    runtime_count += 1;
+                };
+                if (argument_nodes.len == runtime_count and runtime_count != parameters.len) {
+                    infer_static = true;
+                } else if (argument_nodes.len != parameters.len) {
+                    return self.reject(callee_index, .{ .call_argument_count_mismatch = .{
+                        .expected = @intCast(parameters.len),
+                        .found = @intCast(argument_nodes.len),
+                    } });
+                }
             }
             const scratch_start = self.scratch.items.len;
             defer self.scratch.shrinkRetainingCapacity(scratch_start);
             var static_arguments: std.ArrayList(structures.CompileTimeValueId) = .empty;
             defer static_arguments.deinit(self.gpa);
             for (argument_nodes, 0..) |argument, argument_index| {
-                if (parameter_shapes) |parameters| if (parameters[argument_index].mode == .static) {
+                if (parameter_shapes) |parameters| if (!infer_static and parameters[argument_index].mode == .static) {
                     try self.rejectRuntimeCapture(argument);
                     const result = if (parameters[argument_index].is_meta_type)
                         try analyzeStaticTypeArgument(self.ast, self.source, argument, self.type_interner, self.gpa)
@@ -1058,7 +1068,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             const start: u32 = @intCast(self.call_arguments.items.len);
             var runtime_index: usize = 0;
             for (argument_nodes, 0..) |argument, argument_index| {
-                if (parameter_shapes) |parameters| if (parameters[argument_index].mode == .static) continue;
+                if (parameter_shapes) |parameters| if (!infer_static and parameters[argument_index].mode == .static) continue;
                 const value = self.scratch.items[scratch_start + runtime_index];
                 runtime_index += 1;
                 try self.call_arguments.append(self.gpa, .{
@@ -1069,7 +1079,10 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             const target: UnresolvedBody.Call.Target = switch (pending_target) {
                 .unknown_function => .unknown_function,
                 .value => |value| .{ .value = value },
-                .direct => |direct| .{ .direct = try self.type_interner.specializeFunction(direct.instance, static_arguments.items) },
+                .direct => |direct| if (infer_static)
+                    .{ .inferred = direct.instance }
+                else
+                    .{ .direct = try self.type_interner.specializeFunction(direct.instance, static_arguments.items) },
             };
             return .{
                 .target = target,
@@ -1206,6 +1219,140 @@ pub fn analyzeFunctionShape(
     } };
 }
 
+pub fn parameterizedStructSite(ast: *const structures.Ast, declaration: u32) ?i64 {
+    const binding = ast.nodes[declaration];
+    if (binding.tag != .static_binding) return null;
+    const function = ast.nodes[binding.data.node_node.b.index()];
+    if (function.tag != .func) return null;
+    const signature = ast.nodes[function.data.node_node.a.index()];
+    if (ast.nodes[signature.data.node_node.b.index()].tag != .implicit_type) return null;
+    const body = ast.nodes[function.data.node_node.b.index()];
+    if (body.tag != .return_expr or ast.nodes[body.data.node.index()].tag != .@"struct") return null;
+    return @as(i64, body.data.node.index()) - @as(i64, declaration);
+}
+
+pub const StaticInference = union(enum) {
+    arguments: []structures.CompileTimeValueId,
+    missing,
+    conflict,
+};
+
+const InferredParameter = struct {
+    name: []const u8,
+    is_meta_type: bool,
+    value: ?structures.CompileTimeValueId = null,
+
+    fn bind(self: *@This(), value: structures.CompileTimeValueId) bool {
+        if (self.value) |existing| return existing == value;
+        self.value = value;
+        return true;
+    }
+};
+
+pub fn inferStaticArguments(
+    ast: *const structures.Ast,
+    source: []const u8,
+    declaration: u32,
+    argument_types: []const structures.TypeId,
+    type_interner: anytype,
+    gpa: std.mem.Allocator,
+) !StaticInference {
+    const parts = functionParts(ast, declaration);
+    const signature = ast.nodes[parts.signature.index()];
+    const parameters = ast.nodeList(signature.data.node_node.a);
+    var inferred: std.ArrayList(InferredParameter) = .empty;
+    defer inferred.deinit(gpa);
+    for (parameters) |parameter_index| {
+        const parameter = ast.nodes[parameter_index.index()];
+        if (parameterMode(ast, parameter).? != .static) continue;
+        const name_span = tokenSpan(ast, parameter.token_index);
+        try inferred.append(gpa, .{
+            .name = source[name_span.start..name_span.end],
+            .is_meta_type = isMetaTypeAnnotation(ast, source, parameter.data.node_node.b.unwrap().?),
+        });
+    }
+
+    var runtime_index: usize = 0;
+    for (parameters) |parameter_index| {
+        const parameter = ast.nodes[parameter_index.index()];
+        if (parameterMode(ast, parameter).? == .static) continue;
+        const actual_type = argument_types[runtime_index];
+        runtime_index += 1;
+        const annotation = parameter.data.node_node.b.unwrap().?;
+        const annotated = ast.nodes[annotation.index()];
+        if (inferredParameter(ast, source, inferred.items, annotation, true)) |target| {
+            const value = try type_interner.internCompileTimeValue(.{ .type = actual_type });
+            if (!target.bind(value)) return .conflict;
+        } else if (annotated.tag == .call) {
+            const factory = (try resolveNamedExpression(ast, source, annotated.data.node_node.a, type_interner)) orelse continue;
+            if (factory != .declaration) continue;
+            const values = (try type_interner.structFactoryArguments(factory.declaration, actual_type)) orelse continue;
+            const factory_arguments = ast.nodeList(annotated.data.node_node.b);
+            if (factory_arguments.len != values.len) continue;
+            for (factory_arguments, values) |argument, value| {
+                const target = inferredParameter(ast, source, inferred.items, argument, false) orelse continue;
+                if (!target.bind(value)) return .conflict;
+            }
+        }
+    }
+    std.debug.assert(runtime_index == argument_types.len);
+    for (inferred.items) |parameter| {
+        if (parameter.value == null) return .missing;
+    }
+    const arguments = try gpa.alloc(structures.CompileTimeValueId, inferred.items.len);
+    for (inferred.items, arguments) |parameter, *argument| {
+        argument.* = parameter.value.?;
+    }
+    return .{ .arguments = arguments };
+}
+
+fn inferredParameter(
+    ast: *const structures.Ast,
+    source: []const u8,
+    parameters: []InferredParameter,
+    name_index: structures.Node.Index,
+    type_only: bool,
+) ?*InferredParameter {
+    const node = ast.nodes[name_index.index()];
+    if (node.tag != .identifier and node.tag != .type) return null;
+    const span = tokenSpan(ast, node.token_index);
+    const name = source[span.start..span.end];
+    for (parameters) |*parameter| {
+        if ((!type_only or parameter.is_meta_type) and std.mem.eql(u8, name, parameter.name)) return parameter;
+    }
+    return null;
+}
+
+pub fn analyzeIndependentParameterType(
+    ast: *const structures.Ast,
+    source: []const u8,
+    declaration: u32,
+    runtime_index: usize,
+    type_interner: anytype,
+    gpa: std.mem.Allocator,
+) !SemanticResult(?structures.TypeId) {
+    const parts = functionParts(ast, declaration);
+    const signature = ast.nodes[parts.signature.index()];
+    const parameters = ast.nodeList(signature.data.node_node.a);
+    var current: usize = 0;
+    for (parameters) |parameter_index| {
+        const parameter = ast.nodes[parameter_index.index()];
+        if (parameterMode(ast, parameter).? == .static) continue;
+        if (current == runtime_index) {
+            const annotation = parameter.data.node_node.b.unwrap().?;
+            const static_parameters: ParameterScope = .{ .ast = ast, .source = source, .parameters = parameters, .static_only = true };
+            if (runtimeReference(ast, source, annotation, static_parameters) != null) return .{ .success = null };
+            if (ast.nodes[annotation.index()].tag == .call) return .{ .success = null };
+            return switch (try analyzeType(ast, source, annotation, type_interner, gpa, .parameter_type_not_supported)) {
+                .success => |type_id| .{ .success = type_id },
+                .unsupported => |issue| .{ .unsupported = issue },
+            };
+        }
+        current += 1;
+    }
+    unreachable;
+}
+
 pub fn analyzeStaticParameterType(
     ast: *const structures.Ast,
     source: []const u8,
@@ -1221,7 +1368,7 @@ pub fn analyzeStaticParameterType(
     const parameter = ast.nodes[parameters[parameter_index].index()];
     std.debug.assert(parameterMode(ast, parameter).? == .static);
     const annotation = parameter.data.node_node.b.unwrap() orelse unreachable;
-    const runtime_parameters: RuntimeParameters = .{ .ast = ast, .source = source, .parameters = parameters };
+    const runtime_parameters: ParameterScope = .{ .ast = ast, .source = source, .parameters = parameters };
     if (runtimeReference(ast, source, annotation, runtime_parameters)) |reference|
         return .{ .unsupported = issueAt(ast, reference.index(), .value_used_as_type) };
     return analyzeType(ast, source, annotation, type_interner, gpa, .parameter_type_not_supported);
@@ -1243,7 +1390,7 @@ pub fn analyzeFunctionInstanceSignature(
     defer parameters.deinit(gpa);
     var names = std.StringHashMap(void).init(gpa);
     defer names.deinit();
-    const runtime_parameters: RuntimeParameters = .{ .ast = ast, .source = source, .parameters = ast.nodeList(signature.data.node_node.a) };
+    const runtime_parameters: ParameterScope = .{ .ast = ast, .source = source, .parameters = ast.nodeList(signature.data.node_node.a) };
     var specialization_index: usize = 0;
     for (ast.nodeList(signature.data.node_node.a)) |parameter_index| {
         const parameter = ast.nodes[parameter_index.index()];
@@ -1377,15 +1524,16 @@ fn runtimeReference(ast: *const structures.Ast, source: []const u8, index: struc
     }
 }
 
-const RuntimeParameters = struct {
+const ParameterScope = struct {
     ast: *const structures.Ast,
     source: []const u8,
     parameters: []const structures.Node.Index,
+    static_only: bool = false,
 
     fn runtimeName(self: @This(), name: []const u8) bool {
         for (self.parameters) |index| {
             const parameter = self.ast.nodes[index.index()];
-            if (parameterMode(self.ast, parameter) == .static) continue;
+            if ((parameterMode(self.ast, parameter) == .static) != self.static_only) continue;
             const span = tokenSpan(self.ast, parameter.token_index);
             if (std.mem.eql(u8, name, self.source[span.start..span.end])) return true;
         }

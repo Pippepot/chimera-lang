@@ -9228,6 +9228,181 @@ test "static specialization validates compile-time and dependent runtime argumen
     }
 }
 
+test "direct and instance calls infer static parameters from runtime types" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1, "func identity(static T: type, value: T) T -> value\nexit(identity(42))");
+    try testing.expect((try db.get(queries.BuildExecutable, 1)).* != null);
+    try setSource(db, 1,
+        \\struct Box(T: type, N: int)
+        \\  value: T
+        \\func identity(static T: type, value: T) T -> value
+        \\func middle(first: int, static T: type, value: T, last: int) int -> first + value + last
+        \\func read(static T: type, static N: int, boxed: Box(T, N)) int -> boxed.value + N
+        \\struct S
+        \\  value: int
+        \\  func pick(imm self: S, static T: type, value: T) T -> value
+        \\static Alias: type = Box(int, 3)
+        \\const boxed = Alias{value = 10}
+        \\const item = S{value = 1}
+        \\exit(identity(10) + middle(1, 2, 3) + read(boxed) + item.pick(13))
+    );
+    const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
+    const io = testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    try runtime.writeProgram(io, executable.bytes);
+    try testing.expectEqual(@as(u8, 42), try runtime.runProg(io, testing.allocator, &.{}));
+}
+
+test "static inference honors independent expected types and existing explicit calls" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\struct Box(N: int)
+        \\  value: int
+        \\func read(value: byte, static N: int, boxed: Box(N)) int -> boxed.value + N
+        \\const boxed = Box(3){value = 7}
+        \\exit(read(4, boxed) + read(4, 3, boxed) + 22)
+    );
+    const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
+    const io = testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    try runtime.writeProgram(io, executable.bytes);
+    try testing.expectEqual(@as(u8, 42), try runtime.runProg(io, testing.allocator, &.{}));
+}
+
+test "inferred static calls reuse specialization identities across source edits" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\struct Box(N: int)
+        \\  value: int
+        \\func read(static N: int, boxed: Box(N)) int -> boxed.value + N
+        \\exit(read(Box(3){value = 39}))
+    );
+    const before = (try db.get(queries.CollectReachableInstances, 1)).*.?;
+    const old_instance = before.instances[1];
+    const old_artifact = try db.get(queries.CompileFunction, old_instance);
+    try setSource(db, 1,
+        \\struct Box(N: int)
+        \\  value: int
+        \\func read(static N: int, boxed: Box(N)) int -> boxed.value + N
+        \\exit(read(Box(4){value = 38}))
+    );
+    const after = (try db.get(queries.CollectReachableInstances, 1)).*.?;
+    try testing.expect(after.instances[1].specialization != old_instance.specialization);
+    try testing.expect((try db.get(queries.BuildExecutable, 1)).* != null);
+    try setSource(db, 1,
+        \\struct Box(N: int)
+        \\  value: int
+        \\func read(static N: int, boxed: Box(N)) int -> boxed.value + N
+        \\exit(read(Box(3){value = 39}))
+    );
+    const restored = (try db.get(queries.CollectReachableInstances, 1)).*.?;
+    try testing.expectEqual(old_instance, restored.instances[1]);
+    try testing.expectEqual(old_artifact, try db.get(queries.CompileFunction, old_instance));
+}
+
+test "inferred static instance calls retain inherited factory specialization" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\struct Box(T: type)
+        \\  value: T
+        \\  func pick(imm self: Box(T), static U: type, value: U) U -> value
+        \\const boxed = Box(int){value = 1}
+        \\exit(boxed.pick(42))
+    );
+    const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
+    const io = testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    try runtime.writeProgram(io, executable.bytes);
+    try testing.expectEqual(@as(u8, 42), try runtime.runProg(io, testing.allocator, &.{}));
+}
+
+test "inferred calls preserve runtime argument order and parameter modes" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\func stop(code: int) int
+        \\  exit(code)
+        \\  return 0
+        \\func pair(static T: type, first: T, second: T) T -> first + second
+        \\func increment(static T: type, mut value: T)
+        \\  value += 1
+        \\func take(static T: type, var value: T) T -> value
+        \\var answer = 41
+        \\increment(answer)
+        \\_ = take(answer)
+        \\exit(answer)
+    );
+    const io = testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    const first = (try db.get(queries.BuildExecutable, 1)).*.?;
+    try runtime.writeProgram(io, first.bytes);
+    try testing.expectEqual(@as(u8, 42), try runtime.runProg(io, testing.allocator, &.{}));
+    try setSource(db, 1,
+        \\func stop(code: int) int
+        \\  exit(code)
+        \\  return 0
+        \\func pair(static T: type, first: T, second: T) T -> first + second
+        \\exit(pair(stop(11), stop(12)))
+    );
+    const ordered = (try db.get(queries.BuildExecutable, 1)).*.?;
+    try runtime.writeProgram(io, ordered.bytes);
+    try testing.expectEqual(@as(u8, 11), try runtime.runProg(io, testing.allocator, &.{}));
+}
+
+test "static inference rejects missing conflicting and non-invertible evidence" {
+    const cases = [_]struct { source: []const u8, expected: DiagnosticKind }{
+        .{
+            .source = "func read(static N: int, value: int) int -> value\nexit(read(42))",
+            .expected = .static_argument_cannot_be_inferred,
+        },
+        .{
+            .source = "func equal(static T: type, left: T, right: T) T -> left\nexit(equal(1, true))",
+            .expected = .static_argument_inference_conflict,
+        },
+        .{
+            .source =
+            \\func constant(static N: int) type -> int
+            \\func read(static N: int, value: constant(N)) int -> value
+            \\exit(read(42))
+            ,
+            .expected = .static_argument_cannot_be_inferred,
+        },
+        .{
+            .source =
+            \\struct Box(N: int)
+            \\  value: int
+            \\func constant(static N: int) type -> Box(1)
+            \\func read(static N: int, value: constant(N)) int -> value.value
+            \\exit(read(Box(1){value = 42}))
+            ,
+            .expected = .static_argument_cannot_be_inferred,
+        },
+        .{
+            .source =
+            \\struct Box(N: int)
+            \\  value: int
+            \\func equal(static N: int, left: Box(N), right: Box(N)) int -> left.value
+            \\exit(equal(Box(1){value = 1}, Box(2){value = 2}))
+            ,
+            .expected = .static_argument_inference_conflict,
+        },
+    };
+    for (cases, 1..) |case, file_id| {
+        const db = try testDatabase(1);
+        defer db.deinit();
+        try addSource(db, file_id, case.source);
+        try testing.expect((try db.get(queries.BuildExecutable, file_id)).* == null);
+        const diagnostics = try db.transitiveAccumulatorValues(queries.BuildExecutable, file_id, structures.Diagnostic, testing.allocator);
+        defer freeDiagnostics(diagnostics);
+        try testing.expectEqual(@as(usize, 1), diagnostics.len);
+        try testing.expectEqual(case.expected, std.meta.activeTag(diagnostics[0].kind));
+    }
+}
+
 test "static primitive values dominate every specialized control-flow path" {
     const db = try testDatabase(1);
     defer db.deinit();

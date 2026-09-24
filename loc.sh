@@ -15,7 +15,8 @@ from __future__ import annotations
 import os
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 
 
 @dataclass
@@ -26,6 +27,13 @@ class Counts:
     def add(self, other: "Counts") -> None:
         self.code += other.code
         self.test += other.test
+
+
+@dataclass
+class TreeNode:
+    name: str
+    counts: Counts = field(default_factory=Counts)
+    children: dict[str, "TreeNode"] = field(default_factory=dict)
 
 
 def syntax_view(line: str) -> str:
@@ -131,18 +139,36 @@ if not paths:
     print("No Zig files found.")
     raise SystemExit(0)
 
-rows = [(path, count_file(path)) for path in paths]
-total = Counts()
-for _, counts in rows:
-    total.add(counts)
+tree = TreeNode("")
+for path in paths:
+    counts = count_file(path)
+    tree.counts.add(counts)
+    parent = tree
+    for part in Path(path).parts:
+        parent = parent.children.setdefault(part, TreeNode(part))
+        parent.counts.add(counts)
 
-name_width = max(4, *(len(path) for path, _ in rows), len("total"))
+rows: list[tuple[str, Counts]] = []
+
+
+def append_rows(parent: TreeNode, prefix: str = "", at_root: bool = False) -> None:
+    children = sorted(parent.children.values(), key=lambda child: (not child.children, child.name))
+    for index, child in enumerate(children):
+        is_last = index == len(children) - 1
+        label = child.name if at_root else prefix + ("└─" if is_last else "├─") + child.name
+        rows.append((label, child.counts))
+        append_rows(child, "" if at_root else prefix + ("  " if is_last else "│ "))
+
+
+append_rows(tree, at_root=True)
+
+name_width = max(4, *(len(label) for label, _ in rows), len("total"))
 line = "-" * (name_width + 27)
 
 print(f"{'File':<{name_width}} {'Code':>8} {'Test':>8} {'Total':>8}")
 print(line)
-for path, counts in rows:
-    print(f"{path:<{name_width}} {counts.code:>8} {counts.test:>8} {counts.code + counts.test:>8}")
+for label, counts in rows:
+    print(f"{label:<{name_width}} {counts.code:>8} {counts.test:>8} {counts.code + counts.test:>8}")
 print(line)
-print(f"{'total':<{name_width}} {total.code:>8} {total.test:>8} {total.code + total.test:>8}")
+print(f"{'total':<{name_width}} {tree.counts.code:>8} {tree.counts.test:>8} {tree.counts.code + tree.counts.test:>8}")
 PY

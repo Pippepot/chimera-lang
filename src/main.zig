@@ -55,8 +55,9 @@ fn printError(writer: *std.Io.Writer, comptime format: []const u8, args: anytype
 
 fn printUsage(writer: *std.Io.Writer, executable_name: []const u8) !void {
     try writer.print(
-        "usage: {s} [--debug=ast,ssa,asm,timing,memory] [--workers=N] [--disk-cache] <source-file> [program-args...]\n",
-        .{executable_name},
+        "usage: {s} [--debug=ast,ssa,asm,timing,memory] [--workers=N] [--disk-cache] <source-file> [program-args...]\n" ++
+            "       {s} [-h|--help]\n",
+        .{ executable_name, executable_name },
     );
 }
 
@@ -67,14 +68,22 @@ const CommandLine = struct {
     positional: []const []const u8,
 };
 
-fn parseCommandLine(args: []const []const u8, errors: *std.Io.Writer) !?CommandLine {
+const ParsedCommandLine = union(enum) {
+    help,
+    run: CommandLine,
+};
+
+fn parseCommandLine(args: []const []const u8, errors: *std.Io.Writer) !?ParsedCommandLine {
     var flags: DebugFlags = .{};
     var worker_count: usize = 0;
     var disk_cache_enabled = false;
     var valid = true;
     var index: usize = 0;
     while (index < args.len) : (index += 1) {
-        if (std.mem.startsWith(u8, args[index], "--debug=")) {
+        if (std.mem.eql(u8, args[index], "-h") or std.mem.eql(u8, args[index], "--help")) {
+            if (!valid) return null;
+            return .help;
+        } else if (std.mem.startsWith(u8, args[index], "--debug=")) {
             var names = std.mem.splitScalar(u8, args[index]["--debug=".len..], ',');
             while (names.next()) |name| {
                 if (trySetDebugFlag(&flags, name)) continue;
@@ -94,7 +103,7 @@ fn parseCommandLine(args: []const []const u8, errors: *std.Io.Writer) !?CommandL
         }
     }
     if (!valid or index == args.len) return null;
-    return .{ .debug_flags = flags, .worker_count = worker_count, .disk_cache_enabled = disk_cache_enabled, .positional = args[index..] };
+    return .{ .run = .{ .debug_flags = flags, .worker_count = worker_count, .disk_cache_enabled = disk_cache_enabled, .positional = args[index..] } };
 }
 
 fn buildWithStageTimings(db: *query.Database, io: std.Io, timings: *diagnostics.TimingLog) !void {
@@ -297,10 +306,18 @@ pub fn main(init: std.process.Init) !void {
     const errors = &stderr_writer.interface;
 
     const args = try init.minimal.args.toSlice(arena);
-    const command_line = (try parseCommandLine(args[1..], errors)) orelse {
+    const parsed = (try parseCommandLine(args[1..], errors)) orelse {
         try printUsage(errors, args[0]);
         try errors.flush();
         std.process.exit(1);
+    };
+    const command_line = switch (parsed) {
+        .help => {
+            try printUsage(output, args[0]);
+            try output.flush();
+            return;
+        },
+        .run => |command_line| command_line,
     };
     const debug_flags = command_line.debug_flags;
 
@@ -381,8 +398,8 @@ pub fn main(init: std.process.Init) !void {
 test "CLI options stop at the source path and preserve program arguments" {
     var errors: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer errors.deinit();
-    const args = [_][]const u8{ "--debug=ast,memory", "main.chi", "--debug=child", "argument" };
-    const parsed = (try parseCommandLine(&args, &errors.writer)).?;
+    const args = [_][]const u8{ "--debug=ast,memory", "main.chi", "--debug=child", "--help", "-h", "argument" };
+    const parsed = (try parseCommandLine(&args, &errors.writer)).?.run;
     try std.testing.expect(parsed.debug_flags.ast);
     try std.testing.expect(parsed.debug_flags.memory);
     try std.testing.expectEqualSlices([]const u8, args[1..], parsed.positional);
@@ -391,12 +408,22 @@ test "CLI options stop at the source path and preserve program arguments" {
     try std.testing.expect(try parseCommandLine(&.{"--debug=ssa"}, &errors.writer) == null);
     try std.testing.expect(try parseCommandLine(&.{ "--debug=unknown", "main.chi" }, &errors.writer) == null);
     try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "unknown debug flag 'unknown'") != null);
-    const workers = (try parseCommandLine(&.{ "--workers=4", "main.chi" }, &errors.writer)).?;
+    const workers = (try parseCommandLine(&.{ "--workers=4", "main.chi" }, &errors.writer)).?.run;
     try std.testing.expectEqual(@as(usize, 4), workers.worker_count);
     try std.testing.expect(try parseCommandLine(&.{ "--workers=0", "main.chi" }, &errors.writer) == null);
-    const disk_cached = (try parseCommandLine(&.{ "--disk-cache", "--workers=2", "main.chi", "--disk-cache" }, &errors.writer)).?;
+    const disk_cached = (try parseCommandLine(&.{ "--disk-cache", "--workers=2", "main.chi", "--disk-cache" }, &errors.writer)).?.run;
     try std.testing.expect(disk_cached.disk_cache_enabled);
     try std.testing.expectEqualSlices([]const u8, &.{ "main.chi", "--disk-cache" }, disk_cached.positional);
+}
+
+test "CLI help accepts both spellings without a source path" {
+    var errors: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer errors.deinit();
+    try std.testing.expect((try parseCommandLine(&.{"-h"}, &errors.writer)).? == .help);
+    try std.testing.expect((try parseCommandLine(&.{"--help"}, &errors.writer)).? == .help);
+    try std.testing.expect((try parseCommandLine(&.{ "--workers=2", "--help" }, &errors.writer)).? == .help);
+    try std.testing.expectEqual(@as(usize, 0), errors.writer.buffered().len);
+    try std.testing.expect(try parseCommandLine(&.{ "--debug=unknown", "--help" }, &errors.writer) == null);
 }
 
 test "CLI reuses a complete disk cache entry and invalidates changed source" {

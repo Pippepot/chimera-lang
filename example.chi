@@ -1,10 +1,6 @@
-struct S
-  i: int
+func foo(static T: type, mut t: T) T
+  t = 3
+  return t
 
-static S.id = func(s: S) int -> s.i
-
-func S.foo(s: S) int -> s.i
-
-
-const s = S{i = 3}
-exit(s.foo())
+var i = 1
+foo(i)
