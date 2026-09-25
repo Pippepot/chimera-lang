@@ -755,6 +755,29 @@ pub const TypeLayout = struct {
     byte_alignment: u32,
 };
 
+pub const AllocationLayout = struct {
+    byte_size: u64,
+    byte_alignment: u32,
+
+    pub fn forElements(element: TypeLayout, count: u64) error{ InvalidAlignment, SizeOverflow }!AllocationLayout {
+        if (element.byte_alignment == 0 or !std.math.isPowerOfTwo(element.byte_alignment)) return error.InvalidAlignment;
+        return .{
+            .byte_size = std.math.mul(u64, element.byte_size, count) catch return error.SizeOverflow,
+            .byte_alignment = element.byte_alignment,
+        };
+    }
+};
+
+test "allocation layout derives target element layout with checked count" {
+    const testing = std.testing;
+    try testing.expectEqual(
+        AllocationLayout{ .byte_size = 96, .byte_alignment = 16 },
+        try AllocationLayout.forElements(.{ .byte_size = 32, .byte_alignment = 16 }, 3),
+    );
+    try testing.expectError(error.SizeOverflow, AllocationLayout.forElements(.{ .byte_size = 32, .byte_alignment = 16 }, std.math.maxInt(u64)));
+    try testing.expectError(error.InvalidAlignment, AllocationLayout.forElements(.{ .byte_size = 32, .byte_alignment = 3 }, 1));
+}
+
 pub const VariantLayout = struct {
     layout: TypeLayout,
     payload_offset: u32,
@@ -769,6 +792,7 @@ pub const StructField = struct {
 pub const StructDefinition = struct {
     fields: []StructField,
     ownership: StructOwnershipProperties = .{},
+    accessible_fields: bool = true,
 
     pub const ResolvedField = struct {
         index: u32,
@@ -786,7 +810,7 @@ pub const StructDefinition = struct {
     }
 
     pub fn eql(a: StructDefinition, b: StructDefinition) bool {
-        if (a.fields.len != b.fields.len or !std.meta.eql(a.ownership, b.ownership)) return false;
+        if (a.fields.len != b.fields.len or !std.meta.eql(a.ownership, b.ownership) or a.accessible_fields != b.accessible_fields) return false;
         for (a.fields, b.fields) |left, right| {
             if (left.type_id != right.type_id or
                 !std.meta.eql(left.span, right.span) or
@@ -1332,6 +1356,8 @@ pub const Diagnostic = struct {
         static_initializer_type_mismatch: TypeMismatch,
         type_value_used_as_runtime_value,
         value_used_as_type,
+        type_factory_requires_call,
+        generic_struct_requires_specialization,
         function_annotation_not_supported,
         parameter_mode_not_supported,
         static_parameter_requires_specialization,
@@ -1376,6 +1402,7 @@ pub const Diagnostic = struct {
         missing_struct_initializer_field: MissingStructInitializerField,
         struct_initializer_field_type_mismatch: TypeMismatch,
         field_access_not_struct: TypeId,
+        opaque_struct_access: TypeId,
         unknown_field,
         duplicate_local_binding,
         local_type_not_supported,

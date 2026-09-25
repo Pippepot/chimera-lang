@@ -57,28 +57,392 @@ const physics = modules.SourceFile{ .path = "physics/body.chi", .module_path = "
     \\exit(99)
 };
 
-test "standard prelude exports are available without an explicit import" {
-    const f = try Fixture.init("exit(example())", &.{});
+test "embedded memory source is registered in the std.memory module" {
+    const f = try Fixture.init("import std.memory\nexit(42)", &.{});
+    defer f.deinit();
+    const module = try f.db.intern(queries.ModulePaths, .{ .path = "std.memory" });
+    const declarations = (try f.db.get(queries.ModuleDeclarations, module)).*.?;
+    try testing.expect(!declarations.resolveEntry("allocate_host_storage").?.is_public);
+    try f.expectExit(0, 42);
+}
+
+test "host storage externs allocate and release bytes and report invalid sizes" {
+    const f = try Fixture.init(
+        \\import std.memory.{check_storage}
+        \\if check_storage(1) -> if check_storage(4097) -> if check_storage(0) -> exit(1) else if check_storage(-1) -> exit(2) else exit(42) else exit(3) else exit(4)
+    , &.{});
+    defer f.deinit();
+    const memory_module = try f.db.intern(queries.ModulePaths, .{ .path = "std.memory" });
+    const memory_file = (try f.db.get(queries.ModuleDeclarations, memory_module)).*.?.resolveStatic("HostStorage").?;
+    const resolved = (try f.db.get(queries.ResolveItem, memory_file)).*.?;
+    try f.db.setInput(queries.SourceText, resolved.file_id,
+        \\struct HostStorage
+        \\  address_low: int
+        \\  address_high: int
+        \\  byte_size: int
+        \\  drop = explicit
+        \\extern fallible allocate_host_storage(byte_size: int) HostStorage
+        \\extern func deallocate_host_storage(deinit storage: HostStorage)
+        \\pub fallible check_storage(byte_size: int) unit
+        \\  const storage = allocate_host_storage(byte_size)
+        \\  deallocate_host_storage(storage^)
+    );
+    try f.expectExit(0, 42);
+}
+
+test "typed host allocation is explicit-drop and fallible" {
+    const f = try Fixture.init(
+        \\import std.memory.{Allocation, allocate, deallocate}
+        \\fallible use_storage(count: int) unit
+        \\  const allocation: Allocation(int) = allocate(int, count)
+        \\  deallocate(int, allocation^)
+        \\if use_storage(3) -> if use_storage(2147483647) -> exit(1) else exit(42) else exit(2)
+    , &.{});
     defer f.deinit();
     try f.expectExit(0, 42);
 }
 
-test "an explicit empty prelude import suppresses the default inclusion" {
-    const f = try Fixture.init("import std.prelude.{}\nexit(example())", &.{});
-    defer f.deinit();
-    try f.expectDiagnostic(0, .unknown_function);
+test "typed allocation transfers initialized values into and out of storage" {
+    const fixture = try Fixture.init(
+        \\import std.memory.{allocate, deallocate, unsafe_initialize, unsafe_take}
+        \\fallible round_trip() unit
+        \\  var allocation = allocate(int, 3)
+        \\  unsafe_initialize(int, allocation, 1, 42)
+        \\  const value = unsafe_take(int, allocation, 1)
+        \\  deallocate(int, allocation^)
+        \\  value == 42
+        \\if round_trip() -> exit(42) else exit(1)
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+test "typed allocation transfers byte and aggregate elements" {
+    const fixture = try Fixture.init(
+        \\import std.memory.{allocate, deallocate, unsafe_initialize, unsafe_take}
+        \\struct Pair
+        \\  first: int
+        \\  second: byte
+        \\fallible transfer() unit
+        \\  var bytes = allocate(byte, 2)
+        \\  unsafe_initialize(byte, bytes, 1, 7)
+        \\  const number = unsafe_take(byte, bytes, 1)
+        \\  deallocate(byte, bytes^)
+        \\  var pairs = allocate(Pair, 2)
+        \\  unsafe_initialize(Pair, pairs, 1, Pair{first = 42, second = number})
+        \\  const pair = unsafe_take(Pair, pairs, 1)
+        \\  deallocate(Pair, pairs^)
+        \\  pair.first == 42
+        \\if transfer() -> exit(42) else exit(1)
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+test "ref destroys its initialized value on last use" {
+    const fixture = try Fixture.init(
+        \\import std.memory.{make_ref}
+        \\struct Resource
+        \\  value: int
+        \\  drop = func(deinit self: Resource) -> exit(self.value)
+        \\fallible run() unit
+        \\  const owner = make_ref(Resource, Resource{value = 42})
+        \\  _ = owner
+        \\  exit(1)
+        \\if run() -> exit(2) else exit(3)
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+test "ref transfers its value and releases its allocation" {
+    const fixture = try Fixture.init(
+        \\import std.memory.{make_ref, value}
+        \\fallible take() unit
+        \\  const owner = make_ref(int, 42)
+        \\  const number = value(int, owner^)
+        \\  number == 42
+        \\if take() -> exit(42) else exit(1)
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+test "zero-sized ref allocation fails through fallible control flow" {
+    const fixture = try Fixture.init(
+        \\import std.memory.{make_ref}
+        \\if make_ref(unit, ()) -> exit(1) else exit(42)
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+test "ref transfers an aggregate value" {
+    const fixture = try Fixture.init(
+        \\import std.memory.{make_ref, value}
+        \\struct Pair
+        \\  first: int
+        \\  second: byte
+        \\fallible take() unit
+        \\  const owner = make_ref(Pair, Pair{first = 42, second = 7})
+        \\  const pair = value(Pair, owner^)
+        \\  pair.first == 42
+        \\if take() -> exit(42) else exit(1)
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+test "ref can own and transfer another ref" {
+    const fixture = try Fixture.init(
+        \\import std.memory.{make_ref, value}
+        \\fallible take() unit
+        \\  const inner = make_ref(int, 42)
+        \\  const outer = make_ref(Ref(int), inner^)
+        \\  const moved = value(Ref(int), outer^)
+        \\  const number = value(int, moved^)
+        \\  number == 42
+        \\if take() -> exit(42) else exit(1)
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+test "failed ref allocation destroys its owned input" {
+    const fixture = try Fixture.init(
+        \\import std.memory.{make_ref}
+        \\struct Empty
+        \\  drop = func(deinit self: Empty) -> exit(42)
+        \\if make_ref(Empty, Empty{}) -> exit(1) else exit(2)
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+test "prelude exports ref and its constructor without exporting raw allocation" {
+    const fixture = try Fixture.init(
+        \\import std.memory.{value}
+        \\fallible take() unit
+        \\  const owner: Ref(int) = make_ref(int, 42)
+        \\  const number = value(int, owner^)
+        \\  number == 42
+        \\if take() -> exit(42) else exit(1)
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+
+    const raw = try Fixture.init(
+        \\fallible use_storage() unit
+        \\  const storage = allocate(int, 1)
+        \\if use_storage() -> exit(42) else exit(1)
+    , &.{});
+    defer raw.deinit();
+    try raw.expectDiagnostic(0, .unknown_function);
+}
+
+test "generic struct initializer infers type from ref field" {
+    const fixture = try Fixture.init(
+        \\import std.memory.{make_ref}
+        \\struct Foo(T: type)
+        \\  r: Ref(T)
+        \\fallible run() unit
+        \\  const f = Foo{r = make_ref(42)}
+        \\  _ = f
+        \\if run() -> exit(42) else exit(1)
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+test "fallible condition binding initializes an inferred struct field" {
+    const fixture = try Fixture.init(
+        \\struct Foo(T: type)
+        \\  r: Ref(T)
+        \\const f = Foo{r = if const owner = make_ref(42) -> owner^ else exit(1)}
+        \\_ = f
+        \\exit(42)
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+test "fallible condition binding owns its ref on success" {
+    const success = try Fixture.init(
+        \\import std.memory.{value}
+        \\if const owner: Ref(int) = make_ref(42) -> exit(value(int, owner^)) else exit(1)
+    , &.{});
+    defer success.deinit();
+    try success.expectExit(0, 42);
+
+    const failure = try Fixture.init(
+        \\if const owner = make_ref(unit, ()) -> exit(1) else exit(42)
+    , &.{});
+    defer failure.deinit();
+    try failure.expectExit(0, 42);
+}
+
+test "moving a ref preserves its owned value until the new owner's last use" {
+    const fixture = try Fixture.init(
+        \\import std.memory.{make_ref}
+        \\struct Resource
+        \\  value: int
+        \\  drop = func(deinit self: Resource) -> exit(self.value)
+        \\fallible run() unit
+        \\  const first = make_ref(Resource, Resource{value = 42})
+        \\  const moved = first^
+        \\  _ = moved
+        \\  exit(1)
+        \\if run() -> exit(2) else exit(3)
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+test "ref cannot be forged or accessed through its storage field" {
+    const sources = [_][]const u8{
+        \\import std.memory.{Ref}
+        \\const fake = Ref(int){}
+        \\exit(42)
+        ,
+        \\import std.memory.{make_ref}
+        \\fallible inspect() unit
+        \\  const owner = make_ref(int, 42)
+        \\  _ = owner.allocation
+        \\if inspect() -> exit(42) else exit(1)
+    };
+    for (sources) |source| {
+        const fixture = try Fixture.init(source, &.{});
+        defer fixture.deinit();
+        try fixture.expectDiagnostic(0, .opaque_struct_access);
+    }
+}
+
+test "ref cannot be implicitly copied or used after transfer" {
+    const sources = [_]struct { source: []const u8, diagnostic: std.meta.Tag(structures.Diagnostic.Kind) }{
+        .{ .source =
+        \\import std.memory.{make_ref}
+        \\fallible copy_owner() unit
+        \\  const owner = make_ref(int, 42)
+        \\  const copied = owner
+        \\  _ = copied
+        \\if copy_owner() -> exit(1) else exit(2)
+        , .diagnostic = .type_not_copyable },
+        .{ .source =
+        \\import std.memory.{make_ref, value}
+        \\fallible take_twice() unit
+        \\  const owner = make_ref(int, 42)
+        \\  const first = value(int, owner^)
+        \\  const second = value(int, owner^)
+        \\  _ = first
+        \\  _ = second
+        \\if take_twice() -> exit(1) else exit(2)
+        , .diagnostic = .use_after_transfer },
+    };
+    for (sources) |case| {
+        const fixture = try Fixture.init(case.source, &.{});
+        defer fixture.deinit();
+        try fixture.expectDiagnostic(0, case.diagnostic);
+    }
+}
+
+test "typed allocation ownership cannot be abandoned or deallocated twice" {
+    const sources = [_]struct { source: []const u8, diagnostic: std.meta.Tag(structures.Diagnostic.Kind) }{
+        .{ .source =
+        \\import std.memory.{allocate}
+        \\fallible leak() unit
+        \\  const allocation = allocate(int, 1)
+        \\if leak() -> exit(42) else exit(1)
+        , .diagnostic = .value_requires_explicit_drop },
+        .{ .source =
+        \\import std.memory.{allocate, deallocate}
+        \\fallible twice() unit
+        \\  const allocation = allocate(int, 1)
+        \\  deallocate(int, allocation^)
+        \\  deallocate(int, allocation^)
+        \\if twice() -> exit(42) else exit(1)
+        , .diagnostic = .use_after_transfer },
+    };
+    for (sources) |case| {
+        const fixture = try Fixture.init(case.source, &.{});
+        defer fixture.deinit();
+        try fixture.expectDiagnostic(0, case.diagnostic);
+    }
+}
+
+test "typed allocation cannot be forged or have its storage metadata changed" {
+    const sources = [_][]const u8{
+        \\import std.memory.{Allocation}
+        \\const fake = Allocation(int){}
+        \\exit(42)
+        ,
+        \\import std.memory.{allocate, deallocate}
+        \\fallible use_storage() unit
+        \\  var allocation = allocate(int, 3)
+        \\  allocation.storage.byte_size = 0
+        \\  deallocate(int, allocation^)
+        \\if use_storage() -> exit(42) else exit(1)
+    };
+    for (sources) |source| {
+        const fixture = try Fixture.init(source, &.{});
+        defer fixture.deinit();
+        try fixture.expectDiagnostic(0, .opaque_struct_access);
+    }
+}
+
+test "host storage layout edits invalidate compiler-owned extern signatures" {
+    const db = try query.Database.init(testing.allocator, .{ .worker_count = 2 });
+    defer db.deinit();
+    var registry: modules.SourceRegistry = .{};
+    defer registry.deinit(testing.allocator);
+    try registry.update(db, testing.allocator, "import std.memory.{}\nexit(42)", &.{}, &.{});
+    const host_file = registry.fileId("$std/memory/host.chi").?;
+    const declarations = (try db.get(queries.ModuleDeclarations, try db.intern(queries.ModulePaths, .{ .path = "std.memory" }))).*.?;
+    const allocate = declarations.resolveFunction("allocate_host_storage").?;
+    try testing.expect((try db.get(queries.FunctionSignature, allocate)).* != null);
+
+    try db.setInput(queries.SourceText, host_file,
+        \\struct HostStorage
+        \\  address_low: bool
+        \\  address_high: int
+        \\  byte_size: int
+        \\  drop = explicit
+        \\extern fallible allocate_host_storage(byte_size: int) HostStorage
+        \\extern func deallocate_host_storage(deinit storage: HostStorage)
+    );
+    try testing.expect((try db.get(queries.FunctionSignature, allocate)).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(queries.FunctionSignature, allocate, structures.Diagnostic, testing.allocator);
+    defer testing.allocator.free(diagnostics);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(structures.Diagnostic.Kind.invalid_external_signature, diagnostics[0].kind);
+
+    const typed = try Fixture.init(
+        \\import std.memory.{allocate, deallocate}
+        \\fallible use_storage() unit
+        \\  const allocation = allocate(int, 1)
+        \\  deallocate(int, allocation^)
+        \\if use_storage() -> exit(42) else exit(1)
+    , &.{});
+    defer typed.deinit();
+    const typed_declarations = (try typed.db.get(queries.ModuleDeclarations, try typed.db.intern(queries.ModulePaths, .{ .path = "std.memory" }))).*.?;
+    const typed_host = typed_declarations.resolveStatic("HostStorage").?;
+    const typed_source = (try typed.db.get(queries.ResolveItem, typed_host)).*.?;
+    const typed_allocate = (try typed.db.get(queries.ResolveItem, typed_declarations.resolveFunction("allocate").?)).*.?;
+    try typed.db.setInput(queries.SourceText, typed_source.file_id,
+        \\struct HostStorage
+        \\  address_low: bool
+        \\  address_high: int
+        \\  byte_size: int
+        \\  drop = explicit
+        \\extern fallible allocate_host_storage(byte_size: int) HostStorage
+        \\extern func deallocate_host_storage(deinit storage: HostStorage)
+    );
+    try typed.expectDiagnostic(typed_allocate.file_id, .invalid_external_signature);
 }
 
 test "an explicit empty prelude import also suppresses exit" {
     const f = try Fixture.init("import std.prelude.{}\nexit(42)", &.{});
     defer f.deinit();
     try f.expectDiagnostic(0, .unknown_function);
-}
-
-test "an explicit prelude import replaces the default selection" {
-    const f = try Fixture.init("import std.prelude.{example}\nimport std.exit.{exit}\nexit(example())", &.{});
-    defer f.deinit();
-    try f.expectExit(0, 42);
 }
 
 test "exit is an imported function, not a reserved call name" {
@@ -99,6 +463,36 @@ test "an unsupported external declaration is rejected at signature lookup" {
     try f.expectDiagnostic(0, .unsupported_external_declaration);
 }
 
+test "compiler-owned extern names require the reserved module" {
+    const f = try Fixture.init("extern func exit(code: int) never\nexit(42)", &.{});
+    defer f.deinit();
+    try f.expectDiagnostic(0, .unsupported_external_declaration);
+}
+
+test "compiler-owned externs require their registered file" {
+    const db = try query.Database.init(testing.allocator, .{ .worker_count = 2 });
+    defer db.deinit();
+    var registry: modules.SourceRegistry = .{};
+    defer registry.deinit(testing.allocator);
+    try registry.update(db, testing.allocator, "exit(42)", &.{}, &.{});
+    const exit_file = registry.fileId("$std/exit.chi").?;
+    const exit_module = try db.intern(queries.ModulePaths, .{ .path = standard_library.File.exit.modulePath() });
+    const declarations = (try db.get(queries.ModuleDeclarations, exit_module)).*.?;
+    const exit_item = declarations.resolveFunction(@tagName(standard_library.External.exit)).?;
+    try testing.expect((try db.get(queries.FunctionShape, exit_item)).* != null);
+
+    const key = queries.standardFileKey(standard_library.File.exit.path());
+    try db.setInput(queries.StandardFile, key, 0);
+    try testing.expect((try db.get(queries.FunctionShape, exit_item)).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(queries.FunctionShape, exit_item, structures.Diagnostic, testing.allocator);
+    defer testing.allocator.free(diagnostics);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(structures.Diagnostic.Kind.unsupported_external_declaration, diagnostics[0].kind);
+
+    try db.setInput(queries.StandardFile, key, exit_file);
+    try testing.expect((try db.get(queries.FunctionShape, exit_item)).* != null);
+}
+
 test "compiler-owned exit signature invalidates and recovers" {
     const db = try query.Database.init(testing.allocator, .{ .worker_count = 2 });
     defer db.deinit();
@@ -114,9 +508,24 @@ test "compiler-owned exit signature invalidates and recovers" {
     try testing.expectEqual(exit_file, diagnostics[0].file_id);
     try testing.expectEqual(structures.Diagnostic.Kind.invalid_external_signature, diagnostics[0].kind);
 
-    try db.setInput(queries.SourceText, exit_file, standard_library.exit);
+    try db.setInput(queries.SourceText, exit_file, standard_library.source("exit.chi"));
     const f: Fixture = .{ .db = db };
     try f.expectExit(0, 42);
+}
+
+test "external fallible declaration has a fallible signature" {
+    const db = try query.Database.init(testing.allocator, .{ .worker_count = 2 });
+    defer db.deinit();
+    var registry: modules.SourceRegistry = .{};
+    defer registry.deinit(testing.allocator);
+    try registry.update(db, testing.allocator, "exit(42)", &.{}, &.{});
+    const exit_file = registry.fileId("$std/exit.chi").?;
+    try db.setInput(queries.SourceText, exit_file, "pub extern fallible exit(code: int) never");
+    const diagnostics = try db.transitiveAccumulatorValues(queries.BuildExecutable, 0, structures.Diagnostic, testing.allocator);
+    defer testing.allocator.free(diagnostics);
+    try testing.expect((try db.get(queries.BuildExecutable, 0)).* == null);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(structures.Diagnostic.Kind.invalid_external_signature, diagnostics[0].kind);
 }
 
 test "compile-time std exit emits compiler control without an executable" {
@@ -141,21 +550,15 @@ test "indirect compile-time std exit preserves compiler control" {
     try testing.expectEqualSlices(structures.CompilerControl, &.{.{ .exit = 42 }}, controls);
 }
 
-test "current module declarations shadow default prelude exports" {
-    const f = try Fixture.init("func example() int -> return 7\nexit(example())", &.{});
-    defer f.deinit();
-    try f.expectExit(0, 7);
-}
-
 test "prelude resolution is retained across user source and module changes" {
     const db = try query.Database.init(testing.allocator, .{ .worker_count = 2 });
     defer db.deinit();
     var registry: modules.SourceRegistry = .{};
     defer registry.deinit(testing.allocator);
-    try registry.update(db, testing.allocator, "exit(example())", &.{}, &.{});
+    try registry.update(db, testing.allocator, "exit(42)", &.{}, &.{});
     const resolved = try db.get(queries.ResolvePreludeImports, {});
 
-    try registry.update(db, testing.allocator, "import user\nexit(example())", &.{.{
+    try registry.update(db, testing.allocator, "import user\nexit(42)", &.{.{
         .path = "user/a.chi",
         .module_path = "user",
         .source = "pub static value = 1",
@@ -794,6 +1197,26 @@ fn refreshDirectory(db: *query.Database, registry: *modules.SourceRegistry, dire
     const entry = try directory.readFileAlloc(testing.io, "main.chi", testing.allocator, .unlimited);
     defer testing.allocator.free(entry);
     try registry.update(db, testing.allocator, entry, files, catalog.modules);
+}
+
+test "filesystem refresh keeps embedded std separate from user modules" {
+    var directory = testing.tmpDir(.{ .iterate = true });
+    defer directory.cleanup();
+    try directory.dir.createDirPath(testing.io, "std/memory");
+    try directory.dir.createDirPath(testing.io, "nested/std");
+    try directory.dir.writeFile(testing.io, .{ .sub_path = "main.chi", .data = "import nested.std.{answer}\nexit(answer)" });
+    try directory.dir.writeFile(testing.io, .{ .sub_path = "std/memory/allocation.chi", .data = "pub struct Allocation(T: type)" });
+    try directory.dir.writeFile(testing.io, .{ .sub_path = "nested/std/value.chi", .data = "pub static answer = 42" });
+
+    const db = try query.Database.init(testing.allocator, .{ .worker_count = 2 });
+    defer db.deinit();
+    var registry: modules.SourceRegistry = .{};
+    defer registry.deinit(testing.allocator);
+    try refreshDirectory(db, &registry, directory.dir);
+    try testing.expect(registry.fileId("std/memory/allocation.chi") == null);
+    try testing.expect(registry.fileId("$std/memory/allocation.chi") != null);
+    const fixture = Fixture{ .db = db };
+    try fixture.expectExit(0, 42);
 }
 
 test "filesystem refresh observes module and source additions and removals" {

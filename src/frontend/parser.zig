@@ -445,7 +445,9 @@ fn parseFunction(parser: *ParserState) !Node.Index {
     const token_index = parser.index;
     const external = parser.eat(.keyword_extern) != null;
     if (external) {
-        _ = try parser.expect(.keyword_func);
+        if (parser.eatAny(&.{ .keyword_func, .keyword_fallible }) == null) {
+            _ = try parser.expect(.keyword_func);
+        }
     } else {
         _ = parser.eatAny(&.{ .keyword_func, .keyword_fallible }).?;
     }
@@ -2145,6 +2147,13 @@ test "diagnostic tag for dotted selective imports" {
 test "external functions require a name" {
     try testExpectDiagnosticTag(
         "extern func (code: int) never",
+        .{ .expected_token = .{ .expected = .identifier, .found = .l_paren } },
+    );
+}
+
+test "external fallible declarations require a name" {
+    try testExpectDiagnosticTag(
+        "extern fallible (size: int) int",
         .{ .expected_token = .{ .expected = .identifier, .found = .l_paren } },
     );
 }

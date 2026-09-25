@@ -15,10 +15,11 @@ zig build run -- --disk-cache program.chi
 `-h` and `--help` print usage and exit successfully when given before the source
 path. Options after the source path are passed to the generated program instead.
 
-The CLI loads the entry directory tree, shares declarations within each module,
-compiles the designated entry file, writes `./prog`, runs it, and reports its exit
-code. Imports are file-scoped; qualified and selective names work in types,
-values, calls, and compile-time expressions. The embedded `std/prelude.chi`
+The CLI loads the entry directory tree except its root `std/` directory, which
+is reserved for embedded standard-library modules. It shares declarations
+within each module, compiles the designated entry file, writes `./prog`, runs
+it, and reports its exit code. Imports are file-scoped; qualified and selective
+names work in types, values, calls, and compile-time expressions. The embedded `std/prelude.chi`
 exports are in every user file's unqualified scope by default; compiler-owned
 standard-library files do not implicitly import the prelude. An explicit
 `import std.prelude.{}` disables the defaults for a user file. Only the

@@ -1,0 +1,8 @@
+struct HostStorage
+    address_low: int
+    address_high: int
+    byte_size: int
+    drop = explicit
+
+extern fallible allocate_host_storage(byte_size: int) HostStorage
+extern func deallocate_host_storage(deinit storage: HostStorage)

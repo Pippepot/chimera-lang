@@ -417,6 +417,15 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
         },
         .type_value_used_as_runtime_value => try writeSourceLabel(writer, "expected a value, found a type", source, span),
         .value_used_as_type => try writeSourceLabel(writer, "expected a type, found a value", source, span),
+        .type_factory_requires_call => try writeSourceLabel(writer, "call this type-producing function to obtain a type", source, span),
+        .generic_struct_requires_specialization => {
+            try writer.writeAll("struct must be specialized before initialization");
+            if (span) |focus| {
+                const start = @min(focus.start, source.len);
+                const end = @min(@max(focus.end, start), source.len);
+                try writer.print("; write `{s}(...){{...}}`", .{source[start..end]});
+            }
+        },
         .function_annotation_not_supported => try writer.writeAll("type annotations on function bindings are not supported yet"),
         .parameter_mode_not_supported => try writer.writeAll("this parameter access mode is not supported yet"),
         .static_parameter_requires_specialization => try writer.writeAll("a function with static parameters must be called with compile-time arguments"),
@@ -483,6 +492,10 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
         .field_access_not_struct => |found| {
             try writer.writeAll("field access requires a struct value, found ");
             try writeType(types, writer, found);
+        },
+        .opaque_struct_access => |type_id| {
+            try writer.writeAll("cannot construct or access fields of opaque storage owner ");
+            try writeType(types, writer, type_id);
         },
         .unknown_field => try writeSourceLabel(writer, "unknown struct field", source, span),
         .duplicate_local_binding => {

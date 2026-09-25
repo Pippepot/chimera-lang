@@ -10,6 +10,7 @@
 - Typed SSA covers calls, static specialization, callable values, variants, joins, loops, divergence, and fallible control flow. Compile-time thunks and specialized calls evaluate through typed IR, including structs, hooks, and type-valued functions; local captures remain unsupported.
 - Ownership tracks whole-root transfers, borrowed and owned parameters, mutable copy-back, and path-sensitive ASAP cleanup. Partial-field transfer, stable storage for immovable values, and origin-aware pointers/views remain open.
 - Compiler-provided `extern func` declarations use named std identities and ordinary calls. `std.exit.exit` is exported by the prelude, with distinct runtime termination and compile-time compiler control.
+- Host-only `std.memory` now provides checked, fallible typed allocation and explicit deallocation, unsafe element transfer for directly movable elements, and `Ref(T)` for directly movable, automatically droppable values with automatic destruction and consuming extraction. `Ref` and `make_ref` are exported by the prelude. Zero-sized allocations fail; in-place construction for immovable values, explicit duplication, and safe `Borrow` origins are not implemented yet.
 - Successful whole-program executables, typed runtime function bodies, and compiled functions persist in a content-addressed cache. Query snapshots restore interned identities and validate observed source inputs and equal-result query boundaries before reuse. Cache publication is atomic across compiler processes. Independent file and function queries use multiple workers.
 
 ## Priority and dependencies
@@ -44,11 +45,15 @@ address space, lifetime origin, and access mutability distinct.
 - Make `Borrow(T)` the non-owning, non-null reference. Copying a `Borrow` does
   not copy `T` or acquire ownership. It retains the location and lifetime
   dependencies of its source; mutation depends on the access path and aliasing
-  rules. Define safe initialized access and the explicitly unsafe operations
-  for raw or uninitialized storage.
+  rules. A `Borrow(T)` accesses a live initialized value; unsafe indexed
+  initialization, destruction, and borrowing of initialized allocation slots
+  belong on `Allocation`. Defer raw-address and foreign-memory operations.
 - Extend generation-based lifetime and aliasing checks to borrows from locals,
   allocations, owners, and collections, including returned/stored borrows,
   transfers, last-use destruction, and invalidation when storage changes.
+  Conservatively retain every possible source of a borrow, including borrowed
+  inputs to bodyless calls. Reject returned borrows with no inferable origin
+  and other unprovable origins at compile time, without user origin annotations.
   Specify partial-field transfer, initialization, cleanup, and address stability
   where they affect these operations; today's non-escaping `mut` calls do not
   establish the needed lifetime guarantees.
@@ -56,6 +61,8 @@ address space, lifetime origin, and access mutability distinct.
   capacity. Borrowed text and List views must follow the same lifetime and
   storage-change invalidation rules. Defer atomic shared ownership until its
   supported locations, mutation, weak references, and cycle behavior are set.
+- Put the public API in `std.memory`, re-exporting `Ref`, `make_ref`, and `Borrow` from
+  `std.prelude`; keep raw allocation and layout APIs explicitly imported.
 
 Resolve the remaining layout, zero-size, provider/location, address-space, and
 reference API decisions in the design note before freezing their language

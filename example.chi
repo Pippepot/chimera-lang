@@ -1,6 +1,6 @@
-func foo(static T: type, mut t: T) T
-  t = 3
-  return t
+struct Foo(T: type)
+  r: Ref(T)
 
-var i = 1
-foo(i)
+const f = Foo{r = if const owner = make_ref(1) -> owner^ else exit(1)}
+_ = f
+exit(0)

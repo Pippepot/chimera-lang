@@ -22,28 +22,25 @@ pub const StandardSource = struct {
     module_path: []const u8,
 };
 
-/// Standard-library files have reserved `std.<filename>` module identities.
+test "standard file paths derive nested module identities" {
+    try std.testing.expectEqualStrings("std.memory", standard_library.File.memory_host.modulePath());
+    try std.testing.expectEqualStrings("std.device.memory", standard_library.standardModulePath("device/memory/buffer.chi"));
+}
+
+/// Standard-library files have reserved `std` module identities.
 /// They are embedded so compilation does not depend on the process working
 /// directory or an adjacent source checkout.
-pub const standard_sources = [_]StandardSource{
-    .{
-        .registry_path = "$std/example.chi",
-        .display_path = "std/example.chi",
-        .source = standard_library.example,
-        .module_path = "std.example",
-    },
-    .{
-        .registry_path = "$std/exit.chi",
-        .display_path = "std/exit.chi",
-        .source = standard_library.exit,
-        .module_path = "std.exit",
-    },
-    .{
-        .registry_path = "$std/prelude.chi",
-        .display_path = "std/prelude.chi",
-        .source = standard_library.prelude,
-        .module_path = "std.prelude",
-    },
+pub const standard_sources = blk: {
+    var sources: [standard_library.paths.len]StandardSource = undefined;
+    for (standard_library.paths, 0..) |path, index| {
+        sources[index] = .{
+            .registry_path = "$std/" ++ path,
+            .display_path = "std/" ++ path,
+            .source = standard_library.source(path),
+            .module_path = standard_library.standardModulePath(path),
+        };
+    }
+    break :blk sources;
 };
 
 pub const Catalog = struct {
@@ -110,7 +107,7 @@ pub fn collectModuleFiles(
     try modules.append(gpa, try modulePath(gpa, ""));
     while (try walker.next(io)) |entry| {
         if (entry.kind == .directory) {
-            if (!isModuleSegment(entry.basename)) {
+            if (std.mem.eql(u8, entry.path, "std") or !isModuleSegment(entry.basename)) {
                 walker.leave(io);
                 continue;
             }
@@ -212,13 +209,15 @@ pub const SourceRegistry = struct {
             if (!slot.found_existing) slot.value_ptr.* = .empty;
         }
         for (files) |file| try self.registerFile(db, gpa, &current, file);
-        for (standard_sources) |file| try self.registerFile(db, gpa, &current, .{
-            .path = file.registry_path,
-            .module_path = file.module_path,
-            .source = file.source,
-        });
-        try putInput(db, queries.StandardExitFile, {}, self.fileId("$std/exit.chi").?);
-        const prelude_module = try db.intern(queries.ModulePaths, .{ .path = "std.prelude" });
+        for (standard_sources, 0..) |file, index| {
+            try self.registerFile(db, gpa, &current, .{
+                .path = file.registry_path,
+                .module_path = file.module_path,
+                .source = file.source,
+            });
+            try putInput(db, queries.StandardFile, @intCast(index), self.fileId(file.registry_path).?);
+        }
+        const prelude_module = try db.intern(queries.ModulePaths, .{ .path = standard_library.File.prelude.modulePath() });
         try putInput(db, queries.StandardPreludeModule, {}, prelude_module);
         for (current.keys(), current.values()) |module, *members| {
             std.mem.sort(structures.FileId, members.items, {}, std.sort.asc(structures.FileId));

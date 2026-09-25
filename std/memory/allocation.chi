@@ -1,0 +1,30 @@
+pub struct Allocation(T: type)
+    storage: HostStorage
+    count: int
+    drop = explicit
+
+pub extern fallible allocate(static T: type, count: int) Allocation(T)
+pub extern func deallocate(static T: type, deinit allocation: Allocation(T))
+pub extern func unsafe_initialize(static T: type, mut allocation: Allocation(T), index: int, var item: T)
+pub extern func unsafe_take(static T: type, mut allocation: Allocation(T), index: int) T
+
+pub struct Ref(T: type)
+    allocation: Allocation(T)
+    drop = func(deinit self: Ref(T))
+        const item = unsafe_take_ref(T, self)
+        _ = item
+        deallocate_ref(T, self^)
+
+pub fallible make_ref(static T: type, var item: T) Ref(T)
+    var allocation = allocate(T, 1)
+    unsafe_initialize(T, allocation, 0, item^)
+    return unsafe_own_ref(T, allocation^)
+
+pub func value(static T: type, deinit owner: Ref(T)) T
+    const result = unsafe_take_ref(T, owner)
+    deallocate_ref(T, owner^)
+    return result^
+
+extern func unsafe_own_ref(static T: type, deinit allocation: Allocation(T)) Ref(T)
+extern func unsafe_take_ref(static T: type, mut owner: Ref(T)) T
+extern func deallocate_ref(static T: type, deinit owner: Ref(T))

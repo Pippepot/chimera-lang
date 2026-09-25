@@ -1,1 +1,0 @@
-pub func example() int -> return 42

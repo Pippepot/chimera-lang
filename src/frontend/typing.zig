@@ -97,16 +97,25 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         const Expression = semantic.UnresolvedBody.Expression;
         const StateId = enum(u32) { _ };
         const PendingExtraction = struct {
-            local: semantic.UnresolvedBody.LocalId,
+            binding: semantic.UnresolvedBody.ConditionBinding,
             operand: Value,
             target_type: structures.TypeId,
-            annotation_type: ?structures.TypeId,
-            span: structures.SourceSpan,
+        };
+        const PendingConditionBinding = union(enum) {
+            variant: PendingExtraction,
+            call: semantic.UnresolvedBody.ConditionBinding,
+
+            fn conditionBinding(self: @This()) semantic.UnresolvedBody.ConditionBinding {
+                return switch (self) {
+                    .variant => |extraction| extraction.binding,
+                    .call => |binding| binding,
+                };
+            }
         };
         const FlowExit = struct {
             block: structures.FunctionBlockId,
             state: StateId,
-            extraction: ?PendingExtraction = null,
+            binding: ?PendingConditionBinding = null,
         };
         const ValueExit = struct {
             block: structures.FunctionBlockId,
@@ -1038,9 +1047,33 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
 
         fn structInit(self: *Self, expression: Expression) !Value {
             const initializer = expression.operation.struct_init;
-            const definition = (try self.type_interner.structDefinition(initializer.type_id)) orelse
-                return self.reject(initializer.type_span, .{ .struct_initializer_not_struct = initializer.type_id });
-            if (try self.type_interner.structLayout(initializer.type_id) == null) return error.Unavailable;
+            const source_fields = self.unresolved.struct_field_values[initializer.fields.start..initializer.fields.end];
+            const type_id = switch (initializer.target) {
+                .concrete => |concrete| concrete,
+                .inferred => |factory| inferred: {
+                    var field_types: std.ArrayList(structures.TypeId) = .empty;
+                    defer field_types.deinit(self.ctx.allocator());
+                    for (source_fields) |source_field| {
+                        const expected = try self.type_interner.independentStructFieldType(factory, source_field.name);
+                        const operand = try self.valueWithType(source_field.value.value, expected);
+                        if (operand.type_id == .never) return operand;
+                        try field_types.append(self.ctx.allocator(), operand.type_id);
+                    }
+                    const result = try self.type_interner.inferStructArguments(factory, source_fields, field_types.items);
+                    const arguments = switch (result) {
+                        .arguments => |arguments| arguments,
+                        .missing => return self.reject(initializer.type_span, .static_argument_cannot_be_inferred),
+                        .conflict => return self.reject(initializer.type_span, .static_argument_inference_conflict),
+                    };
+                    defer self.ctx.allocator().free(arguments);
+                    const specialized = try self.type_interner.specializeFunction(factory, arguments);
+                    break :inferred try self.type_interner.specializedStructType(specialized);
+                },
+            };
+            const definition = (try self.type_interner.structDefinition(type_id)) orelse
+                return self.reject(initializer.type_span, .{ .struct_initializer_not_struct = type_id });
+            if (!definition.accessible_fields) return self.reject(initializer.type_span, .{ .opaque_struct_access = type_id });
+            if (try self.type_interner.structLayout(type_id) == null) return error.Unavailable;
 
             const seen = try self.ctx.allocator().alloc(bool, definition.fields.len);
             defer self.ctx.allocator().free(seen);
@@ -1049,7 +1082,6 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             defer fields.deinit(self.ctx.allocator());
             var field_values: std.ArrayList(Value) = .empty;
             defer field_values.deinit(self.ctx.allocator());
-            const source_fields = self.unresolved.struct_field_values[initializer.fields.start..initializer.fields.end];
             for (source_fields) |source_field| {
                 const field = definition.resolveField(source_field.name) orelse
                     return self.reject(source_field.name_span, .unknown_struct_field);
@@ -1073,7 +1105,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 });
             }
             for (seen, 0..) |was_seen, field_index| if (!was_seen) return self.reject(initializer.type_span, .{ .missing_struct_initializer_field = .{
-                .type_id = initializer.type_id,
+                .type_id = type_id,
                 .field_index = @intCast(field_index),
             } });
             for (field_values.items) |field_value| try self.recordConsume(field_value);
@@ -1081,7 +1113,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             try self.struct_field_values.appendSlice(self.ctx.allocator(), fields.items);
             const result = try self.appendInstruction(.{ .struct_init = .{
                 .fields = .{ .start = start, .end = @intCast(self.struct_field_values.items.len) },
-                .type_id = initializer.type_id,
+                .type_id = type_id,
             } });
             return self.defineOwnedValue(result, expression.span, false);
         }
@@ -1096,6 +1128,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             if (operand.type_id == .never) return operand;
             const definition = (try self.type_interner.structDefinition(operand.type_id)) orelse
                 return self.reject(operand_use.span, .{ .field_access_not_struct = operand.type_id });
+            if (!definition.accessible_fields) return self.reject(span, .{ .opaque_struct_access = operand.type_id });
             if (try self.type_interner.structLayout(operand.type_id) == null) return error.Unavailable;
             const field = definition.resolveField(name) orelse return self.reject(span, .unknown_field);
             var result = try self.appendInstruction(.{ .field_access = .{
@@ -1679,6 +1712,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             for (source_fields, 0..) |source_field, index| {
                 const definition = (try self.type_interner.structDefinition(target_type)) orelse
                     return self.reject(if (index == 0) assignment_value.target_span else source_fields[index - 1].span, .{ .field_access_not_struct = target_type });
+                if (!definition.accessible_fields) return self.reject(source_field.span, .{ .opaque_struct_access = target_type });
                 if (try self.type_interner.structLayout(target_type) == null) return error.Unavailable;
                 const field = definition.resolveField(source_field.name) orelse return self.reject(source_field.span, .unknown_field);
                 try fields.append(self.ctx.allocator(), .{
@@ -2177,7 +2211,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             const continuation = try self.newBlock(argument_start, @intCast(self.block_argument_types.items.len));
             self.terminate(.{ .branch = try self.valuesBranch(continuation, values.items) });
             flow_exit.block = continuation;
-            flow_exit.extraction = null;
+            flow_exit.binding = null;
         }
 
         fn appendCall(self: *Self, call: CallOperation) !Value {
@@ -2286,17 +2320,18 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 .conjunction => |logical| self.conjunctionCondition(logical),
                 .disjunction => |logical| self.disjunctionCondition(logical),
                 .negation => |operand| self.negatedCondition(operand),
-                .call => |call| self.callCondition(call),
+                .call => |call| self.callCondition(call.target, call.binding),
             };
         }
 
-        fn callCondition(self: *Self, call: semantic.UnresolvedBody.Call) !ConditionFlow {
+        fn callCondition(self: *Self, call: semantic.UnresolvedBody.Call, binding: ?semantic.UnresolvedBody.ConditionBinding) !ConditionFlow {
             const resolved = try self.resolveCall(call, call.span);
             return switch (resolved) {
                 .diverged => |value_to_return| .{ .success = null, .failure = null, .diverged = value_to_return },
                 .callable => |callable| if (callable.is_fallible) blk: {
                     var flow = try self.lowerFallibleCall(callable.operation, call.span);
                     try self.finishCallExits(&flow, callable, call.span);
+                    if (binding) |success_binding| flow.success.?.binding = .{ .call = success_binding };
                     break :blk flow;
                 } else self.reject(call.span, .if_condition_not_fallible),
             };
@@ -2391,14 +2426,12 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             }
             const state = try self.captureState();
             const extraction: ?PendingExtraction = if (membership.binding) |binding| .{
-                .local = binding.local,
+                .binding = binding,
                 .operand = operand,
                 .target_type = try intersectTypes(self.type_interner, source_members, membership.target_type, self.ctx.allocator()),
-                .annotation_type = binding.annotation_type,
-                .span = binding.span,
             } else null;
             return .{
-                .success = .{ .block = success, .state = state, .extraction = extraction },
+                .success = .{ .block = success, .state = state, .binding = if (extraction) |pending_extraction| .{ .variant = pending_extraction } else null },
                 .failure = .{ .block = failure, .state = state },
             };
         }
@@ -2443,40 +2476,55 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         fn enterFlowExit(self: *Self, exit: FlowExit) !void {
             self.enterBlock(exit.block);
             self.restoreState(exit.state);
-            if (exit.extraction) |extraction| {
-                const tag_mapping = try self.appendExtractionTagMapping(extraction.operand.type_id, extraction.target_type);
-                var extracted = try self.appendInstruction(.{ .variant_extract = .{
-                    .operand = extraction.operand.id,
-                    .target_type = extraction.target_type,
-                    .tag_mapping = tag_mapping,
-                } });
-                if (extraction.target_type != .never) {
-                    extracted.borrowed_type = extracted.type_id;
-                    extracted.borrowed_generation = extraction.operand.borrowed_generation orelse extraction.operand.owned_generation;
-                    extracted.borrowed_cleanup_value = extraction.operand.borrowed_cleanup_value orelse extraction.operand.id;
-                    extracted = try self.ownValue(extracted, extraction.span);
-                }
-                if (extraction.target_type != .never and extraction.annotation_type != null) {
-                    const expected = extraction.annotation_type.?;
-                    const use = try self.coerceValue(extracted.id, extracted.type_id, expected) orelse
-                        return self.reject(extraction.span, .{ .local_type_mismatch = self.typeMismatch(expected, extracted.type_id) });
+            if (exit.binding) |pending| {
+                const binding = pending.conditionBinding();
+                var bound: Value = switch (pending) {
+                    .variant => |extraction| blk: {
+                        const tag_mapping = try self.appendExtractionTagMapping(extraction.operand.type_id, extraction.target_type);
+                        var extracted = try self.appendInstruction(.{ .variant_extract = .{
+                            .operand = extraction.operand.id,
+                            .target_type = extraction.target_type,
+                            .tag_mapping = tag_mapping,
+                        } });
+                        if (extraction.target_type != .never) {
+                            extracted.borrowed_type = extracted.type_id;
+                            extracted.borrowed_generation = extraction.operand.borrowed_generation orelse extraction.operand.owned_generation;
+                            extracted.borrowed_cleanup_value = extraction.operand.borrowed_cleanup_value orelse extraction.operand.id;
+                            extracted = try self.ownValue(extracted, binding.span);
+                        }
+                        break :blk extracted;
+                    },
+                    .call => blk: {
+                        const success_block = self.blocks.items[@intFromEnum(exit.block)];
+                        std.debug.assert(success_block.argument_end == success_block.argument_start + 1);
+                        break :blk .{
+                            .id = @enumFromInt(success_block.argument_start),
+                            .type_id = self.block_argument_types.items[success_block.argument_start],
+                            .owned_generation = self.block_argument_generations.items[success_block.argument_start],
+                        };
+                    },
+                };
+                if (bound.type_id != .never) if (binding.annotation_type) |expected| {
+                    const use = try self.coerceValue(bound.id, bound.type_id, expected) orelse
+                        return self.reject(binding.span, .{ .local_type_mismatch = self.typeMismatch(expected, bound.type_id) });
                     if (use.coerce_to != null) {
-                        extracted = try self.coerceOwnedRepresentation(extracted, use, extraction.span);
+                        bound = try self.coerceOwnedRepresentation(bound, use, binding.span);
                     }
-                }
-                const index = @intFromEnum(extraction.local);
+                };
+                const index = @intFromEnum(binding.local);
                 std.debug.assert(self.local_values[index] == null);
-                self.local_values[index] = extracted;
+                self.local_values[index] = bound;
                 self.local_mutable[index] = false;
                 self.local_availability[index] = .available;
-                if (extraction.target_type == .never) self.terminate(.diverge);
+                if (bound.type_id == .never) self.terminate(.diverge);
             }
         }
 
         fn mergeFlowExits(self: *Self, first_exit: ?FlowExit, second_exit: ?FlowExit) !?FlowExit {
             const first = first_exit orelse return second_exit;
             const second = second_exit orelse return first;
-            std.debug.assert(first.extraction == null and second.extraction == null);
+            std.debug.assert(first.binding == null);
+            std.debug.assert(second.binding == null);
             const first_state = self.states.items[@intFromEnum(first.state)];
             const second_state = self.states.items[@intFromEnum(second.state)];
             std.debug.assert(first_state.values.len == second_state.values.len);
@@ -2561,9 +2609,8 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             const then_exit = if (flow.success) |success| blk: {
                 try self.enterFlowExit(success);
                 const result = try self.block(expression.then_block, null);
-                if (self.current_block != null) if (success.extraction) |extraction| {
-                    self.unbindLocal(@intFromEnum(extraction.local));
-                };
+                if (self.current_block != null) if (success.binding) |binding|
+                    self.unbindLocal(@intFromEnum(binding.conditionBinding().local));
                 break :blk try self.valueExit(result);
             } else null;
             const else_exit = if (flow.failure) |failure| blk: {

@@ -1,4 +1,5 @@
 const std = @import("std");
+const standard_library = @import("standard_library");
 const structures = @import("structures.zig");
 const ast = @import("frontend/parser.zig");
 const codegen = @import("backend/codegen.zig");
@@ -91,10 +92,27 @@ pub const StandardPreludeModule = struct {
     pub const Value = structures.ModuleId;
 };
 
-pub const StandardExitFile = struct {
-    pub const Key = void;
+pub const StandardFile = struct {
+    pub const Key = u32;
     pub const Value = structures.FileId;
 };
+
+pub fn standardFileKey(comptime path: []const u8) StandardFile.Key {
+    return comptime blk: {
+        for (standard_library.paths, 0..) |candidate, index| {
+            if (std.mem.eql(u8, candidate, path)) break :blk @intCast(index);
+        }
+        @compileError("unknown standard source: " ++ path);
+    };
+}
+
+fn standardFile(ctx: anytype, file: standard_library.File) !?structures.FileId {
+    const registered = ctx.input(StandardFile, @intFromEnum(file)) catch |err| switch (err) {
+        error.InputNotFound => return null,
+        else => return err,
+    };
+    return registered.*;
+}
 
 pub const ModulePaths = struct {
     pub const Value = structures.ModulePath;
@@ -383,7 +401,12 @@ pub fn TypeInterner(comptime Context: type) type {
             };
             return switch (identity) {
                 .declared => |item_id| (try self.ctx.lookupInterned(ItemLocations, item_id)).name,
-                .generated => "anonymous struct",
+                .generated => |generated| blk: {
+                    const resolved = (try self.ctx.get(ResolveItem, generated.owner.item)).* orelse return error.Unavailable;
+                    const parsed = (try self.ctx.get(ParseFile, resolved.file_id)).* orelse return error.Unavailable;
+                    if (!semantic.isDirectlyReturnedStructSite(&parsed, resolved.declaration, generated.node_offset)) break :blk "anonymous struct";
+                    break :blk (try self.ctx.lookupInterned(ItemLocations, generated.owner.item)).name;
+                },
             };
         }
 
@@ -479,6 +502,45 @@ pub fn TypeInterner(comptime Context: type) type {
             return semantic.inferStaticArguments(&parsed, source, resolved.declaration, argument_types, type_interner, self.ctx.allocator());
         }
 
+        pub fn inferStructArguments(self: @This(), instance: structures.InstanceId, fields: []const semantic.UnresolvedBody.StructFieldValue, field_types: []const structures.TypeId) !semantic.StaticInference {
+            const resolved = (try self.ctx.get(ResolveItem, instance.item)).* orelse return error.Unavailable;
+            const parsed = (try self.ctx.get(ParseFile, resolved.file_id)).* orelse return error.Unavailable;
+            const source = (try self.ctx.input(SourceText, resolved.file_id)).*;
+            const type_interner: @This() = .{
+                .ctx = self.ctx,
+                .file_id = resolved.file_id,
+                .instance = instance,
+                .prior_static_arguments = &.{},
+            };
+            return semantic.inferStructArguments(&parsed, source, resolved.declaration, fields, field_types, type_interner, self.ctx.allocator());
+        }
+
+        pub fn independentStructFieldType(self: @This(), instance: structures.InstanceId, name: []const u8) !?structures.TypeId {
+            const resolved = (try self.ctx.get(ResolveItem, instance.item)).* orelse return error.Unavailable;
+            const parsed = (try self.ctx.get(ParseFile, resolved.file_id)).* orelse return error.Unavailable;
+            const source = (try self.ctx.input(SourceText, resolved.file_id)).*;
+            const type_interner: @This() = .{
+                .ctx = self.ctx,
+                .file_id = resolved.file_id,
+                .instance = instance,
+                .prior_static_arguments = &.{},
+            };
+            return switch (try semantic.analyzeIndependentStructFieldType(&parsed, source, resolved.declaration, name, type_interner, self.ctx.allocator())) {
+                .success => |type_id| type_id,
+                .unsupported => |issue| {
+                    try typing.emitSemanticIssue(self.ctx, resolved.file_id, issue);
+                    return error.Unavailable;
+                },
+            };
+        }
+
+        pub fn specializedStructType(self: @This(), instance: structures.InstanceId) !structures.TypeId {
+            const resolved = (try self.ctx.get(ResolveItem, instance.item)).* orelse return error.Unavailable;
+            const parsed = (try self.ctx.get(ParseFile, resolved.file_id)).* orelse return error.Unavailable;
+            const site = semantic.parameterizedStructSite(&parsed, resolved.declaration) orelse unreachable;
+            return internGeneratedStructType(self.ctx, .{ .owner = instance, .node_offset = site });
+        }
+
         pub fn structFactoryArguments(self: @This(), factory: structures.InstanceId, type_id: structures.TypeId) !?[]const structures.CompileTimeValueId {
             const identity = (try self.structIdentity(type_id)) orelse return null;
             if (identity != .generated or identity.generated.owner.item != factory.item) return null;
@@ -535,6 +597,12 @@ pub fn TypeInterner(comptime Context: type) type {
 
         pub fn functionShape(self: @This(), item_id: structures.ItemId) !?structures.FunctionShape {
             return (try self.ctx.get(FunctionShape, item_id)).*;
+        }
+
+        pub fn isGenericStruct(self: @This(), item_id: structures.ItemId) !bool {
+            const resolved = (try self.ctx.get(ResolveItem, item_id)).* orelse return false;
+            const parsed = (try self.ctx.get(ParseFile, resolved.file_id)).* orelse return false;
+            return semantic.parameterizedStructSite(&parsed, resolved.declaration) != null;
         }
 
         pub fn internFunctionInstance(
@@ -1248,7 +1316,7 @@ pub const ResolveFileImports = struct {
         defer bound.deinit();
         var failed = false;
         const module_path = (try ctx.lookupInterned(ModulePaths, module)).path;
-        const standard_module = std.mem.eql(u8, module_path, "std") or std.mem.startsWith(u8, module_path, "std.");
+        const standard_module = std.mem.eql(u8, module_path, standard_library.root_module) or std.mem.startsWith(u8, module_path, standard_library.root_module ++ ".");
         if (!standard_module and !explicitlyImportsPrelude(collected.entries)) {
             const configured = ctx.input(StandardPreludeModule, {}) catch |err| switch (err) {
                 error.InputNotFound => null,
@@ -1292,7 +1360,7 @@ pub const ResolveFileImports = struct {
 
 const ExportVisit = struct { module: structures.ModuleId, name: []const u8 };
 const ImportOrigin = struct { file_id: structures.FileId, span: structures.SourceSpan };
-const prelude_module_path = "std.prelude";
+const prelude_module_path = standard_library.File.prelude.modulePath();
 
 fn explicitlyImportsPrelude(entries: []const structures.ImportDeclaration) bool {
     for (entries) |entry| {
@@ -1597,9 +1665,8 @@ pub const ResolveItem = struct {
 };
 
 const ExternalSymbol = struct {
-    const Symbol = enum { exit };
     pub const Input = structures.ItemId;
-    pub const Output = ?Symbol;
+    pub const Output = ?standard_library.External;
 
     pub fn run(ctx: anytype, item: Input) anyerror!Output {
         const loc = try ctx.lookupInterned(ItemLocations, item);
@@ -1607,18 +1674,16 @@ const ExternalSymbol = struct {
         const resolved = (try ctx.get(ResolveItem, item)).* orelse return null;
         const parsed = (try ctx.get(ParseFile, resolved.file_id)).* orelse return null;
         if (!semantic.isExternalFunction(&parsed, resolved.declaration)) return null;
-        const registered = ctx.input(StandardExitFile, {}) catch |err| switch (err) {
-            error.InputNotFound => return null,
-            else => return err,
-        };
-        if (registered.* != resolved.file_id) return null;
         const module = switch (loc.origin) {
             .module => |module_id| module_id,
             .entry => return null,
         };
+        const symbol = std.meta.stringToEnum(standard_library.External, loc.name) orelse return null;
+        const file = symbol.file();
         const path = (try ctx.lookupInterned(ModulePaths, module)).path;
-        if (std.mem.eql(u8, path, "std.exit") and std.mem.eql(u8, loc.name, "exit")) return .exit;
-        return null;
+        if (!std.mem.eql(u8, path, file.modulePath())) return null;
+        const registered = (try standardFile(ctx, file)) orelse return null;
+        return if (registered == resolved.file_id) symbol else null;
     }
 };
 
@@ -1767,6 +1832,53 @@ fn validateExternalSignature(ctx: anytype, item: structures.ItemId, file_id: str
     const valid = switch (symbol) {
         .exit => !signature.is_fallible and signature.return_type == .never and
             signature.parameters.len == 1 and signature.parameters[0].mode == .imm and signature.parameters[0].type_id == .int,
+        .allocate_host_storage, .deallocate_host_storage => blk: {
+            const memory_module = try ctx.intern(ModulePaths, .{ .path = standard_library.File.memory_host.modulePath() });
+            const declarations = (try ctx.get(ModuleDeclarations, memory_module)).* orelse break :blk false;
+            const storage_type = (try hostStorageType(ctx, declarations)) orelse break :blk false;
+            break :blk switch (symbol) {
+                .allocate_host_storage => signature.is_fallible and signature.return_type == storage_type and
+                    signature.parameters.len == 1 and signature.parameters[0].mode == .imm and signature.parameters[0].type_id == .int,
+                .deallocate_host_storage => !signature.is_fallible and signature.return_type == .unit and
+                    signature.parameters.len == 1 and signature.parameters[0].mode == .deinit and signature.parameters[0].type_id == storage_type,
+                else => unreachable,
+            };
+        },
+        .allocate, .deallocate => blk: {
+            if (signature.parameters.len != 1) break :blk false;
+            const type_id = if (symbol == .allocate) signature.return_type else signature.parameters[0].type_id;
+            if (try allocationElementType(ctx, type_id) == null) break :blk false;
+            break :blk if (symbol == .allocate)
+                signature.is_fallible and signature.parameters[0].mode == .imm and signature.parameters[0].type_id == .int
+            else
+                !signature.is_fallible and signature.return_type == .unit and signature.parameters[0].mode == .deinit;
+        },
+        .unsafe_initialize, .unsafe_take => blk: {
+            if (signature.is_fallible or signature.parameters.len != (if (symbol == .unsafe_initialize) @as(usize, 3) else 2)) break :blk false;
+            const allocation = signature.parameters[0];
+            if (allocation.mode != .mut) break :blk false;
+            const element_type = (try allocationElementType(ctx, allocation.type_id)) orelse break :blk false;
+            const capabilities = (try ctx.get(OwnershipCapabilities, element_type)).* orelse break :blk false;
+            if (capabilities.move == .none or capabilities.move == .custom or capabilities.needs_custom_move) break :blk false;
+            if (signature.parameters[1].mode != .imm or signature.parameters[1].type_id != .int) break :blk false;
+            break :blk if (symbol == .unsafe_initialize)
+                signature.return_type == .unit and signature.parameters[2].mode == .@"var" and signature.parameters[2].type_id == element_type
+            else
+                signature.return_type == element_type;
+        },
+        .unsafe_own_ref => blk: {
+            if (signature.is_fallible or signature.parameters.len != 1 or signature.parameters[0].mode != .deinit) break :blk false;
+            const element_type = (try allocationElementType(ctx, signature.parameters[0].type_id)) orelse break :blk false;
+            break :blk (try refElementType(ctx, signature.return_type)) == element_type;
+        },
+        .unsafe_take_ref, .deallocate_ref => blk: {
+            if (signature.is_fallible or signature.parameters.len != 1) break :blk false;
+            const element_type = (try refElementType(ctx, signature.parameters[0].type_id)) orelse break :blk false;
+            if (symbol == .deallocate_ref) break :blk signature.parameters[0].mode == .deinit and signature.return_type == .unit;
+            const capabilities = (try ctx.get(OwnershipCapabilities, element_type)).* orelse break :blk false;
+            break :blk signature.parameters[0].mode == .mut and signature.return_type == element_type and
+                capabilities.move != .none and capabilities.move != .custom and !capabilities.needs_custom_move;
+        },
     };
     if (valid) return signature;
     ctx.allocator().free(signature.parameters);
@@ -1776,6 +1888,106 @@ fn validateExternalSignature(ctx: anytype, item: structures.ItemId, file_id: str
         .kind = .invalid_external_signature,
     });
     return null;
+}
+
+fn hostStorageType(ctx: anytype, declarations: structures.ModuleScope) !?structures.TypeId {
+    const storage_item = declarations.resolveStatic(@tagName(standard_library.Structure.HostStorage)) orelse return null;
+    const storage_file = (try ctx.get(ResolveItem, storage_item)).* orelse return null;
+    const registered = (try standardFile(ctx, .memory_host)) orelse return null;
+    if (storage_file.file_id != registered) return null;
+    const definition = (try ctx.get(StructDefinition, storage_item)).* orelse return null;
+    if (definition.fields.len != 3 or
+        definition.ownership.drop == null or definition.ownership.drop.?.capability != .explicit or
+        definition.ownership.move != null or definition.ownership.copy != null)
+    {
+        return null;
+    }
+    for (definition.fields, [_][]const u8{ "address_low", "address_high", "byte_size" }) |field, name| {
+        if (!std.mem.eql(u8, field.name, name) or field.type_id != .int) return null;
+    }
+    return try internStructType(ctx, storage_item);
+}
+
+fn allocationElementType(ctx: anytype, type_id: structures.TypeId) !?structures.TypeId {
+    const interned = type_id.interned() orelse return null;
+    const data = (try ctx.lookupInternedAs(Types, interned)) orelse return null;
+    const generated = switch (data.*) {
+        .structure => |identity| switch (identity) {
+            .generated => |value| value,
+            .declared => return null,
+        },
+        .variant, .callable => return null,
+    };
+    const memory_module = try ctx.intern(ModulePaths, .{ .path = standard_library.File.memory_allocation.modulePath() });
+    const declarations = (try ctx.get(ModuleDeclarations, memory_module)).* orelse return null;
+    const allocation_item = declarations.resolveFunction(@tagName(standard_library.Structure.Allocation)) orelse return null;
+    if (generated.owner.item != allocation_item) return null;
+    const registered = (try standardFile(ctx, .memory_allocation)) orelse return null;
+    const resolved = (try ctx.get(ResolveItem, allocation_item)).* orelse return null;
+    if (resolved.file_id != registered) return null;
+    const tuple = generated.owner.specialization orelse return null;
+    const arguments = (try ctx.lookupInterned(CompileTimeValueTuples, tuple)).values;
+    if (arguments.len != 1) return null;
+    const element = (try ctx.lookupInterned(CompileTimeValues, arguments[0])).*;
+    const element_type = switch (element) {
+        .type => |value| value,
+        .runtime => return null,
+    };
+    if (element_type == .type) return null;
+    const definition = (try ctx.get(GeneratedStructDefinition, generated)).* orelse return null;
+    if (definition.fields.len != 2 or
+        definition.accessible_fields or
+        definition.ownership.move != null or definition.ownership.copy != null or
+        definition.ownership.drop == null or definition.ownership.drop.?.capability != .explicit)
+    {
+        return null;
+    }
+    const storage_type = (try hostStorageType(ctx, declarations)) orelse return null;
+    if (!std.mem.eql(u8, definition.fields[0].name, "storage") or
+        definition.fields[0].type_id != storage_type or
+        !std.mem.eql(u8, definition.fields[1].name, "count") or
+        definition.fields[1].type_id != .int)
+    {
+        return null;
+    }
+    return element_type;
+}
+
+fn refElementType(ctx: anytype, type_id: structures.TypeId) !?structures.TypeId {
+    const interned = type_id.interned() orelse return null;
+    const data = (try ctx.lookupInternedAs(Types, interned)) orelse return null;
+    const generated = switch (data.*) {
+        .structure => |identity| switch (identity) {
+            .generated => |value| value,
+            .declared => return null,
+        },
+        .variant, .callable => return null,
+    };
+    const memory_module = try ctx.intern(ModulePaths, .{ .path = standard_library.File.memory_allocation.modulePath() });
+    const declarations = (try ctx.get(ModuleDeclarations, memory_module)).* orelse return null;
+    const ref_item = declarations.resolveFunction(@tagName(standard_library.Structure.Ref)) orelse return null;
+    if (generated.owner.item != ref_item) return null;
+    const registered = (try standardFile(ctx, .memory_allocation)) orelse return null;
+    const resolved = (try ctx.get(ResolveItem, ref_item)).* orelse return null;
+    if (resolved.file_id != registered) return null;
+    const tuple = generated.owner.specialization orelse return null;
+    const arguments = (try ctx.lookupInterned(CompileTimeValueTuples, tuple)).values;
+    if (arguments.len != 1) return null;
+    const element = (try ctx.lookupInterned(CompileTimeValues, arguments[0])).*;
+    const element_type = switch (element) {
+        .type => |value| value,
+        .runtime => return null,
+    };
+    const definition = (try ctx.get(GeneratedStructDefinition, generated)).* orelse return null;
+    if (definition.fields.len != 1 or definition.accessible_fields or
+        definition.ownership.move != null or definition.ownership.copy != null or definition.ownership.drop == null or
+        definition.ownership.drop.?.capability != .custom or
+        !std.mem.eql(u8, definition.fields[0].name, "allocation") or
+        (try allocationElementType(ctx, definition.fields[0].type_id)) != element_type)
+    {
+        return null;
+    }
+    return element_type;
 }
 
 pub const ResolveStatic = struct {
@@ -2008,6 +2220,7 @@ pub const ExecuteComptimeCall = struct {
                     .outcome = .{ .exit = arguments[0].runtime.int },
                     .arguments = key.arguments,
                 } },
+                .allocate_host_storage, .deallocate_host_storage, .allocate, .deallocate, .unsafe_initialize, .unsafe_take, .unsafe_own_ref, .unsafe_take_ref, .deallocate_ref => null,
             };
         }
 
@@ -2285,7 +2498,13 @@ pub const GeneratedStructDefinition = struct {
             else => return err,
         };
         return switch (result) {
-            .success => |definition| definition,
+            .success => |definition| blk: {
+                var owned = definition;
+                if (std.mem.eql(u8, loc.name, @tagName(standard_library.Structure.Allocation)) or std.mem.eql(u8, loc.name, @tagName(standard_library.Structure.Ref))) {
+                    if ((try standardFile(ctx, .memory_allocation)) == resolved.file_id) owned.accessible_fields = false;
+                }
+                break :blk owned;
+            },
             .unsupported => |issue| blk: {
                 try typing.emitSemanticIssue(ctx, resolved.file_id, issue);
                 break :blk null;
@@ -2413,6 +2632,36 @@ pub const CompileFunction = struct {
                 (try ctx.get(FunctionInstanceSignature, instance_id)).* orelse return null;
             return switch (symbol) {
                 .exit => try codegen.compileExternalExit(ctx.allocator()),
+                .allocate_host_storage => try codegen.compileExternalAllocateHostStorage(ctx.allocator()),
+                .deallocate_host_storage => try codegen.compileExternalDeallocateHostStorage(ctx.allocator()),
+                .allocate => blk: {
+                    const signature = (try ctx.get(FunctionInstanceSignature, instance_id)).* orelse return null;
+                    const element_type = (try allocationElementType(ctx, signature.return_type)) orelse unreachable;
+                    const layout = (try ctx.get(TypeLayout, element_type)).*;
+                    break :blk try codegen.compileExternalAllocateTypedStorage(ctx.allocator(), layout);
+                },
+                .deallocate => try codegen.compileExternalDeallocateHostStorage(ctx.allocator()),
+                .unsafe_initialize, .unsafe_take => blk: {
+                    const signature = (try ctx.get(FunctionInstanceSignature, instance_id)).* orelse return null;
+                    const element_type = (try allocationElementType(ctx, signature.parameters[0].type_id)) orelse unreachable;
+                    const layout = (try ctx.get(TypeLayout, element_type)).*;
+                    const allocation_layout = (try ctx.get(TypeLayout, signature.parameters[0].type_id)).*;
+                    break :blk try codegen.compileExternalSlotTransfer(ctx.allocator(), allocation_layout, layout, symbol == .unsafe_initialize, true);
+                },
+                .unsafe_own_ref => blk: {
+                    const signature = (try ctx.get(FunctionInstanceSignature, instance_id)).* orelse return null;
+                    const allocation_layout = (try ctx.get(TypeLayout, signature.parameters[0].type_id)).*;
+                    const ref_layout = (try ctx.get(TypeLayout, signature.return_type)).*;
+                    std.debug.assert(std.meta.eql(allocation_layout, ref_layout));
+                    break :blk try codegen.compileExternalRefWrap(ctx.allocator(), ref_layout);
+                },
+                .unsafe_take_ref => blk: {
+                    const signature = (try ctx.get(FunctionInstanceSignature, instance_id)).* orelse return null;
+                    const layout = (try ctx.get(TypeLayout, signature.return_type)).*;
+                    const ref_layout = (try ctx.get(TypeLayout, signature.parameters[0].type_id)).*;
+                    break :blk try codegen.compileExternalSlotTransfer(ctx.allocator(), ref_layout, layout, false, false);
+                },
+                .deallocate_ref => try codegen.compileExternalDeallocateHostStorage(ctx.allocator()),
             };
         }
         const body = if (instance_id.specialization == null)

@@ -3,6 +3,8 @@ const structures = @import("../structures.zig");
 
 const image_base: u64 = 0x400000;
 const linux_exit_syscall: i32 = 60;
+const linux_mmap_syscall: i32 = 9;
+const linux_munmap_syscall: i32 = 11;
 
 const Elf64Header = extern struct {
     ident: [16]u8,
@@ -940,6 +942,143 @@ pub fn compileExternalExit(gpa: std.mem.Allocator) !structures.CompiledFunction 
     };
 }
 
+pub fn compileExternalAllocateHostStorage(gpa: std.mem.Allocator) !structures.CompiledFunction {
+    return compileExternalAllocateStorage(gpa, 1, false);
+}
+
+pub fn compileExternalAllocateTypedStorage(gpa: std.mem.Allocator, element: structures.TypeLayout) !structures.CompiledFunction {
+    if (element.byte_alignment > 4096) return error.UnsupportedAllocationAlignment;
+    return compileExternalAllocateStorage(gpa, element.byte_size, true);
+}
+
+fn compileExternalAllocateStorage(gpa: std.mem.Allocator, element_size: u32, with_count: bool) !structures.CompiledFunction {
+    var encoder = try X86Encoder.init(gpa);
+    defer encoder.deinit();
+    if (element_size == 0 or element_size > std.math.maxInt(i32)) {
+        try encoder.zeroEdx();
+        try encoder.ret();
+        return externalArtifact(&encoder, gpa);
+    }
+    const argument_offset: u32 = if (with_count) 24 else 20;
+    try encoder.movEsiFromRsp(argument_offset);
+    try encoder.testEsi();
+    const invalid_size = try encoder.conditionalJumpRelative32(.lei, 0);
+    if (element_size != 1) {
+        try encoder.multiplyRsi(@intCast(element_size));
+        try encoder.compareRsiMaxHostBytes();
+    }
+    const size_overflow = if (element_size != 1) try encoder.jumpIfAbove(0) else null;
+    try encoder.zeroEdi();
+    try encoder.movEdxImmediate32(3);
+    try encoder.movR10dImmediate32(0x22);
+    try encoder.movR8dImmediate32(-1);
+    try encoder.zeroR9d();
+    try encoder.movEaxImmediate32(linux_mmap_syscall);
+    try encoder.syscall();
+    try encoder.compareRaxError();
+    const allocation_failed = try encoder.jumpIfAboveEqual(0);
+    try encoder.movRspFromEax(8);
+    try encoder.shiftRaxRight32();
+    try encoder.movRspFromEax(12);
+    try encoder.movEaxFromEsi();
+    try encoder.movRspFromEax(16);
+    if (with_count) {
+        try encoder.movEaxFromRsp(argument_offset);
+        try encoder.movRspFromEax(20);
+    }
+    try encoder.movEdxImmediate32(1);
+    try encoder.ret();
+    const failure_offset: u32 = @intCast(encoder.code.items.len);
+    try patchRelativeDisplacement(encoder.code.items, invalid_size, failure_offset, @as(u64, invalid_size) + @sizeOf(i32), 0);
+    try patchRelativeDisplacement(encoder.code.items, allocation_failed, failure_offset, @as(u64, allocation_failed) + @sizeOf(i32), 0);
+    if (size_overflow) |field| try patchRelativeDisplacement(encoder.code.items, field, failure_offset, @as(u64, field) + @sizeOf(i32), 0);
+    try encoder.zeroEdx();
+    try encoder.ret();
+    return externalArtifact(&encoder, gpa);
+}
+
+pub fn compileExternalDeallocateHostStorage(gpa: std.mem.Allocator) !structures.CompiledFunction {
+    var encoder = try X86Encoder.init(gpa);
+    defer encoder.deinit();
+    try encoder.movEdiFromRsp(8);
+    try encoder.movEsiFromRsp(12);
+    try encoder.shiftRsiLeft32();
+    try encoder.orRdiRsi();
+    try encoder.movEsiFromRsp(16);
+    try encoder.movEaxImmediate32(linux_munmap_syscall);
+    try encoder.syscall();
+    try encoder.movEdxImmediate32(1);
+    try encoder.ret();
+    return externalArtifact(&encoder, gpa);
+}
+
+pub fn compileExternalRefWrap(gpa: std.mem.Allocator, layout: structures.TypeLayout) !structures.CompiledFunction {
+    var encoder = try X86Encoder.init(gpa);
+    defer encoder.deinit();
+    try encoder.leaRsiFromRsp(layout.byte_size + 8);
+    try encoder.leaRdiFromRsp(8);
+    try encoder.movEcxImmediate32(@intCast(layout.byte_size));
+    try encoder.repMovsb();
+    try encoder.movEdxImmediate32(1);
+    try encoder.ret();
+    return externalArtifact(&encoder, gpa);
+}
+
+pub fn compileExternalSlotTransfer(gpa: std.mem.Allocator, allocation: structures.TypeLayout, element: structures.TypeLayout, initialize: bool, indexed: bool) !structures.CompiledFunction {
+    std.debug.assert(!initialize or indexed);
+    if (element.byte_size > std.math.maxInt(i32)) return error.UnsupportedElementLayout;
+    var encoder = try X86Encoder.init(gpa);
+    defer encoder.deinit();
+    if (element.byte_size == 0) {
+        try encoder.movEdxImmediate32(1);
+        try encoder.ret();
+        return externalArtifact(&encoder, gpa);
+    }
+
+    var argument_end: u32 = 0;
+    if (!initialize and usesMemoryReturn(element)) _ = try reserveStack(&argument_end, element);
+    const allocation_offset = try reserveStack(&argument_end, allocation);
+    const index_offset = if (indexed) try reserveStack(&argument_end, .{ .byte_size = 4, .byte_alignment = 4 }) else null;
+    const element_offset = if (initialize) try reserveStack(&argument_end, element) else 0;
+    try encoder.movRaxFromRsp(allocation_offset + 8);
+    if (index_offset) |offset| {
+        try encoder.movsxdRcxFromRsp(offset + 8);
+        try encoder.multiplyRcx(@intCast(element.byte_size));
+        try encoder.addRaxRcx();
+    }
+    if (initialize) {
+        try encoder.movRdiFromRax();
+        try encoder.leaRsiFromRsp(element_offset + 8);
+    } else {
+        try encoder.movRsiFromRax();
+        if (usesMemoryReturn(element)) {
+            try encoder.leaRdiFromRsp(8);
+        } else {
+            try encoder.movEaxFromRsi();
+        }
+    }
+    if (initialize or usesMemoryReturn(element)) {
+        try encoder.movEcxImmediate32(@intCast(element.byte_size));
+        try encoder.repMovsb();
+    }
+    try encoder.movEdxImmediate32(1);
+    try encoder.ret();
+    return externalArtifact(&encoder, gpa);
+}
+
+fn externalArtifact(encoder: *X86Encoder, gpa: std.mem.Allocator) !structures.CompiledFunction {
+    const code = try encoder.code.toOwnedSlice(gpa);
+    errdefer gpa.free(code);
+    const relocations = try gpa.alloc(structures.CompiledFunction.Relocation, 0);
+    errdefer gpa.free(relocations);
+    return .{
+        .code = code,
+        .required_alignment = 1,
+        .relocations = relocations,
+        .referenced_instances = try gpa.alloc(structures.InstanceId, 0),
+    };
+}
+
 pub const ReachableFunction = struct {
     instance: structures.InstanceId,
     /// Shallow borrowed artifact; its owned slices outlive buildExecutable.
@@ -1169,6 +1308,110 @@ const X86Encoder = struct {
 
     fn movEdxImmediate32(self: *@This(), value: i32) !void {
         try self.appendBits32(&.{0xBA}, @bitCast(value));
+    }
+
+    fn movR10dImmediate32(self: *@This(), value: i32) !void {
+        try self.appendBits32(&.{ 0x41, 0xBA }, @bitCast(value));
+    }
+
+    fn multiplyRsi(self: *@This(), element_size: i32) !void {
+        try self.appendBits32(&.{ 0x48, 0x69, 0xF6 }, @bitCast(element_size));
+    }
+
+    fn compareRsiMaxHostBytes(self: *@This()) !void {
+        try self.appendBits32(&.{ 0x48, 0x81, 0xFE }, std.math.maxInt(i32));
+    }
+
+    fn jumpIfAbove(self: *@This(), displacement: i32) !u32 {
+        const field_offset = std.math.cast(u32, self.code.items.len + 2) orelse return error.FunctionTooLarge;
+        try self.appendBits32(&.{ 0x0F, 0x87 }, @bitCast(displacement));
+        return field_offset;
+    }
+
+    fn movEaxFromEsi(self: *@This()) !void {
+        try self.appendBytes(&.{ 0x89, 0xF0 });
+    }
+
+    fn movsxdRcxFromRsp(self: *@This(), offset: u32) !void {
+        try self.appendBits32(&.{ 0x48, 0x63, 0x8C, 0x24 }, offset);
+    }
+
+    fn multiplyRcx(self: *@This(), element_size: i32) !void {
+        try self.appendBits32(&.{ 0x48, 0x69, 0xC9 }, @bitCast(element_size));
+    }
+
+    fn addRaxRcx(self: *@This()) !void {
+        try self.appendBytes(&.{ 0x48, 0x01, 0xC8 });
+    }
+
+    fn movRdiFromRax(self: *@This()) !void {
+        try self.appendBytes(&.{ 0x48, 0x89, 0xC7 });
+    }
+
+    fn movRsiFromRax(self: *@This()) !void {
+        try self.appendBytes(&.{ 0x48, 0x89, 0xC6 });
+    }
+
+    fn leaRsiFromRsp(self: *@This(), offset: u32) !void {
+        try self.appendBits32(&.{ 0x48, 0x8D, 0xB4, 0x24 }, offset);
+    }
+
+    fn leaRdiFromRsp(self: *@This(), offset: u32) !void {
+        try self.appendBits32(&.{ 0x48, 0x8D, 0xBC, 0x24 }, offset);
+    }
+
+    fn movEaxFromRsi(self: *@This()) !void {
+        try self.appendBytes(&.{ 0x8B, 0x06 });
+    }
+
+    fn repMovsb(self: *@This()) !void {
+        try self.appendBytes(&.{ 0xF3, 0xA4 });
+    }
+
+    fn movR8dImmediate32(self: *@This(), value: i32) !void {
+        try self.appendBits32(&.{ 0x41, 0xB8 }, @bitCast(value));
+    }
+
+    fn zeroR9d(self: *@This()) !void {
+        try self.appendBytes(&.{ 0x45, 0x31, 0xC9 });
+    }
+
+    fn zeroEdx(self: *@This()) !void {
+        try self.appendBytes(&.{ 0x31, 0xD2 });
+    }
+
+    fn testEsi(self: *@This()) !void {
+        try self.appendBytes(&.{ 0x85, 0xF6 });
+    }
+
+    fn compareRaxError(self: *@This()) !void {
+        try self.appendBits32(&.{ 0x48, 0x3D }, @bitCast(@as(i32, -4095)));
+    }
+
+    fn jumpIfAboveEqual(self: *@This(), displacement: i32) !u32 {
+        const field_offset = std.math.cast(u32, self.code.items.len + 2) orelse return error.FunctionTooLarge;
+        try self.appendBits32(&.{ 0x0F, 0x83 }, @bitCast(displacement));
+        return field_offset;
+    }
+
+    fn shiftRaxRight32(self: *@This()) !void {
+        try self.appendBytes(&.{ 0x48, 0xC1, 0xE8, 32 });
+    }
+
+    fn shiftRsiLeft32(self: *@This()) !void {
+        try self.appendBytes(&.{ 0x48, 0xC1, 0xE6, 32 });
+    }
+
+    fn orRdiRsi(self: *@This()) !void {
+        try self.appendBytes(&.{ 0x48, 0x09, 0xF7 });
+    }
+
+    fn movEdiFromRsp(self: *@This(), offset: u32) !void {
+        try self.appendBits32(&.{ 0x8B, 0xBC, 0x24 }, offset);
+    }
+
+    fn movEsiFromRsp(self: *@This(), offset: u32) !void {
+        try self.appendBits32(&.{ 0x8B, 0xB4, 0x24 }, offset);
     }
 
     fn movEdiFromEax(self: *@This()) !void {

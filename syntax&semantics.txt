@@ -402,6 +402,39 @@ _ = resource
 
 
 # Borrowed views
+# `std.memory.Ref(T)` uniquely owns one initialized T in separately managed
+# host storage. Its allocation is fallible, moving it preserves the storage
+# address, and destruction destroys T before releasing that storage. Ref has
+# no implicit copy; explicitly duplicating a copyable T allocates new storage.
+# Value construction and local binding do not themselves select allocation.
+# Immovable T must be constructed in final storage, not moved into a Ref.
+# The current host implementation supports fallible make_ref and consuming
+# value for directly movable, automatically droppable T, but not duplication
+# or in-place construction for immovable T. Zero-sized allocations fail.
+# Ref and make_ref are in the prelude; low-level allocation remains explicit.
+#
+# `std.memory.Allocation(T)` uniquely owns uninitialized storage. Its layout
+# comes from the target representation of T, the element count, and alignment;
+# overflow fails before allocation. It must be consumed by deallocation, which
+# releases storage but does not destroy elements. Initializing, destroying, or
+# borrowing an element through Allocation requires an explicitly unsafe
+# operation with caller-proven bounds and initialization state. `Borrow(T)`
+# itself always denotes a live initialized value; it is non-null, non-owning,
+# and copying it does not copy T. Mutation requires mutable access with no
+# conflicting aliases. Ref is in std.prelude; Borrow will join it when origin
+# checking exists. Raw allocation requires an explicit std.memory import.
+# Borrow and safe borrowed access are not yet implemented: origin tracking
+# through calls, returns, stored values, and invalidation is still required.
+#
+# A returned or stored Borrow depends on every owner it may refer to. The
+# result of a bodyless function conservatively depends on every borrowed input;
+# without borrowed inputs, returning Borrow is a compile error. Any returned or
+# stored borrow whose origin the compiler cannot prove safe is also a compile
+# error; user-written origin contracts are not supported for now. Borrowed
+# access cannot outlive or overlap destruction of an owner or invalidation by
+# storage replacement. Current imm/mut call arguments alone do not establish
+# such an escaping lifetime relationship.
+#
 # Views provide non-owning access to existing data, including collection slices.
 # They may be returned from functions and stored in other values when their
 # lifetime and access dependencies remain valid. Copying a view does not copy or
@@ -410,10 +443,10 @@ _ = resource
 # stored views.
 # Lifetime tracking must also reject uses invalidated by changes to the backing
 # storage, such as collection reallocation. Keeping the owner alive alone is
-# insufficient. Lifetime and access dependencies are inferred where possible
-# and expressed in borrowing API contracts when needed. View types and borrowing
-# contract syntax remain open; adopting these guarantees does not require
-# Mojo's exact spelling.
+# insufficient. Lifetime and access dependencies are inferred; when they cannot
+# be proved safe, the compiler rejects the view. View type syntax remains open;
+# adopting these guarantees does not require Mojo's exact spelling. Device
+# storage and raw foreign addresses are deferred.
 
 
 # Structs
@@ -421,8 +454,9 @@ static S = struct
     a: int
     b: float
 
-# The initializer head must resolve to a named struct type. Every field name is
-# required exactly once and is resolved against that nominal definition. Field
+# The initializer head must resolve to a named struct type or an inferable
+# parameterized struct factory. Every field name is required exactly once and
+# is resolved against that nominal definition. Field
 # expressions evaluate exactly once in source order; order does not change the
 # resulting value.
 const s: S = S{a = 1, b = 2.5}
@@ -440,9 +474,19 @@ struct Box(T: type)
     value: T
 # Equivalent to: func Box(static T: type) type -> struct ...
 const boxed = Box(int){value = 42}
+# A parameterized struct initializer may omit the factory's static arguments
+# when every argument is inferable from initialized field types. A field typed
+# as T infers T from its value; a field typed as Box(T) can recover T from a
+# value with the same nominal factory specialization. Independent field types
+# provide their usual expected type while inferring. Inference uses field types,
+# not the initializer's result context or field values; missing or conflicting
+# evidence is an error. Explicit specialization remains available.
+const inferred_box = Box{value = 42}
 # Generated struct definitions accept the same move, copy, and drop ownership
 # declarations as non-parameterized structs. A custom hook may refer to the
 # factory's static parameters and is specialized with that generated type.
+# A struct directly returned from a function uses the function's name in
+# diagnostics, including when its result is stored in a static alias.
 
 # Every struct definition introduces a distinct nominal type. Static aliases
 # preserve that identity; equal field names and types do not make separately
@@ -576,9 +620,10 @@ fallible accept(arg: int) int
 # partially or not at all; 'as' produces the structural intersection on success,
 # and an empty intersection always fails.
 # A condition binding is immutable and visible only in the success body. Its
-# optional annotation follows ordinary widening rules. The original binding is
-# not refined or aliased by the extracted binding, so extraction requires copy
-# support for the narrowed type.
+# optional annotation follows ordinary widening rules. A fallible call can
+# bind its successful return value as an owned local (`if const item = call() -> ...`).
+# Failure enters `else` without a binding. Variant extraction does not refine
+# or alias the original value, so `as` extraction requires copy support.
 func inspect(fi: float | int)
     if fi is float -> found_float()
     if const f = fi as float -> use_float(f)

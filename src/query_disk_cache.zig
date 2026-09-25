@@ -101,8 +101,8 @@ fn restoreQuery(comptime Q: type, db: *query.Database, reader: *codec.Reader) !u
                 try restoreInput(queries.ModuleCatalog, db, reader, valid)
             else if (std.mem.eql(u8, name, @typeName(queries.StandardPreludeModule)))
                 try restoreInput(queries.StandardPreludeModule, db, reader, valid)
-            else if (std.mem.eql(u8, name, @typeName(queries.StandardExitFile)))
-                try restoreInput(queries.StandardExitFile, db, reader, valid)
+            else if (std.mem.eql(u8, name, @typeName(queries.StandardFile)))
+                try restoreInput(queries.StandardFile, db, reader, valid)
             else
                 return error.InvalidCache;
             if (matched) |dep| {

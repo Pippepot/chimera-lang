@@ -41,7 +41,7 @@ fn testDatabase(worker_count: usize) !*Database {
         try db.addInput(queries.FileModule, file_id, module);
         try db.addInput(queries.SourceText, file_id, source.text);
         try db.addInput(queries.ModuleMembers, module, &.{file_id});
-        if (index == 0) try db.addInput(queries.StandardExitFile, {}, file_id);
+        if (index == 0) try db.addInput(queries.StandardFile, queries.standardFileKey("exit.chi"), file_id);
     }
     return db;
 }
@@ -3025,6 +3025,46 @@ test "nested struct initializers keep independent field ranges" {
     try expectCompiledFunctionResult(db, 1, "answer", &.{"answer"}, 42);
 }
 
+test "generic struct initializers infer static arguments from field types" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\struct Box(T: type)
+        \\  value: T
+        \\struct Wrapper(T: type)
+        \\  box: Box(T)
+        \\func answer() int
+        \\  const box = Box{value = 42}
+        \\  return Wrapper{box = box^}.box.value
+    );
+    try expectCompiledFunctionResult(db, 1, "answer", &.{"answer"}, 42);
+}
+
+test "generic struct inference honors independent field types" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\struct Record(T: type)
+        \\  tag: byte
+        \\  value: T
+        \\func answer() int -> Record{tag = 1, value = 42}.value
+    );
+    try expectCompiledFunctionResult(db, 1, "answer", &.{"answer"}, 42);
+}
+
+test "generic struct inference recovers non-type static arguments" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\struct Tagged(N: int)
+        \\  value: int
+        \\struct Holder(N: int)
+        \\  tag: Tagged(N)
+        \\func answer() int -> Holder{tag = Tagged(3){value = 42}}.tag.value
+    );
+    try expectCompiledFunctionResult(db, 1, "answer", &.{"answer"}, 42);
+}
+
 test "mutable struct fields update the root value" {
     const db = try testDatabase(1);
     defer db.deinit();
@@ -3230,6 +3270,10 @@ test "field assignment tracks definition edits and recovers" {
 test "struct value diagnostics reject invalid fields and targets" {
     const cases = [_]struct { source: []const u8, expected: DiagnosticKind }{
         .{ .source = "func bad() int -> int{}", .expected = .struct_initializer_not_struct },
+        .{ .source = "struct Foo(T: type)\n  r: int\nfunc bad() unit -> Foo{r = 1}", .expected = .static_argument_cannot_be_inferred },
+        .{ .source = "struct Foo(T: type)\n  first: T\n  second: T\nfunc bad() unit -> Foo{first = 1, second = true}", .expected = .static_argument_inference_conflict },
+        .{ .source = "static makeBox = func() type\n  return struct\n    value: int\nfunc bad() unit -> makeBox{value = 1}", .expected = .type_factory_requires_call },
+        .{ .source = "func ordinary() int -> 1\nfunc bad() unit -> ordinary{}", .expected = .value_used_as_type },
         .{ .source = "static Pair = struct\n  left: int\n  right: int\nfunc bad() Pair -> Pair{left = 1, nope = 2}", .expected = .unknown_struct_field },
         .{ .source = "static Pair = struct\n  left: int\n  right: int\nfunc bad() Pair -> Pair{left = 1, left = 2, right = 3}", .expected = .duplicate_struct_initializer_field },
         .{ .source = "static Pair = struct\n  left: int\n  right: int\nfunc bad() Pair -> Pair{left = 1}", .expected = .missing_struct_initializer_field },
@@ -3251,6 +3295,10 @@ test "struct value diagnostics reject invalid fields and targets" {
             .struct_initializer_not_struct => {
                 const start = std.mem.lastIndexOf(u8, case.source, "int").?;
                 try testing.expectEqual(structures.SourceSpan{ .start = start, .end = start + "int".len }, diagnostics[0].span.?);
+            },
+            .generic_struct_requires_specialization => {
+                const start = std.mem.lastIndexOf(u8, case.source, "Foo").?;
+                try testing.expectEqual(structures.SourceSpan{ .start = start, .end = start + "Foo".len }, diagnostics[0].span.?);
             },
             .missing_struct_initializer_field => {
                 const start = std.mem.lastIndexOf(u8, case.source, "Pair").?;
@@ -6366,6 +6414,16 @@ test "logical condition edits retain equal results and recover diagnostics" {
     try testing.expectEqual(@as(usize, 0), recovered.len);
 }
 
+test "fallible if condition binds its successful result" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\fallible give() int -> 42
+        \\func answer() int -> if const result = give() -> result else 0
+    );
+    try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "give" }, 42);
+}
+
 test "if validates conditions and expected result types" {
     const db = try testDatabase(2);
     defer db.deinit();
@@ -6385,6 +6443,21 @@ test "if validates conditions and expected result types" {
             .file_id = 3,
             .source = "static bad = func() int\n  const left: int | none = 1\n  const right: int | unit = 1\n  return if 1 == 1 -> left else right",
             .kind = .return_type_mismatch,
+        },
+        .{
+            .file_id = 4,
+            .source = "func give() int -> 42\nfunc bad() int -> if const result = give() -> result else 0",
+            .kind = .if_condition_not_fallible,
+        },
+        .{
+            .file_id = 5,
+            .source = "fallible give() int -> 42\nfunc bad() int -> if const result: byte = give() -> result else 0",
+            .kind = .local_type_mismatch,
+        },
+        .{
+            .file_id = 6,
+            .source = "fallible give() int -> 42\nfunc bad() int -> if const result = give() -> 1 else result",
+            .kind = .unknown_value,
         },
     };
     for (cases) |case| {
@@ -8268,6 +8341,71 @@ test "struct copy and move properties control ownership uses" {
     const details = copy_diagnostics[0].kind.type_not_copyable;
     try testing.expectEqual(diagnostics[0].kind.type_not_movable, details.type_id);
     try testing.expect(!details.is_movable);
+}
+
+test "copy diagnostic names a parameterized struct" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\struct Ref(T: type)
+        \\  value: T
+        \\func bad() unit
+        \\  const owner = Ref{value = 42}
+        \\  const copied = owner
+        \\  _ = copied
+    );
+    const bad = (try db.get(queries.BuildModuleScope, 1)).*.?.resolveFunction("bad").?;
+    try testing.expect((try db.get(queries.AnalyzeFunctionBody, bad)).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(queries.AnalyzeFunctionBody, bad, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(DiagnosticKind.type_not_copyable, std.meta.activeTag(diagnostics[0].kind));
+    const types: queries.TypeInterner(*Database) = .{ .ctx = db };
+    try testing.expectEqualStrings("Ref", (try types.structName(diagnostics[0].kind.type_not_copyable.type_id)).?);
+}
+
+test "copy diagnostic names the function producing a struct" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\static makeBox = func() type
+        \\  return struct
+        \\    value: int
+        \\static Box: type = makeBox()
+        \\func bad() unit
+        \\  const owner = Box{value = 42}
+        \\  const copied = owner
+        \\  _ = copied
+    );
+    const bad = (try db.get(queries.BuildModuleScope, 1)).*.?.resolveFunction("bad").?;
+    try testing.expect((try db.get(queries.AnalyzeFunctionBody, bad)).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(queries.AnalyzeFunctionBody, bad, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(DiagnosticKind.type_not_copyable, std.meta.activeTag(diagnostics[0].kind));
+    const types: queries.TypeInterner(*Database) = .{ .ctx = db };
+    try testing.expectEqualStrings("makeBox", (try types.structName(diagnostics[0].kind.type_not_copyable.type_id)).?);
+}
+
+test "copy diagnostic leaves a non-function-produced struct anonymous" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\static Box = comptime -> struct
+        \\  value: int
+        \\func bad() unit
+        \\  const owner = Box{value = 42}
+        \\  const copied = owner
+        \\  _ = copied
+    );
+    const bad = (try db.get(queries.BuildModuleScope, 1)).*.?.resolveFunction("bad").?;
+    try testing.expect((try db.get(queries.AnalyzeFunctionBody, bad)).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(queries.AnalyzeFunctionBody, bad, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(DiagnosticKind.type_not_copyable, std.meta.activeTag(diagnostics[0].kind));
+    const types: queries.TypeInterner(*Database) = .{ .ctx = db };
+    try testing.expectEqualStrings("anonymous struct", (try types.structName(diagnostics[0].kind.type_not_copyable.type_id)).?);
 }
 
 test "struct copy property edits invalidate and recover owning callers" {

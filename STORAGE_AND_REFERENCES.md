@@ -20,6 +20,17 @@ syntax.
   host, a device, a stack, or a heap. Storage and reference abstractions carry
   the facts required to access it.
 
+The implemented host subset uses `std.memory.allocate(T, count)` and explicit
+`deallocate(T, allocation^)` with `Allocation(T)`. The `unsafe_initialize` and
+`unsafe_take` element transfers require caller-proven bounds and initialization
+state, and currently support only types with compiler-supported direct moves.
+`make_ref(T, value)` and consuming `value(T, owner^)` use those transfers to
+own one initialized value. The constructor requires an automatically droppable,
+directly movable `T`; zero-sized allocations currently fail. `Ref(T)` has no
+safe borrowed access, explicit duplication, or in-place immovable construction
+yet. `Borrow(T)`, provider selection, device locations, and address spaces
+remain design contracts, not implemented public APIs.
+
 Keep these dimensions independent:
 
 | Dimension | Meaning | Examples |
@@ -93,8 +104,9 @@ an explicitly unsafe operation that assumes its obligation.
 
 `deallocate` consumes an allocation; it does not destroy initialized elements.
 Before deallocation, every live element must be destroyed or transferred out.
-The low-level handle need not maintain a runtime initialization bitmap: access
-to possibly uninitialized elements is unsafe, while higher-level containers
+The low-level handle need not maintain a runtime initialization bitmap:
+initializing, destroying, or accessing an element through `Allocation` is
+unsafe unless the caller establishes its current state. Higher-level containers
 track their initialized range as part of their own invariants.
 
 A `Borrow` from an allocation has a lifetime dependency on the allocation and
@@ -111,17 +123,23 @@ resource needed for access. Mutation is permitted only when the borrowed access
 path is mutable and the aliasing rules permit it; there is no separate `MutBorrow`
 type.
 
+When a returned or stored `Borrow` may refer to several sources, all possible
+owners and resources must outlive it. A bodyless function returning `Borrow`
+conservatively depends on every borrowed input. Without borrowed inputs, such a
+return is a compile error. Other borrows with origins the compiler cannot prove
+safe are also rejected; there are no user-written origin contracts for now.
+
 Address space belongs on `Borrow`, not on `T`. A future spelling such as
 `Borrow(T, S)` may use a static address-space parameter to distinguish generic,
 global, workgroup, private, and constant access. The concrete device identity
 remains runtime state owned by a host-side allocation or device resource; it
 should not become a distinct value type for every device.
 
-The same `Borrow` abstraction may expose explicitly unsafe operations for raw
-addresses, arithmetic, foreign memory, and possibly uninitialized storage; a
-separate `Pointer` name is not required. Safe dereference still requires a live,
-initialized `T`. An allocation should expose only an unsafe borrow until the
-caller or a higher-level owner has established initialization.
+`Borrow(T)` grants access only to a live, initialized `T`. `Allocation` owns
+the unsafe indexed operations for initializing, destroying, and obtaining a
+borrow to an element whose initialized state the caller guarantees. Raw address
+arithmetic and foreign-memory access are outside this host-first API; decide
+their representation when those operations have a concrete use.
 
 `Ref(T)` exclusively owns one initialized `T` in separately allocated
 storage. It does not copy implicitly. Construction combines allocation and
@@ -256,12 +274,15 @@ func deallocate(static T: type, deinit allocation: Allocation(T))
 ```text
 allocation.layout()
 allocation.location()
-allocation.unsafe_borrow(index)  # may address uninitialized storage
+allocation.unsafe_initialize(index, value)
+allocation.unsafe_destroy(index)
+allocation.unsafe_borrow_initialized(index)  # caller guarantees a live T
 ```
 
-The exact generic and method syntax remains open. `unsafe_borrow` borrows from the
-allocation and does not transfer storage ownership. Initialization, element
-destruction, and bounds are the caller's obligation at this low level.
+The exact generic and method syntax remains open. For an immovable `T`, an
+in-place initialization operation constructs directly in the element slot.
+These operations do not transfer storage ownership; initialized state and
+bounds are the caller's obligation at this low level.
 
 Build the first safe owner directly on that core:
 
@@ -294,6 +315,11 @@ For collections, keep `Allocation(T)` plus an initialized count and capacity in
 the collection. Do not add a thin allocation handle until retaining layout and
 location is shown to be a material cost.
 
+Place public declarations under `std.memory`. Re-export `Ref`, `make_ref`, and `Borrow`
+through `std.prelude`; require an explicit `std.memory` import for low-level
+allocation and layout APIs. Compiler support for storage and lifetime checks
+need not be expressible as ordinary library code.
+
 ### Location-specific conveniences
 
 The standard library can offer concise wrappers without weakening the semantic
@@ -317,7 +343,7 @@ storage remain kernel declarations rather than calls to this API.
 - Whether `AllocationLayout` stores resolved bytes only or also typed count.
 - Zero-sized allocation identity and deallocation behavior.
 - How target-specific representation compatibility is declared.
-- Static spelling for address spaces and lifetime contracts on `Borrow`.
+- Static spelling for address spaces on `Borrow`.
 - Whether device transfers are initially synchronous or introduce an explicit
   completion resource.
 - Which locations support `SharedRef` control blocks and atomic reference
