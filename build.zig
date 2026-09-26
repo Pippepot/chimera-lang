@@ -57,8 +57,13 @@ pub fn build(b: *std.Build) void {
         "src/cache.zig",
         "src/query_disk_cache.zig",
     };
-    var previous_test: ?*std.Build.Step = null;
+    const selected_test_source = b.option([]const u8, "test-source", "Run only tests from this source file");
+    var has_matching_source = selected_test_source == null;
     for (test_sources) |source| {
+        if (selected_test_source) |selected| {
+            if (!std.mem.eql(u8, selected, source)) continue;
+            has_matching_source = true;
+        }
         const test_module = b.createModule(.{
             .root_source_file = b.path(source),
             .target = target,
@@ -68,8 +73,10 @@ pub fn build(b: *std.Build) void {
         test_module.addImport("test_sources", test_sources_module);
         const test_binary = b.addTest(.{ .root_module = test_module });
         const run_test = b.addRunArtifact(test_binary);
-        if (previous_test) |previous| run_test.step.dependOn(previous);
+        const workdir = b.addWriteFiles();
+        _ = workdir.add(".test-suite", source);
+        run_test.setCwd(workdir.getDirectory());
         test_step.dependOn(&run_test.step);
-        previous_test = &run_test.step;
     }
+    if (!has_matching_source) test_step.dependOn(&b.addFail(b.fmt("unknown test source: {s}", .{selected_test_source.?})).step);
 }

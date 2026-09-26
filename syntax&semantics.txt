@@ -424,9 +424,13 @@ _ = resource
 # Ref is in the prelude; low-level allocation remains explicit.
 #
 # `std.memory.Allocation(T)` uniquely owns uninitialized storage. Its layout
-# comes from the target representation of T, the element count, and alignment;
-# overflow fails before allocation. It must be consumed by deallocation, which
-# releases storage but does not destroy elements. Initializing, destroying, or
+# comes from the layout domain selected by the execution target and location,
+# the element count, and alignment; the checked byte size is count times that
+# domain's element stride. Alignment is at least the natural alignment for T in
+# that domain. Overflow fails
+# before allocation. The logical count remains separate from the byte layout.
+# It must be consumed by deallocation, which releases storage but does not
+# destroy elements. Initializing, destroying, or
 # borrowing an element through Allocation requires an explicitly unsafe
 # operation with caller-proven bounds and initialization state. `Borrow(T)`
 # itself always denotes a live initialized value; it is non-null, non-owning,
@@ -435,6 +439,21 @@ _ = resource
 # checking exists. Raw allocation requires an explicit std.memory import.
 # Borrow and safe borrowed access are not yet implemented: origin tracking
 # through calls, returns, stored values, and invalidation is still required.
+# A typed allocation selects a provider, a concrete memory location, and a
+# resolved byte layout independently. The execution target and location must
+# support the chosen representation of T; a host layout is not valid in another
+# layout domain without an explicit compatibility guarantee. The provider may
+# reject an unsupported location or layout, but cannot redefine T's representation.
+# The owning handle retains the location, element count, and all authority and
+# layout facts needed to deallocate. Address space belongs to a typed access
+# path, not to T or its provider; the location identifies the actual resource,
+# such as a particular device. Access requires a compatible execution context
+# and address space.
+# For every supported location, a successful zero-byte allocation has a distinct,
+# stable identity suitable for zero-sized element access and destruction. A
+# provider unable to supply one fails the allocation. Other locations have no
+# public allocation or access APIs until their target layout and access rules
+# are implemented. Raw-address and foreign-memory operations remain deferred.
 #
 # A returned or stored Borrow depends on every owner it may refer to. The
 # result of a bodyless function conservatively depends on every borrowed input;

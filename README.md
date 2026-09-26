@@ -72,7 +72,7 @@ zig build test
 git diff --check
 ```
 
-The runner includes inline tests and standalone suites, and runs them sequentially because some write `./prog`. For focused stage checks, use `zig test test_sources.zig --test-filter <name>`; the standalone suites need the build-provided `test_sources` module. Check modified Zig files with `zig fmt --check <files>`. Keep temporary verification files outside the repository.
+The runner includes inline tests and standalone suites. Test binaries run in parallel with separate working directories so each can write `./prog`. Use `zig build test -Dtest-source=tests/modules_test.zig` to run one suite. For focused stage checks, use `zig test test_sources.zig --test-filter <name>`; the standalone suites need the build-provided `test_sources` module. Check modified Zig files with `zig fmt --check <files>`. Keep temporary verification files outside the repository.
 
 ## Benchmark
 

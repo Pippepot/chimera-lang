@@ -34,15 +34,16 @@ fails. For these types, `Ref` destroys its element at the allocated address,
 including custom hooks and zero-sized elements, before releasing the allocation.
 Zero-byte host allocations succeed for nonnegative counts with a distinct,
 stable address per allocation. `Ref(T)` has no safe borrowed access, explicit
-duplication, or recursive in-place construction yet. `Borrow(T)`, provider
-selection, device locations, and address spaces remain design contracts, not
-implemented public APIs.
+duplication, or recursive in-place construction yet. The target, provider,
+location, and address-space contract below is accepted, but provider selection,
+device locations, and address spaces are not implemented public APIs.
 
 Keep these dimensions independent:
 
 | Dimension | Meaning | Examples |
 | --- | --- | --- |
 | Value type | Meaning and operations of a value | `Foo`, `int` |
+| Target representation | Layout rules for a target's storage domain | x86-64 host ABI, a device's validated global-storage ABI |
 | Allocation provider | Policy and mechanism used to obtain and release storage | system allocator, arena, device allocator |
 | Memory location | Concrete memory domain and accessible execution contexts | host memory, pinned host memory, a particular device |
 | Allocation layout | Required byte size and alignment at that location | 128 bytes aligned to 16 |
@@ -63,28 +64,40 @@ allocation provider. Alignment is a nonzero power of two. A successful result
 satisfies both requirements; the provider may reserve more storage internally.
 
 Typed allocation additionally takes an element type and count. Its byte size
-and alignment must be derived for the target representation used at the
-requested memory location, with multiplication and rounding overflow rejected
-before calling the provider. Host `sizeof(T)` must not be reused for another
-target unless the language has established that their representations match.
-Restricting early device buffers to explicitly portable scalar element types is
-preferable to assuming every host type is device-compatible.
+and alignment must be derived from a layout for `T` in the layout domain selected
+by the execution target and memory location. That representation includes the
+element stride and any field or variant offsets;
+`count * stride` and any alignment rounding are checked before calling the
+provider. Alignment must be a nonzero power of two and at least the target's
+natural alignment for `T`; a provider may reject a stricter alignment. Target
+compatibility must be established for `T` and its contained types, not inferred
+from a coincidental host byte size. Host `TypeLayout(TypeId)` is the x86-64 host
+representation only; a future layout must be keyed by type and the target's
+location-specific layout domain, and must not silently fall back to host layout.
+Initially restrict device buffers to validated scalar element types rather than
+assuming every host struct is device-compatible.
 
-`AllocationLayout` is a clearer prospective name than `Layout`: it distinguishes
-byte size and alignment from a future tensor or collection layout describing
-shape, strides, or element order. Count may be retained alongside the resolved
-byte layout by a typed allocation handle. For a zero-byte host layout, the
-current provider reserves one byte to retain a distinct, stable address and
-records that reservation for deallocation; the logical element count and layout
-remain unchanged. Other locations need their own zero-size policy.
+`AllocationLayout` contains resolved byte size and alignment, not the logical
+element count. A typed allocation request binds that layout to `T`, its target
+representation, location, and count; the owner retains those facts alongside
+deallocation authority. For a zero-byte host layout, the current provider
+reserves one byte to retain a distinct, stable address and records the reserved
+size for deallocation; the logical count and layout remain unchanged. Any other
+supported location must likewise give each successful zero-byte allocation a
+distinct, stable identity suitable for zero-sized element access and destruction,
+or fail the allocation. No address arithmetic or foreign-memory access follows
+from that guarantee.
 
 ### Allocation provider and location
 
 The semantic allocation operation has three independent inputs: a provider, a
-memory location, and an allocation layout. It is fallible and returns exclusive
-ownership of uninitialized storage. The provider selects policy; the location
-selects where the storage exists and which execution contexts can access it.
-A provider may reject a location or layout it does not support.
+memory location, and an allocation layout already resolved for a target and
+element type. It is fallible and returns exclusive ownership of uninitialized
+storage. The provider selects policy; the location selects where the storage
+exists and which execution contexts can access it. The target and location select
+a compatible layout domain; neither the provider nor the value type selects it.
+A provider may reject a location or layout it does not support, but cannot
+change the element stride or reinterpret bytes as another target representation.
 
 The surface API may bind a provider to a location for convenience, but that must
 not erase the distinction. In particular, a device context can be both the
@@ -138,11 +151,15 @@ conservatively depends on every borrowed input. Without borrowed inputs, such a
 return is a compile error. Other borrows with origins the compiler cannot prove
 safe are also rejected; there are no user-written origin contracts for now.
 
-Address space belongs on `Borrow`, not on `T`. A future spelling such as
-`Borrow(T, S)` may use a static address-space parameter to distinguish generic,
-global, workgroup, private, and constant access. The concrete device identity
-remains runtime state owned by a host-side allocation or device resource; it
-should not become a distinct value type for every device.
+Address space belongs on `Borrow`, not on `T`. A future `Borrow(T, S)` uses a
+static address-space parameter; each target defines its supported spaces and
+which can access a particular location. The concrete device identity remains
+runtime state owned by a host-side allocation or device resource, not a distinct
+value type for every device. A borrow retains that location and the owner as
+lifetime dependencies. Host code cannot dereference a device-only borrow;
+cross-location transfer is explicit, not a cast of `S` or `T`. Access from a
+second target needs a verified compatible representation, or an explicit
+elementwise conversion rather than a bytewise copy.
 
 `Borrow(T)` grants access only to a live, initialized `T`. `Allocation` owns
 the unsafe indexed operations for initializing, destroying, and obtaining a
@@ -259,25 +276,37 @@ fallible.
 
 Prefer `allocate` and `deallocate` for the raw storage operations. `release` is
 too easily confused with decrementing shared ownership. The semantic interface
-should be equivalent to the following pseudocode:
+should be equivalent to the following pseudocode; it does not introduce public
+non-host declarations yet:
 
 ```text
-fallible layout_for(
+fallible resolve_layout(
     static T: type,
+    target,
     location,
     count,
-    alignment = natural_for(T, location),
-) AllocationLayout(T)
+    alignment = natural_for(T, target, location),
+) ResolvedAllocationLayout(T)
 
 fallible allocate(
-    static T: type,
     mut provider,
-    location,
-    layout: AllocationLayout(T),
+    resolved: ResolvedAllocationLayout(T),
 ) Allocation(T)
 
 func deallocate(static T: type, deinit allocation: Allocation(T))
 ```
+
+`ResolvedAllocationLayout(T)` binds a byte `AllocationLayout` to the selected
+target, location, and nonnegative count. This avoids pairing a host layout with
+a device location or passing a count inconsistent with the resolved byte size.
+The request must not outlive a resource required to validate its location;
+allocation failure leaves provider and location ownership with the caller.
+`Allocation(T)` retains the resolved request and provider authority, directly
+or through a lifetime dependency. The implemented host API fixes target,
+location, and provider implicitly; it stores the logical count separately from
+the mapped byte size. Its public count is `int`, while byte-size arithmetic is
+checked in wider unsigned storage before requesting host memory. Larger public
+counts and other targets require a concrete provider and target ABI first.
 
 `Allocation(T)` should provide only the operations needed by its first users:
 
@@ -289,8 +318,8 @@ allocation.unsafe_destroy(index)
 allocation.unsafe_borrow_initialized(index)  # caller guarantees a live T
 ```
 
-The provider and location API remains open. For an immovable `T`, an
-in-place initialization operation constructs directly in the element slot.
+For an immovable `T`, an in-place initialization operation constructs directly
+in the element slot.
 These operations do not transfer storage ownership; initialized state and
 bounds are the caller's obligation at this low level.
 
@@ -346,14 +375,14 @@ produces a `Borrow(T, global)` or view whose device representation is validated 
 that target; host code cannot safely dereference it. Workgroup and private
 storage remain kernel declarations rather than calls to this API.
 
-### Decisions still required
+### Remaining non-host prerequisites
 
-- The integer type used for byte sizes, counts, and overflow reporting.
-- Whether `AllocationLayout` stores resolved bytes only or also typed count.
-- Zero-sized allocation identity and deallocation behavior.
-- How target-specific representation compatibility is declared.
-- Static spelling for address spaces on `Borrow`.
-- Whether device transfers are initially synchronous or introduce an explicit
-  completion resource.
-- Which locations support `SharedRef` control blocks and atomic reference
-  counting.
+- Select a concrete target and location, then implement and test its layouts,
+  compatible element types, address-space mapping, provider resource lifetime,
+  and zero-byte allocation or failure behavior. Do not add a device `TypeLayout`
+  query or a general provider dispatcher before that target exists.
+- Settle the surface spelling of address spaces and larger count types when
+  non-host allocation and origin-aware `Borrow` become implementable. Initial
+  cross-location transfers remain synchronous; asynchronous operations require
+  an explicit completion resource retaining both allocations.
+- Determine atomic support per location before adding `SharedRef` control blocks.

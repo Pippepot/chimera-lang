@@ -8,7 +8,7 @@
 - Folder modules, file-scoped imports, re-exports, qualified lookup, entry-only execution, and directory refresh are implemented. The embedded `std.prelude` is implicitly imported by user files, with an explicit-import override.
 - Named and generated structs have nominal identity, namespace members and instance calls, layout, field operations, and validated move/copy/drop hooks.
 - Typed SSA covers calls, static specialization, callable values, variants, joins, loops, divergence, and fallible control flow. Compile-time thunks and specialized calls evaluate through typed IR, including structs, hooks, and type-valued functions; local captures remain unsupported.
-- Ownership tracks whole-root transfers, borrowed and owned parameters, mutable copy-back, and path-sensitive ASAP cleanup. Partial-field transfer, general stable storage for immovable values, and origin-aware pointers/views remain open.
+- Ownership tracks whole-root transfers, borrowed and owned parameters, mutable copy-back, and path-sensitive ASAP cleanup. The internal calling convention derives direct or address-passed arguments from ownership capabilities; codegen owns physical argument layout. Partial-field transfer, general stable storage for immovable values, and origin-aware pointers/views remain open.
 - Compiler-provided `extern func` declarations use named std identities and ordinary calls. `std.exit.exit` is exported by the prelude, with distinct runtime termination and compile-time compiler control.
 - Host-only `std.memory` provides checked, fallible typed allocation and explicit deallocation, unsafe element transfer for directly movable elements, and `Ref(T)` with automatic destruction. `Ref.new(value)` infers `T`, while `Ref(T).new(value)` specializes it explicitly; both construct directly movable values or initialize immovable structs with directly movable fields in final storage. Consuming extraction remains limited to directly movable values. `Ref` is exported by the prelude. Zero-byte host allocations succeed with a distinct, stable address; recursive in-place construction, explicit duplication, and safe `Borrow` origins remain open.
 - Successful whole-program executables, typed runtime function bodies, and compiled functions persist in a content-addressed cache. Query snapshots restore interned identities and validate observed source inputs and equal-result query boundaries before reuse. Cache publication is atomic across compiler processes. Independent file and function queries use multiple workers.
@@ -49,11 +49,20 @@ Implemented host subset:
   once in source order and are cleaned up on failure. Destruction runs in the
   allocation; `value` cannot extract a `T` that does not move directly.
 
+Resolved storage contract (non-host APIs are not yet implemented):
+
+- Target-specific element layout and memory location are validated together;
+  the typed request binds layout to type and count, while provider policy stays
+  independent. The owner retains deallocation authority. Address space belongs
+  to access, not the value type. Successful zero-byte allocations retain distinct,
+  stable identities; a provider that cannot supply one fails the request.
+
 Remaining work:
 
-- Resolve target-aware layout beyond host storage and the provider, location,
-  and address-space APIs before extending allocation to other locations, including
-  their zero-size behavior. Keep raw-address and foreign-memory operations deferred.
+- Implement the layout, compatible types, resource-backed provider, and
+  address-space access for a concrete non-host target before allocating there;
+  verify its zero-byte success or failure behavior. Keep raw-address and
+  foreign-memory operations deferred.
 - Extend in-place construction to nested immovable fields and other initializer
   forms, and provide explicit duplication of copyable `T` into a new allocation.
   Add the missing unsafe indexed destruction and borrowing operations on

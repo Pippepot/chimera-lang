@@ -748,8 +748,8 @@ pub const InternVariantResult = union(enum) {
     duplicate: TypeId,
 };
 
-/// Representation facts shared by every runtime type. Type-specific metadata,
-/// such as field or payload offsets, belongs to that representation's query.
+/// Current x86-64 host representation. Type-specific field and payload offsets
+/// belong to their layout queries; other targets need their own layout facts.
 pub const TypeLayout = struct {
     byte_size: u32,
     byte_alignment: u32,
@@ -770,14 +770,23 @@ pub const AllocationLayout = struct {
     }
 };
 
-test "allocation layout derives target element layout with checked count" {
+test "allocation layout derives bytes from resolved element stride with checked count" {
     const testing = std.testing;
     try testing.expectEqual(
         AllocationLayout{ .byte_size = 96, .byte_alignment = 16 },
         try AllocationLayout.forElements(.{ .byte_size = 32, .byte_alignment = 16 }, 3),
     );
+    try testing.expectEqual(
+        AllocationLayout{ .byte_size = 0, .byte_alignment = 16 },
+        try AllocationLayout.forElements(.{ .byte_size = 32, .byte_alignment = 16 }, 0),
+    );
+    try testing.expectEqual(
+        AllocationLayout{ .byte_size = 0, .byte_alignment = 8 },
+        try AllocationLayout.forElements(.{ .byte_size = 0, .byte_alignment = 8 }, std.math.maxInt(u64)),
+    );
     try testing.expectError(error.SizeOverflow, AllocationLayout.forElements(.{ .byte_size = 32, .byte_alignment = 16 }, std.math.maxInt(u64)));
     try testing.expectError(error.InvalidAlignment, AllocationLayout.forElements(.{ .byte_size = 32, .byte_alignment = 3 }, 1));
+    try testing.expectError(error.InvalidAlignment, AllocationLayout.forElements(.{ .byte_size = 0, .byte_alignment = 0 }, 0));
 }
 
 pub const VariantLayout = struct {
