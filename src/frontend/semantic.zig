@@ -1027,7 +1027,10 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 .direct => |direct| direct.shape.parameters,
                 .unknown_function, .value => null,
             };
-            var infer_static = false;
+            var infer_static = if (pending_target == .direct)
+                try self.type_interner.needsInheritedInference(pending_target.direct.instance)
+            else
+                false;
             if (parameter_shapes) |parameters| {
                 var runtime_count: usize = 0;
                 for (parameters) |parameter| if (parameter.mode != .static) {
@@ -1035,6 +1038,8 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 };
                 if (argument_nodes.len == runtime_count and runtime_count != parameters.len) {
                     infer_static = true;
+                } else if (infer_static and argument_nodes.len != runtime_count) {
+                    return self.reject(callee_index, .static_argument_cannot_be_inferred);
                 } else if (argument_nodes.len != parameters.len) {
                     return self.reject(callee_index, .{ .call_argument_count_mismatch = .{
                         .expected = @intCast(parameters.len),
@@ -1288,12 +1293,19 @@ pub fn inferStaticArguments(
     argument_types: []const structures.TypeId,
     type_interner: anytype,
     gpa: std.mem.Allocator,
+    inherited_from: ?u32,
 ) !StaticInference {
     const parts = functionParts(ast, declaration);
     const signature = ast.nodes[parts.signature.index()];
     const parameters = ast.nodeList(signature.data.node_node.a);
-    var inferred = try inferredStaticParameters(ast, source, parameters, gpa);
+    var inferred: std.ArrayList(InferredParameter) = .empty;
     defer inferred.deinit(gpa);
+    if (inherited_from) |owner| {
+        const owner_parts = functionParts(ast, owner);
+        const owner_signature = ast.nodes[owner_parts.signature.index()];
+        try appendInferredStaticParameters(ast, source, ast.nodeList(owner_signature.data.node_node.a), &inferred, gpa);
+    }
+    try appendInferredStaticParameters(ast, source, parameters, &inferred, gpa);
 
     var runtime_index: usize = 0;
     for (parameters) |parameter_index| {
@@ -1321,8 +1333,9 @@ pub fn inferStructArguments(
     const parts = functionParts(ast, declaration);
     const signature = ast.nodes[parts.signature.index()];
     const parameters = ast.nodeList(signature.data.node_node.a);
-    var inferred = try inferredStaticParameters(ast, source, parameters, gpa);
+    var inferred: std.ArrayList(InferredParameter) = .empty;
     defer inferred.deinit(gpa);
+    try appendInferredStaticParameters(ast, source, parameters, &inferred, gpa);
     for (fields, field_types) |field, actual_type| {
         const annotation = structFactoryFieldAnnotation(ast, source, declaration, field.name) orelse continue;
         if (!try bindInferredType(ast, source, inferred.items, annotation, actual_type, type_interner)) return .conflict;
@@ -1365,9 +1378,7 @@ fn structFactoryFieldAnnotation(ast: *const structures.Ast, source: []const u8, 
     return null;
 }
 
-fn inferredStaticParameters(ast: *const structures.Ast, source: []const u8, parameters: []const structures.Node.Index, gpa: std.mem.Allocator) !std.ArrayList(InferredParameter) {
-    var inferred: std.ArrayList(InferredParameter) = .empty;
-    errdefer inferred.deinit(gpa);
+fn appendInferredStaticParameters(ast: *const structures.Ast, source: []const u8, parameters: []const structures.Node.Index, inferred: *std.ArrayList(InferredParameter), gpa: std.mem.Allocator) !void {
     for (parameters) |parameter_index| {
         const parameter = ast.nodes[parameter_index.index()];
         if (parameterMode(ast, parameter).? != .static) continue;
@@ -1377,7 +1388,6 @@ fn inferredStaticParameters(ast: *const structures.Ast, source: []const u8, para
             .is_meta_type = isMetaTypeAnnotation(ast, source, parameter.data.node_node.b.unwrap().?),
         });
     }
-    return inferred;
 }
 
 fn bindInferredType(ast: *const structures.Ast, source: []const u8, inferred: []InferredParameter, annotation: structures.Node.Index, actual_type: structures.TypeId, type_interner: anytype) !bool {
@@ -1842,7 +1852,8 @@ pub fn validateStructNamespace(ast: *const structures.Ast, source: []const u8, s
     const node = ast.nodes[struct_index.index()];
     std.debug.assert(node.tag == .@"struct");
     for (ast.node_refs[node.data.ref.start..node.data.ref.end]) |index| {
-        const member = ast.nodes[index.index()];
+        const item = ast.nodes[index.index()];
+        const member = if (item.tag == .@"pub") ast.nodes[item.data.node.index()] else item;
         if (member.tag == .struct_property) continue;
         if (member.tag != .struct_field and member.tag != .static_binding)
             return issueAt(ast, index.index(), .struct_member_not_supported);
@@ -1873,7 +1884,8 @@ fn analyzeStructMembers(
     var ownership: structures.StructOwnershipProperties = .{};
 
     for (ast.node_refs[struct_node.data.ref.start..struct_node.data.ref.end]) |member_index| {
-        const member = ast.nodes[member_index.index()];
+        const item = ast.nodes[member_index.index()];
+        const member = if (item.tag == .@"pub") ast.nodes[item.data.node.index()] else item;
         if (member.tag == .struct_property) {
             const property_span = tokenSpan(ast, member.token_index);
             const property_name = source[property_span.start..property_span.end];
@@ -2312,7 +2324,9 @@ fn discoverStructItems(
     defer hook_names.deinit();
     var declaration_names = std.StringHashMap(void).init(gpa);
     defer declaration_names.deinit();
-    for (ast.node_refs[struct_node.data.ref.start..struct_node.data.ref.end]) |member_index| {
+    for (ast.node_refs[struct_node.data.ref.start..struct_node.data.ref.end]) |item_index| {
+        const item = ast.nodes[item_index.index()];
+        const member_index = if (item.tag == .@"pub") item.data.node else item_index;
         const member = ast.nodes[member_index.index()];
         const token = ast.tokens[member.token_index];
         const name = source[token.loc.start..token.loc.end];
@@ -2330,7 +2344,7 @@ fn discoverStructItems(
                 .@"struct" => .structure,
                 else => .static,
             };
-            const child = try appendItem(gpa, items, kind, ast.file_id, module, name, member_index.index(), false, parent, source_site);
+            const child = try appendItem(gpa, items, kind, ast.file_id, module, name, member_index.index(), item.tag == .@"pub", parent, source_site);
             if (kind == .structure) {
                 try discoverStructItems(gpa, items, ast, source, module, value, child, null);
             } else {
@@ -2532,6 +2546,10 @@ const TestTypeInterner = struct {
     }
 
     pub fn functionShape(_: @This(), _: structures.ItemId) !?structures.FunctionShape {
+        unreachable;
+    }
+
+    pub fn needsInheritedInference(_: @This(), _: structures.InstanceId) !bool {
         unreachable;
     }
 

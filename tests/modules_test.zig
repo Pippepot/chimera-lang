@@ -69,7 +69,7 @@ test "embedded memory source is registered in the std.memory module" {
 test "host storage externs allocate and release bytes and report invalid sizes" {
     const f = try Fixture.init(
         \\import std.memory.{check_storage}
-        \\if check_storage(1) -> if check_storage(4097) -> if check_storage(0) -> exit(1) else if check_storage(-1) -> exit(2) else exit(42) else exit(3) else exit(4)
+        \\if check_storage(1) -> if check_storage(4097) -> if check_storage(0) -> if check_storage(-1) -> exit(1) else exit(42) else exit(2) else exit(3) else exit(4)
     , &.{});
     defer f.deinit();
     const memory_module = try f.db.intern(queries.ModulePaths, .{ .path = "std.memory" });
@@ -96,7 +96,7 @@ test "typed host allocation is explicit-drop and fallible" {
         \\fallible use_storage(count: int) unit
         \\  const allocation: Allocation(int) = allocate(int, count)
         \\  deallocate(int, allocation^)
-        \\if use_storage(3) -> if use_storage(2147483647) -> exit(1) else exit(42) else exit(2)
+        \\if use_storage(0) -> if use_storage(3) -> if use_storage(-1) -> exit(1) else if use_storage(2147483647) -> exit(2) else exit(42) else exit(3) else exit(4)
     , &.{});
     defer f.deinit();
     try f.expectExit(0, 42);
@@ -141,12 +141,12 @@ test "typed allocation transfers byte and aggregate elements" {
 
 test "ref destroys its initialized value on last use" {
     const fixture = try Fixture.init(
-        \\import std.memory.{make_ref}
+        \\import std.memory.{Ref}
         \\struct Resource
         \\  value: int
         \\  drop = func(deinit self: Resource) -> exit(self.value)
         \\fallible run() unit
-        \\  const owner = make_ref(Resource, Resource{value = 42})
+        \\  const owner = Ref.new(Resource{value = 42})
         \\  _ = owner
         \\  exit(1)
         \\if run() -> exit(2) else exit(3)
@@ -155,11 +155,320 @@ test "ref destroys its initialized value on last use" {
     try fixture.expectExit(0, 42);
 }
 
+test "ref constructs immovable struct directly in owned storage" {
+    const fixture = try Fixture.init(
+        \\struct Immovable
+        \\  move = none
+        \\  value: int
+        \\  marker: byte
+        \\  drop = func(deinit self: Immovable) -> exit(self.value)
+        \\fallible run() unit
+        \\  const owner = Ref(Immovable).new(Immovable{marker = 7, value = 42})
+        \\  _ = owner
+        \\  exit(1)
+        \\if run() -> exit(2) else exit(3)
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+test "ref drops a struct with a custom move without relocating it" {
+    const fixture = try Fixture.init(
+        \\struct CustomMove
+        \\  value: int
+        \\  move = func(var self: CustomMove) CustomMove -> return CustomMove{value = self.value}
+        \\  drop = func(deinit self: CustomMove) -> exit(self.value)
+        \\fallible run() unit
+        \\  const owner = Ref(CustomMove).new(CustomMove{value = 42})
+        \\  _ = owner
+        \\  exit(1)
+        \\if run() -> exit(2) else exit(3)
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+test "immovable and nested custom-move arguments borrow and write back by address" {
+    const fixture = try Fixture.init(
+        \\struct Immovable
+        \\  move = none
+        \\  value: int
+        \\struct CustomMove
+        \\  value: int
+        \\  move = func(var self: CustomMove) CustomMove -> CustomMove{value = self.value}
+        \\struct Wrapper
+        \\  inner: CustomMove
+        \\func bump_immovable(mut value: Immovable)
+        \\  value.value += 1
+        \\func bump_wrapper(mut value: Wrapper)
+        \\  value.inner.value += 1
+        \\func read_immovable(imm value: Immovable) int -> value.value
+        \\func read_wrapper(imm value: Wrapper) int -> value.inner.value
+        \\var first = Immovable{value = 20}
+        \\var second = Wrapper{inner = CustomMove{value = 20}}
+        \\bump_immovable(first)
+        \\bump_wrapper(second)
+        \\exit(read_immovable(first) + read_wrapper(second))
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+test "custom drop hook does not redispatch after replacing self" {
+    const fixture = try Fixture.init(
+        \\struct Resource
+        \\  value: int
+        \\  drop = func(deinit self: Resource)
+        \\    self = Resource{value = self.value + 1}
+        \\    exit(self.value)
+        \\fallible run() unit
+        \\  const owner = Ref.new(Resource{value = 41})
+        \\  _ = owner
+        \\  exit(1)
+        \\if run() -> exit(2) else exit(3)
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+test "ref in-place construction infers immovable element type" {
+    const fixture = try Fixture.init(
+        \\struct Immovable
+        \\  move = none
+        \\  value: int
+        \\fallible run() unit
+        \\  const owner = Ref.new(Immovable{value = 42})
+        \\  _ = owner
+        \\if run() -> exit(42) else exit(1)
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+    const run = (try fixture.db.get(queries.BuildModuleScope, 0)).*.?.resolveFunction("run").?;
+    const body = (try fixture.db.get(queries.AnalyzeFunctionBody, run)).*.?;
+    var constructed_in_place = false;
+    for (body.instructions) |instruction| {
+        if (instruction == .ref_init) constructed_in_place = true;
+        try testing.expect(instruction != .struct_init);
+    }
+    try testing.expect(constructed_in_place);
+}
+
+test "ref constructs generated immovable structs without temporary values" {
+    const fixture = try Fixture.init(
+        \\struct Box(T: type)
+        \\  move = none
+        \\  value: T
+        \\fallible run() unit
+        \\  const owner = Ref.new(Box{value = 42})
+        \\  _ = owner
+        \\if run() -> exit(42) else exit(1)
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+    const run = (try fixture.db.get(queries.BuildModuleScope, 0)).*.?.resolveFunction("run").?;
+    const body = (try fixture.db.get(queries.AnalyzeFunctionBody, run)).*.?;
+    var constructed_in_place = false;
+    for (body.instructions) |instruction| {
+        if (instruction == .ref_init) constructed_in_place = true;
+        try testing.expect(instruction != .struct_init);
+    }
+    try testing.expect(constructed_in_place);
+}
+
+test "ref drops an owned field inside an immovable struct" {
+    const fixture = try Fixture.init(
+        \\struct Resource
+        \\  value: int
+        \\  drop = func(deinit self: Resource) -> exit(self.value)
+        \\struct Immovable
+        \\  move = none
+        \\  field: Ref(Resource)
+        \\fallible run() unit
+        \\  const inner = Ref.new(Resource{value = 42})
+        \\  const outer = Ref(Immovable).new(Immovable{field = inner^})
+        \\  _ = outer
+        \\  exit(1)
+        \\if run() -> exit(2) else exit(3)
+    , &.{});
+    defer fixture.deinit();
+    const run_item = (try fixture.db.get(queries.BuildModuleScope, 0)).*.?.resolveFunction("run").?;
+    const run_body = (try fixture.db.get(queries.AnalyzeFunctionBody, run_item)).*.?;
+    var dropped_in_place = false;
+    for (run_body.instructions) |instruction| if (instruction == .ref_init) {
+        const types: queries.TypeInterner(*query.Database) = .{ .ctx = fixture.db };
+        const owner = (try types.structDefinition(instruction.ref_init.ref_type)).?;
+        const drop_hook = owner.ownership.drop.?.hook.?;
+        const drop_body = (try fixture.db.get(queries.AnalyzeFunctionInstance, drop_hook)).*.?;
+        for (drop_body.instructions) |drop_instruction| {
+            if (drop_instruction == .ref_value_for_drop) dropped_in_place = true;
+        }
+    };
+    try testing.expect(dropped_in_place);
+    try fixture.expectExit(0, 42);
+}
+
+test "ref drops nested owners with the same specialization" {
+    const fixture = try Fixture.init(
+        \\struct Resource
+        \\  value: int
+        \\  drop = func(deinit self: Resource) -> exit(self.value)
+        \\struct Node
+        \\  move = none
+        \\  resource: Resource
+        \\  next: Ref(Node) | none
+        \\fallible run() unit
+        \\  const inner = Ref(Node).new(Node{resource = Resource{value = 42}, next = none})
+        \\  const outer = Ref(Node).new(Node{resource = Resource{value = 1}, next = inner^})
+        \\  _ = outer
+        \\  exit(2)
+        \\if run() -> exit(3) else exit(4)
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+test "ref destructor follows immovable field edits" {
+    const original =
+        \\struct Resource
+        \\  value: int
+        \\  drop = func(deinit self: Resource) -> exit(self.value)
+        \\struct Immovable
+        \\  move = none
+        \\  field: Resource
+        \\fallible run() unit
+        \\  const owner = Ref(Immovable).new(Immovable{field = Resource{value = 42}})
+        \\  _ = owner
+        \\  exit(1)
+        \\if run() -> exit(2) else exit(3)
+    ;
+    const fixture = try Fixture.init(original, &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+    try fixture.db.setInput(queries.SourceText, 0,
+        \\struct Resource
+        \\  value: int
+        \\  drop = func(deinit self: Resource) -> exit(self.value)
+        \\struct Immovable
+        \\  move = none
+        \\  field: int
+        \\fallible run() unit
+        \\  const owner = Ref(Immovable).new(Immovable{field = 42})
+        \\  _ = owner
+        \\  exit(1)
+        \\if run() -> exit(2) else exit(3)
+    );
+    try fixture.expectExit(0, 1);
+    try fixture.db.setInput(queries.SourceText, 0, original);
+    try fixture.expectExit(0, 42);
+}
+
+test "immovable ref from a conditional binding drops on the success path" {
+    const fixture = try Fixture.init(
+        \\struct Immovable
+        \\  move = none
+        \\  value: int
+        \\  drop = func(deinit self: Immovable) -> exit(self.value)
+        \\if const owner = Ref(Immovable).new(Immovable{value = 42})
+        \\  _ = owner
+        \\  exit(1)
+        \\else exit(2)
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+test "zero-sized immovable ref destroys its value" {
+    const fixture = try Fixture.init(
+        \\struct Immovable
+        \\  move = none
+        \\  drop = func(deinit self: Immovable) -> exit(42)
+        \\fallible run() unit
+        \\  const owner = Ref(Immovable).new(Immovable{})
+        \\  _ = owner
+        \\  exit(1)
+        \\if run() -> exit(2) else exit(3)
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+test "ref in-place initializer cleans up fields when a later field fails" {
+    const fixture = try Fixture.init(
+        \\import std.memory.{allocate, deallocate}
+        \\struct Tracked
+        \\  value: int
+        \\  drop = func(deinit self: Tracked) -> exit(self.value)
+        \\struct Immovable
+        \\  move = none
+        \\  first: Tracked
+        \\  second: int
+        \\fallible fail() int
+        \\  const storage = allocate(int, -1)
+        \\  deallocate(int, storage^)
+        \\  return 7
+        \\fallible run() unit
+        \\  const owner = Ref(Immovable).new(Immovable{first = Tracked{value = 42}, second = fail()})
+        \\  _ = owner
+        \\if run() -> exit(1) else exit(2)
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+test "ref rejects transfers and nested immovable fields" {
+    const cases = [_]struct { source: []const u8, diagnostic: std.meta.Tag(structures.Diagnostic.Kind) }{
+        .{ .source =
+        \\struct Immovable
+        \\  move = none
+        \\  value: int
+        \\const original = Immovable{value = 42}
+        \\if Ref(Immovable).new(original) -> exit(1) else exit(2)
+        , .diagnostic = .ref_requires_struct_initializer },
+        .{ .source =
+        \\struct Inner
+        \\  move = none
+        \\  value: int
+        \\struct Outer
+        \\  move = none
+        \\  inner: Inner
+        \\if Ref(Outer).new(Outer{inner = Inner{value = 42}}) -> exit(1) else exit(2)
+        , .diagnostic = .type_not_movable },
+        .{ .source =
+        \\struct Explicit
+        \\  drop = explicit
+        \\  value: int
+        \\if Ref(Explicit).new(Explicit{value = 42}) -> exit(1) else exit(2)
+        , .diagnostic = .ref_requires_automatic_drop },
+        .{ .source =
+        \\struct Explicit
+        \\  drop = explicit
+        \\  value: int
+        \\if Ref.new(Explicit{value = 42}) -> exit(1) else exit(2)
+        , .diagnostic = .ref_requires_automatic_drop },
+        .{ .source =
+        \\import std.memory.{value}
+        \\struct Immovable
+        \\  move = none
+        \\  value: int
+        \\fallible run() unit
+        \\  const owner = Ref(Immovable).new(Immovable{value = 42})
+        \\  const extracted = value(Immovable, owner^)
+        \\  _ = extracted
+        \\if run() -> exit(1) else exit(2)
+        , .diagnostic = .ref_extraction_requires_direct_move },
+    };
+    for (cases) |case| {
+        const fixture = try Fixture.init(case.source, &.{});
+        defer fixture.deinit();
+        try fixture.expectDiagnostic(0, case.diagnostic);
+    }
+}
+
 test "ref transfers its value and releases its allocation" {
     const fixture = try Fixture.init(
-        \\import std.memory.{make_ref, value}
+        \\import std.memory.{value}
         \\fallible take() unit
-        \\  const owner = make_ref(int, 42)
+        \\  const owner = Ref(int).new(42)
         \\  const number = value(int, owner^)
         \\  number == 42
         \\if take() -> exit(42) else exit(1)
@@ -168,10 +477,13 @@ test "ref transfers its value and releases its allocation" {
     try fixture.expectExit(0, 42);
 }
 
-test "zero-sized ref allocation fails through fallible control flow" {
+test "zero-sized ref supports consuming extraction" {
     const fixture = try Fixture.init(
-        \\import std.memory.{make_ref}
-        \\if make_ref(unit, ()) -> exit(1) else exit(42)
+        \\import std.memory.{value}
+        \\fallible take() unit
+        \\  const owner = Ref.new(())
+        \\  _ = value(unit, owner^)
+        \\if take() -> exit(42) else exit(1)
     , &.{});
     defer fixture.deinit();
     try fixture.expectExit(0, 42);
@@ -179,12 +491,12 @@ test "zero-sized ref allocation fails through fallible control flow" {
 
 test "ref transfers an aggregate value" {
     const fixture = try Fixture.init(
-        \\import std.memory.{make_ref, value}
+        \\import std.memory.{value}
         \\struct Pair
         \\  first: int
         \\  second: byte
         \\fallible take() unit
-        \\  const owner = make_ref(Pair, Pair{first = 42, second = 7})
+        \\  const owner = Ref.new(Pair{first = 42, second = 7})
         \\  const pair = value(Pair, owner^)
         \\  pair.first == 42
         \\if take() -> exit(42) else exit(1)
@@ -195,10 +507,10 @@ test "ref transfers an aggregate value" {
 
 test "ref can own and transfer another ref" {
     const fixture = try Fixture.init(
-        \\import std.memory.{make_ref, value}
+        \\import std.memory.{value}
         \\fallible take() unit
-        \\  const inner = make_ref(int, 42)
-        \\  const outer = make_ref(Ref(int), inner^)
+        \\  const inner = Ref.new(42)
+        \\  const outer = Ref(Ref(int)).new(inner^)
         \\  const moved = value(Ref(int), outer^)
         \\  const number = value(int, moved^)
         \\  number == 42
@@ -208,12 +520,16 @@ test "ref can own and transfer another ref" {
     try fixture.expectExit(0, 42);
 }
 
-test "failed ref allocation destroys its owned input" {
+test "zero-sized ref destroys its initialized value on last use" {
     const fixture = try Fixture.init(
-        \\import std.memory.{make_ref}
+        \\import std.memory.{Ref}
         \\struct Empty
         \\  drop = func(deinit self: Empty) -> exit(42)
-        \\if make_ref(Empty, Empty{}) -> exit(1) else exit(2)
+        \\fallible run() unit
+        \\  const owner = Ref(Empty).new(Empty{})
+        \\  _ = owner
+        \\  exit(1)
+        \\if run() -> exit(2) else exit(3)
     , &.{});
     defer fixture.deinit();
     try fixture.expectExit(0, 42);
@@ -223,7 +539,7 @@ test "prelude exports ref and its constructor without exporting raw allocation" 
     const fixture = try Fixture.init(
         \\import std.memory.{value}
         \\fallible take() unit
-        \\  const owner: Ref(int) = make_ref(int, 42)
+        \\  const owner: Ref(int) = Ref.new(42)
         \\  const number = value(int, owner^)
         \\  number == 42
         \\if take() -> exit(42) else exit(1)
@@ -238,15 +554,19 @@ test "prelude exports ref and its constructor without exporting raw allocation" 
     , &.{});
     defer raw.deinit();
     try raw.expectDiagnostic(0, .unknown_function);
+
+    const retired = try Fixture.init("if make_ref(42) -> exit(1) else exit(2)", &.{});
+    defer retired.deinit();
+    try retired.expectDiagnostic(0, .unknown_function);
 }
 
 test "generic struct initializer infers type from ref field" {
     const fixture = try Fixture.init(
-        \\import std.memory.{make_ref}
+        \\import std.memory.{Ref}
         \\struct Foo(T: type)
         \\  r: Ref(T)
         \\fallible run() unit
-        \\  const f = Foo{r = make_ref(42)}
+        \\  const f = Foo{r = Ref.new(42)}
         \\  _ = f
         \\if run() -> exit(42) else exit(1)
     , &.{});
@@ -258,7 +578,7 @@ test "fallible condition binding initializes an inferred struct field" {
     const fixture = try Fixture.init(
         \\struct Foo(T: type)
         \\  r: Ref(T)
-        \\const f = Foo{r = if const owner = make_ref(42) -> owner^ else exit(1)}
+        \\const f = Foo{r = if const owner = Ref.new(42) -> owner^ else exit(1)}
         \\_ = f
         \\exit(42)
     , &.{});
@@ -269,13 +589,18 @@ test "fallible condition binding initializes an inferred struct field" {
 test "fallible condition binding owns its ref on success" {
     const success = try Fixture.init(
         \\import std.memory.{value}
-        \\if const owner: Ref(int) = make_ref(42) -> exit(value(int, owner^)) else exit(1)
+        \\if const owner: Ref(int) = Ref.new(42) -> exit(value(int, owner^)) else exit(1)
     , &.{});
     defer success.deinit();
     try success.expectExit(0, 42);
 
     const failure = try Fixture.init(
-        \\if const owner = make_ref(unit, ()) -> exit(1) else exit(42)
+        \\import std.memory.{allocate, deallocate}
+        \\fallible invalid_ref() Ref(int)
+        \\  const allocation = allocate(int, -1)
+        \\  deallocate(int, allocation^)
+        \\  return Ref.new(42)
+        \\if const owner = invalid_ref() -> exit(1) else exit(42)
     , &.{});
     defer failure.deinit();
     try failure.expectExit(0, 42);
@@ -283,12 +608,12 @@ test "fallible condition binding owns its ref on success" {
 
 test "moving a ref preserves its owned value until the new owner's last use" {
     const fixture = try Fixture.init(
-        \\import std.memory.{make_ref}
+        \\import std.memory.{Ref}
         \\struct Resource
         \\  value: int
         \\  drop = func(deinit self: Resource) -> exit(self.value)
         \\fallible run() unit
-        \\  const first = make_ref(Resource, Resource{value = 42})
+        \\  const first = Ref.new(Resource{value = 42})
         \\  const moved = first^
         \\  _ = moved
         \\  exit(1)
@@ -304,9 +629,9 @@ test "ref cannot be forged or accessed through its storage field" {
         \\const fake = Ref(int){}
         \\exit(42)
         ,
-        \\import std.memory.{make_ref}
+        \\import std.memory.{Ref}
         \\fallible inspect() unit
-        \\  const owner = make_ref(int, 42)
+        \\  const owner = Ref.new(42)
         \\  _ = owner.allocation
         \\if inspect() -> exit(42) else exit(1)
     };
@@ -320,17 +645,17 @@ test "ref cannot be forged or accessed through its storage field" {
 test "ref cannot be implicitly copied or used after transfer" {
     const sources = [_]struct { source: []const u8, diagnostic: std.meta.Tag(structures.Diagnostic.Kind) }{
         .{ .source =
-        \\import std.memory.{make_ref}
+        \\import std.memory.{Ref}
         \\fallible copy_owner() unit
-        \\  const owner = make_ref(int, 42)
+        \\  const owner = Ref.new(42)
         \\  const copied = owner
         \\  _ = copied
         \\if copy_owner() -> exit(1) else exit(2)
         , .diagnostic = .type_not_copyable },
         .{ .source =
-        \\import std.memory.{make_ref, value}
+        \\import std.memory.{Ref, value}
         \\fallible take_twice() unit
-        \\  const owner = make_ref(int, 42)
+        \\  const owner = Ref.new(42)
         \\  const first = value(int, owner^)
         \\  const second = value(int, owner^)
         \\  _ = first
@@ -615,11 +940,90 @@ test "struct namespace declarations and instance fields dispatch separately" {
     , &.{.{ .path = "shapes/s.chi", .module_path = "shapes", .source =
         \\pub struct S
         \\  x: int
-        \\  static answer = 42
-        \\  func identity(static T: type, imm value: T) T -> return value
+        \\  pub static answer = 42
+        \\  pub func identity(static T: type, imm value: T) T -> return value
     }});
     defer f.deinit();
     try f.expectExit(0, 42);
+}
+
+test "struct namespace members require pub across modules" {
+    const f = try Fixture.init(
+        \\import shapes
+        \\const s = shapes.S{value = 40}
+        \\exit(shapes.S.answer + s.read())
+    , &.{.{ .path = "shapes/s.chi", .module_path = "shapes", .source =
+        \\pub struct S
+        \\  value: int
+        \\  pub static answer = 2
+        \\  pub func read(imm self: S) int -> return self.value
+        \\  static secret = 7
+        \\  func hidden(imm self: S) int -> return self.value
+    }});
+    defer f.deinit();
+    try f.expectExit(0, 42);
+
+    try f.db.setInput(queries.SourceText, 0,
+        \\import shapes
+        \\exit(shapes.S.secret)
+    );
+    try f.expectDiagnostic(0, .private_access);
+    try f.db.setInput(queries.SourceText, 0,
+        \\import shapes
+        \\const s = shapes.S{value = 42}
+        \\exit(shapes.S.hidden(s))
+    );
+    try f.expectDiagnostic(0, .private_access);
+    try f.db.setInput(queries.SourceText, 0,
+        \\import shapes
+        \\const s = shapes.S{value = 42}
+        \\exit(s.hidden())
+    );
+    try f.expectDiagnostic(0, .private_access);
+}
+
+test "qualified struct members retain visibility across module files" {
+    const f = try Fixture.init(
+        \\import lib
+        \\exit(lib.S.read(lib.S{value = 21}) + lib.answer())
+    , &.{
+        .{ .path = "lib/s.chi", .module_path = "lib", .source =
+        \\pub struct S
+        \\  value: int
+        },
+        .{ .path = "lib/methods.chi", .module_path = "lib", .source =
+        \\pub func S.read(imm self: S) int -> return self.value
+        \\func S.hidden(imm self: S) int -> return self.value
+        },
+        .{ .path = "lib/api.chi", .module_path = "lib", .source =
+        \\pub func answer() int -> return S.hidden(S{value = 21})
+        },
+    });
+    defer f.deinit();
+    try f.expectExit(0, 42);
+    try f.db.setInput(queries.SourceText, 0,
+        \\import lib
+        \\const s = lib.S{value = 42}
+        \\exit(s.hidden())
+    );
+    try f.expectDiagnostic(0, .private_access);
+}
+
+test "struct member visibility recomputes when pub changes" {
+    const private_source =
+        \\pub struct S
+        \\  func answer() int -> return 42
+    ;
+    const f = try Fixture.init("import lib\nexit(lib.S.answer())", &.{.{ .path = "lib/s.chi", .module_path = "lib", .source = private_source }});
+    defer f.deinit();
+    try f.expectDiagnostic(0, .private_access);
+    try f.db.setInput(queries.SourceText, 1,
+        \\pub struct S
+        \\  pub func answer() int -> return 42
+    );
+    try f.expectExit(0, 42);
+    try f.db.setInput(queries.SourceText, 1, private_source);
+    try f.expectDiagnostic(0, .private_access);
 }
 
 test "qualified struct namespace declarations support instance calls" {
@@ -740,6 +1144,38 @@ test "generated namespace functions support specialized instance calls" {
     , &.{});
     defer f.deinit();
     try f.expectExit(0, 42);
+}
+
+test "generic struct namespace functions infer enclosing type parameters" {
+    const f = try Fixture.init(
+        \\struct Box(T: type)
+        \\  value: T
+        \\  func new(imm value: T) Box(T) -> return Box(T){value = value}
+        \\exit(Box.new(41).value + Box(int).new(1).value)
+    , &.{});
+    defer f.deinit();
+    try f.expectExit(0, 42);
+}
+
+test "generic struct namespace rejects missing members" {
+    const f = try Fixture.init(
+        \\struct Box(T: type)
+        \\  value: T
+        \\exit(Box.missing(42))
+    , &.{});
+    defer f.deinit();
+    try f.expectDiagnostic(0, .unknown_namespace_member);
+}
+
+test "namespace inference requires specializing an enclosing factory" {
+    const f = try Fixture.init(
+        \\struct Outer(T: type)
+        \\  struct Inner
+        \\    func make(imm value: T) T -> return value
+        \\exit(Outer.Inner.make(42))
+    , &.{});
+    defer f.deinit();
+    try f.expectDiagnostic(0, .static_argument_cannot_be_inferred);
 }
 
 test "qualified namespace declarations share the struct member scope" {
@@ -1070,7 +1506,7 @@ fn checkModuleAllocations(gpa: std.mem.Allocator) !void {
     var registry: modules.SourceRegistry = .{};
     defer registry.deinit(gpa);
     const entry = "import shapes\nstatic S = shapes.Box(int, 42)\nconst make = S.make\nexit(make())";
-    const file = modules.SourceFile{ .path = "shapes/a.chi", .module_path = "shapes", .source = "pub struct Box(T: type, amount: int)\n  static answer = amount\n  func make() T -> return answer" };
+    const file = modules.SourceFile{ .path = "shapes/a.chi", .module_path = "shapes", .source = "pub struct Box(T: type, amount: int)\n  static answer = amount\n  pub func make() T -> return answer" };
     try registry.update(db, gpa, entry, &.{file}, &.{});
     try testing.expect((try db.get(queries.BuildExecutable, 0)).* != null);
     try registry.update(db, gpa, entry, &.{}, &.{});
@@ -1118,7 +1554,7 @@ test "struct namespaces validate duplicates and keep ownership hooks separate" {
         \\pub struct S
         \\  copy = trivial
         \\  static answer = 42
-        \\  func copy() int -> return answer
+        \\  pub func copy() int -> return answer
     }});
     defer f.deinit();
     try f.expectExit(0, 42);
@@ -1151,8 +1587,8 @@ test "generated struct namespace members retain inherited and own specialization
         \\pub struct Box(T: type, amount: int)
         \\  value: T
         \\  static offset = amount
-        \\  func make(imm value: T) T -> return value + offset
-        \\  func identity(static U: type, imm value: U) U -> return value + 1
+        \\  pub func make(imm value: T) T -> return value + offset
+        \\  pub func identity(static U: type, imm value: U) U -> return value + 1
     }});
     defer f.deinit();
     try f.expectExit(0, 42);
@@ -1166,10 +1602,23 @@ test "nested generated namespace declarations preserve their enclosing static en
         \\exit(value.value)
     , &.{.{ .path = "lib/a.chi", .module_path = "lib", .source =
         \\pub struct Outer(T: type)
-        \\  struct Inner
+        \\  pub struct Inner
         \\    value: T
-        \\    func make(imm value: T) T -> return value
+        \\    pub func make(imm value: T) T -> return value
     }});
+    defer f.deinit();
+    try f.expectExit(0, 42);
+}
+
+test "nested generic namespace functions infer their own type parameters" {
+    const f = try Fixture.init(
+        \\struct Outer(T: type)
+        \\  struct Inner(U: type)
+        \\    left: T
+        \\    right: U
+        \\    func new(imm left: T, imm right: U) Inner(U) -> return Inner(U){left = left, right = right}
+        \\exit(Outer(int).Inner.new(20, 22).left + Outer(int).Inner.new(20, 22).right)
+    , &.{});
     defer f.deinit();
     try f.expectExit(0, 42);
 }
@@ -1177,10 +1626,10 @@ test "nested generated namespace declarations preserve their enclosing static en
 test "factories inside struct namespaces discover their generated namespace members" {
     const f = try Fixture.init("import lib\nexit(lib.Factory.Box(int).make())", &.{.{ .path = "lib/a.chi", .module_path = "lib", .source =
         \\pub struct Factory
-        \\  struct Box(T: type)
+        \\  pub struct Box(T: type)
         \\    value: T
         \\    static answer = 42
-        \\    func make() T -> return answer
+        \\    pub func make() T -> return answer
     }});
     defer f.deinit();
     try f.expectExit(0, 42);

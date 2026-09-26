@@ -40,13 +40,14 @@ pub const External = enum {
     unsafe_take,
     unsafe_own_ref,
     unsafe_take_ref,
+    unsafe_destroy_ref,
     deallocate_ref,
 
     pub fn file(symbol: External) File {
         return switch (symbol) {
             .exit => .exit,
             .allocate_host_storage, .deallocate_host_storage => .memory_host,
-            .allocate, .deallocate, .unsafe_initialize, .unsafe_take, .unsafe_own_ref, .unsafe_take_ref, .deallocate_ref => .memory_allocation,
+            .allocate, .deallocate, .unsafe_initialize, .unsafe_take, .unsafe_own_ref, .unsafe_take_ref, .unsafe_destroy_ref, .deallocate_ref => .memory_allocation,
         };
     }
 };

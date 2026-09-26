@@ -1,2 +1,2 @@
 pub import std.exit.{exit}
-pub import std.memory.{Ref, make_ref}
+pub import std.memory.{Ref}

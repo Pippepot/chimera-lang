@@ -407,11 +407,21 @@ _ = resource
 # address, and destruction destroys T before releasing that storage. Ref has
 # no implicit copy; explicitly duplicating a copyable T allocates new storage.
 # Value construction and local binding do not themselves select allocation.
-# Immovable T must be constructed in final storage, not moved into a Ref.
-# The current host implementation supports fallible make_ref and consuming
-# value for directly movable, automatically droppable T, but not duplication
-# or in-place construction for immovable T. Zero-sized allocations fail.
-# Ref and make_ref are in the prelude; low-level allocation remains explicit.
+# An immovable or custom-move T can be initialized directly in Ref storage by
+# passing a struct initializer to Ref.new(T{...}) or Ref(T).new(T{...}) when
+# its fields are directly movable. Destruction runs on T in that storage before
+# deallocation. This does not transfer a completed T from another place. Its fields
+# evaluate once in source order and are destroyed if construction cannot
+# complete. Nested immovable fields and non-struct initializers are not yet
+# supported. A borrowed or explicitly transferred immovable value cannot
+# initialize Ref. T must be automatically droppable; consuming value(T, owner^)
+# is supported only when T moves directly. Explicit duplication is not yet
+# implemented. Nonnegative zero-byte host
+# allocations (zero elements or zero-sized T) succeed with a distinct, stable
+# storage address; the provider may reserve a minimal region to supply it.
+# Zero-sized values still run their destruction hooks. Negative counts and
+# layout overflow fail through fallible control flow.
+# Ref is in the prelude; low-level allocation remains explicit.
 #
 # `std.memory.Allocation(T)` uniquely owns uninitialized storage. Its layout
 # comes from the target representation of T, the element count, and alignment;
@@ -516,9 +526,22 @@ func S.read_a(imm value: S) int -> value.a
 # names are errors. Ownership properties use a separate hook scope. Within a
 # namespace declaration, unqualified names search its enclosing struct
 # namespaces before module declarations and the defining file's imports.
+# A public struct exports its type, not its namespace members. Functions,
+# static values, and nested structs are private to their defining module by
+# default; each requires its own pub modifier to be accessed from another
+# module. This applies to both type-qualified and instance-call syntax, and
+# to qualified declarations in other files of the defining module. Fields and
+# ownership properties retain their separate rules.
 # Generated namespaces retain the enclosing factory's static arguments; member
 # functions may also declare their own static parameters. Namespace declarations
 # do not contribute fields or execute when a struct value is initialized.
+# A generic struct factory's namespace can be used before specializing the
+# factory. A direct member call infers its missing factory parameters from the
+# member's runtime argument types, as with Ref.new(value), or the caller may
+# specialize the factory first, as with Ref(T).new(value). Missing members are
+# namespace errors even when the factory is not specialized. In a nested
+# namespace, enclosing factories must be specialized before inferring the
+# immediate factory's arguments.
 
 # A struct cannot contain itself by value, directly or through other structs or
 # inline variants. Such cycles have no finite layout and are rejected. Callable
@@ -552,9 +575,10 @@ func read_a(s: S) int
 # A custom hook replaces that operation for the complete struct. Fieldwise
 # strategies invoke nested custom hooks in declaration order for copy and move,
 # reverse declaration order for drop, and operate only on a variant's active
-# member. Compiler-generated argument, result, and lifetime plumbing does not
-# recursively invoke the hook currently being executed; explicit calls written
-# in the hook body remain ordinary calls.
+# member. The active custom drop hook's deinit self is not automatically
+# destroyed when the hook returns; nested values with the same hook
+# specialization still drop. Copy and move hook plumbing likewise avoids
+# redispatching the active hook. Explicit calls remain ordinary calls.
 # Potentially failing duplication is an explicitly called fallible function,
 # not an implicit copy operation.
 # Without copy support, passing to an owned parameter requires transfer with '^'.

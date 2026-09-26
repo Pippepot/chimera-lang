@@ -8,9 +8,9 @@
 - Folder modules, file-scoped imports, re-exports, qualified lookup, entry-only execution, and directory refresh are implemented. The embedded `std.prelude` is implicitly imported by user files, with an explicit-import override.
 - Named and generated structs have nominal identity, namespace members and instance calls, layout, field operations, and validated move/copy/drop hooks.
 - Typed SSA covers calls, static specialization, callable values, variants, joins, loops, divergence, and fallible control flow. Compile-time thunks and specialized calls evaluate through typed IR, including structs, hooks, and type-valued functions; local captures remain unsupported.
-- Ownership tracks whole-root transfers, borrowed and owned parameters, mutable copy-back, and path-sensitive ASAP cleanup. Partial-field transfer, stable storage for immovable values, and origin-aware pointers/views remain open.
+- Ownership tracks whole-root transfers, borrowed and owned parameters, mutable copy-back, and path-sensitive ASAP cleanup. Partial-field transfer, general stable storage for immovable values, and origin-aware pointers/views remain open.
 - Compiler-provided `extern func` declarations use named std identities and ordinary calls. `std.exit.exit` is exported by the prelude, with distinct runtime termination and compile-time compiler control.
-- Host-only `std.memory` now provides checked, fallible typed allocation and explicit deallocation, unsafe element transfer for directly movable elements, and `Ref(T)` for directly movable, automatically droppable values with automatic destruction and consuming extraction. `Ref` and `make_ref` are exported by the prelude. Zero-sized allocations fail; in-place construction for immovable values, explicit duplication, and safe `Borrow` origins are not implemented yet.
+- Host-only `std.memory` provides checked, fallible typed allocation and explicit deallocation, unsafe element transfer for directly movable elements, and `Ref(T)` with automatic destruction. `Ref.new(value)` infers `T`, while `Ref(T).new(value)` specializes it explicitly; both construct directly movable values or initialize immovable structs with directly movable fields in final storage. Consuming extraction remains limited to directly movable values. `Ref` is exported by the prelude. Zero-byte host allocations succeed with a distinct, stable address; recursive in-place construction, explicit duplication, and safe `Borrow` origins remain open.
 - Successful whole-program executables, typed runtime function bodies, and compiled functions persist in a content-addressed cache. Query snapshots restore interned identities and validate observed source inputs and equal-result query boundaries before reuse. Cache publication is atomic across compiler processes. Independent file and function queries use multiple workers.
 
 ## Priority and dependencies
@@ -30,24 +30,38 @@ implementing them. Value construction and binding do not choose allocation.
 Keep value type, allocation provider, memory location, target-aware layout,
 address space, lifetime origin, and access mutability distinct.
 
-- Define layout and raw storage first: resolve size and alignment for the
-  target location, reject count/size overflow, and make allocation fallible.
-  Implement host-accessible storage first while preserving the distinction
-  between provider, location, and address space for later device storage.
-  `Allocation(T)` owns uninitialized storage and the authority needed to free
-  it; `deallocate` consumes the handle but does not destroy initialized values.
-  Specify initialization and destruction obligations before exposing safe access.
-- Make `Ref(T)` the unique owner of one initialized `T` in separately allocated
-  storage. Construction is fallible; moving the owner preserves the allocation,
-  destruction destroys `T` and deallocates it, and explicit duplication requires
-  copying `T` into a new allocation. Provide construction directly in final
-  storage for immovable values.
-- Make `Borrow(T)` the non-owning, non-null reference. Copying a `Borrow` does
-  not copy `T` or acquire ownership. It retains the location and lifetime
-  dependencies of its source; mutation depends on the access path and aliasing
-  rules. A `Borrow(T)` accesses a live initialized value; unsafe indexed
-  initialization, destruction, and borrowing of initialized allocation slots
-  belong on `Allocation`. Defer raw-address and foreign-memory operations.
+Implemented host subset:
+
+- `std.memory.allocate(T, count)` derives the host layout from `T`, rejects
+  negative counts and size overflow through fallible control flow, and reserves
+  a distinct address even for zero-byte requests. `Allocation(T)` owns
+  uninitialized storage with explicit drop;
+  `deallocate` consumes it without destroying elements. `unsafe_initialize`
+  and `unsafe_take` transfer directly movable elements with caller-proven bounds
+  and initialization state.
+- `Ref.new(value)` infers `T`, and `Ref(T).new(value)` fallibly constructs a `Ref(T)` for directly movable,
+  automatically droppable `T`. Moving the owner preserves its storage; last-use
+  destruction destroys `T` and frees the allocation, while `value` consumes the
+  owner and extracts `T`. `Ref` is a prelude export; low-level
+  allocation requires an explicit `std.memory` import.
+- `Ref.new(T{...})` or `Ref(T).new(T{...})` also initializes an immovable or custom-move struct
+  directly in its allocation when its fields can move directly. Fields evaluate
+  once in source order and are cleaned up on failure. Destruction runs in the
+  allocation; `value` cannot extract a `T` that does not move directly.
+
+Remaining work:
+
+- Resolve target-aware layout beyond host storage and the provider, location,
+  and address-space APIs before extending allocation to other locations, including
+  their zero-size behavior. Keep raw-address and foreign-memory operations deferred.
+- Extend in-place construction to nested immovable fields and other initializer
+  forms, and provide explicit duplication of copyable `T` into a new allocation.
+  Add the missing unsafe indexed destruction and borrowing operations on
+  `Allocation` before exposing safe initialized access.
+- Implement `Borrow(T)` as a non-owning, non-null reference to a live initialized
+  value. Copying it must not copy `T` or acquire ownership; mutation depends on
+  the access path and aliasing rules. Re-export it from `std.prelude` once its
+  origin checks exist.
 - Extend generation-based lifetime and aliasing checks to borrows from locals,
   allocations, owners, and collections, including returned/stored borrows,
   transfers, last-use destruction, and invalidation when storage changes.
@@ -61,12 +75,8 @@ address space, lifetime origin, and access mutability distinct.
   capacity. Borrowed text and List views must follow the same lifetime and
   storage-change invalidation rules. Defer atomic shared ownership until its
   supported locations, mutation, weak references, and cycle behavior are set.
-- Put the public API in `std.memory`, re-exporting `Ref`, `make_ref`, and `Borrow` from
-  `std.prelude`; keep raw allocation and layout APIs explicitly imported.
 
-Resolve the remaining layout, zero-size, provider/location, address-space, and
-reference API decisions in the design note before freezing their language
-contracts. Mojo 1.0 is a design reference, not the naming contract; see its
+Mojo 1.0 is a design reference, not the naming contract; see its
 [pointer guide](https://mojolang.static.modular.com/docs/manual/pointers/) and
 [release notes](https://mojolang.static.modular.com/releases/v1.0.0/).
 

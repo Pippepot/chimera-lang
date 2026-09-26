@@ -264,6 +264,8 @@ fn validFunctionBody(body: structures.FunctionBodyAnalysis) bool {
             .variant_tag, .negi => |value| validValue(value, body),
             .variant_coerce, .variant_extract, .callable_coerce => |operation| validVariantOperation(operation, body),
             .struct_init => |operation| validRange(operation.fields, body.struct_field_values.len),
+            .ref_init => |operation| validValue(operation.allocation, body) and validRange(operation.fields, body.struct_field_values.len),
+            .ref_value_for_drop => |operation| validValue(operation.owner, body),
             .field_access => |operation| validValue(operation.operand, body),
             .field_update => |operation| validValue(operation.operand, body) and validValue(operation.value, body),
             .mut_parameter_write => |operation| validValue(operation.value, body) and

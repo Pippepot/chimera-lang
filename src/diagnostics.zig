@@ -470,6 +470,22 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
             try writeType(types, writer, details.type_id);
             if (details.is_movable) try writer.writeAll("; use `^` to transfer ownership");
         },
+        .ref_requires_automatic_drop => |type_id| {
+            try writer.writeAll("Ref requires an automatically droppable element type; found ");
+            try writeType(types, writer, type_id);
+        },
+        .ref_requires_struct_initializer => |type_id| {
+            try writer.writeAll("in-place Ref construction requires a direct struct initializer for ");
+            try writeType(types, writer, type_id);
+        },
+        .ref_field_requires_direct_move => |type_id| {
+            try writer.writeAll("in-place Ref initialization requires a directly movable field; found ");
+            try writeType(types, writer, type_id);
+        },
+        .ref_extraction_requires_direct_move => |type_id| {
+            try writer.writeAll("cannot extract a non-directly-movable value from Ref; found ");
+            try writeType(types, writer, type_id);
+        },
         .value_requires_explicit_drop => |type_id| {
             try writeType(types, writer, type_id);
             try writer.writeAll(" must be transferred with `^` or passed to a `deinit` parameter before this scope ends");

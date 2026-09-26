@@ -187,6 +187,20 @@ fn renderInstruction(
             }
             try writer.writeAll(")\n");
         },
+        .ref_init => |operation| {
+            try writer.print("    %{d} = ref_init %{d} ", .{ result, @intFromEnum(operation.allocation) });
+            try renderType(operation.type_id, writer);
+            try writer.writeByte('(');
+            for (ssa.struct_field_values[operation.fields.start..operation.fields.end], 0..) |field, index| {
+                if (index != 0) try writer.writeAll(", ");
+                try writer.print("{d} = %{d}", .{ field.field_index, @intFromEnum(field.value) });
+            }
+            try writer.writeAll(")\n");
+        },
+        .ref_value_for_drop => |operation| try writer.print("    %{d} = ref_value_for_drop %{d}\n", .{
+            result,
+            @intFromEnum(operation.owner),
+        }),
         .field_access => |operation| try writer.print("    %{d} = field_access %{d}, {d}\n", .{
             result,
             @intFromEnum(operation.operand),

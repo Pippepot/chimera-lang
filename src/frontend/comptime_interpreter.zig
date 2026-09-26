@@ -98,6 +98,7 @@ pub fn execute(
                     .returned => |value| slots[destination] = value,
                     else => |result| return atSpan(result, instructionSpan(body, instruction_index)),
                 },
+                .ref_init, .ref_value_for_drop => return .unavailable,
                 .field_access => |operation| switch (try accessField(slots[@intFromEnum(operation.operand)].runtime, operation, executor)) {
                     .returned => |value| slots[destination] = value,
                     else => |result| return atSpan(result, instructionSpan(body, instruction_index)),

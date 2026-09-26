@@ -755,6 +755,8 @@ pub const TypeLayout = struct {
     byte_alignment: u32,
 };
 
+pub const ArgumentPassing = enum { direct, indirect };
+
 pub const AllocationLayout = struct {
     byte_size: u64,
     byte_alignment: u32,
@@ -1034,6 +1036,18 @@ pub const StructOperation = struct {
     type_id: TypeId,
 };
 
+pub const RefInitOperation = struct {
+    allocation: FunctionValueId,
+    fields: FunctionValueRange,
+    type_id: TypeId,
+    ref_type: TypeId,
+};
+
+pub const RefValueForDrop = struct {
+    owner: FunctionValueId,
+    type_id: TypeId,
+};
+
 pub const FieldAccessOperation = struct {
     operand: FunctionValueId,
     field_index: u32,
@@ -1073,6 +1087,8 @@ pub const FunctionInstruction = union(enum) {
     variant_extract: VariantOperation,
     callable_coerce: VariantOperation,
     struct_init: StructOperation,
+    ref_init: RefInitOperation,
+    ref_value_for_drop: RefValueForDrop,
     field_access: FieldAccessOperation,
     field_update: FieldUpdateOperation,
     mut_parameter_write: MutParameterWrite,
@@ -1096,6 +1112,8 @@ pub const FunctionInstruction = union(enum) {
             .function_ref => |reference| reference.type_id,
             .variant_coerce, .variant_extract, .callable_coerce => |operation| operation.target_type,
             .struct_init => |operation| operation.type_id,
+            .ref_init => |operation| operation.ref_type,
+            .ref_value_for_drop => |operation| operation.type_id,
             .field_access => |operation| operation.field_type,
             .field_update => |operation| operation.type_id,
             .mut_parameter_write => .unit,
@@ -1394,6 +1412,10 @@ pub const Diagnostic = struct {
         transferred_value_not_restored_before_loop_backedge,
         type_not_movable: TypeId,
         type_not_copyable: TypeNotCopyable,
+        ref_requires_automatic_drop: TypeId,
+        ref_requires_struct_initializer: TypeId,
+        ref_field_requires_direct_move: TypeId,
+        ref_extraction_requires_direct_move: TypeId,
         value_requires_explicit_drop: TypeId,
         expression_not_supported,
         struct_initializer_not_struct: TypeId,

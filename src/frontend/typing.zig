@@ -31,7 +31,7 @@ pub fn emitSemanticIssue(ctx: anytype, file_id: structures.FileId, issue: semant
 
 pub fn resolveAndTypeBody(
     ctx: anytype,
-    item_id: structures.ItemId,
+    instance: structures.InstanceId,
     file_id: structures.FileId,
     parameters: []const structures.CallableParameter,
     return_type: structures.TypeId,
@@ -43,7 +43,7 @@ pub fn resolveAndTypeBody(
     var builder: BodyBuilder(@TypeOf(ctx), @TypeOf(type_interner)) = .{
         .ctx = ctx,
         .type_interner = type_interner,
-        .item_id = item_id,
+        .instance = instance,
         .file_id = file_id,
         .unresolved = unresolved,
         .return_type = return_type,
@@ -162,7 +162,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
 
         ctx: Context,
         type_interner: TypeInterner,
-        item_id: structures.ItemId,
+        instance: structures.InstanceId,
         file_id: structures.FileId,
         unresolved: semantic.UnresolvedBody,
         return_type: structures.TypeId,
@@ -177,6 +177,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         local_can_deinit: []bool = &.{},
         local_mut_parameter: []?u32 = &.{},
         local_availability: []Availability = &.{},
+        active_drop_hook_root: bool = false,
         states: std.ArrayList(State) = .empty,
         block_argument_types: std.ArrayList(structures.TypeId) = .empty,
         block_argument_generations: std.ArrayList(?GenerationId) = .empty,
@@ -224,8 +225,10 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             var parameter_local: usize = 0;
             for (parameters, 0..) |parameter, index| {
                 var entry_value: Value = .{ .id = @enumFromInt(index), .type_id = parameter.type_id };
+                const drop_hook_self = index == 0 and parameter.mode == .deinit and try self.isActiveDropHook(parameter.type_id);
+                if (drop_hook_self) self.active_drop_hook_root = true;
                 if (parameter.mode == .@"var" or parameter.mode == .deinit) {
-                    entry_value.owned_generation = try self.allocateGeneration(parameter.type_id, self.unresolved.parameter_spans[index], parameter.mode == .deinit);
+                    if (!drop_hook_self) entry_value.owned_generation = try self.allocateGeneration(parameter.type_id, self.unresolved.parameter_spans[index], parameter.mode == .deinit);
                 }
                 switch (parameter.mode) {
                     .imm => self.values[index] = .{
@@ -260,6 +263,12 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 } });
             }
             try self.appendBoundary(parameter_boundary);
+        }
+
+        fn isActiveDropHook(self: *Self, type_id: structures.TypeId) !bool {
+            const definition = (try self.type_interner.structDefinition(type_id)) orelse return false;
+            const hook = definition.ownership.drop orelse return false;
+            return hook.hook != null and std.meta.eql(hook.hook.?, self.instance);
         }
 
         fn deinit(self: *Self) void {
@@ -787,7 +796,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 .move => definition.ownership.move.?.hook.?,
                 .drop => definition.ownership.drop.?.hook.?,
             };
-            if (hook.item == self.item_id) return source;
+            if (operation != .drop and std.meta.eql(hook, self.instance)) return source;
             const argument_start: u32 = @intCast(self.call_arguments.items.len);
             try self.call_arguments.append(self.ctx.allocator(), .{ .value = source.id });
             return self.appendInstruction(.{ .call = .{
@@ -1045,30 +1054,36 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             return if (@intFromEnum(left_id) >= @intFromEnum(right_id)) left_id else right_id;
         }
 
+        const PreparedStructInit = struct {
+            type_id: structures.TypeId,
+            fields: structures.FunctionValueRange,
+            values: []Value,
+        };
+        const StructTypeResult = union(enum) { diverged: Value, type_id: structures.TypeId };
+        const StructInitResult = union(enum) { diverged: Value, prepared: PreparedStructInit };
+
         fn structInit(self: *Self, expression: Expression) !Value {
+            const result = try self.prepareStructInit(expression, false);
+            const prepared = switch (result) {
+                .diverged => |diverged| return diverged,
+                .prepared => |prepared_init| prepared_init,
+            };
+            defer self.ctx.allocator().free(prepared.values);
+            for (prepared.values) |field_value| try self.recordConsume(field_value);
+            const constructed = try self.appendInstruction(.{ .struct_init = .{
+                .fields = prepared.fields,
+                .type_id = prepared.type_id,
+            } });
+            return self.defineOwnedValue(constructed, expression.span, false);
+        }
+
+        fn prepareStructInit(self: *Self, expression: Expression, directly_movable_fields: bool) !StructInitResult {
             const initializer = expression.operation.struct_init;
             const source_fields = self.unresolved.struct_field_values[initializer.fields.start..initializer.fields.end];
-            const type_id = switch (initializer.target) {
-                .concrete => |concrete| concrete,
-                .inferred => |factory| inferred: {
-                    var field_types: std.ArrayList(structures.TypeId) = .empty;
-                    defer field_types.deinit(self.ctx.allocator());
-                    for (source_fields) |source_field| {
-                        const expected = try self.type_interner.independentStructFieldType(factory, source_field.name);
-                        const operand = try self.valueWithType(source_field.value.value, expected);
-                        if (operand.type_id == .never) return operand;
-                        try field_types.append(self.ctx.allocator(), operand.type_id);
-                    }
-                    const result = try self.type_interner.inferStructArguments(factory, source_fields, field_types.items);
-                    const arguments = switch (result) {
-                        .arguments => |arguments| arguments,
-                        .missing => return self.reject(initializer.type_span, .static_argument_cannot_be_inferred),
-                        .conflict => return self.reject(initializer.type_span, .static_argument_inference_conflict),
-                    };
-                    defer self.ctx.allocator().free(arguments);
-                    const specialized = try self.type_interner.specializeFunction(factory, arguments);
-                    break :inferred try self.type_interner.specializedStructType(specialized);
-                },
+            const type_result = try self.structInitType(initializer);
+            const type_id = switch (type_result) {
+                .diverged => |diverged| return .{ .diverged = diverged },
+                .type_id => |resolved| resolved,
             };
             const definition = (try self.type_interner.structDefinition(type_id)) orelse
                 return self.reject(initializer.type_span, .{ .struct_initializer_not_struct = type_id });
@@ -1089,7 +1104,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 seen[field.index] = true;
 
                 const operand = try self.valueWithType(source_field.value.value, field.type_id);
-                if (operand.type_id == .never) return operand;
+                if (operand.type_id == .never) return .{ .diverged = operand };
                 var use = try self.coerceValue(operand.id, operand.type_id, field.type_id) orelse
                     return self.reject(source_field.value.span, .{ .struct_initializer_field_type_mismatch = self.typeMismatch(field.type_id, operand.type_id) });
                 const owned = try self.ownValue(operand, source_field.value.span);
@@ -1098,6 +1113,12 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     try self.coerceOwnedRepresentation(owned, use, source_field.value.span)
                 else
                     owned;
+                if (directly_movable_fields) {
+                    const capabilities = (try self.type_interner.ownershipCapabilities(field_value.type_id)) orelse return error.Unavailable;
+                    if (capabilities.move == .none) return self.reject(source_field.value.span, .{ .type_not_movable = field_value.type_id });
+                    if (capabilities.move == .custom or capabilities.needs_custom_move)
+                        return self.reject(source_field.value.span, .{ .ref_field_requires_direct_move = field_value.type_id });
+                }
                 try field_values.append(self.ctx.allocator(), field_value);
                 try fields.append(self.ctx.allocator(), .{
                     .field_index = field.index,
@@ -1108,14 +1129,39 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 .type_id = type_id,
                 .field_index = @intCast(field_index),
             } });
-            for (field_values.items) |field_value| try self.recordConsume(field_value);
             const start: u32 = @intCast(self.struct_field_values.items.len);
             try self.struct_field_values.appendSlice(self.ctx.allocator(), fields.items);
-            const result = try self.appendInstruction(.{ .struct_init = .{
-                .fields = .{ .start = start, .end = @intCast(self.struct_field_values.items.len) },
+            return .{ .prepared = .{
                 .type_id = type_id,
-            } });
-            return self.defineOwnedValue(result, expression.span, false);
+                .fields = .{ .start = start, .end = @intCast(self.struct_field_values.items.len) },
+                .values = try field_values.toOwnedSlice(self.ctx.allocator()),
+            } };
+        }
+
+        fn structInitType(self: *Self, initializer: @FieldType(Expression.Operation, "struct_init")) !StructTypeResult {
+            return switch (initializer.target) {
+                .concrete => |concrete| .{ .type_id = concrete },
+                .inferred => |factory| inferred: {
+                    const fields = self.unresolved.struct_field_values[initializer.fields.start..initializer.fields.end];
+                    var field_types: std.ArrayList(structures.TypeId) = .empty;
+                    defer field_types.deinit(self.ctx.allocator());
+                    for (fields) |field| {
+                        const expected = try self.type_interner.independentStructFieldType(factory, field.name);
+                        const operand = try self.valueWithType(field.value.value, expected);
+                        if (operand.type_id == .never) break :inferred .{ .diverged = operand };
+                        try field_types.append(self.ctx.allocator(), operand.type_id);
+                    }
+                    const result = try self.type_interner.inferStructArguments(factory, fields, field_types.items);
+                    const arguments = switch (result) {
+                        .arguments => |arguments| arguments,
+                        .missing => return self.reject(initializer.type_span, .static_argument_cannot_be_inferred),
+                        .conflict => return self.reject(initializer.type_span, .static_argument_inference_conflict),
+                    };
+                    defer self.ctx.allocator().free(arguments);
+                    const specialized = try self.type_interner.specializeFunction(factory, arguments);
+                    break :inferred .{ .type_id = try self.type_interner.specializedStructType(specialized) };
+                },
+            };
         }
 
         fn fieldAccess(self: *Self, expression: Expression) !Value {
@@ -1778,12 +1824,16 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             };
             const previous_root = self.local_values[local_index].?;
             const rebuilt = try self.updateFields(previous_root, fields.items, result);
-            const updated = if (assignment_value.operation == .replace and fields.items.len == 0)
+            var updated = if (assignment_value.operation == .replace and fields.items.len == 0)
                 withoutOwnershipSource(rebuilt)
             else blk: {
                 if (assignment_value.operation == .replace) try self.recordConsume(result);
                 break :blk try self.updateOwnedValue(previous_root, rebuilt);
             };
+            if (self.active_drop_hook_root and local_index == 0 and fields.items.len == 0 and assignment_value.operation == .replace) {
+                try self.recordConsume(updated);
+                updated.owned_generation = null;
+            }
             if (updated.owned_generation) |generation| {
                 if (self.local_can_deinit[local_index]) self.generations.items[@intFromEnum(generation)].can_deinit = true;
             }
@@ -1836,6 +1886,12 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 operation: CallOperation,
                 is_fallible: bool,
                 mut_arguments: structures.FunctionValueRange,
+            },
+            in_place_ref: struct {
+                allocation: structures.InstanceId,
+                allocation_type: structures.TypeId,
+                ref_type: structures.TypeId,
+                prepared: PreparedStructInit,
             },
         };
 
@@ -1919,6 +1975,26 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     raw_arguments = argument_storage.items;
                 },
             }
+            if (target == .inferred and raw_arguments.len == 1 and try self.type_interner.isStdRefNew(target.inferred.item)) {
+                const index = @intFromEnum(raw_arguments[0].value);
+                if (index >= self.unresolved.parameter_count) {
+                    const expression = self.unresolved.expressions[index - self.unresolved.parameter_count];
+                    if (expression.operation == .struct_init) {
+                        const type_result = try self.structInitType(expression.operation.struct_init);
+                        const element_type = switch (type_result) {
+                            .diverged => |diverged| return .{ .diverged = diverged },
+                            .type_id => |resolved| resolved,
+                        };
+                        const capabilities = (try self.type_interner.ownershipCapabilities(element_type)) orelse return error.Unavailable;
+                        if (capabilities.move == .none or capabilities.move == .custom or capabilities.needs_custom_move) {
+                            const argument = try self.type_interner.internCompileTimeValue(.{ .type = element_type });
+                            const specialized = try self.type_interner.specializeFunction(target.inferred, &.{argument});
+                            target = .{ .direct = specialized };
+                            signature = try self.type_interner.functionSignature(specialized) orelse return error.Unavailable;
+                        }
+                    }
+                }
+            }
             var inferred_call = false;
             const PreparedArgument = struct { operand: Value, owned: ?Value };
             var prepared_arguments: std.ArrayList(PreparedArgument) = .empty;
@@ -1965,6 +2041,57 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 .found = @intCast(raw_arguments.len),
             } });
             if (signature.return_type == .type and !self.allow_type_values) return self.reject(span, .type_value_used_as_runtime_value);
+            if (target == .direct and signature.parameters.len == 1 and
+                signature.parameters[0].mode == .deinit and try self.type_interner.isStdRefValue(target.direct.item) and
+                (try self.type_interner.refTypeElement(signature.parameters[0].type_id)) == signature.return_type)
+            {
+                const element_type = signature.return_type;
+                const capabilities = (try self.type_interner.ownershipCapabilities(element_type)) orelse return error.Unavailable;
+                if (capabilities.move == .none or capabilities.move == .custom or capabilities.needs_custom_move)
+                    return self.reject(raw_arguments[0].span, .{ .ref_extraction_requires_direct_move = element_type });
+            }
+            if (target == .direct and signature.is_fallible and signature.parameters.len == 1 and
+                try self.type_interner.isStdRefNew(target.direct.item))
+            {
+                const element_type = signature.parameters[0].type_id;
+                if (signature.parameters[0].mode == .@"var" and
+                    (try self.type_interner.refTypeElement(signature.return_type)) == element_type)
+                {
+                    const capabilities = (try self.type_interner.ownershipCapabilities(element_type)) orelse return error.Unavailable;
+                    if (capabilities.requires_explicit_drop)
+                        return self.reject(raw_arguments[0].span, .{ .ref_requires_automatic_drop = element_type });
+                    if (capabilities.move == .none or capabilities.move == .custom or capabilities.needs_custom_move) {
+                        const raw = raw_arguments[0];
+                        const index = @intFromEnum(raw.value);
+                        if (index >= self.unresolved.parameter_count) {
+                            const expression = self.unresolved.expressions[index - self.unresolved.parameter_count];
+                            if (expression.operation == .struct_init) {
+                                const prepared_result = try self.prepareStructInit(expression, true);
+                                const prepared = switch (prepared_result) {
+                                    .diverged => |diverged| return .{ .diverged = diverged },
+                                    .prepared => |prepared_init| prepared_init,
+                                };
+                                errdefer self.ctx.allocator().free(prepared.values);
+                                if (prepared.type_id != element_type) return self.reject(raw.span, .{
+                                    .call_argument_type_mismatch = self.typeMismatch(element_type, prepared.type_id),
+                                });
+                                const allocation = (try self.type_interner.refAllocation(element_type)) orelse return error.Unavailable;
+                                return .{ .in_place_ref = .{
+                                    .allocation = allocation.instance,
+                                    .allocation_type = allocation.type_id,
+                                    .ref_type = signature.return_type,
+                                    .prepared = prepared,
+                                } };
+                            }
+                        }
+                        const operand = try self.valueWithType(raw.value, element_type);
+                        if (operand.type_id == .never) return .{ .diverged = operand };
+                        if (try self.coerceValue(operand.id, operand.type_id, element_type) == null)
+                            return self.reject(raw.span, .{ .call_argument_type_mismatch = self.typeMismatch(element_type, operand.type_id) });
+                        return self.reject(raw.span, .{ .ref_requires_struct_initializer = element_type });
+                    }
+                }
+            }
             var place_fields: std.ArrayList(PlaceField) = .empty;
             defer place_fields.deinit(self.ctx.allocator());
             var argument_places: std.ArrayList(?ArgumentPlace) = .empty;
@@ -2086,7 +2213,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 for (method_arguments) |argument| arguments.appendAssumeCapacity(argument.value);
                 return null;
             }
-            const instance = (try self.type_interner.structNamespaceMember(receiver.type_id, member.name)) orelse
+            const instance = (try self.type_interner.structNamespaceMember(receiver.type_id, member.name, call.span)) orelse
                 return self.reject(call.span, .unknown_namespace_member);
             try arguments.append(self.ctx.allocator(), member.receiver);
             const shape = (try self.type_interner.functionShape(instance.item)) orelse {
@@ -2141,6 +2268,20 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             const resolved = try self.resolveCall(call, span);
             return switch (resolved) {
                 .diverged => |value_to_return| value_to_return,
+                .in_place_ref => |construction| blk: {
+                    defer self.ctx.allocator().free(construction.prepared.values);
+                    if (!self.is_fallible) return self.reject(span, .fallible_expression_outside_fallible_function);
+                    const flow = try self.lowerInPlaceRef(construction, span);
+                    try self.enterFlowExit(flow.failure.?);
+                    try self.finishFunctionExit(span, .return_failure);
+                    try self.enterFlowExit(flow.success.?);
+                    const success_block = self.blocks.items[@intFromEnum(flow.success.?.block)];
+                    break :blk .{
+                        .id = @enumFromInt(success_block.argument_start),
+                        .type_id = construction.ref_type,
+                        .owned_generation = self.block_argument_generations.items[success_block.argument_start],
+                    };
+                },
                 .callable => |callable| if (callable.is_fallible) blk: {
                     if (!self.is_fallible) return self.reject(span, .fallible_expression_outside_fallible_function);
                     var flow = try self.lowerFallibleCall(callable.operation, span);
@@ -2157,7 +2298,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     if (value_to_return.type_id == .never) self.terminate(.diverge);
                     break :blk value_to_return;
                 } else blk: {
-                    var value_to_return = try self.appendCall(callable.operation);
+                    var value_to_return = try self.appendCall(callable.operation, span);
                     if (value_to_return.type_id == .never) {
                         try self.moveCurrentBoundaryEffectsToTerminator();
                         self.terminate(.diverge);
@@ -2168,6 +2309,47 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     break :blk value_to_return;
                 },
             };
+        }
+
+        fn lowerInPlaceRef(self: *Self, construction: @FieldType(ResolvedCall, "in_place_ref"), span: structures.SourceSpan) !ConditionFlow {
+            const count = try self.appendInstruction(.{ .const_int = 1 });
+            const argument_start: u32 = @intCast(self.call_arguments.items.len);
+            try self.call_arguments.append(self.ctx.allocator(), .{ .value = count.id });
+            const allocate: CallOperation = .{ .direct = .{
+                .target = construction.allocation.item,
+                .specialization = construction.allocation.specialization,
+                .arguments = .{ .start = argument_start, .end = argument_start + 1 },
+                .return_type = construction.allocation_type,
+            } };
+            var flow = try self.lowerFallibleCall(allocate, span);
+            try self.enterFlowExit(flow.success.?);
+            const allocation_block = self.blocks.items[@intFromEnum(flow.success.?.block)];
+            std.debug.assert(allocation_block.argument_end == allocation_block.argument_start + 1);
+            const allocation_value: Value = .{
+                .id = @enumFromInt(allocation_block.argument_start),
+                .type_id = construction.allocation_type,
+                .owned_generation = self.block_argument_generations.items[allocation_block.argument_start],
+            };
+            const parent_boundary = self.current_boundary;
+            const boundary = try self.newBoundary(span);
+            self.current_boundary = boundary;
+            defer self.current_boundary = parent_boundary;
+            for (construction.prepared.values) |field_value| try self.recordConsume(field_value);
+            try self.recordConsume(allocation_value);
+            const initialized = try self.appendInstruction(.{ .ref_init = .{
+                .allocation = allocation_value.id,
+                .fields = construction.prepared.fields,
+                .type_id = construction.prepared.type_id,
+                .ref_type = construction.ref_type,
+            } });
+            const owner = try self.defineOwnedValue(initialized, span, false);
+            try self.appendBoundary(boundary);
+            const result_start: u32 = @intCast(self.block_argument_types.items.len);
+            _ = try self.appendBlockArgument(owner.type_id, owner.owned_generation);
+            const result_block = try self.newBlock(result_start, result_start + 1);
+            self.terminate(.{ .branch = try self.valuesBranch(result_block, &.{owner}) });
+            flow.success = .{ .block = result_block, .state = try self.captureState() };
+            return flow;
         }
 
         fn finishCallExits(
@@ -2214,7 +2396,20 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             flow_exit.binding = null;
         }
 
-        fn appendCall(self: *Self, call: CallOperation) !Value {
+        fn appendCall(self: *Self, call: CallOperation, span: structures.SourceSpan) !Value {
+            if (call == .direct and try self.type_interner.isStdRefDestroy(call.direct.target)) {
+                const direct = call.direct;
+                std.debug.assert(direct.arguments.end == direct.arguments.start + 1);
+                const owner = self.call_arguments.items[direct.arguments.start].value;
+                const signature = (try self.type_interner.functionSignature(direct.instance())) orelse unreachable;
+                const element_type = (try self.type_interner.refTypeElement(signature.parameters[0].type_id)) orelse unreachable;
+                const value_to_drop = try self.appendInstruction(.{ .ref_value_for_drop = .{
+                    .owner = owner,
+                    .type_id = element_type,
+                } });
+                try self.dropValue(value_to_drop, false, span);
+                return self.appendInstruction(.const_unit);
+            }
             return switch (call) {
                 .direct => |direct| self.appendInstruction(.{ .call = direct }),
                 .indirect => |indirect| self.appendInstruction(.{ .indirect_call = indirect }),
@@ -2328,6 +2523,12 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             const resolved = try self.resolveCall(call, call.span);
             return switch (resolved) {
                 .diverged => |value_to_return| .{ .success = null, .failure = null, .diverged = value_to_return },
+                .in_place_ref => |construction| blk: {
+                    defer self.ctx.allocator().free(construction.prepared.values);
+                    var flow = try self.lowerInPlaceRef(construction, call.span);
+                    if (binding) |success_binding| flow.success.?.binding = .{ .call = success_binding };
+                    break :blk flow;
+                },
                 .callable => |callable| if (callable.is_fallible) blk: {
                     var flow = try self.lowerFallibleCall(callable.operation, call.span);
                     try self.finishCallExits(&flow, callable, call.span);
@@ -3493,6 +3694,8 @@ fn normalizeValueUses(value_uses: []structures.FunctionValueUse, instruction_val
 fn normalizeInstructions(instructions: []structures.FunctionInstruction, instruction_values: []const structures.FunctionValueId) void {
     for (instructions) |*instruction| switch (instruction.*) {
         .const_int, .const_byte, .const_bool, .const_type, .const_unit, .const_none, .function_ref, .struct_init, .call_mut_argument => {},
+        .ref_init => |*operation| operation.allocation = normalizeValue(operation.allocation, instruction_values),
+        .ref_value_for_drop => |*operation| operation.owner = normalizeValue(operation.owner, instruction_values),
         .variant_coerce, .variant_extract, .callable_coerce => |*operation| operation.operand = normalizeValue(operation.operand, instruction_values),
         .field_access => |*operation| operation.operand = normalizeValue(operation.operand, instruction_values),
         .field_update => |*operation| {
@@ -3636,7 +3839,7 @@ fn testInitMaterializerBuilder(context: *TestMaterializerContext) TestMaterializ
     return .{
         .ctx = context,
         .type_interner = .{},
-        .item_id = @enumFromInt(0),
+        .instance = .{ .item = @enumFromInt(0) },
         .file_id = 1,
         .unresolved = .{
             .parameter_count = 0,

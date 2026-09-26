@@ -24,12 +24,19 @@ The implemented host subset uses `std.memory.allocate(T, count)` and explicit
 `deallocate(T, allocation^)` with `Allocation(T)`. The `unsafe_initialize` and
 `unsafe_take` element transfers require caller-proven bounds and initialization
 state, and currently support only types with compiler-supported direct moves.
-`make_ref(T, value)` and consuming `value(T, owner^)` use those transfers to
+`Ref(T).new(value)` and consuming `value(T, owner^)` use those transfers to
 own one initialized value. The constructor requires an automatically droppable,
-directly movable `T`; zero-sized allocations currently fail. `Ref(T)` has no
-safe borrowed access, explicit duplication, or in-place immovable construction
-yet. `Borrow(T)`, provider selection, device locations, and address spaces
-remain design contracts, not implemented public APIs.
+directly movable `T` for transfer from a completed value. `Ref.new(value)`
+infers `T` from the argument. `Ref(T).new(T{...})`
+also initializes an immovable or custom-move struct directly in final storage
+when its fields are directly movable; the fields are cleaned up if construction
+fails. For these types, `Ref` destroys its element at the allocated address,
+including custom hooks and zero-sized elements, before releasing the allocation.
+Zero-byte host allocations succeed for nonnegative counts with a distinct,
+stable address per allocation. `Ref(T)` has no safe borrowed access, explicit
+duplication, or recursive in-place construction yet. `Borrow(T)`, provider
+selection, device locations, and address spaces remain design contracts, not
+implemented public APIs.
 
 Keep these dimensions independent:
 
@@ -66,8 +73,10 @@ preferable to assuming every host type is device-compatible.
 `AllocationLayout` is a clearer prospective name than `Layout`: it distinguishes
 byte size and alignment from a future tensor or collection layout describing
 shape, strides, or element order. Count may be retained alongside the resolved
-byte layout by a typed allocation handle. Zero-sized allocation behavior remains
-open.
+byte layout by a typed allocation handle. For a zero-byte host layout, the
+current provider reserves one byte to retain a distinct, stable address and
+records that reservation for deallocation; the logical element count and layout
+remain unchanged. Other locations need their own zero-size policy.
 
 ### Allocation provider and location
 
@@ -146,9 +155,10 @@ storage. It does not copy implicitly. Construction combines allocation and
 initialization and is therefore fallible; destruction destroys `T` and
 deallocates the storage. Moving the owner preserves the allocation and its
 location. Explicit duplication, when `T` supports copy, creates a distinct allocation.
-For an immovable `T`, a separate construction-in-final-storage operation must
-initialize directly in the allocation instead of first producing a temporary;
-its surface syntax depends on the language's later in-place construction design.
+The current host API initializes an immovable or custom-move struct in final
+storage with `Ref(T).new(T{...})` or `Ref.new(T{...})` when its fields are directly movable. It
+cannot accept an existing immovable value or recursively construct immovable fields. Other
+in-place construction forms need a later design.
 
 `SharedRef(T)` shares ownership of one initialized `T` and its control block.
 Copying it increments a synchronized reference count; ending an owner decrements
@@ -279,7 +289,7 @@ allocation.unsafe_destroy(index)
 allocation.unsafe_borrow_initialized(index)  # caller guarantees a live T
 ```
 
-The exact generic and method syntax remains open. For an immovable `T`, an
+The provider and location API remains open. For an immovable `T`, an
 in-place initialization operation constructs directly in the element slot.
 These operations do not transfer storage ownership; initialized state and
 bounds are the caller's obligation at this low level.
@@ -287,16 +297,15 @@ bounds are the caller's obligation at this low level.
 Build the first safe owner directly on that core:
 
 ```text
-fallible make_ref(
-    static T: type,
-    var value: T,
-    mut provider,
-    location,
-) Ref(T)
+struct Ref(T: type)
+  fallible new(var value: T) Ref(T)
+    ...
 
 func borrow(static T: type, owner: Ref(T)) Borrow(T)
 func value(static T: type, deinit owner: Ref(T)) T
 
+const constructed = Ref.new(value)
+const explicit = Ref(T).new(value)
 const borrowed = borrow(T, owner)
 const extracted = value(T, owner^)
 ```
@@ -306,17 +315,17 @@ const extracted = value(T, owner^)
 `get_value` would not distinguish borrowing, copying, and transfer.
 
 `Ref(T)` uses a one-element target-aware layout, initializes exactly once,
-and makes destruction plus deallocation automatic. A host convenience
-constructor may default the provider and location, but the low-level API should
-not. An additional in-place form is required for immovable `T`; do not force it
-through this value-taking convenience.
+and makes destruction plus deallocation automatic. The current `Ref.new`
+allocates on the host; provider and location selection remain future work.
+For immovable `T`, a struct initializer constructs directly in that allocation
+instead of transferring a completed value.
 
 For collections, keep `Allocation(T)` plus an initialized count and capacity in
 the collection. Do not add a thin allocation handle until retaining layout and
 location is shown to be a material cost.
 
-Place public declarations under `std.memory`. Re-export `Ref`, `make_ref`, and `Borrow`
-through `std.prelude`; require an explicit `std.memory` import for low-level
+Place public declarations under `std.memory`. Re-export `Ref` through
+`std.prelude`; require an explicit `std.memory` import for low-level
 allocation and layout APIs. Compiler support for storage and lifetime checks
 need not be expressible as ordinary library code.
 

@@ -2868,6 +2868,48 @@ test "ownership capabilities compose across callable variant and struct types" {
     try testing.expectEqual(default_struct, (try db.get(queries.OwnershipCapabilities, maybe_pair_type)).*.?);
 }
 
+test "argument passing follows ownership and invalidates with type edits" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+
+    try addSource(db, 1,
+        \\static Direct = struct
+        \\  value: int
+        \\static Immovable = struct
+        \\  move = none
+        \\static Custom = struct
+        \\  value: int
+        \\  move = func(var self: Custom) Custom -> Custom{value = self.value}
+        \\static Nested = struct
+        \\  value: Custom
+        \\static Invalid = struct
+        \\  move = fieldwise
+        \\  value: Immovable
+    );
+    const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
+    const direct = try resolvedStaticType(db, scope.resolveStatic("Direct").?);
+    const immovable = try resolvedStaticType(db, scope.resolveStatic("Immovable").?);
+    const custom = try resolvedStaticType(db, scope.resolveStatic("Custom").?);
+    const nested = try resolvedStaticType(db, scope.resolveStatic("Nested").?);
+    const invalid = try resolvedStaticType(db, scope.resolveStatic("Invalid").?);
+
+    const types: queries.TypeInterner(*Database) = .{ .ctx = db };
+
+    try testing.expectEqual(structures.ArgumentPassing.direct, try types.argumentPassing(.int));
+    try testing.expectEqual(structures.ArgumentPassing.direct, try types.argumentPassing(direct));
+    try testing.expectEqual(structures.ArgumentPassing.indirect, try types.argumentPassing(immovable));
+    try testing.expectEqual(structures.ArgumentPassing.indirect, try types.argumentPassing(custom));
+    try testing.expectEqual(structures.ArgumentPassing.indirect, try types.argumentPassing(nested));
+    try testing.expectError(error.Unavailable, types.argumentPassing(invalid));
+
+    try setSource(db, 1,
+        \\static Direct = struct
+        \\  move = none
+        \\  value: int
+    );
+    try testing.expectEqual(structures.ArgumentPassing.indirect, try types.argumentPassing(direct));
+}
+
 test "struct ownership properties override defaults and validate fields" {
     const db = try testDatabase(1);
     defer db.deinit();

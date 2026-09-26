@@ -749,6 +749,7 @@ fn parseStructValue(parser: *ParserState, token_index: u32) ParseError!Node.Inde
 
 fn parseStructItem(parser: *ParserState) ParseError!Node.Index {
     if ((try parseBinding(parser)).unwrap()) |binding| return binding;
+    if (parser.tokens[parser.index].tag == .keyword_pub) return parsePublic(parser);
     if (parser.tokens[parser.index].tag == .keyword_func or parser.tokens[parser.index].tag == .keyword_fallible or parser.tokens[parser.index].tag == .keyword_struct) {
         return parseExpression(parser);
     }
@@ -1349,6 +1350,21 @@ test "parse function defined inside struct" {
         \\  └─struct_field : y
         \\    └─type : int
     );
+}
+
+test "parse public function inside struct" {
+    const source =
+        \\pub struct S
+        \\  pub fallible new() S -> return S{}
+    ;
+    var report = try parseReport(std.testing.allocator, 0, source);
+    defer report.deinit(std.testing.allocator);
+    const ast = report.ast orelse return error.TestUnexpectedResult;
+    var public_count: usize = 0;
+    for (ast.nodes) |node| if (node.tag == .@"pub") {
+        public_count += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 2), public_count);
 }
 
 test "parse qualified namespace declaration" {
@@ -2135,7 +2151,7 @@ test "diagnostic tag for malformed struct item" {
     try testExpectDiagnosticTag(
         \\static S = struct
         \\  pub x: int
-    , .{ .expected_token = .{ .expected = .identifier, .found = .keyword_pub } });
+    , .{ .invalid_expression = .identifier });
 }
 
 test "diagnostic tag for dotted selective imports" {

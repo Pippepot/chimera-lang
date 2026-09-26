@@ -1,6 +1,6 @@
 struct Foo(T: type)
   r: Ref(T)
 
-const f = Foo{r = if const owner = make_ref(1) -> owner^ else exit(1)}
+const f = Foo{r = if const owner = Ref.new(1) -> owner^ else exit(1)}
 _ = f
 exit(0)

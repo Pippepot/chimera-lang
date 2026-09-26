@@ -424,16 +424,43 @@ pub fn TypeInterner(comptime Context: type) type {
             };
         }
 
-        pub fn structNamespaceMember(self: @This(), type_id: structures.TypeId, name: []const u8) !?structures.InstanceId {
+        pub fn structNamespaceMember(self: @This(), type_id: structures.TypeId, name: []const u8, span: structures.SourceSpan) !?structures.InstanceId {
             const identity = (try self.structIdentity(type_id)) orelse return null;
             const namespace = (try self.ctx.get(StructNamespace, identity)).* orelse return error.Unavailable;
             return .{
-                .item = namespace.resolve(name) orelse return null,
+                .item = (try self.visibleStructMember(namespace, name, span)) orelse return null,
                 .specialization = switch (identity) {
                     .declared => null,
                     .generated => |generated| generated.owner.specialization,
                 },
             };
+        }
+
+        fn genericStructNamespaceMember(self: @This(), factory: structures.InstanceId, name: []const u8, span: ?structures.SourceSpan) !?structures.InstanceId {
+            const resolved = (try self.ctx.get(ResolveItem, factory.item)).* orelse return null;
+            const parsed = (try self.ctx.get(ParseFile, resolved.file_id)).* orelse return null;
+            const site = semantic.parameterizedStructSite(&parsed, resolved.declaration) orelse return null;
+            const namespace = (try self.ctx.get(StructNamespace, .{ .generated = .{
+                .owner = factory,
+                .node_offset = site,
+            } })).* orelse return error.Unavailable;
+            return .{ .item = (try self.visibleStructMember(namespace, name, span)) orelse return null, .specialization = factory.specialization };
+        }
+
+        fn visibleStructMember(self: @This(), namespace: structures.ModuleScope, name: []const u8, span: ?structures.SourceSpan) !?structures.ItemId {
+            const entry = namespace.resolveEntry(name) orelse return null;
+            if (span) |access_span| {
+                const member = try self.ctx.lookupInterned(ItemLocations, entry.item_id);
+                const owner_module = switch (member.origin) {
+                    .module => |module| module,
+                    .entry => unreachable,
+                };
+                if (!entry.is_public and (try self.ctx.input(FileModule, self.file_id.?)).* != owner_module) {
+                    try rejectImport(self.ctx, .{ .file_id = self.file_id.?, .span = access_span }, .private_access);
+                    return error.Unavailable;
+                }
+            }
+            return entry.item_id;
         }
 
         pub fn staticCallArgument(self: @This(), node: structures.Node.Index, is_meta_type: bool, expected_type: ?structures.TypeId) !?structures.CompileTimeValueId {
@@ -471,6 +498,7 @@ pub fn TypeInterner(comptime Context: type) type {
         }
 
         pub fn independentParameterType(self: @This(), instance: structures.InstanceId, runtime_index: usize) !?structures.TypeId {
+            if (try self.needsInheritedInference(instance)) return null;
             const resolved = (try self.ctx.get(ResolveItem, instance.item)).* orelse return error.Unavailable;
             const parsed = (try self.ctx.get(ParseFile, resolved.file_id)).* orelse return error.Unavailable;
             const source = (try self.ctx.input(SourceText, resolved.file_id)).*;
@@ -499,7 +527,20 @@ pub fn TypeInterner(comptime Context: type) type {
                 .instance = instance,
                 .prior_static_arguments = &.{},
             };
-            return semantic.inferStaticArguments(&parsed, source, resolved.declaration, argument_types, type_interner, self.ctx.allocator());
+            const inherited_from = if (try self.needsInheritedInference(instance)) blk: {
+                const location = try self.ctx.lookupInterned(ItemLocations, instance.item);
+                const owner_item = location.owner orelse unreachable;
+                const owner = (try self.ctx.get(ResolveItem, owner_item)).* orelse return error.Unavailable;
+                const owner_arity = (try self.ctx.get(SpecializationArity, owner_item)).* orelse return error.Unavailable;
+                const provided = if (instance.specialization) |tuple|
+                    (try self.ctx.lookupInterned(CompileTimeValueTuples, tuple)).values.len
+                else
+                    0;
+                if (provided < owner_arity.inherited or owner.file_id != resolved.file_id or
+                    semantic.parameterizedStructSite(&parsed, owner.declaration) == null) return .missing;
+                break :blk owner.declaration;
+            } else null;
+            return semantic.inferStaticArguments(&parsed, source, resolved.declaration, argument_types, type_interner, self.ctx.allocator(), inherited_from);
         }
 
         pub fn inferStructArguments(self: @This(), instance: structures.InstanceId, fields: []const semantic.UnresolvedBody.StructFieldValue, field_types: []const structures.TypeId) !semantic.StaticInference {
@@ -570,6 +611,64 @@ pub fn TypeInterner(comptime Context: type) type {
             return (try self.ctx.get(OwnershipCapabilities, type_id)).*;
         }
 
+        pub fn argumentPassing(self: @This(), type_id: structures.TypeId) !structures.ArgumentPassing {
+            const capabilities = (try self.ownershipCapabilities(type_id)) orelse return error.Unavailable;
+            return if (capabilities.move == .none or capabilities.move == .custom or capabilities.needs_custom_move)
+                .indirect
+            else
+                .direct;
+        }
+
+        fn stdMemoryFunction(self: @This(), name: []const u8) !?structures.ItemId {
+            const registered = (try standardFile(self.ctx, .memory_allocation)) orelse return null;
+            const module = try self.ctx.intern(ModulePaths, .{ .path = standard_library.File.memory_allocation.modulePath() });
+            const declarations = (try self.ctx.get(ModuleDeclarations, module)).* orelse return null;
+            const item = declarations.resolveFunction(name) orelse return null;
+            const resolved = (try self.ctx.get(ResolveItem, item)).* orelse return null;
+            return if (resolved.file_id == registered) item else null;
+        }
+
+        pub fn isStdRefNew(self: @This(), item: structures.ItemId) !bool {
+            const location = try self.ctx.lookupInterned(ItemLocations, item);
+            if (!std.mem.eql(u8, location.name, "new")) return false;
+            const factory = (try self.stdMemoryFunction(@tagName(standard_library.Structure.Ref))) orelse return false;
+            if (location.owner != factory) return false;
+            const member = (try self.genericStructNamespaceMember(.{ .item = factory }, "new", null)) orelse return false;
+            return member.item == item;
+        }
+
+        pub fn isStdRefValue(self: @This(), item: structures.ItemId) !bool {
+            return item == (try self.stdMemoryFunction("value") orelse return false);
+        }
+
+        pub fn isStdRefDestroy(self: @This(), item: structures.ItemId) !bool {
+            const name = @tagName(standard_library.External.unsafe_destroy_ref);
+            const location = try self.ctx.lookupInterned(ItemLocations, item);
+            if (!std.mem.eql(u8, location.name, name)) return false;
+            return item == (try self.stdMemoryFunction(name) orelse return false);
+        }
+
+        pub fn refTypeElement(self: @This(), type_id: structures.TypeId) !?structures.TypeId {
+            return refElementType(self.ctx, type_id);
+        }
+
+        pub const RefAllocation = struct {
+            instance: structures.InstanceId,
+            type_id: structures.TypeId,
+        };
+
+        pub fn refAllocation(self: @This(), element_type: structures.TypeId) !?RefAllocation {
+            const item = (try self.stdMemoryFunction(@tagName(standard_library.External.allocate))) orelse return null;
+            if ((try self.ctx.get(ExternalSymbol, item)).* != .allocate) return null;
+            const argument = try self.internCompileTimeValue(.{ .type = element_type });
+            const instance = try self.specializeFunction(.{ .item = item }, &.{argument});
+            const signature = (try self.functionSignature(instance)) orelse return null;
+            if (!signature.is_fallible or signature.parameters.len != 1 or
+                signature.parameters[0].mode != .imm or signature.parameters[0].type_id != .int or
+                (try allocationElementType(self.ctx, signature.return_type)) != element_type) return null;
+            return .{ .instance = instance, .type_id = signature.return_type };
+        }
+
         pub fn ownedFunction(self: @This(), identity: structures.StructIdentity, name: []const u8) !?structures.InstanceId {
             const owner, const struct_site, const specialization = switch (identity) {
                 .declared => |item_id| .{ item_id, @as(?i64, null), @as(?structures.CompileTimeValueTupleId, null) },
@@ -597,6 +696,15 @@ pub fn TypeInterner(comptime Context: type) type {
 
         pub fn functionShape(self: @This(), item_id: structures.ItemId) !?structures.FunctionShape {
             return (try self.ctx.get(FunctionShape, item_id)).*;
+        }
+
+        pub fn needsInheritedInference(self: @This(), instance: structures.InstanceId) !bool {
+            const arity = (try self.ctx.get(SpecializationArity, instance.item)).* orelse return error.Unavailable;
+            const count = if (instance.specialization) |tuple|
+                (try self.ctx.lookupInterned(CompileTimeValueTuples, tuple)).values.len
+            else
+                0;
+            return count < arity.inherited;
         }
 
         pub fn isGenericStruct(self: @This(), item_id: structures.ItemId) !bool {
@@ -739,6 +847,11 @@ pub fn TypeInterner(comptime Context: type) type {
             switch (reference) {
                 .namespace => |namespace| return try self.moduleMember(namespace, name, span),
                 .declaration => |item| {
+                    if (try self.isGenericStruct(item.item)) {
+                        if (try self.genericStructNamespaceMember(item, name, span)) |member| return .{ .declaration = member };
+                        try rejectImport(self.ctx, .{ .file_id = self.file_id.?, .span = span }, .unknown_namespace_member);
+                        return error.Unavailable;
+                    }
                     const value = (try self.staticItem(item)) orelse return null;
                     return self.constantMember(value, name, span);
                 },
@@ -749,7 +862,7 @@ pub fn TypeInterner(comptime Context: type) type {
         fn constantMember(self: @This(), value_id: structures.CompileTimeValueId, name: []const u8, span: structures.SourceSpan) !?structures.NameReference {
             const value = try self.lookupCompileTimeValue(value_id);
             if (value != .type or try self.structIdentity(value.type) == null) return null;
-            if (try self.structNamespaceMember(value.type, name)) |instance| return .{ .declaration = instance };
+            if (try self.structNamespaceMember(value.type, name, span)) |instance| return .{ .declaration = instance };
             try rejectImport(self.ctx, .{ .file_id = self.file_id.?, .span = span }, .unknown_namespace_member);
             return error.Unavailable;
         }
@@ -1871,10 +1984,11 @@ fn validateExternalSignature(ctx: anytype, item: structures.ItemId, file_id: str
             const element_type = (try allocationElementType(ctx, signature.parameters[0].type_id)) orelse break :blk false;
             break :blk (try refElementType(ctx, signature.return_type)) == element_type;
         },
-        .unsafe_take_ref, .deallocate_ref => blk: {
+        .unsafe_take_ref, .unsafe_destroy_ref, .deallocate_ref => blk: {
             if (signature.is_fallible or signature.parameters.len != 1) break :blk false;
             const element_type = (try refElementType(ctx, signature.parameters[0].type_id)) orelse break :blk false;
             if (symbol == .deallocate_ref) break :blk signature.parameters[0].mode == .deinit and signature.return_type == .unit;
+            if (symbol == .unsafe_destroy_ref) break :blk signature.parameters[0].mode == .imm and signature.return_type == .unit;
             const capabilities = (try ctx.get(OwnershipCapabilities, element_type)).* orelse break :blk false;
             break :blk signature.parameters[0].mode == .mut and signature.return_type == element_type and
                 capabilities.move != .none and capabilities.move != .custom and !capabilities.needs_custom_move;
@@ -2131,7 +2245,7 @@ pub const AnalyzeComptimeThunk = struct {
         defer unresolved.deinit(ctx.allocator());
         return typing.resolveAndTypeBody(
             ctx,
-            site.owner.item,
+            site.owner,
             resolved.file_id,
             &.{},
             .unit,
@@ -2220,7 +2334,7 @@ pub const ExecuteComptimeCall = struct {
                     .outcome = .{ .exit = arguments[0].runtime.int },
                     .arguments = key.arguments,
                 } },
-                .allocate_host_storage, .deallocate_host_storage, .allocate, .deallocate, .unsafe_initialize, .unsafe_take, .unsafe_own_ref, .unsafe_take_ref, .deallocate_ref => null,
+                .allocate_host_storage, .deallocate_host_storage, .allocate, .deallocate, .unsafe_initialize, .unsafe_take, .unsafe_own_ref, .unsafe_take_ref, .unsafe_destroy_ref, .deallocate_ref => null,
             };
         }
 
@@ -2419,12 +2533,14 @@ pub const StructNamespace = struct {
         const files = (try ctx.input(ModuleMembers, module)).*;
         for (files) |file_id| {
             const index = (try ctx.get(IndexItems, file_id)).* orelse return null;
-            for (index.ids()) |item| {
-                const loc = try ctx.lookupInterned(ItemLocations, item);
+            const discovered = (try ctx.get(DiscoverItems, file_id)).* orelse return null;
+            std.debug.assert(discovered.items.len == index.count());
+            for (discovered.items, index.ids()) |item, item_id| {
+                const loc = try ctx.lookupInterned(ItemLocations, item_id);
                 if (loc.owner != owner or loc.source_site != member_site or loc.is_hook) continue;
                 if ((try names.getOrPut(loc.name)).found_existing) {
                     const member_parsed = (try ctx.get(ParseFile, file_id)).* orelse return null;
-                    const declaration = index.resolve(item) orelse unreachable;
+                    const declaration = index.resolve(item_id) orelse unreachable;
                     const token = member_parsed.tokens[member_parsed.nodes[declaration].token_index];
                     try ctx.emit(structures.Diagnostic, .{
                         .file_id = file_id,
@@ -2435,7 +2551,7 @@ pub const StructNamespace = struct {
                 }
                 const name = try ctx.allocator().dupe(u8, loc.name);
                 errdefer ctx.allocator().free(name);
-                try entries.append(ctx.allocator(), .{ .name = name, .item_id = item, .kind = loc.kind, .is_public = false });
+                try entries.append(ctx.allocator(), .{ .name = name, .item_id = item_id, .kind = loc.kind, .is_public = item.is_public });
             }
         }
         std.mem.sort(structures.ModuleScope.Entry, entries.items, {}, struct {
@@ -2591,7 +2707,7 @@ fn analyzeFunctionBody(ctx: anytype, instance: structures.InstanceId, publish_in
     defer unresolved.deinit(ctx.allocator());
     return typing.resolveAndTypeBody(
         ctx,
-        instance.item,
+        instance,
         resolved.file_id,
         parameters,
         return_type,
@@ -2661,6 +2777,7 @@ pub const CompileFunction = struct {
                     const ref_layout = (try ctx.get(TypeLayout, signature.parameters[0].type_id)).*;
                     break :blk try codegen.compileExternalSlotTransfer(ctx.allocator(), ref_layout, layout, false, false);
                 },
+                .unsafe_destroy_ref => unreachable,
                 .deallocate_ref => try codegen.compileExternalDeallocateHostStorage(ctx.allocator()),
             };
         }
