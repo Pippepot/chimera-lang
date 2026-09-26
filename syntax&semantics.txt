@@ -426,7 +426,8 @@ _ = resource
 # `std.memory.Allocation(T)` uniquely owns uninitialized storage. Its layout
 # comes from the layout domain selected by the execution target and location,
 # the element count, and alignment; the checked byte size is count times that
-# domain's element stride. Alignment is at least the natural alignment for T in
+# domain's element stride, which is aligned even for zero-count requests.
+# Alignment is at least the natural alignment for T in
 # that domain. Overflow fails
 # before allocation. The logical count remains separate from the byte layout.
 # It must be consumed by deallocation, which releases storage but does not

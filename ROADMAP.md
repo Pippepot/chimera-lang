@@ -56,13 +56,12 @@ Resolved storage contract (non-host APIs are not yet implemented):
   independent. The owner retains deallocation authority. Address space belongs
   to access, not the value type. Successful zero-byte allocations retain distinct,
   stable identities; a provider that cannot supply one fails the request.
+- The host layout query, mmap provider, and pointer-based access emitters are
+  explicitly host-only. Target-neutral allocation sizing checks element strides
+  and count overflow, including for zero-count requests.
 
 Remaining work:
 
-- Implement the layout, compatible types, resource-backed provider, and
-  address-space access for a concrete non-host target before allocating there;
-  verify its zero-byte success or failure behavior. Keep raw-address and
-  foreign-memory operations deferred.
 - Extend in-place construction to nested immovable fields and other initializer
   forms, and provide explicit duplication of copyable `T` into a new allocation.
   Add the missing unsafe indexed destruction and borrowing operations on
@@ -154,6 +153,11 @@ Mojo 1.0 is a design reference, not the naming contract; see its
 
 - General overloading, function literals, closures, postfix `?`, `sizeof`,
   and return-type inference need separate language decisions.
-- Extra targets need use cases; finer-grained invalidation needs measurements.
-  Decide separately whether unreachable declarations should be validated
+- Extra targets need use cases. Before enabling non-host allocation for one,
+  resolve its layout and compatible types for its location, provide a
+  resource-backed allocator and supported address-space access, and verify
+  its zero-byte success or failure behavior. Do not reuse host layout or
+  pointer-based access. Keep raw-address and foreign-memory operations deferred.
+- Finer-grained invalidation needs measurements. Decide separately whether
+  unreachable declarations should be validated
   (currently only demanded signatures, bodies, and values are diagnosed).

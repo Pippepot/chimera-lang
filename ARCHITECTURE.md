@@ -22,14 +22,14 @@ This is a high-level map of the compiler's ownership and stage boundaries. [synt
 
 ## Ownership and layout
 
-- Declared and generated structs publish a common definition with fields and validated ownership hooks. `OwnershipCapabilities(TypeId)` composes move, copy, and drop facts across types; separate layout queries determine size, alignment, and field or variant placement, rejecting recursive by-value struct containment. `TypeLayout(TypeId)` currently describes the x86-64 host representation; a non-host layout must be derived for its target's location-specific layout domain, never inferred from host layout. The accepted provider, location, layout, and access contracts are in [STORAGE_AND_REFERENCES.md](STORAGE_AND_REFERENCES.md).
+- Declared and generated structs publish a common definition with fields and validated ownership hooks. `OwnershipCapabilities(TypeId)` composes move, copy, and drop facts across types; separate layout queries determine size, alignment, and field or variant placement, rejecting recursive by-value struct containment. `HostTypeLayout(TypeId)` describes the x86-64 host representation; a non-host layout must be derived for its target's location-specific layout domain, never inferred from host layout. The accepted provider, location, layout, and access contracts are in [STORAGE_AND_REFERENCES.md](STORAGE_AND_REFERENCES.md).
 - Typing tracks ownership at control-flow edges. After constructing the graph, `src/frontend/lifetime.zig` plans path-sensitive cleanup and explicit-drop obligations from query-local metadata. Typing rejects abandonment before materializing the plan as ordinary typed operations; neither the solver's state nor a generic destruction operation enters published IR.
 
 ## Backend and execution
 
 - Codegen consumes the published graph and layout queries directly, producing owned machine code and symbolic references per function without compiling callees. Reachability starts at the designated file's synthetic top-level entry, includes referenced callable values, and supplies a deterministic order for linking an x86-64 ELF executable. A function named `main` has no special entry role.
 - `TypeInterner.argumentPassing` derives a shared caller/callee passing mode from `OwnershipCapabilities(TypeId)`; values that cannot move directly pass by address. Mutable calls write their updated arguments back. The calling convention is internal to the compiler, not a platform ABI.
-- Embedded standard-library declarations use ordinary lookup, signatures, and instance identities. Supported compiler-owned externs, including exit and host-memory operations, publish artifacts under those identities. A compile-time exit instead propagates compiler control to the driver without producing an executable. `src/runtime.zig` publishes and runs successful executables.
+- Embedded standard-library declarations use ordinary lookup, signatures, and instance identities. Supported compiler-owned externs, including exit and host-memory operations, publish artifacts under those identities. Typed allocation and slot transfers use host-only emitters; another location will require its own provider and access path. A compile-time exit instead propagates compiler control to the driver without producing an executable. `src/runtime.zig` publishes and runs successful executables.
 
 ## Persistence
 

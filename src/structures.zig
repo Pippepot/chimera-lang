@@ -748,8 +748,8 @@ pub const InternVariantResult = union(enum) {
     duplicate: TypeId,
 };
 
-/// Current x86-64 host representation. Type-specific field and payload offsets
-/// belong to their layout queries; other targets need their own layout facts.
+/// Byte size and alignment in one layout domain. Byte size includes the padding
+/// needed for an element stride; the current layout queries resolve the host ABI.
 pub const TypeLayout = struct {
     byte_size: u32,
     byte_alignment: u32,
@@ -761,8 +761,9 @@ pub const AllocationLayout = struct {
     byte_size: u64,
     byte_alignment: u32,
 
-    pub fn forElements(element: TypeLayout, count: u64) error{ InvalidAlignment, SizeOverflow }!AllocationLayout {
+    pub fn forElements(element: TypeLayout, count: u64) error{ InvalidAlignment, InvalidStride, SizeOverflow }!AllocationLayout {
         if (element.byte_alignment == 0 or !std.math.isPowerOfTwo(element.byte_alignment)) return error.InvalidAlignment;
+        if (element.byte_size % element.byte_alignment != 0) return error.InvalidStride;
         return .{
             .byte_size = std.math.mul(u64, element.byte_size, count) catch return error.SizeOverflow,
             .byte_alignment = element.byte_alignment,
@@ -787,6 +788,8 @@ test "allocation layout derives bytes from resolved element stride with checked 
     try testing.expectError(error.SizeOverflow, AllocationLayout.forElements(.{ .byte_size = 32, .byte_alignment = 16 }, std.math.maxInt(u64)));
     try testing.expectError(error.InvalidAlignment, AllocationLayout.forElements(.{ .byte_size = 32, .byte_alignment = 3 }, 1));
     try testing.expectError(error.InvalidAlignment, AllocationLayout.forElements(.{ .byte_size = 0, .byte_alignment = 0 }, 0));
+    try testing.expectError(error.InvalidStride, AllocationLayout.forElements(.{ .byte_size = 3, .byte_alignment = 4 }, 2));
+    try testing.expectError(error.InvalidStride, AllocationLayout.forElements(.{ .byte_size = 3, .byte_alignment = 4 }, 0));
 }
 
 pub const VariantLayout = struct {

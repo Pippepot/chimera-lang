@@ -769,7 +769,7 @@ pub fn TypeInterner(comptime Context: type) type {
         }
 
         pub fn layout(self: @This(), type_id: structures.TypeId) !structures.TypeLayout {
-            return (try self.ctx.get(TypeLayout, type_id)).*;
+            return (try self.ctx.get(HostTypeLayout, type_id)).*;
         }
 
         fn staticParameter(self: @This(), name: []const u8) !?structures.CompileTimeValueId {
@@ -969,7 +969,7 @@ fn lookupCallable(ctx: anytype, type_id: structures.TypeId) !?structures.Callabl
     };
 }
 
-pub const TypeLayout = struct {
+pub const HostTypeLayout = struct {
     pub const Input = structures.TypeId;
     pub const Output = structures.TypeLayout;
 
@@ -1002,7 +1002,7 @@ pub const VariantLayout = struct {
         var payload_size: u32 = 0;
         var payload_alignment: u32 = 1;
         for (members) |member| {
-            const member_layout = (try ctx.get(TypeLayout, member)).*;
+            const member_layout = (try ctx.get(HostTypeLayout, member)).*;
             payload_size = @max(payload_size, member_layout.byte_size);
             payload_alignment = @max(payload_alignment, member_layout.byte_alignment);
         }
@@ -1045,7 +1045,7 @@ pub const StructLayout = struct {
         var byte_size: u32 = 0;
         var byte_alignment: u32 = 1;
         for (definition.fields, field_offsets) |field, *field_offset| {
-            const field_layout = (ctx.get(TypeLayout, field.type_id) catch |err| switch (err) {
+            const field_layout = (ctx.get(HostTypeLayout, field.type_id) catch |err| switch (err) {
                 error.Unavailable => return null,
                 else => return err,
             }).*;
@@ -2753,29 +2753,29 @@ pub const CompileFunction = struct {
                 .allocate => blk: {
                     const signature = (try ctx.get(FunctionInstanceSignature, instance_id)).* orelse return null;
                     const element_type = (try allocationElementType(ctx, signature.return_type)) orelse unreachable;
-                    const layout = (try ctx.get(TypeLayout, element_type)).*;
-                    break :blk try codegen.compileExternalAllocateTypedStorage(ctx.allocator(), layout);
+                    const layout = (try ctx.get(HostTypeLayout, element_type)).*;
+                    break :blk try codegen.compileExternalAllocateHostTypedStorage(ctx.allocator(), layout);
                 },
                 .deallocate => try codegen.compileExternalDeallocateHostStorage(ctx.allocator()),
                 .unsafe_initialize, .unsafe_take => blk: {
                     const signature = (try ctx.get(FunctionInstanceSignature, instance_id)).* orelse return null;
                     const element_type = (try allocationElementType(ctx, signature.parameters[0].type_id)) orelse unreachable;
-                    const layout = (try ctx.get(TypeLayout, element_type)).*;
-                    const allocation_layout = (try ctx.get(TypeLayout, signature.parameters[0].type_id)).*;
-                    break :blk try codegen.compileExternalSlotTransfer(ctx.allocator(), allocation_layout, layout, symbol == .unsafe_initialize, true);
+                    const layout = (try ctx.get(HostTypeLayout, element_type)).*;
+                    const allocation_layout = (try ctx.get(HostTypeLayout, signature.parameters[0].type_id)).*;
+                    break :blk try codegen.compileExternalHostSlotTransfer(ctx.allocator(), allocation_layout, layout, symbol == .unsafe_initialize, true);
                 },
                 .unsafe_own_ref => blk: {
                     const signature = (try ctx.get(FunctionInstanceSignature, instance_id)).* orelse return null;
-                    const allocation_layout = (try ctx.get(TypeLayout, signature.parameters[0].type_id)).*;
-                    const ref_layout = (try ctx.get(TypeLayout, signature.return_type)).*;
+                    const allocation_layout = (try ctx.get(HostTypeLayout, signature.parameters[0].type_id)).*;
+                    const ref_layout = (try ctx.get(HostTypeLayout, signature.return_type)).*;
                     std.debug.assert(std.meta.eql(allocation_layout, ref_layout));
-                    break :blk try codegen.compileExternalRefWrap(ctx.allocator(), ref_layout);
+                    break :blk try codegen.compileExternalHostRefWrap(ctx.allocator(), ref_layout);
                 },
                 .unsafe_take_ref => blk: {
                     const signature = (try ctx.get(FunctionInstanceSignature, instance_id)).* orelse return null;
-                    const layout = (try ctx.get(TypeLayout, signature.return_type)).*;
-                    const ref_layout = (try ctx.get(TypeLayout, signature.parameters[0].type_id)).*;
-                    break :blk try codegen.compileExternalSlotTransfer(ctx.allocator(), ref_layout, layout, false, false);
+                    const layout = (try ctx.get(HostTypeLayout, signature.return_type)).*;
+                    const ref_layout = (try ctx.get(HostTypeLayout, signature.parameters[0].type_id)).*;
+                    break :blk try codegen.compileExternalHostSlotTransfer(ctx.allocator(), ref_layout, layout, false, false);
                 },
                 .unsafe_destroy_ref => unreachable,
                 .deallocate_ref => try codegen.compileExternalDeallocateHostStorage(ctx.allocator()),

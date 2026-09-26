@@ -1054,7 +1054,7 @@ pub fn compileExternalAllocateHostStorage(gpa: std.mem.Allocator) !structures.Co
     return compileExternalAllocateStorage(gpa, 1, false);
 }
 
-pub fn compileExternalAllocateTypedStorage(gpa: std.mem.Allocator, element: structures.TypeLayout) !structures.CompiledFunction {
+pub fn compileExternalAllocateHostTypedStorage(gpa: std.mem.Allocator, element: structures.TypeLayout) !structures.CompiledFunction {
     if (element.byte_alignment > 4096) return error.UnsupportedAllocationAlignment;
     return compileExternalAllocateStorage(gpa, element.byte_size, true);
 }
@@ -1128,7 +1128,7 @@ pub fn compileExternalDeallocateHostStorage(gpa: std.mem.Allocator) !structures.
     return externalArtifact(&encoder, gpa);
 }
 
-pub fn compileExternalRefWrap(gpa: std.mem.Allocator, layout: structures.TypeLayout) !structures.CompiledFunction {
+pub fn compileExternalHostRefWrap(gpa: std.mem.Allocator, layout: structures.TypeLayout) !structures.CompiledFunction {
     var encoder = try X86Encoder.init(gpa);
     defer encoder.deinit();
     try encoder.leaRsiFromRsp(layout.byte_size + 8);
@@ -1140,7 +1140,7 @@ pub fn compileExternalRefWrap(gpa: std.mem.Allocator, layout: structures.TypeLay
     return externalArtifact(&encoder, gpa);
 }
 
-pub fn compileExternalSlotTransfer(gpa: std.mem.Allocator, allocation: structures.TypeLayout, element: structures.TypeLayout, initialize: bool, indexed: bool) !structures.CompiledFunction {
+pub fn compileExternalHostSlotTransfer(gpa: std.mem.Allocator, allocation: structures.TypeLayout, element: structures.TypeLayout, initialize: bool, indexed: bool) !structures.CompiledFunction {
     std.debug.assert(!initialize or indexed);
     if (element.byte_size > std.math.maxInt(i32)) return error.UnsupportedElementLayout;
     var encoder = try X86Encoder.init(gpa);

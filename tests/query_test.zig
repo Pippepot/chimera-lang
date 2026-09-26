@@ -2615,7 +2615,9 @@ test "struct layouts preserve declaration order alignment and nesting" {
     const outer = (try db.get(queries.StructLayout, outer_type)).*.?;
     try testing.expectEqual(structures.TypeLayout{ .byte_size = 24, .byte_alignment = 8 }, outer.layout);
     try testing.expectEqualSlices(u32, &.{ 0, 4, 16 }, outer.field_offsets);
-    try testing.expectEqual(outer.layout, (try db.get(queries.TypeLayout, outer_type)).*);
+    try testing.expectEqual(outer.layout, (try db.get(queries.HostTypeLayout, outer_type)).*);
+    try testing.expectEqual(structures.AllocationLayout{ .byte_size = 48, .byte_alignment = 8 }, try structures.AllocationLayout.forElements(outer.layout, 2));
+    try testing.expectEqual(structures.AllocationLayout{ .byte_size = 0, .byte_alignment = 8 }, try structures.AllocationLayout.forElements(outer.layout, 0));
 }
 
 test "byte literals, layout, calls, fields and static values" {
@@ -2639,7 +2641,7 @@ test "byte literals, layout, calls, fields and static values" {
     const high = try resolvedStaticValue(db, scope.resolveStatic("high").?);
     try testing.expectEqual(structures.TypeId.byte, high.runtime.type_id);
     try testing.expectEqual(@as(u8, 255), high.runtime.value.byte);
-    try testing.expectEqual(structures.TypeLayout{ .byte_size = 1, .byte_alignment = 1 }, (try db.get(queries.TypeLayout, .byte)).*);
+    try testing.expectEqual(structures.TypeLayout{ .byte_size = 1, .byte_alignment = 1 }, (try db.get(queries.HostTypeLayout, .byte)).*);
     const pair_type = try resolvedStaticType(db, scope.resolveStatic("Pair").?);
     const pair_layout = (try db.get(queries.StructLayout, pair_type)).*.?;
     try testing.expectEqual(structures.TypeLayout{ .byte_size = 12, .byte_alignment = 4 }, pair_layout.layout);
@@ -3590,29 +3592,29 @@ test "variant interning owns canonical members" {
     try testing.expectEqualSlices(structures.TypeId, &.{ .int, .unit }, retained.variant.members);
 }
 
-test "type layout reports generic size and alignment for variants" {
+test "host type layout reports size and alignment for variants" {
     const db = try testDatabase(2);
     defer db.deinit();
 
     try testing.expectEqual(
         structures.TypeLayout{ .byte_size = 4, .byte_alignment = 4 },
-        (try db.get(queries.TypeLayout, .int)).*,
+        (try db.get(queries.HostTypeLayout, .int)).*,
     );
     try testing.expectEqual(
         structures.TypeLayout{ .byte_size = 4, .byte_alignment = 4 },
-        (try db.get(queries.TypeLayout, .bool)).*,
+        (try db.get(queries.HostTypeLayout, .bool)).*,
     );
     try testing.expectEqual(
         structures.TypeLayout{ .byte_size = 0, .byte_alignment = 1 },
-        (try db.get(queries.TypeLayout, .unit)).*,
+        (try db.get(queries.HostTypeLayout, .unit)).*,
     );
     try testing.expectEqual(
         structures.TypeLayout{ .byte_size = 0, .byte_alignment = 1 },
-        (try db.get(queries.TypeLayout, .none)).*,
+        (try db.get(queries.HostTypeLayout, .none)).*,
     );
     try testing.expectEqual(
         structures.TypeLayout{ .byte_size = 0, .byte_alignment = 1 },
-        (try db.get(queries.TypeLayout, .never)).*,
+        (try db.get(queries.HostTypeLayout, .never)).*,
     );
 
     const int_or_none = switch ((try db.get(InternVariantPair, .{ .int, .none })).*) {
@@ -3624,18 +3626,18 @@ test "type layout reports generic size and alignment for variants" {
             .byte_size = 8,
             .byte_alignment = 4,
         },
-        (try db.get(queries.TypeLayout, int_or_none)).*,
+        (try db.get(queries.HostTypeLayout, int_or_none)).*,
     );
 
     const variant_layout = (try db.get(queries.VariantLayout, int_or_none)).*;
     try testing.expectEqual(@as(u32, 4), variant_layout.payload_offset);
-    try testing.expectEqual((try db.get(queries.TypeLayout, int_or_none)).*, variant_layout.layout);
+    try testing.expectEqual((try db.get(queries.HostTypeLayout, int_or_none)).*, variant_layout.layout);
 
     const unit_or_none = switch ((try db.get(InternVariantPair, .{ .unit, .none })).*) {
         .type_id => |type_id| type_id,
         .duplicate => unreachable,
     };
-    const first_layout = try db.get(queries.TypeLayout, unit_or_none);
+    const first_layout = try db.get(queries.HostTypeLayout, unit_or_none);
     try testing.expectEqual(
         structures.TypeLayout{
             .byte_size = 4,
@@ -3643,7 +3645,7 @@ test "type layout reports generic size and alignment for variants" {
         },
         first_layout.*,
     );
-    try testing.expectEqual(first_layout, try db.get(queries.TypeLayout, unit_or_none));
+    try testing.expectEqual(first_layout, try db.get(queries.HostTypeLayout, unit_or_none));
 }
 
 test "module scope owns sorted declaration lookup and leaves bodies demand-driven" {

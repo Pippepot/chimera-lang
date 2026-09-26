@@ -67,11 +67,12 @@ Typed allocation additionally takes an element type and count. Its byte size
 and alignment must be derived from a layout for `T` in the layout domain selected
 by the execution target and memory location. That representation includes the
 element stride and any field or variant offsets;
-`count * stride` and any alignment rounding are checked before calling the
+The resolved element stride must be a multiple of its alignment, even when
+count is zero; `count * stride` is checked before calling the
 provider. Alignment must be a nonzero power of two and at least the target's
 natural alignment for `T`; a provider may reject a stricter alignment. Target
 compatibility must be established for `T` and its contained types, not inferred
-from a coincidental host byte size. Host `TypeLayout(TypeId)` is the x86-64 host
+from a coincidental host byte size. `HostTypeLayout(TypeId)` is the x86-64 host
 representation only; a future layout must be keyed by type and the target's
 location-specific layout domain, and must not silently fall back to host layout.
 Initially restrict device buffers to validated scalar element types rather than
