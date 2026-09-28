@@ -8,85 +8,37 @@
 - Folder modules, file-scoped imports, re-exports, qualified lookup, entry-only execution, and directory refresh are implemented. The embedded `std.prelude` is implicitly imported by user files, with an explicit-import override.
 - Named and generated structs have nominal identity, namespace members and instance calls, layout, field operations, and validated move/copy/drop hooks.
 - Typed SSA covers calls, static specialization, callable values, variants, joins, loops, divergence, and fallible control flow. Compile-time thunks and specialized calls evaluate through typed IR, including structs, hooks, and type-valued functions; local captures remain unsupported.
-- Ownership tracks whole-root transfers, borrowed and owned parameters, mutable copy-back, and path-sensitive ASAP cleanup. The internal calling convention derives direct or address-passed arguments from ownership capabilities; codegen owns physical argument layout. Partial-field transfer, general stable storage for immovable values, and origin-aware pointers/views remain open.
+- Ownership tracks root and supported field transfers, borrowed and owned parameters, mutable copy-back, inferred `Ref` origins, and path-sensitive ASAP cleanup. The internal calling convention derives direct or address-passed arguments from ownership capabilities; codegen owns physical argument layout. `Box` and `Buffer` provide host storage; `Ref` and scoped aliases retain checked origins for named places and supported fields, but not temporary projections.
 - Compiler-provided `extern func` declarations use named std identities and ordinary calls. `std.exit.exit` is exported by the prelude, with distinct runtime termination and compile-time compiler control.
-- Host-only `std.memory` provides checked, fallible typed allocation and explicit deallocation, unsafe element transfer for directly movable elements, and `Ref(T)` with automatic destruction. `Ref.new(value)` infers `T`, while `Ref(T).new(value)` specializes it explicitly; both construct directly movable values or initialize immovable structs with directly movable fields in final storage. Consuming extraction remains limited to directly movable values. `Ref` is exported by the prelude. Zero-byte host allocations succeed with a distinct, stable address; recursive in-place construction, explicit duplication, and safe `Borrow` origins remain open.
+- Host-only `std.memory` provides checked typed allocation, unsafe indexed
+  transfers and destruction, `Box(T)` with automatic destruction, copyable
+  `Ref(T, writable)` handles with checked origins, and `Buffer(T)` with borrowed
+  `BufferView(T)` slices. `Box.new` constructs directly movable values or
+  initializes immovable structs in final storage; explicit duplication allocates
+  distinct storage. Consuming extraction requires directly movable values.
+  `Box` and `Ref` are prelude exports. Scoped writable aliases and checked
+  `Buffer.get_mut` are supported. [STORAGE_AND_REFERENCES.md](STORAGE_AND_REFERENCES.md)
+  records the host storage model and accepted cross-target design.
 - Successful whole-program executables, typed runtime function bodies, and compiled functions persist in a content-addressed cache. Query snapshots restore interned identities and validate observed source inputs and equal-result query boundaries before reuse. Cache publication is atomic across compiler processes. Independent file and function queries use multiple workers.
+- Aggregate reference origins retain field, variant, and owned-element projections through copies and joins. Writable effects apply across ordinary, indirect, and fallible calls, custom copy/move hooks, and scheduled destructor hooks; Box construction and extraction preserve contained origins. Initialized raw-allocation contents retain conservative origins, while empty allocations do not imply live elements.
 
 ## Priority and dependencies
 
-Establish storage and reference foundations before expanding the language toward
+Build on the host storage and reference foundation to expand the language toward
 text, generic collections, and ordinary iteration. Independent slices can
 proceed earlier. Each language slice covers diagnostics, execution, ownership,
 and incremental recomputation; reject unsupported forms at their owning boundary.
 
 ## Ordered milestones
 
-### 1. Storage, allocation, and references
+### 1. Static signature constraints (implemented)
 
-Use [STORAGE_AND_REFERENCES.md](STORAGE_AND_REFERENCES.md) as the design note;
-record accepted contracts in [syntax&semantics.txt](syntax&semantics.txt) before
-implementing them. Value construction and binding do not choose allocation.
-Keep value type, allocation provider, memory location, target-aware layout,
-address space, lifetime origin, and access mutability distinct.
-
-Implemented host subset:
-
-- `std.memory.allocate(T, count)` derives the host layout from `T`, rejects
-  negative counts and size overflow through fallible control flow, and reserves
-  a distinct address even for zero-byte requests. `Allocation(T)` owns
-  uninitialized storage with explicit drop;
-  `deallocate` consumes it without destroying elements. `unsafe_initialize`
-  and `unsafe_take` transfer directly movable elements with caller-proven bounds
-  and initialization state.
-- `Ref.new(value)` infers `T`, and `Ref(T).new(value)` fallibly constructs a `Ref(T)` for directly movable,
-  automatically droppable `T`. Moving the owner preserves its storage; last-use
-  destruction destroys `T` and frees the allocation, while `value` consumes the
-  owner and extracts `T`. `Ref` is a prelude export; low-level
-  allocation requires an explicit `std.memory` import.
-- `Ref.new(T{...})` or `Ref(T).new(T{...})` also initializes an immovable or custom-move struct
-  directly in its allocation when its fields can move directly. Fields evaluate
-  once in source order and are cleaned up on failure. Destruction runs in the
-  allocation; `value` cannot extract a `T` that does not move directly.
-
-Resolved storage contract (non-host APIs are not yet implemented):
-
-- Target-specific element layout and memory location are validated together;
-  the typed request binds layout to type and count, while provider policy stays
-  independent. The owner retains deallocation authority. Address space belongs
-  to access, not the value type. Successful zero-byte allocations retain distinct,
-  stable identities; a provider that cannot supply one fails the request.
-- The host layout query, mmap provider, and pointer-based access emitters are
-  explicitly host-only. Target-neutral allocation sizing checks element strides
-  and count overflow, including for zero-count requests.
-
-Remaining work:
-
-- Extend in-place construction to nested immovable fields and other initializer
-  forms, and provide explicit duplication of copyable `T` into a new allocation.
-  Add the missing unsafe indexed destruction and borrowing operations on
-  `Allocation` before exposing safe initialized access.
-- Implement `Borrow(T)` as a non-owning, non-null reference to a live initialized
-  value. Copying it must not copy `T` or acquire ownership; mutation depends on
-  the access path and aliasing rules. Re-export it from `std.prelude` once its
-  origin checks exist.
-- Extend generation-based lifetime and aliasing checks to borrows from locals,
-  allocations, owners, and collections, including returned/stored borrows,
-  transfers, last-use destruction, and invalidation when storage changes.
-  Conservatively retain every possible source of a borrow, including borrowed
-  inputs to bodyless calls. Reject returned borrows with no inferable origin
-  and other unprovable origins at compile time, without user origin annotations.
-  Specify partial-field transfer, initialization, cleanup, and address stability
-  where they affect these operations; today's non-escaping `mut` calls do not
-  establish the needed lifetime guarantees.
-- Build collection storage on `Allocation(T)` with initialized length and
-  capacity. Borrowed text and List views must follow the same lifetime and
-  storage-change invalidation rules. Defer atomic shared ownership until its
-  supported locations, mutation, weak references, and cycle behavior are set.
-
-Mojo 1.0 is a design reference, not the naming contract; see its
-[pointer guide](https://mojolang.static.modular.com/docs/manual/pointers/) and
-[release notes](https://mojolang.static.modular.com/releases/v1.0.0/).
+- Function signatures accept ordered, fallible `where` conditions after the
+  return type and optional `from(...)` contract, on the signature line or
+  following lines. Demanded specializations evaluate them using static values;
+  runtime captures and failed constraints are rejected without changing the
+  callable type. Static type subsets and namespace member types, including
+  callable types and absent members, are supported by `is`.
 
 ### 2. Text and basic I/O
 
@@ -151,6 +103,10 @@ Mojo 1.0 is a design reference, not the naming contract; see its
 
 ## Deferred or independent work
 
+- Borrowing temporary projections needs a lifetime-extension rule beyond the
+  currently supported named places and dereferenced Refs.
+- Shared owners require specified atomic ownership, weak-reference, and cycle
+  behavior before implementation.
 - General overloading, function literals, closures, postfix `?`, `sizeof`,
   and return-type inference need separate language decisions.
 - Extra targets need use cases. Before enabling non-host allocation for one,

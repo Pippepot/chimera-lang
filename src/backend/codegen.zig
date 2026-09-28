@@ -1,4 +1,5 @@
 const std = @import("std");
+const x86 = @import("x86_encoding.zig");
 const structures = @import("../structures.zig");
 
 const image_base: u64 = 0x400000;
@@ -47,15 +48,16 @@ const ValueLocation = union(enum) {
 };
 
 const indirect_layout: structures.TypeLayout = .{ .byte_size = @sizeOf(u64), .byte_alignment = @alignOf(u64) };
+const zero_sized_address_layout: structures.TypeLayout = .{ .byte_size = 1, .byte_alignment = 1 };
 
 fn argumentLayout(types: anytype, type_id: structures.TypeId) !structures.TypeLayout {
-    return if (try types.argumentPassing(type_id) == .indirect) indirect_layout else try types.layout(type_id);
+    return if (try types.facts().argumentPassing(type_id) == .indirect) indirect_layout else try types.layout(type_id);
 }
 
 fn valueSlotLayout(types: anytype, type_id: structures.TypeId) !structures.TypeLayout {
     const layout = try types.layout(type_id);
-    if (layout.byte_size == 0 and try types.argumentPassing(type_id) == .indirect)
-        return .{ .byte_size = 1, .byte_alignment = 1 };
+    if (layout.byte_size == 0 and try types.facts().argumentPassing(type_id) == .indirect)
+        return zero_sized_address_layout;
     return layout;
 }
 
@@ -75,6 +77,12 @@ fn usesMemoryReturn(layout: structures.TypeLayout) bool {
     return layout.byte_size != 0 and layout.byte_size != @sizeOf(u32);
 }
 
+fn returnStorageLayout(types: anytype, type_id: structures.TypeId) !?structures.TypeLayout {
+    if (try types.facts().argumentPassing(type_id) == .indirect) return indirect_layout;
+    const layout = try types.layout(type_id);
+    return if (usesMemoryReturn(layout)) layout else null;
+}
+
 fn ensureAddressableStackRange(offset: u32, byte_size: u32) error{FunctionTooLarge}!void {
     if (byte_size == 0) return;
     const last_byte = std.math.add(u32, offset, byte_size - 1) catch return error.FunctionTooLarge;
@@ -91,20 +99,60 @@ fn branchStorageEnd(ssa: *const structures.FunctionBodyAnalysis, types: anytype,
     return end;
 }
 
-fn callStorageEnd(
+const CallLayout = struct {
+    result: ValueLocation,
+    arguments: []ValueLocation,
+    storage_end: u32,
+
+    fn init(types: anytype, return_type: structures.TypeId, parameters: []const structures.TypeId, gpa: std.mem.Allocator) !CallLayout {
+        const arguments = try gpa.alloc(ValueLocation, parameters.len);
+        errdefer gpa.free(arguments);
+        var end: u32 = 0;
+        const result: ValueLocation = if (try returnStorageLayout(types, return_type)) |layout| blk: {
+            const offset = try reserveStack(&end, layout);
+            break :blk if (try types.facts().argumentPassing(return_type) == .indirect) .{ .indirect = offset } else .{ .stack = offset };
+        } else .eax;
+        for (parameters, arguments) |type_id, *argument| {
+            const offset = try reserveStack(&end, try argumentLayout(types, type_id));
+            argument.* = if (try types.facts().argumentPassing(type_id) == .indirect) .{ .indirect = offset } else .{ .stack = offset };
+        }
+        return .{ .result = result, .arguments = arguments, .storage_end = end };
+    }
+
+    fn deinit(self: *CallLayout, gpa: std.mem.Allocator) void {
+        gpa.free(self.arguments);
+        self.* = undefined;
+    }
+};
+
+const CallLayoutKey = struct { arguments: structures.FunctionValueRange, return_type: structures.TypeId };
+const CallLayouts = std.AutoHashMapUnmanaged(CallLayoutKey, CallLayout);
+
+fn deinitCallLayouts(layouts: *CallLayouts, gpa: std.mem.Allocator) void {
+    var iterator = layouts.valueIterator();
+    while (iterator.next()) |layout| layout.deinit(gpa);
+    layouts.deinit(gpa);
+}
+
+fn planCallStorage(
     ssa: *const structures.FunctionBodyAnalysis,
     types: anytype,
     value_types: []const structures.TypeId,
-    call: anytype,
+    call: structures.FunctionCall,
+    layouts: *CallLayouts,
+    gpa: std.mem.Allocator,
 ) !u32 {
-    var end: u32 = 0;
-    const return_layout = try types.layout(call.return_type);
-    if (usesMemoryReturn(return_layout)) _ = try reserveStack(&end, return_layout);
-    for (ssa.call_arguments[call.arguments.start..call.arguments.end]) |argument| {
-        const type_id = argument.coerce_to orelse value_types[@intFromEnum(argument.value)];
-        _ = try reserveStack(&end, try argumentLayout(types, type_id));
+    const key: CallLayoutKey = .{ .arguments = call.arguments, .return_type = call.return_type };
+    if (layouts.get(key)) |layout| return layout.storage_end;
+    const parameters = try gpa.alloc(structures.TypeId, call.arguments.end - call.arguments.start);
+    defer gpa.free(parameters);
+    for (ssa.call_arguments[call.arguments.start..call.arguments.end], parameters) |argument, *parameter| {
+        parameter.* = argument.coerce_to orelse value_types[@intFromEnum(argument.value)];
     }
-    return end;
+    var layout = try CallLayout.init(types, call.return_type, parameters, gpa);
+    errdefer layout.deinit(gpa);
+    try layouts.put(gpa, key, layout);
+    return layout.storage_end;
 }
 
 const LocationPlan = struct {
@@ -113,6 +161,8 @@ const LocationPlan = struct {
     stack_size: u32,
     edge_scratch_offset: u32,
     return_buffer_offset: ?u32,
+    calls: CallLayouts,
+    incoming: CallLayout,
 
     const Usage = enum { unused, used, returned };
 
@@ -125,76 +175,60 @@ const LocationPlan = struct {
         for (arguments) |argument| needed[@intFromEnum(argument.value)] = .used;
     }
 
+    fn markCallArguments(ssa: *const structures.FunctionBodyAnalysis, call: structures.FunctionCall, needed: []Usage) void {
+        for (ssa.call_arguments[call.arguments.start..call.arguments.end]) |argument| needed[@intFromEnum(argument.value)] = .used;
+    }
+
     fn init(ssa: *const structures.FunctionBodyAnalysis, types: anytype, gpa: std.mem.Allocator) !LocationPlan {
         const needed = try gpa.alloc(Usage, ssa.valueCount());
         defer gpa.free(needed);
         @memset(needed, .unused);
+        const addressable = try gpa.alloc(bool, ssa.valueCount());
+        defer gpa.free(addressable);
+        @memset(addressable, false);
         const value_types = try gpa.alloc(structures.TypeId, ssa.valueCount());
         errdefer gpa.free(value_types);
         @memcpy(value_types[0..ssa.block_argument_types.len], ssa.block_argument_types);
 
-        for (ssa.instructions, 0..) |instruction, instruction_index| {
+        for (ssa.instructions, 0..) |original, instruction_index| {
+            var instruction = original;
             const value_index = @intFromEnum(ssa.instructionValue(instruction_index));
             value_types[value_index] = instruction.resultType();
+            for (instruction.operands()) |operand| if (operand) |value| {
+                needed[@intFromEnum(value.*)] = .used;
+            };
             switch (instruction) {
-                .const_int, .const_byte, .const_bool, .const_unit, .const_none, .function_ref => {},
                 .const_type => unreachable,
-                .variant_coerce, .variant_extract, .callable_coerce => |operation| needed[@intFromEnum(operation.operand)] = .used,
                 .struct_init => |operation| {
                     for (ssa.struct_field_values[operation.fields.start..operation.fields.end]) |field| {
                         needed[@intFromEnum(field.value)] = .used;
                     }
                 },
-                .ref_init => |operation| {
-                    needed[@intFromEnum(operation.allocation)] = .used;
-                    for (ssa.struct_field_values[operation.fields.start..operation.fields.end]) |field| {
-                        needed[@intFromEnum(field.value)] = .used;
-                    }
+                .storage_projection => |operation| if (operation.projection != .dereference) {
+                    addressable[@intFromEnum(operation.owner)] = true;
                 },
-                .ref_value_for_drop => |operation| needed[@intFromEnum(operation.owner)] = .used,
-                .field_access => |operation| needed[@intFromEnum(operation.operand)] = .used,
-                .field_update => |operation| {
-                    needed[@intFromEnum(operation.operand)] = .used;
-                    needed[@intFromEnum(operation.value)] = .used;
+                .borrow_address => |operation| if (!operation.base_is_reference) {
+                    addressable[@intFromEnum(operation.source)] = true;
                 },
-                .mut_parameter_write => |operation| needed[@intFromEnum(operation.value)] = .used,
-                .call_mut_argument => {},
-                .call => |call| {
-                    for (ssa.call_arguments[call.arguments.start..call.arguments.end]) |argument| needed[@intFromEnum(argument.value)] = .used;
-                },
-                .indirect_call => |call| {
-                    needed[@intFromEnum(call.target)] = .used;
-                    for (ssa.call_arguments[call.arguments.start..call.arguments.end]) |argument| needed[@intFromEnum(argument.value)] = .used;
-                },
-                .variant_tag, .negi => |operand| needed[@intFromEnum(operand)] = .used,
-                .addi, .subi, .muli, .divsi => |operands| {
-                    needed[@intFromEnum(operands.lhs)] = .used;
-                    needed[@intFromEnum(operands.rhs)] = .used;
-                },
+                .call => |call| markCallArguments(ssa, call, needed),
+                else => {},
             }
         }
-        for (ssa.blocks) |block| switch (block.terminator) {
-            .branch => |branch| markBranchArguments(ssa, branch, needed),
-            .predicate_branch => |predicate| {
-                needed[@intFromEnum(predicate.operands.lhs)] = .used;
-                needed[@intFromEnum(predicate.operands.rhs)] = .used;
-                markBranchArguments(ssa, predicate.then_branch, needed);
-                markBranchArguments(ssa, predicate.else_branch, needed);
-            },
-            .fallible_call => |fallible| {
-                for (ssa.call_arguments[fallible.call.arguments.start..fallible.call.arguments.end]) |argument| {
-                    needed[@intFromEnum(argument.value)] = .used;
-                }
-            },
-            .fallible_indirect_call => |fallible| {
-                needed[@intFromEnum(fallible.call.target)] = .used;
-                for (ssa.call_arguments[fallible.call.arguments.start..fallible.call.arguments.end]) |argument| {
-                    needed[@intFromEnum(argument.value)] = .used;
-                }
-            },
-            .return_value => |value| needed[@intFromEnum(value.value)] = .used,
-            .return_unit, .return_failure, .diverge => {},
-        };
+        for (ssa.blocks) |block| {
+            var terminator = block.terminator;
+            for (terminator.operands()) |operand| if (operand) |value| {
+                needed[@intFromEnum(value.*)] = .used;
+            };
+            switch (terminator) {
+                .branch => |branch| markBranchArguments(ssa, branch, needed),
+                .predicate_branch => |predicate| {
+                    markBranchArguments(ssa, predicate.then_branch, needed);
+                    markBranchArguments(ssa, predicate.else_branch, needed);
+                },
+                .fallible_call => |fallible| markCallArguments(ssa, fallible.call, needed),
+                .return_unit, .return_value, .return_failure, .diverge => {},
+            }
+        }
         for (ssa.blocks) |block| {
             if (block.instruction_start == block.instruction_end) continue;
             const value = ssa.instructionValue(block.instruction_end - 1);
@@ -213,14 +247,14 @@ const LocationPlan = struct {
         //   rsp + stack_size: return address
         //   rsp + stack_size + 8: incoming argument 0
         var outgoing_size: u32 = 0;
+        var calls: CallLayouts = .empty;
+        errdefer deinitCallLayouts(&calls, gpa);
         for (ssa.instructions) |instruction| switch (instruction) {
-            .call => |call| outgoing_size = @max(outgoing_size, try callStorageEnd(ssa, types, value_types, call)),
-            .indirect_call => |call| outgoing_size = @max(outgoing_size, try callStorageEnd(ssa, types, value_types, call)),
+            .call => |call| outgoing_size = @max(outgoing_size, try planCallStorage(ssa, types, value_types, call, &calls, gpa)),
             else => {},
         };
         for (ssa.blocks) |block| switch (block.terminator) {
-            .fallible_call => |fallible| outgoing_size = @max(outgoing_size, try callStorageEnd(ssa, types, value_types, fallible.call)),
-            .fallible_indirect_call => |fallible| outgoing_size = @max(outgoing_size, try callStorageEnd(ssa, types, value_types, fallible.call)),
+            .fallible_call => |fallible| outgoing_size = @max(outgoing_size, try planCallStorage(ssa, types, value_types, fallible.call, &calls, gpa)),
             else => {},
         };
         var edge_scratch_end = outgoing_size;
@@ -246,63 +280,83 @@ const LocationPlan = struct {
             for (block.argument_start..block.argument_end) |argument_index| {
                 if (needed[argument_index] == .unused) continue;
                 const layout = try valueSlotLayout(types, value_types[argument_index]);
-                if (layout.byte_size == 0) continue;
-                locations[argument_index] = .{ .stack = try reserveStack(&local_end, layout) };
+                if (layout.byte_size == 0 and !addressable[argument_index]) continue;
+                locations[argument_index] = .{ .stack = try reserveStack(&local_end, if (layout.byte_size == 0) zero_sized_address_layout else layout) };
             }
         }
         for (ssa.instructions, locations[ssa.block_argument_types.len..], 0..) |instruction, *location, instruction_index| {
             const value_index = @intFromEnum(ssa.instructionValue(instruction_index));
             location.* = location_blk: {
                 switch (instruction) {
-                    .const_int => |value| break :location_blk .{ .immediate = value },
-                    .const_byte => |value| break :location_blk .{ .immediate = value },
-                    .const_bool => |value| break :location_blk .{ .immediate = @intFromBool(value) },
+                    .const_int => |value| if (!addressable[value_index]) break :location_blk .{ .immediate = value },
+                    .const_byte => |value| if (!addressable[value_index]) break :location_blk .{ .immediate = value },
+                    .const_bool => |value| if (!addressable[value_index]) break :location_blk .{ .immediate = @intFromBool(value) },
                     .const_type => unreachable,
-                    .const_unit, .const_none => break :location_blk .discarded,
-                    .call => |call| if (call.return_type == .unit) {
+                    .const_unit, .const_none => if (!addressable[value_index]) break :location_blk .discarded,
+                    .call => |call| if (call.return_type == .unit and !addressable[value_index]) {
                         break :location_blk .discarded;
                     },
-                    .indirect_call => |call| if (call.return_type == .unit) {
-                        break :location_blk .discarded;
-                    },
-                    .ref_value_for_drop => if (needed[value_index] != .unused) {
+                    .storage_projection, .allocation_element, .borrow_read => if (needed[value_index] != .unused) {
                         break :location_blk .{ .indirect = try reserveStack(&local_end, indirect_layout) };
                     } else break :location_blk .discarded,
                     else => {},
                 }
                 const layout = try valueSlotLayout(types, value_types[value_index]);
-                if (needed[value_index] == .returned and layout.byte_size == @sizeOf(u32)) {
+                const indirect_return = try types.facts().argumentPassing(value_types[value_index]) == .indirect;
+                if (needed[value_index] == .returned and value_types[value_index] == .int and !addressable[value_index]) {
                     break :location_blk .eax;
                 }
-                if (needed[value_index] != .unused) {
-                    if (layout.byte_size == 0) break :location_blk .discarded;
+                if (needed[value_index] != .unused or (indirect_return and instruction == .call)) {
+                    if (layout.byte_size == 0) {
+                        if (addressable[value_index]) break :location_blk .{ .stack = try reserveStack(&local_end, zero_sized_address_layout) };
+                        break :location_blk .discarded;
+                    }
                     break :location_blk .{ .stack = try reserveStack(&local_end, layout) };
                 }
                 break :location_blk .discarded;
             };
         }
+        const entry = ssa.blocks[entry_index];
+        for (entry.argument_start..entry.argument_end) |argument_index| {
+            if (!addressable[argument_index]) continue;
+            if ((try argumentLayout(types, value_types[argument_index])).byte_size != 0) continue;
+            locations[argument_index] = .{ .stack = try reserveStack(&local_end, zero_sized_address_layout) };
+        }
         const stack_size = local_end;
         if (stack_size > std.math.maxInt(i32)) return error.FunctionTooLarge;
-        const entry = ssa.blocks[entry_index];
-        const return_layout = try types.layout(ssa.return_type);
-        var incoming_argument_offset: u32 = 0;
+        var incoming = try CallLayout.init(types, ssa.return_type, ssa.block_argument_types[entry.argument_start..entry.argument_end], gpa);
+        errdefer incoming.deinit(gpa);
         var return_buffer_offset: ?u32 = null;
         const caller_stack_offset = std.math.add(u32, stack_size, @sizeOf(u64)) catch return error.FunctionTooLarge;
         if (caller_stack_offset > std.math.maxInt(i32)) return error.FunctionTooLarge;
-        if (usesMemoryReturn(return_layout)) {
-            const offset = try reserveStack(&incoming_argument_offset, return_layout);
-            return_buffer_offset = std.math.add(u32, caller_stack_offset, offset) catch return error.FunctionTooLarge;
-            try ensureAddressableStackRange(return_buffer_offset.?, return_layout.byte_size);
+        if (try returnStorageLayout(types, ssa.return_type)) |return_storage| {
+            return_buffer_offset = caller_stack_offset;
+            try ensureAddressableStackRange(return_buffer_offset.?, return_storage.byte_size);
+            if (try types.facts().argumentPassing(ssa.return_type) == .indirect) {
+                for (ssa.blocks) |block| {
+                    if (block.instruction_start == block.instruction_end) continue;
+                    const returned = switch (block.terminator) {
+                        .return_value => |value| value,
+                        else => continue,
+                    };
+                    const last = ssa.instructionValue(block.instruction_end - 1);
+                    if (returned.value == last and returned.coerce_to == null)
+                        locations[@intFromEnum(last)] = .{ .indirect = return_buffer_offset.? };
+                }
+            }
         }
         for (locations[entry.argument_start..entry.argument_end], 0..) |*location, argument_offset| {
             const argument_index = entry.argument_start + argument_offset;
             const type_id = value_types[argument_index];
             const layout = try argumentLayout(types, type_id);
-            const argument_stack_offset = try reserveStack(&incoming_argument_offset, layout);
+            const argument_stack_offset = switch (incoming.arguments[argument_offset]) {
+                .stack, .indirect => |offset| offset,
+                else => unreachable,
+            };
             const offset = std.math.add(u32, caller_stack_offset, argument_stack_offset) catch return error.FunctionTooLarge;
             try ensureAddressableStackRange(offset, layout.byte_size);
             if (needed[argument_index] != .unused and layout.byte_size != 0) {
-                location.* = if (try types.argumentPassing(type_id) == .indirect) .{ .indirect = offset } else .{ .incoming_argument = offset };
+                location.* = if (try types.facts().argumentPassing(type_id) == .indirect) .{ .indirect = offset } else .{ .incoming_argument = offset };
             }
         }
         return .{
@@ -311,12 +365,16 @@ const LocationPlan = struct {
             .stack_size = stack_size,
             .edge_scratch_offset = outgoing_size,
             .return_buffer_offset = return_buffer_offset,
+            .calls = calls,
+            .incoming = incoming,
         };
     }
 
     fn deinit(self: *LocationPlan, gpa: std.mem.Allocator) void {
         gpa.free(self.locations);
         gpa.free(self.value_types);
+        deinitCallLayouts(&self.calls, gpa);
+        self.incoming.deinit(gpa);
         self.* = undefined;
     }
 };
@@ -349,6 +407,8 @@ fn FunctionEmitter(comptime Types: type) type {
         variant_coercion_tags: []const u32,
         branch_arguments: []const structures.FunctionValueUse,
         call_arguments: []const structures.FunctionValueUse,
+        call_layouts: CallLayouts,
+        incoming_layout: CallLayout,
         block_offsets: []u32,
         stack_size: u32,
         edge_scratch_offset: u32,
@@ -374,6 +434,8 @@ fn FunctionEmitter(comptime Types: type) type {
                 .variant_coercion_tags = ssa.variant_coercion_tags,
                 .branch_arguments = ssa.branch_arguments,
                 .call_arguments = ssa.call_arguments,
+                .call_layouts = plan.calls,
+                .incoming_layout = plan.incoming,
                 .block_offsets = block_offsets,
                 .stack_size = plan.stack_size,
                 .edge_scratch_offset = plan.edge_scratch_offset,
@@ -393,7 +455,7 @@ fn FunctionEmitter(comptime Types: type) type {
         }
 
         fn emit(self: *Self, ssa: *const structures.FunctionBodyAnalysis) !void {
-            if (self.stack_size != 0) try self.encoder.subRspImmediate32(self.stack_size);
+            if (self.stack_size != 0) try self.encoder.offset(.sub_rsp, self.stack_size);
             try self.emitBlock(ssa, ssa.entry);
             for (ssa.blocks, 0..) |_, block_index| {
                 if (block_index == @intFromEnum(ssa.entry)) continue;
@@ -416,7 +478,19 @@ fn FunctionEmitter(comptime Types: type) type {
                 const instruction = ssa.instructions[instruction_index];
                 const destination = self.locations[@intFromEnum(ssa.instructionValue(instruction_index))];
                 switch (instruction) {
-                    .const_int, .const_byte, .const_bool, .const_unit, .const_none => {},
+                    .const_int => |value| if (destination == .stack) {
+                        try self.encoder.immediate(.mov_eax, value);
+                        try self.storeResult(destination);
+                    },
+                    .const_byte => |value| if (destination == .stack) {
+                        try self.encoder.immediate(.mov_eax, value);
+                        try self.storeByte(destination, 0);
+                    },
+                    .const_bool => |value| if (destination == .stack) {
+                        try self.encoder.immediate(.mov_eax, @intFromBool(value));
+                        try self.storeResult(destination);
+                    },
+                    .const_unit, .const_none => {},
                     .const_type => unreachable,
                     .function_ref => |reference| try self.emitFunctionReference(reference, destination),
                     .variant_tag => |operand| {
@@ -427,7 +501,7 @@ fn FunctionEmitter(comptime Types: type) type {
                         .value = coercion.operand,
                         .coerce_to = coercion.target_type,
                         .variant_tag_mapping = coercion.tag_mapping.?,
-                    }, destination),
+                    }, if (coercion.destination) |storage| self.locations[@intFromEnum(storage)] else destination),
                     .variant_extract => |extraction| if (destination != .discarded) {
                         const source_type = self.valueType(extraction.operand);
                         const mapping = if (extraction.tag_mapping) |range| blk: {
@@ -438,17 +512,55 @@ fn FunctionEmitter(comptime Types: type) type {
                     },
                     .callable_coerce => |coercion| try self.copyValue(coercion.target_type, self.locations[@intFromEnum(coercion.operand)], destination),
                     .struct_init => |operation| try self.emitStructInit(ssa, operation, destination),
-                    .ref_init => |operation| try self.emitRefInit(ssa, operation, destination),
-                    .ref_value_for_drop => |operation| try self.emitRefValueForDrop(operation, destination),
+                    .box_init => |operation| try self.copyValue(operation.box_type, self.locations[@intFromEnum(operation.allocation)], destination),
+                    .storage_projection => |operation| try self.emitStorageProjection(operation, destination),
+                    .allocation_element => |operation| try self.emitAllocationElement(operation, destination),
+                    .borrow_box => |operation| {
+                        if (destination != .discarded) {
+                            std.debug.assert((try self.types.layout(operation.type_id)).byte_size == @sizeOf(u64));
+                            try self.copyRange(self.locations[@intFromEnum(operation.source)], 0, destination, 0, @sizeOf(u64));
+                        }
+                    },
+                    .borrow_address => |operation| if (destination != .discarded) {
+                        if (operation.base_is_reference)
+                            try self.loadAddress(self.locations[@intFromEnum(operation.source)])
+                        else
+                            try self.loadValueAddress(self.locations[@intFromEnum(operation.source)]);
+                        const field_offset = try self.borrowFieldOffset(ssa, operation);
+                        if (field_offset != 0) {
+                            if (field_offset > std.math.maxInt(i32)) return error.FunctionTooLarge;
+                            try self.encoder.addRaxImmediate32(field_offset);
+                        }
+                        try self.storeAddress(destination);
+                    },
+                    .borrow_read => |operation| {
+                        if (destination != .discarded) {
+                            const offset = switch (destination) {
+                                .indirect => |value| value,
+                                else => unreachable,
+                            };
+                            try self.loadAddress(self.locations[@intFromEnum(operation.source)]);
+                            try self.encoder.offset(.mov_rsp_rax, offset);
+                        }
+                    },
+                    .borrow_write => |operation| {
+                        const reference = self.locations[@intFromEnum(operation.reference)];
+                        const offset = switch (reference) {
+                            .stack => |value| value,
+                            else => unreachable,
+                        };
+                        const layout = try self.types.layout(operation.type_id);
+                        try self.copyRange(self.locations[@intFromEnum(operation.value)], 0, .{ .indirect = offset }, 0, layout.byte_size);
+                    },
+                    .value_copy => |operation| try self.copyValue(operation.type_id, self.locations[@intFromEnum(operation.source)], if (operation.destination) |storage| self.locations[@intFromEnum(storage)] else destination),
                     .field_access => |operation| try self.emitFieldAccess(operation, destination),
                     .field_update => |operation| try self.emitFieldUpdate(operation, destination),
                     .mut_parameter_write => |operation| try self.emitMutParameterWrite(ssa, operation),
                     .call_mut_argument => |operation| try self.emitCallMutArgument(operation, destination),
                     .call => |call| try self.emitCall(call, destination),
-                    .indirect_call => |call| try self.emitCall(call, destination),
                     .negi => |operand| {
                         try self.loadValue(self.locations[@intFromEnum(operand)]);
-                        try self.encoder.negateEax();
+                        try self.encoder.emit(.neg_eax);
                         try self.storeResult(destination);
                     },
                     .addi => |operands| try self.emitIntegerBinary(.add, operands, destination),
@@ -468,7 +580,6 @@ fn FunctionEmitter(comptime Types: type) type {
                 },
                 .predicate_branch => |predicate| try self.emitPredicateBranch(ssa, predicate),
                 .fallible_call => |fallible| try self.emitFallibleCall(ssa, fallible),
-                .fallible_indirect_call => |fallible| try self.emitFallibleCall(ssa, fallible),
                 .return_unit => try self.emitReturn(null, .unit),
                 .return_value => |value| try self.emitReturn(value, ssa.return_type),
                 .return_failure => try self.emitFailureReturn(),
@@ -476,11 +587,11 @@ fn FunctionEmitter(comptime Types: type) type {
             }
         }
 
-        fn emitFallibleCall(self: *Self, ssa: *const structures.FunctionBodyAnalysis, fallible: anytype) !void {
+        fn emitFallibleCall(self: *Self, ssa: *const structures.FunctionBodyAnalysis, fallible: @FieldType(structures.FunctionTerminator, "fallible_call")) !void {
             const success = ssa.blocks[@intFromEnum(fallible.success)];
             std.debug.assert(success.argument_end - success.argument_start == 1);
             try self.emitCall(fallible.call, self.locations[success.argument_start]);
-            try self.encoder.compareEdxZero();
+            try self.encoder.emit(.test_edx);
             const success_field = try self.encoder.conditionalJumpRelative32(.nei, 0);
             try self.emitJump(fallible.failure);
             const success_offset = std.math.cast(u32, self.encoder.code.items.len) orelse return error.FunctionTooLarge;
@@ -533,7 +644,7 @@ fn FunctionEmitter(comptime Types: type) type {
         }
 
         fn emitJump(self: *Self, target: structures.FunctionBlockId) !void {
-            const field_offset = try self.encoder.jumpRelative32(0);
+            const field_offset = try self.encoder.jump(.jmp, 0);
             try self.jump_patches.append(self.gpa, .{ .field_offset = field_offset, .target = target });
         }
 
@@ -550,65 +661,68 @@ fn FunctionEmitter(comptime Types: type) type {
         fn emitReturn(self: *Self, value: ?structures.FunctionValueUse, return_type: structures.TypeId) !void {
             if (value) |returned| {
                 const layout = try self.types.layout(return_type);
-                const destination: ValueLocation = if (usesMemoryReturn(layout))
+                const destination: ValueLocation = if (try self.types.facts().argumentPassing(return_type) == .indirect)
+                    .{ .indirect = self.return_buffer_offset orelse unreachable }
+                else if (usesMemoryReturn(layout))
                     .{ .return_buffer = self.return_buffer_offset orelse unreachable }
                 else
                     .eax;
                 try self.emitUse(returned, return_type, destination);
             }
-            try self.encoder.movEdxImmediate32(1);
-            if (self.stack_size != 0) try self.encoder.addRspImmediate32(self.stack_size);
-            try self.encoder.ret();
+            try self.encoder.immediate(.mov_edx, 1);
+            if (self.stack_size != 0) try self.encoder.offset(.add_rsp, self.stack_size);
+            try self.encoder.emit(.ret);
         }
 
         fn emitFailureReturn(self: *Self) !void {
             std.debug.assert(self.is_fallible);
-            try self.encoder.movEdxImmediate32(0);
-            if (self.stack_size != 0) try self.encoder.addRspImmediate32(self.stack_size);
-            try self.encoder.ret();
+            try self.encoder.immediate(.mov_edx, 0);
+            if (self.stack_size != 0) try self.encoder.offset(.add_rsp, self.stack_size);
+            try self.encoder.emit(.ret);
         }
 
-        fn emitCall(self: *Self, call: anytype, destination: ValueLocation) !void {
-            try self.emitCallArguments(call);
-            if (@TypeOf(call) == structures.FunctionCall) {
-                const offset = std.math.cast(u32, self.encoder.code.items.len + 1) orelse return error.FunctionTooLarge;
-                try self.encoder.callRelative32(0);
-                try self.appendRelocation(call.instance(), offset, .call_relative_32);
-            } else {
-                try self.loadAddress(self.locations[@intFromEnum(call.target)]);
-                try self.encoder.callRax();
+        fn emitCall(self: *Self, call: structures.FunctionCall, result: ValueLocation) !void {
+            const destination = if (call.destination) |storage| self.locations[@intFromEnum(storage)] else result;
+            try self.emitCallArguments(call, destination);
+            switch (call.target) {
+                .direct => |instance| {
+                    const offset = std.math.cast(u32, self.encoder.code.items.len + 1) orelse return error.FunctionTooLarge;
+                    try self.encoder.immediate(.call_relative, 0);
+                    try self.appendRelocation(instance, offset, .call_relative_32);
+                },
+                .indirect => |value| {
+                    try self.loadAddress(self.locations[@intFromEnum(value)]);
+                    try self.encoder.emit(.call_rax);
+                },
             }
-            const return_layout = try self.types.layout(call.return_type);
-            if (usesMemoryReturn(return_layout)) {
-                try self.copyValue(call.return_type, .{ .stack = 0 }, destination);
-            } else {
-                try self.storeResult(destination);
+            const layout = self.call_layouts.get(.{ .arguments = call.arguments, .return_type = call.return_type }).?;
+            switch (layout.result) {
+                .indirect => {},
+                .stack => try self.copyValue(call.return_type, layout.result, destination),
+                .eax => try self.copyValue(call.return_type, .eax, destination),
+                else => unreachable,
             }
         }
 
-        fn emitCallArguments(self: *Self, call: anytype) !void {
-            var argument_end: u32 = 0;
-            const return_layout = try self.types.layout(call.return_type);
-            if (usesMemoryReturn(return_layout)) {
-                const return_offset = try reserveStack(&argument_end, return_layout);
-                std.debug.assert(return_offset == 0);
+        fn emitCallArguments(self: *Self, call: structures.FunctionCall, destination: ValueLocation) !void {
+            const layout = self.call_layouts.get(.{ .arguments = call.arguments, .return_type = call.return_type }).?;
+            if (layout.result == .indirect) {
+                try self.loadValueAddress(destination);
+                try self.encoder.offset(.mov_rsp_rax, layout.result.indirect);
             }
-            for (self.call_arguments[call.arguments.start..call.arguments.end]) |argument| {
-                const type_id = argument.coerce_to orelse self.valueType(argument.value);
-                const layout = try argumentLayout(self.types, type_id);
-                const argument_offset = try reserveStack(&argument_end, layout);
-                if (try self.types.argumentPassing(type_id) == .indirect) {
+            for (self.call_arguments[call.arguments.start..call.arguments.end], layout.arguments) |argument, location| {
+                if (location == .indirect) {
                     std.debug.assert(argument.coerce_to == null);
                     try self.loadValueAddress(self.locations[@intFromEnum(argument.value)]);
-                    try self.encoder.movRspFromRax(argument_offset);
-                } else try self.emitUseToMemory(argument, argument_offset);
+                    try self.encoder.offset(.mov_rsp_rax, location.indirect);
+                } else try self.emitUseToMemory(argument, location.stack);
             }
         }
 
         fn loadValueAddress(self: *Self, location: ValueLocation) !void {
             switch (location) {
-                .indirect => |offset| try self.encoder.movRaxFromRsp(offset),
-                .stack, .incoming_argument, .return_buffer => |offset| try self.encoder.leaRaxFromRsp(offset),
+                .indirect => |offset| try self.encoder.offset(.mov_rax_rsp, offset),
+                .stack, .incoming_argument, .return_buffer => |offset| try self.encoder.offset(.lea_rax_rsp, offset),
                 .discarded, .immediate, .eax => unreachable,
             }
         }
@@ -617,7 +731,7 @@ fn FunctionEmitter(comptime Types: type) type {
             if (destination == .discarded) return;
             const offset_usize = std.math.add(usize, self.encoder.code.items.len, 2) catch return error.FunctionTooLarge;
             const offset = std.math.cast(u32, offset_usize) orelse return error.FunctionTooLarge;
-            try self.encoder.movRaxImmediate64(0);
+            try self.encoder.absolute(.mov_rax, 0);
             try self.storeAddress(destination);
             try self.appendRelocation(reference.instance(), offset, .address_absolute_64);
         }
@@ -644,14 +758,18 @@ fn FunctionEmitter(comptime Types: type) type {
 
         fn loadAddress(self: *Self, location: ValueLocation) !void {
             switch (location) {
-                .stack, .incoming_argument, .return_buffer, .indirect => |offset| try self.encoder.movRaxFromRsp(offset),
+                .stack, .incoming_argument, .return_buffer => |offset| try self.encoder.offset(.mov_rax_rsp, offset),
+                .indirect => |offset| {
+                    try self.encoder.offset(.mov_rax_rsp, offset);
+                    try self.encoder.emit(.mov_rax_rax);
+                },
                 .discarded, .immediate, .eax => unreachable,
             }
         }
 
         fn storeAddress(self: *Self, location: ValueLocation) !void {
             switch (location) {
-                .stack, .return_buffer => |offset| try self.encoder.movRspFromRax(offset),
+                .stack, .return_buffer => |offset| try self.encoder.offset(.mov_rsp_rax, offset),
                 .discarded => {},
                 .immediate, .eax, .incoming_argument, .indirect => unreachable,
             }
@@ -695,7 +813,7 @@ fn FunctionEmitter(comptime Types: type) type {
                 return self.copyValue(target_type, self.locations[@intFromEnum(use.value)], destination);
             }
             std.debug.assert(use.coerce_to.? == target_type);
-            if (try self.types.callable(target_type) != null) {
+            if (try self.types.facts().callable(target_type) != null) {
                 std.debug.assert(use.variant_tag_mapping == null);
                 return self.copyValue(target_type, self.locations[@intFromEnum(use.value)], destination);
             }
@@ -718,19 +836,19 @@ fn FunctionEmitter(comptime Types: type) type {
             source: ValueLocation,
             destination: ValueLocation,
         ) !void {
-            const actual_members = try self.types.variantMembers(actual_type);
+            const actual_members = try self.types.facts().variantMembers(actual_type);
             if (actual_members == null) {
-                _ = (try self.types.variantMembers(target_type)) orelse unreachable;
+                _ = (try self.types.facts().variantMembers(target_type)) orelse unreachable;
                 std.debug.assert(tag_mapping.len == 1);
                 const target_payload_offset = (try self.types.variantLayout(target_type)).payload_offset;
                 const actual_layout = try self.types.layout(actual_type);
                 try self.copyRange(source, 0, destination, target_payload_offset, actual_layout.byte_size);
-                try self.encoder.movEaxImmediate32(std.math.cast(i32, tag_mapping[0]) orelse return error.FunctionTooLarge);
+                try self.encoder.immediate(.mov_eax, std.math.cast(i32, tag_mapping[0]) orelse return error.FunctionTooLarge);
                 try self.storeComponent(destination, 0);
                 return;
             }
 
-            _ = try self.types.variantMembers(target_type) orelse {
+            _ = try self.types.facts().variantMembers(target_type) orelse {
                 std.debug.assert(tag_mapping.len == 0);
                 const target_layout = try self.types.layout(target_type);
                 const actual_payload_offset = (try self.types.variantLayout(actual_type)).payload_offset;
@@ -763,13 +881,13 @@ fn FunctionEmitter(comptime Types: type) type {
                 if (target_tag == structures.invalid_variant_tag) continue;
                 matched += 1;
                 if (matched == matching_count) {
-                    try self.encoder.movEaxImmediate32(std.math.cast(i32, target_tag) orelse return error.FunctionTooLarge);
+                    try self.encoder.immediate(.mov_eax, std.math.cast(i32, target_tag) orelse return error.FunctionTooLarge);
                     break;
                 }
                 try self.encoder.compareEax(.{ .immediate = @intCast(source_tag) });
                 const next = try self.encoder.conditionalJumpRelative32(.nei, 0);
-                try self.encoder.movEaxImmediate32(std.math.cast(i32, target_tag) orelse return error.FunctionTooLarge);
-                try done_jumps.append(self.gpa, try self.encoder.jumpRelative32(0));
+                try self.encoder.immediate(.mov_eax, std.math.cast(i32, target_tag) orelse return error.FunctionTooLarge);
+                try done_jumps.append(self.gpa, try self.encoder.jump(.jmp, 0));
                 const next_offset = std.math.cast(u32, self.encoder.code.items.len) orelse return error.FunctionTooLarge;
                 try self.patchJump(next, next_offset);
             }
@@ -805,47 +923,59 @@ fn FunctionEmitter(comptime Types: type) type {
             }
         }
 
-        fn emitRefInit(
-            self: *Self,
-            ssa: *const structures.FunctionBodyAnalysis,
-            operation: structures.RefInitOperation,
-            destination: ValueLocation,
-        ) !void {
-            std.debug.assert(destination != .discarded);
-            const allocation = self.locations[@intFromEnum(operation.allocation)];
-            const allocation_layout = try self.types.layout(self.valueType(operation.allocation));
-            const ref_layout = try self.types.layout(operation.ref_type);
-            std.debug.assert(std.meta.eql(allocation_layout, ref_layout));
-            const struct_layout = (try self.types.structLayout(operation.type_id)) orelse return error.Unavailable;
-            try self.loadAddress(allocation);
-            try self.encoder.movRdiFromRax();
-            for (ssa.struct_field_values[operation.fields.start..operation.fields.end]) |field| {
-                std.debug.assert(field.field_index < struct_layout.field_offsets.len);
-                const field_layout = try self.types.layout(self.valueType(field.value));
-                const field_offset = struct_layout.field_offsets[field.field_index];
-                try ensureAddressableStackRange(field_offset, field_layout.byte_size);
-                const source = self.locations[@intFromEnum(field.value)];
-                var offset: u32 = 0;
-                while (field_layout.byte_size - offset >= @sizeOf(u32)) : (offset += @sizeOf(u32)) {
-                    try self.loadComponent(source, offset);
-                    try self.encoder.movRdiOffsetFromEax(field_offset + offset);
-                }
-                while (offset < field_layout.byte_size) : (offset += 1) {
-                    try self.loadByte(source, offset);
-                    try self.encoder.movRdiOffsetByteFromAl(field_offset + offset);
-                }
-            }
-            try self.copyValue(operation.ref_type, allocation, destination);
-        }
-
-        fn emitRefValueForDrop(self: *Self, operation: structures.RefValueForDrop, destination: ValueLocation) !void {
+        fn emitStorageProjection(self: *Self, operation: structures.StorageProjection, destination: ValueLocation) !void {
             if (destination == .discarded) return;
             const offset = switch (destination) {
                 .indirect => |value| value,
                 else => unreachable,
             };
-            try self.loadAddress(self.locations[@intFromEnum(operation.owner)]);
-            try self.encoder.movRspFromRax(offset);
+            const source = self.locations[@intFromEnum(operation.owner)];
+            switch (operation.projection) {
+                .dereference => try self.loadAddress(source),
+                .field => |index| {
+                    const layout = (try self.types.structLayout(self.valueType(operation.owner))) orelse return error.Unavailable;
+                    try self.loadValueAddress(source);
+                    if (layout.field_offsets[index] != 0) try self.encoder.addRaxImmediate32(layout.field_offsets[index]);
+                },
+                .variant => {
+                    const layout = try self.types.variantLayout(self.valueType(operation.owner));
+                    try self.loadValueAddress(source);
+                    if (layout.payload_offset != 0) try self.encoder.addRaxImmediate32(layout.payload_offset);
+                },
+            }
+            try self.encoder.offset(.mov_rsp_rax, offset);
+        }
+
+        fn borrowFieldOffset(self: *Self, ssa: *const structures.FunctionBodyAnalysis, operation: structures.BorrowAddressOperation) !u32 {
+            if (operation.fields.start == operation.fields.end) return 0;
+            var type_id = self.valueType(operation.source);
+            if (operation.base_is_reference) type_id = (try self.types.facts().borrowElement(type_id)) orelse unreachable;
+            var offset: u32 = 0;
+            for (ssa.borrow_fields[operation.fields.start..operation.fields.end]) |field_index| {
+                const definition = (try self.types.facts().structDefinition(type_id)) orelse unreachable;
+                const layout = (try self.types.structLayout(type_id)) orelse unreachable;
+                offset = std.math.add(u32, offset, layout.field_offsets[field_index]) catch return error.FunctionTooLarge;
+                type_id = definition.fields[field_index].type_id;
+            }
+            return offset;
+        }
+
+        fn emitAllocationElement(self: *Self, operation: structures.AllocationElement, destination: ValueLocation) !void {
+            if (destination == .discarded) return;
+            const offset = switch (destination) {
+                .indirect => |value| value,
+                else => unreachable,
+            };
+            const layout = try self.types.layout(operation.type_id);
+            if (layout.byte_size > std.math.maxInt(i32)) return error.UnsupportedElementLayout;
+            if (layout.byte_size != 0) {
+                try self.loadValue(self.locations[@intFromEnum(operation.index)]);
+                try self.encoder.emit(.movsxd_rcx_eax);
+                try self.encoder.immediate(.imul_rcx, @intCast(layout.byte_size));
+            }
+            try self.loadAddress(self.locations[@intFromEnum(operation.allocation)]);
+            if (layout.byte_size != 0) try self.encoder.emit(.add_rax_rcx);
+            try self.encoder.offset(.mov_rsp_rax, offset);
         }
 
         fn emitFieldAccess(self: *Self, operation: structures.FieldAccessOperation, destination: ValueLocation) !void {
@@ -882,16 +1012,14 @@ fn FunctionEmitter(comptime Types: type) type {
         fn emitMutParameterWrite(self: *Self, ssa: *const structures.FunctionBodyAnalysis, operation: structures.MutParameterWrite) !void {
             const entry = ssa.blocks[@intFromEnum(ssa.entry)];
             std.debug.assert(operation.parameter_index < entry.argument_end - entry.argument_start);
-            var incoming_offset: u32 = 0;
-            const return_layout = try self.types.layout(ssa.return_type);
-            if (usesMemoryReturn(return_layout)) _ = try reserveStack(&incoming_offset, return_layout);
-            for (ssa.block_argument_types[entry.argument_start .. entry.argument_start + operation.parameter_index]) |type_id| {
-                _ = try reserveStack(&incoming_offset, try argumentLayout(self.types, type_id));
-            }
-            const parameter_offset = try reserveStack(&incoming_offset, try argumentLayout(self.types, operation.type_id));
+            const parameter = self.incoming_layout.arguments[operation.parameter_index];
+            const parameter_offset = switch (parameter) {
+                .stack, .indirect => |offset| offset,
+                else => unreachable,
+            };
             const caller_stack_offset = std.math.add(u32, self.stack_size, @sizeOf(u64)) catch return error.FunctionTooLarge;
             const destination_offset = std.math.add(u32, caller_stack_offset, parameter_offset) catch return error.FunctionTooLarge;
-            const destination: ValueLocation = if (try self.types.argumentPassing(operation.type_id) == .indirect)
+            const destination: ValueLocation = if (parameter == .indirect)
                 .{ .indirect = destination_offset }
             else
                 .{ .incoming_argument = destination_offset };
@@ -899,21 +1027,8 @@ fn FunctionEmitter(comptime Types: type) type {
         }
 
         fn emitCallMutArgument(self: *Self, operation: structures.CallMutArgument, destination: ValueLocation) !void {
-            var argument_offset: u32 = 0;
-            const return_layout = try self.types.layout(operation.return_type);
-            if (usesMemoryReturn(return_layout)) _ = try reserveStack(&argument_offset, return_layout);
-            const arguments = self.call_arguments[operation.arguments.start..operation.arguments.end];
-            std.debug.assert(operation.argument_index < arguments.len);
-            for (arguments[0..operation.argument_index]) |argument| {
-                const type_id = argument.coerce_to orelse self.valueType(argument.value);
-                _ = try reserveStack(&argument_offset, try argumentLayout(self.types, type_id));
-            }
-            const source_offset = try reserveStack(&argument_offset, try argumentLayout(self.types, operation.type_id));
-            const source: ValueLocation = if (try self.types.argumentPassing(operation.type_id) == .indirect)
-                .{ .indirect = source_offset }
-            else
-                .{ .stack = source_offset };
-            try self.copyValue(operation.type_id, source, destination);
+            const layout = self.call_layouts.get(.{ .arguments = operation.arguments, .return_type = operation.return_type }).?;
+            try self.copyValue(operation.type_id, layout.arguments[operation.argument_index], destination);
         }
 
         fn copyRange(self: *Self, source: ValueLocation, source_start: u32, destination: ValueLocation, destination_start: u32, byte_size: u32) !void {
@@ -932,13 +1047,13 @@ fn FunctionEmitter(comptime Types: type) type {
             switch (location) {
                 .immediate => |value| {
                     std.debug.assert(component_offset == 0);
-                    try self.encoder.movEaxImmediate32(value);
+                    try self.encoder.immediate(.mov_eax, value);
                 },
                 .eax => std.debug.assert(component_offset == 0),
-                .stack, .incoming_argument, .return_buffer => |offset| try self.encoder.movEaxFromRsp(std.math.add(u32, offset, component_offset) catch return error.FunctionTooLarge),
+                .stack, .incoming_argument, .return_buffer => |offset| try self.encoder.offset(.mov_eax_rsp, std.math.add(u32, offset, component_offset) catch return error.FunctionTooLarge),
                 .indirect => |offset| {
-                    try self.encoder.movRaxFromRsp(offset);
-                    try self.encoder.movEaxFromRaxOffset(component_offset);
+                    try self.encoder.offset(.mov_rax_rsp, offset);
+                    try self.encoder.offset(.mov_eax_rax, component_offset);
                 },
                 .discarded => unreachable,
             }
@@ -946,13 +1061,13 @@ fn FunctionEmitter(comptime Types: type) type {
 
         fn storeComponent(self: *Self, location: ValueLocation, component_offset: u32) !void {
             switch (location) {
-                .stack, .incoming_argument, .return_buffer => |offset| try self.encoder.movRspFromEax(std.math.add(u32, offset, component_offset) catch return error.FunctionTooLarge),
+                .stack, .incoming_argument, .return_buffer => |offset| try self.encoder.offset(.mov_rsp_eax, std.math.add(u32, offset, component_offset) catch return error.FunctionTooLarge),
                 .eax => std.debug.assert(component_offset == 0),
                 .discarded => {},
                 .immediate => unreachable,
                 .indirect => |offset| {
-                    try self.encoder.movRdiFromRsp(offset);
-                    try self.encoder.movRdiOffsetFromEax(component_offset);
+                    try self.encoder.offset(.mov_rdi_rsp, offset);
+                    try self.encoder.offset(.mov_rdi_eax, component_offset);
                 },
             }
         }
@@ -962,12 +1077,12 @@ fn FunctionEmitter(comptime Types: type) type {
                 .immediate => |value| {
                     std.debug.assert(byte_offset < @sizeOf(i32));
                     const bits: u32 = @bitCast(value);
-                    try self.encoder.movEaxImmediate32(@intCast((bits >> @intCast(byte_offset * 8)) & 0xff));
+                    try self.encoder.immediate(.mov_eax, @intCast((bits >> @intCast(byte_offset * 8)) & 0xff));
                 },
-                .stack, .incoming_argument, .return_buffer => |offset| try self.encoder.movzxEaxByteFromRsp(std.math.add(u32, offset, byte_offset) catch return error.FunctionTooLarge),
+                .stack, .incoming_argument, .return_buffer => |offset| try self.encoder.offset(.movzx_eax_rsp, std.math.add(u32, offset, byte_offset) catch return error.FunctionTooLarge),
                 .indirect => |offset| {
-                    try self.encoder.movRaxFromRsp(offset);
-                    try self.encoder.movzxEaxByteFromRaxOffset(byte_offset);
+                    try self.encoder.offset(.mov_rax_rsp, offset);
+                    try self.encoder.offset(.movzx_eax_rax, byte_offset);
                 },
                 .eax => std.debug.assert(byte_offset == 0),
                 .discarded => unreachable,
@@ -976,10 +1091,10 @@ fn FunctionEmitter(comptime Types: type) type {
 
         fn storeByte(self: *Self, location: ValueLocation, byte_offset: u32) !void {
             switch (location) {
-                .stack, .incoming_argument, .return_buffer => |offset| try self.encoder.movRspByteFromAl(std.math.add(u32, offset, byte_offset) catch return error.FunctionTooLarge),
+                .stack, .incoming_argument, .return_buffer => |offset| try self.encoder.offset(.mov_rsp_al, std.math.add(u32, offset, byte_offset) catch return error.FunctionTooLarge),
                 .indirect => |offset| {
-                    try self.encoder.movRdiFromRsp(offset);
-                    try self.encoder.movRdiOffsetByteFromAl(byte_offset);
+                    try self.encoder.offset(.mov_rdi_rsp, offset);
+                    try self.encoder.offset(.mov_rdi_al, byte_offset);
                 },
                 .eax => std.debug.assert(byte_offset == 0),
                 .discarded => {},
@@ -989,16 +1104,20 @@ fn FunctionEmitter(comptime Types: type) type {
 
         fn loadValue(self: *Self, location: ValueLocation) !void {
             switch (location) {
-                .immediate => |value| try self.encoder.movEaxImmediate32(value),
+                .immediate => |value| try self.encoder.immediate(.mov_eax, value),
                 .eax => {},
-                .stack, .incoming_argument, .return_buffer => |offset| try self.encoder.movEaxFromRsp(offset),
-                .discarded, .indirect => unreachable,
+                .stack, .incoming_argument, .return_buffer => |offset| try self.encoder.offset(.mov_eax_rsp, offset),
+                .indirect => |offset| {
+                    try self.encoder.offset(.mov_rax_rsp, offset);
+                    try self.encoder.offset(.mov_eax_rax, 0);
+                },
+                .discarded => unreachable,
             }
         }
 
         fn storeResult(self: *Self, location: ValueLocation) !void {
             switch (location) {
-                .stack, .return_buffer => |offset| try self.encoder.movRspFromEax(offset),
+                .stack, .return_buffer => |offset| try self.encoder.offset(.mov_rsp_eax, offset),
                 .eax, .discarded => {},
                 .immediate, .incoming_argument, .indirect => unreachable,
             }
@@ -1034,10 +1153,10 @@ pub fn compileFunction(ssa: *const structures.FunctionBodyAnalysis, types: anyty
 pub fn compileExternalExit(gpa: std.mem.Allocator) !structures.CompiledFunction {
     var encoder = try X86Encoder.init(gpa);
     defer encoder.deinit();
-    try encoder.movEaxFromRsp(8);
-    try encoder.movEdiFromEax();
-    try encoder.movEaxImmediate32(linux_exit_syscall);
-    try encoder.syscall();
+    try encoder.offset(.mov_eax_rsp, 8);
+    try encoder.emit(.mov_edi_eax);
+    try encoder.immediate(.mov_eax, linux_exit_syscall);
+    try encoder.emit(.syscall);
     const code = try encoder.code.toOwnedSlice(gpa);
     errdefer gpa.free(code);
     const relocations = try gpa.alloc(structures.CompiledFunction.Relocation, 0);
@@ -1063,80 +1182,89 @@ fn compileExternalAllocateStorage(gpa: std.mem.Allocator, element_size: u32, wit
     var encoder = try X86Encoder.init(gpa);
     defer encoder.deinit();
     if (element_size > std.math.maxInt(i32)) {
-        try encoder.zeroEdx();
-        try encoder.ret();
+        try encoder.emit(.zero_edx);
+        try encoder.emit(.ret);
         return externalArtifact(&encoder, gpa);
     }
     const argument_offset: u32 = if (with_count) 24 else 20;
-    try encoder.movEsiFromRsp(argument_offset);
-    try encoder.testEsi();
+    try encoder.offset(.mov_esi_rsp, argument_offset);
+    try encoder.emit(.test_esi);
     const invalid_size = try encoder.conditionalJumpRelative32(.lti, 0);
     if (element_size > 1) {
-        try encoder.multiplyRsi(@intCast(element_size));
-        try encoder.compareRsiMaxHostBytes();
+        try encoder.immediate(.imul_rsi, @intCast(element_size));
+        try encoder.immediate(.cmp_rsi, std.math.maxInt(i32));
     }
-    const size_overflow = if (element_size > 1) try encoder.jumpIfAbove(0) else null;
+    const size_overflow = if (element_size > 1) try encoder.jump(.ja, 0) else null;
     if (element_size == 0) {
-        try encoder.movEsiImmediate32(1);
+        try encoder.immediate(.mov_esi, 1);
     } else {
-        try encoder.testEsi();
+        try encoder.emit(.test_esi);
         const nonzero_size = try encoder.conditionalJumpRelative32(.nei, 0);
-        try encoder.movEsiImmediate32(1);
+        try encoder.immediate(.mov_esi, 1);
         try patchRelativeDisplacement(encoder.code.items, nonzero_size, @intCast(encoder.code.items.len), @as(u64, nonzero_size) + @sizeOf(i32), 0);
     }
-    try encoder.zeroEdi();
-    try encoder.movEdxImmediate32(3);
-    try encoder.movR10dImmediate32(0x22);
-    try encoder.movR8dImmediate32(-1);
-    try encoder.zeroR9d();
-    try encoder.movEaxImmediate32(linux_mmap_syscall);
-    try encoder.syscall();
-    try encoder.compareRaxError();
-    const allocation_failed = try encoder.jumpIfAboveEqual(0);
-    try encoder.movRspFromEax(8);
-    try encoder.shiftRaxRight32();
-    try encoder.movRspFromEax(12);
-    try encoder.movEaxFromEsi();
-    try encoder.movRspFromEax(16);
+    try encoder.emit(.zero_edi);
+    try encoder.immediate(.mov_edx, 3);
+    try encoder.immediate(.mov_r10d, 0x22);
+    try encoder.immediate(.mov_r8d, -1);
+    try encoder.emit(.zero_r9d);
+    try encoder.immediate(.mov_eax, linux_mmap_syscall);
+    try encoder.emit(.syscall);
+    try encoder.immediate(.cmp_rax, -4095);
+    const allocation_failed = try encoder.jump(.jae, 0);
+    try encoder.offset(.mov_rsp_eax, 8);
+    try encoder.emit(.shr_rax_32);
+    try encoder.offset(.mov_rsp_eax, 12);
+    try encoder.emit(.mov_eax_esi);
+    try encoder.offset(.mov_rsp_eax, 16);
     if (with_count) {
-        try encoder.movEaxFromRsp(argument_offset);
-        try encoder.movRspFromEax(20);
+        try encoder.offset(.mov_eax_rsp, argument_offset);
+        try encoder.offset(.mov_rsp_eax, 20);
     }
-    try encoder.movEdxImmediate32(1);
-    try encoder.ret();
+    try encoder.immediate(.mov_edx, 1);
+    try encoder.emit(.ret);
     const failure_offset: u32 = @intCast(encoder.code.items.len);
     try patchRelativeDisplacement(encoder.code.items, invalid_size, failure_offset, @as(u64, invalid_size) + @sizeOf(i32), 0);
     try patchRelativeDisplacement(encoder.code.items, allocation_failed, failure_offset, @as(u64, allocation_failed) + @sizeOf(i32), 0);
     if (size_overflow) |field| try patchRelativeDisplacement(encoder.code.items, field, failure_offset, @as(u64, field) + @sizeOf(i32), 0);
-    try encoder.zeroEdx();
-    try encoder.ret();
+    try encoder.emit(.zero_edx);
+    try encoder.emit(.ret);
     return externalArtifact(&encoder, gpa);
 }
 
 pub fn compileExternalDeallocateHostStorage(gpa: std.mem.Allocator) !structures.CompiledFunction {
     var encoder = try X86Encoder.init(gpa);
     defer encoder.deinit();
-    try encoder.movEdiFromRsp(8);
-    try encoder.movEsiFromRsp(12);
-    try encoder.shiftRsiLeft32();
-    try encoder.orRdiRsi();
-    try encoder.movEsiFromRsp(16);
-    try encoder.movEaxImmediate32(linux_munmap_syscall);
-    try encoder.syscall();
-    try encoder.movEdxImmediate32(1);
-    try encoder.ret();
+    try encoder.offset(.mov_edi_rsp, 8);
+    try encoder.offset(.mov_esi_rsp, 12);
+    try encoder.emit(.shl_rsi_32);
+    try encoder.emit(.or_rdi_rsi);
+    try encoder.offset(.mov_esi_rsp, 16);
+    try encoder.immediate(.mov_eax, linux_munmap_syscall);
+    try encoder.emit(.syscall);
+    try encoder.immediate(.mov_edx, 1);
+    try encoder.emit(.ret);
     return externalArtifact(&encoder, gpa);
 }
 
-pub fn compileExternalHostRefWrap(gpa: std.mem.Allocator, layout: structures.TypeLayout) !structures.CompiledFunction {
+pub fn compileExternalAllocationCount(gpa: std.mem.Allocator, count_offset: u32) !structures.CompiledFunction {
     var encoder = try X86Encoder.init(gpa);
     defer encoder.deinit();
-    try encoder.leaRsiFromRsp(layout.byte_size + 8);
-    try encoder.leaRdiFromRsp(8);
-    try encoder.movEcxImmediate32(@intCast(layout.byte_size));
-    try encoder.repMovsb();
-    try encoder.movEdxImmediate32(1);
-    try encoder.ret();
+    try encoder.offset(.mov_eax_rsp, count_offset + 8);
+    try encoder.immediate(.mov_edx, 1);
+    try encoder.emit(.ret);
+    return externalArtifact(&encoder, gpa);
+}
+
+pub fn compileExternalHostBoxWrap(gpa: std.mem.Allocator, layout: structures.TypeLayout) !structures.CompiledFunction {
+    var encoder = try X86Encoder.init(gpa);
+    defer encoder.deinit();
+    try encoder.offset(.lea_rsi_rsp, layout.byte_size + 8);
+    try encoder.offset(.lea_rdi_rsp, 8);
+    try encoder.immediate(.mov_ecx, @intCast(layout.byte_size));
+    try encoder.emit(.rep_movsb);
+    try encoder.immediate(.mov_edx, 1);
+    try encoder.emit(.ret);
     return externalArtifact(&encoder, gpa);
 }
 
@@ -1146,8 +1274,8 @@ pub fn compileExternalHostSlotTransfer(gpa: std.mem.Allocator, allocation: struc
     var encoder = try X86Encoder.init(gpa);
     defer encoder.deinit();
     if (element.byte_size == 0) {
-        try encoder.movEdxImmediate32(1);
-        try encoder.ret();
+        try encoder.immediate(.mov_edx, 1);
+        try encoder.emit(.ret);
         return externalArtifact(&encoder, gpa);
     }
 
@@ -1156,29 +1284,29 @@ pub fn compileExternalHostSlotTransfer(gpa: std.mem.Allocator, allocation: struc
     const allocation_offset = try reserveStack(&argument_end, allocation);
     const index_offset = if (indexed) try reserveStack(&argument_end, .{ .byte_size = 4, .byte_alignment = 4 }) else null;
     const element_offset = if (initialize) try reserveStack(&argument_end, element) else 0;
-    try encoder.movRaxFromRsp(allocation_offset + 8);
+    try encoder.offset(.mov_rax_rsp, allocation_offset + 8);
     if (index_offset) |offset| {
-        try encoder.movsxdRcxFromRsp(offset + 8);
-        try encoder.multiplyRcx(@intCast(element.byte_size));
-        try encoder.addRaxRcx();
+        try encoder.offset(.movsxd_rcx_rsp, offset + 8);
+        try encoder.immediate(.imul_rcx, @intCast(element.byte_size));
+        try encoder.emit(.add_rax_rcx);
     }
     if (initialize) {
-        try encoder.movRdiFromRax();
-        try encoder.leaRsiFromRsp(element_offset + 8);
+        try encoder.emit(.mov_rdi_rax);
+        try encoder.offset(.lea_rsi_rsp, element_offset + 8);
     } else {
-        try encoder.movRsiFromRax();
+        try encoder.emit(.mov_rsi_rax);
         if (usesMemoryReturn(element)) {
-            try encoder.leaRdiFromRsp(8);
+            try encoder.offset(.lea_rdi_rsp, 8);
         } else {
-            try encoder.movEaxFromRsi();
+            try encoder.emit(.mov_eax_rsi);
         }
     }
     if (initialize or usesMemoryReturn(element)) {
-        try encoder.movEcxImmediate32(@intCast(element.byte_size));
-        try encoder.repMovsb();
+        try encoder.immediate(.mov_ecx, @intCast(element.byte_size));
+        try encoder.emit(.rep_movsb);
     }
-    try encoder.movEdxImmediate32(1);
-    try encoder.ret();
+    try encoder.immediate(.mov_edx, 1);
+    try encoder.emit(.ret);
     return externalArtifact(&encoder, gpa);
 }
 
@@ -1246,10 +1374,10 @@ pub fn buildExecutable(
     defer encoder.deinit();
 
     const call_displacement_offset = encoder.code.items.len + 1;
-    try encoder.callRelative32(0);
-    try encoder.zeroEdi();
-    try encoder.movEaxImmediate32(linux_exit_syscall);
-    try encoder.syscall();
+    try encoder.immediate(.call_relative, 0);
+    try encoder.emit(.zero_edi);
+    try encoder.immediate(.mov_eax, linux_exit_syscall);
+    try encoder.emit(.syscall);
 
     const Layout = struct { address: u64, offset: usize };
     const layouts = try gpa.alloc(Layout, functions.len);
@@ -1261,7 +1389,7 @@ pub fn buildExecutable(
         const function_offset = try offsetFromBase(function_address, code_virtual_address);
         if (function.artifact.code.len > std.math.maxInt(usize) - function_offset) return error.FileTooBig;
         try encoder.code.appendNTimes(gpa, 0x90, function_offset - encoder.code.items.len);
-        try encoder.appendBytes(function.artifact.code);
+        try encoder.code.appendSlice(gpa, function.artifact.code);
         layout.* = .{ .address = function_address, .offset = function_offset };
     }
 
@@ -1355,292 +1483,102 @@ const X86Encoder = struct {
         self.code.deinit(self.gpa);
     }
 
-    fn appendBytes(self: *@This(), bytes: []const u8) !void {
-        try self.code.appendSlice(self.gpa, bytes);
+    fn emit(self: *@This(), operation: x86.Operation) !void {
+        std.debug.assert(x86.encoding(operation).operand == .none);
+        try x86.append(&self.code, self.gpa, operation, 0);
     }
 
-    fn appendBits32(self: *@This(), prefix: []const u8, bits: u32) !void {
-        try self.appendBytes(prefix);
-        var encoded: [4]u8 = undefined;
-        std.mem.writeInt(u32, &encoded, bits, .little);
-        try self.appendBytes(&encoded);
+    fn immediate(self: *@This(), operation: x86.Operation, value: i32) !void {
+        const operand = x86.encoding(operation).operand;
+        std.debug.assert(operand == .i32 or operand == .rel);
+        try x86.append(&self.code, self.gpa, operation, @as(u32, @bitCast(value)));
     }
 
-    fn appendBits64(self: *@This(), prefix: []const u8, bits: u64) !void {
-        try self.appendBytes(prefix);
-        var encoded: [8]u8 = undefined;
-        std.mem.writeInt(u64, &encoded, bits, .little);
-        try self.appendBytes(&encoded);
+    fn offset(self: *@This(), operation: x86.Operation, value: u32) !void {
+        std.debug.assert(x86.encoding(operation).operand == .u32);
+        try x86.append(&self.code, self.gpa, operation, value);
     }
 
-    fn callRelative32(self: *@This(), displacement: i32) !void {
-        try self.appendBits32(&.{0xE8}, @bitCast(displacement));
+    fn absolute(self: *@This(), operation: x86.Operation, value: u64) !void {
+        std.debug.assert(x86.encoding(operation).operand == .u64);
+        try x86.append(&self.code, self.gpa, operation, value);
     }
 
-    fn callRax(self: *@This()) !void {
-        try self.appendBytes(&.{ 0xFF, 0xD0 });
-    }
-
-    fn jumpRelative32(self: *@This(), displacement: i32) !u32 {
-        const field_offset = std.math.cast(u32, self.code.items.len + 1) orelse return error.FunctionTooLarge;
-        try self.appendBits32(&.{0xE9}, @bitCast(displacement));
+    fn jump(self: *@This(), operation: x86.Operation, displacement: i32) !u32 {
+        const encoding = x86.encoding(operation);
+        std.debug.assert(encoding.operand == .rel);
+        const field_offset = std.math.cast(u32, self.code.items.len + encoding.prefix.len) orelse return error.FunctionTooLarge;
+        try self.immediate(operation, displacement);
         return field_offset;
     }
 
     fn conditionalJumpRelative32(self: *@This(), operation: structures.PredicateOperation, displacement: i32) !u32 {
-        const opcode: u8 = switch (operation) {
-            .lti => 0x8C,
-            .gti => 0x8F,
-            .lei => 0x8E,
-            .gei => 0x8D,
-            .eqi, .eqb => 0x84,
-            .nei, .neb => 0x85,
+        const opcode: x86.Operation = switch (operation) {
+            .lti => .jl,
+            .gti => .jg,
+            .lei => .jle,
+            .gei => .jge,
+            .eqi, .eqb => .je,
+            .nei, .neb => .jne,
             .eqt, .net => unreachable,
         };
-        const field_offset = std.math.cast(u32, self.code.items.len + 2) orelse return error.FunctionTooLarge;
-        try self.appendBits32(&.{ 0x0F, opcode }, @bitCast(displacement));
-        return field_offset;
+        return self.jump(opcode, displacement);
     }
 
-    fn subRspImmediate32(self: *@This(), value: u32) !void {
-        try self.appendBits32(&.{ 0x48, 0x81, 0xEC }, value);
-    }
-
-    fn addRspImmediate32(self: *@This(), value: u32) !void {
-        try self.appendBits32(&.{ 0x48, 0x81, 0xC4 }, value);
-    }
-
-    fn zeroEdi(self: *@This()) !void {
-        try self.appendBytes(&.{ 0x31, 0xFF });
-    }
-
-    fn movEaxImmediate32(self: *@This(), value: i32) !void {
-        try self.appendBits32(&.{0xB8}, @bitCast(value));
-    }
-
-    fn movEsiImmediate32(self: *@This(), value: i32) !void {
-        try self.appendBits32(&.{0xBE}, @bitCast(value));
-    }
-
-    fn movRaxImmediate64(self: *@This(), value: u64) !void {
-        try self.appendBits64(&.{ 0x48, 0xB8 }, value);
-    }
-
-    fn movEdxImmediate32(self: *@This(), value: i32) !void {
-        try self.appendBits32(&.{0xBA}, @bitCast(value));
-    }
-
-    fn movR10dImmediate32(self: *@This(), value: i32) !void {
-        try self.appendBits32(&.{ 0x41, 0xBA }, @bitCast(value));
-    }
-
-    fn multiplyRsi(self: *@This(), element_size: i32) !void {
-        try self.appendBits32(&.{ 0x48, 0x69, 0xF6 }, @bitCast(element_size));
-    }
-
-    fn compareRsiMaxHostBytes(self: *@This()) !void {
-        try self.appendBits32(&.{ 0x48, 0x81, 0xFE }, std.math.maxInt(i32));
-    }
-
-    fn jumpIfAbove(self: *@This(), displacement: i32) !u32 {
-        const field_offset = std.math.cast(u32, self.code.items.len + 2) orelse return error.FunctionTooLarge;
-        try self.appendBits32(&.{ 0x0F, 0x87 }, @bitCast(displacement));
-        return field_offset;
-    }
-
-    fn movEaxFromEsi(self: *@This()) !void {
-        try self.appendBytes(&.{ 0x89, 0xF0 });
-    }
-
-    fn movsxdRcxFromRsp(self: *@This(), offset: u32) !void {
-        try self.appendBits32(&.{ 0x48, 0x63, 0x8C, 0x24 }, offset);
-    }
-
-    fn multiplyRcx(self: *@This(), element_size: i32) !void {
-        try self.appendBits32(&.{ 0x48, 0x69, 0xC9 }, @bitCast(element_size));
-    }
-
-    fn addRaxRcx(self: *@This()) !void {
-        try self.appendBytes(&.{ 0x48, 0x01, 0xC8 });
-    }
-
-    fn movRdiFromRax(self: *@This()) !void {
-        try self.appendBytes(&.{ 0x48, 0x89, 0xC7 });
-    }
-
-    fn movRdiOffsetFromEax(self: *@This(), offset: u32) !void {
-        try self.appendBits32(&.{ 0x89, 0x87 }, offset);
-    }
-
-    fn movRdiOffsetByteFromAl(self: *@This(), offset: u32) !void {
-        try self.appendBits32(&.{ 0x88, 0x87 }, offset);
-    }
-
-    fn movRdiFromRsp(self: *@This(), offset: u32) !void {
-        try self.appendBits32(&.{ 0x48, 0x8B, 0xBC, 0x24 }, offset);
-    }
-
-    fn movRsiFromRax(self: *@This()) !void {
-        try self.appendBytes(&.{ 0x48, 0x89, 0xC6 });
-    }
-
-    fn leaRsiFromRsp(self: *@This(), offset: u32) !void {
-        try self.appendBits32(&.{ 0x48, 0x8D, 0xB4, 0x24 }, offset);
-    }
-
-    fn leaRaxFromRsp(self: *@This(), offset: u32) !void {
-        try self.appendBits32(&.{ 0x48, 0x8D, 0x84, 0x24 }, offset);
-    }
-
-    fn movEaxFromRaxOffset(self: *@This(), offset: u32) !void {
-        try self.appendBits32(&.{ 0x8B, 0x80 }, offset);
-    }
-
-    fn movzxEaxByteFromRaxOffset(self: *@This(), offset: u32) !void {
-        try self.appendBits32(&.{ 0x0F, 0xB6, 0x80 }, offset);
-    }
-
-    fn leaRdiFromRsp(self: *@This(), offset: u32) !void {
-        try self.appendBits32(&.{ 0x48, 0x8D, 0xBC, 0x24 }, offset);
-    }
-
-    fn movEaxFromRsi(self: *@This()) !void {
-        try self.appendBytes(&.{ 0x8B, 0x06 });
-    }
-
-    fn repMovsb(self: *@This()) !void {
-        try self.appendBytes(&.{ 0xF3, 0xA4 });
-    }
-
-    fn movR8dImmediate32(self: *@This(), value: i32) !void {
-        try self.appendBits32(&.{ 0x41, 0xB8 }, @bitCast(value));
-    }
-
-    fn zeroR9d(self: *@This()) !void {
-        try self.appendBytes(&.{ 0x45, 0x31, 0xC9 });
-    }
-
-    fn zeroEdx(self: *@This()) !void {
-        try self.appendBytes(&.{ 0x31, 0xD2 });
-    }
-
-    fn testEsi(self: *@This()) !void {
-        try self.appendBytes(&.{ 0x85, 0xF6 });
-    }
-
-    fn compareRaxError(self: *@This()) !void {
-        try self.appendBits32(&.{ 0x48, 0x3D }, @bitCast(@as(i32, -4095)));
-    }
-
-    fn jumpIfAboveEqual(self: *@This(), displacement: i32) !u32 {
-        const field_offset = std.math.cast(u32, self.code.items.len + 2) orelse return error.FunctionTooLarge;
-        try self.appendBits32(&.{ 0x0F, 0x83 }, @bitCast(displacement));
-        return field_offset;
-    }
-
-    fn shiftRaxRight32(self: *@This()) !void {
-        try self.appendBytes(&.{ 0x48, 0xC1, 0xE8, 32 });
-    }
-
-    fn shiftRsiLeft32(self: *@This()) !void {
-        try self.appendBytes(&.{ 0x48, 0xC1, 0xE6, 32 });
-    }
-
-    fn orRdiRsi(self: *@This()) !void {
-        try self.appendBytes(&.{ 0x48, 0x09, 0xF7 });
-    }
-
-    fn movEdiFromRsp(self: *@This(), offset: u32) !void {
-        try self.appendBits32(&.{ 0x8B, 0xBC, 0x24 }, offset);
-    }
-
-    fn movEsiFromRsp(self: *@This(), offset: u32) !void {
-        try self.appendBits32(&.{ 0x8B, 0xB4, 0x24 }, offset);
-    }
-
-    fn movEdiFromEax(self: *@This()) !void {
-        try self.appendBytes(&.{ 0x89, 0xC7 });
-    }
-
-    fn movEcxImmediate32(self: *@This(), value: i32) !void {
-        try self.appendBits32(&.{0xB9}, @bitCast(value));
-    }
-
-    fn movEaxFromRsp(self: *@This(), offset: u32) !void {
-        try self.appendBits32(&.{ 0x8B, 0x84, 0x24 }, offset);
-    }
-
-    fn movRaxFromRsp(self: *@This(), offset: u32) !void {
-        try self.appendBits32(&.{ 0x48, 0x8B, 0x84, 0x24 }, offset);
-    }
-
-    fn movRspFromEax(self: *@This(), offset: u32) !void {
-        try self.appendBits32(&.{ 0x89, 0x84, 0x24 }, offset);
-    }
-
-    fn movRspFromRax(self: *@This(), offset: u32) !void {
-        try self.appendBits32(&.{ 0x48, 0x89, 0x84, 0x24 }, offset);
-    }
-
-    fn movzxEaxByteFromRsp(self: *@This(), offset: u32) !void {
-        try self.appendBits32(&.{ 0x0F, 0xB6, 0x84, 0x24 }, offset);
-    }
-
-    fn movRspByteFromAl(self: *@This(), offset: u32) !void {
-        try self.appendBits32(&.{ 0x88, 0x84, 0x24 }, offset);
-    }
-
-    fn negateEax(self: *@This()) !void {
-        try self.appendBytes(&.{ 0xF7, 0xD8 });
+    fn addRaxImmediate32(self: *@This(), value: u32) !void {
+        std.debug.assert(value <= std.math.maxInt(i32));
+        try self.immediate(.add_rax, @intCast(value));
     }
 
     fn compareEax(self: *@This(), rhs: ValueLocation) !void {
         switch (rhs) {
-            .immediate => |value| try self.appendBits32(&.{0x3D}, @bitCast(value)),
-            .stack, .incoming_argument => |offset| try self.appendBits32(&.{ 0x3B, 0x84, 0x24 }, offset),
-            .eax, .return_buffer, .discarded, .indirect => unreachable,
+            .immediate => |value| try self.immediate(.cmp_eax, value),
+            .stack, .incoming_argument => |stack_offset| try self.offset(.cmp_eax_rsp, stack_offset),
+            .indirect => |stack_offset| {
+                try self.offset(.mov_rcx_rsp, stack_offset);
+                try self.emit(.cmp_eax_rcx);
+            },
+            .eax, .return_buffer, .discarded => unreachable,
         }
-    }
-
-    fn compareEdxZero(self: *@This()) !void {
-        try self.appendBytes(&.{ 0x85, 0xD2 });
     }
 
     fn integerBinary(self: *@This(), operation: IntegerBinaryOperation, rhs: ValueLocation) !void {
         if (operation == .divide_signed) {
             switch (rhs) {
                 .immediate => |value| {
-                    try self.movEcxImmediate32(value);
-                    try self.appendBytes(&.{ 0x99, 0xF7, 0xF9 });
+                    try self.immediate(.mov_ecx, value);
+                    try self.emit(.cdq);
+                    try self.emit(.idiv_ecx);
                 },
-                .stack, .incoming_argument => |offset| {
-                    try self.appendBytes(&.{0x99});
-                    try self.appendBits32(&.{ 0xF7, 0xBC, 0x24 }, offset);
+                .stack, .incoming_argument => |stack_offset| {
+                    try self.emit(.cdq);
+                    try self.offset(.idiv_rsp, stack_offset);
                 },
-                .eax, .return_buffer, .discarded, .indirect => unreachable,
+                .indirect => |stack_offset| {
+                    try self.offset(.mov_rcx_rsp, stack_offset);
+                    try self.emit(.cdq);
+                    try self.emit(.idiv_rcx);
+                },
+                .eax, .return_buffer, .discarded => unreachable,
             }
             return;
         }
 
-        const encoding: struct { immediate: []const u8, stack: []const u8 } = switch (operation) {
-            .add => .{ .immediate = &.{0x05}, .stack = &.{ 0x03, 0x84, 0x24 } },
-            .subtract => .{ .immediate = &.{0x2D}, .stack = &.{ 0x2B, 0x84, 0x24 } },
-            .multiply => .{ .immediate = &.{ 0x69, 0xC0 }, .stack = &.{ 0x0F, 0xAF, 0x84, 0x24 } },
+        const encoding: struct { immediate: x86.Operation, stack: x86.Operation, indirect: x86.Operation } = switch (operation) {
+            .add => .{ .immediate = .add_eax, .stack = .add_eax_rsp, .indirect = .add_eax_rcx },
+            .subtract => .{ .immediate = .sub_eax, .stack = .sub_eax_rsp, .indirect = .sub_eax_rcx },
+            .multiply => .{ .immediate = .imul_eax, .stack = .imul_eax_rsp, .indirect = .imul_eax_rcx },
             .divide_signed => unreachable,
         };
         switch (rhs) {
-            .immediate => |value| try self.appendBits32(encoding.immediate, @bitCast(value)),
-            .stack, .incoming_argument => |offset| try self.appendBits32(encoding.stack, offset),
-            .eax, .return_buffer, .discarded, .indirect => unreachable,
+            .immediate => |value| try self.immediate(encoding.immediate, value),
+            .stack, .incoming_argument => |stack_offset| try self.offset(encoding.stack, stack_offset),
+            .indirect => |stack_offset| {
+                try self.offset(.mov_rcx_rsp, stack_offset);
+                try self.emit(encoding.indirect);
+            },
+            .eax, .return_buffer, .discarded => unreachable,
         }
-    }
-
-    fn ret(self: *@This()) !void {
-        try self.appendBytes(&.{0xC3});
-    }
-
-    fn syscall(self: *@This()) !void {
-        try self.appendBytes(&.{ 0x0F, 0x05 });
     }
 };
 

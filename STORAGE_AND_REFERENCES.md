@@ -1,10 +1,10 @@
 # Storage, allocation, and references
 
-This is a design note, not yet authoritative language semantics. Accepted rules
-belong in [syntax&semantics.txt](syntax&semantics.txt) once the API has been
-reviewed. The API sketches below are conceptual and do not settle
-static-parameter application, lifetime-contract, dereference, or named-argument
-syntax.
+This is a design note; accepted language rules belong in
+[syntax&semantics.txt](syntax&semantics.txt). The host API uses `Box(T)` for
+the unique allocated owner, `Ref(T, writable)` for the storable non-owning
+handle, and `borrow item = ...` for a scoped alias. Future provider, location,
+and target API sketches remain conceptual.
 
 ## Design constraints
 
@@ -20,23 +20,13 @@ syntax.
   host, a device, a stack, or a heap. Storage and reference abstractions carry
   the facts required to access it.
 
-The implemented host subset uses `std.memory.allocate(T, count)` and explicit
-`deallocate(T, allocation^)` with `Allocation(T)`. The `unsafe_initialize` and
-`unsafe_take` element transfers require caller-proven bounds and initialization
-state, and currently support only types with compiler-supported direct moves.
-`Ref(T).new(value)` and consuming `value(T, owner^)` use those transfers to
-own one initialized value. The constructor requires an automatically droppable,
-directly movable `T` for transfer from a completed value. `Ref.new(value)`
-infers `T` from the argument. `Ref(T).new(T{...})`
-also initializes an immovable or custom-move struct directly in final storage
-when its fields are directly movable; the fields are cleaned up if construction
-fails. For these types, `Ref` destroys its element at the allocated address,
-including custom hooks and zero-sized elements, before releasing the allocation.
-Zero-byte host allocations succeed for nonnegative counts with a distinct,
-stable address per allocation. `Ref(T)` has no safe borrowed access, explicit
-duplication, or recursive in-place construction yet. The target, provider,
-location, and address-space contract below is accepted, but provider selection,
-device locations, and address spaces are not implemented public APIs.
+The implemented host API provides typed allocation and unsafe indexed access,
+`Box(T)` owners, copyable `Ref(T, writable)` handles, scoped aliases, and
+`Buffer(T)` with checked element access and borrowed `BufferView(T)` slices.
+Its ownership, access, construction, and failure rules are recorded in
+[syntax&semantics.txt](syntax&semantics.txt).
+The target, provider, location, and address-space contract below is accepted,
+but provider selection, device locations, and address spaces are not public APIs.
 
 Keep these dimensions independent:
 
@@ -66,8 +56,8 @@ satisfies both requirements; the provider may reserve more storage internally.
 Typed allocation additionally takes an element type and count. Its byte size
 and alignment must be derived from a layout for `T` in the layout domain selected
 by the execution target and memory location. That representation includes the
-element stride and any field or variant offsets;
-The resolved element stride must be a multiple of its alignment, even when
+element stride and any field or variant offsets. The resolved element stride
+must be a multiple of its alignment, even when
 count is zero; `count * stride` is checked before calling the
 provider. Alignment must be a nonzero power of two and at least the target's
 natural alignment for `T`; a provider may reject a stricter alignment. Target
@@ -118,7 +108,7 @@ and keeps both allocations alive until it completes.
 
 ### Allocation ownership and initialization
 
-`Allocation(T)` is the prospective low-level owning handle. It retains the
+`Allocation(T)` is the low-level owning handle. It retains the
 provider, location, and original layout needed to deallocate its storage. More
 precisely, it either owns self-contained deallocation authority or has lifetime
 dependencies that keep the provider and location resources alive. It is an
@@ -132,56 +122,83 @@ initializing, destroying, or accessing an element through `Allocation` is
 unsafe unless the caller establishes its current state. Higher-level containers
 track their initialized range as part of their own invariants.
 
-A `Borrow` from an allocation has a lifetime dependency on the allocation and
-retains its location. Consuming the allocation invalidates all such borrows.
-Safe access is rejected when the current execution context
-cannot access the location.
+The current `unsafe_borrow_initialized` is expression-only. The separate
+`unsafe_borrow_element` produces a storable `Ref(T, false)` whose lifetime
+depends on the allocation. Consuming or mutating
+the allocation invalidates dependent
+borrows. Both operations require caller-proven bounds and initialization; they
+are not safe initialized access. Other locations have no access API yet.
 
 ### Reference types
 
-`Borrow(T)` is non-owning and non-nullable. Copying it preserves access to the same
-value without copying the value or acquiring ownership. Absence uses an explicit
-variant rather than a null reference. Its lifetime depends on every owner and
-resource needed for access. Mutation is permitted only when the borrowed access
-path is mutable and the aliasing rules permit it; there is no separate `MutBorrow`
-type.
+`Ref(T, writable: bool)` is non-owning and non-nullable. Its required static
+permission distinguishes read-only from writable access; either handle can be
+copied without copying the referent or acquiring ownership. Absence uses an
+explicit variant rather than a null reference. Its lifetime depends on every
+owner and resource needed for access. Borrowing an immutable `Box(T)` or place
+grants read-only access; borrowing mutably requires a mutable access path.
+`Ref.as_imm` explicitly attenuates writable permission, without any safe
+conversion in the other direction. `const` prevents rebinding a handle but
+does not remove its type-level writable permission. Assigning to a `var Ref`
+changes which value it refers to; assigning through a writable dereference
+replaces the referent and destroys its old value, provided that value can be
+automatically destroyed. Multiple writable handles may coexist. Calls still
+reject overlapping mutable arguments and borrowed arguments that may alias
+them; there is no global exclusive-borrow rule.
 
-When a returned or stored `Borrow` may refer to several sources, all possible
-owners and resources must outlive it. A bodyless function returning `Borrow`
+`borrow item = place` binds a local read-only alias to the initialized place
+without copying T; `borrow mut item = place` requires writable access and
+binds a writable alias. A borrow binding is neither an owned T nor a storable
+Ref, and cannot be retargeted. Assigning to a writable binding replaces the
+captured value. Binding an expression-only borrow with an ordinary `const` or
+`var` instead copies T when copying is supported. A borrow from a Ref retains
+the referent's origin even if the handle is rebound, and cannot be used after
+its owner or storage is invalidated. It cannot transfer ownership of T.
+
+When a returned or stored `Ref` may refer to several sources, all possible
+owners and resources must outlive it. A bodyless function returning `Ref`
 conservatively depends on every borrowed input. Without borrowed inputs, such a
 return is a compile error. Other borrows with origins the compiler cannot prove
-safe are also rejected; there are no user-written origin contracts for now.
+safe are also rejected. A `from(name, ...)` contract on a borrowed return
+narrows the permitted parameter origins; a `mut` parameter names the caller's
+owner after copy-back, whether the callee returns normally or fails.
 
-Address space belongs on `Borrow`, not on `T`. A future `Borrow(T, S)` uses a
-static address-space parameter; each target defines its supported spaces and
-which can access a particular location. The concrete device identity remains
-runtime state owned by a host-side allocation or device resource, not a distinct
+Address space belongs on `Ref`, not on `T`. A future address-space parameter
+would be independent of the existing `writable` permission; each target defines
+its supported spaces and which can access a particular location. The concrete
+device identity remains runtime state owned by a host-side allocation or device
+resource, not a distinct
 value type for every device. A borrow retains that location and the owner as
 lifetime dependencies. Host code cannot dereference a device-only borrow;
 cross-location transfer is explicit, not a cast of `S` or `T`. Access from a
 second target needs a verified compatible representation, or an explicit
 elementwise conversion rather than a bytewise copy.
 
-`Borrow(T)` grants access only to a live, initialized `T`. `Allocation` owns
-the unsafe indexed operations for initializing, destroying, and obtaining a
-borrow to an element whose initialized state the caller guarantees. Raw address
-arithmetic and foreign-memory access are outside this host-first API; decide
-their representation when those operations have a concrete use.
+`Ref(T, writable)` grants access only while its initialized referent remains
+live.
+`Allocation` owns unsafe indexed initialization, destruction, and borrowing;
+the caller proves element initialization. `Box` exposes read-only and writable
+Ref handles of its initialized value, while `Buffer` exposes checked read-only
+and writable element handles (writable access needs a mutable buffer place). Raw
+address arithmetic and foreign-memory access remain outside this host-first
+API; decide their representation when those operations have a concrete use.
 
-`Ref(T)` exclusively owns one initialized `T` in separately allocated
+`Box(T)` exclusively owns one initialized `T` in separately allocated
 storage. It does not copy implicitly. Construction combines allocation and
 initialization and is therefore fallible; destruction destroys `T` and
 deallocates the storage. Moving the owner preserves the allocation and its
 location. Explicit duplication, when `T` supports copy, creates a distinct allocation.
 The current host API initializes an immovable or custom-move struct in final
-storage with `Ref(T).new(T{...})` or `Ref.new(T{...})` when its fields are directly movable. It
-cannot accept an existing immovable value or recursively construct immovable fields. Other
-in-place construction forms need a later design.
+storage with `Box(T).new(T{...})` or `Box.new(T{...})`, including nested
+immovable fields when their leaf fields move directly. Conditional struct
+literals and function results also construct directly in final storage. It
+cannot accept an existing immovable value; other in-place forms remain future work.
 
-`SharedRef(T)` shares ownership of one initialized `T` and its control block.
+An eventual shared owner (name unsettled) would share ownership of one initialized
+`T` and its control block.
 Copying it increments a synchronized reference count; ending an owner decrements
 it, and the final owner destroys the value and releases storage. This does not
-synchronize access to `T`. It is initially available only where the provider and
+synchronize access to `T`. It would initially be available only where the provider and
 location support the required atomic operations. Strong-reference cycles either
 remain forbidden by API design or leak; no upgradeable weak-reference type is
 proposed here.
@@ -229,24 +246,24 @@ Mojo's unified
 is parameterized by pointee type, mutability, origin, and address space. It is
 non-nullable; unsafe operations cover arithmetic, raw addresses, initialization,
 and destruction. `UnsafePointer` is now only a deprecated alias of `Pointer`.
-This supports keeping one non-owning `Borrow` abstraction here, although this
-language should derive mutation permission from the borrowed access path rather
-than duplicating it as a type parameter.
+This supports keeping one non-owning `Ref(T, writable)` abstraction here.
+Borrowing can only grant permission available from the access path; writable
+permission remains part of the resulting handle's type.
 
 Mojo's
 [`OwnedPointer`](https://github.com/modular/modular/blob/975baa793c02665a36194c285496e133c9452068/Mojo/stdlib/std/memory/owned_pointer.mojo)
 allocates a single-element layout, moves or copies a value into it, and on
 destruction destroys the value before deallocating storage. Its interior
 reference receives a lifetime tied to the owner. This is the direct model for
-`Ref(T)`, but retaining the complete allocation initially is simpler than
-Mojo's `ThinAllocation` plus reconstructed layout.
+`Box(T)`, but retaining the complete allocation
+initially is simpler than Mojo's `ThinAllocation` plus reconstructed layout.
 
 Mojo's
 [`ArcPointer`](https://github.com/modular/modular/blob/975baa793c02665a36194c285496e133c9452068/Mojo/stdlib/std/memory/arc_pointer.mojo)
 allocates one control block containing atomic strong and weak counts plus the
 payload. Its atomic bookkeeping does not make payload access thread-safe. The
-control-block pattern applies to `SharedRef(T)`; the `Arc` and `WeakPointer` names
-and upgradeable weak semantics do not.
+control-block pattern applies to a future shared owner; the `Arc` and
+`WeakPointer` names and upgradeable weak semantics do not.
 
 ### Address spaces and devices
 
@@ -309,34 +326,43 @@ the mapped byte size. Its public count is `int`, while byte-size arithmetic is
 checked in wider unsigned storage before requesting host memory. Larger public
 counts and other targets require a concrete provider and target ABI first.
 
-`Allocation(T)` should provide only the operations needed by its first users:
+The host low-level operations are available as standalone `std.memory`
+functions, and `Allocation(T)` exposes methods for the same operations:
 
 ```text
-allocation.layout()
-allocation.location()
-allocation.unsafe_initialize(index, value)
-allocation.unsafe_destroy(index)
-allocation.unsafe_borrow_initialized(index)  # caller guarantees a live T
+unsafe_initialize(T, allocation, index, value)
+unsafe_take(T, allocation, index)
+unsafe_destroy(T, allocation, index)
+unsafe_borrow_initialized(T, allocation, index)  # expression-only borrowed T
+unsafe_borrow_element(T, allocation, index)      # storable Ref(T, false)
 ```
 
-For an immovable `T`, an in-place initialization operation constructs directly
-in the element slot.
+`Allocation(T).capacity()` returns the logical element count retained by the
+allocation, including zero-sized elements; it does not expose storage fields.
+
+Accessors for layout and location remain design sketches.
+For an immovable `T`, a future raw-allocation in-place initialization operation
+would construct directly in the element slot.
 These operations do not transfer storage ownership; initialized state and
 bounds are the caller's obligation at this low level.
 
-Build the first safe owner directly on that core:
+The current safe host owner and borrowed access use that core:
 
 ```text
-struct Ref(T: type)
-  fallible new(var value: T) Ref(T)
+struct Box(T: type)
+  fallible new(var value: T) Box(T)
     ...
 
-func borrow(static T: type, owner: Ref(T)) Borrow(T)
-func value(static T: type, deinit owner: Ref(T)) T
+func borrow_box(static T: type, imm owner: Box(T)) Ref(T, false)
+func borrow_mut_box(static T: type, mut owner: Box(T)) Ref(T, true)
+func borrow_local(static T: type, imm item: T) Ref(T, false)
+func read(static T: type, static writable: bool, imm reference: Ref(T, writable)) T
+func write(static T: type, imm reference: Ref(T, true), var item: T)
+func value(static T: type, deinit owner: Box(T)) T
 
-const constructed = Ref.new(value)
-const explicit = Ref(T).new(value)
-const borrowed = borrow(T, owner)
+const constructed = Box.new(value)
+const explicit = Box(T).new(value)
+const borrowed = borrow_box(T, owner)
 const extracted = value(T, owner^)
 ```
 
@@ -344,20 +370,50 @@ const extracted = value(T, owner^)
 `owner^`; its name does not need an `into_` prefix to restate that transfer.
 `get_value` would not distinguish borrowing, copying, and transfer.
 
-`Ref(T)` uses a one-element target-aware layout, initializes exactly once,
-and makes destruction plus deallocation automatic. The current `Ref.new`
+`Box(T)` uses a one-element host layout, initializes exactly once,
+and makes destruction plus deallocation automatic. The current `Box.new`
 allocates on the host; provider and location selection remain future work.
 For immovable `T`, a struct initializer constructs directly in that allocation
 instead of transferring a completed value.
 
-For collections, keep `Allocation(T)` plus an initialized count and capacity in
-the collection. Do not add a thin allocation handle until retaining layout and
-location is shown to be a material cost.
+The host owner/handle/binding model makes access and attenuation explicit.
+These expressions illustrate supported methods, dereference, and scoped aliases:
 
-Place public declarations under `std.memory`. Re-export `Ref` through
-`std.prelude`; require an explicit `std.memory` import for low-level
-allocation and layout APIs. Compiler support for storage and lifetime checks
-need not be expressible as ordinary library code.
+```text
+var first = Box.new(value)
+var second = Box.new(other_value)
+var handle: Ref(T, true) = first.borrow_mut()
+borrow item = handle[]
+borrow mut writable_item = handle[]
+handle = second.borrow_mut()  # rebinds the handle, not either alias
+writable_item = value         # replaces the first value
+handle[] = other_value        # replaces the second value
+const read_only = handle.as_imm()
+```
+
+`Box` owns the initialized value and stable allocation; `Ref` copies only a
+handle. A borrowed binding retains the captured referent and its origins, not
+the variable used to obtain it. Ordinary `const`/`var` bindings to a borrowed
+T instead copy it when supported. Pointee replacement requires writable
+authority and automatic destruction of the old value. Origin checks apply to
+borrowed returns and stored handles across calls and invalidation, using the
+existing `from(...)` contract where appropriate. Explicit fallible duplication
+of copyable T still allocates a separate owner; extracting T from Box still
+requires a directly movable T. Low-level allocation remains explicit-drop.
+
+`Buffer(T)` keeps `Allocation(T)` plus an initialized count; capacity is derived
+from the allocation's logical count, with no second stored capacity.
+`get(index)` and `get_mut(index)` check initialized bounds and return read-only
+and writable element Refs respectively; `get_mut` requires a mutable buffer
+place. Mutating the buffer invalidates prior element and `BufferView(T)` borrows,
+even if capacity did not change. A higher-level List and text API follow in
+later milestones. Do not add a thin allocation handle until retaining layout
+and location is shown to be a material cost.
+
+Place public declarations under `std.memory`. Re-export `Box` and `Ref`
+through `std.prelude`; require an explicit
+`std.memory` import for low-level allocation and layout APIs. Compiler support
+for storage and lifetime checks need not be expressible as ordinary library code.
 
 ### Location-specific conveniences
 
@@ -372,7 +428,8 @@ copy(source, mut destination)
 
 Here `device` is a runtime resource identifying a particular device, not an
 enum case. Its allocation result retains that identity. Passing it to a kernel
-produces a `Borrow(T, global)` or view whose device representation is validated for
+produces an address-space-qualified read-only `Ref` or view whose device
+representation is validated for
 that target; host code cannot safely dereference it. Workgroup and private
 storage remain kernel declarations rather than calls to this API.
 
@@ -383,7 +440,7 @@ storage remain kernel declarations rather than calls to this API.
   and zero-byte allocation or failure behavior. Do not add a device `TypeLayout`
   query or a general provider dispatcher before that target exists.
 - Settle the surface spelling of address spaces and larger count types when
-  non-host allocation and origin-aware `Borrow` become implementable. Initial
+  non-host allocation and origin-aware `Ref` become implementable. Initial
   cross-location transfers remain synchronous; asynchronous operations require
   an explicit completion resource retaining both allocations.
-- Determine atomic support per location before adding `SharedRef` control blocks.
+- Determine atomic support per location before adding shared-owner control blocks.

@@ -6,6 +6,11 @@ pub const runtime = @import("src/runtime.zig");
 pub const structures = @import("src/structures.zig");
 
 test {
+    _ = @import("src/main.zig");
+    _ = @import("src/cache.zig");
+    _ = @import("src/query_disk_cache.zig");
+    _ = modules;
+    _ = runtime;
     _ = @import("src/frontend/tokenizer.zig");
     _ = @import("src/frontend/parser.zig");
     _ = @import("src/frontend/semantic.zig");

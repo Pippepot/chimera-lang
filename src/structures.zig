@@ -96,6 +96,7 @@ pub const Token = struct {
         keyword_test,
         keyword_true,
         keyword_var,
+        keyword_where,
         keyword_import,
         keyword_pub,
     };
@@ -129,6 +130,7 @@ pub const Token = struct {
         .{ "test", .keyword_test },
         .{ "true", .keyword_true },
         .{ "var", .keyword_var },
+        .{ "where", .keyword_where },
         .{ "import", .keyword_import },
         .{ "pub", .keyword_pub },
     });
@@ -189,10 +191,13 @@ pub const Node = struct {
         call_arg_list,
         const_binding,
         var_binding,
+        borrow_binding,
+        borrow_mut_binding,
         static_binding,
         namespace_declaration,
         comptime_expr,
         field_access,
+        deref,
         func,
         identifier,
         none_literal,
@@ -208,6 +213,8 @@ pub const Node = struct {
         return_nothing,
         return_expr,
         signature,
+        return_origins,
+        where_clauses,
         sizeof_expr,
         @"struct",
         struct_field,
@@ -232,6 +239,11 @@ pub const Node = struct {
             a: Index,
             b: Index,
         },
+        signature: struct {
+            parameters: Index,
+            return_type: Index,
+            where_clauses: Index,
+        },
         ref: struct {
             start: u32,
             end: u32,
@@ -248,7 +260,7 @@ pub const Ast = struct {
     pub fn nodeList(self: Ast, index: Node.Index) []const Node.Index {
         const node = self.nodes[(index.unwrap() orelse return &.{}).index()];
         switch (node.tag) {
-            .param_list, .type_variant, .type_list, .call_arg_list => {},
+            .param_list, .type_variant, .type_list, .call_arg_list, .where_clauses => {},
             else => unreachable,
         }
         return self.node_refs[node.data.ref.start..node.data.ref.end];
@@ -264,13 +276,14 @@ pub const Ast = struct {
             if (left.tag != right.tag or left.token_index != right.token_index) return false;
             switch (left.tag) {
                 .break_nothing, .continue_expr, .return_nothing, .access, .implicit_static, .bool_literal, .identifier, .none_literal, .number_literal, .unit_literal, .type, .implicit_type => {},
-                .break_expr, .return_expr, .loop, .not, .neg, .query_op, .move_expr, .comptime_expr, .sizeof_expr, .field_access, .struct_field, .struct_property, .struct_init_field, .@"pub" => {
+                .break_expr, .return_expr, .loop, .not, .neg, .query_op, .move_expr, .comptime_expr, .sizeof_expr, .field_access, .deref, .struct_field, .struct_property, .struct_init_field, .@"pub" => {
                     if (left.data.node != right.data.node) return false;
                 },
-                .add, .sub, .mul, .div, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .@"and", .@"or", .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .call, .const_binding, .var_binding, .static_binding, .namespace_declaration, .func, .param, .signature, .type_func, .@"if" => {
+                .add, .sub, .mul, .div, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .@"and", .@"or", .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .call, .const_binding, .var_binding, .borrow_binding, .borrow_mut_binding, .static_binding, .namespace_declaration, .func, .param, .return_origins, .type_func, .@"if" => {
                     if (left.data.node_node.a != right.data.node_node.a or left.data.node_node.b != right.data.node_node.b) return false;
                 },
-                .block, .call_arg_list, .param_list, .type_list, .type_variant, .if_else, .@"struct", .struct_init, .import, .selective_import => {
+                .signature => if (!std.meta.eql(left.data.signature, right.data.signature)) return false,
+                .block, .call_arg_list, .param_list, .type_list, .type_variant, .where_clauses, .if_else, .@"struct", .struct_init, .import, .selective_import => {
                     if (left.data.ref.start != right.data.ref.start or left.data.ref.end != right.data.ref.end) return false;
                 },
                 else => return false,
@@ -710,6 +723,7 @@ pub const CallableType = struct {
     parameters: []const CallableParameter,
     return_type: TypeId,
     is_fallible: bool,
+    return_origins: ?[]const u32 = null,
 
     pub fn parametersEql(a: CallableType, b: CallableType) bool {
         return callableParametersEql(a.parameters, b.parameters);
@@ -718,11 +732,16 @@ pub const CallableType = struct {
     pub fn eql(a: CallableType, b: CallableType) bool {
         return a.return_type == b.return_type and
             a.is_fallible == b.is_fallible and
+            (if (a.return_origins) |origins|
+                if (b.return_origins) |other| std.mem.eql(u32, origins, other) else false
+            else
+                b.return_origins == null) and
             a.parametersEql(b);
     }
 
     pub fn deinit(self: *CallableType, gpa: std.mem.Allocator) void {
         gpa.free(self.parameters);
+        if (self.return_origins) |origins| gpa.free(origins);
         self.* = undefined;
     }
 };
@@ -756,41 +775,6 @@ pub const TypeLayout = struct {
 };
 
 pub const ArgumentPassing = enum { direct, indirect };
-
-pub const AllocationLayout = struct {
-    byte_size: u64,
-    byte_alignment: u32,
-
-    pub fn forElements(element: TypeLayout, count: u64) error{ InvalidAlignment, InvalidStride, SizeOverflow }!AllocationLayout {
-        if (element.byte_alignment == 0 or !std.math.isPowerOfTwo(element.byte_alignment)) return error.InvalidAlignment;
-        if (element.byte_size % element.byte_alignment != 0) return error.InvalidStride;
-        return .{
-            .byte_size = std.math.mul(u64, element.byte_size, count) catch return error.SizeOverflow,
-            .byte_alignment = element.byte_alignment,
-        };
-    }
-};
-
-test "allocation layout derives bytes from resolved element stride with checked count" {
-    const testing = std.testing;
-    try testing.expectEqual(
-        AllocationLayout{ .byte_size = 96, .byte_alignment = 16 },
-        try AllocationLayout.forElements(.{ .byte_size = 32, .byte_alignment = 16 }, 3),
-    );
-    try testing.expectEqual(
-        AllocationLayout{ .byte_size = 0, .byte_alignment = 16 },
-        try AllocationLayout.forElements(.{ .byte_size = 32, .byte_alignment = 16 }, 0),
-    );
-    try testing.expectEqual(
-        AllocationLayout{ .byte_size = 0, .byte_alignment = 8 },
-        try AllocationLayout.forElements(.{ .byte_size = 0, .byte_alignment = 8 }, std.math.maxInt(u64)),
-    );
-    try testing.expectError(error.SizeOverflow, AllocationLayout.forElements(.{ .byte_size = 32, .byte_alignment = 16 }, std.math.maxInt(u64)));
-    try testing.expectError(error.InvalidAlignment, AllocationLayout.forElements(.{ .byte_size = 32, .byte_alignment = 3 }, 1));
-    try testing.expectError(error.InvalidAlignment, AllocationLayout.forElements(.{ .byte_size = 0, .byte_alignment = 0 }, 0));
-    try testing.expectError(error.InvalidStride, AllocationLayout.forElements(.{ .byte_size = 3, .byte_alignment = 4 }, 2));
-    try testing.expectError(error.InvalidStride, AllocationLayout.forElements(.{ .byte_size = 3, .byte_alignment = 4 }, 0));
-}
 
 pub const VariantLayout = struct {
     layout: TypeLayout,
@@ -897,6 +881,10 @@ pub const OwnershipCapabilities = struct {
     needs_custom_copy: bool = false,
     needs_automatic_drop: bool = false,
     requires_explicit_drop: bool = false,
+
+    pub fn isDirectlyMovable(self: OwnershipCapabilities) bool {
+        return self.move != .none and !self.needs_custom_move;
+    }
 };
 
 pub const FunctionValueId = enum(u32) { _ };
@@ -955,15 +943,34 @@ pub const FunctionTerminator = union(enum) {
         success: FunctionBlockId,
         failure: FunctionBlockId,
     },
-    fallible_indirect_call: struct {
-        call: IndirectFunctionCall,
-        success: FunctionBlockId,
-        failure: FunctionBlockId,
-    },
     return_unit,
     return_value: FunctionValueUse,
     return_failure,
     diverge,
+
+    pub fn operands(self: *FunctionTerminator) [2]?*FunctionValueId {
+        return switch (self.*) {
+            .predicate_branch => |*branch| .{ &branch.operands.lhs, &branch.operands.rhs },
+            .fallible_call => |*fallible| fallible.call.operands(),
+            .return_value => |*use| .{ &use.value, null },
+            .branch, .return_unit, .return_failure, .diverge => .{ null, null },
+        };
+    }
+
+    pub fn successors(self: *FunctionTerminator) [2]?*FunctionBlockId {
+        return switch (self.*) {
+            .branch => |*branch| .{ &branch.target, null },
+            .predicate_branch => |*branch| .{ &branch.then_branch.target, &branch.else_branch.target },
+            .fallible_call => |*call| .{ &call.success, &call.failure },
+            .return_unit, .return_value, .return_failure, .diverge => .{ null, null },
+        };
+    }
+
+    pub fn successorCount(self: FunctionTerminator) u2 {
+        var terminator = self;
+        const targets = terminator.successors();
+        return @as(u2, @intFromBool(targets[0] != null)) + @intFromBool(targets[1] != null);
+    }
 };
 
 pub const FunctionBlock = struct {
@@ -977,6 +984,26 @@ pub const FunctionBlock = struct {
 /// Function-signature query outputs own `parameters`; interned callable types
 /// clone the same value shape into session-stable storage.
 pub const FunctionSignature = CallableType;
+
+pub const CallBehavior = enum {
+    ordinary,
+    box_new,
+    box_value,
+    box_duplicate,
+    box_borrow,
+    box_borrow_mut,
+    local_borrow,
+    allocation_element_borrow,
+    reference_read,
+    reference_write,
+    reference_attenuate,
+    box_destroy,
+    allocation_destroy,
+    allocation_read,
+    buffer_new,
+    buffer_append,
+    buffer_reserve,
+};
 
 pub const FunctionParameterShape = struct {
     mode: ParameterMode,
@@ -1006,20 +1033,17 @@ pub const FunctionShape = struct {
 };
 
 pub const FunctionCall = struct {
-    target: ItemId,
-    specialization: ?CompileTimeValueTupleId = null,
+    target: union(enum) { direct: InstanceId, indirect: FunctionValueId },
     arguments: FunctionValueRange,
     return_type: TypeId,
+    destination: ?FunctionValueId = null,
 
-    pub fn instance(self: FunctionCall) InstanceId {
-        return .{ .item = self.target, .specialization = self.specialization };
+    pub fn operands(self: *FunctionCall) [2]?*FunctionValueId {
+        return .{
+            if (self.target == .indirect) &self.target.indirect else null,
+            if (self.destination) |*destination| destination else null,
+        };
     }
-};
-
-pub const IndirectFunctionCall = struct {
-    target: FunctionValueId,
-    arguments: FunctionValueRange,
-    return_type: TypeId,
 };
 
 pub const FunctionReference = struct {
@@ -1036,6 +1060,7 @@ pub const VariantOperation = struct {
     operand: FunctionValueId,
     target_type: TypeId,
     tag_mapping: ?FunctionValueRange = null,
+    destination: ?FunctionValueId = null,
 };
 
 pub const StructFieldValue = struct {
@@ -1048,16 +1073,45 @@ pub const StructOperation = struct {
     type_id: TypeId,
 };
 
-pub const RefInitOperation = struct {
+pub const BoxInitOperation = struct {
     allocation: FunctionValueId,
-    fields: FunctionValueRange,
-    type_id: TypeId,
-    ref_type: TypeId,
+    box_type: TypeId,
 };
 
-pub const RefValueForDrop = struct {
+pub const StorageProjection = struct {
     owner: FunctionValueId,
     type_id: TypeId,
+    projection: union(enum) { dereference, field: u32, variant } = .dereference,
+};
+
+pub const AllocationElement = struct {
+    allocation: FunctionValueId,
+    index: FunctionValueId,
+    type_id: TypeId,
+};
+
+pub const BorrowOperation = struct {
+    source: FunctionValueId,
+    type_id: TypeId,
+};
+
+pub const BorrowAddressOperation = struct {
+    source: FunctionValueId,
+    type_id: TypeId,
+    fields: FunctionValueRange = .{ .start = 0, .end = 0 },
+    base_is_reference: bool = false,
+};
+
+pub const BorrowWriteOperation = struct {
+    reference: FunctionValueId,
+    value: FunctionValueId,
+    type_id: TypeId,
+};
+
+pub const ValueCopy = struct {
+    source: FunctionValueId,
+    type_id: TypeId,
+    destination: ?FunctionValueId = null,
 };
 
 pub const FieldAccessOperation = struct {
@@ -1099,19 +1153,44 @@ pub const FunctionInstruction = union(enum) {
     variant_extract: VariantOperation,
     callable_coerce: VariantOperation,
     struct_init: StructOperation,
-    ref_init: RefInitOperation,
-    ref_value_for_drop: RefValueForDrop,
+    box_init: BoxInitOperation,
+    storage_projection: StorageProjection,
+    allocation_element: AllocationElement,
+    borrow_box: BorrowOperation,
+    borrow_address: BorrowAddressOperation,
+    borrow_read: BorrowOperation,
+    borrow_write: BorrowWriteOperation,
+    value_copy: ValueCopy,
     field_access: FieldAccessOperation,
     field_update: FieldUpdateOperation,
     mut_parameter_write: MutParameterWrite,
     call_mut_argument: CallMutArgument,
     call: FunctionCall,
-    indirect_call: IndirectFunctionCall,
     negi: FunctionValueId,
     addi: BinaryOperands,
     subi: BinaryOperands,
     muli: BinaryOperands,
     divsi: BinaryOperands,
+
+    pub fn operands(self: *FunctionInstruction) [2]?*FunctionValueId {
+        return switch (self.*) {
+            .const_int, .const_byte, .const_bool, .const_type, .const_unit, .const_none, .function_ref, .struct_init, .call_mut_argument => .{ null, null },
+            .variant_tag, .negi => |*operand| .{ operand, null },
+            .variant_coerce, .variant_extract, .callable_coerce => |*operation| .{ &operation.operand, if (operation.destination) |*destination| destination else null },
+            .box_init => |*operation| .{ &operation.allocation, null },
+            .storage_projection => |*operation| .{ &operation.owner, null },
+            .allocation_element => |*operation| .{ &operation.allocation, &operation.index },
+            .borrow_box, .borrow_read => |*operation| .{ &operation.source, null },
+            .borrow_address => |*operation| .{ &operation.source, null },
+            .borrow_write => |*operation| .{ &operation.reference, &operation.value },
+            .value_copy => |*operation| .{ &operation.source, if (operation.destination) |*destination| destination else null },
+            .field_access => |*operation| .{ &operation.operand, null },
+            .field_update => |*operation| .{ &operation.operand, &operation.value },
+            .mut_parameter_write => |*operation| .{ &operation.value, null },
+            .call => |*call| call.operands(),
+            .addi, .subi, .muli, .divsi => |*binary| .{ &binary.lhs, &binary.rhs },
+        };
+    }
 
     pub fn resultType(self: FunctionInstruction) TypeId {
         return switch (self) {
@@ -1122,16 +1201,20 @@ pub const FunctionInstruction = union(enum) {
             .const_unit => .unit,
             .const_none => .none,
             .function_ref => |reference| reference.type_id,
-            .variant_coerce, .variant_extract, .callable_coerce => |operation| operation.target_type,
+            .variant_coerce, .variant_extract, .callable_coerce => |operation| if (operation.destination == null) operation.target_type else .unit,
             .struct_init => |operation| operation.type_id,
-            .ref_init => |operation| operation.ref_type,
-            .ref_value_for_drop => |operation| operation.type_id,
+            .box_init => |operation| operation.box_type,
+            .storage_projection => |operation| operation.type_id,
+            .allocation_element => |operation| operation.type_id,
+            .borrow_box, .borrow_read => |operation| operation.type_id,
+            .borrow_address => |operation| operation.type_id,
+            .borrow_write => .unit,
+            .value_copy => |operation| if (operation.destination == null) operation.type_id else .unit,
             .field_access => |operation| operation.field_type,
             .field_update => |operation| operation.type_id,
             .mut_parameter_write => .unit,
             .call_mut_argument => |operation| operation.type_id,
-            .call => |call| call.return_type,
-            .indirect_call => |call| call.return_type,
+            .call => |call| if (call.destination == null) call.return_type else .unit,
         };
     }
 };
@@ -1145,6 +1228,7 @@ pub const FunctionBodyAnalysis = struct {
     block_argument_types: []TypeId,
     variant_coercion_tags: []const u32 = &.{},
     struct_field_values: []StructFieldValue = &.{},
+    borrow_fields: []u32 = &.{},
     branch_arguments: []FunctionValueUse,
     call_arguments: []FunctionValueUse,
     instructions: []Instruction,
@@ -1175,6 +1259,7 @@ pub const FunctionBodyAnalysis = struct {
             !std.mem.eql(TypeId, a.block_argument_types, b.block_argument_types) or
             !std.mem.eql(u32, a.variant_coercion_tags, b.variant_coercion_tags) or
             a.struct_field_values.len != b.struct_field_values.len or
+            !std.mem.eql(u32, a.borrow_fields, b.borrow_fields) or
             !valueUsesEql(a.branch_arguments, b.branch_arguments) or
             !valueUsesEql(a.call_arguments, b.call_arguments) or
             a.instructions.len != b.instructions.len or
@@ -1213,6 +1298,7 @@ pub const FunctionBodyAnalysis = struct {
         gpa.free(self.block_argument_types);
         gpa.free(self.variant_coercion_tags);
         gpa.free(self.struct_field_values);
+        gpa.free(self.borrow_fields);
         gpa.free(self.branch_arguments);
         gpa.free(self.call_arguments);
         gpa.free(self.instructions);
@@ -1371,6 +1457,7 @@ pub const Diagnostic = struct {
         compile_time_unhandled_failure,
         compile_time_division_by_zero,
         compile_time_integer_overflow,
+        compile_time_unsupported_operation,
         compile_time_call_trace,
         unsupported_external_declaration,
         invalid_external_signature,
@@ -1396,6 +1483,7 @@ pub const Diagnostic = struct {
         static_argument_not_supported,
         comptime_runtime_capture,
         static_argument_type_mismatch,
+        where_condition_failed,
         duplicate_parameter,
         parameter_type_missing,
         parameter_type_not_supported,
@@ -1415,19 +1503,35 @@ pub const Diagnostic = struct {
         nested_declaration_not_supported,
         ownership_transfer_requires_place,
         ownership_transfer_requires_owned_place,
+        partial_field_transfer_not_supported,
+        explicit_drop_field_cannot_be_implicitly_ended,
+        field_not_restored_before_mut_return,
         ownership_transfer_requires_owning_context,
         mutable_argument_requires_place,
         mutable_argument_requires_mutable_place,
         overlapping_mutable_arguments,
         use_after_transfer,
         possibly_transferred,
+        borrow_outlives_source,
+        invalid_return_origin,
+        return_origin_not_declared,
+        borrow_requires_place,
+        mutable_borrow_requires_writable_place,
+        dereference_requires_ref: TypeId,
+        reference_not_writable,
         transferred_value_not_restored_before_loop_backedge,
         type_not_movable: TypeId,
         type_not_copyable: TypeNotCopyable,
-        ref_requires_automatic_drop: TypeId,
-        ref_requires_struct_initializer: TypeId,
-        ref_field_requires_direct_move: TypeId,
-        ref_extraction_requires_direct_move: TypeId,
+        buffer_cannot_store_borrow_element: TypeId,
+        buffer_requires_automatic_drop: TypeId,
+        buffer_requires_direct_move: TypeId,
+        borrow_write_cannot_store_borrow: TypeId,
+        borrow_write_requires_automatic_drop: TypeId,
+        borrow_write_requires_direct_move: TypeId,
+        box_requires_automatic_drop: TypeId,
+        box_requires_struct_initializer: TypeId,
+        box_field_requires_direct_move: TypeId,
+        box_extraction_requires_direct_move: TypeId,
         value_requires_explicit_drop: TypeId,
         expression_not_supported,
         struct_initializer_not_struct: TypeId,
@@ -1451,6 +1555,7 @@ pub const Diagnostic = struct {
         integer_literal_out_of_range,
         fallible_condition_not_supported,
         if_condition_not_fallible,
+        box_conditional_condition_not_supported,
         inspection_type_not_supported,
         variant_inspection_operand_not_variant: TypeId,
         condition_binding_must_be_immutable,

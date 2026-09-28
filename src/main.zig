@@ -32,7 +32,7 @@ const RunInput = struct {
 };
 
 const RunOutcome = union(enum) {
-    program_exit: u8,
+    program: std.process.Child.Term,
     compiler_exit: u8,
     rejected,
 };
@@ -115,7 +115,7 @@ fn buildWithStageTimings(db: *query.Database, io: std.Io, timings: *diagnostics.
     const root = try db.intern(queries.ModulePaths, .{ .path = "" });
     if (!(try db.get(queries.ValidateModuleGraph, root)).*) return;
     if ((try db.get(queries.SelectEntry, file_id)).*) |entry|
-        _ = try db.get(queries.AnalyzeFunctionBody, entry);
+        _ = try db.get(queries.AnalyzeFunctionInstance, .{ .item = entry });
     timings.mark(io, "analyze bodies");
     _ = try db.get(queries.CollectReachableInstances, file_id);
     timings.mark(io, "compile functions");
@@ -150,7 +150,7 @@ fn compileAndRun(
                 try timings.print(io, errors);
                 try errors.flush();
             }
-            return .{ .program_exit = status };
+            return .{ .program = status };
         }
     }
     const worker_count = if (input.worker_count == 0)
@@ -262,7 +262,7 @@ fn compileAndRun(
         std.debug.assert(emitted.len != 0);
         try output.flush();
         timings.mark(io, "debug output");
-        const type_interner: queries.TypeInterner(*query.Database) = .{ .ctx = db };
+        const type_interner: queries.TypeFacts(*query.Database) = .{ .ctx = db };
         try diagnostics.renderDiagnostics(type_interner, errors, render_sources.items, emitted);
         if (input.debug_flags.timing) try timings.print(io, errors);
         try errors.flush();
@@ -291,7 +291,7 @@ fn compileAndRun(
         try timings.print(io, errors);
         try errors.flush();
     }
-    return .{ .program_exit = exit_code };
+    return .{ .program = exit_code };
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -382,10 +382,7 @@ pub fn main(init: std.process.Init) !void {
         try errors.flush();
     }
     switch (outcome) {
-        .program_exit => |code| {
-            try output.print("exit code: {d}\n", .{code});
-            try output.flush();
-        },
+        .program => |termination| if (!try reportProgramTermination(output, errors, termination)) std.process.exit(1),
         .compiler_exit => |code| std.process.exit(code),
         .rejected => {
             // Rejected source is an expected user error: exit quietly so the
@@ -393,6 +390,31 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         },
     }
+}
+
+fn reportProgramTermination(output: *std.Io.Writer, errors: *std.Io.Writer, termination: std.process.Child.Term) !bool {
+    switch (termination) {
+        .exited => |code| {
+            try output.print("exit code: {d}\n", .{code});
+            try output.flush();
+            return true;
+        },
+        .signal => |signal| try printError(errors, "generated program terminated by signal {d}", .{@intFromEnum(signal)}),
+        .stopped => |signal| try printError(errors, "generated program stopped by signal {d}", .{@intFromEnum(signal)}),
+        .unknown => |status| try printError(errors, "generated program terminated with unknown status {d}", .{status}),
+    }
+    try errors.flush();
+    return false;
+}
+
+test "CLI reports a generated program signal separately from compiler failure" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var errors: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer errors.deinit();
+    try std.testing.expect(!try reportProgramTermination(&output.writer, &errors.writer, .{ .signal = .TERM }));
+    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "generated program terminated by signal 15") != null);
+    try std.testing.expectEqual(@as(usize, 0), output.writer.buffered().len);
 }
 
 test "CLI options stop at the source path and preserve program arguments" {
@@ -458,7 +480,7 @@ test "CLI reuses a complete disk cache entry and invalidates changed source" {
             .cache_directory = cache_directory,
             .worker_count = 2,
         }, &output.writer, &errors.writer);
-        try std.testing.expectEqual(RunOutcome{ .program_exit = case.expected }, result);
+        try std.testing.expectEqual(RunOutcome{ .program = .{ .exited = case.expected } }, result);
         try std.testing.expectEqual(case.hit, std.mem.indexOf(u8, errors.writer.buffered(), "cache hit") != null);
     }
 
@@ -474,7 +496,7 @@ test "CLI reuses a complete disk cache entry and invalidates changed source" {
         .started = std.Io.Clock.awake.now(io),
         .worker_count = 2,
     }, &uncached_output.writer, &uncached_errors.writer);
-    try std.testing.expectEqual(RunOutcome{ .program_exit = 18 }, uncached_result);
+    try std.testing.expectEqual(RunOutcome{ .program = .{ .exited = 18 } }, uncached_result);
     try std.testing.expect(std.mem.indexOf(u8, uncached_errors.writer.buffered(), "cache hit") == null);
 
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
@@ -511,7 +533,7 @@ test "CLI reuses a complete disk cache entry and invalidates changed source" {
         .cache_directory = cache_directory,
         .worker_count = 2,
     }, &recovered_output.writer, &recovered_errors.writer);
-    try std.testing.expectEqual(RunOutcome{ .program_exit = 19 }, recovered);
+    try std.testing.expectEqual(RunOutcome{ .program = .{ .exited = 19 } }, recovered);
     try std.testing.expectEqual(@as(usize, 0), recovered_errors.writer.buffered().len);
 }
 
@@ -538,7 +560,7 @@ test "one and four workers produce identical multi-file artifacts" {
             .started = std.Io.Clock.awake.now(io),
             .worker_count = workers,
         }, &output.writer, &errors.writer);
-        try std.testing.expectEqual(RunOutcome{ .program_exit = 21 }, result);
+        try std.testing.expectEqual(RunOutcome{ .program = .{ .exited = 21 } }, result);
         try std.testing.expectEqual(@as(usize, 0), errors.writer.buffered().len);
         const artifact = try std.Io.Dir.cwd().readFileAlloc(io, "prog", std.testing.allocator, .limited(1024 * 1024));
         if (first_artifact) |first| {
@@ -571,7 +593,7 @@ test "CLI core renders debug output and runs the compiled program" {
         .started = std.Io.Clock.awake.now(io),
     }, &output.writer, &errors.writer);
 
-    try std.testing.expectEqual(RunOutcome{ .program_exit = 42 }, exit_code);
+    try std.testing.expectEqual(RunOutcome{ .program = .{ .exited = 42 } }, exit_code);
     try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "AST\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "SSA\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "ASM\n") != null);
@@ -643,6 +665,40 @@ test "CLI core renders compile-time call traces from the failure outward" {
     try std.testing.expect(failure < inner_call);
     try std.testing.expect(inner_call < outer_call);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, rendered, "called at compile time from here"));
+}
+
+test "CLI rejects unsupported compile-time borrowing and allocation with diagnostics" {
+    const io = std.testing.io;
+    for ([_][]const u8{
+        \\func compute() int
+        \\  const number = 42
+        \\  borrow item = number
+        \\  return item
+        \\static answer = compute()
+        \\exit(answer)
+        ,
+        \\fallible compute() int
+        \\  const owner = Box.new(42)
+        \\  return owner.borrow()[]
+        \\static answer = compute()
+        \\exit(answer)
+        ,
+    }) |source| {
+        var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer output.deinit();
+        var errors: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer errors.deinit();
+        const result = try compileAndRun(io, std.testing.allocator, .{
+            .source_path = "unsupported.chi",
+            .source = source,
+            .program_args = &.{},
+            .debug_flags = .{},
+            .started = std.Io.Clock.awake.now(io),
+        }, &output.writer, &errors.writer);
+        try std.testing.expectEqual(RunOutcome.rejected, result);
+        try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "operation is not supported during compile-time execution") != null);
+        try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "unsupported.chi:") != null);
+    }
 }
 
 test "CLI core handles compile-time exit without producing an artifact" {
@@ -724,7 +780,7 @@ test "source files load without changing the entry program" {
         .started = std.Io.Clock.awake.now(io),
     }, &output.writer, &errors.writer);
 
-    try std.testing.expectEqual(RunOutcome{ .program_exit = 42 }, exit_code);
+    try std.testing.expectEqual(RunOutcome{ .program = .{ .exited = 42 } }, exit_code);
 }
 
 test "diagnostics render with their own file paths" {
@@ -736,14 +792,14 @@ test "diagnostics render with their own file paths" {
         .{ .path = "physics/body.chi", .source = physics_source, .module_path = "physics" },
     }, &.{ "", "physics" });
     const physics_entry = (try db.get(queries.SelectEntry, 1)).*.?;
-    try std.testing.expect((try db.get(queries.AnalyzeFunctionBody, physics_entry)).* == null);
-    const held = try db.transitiveAccumulatorValues(queries.AnalyzeFunctionBody, physics_entry, structures.Diagnostic, std.testing.allocator);
+    try std.testing.expect((try db.get(queries.AnalyzeFunctionInstance, .{ .item = physics_entry })).* == null);
+    const held = try db.transitiveAccumulatorValues(queries.AnalyzeFunctionInstance, .{ .item = physics_entry }, structures.Diagnostic, std.testing.allocator);
     defer std.testing.allocator.free(held);
     try std.testing.expectEqual(@as(usize, 1), held.len);
 
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
-    const type_interner: queries.TypeInterner(*query.Database) = .{ .ctx = db };
+    const type_interner: queries.TypeFacts(*query.Database) = .{ .ctx = db };
     try diagnostics.renderDiagnostics(type_interner, &output.writer, &.{
         .{ .file_id = 0, .path = "main.chi", .source = entry_source },
         .{ .file_id = 1, .path = "physics/body.chi", .source = physics_source },
@@ -753,6 +809,29 @@ test "diagnostics render with their own file paths" {
         output.writer.buffered(),
         "physics/body.chi:1:1: expected 1 call argument, found 0",
     ) != null);
+}
+
+test "ownership diagnostics describe field transfers" {
+    const db = try query.Database.init(std.testing.allocator, .{ .worker_count = 1 });
+    defer db.deinit();
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    const type_interner: queries.TypeFacts(*query.Database) = .{ .ctx = db };
+    try diagnostics.renderDiagnostics(type_interner, &output.writer, &.{
+        .{ .file_id = 0, .path = "ownership.chi", .source = "" },
+    }, &.{
+        .{ .file_id = 0, .span = null, .kind = .ownership_transfer_requires_place },
+        .{ .file_id = 0, .span = null, .kind = .partial_field_transfer_not_supported },
+        .{ .file_id = 0, .span = null, .kind = .explicit_drop_field_cannot_be_implicitly_ended },
+        .{ .file_id = 0, .span = null, .kind = .{ .box_requires_struct_initializer = .int } },
+    });
+
+    const rendered = output.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "`^` can only transfer a local binding or one of its fields") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "cannot transfer or join these fields independently under the current ownership rules") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "transfer or dispose of it on every path") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "cannot move an existing value of type `int` into Box; use a direct initializer or producer call") != null);
 }
 
 test "CLI debug labels sources across modules and timing preserves unused code" {
@@ -770,7 +849,7 @@ test "CLI debug labels sources across modules and timing preserves unused code" 
         .debug_flags = .{ .ast = true, .ssa = true, .@"asm" = true, .timing = true },
         .started = std.Io.Clock.awake.now(io),
     }, &output.writer, &errors.writer);
-    try std.testing.expectEqual(RunOutcome{ .program_exit = 42 }, outcome);
+    try std.testing.expectEqual(RunOutcome{ .program = .{ .exited = 42 } }, outcome);
     const rendered = output.writer.buffered();
     for ([_][]const u8{ "source /project/main.chi", "source /project/lib/a.chi", "SSA\n", "ASM\n", ":: lib.answer" }) |expected|
         try std.testing.expect(std.mem.indexOf(u8, rendered, expected) != null);

@@ -255,6 +255,11 @@ pub const Database = struct {
         input_entry.changed_at = db.revision;
     }
 
+    pub fn input(db: *Database, comptime I: type, key: I.Key) anyerror!*const I.Value {
+        validateInput(I);
+        return db.getInput(I, key, null);
+    }
+
     pub fn get(db: *Database, comptime Q: type, input_value: Q.Input) anyerror!*const Q.Output {
         const handle = try db.scheduleInternal(Q, input_value, null, .deferred);
         return handle.wait();
@@ -398,9 +403,9 @@ pub const Database = struct {
         }
         try writer.write(u64, @intCast(records.items.len));
         for (records.items) |record| {
-            const input: *const Q.Input = @ptrCast(@alignCast(record.entry.input_ptr));
+            const query_input: *const Q.Input = @ptrCast(@alignCast(record.entry.input_ptr));
             const output: *const Q.Output = @ptrCast(@alignCast(record.entry.output_ptr.?));
-            try writer.write(Q.Input, input.*);
+            try writer.write(Q.Input, query_input.*);
             try writer.write(Q.Output, output.*);
             try writer.write(u64, @intCast(record.inputs.len));
             for (record.inputs) |dep| {
@@ -436,8 +441,8 @@ pub const Database = struct {
 
     fn collectPersistedDependencies(db: *Database, entry: *Entry, seen_entries: *std.AutoHashMap(*Entry, void), seen_inputs: *std.AutoHashMap(*InputEntry, void), inputs: *std.ArrayList(*InputEntry), query_deps: *std.ArrayList(*Entry)) !void {
         if ((try seen_entries.getOrPut(entry)).found_existing) return;
-        for (entry.input_deps.items) |input| {
-            if (!(try seen_inputs.getOrPut(input)).found_existing) try inputs.append(db.allocator, input);
+        for (entry.input_deps.items) |input_entry| {
+            if (!(try seen_inputs.getOrPut(input_entry)).found_existing) try inputs.append(db.allocator, input_entry);
         }
         for (entry.deps.items) |dep| {
             if (dep.fingerprint_output_fn != null) {
@@ -541,7 +546,7 @@ pub const Database = struct {
         };
     }
 
-    fn getInput(db: *Database, comptime I: type, key: I.Key, parent: *Entry) anyerror!*const I.Value {
+    fn getInput(db: *Database, comptime I: type, key: I.Key, parent: ?*Entry) anyerror!*const I.Value {
         const key_copy = key;
         const lookup_key = inputCacheKey(I, &key_copy, inputKeyHash(I, key_copy));
 
@@ -549,7 +554,7 @@ pub const Database = struct {
         defer db.unlock();
 
         const entry = db.inputs.get(lookup_key) orelse try db.insertInputLocked(I, key_copy, lookup_key.hash);
-        try db.addInputDependencyLocked(parent, entry);
+        if (parent) |query_entry| try db.addInputDependencyLocked(query_entry, entry);
         const value: *const I.Value = @ptrCast(@alignCast(entry.value_ptr orelse return error.InputNotFound));
         return value;
     }
@@ -686,8 +691,8 @@ pub const Database = struct {
 
     fn dependenciesChanged(db: *Database, entry: *Entry, worker_index: ?usize) bool {
         const verified_at = entry.verified_at;
-        for (entry.input_deps.items) |input| {
-            if (input.changed_at > verified_at) return true;
+        for (entry.input_deps.items) |input_entry| {
+            if (input_entry.changed_at > verified_at) return true;
         }
         for (entry.deps.items) |dep| {
             // Let Q.run handle dependency errors again, just as on first demand.
@@ -830,12 +835,12 @@ pub const Database = struct {
         return entry.state == .complete and entry.verified_at == db.revision;
     }
 
-    fn addInputDependencyLocked(db: *Database, parent: *Entry, input: *InputEntry) !void {
+    fn addInputDependencyLocked(db: *Database, parent: *Entry, input_entry: *InputEntry) !void {
         const input_deps = &parent.computation.?.input_deps;
         for (input_deps.items) |dep| {
-            if (dep == input) return;
+            if (dep == input_entry) return;
         }
-        try input_deps.append(db.allocator, input);
+        try input_deps.append(db.allocator, input_entry);
     }
 
     fn reachesLocked(db: *Database, start: *Entry, target: *Entry) bool {

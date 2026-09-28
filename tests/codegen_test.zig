@@ -11,6 +11,10 @@ const payload_variant = structures.TypeId.fromInterned(@enumFromInt(3));
 const callable_type = structures.TypeId.fromInterned(@enumFromInt(4));
 
 const TestTypes = struct {
+    pub fn facts(self: @This()) @This() {
+        return self;
+    }
+
     pub fn layout(_: @This(), type_id: structures.TypeId) !structures.TypeLayout {
         if (type_id == .int) return .{ .byte_size = 4, .byte_alignment = 4 };
         if (type_id == .unit or type_id == .none or type_id == .never) return .{ .byte_size = 0, .byte_alignment = 1 };
@@ -27,6 +31,14 @@ const TestTypes = struct {
     }
 
     pub fn structLayout(_: @This(), _: structures.TypeId) !?structures.StructLayout {
+        return null;
+    }
+
+    pub fn structDefinition(_: @This(), _: structures.TypeId) !?structures.StructDefinition {
+        return null;
+    }
+
+    pub fn borrowElement(_: @This(), _: structures.TypeId) !?structures.TypeId {
         return null;
     }
 
@@ -55,7 +67,7 @@ fn integerConstant(value: i32) structures.FunctionBodyAnalysis.Instruction {
 
 fn directCall(target: structures.InstanceId) structures.FunctionBodyAnalysis.Instruction {
     return .{ .call = .{
-        .target = target.item,
+        .target = .{ .direct = target },
         .arguments = .{ .start = 0, .end = 0 },
         .return_type = .int,
     } };
@@ -200,8 +212,8 @@ test "function references relocate absolute addresses for indirect calls" {
     const target: structures.InstanceId = .{ .item = @enumFromInt(0xabcdef01) };
     var instructions = [_]structures.FunctionBodyAnalysis.Instruction{
         .{ .function_ref = .{ .target = target.item, .type_id = callable_type } },
-        .{ .indirect_call = .{
-            .target = @enumFromInt(0),
+        .{ .call = .{
+            .target = .{ .indirect = @enumFromInt(0) },
             .arguments = .{ .start = 0, .end = 0 },
             .return_type = .int,
         } },
@@ -447,7 +459,7 @@ fn testCompileVariantSubsetCallAllocations(gpa: std.mem.Allocator) !void {
         .variant_tag_mapping = .{ .start = 0, .end = 2 },
     }};
     var instructions = [_]structures.FunctionBodyAnalysis.Instruction{.{ .call = .{
-        .target = @enumFromInt(0),
+        .target = .{ .direct = .{ .item = @enumFromInt(0) } },
         .arguments = .{ .start = 0, .end = 1 },
         .return_type = wide_variant,
     } }};

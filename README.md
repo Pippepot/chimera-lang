@@ -42,7 +42,7 @@ run the normal queries.
 Concurrent compiler processes can share the cache and working directory; each
 runs its own executable while `./prog` is replaced atomically.
 
-Top-level code is the entry point; a function named `main` is ordinary. The CLI itself exits with 0 after a normal program exit, or 1 on invalid arguments, source-read failure, source rejection, or compiler failure. It reports the program's status separately. A compile-time `exit(code)` is compiler control instead: it produces no executable and becomes the CLI's own process status.
+Top-level code is the entry point; a function named `main` is ordinary. The CLI itself exits with 0 after a normal program exit, or 1 on invalid arguments, source-read failure, source rejection, compiler failure, or abnormal program termination. It reports the program's exit status or termination signal separately from compiler failures. A compile-time `exit(code)` is compiler control instead: it produces no executable and becomes the CLI's own process status.
 
 ## Documentation
 
@@ -52,7 +52,7 @@ Top-level code is the entry point; a function named `main` is ordinary. The CLI 
 | [ROADMAP.md](ROADMAP.md) | Verified implementation status, gaps, and ordered next steps |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Compiler boundaries, ownership, and representation contracts |
 | [PROGRAM_FLOW.md](PROGRAM_FLOW.md) | Current query flow, invalidation, and result lifetimes |
-| [STORAGE_AND_REFERENCES.md](STORAGE_AND_REFERENCES.md) | Allocation/reference research and API design proposal |
+| [STORAGE_AND_REFERENCES.md](STORAGE_AND_REFERENCES.md) | Implemented host API and accepted future storage design |
 | [AGENTS.md](AGENTS.md) | Contribution and review rules |
 
 Language examples describe the target, not a promise of compiler support. Parser support alone does not establish semantics. Resolve missing language decisions in `syntax&semantics.txt` before implementing them; neither legacy behavior nor an old test overrides it.
@@ -72,7 +72,7 @@ zig build test
 git diff --check
 ```
 
-The runner includes inline tests and standalone suites. Test binaries run in parallel with separate working directories so each can write `./prog`. Use `zig build test -Dtest-source=tests/modules_test.zig` to run one suite. For focused stage checks, use `zig test test_sources.zig --test-filter <name>`; the standalone suites need the build-provided `test_sources` module. Check modified Zig files with `zig fmt --check <files>`. Keep temporary verification files outside the repository.
+The default runner uses four roots: one for all inline tests and three standalone suites. Each inline test runs once. Test binaries have separate working directories so they can write `./prog` in parallel. Use `zig build test -Dtest-source=tests/modules_test.zig` for one suite, or another source path for local tests and their imports. Add `-Dtest-filter="test name fragment"` to narrow the run. Use these build entrypoints for the required module imports. Check modified Zig files with `zig fmt --check <files>`. Keep temporary verification files outside the repository.
 
 ## Benchmark
 
@@ -82,6 +82,18 @@ cached lookup, and incremental recomputation times in CSV form:
 ```sh
 zig build benchmark -Doptimize=ReleaseFast
 ```
+
+The flow benchmark reports typing time, retained snapshot bytes, and dense
+lifetime-table bytes for functions with 8, 32, 128, and 256 branches:
+
+```sh
+zig build flow-benchmark -Doptimize=ReleaseFast
+```
+
+The 256-branch fixture retains 23,667,201 bytes of snapshots and 3,248,256 bytes
+of lifetime tables. Omitting trailing unbound value slots reduced snapshot
+storage by 49% from 46,540,901 bytes without changing the graph or lifetime
+tables. These are logical allocated slice sizes, not process RSS.
 
 For cold multi-file worker scaling and warm and edited disk cache reuse against
 uncached runs, build an optimized compiler and run the generated benchmark fixture.

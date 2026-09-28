@@ -36,23 +36,34 @@ pub const External = enum {
     deallocate_host_storage,
     allocate,
     deallocate,
+    allocation_count,
     unsafe_initialize,
     unsafe_take,
-    unsafe_own_ref,
-    unsafe_take_ref,
-    unsafe_destroy_ref,
-    deallocate_ref,
+    unsafe_destroy,
+    unsafe_borrow_initialized,
+    borrow_box,
+    borrow_mut_box,
+    borrow_local,
+    unsafe_borrow_element,
+    unsafe_borrow_mut_element,
+    read,
+    write,
+    attenuate_ref,
+    unsafe_own_box,
+    unsafe_take_box,
+    unsafe_destroy_box,
+    deallocate_box,
 
     pub fn file(symbol: External) File {
         return switch (symbol) {
             .exit => .exit,
             .allocate_host_storage, .deallocate_host_storage => .memory_host,
-            .allocate, .deallocate, .unsafe_initialize, .unsafe_take, .unsafe_own_ref, .unsafe_take_ref, .unsafe_destroy_ref, .deallocate_ref => .memory_allocation,
+            .allocate, .deallocate, .allocation_count, .unsafe_initialize, .unsafe_take, .unsafe_destroy, .unsafe_borrow_initialized, .borrow_box, .borrow_mut_box, .borrow_local, .unsafe_borrow_element, .unsafe_borrow_mut_element, .read, .write, .attenuate_ref, .unsafe_own_box, .unsafe_take_box, .unsafe_destroy_box, .deallocate_box => .memory_allocation,
         };
     }
 };
 
-pub const Structure = enum { HostStorage, Allocation, Ref };
+pub const Structure = enum { HostStorage, Allocation, Buffer, BufferView, Box, Ref };
 
 pub fn standardModulePath(comptime file_path: []const u8) []const u8 {
     const name = comptime (std.fs.path.dirname(file_path) orelse std.fs.path.stem(file_path));

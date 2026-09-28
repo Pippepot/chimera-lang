@@ -10,6 +10,7 @@ pub const Generation = struct {
     requires_explicit_drop: bool,
     can_deinit: bool,
     cleanup_condition: ?structures.FunctionValueId = null,
+    missing_fields: []const []const u32 = &.{},
 };
 
 pub const LifetimeEffect = union(enum) {
@@ -283,7 +284,7 @@ pub const Solver = struct {
         try worklist.append(self.gpa, self.entry);
         while (worklist.pop()) |block| {
             const terminator = self.blocks[@intFromEnum(block)].terminator orelse unreachable;
-            const successor_count = terminatorSuccessorCount(terminator);
+            const successor_count = terminator.successorCount();
             for (0..successor_count) |ordinal| {
                 const edge = self.findEdge(block, @intCast(ordinal));
                 const successor_index = @intFromEnum(edge.successor);
@@ -307,7 +308,7 @@ pub const Solver = struct {
                 const block_value = self.blocks[block_index];
                 GenerationBits.clear(self.scratch);
                 const terminator = block_value.terminator orelse unreachable;
-                for (0..terminatorSuccessorCount(terminator)) |ordinal| {
+                for (0..terminator.successorCount()) |ordinal| {
                     const edge = self.findEdge(block_id, @intCast(ordinal));
                     std.debug.assert(self.reachable[@intFromEnum(edge.successor)]);
                     GenerationBits.copy(self.edge_scratch, self.blockSet(self.live_in, edge.successor));
@@ -583,7 +584,7 @@ pub const Solver = struct {
         const available = self.blockSet(self.available_out, predecessor);
         const demanded_on_some_edge = self.blockSet(self.live_out, predecessor);
         const representations = self.blockRepresentations(self.representations_out, predecessor);
-        for (0..terminatorSuccessorCount(terminator)) |ordinal| {
+        for (0..terminator.successorCount()) |ordinal| {
             const successor_ordinal: u2 = @intCast(ordinal);
             const edge = self.findEdge(predecessor, successor_ordinal);
             GenerationBits.copy(self.edge_scratch, self.blockSet(self.live_in, edge.successor));
@@ -696,7 +697,7 @@ pub const Solver = struct {
             );
             return;
         }
-        for (0..terminatorSuccessorCount(terminator)) |ordinal| {
+        for (0..terminator.successorCount()) |ordinal| {
             try self.recordEnding(
                 planned_cleanups,
                 explicit_abandonments,
@@ -857,7 +858,7 @@ pub const Solver = struct {
                     const open = self.blockSet(self.live_out, @enumFromInt(block_index));
                     for (open) |word| std.debug.assert(word == 0);
                 },
-                .branch, .predicate_branch, .fallible_call, .fallible_indirect_call, .diverge => {},
+                .branch, .predicate_branch, .fallible_call, .diverge => {},
             }
         }
         self.validateEndingApplications(planned_cleanups, explicit_abandonments);
@@ -886,7 +887,7 @@ pub const Solver = struct {
                 },
             };
             self.scanEffectsForward(self.scratch, block_value.terminator_effects.items);
-            for (0..terminatorSuccessorCount(block_value.terminator orelse unreachable)) |ordinal| {
+            for (0..(block_value.terminator orelse unreachable).successorCount()) |ordinal| {
                 const edge = self.findEdge(block_id, @intCast(ordinal));
                 GenerationBits.copy(self.edge_scratch, self.scratch);
                 self.remapOpenEdge(self.edge_scratch, edge, planned_cleanups, explicit_abandonments);
@@ -1000,14 +1001,6 @@ pub const Solver = struct {
     ) []?structures.FunctionValueId {
         const start = @intFromEnum(block) * self.generations.len;
         return matrix[start .. start + self.generations.len];
-    }
-
-    fn terminatorSuccessorCount(terminator: structures.FunctionTerminator) usize {
-        return switch (terminator) {
-            .branch => 1,
-            .predicate_branch, .fallible_call, .fallible_indirect_call => 2,
-            .return_unit, .return_value, .return_failure, .diverge => 0,
-        };
     }
 };
 
@@ -1250,7 +1243,7 @@ test "lifetime solver handles terminal consumes divergence and fallible producti
 
     const produced_blocks = [_]TestSolverBlock{
         .{ .terminator = .{ .fallible_call = .{
-            .call = .{ .target = @enumFromInt(0), .arguments = .{ .start = 0, .end = 0 }, .return_type = .unit },
+            .call = .{ .target = .{ .direct = .{ .item = @enumFromInt(0) } }, .arguments = .{ .start = 0, .end = 0 }, .return_type = .unit },
             .success = @enumFromInt(1),
             .failure = @enumFromInt(2),
         } } },

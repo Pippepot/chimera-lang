@@ -234,10 +234,11 @@ const operation = choose()
 exit(apply(operation, 21))
 
 # A named `extern func` has a signature but no source body. It is a compiler-
-# provided declaration, not a general foreign-function interface. Only
-# `std.exit.exit` currently has an implementation; other extern declarations
-# are rejected when their signatures are demanded. The compiler requires its
-# exact signature, `extern func exit(code: int) never`. `std.prelude` exports it
+# provided declaration, not a general foreign-function interface. The compiler
+# implements `std.exit.exit` and the host operations declared by `std.memory`;
+# unsupported extern declarations are rejected when their signatures are
+# demanded. The compiler requires exit's exact signature,
+# `extern func exit(code: int) never`. `std.prelude` exports it
 # to user files by default; an explicit prelude import may exclude it. Normal
 # lexical lookup and callable references apply, including shadowing.
 # At runtime exit terminates the program. During compile-time execution it produces an
@@ -274,7 +275,7 @@ exit(0)
 # uses runtime argument types, not runtime values or the call's result context.
 # A parameter annotated with a static type parameter T infers T from its
 # argument's type. A parameter annotated with a declared parameterized struct
-# factory applied to static parameter names (for example Box(T, N)) infers
+# factory applied to static parameter names (for example Container(T, N)) infers
 # those parameters from the same factory's nominal type specialization. Other
 # type-valued functions are not inverted. Multiple uses of an inferred static
 # parameter must agree on its canonical value; absent or conflicting evidence
@@ -298,6 +299,30 @@ func echo(static T: type, value: T) T -> value
 const inferred = echo(42)             # T is int
 func between(a: int, static T: type, value: T) T -> value
 const middle = between(1, 42)         # T is int
+
+# A function signature may end with one or more `where` clauses after its
+# return type and optional `from(...)` origin contract. Each clause contains
+# one fallible condition, on the signature line or on a following line at the
+# same indentation as the declaration. Clauses are checked in source order
+# when the function instance is specialized, before its body is used; they do
+# not make the function fallible at runtime or change its callable type.
+# Only static parameters, module statics, and declarations reachable from
+# them may be read. Runtime parameters and locals are never allowed in a
+# `where`, including on a `fallible` function. A failed condition rejects the
+# specialization with a diagnostic at that clause; unhandled failure during
+# compile-time evaluation also rejects it. Undemanded specializations are not
+# checked. The ordinary function body (or `extern` declaration) is still
+# required, and compile-time execution has no ambient I/O.
+# For a statically known type value, `is` succeeds if every member of its
+# structural variant belongs to the inspected type (including an exact match).
+# For a statically known member value, `is` tests the member's type, including
+# callable types. An absent member tested this way fails the constraint; other
+# invalid names and operations retain their normal diagnostics. Runtime `is`
+# continues to inspect the active member of a variant value.
+func bounded(static limit: int) int where limit > 0
+where limit < 10
+    return limit
+func accepts(static T: type) type where T is int | none -> T
 
 func add1(mut a: int)
     a += 1
@@ -328,10 +353,24 @@ take(a^) # transfer ownership; any subsequent access to 'a' is an error
 # Ordinary place expressions borrow. Binding initializers, replacement
 # assignments, struct fields, owned arguments, and returns require owned values:
 # a bare place is copied and must support copy, an explicitly transferred local
-# root (`name^`) is moved and must support move, and a temporary is moved or
-# constructed directly. `imm` arguments borrow through completion of the call.
-# Explicit transfer is invalid in a borrowing context and is currently limited
-# to whole local roots; partial-field transfer is not yet supported.
+# or field (`name^`, `name.field^`) is moved and must support move, and a
+# temporary is moved or constructed directly. `imm` arguments borrow through
+# completion of the call. Explicit transfer is invalid in a borrowing context.
+# Transferring a field leaves that field uninitialized while independent fields
+# remain accessible. Assigning a new owned value to that field reinitializes it.
+# A whole-place use requires every field to be initialized; only initialized
+# fields are destroyed. The fields initialized on every incoming path are
+# available after a control-flow join. Ownership-carrying field transfers
+# require directly movable fields and fieldwise or trivial-drop parents with
+# no custom move; a deinit hook may consume a field of its root, and a mut
+# parameter must restore every transferred field before returning. A partially
+# initialized parent cannot be used or borrowed as a whole. When an owned
+# field is missing on only some join paths, it ends on paths retaining it if
+# it supports automatic destruction; an explicit-drop field cannot be ended
+# implicitly. A residual parent destroys only still-owned fields, and moving
+# its last owned field leaves no parent drop obligation. Every reachable loop
+# backedge must restore fields available on loop entry; a field absent on entry
+# is ended on backedges where it was restored, subject to the same drop rule.
 #
 # Transfer makes the root unavailable on that path. Reading, transferring, or
 # updating a field of an unavailable or possibly unavailable root is an error.
@@ -401,45 +440,198 @@ _ = resource
 # transferring it.
 
 
-# Borrowed views
-# `std.memory.Ref(T)` uniquely owns one initialized T in separately managed
+# Borrowed views: implemented host semantics
+# `std.memory.Box(T)` uniquely owns one initialized T in separately managed
+# storage. `std.memory.Ref(T, writable: bool)` is a copyable, non-owning,
+# storable handle to an initialized T; `borrow item = place` creates a local,
+# read-only alias to an existing value without copying it. `borrow mut item = place`
+# requires writable access and creates a writable local alias. A borrow
+# binding is not a value, cannot be stored as a field or retargeted, and keeps
+# its original referent alive through its last use. Assignment to a writable
+# borrow binding replaces the referent, not the binding.
+# `borrow` is contextual in a binding; ordinary functions and members may
+# still be named `borrow`. It accepts an initialized named local, parameter,
+# another alias, an accessible field path rooted in one of them, or a
+# dereferenced Ref. Other temporary projections need a separate
+# lifetime-extension rule. `borrow mut` requires a mutable named root/field or
+# writable Ref; deriving a read-only alias from a writable one cannot regain
+# permission. A borrow from a Ref captures the referent, not the handle
+# variable: rebinding a var Ref does not retarget an existing alias. A derived
+# Ref borrowed through an alias also addresses the original referent. Ending,
+# moving, or replacing its referent's storage while the alias is used is
+# rejected. A borrowed return retains its possible origins; `from(...)` can
+# narrow them, while calls without a contract retain borrowed inputs.
+# A bare borrow binding used to initialize an owned value copies T if T is
+# copyable; transferring ownership through the binding is not allowed.
+#
+# Ref(T, false) allows reads and Ref(T, true) also allows replacing an
+# initialized referent. Writable authority is part of the handle's static
+# type, independent of whether its own binding is const or var. Copying a
+# writable handle preserves that authority; copying it does not copy T or
+# acquire ownership. A var Ref binding may be assigned a different handle,
+# while assigning through a writable dereference replaces T and destroys the
+# old value. Converting a writable Ref to a read-only Ref is safe and one-way;
+# `Ref.as_imm` makes that attenuation explicit, and no safe conversion grants
+# write authority. Replacing an initialized explicit-drop referent is rejected;
+# an explicitly consumed referent is no longer initialized and cannot be
+# written through a Ref. Borrowing an immutable Box or
+# place cannot produce a writable Ref. Multiple writable handles may coexist:
+# there is no global exclusive mutable-borrow rule. Calls still reject a mut
+# argument overlapping any borrowed argument that might refer to it.
+# The pointee must remain initialized and its owner and storage valid for every
+# use, including use through copied or returned handles and aggregate fields.
+# A read-only Ref limits access through that handle; it does not freeze the
+# underlying value against other writable handles. No method returning an
+# apparent owned T may silently substitute a borrow for a copy.
+#
+# Box.new(value) allocates fallibly and constructs one T in stable storage;
+# Box has no implicit copy, but explicit fallible duplication copies T into a
+# distinct allocation when T supports copy. Destruction drops the initialized
+# T before freeing storage. Borrowing Box yields a Ref with permission no
+# stronger than the access path; consuming extraction transfers T out only
+# when T can move directly. Direct in-place construction of immovable T must
+# not first create and move a completed T. Producer failure frees the still-
+# uninitialized allocation without destroying T; allocation failure cleans
+# up already evaluated arguments under their ordinary ownership rules.
+# Allocation(T) separately owns uninitialized storage and must be explicitly
+# consumed; its deallocation never destroys initialized elements. Indexed
+# initialization, access, transfer, and destruction remain unsafe unless the
+# caller proves bounds, initialization, and absence of conflicting changes.
+# Buffer(T) owns an initialized prefix of an Allocation(T); checked access
+# fails on invalid indices. Its read-only access yields Ref(T, false), and
+# `get_mut(index)` requires a mutable buffer place and yields Ref(T, true).
+# Mutable Buffer calls invalidate earlier element and view borrows even when
+# the backing allocation does not change. Growth allocates before disturbing
+# existing elements, so allocation failure preserves them. Box, Ref, and
+# Allocation methods expose the common operations alongside the low-level
+# free functions. These expressions compile in the host subset:
+#   var handle: Ref(int, true) = owner.borrow_mut()
+#   borrow item = handle[]
+#   borrow mut writable_item = handle[]
+#   handle = other.borrow_mut()  # retargets handle, not item
+#   writable_item = 42           # replaces the captured referent
+#   handle[] = 43                # replaces the handle's current referent
+#
+# Host storage and low-level operations:
+# `std.memory.Box(T)` uniquely owns one initialized T in separately managed
 # host storage. Its allocation is fallible, moving it preserves the storage
-# address, and destruction destroys T before releasing that storage. Ref has
+# address, and destruction destroys T before releasing that storage. Box has
 # no implicit copy; explicitly duplicating a copyable T allocates new storage.
 # Value construction and local binding do not themselves select allocation.
-# An immovable or custom-move T can be initialized directly in Ref storage by
-# passing a struct initializer to Ref.new(T{...}) or Ref(T).new(T{...}) when
-# its fields are directly movable. Destruction runs on T in that storage before
-# deallocation. This does not transfer a completed T from another place. Its fields
-# evaluate once in source order and are destroyed if construction cannot
-# complete. Nested immovable fields and non-struct initializers are not yet
-# supported. A borrowed or explicitly transferred immovable value cannot
-# initialize Ref. T must be automatically droppable; consuming value(T, owner^)
-# is supported only when T moves directly. Explicit duplication is not yet
-# implemented. Nonnegative zero-byte host
-# allocations (zero elements or zero-sized T) succeed with a distinct, stable
-# storage address; the provider may reserve a minimal region to supply it.
+# An immovable or custom-move T can be initialized directly in Box storage by
+# passing a struct initializer to Box.new(T{...}) or Box(T).new(T{...}). Nested
+# struct initializers also construct immovable fields at their final addresses;
+# leaf values must be directly movable. Fields evaluate once in source order
+# and are destroyed if construction cannot complete. Conditional struct
+# initializers construct only the selected branch in its own Box allocation.
+# Direct or callable-value functions returning T can construct their result
+# directly in Box storage, including fallible functions; on producer failure,
+# the still-uninitialized allocation is deallocated without destroying T.
+# Producer arguments evaluate before Box allocation. If allocation fails, any
+# arguments already prepared for the producer retain their ordinary cleanup
+# obligations; automatic-drop arguments are destroyed. A transferred argument
+# with explicit drop cannot be cleaned up on allocation failure and is rejected.
+# These forms never transfer a completed immovable T. Other expression forms
+# still require a directly movable T. A borrowed or explicitly transferred
+# immovable value cannot initialize Box. T must be automatically droppable;
+# consuming value(T, owner^) is supported only when T moves directly.
+# Explicit fallible duplicate(T, item) accepts copyable, automatically droppable
+# T, including immovable and custom-copy types, and copies into a distinct
+# allocation using T's copy behavior. Noncopyable T cannot be duplicated.
+# Nonnegative zero-byte host allocations (zero elements or zero-sized T)
+# succeed with a distinct, stable storage address; the provider may reserve
+# a minimal region to supply it.
 # Zero-sized values still run their destruction hooks. Negative counts and
 # layout overflow fail through fallible control flow.
-# Ref is in the prelude; low-level allocation remains explicit.
 #
 # `std.memory.Allocation(T)` uniquely owns uninitialized storage. Its layout
 # comes from the layout domain selected by the execution target and location,
 # the element count, and alignment; the checked byte size is count times that
 # domain's element stride, which is aligned even for zero-count requests.
-# Alignment is at least the natural alignment for T in
-# that domain. Overflow fails
-# before allocation. The logical count remains separate from the byte layout.
+# Alignment is at least the natural alignment for T in that domain. Overflow
+# fails before allocation. The logical count remains separate from the byte layout.
 # It must be consumed by deallocation, which releases storage but does not
-# destroy elements. Initializing, destroying, or
-# borrowing an element through Allocation requires an explicitly unsafe
-# operation with caller-proven bounds and initialization state. `Borrow(T)`
-# itself always denotes a live initialized value; it is non-null, non-owning,
-# and copying it does not copy T. Mutation requires mutable access with no
-# conflicting aliases. Ref is in std.prelude; Borrow will join it when origin
-# checking exists. Raw allocation requires an explicit std.memory import.
-# Borrow and safe borrowed access are not yet implemented: origin tracking
-# through calls, returns, stored values, and invalidation is still required.
+# destroy elements. unsafe_initialize(T, mut allocation, index, value) and
+# unsafe_take(T, mut allocation, index) transfer only directly movable T.
+# unsafe_destroy(T, mut allocation, index) destroys an initialized element at
+# its address without moving it. unsafe_borrow_initialized(T, imm allocation,
+# index) yields an expression-only borrow of that element, usable for immediate
+# inspection or imm arguments; binding it as T copies T if allowed, not the
+# borrow. These operations require caller-proven bounds and initialization
+# state; destruction and borrowing also require the caller to prevent
+# conflicting aliases or invalidation during use. They are not safe initialized
+# access. Box and Ref are in std.prelude; raw allocation requires an explicit
+# std.memory import. Ref(T, writable: bool) is a non-null, non-owning host
+# reference with a required static permission. Ref(T, false) is read-only;
+# Ref(T, true) permits writing the referent. Either handle can be copied
+# without copying T, and multiple writable handles may coexist. There is no
+# global exclusive mutable-borrow rule. The owner must remain live through
+# every use; origins are tracked through calls, returns, stored values, and
+# invalidation.
+# borrow_box(T, imm owner: Box(T)) yields Ref(T, false).
+# borrow_mut_box(T, mut owner: Box(T)) requires a mutable Box place and yields
+# Ref(T, true); it cannot borrow an immutable owner or a temporary.
+# read(T, static writable: bool, imm reference: Ref(T, writable)) yields
+# an expression-only borrowed T. write(T, imm reference: Ref(T, true),
+# var item: T) replaces the referent, destroying its old value. The old value
+# must support automatic destruction; replacing an explicit-drop value is
+# rejected. Other handles to the stable Box storage remain valid.
+# A call cannot pass a mutable place together with a borrowed argument that may
+# refer to that place, whether the borrow is expression-only or a Ref handle
+# stored in another local.
+# An owner transferred into the same call cannot also supply an immutable
+# argument or be an origin of a borrowed argument or indirect callee. When
+# disjointness cannot be proved, the call is rejected.
+# A mut argument containing Ref conservatively retains possible referent
+# origins from its call inputs on writeback. A callee-local referent cannot
+# escape through a mut argument.
+# borrow_local(T, imm item: T) borrows the storage of a named local, parameter,
+# alias, or a field path rooted in one of them; it rejects temporary projections.
+# The borrow refers to the original storage. Replacing or transferring the root
+# or any of its fields invalidates the borrow, including changes to siblings:
+# local field updates rebuild the aggregate rather than updating pinned storage.
+# A direct-passed parameter's storage belongs to the callee and cannot escape.
+# An optional `from(name, ...)` after a function's borrowed return type names
+# all parameters whose origins the result may retain. Every returned path must
+# derive only from these parameters; a contract may overapproximate the body.
+# A caller retains only the named origins. Without a contract, calls retain all
+# borrowed inputs conservatively. Contracts belong to callable type identity,
+# including callable values. A named `mut` parameter refers to the caller's
+# owner after copy-back, including a replacement made by the callee. On failure,
+# the caller still receives the updated owner but no borrowed return value.
+# unsafe_borrow_element(T, imm allocation: Allocation(T), index: int) yields a
+# Ref(T, false) of an initialized indexed element. The caller proves bounds,
+# initialization, and absence of conflicting mutation or destruction during use.
+# An uninitialized Allocation(T) has no live T origins; unsafe operations with
+# Ref-containing elements retain conservative content origins and cannot return
+# references to callee-local owners. The caller still proves per-slot
+# initialization and keeps referents live; destruction does not precisely remove
+# individual slots from the current origin set.
+# Allocation(T).capacity() returns its allocated element count, including for
+# zero-sized T. Buffer capacity is derived from that count rather than stored twice.
+# std.memory.Buffer(T) owns Allocation(T) and a contiguous initialized prefix
+# of length elements within capacity allocated slots. Creation is fallible;
+# negative capacity fails. Zero capacity still owns a distinct allocation.
+# Destroying a buffer destroys only the initialized prefix, in reverse order,
+# then deallocates the storage. Its allocation and counters are not exposed for
+# external mutation. Only directly movable, automatically droppable elements
+# may be appended or relocated by the initial buffer API. Ref-containing
+# elements are not supported until mutation can track their referent origins.
+# Buffer growth allocates replacement storage before disturbing initialized
+# elements; allocation failure leaves the original contents intact. Once
+# relocation begins, no further fallible operation may intervene. `get(index)`
+# checks 0 <= index < length and returns Ref(T, false); `get_mut(index)` also
+# checks bounds and returns Ref(T, true) from a mutable Buffer place. An empty
+# Buffer has no initialized element, even for an immovable T; append still
+# rejects elements that cannot move directly. view(start, size)
+# checks that its nonnegative range lies in the initialized prefix and returns
+# BufferView(T), a copyable non-owning slice retaining a Ref(Buffer(T), false). Its
+# len() reports the slice size, and get(index) checks the slice bounds before
+# borrowing an element. Buffer and BufferView internals cannot be changed by
+# external callers. Mutable Buffer calls conservatively invalidate prior element
+# and view borrows, whether or not growth occurred. BufferView(byte) is a raw
+# borrowed byte slice, not validated UTF-8 text. Later List and text views must
+# retain the same backing-owner and storage-change dependencies.
 # A typed allocation selects a provider, a concrete memory location, and a
 # resolved byte layout independently. The execution target and location must
 # support the chosen representation of T; a host layout is not valid in another
@@ -456,14 +648,29 @@ _ = resource
 # public allocation or access APIs until their target layout and access rules
 # are implemented. Raw-address and foreign-memory operations remain deferred.
 #
-# A returned or stored Borrow depends on every owner it may refer to. The
-# result of a bodyless function conservatively depends on every borrowed input;
-# without borrowed inputs, returning Borrow is a compile error. Any returned or
-# stored borrow whose origin the compiler cannot prove safe is also a compile
-# error; user-written origin contracts are not supported for now. Borrowed
+# A returned or stored Ref depends on every owner it may refer to. The
+# result of a bodyless function without a `from(...)` contract conservatively
+# depends on every borrowed input; without a safe borrowed origin, returning
+# Ref is a compile error. A contract narrows these origins but must cover
+# every return path. Any returned or stored borrow whose origin the compiler
+# cannot prove safe is also a compile error. Borrowed
 # access cannot outlive or overlap destruction of an owner or invalidation by
 # storage replacement. Current imm/mut call arguments alone do not establish
 # such an escaping lifetime relationship.
+# A function may return a Ref obtained from a borrowed input, including a
+# Ref, Box, or Allocation passed by immutable access, or a mutable Box whose
+# owner is copied back to the caller. A Ref
+# handle (or a value containing one) passed by value may also be returned: its
+# referent still depends on the caller, not on the lifetime of the handle. It
+# cannot return a Ref of an owned parameter's storage, a local binding, or a
+# temporary that ends with the call. A call returning a value containing Ref
+# conservatively retains the origins of every borrowed input or owned Ref
+# handle capable of supplying it unless a `from(...)` contract narrows them;
+# this includes calls without analyzed bodies and calls through callable values.
+# All possible origins must remain valid through each subsequent use. Rebinding
+# a local invalidates a borrow of its own storage even when its type has trivial
+# destruction. Moving an owner currently invalidates borrows made through that
+# binding; transferring the owner does not silently retarget existing borrows.
 #
 # Views provide non-owning access to existing data, including collection slices.
 # They may be returned from functions and stored in other values when their
@@ -474,7 +681,7 @@ _ = resource
 # Lifetime tracking must also reject uses invalidated by changes to the backing
 # storage, such as collection reallocation. Keeping the owner alive alone is
 # insufficient. Lifetime and access dependencies are inferred; when they cannot
-# be proved safe, the compiler rejects the view. View type syntax remains open;
+# be proved safe, the compiler rejects the view. Other view type syntax remains open;
 # adopting these guarantees does not require Mojo's exact spelling. Device
 # storage and raw foreign addresses are deferred.
 
@@ -499,19 +706,19 @@ struct Q
 # A named struct with parameters declares a type-valued factory. It is sugar for
 # a function with the same name that returns the anonymous struct in its body;
 # every listed parameter is implicitly static. Names remain case-sensitive.
-struct Box(T: type)
+struct Wrapper(T: type)
     copy = trivial
     value: T
-# Equivalent to: func Box(static T: type) type -> struct ...
-const boxed = Box(int){value = 42}
+# Equivalent to: func Wrapper(static T: type) type -> struct ...
+const wrapped = Wrapper(int){value = 42}
 # A parameterized struct initializer may omit the factory's static arguments
 # when every argument is inferable from initialized field types. A field typed
-# as T infers T from its value; a field typed as Box(T) can recover T from a
+# as T infers T from its value; a field typed as Wrapper(T) can recover T from a
 # value with the same nominal factory specialization. Independent field types
 # provide their usual expected type while inferring. Inference uses field types,
 # not the initializer's result context or field values; missing or conflicting
 # evidence is an error. Explicit specialization remains available.
-const inferred_box = Box{value = 42}
+const inferred_wrapper = Wrapper{value = 42}
 # Generated struct definitions accept the same move, copy, and drop ownership
 # declarations as non-parameterized structs. A custom hook may refer to the
 # factory's static parameters and is specialized with that generated type.
@@ -557,8 +764,8 @@ func S.read_a(imm value: S) int -> value.a
 # do not contribute fields or execute when a struct value is initialized.
 # A generic struct factory's namespace can be used before specializing the
 # factory. A direct member call infers its missing factory parameters from the
-# member's runtime argument types, as with Ref.new(value), or the caller may
-# specialize the factory first, as with Ref(T).new(value). Missing members are
+# member's runtime argument types, as with the planned Box.new(value), or the
+# caller may specialize the factory first, as with Box(T).new(value). Missing members are
 # namespace errors even when the factory is not specialized. In a nested
 # namespace, enclosing factories must be specialized before inferring the
 # immediate factory's arguments.

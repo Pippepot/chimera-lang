@@ -23,10 +23,28 @@ pub const BodyOptions = struct {
     publish_instruction_spans: bool = false,
     allow_type_values: bool = false,
     expected_result_type: ?structures.TypeId = null,
+    measurements: ?*BodyMeasurements = null,
+};
+
+pub const BodyMeasurements = struct {
+    snapshots: usize = 0,
+    snapshot_bytes: usize = 0,
+    blocks: usize = 0,
+    generations: usize = 0,
+    lifetime_table_bytes: usize = 0,
 };
 
 pub fn emitSemanticIssue(ctx: anytype, file_id: structures.FileId, issue: semantic.Issue) !void {
     try ctx.emit(structures.Diagnostic, .{ .file_id = file_id, .span = issue.span, .kind = issue.kind });
+}
+
+pub fn referenceReplacementIssue(types: anytype, element_type: structures.TypeId) !?structures.Diagnostic.Kind {
+    if (try types.containsBorrow(element_type)) return .{ .borrow_write_cannot_store_borrow = element_type };
+    const capabilities = (try types.facts().ownershipCapabilities(element_type)) orelse return error.Unavailable;
+    if (capabilities.requires_explicit_drop) return .{ .borrow_write_requires_automatic_drop = element_type };
+    if (!capabilities.isDirectlyMovable())
+        return .{ .borrow_write_requires_direct_move = element_type };
+    return null;
 }
 
 pub fn resolveAndTypeBody(
@@ -40,6 +58,7 @@ pub fn resolveAndTypeBody(
     type_interner: anytype,
     unresolved: semantic.UnresolvedBody,
 ) !?structures.FunctionBodyAnalysis {
+    if (options.measurements) |measurements| measurements.* = .{};
     var builder: BodyBuilder(@TypeOf(ctx), @TypeOf(type_interner)) = .{
         .ctx = ctx,
         .type_interner = type_interner,
@@ -58,18 +77,82 @@ pub fn resolveAndTypeBody(
         error.SourceRejected, error.Unavailable => return null,
         else => return err,
     };
+    builder.resolvePendingReferenceUses() catch |err| switch (err) {
+        error.SourceRejected, error.Unavailable => return null,
+        else => return err,
+    };
     if (builder.generations.items.len != 0) {
         try builder.finishOwnershipMetadata();
-        try builder.analyzeLifetimes();
+        try builder.analyzeLifetimes(options.measurements);
     }
     if (try builder.emitExplicitAbandonmentDiagnostics()) return null;
     try builder.materializeCleanups(builder.planned_cleanups.items);
+    builder.validateCleanupReferenceUses() catch |err| switch (err) {
+        error.SourceRejected, error.Unavailable => return null,
+        else => return err,
+    };
+    if (options.measurements) |measurements| {
+        measurements.snapshots = builder.states.items.len;
+        for (builder.states.items) |state| {
+            measurements.snapshot_bytes += std.mem.sliceAsBytes(state.values).len +
+                std.mem.sliceAsBytes(state.availability).len + std.mem.sliceAsBytes(state.field_availability).len;
+        }
+        measurements.blocks = builder.blocks.items.len;
+        measurements.generations = builder.generations.items.len;
+    }
     return try builder.finish();
 }
 
 fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
     return struct {
         const Self = @This();
+        const ReferenceProjection = struct {
+            step: union(enum) { field: u32, variant: structures.TypeId, element },
+            next: ?u32,
+        };
+        const ReferenceTransform = struct {
+            operation: union(enum) {
+                prefix: @FieldType(ReferenceProjection, "step"),
+                select: @FieldType(ReferenceProjection, "step"),
+                exclude: @FieldType(ReferenceProjection, "step"),
+                widen,
+                read: struct { state: StateId, instruction: u31 },
+                refresh: struct { root: semantic.UnresolvedBody.LocalId, previous: BindingIdentity, replacement: BindingIdentity },
+            },
+            previous: ?u32,
+        };
+        const ReferenceOrigin = struct {
+            generation: ?GenerationId = null,
+            cleanup_value: ?structures.FunctionValueId = null,
+            root: ?semantic.UnresolvedBody.LocalId = null,
+            binding_identity: BindingIdentity = .unknown,
+            parameter: ?u32 = null,
+            loop: ?u32 = null,
+            projection: ?u32 = null,
+            stable: bool = false,
+            read: ?u31 = null,
+            transform: ?u32 = null,
+            next: ?u32 = null,
+        };
+        const BindingIdentity = union(enum) { unknown, fixed: u32, join: u32 };
+        const ReferenceRefresh = union(enum) { value: *?u32, slots: *?u32 };
+        const BindingJoin = struct {
+            slot: ?u32 = null,
+            storage: bool = false,
+            initial: BindingIdentity,
+            alternatives: std.ArrayList(BindingIdentity) = .empty,
+            complete: bool = false,
+        };
+        const ResolvedBindingIdentity = struct {
+            value: ?u32 = null,
+            conflicting: bool = false,
+            incomplete: bool = false,
+        };
+        const LoopReferenceOrigins = struct {
+            slot: u32,
+            origins: ?u32,
+            complete: bool = false,
+        };
         const Value = struct {
             id: structures.FunctionValueId,
             type_id: structures.TypeId,
@@ -82,20 +165,67 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             borrowed_type: ?structures.TypeId = null,
             borrow_condition: ?structures.FunctionValueId = null,
             borrow_root: ?semantic.UnresolvedBody.LocalId = null,
+            reference_origins: ?u32 = null,
+            stable_reference_root: ?semantic.UnresolvedBody.LocalId = null,
+            binding_identity: BindingIdentity = .unknown,
+            storage_identity: ?BindingIdentity = null,
+            materialize_on_copy: bool = false,
             explicit_transfer: bool = false,
         };
         const CallTarget = union(enum) {
             direct: structures.InstanceId,
             inferred: structures.InstanceId,
-            indirect: structures.FunctionValueId,
+            indirect: Value,
         };
         const Availability = enum { unbound, available, transferred, maybe_transferred };
+        const FieldPlace = struct {
+            local: semantic.UnresolvedBody.LocalId,
+            fields: []const semantic.UnresolvedBody.FieldName,
+            moves_owner: bool = false,
+        };
         const State = struct {
             values: []?Value,
             availability: []Availability,
+            field_availability: []Availability,
+
+            fn clone(self: State, allocator: std.mem.Allocator) !State {
+                const values = try allocator.dupe(?Value, self.values);
+                errdefer allocator.free(values);
+                const availability = try allocator.dupe(Availability, self.availability);
+                errdefer allocator.free(availability);
+                return .{ .values = values, .availability = availability, .field_availability = try allocator.dupe(Availability, self.field_availability) };
+            }
+
+            fn deinit(self: *State, allocator: std.mem.Allocator) void {
+                allocator.free(self.values);
+                allocator.free(self.availability);
+                allocator.free(self.field_availability);
+                self.* = undefined;
+            }
         };
         const Expression = semantic.UnresolvedBody.Expression;
         const StateId = enum(u32) { _ };
+        const PendingReferenceUseLocation = union(enum) {
+            boundary: struct { id: BoundaryId, effect_index: usize },
+            terminator: struct { id: structures.FunctionBlockId, effect_index: usize },
+        };
+        const PendingReferenceUse = struct {
+            origins: u32,
+            state: StateId,
+            span: structures.SourceSpan,
+            location: PendingReferenceUseLocation,
+        };
+        const ReferenceUse = struct {
+            origins: u32,
+            span: structures.SourceSpan,
+            location: PendingReferenceUseLocation,
+        };
+        const PendingReferenceInvalidation = struct {
+            origins: u32,
+            known: ?u32,
+            span: structures.SourceSpan,
+        };
+        const PendingReferenceReturn = struct { origins: u32, span: structures.SourceSpan, is_return: bool };
         const PendingExtraction = struct {
             binding: semantic.UnresolvedBody.ConditionBinding,
             operand: Value,
@@ -116,6 +246,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             block: structures.FunctionBlockId,
             state: StateId,
             binding: ?PendingConditionBinding = null,
+            reference_origins: ?u32 = null,
         };
         const ValueExit = struct {
             block: structures.FunctionBlockId,
@@ -135,18 +266,44 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             state_type_end: u32,
             exit_state_start: u32,
         };
-        const LoopBreak = struct { branch: structures.FunctionBranch, state: StateId, value: Value };
+        const LoopBreak = struct {
+            block: structures.FunctionBlockId,
+            branch: structures.FunctionBranch = undefined,
+            state: StateId,
+            value: Value,
+        };
         const PlaceField = struct {
             index: u32,
             type_id: structures.TypeId,
+            name: []const u8,
         };
         const ArgumentPlace = struct {
             local: semantic.UnresolvedBody.LocalId,
             fields: structures.FunctionValueRange,
         };
+        const BorrowPlace = struct {
+            root: union(enum) {
+                local: semantic.UnresolvedBody.LocalId,
+                parameter: semantic.UnresolvedBody.ValueId,
+            },
+            fields: structures.FunctionValueRange,
+        };
+        const ProjectedBorrowPlace = struct {
+            root: Value,
+            alias: ?Alias,
+            fields: structures.FunctionValueRange,
+            writable: bool,
+        };
+        const Alias = struct {
+            root: ?@FieldType(BorrowPlace, "root") = null,
+            fields: structures.FunctionValueRange = .{ .start = 0, .end = 0 },
+            whole_root: bool = false,
+        };
         const PendingMutArgument = struct {
             place: ArgumentPlace,
             argument_index: u32,
+            reference_origins: ?u32 = null,
+            return_origin: bool = false,
         };
         const OwnershipForwardHint = struct {
             predecessor: structures.FunctionBlockId,
@@ -159,6 +316,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             destination: GenerationId,
         };
         const GenerationOrigin = enum { none, define, produce, phi };
+        const LocalMetadata = struct { alias: ?Alias, mutable: bool, can_deinit: bool, mut_parameter: ?u32 };
 
         ctx: Context,
         type_interner: TypeInterner,
@@ -173,19 +331,35 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         allow_type_values: bool = false,
         values: []?Value = &.{},
         local_values: []?Value = &.{},
-        local_mutable: []bool = &.{},
-        local_can_deinit: []bool = &.{},
-        local_mut_parameter: []?u32 = &.{},
+        locals: std.MultiArrayList(LocalMetadata) = .empty,
         local_availability: []Availability = &.{},
+        field_places: []FieldPlace = &.{},
+        field_availability: []Availability = &.{},
         active_drop_hook_root: bool = false,
         states: std.ArrayList(State) = .empty,
         block_argument_types: std.ArrayList(structures.TypeId) = .empty,
         block_argument_generations: std.ArrayList(?GenerationId) = .empty,
         variant_coercion_tags: std.ArrayList(u32) = .empty,
         struct_field_values: std.ArrayList(structures.StructFieldValue) = .empty,
+        box_init_fields: std.ArrayList(PreparedField) = .empty,
+        borrow_fields: std.ArrayList(u32) = .empty,
+        reference_origins: std.ArrayList(ReferenceOrigin) = .empty,
+        reference_projections: std.ArrayList(ReferenceProjection) = .empty,
+        reference_transforms: std.ArrayList(ReferenceTransform) = .empty,
+        binding_joins: std.ArrayList(BindingJoin) = .empty,
+        loop_reference_origins: std.ArrayList(LoopReferenceOrigins) = .empty,
+        loop_backedges: std.ArrayList(StateId) = .empty,
+        pending_reference_uses: std.ArrayList(PendingReferenceUse) = .empty,
+        reference_uses: std.ArrayList(ReferenceUse) = .empty,
+        cleanup_origins: std.AutoHashMapUnmanaged(structures.FunctionValueId, u32) = .empty,
+        drop_effects: std.AutoHashMapUnmanaged(u31, u32) = .empty,
+        pending_reference_invalidations: std.ArrayList(PendingReferenceInvalidation) = .empty,
+        pending_reference_returns: std.ArrayList(PendingReferenceReturn) = .empty,
         call_arguments: std.ArrayList(structures.FunctionValueUse) = .empty,
         mut_argument_fields: std.ArrayList(PlaceField) = .empty,
         pending_mut_arguments: std.ArrayList(PendingMutArgument) = .empty,
+        writable_call_references: std.ArrayList(Value) = .empty,
+        pending_consumed_arguments: std.ArrayList(Value) = .empty,
         branch_arguments: std.ArrayList(structures.FunctionValueUse) = .empty,
         branch_argument_generations: std.ArrayList(?GenerationId) = .empty,
         generations: std.ArrayList(Generation) = .empty,
@@ -201,6 +375,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         current_block: ?structures.FunctionBlockId = null,
         current_boundary: ?BoundaryId = null,
         next_generation_start_order: u32 = 0,
+        next_binding_identity: u32 = 0,
         instruction_count: u32 = 0,
         block_layout_count: u32 = 0,
 
@@ -211,14 +386,25 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             @memset(self.values, null);
             self.local_values = try self.ctx.allocator().alloc(?Value, self.unresolved.local_count);
             @memset(self.local_values, null);
-            self.local_mutable = try self.ctx.allocator().alloc(bool, self.unresolved.local_count);
-            @memset(self.local_mutable, false);
-            self.local_can_deinit = try self.ctx.allocator().alloc(bool, self.unresolved.local_count);
-            @memset(self.local_can_deinit, false);
-            self.local_mut_parameter = try self.ctx.allocator().alloc(?u32, self.unresolved.local_count);
-            @memset(self.local_mut_parameter, null);
+            try self.locals.resize(self.ctx.allocator(), self.unresolved.local_count);
+            @memset(self.locals.items(.alias), null);
+            @memset(self.locals.items(.mutable), false);
+            @memset(self.locals.items(.can_deinit), false);
+            @memset(self.locals.items(.mut_parameter), null);
             self.local_availability = try self.ctx.allocator().alloc(Availability, self.unresolved.local_count);
             @memset(self.local_availability, .unbound);
+            var fields: std.ArrayList(FieldPlace) = .empty;
+            defer fields.deinit(self.ctx.allocator());
+            for (self.unresolved.expressions) |expression| switch (expression.operation) {
+                .field_transfer => |transfer| try fields.append(self.ctx.allocator(), .{
+                    .local = transfer.target,
+                    .fields = self.unresolved.assignment_fields[transfer.fields.start..transfer.fields.end],
+                }),
+                else => {},
+            };
+            self.field_places = try fields.toOwnedSlice(self.ctx.allocator());
+            self.field_availability = try self.ctx.allocator().alloc(Availability, self.field_places.len);
+            @memset(self.field_availability, .available);
             try self.block_argument_types.ensureUnusedCapacity(self.ctx.allocator(), parameters.len);
             try self.block_argument_generations.ensureUnusedCapacity(self.ctx.allocator(), parameters.len);
             const root_span = self.unresolved.blocks[@intFromEnum(self.unresolved.root_block)].span;
@@ -231,16 +417,23 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     if (!drop_hook_self) entry_value.owned_generation = try self.allocateGeneration(parameter.type_id, self.unresolved.parameter_spans[index], parameter.mode == .deinit);
                 }
                 switch (parameter.mode) {
-                    .imm => self.values[index] = .{
-                        .id = entry_value.id,
-                        .type_id = entry_value.type_id,
-                        .borrowed_type = entry_value.type_id,
+                    .imm => {
+                        self.values[index] = .{
+                            .id = entry_value.id,
+                            .type_id = entry_value.type_id,
+                            .borrowed_type = entry_value.type_id,
+                            .reference_origins = try self.addReferenceOrigin(null, .{ .parameter = @intCast(index) }),
+                        };
                     },
                     .mut, .@"var", .deinit => {
+                        if (try self.type_interner.canStoreBorrow(parameter.type_id)) {
+                            entry_value.reference_origins = try self.addReferenceOrigin(null, .{ .parameter = @intCast(index) });
+                        }
+                        entry_value.binding_identity = try self.newBindingIdentity();
                         self.local_values[parameter_local] = entry_value;
-                        self.local_mutable[parameter_local] = true;
-                        self.local_can_deinit[parameter_local] = parameter.mode == .deinit;
-                        if (parameter.mode == .mut) self.local_mut_parameter[parameter_local] = @intCast(index);
+                        self.locals.items(.mutable)[parameter_local] = true;
+                        self.locals.items(.can_deinit)[parameter_local] = parameter.mode == .deinit;
+                        if (parameter.mode == .mut) self.locals.items(.mut_parameter)[parameter_local] = @intCast(index);
                         self.local_availability[parameter_local] = .available;
                         parameter_local += 1;
                     },
@@ -275,24 +468,42 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             const gpa = self.ctx.allocator();
             gpa.free(self.values);
             gpa.free(self.local_values);
-            gpa.free(self.local_mutable);
-            gpa.free(self.local_can_deinit);
-            gpa.free(self.local_mut_parameter);
+            self.locals.deinit(gpa);
             gpa.free(self.local_availability);
-            for (self.states.items) |state| {
-                gpa.free(state.values);
-                gpa.free(state.availability);
-            }
+            gpa.free(self.field_places);
+            gpa.free(self.field_availability);
+            for (self.states.items) |*state| state.deinit(gpa);
             self.states.deinit(gpa);
             self.block_argument_types.deinit(gpa);
             self.block_argument_generations.deinit(gpa);
             self.variant_coercion_tags.deinit(gpa);
             self.struct_field_values.deinit(gpa);
+            self.box_init_fields.deinit(gpa);
+            self.borrow_fields.deinit(gpa);
+            self.reference_origins.deinit(gpa);
+            self.reference_projections.deinit(gpa);
+            self.reference_transforms.deinit(gpa);
+            for (self.binding_joins.items) |*join| join.alternatives.deinit(gpa);
+            self.binding_joins.deinit(gpa);
+            self.loop_reference_origins.deinit(gpa);
+            self.loop_backedges.deinit(gpa);
+            self.pending_reference_uses.deinit(gpa);
+            self.reference_uses.deinit(gpa);
+            self.cleanup_origins.deinit(gpa);
+            self.drop_effects.deinit(gpa);
+            self.pending_reference_invalidations.deinit(gpa);
+            self.pending_reference_returns.deinit(gpa);
             self.call_arguments.deinit(gpa);
             self.mut_argument_fields.deinit(gpa);
             self.pending_mut_arguments.deinit(gpa);
+            self.writable_call_references.deinit(gpa);
+            self.pending_consumed_arguments.deinit(gpa);
             self.branch_arguments.deinit(gpa);
             self.branch_argument_generations.deinit(gpa);
+            for (self.generations.items) |generation| {
+                for (generation.missing_fields) |missing| gpa.free(missing);
+                if (generation.missing_fields.len != 0) gpa.free(generation.missing_fields);
+            }
             self.generations.deinit(gpa);
             self.ownership_forwards.deinit(gpa);
             self.ownership_edges.deinit(gpa);
@@ -341,12 +552,23 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         }
 
         fn block(self: *Self, block_id: semantic.UnresolvedBody.BlockId, expected_type: ?structures.TypeId) !?Value {
+            return self.blockWithBox(block_id, expected_type, null);
+        }
+
+        const BoxDestination = struct { element_type: structures.TypeId, box_type: structures.TypeId };
+        const InPlaceInitializer = union(enum) {
+            fields: Expression,
+            call: semantic.UnresolvedBody.Call,
+            conditional: @FieldType(Expression.Operation, "if_else"),
+        };
+
+        fn blockWithBox(self: *Self, block_id: semantic.UnresolvedBody.BlockId, expected_type: ?structures.TypeId, box_destination: ?BoxDestination) !?Value {
             const unresolved_block = self.unresolved.blocks[@intFromEnum(block_id)];
             const baseline = try self.captureState();
             for (self.unresolved.statements[unresolved_block.statements.start..unresolved_block.statements.end]) |statement| {
                 if (self.current_block == null) return null;
                 switch (statement) {
-                    .discard, .lifetime_extend, .propagate, .bind_local => try self.completedStatement(statement),
+                    .discard, .lifetime_extend, .propagate, .bind_local, .bind_borrow => try self.completedStatement(statement),
                     .break_loop => |value_id| try self.breakLoop(value_id),
                     .continue_loop => |span| try self.continueLoop(span),
                     .return_nothing => |span| try self.returnNothing(span),
@@ -354,7 +576,10 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 }
             }
             if (self.current_block == null) return null;
-            var result = if (unresolved_block.result) |result_id| try self.valueWithType(result_id, expected_type) else null;
+            var result: ?Value = if (unresolved_block.result) |result_id| if (box_destination) |destination|
+                try self.boxFromInitializer(result_id, destination)
+            else
+                try self.valueWithType(result_id, expected_type) else null;
             if (self.current_block == null) return null;
             if (result) |value_to_exit| {
                 const parent_boundary = self.current_boundary;
@@ -373,6 +598,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 .discard, .lifetime_extend => |value_use| value_use.span,
                 .propagate => |propagation| propagation.span,
                 .bind_local => |binding| binding.span,
+                .bind_borrow => |binding| binding.span,
                 else => unreachable,
             };
             const parent_boundary = self.current_boundary;
@@ -383,19 +609,104 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 .discard, .lifetime_extend => |value_use| try self.discardValue(try self.value(value_use.value), value_use.span),
                 .propagate => |propagation| try self.propagateCondition(propagation.condition, propagation.span),
                 .bind_local => |binding| try self.bindLocal(binding),
+                .bind_borrow => |binding| try self.bindBorrow(binding),
                 else => unreachable,
             }
             if (self.current_block != null) try self.appendBoundary(boundary);
         }
 
         fn bindLocal(self: *Self, binding: @FieldType(semantic.UnresolvedBody.Statement, "bind_local")) !void {
-            const bound_value = try self.ownValue(try self.value(binding.value), binding.span);
+            var bound_value = try self.ownValue(try self.value(binding.value), binding.span);
             if (bound_value.type_id == .never) return;
+            bound_value.binding_identity = try self.newBindingIdentity();
             const index = @intFromEnum(binding.local);
             std.debug.assert(self.local_values[index] == null);
             self.local_values[index] = bound_value;
-            self.local_mutable[index] = binding.mutable;
+            self.locals.items(.mutable)[index] = binding.mutable;
             self.local_availability[index] = .available;
+            for (self.field_places, self.field_availability) |place, *availability| {
+                if (place.local == binding.local) availability.* = .available;
+            }
+        }
+
+        fn bindBorrow(self: *Self, binding: @FieldType(semantic.UnresolvedBody.Statement, "bind_borrow")) !void {
+            var alias: Alias = .{};
+            var reference: Value = undefined;
+            const source_index = @intFromEnum(binding.source);
+            const source_expression = if (source_index < self.unresolved.parameter_count) null else self.unresolved.expressions[source_index - self.unresolved.parameter_count];
+            if (source_expression != null and source_expression.?.operation == .dereference) {
+                const handle = source_expression.?.operation.dereference;
+                reference = try self.borrowValue(try self.value(handle.value), handle.span);
+                if (reference.type_id == .never) return;
+                const access = (try self.type_interner.facts().borrowAccess(reference.type_id)) orelse
+                    return self.reject(handle.span, .{ .dereference_requires_ref = reference.type_id });
+                if (binding.writable and !access.writable) return self.reject(binding.span, .reference_not_writable);
+                if (reference.reference_origins == null) return self.reject(binding.span, .borrow_outlives_source);
+                reference = withoutOwnershipSource(reference);
+            } else {
+                var fields: std.ArrayList(PlaceField) = .empty;
+                defer fields.deinit(self.ctx.allocator());
+                const place = (try self.resolveBorrowPlace(binding.source, &fields)) orelse
+                    return self.reject(binding.span, .borrow_requires_place);
+                const source = try self.borrowValue(try self.value(binding.source), binding.span);
+                if (source.type_id == .never) return;
+                const projected = try self.projectBorrowPlace(place, fields.items, binding.writable, binding.span);
+                const root = projected.root;
+                if (projected.alias != null and place.fields.start == place.fields.end) {
+                    reference = root;
+                } else {
+                    reference = try self.appendInstruction(.{ .borrow_address = .{
+                        .source = root.id,
+                        .type_id = (try self.type_interner.referenceType(source.type_id, projected.writable)) orelse return error.Unavailable,
+                        .fields = projected.fields,
+                        .base_is_reference = projected.alias != null,
+                    } });
+                }
+                if (projected.alias) |captured| {
+                    reference.reference_origins = root.reference_origins;
+                    alias = captured;
+                    if (place.fields.start != place.fields.end and alias.root != null) {
+                        alias.fields = try self.concatBorrowFields(alias.fields, projected.fields);
+                        alias.whole_root = false;
+                    }
+                } else {
+                    if (place.root == .parameter and try self.type_interner.facts().argumentPassing(root.type_id) == .direct) {
+                        reference.reference_origins = try self.addReferenceOrigin(source.reference_origins, .{ .cleanup_value = root.id });
+                    } else {
+                        reference = try self.withReferenceOrigin(source, reference);
+                    }
+                    alias = .{ .root = place.root, .fields = projected.fields, .whole_root = place.fields.start == place.fields.end };
+                }
+            }
+            const access = (try self.type_interner.facts().borrowAccess(reference.type_id)) orelse unreachable;
+            if (!binding.writable and access.writable) {
+                var read_only = try self.appendInstruction(.{ .value_copy = .{
+                    .source = reference.id,
+                    .type_id = (try self.type_interner.referenceType(access.element_type, false)) orelse return error.Unavailable,
+                } });
+                read_only.reference_origins = reference.reference_origins;
+                read_only.stable_reference_root = reference.stable_reference_root;
+                reference = read_only;
+            }
+            const index = @intFromEnum(binding.local);
+            std.debug.assert(self.local_values[index] == null);
+            self.local_values[index] = reference;
+            self.locals.items(.alias)[index] = alias;
+            self.local_availability[index] = .available;
+        }
+
+        fn newBindingIdentity(self: *Self) !BindingIdentity {
+            const identity = self.next_binding_identity;
+            self.next_binding_identity = std.math.add(u32, identity, 1) catch return error.AnalysisTooLarge;
+            return .{ .fixed = identity };
+        }
+
+        fn joinBindingIdentities(self: *Self, first: BindingIdentity, second: BindingIdentity) !BindingIdentity {
+            if (std.meta.eql(first, second)) return first;
+            const index: u32 = @intCast(self.binding_joins.items.len);
+            try self.binding_joins.append(self.ctx.allocator(), .{ .initial = first, .complete = true });
+            try self.binding_joins.items[index].alternatives.append(self.ctx.allocator(), second);
+            return .{ .join = index };
         }
 
         fn discardValue(self: *Self, value_to_discard: Value, span: structures.SourceSpan) !void {
@@ -408,14 +719,14 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             const context = self.loop_stack.getLast();
             value_to_break = try self.ownValueEscapingSince(value_to_break, context.baseline, self.unresolved.blocks[@intFromEnum(self.unresolved.root_block)].span);
             self.unbindLocalsSince(context.baseline);
-            const branch = try self.loopBranch(context, context.exit, value_to_break);
-            self.terminate(.{ .branch = branch });
-            try self.loop_breaks.append(self.ctx.allocator(), .{ .branch = branch, .state = try self.captureState(), .value = value_to_break });
+            const state = try self.captureState();
+            try self.loop_breaks.append(self.ctx.allocator(), .{ .block = self.suspendBlock(), .state = state, .value = value_to_break });
         }
 
         fn continueLoop(self: *Self, span: structures.SourceSpan) !void {
             const context = self.loop_stack.getLast();
             self.unbindLocalsSince(context.baseline);
+            try self.normalizeLoopBackedge(context, span);
             try self.validateLoopBackedge(context, span);
             const branch = try self.loopBranch(context, context.header, null);
             self.terminate(.{ .branch = branch });
@@ -437,6 +748,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 std.debug.assert(self.current_block == null);
                 return;
             }
+            try self.validateEscapingBorrows(value_to_return, span, true);
             var use = try self.coerceValue(value_to_return.id, value_to_return.type_id, self.return_type) orelse
                 return self.reject(span, .{ .return_type_mismatch = self.typeMismatch(self.return_type, value_to_return.type_id) });
             const owned = try self.ownValue(value_to_return, span);
@@ -445,6 +757,34 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             try self.recordConsume(returned);
             use.value = returned.id;
             try self.finishFunctionExit(span, if (self.return_type == .unit) .return_unit else .{ .return_value = use });
+        }
+
+        fn validateEscapingBorrows(self: *Self, candidate: Value, span: structures.SourceSpan, is_return: bool) !void {
+            if (!try self.type_interner.canStoreBorrow(candidate.type_id)) return;
+            const origins = candidate.reference_origins orelse {
+                if (try self.typeContainsBorrow(candidate.type_id)) return self.reject(span, .borrow_outlives_source);
+                return;
+            };
+            var pending = false;
+            const resolved = try self.resolveReferenceOrigins(origins, &pending);
+            if (pending)
+                try self.pending_reference_returns.append(self.ctx.allocator(), .{ .origins = origins, .span = span, .is_return = is_return })
+            else
+                try self.validateReferenceEscape(resolved, span, is_return);
+        }
+
+        fn validateReferenceEscape(self: *Self, origins: ?u32, span: structures.SourceSpan, is_return: bool) !void {
+            var origin_id = origins orelse return self.reject(span, .borrow_outlives_source);
+            const signature = (try self.type_interner.functionSignature(self.instance)) orelse return error.Unavailable;
+            while (true) {
+                const origin = self.reference_origins.items[origin_id];
+                if (origin.parameter == null) return self.reject(span, .borrow_outlives_source);
+                if (if (is_return) signature.return_origins else null) |allowed| {
+                    if (std.mem.indexOfScalar(u32, allowed, origin.parameter.?) == null)
+                        return self.reject(span, .return_origin_not_declared);
+                }
+                origin_id = origin.next orelse break;
+            }
         }
 
         fn propagateCondition(self: *Self, condition_id: semantic.UnresolvedBody.ConditionId, span: structures.SourceSpan) !void {
@@ -484,6 +824,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 block_value.terminator_effects.items,
             );
             block_value.terminator_effects.clearRetainingCapacity();
+            self.relocateReferenceUses(.{ .terminator = .{ .id = self.current_block.?, .effect_index = 0 } }, .{ .boundary = .{ .id = boundary, .effect_index = 0 } });
             const parent_boundary = self.current_boundary;
             self.current_boundary = boundary;
             defer self.current_boundary = parent_boundary;
@@ -537,10 +878,14 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 .function_ref => |reference| try self.appendInstruction(.{ .function_ref = reference }),
                 .local_read => |local| try self.readLocal(local, expression.span),
                 .local_transfer => |local| try self.transferLocal(local, expression.span),
+                .field_transfer => |transfer| try self.transferField(transfer, expression.span),
                 .annotation => |annotation| try self.annotate(annotation),
                 .struct_init => try self.structInit(expression),
                 .field_access => try self.fieldAccess(expression),
+                .dereference => |reference| try self.dereference(reference),
                 .assignment => try self.assignment(expression),
+                .borrow_assignment => |assignment_alias| try self.borrowAssignment(assignment_alias),
+                .reference_assignment => |assignment_ref| try self.referenceAssignment(assignment_ref),
                 .call => |call| try self.callFunction(call, expression.span),
                 .negate => |operand| try self.negate(operand),
                 .add, .subtract, .multiply, .divide => try self.binary(expression),
@@ -549,6 +894,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             };
             if (self.current_block != null) try self.appendBoundary(boundary);
             self.values[index] = resolved;
+            try self.rememberCleanupOrigins(resolved);
             return resolved;
         }
 
@@ -560,7 +906,37 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 .transferred => return self.reject(span, .use_after_transfer),
                 .maybe_transferred => return self.reject(span, .possibly_transferred),
             }
-            var value_to_read = self.local_values[index].?;
+            if (self.unavailableField(local, &[_]PlaceField{})) |availability|
+                return self.reject(span, if (availability == .transferred) .use_after_transfer else .possibly_transferred);
+            if (self.locals.items(.alias)[index] != null) {
+                const reference = try self.aliasReference(local);
+                _ = try self.borrowValue(reference, span);
+                const element_type = (try self.type_interner.facts().borrowElement(reference.type_id)) orelse unreachable;
+                return self.readReference(reference, reference.id, element_type, span);
+            }
+            return self.borrowLocalValue(local);
+        }
+
+        fn aliasReference(self: *Self, local: semantic.UnresolvedBody.LocalId) !Value {
+            const index = @intFromEnum(local);
+            const stored = self.local_values[index].?;
+            const alias = self.locals.items(.alias)[index].?;
+            const root = alias.root orelse return stored;
+            const root_value = switch (root) {
+                .local => |owner| self.local_values[@intFromEnum(owner)].?,
+                .parameter => |parameter| self.values[@intFromEnum(parameter)].?,
+            };
+            var reference = try self.appendInstruction(.{ .borrow_address = .{
+                .source = root_value.id,
+                .type_id = stored.type_id,
+                .fields = alias.fields,
+            } });
+            reference.reference_origins = stored.reference_origins;
+            return reference;
+        }
+
+        fn borrowLocalValue(self: *Self, local: semantic.UnresolvedBody.LocalId) Value {
+            var value_to_read = self.local_values[@intFromEnum(local)].?;
             value_to_read.borrowed_generation = value_to_read.owned_generation;
             value_to_read.borrowed_cleanup_value = value_to_read.id;
             value_to_read.owned_generation = null;
@@ -570,9 +946,9 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         }
 
         fn transferLocal(self: *Self, local: semantic.UnresolvedBody.LocalId, span: structures.SourceSpan) !Value {
-            if (self.local_mut_parameter[@intFromEnum(local)] != null) return self.reject(span, .ownership_transfer_requires_owned_place);
+            if (self.locals.items(.mut_parameter)[@intFromEnum(local)] != null) return self.reject(span, .ownership_transfer_requires_owned_place);
             const value_to_transfer = try self.readLocal(local, span);
-            const capabilities = (try self.type_interner.ownershipCapabilities(value_to_transfer.type_id)) orelse return error.Unavailable;
+            const capabilities = (try self.type_interner.facts().ownershipCapabilities(value_to_transfer.type_id)) orelse return error.Unavailable;
             if (capabilities.move == .none) return self.reject(span, .{ .type_not_movable = value_to_transfer.type_id });
             self.local_availability[@intFromEnum(local)] = .transferred;
             var transferred = try self.moveValue(ownershipSource(value_to_transfer), span);
@@ -580,25 +956,173 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             return transferred;
         }
 
+        fn fieldPathContains(prefix: anytype, path: anytype) bool {
+            if (prefix.len > path.len) return false;
+            for (prefix, path[0..prefix.len]) |left, right| {
+                if (!std.mem.eql(u8, left.name, right.name)) return false;
+            }
+            return true;
+        }
+
+        fn unavailableField(self: *const Self, local: semantic.UnresolvedBody.LocalId, path: anytype) ?Availability {
+            for (self.field_places, self.field_availability) |place, availability| {
+                if (place.local != local or availability == .available) continue;
+                if (fieldPathContains(place.fields, path) or fieldPathContains(path, place.fields)) return availability;
+            }
+            return null;
+        }
+
+        fn hasUnavailableFields(self: *const Self, local: semantic.UnresolvedBody.LocalId) bool {
+            return self.unavailableField(local, &[_]PlaceField{}) != null;
+        }
+
+        fn transferField(self: *Self, transfer: @FieldType(Expression.Operation, "field_transfer"), span: structures.SourceSpan) !Value {
+            return self.transferFieldPlace(transfer.target, self.unresolved.assignment_fields[transfer.fields.start..transfer.fields.end], span);
+        }
+
+        fn transferFieldPlace(self: *Self, local: semantic.UnresolvedBody.LocalId, source_fields: []const semantic.UnresolvedBody.FieldName, span: structures.SourceSpan) !Value {
+            const local_index = @intFromEnum(local);
+            const mutable_parameter = self.locals.items(.mut_parameter)[local_index] != null;
+            switch (self.local_availability[local_index]) {
+                .available => {},
+                .transferred => return self.reject(span, .use_after_transfer),
+                .maybe_transferred => return self.reject(span, .possibly_transferred),
+                .unbound => unreachable,
+            }
+            if (self.unavailableField(local, source_fields)) |availability|
+                return self.reject(span, if (availability == .transferred) .use_after_transfer else .possibly_transferred);
+            const root = self.local_values[local_index].?;
+            var fields: std.ArrayList(PlaceField) = .empty;
+            defer fields.deinit(self.ctx.allocator());
+            try self.resolvePlaceFields(root.type_id, source_fields, span, &fields);
+            const field_capabilities = (try self.type_interner.facts().ownershipCapabilities(fields.getLast().type_id)) orelse return error.Unavailable;
+            if (field_capabilities.move == .none) return self.reject(span, .{ .type_not_movable = fields.getLast().type_id });
+            const moves_owner = field_capabilities.needs_automatic_drop or field_capabilities.requires_explicit_drop;
+            var parent_type = root.type_id;
+            for (fields.items, 0..) |part, depth| {
+                const parent_capabilities = (try self.type_interner.facts().ownershipCapabilities(parent_type)) orelse return error.Unavailable;
+                const in_drop_hook = depth == 0 and local_index == 0 and self.active_drop_hook_root;
+                if (parent_capabilities.drop != .fieldwise and parent_capabilities.drop != .trivial and
+                    !((in_drop_hook or mutable_parameter) and parent_capabilities.drop == .custom))
+                    return self.reject(span, .partial_field_transfer_not_supported);
+                if (parent_capabilities.needs_custom_move)
+                    return self.reject(span, .partial_field_transfer_not_supported);
+                parent_type = part.type_id;
+            }
+            try self.recordUse(root);
+            if (moves_owner and !mutable_parameter) try self.recordConsume(root);
+            var field = root;
+            for (fields.items) |part| {
+                const origins = try self.selectReferenceOrigins(field.reference_origins, .{ .field = part.index });
+                field = try self.appendInstruction(.{ .field_access = .{
+                    .operand = field.id,
+                    .field_index = part.index,
+                    .field_type = part.type_id,
+                } });
+                field.reference_origins = origins;
+            }
+            var moved = try self.moveValue(field, span);
+            moved.explicit_transfer = true;
+            for (self.field_places, self.field_availability) |*place, *availability| {
+                if (place.local == local and fieldPathContains(place.fields, source_fields) and fieldPathContains(source_fields, place.fields)) {
+                    place.moves_owner = moves_owner;
+                    availability.* = .transferred;
+                }
+            }
+            if (moves_owner and !mutable_parameter) {
+                var remaining_generation: ?GenerationId = null;
+                const previous_missing = if (root.owned_generation) |previous_generation|
+                    self.generations.items[@intFromEnum(previous_generation)].missing_fields
+                else
+                    &.{};
+                if ((try self.remainingFieldOwnership(root.type_id, previous_missing, fields.items)).any()) {
+                    const remaining = try self.defineOwnedValue(root, span, self.locals.items(.can_deinit)[local_index]);
+                    remaining_generation = remaining.owned_generation;
+                    try self.copyMissingFields(remaining_generation.?, previous_missing, fields.items, null);
+                }
+                self.local_values[local_index].?.owned_generation = remaining_generation;
+            }
+            self.local_values[local_index].?.binding_identity = try self.newBindingIdentity();
+            self.local_values[local_index].?.storage_identity = null;
+            return moved;
+        }
+
+        const RemainingOwnership = struct {
+            automatic: bool = false,
+            explicit: bool = false,
+
+            fn any(self: RemainingOwnership) bool {
+                return self.automatic or self.explicit;
+            }
+        };
+
+        fn remainingFieldOwnership(self: *Self, type_id: structures.TypeId, missing: []const []const u32, moved: []const PlaceField) !RemainingOwnership {
+            const definition = (try self.type_interner.structDefinition(type_id)) orelse unreachable;
+            var remaining: RemainingOwnership = .{};
+            for (definition.fields, 0..) |field, index| {
+                if (moved.len == 1 and moved[0].index == index) continue;
+                var nested: std.ArrayList([]const u32) = .empty;
+                defer nested.deinit(self.ctx.allocator());
+                var absent = false;
+                for (missing) |path| {
+                    std.debug.assert(path.len != 0 and path[0] < definition.fields.len);
+                    if (path[0] != index) continue;
+                    if (path.len == 1) {
+                        absent = true;
+                        break;
+                    }
+                    try nested.append(self.ctx.allocator(), path[1..]);
+                }
+                if (absent) continue;
+                const field_capabilities = (try self.type_interner.facts().ownershipCapabilities(field.type_id)) orelse return error.Unavailable;
+                if (!field_capabilities.needs_automatic_drop and !field_capabilities.requires_explicit_drop) continue;
+                const moved_child: []const PlaceField = if (moved.len != 0 and moved[0].index == index) moved[1..] else &.{};
+                const child: RemainingOwnership = if (nested.items.len == 0 and moved_child.len == 0)
+                    .{ .automatic = field_capabilities.needs_automatic_drop, .explicit = field_capabilities.requires_explicit_drop }
+                else
+                    try self.remainingFieldOwnership(field.type_id, nested.items, moved_child);
+                remaining.automatic = remaining.automatic or child.automatic;
+                remaining.explicit = remaining.explicit or child.explicit;
+            }
+            return remaining;
+        }
+
         fn writeMutParameters(self: *Self) !void {
-            for (self.local_mut_parameter, self.local_values) |parameter_index, local_value| {
+            for (self.locals.items(.mut_parameter), self.local_values, 0..) |parameter_index, local_value, local_index| {
                 const index = parameter_index orelse continue;
+                for (self.field_places, self.field_availability) |place, availability| {
+                    if (@intFromEnum(place.local) == local_index and availability != .available)
+                        return self.reject(self.activeLifetimeSpan(), .field_not_restored_before_mut_return);
+                }
                 const value_to_write = local_value.?;
+                try self.validateEscapingBorrows(value_to_write, self.activeLifetimeSpan(), false);
                 _ = try self.appendInstruction(.{ .mut_parameter_write = .{
                     .parameter_index = index,
                     .value = value_to_write.id,
                     .type_id = value_to_write.type_id,
                 } });
+                try self.recordConsume(value_to_write);
             }
         }
 
         fn ownValue(self: *Self, value_to_own: Value, span: structures.SourceSpan) !Value {
             if (try self.nonCopyableBorrow(value_to_own)) |details| return self.reject(span, .{ .type_not_copyable = details });
-            if (value_to_own.borrowed_type == null) return withoutOwnershipSource(value_to_own);
-            return if (value_to_own.borrow_condition) |borrow_predicate|
-                self.copyValueConditionally(value_to_own, borrow_predicate, span)
+            const owned = if (value_to_own.borrowed_type == null)
+                withoutOwnershipSource(value_to_own)
+            else if (value_to_own.borrow_condition) |borrow_predicate|
+                try self.copyValueConditionally(value_to_own, borrow_predicate, span)
             else
-                self.copyValue(value_to_own, span);
+                try self.copyValue(value_to_own, span);
+            try self.rememberCleanupOrigins(owned);
+            return owned;
+        }
+
+        fn rememberCleanupOrigins(self: *Self, source: Value) !void {
+            const origins = source.reference_origins orelse return;
+            const capabilities = (try self.type_interner.facts().ownershipCapabilities(source.type_id)) orelse return error.Unavailable;
+            if (!capabilities.needs_automatic_drop) return;
+            const merged = try self.mergeReferenceOrigins(self.cleanup_origins.get(source.id), origins);
+            try self.cleanup_origins.put(self.ctx.allocator(), source.id, merged.?);
         }
 
         fn allocateGeneration(
@@ -607,7 +1131,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             span: structures.SourceSpan,
             can_deinit: bool,
         ) !?GenerationId {
-            const capabilities = (try self.type_interner.ownershipCapabilities(type_id)) orelse return error.Unavailable;
+            const capabilities = (try self.type_interner.facts().ownershipCapabilities(type_id)) orelse return error.Unavailable;
             if (!capabilities.needs_automatic_drop and !capabilities.requires_explicit_drop) return null;
             return @as(?GenerationId, try self.appendGeneration(type_id, span, can_deinit, try self.reserveGenerationStartOrder(), capabilities));
         }
@@ -619,7 +1143,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             can_deinit: bool,
             start_order: u32,
         ) !?GenerationId {
-            const capabilities = (try self.type_interner.ownershipCapabilities(type_id)) orelse return error.Unavailable;
+            const capabilities = (try self.type_interner.facts().ownershipCapabilities(type_id)) orelse return error.Unavailable;
             if (!capabilities.needs_automatic_drop and !capabilities.requires_explicit_drop) return null;
             return @as(?GenerationId, try self.appendGeneration(type_id, span, can_deinit, start_order, capabilities));
         }
@@ -679,10 +1203,70 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             first: ?GenerationId,
             second: ?GenerationId,
         ) !?GenerationId {
-            if (first == second) {
-                if (first == null or self.generations.items[@intFromEnum(first.?)].type_id == type_id) return first;
+            return self.joinGenerationGroup(type_id, span, &.{ first, second });
+        }
+
+        fn joinGenerationGroup(self: *Self, type_id: structures.TypeId, span: structures.SourceSpan, incoming: []const ?GenerationId) !?GenerationId {
+            std.debug.assert(incoming.len != 0);
+            const first = incoming[0];
+            var all_equal = self.generationMatchesType(first, type_id);
+            var can_deinit = if (first) |generation| self.generations.items[@intFromEnum(generation)].can_deinit else false;
+            const first_missing = if (first) |generation| self.generations.items[@intFromEnum(generation)].missing_fields else &.{};
+            for (incoming[1..]) |current| {
+                all_equal = all_equal and current == first;
+                const current_missing = if (current) |generation| self.generations.items[@intFromEnum(generation)].missing_fields else &.{};
+                if (!sameMissingFields(first_missing, current_missing)) return self.reject(span, .partial_field_transfer_not_supported);
+                can_deinit = can_deinit and if (current) |generation| self.generations.items[@intFromEnum(generation)].can_deinit else false;
             }
-            return self.allocateGeneration(type_id, span, self.generationsCanDeinit(first, second));
+            if (all_equal) return first;
+            const joined = try self.allocateGeneration(type_id, span, can_deinit);
+            if (joined) |generation| try self.copyMissingFields(generation, first_missing, null, null);
+            return joined;
+        }
+
+        fn sameMissingFields(left: []const []const u32, right: []const []const u32) bool {
+            if (left.len != right.len) return false;
+            for (left) |path| {
+                var found = false;
+                for (right) |other| if (std.mem.eql(u32, path, other)) {
+                    found = true;
+                    break;
+                };
+                if (!found) return false;
+            }
+            return true;
+        }
+
+        fn missingPathStartsWith(path: []const u32, fields: []const PlaceField) bool {
+            if (path.len < fields.len) return false;
+            for (fields, path[0..fields.len]) |field, index| {
+                if (field.index != index) return false;
+            }
+            return true;
+        }
+
+        fn copyMissingFields(self: *Self, generation: GenerationId, previous: []const []const u32, added: ?[]const PlaceField, restored: ?[]const PlaceField) !void {
+            var paths: std.ArrayList([]const u32) = .empty;
+            errdefer {
+                for (paths.items) |path| self.ctx.allocator().free(path);
+                paths.deinit(self.ctx.allocator());
+            }
+            for (previous) |path| {
+                if (restored) |fields| if (missingPathStartsWith(path, fields)) continue;
+                try paths.ensureUnusedCapacity(self.ctx.allocator(), 1);
+                paths.appendAssumeCapacity(try self.ctx.allocator().dupe(u32, path));
+            }
+            if (added) |fields| {
+                try paths.ensureUnusedCapacity(self.ctx.allocator(), 1);
+                const path = try self.ctx.allocator().alloc(u32, fields.len);
+                for (fields, path) |field, *index| index.* = field.index;
+                paths.appendAssumeCapacity(path);
+            }
+            if (paths.items.len != 0) {
+                const generation_data = &self.generations.items[@intFromEnum(generation)];
+                generation_data.requires_explicit_drop = (try self.remainingFieldOwnership(generation_data.type_id, paths.items, &.{})).explicit;
+                self.generations.items[@intFromEnum(generation)].missing_fields = try paths.toOwnedSlice(self.ctx.allocator());
+            }
         }
 
         fn generationsCanDeinit(self: *const Self, first: ?GenerationId, second: ?GenerationId) bool {
@@ -710,6 +1294,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             const block_value = &self.blocks.items[@intFromEnum(self.current_block orelse unreachable)];
             try block_value.terminator_effects.appendSlice(self.ctx.allocator(), boundary.effects.items);
             boundary.effects.clearRetainingCapacity();
+            self.relocateReferenceUses(.{ .boundary = .{ .id = self.current_boundary.?, .effect_index = 0 } }, .{ .terminator = .{ .id = self.current_block.?, .effect_index = 0 } });
         }
 
         fn copyValueConditionally(
@@ -738,23 +1323,49 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             const joined_generation = try self.joinGenerations(source.type_id, span, copied.owned_generation, source.owned_generation);
             self.block_argument_generations.items[argument_start] = joined_generation;
             self.enterBlock(join);
-            return .{
+            var result: Value = .{
                 .id = @enumFromInt(argument_start),
                 .type_id = source.type_id,
                 .owned_generation = joined_generation,
             };
+            try self.mergeValueReferences(&result, copied, source);
+            return result;
         }
 
         fn copyValueAcrossJoin(self: *Self, source: Value, span: structures.SourceSpan) !Value {
-            const capabilities = (try self.type_interner.ownershipCapabilities(source.type_id)) orelse return error.Unavailable;
+            const capabilities = (try self.type_interner.facts().ownershipCapabilities(source.type_id)) orelse return error.Unavailable;
             if (capabilities.copy != .none) return self.copyValue(source, span);
-            const members = (try self.type_interner.variantMembers(source.type_id)) orelse unreachable;
-            return self.mapVariantMember(source, members, .copy);
+            const members = (try self.type_interner.facts().variantMembers(source.type_id)) orelse unreachable;
+            if (!source.materialize_on_copy) try self.recordUse(source);
+            const copied_bits = try self.mapVariantMember(rawValue(source), members, .copy, null);
+            return self.finishCopiedValue(source, copied_bits, span);
         }
 
         fn copyValue(self: *Self, source: Value, span: structures.SourceSpan) anyerror!Value {
-            try self.recordUse(source);
-            const copied = try self.defineOwnedValue(try self.copyValueBits(rawValue(source)), span, false);
+            if (!source.materialize_on_copy) try self.recordUse(source);
+            const copied_bits = try self.copyValueBits(rawValue(source), null);
+            return self.finishCopiedValue(source, copied_bits, span);
+        }
+
+        fn finishCopiedValue(self: *Self, source: Value, copied_bits: Value, span: structures.SourceSpan) !Value {
+            const materialized = if (source.materialize_on_copy and copied_bits.id == source.id)
+                try self.appendInstruction(.{ .value_copy = .{ .source = source.id, .type_id = source.type_id } })
+            else
+                copied_bits;
+            if (source.materialize_on_copy) {
+                const boundary = try self.newBoundary(span);
+                const parent_boundary = self.current_boundary;
+                self.current_boundary = boundary;
+                defer self.current_boundary = parent_boundary;
+                try self.recordUse(source);
+                try self.appendBoundary(boundary);
+            }
+            var copied = try self.defineOwnedValue(materialized, span, false);
+            copied.reference_origins = try self.copyResultOrigins(source);
+            const capabilities = (try self.type_interner.facts().ownershipCapabilities(source.type_id)) orelse return error.Unavailable;
+            if (capabilities.needs_custom_copy) {
+                try self.finishOwnershipEffects(source, &copied.reference_origins);
+            } else copied.stable_reference_root = source.stable_reference_root;
             const source_generation = source.borrowed_generation orelse source.owned_generation;
             if (source_generation != null and copied.owned_generation != null) {
                 std.debug.assert(source_generation != copied.owned_generation);
@@ -762,65 +1373,121 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             return copied;
         }
 
-        fn copyValueBits(self: *Self, source: Value) anyerror!Value {
-            const capabilities = (try self.type_interner.ownershipCapabilities(source.type_id)) orelse return error.Unavailable;
-            return switch (capabilities.copy) {
-                .trivial => source,
-                .none => unreachable,
-                .custom => self.callOwnershipHook(source, .copy),
-                .fieldwise => if (capabilities.needs_custom_copy) self.copyStructFields(source) else source,
+        fn copyResultOrigins(self: *Self, source: Value) !?u32 {
+            if (!try self.type_interner.canStoreBorrow(source.type_id)) return null;
+            const capabilities = (try self.type_interner.facts().ownershipCapabilities(source.type_id)) orelse return error.Unavailable;
+            return if (capabilities.needs_custom_copy)
+                self.widenReferenceOrigins(try self.sourceReferenceOrigins(source))
+            else
+                source.reference_origins;
+        }
+
+        fn copyValueBits(self: *Self, source: Value, destination: ?Value) anyerror!Value {
+            const capabilities = (try self.type_interner.facts().ownershipCapabilities(source.type_id)) orelse return error.Unavailable;
+            if (capabilities.needs_custom_copy) return switch (capabilities.copy) {
+                .custom => self.callOwnershipHook(source, .copy, destination),
+                .fieldwise => self.copyStructFields(source, destination),
+                .none, .trivial => unreachable,
             };
+            std.debug.assert(capabilities.copy != .none);
+            if (destination) |storage| {
+                _ = try self.appendInstruction(.{ .value_copy = .{ .source = source.id, .type_id = source.type_id, .destination = storage.id } });
+                return storage;
+            }
+            return source;
         }
 
         fn moveValue(self: *Self, source: Value, span: structures.SourceSpan) anyerror!Value {
             try self.recordConsume(source);
-            return self.defineOwnedValue(try self.moveValueBits(rawValue(source)), span, false);
+            var moved = try self.defineOwnedValue(try self.moveValueBits(rawValue(source)), span, false);
+            const capabilities = (try self.type_interner.facts().ownershipCapabilities(source.type_id)) orelse return error.Unavailable;
+            moved.reference_origins = if (capabilities.needs_custom_move)
+                try self.widenReferenceOrigins(source.reference_origins)
+            else
+                source.reference_origins;
+            if (capabilities.needs_custom_move) {
+                try self.finishOwnershipEffects(source, &moved.reference_origins);
+            } else moved.stable_reference_root = source.stable_reference_root;
+            try self.rememberCleanupOrigins(moved);
+            return moved;
         }
 
         fn moveValueBits(self: *Self, source: Value) anyerror!Value {
-            const capabilities = (try self.type_interner.ownershipCapabilities(source.type_id)) orelse return error.Unavailable;
+            const capabilities = (try self.type_interner.facts().ownershipCapabilities(source.type_id)) orelse return error.Unavailable;
             return switch (capabilities.move) {
                 .trivial => source,
                 .none => unreachable,
-                .custom => self.callOwnershipHook(source, .move),
+                .custom => self.callOwnershipHook(source, .move, null),
                 .fieldwise => if (capabilities.needs_custom_move) self.moveStructFields(source) else source,
             };
         }
 
         const OwnershipOperation = enum { copy, move, drop };
 
-        fn callOwnershipHook(self: *Self, source: Value, operation: OwnershipOperation) !Value {
+        fn callOwnershipHook(self: *Self, source: Value, operation: OwnershipOperation, destination: ?Value) !Value {
             const definition = (try self.type_interner.structDefinition(source.type_id)) orelse unreachable;
             const hook = switch (operation) {
                 .copy => definition.ownership.copy.?.hook.?,
                 .move => definition.ownership.move.?.hook.?,
                 .drop => definition.ownership.drop.?.hook.?,
             };
-            if (operation != .drop and std.meta.eql(hook, self.instance)) return source;
+            if (operation != .drop and std.meta.eql(hook, self.instance)) {
+                if (destination) |storage| {
+                    _ = try self.appendInstruction(.{ .value_copy = .{ .source = source.id, .type_id = source.type_id, .destination = storage.id } });
+                    return storage;
+                }
+                return source;
+            }
             const argument_start: u32 = @intCast(self.call_arguments.items.len);
             try self.call_arguments.append(self.ctx.allocator(), .{ .value = source.id });
-            return self.appendInstruction(.{ .call = .{
-                .target = hook.item,
-                .specialization = hook.specialization,
+            const result = try self.appendInstruction(.{ .call = .{
+                .target = .{ .direct = hook },
                 .arguments = .{ .start = argument_start, .end = argument_start + 1 },
                 .return_type = if (operation == .drop) .unit else source.type_id,
+                .destination = if (destination) |storage| storage.id else null,
             } });
+            if (operation == .drop) try self.recordDropEffects(source, @truncate(@intFromEnum(result.id)));
+            return destination orelse result;
         }
 
-        fn copyStructFields(self: *Self, source: Value) anyerror!Value {
+        fn recordDropEffects(self: *Self, source: Value, instruction: u31) !void {
+            var references: std.ArrayList(Value) = .empty;
+            defer references.deinit(self.ctx.allocator());
+            var captured = source;
+            captured.reference_origins = source.reference_origins orelse self.cleanup_origins.get(source.id);
+            var visiting: std.ArrayList(structures.TypeId) = .empty;
+            defer visiting.deinit(self.ctx.allocator());
+            try self.collectWritableReferencesAt(captured, &references, &visiting, true);
+            var affected: ?u32 = null;
+            for (references.items) |reference| {
+                const element_type = (try self.type_interner.facts().borrowElement(reference.type_id)) orelse unreachable;
+                const capabilities = (try self.type_interner.facts().ownershipCapabilities(element_type)) orelse return error.Unavailable;
+                if (capabilities.needs_automatic_drop) affected = try self.mergeReferenceOrigins(affected, reference.reference_origins);
+            }
+            if (affected) |origins| try self.drop_effects.put(self.ctx.allocator(), instruction, origins);
+        }
+
+        fn finishOwnershipEffects(self: *Self, source: Value, origins: *?u32) !void {
+            var references: std.ArrayList(Value) = .empty;
+            defer references.deinit(self.ctx.allocator());
+            try self.collectWritableReferences(source, &references);
+            try self.invalidateWritableReferences(references.items, .{ .value = origins });
+        }
+
+        fn copyStructFields(self: *Self, source: Value, destination: ?Value) anyerror!Value {
             const definition = (try self.type_interner.structDefinition(source.type_id)) orelse {
-                const members = (try self.type_interner.variantMembers(source.type_id)) orelse return source;
-                return self.mapVariantMember(source, members, .copy);
+                const members = (try self.type_interner.facts().variantMembers(source.type_id)) orelse return source;
+                return self.mapVariantMember(source, members, .copy, destination);
             };
-            return self.mapStructFields(source, definition, .copy);
+            return self.mapStructFields(source, definition, .copy, destination);
         }
 
         fn moveStructFields(self: *Self, source: Value) anyerror!Value {
             const definition = (try self.type_interner.structDefinition(source.type_id)) orelse {
-                const members = (try self.type_interner.variantMembers(source.type_id)) orelse return source;
-                return self.mapVariantMember(source, members, .move);
+                const members = (try self.type_interner.facts().variantMembers(source.type_id)) orelse return source;
+                return self.mapVariantMember(source, members, .move, null);
             };
-            return self.mapStructFields(source, definition, .move);
+            return self.mapStructFields(source, definition, .move, null);
         }
 
         fn mapStructFields(
@@ -828,25 +1495,31 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             source: Value,
             definition: structures.StructDefinition,
             operation: OwnershipOperation,
+            destination: ?Value,
         ) anyerror!Value {
             var fields: std.ArrayList(structures.StructFieldValue) = .empty;
             defer fields.deinit(self.ctx.allocator());
             for (definition.fields, 0..) |field, index| {
-                const extracted = try self.appendInstruction(.{ .field_access = .{
-                    .operand = source.id,
-                    .field_index = @intCast(index),
-                    .field_type = field.type_id,
-                } });
+                const extracted = if (destination != null)
+                    try self.projectStorage(source, field.type_id, .{ .field = @intCast(index) })
+                else
+                    try self.appendInstruction(.{ .field_access = .{
+                        .operand = source.id,
+                        .field_index = @intCast(index),
+                        .field_type = field.type_id,
+                    } });
+                const field_destination = if (destination) |storage| try self.projectStorage(storage, field.type_id, .{ .field = @intCast(index) }) else null;
                 const owned = switch (operation) {
-                    .copy => try self.copyValueBits(extracted),
+                    .copy => try self.copyValueBits(extracted, field_destination),
                     .move => try self.moveValueBits(extracted),
                     .drop => unreachable,
                 };
-                try fields.append(self.ctx.allocator(), .{
+                if (destination == null) try fields.append(self.ctx.allocator(), .{
                     .field_index = @intCast(index),
                     .value = owned.id,
                 });
             }
+            if (destination) |storage| return storage;
             const field_start: u32 = @intCast(self.struct_field_values.items.len);
             try self.struct_field_values.appendSlice(self.ctx.allocator(), fields.items);
             return self.appendInstruction(.{ .struct_init = .{
@@ -860,28 +1533,43 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             source: Value,
             members: []const structures.TypeId,
             operation: OwnershipOperation,
+            destination: ?Value,
         ) anyerror!Value {
             return (try self.operateOnVariantMember(source, members, switch (operation) {
                 .copy => .copy,
                 .move => .move,
                 .drop => unreachable,
-            })).?;
+            }, destination)).?;
         }
 
-        fn mapExtractedVariantMember(self: *Self, source: Value, member: structures.TypeId, operation: OwnershipOperation) anyerror!Value {
-            const extracted = try self.appendInstruction(.{ .variant_extract = .{
+        fn projectStorage(self: *Self, source: Value, type_id: structures.TypeId, projection: @FieldType(structures.StorageProjection, "projection")) !Value {
+            return self.appendInstruction(.{ .storage_projection = .{ .owner = source.id, .type_id = type_id, .projection = projection } });
+        }
+
+        fn mapExtractedVariantMember(self: *Self, source: Value, member: structures.TypeId, operation: OwnershipOperation, destination: ?Value) anyerror!Value {
+            const extracted = if (destination != null) try self.projectStorage(source, member, .variant) else try self.appendInstruction(.{ .variant_extract = .{
                 .operand = source.id,
                 .target_type = member,
             } });
+            const member_destination = if (destination) |storage| try self.projectStorage(storage, member, .variant) else null;
             const owned = switch (operation) {
                 .copy => blk: {
-                    const capabilities = (try self.type_interner.ownershipCapabilities(member)) orelse return error.Unavailable;
-                    break :blk if (capabilities.copy == .none) extracted else try self.copyValueBits(extracted);
+                    const capabilities = (try self.type_interner.facts().ownershipCapabilities(member)) orelse return error.Unavailable;
+                    break :blk if (capabilities.copy == .none) extracted else try self.copyValueBits(extracted, member_destination);
                 },
                 .move => try self.moveValueBits(extracted),
                 .drop => unreachable,
             };
             const use = (try self.coerceValue(owned.id, member, source.type_id)) orelse unreachable;
+            if (destination) |storage| {
+                _ = try self.appendInstruction(.{ .variant_coerce = .{
+                    .operand = owned.id,
+                    .target_type = source.type_id,
+                    .tag_mapping = use.variant_tag_mapping,
+                    .destination = storage.id,
+                } });
+                return storage;
+            }
             return if (use.coerce_to == null) owned else self.appendCoercion(use);
         }
 
@@ -895,7 +1583,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             _ = try self.operateOnVariantMember(source, members, .{ .drop = .{
                 .can_deinit = can_deinit,
                 .span = span,
-            } });
+            } }, null);
         }
 
         const VariantOwnershipOperation = union(enum) {
@@ -912,12 +1600,15 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             source: Value,
             members: []const structures.TypeId,
             operation: VariantOwnershipOperation,
+            destination: ?Value,
         ) anyerror!?Value {
             std.debug.assert(members.len != 0);
             const tag = try self.appendInstruction(.{ .variant_tag = source.id });
             const argument_start: u32 = @intCast(self.block_argument_types.items.len);
             switch (operation) {
-                .copy, .move => _ = try self.appendBlockArgument(source.type_id, null),
+                .copy, .move => if (destination == null) {
+                    _ = try self.appendBlockArgument(source.type_id, null);
+                },
                 .drop => {},
             }
             const join = try self.newBlock(argument_start, @intCast(self.block_argument_types.items.len));
@@ -942,19 +1633,20 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 self.enterBlock(case);
                 switch (operation) {
                     .drop => |drop| {
-                        const extracted = try self.appendInstruction(.{ .variant_extract = .{
+                        var extracted = try self.appendInstruction(.{ .variant_extract = .{
                             .operand = source.id,
                             .target_type = member,
                         } });
+                        extracted.reference_origins = try self.selectReferenceOrigins(source.reference_origins, .{ .variant = member });
                         try self.dropValue(extracted, drop.can_deinit, drop.span);
                         self.terminate(.{ .branch = self.emptyBranch(join) });
                     },
                     .copy => {
-                        const result = try self.mapExtractedVariantMember(source, member, .copy);
-                        self.terminate(.{ .branch = try self.valuesBranch(join, &.{result}) });
+                        const result = try self.mapExtractedVariantMember(source, member, .copy, destination);
+                        self.terminate(.{ .branch = if (destination != null) self.emptyBranch(join) else try self.valuesBranch(join, &.{result}) });
                     },
                     .move => {
-                        const result = try self.mapExtractedVariantMember(source, member, .move);
+                        const result = try self.mapExtractedVariantMember(source, member, .move, null);
                         self.terminate(.{ .branch = try self.valuesBranch(join, &.{result}) });
                     },
                 }
@@ -963,20 +1655,20 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             self.enterBlock(join);
             return switch (operation) {
                 .drop => null,
-                .copy, .move => .{ .id = @enumFromInt(argument_start), .type_id = source.type_id },
+                .copy, .move => destination orelse .{ .id = @enumFromInt(argument_start), .type_id = source.type_id },
             };
         }
 
         fn dropValue(self: *Self, value_to_drop: Value, can_deinit: bool, span: structures.SourceSpan) anyerror!void {
-            const capabilities = (try self.type_interner.ownershipCapabilities(value_to_drop.type_id)) orelse return error.Unavailable;
+            const capabilities = (try self.type_interner.facts().ownershipCapabilities(value_to_drop.type_id)) orelse return error.Unavailable;
             switch (capabilities.drop) {
                 .trivial => {},
                 .explicit => if (!can_deinit) return self.reject(span, .{ .value_requires_explicit_drop = value_to_drop.type_id }),
-                .custom => _ = try self.callOwnershipHook(value_to_drop, .drop),
+                .custom => _ = try self.callOwnershipHook(value_to_drop, .drop, null),
                 .fieldwise => {
                     if (!capabilities.needs_automatic_drop and !capabilities.requires_explicit_drop) return;
                     const definition = (try self.type_interner.structDefinition(value_to_drop.type_id)) orelse {
-                        const members = (try self.type_interner.variantMembers(value_to_drop.type_id)) orelse return;
+                        const members = (try self.type_interner.facts().variantMembers(value_to_drop.type_id)) orelse return;
                         try self.dropVariantMember(value_to_drop, members, can_deinit, span);
                         return;
                     };
@@ -984,11 +1676,12 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     while (field_index > 0) {
                         field_index -= 1;
                         const field = definition.fields[field_index];
-                        const field_value = try self.appendInstruction(.{ .field_access = .{
+                        var field_value = try self.appendInstruction(.{ .field_access = .{
                             .operand = value_to_drop.id,
                             .field_index = @intCast(field_index),
                             .field_type = field.type_id,
                         } });
+                        field_value.reference_origins = try self.selectReferenceOrigins(value_to_drop.reference_origins, .{ .field = @intCast(field_index) });
                         try self.dropValue(field_value, can_deinit, span);
                     }
                 },
@@ -997,7 +1690,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
 
         fn nonCopyableBorrow(self: *Self, value_to_check: Value) !?structures.Diagnostic.TypeNotCopyable {
             const source_type = value_to_check.borrowed_type orelse return null;
-            const capabilities = (try self.type_interner.ownershipCapabilities(source_type)) orelse return error.Unavailable;
+            const capabilities = (try self.type_interner.facts().ownershipCapabilities(source_type)) orelse return error.Unavailable;
             return if (capabilities.copy == .none) .{
                 .type_id = source_type,
                 .is_movable = capabilities.move != .none,
@@ -1006,7 +1699,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
 
         fn borrowValue(self: *Self, borrowed: Value, span: structures.SourceSpan) !Value {
             if (borrowed.explicit_transfer) return self.reject(span, .ownership_transfer_requires_owning_context);
-            const capabilities = (try self.type_interner.ownershipCapabilities(borrowed.type_id)) orelse return error.Unavailable;
+            const capabilities = (try self.type_interner.facts().ownershipCapabilities(borrowed.type_id)) orelse return error.Unavailable;
             if (borrowed.borrowed_type == null and capabilities.requires_explicit_drop) {
                 return self.reject(span, .{ .value_requires_explicit_drop = borrowed.type_id });
             }
@@ -1019,6 +1712,8 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 .id = resolved.id,
                 .type_id = resolved.type_id,
                 .owned_generation = resolved.owned_generation,
+                .reference_origins = resolved.reference_origins,
+                .stable_reference_root = resolved.stable_reference_root,
             };
         }
 
@@ -1027,6 +1722,8 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 .id = resolved.id,
                 .type_id = resolved.type_id,
                 .owned_generation = resolved.owned_generation orelse resolved.borrowed_generation,
+                .reference_origins = resolved.reference_origins,
+                .stable_reference_root = resolved.stable_reference_root,
             };
         }
 
@@ -1034,14 +1731,176 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             return .{ .id = resolved.id, .type_id = resolved.type_id };
         }
 
+        fn mergeValueReferences(self: *Self, result: *Value, first: Value, second: Value) !void {
+            result.reference_origins = try self.mergeReferenceOrigins(first.reference_origins, second.reference_origins);
+            result.stable_reference_root = sharedStableReferenceRoot(first.stable_reference_root, second.stable_reference_root);
+        }
+
         fn recordUse(self: *Self, source: Value) !void {
+            try self.rememberCleanupOrigins(source);
+            if (source.reference_origins) |origins| {
+                const location: PendingReferenceUseLocation = if (self.current_boundary) |boundary|
+                    .{ .boundary = .{ .id = boundary, .effect_index = self.boundaries.items[@intFromEnum(boundary)].effects.items.len } }
+                else blk: {
+                    const current_block = self.current_block orelse unreachable;
+                    break :blk .{ .terminator = .{ .id = current_block, .effect_index = self.blocks.items[@intFromEnum(current_block)].terminator_effects.items.len } };
+                };
+                try self.reference_uses.append(self.ctx.allocator(), .{ .origins = origins, .span = self.activeLifetimeSpan(), .location = location });
+                var pending = false;
+                const resolved = try self.resolveReferenceOrigins(origins, &pending);
+                var effects: std.ArrayList(LifetimeEffect) = .empty;
+                defer effects.deinit(self.ctx.allocator());
+                if (!pending) try self.collectReferenceUses(resolved, .{
+                    .values = self.local_values,
+                    .availability = self.local_availability,
+                    .field_availability = self.field_availability,
+                }, self.activeLifetimeSpan(), &effects, &pending);
+                if (pending) {
+                    try self.pending_reference_uses.append(self.ctx.allocator(), .{
+                        .origins = origins,
+                        .state = try self.captureState(),
+                        .span = self.activeLifetimeSpan(),
+                        .location = location,
+                    });
+                } else for (effects.items) |effect| try self.recordEffect(effect);
+            }
             const generation = source.borrowed_generation orelse source.owned_generation orelse return;
-            const cleanup_value = source.borrowed_cleanup_value orelse source.id;
+            const cleanup_value = if (source.borrowed_generation != null) source.borrowed_cleanup_value orelse source.id else source.id;
             try self.recordEffect(.{ .use = .{
                 .generation = generation,
                 .cleanup_value = cleanup_value,
                 .cleanup_condition = source.borrow_condition,
             } });
+        }
+
+        fn collectReferenceUses(
+            self: *Self,
+            origins: ?u32,
+            state: State,
+            span: structures.SourceSpan,
+            effects: *std.ArrayList(LifetimeEffect),
+            incomplete: *bool,
+        ) !void {
+            var origin_id = origins;
+            while (origin_id) |index| {
+                const origin = self.reference_origins.items[index];
+                std.debug.assert(origin.loop == null);
+                var generation = origin.generation;
+                var cleanup_value = origin.cleanup_value;
+                if (origin.root) |root| {
+                    const slot = @intFromEnum(root);
+                    switch (state.availability[slot]) {
+                        .available => {},
+                        .transferred => return self.reject(span, .use_after_transfer),
+                        .maybe_transferred => return self.reject(span, .possibly_transferred),
+                        .unbound => return self.reject(span, .borrow_outlives_source),
+                    }
+                    const expected = try self.resolveBindingIdentity(origin.binding_identity);
+                    const actual_identity = if (origin.stable)
+                        state.values[slot].?.storage_identity orelse state.values[slot].?.binding_identity
+                    else
+                        state.values[slot].?.binding_identity;
+                    const actual = try self.resolveBindingIdentity(actual_identity);
+                    if (expected.incomplete or actual.incomplete) {
+                        incomplete.* = true;
+                        origin_id = origin.next;
+                        continue;
+                    }
+                    if (!(origin.stable and std.meta.eql(origin.binding_identity, actual_identity)) and
+                        (expected.conflicting or actual.conflicting or expected.value == null or expected.value != actual.value))
+                        return self.reject(span, .borrow_outlives_source);
+                    generation = state.values[slot].?.owned_generation;
+                    cleanup_value = state.values[slot].?.id;
+                }
+                if (generation) |available_generation| try effects.append(self.ctx.allocator(), .{ .use = .{
+                    .generation = available_generation,
+                    .cleanup_value = cleanup_value.?,
+                } });
+                origin_id = origin.next;
+            }
+        }
+
+        fn resolveBindingIdentity(self: *Self, identity: BindingIdentity) !ResolvedBindingIdentity {
+            var visiting: std.ArrayList(u32) = .empty;
+            defer visiting.deinit(self.ctx.allocator());
+            var result: ResolvedBindingIdentity = .{};
+            try self.expandBindingIdentity(identity, &result, &visiting);
+            return result;
+        }
+
+        fn expandBindingIdentity(
+            self: *Self,
+            identity: BindingIdentity,
+            result: *ResolvedBindingIdentity,
+            visiting: *std.ArrayList(u32),
+        ) !void {
+            switch (identity) {
+                .unknown => result.conflicting = true,
+                .fixed => |fixed| {
+                    if (result.value) |previous| {
+                        if (previous != fixed) result.conflicting = true;
+                    } else result.value = fixed;
+                },
+                .join => |index| {
+                    if (std.mem.indexOfScalar(u32, visiting.items, index) != null) return;
+                    try visiting.append(self.ctx.allocator(), index);
+                    defer _ = visiting.pop();
+                    const join = self.binding_joins.items[index];
+                    if (!join.complete) result.incomplete = true;
+                    try self.expandBindingIdentity(join.initial, result, visiting);
+                    for (join.alternatives.items) |alternative| try self.expandBindingIdentity(alternative, result, visiting);
+                },
+            }
+        }
+
+        fn resolvePendingReferenceUses(self: *Self) !void {
+            for (self.pending_reference_invalidations.items) |pending| {
+                var incomplete = false;
+                var origins = try self.resolveReferenceOrigins(pending.origins, &incomplete);
+                std.debug.assert(!incomplete);
+                while (origins) |index| {
+                    const origin = self.reference_origins.items[index];
+                    if (origin.root) |root| {
+                        var known = pending.known;
+                        while (known) |known_index| {
+                            if (self.reference_origins.items[known_index].root == root) break;
+                            known = self.reference_origins.items[known_index].next;
+                        }
+                        if (known == null) return self.reject(pending.span, .borrow_outlives_source);
+                    }
+                    origins = origin.next;
+                }
+            }
+            for (self.pending_reference_returns.items) |pending_return| {
+                var incomplete = false;
+                const origins = try self.resolveReferenceOrigins(pending_return.origins, &incomplete);
+                std.debug.assert(!incomplete);
+                try self.validateReferenceEscape(origins, pending_return.span, pending_return.is_return);
+            }
+            var pending_index = self.pending_reference_uses.items.len;
+            while (pending_index > 0) {
+                pending_index -= 1;
+                const pending_use = self.pending_reference_uses.items[pending_index];
+                var incomplete = false;
+                const origins = try self.resolveReferenceOrigins(pending_use.origins, &incomplete);
+                std.debug.assert(!incomplete);
+                var effects: std.ArrayList(LifetimeEffect) = .empty;
+                defer effects.deinit(self.ctx.allocator());
+                try self.collectReferenceUses(origins, self.states.items[@intFromEnum(pending_use.state)], pending_use.span, &effects, &incomplete);
+                std.debug.assert(!incomplete);
+                switch (pending_use.location) {
+                    .boundary => |location| try self.boundaries.items[@intFromEnum(location.id)].effects.insertSlice(
+                        self.ctx.allocator(),
+                        location.effect_index,
+                        effects.items,
+                    ),
+                    .terminator => |location| try self.blocks.items[@intFromEnum(location.id)].terminator_effects.insertSlice(
+                        self.ctx.allocator(),
+                        location.effect_index,
+                        effects.items,
+                    ),
+                }
+            }
         }
 
         fn recordConsume(self: *Self, source: Value) !void {
@@ -1054,10 +1913,16 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             return if (@intFromEnum(left_id) >= @intFromEnum(right_id)) left_id else right_id;
         }
 
+        const PreparedField = struct {
+            field_index: u32,
+            source: union(enum) { value: structures.FunctionValueId, nested: structures.FunctionValueRange },
+        };
+
         const PreparedStructInit = struct {
             type_id: structures.TypeId,
             fields: structures.FunctionValueRange,
             values: []Value,
+            reference_origins: ?u32,
         };
         const StructTypeResult = union(enum) { diverged: Value, type_id: structures.TypeId };
         const StructInitResult = union(enum) { diverged: Value, prepared: PreparedStructInit };
@@ -1069,18 +1934,22 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 .prepared => |prepared_init| prepared_init,
             };
             defer self.ctx.allocator().free(prepared.values);
-            for (prepared.values) |field_value| try self.recordConsume(field_value);
+            for (prepared.values) |field_value| {
+                try self.recordConsume(field_value);
+            }
             const constructed = try self.appendInstruction(.{ .struct_init = .{
                 .fields = prepared.fields,
                 .type_id = prepared.type_id,
             } });
-            return self.defineOwnedValue(constructed, expression.span, false);
+            var initialized = try self.defineOwnedValue(constructed, expression.span, false);
+            initialized.reference_origins = prepared.reference_origins;
+            return initialized;
         }
 
         fn prepareStructInit(self: *Self, expression: Expression, directly_movable_fields: bool) !StructInitResult {
             const initializer = expression.operation.struct_init;
             const source_fields = self.unresolved.struct_field_values[initializer.fields.start..initializer.fields.end];
-            const type_result = try self.structInitType(initializer);
+            const type_result = try self.structInitType(initializer, directly_movable_fields);
             const type_id = switch (type_result) {
                 .diverged => |diverged| return .{ .diverged = diverged },
                 .type_id => |resolved| resolved,
@@ -1088,21 +1957,53 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             const definition = (try self.type_interner.structDefinition(type_id)) orelse
                 return self.reject(initializer.type_span, .{ .struct_initializer_not_struct = type_id });
             if (!definition.accessible_fields) return self.reject(initializer.type_span, .{ .opaque_struct_access = type_id });
-            if (try self.type_interner.structLayout(type_id) == null) return error.Unavailable;
 
+            const box_field_start = self.box_init_fields.items.len;
+            var keep_box_fields = false;
+            defer if (directly_movable_fields and !keep_box_fields) self.box_init_fields.shrinkRetainingCapacity(box_field_start);
             const seen = try self.ctx.allocator().alloc(bool, definition.fields.len);
             defer self.ctx.allocator().free(seen);
             @memset(seen, false);
             var fields: std.ArrayList(structures.StructFieldValue) = .empty;
             defer fields.deinit(self.ctx.allocator());
+            var box_fields: std.ArrayList(PreparedField) = .empty;
+            defer box_fields.deinit(self.ctx.allocator());
             var field_values: std.ArrayList(Value) = .empty;
             defer field_values.deinit(self.ctx.allocator());
+            var reference_origins: ?u32 = null;
             for (source_fields) |source_field| {
                 const field = definition.resolveField(source_field.name) orelse
                     return self.reject(source_field.name_span, .unknown_struct_field);
                 if (seen[field.index]) return self.reject(source_field.name_span, .duplicate_struct_initializer_field);
                 seen[field.index] = true;
 
+                if (directly_movable_fields) {
+                    const capabilities = (try self.type_interner.facts().ownershipCapabilities(field.type_id)) orelse return error.Unavailable;
+                    if (!capabilities.isDirectlyMovable()) {
+                        const raw_index = @intFromEnum(source_field.value.value);
+                        if (raw_index >= self.unresolved.parameter_count) {
+                            const nested_expression = self.unresolved.expressions[raw_index - self.unresolved.parameter_count];
+                            if (nested_expression.operation == .struct_init) {
+                                const nested_result = try self.prepareStructInit(nested_expression, true);
+                                const nested = switch (nested_result) {
+                                    .diverged => |diverged| return .{ .diverged = diverged },
+                                    .prepared => |prepared| prepared,
+                                };
+                                defer self.ctx.allocator().free(nested.values);
+                                if (nested.type_id != field.type_id) return self.reject(source_field.value.span, .{
+                                    .struct_initializer_field_type_mismatch = self.typeMismatch(field.type_id, nested.type_id),
+                                });
+                                try field_values.appendSlice(self.ctx.allocator(), nested.values);
+                                reference_origins = try self.mergeReferenceOrigins(reference_origins, try self.prefixReferenceOrigins(nested.reference_origins, .{ .field = field.index }));
+                                try box_fields.append(self.ctx.allocator(), .{
+                                    .field_index = field.index,
+                                    .source = .{ .nested = nested.fields },
+                                });
+                                continue;
+                            }
+                        }
+                    }
+                }
                 const operand = try self.valueWithType(source_field.value.value, field.type_id);
                 if (operand.type_id == .never) return .{ .diverged = operand };
                 var use = try self.coerceValue(operand.id, operand.type_id, field.type_id) orelse
@@ -1114,31 +2015,116 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 else
                     owned;
                 if (directly_movable_fields) {
-                    const capabilities = (try self.type_interner.ownershipCapabilities(field_value.type_id)) orelse return error.Unavailable;
+                    const capabilities = (try self.type_interner.facts().ownershipCapabilities(field_value.type_id)) orelse return error.Unavailable;
                     if (capabilities.move == .none) return self.reject(source_field.value.span, .{ .type_not_movable = field_value.type_id });
-                    if (capabilities.move == .custom or capabilities.needs_custom_move)
-                        return self.reject(source_field.value.span, .{ .ref_field_requires_direct_move = field_value.type_id });
+                    if (capabilities.needs_custom_move)
+                        return self.reject(source_field.value.span, .{ .box_field_requires_direct_move = field_value.type_id });
                 }
                 try field_values.append(self.ctx.allocator(), field_value);
-                try fields.append(self.ctx.allocator(), .{
-                    .field_index = field.index,
-                    .value = field_value.id,
-                });
+                if (try self.type_interner.canStoreBorrow(field_value.type_id))
+                    reference_origins = try self.mergeReferenceOrigins(reference_origins, try self.prefixReferenceOrigins(field_value.reference_origins, .{ .field = field.index }));
+                if (directly_movable_fields) {
+                    try box_fields.append(self.ctx.allocator(), .{ .field_index = field.index, .source = .{ .value = field_value.id } });
+                } else {
+                    try fields.append(self.ctx.allocator(), .{ .field_index = field.index, .value = field_value.id });
+                }
             }
             for (seen, 0..) |was_seen, field_index| if (!was_seen) return self.reject(initializer.type_span, .{ .missing_struct_initializer_field = .{
                 .type_id = type_id,
                 .field_index = @intCast(field_index),
             } });
-            const start: u32 = @intCast(self.struct_field_values.items.len);
-            try self.struct_field_values.appendSlice(self.ctx.allocator(), fields.items);
+            const start: u32 = @intCast(if (directly_movable_fields) self.box_init_fields.items.len else self.struct_field_values.items.len);
+            const end: u32 = if (directly_movable_fields) blk: {
+                try self.box_init_fields.appendSlice(self.ctx.allocator(), box_fields.items);
+                break :blk @intCast(self.box_init_fields.items.len);
+            } else blk: {
+                try self.struct_field_values.appendSlice(self.ctx.allocator(), fields.items);
+                break :blk @intCast(self.struct_field_values.items.len);
+            };
+            const values = try field_values.toOwnedSlice(self.ctx.allocator());
+            keep_box_fields = true;
             return .{ .prepared = .{
                 .type_id = type_id,
-                .fields = .{ .start = start, .end = @intCast(self.struct_field_values.items.len) },
-                .values = try field_values.toOwnedSlice(self.ctx.allocator()),
+                .fields = .{ .start = start, .end = end },
+                .values = values,
+                .reference_origins = reference_origins,
             } };
         }
 
-        fn structInitType(self: *Self, initializer: @FieldType(Expression.Operation, "struct_init")) !StructTypeResult {
+        fn inPlaceStructFieldType(self: *Self, id: semantic.UnresolvedBody.ValueId, expected_type: ?structures.TypeId) anyerror!StructTypeResult {
+            const index = @intFromEnum(id);
+            if (index >= self.unresolved.parameter_count) {
+                const expression = self.unresolved.expressions[index - self.unresolved.parameter_count];
+                if (expression.operation == .struct_init) {
+                    const initializer = expression.operation.struct_init;
+                    const result = try self.structInitType(initializer, true);
+                    const type_id = switch (result) {
+                        .diverged => |diverged| return .{ .diverged = diverged },
+                        .type_id => |resolved| resolved,
+                    };
+                    const capabilities = (try self.type_interner.facts().ownershipCapabilities(type_id)) orelse return error.Unavailable;
+                    if (capabilities.isDirectlyMovable()) {
+                        const operand = try self.valueWithType(id, expected_type);
+                        return if (operand.type_id == .never) .{ .diverged = operand } else .{ .type_id = operand.type_id };
+                    }
+                    if (initializer.target == .concrete) {
+                        const definition = (try self.type_interner.structDefinition(type_id)) orelse
+                            return self.reject(initializer.type_span, .{ .struct_initializer_not_struct = type_id });
+                        if (!definition.accessible_fields) return self.reject(initializer.type_span, .{ .opaque_struct_access = type_id });
+                        for (self.unresolved.struct_field_values[initializer.fields.start..initializer.fields.end]) |field| {
+                            const resolved_field = definition.resolveField(field.name) orelse return self.reject(field.name_span, .unknown_struct_field);
+                            const field_result = try self.inPlaceStructFieldType(field.value.value, resolved_field.type_id);
+                            if (field_result == .diverged) return field_result;
+                        }
+                    }
+                    return .{ .type_id = type_id };
+                }
+            }
+            const operand = try self.valueWithType(id, expected_type);
+            return if (operand.type_id == .never) .{ .diverged = operand } else .{ .type_id = operand.type_id };
+        }
+
+        fn inPlaceResultType(self: *Self, id: semantic.UnresolvedBody.ValueId) anyerror!?structures.TypeId {
+            const index = @intFromEnum(id);
+            if (index < self.unresolved.parameter_count) return null;
+            const expression = self.unresolved.expressions[index - self.unresolved.parameter_count];
+            return switch (expression.operation) {
+                .struct_init => |initializer| switch (initializer.target) {
+                    .concrete => |type_id| type_id,
+                    .inferred => null,
+                },
+                .if_else => |branches| blk: {
+                    const then_result = self.unresolved.blocks[@intFromEnum(branches.then_block)].result orelse break :blk null;
+                    const else_result = self.unresolved.blocks[@intFromEnum(branches.else_block)].result orelse break :blk null;
+                    const then_type = (try self.inPlaceResultType(then_result)) orelse break :blk null;
+                    const else_type = (try self.inPlaceResultType(else_result)) orelse break :blk null;
+                    break :blk if (then_type == else_type) then_type else null;
+                },
+                else => null,
+            };
+        }
+
+        fn inPlaceInitializer(self: *Self, id: semantic.UnresolvedBody.ValueId) ?InPlaceInitializer {
+            const index = @intFromEnum(id);
+            if (index < self.unresolved.parameter_count) return null;
+            const expression = self.unresolved.expressions[index - self.unresolved.parameter_count];
+            return switch (expression.operation) {
+                .struct_init => .{ .fields = expression },
+                .call => |call| .{ .call = call },
+                .if_else => |branches| .{ .conditional = branches },
+                else => null,
+            };
+        }
+
+        fn inPlaceInitializerType(self: *Self, initializer: InPlaceInitializer, id: semantic.UnresolvedBody.ValueId) anyerror!?StructTypeResult {
+            return switch (initializer) {
+                .fields => |expression| try self.structInitType(expression.operation.struct_init, true),
+                .call => |call| if (try self.inPlaceCallResultType(call)) |type_id| .{ .type_id = type_id } else null,
+                .conditional => if (try self.inPlaceResultType(id)) |type_id| .{ .type_id = type_id } else null,
+            };
+        }
+
+        fn structInitType(self: *Self, initializer: @FieldType(Expression.Operation, "struct_init"), in_place: bool) !StructTypeResult {
             return switch (initializer.target) {
                 .concrete => |concrete| .{ .type_id = concrete },
                 .inferred => |factory| inferred: {
@@ -1147,6 +2133,14 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     defer field_types.deinit(self.ctx.allocator());
                     for (fields) |field| {
                         const expected = try self.type_interner.independentStructFieldType(factory, field.name);
+                        if (in_place) {
+                            const field_result = try self.inPlaceStructFieldType(field.value.value, expected);
+                            switch (field_result) {
+                                .diverged => |diverged| break :inferred .{ .diverged = diverged },
+                                .type_id => |type_id| try field_types.append(self.ctx.allocator(), type_id),
+                            }
+                            continue;
+                        }
                         const operand = try self.valueWithType(field.value.value, expected);
                         if (operand.type_id == .never) break :inferred .{ .diverged = operand };
                         try field_types.append(self.ctx.allocator(), operand.type_id);
@@ -1170,18 +2164,47 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         }
 
         fn accessField(self: *Self, operand_use: semantic.UnresolvedBody.ValueUse, name: []const u8, span: structures.SourceSpan) !Value {
+            var place_fields: std.ArrayList(PlaceField) = .empty;
+            defer place_fields.deinit(self.ctx.allocator());
+            if (try self.resolveArgumentPlace(operand_use.value, &place_fields)) |place| {
+                if (self.hasUnavailableFields(place.local)) {
+                    const local_index = @intFromEnum(place.local);
+                    if (self.local_availability[local_index] != .available)
+                        return self.reject(span, if (self.local_availability[local_index] == .maybe_transferred) .possibly_transferred else .use_after_transfer);
+                    const root = self.local_values[local_index].?;
+                    const parent_type = if (place_fields.items.len == 0) root.type_id else place_fields.getLast().type_id;
+                    try place_fields.append(self.ctx.allocator(), try self.resolvePlaceField(parent_type, name, operand_use.span, span));
+                    if (self.unavailableField(place.local, place_fields.items[place.fields.start..])) |availability|
+                        return self.reject(span, if (availability == .transferred) .use_after_transfer else .possibly_transferred);
+                    const source = try self.borrowValue(self.borrowLocalValue(place.local), operand_use.span);
+                    var field = source;
+                    for (place_fields.items[place.fields.start..]) |part| {
+                        const origins = try self.selectReferenceOrigins(field.reference_origins, .{ .field = part.index });
+                        field = try self.appendInstruction(.{ .field_access = .{
+                            .operand = field.id,
+                            .field_index = part.index,
+                            .field_type = part.type_id,
+                        } });
+                        field.reference_origins = origins;
+                    }
+                    field.borrowed_type = field.type_id;
+                    field.borrowed_generation = source.borrowed_generation;
+                    field.borrowed_cleanup_value = source.borrowed_cleanup_value;
+                    field.borrow_root = place.local;
+                    field.binding_identity = source.binding_identity;
+                    return field;
+                }
+            }
             const operand = try self.borrowValue(try self.value(operand_use.value), operand_use.span);
             if (operand.type_id == .never) return operand;
-            const definition = (try self.type_interner.structDefinition(operand.type_id)) orelse
-                return self.reject(operand_use.span, .{ .field_access_not_struct = operand.type_id });
-            if (!definition.accessible_fields) return self.reject(span, .{ .opaque_struct_access = operand.type_id });
-            if (try self.type_interner.structLayout(operand.type_id) == null) return error.Unavailable;
-            const field = definition.resolveField(name) orelse return self.reject(span, .unknown_field);
+            const field = try self.resolvePlaceField(operand.type_id, name, operand_use.span, span);
             var result = try self.appendInstruction(.{ .field_access = .{
                 .operand = operand.id,
                 .field_index = field.index,
                 .field_type = field.type_id,
             } });
+            result.reference_origins = try self.selectReferenceOrigins(operand.reference_origins, .{ .field = field.index });
+            result.binding_identity = operand.binding_identity;
             if (operand.borrowed_type != null) {
                 result.borrowed_type = field.type_id;
                 result.borrowed_generation = operand.borrowed_generation;
@@ -1190,7 +2213,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 if (operand.borrow_condition) |borrow_condition| {
                     return self.accessConditionalTemporary(operand, result, borrow_condition, span);
                 }
-            } else if ((try self.type_interner.ownershipCapabilities(operand.type_id) orelse return error.Unavailable).needs_automatic_drop) {
+            } else if ((try self.type_interner.facts().ownershipCapabilities(operand.type_id) orelse return error.Unavailable).needs_automatic_drop) {
                 result.borrowed_type = field.type_id;
                 result.borrowed_generation = operand.owned_generation;
                 result.borrowed_cleanup_value = operand.id;
@@ -1221,23 +2244,18 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             self.enterBlock(borrowed);
             self.terminate(.{ .branch = try self.valuesBranch(join, &.{field}) });
             self.enterBlock(owned);
-            const capabilities = (try self.type_interner.ownershipCapabilities(operand.type_id)) orelse return error.Unavailable;
+            const capabilities = (try self.type_interner.facts().ownershipCapabilities(operand.type_id)) orelse return error.Unavailable;
             const owned_field = if (capabilities.needs_automatic_drop or capabilities.requires_explicit_drop) blk: {
-                const copied = try self.ownValue(.{
-                    .id = field.id,
-                    .type_id = field.type_id,
-                    .borrowed_type = field.borrowed_type,
-                    .borrowed_generation = operand.owned_generation,
-                    .borrowed_cleanup_value = operand.id,
-                    .borrow_root = field.borrow_root,
-                }, span);
-                break :blk copied;
+                var borrowed_field = field;
+                borrowed_field.borrowed_generation = operand.owned_generation;
+                borrowed_field.borrowed_cleanup_value = operand.id;
+                break :blk try self.ownValue(borrowed_field, span);
             } else withoutOwnershipSource(field);
             self.terminate(.{ .branch = try self.valuesBranch(join, &.{owned_field}) });
             const joined_generation = try self.joinGenerations(field.type_id, span, null, owned_field.owned_generation);
             self.block_argument_generations.items[argument_start] = joined_generation;
             self.enterBlock(join);
-            return self.withCleanupCondition(.{
+            var result: Value = .{
                 .id = @enumFromInt(argument_start),
                 .type_id = field.type_id,
                 .owned_generation = joined_generation,
@@ -1246,20 +2264,23 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 .borrowed_type = field.type_id,
                 .borrow_condition = borrow_condition,
                 .borrow_root = field.borrow_root,
-            });
+            };
+            try self.mergeValueReferences(&result, field, owned_field);
+            return self.withCleanupCondition(result);
         }
 
         fn captureState(self: *Self) !StateId {
-            const values = try self.ctx.allocator().dupe(?Value, self.local_values);
-            errdefer self.ctx.allocator().free(values);
-            const availability = try self.ctx.allocator().dupe(Availability, self.local_availability);
-            errdefer self.ctx.allocator().free(availability);
-            return self.appendState(.{ .values = values, .availability = availability });
+            var count = self.local_values.len;
+            while (count > 0 and self.local_values[count - 1] == null) count -= 1;
+            var state = try (State{ .values = self.local_values[0..count], .availability = self.local_availability, .field_availability = self.field_availability }).clone(self.ctx.allocator());
+            errdefer state.deinit(self.ctx.allocator());
+            return self.appendState(state);
         }
 
         fn appendState(self: *Self, state: State) !StateId {
-            std.debug.assert(state.values.len == state.availability.len);
-            std.debug.assert(state.values.len == self.local_values.len);
+            std.debug.assert(state.values.len <= state.availability.len);
+            std.debug.assert(state.availability.len == self.local_values.len);
+            std.debug.assert(state.field_availability.len == self.field_availability.len);
             const id: StateId = @enumFromInt(self.states.items.len);
             try self.states.append(self.ctx.allocator(), state);
             return id;
@@ -1267,36 +2288,39 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
 
         fn restoreState(self: *Self, id: StateId) void {
             const state = self.states.items[@intFromEnum(id)];
-            @memcpy(self.local_values, state.values);
+            @memcpy(self.local_values[0..state.values.len], state.values);
+            @memset(self.local_values[state.values.len..], null);
             @memcpy(self.local_availability, state.availability);
+            @memcpy(self.field_availability, state.field_availability);
         }
 
         fn activeStateValues(self: *Self, id: StateId) !std.ArrayList(Value) {
             var values: std.ArrayList(Value) = .empty;
             errdefer values.deinit(self.ctx.allocator());
-            for (self.states.items[@intFromEnum(id)].values, self.local_mutable) |value_in_state, mutable| {
-                if (mutable) if (value_in_state) |value_to_append| try values.append(self.ctx.allocator(), value_to_append);
+            for (self.states.items[@intFromEnum(id)].values, 0..) |value_in_state, slot| {
+                if (self.locals.items(.mutable)[slot]) if (value_in_state) |value_to_append| try values.append(self.ctx.allocator(), value_to_append);
             }
             return values;
         }
 
         fn stateWithArguments(self: *Self, baseline: StateId, argument_start: u32) !StateId {
-            const baseline_state = self.states.items[@intFromEnum(baseline)];
-            const values = try self.ctx.allocator().dupe(?Value, baseline_state.values);
-            errdefer self.ctx.allocator().free(values);
-            const availability = try self.ctx.allocator().dupe(Availability, baseline_state.availability);
-            errdefer self.ctx.allocator().free(availability);
+            var state = try self.states.items[@intFromEnum(baseline)].clone(self.ctx.allocator());
+            errdefer state.deinit(self.ctx.allocator());
             var argument = argument_start;
-            for (values, self.local_mutable) |*value_in_state, mutable| {
-                if (!mutable or value_in_state.* == null) continue;
+            for (state.values, 0..) |*value_in_state, slot| {
+                if (!self.locals.items(.mutable)[slot] or value_in_state.* == null) continue;
+                const identity = value_in_state.*.?.binding_identity;
+                const storage_identity = value_in_state.*.?.storage_identity;
                 value_in_state.* = .{
                     .id = @enumFromInt(argument),
                     .type_id = self.block_argument_types.items[argument],
                     .owned_generation = self.block_argument_generations.items[argument],
+                    .binding_identity = identity,
+                    .storage_identity = storage_identity,
                 };
                 argument += 1;
             }
-            return self.appendState(.{ .values = values, .availability = availability });
+            return self.appendState(state);
         }
 
         fn loop(self: *Self, body: semantic.UnresolvedBody.BlockId) !Value {
@@ -1335,8 +2359,41 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             const exit = try self.newBlock(exit_argument_start, @intCast(self.block_argument_types.items.len));
 
             const header_state = try self.stateWithArguments(baseline, state_type_start);
+            const identity_start = self.binding_joins.items.len;
+            for (self.states.items[@intFromEnum(baseline)].values, 0..) |initial, slot| {
+                const mutable = self.locals.items(.mutable)[slot];
+                if (!mutable or initial == null) continue;
+                const index: u32 = @intCast(self.binding_joins.items.len);
+                try self.binding_joins.append(self.ctx.allocator(), .{
+                    .slot = @intCast(slot),
+                    .initial = initial.?.binding_identity,
+                });
+                self.states.items[@intFromEnum(header_state)].values[slot].?.binding_identity = .{ .join = index };
+                const storage_index: u32 = @intCast(self.binding_joins.items.len);
+                try self.binding_joins.append(self.ctx.allocator(), .{
+                    .slot = @intCast(slot),
+                    .storage = true,
+                    .initial = initial.?.storage_identity orelse initial.?.binding_identity,
+                });
+                self.states.items[@intFromEnum(header_state)].values[slot].?.storage_identity = .{ .join = storage_index };
+            }
+            const identity_end = self.binding_joins.items.len;
+            const origin_start = self.loop_reference_origins.items.len;
+            for (self.states.items[@intFromEnum(baseline)].values, 0..) |initial, slot| {
+                const mutable = self.locals.items(.mutable)[slot];
+                if (!mutable or initial == null or !try self.typeContainsBorrow(initial.?.type_id)) continue;
+                const origin_index: u32 = @intCast(self.loop_reference_origins.items.len);
+                try self.loop_reference_origins.append(self.ctx.allocator(), .{
+                    .slot = @intCast(slot),
+                    .origins = initial.?.reference_origins,
+                });
+                self.states.items[@intFromEnum(header_state)].values[slot].?.reference_origins =
+                    try self.addReferenceOrigin(null, .{ .loop = origin_index });
+            }
+            const origin_end = self.loop_reference_origins.items.len;
 
             const break_start: u32 = @intCast(self.loop_breaks.items.len);
+            const backedge_start = self.loop_backedges.items.len;
             try self.loop_stack.append(self.ctx.allocator(), .{
                 .header = header,
                 .exit = exit,
@@ -1349,11 +2406,12 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             self.restoreState(header_state);
             const body_value = try self.block(body, null);
             if (body_value != null) {
+                try self.normalizeLoopBackedge(self.loop_stack.getLast(), self.unresolved.blocks[@intFromEnum(body)].span);
                 try self.validateLoopBackedge(self.loop_stack.getLast(), self.unresolved.blocks[@intFromEnum(body)].span);
                 const repeat = try self.loopBranch(self.loop_stack.getLast(), header, null);
                 self.terminate(.{ .branch = repeat });
             }
-            _ = self.loop_stack.pop();
+            const loop_context = self.loop_stack.pop().?;
 
             try self.reconcileLoopHeaderGenerations(
                 header,
@@ -1367,6 +2425,23 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 break_start,
                 self.unresolved.blocks[@intFromEnum(body)].span,
             );
+            for (self.binding_joins.items[identity_start..identity_end]) |*join| {
+                for (self.loop_backedges.items[backedge_start..]) |backedge| {
+                    const value_on_edge = self.states.items[@intFromEnum(backedge)].values[join.slot.?].?;
+                    try join.alternatives.append(self.ctx.allocator(), if (join.storage)
+                        value_on_edge.storage_identity orelse value_on_edge.binding_identity
+                    else
+                        value_on_edge.binding_identity);
+                }
+                join.complete = true;
+            }
+            for (self.loop_reference_origins.items[origin_start..origin_end]) |*loop_origins| {
+                for (self.loop_backedges.items[backedge_start..]) |backedge| {
+                    loop_origins.origins = try self.mergeReferenceOrigins(loop_origins.origins, self.states.items[@intFromEnum(backedge)].values[loop_origins.slot].?.reference_origins);
+                }
+                loop_origins.complete = true;
+            }
+            self.loop_backedges.shrinkRetainingCapacity(backedge_start);
 
             const breaks = self.loop_breaks.items[break_start..];
             if (breaks.len == 0) {
@@ -1376,45 +2451,68 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 return .{ .id = @enumFromInt(exit_argument_start), .type_id = .never };
             }
 
+            try self.normalizeLoopBreakFields(breaks);
+            for (breaks) |*break_edge| {
+                self.enterPendingBlock(break_edge.block);
+                self.restoreState(break_edge.state);
+                break_edge.branch = try self.loopBranch(loop_context, exit, break_edge.value);
+                self.terminate(.{ .branch = break_edge.branch });
+            }
+
             var joined = breaks[0].value.type_id;
             for (breaks[1..]) |break_edge| joined = try joinTypes(self.type_interner, joined, break_edge.value.type_id, self.ctx.allocator());
             self.block_argument_types.items[exit_argument_start] = joined;
-            var result_generation = breaks[0].value.owned_generation;
-            var result_generations_equal = self.generationMatchesType(result_generation, joined);
-            for (breaks[1..]) |break_edge| {
-                result_generations_equal = result_generations_equal and break_edge.value.owned_generation == result_generation;
-            }
-            if (!result_generations_equal) result_generation = try self.allocateGeneration(joined, self.unresolved.blocks[@intFromEnum(body)].span, false);
+            const exit_span = self.unresolved.blocks[@intFromEnum(body)].span;
+            const incoming_generations = try self.ctx.allocator().alloc(?GenerationId, breaks.len);
+            defer self.ctx.allocator().free(incoming_generations);
+            for (breaks, incoming_generations) |break_edge, *generation| generation.* = break_edge.value.owned_generation;
+            const result_generation = try self.joinGenerationGroup(joined, exit_span, incoming_generations);
             self.block_argument_generations.items[exit_argument_start] = result_generation;
             for (breaks) |break_edge| {
                 self.branch_arguments.items[break_edge.branch.arguments.start] =
                     (try self.coerceValue(break_edge.value.id, break_edge.value.type_id, joined)) orelse unreachable;
             }
             var state_argument = exit_argument_start + 2;
-            for (self.states.items[@intFromEnum(baseline)].values, self.local_mutable, 0..) |initial, mutable, slot| {
+            for (self.states.items[@intFromEnum(baseline)].values, 0..) |initial, slot| {
+                const mutable = self.locals.items(.mutable)[slot];
                 if (!mutable or initial == null) continue;
-                var state_generation = self.states.items[@intFromEnum(breaks[0].state)].values[slot].?.owned_generation;
-                var state_generations_equal = self.generationMatchesType(state_generation, self.block_argument_types.items[state_argument]);
-                for (breaks[1..]) |break_edge| {
-                    state_generations_equal = state_generations_equal and
-                        self.states.items[@intFromEnum(break_edge.state)].values[slot].?.owned_generation == state_generation;
+                const state_type = self.block_argument_types.items[state_argument];
+                for (breaks, incoming_generations) |break_edge, *generation| {
+                    generation.* = self.states.items[@intFromEnum(break_edge.state)].values[slot].?.owned_generation;
                 }
-                if (!state_generations_equal) {
-                    state_generation = try self.allocateGeneration(
-                        self.block_argument_types.items[state_argument],
-                        self.unresolved.blocks[@intFromEnum(body)].span,
-                        false,
-                    );
-                }
-                self.block_argument_generations.items[state_argument] = state_generation;
+                self.block_argument_generations.items[state_argument] = try self.joinGenerationGroup(state_type, exit_span, incoming_generations);
                 state_argument += 1;
             }
             const output_state = try self.stateWithArguments(baseline, exit_argument_start + 2);
+            for (self.states.items[@intFromEnum(baseline)].values, 0..) |initial, slot| {
+                const mutable = self.locals.items(.mutable)[slot];
+                if (!mutable or initial == null) continue;
+                var origins: ?u32 = null;
+                var identity = self.states.items[@intFromEnum(breaks[0].state)].values[slot].?.binding_identity;
+                var storage_identity = self.states.items[@intFromEnum(breaks[0].state)].values[slot].?.storage_identity orelse identity;
+                for (breaks) |break_edge| {
+                    origins = try self.mergeReferenceOrigins(origins, self.states.items[@intFromEnum(break_edge.state)].values[slot].?.reference_origins);
+                }
+                for (breaks[1..]) |break_edge| {
+                    identity = try self.joinBindingIdentities(identity, self.states.items[@intFromEnum(break_edge.state)].values[slot].?.binding_identity);
+                    const value_on_edge = self.states.items[@intFromEnum(break_edge.state)].values[slot].?;
+                    storage_identity = try self.joinBindingIdentities(storage_identity, value_on_edge.storage_identity orelse value_on_edge.binding_identity);
+                }
+                self.states.items[@intFromEnum(output_state)].values[slot].?.reference_origins = origins;
+                self.states.items[@intFromEnum(output_state)].values[slot].?.binding_identity = identity;
+                self.states.items[@intFromEnum(output_state)].values[slot].?.storage_identity = storage_identity;
+            }
             for (self.states.items[@intFromEnum(output_state)].availability, 0..) |*availability, index| {
                 if (self.states.items[@intFromEnum(baseline)].availability[index] == .unbound) continue;
                 availability.* = self.states.items[@intFromEnum(breaks[0].state)].availability[index];
                 for (breaks[1..]) |break_edge| {
                     availability.* = joinAvailability(availability.*, self.states.items[@intFromEnum(break_edge.state)].availability[index]);
+                }
+            }
+            for (self.states.items[@intFromEnum(output_state)].field_availability, 0..) |*availability, index| {
+                availability.* = self.states.items[@intFromEnum(breaks[0].state)].field_availability[index];
+                for (breaks[1..]) |break_edge| {
+                    availability.* = joinAvailability(availability.*, self.states.items[@intFromEnum(break_edge.state)].field_availability[index]);
                 }
             }
             var any_borrowed = false;
@@ -1426,7 +2524,11 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             var borrowed_generation: ?GenerationId = null;
             var borrowed_cleanup_value: ?structures.FunctionValueId = null;
             var borrowed_generation_initialized = false;
+            var reference_origins: ?u32 = null;
+            var stable_reference_root = breaks[0].value.stable_reference_root;
             for (breaks) |break_edge| {
+                reference_origins = try self.mergeReferenceOrigins(reference_origins, break_edge.value.reference_origins);
+                stable_reference_root = sharedStableReferenceRoot(stable_reference_root, break_edge.value.stable_reference_root);
                 any_borrowed = any_borrowed or break_edge.value.borrowed_type != null;
                 all_borrowed = all_borrowed and break_edge.value.borrowed_type != null;
                 has_conditional_borrow = has_conditional_borrow or break_edge.value.borrow_condition != null;
@@ -1464,6 +2566,8 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 else
                     null,
                 .borrow_root = borrow_root,
+                .reference_origins = reference_origins,
+                .stable_reference_root = stable_reference_root,
                 .explicit_transfer = contains_transfer,
             });
         }
@@ -1487,6 +2591,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 const provisional = self.block_argument_generations.items[argument];
                 var all_equal = self.generationMatchesType(provisional, self.block_argument_types.items[argument]);
                 var can_deinit = if (provisional) |generation| self.generations.items[@intFromEnum(generation)].can_deinit else false;
+                const missing = if (provisional) |generation| self.generations.items[@intFromEnum(generation)].missing_fields else &.{};
                 for (self.blocks.items[block_start..]) |block_value| {
                     const branch = switch (block_value.terminator orelse continue) {
                         .branch => |branch| branch,
@@ -1494,6 +2599,8 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     };
                     if (branch.target != header) continue;
                     const backedge_generation = self.branch_argument_generations.items[branch.arguments.start + offset];
+                    const backedge_missing = if (backedge_generation) |generation| self.generations.items[@intFromEnum(generation)].missing_fields else &.{};
+                    if (!sameMissingFields(missing, backedge_missing)) return self.reject(span, .partial_field_transfer_not_supported);
                     all_equal = all_equal and backedge_generation == provisional;
                     can_deinit = can_deinit and if (backedge_generation) |generation|
                         self.generations.items[@intFromEnum(generation)].can_deinit
@@ -1507,6 +2614,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     can_deinit,
                     header_start_orders[offset].?,
                 )).?;
+                try self.copyMissingFields(joined, missing, null, null);
                 self.block_argument_generations.items[argument] = joined;
                 self.remapLoopGeneration(
                     provisional,
@@ -1597,7 +2705,10 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
 
         fn valuesBranch(self: *Self, target: structures.FunctionBlockId, values: []const Value) !structures.FunctionBranch {
             const start: u32 = @intCast(self.branch_arguments.items.len);
-            for (values) |value_to_pass| try self.appendBranchArgument(.{ .value = value_to_pass.id }, value_to_pass.owned_generation);
+            for (values) |value_to_pass| {
+                try self.rememberCleanupOrigins(value_to_pass);
+                try self.appendBranchArgument(.{ .value = value_to_pass.id }, value_to_pass.owned_generation);
+            }
             return .{ .target = target, .arguments = .{ .start = start, .end = @intCast(self.branch_arguments.items.len) } };
         }
 
@@ -1622,7 +2733,9 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             else
                 unreachable;
             var type_index = type_start;
-            for (self.states.items[@intFromEnum(context.baseline)].values, self.local_values, self.local_mutable) |initial, current, mutable| {
+            for (self.states.items[@intFromEnum(context.baseline)].values, 0..) |initial, slot| {
+                const current = self.local_values[slot];
+                const mutable = self.locals.items(.mutable)[slot];
                 if (!mutable or initial == null) continue;
                 const state = current.?;
                 const use = (try self.coerceValue(state.id, state.type_id, self.block_argument_types.items[type_index])) orelse unreachable;
@@ -1630,7 +2743,25 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 type_index += 1;
             }
             std.debug.assert(type_index == type_start + context.state_type_end - context.state_type_start);
+            if (target == context.header) try self.loop_backedges.append(self.ctx.allocator(), try self.captureState());
             return .{ .target = target, .arguments = .{ .start = start, .end = @intCast(self.branch_arguments.items.len) } };
+        }
+
+        fn normalizeLoopBackedge(self: *Self, context: LoopContext, span: structures.SourceSpan) !void {
+            const baseline = self.states.items[@intFromEnum(context.baseline)];
+            const previous_boundary = self.current_boundary;
+            defer self.current_boundary = previous_boundary;
+            var boundary: ?BoundaryId = null;
+            for (baseline.field_availability, self.field_availability, self.field_places) |initial, current, place| {
+                if (!place.moves_owner or baseline.availability[@intFromEnum(place.local)] != .available or
+                    initial != .transferred or current != .available) continue;
+                if (boundary == null) {
+                    boundary = try self.newBoundary(span);
+                    self.current_boundary = boundary;
+                }
+                try self.endField(place, span);
+            }
+            if (boundary) |end_boundary| try self.appendBoundary(end_boundary);
         }
 
         fn validateLoopBackedge(self: *Self, context: LoopContext, span: structures.SourceSpan) !void {
@@ -1639,6 +2770,10 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 if (initial == .available and current != .available) {
                     return self.reject(span, .transferred_value_not_restored_before_loop_backedge);
                 }
+            }
+            for (self.states.items[@intFromEnum(context.baseline)].field_availability, self.field_availability, self.field_places) |initial, current, place| {
+                if (baseline[@intFromEnum(place.local)] == .available and initial == .available and current != .available)
+                    return self.reject(span, .transferred_value_not_restored_before_loop_backedge);
             }
         }
 
@@ -1658,6 +2793,13 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             span: structures.SourceSpan,
         ) !Value {
             var result = try self.appendCoercion(use);
+            result.reference_origins = source.reference_origins;
+            if (try self.type_interner.facts().variantMembers(result.type_id)) |members| {
+                if (try self.type_interner.facts().variantMembers(source.type_id) == null) {
+                    const member = members[self.variant_coercion_tags.items[use.variant_tag_mapping.?.start]];
+                    result.reference_origins = try self.prefixReferenceOrigins(source.reference_origins, .{ .variant = member });
+                }
+            }
             if (source.borrowed_type != null) {
                 result.borrowed_type = source.borrowed_type;
                 result.borrowed_generation = source.borrowed_generation;
@@ -1685,7 +2827,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
 
         fn appendCoercion(self: *Self, use: structures.FunctionValueUse) !Value {
             const target_type = use.coerce_to.?;
-            const operation: structures.FunctionInstruction = if (try self.type_interner.callable(target_type) != null)
+            const operation: structures.FunctionInstruction = if (try self.type_interner.facts().callable(target_type) != null)
                 .{ .callable_coerce = .{ .operand = use.value, .target_type = target_type } }
             else
                 .{ .variant_coerce = .{
@@ -1704,10 +2846,10 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         ) !?structures.FunctionValueUse {
             if (actual_type == target_type) return .{ .value = value_id };
             if (actual_type == .never or !try semantic.canWidenTo(self.type_interner, actual_type, target_type)) return null;
-            const target_members = try self.type_interner.variantMembers(target_type) orelse
+            const target_members = try self.type_interner.facts().variantMembers(target_type) orelse
                 return .{ .value = value_id, .coerce_to = target_type };
             const mapping_start: u32 = @intCast(self.variant_coercion_tags.items.len);
-            if (try self.type_interner.variantMembers(actual_type)) |actual_members| {
+            if (try self.type_interner.facts().variantMembers(actual_type)) |actual_members| {
                 for (actual_members) |actual_member| try self.appendVariantTag(target_members, actual_member);
             } else {
                 try self.appendVariantTag(target_members, actual_type);
@@ -1732,8 +2874,8 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             source_type: structures.TypeId,
             target_type: structures.TypeId,
         ) !?structures.FunctionValueRange {
-            const target_members = try self.type_interner.variantMembers(target_type) orelse return null;
-            const source_members = (try self.type_interner.variantMembers(source_type)).?;
+            const target_members = try self.type_interner.facts().variantMembers(target_type) orelse return null;
+            const source_members = (try self.type_interner.facts().variantMembers(source_type)).?;
             const start: u32 = @intCast(self.variant_coercion_tags.items.len);
             for (source_members) |source_member| {
                 const target_tag: u32 = for (target_members, 0..) |target_member, index| {
@@ -1742,6 +2884,29 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 try self.variant_coercion_tags.append(self.ctx.allocator(), target_tag);
             }
             return .{ .start = start, .end = @intCast(self.variant_coercion_tags.items.len) };
+        }
+
+        fn resolvePlaceFields(
+            self: *Self,
+            root_type: structures.TypeId,
+            source_fields: []const semantic.UnresolvedBody.FieldName,
+            root_span: structures.SourceSpan,
+            fields: *std.ArrayList(PlaceField),
+        ) !void {
+            var target_type = root_type;
+            for (source_fields, 0..) |source_field, index| {
+                const field = try self.resolvePlaceField(target_type, source_field.name, if (index == 0) root_span else source_fields[index - 1].span, source_field.span);
+                try fields.append(self.ctx.allocator(), field);
+                target_type = field.type_id;
+            }
+        }
+
+        fn resolvePlaceField(self: *Self, parent_type: structures.TypeId, name: []const u8, parent_span: structures.SourceSpan, field_span: structures.SourceSpan) !PlaceField {
+            const definition = (try self.type_interner.structDefinition(parent_type)) orelse
+                return self.reject(parent_span, .{ .field_access_not_struct = parent_type });
+            if (!definition.accessible_fields) return self.reject(field_span, .{ .opaque_struct_access = parent_type });
+            const field = definition.resolveField(name) orelse return self.reject(field_span, .unknown_field);
+            return .{ .index = field.index, .type_id = field.type_id, .name = name };
         }
 
         fn assignment(self: *Self, expression: Expression) !Value {
@@ -1754,19 +2919,8 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             var fields: std.ArrayList(PlaceField) = .empty;
             defer fields.deinit(self.ctx.allocator());
             const source_fields = self.unresolved.assignment_fields[assignment_value.fields.start..assignment_value.fields.end];
-            var target_type = root.type_id;
-            for (source_fields, 0..) |source_field, index| {
-                const definition = (try self.type_interner.structDefinition(target_type)) orelse
-                    return self.reject(if (index == 0) assignment_value.target_span else source_fields[index - 1].span, .{ .field_access_not_struct = target_type });
-                if (!definition.accessible_fields) return self.reject(source_field.span, .{ .opaque_struct_access = target_type });
-                if (try self.type_interner.structLayout(target_type) == null) return error.Unavailable;
-                const field = definition.resolveField(source_field.name) orelse return self.reject(source_field.span, .unknown_field);
-                try fields.append(self.ctx.allocator(), .{
-                    .index = field.index,
-                    .type_id = field.type_id,
-                });
-                target_type = field.type_id;
-            }
+            try self.resolvePlaceFields(root.type_id, source_fields, assignment_value.target_span, &fields);
+            const target_type = if (fields.items.len == 0) root.type_id else fields.getLast().type_id;
             var target = root;
             for (fields.items) |field| {
                 target = try self.appendInstruction(.{ .field_access = .{
@@ -1785,6 +2939,26 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             if (fields.items.len != 0 and self.local_availability[local_index] != .available) {
                 return self.reject(assignment_value.target_span, if (self.local_availability[local_index] == .maybe_transferred) .possibly_transferred else .use_after_transfer);
             }
+            var replacing_unavailable_field = false;
+            var skip_old_drop = false;
+            for (self.field_places, self.field_availability) |place, availability| {
+                if (place.local != assignment_value.target or availability == .available) continue;
+                if (fieldPathContains(place.fields, source_fields) and place.fields.len < source_fields.len)
+                    return self.reject(target_span, if (availability == .transferred) .use_after_transfer else .possibly_transferred);
+                if (fieldPathContains(source_fields, place.fields)) {
+                    replacing_unavailable_field = true;
+                    if (place.moves_owner) {
+                        if (availability == .maybe_transferred and fields.items.len != 0)
+                            return self.reject(target_span, .possibly_transferred);
+                        skip_old_drop = true;
+                    }
+                }
+            }
+            if (assignment_value.operation != .replace and replacing_unavailable_field)
+                return self.reject(target_span, .use_after_transfer);
+            if (assignment_value.operation == .replace and fields.items.len == 0 and
+                self.locals.items(.mut_parameter)[local_index] != null and replacing_unavailable_field)
+                return self.reject(target_span, .field_not_restored_before_mut_return);
             const result = if (assignment_value.operation == .replace) blk: {
                 var latest_target = self.local_values[local_index].?;
                 for (fields.items) |field| {
@@ -1800,11 +2974,12 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 use.value = owned.id;
                 if (fields.items.len != 0) {
                     // Partial-place lifetimes are not modeled yet, so a replaced field ends here.
-                    const target_capabilities = (try self.type_interner.ownershipCapabilities(latest_target.type_id)) orelse return error.Unavailable;
+                    const target_capabilities = (try self.type_interner.facts().ownershipCapabilities(latest_target.type_id)) orelse return error.Unavailable;
                     if (self.local_availability[local_index] == .maybe_transferred and target_capabilities.needs_automatic_drop) {
                         return self.reject(target_span, .possibly_transferred);
                     }
-                    try self.dropValue(latest_target, self.local_can_deinit[local_index], target_span);
+                    if (!skip_old_drop or self.local_values[local_index].?.owned_generation != null)
+                        try self.dropReplacedField(self.local_values[local_index].?, latest_target, fields.items, self.locals.items(.can_deinit)[local_index], target_span);
                 }
                 break :blk if (use.coerce_to == null)
                     owned
@@ -1822,6 +2997,10 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     .divide => .{ .divsi = operands },
                 });
             };
+            if (assignment_value.operation == .replace and fields.items.len == 0 and self.locals.items(.mut_parameter)[local_index] != null) {
+                try self.dropValue(root, false, target_span);
+                try self.recordConsume(root);
+            }
             const previous_root = self.local_values[local_index].?;
             const rebuilt = try self.updateFields(previous_root, fields.items, result);
             var updated = if (assignment_value.operation == .replace and fields.items.len == 0)
@@ -1830,21 +3009,91 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 if (assignment_value.operation == .replace) try self.recordConsume(result);
                 break :blk try self.updateOwnedValue(previous_root, rebuilt);
             };
+            if (assignment_value.operation == .replace and fields.items.len != 0 and
+                self.locals.items(.mut_parameter)[local_index] == null and !(self.active_drop_hook_root and local_index == 0))
+            {
+                var still_partial = false;
+                for (self.field_places, self.field_availability) |place, availability| {
+                    if (place.local == assignment_value.target and availability != .available and
+                        !fieldPathContains(source_fields, place.fields)) still_partial = true;
+                }
+                if (updated.owned_generation == null) {
+                    if (still_partial and result.owned_generation != null) {
+                        var missing_paths: std.ArrayList([]const u32) = .empty;
+                        defer {
+                            for (missing_paths.items) |path| self.ctx.allocator().free(path);
+                            missing_paths.deinit(self.ctx.allocator());
+                        }
+                        var path_fields: std.ArrayList(PlaceField) = .empty;
+                        defer path_fields.deinit(self.ctx.allocator());
+                        for (self.field_places, self.field_availability) |place, availability| {
+                            if (place.local != assignment_value.target or !place.moves_owner or availability == .available or
+                                fieldPathContains(source_fields, place.fields)) continue;
+                            if (availability != .transferred) return self.reject(target_span, .possibly_transferred);
+                            path_fields.clearRetainingCapacity();
+                            try self.resolvePlaceFields(updated.type_id, place.fields, target_span, &path_fields);
+                            try missing_paths.ensureUnusedCapacity(self.ctx.allocator(), 1);
+                            const path = try self.ctx.allocator().alloc(u32, path_fields.items.len);
+                            for (path_fields.items, path) |field, *index| index.* = field.index;
+                            var duplicate = false;
+                            for (missing_paths.items) |existing| {
+                                if (std.mem.eql(u32, existing, path)) {
+                                    duplicate = true;
+                                    break;
+                                }
+                            }
+                            if (duplicate) self.ctx.allocator().free(path) else missing_paths.appendAssumeCapacity(path);
+                        }
+                        updated = try self.defineOwnedValue(updated, expression.span, self.locals.items(.can_deinit)[local_index]);
+                        try self.copyMissingFields(updated.owned_generation.?, missing_paths.items, null, null);
+                    } else if (!still_partial) {
+                        updated = try self.defineOwnedValue(updated, expression.span, self.locals.items(.can_deinit)[local_index]);
+                    }
+                } else if (replacing_unavailable_field and self.generations.items[@intFromEnum(updated.owned_generation.?)].missing_fields.len != 0) {
+                    const previous_missing = self.generations.items[@intFromEnum(updated.owned_generation.?)].missing_fields;
+                    try self.recordConsume(updated);
+                    updated = try self.defineOwnedValue(updated, expression.span, self.locals.items(.can_deinit)[local_index]);
+                    try self.copyMissingFields(updated.owned_generation.?, previous_missing, null, fields.items);
+                }
+            }
             if (self.active_drop_hook_root and local_index == 0 and fields.items.len == 0 and assignment_value.operation == .replace) {
                 try self.recordConsume(updated);
                 updated.owned_generation = null;
             }
             if (updated.owned_generation) |generation| {
-                if (self.local_can_deinit[local_index]) self.generations.items[@intFromEnum(generation)].can_deinit = true;
+                if (self.locals.items(.can_deinit)[local_index]) self.generations.items[@intFromEnum(generation)].can_deinit = true;
             }
+            updated.binding_identity = try self.newBindingIdentity();
+            updated.storage_identity = null;
             self.local_values[local_index] = updated;
             self.local_availability[local_index] = .available;
+            if (assignment_value.operation == .replace) {
+                for (self.field_places, self.field_availability) |place, *availability| {
+                    if (place.local == assignment_value.target and fieldPathContains(source_fields, place.fields))
+                        availability.* = .available;
+                }
+            }
             return .{
                 .id = result.id,
                 .type_id = result.type_id,
                 .borrowed_type = result.type_id,
                 .borrow_root = assignment_value.target,
             };
+        }
+
+        fn dropReplacedField(self: *Self, root: Value, target: Value, fields: []const PlaceField, can_deinit: bool, span: structures.SourceSpan) !void {
+            const generation = root.owned_generation orelse return self.dropValue(target, can_deinit, span);
+            var missing_children: std.ArrayList([]const u32) = .empty;
+            defer missing_children.deinit(self.ctx.allocator());
+            for (self.generations.items[@intFromEnum(generation)].missing_fields) |missing| {
+                if (!missingPathStartsWith(missing, fields)) continue;
+                if (missing.len == fields.len) return;
+                try missing_children.append(self.ctx.allocator(), missing[fields.len..]);
+            }
+            if (missing_children.items.len == 0)
+                try self.dropValue(target, can_deinit, span)
+            else
+                try self.dropValueExcluding(target, missing_children.items, can_deinit, span);
         }
 
         fn negate(self: *Self, operand_use: semantic.UnresolvedBody.ValueUse) !Value {
@@ -1863,6 +3112,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             if (lhs.type_id == .never) return lhs;
             const rhs = try self.borrowValue(try self.value(raw.rhs.value), raw.rhs.span);
             if (rhs.type_id == .never) return rhs;
+            try self.recordUse(lhs);
             if (lhs.type_id != .int) return self.reject(raw.lhs.span, .{ .arithmetic_operand_not_int = lhs.type_id });
             if (rhs.type_id != .int) return self.reject(raw.rhs.span, .{ .arithmetic_operand_not_int = rhs.type_id });
             const operands: structures.BinaryOperands = .{ .lhs = lhs.id, .rhs = rhs.id };
@@ -1876,58 +3126,156 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             return self.appendInstruction(instruction);
         }
 
-        const CallOperation = union(enum) {
-            direct: structures.FunctionCall,
-            indirect: structures.IndirectFunctionCall,
+        const ResolvedCallable = struct {
+            operation: structures.FunctionCall,
+            behavior: structures.CallBehavior,
+            is_fallible: bool,
+            mut_arguments: structures.FunctionValueRange,
+            consumed_arguments: structures.FunctionValueRange,
+            writable_references: structures.FunctionValueRange,
+            reference_origins: ?u32,
         };
         const ResolvedCall = union(enum) {
             diverged: Value,
-            callable: struct {
-                operation: CallOperation,
-                is_fallible: bool,
-                mut_arguments: structures.FunctionValueRange,
+            callable: ResolvedCallable,
+            conditional_box: struct {
+                initializer: @FieldType(Expression.Operation, "if_else"),
+                destination: BoxDestination,
             },
-            in_place_ref: struct {
+            in_place_box: struct {
                 allocation: structures.InstanceId,
                 allocation_type: structures.TypeId,
-                ref_type: structures.TypeId,
-                prepared: PreparedStructInit,
+                box_type: structures.TypeId,
+                source: union(enum) {
+                    fields: PreparedStructInit,
+                    copy: Value,
+                    call: ResolvedCallable,
+                },
             },
         };
+
+        fn prepareInPlaceBoxFields(self: *Self, expression: Expression, destination: BoxDestination, span: structures.SourceSpan) !ResolvedCall {
+            const result = try self.prepareStructInit(expression, true);
+            const prepared = switch (result) {
+                .diverged => |diverged| return .{ .diverged = diverged },
+                .prepared => |fields| fields,
+            };
+            errdefer self.ctx.allocator().free(prepared.values);
+            if (prepared.type_id != destination.element_type) return self.reject(span, .{
+                .call_argument_type_mismatch = self.typeMismatch(destination.element_type, prepared.type_id),
+            });
+            const allocation = (try self.type_interner.boxAllocation(destination.element_type)) orelse return error.Unavailable;
+            return .{ .in_place_box = .{
+                .allocation = allocation.instance,
+                .allocation_type = allocation.type_id,
+                .box_type = destination.box_type,
+                .source = .{ .fields = prepared },
+            } };
+        }
 
         fn resolveArgumentPlace(
             self: *Self,
             value_id: semantic.UnresolvedBody.ValueId,
             fields: *std.ArrayList(PlaceField),
         ) !?ArgumentPlace {
+            const place = (try self.resolveBorrowPlace(value_id, fields)) orelse return null;
+            return switch (place.root) {
+                .local => |local| .{ .local = local, .fields = place.fields },
+                .parameter => {
+                    fields.shrinkRetainingCapacity(place.fields.start);
+                    return null;
+                },
+            };
+        }
+
+        fn resolveBorrowPlace(
+            self: *Self,
+            value_id: semantic.UnresolvedBody.ValueId,
+            fields: *std.ArrayList(PlaceField),
+        ) !?BorrowPlace {
             const start: u32 = @intCast(fields.items.len);
-            const local = (try self.appendArgumentPlaceFields(value_id, fields)) orelse {
+            const root = (try self.appendBorrowPlaceFields(value_id, fields, start)) orelse {
                 fields.shrinkRetainingCapacity(start);
                 return null;
             };
             return .{
-                .local = local,
+                .root = root,
                 .fields = .{ .start = start, .end = @intCast(fields.items.len) },
             };
         }
 
-        fn appendArgumentPlaceFields(
+        fn publishBorrowFields(self: *Self, fields: []const PlaceField) !structures.FunctionValueRange {
+            const start: u32 = @intCast(self.borrow_fields.items.len);
+            for (fields) |field| {
+                try self.borrow_fields.append(self.ctx.allocator(), field.index);
+            }
+            return .{ .start = start, .end = @intCast(self.borrow_fields.items.len) };
+        }
+
+        fn concatBorrowFields(self: *Self, first: structures.FunctionValueRange, second: structures.FunctionValueRange) !structures.FunctionValueRange {
+            const start: u32 = @intCast(self.borrow_fields.items.len);
+            try self.borrow_fields.ensureUnusedCapacity(self.ctx.allocator(), first.end - first.start + second.end - second.start);
+            self.borrow_fields.appendSliceAssumeCapacity(self.borrow_fields.items[first.start..first.end]);
+            self.borrow_fields.appendSliceAssumeCapacity(self.borrow_fields.items[second.start..second.end]);
+            return .{ .start = start, .end = @intCast(self.borrow_fields.items.len) };
+        }
+
+        fn projectBorrowPlace(self: *Self, place: BorrowPlace, fields: []const PlaceField, writable: bool, span: structures.SourceSpan) !ProjectedBorrowPlace {
+            const alias = if (place.root == .local) self.locals.items(.alias)[@intFromEnum(place.root.local)] else null;
+            const root: Value = if (alias != null)
+                try self.aliasReference(place.root.local)
+            else switch (place.root) {
+                .local => |local| blk: {
+                    const index = @intFromEnum(local);
+                    if (writable and !self.locals.items(.mutable)[index])
+                        return self.reject(span, .mutable_borrow_requires_writable_place);
+                    break :blk self.local_values[index].?;
+                },
+                .parameter => |parameter| blk: {
+                    if (writable) return self.reject(span, .mutable_borrow_requires_writable_place);
+                    const value_to_borrow = self.values[@intFromEnum(parameter)].?;
+                    if (value_to_borrow.borrowed_type == null) return self.reject(span, .borrow_requires_place);
+                    break :blk value_to_borrow;
+                },
+            };
+            const access = if (alias != null) (try self.type_interner.facts().borrowAccess(root.type_id)).? else null;
+            if (access) |borrow_access| if (writable and !borrow_access.writable) return self.reject(span, .reference_not_writable);
+            return .{
+                .root = root,
+                .alias = alias,
+                .fields = try self.publishBorrowFields(fields[place.fields.start..place.fields.end]),
+                .writable = if (access) |borrow_access| borrow_access.writable else writable,
+            };
+        }
+
+        fn appendBorrowPlaceFields(
             self: *Self,
             value_id: semantic.UnresolvedBody.ValueId,
             fields: *std.ArrayList(PlaceField),
-        ) !?semantic.UnresolvedBody.LocalId {
+            start: u32,
+        ) !?@FieldType(BorrowPlace, "root") {
             const index = @intFromEnum(value_id);
-            if (index < self.unresolved.parameter_count) return null;
+            if (index < self.unresolved.parameter_count) return .{ .parameter = value_id };
             const expression = self.unresolved.expressions[index - self.unresolved.parameter_count];
             return switch (expression.operation) {
-                .local_read => |local| local,
+                .local_read => |local| .{ .local = local },
                 .field_access => |access| blk: {
-                    const local = (try self.appendArgumentPlaceFields(access.operand.value, fields)) orelse return null;
-                    const parent = self.values[@intFromEnum(access.operand.value)].?;
-                    const definition = (try self.type_interner.structDefinition(parent.type_id)) orelse unreachable;
-                    const field = definition.resolveField(access.name) orelse unreachable;
-                    try fields.append(self.ctx.allocator(), .{ .index = field.index, .type_id = field.type_id });
-                    break :blk local;
+                    const root = (try self.appendBorrowPlaceFields(access.operand.value, fields, start)) orelse return null;
+                    const parent_type = if (fields.items.len == start)
+                        switch (root) {
+                            .local => |local| local_type: {
+                                const type_id = self.local_values[@intFromEnum(local)].?.type_id;
+                                break :local_type if (self.locals.items(.alias)[@intFromEnum(local)] != null)
+                                    (try self.type_interner.facts().borrowElement(type_id)).?
+                                else
+                                    type_id;
+                            },
+                            .parameter => |parameter| self.values[@intFromEnum(parameter)].?.type_id,
+                        }
+                    else
+                        fields.getLast().type_id;
+                    try fields.append(self.ctx.allocator(), try self.resolvePlaceField(parent_type, access.name, access.operand.span, expression.span));
+                    break :blk root;
                 },
                 else => null,
             };
@@ -1965,9 +3313,9 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     raw_arguments = self.unresolved.call_arguments[call.arguments.start..call.arguments.end];
                     const callee = try self.borrowValue(try self.value(target_use.value), target_use.span);
                     if (callee.type_id == .never) return .{ .diverged = callee };
-                    signature = try self.type_interner.callable(callee.type_id) orelse
+                    signature = try self.type_interner.facts().callable(callee.type_id) orelse
                         return self.reject(target_use.span, .value_not_callable);
-                    target = .{ .indirect = callee.id };
+                    target = .{ .indirect = callee };
                 },
                 .member => |member| {
                     if (try self.resolveMemberCall(call, member, &argument_storage, &target, &signature)) |diverged|
@@ -1975,18 +3323,15 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     raw_arguments = argument_storage.items;
                 },
             }
-            if (target == .inferred and raw_arguments.len == 1 and try self.type_interner.isStdRefNew(target.inferred.item)) {
-                const index = @intFromEnum(raw_arguments[0].value);
-                if (index >= self.unresolved.parameter_count) {
-                    const expression = self.unresolved.expressions[index - self.unresolved.parameter_count];
-                    if (expression.operation == .struct_init) {
-                        const type_result = try self.structInitType(expression.operation.struct_init);
+            if (target == .inferred and raw_arguments.len == 1 and (try self.type_interner.callBehavior(target.inferred.item)) == .box_new) {
+                if (self.inPlaceInitializer(raw_arguments[0].value)) |initializer| {
+                    if (try self.inPlaceInitializerType(initializer, raw_arguments[0].value)) |type_result| {
                         const element_type = switch (type_result) {
                             .diverged => |diverged| return .{ .diverged = diverged },
                             .type_id => |resolved| resolved,
                         };
-                        const capabilities = (try self.type_interner.ownershipCapabilities(element_type)) orelse return error.Unavailable;
-                        if (capabilities.move == .none or capabilities.move == .custom or capabilities.needs_custom_move) {
+                        const capabilities = (try self.type_interner.facts().ownershipCapabilities(element_type)) orelse return error.Unavailable;
+                        if (!capabilities.isDirectlyMovable()) {
                             const argument = try self.type_interner.internCompileTimeValue(.{ .type = element_type });
                             const specialized = try self.type_interner.specializeFunction(target.inferred, &.{argument});
                             target = .{ .direct = specialized };
@@ -2041,54 +3386,82 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 .found = @intCast(raw_arguments.len),
             } });
             if (signature.return_type == .type and !self.allow_type_values) return self.reject(span, .type_value_used_as_runtime_value);
-            if (target == .direct and signature.parameters.len == 1 and
-                signature.parameters[0].mode == .deinit and try self.type_interner.isStdRefValue(target.direct.item) and
-                (try self.type_interner.refTypeElement(signature.parameters[0].type_id)) == signature.return_type)
-            {
-                const element_type = signature.return_type;
-                const capabilities = (try self.type_interner.ownershipCapabilities(element_type)) orelse return error.Unavailable;
-                if (capabilities.move == .none or capabilities.move == .custom or capabilities.needs_custom_move)
-                    return self.reject(raw_arguments[0].span, .{ .ref_extraction_requires_direct_move = element_type });
-            }
+            const behavior = if (target == .direct) try self.type_interner.callBehavior(target.direct.item) else .ordinary;
             if (target == .direct and signature.is_fallible and signature.parameters.len == 1 and
-                try self.type_interner.isStdRefNew(target.direct.item))
+                behavior == .box_new)
             {
                 const element_type = signature.parameters[0].type_id;
                 if (signature.parameters[0].mode == .@"var" and
-                    (try self.type_interner.refTypeElement(signature.return_type)) == element_type)
+                    (try self.type_interner.facts().boxElement(signature.return_type)) == element_type)
                 {
-                    const capabilities = (try self.type_interner.ownershipCapabilities(element_type)) orelse return error.Unavailable;
-                    if (capabilities.requires_explicit_drop)
-                        return self.reject(raw_arguments[0].span, .{ .ref_requires_automatic_drop = element_type });
-                    if (capabilities.move == .none or capabilities.move == .custom or capabilities.needs_custom_move) {
+                    const capabilities = (try self.type_interner.facts().ownershipCapabilities(element_type)) orelse return error.Unavailable;
+                    if (!capabilities.isDirectlyMovable()) {
                         const raw = raw_arguments[0];
-                        const index = @intFromEnum(raw.value);
-                        if (index >= self.unresolved.parameter_count) {
-                            const expression = self.unresolved.expressions[index - self.unresolved.parameter_count];
-                            if (expression.operation == .struct_init) {
-                                const prepared_result = try self.prepareStructInit(expression, true);
-                                const prepared = switch (prepared_result) {
-                                    .diverged => |diverged| return .{ .diverged = diverged },
-                                    .prepared => |prepared_init| prepared_init,
-                                };
-                                errdefer self.ctx.allocator().free(prepared.values);
-                                if (prepared.type_id != element_type) return self.reject(raw.span, .{
-                                    .call_argument_type_mismatch = self.typeMismatch(element_type, prepared.type_id),
-                                });
-                                const allocation = (try self.type_interner.refAllocation(element_type)) orelse return error.Unavailable;
-                                return .{ .in_place_ref = .{
-                                    .allocation = allocation.instance,
-                                    .allocation_type = allocation.type_id,
-                                    .ref_type = signature.return_type,
-                                    .prepared = prepared,
-                                } };
+                        if (self.inPlaceInitializer(raw.value)) |initializer| {
+                            if (initializer == .fields) {
+                                const expression = initializer.fields;
+                                return self.prepareInPlaceBoxFields(expression, .{
+                                    .element_type = element_type,
+                                    .box_type = signature.return_type,
+                                }, raw.span);
                             }
+                            if (initializer == .call) {
+                                const producer = initializer.call;
+                                if ((try self.inPlaceCallResultType(producer)) == element_type) {
+                                    const resolved = try self.resolveCall(producer, raw.span);
+                                    switch (resolved) {
+                                        .diverged => |diverged| return .{ .diverged = diverged },
+                                        .callable => |callable| {
+                                            std.debug.assert(callable.operation.return_type == element_type);
+                                            const allocation = (try self.type_interner.boxAllocation(element_type)) orelse return error.Unavailable;
+                                            return .{ .in_place_box = .{
+                                                .allocation = allocation.instance,
+                                                .allocation_type = allocation.type_id,
+                                                .box_type = signature.return_type,
+                                                .source = .{ .call = callable },
+                                            } };
+                                        },
+                                        .in_place_box, .conditional_box => unreachable,
+                                    }
+                                }
+                            }
+                            if (initializer == .conditional) return .{ .conditional_box = .{
+                                .initializer = initializer.conditional,
+                                .destination = .{ .element_type = element_type, .box_type = signature.return_type },
+                            } };
                         }
                         const operand = try self.valueWithType(raw.value, element_type);
                         if (operand.type_id == .never) return .{ .diverged = operand };
                         if (try self.coerceValue(operand.id, operand.type_id, element_type) == null)
                             return self.reject(raw.span, .{ .call_argument_type_mismatch = self.typeMismatch(element_type, operand.type_id) });
-                        return self.reject(raw.span, .{ .ref_requires_struct_initializer = element_type });
+                        return self.reject(raw.span, .{ .box_requires_struct_initializer = element_type });
+                    }
+                }
+            }
+            if (target == .direct and signature.is_fallible and signature.parameters.len == 1 and
+                behavior == .box_duplicate)
+            {
+                const element_type = signature.parameters[0].type_id;
+                if (signature.parameters[0].mode == .imm and
+                    (try self.type_interner.facts().boxElement(signature.return_type)) == element_type)
+                {
+                    const capabilities = (try self.type_interner.facts().ownershipCapabilities(element_type)) orelse return error.Unavailable;
+                    if (!capabilities.isDirectlyMovable() and
+                        capabilities.copy != .none)
+                    {
+                        const raw = raw_arguments[0];
+                        const operand = try self.valueWithType(raw.value, element_type);
+                        if (operand.type_id == .never) return .{ .diverged = operand };
+                        if (operand.type_id != element_type) return self.reject(raw.span, .{
+                            .call_argument_type_mismatch = self.typeMismatch(element_type, operand.type_id),
+                        });
+                        const allocation = (try self.type_interner.boxAllocation(element_type)) orelse return error.Unavailable;
+                        return .{ .in_place_box = .{
+                            .allocation = allocation.instance,
+                            .allocation_type = allocation.type_id,
+                            .box_type = signature.return_type,
+                            .source = .{ .copy = operand },
+                        } };
                     }
                 }
             }
@@ -2096,12 +3469,28 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             defer place_fields.deinit(self.ctx.allocator());
             var argument_places: std.ArrayList(?ArgumentPlace) = .empty;
             defer argument_places.deinit(self.ctx.allocator());
+            var argument_reference_origins: std.ArrayList(?u32) = .empty;
+            defer argument_reference_origins.deinit(self.ctx.allocator());
+            var writable_references: std.ArrayList(Value) = .empty;
+            defer writable_references.deinit(self.ctx.allocator());
             var arguments_to_publish: std.ArrayList(structures.FunctionValueUse) = .empty;
             defer arguments_to_publish.deinit(self.ctx.allocator());
             var arguments_to_consume: std.ArrayList(Value) = .empty;
             defer arguments_to_consume.deinit(self.ctx.allocator());
             var mut_arguments_to_publish: std.ArrayList(PendingMutArgument) = .empty;
             defer mut_arguments_to_publish.deinit(self.ctx.allocator());
+            const borrowed_return = try self.type_interner.canStoreBorrow(signature.return_type);
+            var borrowed_mut_output = false;
+            for (signature.parameters) |parameter| {
+                if (parameter.mode == .mut and try self.type_interner.canStoreBorrow(parameter.type_id)) borrowed_mut_output = true;
+            }
+            var reference_origins: ?u32 = null;
+            var mut_reference_origins: ?u32 = null;
+            var mut_return_origin = false;
+            const boxes_argument = behavior == .box_new or behavior == .box_duplicate;
+            const extracts_box = behavior == .box_value;
+            const invokes_copy_hook = behavior == .box_duplicate and
+                ((try self.type_interner.facts().ownershipCapabilities(signature.parameters[0].type_id)) orelse return error.Unavailable).needs_custom_copy;
             // Finish each argument before evaluating the next one. Nested copy
             // hooks may publish their own calls, so the outer operands stay in
             // local storage until their complete contiguous range is known.
@@ -2123,10 +3512,38 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 }
                 var argument = try self.coerceValue(operand.id, operand.type_id, expected.type_id) orelse
                     return self.reject(raw.span, .{ .call_argument_type_mismatch = self.typeMismatch(expected.type_id, operand.type_id) });
-                if (expected.mode == .@"var" or expected.mode == .deinit) {
-                    const owned = if (inferred_call) prepared_arguments.items[argument_index].owned.? else try self.ownValue(operand, raw.span);
-                    argument.value = owned.id;
-                    try arguments_to_consume.append(self.ctx.allocator(), owned);
+                const owned = if (expected.mode == .@"var" or expected.mode == .deinit)
+                    if (inferred_call) prepared_arguments.items[argument_index].owned.? else try self.ownValue(operand, raw.span)
+                else
+                    null;
+                const argument_value = owned orelse operand;
+                if ((!boxes_argument and !extracts_box) or invokes_copy_hook) try self.collectWritableReferences(argument_value, &writable_references);
+                try argument_reference_origins.append(self.ctx.allocator(), argument_value.reference_origins);
+                const return_origin = borrowed_return and
+                    (signature.return_origins == null or std.mem.indexOfScalar(u32, signature.return_origins.?, @intCast(argument_index)) != null);
+                const contributes_to_return = return_origin and expected.mode != .mut;
+                if (return_origin and expected.mode == .mut) mut_return_origin = true;
+                if (contributes_to_return or borrowed_mut_output) {
+                    const origins: ?u32 = if (expected.mode == .imm and try self.type_interner.facts().borrowElement(operand.type_id) == null)
+                        try self.sourceReferenceOrigins(operand)
+                    else if (try self.type_interner.canStoreBorrow(argument_value.type_id))
+                        argument_value.reference_origins
+                    else
+                        null;
+                    if (contributes_to_return) {
+                        const returned = if (boxes_argument)
+                            try self.prefixReferenceOrigins(if (behavior == .box_duplicate) try self.copyResultOrigins(operand) else origins, .element)
+                        else if (extracts_box)
+                            try self.selectReferenceOrigins(origins, .element)
+                        else
+                            try self.widenReferenceOrigins(origins);
+                        reference_origins = try self.mergeReferenceOrigins(reference_origins, returned);
+                    }
+                    if (borrowed_mut_output) mut_reference_origins = try self.mergeReferenceOrigins(mut_reference_origins, origins);
+                }
+                if (owned) |owned_argument| {
+                    argument.value = owned_argument.id;
+                    try arguments_to_consume.append(self.ctx.allocator(), owned_argument);
                 } else if (expected.mode == .mut) {
                     const place = maybe_place orelse return self.reject(raw.span, .mutable_argument_requires_place);
                     const field_start: u32 = @intCast(self.mut_argument_fields.items.len);
@@ -2137,15 +3554,25 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                             .fields = .{ .start = field_start, .end = @intCast(self.mut_argument_fields.items.len) },
                         },
                         .argument_index = @intCast(argument_index),
+                        .return_origin = return_origin,
                     });
                 }
                 try arguments_to_publish.append(self.ctx.allocator(), argument);
             }
+            if (target == .indirect) try self.recordUse(target.indirect);
             for (raw_arguments, signature.parameters, argument_places.items, 0..) |raw, parameter, maybe_place, argument_index| {
                 if (parameter.mode != .mut) continue;
                 const place = maybe_place orelse return self.reject(raw.span, .mutable_argument_requires_place);
                 const local_index = @intFromEnum(place.local);
-                if (!self.local_mutable[local_index]) return self.reject(raw.span, .mutable_argument_requires_mutable_place);
+                if (!self.locals.items(.mutable)[local_index]) {
+                    const alias = self.locals.items(.alias)[local_index];
+                    const writable_alias = if (alias != null)
+                        (try self.type_interner.facts().borrowAccess(self.local_values[local_index].?.type_id)).?.writable
+                    else
+                        false;
+                    if (!(writable_alias and (behavior == .box_borrow or behavior == .box_borrow_mut)))
+                        return self.reject(raw.span, .mutable_argument_requires_mutable_place);
+                }
                 switch (self.local_availability[local_index]) {
                     .unbound => unreachable,
                     .available => {},
@@ -2153,41 +3580,93 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     .maybe_transferred => return self.reject(raw.span, .possibly_transferred),
                 }
                 for (signature.parameters, argument_places.items, 0..) |other_parameter, other_place, other_index| {
-                    if (argument_index == other_index or (other_parameter.mode != .imm and other_parameter.mode != .mut)) continue;
+                    if (argument_index == other_index) continue;
                     if (other_place) |resolved_other| {
-                        if (placesOverlap(place_fields.items, place, resolved_other)) {
+                        if ((other_parameter.mode == .imm or other_parameter.mode == .mut) and
+                            placesOverlap(place_fields.items, place, resolved_other))
+                        {
                             return self.reject(raw.span, .overlapping_mutable_arguments);
                         }
                     }
+                    if (argument_reference_origins.items[other_index] == null) continue;
+                    var incomplete = false;
+                    var origin_id = try self.resolveReferenceOrigins(argument_reference_origins.items[other_index], &incomplete);
+                    if (incomplete) return self.reject(raw.span, .overlapping_mutable_arguments);
+                    while (origin_id) |index| {
+                        const origin = self.reference_origins.items[index];
+                        if (origin.root == place.local) return self.reject(raw.span, .overlapping_mutable_arguments);
+                        origin_id = origin.next;
+                    }
                 }
             }
+            for (raw_arguments, argument_places.items, arguments_to_publish.items, argument_reference_origins.items, signature.parameters) |raw, maybe_place, argument, origins, parameter| {
+                if (parameter.mode == .imm) if (maybe_place) |place| {
+                    switch (self.local_availability[@intFromEnum(place.local)]) {
+                        .available => {},
+                        .transferred => return self.reject(raw.span, .use_after_transfer),
+                        .maybe_transferred => return self.reject(raw.span, .possibly_transferred),
+                        .unbound => unreachable,
+                    }
+                };
+                if (origins != null) try self.recordUse(.{ .id = argument.value, .type_id = parameter.type_id, .reference_origins = origins });
+            }
             const argument_start: u32 = @intCast(self.call_arguments.items.len);
-            for (arguments_to_consume.items) |owned_argument| try self.recordConsume(owned_argument);
+            const consume_start: u32 = @intCast(self.pending_consumed_arguments.items.len);
+            try self.pending_consumed_arguments.appendSlice(self.ctx.allocator(), arguments_to_consume.items);
             try self.call_arguments.appendSlice(self.ctx.allocator(), arguments_to_publish.items);
             const arguments: structures.FunctionValueRange = .{ .start = argument_start, .end = @intCast(self.call_arguments.items.len) };
+            const consumed_arguments: structures.FunctionValueRange = .{
+                .start = consume_start,
+                .end = @intCast(self.pending_consumed_arguments.items.len),
+            };
+            if (borrowed_mut_output) for (mut_arguments_to_publish.items) |*pending| {
+                if (try self.type_interner.canStoreBorrow(signature.parameters[pending.argument_index].type_id))
+                    pending.reference_origins = mut_reference_origins;
+            };
             const mut_argument_start: u32 = @intCast(self.pending_mut_arguments.items.len);
             try self.pending_mut_arguments.appendSlice(self.ctx.allocator(), mut_arguments_to_publish.items);
             const mut_arguments: structures.FunctionValueRange = .{
                 .start = mut_argument_start,
                 .end = @intCast(self.pending_mut_arguments.items.len),
             };
-            return switch (target) {
-                .inferred => unreachable,
-                .direct => |instance| .{ .callable = .{
-                    .operation = .{ .direct = .{
-                        .target = instance.item,
-                        .specialization = instance.specialization,
-                        .arguments = arguments,
-                        .return_type = signature.return_type,
-                    } },
-                    .is_fallible = signature.is_fallible,
-                    .mut_arguments = mut_arguments,
-                } },
-                .indirect => |callee| .{ .callable = .{
-                    .operation = .{ .indirect = .{ .target = callee, .arguments = arguments, .return_type = signature.return_type } },
-                    .is_fallible = signature.is_fallible,
-                    .mut_arguments = mut_arguments,
-                } },
+            const writable_start: u32 = @intCast(self.writable_call_references.items.len);
+            try self.writable_call_references.appendSlice(self.ctx.allocator(), writable_references.items);
+            const writable_range: structures.FunctionValueRange = .{
+                .start = writable_start,
+                .end = @intCast(self.writable_call_references.items.len),
+            };
+            if (try self.typeContainsBorrow(signature.return_type) and reference_origins == null and !mut_return_origin and
+                !(behavior == .local_borrow or behavior == .box_borrow_mut))
+                return self.reject(span, .borrow_outlives_source);
+            return .{ .callable = .{
+                .behavior = behavior,
+                .operation = .{
+                    .target = switch (target) {
+                        .direct => |instance| .{ .direct = instance },
+                        .indirect => |callee| .{ .indirect = callee.id },
+                        .inferred => unreachable,
+                    },
+                    .arguments = arguments,
+                    .return_type = signature.return_type,
+                },
+                .is_fallible = signature.is_fallible,
+                .mut_arguments = mut_arguments,
+                .consumed_arguments = consumed_arguments,
+                .writable_references = writable_range,
+                .reference_origins = reference_origins,
+            } };
+        }
+
+        fn inPlaceCallResultType(self: *Self, call: semantic.UnresolvedBody.Call) !?structures.TypeId {
+            return switch (call.target) {
+                .direct => |instance| if (try self.type_interner.functionSignature(instance)) |signature| signature.return_type else null,
+                .value => |target| blk: {
+                    const callee = try self.value(target.value);
+                    if (callee.type_id == .never) break :blk null;
+                    const signature = (try self.type_interner.facts().callable(callee.type_id)) orelse break :blk null;
+                    break :blk signature.return_type;
+                },
+                else => null,
             };
         }
 
@@ -2206,9 +3685,9 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             const method_arguments = self.unresolved.method_call_arguments[call.arguments.start..call.arguments.end];
             if (definition.resolveField(member.name) != null) {
                 const callee = try self.borrowValue(try self.accessField(member.receiver, member.name, call.span), call.span);
-                signature.* = try self.type_interner.callable(callee.type_id) orelse
+                signature.* = try self.type_interner.facts().callable(callee.type_id) orelse
                     return self.reject(call.span, .value_not_callable);
-                target.* = .{ .indirect = callee.id };
+                target.* = .{ .indirect = callee };
                 try arguments.ensureTotalCapacity(self.ctx.allocator(), method_arguments.len);
                 for (method_arguments) |argument| arguments.appendAssumeCapacity(argument.value);
                 return null;
@@ -2220,10 +3699,10 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 const value_id = (try self.type_interner.staticItem(instance)) orelse return error.Unavailable;
                 const value_to_call = try self.type_interner.lookupCompileTimeValue(value_id);
                 if (value_to_call != .runtime) return self.reject(call.span, .value_not_callable);
-                signature.* = (try self.type_interner.callable(value_to_call.runtime.type_id)) orelse
+                signature.* = (try self.type_interner.facts().callable(value_to_call.runtime.type_id)) orelse
                     return self.reject(call.span, .value_not_callable);
                 const callee = try self.appendInstruction(.{ .function_ref = value_to_call.runtime.value.function_ref });
-                target.* = .{ .indirect = callee.id };
+                target.* = .{ .indirect = callee };
                 for (method_arguments) |argument| try arguments.append(self.ctx.allocator(), argument.value);
                 return null;
             };
@@ -2268,59 +3747,94 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             const resolved = try self.resolveCall(call, span);
             return switch (resolved) {
                 .diverged => |value_to_return| value_to_return,
-                .in_place_ref => |construction| blk: {
-                    defer self.ctx.allocator().free(construction.prepared.values);
-                    if (!self.is_fallible) return self.reject(span, .fallible_expression_outside_fallible_function);
-                    const flow = try self.lowerInPlaceRef(construction, span);
-                    try self.enterFlowExit(flow.failure.?);
-                    try self.finishFunctionExit(span, .return_failure);
-                    try self.enterFlowExit(flow.success.?);
-                    const success_block = self.blocks.items[@intFromEnum(flow.success.?.block)];
-                    break :blk .{
-                        .id = @enumFromInt(success_block.argument_start),
-                        .type_id = construction.ref_type,
-                        .owned_generation = self.block_argument_generations.items[success_block.argument_start],
-                    };
+                .conditional_box => |construction| if (self.is_fallible)
+                    self.conditionalWithBox(construction.initializer, construction.destination)
+                else
+                    self.reject(span, .fallible_expression_outside_fallible_function),
+                .in_place_box => |construction| blk: {
+                    defer if (construction.source == .fields) self.ctx.allocator().free(construction.source.fields.values);
+                    break :blk try self.inPlaceBoxValue(construction, span);
                 },
-                .callable => |callable| if (callable.is_fallible) blk: {
-                    if (!self.is_fallible) return self.reject(span, .fallible_expression_outside_fallible_function);
-                    var flow = try self.lowerFallibleCall(callable.operation, span);
-                    try self.finishCallExits(&flow, callable, span);
-                    try self.enterFlowExit(flow.failure.?);
-                    try self.finishFunctionExit(span, .return_failure);
-                    try self.enterFlowExit(flow.success.?);
-                    const success_block = self.blocks.items[@intFromEnum(flow.success.?.block)];
-                    const value_to_return: Value = .{
-                        .id = @enumFromInt(success_block.argument_start),
-                        .type_id = callReturnType(callable.operation),
-                        .owned_generation = self.block_argument_generations.items[success_block.argument_start],
-                    };
-                    if (value_to_return.type_id == .never) self.terminate(.diverge);
-                    break :blk value_to_return;
-                } else blk: {
-                    var value_to_return = try self.appendCall(callable.operation, span);
-                    if (value_to_return.type_id == .never) {
-                        try self.moveCurrentBoundaryEffectsToTerminator();
-                        self.terminate(.diverge);
-                    } else {
-                        value_to_return = try self.defineOwnedValue(value_to_return, span, false);
-                        try self.applyCallMutArguments(callable.operation, callable.mut_arguments);
-                    }
-                    break :blk value_to_return;
-                },
+                .callable => |callable| self.resolvedCallValue(callable, call, span),
             };
         }
 
-        fn lowerInPlaceRef(self: *Self, construction: @FieldType(ResolvedCall, "in_place_ref"), span: structures.SourceSpan) !ConditionFlow {
+        fn resolvedCallValue(self: *Self, callable: ResolvedCallable, call: semantic.UnresolvedBody.Call, span: structures.SourceSpan) !Value {
+            switch (callable.behavior) {
+                .box_borrow, .box_borrow_mut => return self.boxBorrowOperation(callable.operation, call),
+                .local_borrow => return self.localBorrowOperation(callable.operation, call, span),
+                .allocation_element_borrow => return self.allocationBorrowOperation(callable.operation, call),
+                .reference_read => return self.borrowReadOperation(callable.operation, call),
+                .reference_write => return self.borrowWriteOperation(callable.operation, call, span, callable.consumed_arguments),
+                .reference_attenuate => return self.attenuateRefOperation(callable.operation, call),
+                .allocation_destroy, .allocation_read => return self.indexedAllocationOperation(callable.operation, call, span, callable.mut_arguments),
+                .ordinary, .box_new, .box_value, .box_duplicate, .box_destroy, .buffer_new, .buffer_append, .buffer_reserve => {},
+            }
+            if (callable.is_fallible) {
+                if (!self.is_fallible) return self.reject(span, .fallible_expression_outside_fallible_function);
+                try self.recordCallArgumentConsumes(callable.consumed_arguments);
+                var flow = try self.lowerFallibleCall(callable.operation, span);
+                try self.finishCallExits(&flow, callable, span);
+                try self.enterFlowExit(flow.failure.?);
+                try self.finishFunctionExit(span, .return_failure);
+                try self.enterFlowExit(flow.success.?);
+                const success_block = self.blocks.items[@intFromEnum(flow.success.?.block)];
+                const value_to_return: Value = .{
+                    .id = @enumFromInt(success_block.argument_start),
+                    .type_id = callable.operation.return_type,
+                    .owned_generation = self.block_argument_generations.items[success_block.argument_start],
+                    .reference_origins = flow.success.?.reference_origins,
+                };
+                if (value_to_return.type_id == .never) self.terminate(.diverge);
+                return value_to_return;
+            }
+            try self.recordCallArgumentConsumes(callable.consumed_arguments);
+            var value_to_return = try self.appendCall(callable.operation, span);
+            if (value_to_return.type_id == .never) {
+                try self.moveCurrentBoundaryEffectsToTerminator();
+                self.terminate(.diverge);
+            } else {
+                value_to_return = try self.defineOwnedValue(value_to_return, span, false);
+                value_to_return.reference_origins = try self.finishCallEffects(callable);
+            }
+            return value_to_return;
+        }
+
+        fn inPlaceBoxValue(self: *Self, construction: @FieldType(ResolvedCall, "in_place_box"), span: structures.SourceSpan) !Value {
+            if (!self.is_fallible) return self.reject(span, .fallible_expression_outside_fallible_function);
+            const flow = try self.lowerInPlaceBox(construction, span);
+            try self.enterFlowExit(flow.failure.?);
+            try self.finishFunctionExit(span, .return_failure);
+            try self.enterFlowExit(flow.success.?);
+            const success_block = self.blocks.items[@intFromEnum(flow.success.?.block)];
+            return .{
+                .id = @enumFromInt(success_block.argument_start),
+                .type_id = construction.box_type,
+                .owned_generation = self.block_argument_generations.items[success_block.argument_start],
+                .reference_origins = flow.success.?.reference_origins,
+            };
+        }
+
+        fn lowerInPlaceBox(self: *Self, construction: @FieldType(ResolvedCall, "in_place_box"), span: structures.SourceSpan) !ConditionFlow {
+            const type_id = switch (construction.source) {
+                .fields => |prepared| prepared.type_id,
+                .copy => |source| source.type_id,
+                .call => |source| source.operation.return_type,
+            };
+            var reference_origins: ?u32 = null;
+            switch (construction.source) {
+                .fields => |prepared| reference_origins = prepared.reference_origins,
+                .copy => |source| reference_origins = try self.copyResultOrigins(source),
+                .call => |source| reference_origins = source.reference_origins,
+            }
             const count = try self.appendInstruction(.{ .const_int = 1 });
             const argument_start: u32 = @intCast(self.call_arguments.items.len);
             try self.call_arguments.append(self.ctx.allocator(), .{ .value = count.id });
-            const allocate: CallOperation = .{ .direct = .{
-                .target = construction.allocation.item,
-                .specialization = construction.allocation.specialization,
+            const allocate: structures.FunctionCall = .{
+                .target = .{ .direct = construction.allocation },
                 .arguments = .{ .start = argument_start, .end = argument_start + 1 },
                 .return_type = construction.allocation_type,
-            } };
+            };
             var flow = try self.lowerFallibleCall(allocate, span);
             try self.enterFlowExit(flow.success.?);
             const allocation_block = self.blocks.items[@intFromEnum(flow.success.?.block)];
@@ -2334,28 +3848,111 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             const boundary = try self.newBoundary(span);
             self.current_boundary = boundary;
             defer self.current_boundary = parent_boundary;
-            for (construction.prepared.values) |field_value| try self.recordConsume(field_value);
+            const destination = try self.projectStorage(allocation_value, type_id, .dereference);
+            if (construction.source == .call) try self.recordCallArgumentConsumes(construction.source.call.consumed_arguments);
+            if (construction.source == .call and construction.source.call.is_fallible) {
+                const producer = construction.source.call;
+                var operation = producer.operation;
+                operation.destination = destination.id;
+                var produced = try self.lowerFallibleCall(operation, span);
+                try self.enterFlowExit(produced.failure.?);
+                const cleanup_boundary = try self.newBoundary(span);
+                self.current_boundary = cleanup_boundary;
+                _ = try self.finishCallEffects(producer);
+                try self.recordConsume(allocation_value);
+                const deallocate = (try self.type_interner.boxDeallocation(producer.operation.return_type, construction.allocation_type)) orelse return error.Unavailable;
+                const cleanup_argument: u32 = @intCast(self.call_arguments.items.len);
+                try self.call_arguments.append(self.ctx.allocator(), .{ .value = allocation_value.id });
+                _ = try self.appendCall(.{
+                    .target = .{ .direct = deallocate },
+                    .arguments = .{ .start = cleanup_argument, .end = cleanup_argument + 1 },
+                    .return_type = .unit,
+                }, span);
+                try self.appendBoundary(cleanup_boundary);
+                self.current_boundary = boundary;
+                const cleanup_state = try self.captureState();
+                const continuation_start: u32 = @intCast(self.block_argument_types.items.len);
+                const cleanup_continuation = try self.newBlock(continuation_start, continuation_start);
+                self.terminate(.{ .branch = try self.valuesBranch(cleanup_continuation, &.{}) });
+                produced.failure = .{ .block = cleanup_continuation, .state = cleanup_state };
+                flow.failure = try self.mergeFlowExits(flow.failure, produced.failure);
+                try self.enterFlowExit(produced.success.?);
+            }
+            switch (construction.source) {
+                .fields => |prepared| {
+                    for (prepared.values) |field_value| try self.recordConsume(field_value);
+                },
+                .copy => |source| {
+                    _ = try self.borrowValue(source, span);
+                },
+                .call => {},
+            }
             try self.recordConsume(allocation_value);
-            const initialized = try self.appendInstruction(.{ .ref_init = .{
+            switch (construction.source) {
+                .fields => |prepared| try self.initializePreparedFields(destination, prepared.fields),
+                .copy => |source| {
+                    _ = try self.copyValueBits(rawValue(source), destination);
+                },
+                .call => |source| if (!source.is_fallible) {
+                    var operation = source.operation;
+                    operation.destination = destination.id;
+                    _ = try self.appendInstruction(.{ .call = operation });
+                },
+            }
+            const initialized = try self.appendInstruction(.{ .box_init = .{
                 .allocation = allocation_value.id,
-                .fields = construction.prepared.fields,
-                .type_id = construction.prepared.type_id,
-                .ref_type = construction.ref_type,
+                .box_type = construction.box_type,
             } });
-            const owner = try self.defineOwnedValue(initialized, span, false);
+            switch (construction.source) {
+                .call => |call| reference_origins = try self.finishCallEffects(call),
+                .copy => |source| {
+                    const capabilities = (try self.type_interner.facts().ownershipCapabilities(source.type_id)) orelse return error.Unavailable;
+                    if (capabilities.needs_custom_copy) try self.finishOwnershipEffects(source, &reference_origins);
+                },
+                .fields => {},
+            }
+            var owner = try self.defineOwnedValue(initialized, span, false);
+            owner.reference_origins = try self.prefixReferenceOrigins(reference_origins, .element);
             try self.appendBoundary(boundary);
             const result_start: u32 = @intCast(self.block_argument_types.items.len);
             _ = try self.appendBlockArgument(owner.type_id, owner.owned_generation);
             const result_block = try self.newBlock(result_start, result_start + 1);
             self.terminate(.{ .branch = try self.valuesBranch(result_block, &.{owner}) });
-            flow.success = .{ .block = result_block, .state = try self.captureState() };
+            flow.success = .{ .block = result_block, .state = try self.captureState(), .reference_origins = owner.reference_origins };
             return flow;
+        }
+
+        fn finishCallEffects(self: *Self, callable: ResolvedCallable) !?u32 {
+            try self.applyCallMutArguments(callable.operation, callable.mut_arguments);
+            var returned_origins = try self.mergeReferenceOrigins(
+                callable.reference_origins,
+                try self.mutReturnOrigins(callable.mut_arguments),
+            );
+            try self.invalidateWritableReferences(
+                self.writable_call_references.items[callable.writable_references.start..callable.writable_references.end],
+                if (callable.behavior == .box_duplicate) .{ .value = &returned_origins } else .{ .slots = &returned_origins },
+            );
+            return returned_origins;
+        }
+
+        fn initializePreparedFields(self: *Self, destination: Value, fields: structures.FunctionValueRange) anyerror!void {
+            const definition = (try self.type_interner.structDefinition(destination.type_id)) orelse unreachable;
+            for (self.box_init_fields.items[fields.start..fields.end]) |field| {
+                const type_id = definition.fields[field.field_index].type_id;
+                const storage = try self.projectStorage(destination, type_id, .{ .field = field.field_index });
+                switch (field.source) {
+                    .value => |field_value| {
+                        _ = try self.appendInstruction(.{ .value_copy = .{ .source = field_value, .type_id = type_id, .destination = storage.id } });
+                    },
+                    .nested => |children| try self.initializePreparedFields(storage, children),
+                }
+            }
         }
 
         fn finishCallExits(
             self: *Self,
             flow: *ConditionFlow,
-            callable: @FieldType(ResolvedCall, "callable"),
+            callable: ResolvedCallable,
             span: structures.SourceSpan,
         ) !void {
             if (flow.success) |*success| try self.finishCallExit(success, callable, span);
@@ -2365,7 +3962,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         fn finishCallExit(
             self: *Self,
             flow_exit: *FlowExit,
-            callable: @FieldType(ResolvedCall, "callable"),
+            callable: ResolvedCallable,
             span: structures.SourceSpan,
         ) !void {
             try self.enterFlowExit(flow_exit.*);
@@ -2373,7 +3970,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             const boundary = try self.newBoundary(span);
             self.current_boundary = boundary;
             defer self.current_boundary = parent_boundary;
-            try self.applyCallMutArguments(callable.operation, callable.mut_arguments);
+            const returned_origins = try self.finishCallEffects(callable);
             try self.appendBoundary(boundary);
             flow_exit.state = try self.captureState();
             const source = self.blocks.items[@intFromEnum(flow_exit.block)];
@@ -2388,60 +3985,764 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     .id = @enumFromInt(argument_index),
                     .type_id = type_id,
                     .owned_generation = generation,
+                    .reference_origins = returned_origins,
                 });
             }
             const continuation = try self.newBlock(argument_start, @intCast(self.block_argument_types.items.len));
             self.terminate(.{ .branch = try self.valuesBranch(continuation, values.items) });
             flow_exit.block = continuation;
             flow_exit.binding = null;
+            flow_exit.reference_origins = returned_origins;
         }
 
-        fn appendCall(self: *Self, call: CallOperation, span: structures.SourceSpan) !Value {
-            if (call == .direct and try self.type_interner.isStdRefDestroy(call.direct.target)) {
-                const direct = call.direct;
-                std.debug.assert(direct.arguments.end == direct.arguments.start + 1);
-                const owner = self.call_arguments.items[direct.arguments.start].value;
-                const signature = (try self.type_interner.functionSignature(direct.instance())) orelse unreachable;
-                const element_type = (try self.type_interner.refTypeElement(signature.parameters[0].type_id)) orelse unreachable;
-                const value_to_drop = try self.appendInstruction(.{ .ref_value_for_drop = .{
+        fn appendCall(self: *Self, call: structures.FunctionCall, span: structures.SourceSpan) !Value {
+            if (call.target == .direct and (try self.type_interner.callBehavior(call.target.direct.item)) == .box_destroy) {
+                std.debug.assert(call.arguments.end == call.arguments.start + 1);
+                const owner = self.call_arguments.items[call.arguments.start].value;
+                const signature = (try self.type_interner.functionSignature(call.target.direct)) orelse unreachable;
+                const element_type = (try self.type_interner.facts().boxElement(signature.parameters[0].type_id)) orelse unreachable;
+                const value_to_drop = try self.appendInstruction(.{ .storage_projection = .{
                     .owner = owner,
                     .type_id = element_type,
                 } });
                 try self.dropValue(value_to_drop, false, span);
                 return self.appendInstruction(.const_unit);
             }
-            return switch (call) {
-                .direct => |direct| self.appendInstruction(.{ .call = direct }),
-                .indirect => |indirect| self.appendInstruction(.{ .indirect_call = indirect }),
+            return self.appendInstruction(.{ .call = call });
+        }
+
+        fn indexedAllocationOperation(
+            self: *Self,
+            operation: structures.FunctionCall,
+            call: semantic.UnresolvedBody.Call,
+            span: structures.SourceSpan,
+            mut_arguments: structures.FunctionValueRange,
+        ) !Value {
+            std.debug.assert(operation.arguments.end == operation.arguments.start + 2);
+            const arguments = self.call_arguments.items[operation.arguments.start..operation.arguments.end];
+            const original = try self.value(self.unresolved.call_arguments[call.arguments.start].value);
+            const element_type = (try self.type_interner.facts().allocationElement(original.type_id)) orelse unreachable;
+            const element = try self.appendInstruction(.{ .allocation_element = .{
+                .allocation = arguments[0].value,
+                .index = arguments[1].value,
+                .type_id = element_type,
+            } });
+            if ((try self.type_interner.callBehavior(operation.target.direct.item)) == .allocation_destroy) {
+                try self.dropValue(element, true, span);
+                for (self.pending_mut_arguments.items[mut_arguments.start..mut_arguments.end]) |pending| {
+                    self.local_values[@intFromEnum(pending.place.local)].?.binding_identity = try self.newBindingIdentity();
+                }
+                return self.appendInstruction(.const_unit);
+            }
+            std.debug.assert(operation.return_type == element_type);
+            var borrowed = element;
+            borrowed.borrowed_type = element_type;
+            borrowed.borrowed_generation = original.borrowed_generation orelse original.owned_generation;
+            borrowed.borrowed_cleanup_value = original.borrowed_cleanup_value orelse original.id;
+            borrowed.materialize_on_copy = true;
+            return self.withReferenceOrigin(original, borrowed);
+        }
+
+        fn boxBorrowOperation(self: *Self, operation: structures.FunctionCall, call: semantic.UnresolvedBody.Call) !Value {
+            std.debug.assert(operation.arguments.end == operation.arguments.start + 1);
+            const owner_value = switch (call.target) {
+                .member => |member| member.receiver.value,
+                else => self.unresolved.call_arguments[call.arguments.start].value,
+            };
+            const owner = try self.value(owner_value);
+            const argument = self.call_arguments.items[operation.arguments.start];
+            const reference = try self.appendInstruction(.{ .borrow_box = .{ .source = argument.value, .type_id = operation.return_type } });
+            var borrowed = try self.withMutableParameterOrigin(owner, reference);
+            if (owner.borrow_root) |root| {
+                if (owner.id == self.local_values[@intFromEnum(root)].?.id) {
+                    borrowed.stable_reference_root = root;
+                } else if (@intFromEnum(owner_value) >= self.unresolved.parameter_count) {
+                    const receiver = self.unresolved.expressions[@intFromEnum(owner_value) - self.unresolved.parameter_count];
+                    if (receiver.operation == .local_read) {
+                        const alias = self.locals.items(.alias)[@intFromEnum(receiver.operation.local_read)];
+                        if (alias) |captured| if (captured.root) |place_root| {
+                            if (captured.whole_root and place_root == .local and place_root.local == root)
+                                borrowed.stable_reference_root = root;
+                        };
+                    }
+                }
+            }
+            if (borrowed.stable_reference_root) |root| {
+                var origins: ?u32 = null;
+                var current = borrowed.reference_origins;
+                while (current) |index| {
+                    var origin = self.reference_origins.items[index];
+                    if (origin.root == root) {
+                        origin.stable = true;
+                        const owner_value_at_root = self.local_values[@intFromEnum(root)].?;
+                        origin.binding_identity = owner_value_at_root.storage_identity orelse owner_value_at_root.binding_identity;
+                    }
+                    origins = try self.addReferenceOrigin(origins, origin);
+                    current = origin.next;
+                }
+                borrowed.reference_origins = origins;
+            }
+            return borrowed;
+        }
+
+        fn addReferenceOrigin(self: *Self, head: ?u32, origin: ReferenceOrigin) !?u32 {
+            var cursor = head;
+            while (cursor) |index| {
+                const existing = self.reference_origins.items[index];
+                if (existing.generation == origin.generation and existing.cleanup_value == origin.cleanup_value and
+                    existing.root == origin.root and std.meta.eql(existing.binding_identity, origin.binding_identity) and
+                    existing.parameter == origin.parameter and existing.loop == origin.loop and
+                    existing.stable == origin.stable and existing.read == origin.read and
+                    self.sameReferenceProjection(existing.projection, origin.projection) and
+                    self.sameReferenceTransform(existing.transform, origin.transform)) return head;
+                cursor = existing.next;
+            }
+            const index: u32 = @intCast(self.reference_origins.items.len);
+            var added = origin;
+            added.next = head;
+            try self.reference_origins.append(self.ctx.allocator(), added);
+            return index;
+        }
+
+        fn sameReferenceProjection(self: *const Self, left: ?u32, right: ?u32) bool {
+            var first = left;
+            var second = right;
+            while (first != null and second != null) {
+                const first_projection = self.reference_projections.items[first.?];
+                const second_projection = self.reference_projections.items[second.?];
+                if (!std.meta.eql(first_projection.step, second_projection.step)) return false;
+                first = first_projection.next;
+                second = second_projection.next;
+            }
+            return first == null and second == null;
+        }
+
+        fn sameReferenceTransform(self: *const Self, left: ?u32, right: ?u32) bool {
+            var first = left;
+            var second = right;
+            while (first != null and second != null) {
+                const first_transform = self.reference_transforms.items[first.?];
+                const second_transform = self.reference_transforms.items[second.?];
+                if (!std.meta.eql(first_transform.operation, second_transform.operation)) return false;
+                first = first_transform.previous;
+                second = second_transform.previous;
+            }
+            return first == null and second == null;
+        }
+
+        fn deferReferenceTransform(self: *Self, origin: *ReferenceOrigin, operation: @FieldType(ReferenceTransform, "operation")) !void {
+            const index: u32 = @intCast(self.reference_transforms.items.len);
+            try self.reference_transforms.append(self.ctx.allocator(), .{ .operation = operation, .previous = origin.transform });
+            origin.transform = index;
+        }
+
+        fn applyReferenceTransforms(self: *Self, origins: ?u32, transform: ?u32) anyerror!?u32 {
+            const index = transform orelse return origins;
+            const transformation = self.reference_transforms.items[index];
+            const previous = try self.applyReferenceTransforms(origins, transformation.previous);
+            return switch (transformation.operation) {
+                .prefix => |step| self.prefixReferenceOrigins(previous, step),
+                .select => |step| self.selectReferenceOrigins(previous, step),
+                .exclude => |step| self.excludeReferenceOrigins(previous, step),
+                .widen => self.widenReferenceOrigins(previous),
+                .read => |read| self.readReferenceOrigins(previous, read.state, read.instruction),
+                .refresh => |refresh| self.refreshStableOrigins(previous, refresh.root, refresh.previous, refresh.replacement),
             };
         }
 
-        fn applyCallMutArguments(self: *Self, call: CallOperation, range: structures.FunctionValueRange) !void {
-            const arguments = switch (call) {
-                inline else => |operation| operation.arguments,
+        fn prefixReferenceOrigins(self: *Self, origins: ?u32, step: @FieldType(ReferenceProjection, "step")) !?u32 {
+            var result: ?u32 = null;
+            var current = origins;
+            while (current) |index| {
+                var origin = self.reference_origins.items[index];
+                if (origin.loop != null) {
+                    try self.deferReferenceTransform(&origin, .{ .prefix = step });
+                } else {
+                    const projection: u32 = @intCast(self.reference_projections.items.len);
+                    try self.reference_projections.append(self.ctx.allocator(), .{ .step = step, .next = origin.projection });
+                    origin.projection = projection;
+                }
+                result = try self.addReferenceOrigin(result, origin);
+                current = origin.next;
+            }
+            return result;
+        }
+
+        fn selectReferenceOrigins(self: *Self, origins: ?u32, step: @FieldType(ReferenceProjection, "step")) !?u32 {
+            var result: ?u32 = null;
+            var current = origins;
+            while (current) |index| {
+                var origin = self.reference_origins.items[index];
+                current = origin.next;
+                if (origin.loop != null) {
+                    try self.deferReferenceTransform(&origin, .{ .select = step });
+                } else if (origin.projection) |projection_index| {
+                    const projection = self.reference_projections.items[projection_index];
+                    if (!std.meta.eql(projection.step, step)) continue;
+                    origin.projection = projection.next;
+                }
+                result = try self.addReferenceOrigin(result, origin);
+            }
+            return result;
+        }
+
+        fn refreshStableOrigins(self: *Self, origins: ?u32, root: semantic.UnresolvedBody.LocalId, previous: BindingIdentity, replacement: BindingIdentity) !?u32 {
+            var result: ?u32 = null;
+            var current = origins;
+            while (current) |index| {
+                var origin = self.reference_origins.items[index];
+                if (origin.loop != null) {
+                    try self.deferReferenceTransform(&origin, .{ .refresh = .{ .root = root, .previous = previous, .replacement = replacement } });
+                } else if (origin.root == root and origin.stable and std.meta.eql(origin.binding_identity, previous)) {
+                    origin.binding_identity = replacement;
+                }
+                result = try self.addReferenceOrigin(result, origin);
+                current = origin.next;
+            }
+            return result;
+        }
+
+        fn replaceProjectedOrigins(self: *Self, origins: ?u32, step: @FieldType(ReferenceProjection, "step"), replacement: ?u32) !?u32 {
+            return self.mergeReferenceOrigins(try self.excludeReferenceOrigins(origins, step), try self.prefixReferenceOrigins(replacement, step));
+        }
+
+        fn excludeReferenceOrigins(self: *Self, origins: ?u32, step: @FieldType(ReferenceProjection, "step")) !?u32 {
+            var result: ?u32 = null;
+            var current = origins;
+            while (current) |index| {
+                var origin = self.reference_origins.items[index];
+                current = origin.next;
+                if (origin.loop != null) {
+                    try self.deferReferenceTransform(&origin, .{ .exclude = step });
+                } else if (origin.projection) |projection| {
+                    if (std.meta.eql(self.reference_projections.items[projection].step, step)) continue;
+                }
+                result = try self.addReferenceOrigin(result, origin);
+            }
+            return result;
+        }
+
+        fn widenReferenceOrigins(self: *Self, origins: ?u32) !?u32 {
+            var result: ?u32 = null;
+            var current = origins;
+            while (current) |index| {
+                var origin = self.reference_origins.items[index];
+                if (origin.loop != null) try self.deferReferenceTransform(&origin, .widen);
+                origin.projection = null;
+                origin.stable = false;
+                result = try self.addReferenceOrigin(result, origin);
+                current = origin.next;
+            }
+            return result;
+        }
+
+        fn collectWritableReferences(self: *Self, value_to_check: Value, references: *std.ArrayList(Value)) anyerror!void {
+            var visiting: std.ArrayList(structures.TypeId) = .empty;
+            defer visiting.deinit(self.ctx.allocator());
+            try self.collectWritableReferencesAt(value_to_check, references, &visiting, false);
+        }
+
+        fn collectWritableReferencesAt(self: *Self, value_to_check: Value, references: *std.ArrayList(Value), visiting: *std.ArrayList(structures.TypeId), dropping: bool) anyerror!void {
+            if (value_to_check.reference_origins == null) return;
+            if (std.mem.indexOfScalar(structures.TypeId, visiting.items, value_to_check.type_id) != null) return;
+            var drop_fields = dropping;
+            if (dropping) {
+                const capabilities = (try self.type_interner.facts().ownershipCapabilities(value_to_check.type_id)) orelse return error.Unavailable;
+                switch (capabilities.drop) {
+                    .trivial, .explicit => return,
+                    .fieldwise => {},
+                    .custom => drop_fields = try self.type_interner.facts().boxElement(value_to_check.type_id) != null,
+                }
+            }
+            try visiting.append(self.ctx.allocator(), value_to_check.type_id);
+            defer _ = visiting.pop();
+            if (try self.type_interner.facts().borrowAccess(value_to_check.type_id)) |access| {
+                if (access.writable) try references.append(self.ctx.allocator(), value_to_check);
+                if (try self.type_interner.canStoreBorrow(access.element_type)) {
+                    var element = value_to_check;
+                    element.type_id = access.element_type;
+                    element.reference_origins = try self.selectReferenceOrigins(value_to_check.reference_origins, .element);
+                    try self.collectWritableReferencesAt(element, references, visiting, drop_fields);
+                }
+                return;
+            }
+            if (try self.type_interner.facts().boxElement(value_to_check.type_id)) |element_type| {
+                var element = value_to_check;
+                element.type_id = element_type;
+                element.reference_origins = try self.selectReferenceOrigins(value_to_check.reference_origins, .element);
+                return self.collectWritableReferencesAt(element, references, visiting, drop_fields);
+            }
+            if (try self.type_interner.facts().allocationElement(value_to_check.type_id)) |element_type| {
+                var element = value_to_check;
+                element.type_id = element_type;
+                return self.collectWritableReferencesAt(element, references, visiting, drop_fields);
+            }
+            if (try self.type_interner.structDefinition(value_to_check.type_id)) |definition| {
+                for (definition.fields, 0..) |field, index| {
+                    var projected = value_to_check;
+                    projected.type_id = field.type_id;
+                    projected.reference_origins = try self.selectReferenceOrigins(value_to_check.reference_origins, .{ .field = @intCast(index) });
+                    try self.collectWritableReferencesAt(projected, references, visiting, drop_fields);
+                }
+            } else if (try self.type_interner.facts().variantMembers(value_to_check.type_id)) |members| {
+                for (members) |member| {
+                    var projected = value_to_check;
+                    projected.type_id = member;
+                    projected.reference_origins = try self.selectReferenceOrigins(value_to_check.reference_origins, .{ .variant = member });
+                    try self.collectWritableReferencesAt(projected, references, visiting, drop_fields);
+                }
+            }
+        }
+
+        fn resolveReferenceOrigins(self: *Self, origins: ?u32, incomplete: *bool) !?u32 {
+            var visiting: std.ArrayList(u32) = .empty;
+            defer visiting.deinit(self.ctx.allocator());
+            var resolved: ?u32 = null;
+            try self.expandReferenceOrigins(origins, &resolved, &visiting, incomplete);
+            return resolved;
+        }
+
+        fn expandReferenceOrigins(
+            self: *Self,
+            origins: ?u32,
+            resolved: *?u32,
+            visiting: *std.ArrayList(u32),
+            incomplete: *bool,
+        ) !void {
+            var origin_id = origins;
+            while (origin_id) |index| {
+                const origin = self.reference_origins.items[index];
+                if (origin.loop) |loop_index| {
+                    if (std.mem.indexOfScalar(u32, visiting.items, loop_index) == null) {
+                        try visiting.append(self.ctx.allocator(), loop_index);
+                        const loop_origins = self.loop_reference_origins.items[loop_index];
+                        if (!loop_origins.complete) incomplete.* = true;
+                        var expanded: ?u32 = null;
+                        try self.expandReferenceOrigins(loop_origins.origins, &expanded, visiting, incomplete);
+                        resolved.* = try self.mergeReferenceOrigins(resolved.*, try self.applyReferenceTransforms(expanded, origin.transform));
+                        _ = visiting.pop();
+                    }
+                } else {
+                    resolved.* = try self.addReferenceOrigin(resolved.*, origin);
+                }
+                origin_id = origin.next;
+            }
+        }
+
+        fn typeContainsBorrow(self: *Self, type_id: structures.TypeId) !bool {
+            return self.type_interner.containsBorrow(type_id);
+        }
+
+        fn mergeReferenceOrigins(self: *Self, first: ?u32, second: ?u32) !?u32 {
+            var merged = first;
+            var cursor = second;
+            while (cursor) |index| {
+                const origin = self.reference_origins.items[index];
+                merged = try self.addReferenceOrigin(merged, origin);
+                cursor = origin.next;
+            }
+            return merged;
+        }
+
+        fn sourceReferenceOrigins(self: *Self, source: Value) !?u32 {
+            const generation = source.borrowed_generation orelse source.owned_generation;
+            if (source.binding_identity == .unknown and source.reference_origins != null) return source.reference_origins;
+            if (generation == null and source.borrow_root == null) return source.reference_origins;
+            return self.addReferenceOrigin(source.reference_origins, .{
+                .generation = generation,
+                .cleanup_value = source.borrowed_cleanup_value orelse source.id,
+                .root = source.borrow_root,
+                .binding_identity = source.binding_identity,
+            });
+        }
+
+        fn withReferenceOrigin(self: *Self, source: Value, reference: Value) !Value {
+            var result = reference;
+            result.reference_origins = try self.sourceReferenceOrigins(source);
+            return result;
+        }
+
+        fn withMutableParameterOrigin(self: *Self, source: Value, reference: Value) !Value {
+            if (source.borrow_root) |root| {
+                if (self.locals.items(.mut_parameter)[@intFromEnum(root)]) |parameter| {
+                    var result = reference;
+                    result.reference_origins = try self.addReferenceOrigin(source.reference_origins, .{
+                        .generation = source.borrowed_generation orelse source.owned_generation,
+                        .cleanup_value = source.borrowed_cleanup_value orelse source.id,
+                        .root = root,
+                        .binding_identity = source.binding_identity,
+                        .parameter = parameter,
+                    });
+                    return result;
+                }
+            }
+            return self.withReferenceOrigin(source, reference);
+        }
+
+        fn localBorrowOperation(self: *Self, operation: structures.FunctionCall, call: semantic.UnresolvedBody.Call, span: structures.SourceSpan) !Value {
+            std.debug.assert(operation.arguments.end == operation.arguments.start + 1);
+            const raw = self.unresolved.call_arguments[call.arguments.start].value;
+            var place_fields: std.ArrayList(PlaceField) = .empty;
+            defer place_fields.deinit(self.ctx.allocator());
+            const place = (try self.resolveBorrowPlace(raw, &place_fields)) orelse return self.reject(span, .borrow_requires_place);
+            const projected = try self.projectBorrowPlace(place, place_fields.items, false, span);
+            const root = projected.root;
+            const source = try self.value(raw);
+            const reference = try self.appendInstruction(.{ .borrow_address = .{
+                .source = root.id,
+                .type_id = operation.return_type,
+                .fields = projected.fields,
+                .base_is_reference = projected.alias != null,
+            } });
+            if (projected.alias != null) {
+                var captured = reference;
+                captured.reference_origins = root.reference_origins;
+                return captured;
+            }
+            if (place.root == .parameter and try self.type_interner.facts().argumentPassing(root.type_id) == .direct) {
+                var local_reference = reference;
+                local_reference.reference_origins = try self.addReferenceOrigin(source.reference_origins, .{
+                    .cleanup_value = root.id,
+                });
+                return local_reference;
+            }
+            return self.withReferenceOrigin(source, reference);
+        }
+
+        fn allocationBorrowOperation(self: *Self, operation: structures.FunctionCall, call: semantic.UnresolvedBody.Call) !Value {
+            std.debug.assert(operation.arguments.end == operation.arguments.start + 2);
+            const arguments = self.call_arguments.items[operation.arguments.start..operation.arguments.end];
+            const allocation = try self.value(self.unresolved.call_arguments[call.arguments.start].value);
+            const element_type = (try self.type_interner.facts().allocationElement(allocation.type_id)) orelse unreachable;
+            const element = try self.appendInstruction(.{ .allocation_element = .{
+                .allocation = arguments[0].value,
+                .index = arguments[1].value,
+                .type_id = element_type,
+            } });
+            const reference = try self.appendInstruction(.{ .borrow_address = .{ .source = element.id, .type_id = operation.return_type } });
+            return self.withMutableParameterOrigin(allocation, reference);
+        }
+
+        fn borrowReadOperation(self: *Self, operation: structures.FunctionCall, call: semantic.UnresolvedBody.Call) !Value {
+            std.debug.assert(operation.arguments.end == operation.arguments.start + 1);
+            const reference = try self.value(self.unresolved.call_arguments[call.arguments.start].value);
+            const argument = self.call_arguments.items[operation.arguments.start];
+            return self.readReference(reference, argument.value, operation.return_type, call.span);
+        }
+
+        fn dereference(self: *Self, source: semantic.UnresolvedBody.ValueUse) !Value {
+            const reference = try self.borrowValue(try self.value(source.value), source.span);
+            if (reference.type_id == .never) return reference;
+            const element_type = (try self.type_interner.facts().borrowAccess(reference.type_id) orelse
+                return self.reject(source.span, .{ .dereference_requires_ref = reference.type_id })).element_type;
+            return self.readReference(reference, reference.id, element_type, source.span);
+        }
+
+        fn readReference(self: *Self, reference: Value, source: structures.FunctionValueId, element_type: structures.TypeId, span: structures.SourceSpan) !Value {
+            const source_origins = reference.reference_origins orelse return self.reject(span, .borrow_outlives_source);
+            var incomplete = false;
+            var origin_id = try self.resolveReferenceOrigins(source_origins, &incomplete);
+            var borrow_root: ?semantic.UnresolvedBody.LocalId = null;
+            while (origin_id) |index| {
+                const origin = self.reference_origins.items[index];
+                borrow_root = laterBorrowRoot(borrow_root, origin.root);
+                origin_id = origin.next;
+            }
+            var result = try self.appendInstruction(.{ .borrow_read = .{ .source = source, .type_id = element_type } });
+            result.borrowed_type = element_type;
+            result.borrow_root = borrow_root;
+            result.reference_origins = try self.readReferenceOrigins(reference.reference_origins, null, @truncate(@intFromEnum(result.id)));
+            result.materialize_on_copy = true;
+            return result;
+        }
+
+        fn readReferenceOrigins(self: *Self, source_origins: ?u32, state: ?StateId, instruction: u31) !?u32 {
+            var origins: ?u32 = null;
+            var current = source_origins;
+            while (current) |index| {
+                var origin = self.reference_origins.items[index];
+                current = origin.next;
+                if (origin.loop != null) {
+                    try self.deferReferenceTransform(&origin, .{ .read = .{ .state = state orelse try self.captureState(), .instruction = instruction } });
+                } else if (origin.projection) |projection_index| {
+                    const projection = self.reference_projections.items[projection_index];
+                    if (projection.step == .element) origin.projection = projection.next;
+                } else if (origin.stable) {
+                    if (origin.root) |root| {
+                        const values_at_read = if (state) |state_id| self.states.items[@intFromEnum(state_id)].values else self.local_values;
+                        if (@intFromEnum(root) < values_at_read.len) {
+                            if (values_at_read[@intFromEnum(root)]) |value_at_read| origin.binding_identity = value_at_read.binding_identity;
+                        }
+                    }
+                    origin.stable = false;
+                }
+                origin.read = instruction;
+                origins = try self.addReferenceOrigin(origins, origin);
+            }
+            return origins;
+        }
+
+        fn validateReferenceReplacement(self: *Self, element_type: structures.TypeId, span: structures.SourceSpan) !void {
+            if (try referenceReplacementIssue(self.type_interner, element_type)) |issue| return self.reject(span, issue);
+        }
+
+        fn referenceAssignment(self: *Self, assignment_ref: @FieldType(Expression.Operation, "reference_assignment")) !Value {
+            const reference = try self.value(assignment_ref.reference.value);
+            if (reference.type_id == .never) return reference;
+            var result = try self.assignReference(reference, assignment_ref.value, assignment_ref.reference.span);
+            if (result.type_id != .never) try self.advanceOwnedReferenceOrigins(reference, reference.id, .{ .value = &result.reference_origins });
+            return result;
+        }
+
+        fn borrowAssignment(self: *Self, assignment_alias: @FieldType(Expression.Operation, "borrow_assignment")) !Value {
+            const local_index = @intFromEnum(assignment_alias.target);
+            var reference = try self.aliasReference(assignment_alias.target);
+            _ = try self.borrowValue(reference, assignment_alias.target_span);
+            const source_fields = self.unresolved.assignment_fields[assignment_alias.fields.start..assignment_alias.fields.end];
+            if (source_fields.len != 0) {
+                const element_type = (try self.type_interner.facts().borrowElement(reference.type_id)) orelse unreachable;
+                var fields: std.ArrayList(PlaceField) = .empty;
+                defer fields.deinit(self.ctx.allocator());
+                try self.resolvePlaceFields(element_type, source_fields, assignment_alias.target_span, &fields);
+                const field_reference = try self.appendInstruction(.{ .borrow_address = .{
+                    .source = reference.id,
+                    .type_id = (try self.type_interner.referenceType(fields.getLast().type_id, true)) orelse return error.Unavailable,
+                    .fields = try self.publishBorrowFields(fields.items),
+                    .base_is_reference = true,
+                } });
+                reference = field_reference;
+                reference.reference_origins = self.local_values[local_index].?.reference_origins;
+            }
+            var result = try self.assignReference(reference, assignment_alias.value, assignment_alias.target_span);
+            if (result.type_id == .never) return result;
+            const alias = self.locals.items(.alias)[local_index].?;
+            const element_type = (try self.type_interner.facts().borrowElement(reference.type_id)) orelse unreachable;
+            const capabilities = (try self.type_interner.facts().ownershipCapabilities(element_type)) orelse return error.Unavailable;
+            if (alias.root) |root| if (root == .local and
+                ((alias.whole_root and source_fields.len == 0) or capabilities.needs_automatic_drop))
+            {
+                const owner_index = @intFromEnum(root.local);
+                var owner = self.local_values[owner_index].?;
+                try self.recordConsume(owner);
+                owner.owned_generation = try self.allocateGeneration(owner.type_id, assignment_alias.value.span, self.locals.items(.can_deinit)[owner_index]);
+                if (owner.owned_generation) |generation| try self.recordEffect(.{ .define = .{
+                    .generation = generation,
+                    .value = owner.id,
+                } });
+                self.local_values[owner_index] = owner;
+                if (capabilities.needs_automatic_drop) try self.advanceReferenceRoot(root.local, null, .{ .value = &result.reference_origins });
             };
-            const return_type = callReturnType(call);
+            if (alias.root == null) try self.advanceOwnedReferenceOrigins(reference, self.local_values[local_index].?.id, .{ .value = &result.reference_origins });
+            return result;
+        }
+
+        fn invalidateWritableReferences(self: *Self, references: []const Value, refresh: ReferenceRefresh) !void {
+            for (references) |reference|
+                try self.advanceOwnedReferenceOrigins(reference, reference.id, refresh);
+        }
+
+        fn advanceOwnedReferenceOrigins(self: *Self, reference: Value, captured_handle: structures.FunctionValueId, fresh_result_origins: ?ReferenceRefresh) !void {
+            const element_type = (try self.type_interner.facts().borrowElement(reference.type_id)) orelse unreachable;
+            const capabilities = (try self.type_interner.facts().ownershipCapabilities(element_type)) orelse return error.Unavailable;
+            if (!capabilities.needs_automatic_drop) return;
+            var incomplete = false;
+            var origins = try self.resolveReferenceOrigins(reference.reference_origins, &incomplete);
+            var refreshed = origins;
+            if (incomplete) try self.pending_reference_invalidations.append(self.ctx.allocator(), .{
+                .origins = reference.reference_origins.?,
+                .known = origins,
+                .span = self.activeLifetimeSpan(),
+            });
+            while (origins) |origin_index| {
+                const origin = self.reference_origins.items[origin_index];
+                if (origin.root) |root| {
+                    try self.advanceReferenceRoot(root, captured_handle, fresh_result_origins);
+                    refreshed = try self.updatedRootOrigin(refreshed, root, self.local_values[@intFromEnum(root)].?.binding_identity);
+                }
+                origins = origin.next;
+            }
+            if (incomplete) for (self.local_values, self.local_availability) |*stored, availability| {
+                if (availability == .available and stored.* != null and stored.*.?.id == captured_handle and
+                    try self.type_interner.facts().borrowElement(stored.*.?.type_id) != null)
+                    stored.*.?.reference_origins = refreshed;
+            };
+        }
+
+        fn advanceReferenceRoot(self: *Self, root: semantic.UnresolvedBody.LocalId, captured_handle: ?structures.FunctionValueId, fresh_result_origins: ?ReferenceRefresh) !void {
+            const owner_index = @intFromEnum(root);
+            var owner = self.local_values[owner_index].?;
+            const previous_identity = owner.binding_identity;
+            owner.storage_identity = if (captured_handle != null) owner.storage_identity orelse previous_identity else null;
+            owner.binding_identity = try self.newBindingIdentity();
+            self.local_values[owner_index] = owner;
+            for (self.locals.items(.alias), self.local_values, self.local_availability) |other_alias, *other_value, availability| {
+                if (availability != .available or other_value.* == null) continue;
+                const names_root = if (other_alias) |alias| if (alias.root) |alias_root|
+                    alias_root == .local and alias_root.local == root
+                else
+                    false else false;
+                if (names_root or (captured_handle != null and
+                    ((other_value.*.?.id == captured_handle.? and try self.type_interner.facts().borrowElement(other_value.*.?.type_id) != null) or
+                        other_value.*.?.stable_reference_root == root)))
+                {
+                    if (try self.hasCurrentRootOrigin(other_value.*.?.reference_origins, root, previous_identity))
+                        other_value.*.?.reference_origins = try self.updatedRootOrigin(other_value.*.?.reference_origins, root, owner.binding_identity);
+                }
+                if (captured_handle != null)
+                    other_value.*.?.reference_origins = try self.refreshStableOrigins(other_value.*.?.reference_origins, root, previous_identity, owner.storage_identity orelse owner.binding_identity);
+            }
+            if (fresh_result_origins) |refresh| switch (refresh) {
+                .value => |origins| origins.* = try self.updatedRootOrigin(origins.*, root, owner.binding_identity),
+                .slots => |origins| origins.* = try self.refreshStableOrigins(origins.*, root, previous_identity, owner.storage_identity orelse owner.binding_identity),
+            };
+        }
+
+        fn hasCurrentRootOrigin(self: *Self, origins: ?u32, root: semantic.UnresolvedBody.LocalId, identity: BindingIdentity) !bool {
+            const actual = try self.resolveBindingIdentity(identity);
+            if (actual.incomplete or actual.conflicting or actual.value == null) return false;
+            var incomplete = false;
+            var current = try self.resolveReferenceOrigins(origins, &incomplete);
+            if (incomplete) return false;
+            var found = false;
+            while (current) |index| {
+                const origin = self.reference_origins.items[index];
+                if (origin.root == root) {
+                    const expected = try self.resolveBindingIdentity(origin.binding_identity);
+                    if (expected.incomplete or expected.conflicting or expected.value != actual.value) return false;
+                    found = true;
+                }
+                current = origin.next;
+            }
+            return found;
+        }
+
+        fn updatedRootOrigin(self: *Self, origins: ?u32, root: semantic.UnresolvedBody.LocalId, identity: BindingIdentity) !?u32 {
+            var updated: ?u32 = null;
+            var current = origins;
+            while (current) |index| {
+                var origin = self.reference_origins.items[index];
+                if (origin.root == root) origin.binding_identity = if (origin.stable)
+                    self.local_values[@intFromEnum(root)].?.storage_identity orelse identity
+                else
+                    identity;
+                updated = try self.addReferenceOrigin(updated, origin);
+                current = origin.next;
+            }
+            return updated;
+        }
+
+        fn assignReference(self: *Self, reference: Value, value_use: semantic.UnresolvedBody.ValueUse, span: structures.SourceSpan) !Value {
+            const access = (try self.type_interner.facts().borrowAccess(reference.type_id)) orelse
+                return self.reject(span, .{ .dereference_requires_ref = reference.type_id });
+            if (!access.writable) return self.reject(span, .reference_not_writable);
+            try self.validateReferenceReplacement(access.element_type, value_use.span);
+            const raw_value = try self.valueWithType(value_use.value, access.element_type);
+            if (raw_value.type_id == .never) return raw_value;
+            const use = try self.coerceValue(raw_value.id, raw_value.type_id, access.element_type) orelse
+                return self.reject(value_use.span, .{ .assignment_type_mismatch = self.typeMismatch(access.element_type, raw_value.type_id) });
+            const owned = try self.ownValue(raw_value, value_use.span);
+            const operand = if (use.coerce_to) |_| try self.coerceOwnedRepresentation(owned, use, value_use.span) else owned;
+            try self.recordConsume(operand);
+            _ = try self.replaceReference(reference, reference.id, operand.id, span);
+            return self.readReference(reference, reference.id, access.element_type, span);
+        }
+
+        fn borrowWriteOperation(
+            self: *Self,
+            operation: structures.FunctionCall,
+            call: semantic.UnresolvedBody.Call,
+            span: structures.SourceSpan,
+            consumed_arguments: structures.FunctionValueRange,
+        ) !Value {
+            std.debug.assert(operation.arguments.end == operation.arguments.start + 2);
+            const arguments = self.call_arguments.items[operation.arguments.start..operation.arguments.end];
+            const reference_id = switch (call.target) {
+                .member => |member| member.receiver.value,
+                else => self.unresolved.call_arguments[call.arguments.start].value,
+            };
+            const reference = try self.value(reference_id);
+            try self.recordCallArgumentConsumes(consumed_arguments);
+            const result = try self.replaceReference(reference, arguments[0].value, arguments[1].value, span);
+            try self.advanceOwnedReferenceOrigins(reference, reference.id, null);
+            return result;
+        }
+
+        fn replaceReference(self: *Self, reference: Value, reference_id: structures.FunctionValueId, item_id: structures.FunctionValueId, span: structures.SourceSpan) !Value {
+            try self.recordUse(reference);
+            const pinned = try self.appendInstruction(.{ .value_copy = .{ .source = reference_id, .type_id = reference.type_id } });
+            const element_type = (try self.type_interner.facts().borrowElement(reference.type_id)) orelse unreachable;
+            const old_value = try self.appendInstruction(.{ .borrow_read = .{ .source = pinned.id, .type_id = element_type } });
+            try self.dropValue(old_value, false, span);
+            return self.appendInstruction(.{ .borrow_write = .{
+                .reference = pinned.id,
+                .value = item_id,
+                .type_id = element_type,
+            } });
+        }
+
+        fn attenuateRefOperation(self: *Self, operation: structures.FunctionCall, call: semantic.UnresolvedBody.Call) !Value {
+            std.debug.assert(operation.arguments.end == operation.arguments.start + 1);
+            const reference_value = switch (call.target) {
+                .member => |member| member.receiver.value,
+                else => self.unresolved.call_arguments[call.arguments.start].value,
+            };
+            const reference = try self.value(reference_value);
+            var result = try self.appendInstruction(.{ .value_copy = .{
+                .source = self.call_arguments.items[operation.arguments.start].value,
+                .type_id = operation.return_type,
+            } });
+            result.reference_origins = reference.reference_origins;
+            result.stable_reference_root = reference.stable_reference_root;
+            return result;
+        }
+
+        fn applyCallMutArguments(self: *Self, call: structures.FunctionCall, range: structures.FunctionValueRange) !void {
             for (self.pending_mut_arguments.items[range.start..range.end]) |pending| {
                 const fields = self.mut_argument_fields.items[pending.place.fields.start..pending.place.fields.end];
                 const leaf_type = if (fields.len == 0)
                     self.local_values[@intFromEnum(pending.place.local)].?.type_id
                 else
                     fields[fields.len - 1].type_id;
-                const updated_leaf = try self.appendInstruction(.{ .call_mut_argument = .{
-                    .arguments = arguments,
-                    .return_type = return_type,
+                var updated_leaf = try self.appendInstruction(.{ .call_mut_argument = .{
+                    .arguments = call.arguments,
+                    .return_type = call.return_type,
                     .argument_index = pending.argument_index,
                     .type_id = leaf_type,
                 } });
+                updated_leaf.reference_origins = try self.mergeReferenceOrigins(
+                    self.local_values[@intFromEnum(pending.place.local)].?.reference_origins,
+                    pending.reference_origins,
+                );
                 try self.updateMutArgumentPlace(pending.place, updated_leaf);
             }
+        }
+
+        fn mutReturnOrigins(self: *Self, range: structures.FunctionValueRange) !?u32 {
+            var origins: ?u32 = null;
+            for (self.pending_mut_arguments.items[range.start..range.end]) |pending| {
+                if (!pending.return_origin) continue;
+                const updated = self.borrowLocalValue(pending.place.local);
+                const source_origins = if (try self.type_interner.facts().borrowElement(updated.type_id) != null)
+                    updated.reference_origins
+                else
+                    try self.sourceReferenceOrigins(updated);
+                origins = try self.mergeReferenceOrigins(origins, source_origins);
+            }
+            return origins;
+        }
+
+        fn recordCallArgumentConsumes(self: *Self, range: structures.FunctionValueRange) !void {
+            for (self.pending_consumed_arguments.items[range.start..range.end]) |argument| try self.recordConsume(argument);
         }
 
         fn updateMutArgumentPlace(self: *Self, place: ArgumentPlace, updated_leaf: Value) !void {
             const local_index = @intFromEnum(place.local);
             const fields = self.mut_argument_fields.items[place.fields.start..place.fields.end];
             const previous = self.local_values[local_index].?;
-            self.local_values[local_index] = try self.updateOwnedValue(previous, try self.updateFields(previous, fields, updated_leaf));
+            var updated = try self.updateOwnedValue(previous, try self.updateFields(previous, fields, updated_leaf));
+            updated.binding_identity = try self.newBindingIdentity();
+            updated.storage_identity = null;
+            self.local_values[local_index] = updated;
         }
 
         fn updateOwnedValue(self: *Self, previous: Value, updated: Value) !Value {
@@ -2463,43 +4764,39 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             var current = root;
             for (fields) |field| {
                 try parents.append(self.ctx.allocator(), current);
+                const origins = try self.selectReferenceOrigins(current.reference_origins, .{ .field = field.index });
                 current = try self.appendInstruction(.{ .field_access = .{
                     .operand = current.id,
                     .field_index = field.index,
                     .field_type = field.type_id,
                 } });
+                current.reference_origins = origins;
             }
             var updated = updated_leaf;
             var field_index = fields.len;
             while (field_index > 0) {
                 field_index -= 1;
+                const previous = parents.items[field_index];
+                const updated_origins = try self.replaceProjectedOrigins(previous.reference_origins, .{ .field = fields[field_index].index }, updated.reference_origins);
                 updated = try self.appendInstruction(.{ .field_update = .{
-                    .operand = parents.items[field_index].id,
+                    .operand = previous.id,
                     .value = updated.id,
                     .field_index = fields[field_index].index,
-                    .type_id = parents.items[field_index].type_id,
+                    .type_id = previous.type_id,
                 } });
+                updated.reference_origins = updated_origins;
             }
             return updated;
         }
 
-        fn callReturnType(call: CallOperation) structures.TypeId {
-            return switch (call) {
-                inline else => |operation| operation.return_type,
-            };
-        }
-
-        fn lowerFallibleCall(self: *Self, call: CallOperation, span: structures.SourceSpan) !ConditionFlow {
+        fn lowerFallibleCall(self: *Self, call: structures.FunctionCall, span: structures.SourceSpan) !ConditionFlow {
             const argument_start: u32 = @intCast(self.block_argument_types.items.len);
-            const produced_generation = try self.allocateGeneration(callReturnType(call), span, false);
-            _ = try self.appendBlockArgument(callReturnType(call), produced_generation);
+            const produced_generation = if (call.destination == null) try self.allocateGeneration(call.return_type, span, false) else null;
+            _ = try self.appendBlockArgument(if (call.destination == null) call.return_type else .unit, produced_generation);
             const success = try self.newBlock(argument_start, argument_start + 1);
             const failure = try self.newBlock(argument_start + 1, argument_start + 1);
             try self.moveCurrentBoundaryEffectsToTerminator();
-            self.terminate(switch (call) {
-                .direct => |direct| .{ .fallible_call = .{ .call = direct, .success = success, .failure = failure } },
-                .indirect => |indirect| .{ .fallible_indirect_call = .{ .call = indirect, .success = success, .failure = failure } },
-            });
+            self.terminate(.{ .fallible_call = .{ .call = call, .success = success, .failure = failure } });
             const state = try self.captureState();
             return .{
                 .success = .{ .block = success, .state = state },
@@ -2511,6 +4808,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             const condition_data = self.unresolved.conditions[@intFromEnum(id)];
             return switch (condition_data) {
                 .comparison => |comparison| self.comparisonCondition(comparison),
+                .static_membership => |membership| self.staticMembershipCondition(membership),
                 .variant_membership => |membership| self.variantMembershipCondition(membership),
                 .conjunction => |logical| self.conjunctionCondition(logical),
                 .disjunction => |logical| self.disjunctionCondition(logical),
@@ -2519,17 +4817,28 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             };
         }
 
+        fn staticMembershipCondition(self: *Self, membership: @FieldType(semantic.UnresolvedBody.Condition, "static_membership")) !ConditionFlow {
+            const matches = (try self.type_interner.evaluateWhereMembership(membership.operand, membership.target_type)) orelse return error.Unavailable;
+            const argument_start: u32 = @intCast(self.block_argument_types.items.len);
+            const next = try self.newBlock(argument_start, argument_start);
+            self.terminate(.{ .branch = self.emptyBranch(next) });
+            const exit: FlowExit = .{ .block = next, .state = try self.captureState() };
+            return if (matches) .{ .success = exit, .failure = null } else .{ .success = null, .failure = exit };
+        }
+
         fn callCondition(self: *Self, call: semantic.UnresolvedBody.Call, binding: ?semantic.UnresolvedBody.ConditionBinding) !ConditionFlow {
             const resolved = try self.resolveCall(call, call.span);
             return switch (resolved) {
                 .diverged => |value_to_return| .{ .success = null, .failure = null, .diverged = value_to_return },
-                .in_place_ref => |construction| blk: {
-                    defer self.ctx.allocator().free(construction.prepared.values);
-                    var flow = try self.lowerInPlaceRef(construction, call.span);
+                .conditional_box => self.reject(call.span, .box_conditional_condition_not_supported),
+                .in_place_box => |construction| blk: {
+                    defer if (construction.source == .fields) self.ctx.allocator().free(construction.source.fields.values);
+                    var flow = try self.lowerInPlaceBox(construction, call.span);
                     if (binding) |success_binding| flow.success.?.binding = .{ .call = success_binding };
                     break :blk flow;
                 },
                 .callable => |callable| if (callable.is_fallible) blk: {
+                    try self.recordCallArgumentConsumes(callable.consumed_arguments);
                     var flow = try self.lowerFallibleCall(callable.operation, call.span);
                     try self.finishCallExits(&flow, callable, call.span);
                     if (binding) |success_binding| flow.success.?.binding = .{ .call = success_binding };
@@ -2543,6 +4852,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             if (lhs.type_id == .never) return .{ .success = null, .failure = null, .diverged = lhs };
             const rhs = try self.borrowValue(try self.value(comparison.operands.rhs.value), comparison.operands.rhs.span);
             if (rhs.type_id == .never) return .{ .success = null, .failure = null, .diverged = rhs };
+            try self.recordUse(lhs);
             const operation: structures.PredicateOperation = switch (comparison.operation) {
                 .lt, .gt, .le, .ge => blk: {
                     if (lhs.type_id != .int) return self.reject(comparison.operands.lhs.span, .{ .comparison_operand_not_int = lhs.type_id });
@@ -2592,10 +4902,10 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         ) !ConditionFlow {
             const operand = try self.borrowValue(try self.value(membership.operand.value), membership.operand.span);
             if (operand.type_id == .never) return .{ .success = null, .failure = null, .diverged = operand };
-            const source_members = try self.type_interner.variantMembers(operand.type_id) orelse {
+            const source_members = try self.type_interner.facts().variantMembers(operand.type_id) orelse {
                 return self.reject(membership.operand.span, .{ .variant_inspection_operand_not_variant = operand.type_id });
             };
-            const target_members = try self.type_interner.variantMembers(membership.target_type);
+            const target_members = try self.type_interner.facts().variantMembers(membership.target_type);
             var matching_count: usize = 0;
             for (source_members) |member| {
                 if (includesType(membership.target_type, target_members, member)) matching_count += 1;
@@ -2688,6 +4998,12 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                             .tag_mapping = tag_mapping,
                         } });
                         if (extraction.target_type != .never) {
+                            if (try self.type_interner.canStoreBorrow(extracted.type_id)) {
+                                extracted.reference_origins = if (try self.type_interner.facts().variantMembers(extracted.type_id) != null)
+                                    extraction.operand.reference_origins
+                                else
+                                    try self.selectReferenceOrigins(extraction.operand.reference_origins, .{ .variant = extracted.type_id });
+                            }
                             extracted.borrowed_type = extracted.type_id;
                             extracted.borrowed_generation = extraction.operand.borrowed_generation orelse extraction.operand.owned_generation;
                             extracted.borrowed_cleanup_value = extraction.operand.borrowed_cleanup_value orelse extraction.operand.id;
@@ -2702,6 +5018,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                             .id = @enumFromInt(success_block.argument_start),
                             .type_id = self.block_argument_types.items[success_block.argument_start],
                             .owned_generation = self.block_argument_generations.items[success_block.argument_start],
+                            .reference_origins = exit.reference_origins,
                         };
                     },
                 };
@@ -2714,18 +5031,20 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 };
                 const index = @intFromEnum(binding.local);
                 std.debug.assert(self.local_values[index] == null);
+                bound.binding_identity = try self.newBindingIdentity();
                 self.local_values[index] = bound;
-                self.local_mutable[index] = false;
+                self.locals.items(.mutable)[index] = false;
                 self.local_availability[index] = .available;
                 if (bound.type_id == .never) self.terminate(.diverge);
             }
         }
 
         fn mergeFlowExits(self: *Self, first_exit: ?FlowExit, second_exit: ?FlowExit) !?FlowExit {
-            const first = first_exit orelse return second_exit;
-            const second = second_exit orelse return first;
+            var first = first_exit orelse return second_exit;
+            var second = second_exit orelse return first;
             std.debug.assert(first.binding == null);
             std.debug.assert(second.binding == null);
+            try self.normalizeJoinedFields(&first, &second);
             const first_state = self.states.items[@intFromEnum(first.state)];
             const second_state = self.states.items[@intFromEnum(second.state)];
             std.debug.assert(first_state.values.len == second_state.values.len);
@@ -2769,9 +5088,9 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             }
 
             const merged = try self.newBlock(argument_start, @intCast(self.block_argument_types.items.len));
-            self.enterBlock(first.block);
+            self.enterPendingBlock(first.block);
             self.terminate(.{ .branch = try self.valuesBranch(merged, first_values.items) });
-            self.enterBlock(second.block);
+            self.enterPendingBlock(second.block);
             self.terminate(.{ .branch = try self.valuesBranch(merged, second_values.items) });
             for (generation_only_joins.items) |generation_join| {
                 const left = first_state.values[generation_join.slot].?;
@@ -2780,26 +5099,67 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 try self.recordGenerationOnlyForward(second.block, 0, right.owned_generation, generation_join.destination);
             }
 
-            const values = try self.ctx.allocator().dupe(?Value, first_state.values);
-            errdefer self.ctx.allocator().free(values);
-            const availability = try self.ctx.allocator().dupe(Availability, first_state.availability);
-            errdefer self.ctx.allocator().free(availability);
+            var state = try first_state.clone(self.ctx.allocator());
+            errdefer state.deinit(self.ctx.allocator());
+            const values = state.values;
+            for (values, second_state.values) |*first_value, second_value| {
+                if (first_value.*) |*left| {
+                    const right = second_value.?;
+                    try self.mergeValueReferences(left, left.*, right);
+                    left.storage_identity = try self.joinBindingIdentities(left.storage_identity orelse left.binding_identity, right.storage_identity orelse right.binding_identity);
+                    left.binding_identity = try self.joinBindingIdentities(left.binding_identity, right.binding_identity);
+                }
+            }
             for (changed_slots.items, argument_start..) |slot, argument| {
+                const joined = values[slot].?;
                 values[slot] = .{
                     .id = @enumFromInt(argument),
                     .type_id = self.block_argument_types.items[argument],
                     .owned_generation = self.block_argument_generations.items[argument],
+                    .reference_origins = joined.reference_origins,
+                    .stable_reference_root = joined.stable_reference_root,
+                    .binding_identity = joined.binding_identity,
+                    .storage_identity = joined.storage_identity,
                 };
             }
             for (generation_only_joins.items) |generation_join| {
                 values[generation_join.slot].?.owned_generation = generation_join.destination;
             }
-            for (availability, second_state.availability) |*output, right| output.* = joinAvailability(output.*, right);
-            const state_id = try self.appendState(.{ .values = values, .availability = availability });
+            for (state.availability, second_state.availability) |*output, right| output.* = joinAvailability(output.*, right);
+            for (state.field_availability, second_state.field_availability) |*output, right| output.* = joinAvailability(output.*, right);
+            const state_id = try self.appendState(state);
             return .{ .block = merged, .state = state_id };
         }
 
         fn conditional(self: *Self, expression: @FieldType(Expression.Operation, "if_else")) !Value {
+            return self.conditionalWithBox(expression, null);
+        }
+
+        fn boxFromInitializer(self: *Self, id: semantic.UnresolvedBody.ValueId, destination: BoxDestination) anyerror!Value {
+            if (self.inPlaceInitializer(id)) |initializer| {
+                if (initializer == .conditional) return self.conditionalWithBox(initializer.conditional, destination);
+                if (initializer == .fields) {
+                    const expression = initializer.fields;
+                    const resolved = try self.prepareInPlaceBoxFields(expression, destination, expression.span);
+                    return switch (resolved) {
+                        .diverged => |diverged| diverged,
+                        .in_place_box => |construction| blk: {
+                            defer if (construction.source == .fields) self.ctx.allocator().free(construction.source.fields.values);
+                            break :blk try self.inPlaceBoxValue(construction, expression.span);
+                        },
+                        else => unreachable,
+                    };
+                }
+            }
+            const operand = try self.valueWithType(id, destination.element_type);
+            if (operand.type_id == .never) return operand;
+            if (try self.coerceValue(operand.id, operand.type_id, destination.element_type) == null) return self.reject(self.activeLifetimeSpan(), .{
+                .call_argument_type_mismatch = self.typeMismatch(destination.element_type, operand.type_id),
+            });
+            return self.reject(self.activeLifetimeSpan(), .{ .box_requires_struct_initializer = destination.element_type });
+        }
+
+        fn conditionalWithBox(self: *Self, expression: @FieldType(Expression.Operation, "if_else"), box_destination: ?BoxDestination) anyerror!Value {
             const baseline = try self.captureState();
             const flow = try self.condition(expression.condition);
             if (flow.success == null and flow.failure == null) {
@@ -2807,16 +5167,16 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 return flow.diverged.?;
             }
 
-            const then_exit = if (flow.success) |success| blk: {
+            var then_exit = if (flow.success) |success| blk: {
                 try self.enterFlowExit(success);
-                const result = try self.block(expression.then_block, null);
+                const result = try self.blockWithBox(expression.then_block, null, box_destination);
                 if (self.current_block != null) if (success.binding) |binding|
                     self.unbindLocal(@intFromEnum(binding.conditionBinding().local));
                 break :blk try self.valueExit(result);
             } else null;
-            const else_exit = if (flow.failure) |failure| blk: {
+            var else_exit = if (flow.failure) |failure| blk: {
                 try self.enterFlowExit(failure);
-                break :blk try self.valueExit(try self.block(expression.else_block, null));
+                break :blk try self.valueExit(try self.blockWithBox(expression.else_block, null, box_destination));
             } else null;
 
             const argument_start: u32 = @intCast(self.block_argument_types.items.len);
@@ -2827,6 +5187,8 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 self.terminate(.diverge);
                 return .{ .id = @enumFromInt(argument_start), .type_id = .never };
             }
+            if (then_exit) |*then_value| if (else_exit) |*else_value|
+                try self.normalizeJoinedFields(then_value, else_value);
 
             const joined = if (then_exit) |then_result|
                 if (else_exit) |else_result|
@@ -2923,6 +5285,14 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 .id = @enumFromInt(argument_start),
                 .type_id = joined,
                 .owned_generation = joined_generation,
+                .reference_origins = try self.mergeReferenceOrigins(
+                    if (then_exit) |exit| exit.value.reference_origins else null,
+                    if (else_exit) |exit| exit.value.reference_origins else null,
+                ),
+                .stable_reference_root = if (then_exit) |exit| if (else_exit) |other|
+                    sharedStableReferenceRoot(exit.value.stable_reference_root, other.value.stable_reference_root)
+                else
+                    exit.value.stable_reference_root else else_exit.?.value.stable_reference_root,
                 .borrowed_generation = joinedBorrowedGeneration(then_exit, else_exit),
                 .borrowed_cleanup_value = joinedBorrowedCleanupValue(then_exit, else_exit),
                 .borrowed_type = borrowed_source,
@@ -2938,6 +5308,75 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             return .{ .block = self.suspendBlock(), .state = state, .value = value_to_exit };
         }
 
+        fn normalizeJoinedFields(self: *Self, first: anytype, second: @TypeOf(first)) !void {
+            for (self.field_places, 0..) |place, index| {
+                if (!place.moves_owner) continue;
+                const first_state = self.states.items[@intFromEnum(first.*.state)];
+                const second_state = self.states.items[@intFromEnum(second.*.state)];
+                const local_index = @intFromEnum(place.local);
+                if (first_state.availability[local_index] != .available or second_state.availability[local_index] != .available) continue;
+                const left = first_state.field_availability[index];
+                const right = second_state.field_availability[index];
+                if (left == right) continue;
+                if (left == .available and right == .transferred) {
+                    first.* = try self.endFieldBeforeJoin(first.*, place);
+                } else if (right == .available and left == .transferred) {
+                    second.* = try self.endFieldBeforeJoin(second.*, place);
+                } else {
+                    return self.reject(self.activeLifetimeSpan(), .partial_field_transfer_not_supported);
+                }
+            }
+        }
+
+        fn normalizeLoopBreakFields(self: *Self, breaks: []LoopBreak) !void {
+            for (self.field_places, 0..) |place, index| {
+                if (!place.moves_owner) continue;
+                const local_index = @intFromEnum(place.local);
+                var transferred = false;
+                for (breaks) |break_edge| {
+                    const state = self.states.items[@intFromEnum(break_edge.state)];
+                    if (state.availability[local_index] == .available and state.field_availability[index] == .transferred) {
+                        transferred = true;
+                        break;
+                    }
+                }
+                if (!transferred) continue;
+                for (breaks) |*break_edge| {
+                    const state = self.states.items[@intFromEnum(break_edge.state)];
+                    if (state.availability[local_index] == .available and state.field_availability[index] == .available)
+                        break_edge.* = try self.endFieldBeforeJoin(break_edge.*, place);
+                }
+            }
+        }
+
+        fn endFieldBeforeJoin(self: *Self, exit: anytype, place: FieldPlace) !@TypeOf(exit) {
+            const span = self.activeLifetimeSpan();
+            self.enterPendingBlock(exit.block);
+            self.restoreState(exit.state);
+            const boundary = try self.newBoundary(span);
+            const previous_boundary = self.current_boundary;
+            self.current_boundary = boundary;
+            defer self.current_boundary = previous_boundary;
+            try self.endField(place, span);
+            try self.appendBoundary(boundary);
+            var result = exit;
+            result.state = try self.captureState();
+            result.block = self.suspendBlock();
+            return result;
+        }
+
+        fn endField(self: *Self, place: FieldPlace, span: structures.SourceSpan) !void {
+            const field_type = self.local_values[@intFromEnum(place.local)].?.type_id;
+            var fields: std.ArrayList(PlaceField) = .empty;
+            defer fields.deinit(self.ctx.allocator());
+            try self.resolvePlaceFields(field_type, place.fields, span, &fields);
+            const capabilities = (try self.type_interner.facts().ownershipCapabilities(fields.getLast().type_id)) orelse return error.Unavailable;
+            if (capabilities.requires_explicit_drop) return self.reject(span, .explicit_drop_field_cannot_be_implicitly_ended);
+            const field = try self.transferFieldPlace(place.local, place.fields, span);
+            try self.dropValue(field, false, span);
+            try self.recordConsume(field);
+        }
+
         fn changedStateSlots(
             self: *Self,
             baseline: StateId,
@@ -2950,8 +5389,10 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             const baseline_state = self.states.items[@intFromEnum(baseline)].values;
             const first_state = self.states.items[@intFromEnum(first.?.state)].values;
             const second_state = self.states.items[@intFromEnum(second.?.state)].values;
-            for (baseline_state, first_state, second_state, 0..) |initial, left, right, slot| {
+            for (baseline_state, 0..) |initial, slot| {
                 if (initial == null) continue;
+                const left = first_state[slot];
+                const right = second_state[slot];
                 std.debug.assert(left != null and right != null);
                 std.debug.assert(left.?.type_id == right.?.type_id);
                 if (left.?.id != right.?.id) try slots.append(self.ctx.allocator(), @intCast(slot));
@@ -2971,8 +5412,10 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             const baseline_state = self.states.items[@intFromEnum(baseline)].values;
             const first_state = self.states.items[@intFromEnum(first.?.state)].values;
             const second_state = self.states.items[@intFromEnum(second.?.state)].values;
-            for (baseline_state, first_state, second_state, 0..) |initial, left, right, slot| {
+            for (baseline_state, 0..) |initial, slot| {
                 if (initial == null) continue;
+                const left = first_state[slot];
+                const right = second_state[slot];
                 std.debug.assert(left != null and right != null);
                 if (left.?.id != right.?.id or left.?.owned_generation == right.?.owned_generation) continue;
                 const destination = (try self.joinGenerations(
@@ -2998,6 +5441,10 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             const right = if (second) |exit| if (exit.value.borrowed_type != null) exit.value.borrowed_cleanup_value else null else null;
             if (left != null and right != null and left != right) return null;
             return left orelse right;
+        }
+
+        fn sharedStableReferenceRoot(first: ?semantic.UnresolvedBody.LocalId, second: ?semantic.UnresolvedBody.LocalId) ?semantic.UnresolvedBody.LocalId {
+            return if (first == second) first else null;
         }
 
         fn setConditionalTerminator(
@@ -3050,26 +5497,53 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         ) !StateId {
             const source = if (first) |exit| exit.state else second.?.state;
             const baseline_state = self.states.items[@intFromEnum(baseline)];
-            const values = try self.ctx.allocator().dupe(?Value, baseline_state.values);
-            errdefer self.ctx.allocator().free(values);
             const source_state = self.states.items[@intFromEnum(source)];
-            for (values, source_state.values) |*output, value_on_path| {
-                if (output.* != null) output.* = value_on_path.?;
+            var state = try (State{ .values = baseline_state.values, .availability = source_state.availability, .field_availability = source_state.field_availability }).clone(self.ctx.allocator());
+            errdefer state.deinit(self.ctx.allocator());
+            const values = state.values;
+            for (values, 0..) |*output, slot| {
+                if (output.* != null) {
+                    output.* = source_state.values[slot].?;
+                    if (first != null and second != null) {
+                        output.*.?.stable_reference_root = sharedStableReferenceRoot(
+                            self.states.items[@intFromEnum(first.?.state)].values[slot].?.stable_reference_root,
+                            self.states.items[@intFromEnum(second.?.state)].values[slot].?.stable_reference_root,
+                        );
+                        output.*.?.reference_origins = try self.mergeReferenceOrigins(
+                            self.states.items[@intFromEnum(first.?.state)].values[slot].?.reference_origins,
+                            self.states.items[@intFromEnum(second.?.state)].values[slot].?.reference_origins,
+                        );
+                        const first_identity = self.states.items[@intFromEnum(first.?.state)].values[slot].?.binding_identity;
+                        const second_identity = self.states.items[@intFromEnum(second.?.state)].values[slot].?.binding_identity;
+                        output.*.?.storage_identity = try self.joinBindingIdentities(
+                            self.states.items[@intFromEnum(first.?.state)].values[slot].?.storage_identity orelse first_identity,
+                            self.states.items[@intFromEnum(second.?.state)].values[slot].?.storage_identity orelse second_identity,
+                        );
+                        output.*.?.binding_identity = if (std.meta.eql(first_identity, second_identity))
+                            first_identity
+                        else
+                            try self.newBindingIdentity();
+                    }
+                }
             }
             for (changed_slots, argument_start..) |slot, argument| {
                 values[slot] = .{
                     .id = @enumFromInt(argument),
                     .type_id = self.block_argument_types.items[argument],
                     .owned_generation = self.block_argument_generations.items[argument],
+                    .reference_origins = values[slot].?.reference_origins,
+                    .stable_reference_root = values[slot].?.stable_reference_root,
+                    .binding_identity = values[slot].?.binding_identity,
+                    .storage_identity = values[slot].?.storage_identity,
                 };
             }
-            const availability = try self.ctx.allocator().dupe(Availability, source_state.availability);
-            errdefer self.ctx.allocator().free(availability);
             if (first != null and second != null) {
                 const other = self.states.items[@intFromEnum(second.?.state)].availability;
-                for (availability, other) |*output, right| output.* = joinAvailability(output.*, right);
+                for (state.availability, other) |*output, right| output.* = joinAvailability(output.*, right);
+                const other_fields = self.states.items[@intFromEnum(second.?.state)].field_availability;
+                for (state.field_availability, other_fields) |*output, right| output.* = joinAvailability(output.*, right);
             }
-            return self.appendState(.{ .values = values, .availability = availability });
+            return self.appendState(state);
         }
 
         fn joinAvailability(left: Availability, right: Availability) Availability {
@@ -3145,10 +5619,6 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                         try self.appendProducedOwnershipEdge(predecessor, 0, call.success);
                         try self.appendProducedOwnershipEdge(predecessor, 1, call.failure);
                     },
-                    .fallible_indirect_call => |call| {
-                        try self.appendProducedOwnershipEdge(predecessor, 0, call.success);
-                        try self.appendProducedOwnershipEdge(predecessor, 1, call.failure);
-                    },
                     .return_unit, .return_value, .return_failure, .diverge => {},
                 }
             }
@@ -3162,7 +5632,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             try self.validateGenerationOrigins();
         }
 
-        fn analyzeLifetimes(self: *Self) !void {
+        fn analyzeLifetimes(self: *Self, measurements: ?*BodyMeasurements) !void {
             var solver = try LifetimeSolver.init(
                 self.ctx.allocator(),
                 self.generations.items,
@@ -3174,6 +5644,10 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 @enumFromInt(0),
             );
             defer solver.deinit();
+            if (measurements) |result| {
+                result.lifetime_table_bytes = 2 * std.mem.sliceAsBytes(solver.representations_in).len +
+                    4 * std.mem.sliceAsBytes(solver.available_in).len;
+            }
             try solver.solve(&self.planned_cleanups, &self.explicit_abandonments);
         }
 
@@ -3266,10 +5740,49 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
 
         fn emitDropCleanup(self: *Self, cleanup: PlannedCleanup) !void {
             const generation = self.generations.items[@intFromEnum(cleanup.generation)];
-            try self.dropValue(.{
+            const value_to_drop: Value = .{
                 .id = cleanup.cleanup_value,
                 .type_id = generation.type_id,
-            }, generation.can_deinit, generation.span);
+                .reference_origins = self.cleanup_origins.get(cleanup.cleanup_value),
+            };
+            if (generation.missing_fields.len == 0) {
+                try self.dropValue(value_to_drop, generation.can_deinit, generation.span);
+            } else {
+                try self.dropValueExcluding(value_to_drop, generation.missing_fields, generation.can_deinit, generation.span);
+            }
+        }
+
+        fn dropValueExcluding(self: *Self, value_to_drop: Value, missing: []const []const u32, can_deinit: bool, span: structures.SourceSpan) !void {
+            std.debug.assert(missing.len != 0);
+            const definition = (try self.type_interner.structDefinition(value_to_drop.type_id)) orelse unreachable;
+            var field_index = definition.fields.len;
+            while (field_index > 0) {
+                field_index -= 1;
+                var nested: std.ArrayList([]const u32) = .empty;
+                defer nested.deinit(self.ctx.allocator());
+                var absent = false;
+                for (missing) |path| {
+                    std.debug.assert(path.len != 0 and path[0] < definition.fields.len);
+                    if (path[0] != field_index) continue;
+                    if (path.len == 1) {
+                        absent = true;
+                        break;
+                    }
+                    try nested.append(self.ctx.allocator(), path[1..]);
+                }
+                if (absent) continue;
+                const field = definition.fields[field_index];
+                var child = try self.appendInstruction(.{ .field_access = .{
+                    .operand = value_to_drop.id,
+                    .field_index = @intCast(field_index),
+                    .field_type = field.type_id,
+                } });
+                child.reference_origins = try self.selectReferenceOrigins(value_to_drop.reference_origins, .{ .field = @intCast(field_index) });
+                if (nested.items.len != 0)
+                    try self.dropValueExcluding(child, nested.items, can_deinit, span)
+                else
+                    try self.dropValue(child, can_deinit, span);
+            }
         }
 
         const BoundaryLocation = struct {
@@ -3314,7 +5827,97 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             self.blocks.items[block_index].terminator_effects.clearRetainingCapacity();
             self.blocks.items[block_index].terminator = null;
             self.blocks.items[block_index].terminator_span = null;
+            self.relocateReferenceUses(.{ .terminator = .{ .id = block_id, .effect_index = 0 } }, .{ .terminator = .{ .id = suffix, .effect_index = 0 } });
             return suffix;
+        }
+
+        fn relocateReferenceUses(self: *Self, from: PendingReferenceUseLocation, to: PendingReferenceUseLocation) void {
+            for (self.reference_uses.items) |*use| {
+                const matches = switch (from) {
+                    .boundary => |location| use.location == .boundary and use.location.boundary.id == location.id,
+                    .terminator => |location| use.location == .terminator and use.location.terminator.id == location.id,
+                };
+                if (matches) use.location = to;
+            }
+        }
+
+        fn validateCleanupReferenceUses(self: *Self) !void {
+            if (self.drop_effects.count() == 0) return;
+            for (self.reference_uses.items) |use| {
+                var incomplete = false;
+                var origins = try self.resolveReferenceOrigins(use.origins, &incomplete);
+                std.debug.assert(!incomplete);
+                while (origins) |index| {
+                    const origin = self.reference_origins.items[index];
+                    origins = origin.next;
+                    if (origin.read == null) continue;
+                    if (try self.referenceCrossesDrop(origin, use.location)) return self.reject(use.span, .borrow_outlives_source);
+                }
+            }
+        }
+
+        fn dropAffectsOrigin(self: *Self, instruction: u31, source: ReferenceOrigin) !bool {
+            const affected = self.drop_effects.get(instruction) orelse return false;
+            var incomplete = false;
+            var origins = try self.resolveReferenceOrigins(affected, &incomplete);
+            std.debug.assert(!incomplete);
+            while (origins) |index| {
+                const origin = self.reference_origins.items[index];
+                if (source.root != null and source.root == origin.root) return true;
+                if (source.generation != null and source.generation == origin.generation) return true;
+                if (source.parameter != null and source.parameter == origin.parameter) return true;
+                origins = origin.next;
+            }
+            return false;
+        }
+
+        fn referenceCrossesDrop(self: *Self, origin: ReferenceOrigin, use: PendingReferenceUseLocation) !bool {
+            const Cursor = struct { block: structures.FunctionBlockId, end: usize, invalidated: bool = false };
+            const start: Cursor = switch (use) {
+                .boundary => |location| blk: {
+                    const boundary = self.findBoundary(location.id);
+                    break :blk .{ .block = boundary.block, .end = boundary.item_index };
+                },
+                .terminator => |location| .{ .block = location.id, .end = self.blocks.items[@intFromEnum(location.id)].items.items.len },
+            };
+            var worklist: std.ArrayList(Cursor) = .empty;
+            defer worklist.deinit(self.ctx.allocator());
+            try worklist.append(self.ctx.allocator(), start);
+            const visited = try self.ctx.allocator().alloc([2]bool, self.blocks.items.len);
+            defer self.ctx.allocator().free(visited);
+            @memset(visited, .{ false, false });
+            while (worklist.pop()) |cursor| {
+                const block_index = @intFromEnum(cursor.block);
+                const block_value = self.blocks.items[block_index];
+                if (cursor.end == block_value.items.items.len) {
+                    if (visited[block_index][@intFromBool(cursor.invalidated)]) continue;
+                    visited[block_index][@intFromBool(cursor.invalidated)] = true;
+                }
+                var invalidated = cursor.invalidated;
+                var item_index = cursor.end;
+                var reached_read = false;
+                while (item_index > 0) {
+                    item_index -= 1;
+                    const item = block_value.items.items[item_index];
+                    if (item != .instruction) continue;
+                    if (item.instruction.id == origin.read.?) {
+                        if (invalidated) return true;
+                        reached_read = true;
+                        break;
+                    }
+                    invalidated = invalidated or try self.dropAffectsOrigin(item.instruction.id, origin);
+                }
+                if (reached_read) continue;
+                for (self.blocks.items, 0..) |predecessor, predecessor_index| {
+                    var terminator = predecessor.terminator.?;
+                    var reaches = false;
+                    for (terminator.successors()) |successor| if (successor) |target| {
+                        reaches = reaches or target.* == cursor.block;
+                    };
+                    if (reaches) try worklist.append(self.ctx.allocator(), .{ .block = @enumFromInt(predecessor_index), .end = predecessor.items.items.len, .invalidated = invalidated });
+                }
+            }
+            return false;
         }
 
         const PassThroughBlock = struct {
@@ -3350,26 +5953,8 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         }
 
         fn edgeTarget(self: *const Self, predecessor: structures.FunctionBlockId, successor_ordinal: u2) structures.FunctionBlockId {
-            const terminator = self.blocks.items[@intFromEnum(predecessor)].terminator orelse unreachable;
-            return switch (terminator) {
-                .branch => |branch| if (successor_ordinal == 0) branch.target else unreachable,
-                .predicate_branch => |branch| switch (successor_ordinal) {
-                    0 => branch.then_branch.target,
-                    1 => branch.else_branch.target,
-                    else => unreachable,
-                },
-                .fallible_call => |call| switch (successor_ordinal) {
-                    0 => call.success,
-                    1 => call.failure,
-                    else => unreachable,
-                },
-                .fallible_indirect_call => |call| switch (successor_ordinal) {
-                    0 => call.success,
-                    1 => call.failure,
-                    else => unreachable,
-                },
-                .return_unit, .return_value, .return_failure, .diverge => unreachable,
-            };
+            var terminator = self.blocks.items[@intFromEnum(predecessor)].terminator orelse unreachable;
+            return (terminator.successors()[successor_ordinal] orelse unreachable).*;
         }
 
         fn retargetEdge(
@@ -3379,27 +5964,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             target: structures.FunctionBlockId,
         ) void {
             const terminator = &self.blocks.items[@intFromEnum(predecessor)].terminator.?;
-            switch (terminator.*) {
-                .branch => |*branch| if (successor_ordinal == 0) {
-                    branch.target = target;
-                } else unreachable,
-                .predicate_branch => |*branch| switch (successor_ordinal) {
-                    0 => branch.then_branch.target = target,
-                    1 => branch.else_branch.target = target,
-                    else => unreachable,
-                },
-                .fallible_call => |*call| switch (successor_ordinal) {
-                    0 => call.success = target,
-                    1 => call.failure = target,
-                    else => unreachable,
-                },
-                .fallible_indirect_call => |*call| switch (successor_ordinal) {
-                    0 => call.success = target,
-                    1 => call.failure = target,
-                    else => unreachable,
-                },
-                .return_unit, .return_value, .return_failure, .diverge => unreachable,
-            }
+            (terminator.successors()[successor_ordinal] orelse unreachable).* = target;
         }
 
         fn validateGenerationOrigins(self: *Self) !void {
@@ -3549,6 +6114,13 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             self.current_block = block_id;
         }
 
+        fn enterPendingBlock(self: *Self, block_id: structures.FunctionBlockId) void {
+            if (self.blocks.items[@intFromEnum(block_id)].layout_index == null)
+                self.enterBlock(block_id)
+            else
+                self.resumeBlock(block_id);
+        }
+
         fn assignBlockLayout(self: *Self, block_id: structures.FunctionBlockId) void {
             const block_value = &self.blocks.items[@intFromEnum(block_id)];
             std.debug.assert(block_value.layout_index == null);
@@ -3654,6 +6226,8 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             errdefer gpa.free(variant_coercion_tags);
             const struct_field_values = try self.struct_field_values.toOwnedSlice(gpa);
             errdefer gpa.free(struct_field_values);
+            const borrow_fields = try self.borrow_fields.toOwnedSlice(gpa);
+            errdefer gpa.free(borrow_fields);
             const call_arguments = try self.call_arguments.toOwnedSlice(gpa);
             errdefer gpa.free(call_arguments);
             const branches = try self.branch_arguments.toOwnedSlice(gpa);
@@ -3663,6 +6237,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 .block_argument_types = block_argument_types,
                 .variant_coercion_tags = variant_coercion_tags,
                 .struct_field_values = struct_field_values,
+                .borrow_fields = borrow_fields,
                 .call_arguments = call_arguments,
                 .branch_arguments = branches,
                 .instructions = instructions,
@@ -3692,38 +6267,19 @@ fn normalizeValueUses(value_uses: []structures.FunctionValueUse, instruction_val
 }
 
 fn normalizeInstructions(instructions: []structures.FunctionInstruction, instruction_values: []const structures.FunctionValueId) void {
-    for (instructions) |*instruction| switch (instruction.*) {
-        .const_int, .const_byte, .const_bool, .const_type, .const_unit, .const_none, .function_ref, .struct_init, .call_mut_argument => {},
-        .ref_init => |*operation| operation.allocation = normalizeValue(operation.allocation, instruction_values),
-        .ref_value_for_drop => |*operation| operation.owner = normalizeValue(operation.owner, instruction_values),
-        .variant_coerce, .variant_extract, .callable_coerce => |*operation| operation.operand = normalizeValue(operation.operand, instruction_values),
-        .field_access => |*operation| operation.operand = normalizeValue(operation.operand, instruction_values),
-        .field_update => |*operation| {
-            operation.operand = normalizeValue(operation.operand, instruction_values);
-            operation.value = normalizeValue(operation.value, instruction_values);
-        },
-        .mut_parameter_write => |*operation| operation.value = normalizeValue(operation.value, instruction_values),
-        .call => {},
-        .indirect_call => |*call| call.target = normalizeValue(call.target, instruction_values),
-        .variant_tag, .negi => |*operand| operand.* = normalizeValue(operand.*, instruction_values),
-        .addi, .subi, .muli, .divsi => |*operands| {
-            operands.lhs = normalizeValue(operands.lhs, instruction_values);
-            operands.rhs = normalizeValue(operands.rhs, instruction_values);
-        },
-    };
+    for (instructions) |*instruction| {
+        for (instruction.operands()) |maybe_operand| {
+            if (maybe_operand) |operand| operand.* = normalizeValue(operand.*, instruction_values);
+        }
+    }
 }
 
 fn normalizeTerminators(blocks: []structures.FunctionBlock, instruction_values: []const structures.FunctionValueId) void {
-    for (blocks) |*block_value| switch (block_value.terminator) {
-        .branch, .fallible_call, .return_failure, .diverge => {},
-        .fallible_indirect_call => |*fallible| fallible.call.target = normalizeValue(fallible.call.target, instruction_values),
-        .predicate_branch => |*predicate| {
-            predicate.operands.lhs = normalizeValue(predicate.operands.lhs, instruction_values);
-            predicate.operands.rhs = normalizeValue(predicate.operands.rhs, instruction_values);
-        },
-        .return_unit => {},
-        .return_value => |*value_use| normalizeValueUse(value_use, instruction_values),
-    };
+    for (blocks) |*block_value| {
+        for (block_value.terminator.operands()) |maybe_operand| {
+            if (maybe_operand) |operand| operand.* = normalizeValue(operand.*, instruction_values);
+        }
+    }
 }
 
 fn intersectTypes(
@@ -3732,7 +6288,7 @@ fn intersectTypes(
     target_type: structures.TypeId,
     gpa: std.mem.Allocator,
 ) !structures.TypeId {
-    const target_members = try type_interner.variantMembers(target_type);
+    const target_members = try type_interner.facts().variantMembers(target_type);
     var intersection: std.ArrayList(structures.TypeId) = .empty;
     defer intersection.deinit(gpa);
     for (source_members) |member| {
@@ -3741,7 +6297,7 @@ fn intersectTypes(
     return switch (intersection.items.len) {
         0 => .never,
         1 => intersection.items[0],
-        else => switch (try type_interner.internVariant(intersection.items)) {
+        else => switch (try type_interner.facts().internVariant(intersection.items)) {
             .type_id => |type_id| type_id,
             .duplicate => unreachable,
         },
@@ -3759,8 +6315,8 @@ fn joinTypes(type_interner: anytype, left: structures.TypeId, right: structures.
     if (try semantic.canWidenTo(type_interner, left, right)) return right;
     if (try semantic.canWidenTo(type_interner, right, left)) return left;
 
-    const left_members = (try type_interner.variantMembers(left)) orelse &.{left};
-    const right_members = (try type_interner.variantMembers(right)) orelse &.{right};
+    const left_members = (try type_interner.facts().variantMembers(left)) orelse &.{left};
+    const right_members = (try type_interner.facts().variantMembers(right)) orelse &.{right};
     var members: std.ArrayList(structures.TypeId) = .empty;
     defer members.deinit(gpa);
     try members.appendSlice(gpa, left_members);
@@ -3768,7 +6324,7 @@ fn joinTypes(type_interner: anytype, left: structures.TypeId, right: structures.
     for (right_members) |member| {
         if (!containsType(left_members, member)) try members.append(gpa, member);
     }
-    return switch (try type_interner.internVariant(members.items)) {
+    return switch (try type_interner.facts().internVariant(members.items)) {
         .type_id => |type_id| type_id,
         .duplicate => unreachable,
     };
@@ -3794,6 +6350,30 @@ const TestMaterializerContext = struct {
 };
 
 const TestMaterializerTypes = struct {
+    pub fn facts(self: @This()) @This() {
+        return self;
+    }
+
+    pub fn borrowElement(_: @This(), _: structures.TypeId) !?structures.TypeId {
+        return null;
+    }
+
+    pub fn borrowAccess(_: @This(), _: structures.TypeId) !?struct { element_type: structures.TypeId, writable: bool } {
+        return null;
+    }
+
+    pub fn boxElement(_: @This(), _: structures.TypeId) !?structures.TypeId {
+        return null;
+    }
+
+    pub fn allocationElement(_: @This(), _: structures.TypeId) !?structures.TypeId {
+        return null;
+    }
+
+    pub fn canStoreBorrow(_: @This(), _: structures.TypeId) !bool {
+        return false;
+    }
+
     const custom_type = structures.TypeId.fromInterned(@enumFromInt(0));
     const variant_type = structures.TypeId.fromInterned(@enumFromInt(1));
     const second_custom_type = structures.TypeId.fromInterned(@enumFromInt(2));
@@ -3911,8 +6491,8 @@ test "cleanup materializer inserts ordered custom drops at an interior boundary"
     try std.testing.expectEqual(@as(usize, 5), body.instructions.len);
     try std.testing.expectEqual(structures.FunctionInstruction.const_int, std.meta.activeTag(body.instructions[0]));
     try std.testing.expectEqual(structures.FunctionInstruction.const_int, std.meta.activeTag(body.instructions[1]));
-    try std.testing.expectEqual(TestMaterializerTypes.second_custom_drop_hook, body.instructions[2].call.target);
-    try std.testing.expectEqual(TestMaterializerTypes.custom_drop_hook, body.instructions[3].call.target);
+    try std.testing.expectEqual(TestMaterializerTypes.second_custom_drop_hook, body.instructions[2].call.target.direct.item);
+    try std.testing.expectEqual(TestMaterializerTypes.custom_drop_hook, body.instructions[3].call.target.direct.item);
     try std.testing.expectEqual(structures.FunctionInstruction.const_int, std.meta.activeTag(body.instructions[4]));
     try std.testing.expectEqual(@as(structures.FunctionBlockId, @enumFromInt(1)), body.blocks[@intFromEnum(entry)].terminator.branch.target);
     try std.testing.expectEqual(structures.FunctionTerminator.return_unit, body.blocks[1].terminator);
@@ -3952,8 +6532,8 @@ test "cleanup materializer finds boundaries after earlier splits" {
     var body = try builder.finish();
     defer body.deinit(context.gpa);
     try std.testing.expectEqual(@as(usize, 3), body.blocks.len);
-    try std.testing.expectEqual(TestMaterializerTypes.custom_drop_hook, body.instructions[1].call.target);
-    try std.testing.expectEqual(TestMaterializerTypes.second_custom_drop_hook, body.instructions[3].call.target);
+    try std.testing.expectEqual(TestMaterializerTypes.custom_drop_hook, body.instructions[1].call.target.direct.item);
+    try std.testing.expectEqual(TestMaterializerTypes.second_custom_drop_hook, body.instructions[3].call.target.direct.item);
     try std.testing.expectEqual(structures.FunctionTerminator.return_unit, body.blocks[2].terminator);
 }
 
@@ -3984,7 +6564,7 @@ test "cleanup materializer emits produced cleanup at block entry" {
     const target_block = body.blocks[@intFromEnum(target)];
     try std.testing.expectEqual(@as(u32, 1), target_block.argument_end - target_block.argument_start);
     try std.testing.expectEqual(@as(u32, 1), target_block.instruction_end - target_block.instruction_start);
-    try std.testing.expectEqual(TestMaterializerTypes.custom_drop_hook, body.instructions[target_block.instruction_start].call.target);
+    try std.testing.expectEqual(TestMaterializerTypes.custom_drop_hook, body.instructions[target_block.instruction_start].call.target.direct.item);
     const suffix = target_block.terminator.branch.target;
     try std.testing.expectEqual(structures.FunctionTerminator.return_unit, body.blocks[@intFromEnum(suffix)].terminator);
 }
@@ -4034,7 +6614,7 @@ test "cleanup materializer interposes only one predicate edge" {
     try std.testing.expectEqual(@as(u32, 1), forwarded.end - forwarded.start);
     try std.testing.expectEqual(@as(structures.FunctionValueId, @enumFromInt(cleanup_range.argument_start)), body.branch_arguments[forwarded.start].value);
     try std.testing.expectEqual(@as(u32, 1), cleanup_range.instruction_end - cleanup_range.instruction_start);
-    try std.testing.expectEqual(TestMaterializerTypes.custom_drop_hook, body.instructions[cleanup_range.instruction_start].call.target);
+    try std.testing.expectEqual(TestMaterializerTypes.custom_drop_hook, body.instructions[cleanup_range.instruction_start].call.target.direct.item);
 }
 
 test "cleanup materializer forwards fallible success payloads" {
@@ -4049,7 +6629,7 @@ test "cleanup materializer forwards fallible success payloads" {
     const success = try builder.newBlock(0, 1);
     const failure = try builder.newBlock(1, 1);
     builder.terminate(.{ .fallible_call = .{
-        .call = .{ .target = @enumFromInt(3), .arguments = .{ .start = 0, .end = 0 }, .return_type = .int },
+        .call = .{ .target = .{ .direct = .{ .item = @enumFromInt(3) } }, .arguments = .{ .start = 0, .end = 0 }, .return_type = .int },
         .success = success,
         .failure = failure,
     } });
@@ -4106,7 +6686,7 @@ test "cleanup materializer guards conditional ownership" {
     const owned_block = body.blocks[@intFromEnum(predicate.else_branch.target)];
     try std.testing.expectEqual(@as(u32, 0), borrowed_block.instruction_end - borrowed_block.instruction_start);
     try std.testing.expectEqual(@as(u32, 1), owned_block.instruction_end - owned_block.instruction_start);
-    try std.testing.expectEqual(TestMaterializerTypes.custom_drop_hook, body.instructions[owned_block.instruction_start].call.target);
+    try std.testing.expectEqual(TestMaterializerTypes.custom_drop_hook, body.instructions[owned_block.instruction_start].call.target.direct.item);
     try std.testing.expectEqual(borrowed_block.terminator.branch.target, owned_block.terminator.branch.target);
 }
 
@@ -4135,7 +6715,7 @@ test "cleanup materializer rejoins variant cleanup with the suffix" {
     var custom_drop_count: usize = 0;
     var rejoins_suffix = false;
     for (body.instructions) |instruction| {
-        if (instruction == .call and instruction.call.target == TestMaterializerTypes.custom_drop_hook) custom_drop_count += 1;
+        if (instruction == .call and instruction.call.target == .direct and instruction.call.target.direct.item == TestMaterializerTypes.custom_drop_hook) custom_drop_count += 1;
     }
     for (body.blocks) |block_value| switch (block_value.terminator) {
         .branch => |branch| rejoins_suffix = rejoins_suffix or branch.target == suffix,

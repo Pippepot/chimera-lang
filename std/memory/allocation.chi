@@ -3,28 +3,140 @@ pub struct Allocation(T: type)
     count: int
     drop = explicit
 
+    pub fallible allocate_raw(count: int) Allocation(T) -> allocate(T, count)
+    pub func release(deinit self: Allocation(T)) -> deallocate(T, self^)
+    pub func capacity(imm self: Allocation(T)) int -> allocation_count(T, self)
+    pub func unsafe_init(mut self: Allocation(T), index: int, var item: T) -> unsafe_initialize(T, self, index, item^)
+    pub func unsafe_remove(mut self: Allocation(T), index: int) T -> unsafe_take(T, self, index)
+    pub func unsafe_drop(mut self: Allocation(T), index: int) -> unsafe_destroy(T, self, index)
+    pub func unsafe_ref(imm self: Allocation(T), index: int) Ref(T, false) from(self) -> unsafe_borrow_element(T, self, index)
+
 pub extern fallible allocate(static T: type, count: int) Allocation(T)
 pub extern func deallocate(static T: type, deinit allocation: Allocation(T))
+extern func allocation_count(static T: type, imm allocation: Allocation(T)) int
 pub extern func unsafe_initialize(static T: type, mut allocation: Allocation(T), index: int, var item: T)
 pub extern func unsafe_take(static T: type, mut allocation: Allocation(T), index: int) T
+pub extern func unsafe_destroy(static T: type, mut allocation: Allocation(T), index: int)
+pub extern func unsafe_borrow_initialized(static T: type, imm allocation: Allocation(T), index: int) T
 
-pub struct Ref(T: type)
+pub struct Buffer(T: type)
+    move = none
+    storage: Allocation(T)
+    initialized: int
+    drop = func(deinit self: Buffer(T))
+        var index = self.initialized
+        loop
+            if index == 0 -> break
+            index -= 1
+            unsafe_destroy(T, self.storage, index)
+        deallocate(T, self.storage^)
+
+    pub fallible new(reserved: int) Buffer(T)
+        const storage = allocate(T, reserved)
+        return Buffer(T){storage = storage^, initialized = 0}
+
+    pub func len(imm self: Buffer(T)) int -> self.initialized
+    pub func capacity(imm self: Buffer(T)) int -> self.storage.capacity()
+
+    pub fallible get(imm self: Buffer(T), index: int) Ref(T, false)
+        index >= 0
+        index < self.initialized
+        return unsafe_borrow_element(T, self.storage, index)
+
+    pub fallible get_mut(mut self: Buffer(T), index: int) Ref(T, true) from(self)
+        index >= 0
+        index < self.initialized
+        return unsafe_borrow_mut_element(T, self.storage, index)
+
+    pub fallible view(imm self: Buffer(T), start: int, size: int) BufferView(T)
+        start >= 0
+        size >= 0
+        start <= self.initialized
+        size <= self.initialized - start
+        return BufferView(T){backing = borrow_local(Buffer(T), self), start = start, size = size}
+
+    pub fallible reserve(mut self: Buffer(T), minimum_capacity: int)
+        minimum_capacity >= 0
+        if minimum_capacity <= self.capacity() -> return
+        var replacement = allocate(T, minimum_capacity)
+        var index = 0
+        loop
+            if index == self.initialized -> break
+            unsafe_initialize(T, replacement, index, unsafe_take(T, self.storage, index))
+            index += 1
+        const previous = self.storage^
+        self.storage = replacement^
+        deallocate(T, previous^)
+
+    pub fallible append(mut self: Buffer(T), var item: T)
+        const capacity = self.capacity()
+        if self.initialized == capacity
+            capacity < 2147483647
+            var next_capacity = 1
+            if capacity > 0
+                if capacity <= 1073741823 -> next_capacity = capacity * 2
+                else next_capacity = 2147483647
+            self.reserve(next_capacity)
+        unsafe_initialize(T, self.storage, self.initialized, item^)
+        self.initialized += 1
+
+pub struct BufferView(T: type)
+    backing: Ref(Buffer(T), false)
+    start: int
+    size: int
+
+    pub func len(imm self: BufferView(T)) int -> self.size
+
+    pub fallible get(imm self: BufferView(T), index: int) Ref(T, false)
+        index >= 0
+        index < self.size
+        return read(Buffer(T), false, self.backing).get(self.start + index)
+
+pub struct Box(T: type)
     allocation: Allocation(T)
-    drop = func(deinit self: Ref(T))
-        unsafe_destroy_ref(T, self)
-        deallocate_ref(T, self^)
+    drop = func(deinit self: Box(T))
+        unsafe_destroy_box(T, self)
+        deallocate_box(T, self^)
 
-    pub fallible new(var item: T) Ref(T)
+    pub fallible new(var item: T) Box(T)
         var allocation = allocate(T, 1)
         unsafe_initialize(T, allocation, 0, item^)
-        return unsafe_own_ref(T, allocation^)
+        return unsafe_own_box(T, allocation^)
 
-pub func value(static T: type, deinit owner: Ref(T)) T
-    const result = unsafe_take_ref(T, owner)
-    deallocate_ref(T, owner^)
+    pub func borrow(imm self: Box(T)) Ref(T, false) from(self) -> borrow_box(T, self)
+    pub func borrow_mut(mut self: Box(T)) Ref(T, true) from(self) -> borrow_mut_box(T, self)
+    pub fallible duplicate(imm self: Box(T)) Box(T) -> copy_into_box(T, self.borrow()[])
+    pub func into_value(deinit self: Box(T)) T -> value(T, self^)
+
+pub struct Ref(T: type, writable: bool)
+    address_low: int
+    address_high: int
+    copy = trivial
+
+    pub func as_imm(imm self: Ref(T, true)) Ref(T, false) from(self) -> attenuate_ref(T, self)
+    pub func copy(imm self: Ref(T, writable)) T -> read(T, writable, self)
+    pub func replace(imm self: Ref(T, true), var item: T) -> write(T, self, item^)
+
+pub extern func borrow_box(static T: type, imm owner: Box(T)) Ref(T, false)
+pub extern func borrow_mut_box(static T: type, mut owner: Box(T)) Ref(T, true)
+pub extern func borrow_local(static T: type, imm item: T) Ref(T, false)
+pub extern func unsafe_borrow_element(static T: type, imm allocation: Allocation(T), index: int) Ref(T, false)
+extern func unsafe_borrow_mut_element(static T: type, imm allocation: Allocation(T), index: int) Ref(T, true)
+pub extern func read(static T: type, static writable: bool, imm reference: Ref(T, writable)) T
+pub extern func write(static T: type, imm reference: Ref(T, true), var item: T)
+extern func attenuate_ref(static T: type, imm reference: Ref(T, true)) Ref(T, false)
+
+pub fallible duplicate(static T: type, imm item: T) Box(T)
+    return Box(T).new(item)
+
+fallible copy_into_box(static T: type, imm item: T) Box(T) -> duplicate(T, item)
+
+pub func value(static T: type, deinit owner: Box(T)) T
+    const result = unsafe_take_box(T, owner)
+    deallocate_box(T, owner^)
     return result^
 
-extern func unsafe_own_ref(static T: type, deinit allocation: Allocation(T)) Ref(T)
-extern func unsafe_take_ref(static T: type, mut owner: Ref(T)) T
-extern func unsafe_destroy_ref(static T: type, imm owner: Ref(T))
-extern func deallocate_ref(static T: type, deinit owner: Ref(T))
+extern func unsafe_own_box(static T: type, deinit allocation: Allocation(T)) Box(T)
+extern func unsafe_take_box(static T: type, mut owner: Box(T)) T
+extern func unsafe_destroy_box(static T: type, imm owner: Box(T))
+extern func deallocate_box(static T: type, deinit owner: Box(T))

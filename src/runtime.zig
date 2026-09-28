@@ -27,7 +27,7 @@ pub const PreparedProgram = struct {
         self.* = undefined;
     }
 
-    pub fn run(self: PreparedProgram, io: std.Io, args: []const []const u8) !u8 {
+    pub fn run(self: PreparedProgram, io: std.Io, args: []const []const u8) !std.process.Child.Term {
         return runProgram(io, self.allocator, self.path, args);
     }
 };
@@ -85,15 +85,26 @@ test "prepared program keeps its executable across output replacement" {
     var second = try prepareProgram(io, std.testing.allocator, "#!/bin/sh\nexit 42\n");
     defer second.deinit(io);
     defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
-    try std.testing.expectEqual(@as(u8, 41), try first.run(io, &.{}));
-    try std.testing.expectEqual(@as(u8, 42), try second.run(io, &.{}));
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 41 }, try first.run(io, &.{}));
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 42 }, try second.run(io, &.{}));
+}
+
+test "prepared program retains its termination signal" {
+    const io = std.testing.io;
+    var program = try prepareProgram(io, std.testing.allocator, "#!/bin/sh\nkill -TERM $$\n");
+    defer program.deinit(io);
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    try std.testing.expectEqual(std.process.Child.Term{ .signal = .TERM }, try program.run(io, &.{}));
 }
 
 pub fn runProg(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !u8 {
-    return runProgram(io, gpa, "./prog", args);
+    return switch (try runProgram(io, gpa, "./prog", args)) {
+        .exited => |code| code,
+        else => error.ProgramDidNotExitNormally,
+    };
 }
 
-fn runProgram(io: std.Io, gpa: std.mem.Allocator, path: []const u8, args: []const []const u8) !u8 {
+fn runProgram(io: std.Io, gpa: std.mem.Allocator, path: []const u8, args: []const []const u8) !std.process.Child.Term {
     var argv = try std.ArrayList([]const u8).initCapacity(gpa, 1 + args.len);
     defer argv.deinit(gpa);
 
@@ -101,8 +112,5 @@ fn runProgram(io: std.Io, gpa: std.mem.Allocator, path: []const u8, args: []cons
     for (args) |arg| argv.appendAssumeCapacity(arg);
 
     var child = try std.process.spawn(io, .{ .argv = argv.items });
-    return switch (try child.wait(io)) {
-        .exited => |code| code,
-        else => error.ProgramDidNotExitNormally,
-    };
+    return child.wait(io);
 }

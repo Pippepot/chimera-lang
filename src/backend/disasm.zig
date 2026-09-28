@@ -1,67 +1,9 @@
 const std = @import("std");
-
-const Operand = enum { none, i32, u32, u64, rel };
-
-const Pattern = struct {
-    prefix: []const u8,
-    operand: Operand = .none,
-    asm_prefix: []const u8,
-    asm_suffix: []const u8 = "",
-
-    fn length(self: Pattern) usize {
-        return self.prefix.len + @as(usize, switch (self.operand) {
-            .none => 0,
-            .i32, .u32, .rel => 4,
-            .u64 => 8,
-        });
-    }
-};
-
-// Instructions emitted by the x86 backend, including linker padding.
-const patterns = [_]Pattern{
-    .{ .prefix = &.{0xC3}, .asm_prefix = "ret" },
-    .{ .prefix = &.{ 0x31, 0xFF }, .asm_prefix = "xor edi, edi" },
-    .{ .prefix = &.{0x99}, .asm_prefix = "cdq" },
-    .{ .prefix = &.{ 0xF7, 0xF9 }, .asm_prefix = "idiv ecx" },
-    .{ .prefix = &.{ 0xF7, 0xD8 }, .asm_prefix = "neg eax" },
-    .{ .prefix = &.{ 0xFF, 0xD0 }, .asm_prefix = "call rax" },
-    .{ .prefix = &.{ 0x89, 0xC7 }, .asm_prefix = "mov edi, eax" },
-    .{ .prefix = &.{ 0x0F, 0x05 }, .asm_prefix = "syscall" },
-    .{ .prefix = &.{ 0x8B, 0x84, 0x24 }, .operand = .u32, .asm_prefix = "mov eax, [rsp+", .asm_suffix = "]" },
-    .{ .prefix = &.{ 0x89, 0x84, 0x24 }, .operand = .u32, .asm_prefix = "mov [rsp+", .asm_suffix = "], eax" },
-    .{ .prefix = &.{ 0x03, 0x84, 0x24 }, .operand = .u32, .asm_prefix = "add eax, [rsp+", .asm_suffix = "]" },
-    .{ .prefix = &.{ 0x2B, 0x84, 0x24 }, .operand = .u32, .asm_prefix = "sub eax, [rsp+", .asm_suffix = "]" },
-    .{ .prefix = &.{ 0xF7, 0xBC, 0x24 }, .operand = .u32, .asm_prefix = "idiv dword [rsp+", .asm_suffix = "]" },
-    .{ .prefix = &.{ 0x0F, 0xAF, 0x84, 0x24 }, .operand = .u32, .asm_prefix = "imul eax, [rsp+", .asm_suffix = "]" },
-    .{ .prefix = &.{ 0x48, 0x8B, 0x84, 0x24 }, .operand = .u32, .asm_prefix = "mov rax, [rsp+", .asm_suffix = "]" },
-    .{ .prefix = &.{ 0x48, 0x89, 0x84, 0x24 }, .operand = .u32, .asm_prefix = "mov [rsp+", .asm_suffix = "], rax" },
-    .{ .prefix = &.{0xB8}, .operand = .i32, .asm_prefix = "mov eax, " },
-    .{ .prefix = &.{0xB9}, .operand = .i32, .asm_prefix = "mov ecx, " },
-    .{ .prefix = &.{0xBA}, .operand = .i32, .asm_prefix = "mov edx, " },
-    .{ .prefix = &.{ 0x48, 0xB8 }, .operand = .u64, .asm_prefix = "mov rax, " },
-    .{ .prefix = &.{ 0x69, 0xC0 }, .operand = .i32, .asm_prefix = "imul eax, eax, " },
-    .{ .prefix = &.{0x2D}, .operand = .i32, .asm_prefix = "sub eax, " },
-    .{ .prefix = &.{0x05}, .operand = .i32, .asm_prefix = "add eax, " },
-    .{ .prefix = &.{0x3D}, .operand = .i32, .asm_prefix = "cmp eax, " },
-    .{ .prefix = &.{ 0x48, 0x81, 0xEC }, .operand = .u32, .asm_prefix = "sub rsp, " },
-    .{ .prefix = &.{ 0x48, 0x81, 0xC4 }, .operand = .u32, .asm_prefix = "add rsp, " },
-    .{ .prefix = &.{0xE8}, .operand = .rel, .asm_prefix = "call " },
-    .{ .prefix = &.{0xE9}, .operand = .rel, .asm_prefix = "jmp " },
-    .{ .prefix = &.{ 0x0F, 0x84 }, .operand = .rel, .asm_prefix = "je " },
-    .{ .prefix = &.{ 0x0F, 0x85 }, .operand = .rel, .asm_prefix = "jne " },
-    .{ .prefix = &.{ 0x0F, 0x8C }, .operand = .rel, .asm_prefix = "jl " },
-    .{ .prefix = &.{ 0x0F, 0x8F }, .operand = .rel, .asm_prefix = "jg " },
-    .{ .prefix = &.{ 0x0F, 0x8E }, .operand = .rel, .asm_prefix = "jle " },
-    .{ .prefix = &.{ 0x0F, 0x8D }, .operand = .rel, .asm_prefix = "jge " },
-    .{ .prefix = &.{0x90}, .asm_prefix = "nop" },
-    .{ .prefix = &.{ 0x85, 0xD2 }, .asm_prefix = "test edx, edx" },
-    .{ .prefix = &.{ 0x3B, 0x84, 0x24 }, .operand = .u32, .asm_prefix = "cmp eax, [rsp+", .asm_suffix = "]" },
-    .{ .prefix = &.{ 0x0F, 0xB6, 0x84, 0x24 }, .operand = .u32, .asm_prefix = "movzx eax, byte [rsp+", .asm_suffix = "]" },
-    .{ .prefix = &.{ 0x88, 0x84, 0x24 }, .operand = .u32, .asm_prefix = "mov [rsp+", .asm_suffix = "], al" },
-};
+const x86 = @import("x86_encoding.zig");
+const Pattern = x86.Encoding;
 
 fn matchPattern(code: []const u8) ?Pattern {
-    for (patterns) |pat| {
+    for (x86.patterns) |pat| {
         if (code.len < pat.length()) continue;
         if (std.mem.eql(u8, code[0..pat.prefix.len], pat.prefix)) return pat;
     }
@@ -79,16 +21,19 @@ fn collectTargets(code: []const u8, gpa: std.mem.Allocator) !std.AutoHashMap(i64
     var next_label: usize = 0;
     var cursor: usize = 0;
     while (cursor < code.len) {
-        const pat = matchPattern(code[cursor..]) orelse {
-            cursor += 1;
-            continue;
-        };
+        const pat = matchPattern(code[cursor..]) orelse break;
+        try targets.put(@intCast(cursor), std.math.maxInt(usize));
+        cursor += pat.length();
+    }
+    cursor = 0;
+    while (cursor < code.len) {
+        const pat = matchPattern(code[cursor..]) orelse break;
         if (pat.operand == .rel) {
             const target = relativeTarget(code, cursor, pat);
-            if (target >= 0 and target < code.len and !targets.contains(target)) {
-                try targets.put(target, next_label);
+            if (targets.getPtr(target)) |label| if (label.* == std.math.maxInt(usize)) {
+                label.* = next_label;
                 next_label += 1;
-            }
+            };
         }
         cursor += pat.length();
     }
@@ -102,13 +47,12 @@ pub fn disassemble(code: []const u8, gpa: std.mem.Allocator) ![]const u8 {
     defer targets.deinit();
     var cursor: usize = 0;
     while (cursor < code.len) {
-        if (targets.get(@intCast(cursor))) |label_idx| {
+        if (targets.get(@intCast(cursor))) |label_idx| if (label_idx != std.math.maxInt(usize)) {
             try out.print(gpa, "L{d}:\n", .{label_idx});
-        }
+        };
         const pat = matchPattern(code[cursor..]) orelse {
-            try out.print(gpa, "  db 0x{x:0>2}\n", .{code[cursor]});
-            cursor += 1;
-            continue;
+            for (code[cursor..]) |byte| try out.print(gpa, "  db 0x{x:0>2}\n", .{byte});
+            break;
         };
         switch (pat.operand) {
             .none => try out.print(gpa, "  {s}\n", .{pat.asm_prefix}),
@@ -126,8 +70,9 @@ pub fn disassemble(code: []const u8, gpa: std.mem.Allocator) ![]const u8 {
             },
             .rel => {
                 const target = relativeTarget(code, cursor, pat);
-                if (targets.get(target)) |label_idx| {
-                    try out.print(gpa, "  {s}L{d}{s}\n", .{ pat.asm_prefix, label_idx, pat.asm_suffix });
+                const label = targets.get(target) orelse std.math.maxInt(usize);
+                if (label != std.math.maxInt(usize)) {
+                    try out.print(gpa, "  {s}L{d}{s}\n", .{ pat.asm_prefix, label, pat.asm_suffix });
                 } else {
                     try out.print(gpa, "  {s}{d}{s}\n", .{ pat.asm_prefix, target, pat.asm_suffix });
                 }
@@ -166,4 +111,28 @@ test "disassembly decodes stack comparisons byte copies and fallible status" {
         "  cmp eax, [rsp+4]\n  movzx eax, byte [rsp+8]\n  mov [rsp+9], al\n  test edx, edx\n  nop\n",
         rendered,
     );
+}
+
+test "every encoder operation decodes as exactly one instruction" {
+    for (std.meta.tags(x86.Operation)) |operation| {
+        var code: std.ArrayList(u8) = .empty;
+        defer code.deinit(std.testing.allocator);
+        try x86.append(&code, std.testing.allocator, operation, 0xe8e8e8e8e8e8e8e8);
+        const pattern = matchPattern(code.items).?;
+        try std.testing.expectEqual(code.items.len, pattern.length());
+        try std.testing.expectEqualStrings(x86.encoding(operation).asm_prefix, pattern.asm_prefix);
+        const rendered = try disassemble(code.items, std.testing.allocator);
+        defer std.testing.allocator.free(rendered);
+        try std.testing.expect(std.mem.indexOf(u8, rendered, "db ") == null);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, rendered, "\n"));
+    }
+}
+
+test "unknown bytes and instruction interiors do not become branch labels" {
+    const unknown = try disassemble(&.{ 0xff, 0xe8, 0, 0, 0, 0, 0x90 }, std.testing.allocator);
+    defer std.testing.allocator.free(unknown);
+    try std.testing.expect(std.mem.indexOf(u8, unknown, "call") == null);
+    const interior = try disassemble(&.{ 0xe9, 0xfd, 0xff, 0xff, 0xff }, std.testing.allocator);
+    defer std.testing.allocator.free(interior);
+    try std.testing.expectEqualStrings("  jmp 2\n", interior);
 }

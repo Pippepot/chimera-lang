@@ -203,6 +203,7 @@ fn parseBlock(parser: *ParserState) ParseError!Node.Index {
 }
 
 fn parseExpression(parser: *ParserState) ParseError!Node.Index {
+    if (isBorrowBinding(parser)) return try parseBinding(parser);
     return switch (parser.tokens[parser.index].tag) {
         .keyword_comptime => try parseComptime(parser),
         .keyword_const, .keyword_var, .keyword_static => try parseBinding(parser),
@@ -303,9 +304,12 @@ fn parseComptime(parser: *ParserState) !Node.Index {
 }
 
 fn parseBinding(parser: *ParserState) !Node.Index {
-    const binding_keyword = parser.eat(.keyword_const) orelse parser.eat(.keyword_var) orelse parser.eat(.keyword_static) orelse return .null;
+    const borrow_binding = isBorrowBinding(parser);
+    const binding_keyword = parser.eat(.keyword_const) orelse parser.eat(.keyword_var) orelse parser.eat(.keyword_static) orelse
+        (if (borrow_binding) parser.eat(.identifier) else null) orelse return .null;
+    const writable_borrow = borrow_binding and parser.eat(.keyword_mut) != null;
     const name = try parseDeclarationName(parser, binding_keyword.tag == .keyword_static);
-    const type_annotation = try parseTypeAnnotation(parser);
+    const type_annotation = if (borrow_binding) Node.Index.null else try parseTypeAnnotation(parser);
     _ = try parser.expect(.equal);
     const explicit_type_value = if (type_annotation.unwrap()) |annotation| blk: {
         const node = parser.nodes.items[annotation.index()];
@@ -325,11 +329,19 @@ fn parseBinding(parser: *ParserState) !Node.Index {
         .keyword_const => .const_binding,
         .keyword_var => .var_binding,
         .keyword_static => .static_binding,
+        .identifier => if (writable_borrow) .borrow_mut_binding else .borrow_binding,
         else => unreachable,
     };
 
     const binding = try parser.addNode(.{ .tag = tag, .token_index = name.token_index, .data = .{ .node_node = .{ .a = type_annotation, .b = value } } });
     return finishQualifiedDeclaration(parser, name, binding);
+}
+
+fn isBorrowBinding(parser: *ParserState) bool {
+    const token = parser.tokens[parser.index];
+    if (token.tag != .identifier or !std.mem.eql(u8, parser.source[token.loc.start..token.loc.end], "borrow")) return false;
+    const name_index = parser.index + @as(u32, if (parser.tokens[parser.index + 1].tag == .keyword_mut) 2 else 1);
+    return parser.tokens[name_index].tag == .identifier and parser.tokens[name_index + 1].tag == .equal;
 }
 
 fn parseDeclarationName(parser: *ParserState, allow_qualified: bool) !DeclarationName {
@@ -470,7 +482,31 @@ fn parseFuncSignature(parser: *ParserState) !Node.Index {
         .identifier, .keyword_func, .keyword_fallible, .keyword_none => try parseType(parser),
         else => .null,
     };
-    return parser.addNode(.{ .tag = .signature, .token_index = token_index, .data = .{ .node_node = .{ .a = params, .b = return_type } } });
+    var result = return_type;
+    if (return_type != .null and parser.tokens[parser.index].tag == .identifier) {
+        const origin_token = parser.tokens[parser.index];
+        if (std.mem.eql(u8, parser.source[origin_token.loc.start..origin_token.loc.end], "from")) {
+            const origin_token_index = parser.index;
+            parser.index += 1;
+            const origins = try parseCallArgList(parser);
+            result = try parser.addNode(.{ .tag = .return_origins, .token_index = origin_token_index, .data = .{ .node_node = .{ .a = return_type, .b = origins } } });
+        }
+    }
+    const where_token_index = parser.index;
+    const where_start = parser.scratch_stack.items.len;
+    defer parser.scratch_stack.shrinkRetainingCapacity(where_start);
+    while (parser.eat(.keyword_where) != null) {
+        try parser.scratch_stack.append(parser.gpa, try parseExpressionPrecedence(parser, 0));
+    }
+    const clauses = if (where_start == parser.scratch_stack.items.len)
+        Node.Index.null
+    else
+        try addNodeList(parser, where_token_index, parser.scratch_stack.items[where_start..], .where_clauses);
+    return parser.addNode(.{ .tag = .signature, .token_index = token_index, .data = .{ .signature = .{
+        .parameters = params,
+        .return_type = result,
+        .where_clauses = clauses,
+    } } });
 }
 
 fn parseParamList(parser: *ParserState, parameters_are_static: bool) !Node.Index {
@@ -655,6 +691,12 @@ fn parsePostfix(parser: *ParserState) ParseError!Node.Index {
                 lhs = try parser.addNode(.{ .tag = .call, .token_index = token_index, .data = .{ .node_node = .{ .a = lhs, .b = args } } });
             },
             .l_brace => lhs = try parseStructInit(parser, lhs),
+            .l_bracket => {
+                const token_index = parser.index;
+                parser.index += 1;
+                _ = try parser.expect(.r_bracket);
+                lhs = try parser.addNode(.{ .tag = .deref, .token_index = token_index, .data = .{ .node = lhs } });
+            },
             .period => lhs = try parseFieldAccess(parser, lhs),
             .question_mark => lhs = try parsePostfixNode(parser, lhs, .query_op),
             .caret => lhs = try parsePostfixNode(parser, lhs, .move_expr),
@@ -722,7 +764,11 @@ fn parseStruct(parser: *ParserState) ParseError!Node.Index {
         const parameters = try parseParamList(parser, true);
         const value = try parseStructValue(parser, token_index);
         const return_type = try parser.addNode(.{ .tag = .implicit_type, .token_index = token_index, .data = .{ .none = {} } });
-        const signature = try parser.addNode(.{ .tag = .signature, .token_index = token_index, .data = .{ .node_node = .{ .a = parameters, .b = return_type } } });
+        const signature = try parser.addNode(.{ .tag = .signature, .token_index = token_index, .data = .{ .signature = .{
+            .parameters = parameters,
+            .return_type = return_type,
+            .where_clauses = .null,
+        } } });
         const body = try parser.addNode(.{ .tag = .return_expr, .token_index = token_index, .data = .{ .node = value } });
         const function = try parser.addNode(.{ .tag = .func, .token_index = token_index, .data = .{ .node_node = .{ .a = signature, .b = body } } });
         return finishNamedDeclaration(parser, name_token_index, function);
@@ -911,7 +957,7 @@ fn renderNode(gpa: std.mem.Allocator, node_index: Node.Index, ast: *const Ast, s
         },
         .unit_literal => try writer.writeAll(" : ()\n"),
         .implicit_static, .implicit_type => try writer.writeByte('\n'),
-        .break_expr, .return_expr, .loop, .not, .neg, .query_op, .move_expr, .comptime_expr, .sizeof_expr, .field_access, .struct_field, .struct_property, .struct_init_field, .@"pub" => {
+        .break_expr, .return_expr, .loop, .not, .neg, .query_op, .move_expr, .comptime_expr, .sizeof_expr, .field_access, .deref, .struct_field, .struct_property, .struct_init_field, .@"pub" => {
             if (node.tag == .field_access or node.tag == .struct_field or node.tag == .struct_property or node.tag == .struct_init_field) {
                 const loc = ast.tokens[node.token_index].loc;
                 try writer.print(" : {s}", .{source[loc.start..loc.end]});
@@ -919,7 +965,7 @@ fn renderNode(gpa: std.mem.Allocator, node_index: Node.Index, ast: *const Ast, s
             try writer.writeByte('\n');
             try renderNode(gpa, node.data.node, ast, source, writer, seen, new_indent, true, false);
         },
-        .add, .sub, .mul, .div, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .@"and", .@"or", .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .call, .const_binding, .var_binding, .static_binding, .namespace_declaration, .func, .param, .signature, .type_func, .@"if" => {
+        .add, .sub, .mul, .div, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .@"and", .@"or", .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .call, .const_binding, .var_binding, .borrow_binding, .borrow_mut_binding, .static_binding, .namespace_declaration, .func, .param, .return_origins, .type_func, .@"if" => {
             if (node.tag == .param) {
                 const loc = ast.tokens[node.token_index].loc;
                 try writer.print(" : {s}", .{source[loc.start..loc.end]});
@@ -933,7 +979,15 @@ fn renderNode(gpa: std.mem.Allocator, node_index: Node.Index, ast: *const Ast, s
                 try renderNode(gpa, b, ast, source, writer, seen, new_indent, true, false);
             }
         },
-        .block, .call_arg_list, .param_list, .type_list, .type_variant, .if_else, .@"struct", .struct_init, .import, .selective_import => {
+        .signature => {
+            try writer.writeByte('\n');
+            const parts = node.data.signature;
+            const last = if (parts.where_clauses != .null) parts.where_clauses else parts.return_type;
+            if (parts.parameters.unwrap()) |parameters| try renderNode(gpa, parameters, ast, source, writer, seen, new_indent, last == .null, false);
+            if (parts.return_type.unwrap()) |result| try renderNode(gpa, result, ast, source, writer, seen, new_indent, result == last, false);
+            if (parts.where_clauses.unwrap()) |clauses| try renderNode(gpa, clauses, ast, source, writer, seen, new_indent, true, false);
+        },
+        .block, .call_arg_list, .param_list, .type_list, .type_variant, .where_clauses, .if_else, .@"struct", .struct_init, .import, .selective_import => {
             try writer.writeByte('\n');
             for (node.data.ref.start..node.data.ref.end) |i| {
                 try renderNode(gpa, ast.node_refs[i], ast, source, writer, seen, new_indent, i == node.data.ref.end - 1, false);
@@ -1241,7 +1295,7 @@ test "parse direct calls in type positions" {
     const binding = ast.nodes[ast.node_refs[ast.nodes[0].data.ref.start].index()];
     const function = ast.nodes[binding.data.node_node.b.index()];
     const signature = ast.nodes[function.data.node_node.a.index()];
-    const parameters = ast.nodes[signature.data.node_node.a.index()];
+    const parameters = ast.nodes[signature.data.signature.parameters.index()];
     const parameter = ast.nodes[ast.node_refs[parameters.data.ref.start].index()];
     const call = ast.nodes[parameter.data.node_node.b.index()];
     try std.testing.expectEqual(Node.Tag.call, call.tag);
@@ -1257,12 +1311,12 @@ test "parse qualified types and factory calls" {
     const binding = ast.nodes[ast.node_refs[ast.nodes[0].data.ref.start].index()];
     const function = ast.nodes[binding.data.node_node.b.index()];
     const signature = ast.nodes[function.data.node_node.a.index()];
-    const parameters = ast.nodes[signature.data.node_node.a.index()];
+    const parameters = ast.nodes[signature.data.signature.parameters.index()];
     const parameter = ast.nodes[ast.node_refs[parameters.data.ref.start].index()];
     const call = ast.nodes[parameter.data.node_node.b.index()];
     try std.testing.expectEqual(Node.Tag.call, call.tag);
     try std.testing.expectEqual(Node.Tag.field_access, ast.nodes[call.data.node_node.a.index()].tag);
-    try std.testing.expectEqual(Node.Tag.field_access, ast.nodes[signature.data.node_node.b.index()].tag);
+    try std.testing.expectEqual(Node.Tag.field_access, ast.nodes[signature.data.signature.return_type.index()].tag);
 }
 
 test "parse struct declaration" {

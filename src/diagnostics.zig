@@ -380,6 +380,7 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
         .compile_time_unhandled_failure => try writer.writeAll("compile-time expression failed without handling the failure"),
         .compile_time_division_by_zero => try writer.writeAll("division by zero during compile-time execution"),
         .compile_time_integer_overflow => try writer.writeAll("integer overflow during compile-time execution"),
+        .compile_time_unsupported_operation => try writer.writeAll("operation is not supported during compile-time execution"),
         .compile_time_call_trace => try writer.writeAll("called at compile time from here"),
         .unsupported_external_declaration => try writer.writeAll("external function has no compiler-provided implementation"),
         .invalid_external_signature => try writer.writeAll("external function signature does not match its compiler-provided implementation"),
@@ -434,6 +435,7 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
         .comptime_runtime_capture => try writer.writeAll("compile-time expressions cannot capture runtime locals"),
         .static_argument_not_supported => try writer.writeAll("this static argument is not supported yet"),
         .static_argument_type_mismatch => try writer.writeAll("static argument does not match the parameter type"),
+        .where_condition_failed => try writer.writeAll("function specialization does not satisfy this where condition"),
         .duplicate_parameter => {
             try writeSourceLabel(writer, "parameter name is already declared", source, span);
         },
@@ -453,13 +455,26 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
         .private_access => try writeSourceLabel(writer, "declaration is not public", source, span),
         .import_conflict => try writeSourceLabel(writer, "imported name is already declared", source, span),
         .nested_declaration_not_supported => try writer.writeAll("nested declarations are not supported yet; move this declaration to the top level"),
-        .ownership_transfer_requires_place => try writer.writeAll("`^` can only transfer a whole local binding"),
+        .ownership_transfer_requires_place => try writer.writeAll("`^` can only transfer a local binding or one of its fields"),
         .ownership_transfer_requires_owned_place => try writer.writeAll("cannot transfer this borrowed value; ownership remains with the caller"),
+        .partial_field_transfer_not_supported => try writer.writeAll("cannot transfer or join these fields independently under the current ownership rules"),
+        .explicit_drop_field_cannot_be_implicitly_ended => try writer.writeAll("cannot implicitly end an explicit-drop field; transfer or dispose of it on every path"),
+        .field_not_restored_before_mut_return => try writer.writeAll("a `mut` argument must have every transferred field restored before returning"),
         .ownership_transfer_requires_owning_context => try writer.writeAll("remove `^`: this use borrows the value instead of taking ownership"),
         .mutable_argument_requires_place, .mutable_argument_requires_mutable_place => try writer.writeAll("argument to a `mut` parameter must be a mutable local or one of its fields"),
         .overlapping_mutable_arguments => try writer.writeAll("this `mut` argument accesses the same value as another argument in the call"),
         .use_after_transfer => try writer.writeAll("cannot use this value after it was transferred with `^`"),
         .possibly_transferred => try writer.writeAll("cannot use this value because it may already have been transferred with `^`"),
+        .borrow_outlives_source => try writer.writeAll("borrow cannot outlive the value or storage it references"),
+        .invalid_return_origin => try writer.writeAll("return origin contract must name distinct runtime parameters"),
+        .return_origin_not_declared => try writer.writeAll("returned borrow has an origin not named in its contract"),
+        .borrow_requires_place => try writer.writeAll("borrowing a value's storage requires a named local or parameter, or one of its fields"),
+        .mutable_borrow_requires_writable_place => try writer.writeAll("`borrow mut` requires a mutable place or writable Ref"),
+        .dereference_requires_ref => |type_id| {
+            try writer.writeAll("dereference requires a Ref, found ");
+            try writeType(types, writer, type_id);
+        },
+        .reference_not_writable => try writer.writeAll("cannot assign through a read-only Ref"),
         .transferred_value_not_restored_before_loop_backedge => try writer.writeAll("transferred value must be reassigned before the next loop iteration"),
         .type_not_movable => |type_id| {
             try writer.writeAll("cannot transfer value of immovable type ");
@@ -470,20 +485,45 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
             try writeType(types, writer, details.type_id);
             if (details.is_movable) try writer.writeAll("; use `^` to transfer ownership");
         },
-        .ref_requires_automatic_drop => |type_id| {
-            try writer.writeAll("Ref requires an automatically droppable element type; found ");
+        .buffer_cannot_store_borrow_element => |type_id| {
+            try writer.writeAll("Buffer cannot store values containing Ref yet; element type is ");
             try writeType(types, writer, type_id);
         },
-        .ref_requires_struct_initializer => |type_id| {
-            try writer.writeAll("in-place Ref construction requires a direct struct initializer for ");
+        .buffer_requires_automatic_drop => |type_id| {
+            try writer.writeAll("Buffer requires an automatically droppable element type; found ");
             try writeType(types, writer, type_id);
         },
-        .ref_field_requires_direct_move => |type_id| {
-            try writer.writeAll("in-place Ref initialization requires a directly movable field; found ");
+        .buffer_requires_direct_move => |type_id| {
+            try writer.writeAll("Buffer requires a directly movable element type for relocation; found ");
             try writeType(types, writer, type_id);
         },
-        .ref_extraction_requires_direct_move => |type_id| {
-            try writer.writeAll("cannot extract a non-directly-movable value from Ref; found ");
+        .borrow_write_cannot_store_borrow => |type_id| {
+            try writer.writeAll("write cannot replace a value containing Ref yet; pointee type is ");
+            try writeType(types, writer, type_id);
+        },
+        .borrow_write_requires_automatic_drop => |type_id| {
+            try writer.writeAll("write requires an automatically droppable pointee type; found ");
+            try writeType(types, writer, type_id);
+        },
+        .borrow_write_requires_direct_move => |type_id| {
+            try writer.writeAll("write requires a directly movable pointee type; found ");
+            try writeType(types, writer, type_id);
+        },
+        .box_requires_automatic_drop => |type_id| {
+            try writer.writeAll("Box requires an automatically droppable element type; found ");
+            try writeType(types, writer, type_id);
+        },
+        .box_requires_struct_initializer => |type_id| {
+            try writer.writeAll("cannot move an existing value of type ");
+            try writeType(types, writer, type_id);
+            try writer.writeAll(" into Box; use a direct initializer or producer call");
+        },
+        .box_field_requires_direct_move => |type_id| {
+            try writer.writeAll("in-place Box initialization requires a directly movable field; found ");
+            try writeType(types, writer, type_id);
+        },
+        .box_extraction_requires_direct_move => |type_id| {
+            try writer.writeAll("cannot extract a non-directly-movable value from Box; found ");
             try writeType(types, writer, type_id);
         },
         .value_requires_explicit_drop => |type_id| {
@@ -536,6 +576,7 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
         .integer_literal_out_of_range => try writer.writeAll("integer literal is outside the supported i32 range"),
         .fallible_condition_not_supported => try writer.writeAll("this condition syntax is not supported yet"),
         .if_condition_not_fallible => try writer.writeAll("condition must be able to fail, such as a comparison; plain values are not supported as conditions"),
+        .box_conditional_condition_not_supported => try writer.writeAll("conditional Box construction cannot be used directly as an `if` condition yet"),
         .inspection_type_not_supported => try writer.writeAll("this inspection type is not supported yet"),
         .variant_inspection_operand_not_variant => |found| {
             try writer.writeAll("variant inspection requires a variant value, found ");

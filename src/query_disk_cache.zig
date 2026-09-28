@@ -5,7 +5,7 @@ const query = @import("query/engine.zig");
 const queries = @import("queries.zig");
 const structures = @import("structures.zig");
 
-const format = "CHIQRY04";
+const format = "CHIQRY08";
 const max_records = 1_000_000;
 
 pub fn save(io: std.Io, allocator: std.mem.Allocator, directory: []const u8, key: cache.Key, db: *query.Database) !void {
@@ -13,7 +13,6 @@ pub fn save(io: std.Io, allocator: std.mem.Allocator, directory: []const u8, key
     defer writer.deinit();
     try writer.bytes.appendSlice(allocator, format);
     try db.writeInternedValues(&writer);
-    try db.writeCompletedQueries(queries.AnalyzeFunctionBody, &writer);
     try db.writeCompletedQueries(queries.AnalyzeFunctionInstance, &writer);
     try db.writeCompletedQueries(queries.CompileFunction, &writer);
     try cache.save(io, allocator, directory, key, writer.bytes.items);
@@ -64,8 +63,7 @@ fn restoreIntern(comptime I: type, db: *query.Database, reader: *codec.Reader, i
 pub fn restoreQueries(db: *query.Database, payload: []const u8, offset: usize) !usize {
     if (offset > payload.len) return error.InvalidCache;
     var reader: codec.Reader = .{ .allocator = db.allocator, .bytes = payload, .offset = offset };
-    var imported = try restoreQuery(queries.AnalyzeFunctionBody, db, &reader);
-    imported += try restoreQuery(queries.AnalyzeFunctionInstance, db, &reader);
+    var imported = try restoreQuery(queries.AnalyzeFunctionInstance, db, &reader);
     imported += try restoreQuery(queries.CompileFunction, db, &reader);
     if (!reader.finished()) return error.InvalidCache;
     return imported;
@@ -87,7 +85,7 @@ fn restoreQuery(comptime Q: type, db: *query.Database, reader: *codec.Reader) !u
         defer query_deps.deinit(reader.allocator);
         var valid = try validateIds(Q.Input, db, input) and
             try validateIds(Q.Output, db, output) and
-            validOutput(Q, output);
+            try validOutput(Q, db, output);
         for (0..dep_count) |_| {
             const name = try reader.read([]const u8);
             defer reader.allocator.free(name);
@@ -125,8 +123,6 @@ fn restoreQuery(comptime Q: type, db: *query.Database, reader: *codec.Reader) !u
                 try restoreQueryDependency(queries.FunctionSignature, db, reader, valid)
             else if (std.mem.eql(u8, name, @typeName(queries.FunctionInstanceSignature)))
                 try restoreQueryDependency(queries.FunctionInstanceSignature, db, reader, valid)
-            else if (std.mem.eql(u8, name, @typeName(queries.AnalyzeFunctionBody)))
-                try restoreQueryDependency(queries.AnalyzeFunctionBody, db, reader, valid)
             else if (std.mem.eql(u8, name, @typeName(queries.AnalyzeFunctionInstance)))
                 try restoreQueryDependency(queries.AnalyzeFunctionInstance, db, reader, valid)
             else
@@ -206,9 +202,56 @@ fn validateIds(comptime T: type, db: *query.Database, value: T) !bool {
     };
 }
 
-fn validOutput(comptime Q: type, output: Q.Output) bool {
+fn validOutput(comptime Q: type, db: *query.Database, output: Q.Output) !bool {
     if (Q == queries.CompileFunction) return validCompiledFunction(output.?);
-    return validFunctionBody(output.?);
+    if (!validFunctionBody(output.?)) return false;
+    return validReferenceOperations(db, output.?) catch |err| switch (err) {
+        error.Unavailable => false,
+        else => return err,
+    };
+}
+
+fn validReferenceOperations(db: *query.Database, body: structures.FunctionBodyAnalysis) !bool {
+    const types: queries.TypeFacts(*query.Database) = .{ .ctx = db };
+    for (body.instructions) |instruction| {
+        if (instruction == .borrow_address) {
+            if (!try validBorrowFields(types, body, instruction.borrow_address)) return false;
+            continue;
+        }
+        if (instruction == .storage_projection and !try validStorageProjection(types, body, instruction.storage_projection)) return false;
+    }
+    return true;
+}
+
+fn validBorrowFields(types: anytype, body: structures.FunctionBodyAnalysis, operation: structures.BorrowAddressOperation) !bool {
+    const source_index = @intFromEnum(operation.source);
+    var type_id = if (source_index < body.block_argument_types.len)
+        body.block_argument_types[source_index]
+    else
+        body.instructions[source_index - body.block_argument_types.len].resultType();
+    if (operation.base_is_reference) type_id = (try types.borrowElement(type_id)) orelse return false;
+    for (body.borrow_fields[operation.fields.start..operation.fields.end]) |field_index| {
+        const definition = (try types.structDefinition(type_id)) orelse return false;
+        if (field_index >= definition.fields.len) return false;
+        type_id = definition.fields[field_index].type_id;
+    }
+    return type_id == ((try types.borrowElement(operation.type_id)) orelse return false);
+}
+
+fn validStorageProjection(types: anytype, body: structures.FunctionBodyAnalysis, operation: structures.StorageProjection) !bool {
+    const index = @intFromEnum(operation.owner);
+    const type_id = if (index < body.block_argument_types.len) body.block_argument_types[index] else body.instructions[index - body.block_argument_types.len].resultType();
+    switch (operation.projection) {
+        .dereference => return true,
+        .field => |field| {
+            const definition = (try types.structDefinition(type_id)) orelse return false;
+            return field < definition.fields.len and definition.fields[field].type_id == operation.type_id;
+        },
+        .variant => {
+            const members = (try types.variantMembers(type_id)) orelse return false;
+            return std.mem.indexOfScalar(structures.TypeId, members, operation.type_id) != null;
+        },
+    }
 }
 
 fn validRange(range: structures.FunctionValueRange, length: usize) bool {
@@ -228,10 +271,6 @@ fn validCall(call: structures.FunctionCall, body: structures.FunctionBodyAnalysi
     return validRange(call.arguments, body.call_arguments.len);
 }
 
-fn validIndirectCall(call: structures.IndirectFunctionCall, body: structures.FunctionBodyAnalysis) bool {
-    return validValue(call.target, body) and validRange(call.arguments, body.call_arguments.len);
-}
-
 fn validBranch(branch: structures.FunctionBranch, body: structures.FunctionBodyAnalysis) bool {
     if (@intFromEnum(branch.target) >= body.blocks.len or !validRange(branch.arguments, body.branch_arguments.len)) return false;
     const target = body.blocks[@intFromEnum(branch.target)];
@@ -240,12 +279,7 @@ fn validBranch(branch: structures.FunctionBranch, body: structures.FunctionBodyA
 }
 
 fn validVariantOperation(operation: structures.VariantOperation, body: structures.FunctionBodyAnalysis) bool {
-    return validValue(operation.operand, body) and
-        (operation.tag_mapping == null or validRange(operation.tag_mapping.?, body.variant_coercion_tags.len));
-}
-
-fn validOperands(operands: structures.BinaryOperands, body: structures.FunctionBodyAnalysis) bool {
-    return validValue(operands.lhs, body) and validValue(operands.rhs, body);
+    return operation.tag_mapping == null or validRange(operation.tag_mapping.?, body.variant_coercion_tags.len);
 }
 
 fn validFunctionBody(body: structures.FunctionBodyAnalysis) bool {
@@ -258,35 +292,38 @@ fn validFunctionBody(body: structures.FunctionBodyAnalysis) bool {
     for (body.call_arguments) |use| if (!validUse(use, body)) return false;
     const entry = body.blocks[@intFromEnum(body.entry)];
     if (entry.argument_start > entry.argument_end or entry.argument_end > body.block_argument_types.len) return false;
-    for (body.instructions) |instruction| {
+    for (body.instructions) |original| {
+        var instruction = original;
+        for (instruction.operands()) |operand| if (operand) |value| {
+            if (!validValue(value.*, body)) return false;
+        };
         const valid = switch (instruction) {
-            .const_int, .const_byte, .const_bool, .const_type, .const_unit, .const_none, .function_ref => true,
-            .variant_tag, .negi => |value| validValue(value, body),
             .variant_coerce, .variant_extract, .callable_coerce => |operation| validVariantOperation(operation, body),
             .struct_init => |operation| validRange(operation.fields, body.struct_field_values.len),
-            .ref_init => |operation| validValue(operation.allocation, body) and validRange(operation.fields, body.struct_field_values.len),
-            .ref_value_for_drop => |operation| validValue(operation.owner, body),
-            .field_access => |operation| validValue(operation.operand, body),
-            .field_update => |operation| validValue(operation.operand, body) and validValue(operation.value, body),
-            .mut_parameter_write => |operation| validValue(operation.value, body) and
-                operation.parameter_index < entry.argument_end - entry.argument_start,
+            .borrow_address => |operation| validRange(operation.fields, body.borrow_fields.len),
+            .mut_parameter_write => |operation| operation.parameter_index < entry.argument_end - entry.argument_start,
             .call_mut_argument => |operation| validRange(operation.arguments, body.call_arguments.len) and
                 operation.argument_index < operation.arguments.end - operation.arguments.start,
             .call => |call| validCall(call, body),
-            .indirect_call => |call| validIndirectCall(call, body),
-            .addi, .subi, .muli, .divsi => |operands| validOperands(operands, body),
+            else => true,
         };
         if (!valid) return false;
     }
     for (body.blocks) |block| {
         if (block.argument_start > block.argument_end or block.argument_end > body.block_argument_types.len or
             block.instruction_start > block.instruction_end or block.instruction_end > body.instructions.len) return false;
+        var terminator = block.terminator;
+        for (terminator.operands()) |operand| if (operand) |value| {
+            if (!validValue(value.*, body)) return false;
+        };
+        for (terminator.successors()) |successor| if (successor) |target| {
+            if (@intFromEnum(target.*) >= body.blocks.len) return false;
+        };
         const valid = switch (block.terminator) {
             .branch => |branch| validBranch(branch, body),
-            .predicate_branch => |branch| validOperands(branch.operands, body) and
-                validBranch(branch.then_branch, body) and validBranch(branch.else_branch, body),
-            .fallible_call => |branch| validCall(branch.call, body) and validFallibleTargets(branch.success, branch.failure, body),
-            .fallible_indirect_call => |branch| validIndirectCall(branch.call, body) and validFallibleTargets(branch.success, branch.failure, body),
+            .predicate_branch => |branch| validBranch(branch.then_branch, body) and validBranch(branch.else_branch, body),
+            .fallible_call => |branch| validCall(branch.call, body) and
+                validFallibleTargets(branch.success, branch.failure, body),
             .return_value => |use| validUse(use, body),
             .return_failure => body.is_fallible,
             .return_unit, .diverge => true,
@@ -394,6 +431,67 @@ test "cached body validation rejects invalid control flow and argument indexes" 
     try std.testing.expect(!validFunctionBody(body));
     body.is_fallible = true;
     try std.testing.expect(validFunctionBody(body));
+
+    instructions[0] = .{ .storage_projection = .{
+        .owner = @enumFromInt(0),
+        .projection = .{ .field = 7 },
+        .type_id = .int,
+    } };
+    body.instructions = &instructions;
+    blocks[0].instruction_end = 1;
+    blocks[0].terminator = .return_unit;
+    try std.testing.expect(validFunctionBody(body));
+    const db = try query.Database.init(std.testing.allocator, .{ .worker_count = 1 });
+    defer db.deinit();
+    try std.testing.expect(!(try validReferenceOperations(db, body)));
+
+    const modules = @import("modules.zig");
+    try modules.registerSources(db, std.testing.allocator,
+        \\struct Pair
+        \\  value: int
+        \\static IntRef = Ref(int, false)
+        \\exit(42)
+    , &.{}, &.{});
+    const module = try db.intern(queries.ModulePaths, .{ .path = "" });
+    const pair = (try db.get(queries.ModuleDeclarations, module)).*.?.resolveStatic("Pair").?;
+    const pair_type = structures.TypeId.fromInterned(try db.intern(queries.Types, .{ .structure = .{ .declared = pair } }));
+    argument_types[0] = pair_type;
+    instructions[0].storage_projection.projection = .{ .field = 0 };
+    try std.testing.expect(try validReferenceOperations(db, body));
+    instructions[0].storage_projection.projection = .{ .field = 7 };
+    try std.testing.expect(!(try validReferenceOperations(db, body)));
+
+    const variant_type = structures.TypeId.fromInterned(try db.intern(queries.Types, .{ .variant = .{ .members = &.{ .int, .byte } } }));
+    argument_types[0] = variant_type;
+    instructions[0].storage_projection.projection = .variant;
+    try std.testing.expect(try validReferenceOperations(db, body));
+    instructions[0].storage_projection.type_id = .bool;
+    try std.testing.expect(!(try validReferenceOperations(db, body)));
+
+    instructions[0] = .{ .value_copy = .{ .source = @enumFromInt(0), .type_id = variant_type, .destination = @enumFromInt(999) } };
+    try std.testing.expect(!validFunctionBody(body));
+
+    const reference_item = (try db.get(queries.ModuleDeclarations, module)).*.?.resolveStatic("IntRef").?;
+    const reference_value = (try db.get(queries.ResolveStatic, reference_item)).*.?;
+    const reference_type = (try db.lookupInterned(queries.CompileTimeValues, reference_value)).type;
+    var path = [_]u32{0};
+    body.borrow_fields = &path;
+    argument_types[0] = pair_type;
+    instructions[0] = .{ .borrow_address = .{
+        .source = @enumFromInt(0),
+        .type_id = reference_type,
+        .fields = .{ .start = 0, .end = 1 },
+    } };
+    try std.testing.expect(validFunctionBody(body));
+    try std.testing.expect(try validReferenceOperations(db, body));
+    path[0] = 1;
+    try std.testing.expect(!(try validReferenceOperations(db, body)));
+    path[0] = 0;
+    instructions[0].borrow_address.fields.end = 2;
+    try std.testing.expect(!validFunctionBody(body));
+    instructions[0].borrow_address.fields.end = 1;
+    instructions[0].borrow_address.type_id = .int;
+    try std.testing.expect(!(try validReferenceOperations(db, body)));
 }
 
 test "typed bodies and code survive an edit to another file" {
@@ -458,6 +556,113 @@ test "typed bodies and code survive an edit to another file" {
     const fourth_offset = try restoreInterns(fourth, allocator, payload[0 .. payload.len - 1]);
     try modules.registerSources(fourth, allocator, "exit(a() + b())", &source_files, &.{""});
     try std.testing.expectError(error.InvalidCache, restoreQueries(fourth, payload[0 .. payload.len - 1], fourth_offset));
+}
+
+test "Box and Ref alias bodies restore and invalidate after a binding edit" {
+    const modules = @import("modules.zig");
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const initial_source =
+        \\fallible run() int
+        \\  var owner = Box.new(17)
+        \\  borrow item = owner.borrow()[]
+        \\  return item
+        \\if const result = run() -> exit(result) else exit(1)
+    ;
+    const edited_source =
+        \\fallible run() int
+        \\  var owner = Box.new(17)
+        \\  borrow mut item = owner.borrow_mut()[]
+        \\  item = 42
+        \\  return item
+        \\if const result = run() -> exit(result) else exit(1)
+    ;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(directory);
+    const digest = cache.querySnapshotKey(try cache.compilerDigest(io), "main.chi", &.{});
+
+    const first = try query.Database.init(allocator, .{ .worker_count = 2 });
+    defer first.deinit();
+    try modules.registerSources(first, allocator, initial_source, &.{}, &.{});
+    const original = (try first.get(queries.BuildExecutable, 0)).* orelse return error.TestUnexpectedResult;
+    const run = (try first.get(queries.BuildModuleScope, 0)).*.?.resolveFunction("run").?;
+    const original_body = (try first.get(queries.AnalyzeFunctionInstance, .{ .item = run })).*.?;
+    try save(io, allocator, directory, digest, first);
+    const payload = (try cache.load(io, allocator, directory, digest)) orelse return error.TestUnexpectedResult;
+    defer allocator.free(payload);
+
+    const second = try query.Database.init(allocator, .{ .worker_count = 2 });
+    defer second.deinit();
+    const offset = try restoreInterns(second, allocator, payload);
+    try modules.registerSources(second, allocator, initial_source, &.{}, &.{});
+    const imported = try restoreQueries(second, payload, offset);
+    try std.testing.expect(imported > 0);
+    const restored_run = (try second.get(queries.BuildModuleScope, 0)).*.?.resolveFunction("run").?;
+    const restored_body = (try second.get(queries.AnalyzeFunctionInstance, .{ .item = restored_run })).*.?;
+    try std.testing.expect(structures.FunctionBodyAnalysis.eql(original_body, restored_body));
+    const restored = (try second.get(queries.BuildExecutable, 0)).* orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, original.bytes, restored.bytes);
+
+    const third = try query.Database.init(allocator, .{ .worker_count = 2 });
+    defer third.deinit();
+    const third_offset = try restoreInterns(third, allocator, payload);
+    try modules.registerSources(third, allocator, edited_source, &.{}, &.{});
+    const reused = try restoreQueries(third, payload, third_offset);
+    try std.testing.expect(reused < imported);
+    const edited_run = (try third.get(queries.BuildModuleScope, 0)).*.?.resolveFunction("run").?;
+    const edited_body = (try third.get(queries.AnalyzeFunctionInstance, .{ .item = edited_run })).*.?;
+    var wrote_referent = false;
+    for (edited_body.instructions) |instruction| if (instruction == .borrow_write) {
+        wrote_referent = true;
+    };
+    try std.testing.expect(wrote_referent);
+    const edited = (try third.get(queries.BuildExecutable, 0)).* orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!std.mem.eql(u8, original.bytes, edited.bytes));
+}
+
+test "in-place Box initializer bodies restore from disk" {
+    const modules = @import("modules.zig");
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const source =
+        \\struct Immovable
+        \\  move = none
+        \\  value: int
+        \\fallible run() unit
+        \\  const owner = Box.new(Immovable{value = 42})
+        \\  _ = owner
+        \\if run() -> exit(42) else exit(1)
+    ;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(directory);
+    const digest = cache.querySnapshotKey(try cache.compilerDigest(io), "main.chi", &.{});
+
+    const first = try query.Database.init(allocator, .{ .worker_count = 2 });
+    defer first.deinit();
+    try modules.registerSources(first, allocator, source, &.{}, &.{});
+    const original = (try first.get(queries.BuildExecutable, 0)).* orelse return error.TestUnexpectedResult;
+    try save(io, allocator, directory, digest, first);
+    const payload = (try cache.load(io, allocator, directory, digest)) orelse return error.TestUnexpectedResult;
+    defer allocator.free(payload);
+
+    const second = try query.Database.init(allocator, .{ .worker_count = 2 });
+    defer second.deinit();
+    const offset = try restoreInterns(second, allocator, payload);
+    try modules.registerSources(second, allocator, source, &.{}, &.{});
+    try std.testing.expect((try restoreQueries(second, payload, offset)) > 0);
+    const run = (try second.get(queries.BuildModuleScope, 0)).*.?.resolveFunction("run").?;
+    const body = (try second.get(queries.AnalyzeFunctionInstance, .{ .item = run })).*.?;
+    var has_in_place_fields = false;
+    for (body.instructions) |instruction| if (instruction == .value_copy and instruction.value_copy.destination != null) {
+        has_in_place_fields = true;
+    };
+    try std.testing.expect(has_in_place_fields);
+    const restored = (try second.get(queries.BuildExecutable, 0)).* orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, original.bytes, restored.bytes);
 }
 
 test "invalid machine-code cache shapes are rejected" {

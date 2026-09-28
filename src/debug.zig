@@ -28,10 +28,7 @@ pub fn renderReachableSsa(
 
     try writer.writeAll("SSA\n");
     for (reachable.instances) |instance| {
-        const body = if (instance.specialization == null)
-            (try db.get(queries.AnalyzeFunctionBody, instance.item)).*
-        else
-            (try db.get(queries.AnalyzeFunctionInstance, instance)).*;
+        const body = (try db.get(queries.AnalyzeFunctionInstance, instance)).*;
         if (body == null) continue;
         try renderFunctionSource(db, instance, sources, writer);
         try renderSsaFunction(db, instance, &body.?, writer);
@@ -103,18 +100,14 @@ fn renderSsaFunction(
                 try writer.writeByte('\n');
             },
             .fallible_call => |fallible| {
-                const target = try db.lookupInterned(queries.ItemLocations, fallible.call.target);
-                try writer.print("    fcall @{s} -> b{d}, b{d}\n", .{
-                    target.name,
+                try writer.writeAll("    fcall ");
+                try renderCallTarget(db, fallible.call.target, writer);
+                if (fallible.call.destination) |storage| try writer.print(" into %{d}", .{@intFromEnum(storage)});
+                try writer.print(" -> b{d}, b{d}\n", .{
                     @intFromEnum(fallible.success),
                     @intFromEnum(fallible.failure),
                 });
             },
-            .fallible_indirect_call => |fallible| try writer.print("    fcall %{d} -> b{d}, b{d}\n", .{
-                @intFromEnum(fallible.call.target),
-                @intFromEnum(fallible.success),
-                @intFromEnum(fallible.failure),
-            }),
             .return_unit => try writer.writeAll("    ret\n"),
             .return_value => |value| {
                 try writer.writeAll("    ret ");
@@ -169,6 +162,7 @@ fn renderInstruction(
         .variant_coerce => |coercion| {
             try writer.print("    %{d} = variant_coerce %{d} to ", .{ result, @intFromEnum(coercion.operand) });
             try renderType(coercion.target_type, writer);
+            if (coercion.destination) |storage| try writer.print(" into %{d}", .{@intFromEnum(storage)});
             try writer.writeByte('\n');
         },
         .variant_extract => |extraction| {
@@ -187,20 +181,43 @@ fn renderInstruction(
             }
             try writer.writeAll(")\n");
         },
-        .ref_init => |operation| {
-            try writer.print("    %{d} = ref_init %{d} ", .{ result, @intFromEnum(operation.allocation) });
-            try renderType(operation.type_id, writer);
-            try writer.writeByte('(');
-            for (ssa.struct_field_values[operation.fields.start..operation.fields.end], 0..) |field, index| {
-                if (index != 0) try writer.writeAll(", ");
-                try writer.print("{d} = %{d}", .{ field.field_index, @intFromEnum(field.value) });
-            }
-            try writer.writeAll(")\n");
+        .box_init => |operation| {
+            try writer.print("    %{d} = box_init %{d} ", .{ result, @intFromEnum(operation.allocation) });
+            try renderType(operation.box_type, writer);
+            try writer.writeByte('\n');
         },
-        .ref_value_for_drop => |operation| try writer.print("    %{d} = ref_value_for_drop %{d}\n", .{
+        .storage_projection => |operation| {
+            try writer.print("    %{d} = storage_projection %{d}", .{ result, @intFromEnum(operation.owner) });
+            switch (operation.projection) {
+                .dereference => try writer.writeAll("[]"),
+                .field => |index| try writer.print(".{d}", .{index}),
+                .variant => try writer.writeAll(".payload"),
+            }
+            try writer.writeByte('\n');
+        },
+        .allocation_element => |operation| try writer.print("    %{d} = allocation_element %{d}[%{d}]\n", .{
             result,
-            @intFromEnum(operation.owner),
+            @intFromEnum(operation.allocation),
+            @intFromEnum(operation.index),
         }),
+        .borrow_box => |operation| try writer.print("    %{d} = borrow_box %{d}\n", .{ result, @intFromEnum(operation.source) }),
+        .borrow_address => |operation| {
+            try writer.print("    %{d} = borrow_address %{d}", .{ result, @intFromEnum(operation.source) });
+            if (operation.base_is_reference) try writer.writeAll("[]");
+            for (ssa.borrow_fields[operation.fields.start..operation.fields.end]) |field| try writer.print(".{d}", .{field});
+            try writer.writeByte('\n');
+        },
+        .borrow_read => |operation| try writer.print("    %{d} = borrow_read %{d}\n", .{ result, @intFromEnum(operation.source) }),
+        .borrow_write => |operation| try writer.print("    %{d} = borrow_write %{d}, %{d}\n", .{
+            result,
+            @intFromEnum(operation.reference),
+            @intFromEnum(operation.value),
+        }),
+        .value_copy => |operation| {
+            try writer.print("    %{d} = value_copy %{d}", .{ result, @intFromEnum(operation.source) });
+            if (operation.destination) |storage| try writer.print(" into %{d}", .{@intFromEnum(storage)});
+            try writer.writeByte('\n');
+        },
         .field_access => |operation| try writer.print("    %{d} = field_access %{d}, {d}\n", .{
             result,
             @intFromEnum(operation.operand),
@@ -218,22 +235,33 @@ fn renderInstruction(
         }),
         .call_mut_argument => |operation| try writer.print("    %{d} = call_mut_argument {d}\n", .{ result, operation.argument_index }),
         .call => |call| {
-            const target = try db.lookupInterned(queries.ItemLocations, call.target);
-            try writer.print("    %{d} = call @{s}(", .{ result, target.name });
+            try writer.print("    %{d} = call ", .{result});
+            try renderCallTarget(db, call.target, writer);
+            try writer.writeByte('(');
             for (ssa.call_arguments[call.arguments.start..call.arguments.end], 0..) |argument, index| {
                 if (index != 0) try writer.writeAll(", ");
                 try renderValueUse(argument, writer);
             }
             try writer.writeAll(") : ");
             try renderType(call.return_type, writer);
+            if (call.destination) |storage| try writer.print(" into %{d}", .{@intFromEnum(storage)});
             try writer.writeByte('\n');
         },
-        .indirect_call => |call| try writer.print("    %{d} = call %{d}\n", .{ result, @intFromEnum(call.target) }),
         .negi => |operand| try writer.print("    %{d} = negi %{d}\n", .{ result, @intFromEnum(operand) }),
         .addi => |operands| try renderBinary(writer, result, "addi", operands),
         .subi => |operands| try renderBinary(writer, result, "subi", operands),
         .muli => |operands| try renderBinary(writer, result, "muli", operands),
         .divsi => |operands| try renderBinary(writer, result, "divsi", operands),
+    }
+}
+
+fn renderCallTarget(db: *query.Database, target: @FieldType(structures.FunctionCall, "target"), writer: *std.Io.Writer) !void {
+    switch (target) {
+        .direct => |instance| {
+            const location = try db.lookupInterned(queries.ItemLocations, instance.item);
+            try writer.print("@{s}", .{location.name});
+        },
+        .indirect => |value| try writer.print("%{d}", .{@intFromEnum(value)}),
     }
 }
 
