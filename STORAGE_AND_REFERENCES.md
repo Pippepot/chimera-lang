@@ -8,9 +8,9 @@ and target API sketches remain conceptual.
 
 ## Design constraints
 
-- Evaluating an expression constructs a value; it does not select a storage
-  location or allocation strategy. A struct initializer does not imply stack or
-  heap allocation, and binding its result does not change that.
+- Construction uses the destination supplied by its context. A struct
+  initializer does not itself select a storage location or allocation strategy;
+  the same expression can initialize a local, a field, or allocated storage.
 - The implementation may use registers, inline storage, automatic storage, or
   no storage when the difference is unobservable.
 - Separately managed dynamic storage is explicit. Allocation does not construct
@@ -23,8 +23,10 @@ and target API sketches remain conceptual.
 The implemented host API provides typed allocation and unsafe indexed access,
 `Box(T)` owners, copyable `Ref(T, writable)` handles, scoped aliases, and
 `Buffer(T)` with checked element access and borrowed `BufferView(T)` slices.
-Its ownership, access, construction, and failure rules are recorded in
-[syntax&semantics.txt](syntax&semantics.txt).
+The accepted ownership, access, construction, and failure rules are recorded in
+[syntax&semantics.txt](syntax&semantics.txt). General destination construction,
+deferred `init` arguments, and consuming access through `deinit` are accepted
+changes awaiting implementation in [milestone 1](ROADMAP.md#1-destination-construction-and-consuming-access).
 The target, provider, location, and address-space contract below is accepted,
 but provider selection, device locations, and address spaces are not public APIs.
 
@@ -187,12 +189,17 @@ API; decide their representation when those operations have a concrete use.
 storage. It does not copy implicitly. Construction combines allocation and
 initialization and is therefore fallible; destruction destroys `T` and
 deallocates the storage. Moving the owner preserves the allocation and its
-location. Explicit duplication, when `T` supports copy, creates a distinct allocation.
-The current host API initializes an immovable or custom-move struct in final
-storage with `Box(T).new(T{...})` or `Box.new(T{...})`, including nested
-immovable fields when their leaf fields move directly. Conditional struct
-literals and function results also construct directly in final storage. It
-cannot accept an existing immovable value; other in-place forms remain future work.
+location. Under the accepted `Box.new(init value: T)` contract, allocation
+precedes evaluation of the entire initializer expression. Fresh values construct
+directly in the allocation, existing copyable values copy into it, and explicit
+transfers require move support. This also permits copying an existing immovable
+value when it supports copy. A named, noncopyable immovable value cannot be
+relocated into a Box.
+
+`Box.new(owner.borrow()[])` explicitly creates a distinct allocation by copying
+the pointee. The general constructor replaces the separate duplication API and
+Box-specific initializer preparation. Current compiler support covers only a
+subset of destination construction; milestone 1 completes the general contract.
 
 An eventual shared owner (name unsettled) would share ownership of one initialized
 `T` and its control block.
@@ -341,16 +348,20 @@ unsafe_borrow_element(T, allocation, index)      # storable Ref(T, false)
 allocation, including zero-sized elements; it does not expose storage fields.
 
 Accessors for layout and location remain design sketches.
-For an immovable `T`, a future raw-allocation in-place initialization operation
-would construct directly in the element slot.
+The accepted `unsafe_initialize` contract takes its value as an `init` parameter
+and constructs directly in the uninitialized element slot, including immovable
+values. This is the general storage primitive used by owning abstractions;
+it does not require Box-specific expression recognition.
 These operations do not transfer storage ownership; initialized state and
 bounds are the caller's obligation at this low level.
 
-The current safe host owner and borrowed access use that core:
+The accepted safe host owner and borrowed access use that core. The constructor's
+`init` mode and the consuming-access interpretation of `deinit` belong to
+milestone 1:
 
 ```text
 struct Box(T: type)
-  fallible new(var value: T) Box(T)
+  fallible new(init value: T) Box(T)
     ...
 
 func borrow_box(static T: type, imm owner: Box(T)) Ref(T, false)
@@ -366,15 +377,20 @@ const borrowed = borrow_box(T, owner)
 const extracted = value(T, owner^)
 ```
 
-`value` consumes the owner because its parameter is `deinit` and the call passes
-`owner^`; its name does not need an `into_` prefix to restate that transfer.
+`value` consumes the owner in place because its parameter is `deinit`. Both
+`value(T, owner)` and `value(T, owner^)` supply that consuming access without
+first relocating the owner; its name does not need an `into_` prefix.
 `get_value` would not distinguish borrowing, copying, and transfer.
 
 `Box(T)` uses a one-element host layout, initializes exactly once,
-and makes destruction plus deallocation automatic. The current `Box.new`
-allocates on the host; provider and location selection remain future work.
-For immovable `T`, a struct initializer constructs directly in that allocation
-instead of transferring a completed value.
+and makes destruction plus deallocation automatic. Host allocation remains the
+default; provider and location selection remain future work. With `init`,
+`Box.new(make(argument()))` allocates before evaluating `argument()` or calling
+`make`. Allocation failure skips the whole expression. Failure during
+initialization cleans up completed subobjects and frees the allocation; it does
+not destroy an object whose initialization never completed or roll back prior
+ownership transfers. Returning a named local from `make` still requires copy or
+move support; a fresh return expression constructs directly in the allocation.
 
 The host owner/handle/binding model makes access and attenuation explicit.
 These expressions illustrate supported methods, dereference, and scoped aliases:
@@ -391,14 +407,15 @@ handle[] = other_value        # replaces the second value
 const read_only = handle.as_imm()
 ```
 
-`Box` owns the initialized value and stable allocation; `Ref` copies only a
-handle. A borrowed binding retains the captured referent and its origins, not
-the variable used to obtain it. Ordinary `const`/`var` bindings to a borrowed
-T instead copy it when supported. Pointee replacement requires writable
+`Box` owns the initialized value and stable allocation; `Ref.copy` copies only a
+handle. The old pointee-copying `Ref.copy` method becomes `Ref.read`, requiring
+copy support from the pointee. A borrowed binding retains the captured referent
+and its origins, not the variable used to obtain it. Ordinary `const`/`var`
+bindings to a borrowed T instead copy it when supported. Pointee replacement requires writable
 authority and automatic destruction of the old value. Origin checks apply to
 borrowed returns and stored handles across calls and invalidation, using the
-existing `from(...)` contract where appropriate. Explicit fallible duplication
-of copyable T still allocates a separate owner; extracting T from Box still
+existing `from(...)` contract where appropriate. `Box.new` applied to a borrowed
+copyable T allocates a separate owner; extracting T from Box still
 requires a directly movable T. Low-level allocation remains explicit-drop.
 
 `Buffer(T)` keeps `Allocation(T)` plus an initialized count; capacity is derived

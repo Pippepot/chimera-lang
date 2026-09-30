@@ -13,10 +13,12 @@
 # byte: distinct unsigned 8-bit integer, values 0 through 255, size and
 # alignment 1. It has trivial move, copy, and drop, but no arithmetic or
 # comparison operations yet.
-# Decimal integer literals default to int. In an expected byte position, a
-# direct integer literal has type byte; values outside 0 through 255 are source
-# errors. A value already typed int does not implicitly convert to byte, nor
-# does a byte value implicitly convert to int.
+# int_literal: compile-time-only type of decimal integer literals. A unary
+# minus applied directly to an integer literal belongs to the literal. Without
+# an expected type, an int_literal value defaults to int; values outside int's
+# range are source errors. std converts int_literal to byte for values 0
+# through 255; other values are source errors. No converter relates int and
+# byte values in either direction.
 # float: floating-point number.
 # bool: true or false.
 # type: the type of compile-time type values.
@@ -27,16 +29,19 @@
 # them as type values; the enclosing function's return type does not change
 # their meaning in arguments, local initializers, or other nested expressions.
 # never: bottom type for expressions that never return.
-# Subexpressions evaluate exactly once, left to right in source order.
+# Evaluated subexpressions execute once, left to right in source order.
+# An init argument defers its entire expression until destination construction;
+# forwarding does not evaluate it, and earlier failure may skip it.
 # Struct initializers evaluate in initializer order, not field declaration order.
 # Reordering is allowed only when unobservable.
 
 
 # Numeric conversions (open)
-# Explicit numeric conversion/cast syntax and behavior must be defined before
-# deciding implicit numeric coercions. Conversion failure, rounding, overflow,
-# and literal typing for other numeric types remain open. Existing variant
-# widening and 'as' extraction do not define numeric conversion behavior.
+# Converters are infallible, so conversions between numeric runtime types that
+# wrap, truncate, round, saturate, or widen are named functions instead. Their
+# names, overflow and failure behavior, other numeric widths, and float literal
+# typing remain open. Existing variant widening and 'as' extraction do not
+# define numeric conversion behavior.
 
 
 # Structural tuples
@@ -255,14 +260,17 @@ exit(0)
 # static: value supplied at compile time.
 # mut: mutable access to a caller-owned variable.
 # var: function-owned variable, which may be stored or returned.
-# deinit: function-owned variable satisfying an explicit drop obligation.
+# deinit: consuming access to an existing value in its current storage.
+# init: pending construction into a destination supplied by the callee.
 # A runtime parameter's access mode is part of callable type identity. An
-# omitted mode is imm. Function declarations support static, imm, mut, var, and
-# deinit. Static parameters belong to the declaration and specialization key,
+# omitted mode is imm. Function declarations support static, imm, mut, var,
+# deinit, and init. There is no separate consume mode.
+# Static parameters belong to the declaration and specialization key,
 # not to the specialized function's runtime callable type or calling convention.
-# Callable type annotations currently spell only imm; inferred callable values
-# retain the exact declaration mode. Syntax for other modes in callable types
-# remains open.
+# Runtime callable parameter types retain these modes, for example
+# func(imm T) T, func(deinit T) T, and fallible(init T) Box(T). Taking a function
+# value, aliasing it, or calling it indirectly does not erase its modes or
+# deferred effects. Implementation support is tracked in ROADMAP.md.
 # Callable compatibility requires identical parameter modes. Ordinary-to-
 # fallible callable widening still applies when every parameter mode and type
 # and the return type match.
@@ -342,27 +350,45 @@ take(a)  # copy into an owned parameter, only if the type supports copy
 take(a^) # transfer ownership; any subsequent access to 'a' is an error
 # Inside the function, a var parameter is an owned mutable local. It follows the
 # same transfer, reassignment, branch, and loop availability rules as local var.
-# A deinit parameter is an owned mutable local authorized to satisfy explicit
-# drop obligations. Its arguments use the same ownership matrix: a bare place
-# copies when supported, `name^` transfers and invalidates the caller's root,
-# and a temporary is already owned. A deinit parameter may transfer its value
-# onward instead of consuming it locally.
+# A deinit parameter takes ownership of the original value in its existing
+# storage, with mutable access and authority to finish its lifetime. A bare
+# owning place is consumed, not copied. An explicit '^' on that place also
+# transfers access without a preliminary move into a separate parameter object.
+# Binding the parameter invokes no copy or move hook and does not require
+# movability. A fresh argument constructs in storage valid through the call.
+# Borrowed aliases and Refs do not grant ownership of their referents.
+#
+# The caller loses access when its deinit argument is prepared. The original
+# storage remains valid through the call and required cleanup. Conflicting
+# borrows are rejected; references to that parameter's own storage cannot
+# escape its lifetime. Contained references retain their independent origins.
+# Later argument failure does not restore ownership; prepared arguments must
+# have valid cleanup, including explicit-drop obligations.
+#
+# A deinit callee must complete or delegate the source's lifetime. It can move
+# fields, construct another value, or forward consuming access to another
+# deinit parameter. There is no automatic whole-object drop-hook call after
+# deinitialization. Remaining automatic fields are cleaned up under the normal
+# lifetime rules; explicit-drop fields require explicit disposal or transfer.
+# This contract applies to ordinary functions as well as ownership hooks.
 
 # Runtime const and var bindings both own their values; const controls mutation,
 # not ownership. A place is a local binding followed by zero or more fields.
 # Ordinary place expressions borrow. Binding initializers, replacement
-# assignments, struct fields, owned arguments, and returns require owned values:
+# assignments, struct fields, var arguments, and returns require owned values:
 # a bare place is copied and must support copy, an explicitly transferred local
 # or field (`name^`, `name.field^`) is moved and must support move, and a
-# temporary is moved or constructed directly. `imm` arguments borrow through
-# completion of the call. Explicit transfer is invalid in a borrowing context.
+# fresh result constructs directly in its destination. `imm` arguments borrow
+# through completion of the call. Explicit transfer is invalid in a borrowing
+# context. Transfer into a distinct value destination requires move capability;
+# passing consuming access to deinit does not itself relocate the source.
 # Transferring a field leaves that field uninitialized while independent fields
 # remain accessible. Assigning a new owned value to that field reinitializes it.
 # A whole-place use requires every field to be initialized; only initialized
 # fields are destroyed. The fields initialized on every incoming path are
 # available after a control-flow join. Ownership-carrying field transfers
-# require directly movable fields and fieldwise or trivial-drop parents with
-# no custom move; a deinit hook may consume a field of its root, and a mut
+# require movable fields and fieldwise or trivial-drop parents with
+# no custom move; a deinit parameter may consume a field of its root, and a mut
 # parameter must restore every transferred field before returning. A partially
 # initialized parent cannot be used or borrowed as a whole. When an owned
 # field is missing on only some join paths, it ends on paths retaining it if
@@ -380,9 +406,11 @@ take(a^) # transfer ownership; any subsequent access to 'a' is an error
 # reachable backedge.
 #
 # Each successful initialization of an owning place starts a new ownership
-# generation. A transfer ends that generation without destroying it and carries
-# its destruction obligation to the destination. Reinitializing the place starts
-# another generation; lifetimes belong to generations, not lexical names.
+# generation. A move ends the source generation without an automatic whole-source
+# drop and creates the destination generation. A custom move hook still completes
+# its source's lifetime under the deinit rules. Passing to deinit delegates the
+# original generation's completion without relocation. Reinitializing the place
+# starts another generation; lifetimes belong to generations, not lexical names.
 #
 # Automatic destruction follows Mojo's last-use (ASAP) timing. A generation is
 # destroyed at the earliest completed subexpression boundary after its final
@@ -437,10 +465,102 @@ _ = resource
 # This applies to explicit-drop fields, variant members, and borrowed
 # temporaries as well. Replacement ends any still-live old value; only a
 # deinit-authorized root may replace an explicit-drop value without first
-# transferring it.
+# transferring it. That authority does not waive remaining field obligations.
 
 
-# Borrowed views: implemented host semantics
+# Destination construction
+# An owning initialization supplies uninitialized storage for one result.
+# A borrowed place copies into that destination; an explicitly transferred
+# place moves into it. Copy and move capabilities are independent: an immovable
+# source can be copied into distinct storage if it supports copy.
+# Fresh struct initializers construct their fields at their final addresses.
+# Calls receive the caller's result destination; blocks, conditional results,
+# loop break results, and variant widenings propagate destinations to the
+# selected result and its storage projections. These guarantees apply to direct
+# and indirect calls, including fallible calls, regardless of optimization.
+# Delivering a fresh result does not itself invoke a copy or move hook.
+# An immovable object retains its address throughout its lifetime, including
+# destruction. Address stability does not extend or retarget existing borrows.
+#
+# An ordinary named local is an existing object, not a pending initializer.
+# Returning it bare copies; returning it with '^' requests movement. Last use
+# does not implicitly transfer it, and optional named-return elision cannot
+# make an otherwise invalid function valid or erase observable hook effects.
+# No explicit named-result syntax is introduced here.
+struct Immovable
+    move = none
+
+func make_direct() Immovable
+    return Immovable{} # valid: constructs in the caller's result destination
+
+func make_named() Immovable
+    const im = Immovable{}
+    return im # error: this type has no copy capability
+# With copy support, make_named copies im into the result and ends im normally.
+# return im^ would still be invalid because the type cannot move.
+# An init caller does not change either function body's meaning.
+#
+# Initialization does not overwrite a live value. Replacement must respect
+# the old generation's lifetime and source dependencies. In-place construction
+# does not permit destroying a source before copying it, overlapping source
+# and destination storage, or staging and relocating an immovable value.
+# Replacement forms without a valid lifetime and storage plan are rejected.
+
+
+# Deferred initializer parameters
+# An init parameter represents pending construction of T, not an existing T
+# or a cached value. Its argument is type-checked and participates in static
+# inference without evaluating the expression. Binding it defers the entire
+# expression, including producer arguments, copy hooks, and explicit transfers.
+# Ordinary parameters retain eager argument evaluation in source order.
+#
+# Every path that completes the receiving function successfully must consume
+# each init parameter exactly once, either by constructing it into an owning
+# destination or by forwarding it to another init parameter. Forwarding does
+# not evaluate the expression; the receiving callee takes over the obligation.
+# Construction supplies a destination and consumes the initializer even if its
+# evaluation fails. A path that fails or diverges before consumption may leave
+# it unevaluated. Returning successfully with a pending initializer, or using
+# one after it was consumed, is an error. An init parameter cannot be copied,
+# stored, returned as a pending initializer, or escape the receiving call.
+# Captured values remain subject to their ordinary lifetime obligations when
+# failure or divergence skips evaluation.
+#
+# An init parameter cannot be read, borrowed as T, or inspected for fields
+# before construction. Constructing it into a local consumes the initializer
+# and establishes that local as the value's destination. An immovable local
+# cannot subsequently be relocated into another destination.
+func materialize(static T: type, init item: T) T
+    return item # constructs directly in this call's result destination
+
+func forward_initializer(static T: type, init item: T) T
+    return materialize(T, item) # forwards once, without early construction
+#
+# Deferred expressions retain the lexical bindings and access needed for later
+# evaluation. Their possible reads, writes, transfers, reference origins, and
+# failures are checked across argument preparation, the call, and forwarding.
+# Required owners and storage must remain valid until those accesses end;
+# conflicting consumption or mutation is rejected. Merely deferring a transfer
+# does not perform it, nor does nonescaping capture require a public closure.
+# Callable boundaries must preserve these effects rather than infer safety
+# from a particular callee body, inlining, or a direct-call spelling.
+# A caller may use a source afterward only if it remains available on every
+# path reaching that use. Skipped evaluation does not consume its source;
+# failure after a transfer does not undo it. A shared failure continuation may
+# therefore see the source as possibly consumed.
+#
+# Initializer evaluation follows ordinary fallible control flow at its
+# construction site: failure must be handled or propagated there. Forwarding
+# preserves that possibility without triggering it. Partial construction cleans
+# up completed subobjects, with dependents before owners and otherwise reverse
+# initialization order. A completed nested object receives its normal drop;
+# an incomplete object's whole-object drop hook is never called. Explicit-drop
+# obligations must be discharged on failure too. A successfully completed
+# aggregate uses its ordinary destruction order, not partial-construction order.
+# Runtime and compile-time execution obey the same rules.
+
+
+# Borrowed views and host storage
 # `std.memory.Box(T)` uniquely owns one initialized T in separately managed
 # storage. `std.memory.Ref(T, writable: bool)` is a copyable, non-owning,
 # storable handle to an initialized T; `borrow item = place` creates a local,
@@ -484,15 +604,13 @@ _ = resource
 # underlying value against other writable handles. No method returning an
 # apparent owned T may silently substitute a borrow for a copy.
 #
-# Box.new(value) allocates fallibly and constructs one T in stable storage;
-# Box has no implicit copy, but explicit fallible duplication copies T into a
-# distinct allocation when T supports copy. Destruction drops the initialized
-# T before freeing storage. Borrowing Box yields a Ref with permission no
-# stronger than the access path; consuming extraction transfers T out only
-# when T can move directly. Direct in-place construction of immovable T must
-# not first create and move a completed T. Producer failure frees the still-
-# uninitialized allocation without destroying T; allocation failure cleans
-# up already evaluated arguments under their ordinary ownership rules.
+# Ref.copy copies the handle, retaining its permission and referent origins.
+# Ref.read copies the referenced T and requires T's copy capability; it never
+# substitutes a borrow. Dereference remains borrowed access to the referent.
+#
+# Box.new uses the init contract described below. Borrowing Box yields a Ref
+# with permission no stronger than the access path; consuming extraction
+# transfers T out only when T can move directly.
 # Allocation(T) separately owns uninitialized storage and must be explicitly
 # consumed; its deallocation never destroys initialized elements. Indexed
 # initialization, access, transfer, and destruction remain unsafe unless the
@@ -516,28 +634,35 @@ _ = resource
 # `std.memory.Box(T)` uniquely owns one initialized T in separately managed
 # host storage. Its allocation is fallible, moving it preserves the storage
 # address, and destruction destroys T before releasing that storage. Box has
-# no implicit copy; explicitly duplicating a copyable T allocates new storage.
+# no copy capability; allocating a separate owner is an explicit fallible call.
 # Value construction and local binding do not themselves select allocation.
-# An immovable or custom-move T can be initialized directly in Box storage by
-# passing a struct initializer to Box.new(T{...}) or Box(T).new(T{...}). Nested
-# struct initializers also construct immovable fields at their final addresses;
-# leaf values must be directly movable. Fields evaluate once in source order
-# and are destroyed if construction cannot complete. Conditional struct
-# initializers construct only the selected branch in its own Box allocation.
-# Direct or callable-value functions returning T can construct their result
-# directly in Box storage, including fallible functions; on producer failure,
-# the still-uninitialized allocation is deallocated without destroying T.
-# Producer arguments evaluate before Box allocation. If allocation fails, any
-# arguments already prepared for the producer retain their ordinary cleanup
-# obligations; automatic-drop arguments are destroyed. A transferred argument
-# with explicit drop cannot be cleaned up on allocation failure and is rejected.
-# These forms never transfer a completed immovable T. Other expression forms
-# still require a directly movable T. A borrowed or explicitly transferred
-# immovable value cannot initialize Box. T must be automatically droppable;
-# consuming value(T, owner^) is supported only when T moves directly.
-# Explicit fallible duplicate(T, item) accepts copyable, automatically droppable
-# T, including immovable and custom-copy types, and copies into a distinct
-# allocation using T's copy behavior. Noncopyable T cannot be duplicated.
+# Box(T).new has the signature fallible(init item: T) Box(T). Box.new may infer
+# T from the unevaluated initializer's type. The constructor obtains storage
+# before evaluating any part of item, for every T and every initializer shape.
+# Box.new(make(argument())) orders allocation before argument() and make().
+# Box.new(if condition -> first else second) allocates before the condition.
+# Nested Box construction follows the same rule, with the outer allocation first.
+#
+# Struct initializers and function results construct directly in that storage.
+# A bare existing value copies into it, including a copyable immovable value;
+# an explicit transfer moves into it and requires move capability. Custom hooks
+# use the same destination rules. No caller-written producer wrapper or distinct
+# constructor is required for different capabilities. A transferred immovable
+# value remains invalid. T must be automatically droppable.
+#
+# Allocation failure skips the entire initializer. If evaluation later fails,
+# completed subobjects are cleaned up under the partial-construction rules,
+# then the allocation is released. No destructor runs on an uninitialized T.
+# Only successful construction publishes a Box owning the live T and storage.
+# Earlier transfers and other initializer effects are not rolled back. Explicit
+# drop obligations created during evaluation must have a valid failure path.
+# These guarantees use general init and storage initialization semantics, not
+# Box-specific expression recognition or optional optimization.
+#
+# Box.new(owner.borrow()[]) copies a copyable pointee into a distinct allocation.
+# Box has no separate duplication API. Consuming value(T, owner) or
+# value(T, owner^) uses deinit access to the Box; extraction of T still
+# requires direct movement in the host API.
 # Nonnegative zero-byte host allocations (zero elements or zero-sized T)
 # succeed with a distinct, stable storage address; the provider may reserve
 # a minimal region to supply it.
@@ -551,8 +676,15 @@ _ = resource
 # Alignment is at least the natural alignment for T in that domain. Overflow
 # fails before allocation. The logical count remains separate from the byte layout.
 # It must be consumed by deallocation, which releases storage but does not
-# destroy elements. unsafe_initialize(T, mut allocation, index, value) and
-# unsafe_take(T, mut allocation, index) transfer only directly movable T.
+# destroy elements. unsafe_initialize(T, mut allocation, index, init value)
+# consumes an initializer into an uninitialized element slot using the general
+# destination rules. Allocation and index arguments evaluate eagerly; the value
+# expression is deferred until slot initialization.
+# unsafe_initialize_all(T, N, mut allocation, init value: collection_literal(T, N))
+# constructs the literal's elements in order into slots 0 through N - 1; the
+# caller proves capacity and that those slots are uninitialized.
+# unsafe_take(T, mut allocation, index) still requires directly movable T in
+# the host API.
 # unsafe_destroy(T, mut allocation, index) destroys an initialized element at
 # its address without moving it. unsafe_borrow_initialized(T, imm allocation,
 # index) yields an expression-only borrow of that element, usable for immediate
@@ -746,7 +878,8 @@ func S.read_a(imm value: S) int -> value.a
 # generated namespace because its identity includes the factory specialization.
 # value.function(args) desugars to S.function(value, args), where value has
 # type S. Both forms obey the same argument access and ownership rules, and
-# evaluate the receiver and remaining arguments exactly once, left to right.
+# prepare the receiver and remaining arguments left to right. An init argument
+# defers evaluation until construction; a deinit receiver consumes in place.
 # Callable values stored in the namespace also support this receiver insertion;
 # callable instance fields are called directly without inserting the receiver.
 # Fields and ordinary namespace declarations share one name scope; duplicate
@@ -764,10 +897,10 @@ func S.read_a(imm value: S) int -> value.a
 # do not contribute fields or execute when a struct value is initialized.
 # A generic struct factory's namespace can be used before specializing the
 # factory. A direct member call infers its missing factory parameters from the
-# member's runtime argument types, as with the planned Box.new(value), or the
-# caller may specialize the factory first, as with Box(T).new(value). Missing members are
-# namespace errors even when the factory is not specialized. In a nested
-# namespace, enclosing factories must be specialized before inferring the
+# member's argument types, including unevaluated init arguments in Box.new(value).
+# The caller may specialize the factory first, as with Box(T).new(value).
+# Missing members are namespace errors even when the factory is not specialized.
+# In a nested namespace, enclosing factories must be specialized before inferring the
 # immediate factory's arguments.
 
 # A struct cannot contain itself by value, directly or through other structs or
@@ -797,18 +930,32 @@ func read_a(s: S) int
 # 'func' means a complete function expression used as a custom, infallible hook.
 # Its sole parameter name is immaterial. The required signatures are:
 # copy = func(imm self: S) S
-# move = func(var self: S) S
+# move = func(deinit self: S) S
 # drop = func(deinit self: S) unit
 # A custom hook replaces that operation for the complete struct. Fieldwise
 # strategies invoke nested custom hooks in declaration order for copy and move,
 # reverse declaration order for drop, and operate only on a variant's active
-# member. The active custom drop hook's deinit self is not automatically
-# destroyed when the hook returns; nested values with the same hook
-# specialization still drop. Copy and move hook plumbing likewise avoids
-# redispatching the active hook. Explicit calls remain ordinary calls.
+# member. A move hook receives consuming access to the original source, with
+# no preliminary move or copy. A copy hook borrows the original source. Both
+# construct their result in the operation's final destination.
+# A custom move hook constructs a fresh result, for example from transferred
+# fields. A move or drop hook completes its source's lifetime under the ordinary
+# deinit rules: no repeated whole-source drop, but remaining fields still need
+# cleanup. Nested values invoke their selected hooks normally, even when those
+# hooks have the same specialization as the enclosing hook.
+# There is no active-hook redispatch suppression. Moving the whole source again
+# inside its move hook, including 'return self^', recursively requests that move
+# operation; it does not request a builtin fallback. Likewise, 'return self'
+# inside a copy hook requests another copy. Use trivial or fieldwise strategies
+# for compiler-provided default behavior, or construct a fresh result explicitly.
+# Hook entry and result delivery introduce no extra copy or move. Operations
+# explicitly requested inside the hook follow the same rules as other code.
+# The logical effects of selected hooks are observable and cannot be omitted
+# merely because storage could be reused.
 # Potentially failing duplication is an explicitly called fallible function,
 # not an implicit copy operation.
-# Without copy support, passing to an owned parameter requires transfer with '^'.
+# Without copy support, an existing value passed to a var parameter requires
+# transfer with '^'. A deinit parameter consumes the original value in place.
 # move = none requires construction in final storage and a stable address.
 # Directly containing an immovable value makes the containing struct immovable;
 # indirection does not.
@@ -819,6 +966,24 @@ func read_a(s: S) int
 # A variant moves or copies fieldwise when every member supports that operation,
 # and otherwise does not support it. A variant drops trivially when every member
 # does; otherwise it drops fieldwise according to its active member.
+
+# Capability-backed ownership members
+# T.copy exists exactly when T supports copy, with logical type func(imm T) T.
+# T.move exists exactly when T supports move, with logical type func(deinit T) T.
+# These compiler-provided namespace members select the same ownership operation
+# as implicit copying or explicit transfer into a distinct destination. They
+# are not wrappers that implement copying by returning self or moving by
+# returning self^. Custom hooks supply the selected operation's body.
+# Type-qualified calls, instance calls, aliases, and indirect calls preserve
+# these signatures and invoke the operation once. value.move() and T.move(value)
+# consume the receiver/source; neither first copies or moves it into a parameter.
+# Their results construct directly in the caller's destination.
+# The member names copy and move are reserved for these operations. Ownership
+# properties remain in their separate declaration scope. Arbitrary namespace
+# functions cannot manufacture a capability or replace its member.
+# Capability validation precedes member availability. A where-condition may
+# test these members and their callable types; a missing capability fails the
+# condition, while an invalid ownership definition remains a diagnostic.
 
 
 # Variants
@@ -838,6 +1003,82 @@ reassigned = int_or_float_value
 
 # Variants never narrow implicitly. Control flow does not refine existing
 # bindings; extraction or a pattern introduces a separate narrowed binding.
+
+
+# Converters
+# A converter declares an implicit conversion from a source type to a target
+# type. It has no name and is not called directly. Its signature has exactly one
+# value parameter, which receives the converted expression; every other
+# parameter is static and inferred from the source and target types together.
+# A static parameter that neither type determines is an error. The value
+# parameter's mode follows its type: static for a compile-time-only type such as
+# int_literal, init for collection_literal, and imm otherwise, so inserting a
+# converter never consumes an existing value. Converters are not fallible.
+# Bodies, `where` clauses, and reference origins follow ordinary function rules.
+struct Degrees
+    value: float
+struct Radians
+    value: float
+pub converter(value: Degrees) Radians -> Radians{value = to_radians(value.value)}
+pub converter(static T: type, value: Ref(T, true)) Ref(T, false) -> value.as_imm()
+
+# A converter is a top-level declaration in a module that owns its source or
+# target type. A struct is owned by its defining module, a parameterized struct
+# by the module declaring its factory, and compiler-owned primitive and literal
+# types by the standard library. Aliases resolve to canonical types first.
+# Structural variants, tuples, and callable types have no owner, so the other
+# type must supply one. A pub converter applies in every module; a private
+# converter applies only in its declaring module. Imports never add or remove
+# candidates.
+#
+# Conversion applies only where the expected type is already known: bindings,
+# assignments, arguments, returns, struct initializer fields, and the results
+# propagated to them, such as conditional branches. A value whose type equals
+# the expected type is not converted. Otherwise the candidates are the built-in
+# conversions (variant widening, callable widening, and literal defaults), a
+# converter from the source to the expected type, and, for an expected variant,
+# a converter from the source to one member followed by widening. Exactly one
+# candidate must apply; none is a type error and several are an ambiguity error
+# at that use. Overlapping declarations are diagnosed only where they are
+# ambiguous. An integer literal whose default type is a member of the expected
+# variant takes that type without considering other candidates. `where`
+# clauses are checked on the selected converter; failure is a source error.
+func draw(angle: Radians)
+draw(degrees)                                # converts
+const angle: Radians = degrees               # converts
+func maybe_angle() Radians | none -> degrees # converts, then widens
+const n: int | byte = 1                      # int, the literal default
+const copied = degrees                       # Degrees; no expected type
+
+# Conversion never chains: a converter's result is not converted again, and no
+# built-in conversion precedes a converter. Converters do not take part in
+# static inference, inferred binding types, member or operator lookup, or
+# joins. An operation is resolved first; conversion may then satisfy its known
+# parameter types.
+#
+# T(value) applies the same conversion explicitly, as if initializing a binding
+# of type T. T must resolve to a type value: a parameterized factory is
+# specialized first, and omitted factory arguments are not inferred.
+const explicit = Radians(degrees)
+const read_only = Ref(int, false)(handle)
+
+
+# Collection literals
+# [a, b] has type collection_literal(T, N): pending construction of N elements
+# of type T, consumed only through init parameters, including converters. It
+# cannot be bound or stored. Construction evaluates the elements in source order
+# into N consecutive element destinations.
+#
+# When the selected converter's target determines T, each element is checked
+# against T with its own conversion. Otherwise elements take their default types
+# and then join like conditional branches. Joining no elements does not produce
+# never, so [] requires an expected type that determines T. Without an expected
+# type, a collection literal will default to Array(T, N); until Array exists it
+# is an error.
+# std: pub converter(static T: type, static N: int, init value: collection_literal(T, N)) List(T)
+const bytes: List(byte) = [1, 2] # T = byte; each element converts
+const numbers: List(int | float) = [1, 2.5]
+# Without an expected type, [1, 2.5] has type collection_literal(int | float, 2).
 
 
 # Fallibility
