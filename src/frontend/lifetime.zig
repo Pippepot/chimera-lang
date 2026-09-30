@@ -8,7 +8,7 @@ pub const Generation = struct {
     start_order: u32,
     span: structures.SourceSpan,
     requires_explicit_drop: bool,
-    can_deinit: bool,
+    cleanup_fields: bool,
     cleanup_condition: ?structures.FunctionValueId = null,
     missing_fields: []const []const u32 = &.{},
 };
@@ -720,7 +720,7 @@ pub const Solver = struct {
     ) !void {
         const generation_data = self.generations[@intFromEnum(generation)];
         const effective_condition = cleanup_condition orelse generation_data.cleanup_condition;
-        if (!generation_data.requires_explicit_drop or generation_data.can_deinit) {
+        if (!generation_data.requires_explicit_drop) {
             try planned_cleanups.append(self.gpa, .{
                 .generation = generation,
                 .cleanup_value = cleanup_value,
@@ -1085,7 +1085,7 @@ fn testSolverGeneration(start_order: u32, explicit: bool) Generation {
         .start_order = start_order,
         .span = .{ .start = start_order, .end = start_order + 1 },
         .requires_explicit_drop = explicit,
-        .can_deinit = false,
+        .cleanup_fields = false,
     };
 }
 

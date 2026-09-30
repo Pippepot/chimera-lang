@@ -912,6 +912,29 @@ pub const FunctionValueUse = struct {
     variant_tag_mapping: ?FunctionValueRange = null,
 };
 
+pub const FunctionCallArgument = union(enum) {
+    prepared: FunctionValueUse,
+    deinit: FunctionValueId,
+
+    pub fn valueUse(self: @This()) FunctionValueUse {
+        return switch (self) {
+            .prepared => |use| use,
+            .deinit => |source| .{ .value = source },
+        };
+    }
+
+    pub fn valueId(self: @This()) FunctionValueId {
+        return self.valueUse().value;
+    }
+
+    pub fn operand(self: *@This()) *FunctionValueId {
+        return switch (self.*) {
+            .prepared => |*use| &use.value,
+            .deinit => |*source| source,
+        };
+    }
+};
+
 pub const PredicateOperation = enum {
     lti,
     gti,
@@ -1225,12 +1248,13 @@ pub const FunctionInstruction = union(enum) {
 pub const FunctionBodyAnalysis = struct {
     return_type: TypeId,
     is_fallible: bool = false,
+    parameter_modes: []ParameterMode,
     block_argument_types: []TypeId,
     variant_coercion_tags: []const u32 = &.{},
     struct_field_values: []StructFieldValue = &.{},
     borrow_fields: []u32 = &.{},
     branch_arguments: []FunctionValueUse,
-    call_arguments: []FunctionValueUse,
+    call_arguments: []FunctionCallArgument,
     instructions: []Instruction,
     instruction_spans: []SourceSpan = &.{},
     terminator_spans: []SourceSpan = &.{},
@@ -1256,12 +1280,13 @@ pub const FunctionBodyAnalysis = struct {
         if (a.entry != b.entry or
             a.return_type != b.return_type or
             a.is_fallible != b.is_fallible or
+            !std.mem.eql(ParameterMode, a.parameter_modes, b.parameter_modes) or
             !std.mem.eql(TypeId, a.block_argument_types, b.block_argument_types) or
             !std.mem.eql(u32, a.variant_coercion_tags, b.variant_coercion_tags) or
             a.struct_field_values.len != b.struct_field_values.len or
             !std.mem.eql(u32, a.borrow_fields, b.borrow_fields) or
             !valueUsesEql(a.branch_arguments, b.branch_arguments) or
-            !valueUsesEql(a.call_arguments, b.call_arguments) or
+            !callArgumentsEql(a.call_arguments, b.call_arguments) or
             a.instructions.len != b.instructions.len or
             !sourceSpansEql(a.instruction_spans, b.instruction_spans) or
             !sourceSpansEql(a.terminator_spans, b.terminator_spans) or
@@ -1286,6 +1311,14 @@ pub const FunctionBodyAnalysis = struct {
         return true;
     }
 
+    fn callArgumentsEql(left: []const FunctionCallArgument, right: []const FunctionCallArgument) bool {
+        if (left.len != right.len) return false;
+        for (left, right) |left_argument, right_argument| {
+            if (!std.meta.eql(left_argument, right_argument)) return false;
+        }
+        return true;
+    }
+
     fn sourceSpansEql(left: []const SourceSpan, right: []const SourceSpan) bool {
         if (left.len != right.len) return false;
         for (left, right) |left_span, right_span| {
@@ -1295,6 +1328,7 @@ pub const FunctionBodyAnalysis = struct {
     }
 
     pub fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
+        gpa.free(self.parameter_modes);
         gpa.free(self.block_argument_types);
         gpa.free(self.variant_coercion_tags);
         gpa.free(self.struct_field_values);

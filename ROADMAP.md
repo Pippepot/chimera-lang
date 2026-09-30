@@ -10,7 +10,7 @@
 - Function signatures support ordered `where` conditions checked at specialization
   using static values, including type and namespace member tests with `is`.
 - Typed SSA covers calls, static specialization, callable values, variants, joins, loops, divergence, and fallible control flow. Compile-time thunks and specialized calls evaluate through typed IR, including structs, hooks, and type-valued functions; local captures remain unsupported.
-- Ownership tracks root and supported field transfers, borrowed and owned parameters, mutable copy-back, inferred `Ref` origins, and path-sensitive ASAP cleanup. The internal calling convention derives direct or address-passed arguments from ownership capabilities; codegen owns physical argument layout. `Box` and `Buffer` provide host storage; `Ref` and scoped aliases retain checked origins for named places and supported fields, but not temporary projections.
+- Ownership tracks root and supported field transfers, borrowed and owned parameters, mutable copy-back, inferred `Ref` origins, and path-sensitive ASAP cleanup. `deinit` consumes owned places in place, rejects borrowed sources, and lets custom move hooks transfer fields. Unfinished sources clean up remaining automatic fields without waiving explicit-field obligations. Fresh variant arguments, later argument failure, compile-time execution, and parameter-mode edits across query/cache reuse are covered. The internal calling convention derives direct or address-passed arguments from ownership capabilities and consuming access; codegen owns physical argument layout. `Box` and `Buffer` provide host storage; `Ref` and scoped aliases retain checked origins for named places and supported fields, but not temporary projections.
 - Compiler-provided `extern func` declarations use named std identities and ordinary calls. `std.exit.exit` is exported by the prelude, with distinct runtime termination and compile-time compiler control.
 - Host-only `std.memory` provides checked typed allocation, unsafe indexed
   transfers and destruction, `Box(T)` with automatic destruction, copyable
@@ -44,11 +44,9 @@ construction paths and ownership-hook conventions with this general model.
   allocations. Keep copy and move capabilities independent. Fresh results need
   no intermediate move; returning a named local still copies or explicitly
   moves it. Do not make validity depend on optional return-value elision.
-- Change `deinit` to consume the original value in place and use it for move
-  hooks and consuming members. Replace active-hook redispatch suppression with
-  explicit source and result lifetime rules.
-  Expose capability-backed `T.copy` and `T.move` for calls and `where` tests;
-  rename the pointee-copying `Ref.copy` operation to `Ref.read`.
+- Complete `deinit` consuming access across every place and result shape,
+  including source and result lifetime rules. Expose capability-backed
+  `T.copy` and `T.move` for calls and `where` tests.
 - Add nonescaping `init` parameters: each successful path constructs or
   forwards each parameter exactly once, while earlier failure may skip it.
   Construction occurs when a destination is supplied; forwarding does not
@@ -68,7 +66,27 @@ construction paths and ownership-hook conventions with this general model.
   and compile-time execution, diagnostics, incremental recomputation, and cache
   reuse for changed signatures and ownership capabilities.
 
-### 2. Converters and literal types
+### 2. Field visibility
+
+Implement field visibility from [syntax&semantics.txt](syntax&semantics.txt).
+It replaces the temporary name-matched opaque storage owners in `std.memory`.
+
+- Accept `pub` on declared and generated struct fields and publish visibility
+  with the struct definition. Check it at every field projection and
+  initializer field name against the defining module of the struct or its
+  factory; report privacy distinctly from unknown fields. Reject a `pub` field
+  whose type names a declaration hidden from importing modules.
+- Remove `accessible_fields`, its name list, and its file-scoped exception.
+  `std.memory` fields stay private through the general rule; standard type
+  recognition keeps using registered identities. Mark fields `pub` where
+  existing tests and examples access imported structs.
+- Verify rejected initialization, reads, writes, borrows, and consuming moves
+  from other modules; access from every file of the defining module; foreign
+  specializations and re-exports; whole-value move, copy, and drop of values
+  with private fields; compile-time execution; and incremental recomputation
+  when a field gains or loses `pub`.
+
+### 3. Converters and literal types
 
 - Add `converter` declarations owned by the module of their source or target
   type, with pub/private visibility, static parameters inferred from both
@@ -84,7 +102,7 @@ construction paths and ownership-hook conventions with this general model.
   execution, and incremental recomputation when either owning module adds or
   removes a converter.
 
-### 3. Text and basic I/O
+### 4. Text and basic I/O
 
 - Define UTF-8 string literals through the literal-type converter model and a
   `std` **String** exported through
@@ -96,7 +114,7 @@ construction paths and ownership-hook conventions with this general model.
   borrowing for slices, and cleanup. Compile-time execution retains no ambient
   I/O.
 
-### 4. Ranges, List, and iteration
+### 5. Ranges, List, and iteration
 
 - Implement exclusive/inclusive ascending ranges and empty-range behavior.
   Decide endpoint types, descending iteration, steps, overflow-safe termination,
@@ -113,20 +131,20 @@ construction paths and ownership-hook conventions with this general model.
   iterator state and invalidation, loop results, and cleanup on every exit path.
   Range-only iteration may precede List if it uses that contract.
 
-### 5. Structural tuples
+### 6. Structural tuples
 
 - Implement ordered structural identity for `(foo, bar)` with type spelling,
   access, destructuring, layout, and elementwise ownership. Resolve grouping
   and singleton syntax alongside `()`; tuples support multiple results and
   later Map iteration.
 
-### 6. Match
+### 7. Match
 
 - Evaluate the subject once; add literal, wildcard, binding, `pattern as name`,
   and `is Type` patterns. Diagnose redundancy and non-exhaustiveness using
   existing branch joins and variant mappings.
 
-### 7. Numeric foundations
+### 8. Numeric foundations
 
 - Add named numeric conversion functions (wrap, truncate, round, saturate,
   widen) with specified overflow and failure behavior; converters never relate
@@ -141,7 +159,7 @@ construction paths and ownership-hook conventions with this general model.
   Extend to float and user structs after their semantics are settled; do not
   assume general overloading follows from operator lookup.
 
-### 8. Collections and algorithms
+### 9. Collections and algorithms
 
 - Add **Map**, **Set**, **Queue**, and **Stack** on established storage and
   iteration contracts. Specify hashing/equality, ordering, mutation, and

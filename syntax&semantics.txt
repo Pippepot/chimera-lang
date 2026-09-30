@@ -108,8 +108,8 @@ var body: physics.Body
 # Declarations are module-private by default: visible from every file of the
 # same module, inaccessible elsewhere. `pub` opens a top-level static,
 # function, struct, or import to importing modules; it is rejected on
-# runtime const/var bindings and anywhere inside a body. Struct-field
-# visibility is out of scope.
+# runtime const/var bindings and anywhere inside a body. Struct fields and
+# namespace members take their own `pub`; see Structs.
 pub struct Body
     a: int
 # Imports are private by default and never create declarations. `pub import`
@@ -890,8 +890,8 @@ func S.read_a(imm value: S) int -> value.a
 # static values, and nested structs are private to their defining module by
 # default; each requires its own pub modifier to be accessed from another
 # module. This applies to both type-qualified and instance-call syntax, and
-# to qualified declarations in other files of the defining module. Fields and
-# ownership properties retain their separate rules.
+# to qualified declarations in other files of the defining module. Fields
+# follow field visibility below; ownership members follow their capabilities.
 # Generated namespaces retain the enclosing factory's static arguments; member
 # functions may also declare their own static parameters. Namespace declarations
 # do not contribute fields or execute when a struct value is initialized.
@@ -913,6 +913,38 @@ mutable_s.a = 2
 
 func read_a(s: S) int
     return s.a # default immutable access permits reading fields, not mutating them
+
+# Field visibility
+# Fields are private to the struct's defining module by default: every file of
+# that module can name them; other modules cannot. `pub` makes a field part of
+# the struct's public representation. A generated struct's defining module is
+# its factory's; specialization and re-export do not change field visibility.
+# Visibility is checked at every field projection: reads, writes, borrows,
+# consuming moves, and field names in a struct initializer. A visible field is
+# readable, and writable wherever access to the enclosing value permits
+# mutation. Naming an inaccessible field is a privacy error, not a missing
+# field.
+# T{...} is structural initialization, not a special constructor. Because it
+# names every field, any inaccessible field prevents structural initialization
+# of the complete value; ordinary functions such as Interval.new provide
+# validated construction. A struct without fields can be initialized wherever its type is
+# accessible.
+# Field privacy restricts field access, not the value: other modules may move,
+# copy, pass, return, and drop it according to its ownership capabilities, and
+# fieldwise or custom hooks act on every field. Public fields therefore carry no
+# invariant that their module relies on. A `pub` field's declared type must not
+# name a declaration hidden from importing modules.
+pub struct Point
+    pub x: int
+    pub y: int # other modules may write Point{x = 1, y = 2}
+
+pub struct Interval
+    start: int
+    end: int
+
+    pub fallible new(start: int, end: int) Interval
+        start <= end
+        return Interval{start = start, end = end}
 
 # Ownership properties and defaults:
 # move = trivial | fieldwise | none | func

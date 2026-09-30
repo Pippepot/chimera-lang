@@ -289,9 +289,10 @@ fn validFunctionBody(body: structures.FunctionBodyAnalysis) bool {
     if (body.terminator_spans.len != 0 and body.terminator_spans.len != body.blocks.len) return false;
     for (body.struct_field_values) |field| if (!validValue(field.value, body)) return false;
     for (body.branch_arguments) |use| if (!validUse(use, body)) return false;
-    for (body.call_arguments) |use| if (!validUse(use, body)) return false;
+    for (body.call_arguments) |argument| if (!validUse(argument.valueUse(), body)) return false;
     const entry = body.blocks[@intFromEnum(body.entry)];
     if (entry.argument_start > entry.argument_end or entry.argument_end > body.block_argument_types.len) return false;
+    if (body.parameter_modes.len != entry.argument_end - entry.argument_start) return false;
     for (body.instructions) |original| {
         var instruction = original;
         for (instruction.operands()) |operand| if (operand) |value| {
@@ -384,8 +385,9 @@ test "query restore rejects an offset past the payload" {
 
 test "cached body validation rejects invalid control flow and argument indexes" {
     var argument_types = [_]structures.TypeId{.int};
+    var parameter_modes = [_]structures.ParameterMode{.imm};
     var branch_arguments: [0]structures.FunctionValueUse = .{};
-    var call_arguments: [0]structures.FunctionValueUse = .{};
+    var call_arguments: [0]structures.FunctionCallArgument = .{};
     var instructions = [_]structures.FunctionInstruction{.{ .mut_parameter_write = .{
         .parameter_index = 1,
         .value = @enumFromInt(0),
@@ -400,6 +402,7 @@ test "cached body validation rejects invalid control flow and argument indexes" 
     }};
     var body: structures.FunctionBodyAnalysis = .{
         .return_type = .unit,
+        .parameter_modes = &parameter_modes,
         .block_argument_types = &argument_types,
         .branch_arguments = &branch_arguments,
         .call_arguments = &call_arguments,
@@ -663,6 +666,68 @@ test "in-place Box initializer bodies restore from disk" {
     try std.testing.expect(has_in_place_fields);
     const restored = (try second.get(queries.BuildExecutable, 0)).* orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualSlices(u8, original.bytes, restored.bytes);
+}
+
+test "deinit bodies restore and invalidate when parameter modes change" {
+    const modules = @import("modules.zig");
+    const runtime = @import("runtime.zig");
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const source =
+        \\func take(deinit value: int | none) int
+        \\  if const number = value as int -> return number
+        \\  return 1
+        \\const callback = take
+        \\exit(callback(42))
+    ;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(directory);
+    const digest = cache.querySnapshotKey(try cache.compilerDigest(io), "main.chi", &.{});
+
+    const first = try query.Database.init(allocator, .{ .worker_count = 2 });
+    defer first.deinit();
+    try modules.registerSources(first, allocator, source, &.{}, &.{});
+    const original = (try first.get(queries.BuildExecutable, 0)).* orelse return error.TestUnexpectedResult;
+    const take = (try first.get(queries.BuildModuleScope, 0)).*.?.resolveFunction("take").?;
+    const original_body = (try first.get(queries.AnalyzeFunctionInstance, .{ .item = take })).*.?;
+    try save(io, allocator, directory, digest, first);
+    const payload = (try cache.load(io, allocator, directory, digest)) orelse return error.TestUnexpectedResult;
+    defer allocator.free(payload);
+
+    const second = try query.Database.init(allocator, .{ .worker_count = 2 });
+    defer second.deinit();
+    const offset = try restoreInterns(second, allocator, payload);
+    try modules.registerSources(second, allocator, source, &.{}, &.{});
+    const imported = try restoreQueries(second, payload, offset);
+    try std.testing.expect(imported > 0);
+    const restored_take = (try second.get(queries.BuildModuleScope, 0)).*.?.resolveFunction("take").?;
+    const restored_body = (try second.get(queries.AnalyzeFunctionInstance, .{ .item = restored_take })).*.?;
+    try std.testing.expect(structures.FunctionBodyAnalysis.eql(original_body, restored_body));
+    const restored = (try second.get(queries.BuildExecutable, 0)).* orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, original.bytes, restored.bytes);
+    try runtime.writeProgram(io, restored.bytes);
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    try std.testing.expectEqual(@as(u8, 42), try runtime.runProg(io, allocator, &.{}));
+
+    const edited_source = try std.mem.replaceOwned(u8, allocator, source, "deinit", "imm");
+    defer allocator.free(edited_source);
+    const third = try query.Database.init(allocator, .{ .worker_count = 2 });
+    defer third.deinit();
+    const edited_offset = try restoreInterns(third, allocator, payload);
+    try modules.registerSources(third, allocator, edited_source, &.{}, &.{});
+    try std.testing.expect((try restoreQueries(third, payload, edited_offset)) < imported);
+    const edited = (try third.get(queries.BuildExecutable, 0)).* orelse return error.TestUnexpectedResult;
+
+    const cold = try query.Database.init(allocator, .{ .worker_count = 2 });
+    defer cold.deinit();
+    try modules.registerSources(cold, allocator, edited_source, &.{}, &.{});
+    const rebuilt = (try cold.get(queries.BuildExecutable, 0)).* orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, rebuilt.bytes, edited.bytes);
+    try std.testing.expect(!std.mem.eql(u8, original.bytes, edited.bytes));
+    try runtime.writeProgram(io, edited.bytes);
+    try std.testing.expectEqual(@as(u8, 42), try runtime.runProg(io, allocator, &.{}));
 }
 
 test "invalid machine-code cache shapes are rejected" {

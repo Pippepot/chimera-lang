@@ -2052,7 +2052,7 @@ fn analyzeStructMembers(
                 const self_type = try type_interner.structIdentityType(identity);
                 const mode: structures.ParameterMode, const return_type: structures.TypeId = switch (operation) {
                     .copy => .{ .imm, self_type },
-                    .move => .{ .@"var", self_type },
+                    .move => .{ .deinit, self_type },
                     .drop => .{ .deinit, .unit },
                 };
                 const hook = (try type_interner.ownedFunction(identity, property_name)) orelse return error.Unavailable;

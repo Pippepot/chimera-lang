@@ -240,7 +240,8 @@ fn renderInstruction(
             try writer.writeByte('(');
             for (ssa.call_arguments[call.arguments.start..call.arguments.end], 0..) |argument, index| {
                 if (index != 0) try writer.writeAll(", ");
-                try renderValueUse(argument, writer);
+                if (argument == .deinit) try writer.writeAll("deinit ");
+                try renderValueUse(argument.valueUse(), writer);
             }
             try writer.writeAll(") : ");
             try renderType(call.return_type, writer);

@@ -114,7 +114,7 @@ pub struct Ref(T: type, writable: bool)
     copy = trivial
 
     pub func as_imm(imm self: Ref(T, true)) Ref(T, false) from(self) -> attenuate_ref(T, self)
-    pub func copy(imm self: Ref(T, writable)) T -> read(T, writable, self)
+    pub func read(imm self: Ref(T, writable)) T -> self[]
     pub func replace(imm self: Ref(T, true), var item: T) -> write(T, self, item^)
 
 pub extern func borrow_box(static T: type, imm owner: Box(T)) Ref(T, false)

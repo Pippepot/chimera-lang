@@ -95,7 +95,25 @@ pub fn execute(
                     .returned => |value| slots[destination] = value,
                     else => |result| return atSpan(result, instructionSpan(body, instruction_index)),
                 },
-                .box_init, .storage_projection, .allocation_element, .borrow_box, .borrow_address, .borrow_read, .borrow_write => return executionError(.unsupported_operation, instructionSpan(body, instruction_index)),
+                .storage_projection => |operation| switch (operation.projection) {
+                    .field => |index| switch (try accessField(slots[@intFromEnum(operation.owner)].runtime, .{
+                        .operand = operation.owner,
+                        .field_index = index,
+                        .field_type = operation.type_id,
+                    }, executor)) {
+                        .returned => |value| slots[destination] = value,
+                        else => |result| return atSpan(result, instructionSpan(body, instruction_index)),
+                    },
+                    .variant => switch (try extractVariant(body, slots[@intFromEnum(operation.owner)].runtime, .{
+                        .operand = operation.owner,
+                        .target_type = operation.type_id,
+                    }, executor)) {
+                        .returned => |value| slots[destination] = value,
+                        else => |result| return atSpan(result, instructionSpan(body, instruction_index)),
+                    },
+                    .dereference => return executionError(.unsupported_operation, instructionSpan(body, instruction_index)),
+                },
+                .box_init, .allocation_element, .borrow_box, .borrow_address, .borrow_read, .borrow_write => return executionError(.unsupported_operation, instructionSpan(body, instruction_index)),
                 .value_copy => |operation| {
                     if (operation.destination != null) return executionError(.unsupported_operation, instructionSpan(body, instruction_index));
                     slots[destination] = slots[@intFromEnum(operation.source)];
@@ -202,7 +220,7 @@ fn executeCall(
     const arguments = body.call_arguments[call.arguments.start..call.arguments.end];
     const interpreted = scratch[call.arguments.start..call.arguments.end];
     for (arguments, interpreted) |argument, *destination| {
-        switch (try valueUse(body, slots, argument, executor)) {
+        switch (try valueUse(body, slots, argument.valueUse(), executor)) {
             .returned => |value| destination.* = value,
             else => |result| return result,
         }

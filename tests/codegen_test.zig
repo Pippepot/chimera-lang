@@ -103,6 +103,7 @@ fn functionSsa(
     };
     return .{
         .return_type = return_type,
+        .parameter_modes = &.{},
         .block_argument_types = &.{},
         .branch_arguments = &.{},
         .call_arguments = &.{},
@@ -225,6 +226,7 @@ test "function references relocate absolute addresses for indirect calls" {
     }};
     const ssa: structures.FunctionBodyAnalysis = .{
         .return_type = .int,
+        .parameter_modes = &.{},
         .block_argument_types = &.{},
         .branch_arguments = &.{},
         .call_arguments = &.{},
@@ -358,6 +360,7 @@ test "typed expression values survive calls and execute every integer arithmetic
 
 test "cyclic CFG accepts multi-value parallel backedge copies" {
     var block_argument_types = [_]structures.TypeId{ .int, .int, .int, .int, .int };
+    var parameter_modes = [_]structures.ParameterMode{ .imm, .imm };
     var branch_arguments = [_]structures.FunctionValueUse{
         .{ .value = @enumFromInt(0) },
         .{ .value = @enumFromInt(1) },
@@ -396,6 +399,7 @@ test "cyclic CFG accepts multi-value parallel backedge copies" {
     };
     const ssa: structures.FunctionBodyAnalysis = .{
         .return_type = .int,
+        .parameter_modes = &parameter_modes,
         .block_argument_types = &block_argument_types,
         .branch_arguments = &branch_arguments,
         .call_arguments = &.{},
@@ -423,6 +427,7 @@ test "variant subset call construction cleans up every allocation failure" {
 
 test "variant injection copies an arbitrary-size non-variant interned payload" {
     var block_argument_types = [_]structures.TypeId{seven_byte_payload};
+    var parameter_modes = [_]structures.ParameterMode{.imm};
     var instructions = [_]structures.FunctionBodyAnalysis.Instruction{.{ .variant_coerce = .{
         .operand = @enumFromInt(0),
         .target_type = payload_variant,
@@ -436,6 +441,7 @@ test "variant injection copies an arbitrary-size non-variant interned payload" {
     }};
     const ssa: structures.FunctionBodyAnalysis = .{
         .return_type = payload_variant,
+        .parameter_modes = &parameter_modes,
         .block_argument_types = &block_argument_types,
         .variant_coercion_tags = &.{1},
         .branch_arguments = &.{},
@@ -453,11 +459,12 @@ test "variant injection copies an arbitrary-size non-variant interned payload" {
 
 fn testCompileVariantSubsetCallAllocations(gpa: std.mem.Allocator) !void {
     var block_argument_types = [_]structures.TypeId{small_variant};
-    var call_arguments = [_]structures.FunctionValueUse{.{
+    var parameter_modes = [_]structures.ParameterMode{.imm};
+    var call_arguments = [_]structures.FunctionCallArgument{.{ .prepared = .{
         .value = @enumFromInt(0),
         .coerce_to = wide_variant,
         .variant_tag_mapping = .{ .start = 0, .end = 2 },
-    }};
+    } }};
     var instructions = [_]structures.FunctionBodyAnalysis.Instruction{.{ .call = .{
         .target = .{ .direct = .{ .item = @enumFromInt(0) } },
         .arguments = .{ .start = 0, .end = 1 },
@@ -471,6 +478,7 @@ fn testCompileVariantSubsetCallAllocations(gpa: std.mem.Allocator) !void {
     }};
     const ssa: structures.FunctionBodyAnalysis = .{
         .return_type = wide_variant,
+        .parameter_modes = &parameter_modes,
         .block_argument_types = &block_argument_types,
         .variant_coercion_tags = &.{ 0, 2 },
         .branch_arguments = &.{},

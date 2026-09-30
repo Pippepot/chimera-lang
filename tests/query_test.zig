@@ -189,6 +189,15 @@ fn expectDirectValueUses(expected: []const structures.FunctionValueId, actual: [
     }
 }
 
+fn expectDirectCallArguments(expected: []const structures.FunctionValueId, actual: []const structures.FunctionCallArgument) !void {
+    try testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |expected_value, argument| {
+        try testing.expect(argument == .prepared);
+        try testing.expectEqual(expected_value, argument.prepared.value);
+        try testing.expectEqual(@as(?structures.TypeId, null), argument.prepared.coerce_to);
+    }
+}
+
 fn expectImmParameters(expected: []const structures.TypeId, actual: []const structures.CallableParameter) !void {
     try testing.expectEqual(expected.len, actual.len);
     for (expected, actual) |expected_type, parameter| {
@@ -1865,7 +1874,7 @@ test "custom ownership hooks execute without active-hook redispatch" {
         .{
             .source =
             \\static Box = struct
-            \\  copy = func(imm self: Box) Box -> self
+            \\  copy = func(imm self: Box) Box -> Box{value = self.value}
             \\  value: int
             \\func answer() int
             \\  const source = Box{value = 42}
@@ -1890,9 +1899,9 @@ test "custom ownership hooks execute without active-hook redispatch" {
         .{
             .source =
             \\static Box = struct
-            \\  move = func(var self: Box) Box
+            \\  move = func(deinit self: Box) Box
             \\    self.value += 1
-            \\    return self^
+            \\    return Box{value = self.value}
             \\  value: int
             \\func answer() int
             \\  const source = Box{value = 41}
@@ -1978,7 +1987,7 @@ test "custom ownership hooks execute without active-hook redispatch" {
         .{
             .source =
             \\static Inner = struct
-            \\  move = func(var self: Inner) Inner -> exit(self.value)
+            \\  move = func(deinit self: Inner) Inner -> exit(self.value)
             \\  value: int
             \\func answer()
             \\  const source: Inner | int = Inner{value = 42}
@@ -2884,7 +2893,7 @@ test "argument passing follows ownership and invalidates with type edits" {
         \\  move = none
         \\static Custom = struct
         \\  value: int
-        \\  move = func(var self: Custom) Custom -> Custom{value = self.value}
+        \\  move = func(deinit self: Custom) Custom -> Custom{value = self.value}
         \\static Nested = struct
         \\  value: Custom
         \\static Invalid = struct
@@ -2962,7 +2971,7 @@ test "incompatible ownership diagnostics retain the failed field rule" {
     }{
         .{ .source = "static Field = struct\n  move = fieldwise\n  value: int\nstatic Invalid = struct\n  move = trivial\n  value: Field", .reason = .trivial_move },
         .{ .source = "static Field = struct\n  move = none\n  value: int\nstatic Invalid = struct\n  move = fieldwise\n  value: Field", .reason = .fieldwise_move },
-        .{ .source = "static Field = struct\n  move = none\n  value: int\nstatic Invalid = struct\n  move = func(var self: Invalid) Invalid -> self^\n  value: Field", .reason = .custom_move },
+        .{ .source = "static Field = struct\n  move = none\n  value: int\nstatic Invalid = struct\n  move = func(deinit self: Invalid) Invalid -> self^\n  value: Field", .reason = .custom_move },
         .{ .source = "static Field = struct\n  value: int\nstatic Invalid = struct\n  copy = trivial\n  value: Field", .reason = .trivial_copy },
         .{ .source = "static Field = struct\n  value: int\nstatic Invalid = struct\n  copy = fieldwise\n  value: Field", .reason = .fieldwise_copy },
         .{ .source = "static Field = struct\n  drop = explicit\nstatic Invalid = struct\n  drop = trivial\n  value: Field", .reason = .trivial_drop },
@@ -4145,9 +4154,9 @@ test "compile-time interpreter executes custom aggregate ownership hooks" {
         \\  copy = func(imm self: Box) Box -> Box{value = self.value + 1}
         \\  value: int
         \\static MovedBox = struct
-        \\  move = func(var self: MovedBox) MovedBox
+        \\  move = func(deinit self: MovedBox) MovedBox
         \\    self.value += 1
-        \\    return self^
+        \\    return MovedBox{value = self.value}
         \\  value: int
         \\static result = comptime
         \\  const source = Box{value = 41}
@@ -4163,6 +4172,47 @@ test "compile-time interpreter executes custom aggregate ownership hooks" {
         structures.CompileTimeValue{ .runtime = .{ .type_id = .int, .value = .{ .int = 42 } } },
         try resolvedStaticValue(db, scope.resolveStatic(name).?),
     );
+}
+
+test "deinit compile-time calls preserve coercions field transfers and completion" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\func consume(deinit value: int | none) int
+        \\  if const number = value as int -> return number
+        \\  return 0
+        \\struct Item
+        \\  value: int
+        \\  drop = explicit
+        \\  move = func(deinit self: Item) Item -> Item{value = self.value^}
+        \\func dispose(static T: type, deinit item: T) int -> item.value
+        \\static direct = consume(42)
+        \\static indirect = comptime
+        \\  const callee = consume
+        \\  callee(42)
+        \\static moved = comptime
+        \\  const source = Item{value = 42}
+        \\  const destination = source^
+        \\  dispose(destination)
+        \\struct Child
+        \\  value: int
+        \\  drop = func(deinit self: Child) -> exit(self.value)
+        \\struct Parent
+        \\  child: Child
+        \\  drop = func(deinit self: Parent) -> exit(1)
+        \\func finish(deinit parent: Parent) -> ()
+        \\static stopped = finish(Parent{child = Child{value = 42}})
+    );
+    const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
+    for ([_][]const u8{ "direct", "indirect", "moved" }) |name| try testing.expectEqual(
+        structures.CompileTimeValue{ .runtime = .{ .type_id = .int, .value = .{ .int = 42 } } },
+        try resolvedStaticValue(db, scope.resolveStatic(name).?),
+    );
+    const stopped = scope.resolveStatic("stopped").?;
+    try testing.expect((try db.get(queries.ResolveStatic, stopped)).* == null);
+    const controls = try db.transitiveAccumulatorValues(queries.ResolveStatic, stopped, structures.CompilerControl, testing.allocator);
+    defer testing.allocator.free(controls);
+    try testing.expectEqualSlices(structures.CompilerControl, &.{.{ .exit = 42 }}, controls);
 }
 
 test "compile-time aggregate results are canonical and cleanup preserves reverse field order" {
@@ -5403,7 +5453,7 @@ test "variant values cross calls and subset widening remaps their tag" {
     const producer = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = producer_id })).*.?;
     try testing.expect(producer.blocks[0].terminator.return_value.coerce_to != null);
     const caller = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = caller_id })).*.?;
-    try testing.expect(caller.call_arguments[0].coerce_to != null);
+    try testing.expect(caller.call_arguments[0].prepared.coerce_to != null);
     try testing.expect((try db.get(queries.AnalyzeFunctionInstance, .{ .item = caller_id })).* != null);
     try testing.expect((try db.get(queries.CompileFunction, .{ .item = caller_id })).* != null);
     try expectCompiledVariantWord(db, 1, "caller", &.{ "caller", "producer", "accept" }, 0, 2);
@@ -6924,13 +6974,13 @@ test "parameters and nested call arguments form one typed value graph" {
     try testing.expectEqual(@as(u32, 2), @intFromEnum(add.blocks[0].terminator.return_value.value));
 
     const twice = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = twice_id })).*.?;
-    try expectDirectValueUses(&.{ @enumFromInt(0), @enumFromInt(0) }, twice.call_arguments);
+    try expectDirectCallArguments(&.{ @enumFromInt(0), @enumFromInt(0) }, twice.call_arguments);
     try testing.expectEqual(add_id, twice.instructions[0].call.target.direct.item);
     try testing.expectEqual(structures.FunctionValueRange{ .start = 0, .end = 2 }, twice.instructions[0].call.arguments);
     try testing.expectEqual(@as(u32, 1), @intFromEnum(twice.blocks[0].terminator.return_value.value));
 
     const answer = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = scope.resolve("answer").? })).*.?;
-    try expectDirectValueUses(&.{
+    try expectDirectCallArguments(&.{
         @enumFromInt(0),
         @enumFromInt(1),
         @enumFromInt(2),
@@ -7941,7 +7991,7 @@ test "discard assignment borrows once without copy or move" {
     try addSource(db, 1,
         \\static Box = struct
         \\  copy = func(imm self: Box) Box -> self
-        \\  move = func(var self: Box) Box -> self^
+        \\  move = func(deinit self: Box) Box -> Box{value = self.value}
         \\  value: int
         \\func increment(mut value: int) Box
         \\  value += 1
@@ -8349,6 +8399,26 @@ test "var parameter mode edits invalidate and recover callers" {
     try testing.expectEqual(@as(usize, 0), diagnostics.len);
 }
 
+test "deinit mode edits invalidate caller and callee calling conventions" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    const source =
+        \\func take({mode} value: int) int -> value
+        \\func answer() int
+        \\  const callee = take
+        \\  return callee(42)
+    ;
+    for ([_][]const u8{ "imm", "deinit", "imm" }, 0..) |mode, index| {
+        const edited = try std.mem.replaceOwned(u8, testing.allocator, source, "{mode}", mode);
+        defer testing.allocator.free(edited);
+        if (index == 0) try addSource(db, 1, edited) else try setSource(db, 1, edited);
+        try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "take" }, 42);
+        const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
+        const body = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = scope.resolveFunction("take").? })).*.?;
+        try testing.expectEqual(if (index == 1) structures.ParameterMode.deinit else .imm, body.parameter_modes[0]);
+    }
+}
+
 test "struct copy and move properties control ownership uses" {
     const db = try testDatabase(1);
     defer db.deinit();
@@ -8593,37 +8663,43 @@ test "explicit-drop abandonment diagnostics update and recover incrementally" {
     try testing.expectEqual(@as(usize, 0), diagnostics.len);
 }
 
-test "deinit parameters satisfy explicit-drop obligations" {
+test "deinit parameters complete explicit roots but retain field obligations" {
     const db = try testDatabase(1);
     defer db.deinit();
     try addSource(db, 1,
         \\static Resource = struct
         \\  drop = explicit
         \\  value: int
-        \\func dispose(deinit resource: Resource) int
-        \\  resource = Resource{value = resource.value + 1}
-        \\  return resource.value
-        \\func direct() int -> dispose(Resource{value = 41})
-        \\func answer() int
-        \\  const selected = dispose
-        \\  const resource = Resource{value = 41}
-        \\  return selected(resource^)
+        \\func dispose(deinit resource: Resource) int -> resource.value
     );
-    try expectCompiledFunctionResult(db, 1, "direct", &.{ "direct", "dispose" }, 42);
-    try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "dispose" }, 42);
+    const dispose = (try db.get(queries.BuildModuleScope, 1)).*.?.resolveFunction("dispose").?;
+    try testing.expect((try db.get(queries.AnalyzeFunctionInstance, .{ .item = dispose })).* != null);
+    try setSource(db, 1,
+        \\static Field = struct
+        \\  drop = explicit
+        \\static Resource = struct
+        \\  drop = explicit
+        \\  field: Field
+        \\func dispose(deinit resource: Resource) -> ()
+    );
+    try testing.expect((try db.get(queries.AnalyzeFunctionInstance, .{ .item = dispose })).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(queries.AnalyzeFunctionInstance, .{ .item = dispose }, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(DiagnosticKind.value_requires_explicit_drop, std.meta.activeTag(diagnostics[0].kind));
 }
 
-test "deinit arguments require ownership and invalidate transferred roots" {
+test "deinit arguments reject borrowed sources and invalidate transferred roots" {
     const cases = [_]struct {
         source: []const u8,
         kind: DiagnosticKind,
     }{
         .{
-            .source = "static Resource = struct\n  drop = explicit\n  value: int\nfunc dispose(deinit resource: Resource) -> return\nfunc bad()\n  const resource = Resource{value = 42}\n  dispose(resource)",
-            .kind = .type_not_copyable,
+            .source = "static Resource = struct\n  copy = none\n  value: int\nfunc dispose(deinit resource: Resource) -> return\nfunc bad(imm resource: Resource) -> dispose(resource)",
+            .kind = .ownership_transfer_requires_owned_place,
         },
         .{
-            .source = "static Resource = struct\n  drop = explicit\n  value: int\nfunc dispose(deinit resource: Resource) -> return\nfunc bad() int\n  const resource = Resource{value = 42}\n  dispose(resource^)\n  return resource.value",
+            .source = "static Resource = struct\n  value: int\nfunc dispose(deinit resource: Resource) -> return\nfunc bad() int\n  const resource = Resource{value = 42}\n  dispose(resource^)\n  return resource.value",
             .kind = .use_after_transfer,
         },
     };
@@ -10524,7 +10600,7 @@ test "generated namespace queries reject stale source positions" {
     try testing.expect((try db.get(queries.GeneratedStructDefinition, identity.generated)).* == null);
 }
 
-test "aggregate explicit drop retains automatic field cleanup" {
+test "aggregate deinit cannot abandon an explicit-drop field" {
     const db = try testDatabase(1);
     defer db.deinit();
     try addSource(db, 1,
@@ -10538,10 +10614,12 @@ test "aggregate explicit drop retains automatic field cleanup" {
         \\func consume(deinit value: Combined) -> return
         \\consume(Combined{automatic = Automatic{}, explicit = Explicit{}})
     );
-    const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
-    defer std.Io.Dir.cwd().deleteFile(testing.io, "prog") catch {};
-    try runtime.writeProgram(testing.io, executable.bytes);
-    try testing.expectEqual(@as(u8, 42), try runtime.runProg(testing.io, testing.allocator, &.{}));
+    const consume = (try db.get(queries.BuildModuleScope, 1)).*.?.resolveFunction("consume").?;
+    try testing.expect((try db.get(queries.AnalyzeFunctionInstance, .{ .item = consume })).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(queries.AnalyzeFunctionInstance, .{ .item = consume }, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(DiagnosticKind.value_requires_explicit_drop, std.meta.activeTag(diagnostics[0].kind));
 }
 
 test "whole replacement does not extend the old generation past its last use" {

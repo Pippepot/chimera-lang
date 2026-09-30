@@ -510,13 +510,13 @@ test "Box.duplicate preserves in-place copying of immovable values" {
     try fixture.expectExit(0, 42);
 }
 
-test "Ref copy and replacement methods distinguish copying from borrowing" {
+test "Ref read and replacement methods distinguish copying from borrowing" {
     const fixture = try Fixture.init(
         \\fallible run() int
         \\  var owner = Box.new(17)
         \\  const reference = owner.borrow_mut()
         \\  reference.replace(42)
-        \\  return reference.copy()
+        \\  return reference.read()
         \\if const result = run() -> exit(result) else exit(1)
     , &.{});
     defer fixture.deinit();
@@ -2993,7 +2993,7 @@ test "buffer append rejects elements with custom move" {
         \\import std.memory.{Buffer}
         \\struct CustomMove
         \\  value: int
-        \\  move = func(var self: CustomMove) CustomMove -> CustomMove{value = self.value}
+        \\  move = func(deinit self: CustomMove) CustomMove -> CustomMove{value = self.value}
         \\fallible run() unit
         \\  var buffer = Buffer(CustomMove).new(1)
         \\  buffer.append(CustomMove{value = 42})
@@ -3008,7 +3008,7 @@ test "buffer reserve rejects elements with custom move" {
         \\import std.memory.{Buffer}
         \\struct CustomMove
         \\  value: int
-        \\  move = func(var self: CustomMove) CustomMove -> CustomMove{value = self.value}
+        \\  move = func(deinit self: CustomMove) CustomMove -> CustomMove{value = self.value}
         \\fallible run() unit
         \\  var buffer = Buffer(CustomMove).new(0)
         \\  buffer.reserve(1)
@@ -4102,7 +4102,7 @@ test "Box drops a struct with a custom move without relocating it" {
     const fixture = try Fixture.init(
         \\struct CustomMove
         \\  value: int
-        \\  move = func(var self: CustomMove) CustomMove -> return CustomMove{value = self.value}
+        \\  move = func(deinit self: CustomMove) CustomMove -> return CustomMove{value = self.value}
         \\  drop = func(deinit self: CustomMove) -> exit(self.value)
         \\fallible run() unit
         \\  const owner = Box(CustomMove).new(CustomMove{value = 42})
@@ -4121,7 +4121,7 @@ test "immovable and nested custom-move arguments borrow and write back by addres
         \\  value: int
         \\struct CustomMove
         \\  value: int
-        \\  move = func(var self: CustomMove) CustomMove -> CustomMove{value = self.value}
+        \\  move = func(deinit self: CustomMove) CustomMove -> CustomMove{value = self.value}
         \\struct Wrapper
         \\  inner: CustomMove
         \\func bump_immovable(mut value: Immovable)
@@ -4138,6 +4138,300 @@ test "immovable and nested custom-move arguments borrow and write back by addres
     , &.{});
     defer fixture.deinit();
     try fixture.expectExit(0, 42);
+}
+
+test "deinit consumes an immovable local at its original address" {
+    const fixture = try Fixture.init(
+        \\struct Item
+        \\  move = none
+        \\  value: int
+        \\func consume(deinit item: Item) int -> item.value
+        \\const item = Item{value = 42}
+        \\exit(consume(item))
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+test "deinit does not invoke a custom move hook" {
+    const fixture = try Fixture.init(
+        \\struct Item
+        \\  value: int
+        \\  move = func(deinit self: Item) Item -> Item{value = self.value + 1}
+        \\func consume(deinit item: Item) int -> item.value
+        \\const item = Item{value = 42}
+        \\exit(consume(item^))
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+test "deinit constructs fresh variant arguments before passing their address" {
+    const fixture = try Fixture.init(
+        \\func consume(deinit item: int | none) int
+        \\  if const number = item as int -> return number
+        \\  return 1
+        \\const indirect = consume
+        \\exit(consume(20) + indirect(22))
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+test "deinit rejects borrowed parameters instead of copying them" {
+    const fixture = try Fixture.init(
+        \\struct Item
+        \\  value: int
+        \\  copy = func(imm self: Item) Item -> Item{value = self.value + 1}
+        \\func consume(deinit item: Item) int -> item.value
+        \\func forward(imm item: Item) int -> consume(item)
+        \\exit(forward(Item{value = 42}))
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectDiagnostic(0, .ownership_transfer_requires_owned_place);
+}
+
+test "deinit rejects borrowed fields aliases and referents" {
+    const cases = [_][]const u8{
+        \\func run(imm holder: Holder) int -> consume(holder.item)
+        \\exit(run(Holder{item = Item{value = 42}}))
+        ,
+        \\const item = Item{value = 42}
+        \\borrow alias = item
+        \\exit(consume(alias))
+        ,
+        \\const holder = Holder{item = Item{value = 42}}
+        \\borrow alias = holder
+        \\exit(consume(alias.item))
+        ,
+        \\fallible run() int
+        \\  const owner = Box.new(Item{value = 42})
+        \\  return consume(owner.borrow()[])
+        \\if const result = run() -> exit(result) else exit(1)
+        ,
+        \\func run(mut item: Item) int -> consume(item)
+        \\var item = Item{value = 42}
+        \\exit(run(item))
+        ,
+    };
+    for (cases) |body| {
+        const source = try std.mem.concat(testing.allocator, u8, &.{
+            \\struct Item
+            \\  copy = trivial
+            \\  value: int
+            \\struct Holder
+            \\  item: Item
+            \\func consume(deinit item: Item) int -> item.value
+            \\
+            ,
+            body,
+        });
+        defer testing.allocator.free(source);
+        const fixture = try Fixture.init(source, &.{});
+        defer fixture.deinit();
+        try fixture.expectDiagnostic(0, .ownership_transfer_requires_owned_place);
+    }
+}
+
+test "deinit member receivers preserve independent field availability" {
+    const fixture = try Fixture.init(
+        \\struct Item
+        \\  move = none
+        \\  value: int
+        \\  pub func consume(deinit self: Item) int -> self.value
+        \\struct Pair
+        \\  first: Item
+        \\  second: Item
+        \\const pair = Pair{first = Item{value = 20}, second = Item{value = 22}}
+        \\const first = pair.first^.consume()
+        \\exit(first + pair.second.consume())
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+test "deinit completes an explicit-drop root" {
+    const fixture = try Fixture.init(
+        \\struct Item
+        \\  drop = explicit
+        \\  value: int
+        \\func dispose(deinit item: Item) int -> item.value
+        \\const item = Item{value = 42}
+        \\exit(dispose(item))
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+test "deinit move hooks transfer fields through nested hooks exactly once" {
+    const fixture = try Fixture.init(
+        \\struct Field
+        \\  value: int
+        \\  move = func(deinit self: Field) Field
+        \\    const value = self.value^
+        \\    return Field{value = value + 1}
+        \\struct Item
+        \\  field: Field
+        \\  move = func(deinit self: Item) Item -> Item{field = self.field^}
+        \\const item = Item{field = Field{value = 41}}
+        \\const moved = item^
+        \\exit(moved.field.value)
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+test "deinit conflicts with an earlier borrow of the same field" {
+    const fixture = try Fixture.init(
+        \\struct Item
+        \\  value: int
+        \\struct Holder
+        \\  item: Item
+        \\func take(imm borrowed: Item, deinit consumed: Item) int -> borrowed.value
+        \\const holder = Holder{item = Item{value = 42}}
+        \\exit(take(holder.item, holder.item))
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectDiagnostic(0, .use_after_transfer);
+}
+
+test "deinit move hooks transfer fields and clean up remaining fields" {
+    const fixture = try Fixture.init(
+        \\struct Child
+        \\  value: int
+        \\  drop = func(deinit self: Child) -> exit(self.value)
+        \\struct Item
+        \\  value: int
+        \\  child: Child
+        \\  move = func(deinit self: Item) Item -> Item{value = self.value^, child = Child{value = 1}}
+        \\const item = Item{value = 0, child = Child{value = 42}}
+        \\const moved = item^
+        \\exit(moved.value)
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+test "deinit forwards an explicit-drop field from its original storage" {
+    const fixture = try Fixture.init(
+        \\import std.memory.{Allocation, allocate, deallocate}
+        \\struct Holder
+        \\  drop = explicit
+        \\  storage: Allocation(int)
+        \\func dispose(deinit holder: Holder)
+        \\  deallocate(int, holder.storage)
+        \\fallible run() unit
+        \\  const holder = Holder{storage = allocate(int, 1)}
+        \\  dispose(holder)
+        \\if run() -> exit(42) else exit(1)
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+test "deinit member call consumes an owned field" {
+    const fixture = try Fixture.init(
+        \\import std.memory.{Allocation, allocate}
+        \\struct Holder
+        \\  storage: Allocation(int)
+        \\func dispose(deinit holder: Holder)
+        \\  holder.storage.release()
+        \\fallible run() unit
+        \\  const holder = Holder{storage = allocate(int, 1)}
+        \\  dispose(holder)
+        \\if run() -> exit(42) else exit(1)
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+test "deinit field consumption invalidates later field reads" {
+    const fixture = try Fixture.init(
+        \\import std.memory.{Allocation, allocate, deallocate}
+        \\struct Holder
+        \\  storage: Allocation(int)
+        \\func invalid(deinit holder: Holder) int
+        \\  deallocate(int, holder.storage)
+        \\  return holder.storage.capacity()
+        \\fallible run() int
+        \\  const holder = Holder{storage = allocate(int, 1)}
+        \\  return invalid(holder)
+        \\if const result = run() -> exit(result) else exit(1)
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectDiagnostic(0, .use_after_transfer);
+}
+
+test "deinit source is cleaned when a later argument fails" {
+    const fixture = try Fixture.init(
+        \\struct Item
+        \\  value: int
+        \\  drop = func(deinit self: Item) -> exit(self.value)
+        \\fallible fail() int
+        \\  1 == 0
+        \\  return 0
+        \\func take(deinit item: Item, value: int) -> ()
+        \\fallible run() unit
+        \\  const item = Item{value = 42}
+        \\  take(item, fail())
+        \\if run() -> exit(1) else exit(2)
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+test "deinit forwarding retains residual cleanup when a later argument fails" {
+    const fixture = try Fixture.init(
+        \\struct Child
+        \\  value: int
+        \\  drop = func(deinit self: Child) -> exit(self.value)
+        \\struct Item
+        \\  child: Child
+        \\  drop = func(deinit self: Item) -> exit(1)
+        \\func take(deinit item: Item, value: int) -> ()
+        \\fallible fail() int
+        \\  1 == 0
+        \\  return 0
+        \\fallible forward(deinit item: Item) unit
+        \\  take(item, fail())
+        \\if forward(Item{child = Child{value = 42}}) -> exit(2) else exit(3)
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+test "deinit fresh variant cleanup survives later argument failure" {
+    const fixture = try Fixture.init(
+        \\struct Item
+        \\  value: int
+        \\  drop = func(deinit self: Item) -> exit(self.value)
+        \\func take(deinit item: Item | none, value: int) -> ()
+        \\fallible fail() int
+        \\  1 == 0
+        \\  return 0
+        \\fallible run() unit
+        \\  take(Item{value = 42}, fail())
+        \\if run() -> exit(1) else exit(2)
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+test "deinit explicit arguments cannot be abandoned by later argument failure" {
+    const fixture = try Fixture.init(
+        \\struct Item
+        \\  drop = explicit
+        \\func take(deinit item: Item, value: int) -> ()
+        \\fallible fail() int
+        \\  1 == 0
+        \\  return 0
+        \\fallible run() unit
+        \\  const item = Item{}
+        \\  take(item, fail())
+        \\if run() -> exit(1) else exit(2)
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectDiagnostic(0, .value_requires_explicit_drop);
 }
 
 test "custom drop hook does not redispatch after replacing self" {
@@ -4925,7 +5219,7 @@ test "custom copies and moves retain all possible field origins" {
     ;
     inline for (.{
         .{ .hook = "copy = func(imm self: Pair) Pair", .operand = "source" },
-        .{ .hook = "move = func(var self: Pair) Pair", .operand = "source^" },
+        .{ .hook = "move = func(deinit self: Pair) Pair", .operand = "source^" },
     }) |case| {
         const hooked = try std.mem.replaceOwned(u8, testing.allocator, source, "{hook}", case.hook);
         defer testing.allocator.free(hooked);
@@ -5076,7 +5370,7 @@ test "custom copy and move effects invalidate pending borrows" {
         .{ .movement = "", .hook = "copy = func(imm", .parameter = "Copier", .argument = "source", .access = "copied.target[].value" },
         .{ .movement = "", .hook = "copy = func(imm", .parameter = "Box(Copier)", .argument = "duplicate(Copier, source)", .access = "copied.borrow()[].target[].value" },
         .{ .movement = "  move = none\n", .hook = "copy = func(imm", .parameter = "Box(Copier)", .argument = "duplicate(Copier, source)", .access = "copied.borrow()[].target[].value" },
-        .{ .movement = "", .hook = "move = func(var", .parameter = "Copier", .argument = "source^", .access = "copied.target[].value" },
+        .{ .movement = "", .hook = "move = func(deinit", .parameter = "Copier", .argument = "source^", .access = "copied.target[].value" },
     };
     inline for (cases) |case| {
         const source = try std.mem.concat(testing.allocator, u8, &.{

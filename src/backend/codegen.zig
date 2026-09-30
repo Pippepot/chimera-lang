@@ -50,8 +50,12 @@ const ValueLocation = union(enum) {
 const indirect_layout: structures.TypeLayout = .{ .byte_size = @sizeOf(u64), .byte_alignment = @alignOf(u64) };
 const zero_sized_address_layout: structures.TypeLayout = .{ .byte_size = 1, .byte_alignment = 1 };
 
-fn argumentLayout(types: anytype, type_id: structures.TypeId) !structures.TypeLayout {
-    return if (try types.facts().argumentPassing(type_id) == .indirect) indirect_layout else try types.layout(type_id);
+fn argumentByAddress(types: anytype, type_id: structures.TypeId, source_address: bool) !bool {
+    return source_address or try types.facts().argumentPassing(type_id) == .indirect;
+}
+
+fn argumentLayout(types: anytype, type_id: structures.TypeId, source_address: bool) !structures.TypeLayout {
+    return if (try argumentByAddress(types, type_id, source_address)) indirect_layout else try types.layout(type_id);
 }
 
 fn valueSlotLayout(types: anytype, type_id: structures.TypeId) !structures.TypeLayout {
@@ -104,7 +108,8 @@ const CallLayout = struct {
     arguments: []ValueLocation,
     storage_end: u32,
 
-    fn init(types: anytype, return_type: structures.TypeId, parameters: []const structures.TypeId, gpa: std.mem.Allocator) !CallLayout {
+    fn init(types: anytype, return_type: structures.TypeId, parameters: []const structures.TypeId, source_addresses: []const bool, gpa: std.mem.Allocator) !CallLayout {
+        std.debug.assert(parameters.len == source_addresses.len);
         const arguments = try gpa.alloc(ValueLocation, parameters.len);
         errdefer gpa.free(arguments);
         var end: u32 = 0;
@@ -112,9 +117,9 @@ const CallLayout = struct {
             const offset = try reserveStack(&end, layout);
             break :blk if (try types.facts().argumentPassing(return_type) == .indirect) .{ .indirect = offset } else .{ .stack = offset };
         } else .eax;
-        for (parameters, arguments) |type_id, *argument| {
-            const offset = try reserveStack(&end, try argumentLayout(types, type_id));
-            argument.* = if (try types.facts().argumentPassing(type_id) == .indirect) .{ .indirect = offset } else .{ .stack = offset };
+        for (parameters, source_addresses, arguments) |type_id, source_address, *argument| {
+            const offset = try reserveStack(&end, try argumentLayout(types, type_id, source_address));
+            argument.* = if (try argumentByAddress(types, type_id, source_address)) .{ .indirect = offset } else .{ .stack = offset };
         }
         return .{ .result = result, .arguments = arguments, .storage_end = end };
     }
@@ -146,10 +151,14 @@ fn planCallStorage(
     if (layouts.get(key)) |layout| return layout.storage_end;
     const parameters = try gpa.alloc(structures.TypeId, call.arguments.end - call.arguments.start);
     defer gpa.free(parameters);
-    for (ssa.call_arguments[call.arguments.start..call.arguments.end], parameters) |argument, *parameter| {
-        parameter.* = argument.coerce_to orelse value_types[@intFromEnum(argument.value)];
+    const source_addresses = try gpa.alloc(bool, parameters.len);
+    defer gpa.free(source_addresses);
+    for (ssa.call_arguments[call.arguments.start..call.arguments.end], parameters, source_addresses) |argument, *parameter, *source_address| {
+        const use = argument.valueUse();
+        parameter.* = use.coerce_to orelse value_types[@intFromEnum(use.value)];
+        source_address.* = argument == .deinit;
     }
-    var layout = try CallLayout.init(types, call.return_type, parameters, gpa);
+    var layout = try CallLayout.init(types, call.return_type, parameters, source_addresses, gpa);
     errdefer layout.deinit(gpa);
     try layouts.put(gpa, key, layout);
     return layout.storage_end;
@@ -175,8 +184,12 @@ const LocationPlan = struct {
         for (arguments) |argument| needed[@intFromEnum(argument.value)] = .used;
     }
 
-    fn markCallArguments(ssa: *const structures.FunctionBodyAnalysis, call: structures.FunctionCall, needed: []Usage) void {
-        for (ssa.call_arguments[call.arguments.start..call.arguments.end]) |argument| needed[@intFromEnum(argument.value)] = .used;
+    fn markCallArguments(ssa: *const structures.FunctionBodyAnalysis, call: structures.FunctionCall, needed: []Usage, addressable: []bool) void {
+        for (ssa.call_arguments[call.arguments.start..call.arguments.end]) |argument| {
+            const index = @intFromEnum(argument.valueId());
+            needed[index] = .used;
+            if (argument == .deinit) addressable[index] = true;
+        }
     }
 
     fn init(ssa: *const structures.FunctionBodyAnalysis, types: anytype, gpa: std.mem.Allocator) !LocationPlan {
@@ -210,7 +223,7 @@ const LocationPlan = struct {
                 .borrow_address => |operation| if (!operation.base_is_reference) {
                     addressable[@intFromEnum(operation.source)] = true;
                 },
-                .call => |call| markCallArguments(ssa, call, needed),
+                .call => |call| markCallArguments(ssa, call, needed, addressable),
                 else => {},
             }
         }
@@ -225,7 +238,7 @@ const LocationPlan = struct {
                     markBranchArguments(ssa, predicate.then_branch, needed);
                     markBranchArguments(ssa, predicate.else_branch, needed);
                 },
-                .fallible_call => |fallible| markCallArguments(ssa, fallible.call, needed),
+                .fallible_call => |fallible| markCallArguments(ssa, fallible.call, needed, addressable),
                 .return_unit, .return_value, .return_failure, .diverge => {},
             }
         }
@@ -319,12 +332,16 @@ const LocationPlan = struct {
         const entry = ssa.blocks[entry_index];
         for (entry.argument_start..entry.argument_end) |argument_index| {
             if (!addressable[argument_index]) continue;
-            if ((try argumentLayout(types, value_types[argument_index])).byte_size != 0) continue;
+            if ((try argumentLayout(types, value_types[argument_index], ssa.parameter_modes[argument_index - entry.argument_start] == .deinit)).byte_size != 0) continue;
             locations[argument_index] = .{ .stack = try reserveStack(&local_end, zero_sized_address_layout) };
         }
         const stack_size = local_end;
         if (stack_size > std.math.maxInt(i32)) return error.FunctionTooLarge;
-        var incoming = try CallLayout.init(types, ssa.return_type, ssa.block_argument_types[entry.argument_start..entry.argument_end], gpa);
+        std.debug.assert(ssa.parameter_modes.len == entry.argument_end - entry.argument_start);
+        const incoming_addresses = try gpa.alloc(bool, ssa.parameter_modes.len);
+        defer gpa.free(incoming_addresses);
+        for (ssa.parameter_modes, incoming_addresses) |mode, *source_address| source_address.* = mode == .deinit;
+        var incoming = try CallLayout.init(types, ssa.return_type, ssa.block_argument_types[entry.argument_start..entry.argument_end], incoming_addresses, gpa);
         errdefer incoming.deinit(gpa);
         var return_buffer_offset: ?u32 = null;
         const caller_stack_offset = std.math.add(u32, stack_size, @sizeOf(u64)) catch return error.FunctionTooLarge;
@@ -348,7 +365,8 @@ const LocationPlan = struct {
         for (locations[entry.argument_start..entry.argument_end], 0..) |*location, argument_offset| {
             const argument_index = entry.argument_start + argument_offset;
             const type_id = value_types[argument_index];
-            const layout = try argumentLayout(types, type_id);
+            const source_address = incoming_addresses[argument_offset];
+            const layout = try argumentLayout(types, type_id, source_address);
             const argument_stack_offset = switch (incoming.arguments[argument_offset]) {
                 .stack, .indirect => |offset| offset,
                 else => unreachable,
@@ -356,7 +374,7 @@ const LocationPlan = struct {
             const offset = std.math.add(u32, caller_stack_offset, argument_stack_offset) catch return error.FunctionTooLarge;
             try ensureAddressableStackRange(offset, layout.byte_size);
             if (needed[argument_index] != .unused and layout.byte_size != 0) {
-                location.* = if (try types.facts().argumentPassing(type_id) == .indirect) .{ .indirect = offset } else .{ .incoming_argument = offset };
+                location.* = if (try argumentByAddress(types, type_id, source_address)) .{ .indirect = offset } else .{ .incoming_argument = offset };
             }
         }
         return .{
@@ -406,7 +424,7 @@ fn FunctionEmitter(comptime Types: type) type {
         value_types: []const structures.TypeId,
         variant_coercion_tags: []const u32,
         branch_arguments: []const structures.FunctionValueUse,
-        call_arguments: []const structures.FunctionValueUse,
+        call_arguments: []const structures.FunctionCallArgument,
         call_layouts: CallLayouts,
         incoming_layout: CallLayout,
         block_offsets: []u32,
@@ -712,10 +730,11 @@ fn FunctionEmitter(comptime Types: type) type {
             }
             for (self.call_arguments[call.arguments.start..call.arguments.end], layout.arguments) |argument, location| {
                 if (location == .indirect) {
-                    std.debug.assert(argument.coerce_to == null);
-                    try self.loadValueAddress(self.locations[@intFromEnum(argument.value)]);
+                    const use = argument.valueUse();
+                    std.debug.assert(use.coerce_to == null);
+                    try self.loadValueAddress(self.locations[@intFromEnum(use.value)]);
                     try self.encoder.offset(.mov_rsp_rax, location.indirect);
-                } else try self.emitUseToMemory(argument, location.stack);
+                } else try self.emitUseToMemory(argument.valueUse(), location.stack);
             }
         }
 
@@ -1235,11 +1254,12 @@ fn compileExternalAllocateStorage(gpa: std.mem.Allocator, element_size: u32, wit
 pub fn compileExternalDeallocateHostStorage(gpa: std.mem.Allocator) !structures.CompiledFunction {
     var encoder = try X86Encoder.init(gpa);
     defer encoder.deinit();
-    try encoder.offset(.mov_edi_rsp, 8);
-    try encoder.offset(.mov_esi_rsp, 12);
-    try encoder.emit(.shl_rsi_32);
-    try encoder.emit(.or_rdi_rsi);
-    try encoder.offset(.mov_esi_rsp, 16);
+    try encoder.offset(.mov_rax_rsp, 8);
+    try encoder.emit(.mov_rax_rax);
+    try encoder.emit(.mov_rdi_rax);
+    try encoder.offset(.mov_rax_rsp, 8);
+    try encoder.offset(.mov_eax_rax, 8);
+    try encoder.emit(.mov_esi_eax);
     try encoder.immediate(.mov_eax, linux_munmap_syscall);
     try encoder.emit(.syscall);
     try encoder.immediate(.mov_edx, 1);
@@ -1259,7 +1279,11 @@ pub fn compileExternalAllocationCount(gpa: std.mem.Allocator, count_offset: u32)
 pub fn compileExternalHostBoxWrap(gpa: std.mem.Allocator, layout: structures.TypeLayout) !structures.CompiledFunction {
     var encoder = try X86Encoder.init(gpa);
     defer encoder.deinit();
-    try encoder.offset(.lea_rsi_rsp, layout.byte_size + 8);
+    var argument_end: u32 = 0;
+    _ = try reserveStack(&argument_end, layout);
+    const allocation_offset = try reserveStack(&argument_end, indirect_layout);
+    try encoder.offset(.mov_rax_rsp, allocation_offset + 8);
+    try encoder.emit(.mov_rsi_rax);
     try encoder.offset(.lea_rdi_rsp, 8);
     try encoder.immediate(.mov_ecx, @intCast(layout.byte_size));
     try encoder.emit(.rep_movsb);

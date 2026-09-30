@@ -64,6 +64,7 @@ const instructions = .{
     .ja = Encoding{ .prefix = &.{ 0x0F, 0x87 }, .operand = .rel, .asm_prefix = "ja " },
     .jae = Encoding{ .prefix = &.{ 0x0F, 0x83 }, .operand = .rel, .asm_prefix = "jae " },
     .mov_eax_esi = Encoding{ .prefix = &.{ 0x89, 0xF0 }, .asm_prefix = "mov eax, esi" },
+    .mov_esi_eax = Encoding{ .prefix = &.{ 0x89, 0xC6 }, .asm_prefix = "mov esi, eax" },
     .movsxd_rcx_rsp = Encoding{ .prefix = &.{ 0x48, 0x63, 0x8C, 0x24 }, .operand = .u32, .asm_prefix = "movsxd rcx, [rsp+", .asm_suffix = "]" },
     .movsxd_rcx_eax = Encoding{ .prefix = &.{ 0x48, 0x63, 0xC8 }, .asm_prefix = "movsxd rcx, eax" },
     .mov_rcx_rsp = Encoding{ .prefix = &.{ 0x48, 0x8B, 0x8C, 0x24 }, .operand = .u32, .asm_prefix = "mov rcx, [rsp+", .asm_suffix = "]" },
