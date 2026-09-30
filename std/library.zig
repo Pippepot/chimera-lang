@@ -5,6 +5,7 @@ pub const File = enum(u32) {
     memory_allocation,
     memory_host,
     prelude,
+    ownership,
 
     pub fn path(file: File) []const u8 {
         return switch (file) {
@@ -12,6 +13,7 @@ pub const File = enum(u32) {
             .memory_allocation => "memory/allocation.chi",
             .memory_host => "memory/host.chi",
             .prelude => "prelude.chi",
+            .ownership => "ownership.chi",
         };
     }
 
@@ -53,10 +55,13 @@ pub const External = enum {
     unsafe_take_box,
     unsafe_destroy_box,
     deallocate_box,
+    copy_value,
+    move_value,
 
     pub fn file(symbol: External) File {
         return switch (symbol) {
             .exit => .exit,
+            .copy_value, .move_value => .ownership,
             .allocate_host_storage, .deallocate_host_storage => .memory_host,
             .allocate, .deallocate, .allocation_count, .unsafe_initialize, .unsafe_take, .unsafe_destroy, .unsafe_borrow_initialized, .borrow_box, .borrow_mut_box, .borrow_local, .unsafe_borrow_element, .unsafe_borrow_mut_element, .read, .write, .attenuate_ref, .unsafe_own_box, .unsafe_take_box, .unsafe_destroy_box, .deallocate_box => .memory_allocation,
         };

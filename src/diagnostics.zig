@@ -386,6 +386,7 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
         .invalid_external_signature => try writer.writeAll("external function signature does not match its compiler-provided implementation"),
         .struct_member_not_supported => try writer.writeAll("struct bodies support fields, namespace declarations, and `move`, `copy`, or `drop` properties"),
         .duplicate_struct_member => try writeSourceLabel(writer, "struct member is already declared", source, span),
+        .reserved_ownership_member => try writeSourceLabel(writer, "`copy` and `move` are reserved for ownership capabilities", source, span),
         .duplicate_struct_property => try writeSourceLabel(writer, "struct ownership property is already declared", source, span),
         .unknown_struct_property => {
             try writeSourceLabel(writer, "unknown struct ownership property", source, span);

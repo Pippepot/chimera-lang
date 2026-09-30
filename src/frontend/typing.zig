@@ -24,6 +24,7 @@ pub const BodyOptions = struct {
     allow_type_values: bool = false,
     expected_result_type: ?structures.TypeId = null,
     measurements: ?*BodyMeasurements = null,
+    ownership_member: ?structures.OwnershipMember = null,
 };
 
 pub const BodyMeasurements = struct {
@@ -73,7 +74,7 @@ pub fn resolveAndTypeBody(
         .expected_result_type = options.expected_result_type,
     };
     defer builder.deinit();
-    builder.build(parameters) catch |err| switch (err) {
+    builder.build(parameters, options.ownership_member) catch |err| switch (err) {
         error.SourceRejected, error.Unavailable => return null,
         else => return err,
     };
@@ -542,8 +543,9 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             return .{ .expected = expected, .found = found };
         }
 
-        fn build(self: *Self, parameters: []const structures.CallableParameter) !void {
+        fn build(self: *Self, parameters: []const structures.CallableParameter, ownership_member: ?structures.OwnershipMember) !void {
             try self.init(parameters);
+            if (ownership_member) |operation| return self.buildOwnershipMember(operation);
             const result = try self.block(self.unresolved.root_block, self.expected_result_type);
             if (self.current_block == null) return;
             const root = self.unresolved.blocks[@intFromEnum(self.unresolved.root_block)];
@@ -561,6 +563,19 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             } else {
                 return self.reject(root.span, .{ .missing_return_value = self.return_type });
             }
+        }
+
+        fn buildOwnershipMember(self: *Self, operation: structures.OwnershipMember) !void {
+            if (self.return_type == .never) {
+                self.terminate(.diverge);
+                return;
+            }
+            const span = self.unresolved.parameter_spans[0];
+            const result = switch (operation) {
+                .copy => try self.copyValue(self.values[0].?, span),
+                .move => try self.moveValue(self.local_values[0].?, span),
+            };
+            try self.returnValue(result, span);
         }
 
         fn block(self: *Self, block_id: semantic.UnresolvedBody.BlockId, expected_type: ?structures.TypeId) !?Value {
@@ -3734,9 +3749,18 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 if (receiver.type_id == .never) return receiver;
                 break :blk receiver.type_id;
             };
+            const method_arguments = self.unresolved.method_call_arguments[call.arguments.start..call.arguments.end];
+            if (std.meta.stringToEnum(structures.OwnershipMember, member.name)) |operation| {
+                const instance = (try self.type_interner.ownershipMember(receiver_type, operation)) orelse
+                    return self.reject(call.span, .unknown_namespace_member);
+                signature.* = (try self.type_interner.functionSignature(instance)) orelse return error.Unavailable;
+                target.* = .{ .direct = instance };
+                try arguments.append(self.ctx.allocator(), member.receiver);
+                for (method_arguments) |argument| try arguments.append(self.ctx.allocator(), argument.value);
+                return null;
+            }
             const definition = (try self.type_interner.structDefinition(receiver_type)) orelse
                 return self.reject(member.receiver.span, .{ .field_access_not_struct = receiver_type });
-            const method_arguments = self.unresolved.method_call_arguments[call.arguments.start..call.arguments.end];
             if (definition.resolveField(member.name) != null) {
                 const callee = try self.borrowValue(try self.accessField(member.receiver, member.name, call.span), call.span);
                 signature.* = try self.type_interner.facts().callable(callee.type_id) orelse

@@ -730,6 +730,70 @@ test "deinit bodies restore and invalidate when parameter modes change" {
     try std.testing.expectEqual(@as(u8, 42), try runtime.runProg(io, allocator, &.{}));
 }
 
+test "ownership members restore specialized callables and invalidate capability edits" {
+    const modules = @import("modules.zig");
+    const runtime = @import("runtime.zig");
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const source =
+        \\struct Item
+        \\  copy = trivial
+        \\  value: int
+        \\static duplicate = Item.copy
+        \\static transfer = Item.move
+        \\const source = Item{value = 42}
+        \\const copied = duplicate(source)
+        \\const moved = transfer(copied)
+        \\exit(moved.value)
+    ;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(directory);
+    const digest = cache.querySnapshotKey(try cache.compilerDigest(io), "main.chi", &.{});
+    const first = try query.Database.init(allocator, .{ .worker_count = 2 });
+    defer first.deinit();
+    try modules.registerSources(first, allocator, source, &.{}, &.{});
+    try std.testing.expect((try first.get(queries.BuildExecutable, 0)).* != null);
+    try save(io, allocator, directory, digest, first);
+    const payload = (try cache.load(io, allocator, directory, digest)) orelse return error.TestUnexpectedResult;
+    defer allocator.free(payload);
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+
+    for ([_][]const u8{ "trivial", "func(imm self: Item) Item -> Item{value = self.value + 1}", "none" }, 0..) |operation, index| {
+        const edited_source = try std.mem.replaceOwned(u8, allocator, source, "trivial", operation);
+        defer allocator.free(edited_source);
+        const restored = try query.Database.init(allocator, .{ .worker_count = 2 });
+        defer restored.deinit();
+        const offset = try restoreInterns(restored, allocator, payload);
+        try modules.registerSources(restored, allocator, edited_source, &.{}, &.{});
+        try std.testing.expect(try restoreQueries(restored, payload, offset) > 0);
+        const cold = try query.Database.init(allocator, .{ .worker_count = 2 });
+        defer cold.deinit();
+        try modules.registerSources(cold, allocator, edited_source, &.{}, &.{});
+        const warm_result = (try restored.get(queries.BuildExecutable, 0)).*;
+        const cold_result = (try cold.get(queries.BuildExecutable, 0)).*;
+        if (index == 2) {
+            try std.testing.expect(warm_result == null);
+            try std.testing.expect(cold_result == null);
+            const warm_diagnostics = try restored.transitiveAccumulatorValues(queries.BuildExecutable, 0, structures.Diagnostic, allocator);
+            defer allocator.free(warm_diagnostics);
+            const cold_diagnostics = try cold.transitiveAccumulatorValues(queries.BuildExecutable, 0, structures.Diagnostic, allocator);
+            defer allocator.free(cold_diagnostics);
+            try std.testing.expectEqual(@as(usize, 1), warm_diagnostics.len);
+            try std.testing.expectEqual(@as(usize, 1), cold_diagnostics.len);
+            try std.testing.expectEqual(std.meta.Tag(structures.Diagnostic.Kind).unknown_namespace_member, std.meta.activeTag(warm_diagnostics[0].kind));
+            try std.testing.expectEqual(std.meta.activeTag(cold_diagnostics[0].kind), std.meta.activeTag(warm_diagnostics[0].kind));
+        } else {
+            try std.testing.expect(warm_result != null);
+            try std.testing.expect(cold_result != null);
+            try std.testing.expectEqualSlices(u8, cold_result.?.bytes, warm_result.?.bytes);
+            try runtime.writeProgram(io, warm_result.?.bytes);
+            try std.testing.expectEqual(@as(u8, if (index == 0) 42 else 43), try runtime.runProg(io, allocator, &.{}));
+        }
+    }
+}
+
 test "invalid machine-code cache shapes are rejected" {
     const valid: structures.CompiledFunction = .{
         .code = &.{ 0, 0, 0, 0 },

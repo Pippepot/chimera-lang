@@ -603,8 +603,14 @@ fn parseTypeList(parser: *ParserState) !Node.Index {
     while (true) {
         if (parser.eat(.r_paren) != null) break;
 
+        const access_token_index = parser.index;
+        const access = parser.eatAny(&.{ .keyword_imm, .keyword_mut, .keyword_var, .keyword_deinit });
         const ty = try parseType(parser);
-        try parser.scratch_stack.append(parser.gpa, ty);
+        const parameter = if (access != null) blk: {
+            const mode = try parser.addNode(.{ .tag = .access, .token_index = access_token_index, .data = .{ .none = {} } });
+            break :blk try parser.addNode(.{ .tag = .param, .token_index = access_token_index, .data = .{ .node_node = .{ .a = mode, .b = ty } } });
+        } else ty;
+        try parser.scratch_stack.append(parser.gpa, parameter);
 
         if (parser.eat(.comma) != null) continue;
         _ = try parser.expect(.r_paren);

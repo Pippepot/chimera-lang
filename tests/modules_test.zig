@@ -4250,6 +4250,236 @@ test "deinit member receivers preserve independent field availability" {
     try fixture.expectExit(0, 42);
 }
 
+test "ownership members expose primitive copy and move as callable values" {
+    const fixture = try Fixture.init(
+        \\const duplicate = int.copy
+        \\const transfer = int.move
+        \\const value = duplicate(42)
+        \\exit(transfer(value))
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+test "ownership members select custom hooks once for calls and aliases" {
+    const fixture = try Fixture.init(
+        \\struct Item
+        \\  value: int
+        \\  copy = func(imm self: Item) Item -> Item{value = self.value + 1}
+        \\  move = func(deinit self: Item) Item -> Item{value = self.value + 2}
+        \\const source = Item{value = 35}
+        \\const copied = Item.copy(source)
+        \\const moved = copied.move()
+        \\const transfer = Item.move
+        \\const indirect = transfer(moved)
+        \\exit(indirect.value + source.copy().value - source.value + 1)
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+test "ownership members compose fieldwise variants and generated types" {
+    const fixture = try Fixture.init(
+        \\struct Cell(T: type)
+        \\  copy = fieldwise
+        \\  value: T
+        \\static IntCell = Cell(int)
+        \\static Maybe = IntCell | none
+        \\const original: Maybe = IntCell{value = 42}
+        \\const copied = Maybe.copy(original)
+        \\const moved = copied.move()
+        \\if const cell = moved as IntCell -> exit(cell.value) else exit(1)
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+test "ownership members preserve consuming access diagnostics" {
+    const fixture = try Fixture.init(
+        \\struct Item
+        \\  copy = trivial
+        \\  value: int
+        \\func invalid(imm item: Item) Item -> item.move()
+        \\const result = invalid(Item{value = 42})
+        \\exit(result.value)
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectDiagnostic(0, .ownership_transfer_requires_owned_place);
+}
+
+test "ownership members copy immovable values independently of move support" {
+    const fixture = try Fixture.init(
+        \\struct Item
+        \\  move = none
+        \\  copy = trivial
+        \\  value: int
+        \\const source = Item{value = 42}
+        \\const copied = Item.copy(source)
+        \\exit(copied.value)
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+test "ownership members expose callable copy and move" {
+    const fixture = try Fixture.init(
+        \\static Callback: type = func(int) int
+        \\func increment(value: int) int -> value + 1
+        \\const original = Callback.copy(increment)
+        \\const transferred = original.move()
+        \\exit(transferred(41))
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+test "ownership members participate in where type tests" {
+    const fixture = try Fixture.init(
+        \\struct CopyOnly
+        \\  move = none
+        \\  copy = trivial
+        \\  value: int
+        \\func copyable(static T: type) int where T.copy is func(imm T) T -> 20
+        \\func movable(static T: type) int where T.move is func(deinit T) T -> 22
+        \\exit(copyable(CopyOnly) + movable(int))
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+test "ownership members with missing capabilities fail where conditions" {
+    for ([_][]const u8{ "copy", "move" }) |name| {
+        const source = try std.fmt.allocPrint(testing.allocator,
+            \\struct Item
+            \\  copy = none
+            \\  move = none
+            \\  value: int
+            \\func accept(static T: type) int where T.{s} is func({s} T) T -> 42
+            \\exit(accept(Item))
+        , .{ name, if (std.mem.eql(u8, name, "copy")) "imm" else "deinit" });
+        defer testing.allocator.free(source);
+        const fixture = try Fixture.init(source, &.{});
+        defer fixture.deinit();
+        try fixture.expectDiagnostic(0, .where_condition_failed);
+    }
+}
+
+test "ownership members cannot be replaced by namespace declarations" {
+    const cases = [_][]const u8{
+        \\struct Item
+        \\  func copy() int -> 42
+        \\_ = Item.copy
+        ,
+        \\struct Item
+        \\  copy = trivial
+        \\func Item.copy() int -> 42
+        \\_ = Item.copy
+        ,
+        \\struct Item
+        \\  move: int
+        \\_ = Item.move
+        ,
+    };
+    for (cases) |source| {
+        const fixture = try Fixture.init(source, &.{});
+        defer fixture.deinit();
+        try fixture.expectDiagnostic(0, .reserved_ownership_member);
+    }
+}
+
+test "ownership members execute selected operations at compile time" {
+    const fixture = try Fixture.init(
+        \\struct Cell(T: type)
+        \\  value: T
+        \\  copy = func(imm self: Cell(T)) Cell(T) -> Cell(T){value = self.value + 1}
+        \\  move = func(deinit self: Cell(T)) Cell(T) -> Cell(T){value = self.value + 2}
+        \\static IntCell = Cell(int)
+        \\static Maybe = IntCell | none
+        \\static result = comptime
+        \\  const source: Maybe = IntCell{value = 38}
+        \\  const duplicate = Maybe.copy
+        \\  const copied = duplicate(source)
+        \\  const moved = copied.move()
+        \\  if const cell = moved as IntCell -> cell.value else 1
+        \\exit(result)
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+test "ownership members preserve reference origins" {
+    for ([_][]const u8{ "copy", "move" }) |name| {
+        const source = try std.fmt.allocPrint(testing.allocator,
+            \\fallible run() int
+            \\  const owner = Box.new(42)
+            \\  const original = owner.borrow()
+            \\  const callback = Ref(int, false).{s}
+            \\  const handle = callback(original)
+            \\  return handle[]
+            \\if const result = run() -> exit(result) else exit(1)
+        , .{name});
+        defer testing.allocator.free(source);
+        const fixture = try Fixture.init(source, &.{});
+        defer fixture.deinit();
+        try fixture.expectExit(0, 42);
+        const invalid = try std.mem.replaceOwned(u8, testing.allocator, source, "return handle[]", "const consumed = owner^\n  return handle[]");
+        defer testing.allocator.free(invalid);
+        try fixture.db.setInput(queries.SourceText, 0, invalid);
+        try fixture.expectDiagnostic(0, .use_after_transfer);
+    }
+}
+
+test "ownership members validate definitions before where availability" {
+    const fixture = try Fixture.init(
+        \\struct Item
+        \\  copy = func(imm self: int) int -> self
+        \\  value: int
+        \\func accept(static T: type) int where T.copy is func(imm T) T -> 42
+        \\exit(accept(Item))
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectDiagnostic(0, .struct_ownership_hook_signature_mismatch);
+}
+
+test "ownership members invalidate retained callables after capability edits" {
+    const original =
+        \\pub struct Item
+        \\  copy = trivial
+        \\  value: int
+    ;
+    const fixture = try Fixture.init(
+        \\import lib
+        \\static duplicate = lib.Item.copy
+        \\const source = lib.Item{value = 42}
+        \\const copied = duplicate(source)
+        \\exit(copied.value)
+    , &.{.{ .path = "lib/a.chi", .module_path = "lib", .source = original }});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+    const scope = (try fixture.db.get(queries.BuildModuleScope, 0)).*.?;
+    const value_id = (try fixture.db.get(queries.ResolveStatic, scope.resolveStatic("duplicate").?)).*.?;
+    const reference = (try fixture.db.lookupInterned(queries.CompileTimeValues, value_id)).runtime.value.function_ref;
+    try fixture.db.setInput(queries.SourceText, 1,
+        \\pub struct Item
+        \\  copy = none
+        \\  value: int
+    );
+    try fixture.expectDiagnostic(0, .unknown_namespace_member);
+    try testing.expect((try fixture.db.get(queries.FunctionInstanceSignature, reference.instance())).* == null);
+    const diagnostics = try fixture.db.transitiveAccumulatorValues(queries.FunctionInstanceSignature, reference.instance(), structures.Diagnostic, testing.allocator);
+    defer testing.allocator.free(diagnostics);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(std.meta.Tag(structures.Diagnostic.Kind).type_not_copyable, std.meta.activeTag(diagnostics[0].kind));
+    try fixture.db.setInput(queries.SourceText, 1,
+        \\pub struct Item
+        \\  copy = func(imm self: Item) Item -> Item{value = self.value + 1}
+        \\  value: int
+    );
+    try fixture.expectExit(0, 43);
+    try fixture.db.setInput(queries.SourceText, 1, original);
+    try fixture.expectExit(0, 42);
+}
+
 test "deinit completes an explicit-drop root" {
     const fixture = try Fixture.init(
         \\struct Item
@@ -6819,15 +7049,15 @@ test "qualified factories work in signatures fields initializers and compile tim
 }
 
 test "struct namespaces validate duplicates and keep ownership hooks separate" {
-    const f = try Fixture.init("import lib\nexit(lib.S.copy())", &.{.{ .path = "lib/a.chi", .module_path = "lib", .source =
+    const f = try Fixture.init("import lib\nexit(lib.S.read())", &.{.{ .path = "lib/a.chi", .module_path = "lib", .source =
         \\pub struct S
         \\  copy = trivial
         \\  static answer = 42
-        \\  pub func copy() int -> return answer
+        \\  pub func read() int -> return answer
     }});
     defer f.deinit();
     try f.expectExit(0, 42);
-    try f.db.setInput(queries.SourceText, 1, "pub struct S\n  copy: int\n  func copy() int -> return 42");
+    try f.db.setInput(queries.SourceText, 1, "pub struct S\n  value: int\n  func value() int -> return 42\n  pub func read() int -> return 42");
     try f.expectDiagnostic(1, .duplicate_struct_member);
     try f.db.setInput(queries.SourceText, 1, "pub struct S\n  value: int");
     try f.expectDiagnostic(0, .unknown_namespace_member);

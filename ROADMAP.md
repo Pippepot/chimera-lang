@@ -9,6 +9,13 @@
 - Named and generated structs have nominal identity, namespace members and instance calls, layout, field operations, and validated move/copy/drop hooks.
 - Function signatures support ordered `where` conditions checked at specialization
   using static values, including type and namespace member tests with `is`.
+- Capability-backed `T.copy` and `T.move` support type-qualified and instance
+  calls, aliases, indirect calls, and `where` tests. Callable types retain explicit
+  runtime parameter modes. Primitive, callable, variant, declared, and generated
+  types share operation selection; runtime and compile-time calls invoke the
+  selected hooks once. Reserved names and invalid ownership definitions are
+  checked before availability, including capability edits and snapshot reuse.
+  General final-destination construction remains part of milestone 1.
 - Typed SSA covers calls, static specialization, callable values, variants, joins, loops, divergence, and fallible control flow. Compile-time thunks and specialized calls evaluate through typed IR, including structs, hooks, and type-valued functions; local captures remain unsupported.
 - Ownership tracks root and supported field transfers, borrowed and owned parameters, mutable copy-back, inferred `Ref` origins, and path-sensitive ASAP cleanup. `deinit` consumes owned places in place, rejects borrowed sources, and lets custom move hooks transfer fields. Unfinished sources clean up remaining automatic fields without waiving explicit-field obligations. Fresh variant arguments, later argument failure, compile-time execution, and parameter-mode edits across query/cache reuse are covered. The internal calling convention derives direct or address-passed arguments from ownership capabilities and consuming access; codegen owns physical argument layout. `Box` and `Buffer` provide host storage; `Ref` and scoped aliases retain checked origins for named places and supported fields, but not temporary projections.
 - Compiler-provided `extern func` declarations use named std identities and ordinary calls. `std.exit.exit` is exported by the prelude, with distinct runtime termination and compile-time compiler control.
@@ -45,8 +52,8 @@ construction paths and ownership-hook conventions with this general model.
   no intermediate move; returning a named local still copies or explicitly
   moves it. Do not make validity depend on optional return-value elision.
 - Complete `deinit` consuming access across every place and result shape,
-  including source and result lifetime rules. Expose capability-backed
-  `T.copy` and `T.move` for calls and `where` tests.
+  including source and result lifetime rules. Extend general destination
+  construction through the existing `T.copy` and `T.move` callable boundaries.
 - Add nonescaping `init` parameters: each successful path constructs or
   forwards each parameter exactly once, while earlier failure may skip it.
   Construction occurs when a destination is supplied; forwarding does not

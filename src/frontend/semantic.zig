@@ -408,6 +408,11 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             std.debug.assert(runtime_index == self.parameters.len);
             self.static_expression_count = @intCast(self.expressions.items.len);
 
+            if (parts.body == .null) {
+                std.debug.assert(isExternalFunction(self.ast, declaration));
+                self.root_block = try self.finishBlock(&.{}, null, tokenSpan(self.ast, function.token_index));
+                return;
+            }
             const body = self.ast.nodes[parts.body.index()];
             var body_statements: std.ArrayList(UnresolvedBody.Statement) = .empty;
             defer body_statements.deinit(self.gpa);
@@ -1889,12 +1894,15 @@ fn analyzeType(
         var parameters: std.ArrayList(structures.CallableParameter) = .empty;
         defer parameters.deinit(gpa);
         for (ast.nodeList(node.data.node_node.a)) |parameter_index| {
-            const parameter_type = switch (try analyzeType(ast, source, parameter_index, type_interner, gpa, unsupported_kind)) {
+            const parameter = ast.nodes[parameter_index.index()];
+            const explicit_mode = parameter.tag == .param;
+            const type_index = if (explicit_mode) parameter.data.node_node.b else parameter_index;
+            const parameter_type = switch (try analyzeType(ast, source, type_index, type_interner, gpa, unsupported_kind)) {
                 .success => |type_id| type_id,
                 .unsupported => |issue| return .{ .unsupported = issue },
             };
             if (parameter_type == .type) return .{ .unsupported = issueAt(ast, parameter_index.index(), unsupported_kind) };
-            try parameters.append(gpa, .{ .mode = .imm, .type_id = parameter_type });
+            try parameters.append(gpa, .{ .mode = if (explicit_mode) parameterMode(ast, parameter).? else .imm, .type_id = parameter_type });
         }
         const return_type = switch (try analyzeType(ast, source, node.data.node_node.b, type_interner, gpa, unsupported_kind)) {
             .success => |type_id| type_id,
@@ -2009,6 +2017,8 @@ pub fn validateStructNamespace(ast: *const structures.Ast, source: []const u8, s
         if (member.tag != .struct_field and member.tag != .static_binding)
             return issueAt(ast, index.index(), .struct_member_not_supported);
         const span = tokenSpan(ast, member.token_index);
+        if (std.meta.stringToEnum(structures.OwnershipMember, source[span.start..span.end]) != null)
+            return .{ .span = span, .kind = .reserved_ownership_member };
         if ((try names.getOrPut(source[span.start..span.end])).found_existing)
             return .{ .span = span, .kind = .duplicate_struct_member };
     }

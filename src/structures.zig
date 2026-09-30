@@ -323,6 +323,8 @@ pub const ModulePath = struct {
 
 pub const ItemId = enum(u32) { _ };
 
+pub const OwnershipMember = enum { copy, move };
+
 pub const ItemKind = enum {
     function,
     structure,
@@ -1497,6 +1499,7 @@ pub const Diagnostic = struct {
         invalid_external_signature,
         struct_member_not_supported,
         duplicate_struct_member,
+        reserved_ownership_member,
         duplicate_struct_property,
         unknown_struct_property,
         invalid_struct_property_value: InvalidStructPropertyValue,
