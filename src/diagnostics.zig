@@ -521,15 +521,6 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
             try writer.writeAll("Box requires an automatically droppable element type; found ");
             try writeType(types, writer, type_id);
         },
-        .box_requires_struct_initializer => |type_id| {
-            try writer.writeAll("cannot move an existing value of type ");
-            try writeType(types, writer, type_id);
-            try writer.writeAll(" into Box; use a direct initializer or producer call");
-        },
-        .box_field_requires_direct_move => |type_id| {
-            try writer.writeAll("in-place Box initialization requires a directly movable field; found ");
-            try writeType(types, writer, type_id);
-        },
         .box_extraction_requires_direct_move => |type_id| {
             try writer.writeAll("cannot extract a non-directly-movable value from Box; found ");
             try writeType(types, writer, type_id);
@@ -584,7 +575,6 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
         .integer_literal_out_of_range => try writer.writeAll("integer literal is outside the supported i32 range"),
         .fallible_condition_not_supported => try writer.writeAll("this condition syntax is not supported yet"),
         .if_condition_not_fallible => try writer.writeAll("condition must be able to fail, such as a comparison; plain values are not supported as conditions"),
-        .box_conditional_condition_not_supported => try writer.writeAll("conditional Box construction cannot be used directly as an `if` condition yet"),
         .inspection_type_not_supported => try writer.writeAll("this inspection type is not supported yet"),
         .variant_inspection_operand_not_variant => |found| {
             try writer.writeAll("variant inspection requires a variant value, found ");

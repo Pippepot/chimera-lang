@@ -20,5 +20,5 @@ Build clear, correct code with the least total machinery.
 ## Verification
 
 - Test behavior, ownership, and incremental recomputation, not type-system guarantees. Keep large cross-module suites in `*_test.zig`.
-- Use [README.md](README.md) for test commands; run relevant tests, formatting checks, and `git diff --check`.
+- Use [docs/COMPILER.md](docs/COMPILER.md) for test commands; run relevant tests, formatting checks, and `git diff --check`.
 - Update the document that owns a changed fact; replace obsolete roadmap details rather than accumulating history.

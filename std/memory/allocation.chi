@@ -92,6 +92,15 @@ pub struct BufferView(T: type)
         index < self.size
         return read(Buffer(T), false, self.backing).get(self.start + index)
 
+# Temporary construction ownership; the initialized value's lifetime is tracked
+# separately until it passes to Box. Failure releases storage after its fields.
+struct UninitializedStorage(T: type)
+    allocation: Allocation(T)
+    drop = func(deinit self: UninitializedStorage(T)) -> deallocate(T, self.allocation)
+
+fallible allocate_uninitialized(static T: type) UninitializedStorage(T)
+    return UninitializedStorage(T){allocation = allocate(T, 1)}
+
 pub struct Box(T: type)
     allocation: Allocation(T)
     drop = func(deinit self: Box(T))

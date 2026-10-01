@@ -20,10 +20,48 @@ This is a high-level map of the compiler's ownership and stage boundaries. [synt
 - `AnalyzeFunctionInstance(InstanceId)` owns all runtime bodies, including unspecialized declarations. `AnalysisContext` supplies source-dependent resolution, visibility, and specialization. Its `TypeFacts` view owns context-free structural and ownership lookups and is also used directly by diagnostics and cache validation. `HostTypes` adds physical layout for codegen; compile-time interpretation uses its own call executor. These adapters derive existing query facts without adding caches.
 - Typing chooses type-specific operations and explicit coercions before publication; a selected converter is published as an ordinary call. Joins, ownership uses, and fallible success/failure paths are represented in the graph; later stages do not rediscover their legality or build another general-purpose lowering IR. Source evaluation order is preserved.
 - Shared IR owns direct operand and successor enumeration. Normalization, cache validation, lifetime traversal, and backend use marking reuse it; array ranges, operation legality, and addressability remain with their consumers. Block arguments describe their logical type and whether the join passes storage. Storage selection is independent of a type's move capability, and cleanup edge splitting preserves it.
-- Calls share one operation with independent direct/indirect targets and optional result destinations. Owning initialization of a type that cannot move directly constructs in the destination its consumer supplies: `local_storage` for locals, temporaries, and owned arguments, `result_storage` for the caller's result, and logical storage projections for fields and variant payloads. Ordinary calls, copies, moves, and variant coercions write those destinations; conditional and loop results propagate them, and fallible results construct in storage instead of crossing the success edge. Typing never relocates a completed value of such a type and rejects forms that would need it. Inferred-return compile-time thunks publish their result as a value instead. The Box-specific initializer preparation stays private to typing until deferred `init` arguments replace it; no Box-specific field or copy program reaches codegen. Typing owns evaluation order, captures, and cleanup paths; codegen and the compile-time interpreter consume explicit destinations and operations.
+- Calls share one operation with independent direct/indirect targets and optional result destinations. Owning initialization of a type that cannot move directly constructs in the destination its consumer supplies: `local_storage` for locals, temporaries, and owned arguments, `result_storage` for the caller's result, and logical storage projections for fields and variant payloads. Ordinary calls, copies, moves, and variant coercions write those destinations; conditional and loop results propagate them, and fallible results construct in storage instead of crossing the success edge. Typing never relocates a completed value of such a type and rejects forms that would need it. Inferred-return compile-time thunks publish their result as a value instead. Known direct `Box.new` calls obtain storage before lowering their unresolved initializer through this same construction path. A private standard-library owner releases unfinished storage through ordinary lifetime planning; query-local construction scopes collect initializer failures and retain storage through early exits. Successful construction transfers the initialized value and allocation to Box together. The constructor interception remains temporary until general deferred `init` parameters replace it. Typing owns evaluation order, captures, and cleanup paths; codegen and the compile-time interpreter consume explicit destinations and operations.
 - A value that cannot move directly is denoted by its storage. Field reads are storage projections, and a mutable local keeps one storage value across field updates, replacements, `mut` arguments, and loops: `call_mut_argument` writes its destination, and loops carry only the local's lifetime generation, not a block argument. Replacement ends the old value before constructing in the same storage; a replaced field leaves its root's generation first, so an exit from the right-hand side sees the field missing. Joins that select such values pass addresses; codegen gives their block arguments address slots, and the compile-time interpreter passes storage cells, promoting a runtime slot before a storage projection or address-passed join creates a view. Compile-time field reads materialize only the selected field, so an unfinished sibling does not prevent access.
 - For a borrowed variant argument that cannot move directly, its known type follows conditional results and loop breaks. Fresh initializers construct into storage of that type; existing values of the same type retain their borrowed storage. Widening an existing narrower value still requires direct movability. Typing carries the borrow context separately from an owning destination and preserves the source's cleanup and reference origins when widening directly movable values.
 - Compile-time expressions that require evaluation, including initializers, static arguments, and expressions in type positions, are typed before interpretation; direct type aliases and declared struct identities can resolve without it. Compile-time calls are memoized by concrete instance and canonical argument values. Interpreted outcomes distinguish values, fallible failure, and compiler control; type values have no runtime representation.
+
+## Deferred construction (planned)
+
+General `init` parameters are not implemented. The following boundaries guide
+their implementation; [ROADMAP.md](ROADMAP.md#1-destination-construction-and-consuming-access)
+owns the remaining checkpoints and [syntax&semantics.txt](syntax&semantics.txt)
+owns the language contract.
+
+- Keep a parameter's pending/consumed obligation separate from the result type's
+  move, copy, and drop capabilities. A pending initializer is neither a live T
+  nor T's storage. Its representation must remain distinct in typed operands,
+  entry arguments, execution, and cache validation.
+- Type the complete deferred expression in its caller's lexical context,
+  including blocks, conditionals, loops, and nested construction. Publish owned
+  typed regions and explicit captures with the analyzed caller. Lower those
+  regions to private callbacks with call-lived environments; invoke them with a
+  destination, and forward their handles without executing them. This needs no
+  public capturing-closure API. Raw source pointers and frame addresses never
+  enter query results or disk snapshots.
+- Typing owns capture authority, lifetime retention, reference origins, and
+  effects across eager argument preparation and receiving calls. Deferring a
+  transfer retains access without performing it. Runtime cleanup must know
+  whether each captured root or field remains live after skipped or completed
+  evaluation; a conservative source diagnostic alone cannot resolve that
+  destruction obligation. Direct and indirect calls share this contract.
+- Separate declared source fallibility from deferred evaluation outcomes. An
+  ordinary `materialize(init item: T)` can encounter initializer failure;
+  receiving `init` does not authorize arbitrary fallible statements in its body.
+  The private execution protocol must also preserve caller-directed return,
+  break, and continue, unwinding receiving calls before dispatching the lexical
+  continuation. Choose the outcome encoding and typed-region layout with the
+  first executing implementation, rather than extending the current boolean
+  failure convention independently.
+- Interpret frame-bound initializer handles within the active execution, using
+  the same destinations and outcomes as native code. They cannot enter canonical
+  `CompileTimeValues` or memoized argument tuples. Keep memoization for completed
+  values and cover call-cycle detection on the frame-local path. General `init`
+  tests can use local storage; host allocation remains a runtime capability.
 
 ## Ownership and layout
 
@@ -42,7 +80,7 @@ This is a high-level map of the compiler's ownership and stage boundaries. [synt
 - Argument passing is derived from `OwnershipCapabilities(TypeId)`; values that cannot move directly pass by address. One backend `CallLayout` supplies storage planning, argument emission, returns, mutable copy-back, and copy hooks. Mutable calls write their updated arguments back. The calling convention is internal to the compiler, not a platform ABI.
 - Aggregate construction uses addressable storage, including four-byte register returns. The encoder and assembly renderer share opcode bytes, operand widths, and display forms in `src/backend/x86_encoding.zig`; unknown bytes end decoding rather than permitting resynchronization inside an instruction.
 - Embedded standard-library declarations use ordinary lookup, signatures, and instance identities. Supported compiler-owned externs, including exit and host-memory operations, publish artifacts under those identities. Typed allocation and slot transfers use host-only emitters; another location will require its own provider and access path. A compile-time exit instead propagates compiler control to the driver without producing an executable. `src/runtime.zig` publishes and runs successful executables.
-- Standard calls are classified by registered declaration identity at the analysis boundary; lowering retains the resolved behavior instead of rediscovering names. Box, Buffer, and reference-write type eligibility is checked when a signature is demanded, including acquisition as a function value. These capability constraints remain compiler-owned until the language can express them. Reference-write eligibility is shared with assignment typing. Current Box initializer-shape checks remain in typing until milestone 1 replaces them with the general `init` contract.
+- Standard calls are classified by registered declaration identity at the analysis boundary; lowering retains the resolved behavior instead of rediscovering names. Box, Buffer, and reference-write type eligibility is checked when a signature is demanded, including acquisition as a function value. These capability constraints remain compiler-owned until the language can express them. Reference-write eligibility is shared with assignment typing. The analysis boundary validates the private uninitialized-storage owner's signature, nominal identity, fields, and automatic cleanup capability before typing uses it.
 - Standard memory types share nominal identity and specialization lookup over existing queries. Their representation and ownership checks remain type-specific.
 
 ## Persistence

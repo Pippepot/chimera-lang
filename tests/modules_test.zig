@@ -4081,6 +4081,299 @@ test "Box destroys its initialized value on last use" {
     try fixture.expectExit(0, 42);
 }
 
+test "Box destination construction covers nested producers and loop results" {
+    for ([_][]const u8{
+        "Item{leaf = producer(42)}",
+        "make(42)",
+        "loop\n    if flag == 1 -> break make(42)\n    break Item{leaf = producer(1)}\n  ",
+    }) |initializer| {
+        const source = try std.fmt.allocPrint(testing.allocator,
+            \\struct Leaf
+            \\  move = none
+            \\  value: int
+            \\struct Item
+            \\  move = none
+            \\  leaf: Leaf
+            \\func leaf(value: int) Leaf -> Leaf{{value = value}}
+            \\func make(value: int) Item -> Item{{leaf = leaf(value)}}
+            \\fallible run(flag: int) int
+            \\  const producer = leaf
+            \\  const owner = Box(Item).new({s})
+            \\  return owner.borrow()[].leaf.value
+            \\if const result = run(1) -> exit(result) else exit(1)
+        , .{initializer});
+        defer testing.allocator.free(source);
+        const fixture = try Fixture.init(source, &.{});
+        defer fixture.deinit();
+        try fixture.expectExit(0, 42);
+    }
+}
+
+test "Box destination construction copies immovable places and moves once" {
+    const cases = [_]struct { movement: []const u8, copy: []const u8, initializer: []const u8 }{
+        .{ .movement = "none", .copy = "func(imm self: Item) Item -> Item{value = self.value + 1}", .initializer = "original" },
+        .{ .movement = "func(deinit self: Item) Item -> Item{value = self.value + 1}", .copy = "none", .initializer = "original^" },
+    };
+    for (cases) |case| {
+        const source = try std.fmt.allocPrint(testing.allocator,
+            \\struct Item
+            \\  move = {s}
+            \\  copy = {s}
+            \\  value: int
+            \\fallible run() int
+            \\  const original = Item{{value = 41}}
+            \\  const owner = Box.new({s})
+            \\  return owner.borrow()[].value
+            \\if const result = run() -> exit(result) else exit(1)
+        , .{ case.movement, case.copy, case.initializer });
+        defer testing.allocator.free(source);
+        const fixture = try Fixture.init(source, &.{});
+        defer fixture.deinit();
+        try fixture.expectExit(0, 42);
+    }
+}
+
+test "Box destination construction widens fresh immovable variants" {
+    const fixture = try Fixture.init(
+        \\struct Item
+        \\  move = none
+        \\  value: int
+        \\func make() Item -> Item{value = 42}
+        \\static MaybeItem = Item | none
+        \\fallible run(flag: int) int
+        \\  const producer = make
+        \\  const owner = Box(MaybeItem).new(if flag == 1 -> producer() else none)
+        \\  if owner.borrow()[] is Item -> return 41
+        \\  return 1
+        \\fallible answer() int -> run(1) + run(0)
+        \\if const result = answer() -> exit(result) else exit(1)
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+test "unevaluated initializer inference preserves lookup diagnostics" {
+    const cases = [_]struct { expression: []const u8, kind: std.meta.Tag(structures.Diagnostic.Kind) }{
+        .{ .expression = "unknown()", .kind = .unknown_function },
+        .{ .expression = "callback()", .kind = .value_not_callable },
+        .{ .expression = "item.missing()", .kind = .unknown_namespace_member },
+        .{ .expression = "number.missing()", .kind = .field_access_not_struct },
+        .{ .expression = "item.value()", .kind = .value_not_callable },
+        .{ .expression = "item.bad()", .kind = .value_not_callable },
+        .{ .expression = "item.copy()", .kind = .unknown_namespace_member },
+        .{ .expression = "item.missing", .kind = .unknown_field },
+        .{ .expression = "number.value", .kind = .field_access_not_struct },
+        .{ .expression = "number[]", .kind = .dereference_requires_ref },
+    };
+    for (cases) |case| for ([_][]const u8{ "Box.new", "Box(int).new" }) |constructor| {
+        const source = try std.fmt.allocPrint(testing.allocator,
+            \\struct Item
+            \\  value: int
+            \\static Item.bad = 42
+            \\const item = Item{{value = 42}}
+            \\const number = 42
+            \\const callback = 42
+            \\if {s}({s}) -> exit(1) else exit(2)
+        , .{ constructor, case.expression });
+        defer testing.allocator.free(source);
+        const fixture = try Fixture.init(source, &.{});
+        defer fixture.deinit();
+        try fixture.expectDiagnostic(0, case.kind);
+    };
+}
+
+test "unevaluated result inference preserves divergence before lookup" {
+    for ([_][]const u8{ "stop().field", "stop().method()", "stop()[]", "stop()()" }) |expression| {
+        const source = try std.fmt.allocPrint(testing.allocator,
+            \\struct Pinned
+            \\  move = none
+            \\  value: int
+            \\func stop() never -> exit(42)
+            \\const selected = if 1 == 1 -> {s} else Pinned{{value = 1}}
+            \\_ = selected
+            \\exit(1)
+        , .{expression});
+        defer testing.allocator.free(source);
+        const fixture = try Fixture.init(source, &.{});
+        defer fixture.deinit();
+        try fixture.expectExit(0, 42);
+    }
+}
+
+test "Box infers member call results without evaluating their receivers or arguments" {
+    for ([_][]const u8{
+        "factory.build(42)",
+        "factory.identity(make(42))",
+        "factory.identity(Item, make(42))",
+        "factory.create(42)",
+        "make_factory().build(42)",
+        "original.copy()",
+    }) |initializer| {
+        const source = try std.fmt.allocPrint(testing.allocator,
+            \\struct Item
+            \\  move = none
+            \\  value: int
+            \\  copy = func(imm self: Item) Item -> Item{{value = self.value}}
+            \\func make(value: int) Item -> Item{{value = value}}
+            \\struct Factory
+            \\  create: func(int) Item
+            \\  func build(imm self: Factory, value: int) Item -> make(value)
+            \\  func identity(imm self: Factory, static T: type, imm value: T) T -> value
+            \\func make_factory() Factory -> Factory{{create = make}}
+            \\fallible run() int
+            \\  const factory = Factory{{create = make}}
+            \\  const original = Item{{value = 42}}
+            \\  const owner = Box.new({s})
+            \\  return owner.borrow()[].value
+            \\if const result = run() -> exit(result) else exit(1)
+        , .{initializer});
+        defer testing.allocator.free(source);
+        const fixture = try Fixture.init(source, &.{});
+        defer fixture.deinit();
+        try fixture.expectExit(0, 42);
+        const forbidden_producer = try std.mem.replaceOwned(u8, testing.allocator, source, "func make(value: int) Item -> Item{value = value}", "func make(value: int) Item -> exit(90)");
+        defer testing.allocator.free(forbidden_producer);
+        const forbidden_copy = try std.mem.replaceOwned(u8, testing.allocator, forbidden_producer, "copy = func(imm self: Item) Item -> Item{value = self.value}", "copy = func(imm self: Item) Item -> exit(91)");
+        defer testing.allocator.free(forbidden_copy);
+        const forbidden_receiver = try std.mem.replaceOwned(u8, testing.allocator, forbidden_copy, "func make_factory() Factory -> Factory{create = make}", "func make_factory() Factory -> exit(92)");
+        defer testing.allocator.free(forbidden_receiver);
+        try fixture.db.setInput(queries.SourceText, 0, forbidden_receiver);
+        try replaceAllocationSource(fixture, "    return UninitializedStorage(T){allocation = allocate(T, 1)}", "    exit(43)");
+        try fixture.expectExit(0, 43);
+    }
+}
+
+fn replaceAllocationSource(fixture: Fixture, original: []const u8, replacement: []const u8) !void {
+    const file = (try fixture.db.input(queries.StandardFile, @intFromEnum(standard_library.File.memory_allocation))).*;
+    const source = (try fixture.db.input(queries.SourceText, file)).*;
+    try testing.expect(std.mem.indexOf(u8, source, original) != null);
+    const edited = try std.mem.replaceOwned(u8, testing.allocator, source, original, replacement);
+    defer testing.allocator.free(edited);
+    const with_exit = try std.fmt.allocPrint(testing.allocator, "import std.exit.{{exit}}\n\n{s}", .{edited});
+    defer testing.allocator.free(with_exit);
+    try fixture.db.setInput(queries.SourceText, file, with_exit);
+}
+
+test "Box obtains storage before producer arguments conditions and ownership hooks" {
+    for ([_][]const u8{
+        "Box.new(make(forbidden()))",
+        "Box.new(if forbidden() == 1 -> make(42) else make(1))",
+        "Box(Item).new(original)",
+        "Box(Item).new(original^)",
+        "Box.new(Box.new(make(forbidden())))",
+    }) |call| {
+        const source = try std.fmt.allocPrint(testing.allocator,
+            \\struct Item
+            \\  value: int
+            \\  copy = func(imm self: Item) Item -> exit(90)
+            \\  move = func(deinit self: Item) Item -> exit(91)
+            \\func forbidden() int -> exit(92)
+            \\func make(value: int) Item -> Item{{value = value}}
+            \\const original = Item{{value = 41}}
+            \\if {s} -> exit(1) else exit(2)
+        , .{call});
+        defer testing.allocator.free(source);
+        const fixture = try Fixture.init(source, &.{});
+        defer fixture.deinit();
+        try replaceAllocationSource(fixture, "    return UninitializedStorage(T){allocation = allocate(T, 1)}", "    exit(42)");
+        try fixture.expectExit(0, 42);
+    }
+}
+
+test "Box allocation failure skips initialization and preserves its source" {
+    const fixture = try Fixture.init(
+        \\func forbidden() int -> exit(90)
+        \\func make(value: int) int -> value
+        \\func run() int
+        \\  const original = 42
+        \\  if Box.new(make(forbidden())) -> return 1
+        \\  if Box.new(original^) -> return 2
+        \\  return original
+        \\exit(run())
+    , &.{});
+    defer fixture.deinit();
+    try replaceAllocationSource(fixture, "allocation = allocate(T, 1)", "allocation = allocate(T, -1)");
+    try fixture.expectExit(0, 42);
+}
+
+test "Box destination construction recomputes after copy capability and allocator edits" {
+    const source =
+        \\struct Item
+        \\  move = none
+        \\  value: int
+        \\  copy = func(imm self: Item) Item -> Item{value = self.value + 1}
+        \\fallible run() int
+        \\  const original = Item{value = 41}
+        \\  const owner = Box.new(original)
+        \\  return owner.borrow()[].value
+        \\if const result = run() -> exit(result) else exit(43)
+    ;
+    const fixture = try Fixture.init(source, &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+    const without_copy = try std.mem.replaceOwned(u8, testing.allocator, source, "copy = func(imm self: Item) Item -> Item{value = self.value + 1}", "copy = none");
+    defer testing.allocator.free(without_copy);
+    try fixture.db.setInput(queries.SourceText, 0, without_copy);
+    try fixture.expectDiagnostic(0, .type_not_copyable);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(0, 42);
+    try replaceAllocationSource(fixture, "allocation = allocate(T, 1)", "allocation = allocate(T, -1)");
+    try fixture.expectExit(0, 43);
+    const file = (try fixture.db.input(queries.StandardFile, @intFromEnum(standard_library.File.memory_allocation))).*;
+    try fixture.db.setInput(queries.SourceText, file, standard_library.source("memory/allocation.chi"));
+    try fixture.expectExit(0, 42);
+}
+
+test "Box initializer failure cleans partial fields before releasing storage" {
+    const fixture = try Fixture.init(
+        \\struct Leaf
+        \\  move = none
+        \\  value: int
+        \\  drop = func(deinit self: Leaf) -> exit(self.value)
+        \\struct Item
+        \\  move = none
+        \\  leaf: Leaf
+        \\  marker: int
+        \\  drop = func(deinit self: Item) -> exit(91)
+        \\fallible fail() int
+        \\  1 == 0
+        \\  return 0
+        \\if Box.new(Item{leaf = Leaf{value = 42}, marker = fail()}) -> exit(1) else exit(2)
+    , &.{});
+    defer fixture.deinit();
+    try replaceAllocationSource(fixture, "drop = func(deinit self: UninitializedStorage(T)) -> deallocate(T, self.allocation)", "drop = func(deinit self: UninitializedStorage(T))\n        deallocate(T, self.allocation)\n        exit(90)");
+    try fixture.expectExit(0, 42);
+}
+
+test "Box releases uninitialized storage on failure return break and continue" {
+    const initializers = [_][]const u8{
+        "if 1 == 1\n      fail()\n      Item{}\n    else Item{}",
+        "if 1 == 1\n      return 7\n    else Item{}",
+        "if 1 == 1\n      break 7\n    else Item{}",
+        "if 1 == 1\n      continue\n    else Item{}",
+    };
+    for (initializers) |initializer| {
+        const source = try std.fmt.allocPrint(testing.allocator,
+            \\struct Item
+            \\  move = none
+            \\  drop = func(deinit self: Item) -> exit(90)
+            \\fallible fail() int
+            \\  1 == 0
+            \\  return 0
+            \\func run() int
+            \\  return loop
+            \\    if Box(Item).new({s}) -> break 1
+            \\    break 2
+            \\exit(run())
+        , .{initializer});
+        defer testing.allocator.free(source);
+        const fixture = try Fixture.init(source, &.{});
+        defer fixture.deinit();
+        try replaceAllocationSource(fixture, "drop = func(deinit self: UninitializedStorage(T)) -> deallocate(T, self.allocation)", "drop = func(deinit self: UninitializedStorage(T))\n        deallocate(T, self.allocation)\n        exit(42)");
+        try fixture.expectExit(0, 42);
+    }
+}
+
 test "Box constructs immovable struct directly in owned storage" {
     const fixture = try Fixture.init(
         \\struct Immovable
@@ -6062,35 +6355,24 @@ test "Box allocation failure rejects an unhandled explicit-drop producer argumen
     try fixture.expectDiagnostic(0, .value_requires_explicit_drop);
 }
 
-test "Box allocation failure cleans an automatic-drop producer argument" {
+test "Box allocation failure skips fresh producer arguments" {
     const fixture = try Fixture.init(
         \\struct Tracked
         \\  value: int
-        \\  drop = func(deinit self: Tracked) -> ()
+        \\  drop = func(deinit self: Tracked) -> exit(90)
         \\struct Immovable
         \\  move = none
         \\  value: int
         \\func make(deinit item: Tracked) Immovable -> Immovable{value = item.value}
+        \\func forbidden() int -> exit(91)
         \\fallible run() unit
-        \\  const owner = Box.new(make(Tracked{value = 42}))
+        \\  const owner = Box.new(make(Tracked{value = forbidden()}))
         \\  _ = owner
-        \\if run() -> exit(42) else exit(1)
+        \\if run() -> exit(1) else exit(42)
     , &.{});
     defer fixture.deinit();
+    try replaceAllocationSource(fixture, "allocation = allocate(T, 1)", "allocation = allocate(T, -1)");
     try fixture.expectExit(0, 42);
-    const run = (try fixture.db.get(queries.BuildModuleScope, 0)).*.?.resolveFunction("run").?;
-    const body = (try fixture.db.get(queries.AnalyzeFunctionInstance, .{ .item = run })).*.?;
-    const types: queries.AnalysisContext(*query.Database) = .{ .ctx = fixture.db };
-    var drop_hook: ?structures.InstanceId = null;
-    for (body.instructions) |instruction| if (instruction == .struct_init) {
-        drop_hook = (try types.structDefinition(instruction.struct_init.type_id)).?.ownership.drop.?.hook;
-    };
-    try testing.expect(drop_hook != null);
-    var cleanup_present = false;
-    for (body.instructions) |instruction| if (instruction == .call) {
-        if (instruction.call.target == .direct and std.meta.eql(instruction.call.target.direct, drop_hook.?)) cleanup_present = true;
-    };
-    try testing.expect(cleanup_present);
 }
 
 test "Box propagates mutable producer arguments on failure and success" {
@@ -6167,7 +6449,7 @@ test "Box constructs conditional immovable literals without temporary values" {
     for (body.instructions) |instruction| try testing.expect(instruction != .struct_init);
 }
 
-test "conditional Box construction in an if condition reports its unsupported form" {
+test "conditional Box construction works in an if condition" {
     const fixture = try Fixture.init(
         \\struct Immovable
         \\  move = none
@@ -6175,7 +6457,7 @@ test "conditional Box construction in an if condition reports its unsupported fo
         \\if Box.new(if 1 == 1 -> Immovable{value = 42} else Immovable{value = 0}) -> exit(42) else exit(1)
     , &.{});
     defer fixture.deinit();
-    try fixture.expectDiagnostic(0, .box_conditional_condition_not_supported);
+    try fixture.expectExit(0, 42);
 }
 
 test "Box infers the result of conditional immovable literals" {
@@ -6411,7 +6693,7 @@ test "Box in-place initializer cleans up fields when a later field fails" {
     try fixture.expectExit(0, 42);
 }
 
-test "Box rejects transfers and nested immovable fields" {
+test "Box rejects noncopyable places and explicit-drop elements" {
     const cases = [_]struct { source: []const u8, diagnostic: std.meta.Tag(structures.Diagnostic.Kind) }{
         .{ .source =
         \\struct Immovable
@@ -6419,7 +6701,7 @@ test "Box rejects transfers and nested immovable fields" {
         \\  value: int
         \\const original = Immovable{value = 42}
         \\if Box(Immovable).new(original) -> exit(1) else exit(2)
-        , .diagnostic = .box_requires_struct_initializer },
+        , .diagnostic = .type_not_copyable },
         .{ .source =
         \\struct Explicit
         \\  drop = explicit
@@ -6447,7 +6729,7 @@ test "Box rejects transfers and nested immovable fields" {
     for (cases) |case| {
         const fixture = try Fixture.init(case.source, &.{});
         defer fixture.deinit();
-        if (case.diagnostic == .box_requires_struct_initializer)
+        if (case.diagnostic == .type_not_copyable)
             try fixture.expectDiagnostic(0, case.diagnostic)
         else
             try fixture.expectLibraryDiagnostic(case.diagnostic);

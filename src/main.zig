@@ -824,14 +824,14 @@ test "ownership diagnostics describe field transfers" {
         .{ .file_id = 0, .span = null, .kind = .ownership_transfer_requires_place },
         .{ .file_id = 0, .span = null, .kind = .partial_field_transfer_not_supported },
         .{ .file_id = 0, .span = null, .kind = .explicit_drop_field_cannot_be_implicitly_ended },
-        .{ .file_id = 0, .span = null, .kind = .{ .box_requires_struct_initializer = .int } },
+        .{ .file_id = 0, .span = null, .kind = .{ .box_extraction_requires_direct_move = .int } },
     });
 
     const rendered = output.writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, rendered, "`^` can only transfer a local binding or one of its fields") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "cannot transfer or join these fields independently under the current ownership rules") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "transfer or dispose of it on every path") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "cannot move an existing value of type `int` into Box; use a direct initializer or producer call") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "cannot extract a non-directly-movable value from Box; found `int`") != null);
 }
 
 test "CLI debug labels sources across modules and timing preserves unused code" {

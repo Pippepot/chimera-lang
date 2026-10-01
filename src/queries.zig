@@ -790,32 +790,28 @@ pub fn AnalysisContext(comptime Context: type) type {
             return false;
         }
 
-        pub const BoxAllocation = struct {
+        pub const StorageAllocation = struct {
             instance: structures.InstanceId,
             type_id: structures.TypeId,
+            allocation_type: structures.TypeId,
         };
 
-        pub fn boxAllocation(self: @This(), element_type: structures.TypeId) !?BoxAllocation {
-            const item = (try self.stdMemoryFunction(@tagName(standard_library.External.allocate))) orelse return null;
-            if ((try self.ctx.get(ExternalSymbol, item)).* != .allocate) return null;
+        pub fn uninitializedAllocation(self: @This(), element_type: structures.TypeId) !?StorageAllocation {
+            const item = (try self.stdMemoryFunction("allocate_uninitialized")) orelse return null;
             const argument = try self.internCompileTimeValue(.{ .type = element_type });
             const instance = try self.specializeFunction(.{ .item = item }, &.{argument});
             const signature = (try self.functionSignature(instance)) orelse return null;
-            if (!signature.is_fallible or signature.parameters.len != 1 or
-                signature.parameters[0].mode != .imm or signature.parameters[0].type_id != .int or
-                (try allocationElementType(self.ctx, signature.return_type)) != element_type) return null;
-            return .{ .instance = instance, .type_id = signature.return_type };
-        }
-
-        pub fn boxDeallocation(self: @This(), element_type: structures.TypeId, allocation_type: structures.TypeId) !?structures.InstanceId {
-            const item = (try self.stdMemoryFunction(@tagName(standard_library.External.deallocate))) orelse return null;
-            if ((try self.ctx.get(ExternalSymbol, item)).* != .deallocate) return null;
-            const argument = try self.internCompileTimeValue(.{ .type = element_type });
-            const instance = try self.specializeFunction(.{ .item = item }, &.{argument});
-            const signature = (try self.functionSignature(instance)) orelse return null;
-            if (signature.is_fallible or signature.return_type != .unit or signature.parameters.len != 1 or
-                signature.parameters[0].mode != .deinit or signature.parameters[0].type_id != allocation_type) return null;
-            return instance;
+            if (!signature.is_fallible or signature.parameters.len != 0) return null;
+            const factory = (try self.stdMemoryFunction("UninitializedStorage")) orelse return null;
+            const expected_type = try self.specializedStructType(try self.specializeFunction(.{ .item = factory }, &.{argument}));
+            if (signature.return_type != expected_type) return null;
+            const definition = (try self.structDefinition(expected_type)) orelse return null;
+            if (definition.fields.len != 1 or !std.mem.eql(u8, definition.fields[0].name, "allocation")) return null;
+            const allocation_type = definition.fields[0].type_id;
+            if ((try allocationElementType(self.ctx, allocation_type)) != element_type) return null;
+            const capabilities = (try self.facts().ownershipCapabilities(expected_type)) orelse return null;
+            if (!capabilities.needs_automatic_drop or capabilities.requires_explicit_drop) return null;
+            return .{ .instance = instance, .type_id = expected_type, .allocation_type = allocation_type };
         }
 
         pub fn ownedFunction(self: @This(), identity: structures.StructIdentity, name: []const u8) !?structures.InstanceId {

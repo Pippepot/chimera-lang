@@ -31,9 +31,15 @@
 - Host-only `std.memory` provides checked typed allocation, unsafe indexed
   transfers and destruction, `Box(T)` with automatic destruction, copyable
   `Ref(T, writable)` handles with checked origins, and `Buffer(T)` with borrowed
-  `BufferView(T)` slices. `Box.new` constructs directly movable values or
-  initializes immovable structs in final storage; explicit duplication allocates
-  distinct storage. Consuming extraction requires directly movable values.
+  `BufferView(T)` slices. Known direct `Box.new` calls allocate before evaluating
+  the entire initializer, then use general destination construction for nested
+  fields, producers, copies, moves, variants, conditionals, and loop results.
+  Unfinished construction cleans completed fields before releasing storage;
+  initializer failure reaches the constructor's failure continuation, and early
+  return, break, and continue release unfinished storage. Inference requires an
+  unevaluated result type; `Box(T).new` supplies it for loops and block-local
+  results. Separate duplication APIs remain, and consuming extraction requires
+  directly movable values.
   `Box` and `Ref` are prelude exports. Scoped writable aliases and checked
   `Buffer.get_mut` are supported. [STORAGE_AND_REFERENCES.md](STORAGE_AND_REFERENCES.md)
   records the host storage model and accepted cross-target design.
@@ -62,9 +68,10 @@ construction paths and ownership-hook conventions with this general model.
   Retain parameter modes and deferred borrow, consumption, and failure effects
   across callable boundaries, including indirect calls. This does not require
   public capturing closures or a separate producer-based Box API.
-- Make `Box.new(init item: T)` allocate before evaluating the initializer and
-  use general initialization of uninitialized storage. Preserve nested cleanup
-  and reference origins. Once this works, remove `Box.duplicate`, public
+- Express `Box.new(init item: T)` and raw storage initialization through general
+  `init` parameters, extending the allocation-before-evaluation behavior of
+  known direct constructors across acquisition and indirect calls. Preserve
+  nested cleanup and reference origins. Once this works, remove `Box.duplicate`, public
   `duplicate`, private `copy_into_box`, and the duplicate-specific compiler
   handling. Keep unsupported live-storage replacement cases rejected.
 - Verify exact hook effects, stable addresses through destruction, named-local
@@ -73,6 +80,40 @@ construction paths and ownership-hook conventions with this general model.
   construction failure, and consumption before later failure. Cover runtime
   and compile-time execution, diagnostics, incremental recomputation, and cache
   reuse for changed signatures and ownership capabilities.
+
+#### Implementation order for the remaining `init` work
+
+1. Establish the general parameter contract together with a working
+   `materialize(init item: T)` and forwarding path. Keep `init` in callable
+   identity and static inference. Track each parameter's pending/consumed state
+   independently of T's ownership capabilities; check every successful exit and
+   loop backedge. Acquiring a callable must preserve this contract.
+2. Type deferred expressions in their caller's lexical context and publish their
+   construction regions and captures. Support the complete expression shapes
+   required by milestone 1, using the planned
+   [deferred construction boundaries](ARCHITECTURE.md#deferred-construction-planned).
+3. Apply the expression's reads, writes, transfers, and reference origins across
+   eager argument preparation, receiving calls, and forwarding. Preserve skipped
+   and completed transfers separately for cleanup, including fields and shared
+   failure continuations. Check the argument contract without inspecting the
+   receiving callee's body.
+4. Give native execution and compile-time interpretation the same construction
+   and forwarding operations, including indirect calls, deferred failure, and
+   lexical exits. Implement the private outcome protocol and frame-local
+   interpretation before using general `init` in allocating library functions.
+5. Express Box and raw slot initialization as ordinary `init` consumers. Remove
+   the direct-constructor interception and the duplication APIs and compiler
+   behavior together. Verify allocation precedes the entire initializer through
+   aliases, acquisition, and indirect calls as well as direct syntax.
+6. Verify query ownership, equality, dependency tracking, cache round trips, and
+   invalidation for modes, capture effects, and typed regions. Cover nested
+   initializers, partial failure, skipped and completed transfers, writable
+   captures, lexical exits, and ownership hooks in both execution paths. Review
+   the complete implementation and remove superseded temporary machinery.
+
+These are dependencies within one feature. The first implementation checkpoint
+must execute construction and forwarding; accepting the modifier alone does not
+establish support. Each checkpoint includes diagnostics and focused tests.
 
 ### 2. Field visibility
 
