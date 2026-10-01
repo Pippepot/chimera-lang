@@ -178,7 +178,16 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             inferred: structures.InstanceId,
             indirect: Value,
         };
-        const Availability = enum { unbound, available, transferred, maybe_transferred };
+        const Availability = enum { unbound, available, transferred, maybe_transferred, replacing };
+
+        fn unavailableUse(availability: Availability) structures.Diagnostic.Kind {
+            return switch (availability) {
+                .transferred => .use_after_transfer,
+                .maybe_transferred => .possibly_transferred,
+                .replacing => .replaced_value_used,
+                .unbound, .available => unreachable,
+            };
+        }
         const FieldPlace = struct {
             local: semantic.UnresolvedBody.LocalId,
             fields: []const semantic.UnresolvedBody.FieldName,
@@ -248,6 +257,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             state: StateId,
             binding: ?PendingConditionBinding = null,
             reference_origins: ?u32 = null,
+            constructed: ?Value = null,
         };
         const ValueExit = struct {
             block: structures.FunctionBlockId,
@@ -266,6 +276,15 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             state_type_start: u32,
             state_type_end: u32,
             exit_state_start: u32,
+            result: BranchResult,
+        };
+        const LoopBackedge = struct {
+            block: structures.FunctionBlockId,
+            state: StateId,
+        };
+        const InPlaceLoopSlot = struct {
+            slot: u32,
+            start_order: u32,
         };
         const LoopBreak = struct {
             block: structures.FunctionBlockId,
@@ -349,7 +368,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         reference_transforms: std.ArrayList(ReferenceTransform) = .empty,
         binding_joins: std.ArrayList(BindingJoin) = .empty,
         loop_reference_origins: std.ArrayList(LoopReferenceOrigins) = .empty,
-        loop_backedges: std.ArrayList(StateId) = .empty,
+        loop_backedges: std.ArrayList(LoopBackedge) = .empty,
         pending_reference_uses: std.ArrayList(PendingReferenceUse) = .empty,
         reference_uses: std.ArrayList(ReferenceUse) = .empty,
         cleanup_origins: std.AutoHashMapUnmanaged(structures.FunctionValueId, u32) = .empty,
@@ -361,6 +380,8 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         pending_mut_arguments: std.ArrayList(PendingMutArgument) = .empty,
         writable_call_references: std.ArrayList(Value) = .empty,
         pending_consumed_arguments: std.ArrayList(Value) = .empty,
+        pending_deinit_places: std.ArrayList(ArgumentPlace) = .empty,
+        pending_deinit_fields: std.ArrayList(PlaceField) = .empty,
         branch_arguments: std.ArrayList(structures.FunctionValueUse) = .empty,
         branch_argument_generations: std.ArrayList(?GenerationId) = .empty,
         generations: std.ArrayList(Generation) = .empty,
@@ -457,20 +478,29 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             var path: std.ArrayList(semantic.UnresolvedBody.FieldName) = .empty;
             defer path.deinit(self.ctx.allocator());
             for (self.unresolved.expressions, 0..) |expression, index| {
-                if (expression.operation != .field_access and expression.operation != .field_transfer) continue;
                 path.clearRetainingCapacity();
-                const root = (try self.appendSourcePlaceFields(@enumFromInt(self.unresolved.parameter_count + index), &path)) orelse continue;
-                if (root != .local) continue;
+                const local = switch (expression.operation) {
+                    .field_access, .field_transfer => switch ((try self.appendSourcePlaceFields(@enumFromInt(self.unresolved.parameter_count + index), &path)) orelse continue) {
+                        .local => |local| local,
+                        .parameter => continue,
+                    },
+                    .assignment => |target| blk: {
+                        if (target.fields.start == target.fields.end) continue;
+                        try path.appendSlice(self.ctx.allocator(), self.unresolved.assignment_fields[target.fields.start..target.fields.end]);
+                        break :blk target.target;
+                    },
+                    else => continue,
+                };
                 var duplicate = false;
                 for (places.items) |place| {
-                    if (place.local == root.local and place.fields.len == path.items.len and fieldPathContains(place.fields, path.items)) {
+                    if (place.local == local and place.fields.len == path.items.len and fieldPathContains(place.fields, path.items)) {
                         duplicate = true;
                         break;
                     }
                 }
                 if (duplicate) continue;
                 try places.ensureUnusedCapacity(self.ctx.allocator(), 1);
-                places.appendAssumeCapacity(.{ .local = root.local, .fields = try path.toOwnedSlice(self.ctx.allocator()) });
+                places.appendAssumeCapacity(.{ .local = local, .fields = try path.toOwnedSlice(self.ctx.allocator()) });
             }
             return places.toOwnedSlice(self.ctx.allocator());
         }
@@ -511,6 +541,8 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             self.pending_mut_arguments.deinit(gpa);
             self.writable_call_references.deinit(gpa);
             self.pending_consumed_arguments.deinit(gpa);
+            self.pending_deinit_places.deinit(gpa);
+            self.pending_deinit_fields.deinit(gpa);
             self.branch_arguments.deinit(gpa);
             self.branch_argument_generations.deinit(gpa);
             for (self.generations.items) |generation| {
@@ -571,15 +603,20 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 return;
             }
             const span = self.unresolved.parameter_spans[0];
+            const storage = if (try self.constructsInPlace(self.return_type))
+                try self.appendInstruction(.{ .result_storage = self.return_type })
+            else
+                null;
             const result = switch (operation) {
-                .copy => try self.copyValue(self.values[0].?, span),
-                .move => try self.moveValue(self.local_values[0].?, span),
+                .copy => try self.copyValue(self.values[0].?, span, storage),
+                .move => try self.moveValue(self.local_values[0].?, span, storage),
             };
+            if (storage != null) return self.returnConstructed(result, span);
             try self.returnValue(result, span);
         }
 
         fn block(self: *Self, block_id: semantic.UnresolvedBody.BlockId, expected_type: ?structures.TypeId) !?Value {
-            return self.blockWithBox(block_id, expected_type, null);
+            return self.blockWithResult(block_id, .{ .value = .{ .expected_type = expected_type } });
         }
 
         const BoxDestination = struct { element_type: structures.TypeId, box_type: structures.TypeId };
@@ -589,9 +626,30 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             conditional: @FieldType(Expression.Operation, "if_else"),
         };
 
-        fn blockWithBox(self: *Self, block_id: semantic.UnresolvedBody.BlockId, expected_type: ?structures.TypeId, box_destination: ?BoxDestination) !?Value {
+        const Destination = struct {
+            storage: Value,
+            site: InitializationSite,
+        };
+        const InitializationSite = enum { local, field, argument, assignment, return_value };
+
+        const ValueContext = struct {
+            expected_type: ?structures.TypeId = null,
+            borrows_expected_type: bool = false,
+        };
+
+        const BranchResult = union(enum) {
+            value: ValueContext,
+            destination: Destination,
+            discard,
+            box: BoxDestination,
+        };
+
+        fn blockWithResult(self: *Self, block_id: semantic.UnresolvedBody.BlockId, mode: BranchResult) !?Value {
             const unresolved_block = self.unresolved.blocks[@intFromEnum(block_id)];
             const baseline = try self.captureState();
+            const enclosing_boundary = self.current_boundary;
+            self.current_boundary = null;
+            defer self.current_boundary = enclosing_boundary;
             for (self.unresolved.statements[unresolved_block.statements.start..unresolved_block.statements.end]) |statement| {
                 if (self.current_block == null) return null;
                 switch (statement) {
@@ -599,21 +657,21 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     .break_loop => |value_id| try self.breakLoop(value_id),
                     .continue_loop => |span| try self.continueLoop(span),
                     .return_nothing => |span| try self.returnNothing(span),
-                    .return_value => |returned| try self.returnValue(try self.valueWithType(returned.value, self.return_type), returned.span),
+                    .return_value => |returned| try self.returnExpression(returned.value, returned.span),
                 }
             }
             if (self.current_block == null) return null;
-            var result: ?Value = if (unresolved_block.result) |result_id| if (box_destination) |destination|
-                try self.boxFromInitializer(result_id, destination)
-            else
-                try self.valueWithType(result_id, expected_type) else null;
-            if (self.current_block == null) return null;
-            if (result) |value_to_exit| {
-                const parent_boundary = self.current_boundary;
+            var result: ?Value = null;
+            if (unresolved_block.result) |result_id| {
                 const boundary = try self.newBoundary(unresolved_block.span);
                 self.current_boundary = boundary;
-                result = try self.ownValueEscapingSince(value_to_exit, baseline, unresolved_block.span);
-                self.current_boundary = parent_boundary;
+                const branch_result = try self.branchResult(result_id, mode);
+                if (self.current_block == null) return null;
+                result = if (mode == .discard)
+                    try self.discardResult(branch_result, unresolved_block.span)
+                else
+                    try self.ownValueEscapingSince(branch_result, baseline, unresolved_block.span);
+                self.current_boundary = null;
                 try self.appendBoundary(boundary);
             }
             self.unbindLocalsSince(baseline);
@@ -633,7 +691,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             self.current_boundary = boundary;
             defer self.current_boundary = parent_boundary;
             switch (statement) {
-                .discard, .lifetime_extend => |value_use| try self.discardValue(try self.value(value_use.value), value_use.span),
+                .discard, .lifetime_extend => |value_use| try self.discardValue(try self.discardedValue(value_use.value), value_use.span),
                 .propagate => |propagation| try self.propagateCondition(propagation.condition, propagation.span),
                 .bind_local => |binding| try self.bindLocal(binding),
                 .bind_borrow => |binding| try self.bindBorrow(binding),
@@ -642,8 +700,20 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             if (self.current_block != null) try self.appendBoundary(boundary);
         }
 
+        fn branchResult(self: *Self, id: semantic.UnresolvedBody.ValueId, mode: BranchResult) !Value {
+            return switch (mode) {
+                .value => |context| self.valueWithContext(id, context),
+                .destination => |destination| self.construct(id, self.valueSpan(id), destination),
+                .discard => self.discardedValue(id),
+                .box => |destination| self.boxFromInitializer(id, destination),
+            };
+        }
+
         fn bindLocal(self: *Self, binding: @FieldType(semantic.UnresolvedBody.Statement, "bind_local")) !void {
-            var bound_value = try self.ownValue(try self.value(binding.value), binding.span);
+            var bound_value = if (try self.inPlaceConditionalType(binding.value)) |type_id|
+                try self.construct(binding.value, binding.span, .{ .storage = try self.localStorage(type_id), .site = .local })
+            else
+                try self.ownValue(try self.value(binding.value), binding.span);
             if (bound_value.type_id == .never) return;
             bound_value.binding_identity = try self.newBindingIdentity();
             const index = @intFromEnum(binding.local);
@@ -741,9 +811,10 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         }
 
         fn breakLoop(self: *Self, value_id: semantic.UnresolvedBody.ValueId) !void {
-            var value_to_break = try self.value(value_id);
-            if (value_to_break.type_id == .never) return;
             const context = self.loop_stack.getLast();
+            var value_to_break = try self.branchResult(value_id, context.result);
+            if (value_to_break.type_id == .never) return;
+            if (context.result == .discard) value_to_break = try self.discardResult(value_to_break, self.valueSpan(value_id));
             value_to_break = try self.ownValueEscapingSince(value_to_break, context.baseline, self.unresolved.blocks[@intFromEnum(self.unresolved.root_block)].span);
             self.unbindLocalsSince(context.baseline);
             const state = try self.captureState();
@@ -768,6 +839,21 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             const use = try self.coerceValue(unit.id, .unit, self.return_type) orelse
                 return self.reject(span, .{ .missing_return_value = self.return_type });
             try self.finishFunctionExit(span, .{ .return_value = use });
+        }
+
+        fn returnExpression(self: *Self, id: semantic.UnresolvedBody.ValueId, span: structures.SourceSpan) !void {
+            if (self.infer_return_type or !try self.constructsInPlace(self.return_type))
+                return self.returnValue(try self.valueWithType(id, self.return_type), span);
+            const storage = try self.appendInstruction(.{ .result_storage = self.return_type });
+            const result = try self.construct(id, span, .{ .storage = storage, .site = .return_value });
+            if (result.type_id == .never) return;
+            try self.returnConstructed(result, span);
+        }
+
+        fn returnConstructed(self: *Self, result: Value, span: structures.SourceSpan) !void {
+            try self.validateEscapingBorrows(result, span, true);
+            try self.recordConsume(result);
+            try self.finishFunctionExit(span, .{ .return_value = .{ .value = result.id } });
         }
 
         fn returnValue(self: *Self, value_to_return: Value, span: structures.SourceSpan) !void {
@@ -880,10 +966,16 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         }
 
         fn valueWithType(self: *Self, id: semantic.UnresolvedBody.ValueId, expected_type: ?structures.TypeId) anyerror!Value {
+            return self.valueWithContext(id, .{ .expected_type = expected_type });
+        }
+
+        fn valueWithContext(self: *Self, id: semantic.UnresolvedBody.ValueId, context: ValueContext) anyerror!Value {
+            if (context.borrows_expected_type) std.debug.assert(context.expected_type != null);
             const index = @intFromEnum(id);
-            if (self.values[index]) |resolved| return resolved;
+            if (self.values[index]) |resolved| return self.borrowedArgumentValue(resolved, context, self.valueSpan(id));
             std.debug.assert(index >= self.unresolved.parameter_count);
             const expression = self.unresolved.expressions[index - self.unresolved.parameter_count];
+            const expected_type = context.expected_type;
             const parent_boundary = self.current_boundary;
             const boundary = try self.newBoundary(expression.span);
             self.current_boundary = boundary;
@@ -904,25 +996,42 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 .none => try self.appendInstruction(.const_none),
                 .function_ref => |reference| try self.appendInstruction(.{ .function_ref = reference }),
                 .local_read => |local| try self.readLocal(local, expression.span),
-                .local_transfer => |local| try self.transferLocal(local, expression.span),
-                .field_transfer => |transfer| try self.transferField(transfer, expression.span),
-                .annotation => |annotation| try self.annotate(annotation),
-                .struct_init => try self.structInit(expression),
+                .local_transfer => |local| explicitTransfer(try self.transferLocal(local, expression.span, null)),
+                .field_transfer => |transfer| explicitTransfer(try self.transferField(transfer, expression.span)),
+                .annotation => |annotation| if (context.borrows_expected_type)
+                    try self.constructAnnotated(annotation, .{ .storage = try self.localStorage(expected_type.?), .site = .argument })
+                else
+                    try self.annotate(annotation),
+                .struct_init => if (context.borrows_expected_type)
+                    try self.constructStruct(expression, .{ .storage = try self.localStorage(expected_type.?), .site = .argument })
+                else
+                    try self.structInit(expression),
                 .field_access => try self.fieldAccess(expression),
                 .dereference => |reference| try self.dereference(reference),
                 .assignment => try self.assignment(expression),
                 .borrow_assignment => |assignment_alias| try self.borrowAssignment(assignment_alias),
                 .reference_assignment => |assignment_ref| try self.referenceAssignment(assignment_ref),
-                .call => |call| try self.callFunction(call, expression.span),
+                .call => |call| try self.callFunction(call, expression.span, if (context.borrows_expected_type) .{ .borrowed = expected_type.? } else .value),
                 .negate => |operand| try self.negate(operand),
                 .add, .subtract, .multiply, .divide => try self.binary(expression),
-                .if_else => |expression_if| try self.conditional(expression_if),
-                .loop => |body| try self.loop(body),
+                .if_else => |expression_if| try self.conditional(expression_if, .{ .value = context }),
+                .loop => |body| try self.loop(body, .{ .value = context }),
             };
+            const result = try self.borrowedArgumentValue(resolved, context, expression.span);
             if (self.current_block != null) try self.appendBoundary(boundary);
-            self.values[index] = resolved;
-            try self.rememberCleanupOrigins(resolved);
-            return resolved;
+            self.values[index] = result;
+            try self.rememberCleanupOrigins(result);
+            return result;
+        }
+
+        fn borrowedArgumentValue(self: *Self, source: Value, context: ValueContext, span: structures.SourceSpan) !Value {
+            if (!context.borrows_expected_type or source.type_id == .never) return source;
+            if (source.explicit_transfer) return self.reject(span, .ownership_transfer_requires_owning_context);
+            const target_type = context.expected_type.?;
+            if (source.type_id == target_type) return source;
+            const use = try self.coerceValue(source.id, source.type_id, target_type) orelse
+                return self.reject(span, .{ .call_argument_type_mismatch = self.typeMismatch(target_type, source.type_id) });
+            return self.coerceOwnedRepresentation(source, use, span, try self.localStorage(target_type));
         }
 
         fn readLocal(self: *Self, local: semantic.UnresolvedBody.LocalId, span: structures.SourceSpan) !Value {
@@ -930,11 +1039,10 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             switch (self.local_availability[index]) {
                 .unbound => unreachable,
                 .available => {},
-                .transferred => return self.reject(span, .use_after_transfer),
-                .maybe_transferred => return self.reject(span, .possibly_transferred),
+                .transferred, .maybe_transferred, .replacing => |availability| return self.reject(span, unavailableUse(availability)),
             }
             if (self.unavailableField(local, &[_]PlaceField{})) |availability|
-                return self.reject(span, if (availability == .transferred) .use_after_transfer else .possibly_transferred);
+                return self.reject(span, unavailableUse(availability));
             if (self.locals.items(.alias)[index] != null) {
                 const reference = try self.aliasReference(local);
                 _ = try self.borrowValue(reference, span);
@@ -972,15 +1080,19 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             return value_to_read;
         }
 
-        fn transferLocal(self: *Self, local: semantic.UnresolvedBody.LocalId, span: structures.SourceSpan) !Value {
+        fn explicitTransfer(transferred: Value) Value {
+            var result = transferred;
+            result.explicit_transfer = true;
+            return result;
+        }
+
+        fn transferLocal(self: *Self, local: semantic.UnresolvedBody.LocalId, span: structures.SourceSpan, destination: ?Value) !Value {
             if (self.locals.items(.mut_parameter)[@intFromEnum(local)] != null) return self.reject(span, .ownership_transfer_requires_owned_place);
             const value_to_transfer = try self.readLocal(local, span);
             const capabilities = (try self.type_interner.facts().ownershipCapabilities(value_to_transfer.type_id)) orelse return error.Unavailable;
             if (capabilities.move == .none) return self.reject(span, .{ .type_not_movable = value_to_transfer.type_id });
             self.local_availability[@intFromEnum(local)] = .transferred;
-            var transferred = try self.moveValue(ownershipSource(value_to_transfer), span);
-            transferred.explicit_transfer = true;
-            return transferred;
+            return self.moveValue(ownershipSource(value_to_transfer), span, destination);
         }
 
         fn fieldPathContains(prefix: anytype, path: anytype) bool {
@@ -1008,53 +1120,42 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             defer fields.deinit(self.ctx.allocator());
             const root = self.local_values[@intFromEnum(transfer.target)].?;
             try self.resolvePlaceFields(root.type_id, self.unresolved.assignment_fields[transfer.fields.start..transfer.fields.end], span, &fields);
-            return self.transferFieldPlace(transfer.target, fields.items, span, true);
+            return self.transferFieldPlace(transfer.target, fields.items, span, .{ .move = null });
         }
 
-        fn transferFieldPlace(self: *Self, local: semantic.UnresolvedBody.LocalId, fields: []const PlaceField, span: structures.SourceSpan, relocate: bool) !Value {
+        const FieldTransfer = union(enum) { move: ?Value, consume };
+
+        fn transferFieldPlace(self: *Self, local: semantic.UnresolvedBody.LocalId, fields: []const PlaceField, span: structures.SourceSpan, transfer: FieldTransfer) !Value {
             const local_index = @intFromEnum(local);
             const mutable_parameter = self.locals.items(.mut_parameter)[local_index] != null;
             switch (self.local_availability[local_index]) {
                 .available => {},
-                .transferred => return self.reject(span, .use_after_transfer),
-                .maybe_transferred => return self.reject(span, .possibly_transferred),
+                .transferred, .maybe_transferred, .replacing => |availability| return self.reject(span, unavailableUse(availability)),
                 .unbound => unreachable,
             }
             if (self.unavailableField(local, fields)) |availability|
-                return self.reject(span, if (availability == .transferred) .use_after_transfer else .possibly_transferred);
+                return self.reject(span, unavailableUse(availability));
             const root = self.local_values[local_index].?;
             const field_type = fields[fields.len - 1].type_id;
             const field_capabilities = (try self.type_interner.facts().ownershipCapabilities(field_type)) orelse return error.Unavailable;
-            if (relocate and field_capabilities.move == .none) return self.reject(span, .{ .type_not_movable = field_type });
+            if (transfer == .move and field_capabilities.move == .none) return self.reject(span, .{ .type_not_movable = field_type });
             const moves_owner = field_capabilities.needs_automatic_drop or field_capabilities.requires_explicit_drop;
-            var parent_type = root.type_id;
-            for (fields, 0..) |part, depth| {
-                const parent_capabilities = (try self.type_interner.facts().ownershipCapabilities(parent_type)) orelse return error.Unavailable;
-                const deinit_root = depth == 0 and self.locals.items(.can_deinit)[local_index];
-                if (!deinit_root and parent_capabilities.drop != .fieldwise and parent_capabilities.drop != .trivial and
-                    !(mutable_parameter and parent_capabilities.drop == .custom))
-                    return self.reject(span, .partial_field_transfer_not_supported);
-                if (parent_capabilities.needs_custom_move and !deinit_root)
-                    return self.reject(span, .partial_field_transfer_not_supported);
-                parent_type = part.type_id;
-            }
+            try self.validateMissingFieldParents(local, fields, span);
             try self.recordUse(root);
             if (moves_owner and !mutable_parameter) try self.recordConsume(root);
             var field = root;
             for (fields) |part| {
                 const origins = try self.selectReferenceOrigins(field.reference_origins, .{ .field = part.index });
-                field = if (relocate)
-                    try self.appendInstruction(.{ .field_access = .{
-                        .operand = field.id,
-                        .field_index = part.index,
-                        .field_type = part.type_id,
-                    } })
+                field = if (transfer == .consume)
+                    try self.projectStorage(field, part.type_id, .{ .field = part.index })
                 else
-                    try self.projectStorage(field, part.type_id, .{ .field = part.index });
+                    try self.fieldView(field, part.index, part.type_id);
                 field.reference_origins = origins;
             }
-            var moved = if (relocate) try self.moveValue(field, span) else try self.defineOwnedValue(field, span, false);
-            moved.explicit_transfer = relocate;
+            const moved = switch (transfer) {
+                .move => |destination| try self.moveValue(field, span, destination),
+                .consume => try self.defineOwnedValue(field, span, false),
+            };
             for (self.field_places, self.field_availability) |*place, *availability| {
                 if (place.local == local and place.fields.len == fields.len and fieldPathContains(place.fields, fields)) {
                     place.moves_owner = moves_owner;
@@ -1077,6 +1178,22 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             self.local_values[local_index].?.binding_identity = try self.newBindingIdentity();
             self.local_values[local_index].?.storage_identity = null;
             return moved;
+        }
+
+        fn validateMissingFieldParents(self: *Self, local: semantic.UnresolvedBody.LocalId, fields: []const PlaceField, span: structures.SourceSpan) !void {
+            const local_index = @intFromEnum(local);
+            const mutable_parameter = self.locals.items(.mut_parameter)[local_index] != null;
+            var parent_type = self.local_values[local_index].?.type_id;
+            for (fields, 0..) |part, depth| {
+                const parent_capabilities = (try self.type_interner.facts().ownershipCapabilities(parent_type)) orelse return error.Unavailable;
+                const deinit_root = depth == 0 and self.locals.items(.can_deinit)[local_index];
+                if (!deinit_root and parent_capabilities.drop != .fieldwise and parent_capabilities.drop != .trivial and
+                    !(mutable_parameter and parent_capabilities.drop == .custom))
+                    return self.reject(span, .partial_field_transfer_not_supported);
+                if (parent_capabilities.needs_custom_move and !deinit_root)
+                    return self.reject(span, .partial_field_transfer_not_supported);
+                parent_type = part.type_id;
+            }
         }
 
         const RemainingOwnership = struct {
@@ -1122,6 +1239,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         fn writeMutParameters(self: *Self) !void {
             for (self.locals.items(.mut_parameter), self.local_values, 0..) |parameter_index, local_value, local_index| {
                 const index = parameter_index orelse continue;
+                if (self.local_availability[local_index] != .available) return self.reject(self.activeLifetimeSpan(), unavailableUse(self.local_availability[local_index]));
                 for (self.field_places, self.field_availability) |place, availability| {
                     if (@intFromEnum(place.local) == local_index and availability != .available)
                         return self.reject(self.activeLifetimeSpan(), .field_not_restored_before_mut_return);
@@ -1137,6 +1255,222 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             }
         }
 
+        fn constructsInPlace(self: *Self, type_id: structures.TypeId) !bool {
+            const capabilities = (try self.type_interner.facts().ownershipCapabilities(type_id)) orelse return error.Unavailable;
+            return !capabilities.isDirectlyMovable();
+        }
+
+        fn localStorage(self: *Self, type_id: structures.TypeId) !Value {
+            return self.appendInstruction(.{ .local_storage = type_id });
+        }
+
+        fn valueSpan(self: *const Self, id: semantic.UnresolvedBody.ValueId) structures.SourceSpan {
+            const index = @intFromEnum(id);
+            if (index < self.unresolved.parameter_count) return self.unresolved.parameter_spans[index];
+            return self.unresolved.expressions[index - self.unresolved.parameter_count].span;
+        }
+
+        fn initializationMismatch(self: *Self, site: InitializationSite, expected: structures.TypeId, found: structures.TypeId) structures.Diagnostic.Kind {
+            const mismatch = self.typeMismatch(expected, found);
+            return switch (site) {
+                .local => .{ .local_type_mismatch = mismatch },
+                .field => .{ .struct_initializer_field_type_mismatch = mismatch },
+                .argument => .{ .call_argument_type_mismatch = mismatch },
+                .assignment => .{ .assignment_type_mismatch = mismatch },
+                .return_value => .{ .return_type_mismatch = mismatch },
+            };
+        }
+
+        fn construct(self: *Self, id: semantic.UnresolvedBody.ValueId, span: structures.SourceSpan, destination: Destination) anyerror!Value {
+            const index = @intFromEnum(id);
+            const expected_type = destination.storage.type_id;
+            if (index < self.unresolved.parameter_count or self.values[index] != null or !try self.constructsInPlace(expected_type))
+                return self.placeEvaluated(id, span, destination);
+            const expression = self.unresolved.expressions[index - self.unresolved.parameter_count];
+            switch (expression.operation) {
+                .struct_init, .call, .if_else, .loop, .annotation, .local_transfer, .field_transfer => {},
+                else => return self.placeEvaluated(id, span, destination),
+            }
+            const parent_boundary = self.current_boundary;
+            const boundary = try self.newBoundary(expression.span);
+            self.current_boundary = boundary;
+            defer self.current_boundary = parent_boundary;
+            const constructed = switch (expression.operation) {
+                .struct_init => try self.constructStruct(expression, destination),
+                .call => |call| try self.callFunction(call, expression.span, .{ .destination = destination }),
+                .if_else => |branches| try self.conditional(branches, .{ .destination = destination }),
+                .loop => |body| try self.loop(body, .{ .destination = destination }),
+                .annotation => |annotation| try self.constructAnnotated(annotation, destination),
+                .local_transfer => |local| try self.constructLocalTransfer(local, expression.span, destination),
+                .field_transfer => |transfer| try self.constructFieldTransfer(transfer, expression.span, destination),
+                else => unreachable,
+            };
+            if (self.current_block != null) try self.appendBoundary(boundary);
+            self.values[index] = constructed;
+            try self.rememberCleanupOrigins(constructed);
+            return constructed;
+        }
+
+        fn placeEvaluated(self: *Self, id: semantic.UnresolvedBody.ValueId, span: structures.SourceSpan, destination: Destination) !Value {
+            const source = try self.valueWithType(id, destination.storage.type_id);
+            const parent_boundary = self.current_boundary;
+            const boundary = try self.newBoundary(span);
+            self.current_boundary = boundary;
+            defer self.current_boundary = parent_boundary;
+            const placed = try self.placeValue(source, span, destination);
+            if (self.current_block != null) try self.appendBoundary(boundary);
+            return placed;
+        }
+
+        fn placeValue(self: *Self, source: Value, span: structures.SourceSpan, destination: Destination) !Value {
+            if (source.type_id == .never) return source;
+            const target_type = destination.storage.type_id;
+            if (!try self.constructsInPlace(source.type_id)) {
+                var use = try self.coerceValue(source.id, source.type_id, target_type) orelse
+                    return self.reject(span, self.initializationMismatch(destination.site, target_type, source.type_id));
+                const owned = try self.ownValue(source, span);
+                use.value = owned.id;
+                if (use.coerce_to == null)
+                    _ = try self.copyBits(owned, destination.storage)
+                else
+                    _ = try self.appendCoercion(use, destination.storage.id);
+                try self.recordConsume(owned);
+                var placed = try self.defineOwnedValue(destination.storage, span, false);
+                placed.reference_origins = try self.coercedReferenceOrigins(owned, use);
+                return placed;
+            }
+            const storage = try self.memberDestination(destination, source.type_id, span, .existing);
+            if (source.borrowed_type == null or source.borrow_condition != null)
+                return self.reject(span, .{ .relocation_requires_direct_move = source.type_id });
+            if (try self.nonCopyableBorrow(source)) |details| return self.reject(span, .{ .type_not_copyable = details });
+            return self.finishMemberStorage(try self.copyValue(source, span, storage), destination.storage, span);
+        }
+
+        fn memberStorage(self: *Self, destination: Value, source_type: structures.TypeId) !?Value {
+            if (source_type == destination.type_id) return destination;
+            const members = (try self.type_interner.facts().variantMembers(destination.type_id)) orelse return null;
+            if (try self.type_interner.facts().variantMembers(source_type) != null or !containsType(members, source_type)) return null;
+            return try self.projectStorage(destination, source_type, .variant);
+        }
+
+        fn memberDestination(self: *Self, destination: Destination, source_type: structures.TypeId, span: structures.SourceSpan, source: enum { fresh, existing }) !Value {
+            if (try self.memberStorage(destination.storage, source_type)) |storage| return storage;
+            if (!try semantic.canWidenTo(self.type_interner, source_type, destination.storage.type_id))
+                return self.reject(span, self.initializationMismatch(destination.site, destination.storage.type_id, source_type));
+            if (source == .existing and try self.type_interner.facts().variantMembers(source_type) != null) return destination.storage;
+            return self.reject(span, .{ .relocation_requires_direct_move = source_type });
+        }
+
+        fn finishMemberStorage(self: *Self, member: Value, destination: Value, span: structures.SourceSpan) !Value {
+            if (member.type_id == .never or member.id == destination.id) return member;
+            const use = (try self.coerceValue(member.id, member.type_id, destination.type_id)).?;
+            _ = try self.appendCoercion(use, destination.id);
+            try self.recordConsume(member);
+            var result = try self.defineOwnedValue(destination, span, false);
+            result.reference_origins = try self.prefixReferenceOrigins(member.reference_origins, .{ .variant = member.type_id });
+            return result;
+        }
+
+        fn constructStruct(self: *Self, expression: Expression, destination: Destination) !Value {
+            const initializer = expression.operation.struct_init;
+            const type_id = switch (try self.structInitType(initializer)) {
+                .diverged => |diverged| return diverged,
+                .type_id => |resolved| resolved,
+            };
+            if (!try self.constructsInPlace(type_id)) return self.placeValue(try self.structInitValue(expression, type_id), expression.span, destination);
+            const storage = try self.memberDestination(destination, type_id, expression.span, .fresh);
+            return self.finishMemberStorage(try self.constructFields(expression, type_id, storage), destination.storage, expression.span);
+        }
+
+        fn constructFields(self: *Self, expression: Expression, type_id: structures.TypeId, storage: Value) !Value {
+            const initializer = expression.operation.struct_init;
+            const definition = (try self.type_interner.structDefinition(type_id)) orelse
+                return self.reject(initializer.type_span, .{ .struct_initializer_not_struct = type_id });
+            if (!definition.accessible_fields) return self.reject(initializer.type_span, .{ .opaque_struct_access = type_id });
+            const seen = try self.ctx.allocator().alloc(bool, definition.fields.len);
+            defer self.ctx.allocator().free(seen);
+            @memset(seen, false);
+            var fields: std.ArrayList(Value) = .empty;
+            defer fields.deinit(self.ctx.allocator());
+            var reference_origins: ?u32 = null;
+            for (self.unresolved.struct_field_values[initializer.fields.start..initializer.fields.end]) |source_field| {
+                const field = definition.resolveField(source_field.name) orelse
+                    return self.reject(source_field.name_span, .unknown_struct_field);
+                if (seen[field.index]) return self.reject(source_field.name_span, .duplicate_struct_initializer_field);
+                seen[field.index] = true;
+                const field_storage = try self.projectStorage(storage, field.type_id, .{ .field = field.index });
+                const field_value = try self.construct(source_field.value.value, source_field.value.span, .{ .storage = field_storage, .site = .field });
+                if (field_value.type_id == .never) return field_value;
+                try fields.append(self.ctx.allocator(), field_value);
+                if (try self.type_interner.canStoreBorrow(field.type_id))
+                    reference_origins = try self.mergeReferenceOrigins(reference_origins, try self.prefixReferenceOrigins(field_value.reference_origins, .{ .field = field.index }));
+            }
+            for (seen, 0..) |was_seen, field_index| if (!was_seen) return self.reject(initializer.type_span, .{ .missing_struct_initializer_field = .{
+                .type_id = type_id,
+                .field_index = @intCast(field_index),
+            } });
+            for (fields.items) |field_value| try self.recordConsume(field_value);
+            var constructed = try self.defineOwnedValue(storage, expression.span, false);
+            constructed.reference_origins = reference_origins;
+            return constructed;
+        }
+
+        fn constructAnnotated(self: *Self, annotation: @FieldType(Expression.Operation, "annotation"), destination: Destination) !Value {
+            const storage = try self.memberStorage(destination.storage, annotation.type_id) orelse
+                return self.placeValue(try self.annotate(annotation), annotation.value.span, destination);
+            const annotated = try self.construct(annotation.value.value, annotation.value.span, .{ .storage = storage, .site = .local });
+            return self.finishMemberStorage(annotated, destination.storage, annotation.value.span);
+        }
+
+        fn constructLocalTransfer(self: *Self, local: semantic.UnresolvedBody.LocalId, span: structures.SourceSpan, destination: Destination) !Value {
+            const source_type = try self.placeRootType(.{ .local = local });
+            if (!try self.constructsInPlace(source_type)) return self.placeValue(try self.transferLocal(local, span, null), span, destination);
+            const storage = try self.memberDestination(destination, source_type, span, .existing);
+            return self.finishMemberStorage(try self.transferLocal(local, span, storage), destination.storage, span);
+        }
+
+        fn constructFieldTransfer(self: *Self, transfer: @FieldType(Expression.Operation, "field_transfer"), span: structures.SourceSpan, destination: Destination) !Value {
+            var fields: std.ArrayList(PlaceField) = .empty;
+            defer fields.deinit(self.ctx.allocator());
+            const root = self.local_values[@intFromEnum(transfer.target)].?;
+            try self.resolvePlaceFields(root.type_id, self.unresolved.assignment_fields[transfer.fields.start..transfer.fields.end], span, &fields);
+            const source_type = fields.getLast().type_id;
+            if (!try self.constructsInPlace(source_type))
+                return self.placeValue(try self.transferFieldPlace(transfer.target, fields.items, span, .{ .move = null }), span, destination);
+            const storage = try self.memberDestination(destination, source_type, span, .existing);
+            return self.finishMemberStorage(try self.transferFieldPlace(transfer.target, fields.items, span, .{ .move = storage }), destination.storage, span);
+        }
+
+        fn discardedValue(self: *Self, id: semantic.UnresolvedBody.ValueId) anyerror!Value {
+            const index = @intFromEnum(id);
+            if (index < self.unresolved.parameter_count or self.values[index] != null) return self.value(id);
+            const expression = self.unresolved.expressions[index - self.unresolved.parameter_count];
+            if (expression.operation != .if_else and expression.operation != .loop) return self.value(id);
+            const parent_boundary = self.current_boundary;
+            const boundary = try self.newBoundary(expression.span);
+            self.current_boundary = boundary;
+            defer self.current_boundary = parent_boundary;
+            const resolved = switch (expression.operation) {
+                .if_else => |branches| try self.conditional(branches, .discard),
+                .loop => |body| try self.loop(body, .discard),
+                else => unreachable,
+            };
+            if (self.current_block != null) try self.appendBoundary(boundary);
+            self.values[index] = resolved;
+            return resolved;
+        }
+
+        fn discardResult(self: *Self, result: Value, span: structures.SourceSpan) !Value {
+            const parent_boundary = self.current_boundary;
+            const boundary = try self.newBoundary(span);
+            self.current_boundary = boundary;
+            defer self.current_boundary = parent_boundary;
+            try self.discardValue(result, span);
+            const unit = try self.appendInstruction(.const_unit);
+            try self.appendBoundary(boundary);
+            return unit;
+        }
+
         fn ownValue(self: *Self, value_to_own: Value, span: structures.SourceSpan) !Value {
             if (try self.nonCopyableBorrow(value_to_own)) |details| return self.reject(span, .{ .type_not_copyable = details });
             const owned = if (value_to_own.borrowed_type == null)
@@ -1144,7 +1478,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             else if (value_to_own.borrow_condition) |borrow_predicate|
                 try self.copyValueConditionally(value_to_own, borrow_predicate, span)
             else
-                try self.copyValue(value_to_own, span);
+                try self.copyValue(value_to_own, span, null);
             try self.rememberCleanupOrigins(owned);
             return owned;
         }
@@ -1161,7 +1495,13 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 const type_id = if (fields.items.len == 0) self.local_values[local_index].?.type_id else fields.getLast().type_id;
                 if (expected_type) |expected| if (type_id != expected)
                     return self.reject(span, .{ .call_argument_type_mismatch = self.typeMismatch(expected, type_id) });
-                if (fields.items.len != 0) return self.transferFieldPlace(local, fields.items, span, false);
+                const field_start: u32 = @intCast(self.pending_deinit_fields.items.len);
+                try self.pending_deinit_fields.appendSlice(self.ctx.allocator(), fields.items);
+                try self.pending_deinit_places.append(self.ctx.allocator(), .{
+                    .local = local,
+                    .fields = .{ .start = field_start, .end = @intCast(self.pending_deinit_fields.items.len) },
+                });
+                if (fields.items.len != 0) return self.transferFieldPlace(local, fields.items, span, .consume);
                 if (self.locals.items(.mut_parameter)[local_index] != null)
                     return self.reject(span, .ownership_transfer_requires_owned_place);
                 const source = try self.readLocal(local, span);
@@ -1169,7 +1509,10 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 self.local_availability[local_index] = .transferred;
                 return ownershipSource(source);
             }
-            const value_to_consume = try self.valueWithType(id, expected_type);
+            const value_to_consume = if (expected_type != null and try self.constructsInPlace(expected_type.?))
+                try self.construct(id, span, .{ .storage = try self.localStorage(expected_type.?), .site = .argument })
+            else
+                try self.valueWithType(id, expected_type);
             if (value_to_consume.borrowed_type != null)
                 return self.reject(span, .ownership_transfer_requires_owned_place);
             try self.rememberCleanupOrigins(value_to_consume);
@@ -1395,16 +1738,16 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
 
         fn copyValueAcrossJoin(self: *Self, source: Value, span: structures.SourceSpan) !Value {
             const capabilities = (try self.type_interner.facts().ownershipCapabilities(source.type_id)) orelse return error.Unavailable;
-            if (capabilities.copy != .none) return self.copyValue(source, span);
+            if (capabilities.copy != .none) return self.copyValue(source, span, null);
             const members = (try self.type_interner.facts().variantMembers(source.type_id)) orelse unreachable;
             if (!source.materialize_on_copy) try self.recordUse(source);
             const copied_bits = try self.mapVariantMember(rawValue(source), members, .copy, null);
             return self.finishCopiedValue(source, copied_bits, span);
         }
 
-        fn copyValue(self: *Self, source: Value, span: structures.SourceSpan) anyerror!Value {
+        fn copyValue(self: *Self, source: Value, span: structures.SourceSpan, destination: ?Value) anyerror!Value {
             if (!source.materialize_on_copy) try self.recordUse(source);
-            const copied_bits = try self.copyValueBits(rawValue(source), null);
+            const copied_bits = try self.copyValueBits(rawValue(source), destination);
             return self.finishCopiedValue(source, copied_bits, span);
         }
 
@@ -1444,23 +1787,21 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         }
 
         fn copyValueBits(self: *Self, source: Value, destination: ?Value) anyerror!Value {
+            if (destination) |storage| if (storage.type_id != source.type_id)
+                return self.mapVariantMember(source, (try self.type_interner.facts().variantMembers(source.type_id)).?, .copy, storage);
             const capabilities = (try self.type_interner.facts().ownershipCapabilities(source.type_id)) orelse return error.Unavailable;
             if (capabilities.needs_custom_copy) return switch (capabilities.copy) {
                 .custom => self.callOwnershipHook(source, .copy, destination),
-                .fieldwise => self.copyStructFields(source, destination),
+                .fieldwise => self.copyStructFields(source, destination orelse try self.inPlaceStorage(source.type_id)),
                 .none, .trivial => unreachable,
             };
             std.debug.assert(capabilities.copy != .none);
-            if (destination) |storage| {
-                _ = try self.appendInstruction(.{ .value_copy = .{ .source = source.id, .type_id = source.type_id, .destination = storage.id } });
-                return storage;
-            }
-            return source;
+            return self.copyBits(source, destination orelse try self.inPlaceStorage(source.type_id));
         }
 
-        fn moveValue(self: *Self, source: Value, span: structures.SourceSpan) anyerror!Value {
+        fn moveValue(self: *Self, source: Value, span: structures.SourceSpan, destination: ?Value) anyerror!Value {
             try self.recordConsume(source);
-            var moved = try self.defineOwnedValue(try self.moveValueBits(rawValue(source)), span, false);
+            var moved = try self.defineOwnedValue(try self.moveValueBits(rawValue(source), destination), span, false);
             const capabilities = (try self.type_interner.facts().ownershipCapabilities(source.type_id)) orelse return error.Unavailable;
             moved.reference_origins = if (capabilities.needs_custom_move)
                 try self.widenReferenceOrigins(source.reference_origins)
@@ -1473,14 +1814,29 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             return moved;
         }
 
-        fn moveValueBits(self: *Self, source: Value) anyerror!Value {
+        fn moveValueBits(self: *Self, source: Value, destination: ?Value) anyerror!Value {
+            if (destination) |storage| if (storage.type_id != source.type_id)
+                return self.mapVariantMember(source, (try self.type_interner.facts().variantMembers(source.type_id)).?, .move, storage);
             const capabilities = (try self.type_interner.facts().ownershipCapabilities(source.type_id)) orelse return error.Unavailable;
             return switch (capabilities.move) {
-                .trivial => source,
+                .trivial => self.copyBits(source, destination),
                 .none => unreachable,
-                .custom => self.callOwnershipHook(source, .move, null),
-                .fieldwise => if (capabilities.needs_custom_move) self.moveStructFields(source) else source,
+                .custom => self.callOwnershipHook(source, .move, destination),
+                .fieldwise => if (capabilities.needs_custom_move)
+                    self.moveStructFields(source, destination orelse try self.localStorage(source.type_id))
+                else
+                    self.copyBits(source, destination),
             };
+        }
+
+        fn copyBits(self: *Self, source: Value, destination: ?Value) !Value {
+            const storage = destination orelse return source;
+            _ = try self.appendInstruction(.{ .value_copy = .{ .source = source.id, .type_id = source.type_id, .destination = storage.id } });
+            return storage;
+        }
+
+        fn inPlaceStorage(self: *Self, type_id: structures.TypeId) !?Value {
+            return if (try self.constructsInPlace(type_id)) try self.localStorage(type_id) else null;
         }
 
         const OwnershipOperation = enum { copy, move, drop };
@@ -1536,12 +1892,12 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             return self.mapStructFields(source, definition, .copy, destination);
         }
 
-        fn moveStructFields(self: *Self, source: Value) anyerror!Value {
+        fn moveStructFields(self: *Self, source: Value, destination: Value) anyerror!Value {
             const definition = (try self.type_interner.structDefinition(source.type_id)) orelse {
-                const members = (try self.type_interner.facts().variantMembers(source.type_id)) orelse return source;
-                return self.mapVariantMember(source, members, .move, null);
+                const members = (try self.type_interner.facts().variantMembers(source.type_id)).?;
+                return self.mapVariantMember(source, members, .move, destination);
             };
-            return self.mapStructFields(source, definition, .move, null);
+            return self.mapStructFields(source, definition, .move, destination);
         }
 
         fn mapStructFields(
@@ -1565,7 +1921,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 const field_destination = if (destination) |storage| try self.projectStorage(storage, field.type_id, .{ .field = @intCast(index) }) else null;
                 const owned = switch (operation) {
                     .copy => try self.copyValueBits(extracted, field_destination),
-                    .move => try self.moveValueBits(extracted),
+                    .move => try self.moveValueBits(extracted, field_destination),
                     .drop => unreachable,
                 };
                 if (destination == null) try fields.append(self.ctx.allocator(), .{
@@ -1600,6 +1956,11 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             return self.appendInstruction(.{ .storage_projection = .{ .owner = source.id, .type_id = type_id, .projection = projection } });
         }
 
+        fn fieldView(self: *Self, owner: Value, index: u32, field_type: structures.TypeId) !Value {
+            if (try self.constructsInPlace(field_type)) return self.projectStorage(owner, field_type, .{ .field = index });
+            return self.appendInstruction(.{ .field_access = .{ .operand = owner.id, .field_index = index, .field_type = field_type } });
+        }
+
         fn mapExtractedVariantMember(self: *Self, source: Value, member: structures.TypeId, operation: OwnershipOperation, destination: ?Value) anyerror!Value {
             const extracted = if (destination != null) try self.projectStorage(source, member, .variant) else try self.appendInstruction(.{ .variant_extract = .{
                 .operand = source.id,
@@ -1611,20 +1972,20 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     const capabilities = (try self.type_interner.facts().ownershipCapabilities(member)) orelse return error.Unavailable;
                     break :blk if (capabilities.copy == .none) extracted else try self.copyValueBits(extracted, member_destination);
                 },
-                .move => try self.moveValueBits(extracted),
+                .move => try self.moveValueBits(extracted, member_destination),
                 .drop => unreachable,
             };
-            const use = (try self.coerceValue(owned.id, member, source.type_id)) orelse unreachable;
+            const use = (try self.coerceValue(owned.id, member, if (destination) |storage| storage.type_id else source.type_id)) orelse unreachable;
             if (destination) |storage| {
                 _ = try self.appendInstruction(.{ .variant_coerce = .{
                     .operand = owned.id,
-                    .target_type = source.type_id,
+                    .target_type = storage.type_id,
                     .tag_mapping = use.variant_tag_mapping,
                     .destination = storage.id,
                 } });
                 return storage;
             }
-            return if (use.coerce_to == null) owned else self.appendCoercion(use);
+            return if (use.coerce_to == null) owned else self.appendCoercion(use, null);
         }
 
         fn dropVariantMember(
@@ -1666,10 +2027,16 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 .drop => {},
             }
             const join = try self.newBlock(argument_start, @intCast(self.block_argument_types.items.len));
+            const destination_members = if (destination) |storage| (try self.type_interner.facts().variantMembers(storage.type_id)).? else members;
+            var remaining: usize = 0;
+            for (members) |member| remaining += @intFromBool(containsType(destination_members, member));
+            std.debug.assert(remaining != 0);
 
             for (members, 0..) |member, member_index| {
+                if (!containsType(destination_members, member)) continue;
+                remaining -= 1;
                 const case = try self.newBlock(argument_start, argument_start);
-                const next = if (member_index + 1 == members.len)
+                const next = if (remaining == 0)
                     null
                 else
                     try self.newBlock(argument_start, argument_start);
@@ -1692,13 +2059,9 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                         try self.dropValue(extracted, drop.can_deinit, drop.span);
                         self.terminate(.{ .branch = self.emptyBranch(join) });
                     },
-                    .copy => {
-                        const result = try self.mapExtractedVariantMember(source, member, .copy, destination);
+                    .copy, .move => {
+                        const result = try self.mapExtractedVariantMember(source, member, if (operation == .copy) .copy else .move, destination);
                         self.terminate(.{ .branch = if (destination != null) self.emptyBranch(join) else try self.valuesBranch(join, &.{result}) });
-                    },
-                    .move => {
-                        const result = try self.mapExtractedVariantMember(source, member, .move, null);
-                        self.terminate(.{ .branch = try self.valuesBranch(join, &.{result}) });
                     },
                 }
                 if (next) |next_block| self.enterBlock(next_block);
@@ -1811,11 +2174,13 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     });
                 } else for (effects.items) |effect| try self.recordEffect(effect);
             }
-            const generation = source.borrowed_generation orelse source.owned_generation orelse return;
-            const cleanup_value = if (source.borrowed_generation != null) source.borrowed_cleanup_value orelse source.id else source.id;
-            try self.recordEffect(.{ .use = .{
+            if (source.borrowed_generation) |generation| try self.recordEffect(.{ .use = .{
                 .generation = generation,
-                .cleanup_value = cleanup_value,
+                .cleanup_value = source.borrowed_cleanup_value orelse source.id,
+            } });
+            if (source.owned_generation) |generation| try self.recordEffect(.{ .use = .{
+                .generation = generation,
+                .cleanup_value = source.id,
                 .cleanup_condition = source.borrow_condition,
             } });
         }
@@ -1838,8 +2203,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     const slot = @intFromEnum(root);
                     switch (state.availability[slot]) {
                         .available => {},
-                        .transferred => return self.reject(span, .use_after_transfer),
-                        .maybe_transferred => return self.reject(span, .possibly_transferred),
+                        .transferred, .maybe_transferred, .replacing => |availability| return self.reject(span, unavailableUse(availability)),
                         .unbound => return self.reject(span, .borrow_outlives_source),
                     }
                     const expected = try self.resolveBindingIdentity(origin.binding_identity);
@@ -1975,7 +2339,16 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         const StructInitResult = union(enum) { diverged: Value, prepared: PreparedStructInit };
 
         fn structInit(self: *Self, expression: Expression) !Value {
-            const result = try self.prepareStructInit(expression, false);
+            const type_id = switch (try self.structInitType(expression.operation.struct_init)) {
+                .diverged => |diverged| return diverged,
+                .type_id => |resolved| resolved,
+            };
+            if (try self.constructsInPlace(type_id)) return self.constructFields(expression, type_id, try self.localStorage(type_id));
+            return self.structInitValue(expression, type_id);
+        }
+
+        fn structInitValue(self: *Self, expression: Expression, type_id: structures.TypeId) !Value {
+            const result = try self.prepareStructInit(expression, type_id, false);
             const prepared = switch (result) {
                 .diverged => |diverged| return diverged,
                 .prepared => |prepared_init| prepared_init,
@@ -1993,14 +2366,9 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             return initialized;
         }
 
-        fn prepareStructInit(self: *Self, expression: Expression, directly_movable_fields: bool) !StructInitResult {
+        fn prepareStructInit(self: *Self, expression: Expression, type_id: structures.TypeId, directly_movable_fields: bool) !StructInitResult {
             const initializer = expression.operation.struct_init;
             const source_fields = self.unresolved.struct_field_values[initializer.fields.start..initializer.fields.end];
-            const type_result = try self.structInitType(initializer, directly_movable_fields);
-            const type_id = switch (type_result) {
-                .diverged => |diverged| return .{ .diverged = diverged },
-                .type_id => |resolved| resolved,
-            };
             const definition = (try self.type_interner.structDefinition(type_id)) orelse
                 return self.reject(initializer.type_span, .{ .struct_initializer_not_struct = type_id });
             if (!definition.accessible_fields) return self.reject(initializer.type_span, .{ .opaque_struct_access = type_id });
@@ -2031,7 +2399,11 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                         if (raw_index >= self.unresolved.parameter_count) {
                             const nested_expression = self.unresolved.expressions[raw_index - self.unresolved.parameter_count];
                             if (nested_expression.operation == .struct_init) {
-                                const nested_result = try self.prepareStructInit(nested_expression, true);
+                                const nested_type = switch (try self.structInitType(nested_expression.operation.struct_init)) {
+                                    .diverged => |diverged| return .{ .diverged = diverged },
+                                    .type_id => |resolved| resolved,
+                                };
+                                const nested_result = try self.prepareStructInit(nested_expression, nested_type, true);
                                 const nested = switch (nested_result) {
                                     .diverged => |diverged| return .{ .diverged = diverged },
                                     .prepared => |prepared| prepared,
@@ -2058,7 +2430,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 const owned = try self.ownValue(operand, source_field.value.span);
                 use.value = owned.id;
                 const field_value = if (use.coerce_to != null)
-                    try self.coerceOwnedRepresentation(owned, use, source_field.value.span)
+                    try self.coerceOwnedRepresentation(owned, use, source_field.value.span, null)
                 else
                     owned;
                 if (directly_movable_fields) {
@@ -2104,7 +2476,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 const expression = self.unresolved.expressions[index - self.unresolved.parameter_count];
                 if (expression.operation == .struct_init) {
                     const initializer = expression.operation.struct_init;
-                    const result = try self.structInitType(initializer, true);
+                    const result = try self.structInitType(initializer);
                     const type_id = switch (result) {
                         .diverged => |diverged| return .{ .diverged = diverged },
                         .type_id => |resolved| resolved,
@@ -2131,26 +2503,6 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             return if (operand.type_id == .never) .{ .diverged = operand } else .{ .type_id = operand.type_id };
         }
 
-        fn inPlaceResultType(self: *Self, id: semantic.UnresolvedBody.ValueId) anyerror!?structures.TypeId {
-            const index = @intFromEnum(id);
-            if (index < self.unresolved.parameter_count) return null;
-            const expression = self.unresolved.expressions[index - self.unresolved.parameter_count];
-            return switch (expression.operation) {
-                .struct_init => |initializer| switch (initializer.target) {
-                    .concrete => |type_id| type_id,
-                    .inferred => null,
-                },
-                .if_else => |branches| blk: {
-                    const then_result = self.unresolved.blocks[@intFromEnum(branches.then_block)].result orelse break :blk null;
-                    const else_result = self.unresolved.blocks[@intFromEnum(branches.else_block)].result orelse break :blk null;
-                    const then_type = (try self.inPlaceResultType(then_result)) orelse break :blk null;
-                    const else_type = (try self.inPlaceResultType(else_result)) orelse break :blk null;
-                    break :blk if (then_type == else_type) then_type else null;
-                },
-                else => null,
-            };
-        }
-
         fn inPlaceInitializer(self: *Self, id: semantic.UnresolvedBody.ValueId) ?InPlaceInitializer {
             const index = @intFromEnum(id);
             if (index < self.unresolved.parameter_count) return null;
@@ -2165,32 +2517,138 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
 
         fn inPlaceInitializerType(self: *Self, initializer: InPlaceInitializer, id: semantic.UnresolvedBody.ValueId) anyerror!?StructTypeResult {
             return switch (initializer) {
-                .fields => |expression| try self.structInitType(expression.operation.struct_init, true),
-                .call => |call| if (try self.inPlaceCallResultType(call)) |type_id| .{ .type_id = type_id } else null,
-                .conditional => if (try self.inPlaceResultType(id)) |type_id| .{ .type_id = type_id } else null,
+                .fields => |expression| try self.structInitType(expression.operation.struct_init),
+                .call => if (try self.unevaluatedType(id, null)) |type_id| .{ .type_id = type_id } else null,
+                .conditional => |branches| blk: {
+                    const then_type = (try self.unevaluatedBranchType(branches.then_block)) orelse break :blk null;
+                    const else_type = (try self.unevaluatedBranchType(branches.else_block)) orelse break :blk null;
+                    break :blk if (then_type == else_type) .{ .type_id = then_type } else null;
+                },
             };
         }
 
-        fn structInitType(self: *Self, initializer: @FieldType(Expression.Operation, "struct_init"), in_place: bool) !StructTypeResult {
+        fn unevaluatedType(self: *Self, id: semantic.UnresolvedBody.ValueId, expected_type: ?structures.TypeId) anyerror!?structures.TypeId {
+            const index = @intFromEnum(id);
+            if (index < self.unresolved.parameter_count) return self.values[index].?.type_id;
+            if (self.values[index]) |resolved| return resolved.type_id;
+            return switch (self.unresolved.expressions[index - self.unresolved.parameter_count].operation) {
+                .integer_literal => if (expected_type == .byte) .byte else .int,
+                .integer, .negate, .add, .subtract, .multiply, .divide => .int,
+                .byte => .byte,
+                .boolean => .bool,
+                .unit => .unit,
+                .none => .none,
+                .function_ref => |reference| reference.type_id,
+                .annotation => |annotation| annotation.type_id,
+                .local_read, .local_transfer => |local| if (self.local_values[@intFromEnum(local)] == null) null else try self.placeRootType(.{ .local = local }),
+                .field_transfer => |transfer| blk: {
+                    if (self.local_values[@intFromEnum(transfer.target)] == null) break :blk null;
+                    var type_id = try self.placeRootType(.{ .local = transfer.target });
+                    for (self.unresolved.assignment_fields[transfer.fields.start..transfer.fields.end]) |field|
+                        type_id = (try self.unevaluatedFieldType(type_id, field.name)) orelse break :blk null;
+                    break :blk type_id;
+                },
+                .field_access => |access| if (try self.unevaluatedType(access.operand.value, null)) |operand_type| try self.unevaluatedFieldType(operand_type, access.name) else null,
+                .dereference => |reference| blk: {
+                    const reference_type = (try self.unevaluatedType(reference.value, null)) orelse break :blk null;
+                    break :blk if (try self.type_interner.facts().borrowAccess(reference_type)) |access| access.element_type else null;
+                },
+                .struct_init => |initializer| switch (initializer.target) {
+                    .concrete => |type_id| type_id,
+                    .inferred => |factory| try self.unevaluatedStructType(factory, initializer),
+                },
+                .call => |call| try self.unevaluatedCallType(call),
+                .if_else => |branches| blk: {
+                    const then_type = (try self.unevaluatedBranchType(branches.then_block)) orelse break :blk null;
+                    const else_type = (try self.unevaluatedBranchType(branches.else_block)) orelse break :blk null;
+                    break :blk try joinTypes(self.type_interner, then_type, else_type, self.ctx.allocator());
+                },
+                .type_value, .assignment, .borrow_assignment, .reference_assignment, .loop => null,
+            };
+        }
+
+        fn inPlaceConditionalType(self: *Self, id: semantic.UnresolvedBody.ValueId) !?structures.TypeId {
+            const index = @intFromEnum(id);
+            if (index < self.unresolved.parameter_count or self.values[index] != null) return null;
+            if (self.unresolved.expressions[index - self.unresolved.parameter_count].operation != .if_else) return null;
+            const type_id = (try self.unevaluatedType(id, null)) orelse return null;
+            return if (try self.constructsInPlace(type_id)) type_id else null;
+        }
+
+        fn unevaluatedBranchType(self: *Self, block_id: semantic.UnresolvedBody.BlockId) !?structures.TypeId {
+            const result = self.unresolved.blocks[@intFromEnum(block_id)].result orelse return .never;
+            return self.unevaluatedType(result, null);
+        }
+
+        fn unevaluatedFieldType(self: *Self, parent_type: structures.TypeId, name: []const u8) !?structures.TypeId {
+            const definition = (try self.type_interner.structDefinition(parent_type)) orelse return null;
+            if (!definition.accessible_fields) return null;
+            return if (definition.resolveField(name)) |field| field.type_id else null;
+        }
+
+        fn unevaluatedStructType(self: *Self, factory: structures.InstanceId, initializer: @FieldType(Expression.Operation, "struct_init")) !?structures.TypeId {
+            const fields = self.unresolved.struct_field_values[initializer.fields.start..initializer.fields.end];
+            var field_types: std.ArrayList(structures.TypeId) = .empty;
+            defer field_types.deinit(self.ctx.allocator());
+            for (fields) |field| {
+                const expected = try self.type_interner.independentStructFieldType(factory, field.name);
+                try field_types.append(self.ctx.allocator(), (try self.unevaluatedType(field.value.value, expected)) orelse return null);
+            }
+            const arguments = switch (try self.type_interner.inferStructArguments(factory, fields, field_types.items)) {
+                .arguments => |arguments| arguments,
+                .missing, .conflict => return null,
+            };
+            defer self.ctx.allocator().free(arguments);
+            return try self.type_interner.specializedStructType(try self.type_interner.specializeFunction(factory, arguments));
+        }
+
+        fn unevaluatedCallType(self: *Self, call: semantic.UnresolvedBody.Call) !?structures.TypeId {
+            const instance = switch (call.target) {
+                .direct => |instance| instance,
+                .inferred => |generic| (try self.unevaluatedSpecialization(generic, self.unresolved.call_arguments[call.arguments.start..call.arguments.end])) orelse return null,
+                .value => |callee| {
+                    const callee_type = (try self.unevaluatedType(callee.value, null)) orelse return null;
+                    return if (try self.type_interner.facts().callable(callee_type)) |signature| signature.return_type else null;
+                },
+                .member, .unknown_function => return null,
+            };
+            return ((try self.type_interner.functionSignature(instance)) orelse return error.Unavailable).return_type;
+        }
+
+        fn unevaluatedSpecialization(self: *Self, generic: structures.InstanceId, arguments: []const semantic.UnresolvedBody.ValueUse) !?structures.InstanceId {
+            const shape = (try self.type_interner.functionShape(generic.item)) orelse return error.Unavailable;
+            var argument_types: std.ArrayList(structures.TypeId) = .empty;
+            defer argument_types.deinit(self.ctx.allocator());
+            for (shape.parameters) |parameter| {
+                if (parameter.mode == .static) continue;
+                const runtime_index = argument_types.items.len;
+                if (runtime_index == arguments.len) return null;
+                const expected = try self.type_interner.independentParameterType(generic, runtime_index);
+                try argument_types.append(self.ctx.allocator(), (try self.unevaluatedType(arguments[runtime_index].value, expected)) orelse return null);
+            }
+            if (argument_types.items.len != arguments.len) return null;
+            const inferred = switch (try self.type_interner.inferStaticArguments(generic, argument_types.items)) {
+                .arguments => |inferred| inferred,
+                .missing, .conflict => return null,
+            };
+            defer self.ctx.allocator().free(inferred);
+            return try self.type_interner.specializeFunction(generic, inferred);
+        }
+
+        fn structInitType(self: *Self, initializer: @FieldType(Expression.Operation, "struct_init")) !StructTypeResult {
             return switch (initializer.target) {
                 .concrete => |concrete| .{ .type_id = concrete },
                 .inferred => |factory| inferred: {
+                    if (try self.unevaluatedStructType(factory, initializer)) |type_id| break :inferred .{ .type_id = type_id };
                     const fields = self.unresolved.struct_field_values[initializer.fields.start..initializer.fields.end];
                     var field_types: std.ArrayList(structures.TypeId) = .empty;
                     defer field_types.deinit(self.ctx.allocator());
                     for (fields) |field| {
                         const expected = try self.type_interner.independentStructFieldType(factory, field.name);
-                        if (in_place) {
-                            const field_result = try self.inPlaceStructFieldType(field.value.value, expected);
-                            switch (field_result) {
-                                .diverged => |diverged| break :inferred .{ .diverged = diverged },
-                                .type_id => |type_id| try field_types.append(self.ctx.allocator(), type_id),
-                            }
-                            continue;
+                        switch (try self.inPlaceStructFieldType(field.value.value, expected)) {
+                            .diverged => |diverged| break :inferred .{ .diverged = diverged },
+                            .type_id => |type_id| try field_types.append(self.ctx.allocator(), type_id),
                         }
-                        const operand = try self.valueWithType(field.value.value, expected);
-                        if (operand.type_id == .never) break :inferred .{ .diverged = operand };
-                        try field_types.append(self.ctx.allocator(), operand.type_id);
                     }
                     const result = try self.type_interner.inferStructArguments(factory, fields, field_types.items);
                     const arguments = switch (result) {
@@ -2217,21 +2675,17 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 if (self.hasUnavailableFields(place.local)) {
                     const local_index = @intFromEnum(place.local);
                     if (self.local_availability[local_index] != .available)
-                        return self.reject(span, if (self.local_availability[local_index] == .maybe_transferred) .possibly_transferred else .use_after_transfer);
+                        return self.reject(span, unavailableUse(self.local_availability[local_index]));
                     const root = self.local_values[local_index].?;
                     const parent_type = if (place_fields.items.len == 0) root.type_id else place_fields.getLast().type_id;
                     try place_fields.append(self.ctx.allocator(), try self.resolvePlaceField(parent_type, name, operand_use.span, span));
                     if (self.unavailableField(place.local, place_fields.items[place.fields.start..])) |availability|
-                        return self.reject(span, if (availability == .transferred) .use_after_transfer else .possibly_transferred);
+                        return self.reject(span, unavailableUse(availability));
                     const source = try self.borrowValue(self.borrowLocalValue(place.local), operand_use.span);
                     var field = source;
                     for (place_fields.items[place.fields.start..]) |part| {
                         const origins = try self.selectReferenceOrigins(field.reference_origins, .{ .field = part.index });
-                        field = try self.appendInstruction(.{ .field_access = .{
-                            .operand = field.id,
-                            .field_index = part.index,
-                            .field_type = part.type_id,
-                        } });
+                        field = try self.fieldView(field, part.index, part.type_id);
                         field.reference_origins = origins;
                     }
                     field.borrowed_type = field.type_id;
@@ -2245,11 +2699,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             const operand = try self.borrowValue(try self.value(operand_use.value), operand_use.span);
             if (operand.type_id == .never) return operand;
             const field = try self.resolvePlaceField(operand.type_id, name, operand_use.span, span);
-            var result = try self.appendInstruction(.{ .field_access = .{
-                .operand = operand.id,
-                .field_index = field.index,
-                .field_type = field.type_id,
-            } });
+            var result = try self.fieldView(operand, field.index, field.type_id);
             result.reference_origins = try self.selectReferenceOrigins(operand.reference_origins, .{ .field = field.index });
             result.binding_identity = operand.binding_identity;
             if (operand.borrowed_type != null) {
@@ -2345,7 +2795,9 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             var values: std.ArrayList(Value) = .empty;
             errdefer values.deinit(self.ctx.allocator());
             for (self.states.items[@intFromEnum(id)].values, 0..) |value_in_state, slot| {
-                if (self.locals.items(.mutable)[slot]) if (value_in_state) |value_to_append| try values.append(self.ctx.allocator(), value_to_append);
+                if (self.locals.items(.mutable)[slot]) if (value_in_state) |value_to_append| {
+                    if (!try self.constructsInPlace(value_to_append.type_id)) try values.append(self.ctx.allocator(), value_to_append);
+                };
             }
             return values;
         }
@@ -2356,31 +2808,39 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             var argument = argument_start;
             for (state.values, 0..) |*value_in_state, slot| {
                 if (!self.locals.items(.mutable)[slot] or value_in_state.* == null) continue;
-                const identity = value_in_state.*.?.binding_identity;
-                const storage_identity = value_in_state.*.?.storage_identity;
+                const current = value_in_state.*.?;
+                const in_place = try self.constructsInPlace(current.type_id);
                 value_in_state.* = .{
-                    .id = @enumFromInt(argument),
-                    .type_id = self.block_argument_types.items[argument],
-                    .owned_generation = self.block_argument_generations.items[argument],
-                    .binding_identity = identity,
-                    .storage_identity = storage_identity,
+                    .id = if (in_place) current.id else @enumFromInt(argument),
+                    .type_id = current.type_id,
+                    .owned_generation = if (in_place) current.owned_generation else self.block_argument_generations.items[argument],
+                    .binding_identity = current.binding_identity,
+                    .storage_identity = current.storage_identity,
                 };
-                argument += 1;
+                if (!in_place) argument += 1;
             }
             return self.appendState(state);
         }
 
-        fn loop(self: *Self, body: semantic.UnresolvedBody.BlockId) !Value {
+        fn loop(self: *Self, body: semantic.UnresolvedBody.BlockId, mode: BranchResult) !Value {
+            std.debug.assert(mode != .box);
+            const constructed = if (mode == .destination) mode.destination.storage else null;
             const baseline = try self.captureState();
             var initial_values = try self.activeStateValues(baseline);
             defer initial_values.deinit(self.ctx.allocator());
-            var header_start_orders: std.ArrayList(?u32) = .empty;
+            var header_start_orders: std.ArrayList(u32) = .empty;
             defer header_start_orders.deinit(self.ctx.allocator());
-            for (initial_values.items) |initial| {
-                try header_start_orders.append(
-                    self.ctx.allocator(),
-                    if (initial.owned_generation != null) try self.reserveGenerationStartOrder() else null,
-                );
+            for (initial_values.items) |_| try header_start_orders.append(self.ctx.allocator(), try self.reserveGenerationStartOrder());
+
+            var in_place_slots: std.ArrayList(InPlaceLoopSlot) = .empty;
+            defer in_place_slots.deinit(self.ctx.allocator());
+            for (self.states.items[@intFromEnum(baseline)].values, 0..) |initial, slot| {
+                const carried = initial orelse continue;
+                if (!self.locals.items(.mutable)[slot] or !try self.constructsInPlace(carried.type_id)) continue;
+                try in_place_slots.append(self.ctx.allocator(), .{
+                    .slot = @intCast(slot),
+                    .start_order = try self.reserveGenerationStartOrder(),
+                });
             }
 
             const state_type_start: u32 = @intCast(self.block_argument_types.items.len);
@@ -2388,6 +2848,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             const state_type_end: u32 = @intCast(self.block_argument_types.items.len);
             const header = try self.newBlock(state_type_start, state_type_end);
             const initial_branch = try self.valuesBranch(header, initial_values.items);
+            const entry_predecessor = self.current_block.?;
             self.terminate(.{ .branch = initial_branch });
             const loop_state_start = self.states.items.len;
             const loop_boundary_start = self.boundaries.items.len;
@@ -2395,8 +2856,11 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             const loop_branch_argument_start = self.branch_arguments.items.len;
 
             const exit_argument_start: u32 = @intCast(self.block_argument_types.items.len);
-            _ = try self.appendBlockArgument(.never, null);
-            _ = try self.appendBlockArgument(.bool, null);
+            if (constructed == null) {
+                _ = try self.appendBlockArgument(.never, null);
+                _ = try self.appendBlockArgument(.bool, null);
+            }
+            const exit_state_start: u32 = @intCast(self.block_argument_types.items.len);
             for (state_type_start..state_type_end) |type_index| {
                 _ = try self.appendBlockArgument(
                     self.block_argument_types.items[type_index],
@@ -2447,7 +2911,8 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 .baseline = baseline,
                 .state_type_start = state_type_start,
                 .state_type_end = state_type_end,
-                .exit_state_start = exit_argument_start + 2,
+                .exit_state_start = exit_state_start,
+                .result = mode,
             });
             self.enterBlock(header);
             self.restoreState(header_state);
@@ -2472,9 +2937,22 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 break_start,
                 self.unresolved.blocks[@intFromEnum(body)].span,
             );
+            for (in_place_slots.items) |in_place| try self.reconcileInPlaceLoopHeader(
+                in_place,
+                entry_predecessor,
+                self.states.items[@intFromEnum(baseline)].values[in_place.slot].?,
+                self.loop_backedges.items[backedge_start..],
+                loop_state_start,
+                loop_boundary_start,
+                loop_block_start,
+                state_type_start,
+                loop_branch_argument_start,
+                break_start,
+                self.unresolved.blocks[@intFromEnum(body)].span,
+            );
             for (self.binding_joins.items[identity_start..identity_end]) |*join| {
                 for (self.loop_backedges.items[backedge_start..]) |backedge| {
-                    const value_on_edge = self.states.items[@intFromEnum(backedge)].values[join.slot.?].?;
+                    const value_on_edge = self.states.items[@intFromEnum(backedge.state)].values[join.slot.?].?;
                     try join.alternatives.append(self.ctx.allocator(), if (join.storage)
                         value_on_edge.storage_identity orelse value_on_edge.binding_identity
                     else
@@ -2484,7 +2962,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             }
             for (self.loop_reference_origins.items[origin_start..origin_end]) |*loop_origins| {
                 for (self.loop_backedges.items[backedge_start..]) |backedge| {
-                    loop_origins.origins = try self.mergeReferenceOrigins(loop_origins.origins, self.states.items[@intFromEnum(backedge)].values[loop_origins.slot].?.reference_origins);
+                    loop_origins.origins = try self.mergeReferenceOrigins(loop_origins.origins, self.states.items[@intFromEnum(backedge.state)].values[loop_origins.slot].?.reference_origins);
                 }
                 loop_origins.complete = true;
             }
@@ -2502,27 +2980,38 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             for (breaks) |*break_edge| {
                 self.enterPendingBlock(break_edge.block);
                 self.restoreState(break_edge.state);
-                break_edge.branch = try self.loopBranch(loop_context, exit, break_edge.value);
+                break_edge.branch = try self.loopBranch(loop_context, exit, if (constructed == null) break_edge.value else null);
                 self.terminate(.{ .branch = break_edge.branch });
             }
 
-            var joined = breaks[0].value.type_id;
-            for (breaks[1..]) |break_edge| joined = try joinTypes(self.type_interner, joined, break_edge.value.type_id, self.ctx.allocator());
-            self.block_argument_types.items[exit_argument_start] = joined;
+            var joined = if (constructed) |storage| storage.type_id else breaks[0].value.type_id;
+            if (constructed == null) {
+                for (breaks[1..]) |break_edge| joined = try joinTypes(self.type_interner, joined, break_edge.value.type_id, self.ctx.allocator());
+                if (try self.constructsInPlace(joined)) for (breaks) |break_edge| {
+                    if (break_edge.value.type_id != joined) return self.reject(self.activeLifetimeSpan(), .{ .relocation_requires_direct_move = break_edge.value.type_id });
+                };
+                self.block_argument_types.items[exit_argument_start] = joined;
+            }
             const exit_span = self.unresolved.blocks[@intFromEnum(body)].span;
             const incoming_generations = try self.ctx.allocator().alloc(?GenerationId, breaks.len);
             defer self.ctx.allocator().free(incoming_generations);
             for (breaks, incoming_generations) |break_edge, *generation| generation.* = break_edge.value.owned_generation;
             const result_generation = try self.joinGenerationGroup(joined, exit_span, incoming_generations);
-            self.block_argument_generations.items[exit_argument_start] = result_generation;
-            for (breaks) |break_edge| {
-                self.branch_arguments.items[break_edge.branch.arguments.start] =
-                    (try self.coerceValue(break_edge.value.id, break_edge.value.type_id, joined)) orelse unreachable;
+            if (constructed != null) {
+                if (result_generation) |generation| for (breaks) |break_edge| {
+                    try self.recordGenerationOnlyForward(break_edge.block, 0, break_edge.value.owned_generation, generation);
+                };
+            } else {
+                self.block_argument_generations.items[exit_argument_start] = result_generation;
+                for (breaks) |break_edge| {
+                    self.branch_arguments.items[break_edge.branch.arguments.start] =
+                        (try self.coerceValue(break_edge.value.id, break_edge.value.type_id, joined)) orelse unreachable;
+                }
             }
-            var state_argument = exit_argument_start + 2;
+            var state_argument = exit_state_start;
             for (self.states.items[@intFromEnum(baseline)].values, 0..) |initial, slot| {
                 const mutable = self.locals.items(.mutable)[slot];
-                if (!mutable or initial == null) continue;
+                if (!mutable or initial == null or try self.constructsInPlace(initial.?.type_id)) continue;
                 const state_type = self.block_argument_types.items[state_argument];
                 for (breaks, incoming_generations) |break_edge, *generation| {
                     generation.* = self.states.items[@intFromEnum(break_edge.state)].values[slot].?.owned_generation;
@@ -2530,7 +3019,17 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 self.block_argument_generations.items[state_argument] = try self.joinGenerationGroup(state_type, exit_span, incoming_generations);
                 state_argument += 1;
             }
-            const output_state = try self.stateWithArguments(baseline, exit_argument_start + 2);
+            const output_state = try self.stateWithArguments(baseline, exit_state_start);
+            for (in_place_slots.items) |in_place| {
+                for (breaks, incoming_generations) |break_edge, *generation| {
+                    generation.* = self.states.items[@intFromEnum(break_edge.state)].values[in_place.slot].?.owned_generation;
+                }
+                const output = &self.states.items[@intFromEnum(output_state)].values[in_place.slot].?;
+                output.owned_generation = try self.joinGenerationGroup(output.type_id, exit_span, incoming_generations);
+                if (output.owned_generation) |generation| for (breaks, incoming_generations) |break_edge, incoming| {
+                    try self.recordGenerationOnlyForward(break_edge.block, 0, incoming, generation);
+                };
+            }
             for (self.states.items[@intFromEnum(baseline)].values, 0..) |initial, slot| {
                 const mutable = self.locals.items(.mutable)[slot];
                 if (!mutable or initial == null) continue;
@@ -2602,7 +3101,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             self.enterBlock(exit);
             self.restoreState(output_state);
             return self.withCleanupCondition(.{
-                .id = @enumFromInt(exit_argument_start),
+                .id = if (constructed) |storage| storage.id else @enumFromInt(exit_argument_start),
                 .type_id = joined,
                 .owned_generation = result_generation,
                 .borrowed_generation = borrowed_generation,
@@ -2624,7 +3123,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             header: structures.FunctionBlockId,
             state_type_start: u32,
             state_type_end: u32,
-            header_start_orders: []const ?u32,
+            header_start_orders: []const u32,
             state_start: usize,
             boundary_start: usize,
             block_start: usize,
@@ -2655,11 +3154,12 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                         false;
                 }
                 if (all_equal) continue;
+                std.debug.assert(provisional != null);
                 const joined = (try self.allocateGenerationAt(
                     self.block_argument_types.items[argument],
                     span,
                     cleanup_fields,
-                    header_start_orders[offset].?,
+                    header_start_orders[offset],
                 )).?;
                 try self.copyMissingFields(joined, missing, null, null);
                 self.block_argument_generations.items[argument] = joined;
@@ -2674,6 +3174,45 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     break_start,
                 );
             }
+        }
+
+        fn reconcileInPlaceLoopHeader(
+            self: *Self,
+            in_place: InPlaceLoopSlot,
+            entry_predecessor: structures.FunctionBlockId,
+            initial: Value,
+            backedges: []const LoopBackedge,
+            state_start: usize,
+            boundary_start: usize,
+            block_start: usize,
+            block_argument_start: usize,
+            branch_argument_start: usize,
+            break_start: usize,
+            span: structures.SourceSpan,
+        ) !void {
+            const provisional = initial.owned_generation;
+            var all_equal = true;
+            var cleanup_fields = if (provisional) |generation| self.generations.items[@intFromEnum(generation)].cleanup_fields else false;
+            const missing = if (provisional) |generation| self.generations.items[@intFromEnum(generation)].missing_fields else &.{};
+            for (backedges) |backedge| {
+                const backedge_generation = self.states.items[@intFromEnum(backedge.state)].values[in_place.slot].?.owned_generation;
+                const backedge_missing = if (backedge_generation) |generation| self.generations.items[@intFromEnum(generation)].missing_fields else &.{};
+                if (!sameMissingFields(missing, backedge_missing)) return self.reject(span, .partial_field_transfer_not_supported);
+                all_equal = all_equal and backedge_generation == provisional;
+                cleanup_fields = cleanup_fields and if (backedge_generation) |generation| self.generations.items[@intFromEnum(generation)].cleanup_fields else false;
+            }
+            if (all_equal) return;
+            std.debug.assert(provisional != null);
+            const joined = (try self.allocateGenerationAt(initial.type_id, span, cleanup_fields, in_place.start_order)).?;
+            try self.copyMissingFields(joined, missing, null, null);
+            self.remapLoopGeneration(provisional, joined, state_start, boundary_start, block_start, block_argument_start, branch_argument_start, break_start);
+            try self.recordGenerationOnlyForward(entry_predecessor, 0, provisional, joined);
+            for (backedges) |backedge| try self.recordGenerationOnlyForward(
+                backedge.block,
+                0,
+                self.states.items[@intFromEnum(backedge.state)].values[in_place.slot].?.owned_generation,
+                joined,
+            );
         }
 
         fn generationMatchesType(self: *const Self, generation: ?GenerationId, type_id: structures.TypeId) bool {
@@ -2711,6 +3250,11 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             }
             for (self.loop_breaks.items[break_start..]) |*loop_break| {
                 remapValueGeneration(&loop_break.value, source.?, destination);
+            }
+            for (self.ownership_forward_hints.items) |*hint| {
+                if (@intFromEnum(hint.predecessor) < block_start) continue;
+                if (hint.source == source) hint.source = destination;
+                if (hint.destination == source.?) hint.destination = destination;
             }
             for (self.local_values) |*local_value| if (local_value.*) |*resolved| {
                 remapValueGeneration(resolved, source.?, destination);
@@ -2783,14 +3327,14 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             for (self.states.items[@intFromEnum(context.baseline)].values, 0..) |initial, slot| {
                 const current = self.local_values[slot];
                 const mutable = self.locals.items(.mutable)[slot];
-                if (!mutable or initial == null) continue;
+                if (!mutable or initial == null or try self.constructsInPlace(initial.?.type_id)) continue;
                 const state = current.?;
                 const use = (try self.coerceValue(state.id, state.type_id, self.block_argument_types.items[type_index])) orelse unreachable;
                 try self.appendBranchArgument(use, state.owned_generation);
                 type_index += 1;
             }
             std.debug.assert(type_index == type_start + context.state_type_end - context.state_type_start);
-            if (target == context.header) try self.loop_backedges.append(self.ctx.allocator(), try self.captureState());
+            if (target == context.header) try self.loop_backedges.append(self.ctx.allocator(), .{ .block = self.current_block.?, .state = try self.captureState() });
             return .{ .target = target, .arguments = .{ .start = start, .end = @intCast(self.branch_arguments.items.len) } };
         }
 
@@ -2825,12 +3369,14 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         }
 
         fn annotate(self: *Self, annotation: @FieldType(Expression.Operation, "annotation")) !Value {
+            if (try self.constructsInPlace(annotation.type_id))
+                return self.constructAnnotated(annotation, .{ .storage = try self.localStorage(annotation.type_id), .site = .local });
             const operand = try self.valueWithType(annotation.value.value, annotation.type_id);
             if (operand.type_id == .never) return operand;
             const use = try self.coerceValue(operand.id, operand.type_id, annotation.type_id) orelse
                 return self.reject(annotation.value.span, .{ .local_type_mismatch = self.typeMismatch(annotation.type_id, operand.type_id) });
             if (use.coerce_to == null) return operand;
-            return self.coerceOwnedRepresentation(operand, use, annotation.value.span);
+            return self.coerceOwnedRepresentation(operand, use, annotation.value.span, null);
         }
 
         fn coerceOwnedRepresentation(
@@ -2838,15 +3384,14 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             source: Value,
             use: structures.FunctionValueUse,
             span: structures.SourceSpan,
+            destination: ?Value,
         ) !Value {
-            var result = try self.appendCoercion(use);
-            result.reference_origins = source.reference_origins;
-            if (try self.type_interner.facts().variantMembers(result.type_id)) |members| {
-                if (try self.type_interner.facts().variantMembers(source.type_id) == null) {
-                    const member = members[self.variant_coercion_tags.items[use.variant_tag_mapping.?.start]];
-                    result.reference_origins = try self.prefixReferenceOrigins(source.reference_origins, .{ .variant = member });
-                }
-            }
+            if (try self.constructsInPlace(source.type_id)) return self.reject(span, .{ .relocation_requires_direct_move = source.type_id });
+            var result = if (destination) |storage| blk: {
+                _ = try self.appendCoercion(use, storage.id);
+                break :blk storage;
+            } else try self.appendCoercion(use, null);
+            result.reference_origins = try self.coercedReferenceOrigins(source, use);
             if (source.borrowed_type != null) {
                 result.borrowed_type = source.borrowed_type;
                 result.borrowed_generation = source.borrowed_generation;
@@ -2872,15 +3417,24 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             return self.defineOwnedValue(.{ .id = source.id, .type_id = target_type }, span, cleanup_fields);
         }
 
-        fn appendCoercion(self: *Self, use: structures.FunctionValueUse) !Value {
+        fn coercedReferenceOrigins(self: *Self, source: Value, use: structures.FunctionValueUse) !?u32 {
+            const members = (try self.type_interner.facts().variantMembers(use.coerce_to orelse return source.reference_origins)) orelse
+                return source.reference_origins;
+            if (try self.type_interner.facts().variantMembers(source.type_id) != null) return source.reference_origins;
+            const member = members[self.variant_coercion_tags.items[use.variant_tag_mapping.?.start]];
+            return self.prefixReferenceOrigins(source.reference_origins, .{ .variant = member });
+        }
+
+        fn appendCoercion(self: *Self, use: structures.FunctionValueUse, destination: ?structures.FunctionValueId) !Value {
             const target_type = use.coerce_to.?;
             const operation: structures.FunctionInstruction = if (try self.type_interner.facts().callable(target_type) != null)
-                .{ .callable_coerce = .{ .operand = use.value, .target_type = target_type } }
+                .{ .callable_coerce = .{ .operand = use.value, .target_type = target_type, .destination = destination } }
             else
                 .{ .variant_coerce = .{
                     .operand = use.value,
                     .target_type = target_type,
                     .tag_mapping = use.variant_tag_mapping.?,
+                    .destination = destination,
                 } };
             return self.appendInstruction(operation);
         }
@@ -2959,62 +3513,49 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         fn assignment(self: *Self, expression: Expression) !Value {
             const assignment_value = expression.operation.assignment;
             const local_index = @intFromEnum(assignment_value.target);
-            if (self.local_availability[local_index] != .available and (assignment_value.fields.start != assignment_value.fields.end or assignment_value.operation != .replace)) {
-                return self.reject(assignment_value.target_span, if (self.local_availability[local_index] == .maybe_transferred) .possibly_transferred else .use_after_transfer);
-            }
+            const replaces = assignment_value.operation == .replace;
+            const mut_parameter = self.locals.items(.mut_parameter)[local_index] != null;
+            const root_availability = self.local_availability[local_index];
+            if (root_availability == .replacing or (root_availability != .available and (assignment_value.fields.start != assignment_value.fields.end or !replaces)))
+                return self.reject(assignment_value.target_span, unavailableUse(root_availability));
             const root = self.local_values[local_index].?;
             var fields: std.ArrayList(PlaceField) = .empty;
             defer fields.deinit(self.ctx.allocator());
             const source_fields = self.unresolved.assignment_fields[assignment_value.fields.start..assignment_value.fields.end];
             try self.resolvePlaceFields(root.type_id, source_fields, assignment_value.target_span, &fields);
             const target_type = if (fields.items.len == 0) root.type_id else fields.getLast().type_id;
-            var target = root;
-            for (fields.items) |field| {
-                target = try self.appendInstruction(.{ .field_access = .{
-                    .operand = target.id,
-                    .field_index = field.index,
-                    .field_type = field.type_id,
-                } });
-            }
             const target_span = if (source_fields.len == 0) assignment_value.target_span else source_fields[source_fields.len - 1].span;
-            const raw_operand = try self.valueWithType(assignment_value.value.value, if (assignment_value.operation == .replace) target_type else null);
-            const operand = if (assignment_value.operation == .replace)
-                raw_operand
+            const in_place = try self.constructsInPlace(root.type_id);
+            if (in_place) for (self.pending_deinit_places.items) |pending| {
+                if (pending.local != assignment_value.target) continue;
+                const consumed_fields = self.pending_deinit_fields.items[pending.fields.start..pending.fields.end];
+                if (fieldPathContains(consumed_fields, fields.items) or fieldPathContains(fields.items, consumed_fields))
+                    return self.reject(target_span, .consumed_storage_in_use);
+            };
+            const constructs_target = in_place and replaces and try self.constructsInPlace(target_type);
+            var target = root;
+            if (!replaces) for (fields.items) |field| {
+                target = try self.fieldView(target, field.index, field.type_id);
+            };
+            const replaced_storage = if (constructs_target) try self.fieldStorage(rawValue(root), fields.items) else null;
+            const early_replaced = if (replaced_storage) |storage| try self.beginInPlaceReplacement(assignment_value.target, storage, fields.items, source_fields, target_span) else null;
+            const raw_operand = if (replaced_storage) |storage|
+                try self.construct(assignment_value.value.value, assignment_value.value.span, .{ .storage = storage, .site = .assignment })
             else
-                try self.borrowValue(raw_operand, assignment_value.value.span);
+                try self.valueWithType(assignment_value.value.value, if (replaces) target_type else null);
+            const operand = if (replaces) raw_operand else try self.borrowValue(raw_operand, assignment_value.value.span);
             if (operand.type_id == .never) return operand;
             if (fields.items.len != 0 and self.local_availability[local_index] != .available) {
-                return self.reject(assignment_value.target_span, if (self.local_availability[local_index] == .maybe_transferred) .possibly_transferred else .use_after_transfer);
+                return self.reject(assignment_value.target_span, unavailableUse(self.local_availability[local_index]));
             }
-            var replacing_unavailable_field = false;
-            var skip_old_drop = false;
-            for (self.field_places, self.field_availability) |place, availability| {
-                if (place.local != assignment_value.target or availability == .available) continue;
-                if (fieldPathContains(place.fields, source_fields) and place.fields.len < source_fields.len)
-                    return self.reject(target_span, if (availability == .transferred) .use_after_transfer else .possibly_transferred);
-                if (fieldPathContains(source_fields, place.fields)) {
-                    replacing_unavailable_field = true;
-                    if (place.moves_owner) {
-                        if (availability == .maybe_transferred and fields.items.len != 0)
-                            return self.reject(target_span, .possibly_transferred);
-                        skip_old_drop = true;
-                    }
-                }
-            }
-            if (assignment_value.operation != .replace and replacing_unavailable_field)
+            const replaced = early_replaced orelse try self.replacedFields(assignment_value.target, source_fields, fields.items.len != 0, target_span);
+            if (!replaces and replaced.unavailable)
                 return self.reject(target_span, .use_after_transfer);
-            if (assignment_value.operation == .replace and fields.items.len == 0 and
-                self.locals.items(.mut_parameter)[local_index] != null and replacing_unavailable_field)
+            if (replaces and fields.items.len == 0 and mut_parameter and replaced.unavailable)
                 return self.reject(target_span, .field_not_restored_before_mut_return);
-            const result = if (assignment_value.operation == .replace) blk: {
+            const result = if (constructs_target) operand else if (replaces) blk: {
                 var latest_target = self.local_values[local_index].?;
-                for (fields.items) |field| {
-                    latest_target = try self.appendInstruction(.{ .field_access = .{
-                        .operand = latest_target.id,
-                        .field_index = field.index,
-                        .field_type = field.type_id,
-                    } });
-                }
+                for (fields.items) |field| latest_target = try self.fieldView(latest_target, field.index, field.type_id);
                 var use = try self.coerceValue(operand.id, operand.type_id, target_type) orelse
                     return self.reject(assignment_value.value.span, .{ .assignment_type_mismatch = self.typeMismatch(target_type, operand.type_id) });
                 const owned = try self.ownValue(operand, assignment_value.value.span);
@@ -3025,13 +3566,13 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     if (self.local_availability[local_index] == .maybe_transferred and target_capabilities.needs_automatic_drop) {
                         return self.reject(target_span, .possibly_transferred);
                     }
-                    if (!skip_old_drop or self.local_values[local_index].?.owned_generation != null)
+                    if (!replaced.skip_old_drop or self.local_values[local_index].?.owned_generation != null)
                         try self.dropReplacedField(self.local_values[local_index].?, latest_target, fields.items, self.locals.items(.can_deinit)[local_index], target_span);
                 }
                 break :blk if (use.coerce_to == null)
                     owned
                 else
-                    try self.coerceOwnedRepresentation(owned, use, assignment_value.value.span);
+                    try self.coerceOwnedRepresentation(owned, use, assignment_value.value.span, null);
             } else blk: {
                 if (target_type != .int) return self.reject(target_span, .{ .arithmetic_operand_not_int = target_type });
                 if (operand.type_id != .int) return self.reject(assignment_value.value.span, .{ .arithmetic_operand_not_int = operand.type_id });
@@ -3044,64 +3585,26 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     .divide => .{ .divsi = operands },
                 });
             };
-            if (assignment_value.operation == .replace and fields.items.len == 0 and self.locals.items(.mut_parameter)[local_index] != null) {
+            if (!constructs_target and replaces and fields.items.len == 0 and mut_parameter) {
                 try self.dropValue(root, false, target_span);
                 try self.recordConsume(root);
             }
             const previous_root = self.local_values[local_index].?;
-            const rebuilt = try self.updateFields(previous_root, fields.items, result);
-            var updated = if (assignment_value.operation == .replace and fields.items.len == 0)
-                withoutOwnershipSource(rebuilt)
+            var updated = if (replaces and fields.items.len == 0)
+                withoutOwnershipSource(result)
             else blk: {
-                if (assignment_value.operation == .replace) try self.recordConsume(result);
+                if (replaces) try self.recordConsume(result);
+                if (!in_place) break :blk try self.updateOwnedValue(previous_root, try self.updateFields(previous_root, fields.items, result));
+                if (!constructs_target) _ = try self.copyBits(result, try self.fieldStorage(rawValue(previous_root), fields.items));
+                var rebuilt = previous_root;
+                rebuilt.reference_origins = try self.fieldUpdateOrigins(previous_root.reference_origins, fields.items, result.reference_origins);
                 break :blk try self.updateOwnedValue(previous_root, rebuilt);
             };
-            if (assignment_value.operation == .replace and fields.items.len != 0 and
-                self.locals.items(.mut_parameter)[local_index] == null)
-            {
-                var still_partial = false;
-                for (self.field_places, self.field_availability) |place, availability| {
-                    if (place.local == assignment_value.target and availability != .available and
-                        !fieldPathContains(source_fields, place.fields)) still_partial = true;
-                }
-                if (updated.owned_generation == null) {
-                    if (still_partial and result.owned_generation != null) {
-                        var missing_paths: std.ArrayList([]const u32) = .empty;
-                        defer {
-                            for (missing_paths.items) |path| self.ctx.allocator().free(path);
-                            missing_paths.deinit(self.ctx.allocator());
-                        }
-                        var path_fields: std.ArrayList(PlaceField) = .empty;
-                        defer path_fields.deinit(self.ctx.allocator());
-                        for (self.field_places, self.field_availability) |place, availability| {
-                            if (place.local != assignment_value.target or !place.moves_owner or availability == .available or
-                                fieldPathContains(source_fields, place.fields)) continue;
-                            if (availability != .transferred) return self.reject(target_span, .possibly_transferred);
-                            path_fields.clearRetainingCapacity();
-                            try self.resolvePlaceFields(updated.type_id, place.fields, target_span, &path_fields);
-                            try missing_paths.ensureUnusedCapacity(self.ctx.allocator(), 1);
-                            const path = try self.ctx.allocator().alloc(u32, path_fields.items.len);
-                            for (path_fields.items, path) |field, *index| index.* = field.index;
-                            var duplicate = false;
-                            for (missing_paths.items) |existing| {
-                                if (std.mem.eql(u32, existing, path)) {
-                                    duplicate = true;
-                                    break;
-                                }
-                            }
-                            if (duplicate) self.ctx.allocator().free(path) else missing_paths.appendAssumeCapacity(path);
-                        }
-                        updated = try self.defineOwnedValue(updated, expression.span, self.locals.items(.can_deinit)[local_index]);
-                        try self.copyMissingFields(updated.owned_generation.?, missing_paths.items, null, null);
-                    } else if (!still_partial) {
-                        updated = try self.defineOwnedValue(updated, expression.span, self.locals.items(.can_deinit)[local_index]);
-                    }
-                } else if (replacing_unavailable_field and self.generations.items[@intFromEnum(updated.owned_generation.?)].missing_fields.len != 0) {
-                    const previous_missing = self.generations.items[@intFromEnum(updated.owned_generation.?)].missing_fields;
-                    try self.recordConsume(updated);
-                    updated = try self.defineOwnedValue(updated, expression.span, self.locals.items(.can_deinit)[local_index]);
-                    try self.copyMissingFields(updated.owned_generation.?, previous_missing, null, fields.items);
-                }
+            if (replaces and fields.items.len == 0 and mut_parameter) {
+                try self.recordConsume(updated);
+                updated.owned_generation = null;
+            } else if (replaces and fields.items.len != 0 and !mut_parameter) {
+                updated = try self.restoreAssignedFields(assignment_value.target, updated, result, source_fields, fields.items, replaced.unavailable, expression.span, target_span);
             }
             if (updated.owned_generation) |generation| {
                 if (self.locals.items(.can_deinit)[local_index]) try self.setDeinitCleanup(generation);
@@ -3110,7 +3613,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             updated.storage_identity = null;
             self.local_values[local_index] = updated;
             self.local_availability[local_index] = .available;
-            if (assignment_value.operation == .replace) {
+            if (replaces) {
                 for (self.field_places, self.field_availability) |place, *availability| {
                     if (place.local == assignment_value.target and fieldPathContains(source_fields, place.fields))
                         availability.* = .available;
@@ -3122,6 +3625,158 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 .borrowed_type = result.type_id,
                 .borrow_root = assignment_value.target,
             };
+        }
+
+        const ReplacedFields = struct { unavailable: bool = false, skip_old_drop: bool = false };
+
+        fn replacedFields(self: *Self, local: semantic.UnresolvedBody.LocalId, source_fields: []const semantic.UnresolvedBody.FieldName, has_fields: bool, span: structures.SourceSpan) !ReplacedFields {
+            var replaced: ReplacedFields = .{};
+            for (self.field_places, self.field_availability) |place, availability| {
+                if (place.local != local or availability == .available) continue;
+                if (fieldPathContains(place.fields, source_fields) and place.fields.len < source_fields.len)
+                    return self.reject(span, unavailableUse(availability));
+                if (fieldPathContains(source_fields, place.fields)) {
+                    replaced.unavailable = true;
+                    if (place.moves_owner) {
+                        if (availability == .maybe_transferred and has_fields)
+                            return self.reject(span, .possibly_transferred);
+                        replaced.skip_old_drop = true;
+                    }
+                }
+            }
+            return replaced;
+        }
+
+        fn beginInPlaceReplacement(
+            self: *Self,
+            local: semantic.UnresolvedBody.LocalId,
+            storage: Value,
+            fields: []const PlaceField,
+            source_fields: []const semantic.UnresolvedBody.FieldName,
+            span: structures.SourceSpan,
+        ) !ReplacedFields {
+            const parent_boundary = self.current_boundary;
+            const boundary = try self.newBoundary(span);
+            self.current_boundary = boundary;
+            defer self.current_boundary = parent_boundary;
+            const local_index = @intFromEnum(local);
+            var replaced = try self.replacedFields(local, source_fields, fields.len != 0, span);
+            if (fields.len == 0) {
+                const root = self.local_values[local_index].?;
+                if (self.locals.items(.mut_parameter)[local_index] != null) {
+                    if (replaced.unavailable) return self.reject(span, .field_not_restored_before_mut_return);
+                    try self.dropValue(root, false, span);
+                    try self.recordConsume(root);
+                }
+                if (self.local_availability[local_index] == .available) self.local_availability[local_index] = .replacing;
+            } else {
+                replaced = try self.endReplacedField(local, storage, fields, replaced, span);
+                for (self.field_places, self.field_availability) |place, *availability| {
+                    if (place.local == local and fieldPathContains(source_fields, place.fields)) availability.* = .replacing;
+                }
+            }
+            try self.appendBoundary(boundary);
+            return replaced;
+        }
+
+        fn endReplacedField(self: *Self, local: semantic.UnresolvedBody.LocalId, storage: Value, fields: []const PlaceField, previous: ReplacedFields, span: structures.SourceSpan) !ReplacedFields {
+            try self.validateMissingFieldParents(local, fields, span);
+            const local_index = @intFromEnum(local);
+            const root = self.local_values[local_index].?;
+            const can_deinit = self.locals.items(.can_deinit)[local_index];
+            if (!previous.skip_old_drop or root.owned_generation != null)
+                try self.dropReplacedField(root, storage, fields, can_deinit, span);
+            self.local_values[local_index].?.binding_identity = try self.newBindingIdentity();
+            self.local_values[local_index].?.storage_identity = null;
+            const generation = root.owned_generation orelse return previous;
+            const field_capabilities = (try self.type_interner.facts().ownershipCapabilities(fields[fields.len - 1].type_id)) orelse return error.Unavailable;
+            if (!field_capabilities.needs_automatic_drop and !field_capabilities.requires_explicit_drop) return previous;
+            for (self.field_places) |*place| {
+                if (place.local == local and place.fields.len == fields.len and fieldPathContains(place.fields, fields)) place.moves_owner = true;
+            }
+            const missing = self.generations.items[@intFromEnum(generation)].missing_fields;
+            try self.recordConsume(root);
+            self.local_values[local_index].?.owned_generation = null;
+            if ((try self.remainingFieldOwnership(root.type_id, missing, fields)).any()) {
+                const remaining = try self.defineOwnedValue(root, span, can_deinit);
+                try self.copyMissingFields(remaining.owned_generation.?, missing, fields, fields);
+                self.local_values[local_index].?.owned_generation = remaining.owned_generation;
+            }
+            var replaced = previous;
+            replaced.unavailable = true;
+            return replaced;
+        }
+
+        fn fieldStorage(self: *Self, root: Value, fields: []const PlaceField) !Value {
+            var storage = root;
+            for (fields) |field| storage = try self.projectStorage(storage, field.type_id, .{ .field = field.index });
+            return storage;
+        }
+
+        fn fieldUpdateOrigins(self: *Self, root_origins: ?u32, fields: []const PlaceField, leaf_origins: ?u32) anyerror!?u32 {
+            if (fields.len == 0) return leaf_origins;
+            const step: @FieldType(ReferenceProjection, "step") = .{ .field = fields[0].index };
+            const field_origins = try self.fieldUpdateOrigins(try self.selectReferenceOrigins(root_origins, step), fields[1..], leaf_origins);
+            return self.replaceProjectedOrigins(root_origins, step, field_origins);
+        }
+
+        fn restoreAssignedFields(
+            self: *Self,
+            local: semantic.UnresolvedBody.LocalId,
+            assigned: Value,
+            result: Value,
+            source_fields: []const semantic.UnresolvedBody.FieldName,
+            fields: []const PlaceField,
+            replacing_unavailable_field: bool,
+            span: structures.SourceSpan,
+            target_span: structures.SourceSpan,
+        ) !Value {
+            const can_deinit = self.locals.items(.can_deinit)[@intFromEnum(local)];
+            var updated = assigned;
+            var still_partial = false;
+            for (self.field_places, self.field_availability) |place, availability| {
+                if (place.local == local and availability != .available and
+                    !fieldPathContains(source_fields, place.fields)) still_partial = true;
+            }
+            if (updated.owned_generation == null) {
+                if (still_partial and result.owned_generation != null) {
+                    var missing_paths: std.ArrayList([]const u32) = .empty;
+                    defer {
+                        for (missing_paths.items) |path| self.ctx.allocator().free(path);
+                        missing_paths.deinit(self.ctx.allocator());
+                    }
+                    var path_fields: std.ArrayList(PlaceField) = .empty;
+                    defer path_fields.deinit(self.ctx.allocator());
+                    for (self.field_places, self.field_availability) |place, availability| {
+                        if (place.local != local or !place.moves_owner or availability == .available or
+                            fieldPathContains(source_fields, place.fields)) continue;
+                        if (availability != .transferred) return self.reject(target_span, .possibly_transferred);
+                        path_fields.clearRetainingCapacity();
+                        try self.resolvePlaceFields(updated.type_id, place.fields, target_span, &path_fields);
+                        try missing_paths.ensureUnusedCapacity(self.ctx.allocator(), 1);
+                        const path = try self.ctx.allocator().alloc(u32, path_fields.items.len);
+                        for (path_fields.items, path) |field, *index| index.* = field.index;
+                        var duplicate = false;
+                        for (missing_paths.items) |existing| {
+                            if (std.mem.eql(u32, existing, path)) {
+                                duplicate = true;
+                                break;
+                            }
+                        }
+                        if (duplicate) self.ctx.allocator().free(path) else missing_paths.appendAssumeCapacity(path);
+                    }
+                    updated = try self.defineOwnedValue(updated, span, can_deinit);
+                    try self.copyMissingFields(updated.owned_generation.?, missing_paths.items, null, null);
+                } else if (!still_partial) {
+                    updated = try self.defineOwnedValue(updated, span, can_deinit);
+                }
+            } else if (replacing_unavailable_field and self.generations.items[@intFromEnum(updated.owned_generation.?)].missing_fields.len != 0) {
+                const previous_missing = self.generations.items[@intFromEnum(updated.owned_generation.?)].missing_fields;
+                try self.recordConsume(updated);
+                updated = try self.defineOwnedValue(updated, span, can_deinit);
+                try self.copyMissingFields(updated.owned_generation.?, previous_missing, null, fields);
+            }
+            return updated;
         }
 
         fn dropReplacedField(self: *Self, root: Value, target: Value, fields: []const PlaceField, can_deinit: bool, span: structures.SourceSpan) !void {
@@ -3198,7 +3853,11 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         };
 
         fn prepareInPlaceBoxFields(self: *Self, expression: Expression, destination: BoxDestination, span: structures.SourceSpan) !ResolvedCall {
-            const result = try self.prepareStructInit(expression, true);
+            const type_id = switch (try self.structInitType(expression.operation.struct_init)) {
+                .diverged => |diverged| return .{ .diverged = diverged },
+                .type_id => |resolved| resolved,
+            };
+            const result = try self.prepareStructInit(expression, type_id, true);
             const prepared = switch (result) {
                 .diverged => |diverged| return .{ .diverged = diverged },
                 .prepared => |fields| fields,
@@ -3341,6 +4000,14 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         }
 
         fn resolveCall(self: *Self, call: semantic.UnresolvedBody.Call, span: structures.SourceSpan) !ResolvedCall {
+            // Earlier deinit arguments retain their storage while later arguments,
+            // including nested calls, are evaluated.
+            const deinit_place_start = self.pending_deinit_places.items.len;
+            const deinit_field_start = self.pending_deinit_fields.items.len;
+            defer {
+                self.pending_deinit_places.shrinkRetainingCapacity(deinit_place_start);
+                self.pending_deinit_fields.shrinkRetainingCapacity(deinit_field_start);
+            }
             var target: CallTarget = undefined;
             var signature: structures.CallableType = undefined;
             var argument_storage: std.ArrayList(semantic.UnresolvedBody.ValueUse) = .empty;
@@ -3459,7 +4126,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                             }
                             if (initializer == .call) {
                                 const producer = initializer.call;
-                                if ((try self.inPlaceCallResultType(producer)) == element_type) {
+                                if ((try self.unevaluatedType(raw.value, null)) == element_type) {
                                     const resolved = try self.resolveCall(producer, raw.span);
                                     switch (resolved) {
                                         .diverged => |diverged| return .{ .diverged = diverged },
@@ -3551,6 +4218,13 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     prepared_arguments.items[argument_index].operand
                 else if (expected.mode == .deinit)
                     try self.prepareDeinitArgument(raw.value, expected.type_id, raw.span)
+                else if (expected.mode == .@"var" and try self.constructsInPlace(expected.type_id))
+                    try self.construct(raw.value, raw.span, .{ .storage = try self.localStorage(expected.type_id), .site = .argument })
+                else if (expected.mode == .imm)
+                    try self.valueWithContext(raw.value, .{
+                        .expected_type = expected.type_id,
+                        .borrows_expected_type = try self.constructsInPlace(expected.type_id) and try self.type_interner.facts().variantMembers(expected.type_id) != null,
+                    })
                 else
                     try self.valueWithType(raw.value, expected.type_id);
                 if (raw_operand.type_id == .never) return .{ .diverged = raw_operand };
@@ -3569,9 +4243,20 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 }
                 var argument = try self.coerceValue(operand.id, operand.type_id, expected.type_id) orelse
                     return self.reject(raw.span, .{ .call_argument_type_mismatch = self.typeMismatch(expected.type_id, operand.type_id) });
-                const owned = switch (expected.mode) {
+                var widened: ?Value = null;
+                if (argument.coerce_to != null and try self.constructsInPlace(expected.type_id)) {
+                    if (try self.constructsInPlace(operand.type_id)) return self.reject(raw.span, .{ .relocation_requires_direct_move = operand.type_id });
+                    std.debug.assert(expected.mode == .imm or inferred_call);
+                    const storage = try self.localStorage(expected.type_id);
+                    if (expected.mode == .imm)
+                        _ = try self.appendCoercion(argument, storage.id)
+                    else
+                        widened = try self.placeValue(prepared_arguments.items[argument_index].owned.?, raw.span, .{ .storage = storage, .site = .argument });
+                    argument = .{ .value = storage.id };
+                }
+                const owned = widened orelse switch (expected.mode) {
                     .@"var" => if (inferred_call) prepared_arguments.items[argument_index].owned.? else try self.ownValue(operand, raw.span),
-                    .deinit => if (argument.coerce_to != null) try self.coerceOwnedRepresentation(operand, argument, raw.span) else operand,
+                    .deinit => if (argument.coerce_to != null) try self.coerceOwnedRepresentation(operand, argument, raw.span, null) else operand,
                     else => null,
                 };
                 const argument_value = owned orelse operand;
@@ -3634,11 +4319,10 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 switch (self.local_availability[local_index]) {
                     .unbound => unreachable,
                     .available => {},
-                    .transferred => return self.reject(raw.span, .use_after_transfer),
-                    .maybe_transferred => return self.reject(raw.span, .possibly_transferred),
+                    .transferred, .maybe_transferred, .replacing => |availability| return self.reject(raw.span, unavailableUse(availability)),
                 }
                 if (self.unavailableField(place.local, place_fields.items[place.fields.start..place.fields.end])) |availability|
-                    return self.reject(raw.span, if (availability == .transferred) .use_after_transfer else .possibly_transferred);
+                    return self.reject(raw.span, unavailableUse(availability));
                 for (signature.parameters, argument_places.items, 0..) |other_parameter, other_place, other_index| {
                     if (argument_index == other_index) continue;
                     if (other_place) |resolved_other| {
@@ -3663,12 +4347,11 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 if (parameter.mode == .imm) if (maybe_place) |place| {
                     switch (self.local_availability[@intFromEnum(place.local)]) {
                         .available => {},
-                        .transferred => return self.reject(raw.span, .use_after_transfer),
-                        .maybe_transferred => return self.reject(raw.span, .possibly_transferred),
+                        .transferred, .maybe_transferred, .replacing => |availability| return self.reject(raw.span, unavailableUse(availability)),
                         .unbound => unreachable,
                     }
                     if (self.unavailableField(place.local, place_fields.items[place.fields.start..place.fields.end])) |availability|
-                        return self.reject(raw.span, if (availability == .transferred) .use_after_transfer else .possibly_transferred);
+                        return self.reject(raw.span, unavailableUse(availability));
                 };
                 if (origins != null) try self.recordUse(.{ .id = argument.valueId(), .type_id = parameter.type_id, .reference_origins = origins });
             }
@@ -3717,19 +4400,6 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 .writable_references = writable_range,
                 .reference_origins = reference_origins,
             } };
-        }
-
-        fn inPlaceCallResultType(self: *Self, call: semantic.UnresolvedBody.Call) !?structures.TypeId {
-            return switch (call.target) {
-                .direct => |instance| if (try self.type_interner.functionSignature(instance)) |signature| signature.return_type else null,
-                .value => |target| blk: {
-                    const callee = try self.value(target.value);
-                    if (callee.type_id == .never) break :blk null;
-                    const signature = (try self.type_interner.facts().callable(callee.type_id)) orelse break :blk null;
-                    break :blk signature.return_type;
-                },
-                else => null,
-            };
         }
 
         fn resolveMemberCall(
@@ -3821,41 +4491,74 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             return null;
         }
 
-        fn callFunction(self: *Self, call: semantic.UnresolvedBody.Call, span: structures.SourceSpan) !Value {
+        const CallResult = union(enum) { value, destination: Destination, borrowed: structures.TypeId };
+
+        fn callFunction(self: *Self, call: semantic.UnresolvedBody.Call, span: structures.SourceSpan, mode: CallResult) !Value {
             const resolved = try self.resolveCall(call, span);
-            return switch (resolved) {
-                .diverged => |value_to_return| value_to_return,
+            const result = switch (resolved) {
+                .diverged => |value_to_return| return value_to_return,
                 .conditional_box => |construction| if (self.is_fallible)
-                    self.conditionalWithBox(construction.initializer, construction.destination)
+                    try self.conditional(construction.initializer, .{ .box = construction.destination })
                 else
-                    self.reject(span, .fallible_expression_outside_fallible_function),
+                    return self.reject(span, .fallible_expression_outside_fallible_function),
                 .in_place_box => |construction| blk: {
                     defer if (construction.source == .fields) self.ctx.allocator().free(construction.source.fields.values);
                     break :blk try self.inPlaceBoxValue(construction, span);
                 },
-                .callable => |callable| self.resolvedCallValue(callable, call, span),
+                .callable => |callable| return self.resolvedCallResult(callable, call, span, mode),
+            };
+            return if (mode == .destination) self.placeValue(result, span, mode.destination) else result;
+        }
+
+        fn resolvedCallResult(self: *Self, callable: ResolvedCallable, call: semantic.UnresolvedBody.Call, span: structures.SourceSpan, mode: CallResult) !Value {
+            if (mode == .value) return self.resolvedCallValue(callable, call, span, null);
+            const return_type = callable.operation.return_type;
+            if (!lowersToCall(callable.behavior) or !try self.constructsInPlace(return_type)) {
+                const result = try self.resolvedCallValue(callable, call, span, null);
+                return if (mode == .destination) self.placeValue(result, span, mode.destination) else result;
+            }
+            const target: Destination = switch (mode) {
+                .destination => |destination| destination,
+                .borrowed => |type_id| .{ .storage = try self.localStorage(type_id), .site = .argument },
+                .value => unreachable,
+            };
+            const storage = try self.memberDestination(target, return_type, span, .fresh);
+            return self.finishMemberStorage(try self.resolvedCallValue(callable, call, span, storage), target.storage, span);
+        }
+
+        fn lowersToCall(behavior: structures.CallBehavior) bool {
+            return switch (behavior) {
+                .box_borrow, .box_borrow_mut, .local_borrow, .allocation_element_borrow, .reference_read, .reference_write, .reference_attenuate, .allocation_destroy, .allocation_read => false,
+                .ordinary, .box_new, .box_value, .box_duplicate, .box_destroy, .buffer_new, .buffer_append, .buffer_reserve => true,
             };
         }
 
-        fn resolvedCallValue(self: *Self, callable: ResolvedCallable, call: semantic.UnresolvedBody.Call, span: structures.SourceSpan) !Value {
-            switch (callable.behavior) {
-                .box_borrow, .box_borrow_mut => return self.boxBorrowOperation(callable.operation, call),
-                .local_borrow => return self.localBorrowOperation(callable.operation, call, span),
-                .allocation_element_borrow => return self.allocationBorrowOperation(callable.operation, call),
-                .reference_read => return self.borrowReadOperation(callable.operation, call),
-                .reference_write => return self.borrowWriteOperation(callable.operation, call, span, callable.consumed_arguments),
-                .reference_attenuate => return self.attenuateRefOperation(callable.operation, call),
-                .allocation_destroy, .allocation_read => return self.indexedAllocationOperation(callable.operation, call, span, callable.mut_arguments),
-                .ordinary, .box_new, .box_value, .box_duplicate, .box_destroy, .buffer_new, .buffer_append, .buffer_reserve => {},
+        fn resolvedCallValue(self: *Self, resolved: ResolvedCallable, call: semantic.UnresolvedBody.Call, span: structures.SourceSpan, destination: ?Value) !Value {
+            var callable = resolved;
+            if (!lowersToCall(callable.behavior)) {
+                std.debug.assert(destination == null);
+                return switch (callable.behavior) {
+                    .box_borrow, .box_borrow_mut => self.boxBorrowOperation(callable.operation, call),
+                    .local_borrow => self.localBorrowOperation(callable.operation, call, span),
+                    .allocation_element_borrow => self.allocationBorrowOperation(callable.operation, call),
+                    .reference_read => self.borrowReadOperation(callable.operation, call),
+                    .reference_write => self.borrowWriteOperation(callable.operation, call, span, callable.consumed_arguments),
+                    .reference_attenuate => self.attenuateRefOperation(callable.operation, call),
+                    .allocation_destroy, .allocation_read => self.indexedAllocationOperation(callable.operation, call, span, callable.mut_arguments),
+                    else => unreachable,
+                };
             }
             if (callable.is_fallible) {
                 if (!self.is_fallible) return self.reject(span, .fallible_expression_outside_fallible_function);
                 try self.recordCallArgumentConsumes(callable.consumed_arguments);
+                const storage = destination orelse try self.inPlaceStorage(callable.operation.return_type);
+                if (storage) |result_storage| callable.operation.destination = result_storage.id;
                 var flow = try self.lowerFallibleCall(callable.operation, span);
                 try self.finishCallExits(&flow, callable, span);
                 try self.enterFlowExit(flow.failure.?);
                 try self.finishFunctionExit(span, .return_failure);
                 try self.enterFlowExit(flow.success.?);
+                if (flow.success.?.constructed) |constructed| return constructed;
                 const success_block = self.blocks.items[@intFromEnum(flow.success.?.block)];
                 const value_to_return: Value = .{
                     .id = @enumFromInt(success_block.argument_start),
@@ -3867,12 +4570,13 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 return value_to_return;
             }
             try self.recordCallArgumentConsumes(callable.consumed_arguments);
+            if (destination) |storage| callable.operation.destination = storage.id;
             var value_to_return = try self.appendCall(callable.operation, span);
             if (value_to_return.type_id == .never) {
                 try self.moveCurrentBoundaryEffectsToTerminator();
                 self.terminate(.diverge);
             } else {
-                value_to_return = try self.defineOwnedValue(value_to_return, span, false);
+                value_to_return = try self.defineOwnedValue(destination orelse value_to_return, span, false);
                 value_to_return.reference_origins = try self.finishCallEffects(callable);
             }
             return value_to_return;
@@ -4033,8 +4737,8 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             callable: ResolvedCallable,
             span: structures.SourceSpan,
         ) !void {
-            if (flow.success) |*success| try self.finishCallExit(success, callable, span);
-            if (flow.failure) |*failure| try self.finishCallExit(failure, callable, span);
+            if (flow.success) |*success| try self.finishCallExit(success, callable, span, callable.operation.destination);
+            if (flow.failure) |*failure| try self.finishCallExit(failure, callable, span, null);
         }
 
         fn finishCallExit(
@@ -4042,6 +4746,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             flow_exit: *FlowExit,
             callable: ResolvedCallable,
             span: structures.SourceSpan,
+            constructed: ?structures.FunctionValueId,
         ) !void {
             try self.enterFlowExit(flow_exit.*);
             const parent_boundary = self.current_boundary;
@@ -4049,6 +4754,11 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             self.current_boundary = boundary;
             defer self.current_boundary = parent_boundary;
             const returned_origins = try self.finishCallEffects(callable);
+            if (constructed) |storage| {
+                var result = try self.defineOwnedValue(.{ .id = storage, .type_id = callable.operation.return_type }, span, false);
+                result.reference_origins = returned_origins;
+                flow_exit.constructed = result;
+            }
             try self.appendBoundary(boundary);
             flow_exit.state = try self.captureState();
             const source = self.blocks.items[@intFromEnum(flow_exit.block)];
@@ -4719,7 +5429,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             const use = try self.coerceValue(raw_value.id, raw_value.type_id, access.element_type) orelse
                 return self.reject(value_use.span, .{ .assignment_type_mismatch = self.typeMismatch(access.element_type, raw_value.type_id) });
             const owned = try self.ownValue(raw_value, value_use.span);
-            const operand = if (use.coerce_to) |_| try self.coerceOwnedRepresentation(owned, use, value_use.span) else owned;
+            const operand = if (use.coerce_to) |_| try self.coerceOwnedRepresentation(owned, use, value_use.span, null) else owned;
             try self.recordConsume(operand);
             _ = try self.replaceReference(reference, reference.id, operand.id, span);
             return self.readReference(reference, reference.id, access.element_type, span);
@@ -4777,21 +5487,33 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         fn applyCallMutArguments(self: *Self, call: structures.FunctionCall, range: structures.FunctionValueRange) !void {
             for (self.pending_mut_arguments.items[range.start..range.end]) |pending| {
                 const fields = self.mut_argument_fields.items[pending.place.fields.start..pending.place.fields.end];
-                const leaf_type = if (fields.len == 0)
-                    self.local_values[@intFromEnum(pending.place.local)].?.type_id
-                else
-                    fields[fields.len - 1].type_id;
-                var updated_leaf = try self.appendInstruction(.{ .call_mut_argument = .{
+                const root = self.local_values[@intFromEnum(pending.place.local)].?;
+                const leaf_type = if (fields.len == 0) root.type_id else fields[fields.len - 1].type_id;
+                const leaf_origins = try self.mergeReferenceOrigins(root.reference_origins, pending.reference_origins);
+                const updated_argument: structures.CallMutArgument = .{
                     .arguments = call.arguments,
                     .return_type = call.return_type,
                     .argument_index = pending.argument_index,
                     .type_id = leaf_type,
-                } });
-                updated_leaf.reference_origins = try self.mergeReferenceOrigins(
-                    self.local_values[@intFromEnum(pending.place.local)].?.reference_origins,
-                    pending.reference_origins,
-                );
-                try self.updateMutArgumentPlace(pending.place, updated_leaf);
+                };
+                var updated_root = root;
+                if (try self.constructsInPlace(root.type_id)) {
+                    var in_place = updated_argument;
+                    in_place.destination = if (try self.constructsInPlace(leaf_type))
+                        self.call_arguments.items[call.arguments.start + pending.argument_index].valueId()
+                    else
+                        (try self.fieldStorage(rawValue(root), fields)).id;
+                    _ = try self.appendInstruction(.{ .call_mut_argument = in_place });
+                    updated_root.reference_origins = try self.fieldUpdateOrigins(root.reference_origins, fields, leaf_origins);
+                } else {
+                    var updated_leaf = try self.appendInstruction(.{ .call_mut_argument = updated_argument });
+                    updated_leaf.reference_origins = leaf_origins;
+                    updated_root = try self.updateFields(root, fields, updated_leaf);
+                }
+                var updated = try self.updateOwnedValue(root, updated_root);
+                updated.binding_identity = try self.newBindingIdentity();
+                updated.storage_identity = null;
+                self.local_values[@intFromEnum(pending.place.local)] = updated;
             }
         }
 
@@ -4811,16 +5533,6 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
 
         fn recordCallArgumentConsumes(self: *Self, range: structures.FunctionValueRange) !void {
             for (self.pending_consumed_arguments.items[range.start..range.end]) |argument| try self.recordConsume(argument);
-        }
-
-        fn updateMutArgumentPlace(self: *Self, place: ArgumentPlace, updated_leaf: Value) !void {
-            const local_index = @intFromEnum(place.local);
-            const fields = self.mut_argument_fields.items[place.fields.start..place.fields.end];
-            const previous = self.local_values[local_index].?;
-            var updated = try self.updateOwnedValue(previous, try self.updateFields(previous, fields, updated_leaf));
-            updated.binding_identity = try self.newBindingIdentity();
-            updated.storage_identity = null;
-            self.local_values[local_index] = updated;
         }
 
         fn updateOwnedValue(self: *Self, previous: Value, updated: Value) !Value {
@@ -4915,8 +5627,10 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     if (binding) |success_binding| flow.success.?.binding = .{ .call = success_binding };
                     break :blk flow;
                 },
-                .callable => |callable| if (callable.is_fallible) blk: {
+                .callable => |resolved_callable| if (resolved_callable.is_fallible) blk: {
+                    var callable = resolved_callable;
                     try self.recordCallArgumentConsumes(callable.consumed_arguments);
+                    if (try self.inPlaceStorage(callable.operation.return_type)) |storage| callable.operation.destination = storage.id;
                     var flow = try self.lowerFallibleCall(callable.operation, call.span);
                     try self.finishCallExits(&flow, callable, call.span);
                     if (binding) |success_binding| flow.success.?.binding = .{ .call = success_binding };
@@ -5068,28 +5782,9 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             if (exit.binding) |pending| {
                 const binding = pending.conditionBinding();
                 var bound: Value = switch (pending) {
-                    .variant => |extraction| blk: {
-                        const tag_mapping = try self.appendExtractionTagMapping(extraction.operand.type_id, extraction.target_type);
-                        var extracted = try self.appendInstruction(.{ .variant_extract = .{
-                            .operand = extraction.operand.id,
-                            .target_type = extraction.target_type,
-                            .tag_mapping = tag_mapping,
-                        } });
-                        if (extraction.target_type != .never) {
-                            if (try self.type_interner.canStoreBorrow(extracted.type_id)) {
-                                extracted.reference_origins = if (try self.type_interner.facts().variantMembers(extracted.type_id) != null)
-                                    extraction.operand.reference_origins
-                                else
-                                    try self.selectReferenceOrigins(extraction.operand.reference_origins, .{ .variant = extracted.type_id });
-                            }
-                            extracted.borrowed_type = extracted.type_id;
-                            extracted.borrowed_generation = extraction.operand.borrowed_generation orelse extraction.operand.owned_generation;
-                            extracted.borrowed_cleanup_value = extraction.operand.borrowed_cleanup_value orelse extraction.operand.id;
-                            extracted = try self.ownValue(extracted, binding.span);
-                        }
-                        break :blk extracted;
-                    },
+                    .variant => |extraction| try self.extractVariantBinding(extraction, binding.span),
                     .call => blk: {
+                        if (exit.constructed) |constructed| break :blk constructed;
                         const success_block = self.blocks.items[@intFromEnum(exit.block)];
                         std.debug.assert(success_block.argument_end == success_block.argument_start + 1);
                         break :blk .{
@@ -5104,7 +5799,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     const use = try self.coerceValue(bound.id, bound.type_id, expected) orelse
                         return self.reject(binding.span, .{ .local_type_mismatch = self.typeMismatch(expected, bound.type_id) });
                     if (use.coerce_to != null) {
-                        bound = try self.coerceOwnedRepresentation(bound, use, binding.span);
+                        bound = try self.coerceOwnedRepresentation(bound, use, binding.span, null);
                     }
                 };
                 const index = @intFromEnum(binding.local);
@@ -5115,6 +5810,33 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 self.local_availability[index] = .available;
                 if (bound.type_id == .never) self.terminate(.diverge);
             }
+        }
+
+        fn extractVariantBinding(self: *Self, extraction: PendingExtraction, span: structures.SourceSpan) !Value {
+            const target_type = extraction.target_type;
+            const in_place = target_type != .never and try self.constructsInPlace(target_type);
+            if (in_place and try self.type_interner.facts().variantMembers(target_type) != null) {
+                var narrowed = extraction.operand;
+                narrowed.borrowed_type = target_type;
+                if (try self.nonCopyableBorrow(narrowed)) |details| return self.reject(span, .{ .type_not_copyable = details });
+                return self.copyValue(extraction.operand, span, try self.localStorage(target_type));
+            }
+            var extracted = if (in_place) try self.projectStorage(extraction.operand, target_type, .variant) else try self.appendInstruction(.{ .variant_extract = .{
+                .operand = extraction.operand.id,
+                .target_type = target_type,
+                .tag_mapping = try self.appendExtractionTagMapping(extraction.operand.type_id, target_type),
+            } });
+            if (target_type == .never) return extracted;
+            if (try self.type_interner.canStoreBorrow(target_type)) {
+                extracted.reference_origins = if (try self.type_interner.facts().variantMembers(target_type) != null)
+                    extraction.operand.reference_origins
+                else
+                    try self.selectReferenceOrigins(extraction.operand.reference_origins, .{ .variant = target_type });
+            }
+            extracted.borrowed_type = target_type;
+            extracted.borrowed_generation = extraction.operand.borrowed_generation orelse extraction.operand.owned_generation;
+            extracted.borrowed_cleanup_value = extraction.operand.borrowed_cleanup_value orelse extraction.operand.id;
+            return self.ownValue(extracted, span);
         }
 
         fn mergeFlowExits(self: *Self, first_exit: ?FlowExit, second_exit: ?FlowExit) !?FlowExit {
@@ -5209,13 +5931,9 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             return .{ .block = merged, .state = state_id };
         }
 
-        fn conditional(self: *Self, expression: @FieldType(Expression.Operation, "if_else")) !Value {
-            return self.conditionalWithBox(expression, null);
-        }
-
         fn boxFromInitializer(self: *Self, id: semantic.UnresolvedBody.ValueId, destination: BoxDestination) anyerror!Value {
             if (self.inPlaceInitializer(id)) |initializer| {
-                if (initializer == .conditional) return self.conditionalWithBox(initializer.conditional, destination);
+                if (initializer == .conditional) return self.conditional(initializer.conditional, .{ .box = destination });
                 if (initializer == .fields) {
                     const expression = initializer.fields;
                     const resolved = try self.prepareInPlaceBoxFields(expression, destination, expression.span);
@@ -5237,7 +5955,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             return self.reject(self.activeLifetimeSpan(), .{ .box_requires_struct_initializer = destination.element_type });
         }
 
-        fn conditionalWithBox(self: *Self, expression: @FieldType(Expression.Operation, "if_else"), box_destination: ?BoxDestination) anyerror!Value {
+        fn conditional(self: *Self, expression: @FieldType(Expression.Operation, "if_else"), mode: BranchResult) anyerror!Value {
             const baseline = try self.captureState();
             const flow = try self.condition(expression.condition);
             if (flow.success == null and flow.failure == null) {
@@ -5247,14 +5965,14 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
 
             var then_exit = if (flow.success) |success| blk: {
                 try self.enterFlowExit(success);
-                const result = try self.blockWithBox(expression.then_block, null, box_destination);
+                const result = try self.blockWithResult(expression.then_block, mode);
                 if (self.current_block != null) if (success.binding) |binding|
                     self.unbindLocal(@intFromEnum(binding.conditionBinding().local));
                 break :blk try self.valueExit(result);
             } else null;
             var else_exit = if (flow.failure) |failure| blk: {
                 try self.enterFlowExit(failure);
-                break :blk try self.valueExit(try self.blockWithBox(expression.else_block, null, box_destination));
+                break :blk try self.valueExit(try self.blockWithResult(expression.else_block, mode));
             } else null;
 
             const argument_start: u32 = @intCast(self.block_argument_types.items.len);
@@ -5268,13 +5986,21 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             if (then_exit) |*then_value| if (else_exit) |*else_value|
                 try self.normalizeJoinedFields(then_value, else_value);
 
-            const joined = if (then_exit) |then_result|
+            const constructed = if (mode == .destination) mode.destination.storage else null;
+            const joined = if (constructed) |storage|
+                storage.type_id
+            else if (then_exit) |then_result|
                 if (else_exit) |else_result|
                     try joinTypes(self.type_interner, then_result.value.type_id, else_result.value.type_id, self.ctx.allocator())
                 else
                     then_result.value.type_id
             else
                 else_exit.?.value.type_id;
+            if (constructed == null and try self.constructsInPlace(joined)) {
+                if (then_exit) |exit| if (exit.value.type_id != joined) return self.reject(self.activeLifetimeSpan(), .{ .relocation_requires_direct_move = exit.value.type_id });
+                if (else_exit) |exit| if (exit.value.type_id != joined) return self.reject(self.activeLifetimeSpan(), .{ .relocation_requires_direct_move = exit.value.type_id });
+            }
+            const result_type: ?structures.TypeId = if (constructed == null) joined else null;
             const then_is_borrowed = if (then_exit) |exit| exit.value.borrowed_type != null else false;
             const else_is_borrowed = if (else_exit) |exit| exit.value.borrowed_type != null else false;
             const any_borrowed = then_is_borrowed or else_is_borrowed;
@@ -5285,7 +6011,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             const first_generation = if (then_exit) |exit| exit.value.owned_generation else else_exit.?.value.owned_generation;
             const second_generation = if (else_exit) |exit| exit.value.owned_generation else first_generation;
             const joined_generation = try self.joinGenerations(joined, self.activeLifetimeSpan(), first_generation, second_generation);
-            _ = try self.appendBlockArgument(joined, joined_generation);
+            if (result_type != null) _ = try self.appendBlockArgument(joined, joined_generation);
             if (needs_borrow_condition) _ = try self.appendBlockArgument(.bool, null);
             var changed_slots = try self.changedStateSlots(baseline, then_exit, else_exit);
             defer changed_slots.deinit(self.ctx.allocator());
@@ -5312,15 +6038,19 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             }
             const merge_block = try self.newBlock(argument_start, @intCast(self.block_argument_types.items.len));
             const then_predecessor = if (then_exit) |exit|
-                try self.setConditionalTerminator(merge_block, exit, joined, changed_slots.items, needs_borrow_condition)
+                try self.setConditionalTerminator(merge_block, exit, result_type, changed_slots.items, needs_borrow_condition)
             else
                 null;
             const else_predecessor = if (else_exit) |exit|
-                try self.setConditionalTerminator(merge_block, exit, joined, changed_slots.items, needs_borrow_condition)
+                try self.setConditionalTerminator(merge_block, exit, result_type, changed_slots.items, needs_borrow_condition)
             else
                 null;
 
-            const output_state = try self.conditionalState(baseline, then_exit, else_exit, changed_slots.items, argument_start + 1 + @intFromBool(needs_borrow_condition));
+            const output_state = try self.conditionalState(baseline, then_exit, else_exit, changed_slots.items, argument_start + @intFromBool(result_type != null) + @intFromBool(needs_borrow_condition));
+            if (constructed != null) if (joined_generation) |generation| {
+                if (then_exit) |exit| try self.recordGenerationOnlyForward(then_predecessor.?, 0, exit.value.owned_generation, generation);
+                if (else_exit) |exit| try self.recordGenerationOnlyForward(else_predecessor.?, 0, exit.value.owned_generation, generation);
+            };
             for (generation_only_joins.items) |generation_join| {
                 self.states.items[@intFromEnum(output_state)].values[generation_join.slot].?.owned_generation = generation_join.destination;
                 if (then_exit) |exit| try self.recordGenerationOnlyForward(
@@ -5360,7 +6090,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             self.enterBlock(merge_block);
             self.restoreState(output_state);
             return self.withCleanupCondition(.{
-                .id = @enumFromInt(argument_start),
+                .id = if (constructed) |storage| storage.id else @enumFromInt(argument_start),
                 .type_id = joined,
                 .owned_generation = joined_generation,
                 .reference_origins = try self.mergeReferenceOrigins(
@@ -5413,7 +6143,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 var transferred = false;
                 for (breaks) |break_edge| {
                     const state = self.states.items[@intFromEnum(break_edge.state)];
-                    if (state.availability[local_index] == .available and state.field_availability[index] == .transferred) {
+                    if (state.availability[local_index] == .available and (state.field_availability[index] == .transferred or state.field_availability[index] == .replacing)) {
                         transferred = true;
                         break;
                     }
@@ -5450,7 +6180,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             try self.resolvePlaceFields(field_type, place.fields, span, &fields);
             const capabilities = (try self.type_interner.facts().ownershipCapabilities(fields.getLast().type_id)) orelse return error.Unavailable;
             if (capabilities.requires_explicit_drop) return self.reject(span, .explicit_drop_field_cannot_be_implicitly_ended);
-            const field = try self.transferFieldPlace(place.local, fields.items, span, true);
+            const field = try self.transferFieldPlace(place.local, fields.items, span, .consume);
             try self.dropValue(field, false, span);
             try self.recordConsume(field);
         }
@@ -5529,7 +6259,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             self: *Self,
             target: structures.FunctionBlockId,
             exit: ValueExit,
-            result_type: structures.TypeId,
+            result_type: ?structures.TypeId,
             changed_slots: []const u32,
             include_borrow_condition: bool,
         ) !structures.FunctionBlockId {
@@ -5552,13 +6282,15 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             self: *Self,
             target: structures.FunctionBlockId,
             exit: ValueExit,
-            result_type: structures.TypeId,
+            result_type: ?structures.TypeId,
             changed_slots: []const u32,
             borrow_condition: ?structures.FunctionValueId,
         ) !structures.FunctionBranch {
             const start: u32 = @intCast(self.branch_arguments.items.len);
-            const result = (try self.coerceValue(exit.value.id, exit.value.type_id, result_type)) orelse unreachable;
-            try self.appendBranchArgument(result, exit.value.owned_generation);
+            if (result_type) |type_id| {
+                const result = (try self.coerceValue(exit.value.id, exit.value.type_id, type_id)) orelse unreachable;
+                try self.appendBranchArgument(result, exit.value.owned_generation);
+            }
             if (borrow_condition) |borrow_predicate| try self.appendBranchArgument(.{ .value = borrow_predicate }, null);
             const state = self.states.items[@intFromEnum(exit.state)].values;
             for (changed_slots) |slot| try self.appendBranchArgument(.{ .value = state[slot].?.id }, state[slot].?.owned_generation);

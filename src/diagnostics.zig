@@ -466,6 +466,8 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
         .overlapping_mutable_arguments => try writer.writeAll("this `mut` argument accesses the same value as another argument in the call"),
         .use_after_transfer => try writer.writeAll("cannot use this value after it was transferred with `^`"),
         .possibly_transferred => try writer.writeAll("cannot use this value because it may already have been transferred with `^`"),
+        .replaced_value_used => try writer.writeAll("cannot use this value while it is replaced in its own storage; its type cannot move directly, so read or transfer it before the replacement"),
+        .consumed_storage_in_use => try writer.writeAll("cannot overwrite storage retained by a pending `deinit` argument; replace it after the call completes"),
         .borrow_outlives_source => try writer.writeAll("borrow cannot outlive the value or storage it references"),
         .invalid_return_origin => try writer.writeAll("return origin contract must name distinct runtime parameters"),
         .return_origin_not_declared => try writer.writeAll("returned borrow has an origin not named in its contract"),
@@ -480,6 +482,11 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
         .type_not_movable => |type_id| {
             try writer.writeAll("cannot transfer value of immovable type ");
             try writeType(types, writer, type_id);
+        },
+        .relocation_requires_direct_move => |type_id| {
+            try writer.writeAll("a completed value of type ");
+            try writeType(types, writer, type_id);
+            try writer.writeAll(" cannot move directly into another destination; construct it there, giving the result a known type if needed");
         },
         .type_not_copyable => |details| {
             try writer.writeAll("cannot implicitly copy value of non-copyable type ");

@@ -4592,6 +4592,97 @@ test "deinit field consumption invalidates later field reads" {
     try fixture.expectDiagnostic(0, .use_after_transfer);
 }
 
+test "pending deinit arguments retain their storage during argument evaluation" {
+    const cases = [_]struct { call: []const u8, source: []const u8, replacement: []const u8 }{
+        .{ .call = "take", .source = "item", .replacement = "item = Pinned{value = 7}" },
+        .{ .call = "take", .source = "item^", .replacement = "item = Pinned{value = 7}" },
+        .{ .call = "callee", .source = "item", .replacement = "item = Pinned{value = 7}" },
+        .{ .call = "generic", .source = "item", .replacement = "item = Pinned{value = 7}" },
+        .{ .call = "take", .source = "holder.item", .replacement = "holder.item = Pinned{value = 7}" },
+        .{ .call = "take", .source = "holder.item", .replacement = "holder = Holder{item = Pinned{value = 7}, count = 0}" },
+        .{ .call = "take_int", .source = "holder.count", .replacement = "holder.count = 7" },
+        .{ .call = "take", .source = "item", .replacement = "take_int(holder.count, if 1 == 1\n      item = Pinned{value = 7}\n      0\n    else 0)" },
+    };
+    for (cases) |case| {
+        const source = try std.fmt.allocPrint(testing.allocator,
+            \\struct Pinned
+            \\  move = none
+            \\  value: int
+            \\struct Holder
+            \\  item: Pinned
+            \\  count: int
+            \\func take(deinit old: Pinned, marker: int) int -> old.value + marker
+            \\func take_int(deinit old: int, marker: int) int -> old + marker
+            \\func generic(static T: type, deinit old: T, marker: int) int -> 42
+            \\func run() int
+            \\  const callee: func(deinit Pinned, int) int = take
+            \\  var item = Pinned{{value = 42}}
+            \\  var holder = Holder{{item = Pinned{{value = 42}}, count = 0}}
+            \\  return {s}({s}, if 1 == 1
+            \\    {s}
+            \\    0
+            \\  else 0)
+            \\exit(run())
+        , .{ case.call, case.source, case.replacement });
+        defer testing.allocator.free(source);
+        const fixture = try Fixture.init(source, &.{});
+        defer fixture.deinit();
+        try fixture.expectDiagnostic(0, .consumed_storage_in_use);
+    }
+}
+
+test "pending deinit arguments permit sibling writes and release storage after calls" {
+    const fixture = try Fixture.init(
+        \\struct Pinned
+        \\  move = none
+        \\  value: int
+        \\struct Holder
+        \\  item: Pinned
+        \\  count: int
+        \\func take(deinit old: Pinned, marker: int) int -> old.value + marker
+        \\func take_int(deinit old: int, marker: int) int -> old + marker
+        \\func run() int
+        \\  var holder = Holder{item = Pinned{value = 20}, count = 0}
+        \\  var other = 2
+        \\  const first = take(holder.item, take_int(other, if 1 == 1
+        \\    holder.count = 1
+        \\    holder.count
+        \\  else 0))
+        \\  holder.item = Pinned{value = 17}
+        \\  other = 2
+        \\  return first + take(holder.item, other)
+        \\static compiled = comptime -> run()
+        \\exit(run() + compiled - 42)
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+test "pending deinit storage checks follow movability edits" {
+    const source =
+        \\struct Pinned
+        \\  move = none
+        \\  value: int
+        \\func take(deinit old: Pinned, marker: int) int -> old.value
+        \\func run() int
+        \\  var item = Pinned{value = 42}
+        \\  return take(item, if 1 == 1
+        \\    item = Pinned{value = 7}
+        \\    0
+        \\  else 0)
+        \\exit(run())
+    ;
+    const fixture = try Fixture.init(source, &.{});
+    defer fixture.deinit();
+    try fixture.expectDiagnostic(0, .consumed_storage_in_use);
+    const movable = try std.mem.replaceOwned(u8, testing.allocator, source, "move = none", "move = fieldwise");
+    defer testing.allocator.free(movable);
+    try fixture.db.setInput(queries.SourceText, 0, movable);
+    try fixture.expectExit(0, 42);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectDiagnostic(0, .consumed_storage_in_use);
+}
+
 test "deinit source is cleaned when a later argument fails" {
     const fixture = try Fixture.init(
         \\struct Item
@@ -4676,6 +4767,822 @@ test "custom drop hook does not redispatch after replacing self" {
         \\  _ = owner
         \\  exit(1)
         \\if run() -> exit(2) else exit(3)
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+fn expectNoRelocation(fixture: Fixture, name: []const u8) !void {
+    const types: queries.TypeFacts(*query.Database) = .{ .ctx = fixture.db };
+    const function = (try fixture.db.get(queries.BuildModuleScope, 0)).*.?.resolveFunction(name).?;
+    const body = (try fixture.db.get(queries.AnalyzeFunctionInstance, .{ .item = function })).*.?;
+    for (body.instructions) |instruction| {
+        const copied: ?structures.TypeId = switch (instruction) {
+            .struct_init => |operation| operation.type_id,
+            .field_access => |operation| operation.field_type,
+            .field_update => |operation| operation.type_id,
+            .variant_extract => |operation| operation.target_type,
+            .variant_coerce, .callable_coerce => |operation| if (operation.destination == null) operation.target_type else null,
+            .value_copy => |operation| if (operation.destination == null) operation.type_id else null,
+            .call_mut_argument => |operation| if (operation.destination == null) operation.type_id else null,
+            else => null,
+        };
+        if (copied) |type_id| try testing.expectEqual(structures.ArgumentPassing.direct, try types.argumentPassing(type_id));
+    }
+    for (body.branch_arguments) |use| if (use.coerce_to) |type_id| try testing.expectEqual(structures.ArgumentPassing.direct, try types.argumentPassing(type_id));
+    if (try types.argumentPassing(body.return_type) == .direct) return;
+    for (body.blocks) |block| if (block.terminator == .return_value) {
+        const returned = block.terminator.return_value;
+        try testing.expect(returned.coerce_to == null);
+        try testing.expect(@intFromEnum(returned.value) >= body.block_argument_types.len);
+        try testing.expect(body.instructions[@intFromEnum(returned.value) - body.block_argument_types.len] == .result_storage);
+    };
+}
+
+test "fresh results construct in their final destinations" {
+    const fixture = try Fixture.init(
+        \\struct Tracked
+        \\  move = none
+        \\  value: int
+        \\  drop = func(deinit self: Tracked) -> ()
+        \\struct Moved
+        \\  value: int
+        \\  move = func(deinit self: Moved) Moved -> exit(90)
+        \\struct Pair
+        \\  first: Tracked
+        \\  second: Moved
+        \\func make(value: int) Tracked -> Tracked{value = value}
+        \\func build(choice: int) Pair
+        \\  const producer = make
+        \\  return Pair{first = if choice == 1 -> producer(20) else make(1), second = Moved{value = 22}}
+        \\func maybe(choice: int) Pair | none
+        \\  if choice == 0 -> return none
+        \\  return build(choice)
+        \\func pick(choice: int) Moved
+        \\  var index = 0
+        \\  return loop
+        \\    index += 1
+        \\    if index == choice -> break Moved{value = index}
+        \\func present(imm value: Pair | none) int
+        \\  if value is Pair -> return 1
+        \\  return 0
+        \\func consume(var pair: Pair) int -> pair.first.value + pair.second.value
+        \\exit(consume(build(1)) + pick(3).value + present(maybe(1)) + present(maybe(0)) - 4)
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+    for ([_][]const u8{ "build", "maybe", "pick" }) |name| try expectNoRelocation(fixture, name);
+}
+
+test "named results copy or explicitly move into their destination" {
+    const fixture = try Fixture.init(
+        \\struct Counted
+        \\  value: int
+        \\  copy = func(imm self: Counted) Counted -> Counted{value = self.value + 1}
+        \\  move = func(deinit self: Counted) Counted -> Counted{value = self.value + 10}
+        \\struct Holder
+        \\  item: Counted
+        \\func fresh() Counted -> Counted{value = 0}
+        \\func copied() Counted
+        \\  const named = Counted{value = 0}
+        \\  return named
+        \\func moved() Counted
+        \\  const named = Counted{value = 0}
+        \\  return named^
+        \\const holder = Holder{item = moved()}
+        \\exit(fresh().value + copied().value + moved().value + holder.item.value + 21)
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+    for ([_][]const u8{ "fresh", "copied", "moved" }) |name| try expectNoRelocation(fixture, name);
+}
+
+test "a named immovable result copies only with copy capability" {
+    const cases = [_]struct { copy: []const u8, result: []const u8, kind: ?std.meta.Tag(structures.Diagnostic.Kind) }{
+        .{ .copy = "none", .result = "pinned", .kind = .type_not_copyable },
+        .{ .copy = "trivial", .result = "pinned^", .kind = .type_not_movable },
+        .{ .copy = "trivial", .result = "pinned", .kind = null },
+    };
+    for (cases) |case| {
+        const source = try std.fmt.allocPrint(testing.allocator,
+            \\struct Pinned
+            \\  move = none
+            \\  copy = {s}
+            \\  value: int
+            \\func named() Pinned
+            \\  const pinned = Pinned{{value = 42}}
+            \\  return {s}
+            \\exit(named().value)
+        , .{ case.copy, case.result });
+        defer testing.allocator.free(source);
+        const fixture = try Fixture.init(source, &.{});
+        defer fixture.deinit();
+        if (case.kind) |kind| try fixture.expectDiagnostic(0, kind) else try fixture.expectExit(0, 42);
+    }
+}
+
+test "results that cannot move directly select, widen, or reject without relocation" {
+    const cases = [_]struct { body: []const u8, kind: ?std.meta.Tag(structures.Diagnostic.Kind) }{
+        .{ .body = "const pinned = if 1 < 2 -> Pinned{value = 42} else Pinned{value = 1}\nexit(pinned.value)", .kind = null },
+        .{ .body = "const pinned = if 1 < 2 -> Pinned{value = 42} else none\nif pinned is Pinned -> exit(42) else exit(1)", .kind = null },
+        .{ .body = "const pinned = if 1 < 2\n  const value = 40\n  make(value + 2)\nelse Pinned{value = 1}\nexit(pinned.value)", .kind = null },
+        .{ .body = "var index = 0\nconst pinned = loop\n  index += 1\n  if index == 42 -> break make(index)\nexit(pinned.value)", .kind = null },
+        .{ .body = "var index = 0\nconst pinned = loop\n  index += 1\n  if index == 1 -> break none\n  break make(index)\nexit(1)", .kind = .relocation_requires_direct_move },
+        .{ .body = "const pinned: Pinned = if 1 < 2 -> Pinned{value = 42} else Pinned{value = 1}\nexit(pinned.value)", .kind = null },
+        .{ .body = "if 1 < 2\n  Pinned{value = 1}\nexit(42)", .kind = null },
+        .{ .body = "func look(imm value: Pinned | none) int -> 42\nconst pinned = Pinned{value = 1}\nexit(look(pinned))", .kind = .relocation_requires_direct_move },
+        .{ .body = "func look(imm value: Pinned | none) int\n  if value is Pinned -> return 42\n  return 1\nexit(look(make(1)) + look(Pinned{value = 1}) - 42)", .kind = null },
+        .{ .body = "func keep(var value: Pinned | none) int\n  if value is Pinned -> return 42\n  return 1\nexit(keep(Pinned{value = 1}))", .kind = null },
+        .{ .body = "func maybe() Pinned | none -> Pinned{value = 1}\nfunc widen() Pinned | none | int -> maybe()\nconst widened = widen()\nexit(42)", .kind = .relocation_requires_direct_move },
+        .{ .body = "func look(imm value: Pinned | none) int\n  if value is Pinned -> return 1\n  return 42\nexit(look(none))", .kind = null },
+        .{ .body = "func keep(static T: type, var t: T, var value: Pinned | none) int\n  if value is Pinned -> return 1\n  return t\nexit(keep(42, none))", .kind = null },
+        .{ .body = "func keep(static T: type, var t: T, var value: Pinned | none) int -> 42\nexit(keep(5, make(1)))", .kind = .relocation_requires_direct_move },
+        .{ .body = "func consume(static T: type, var t: T, deinit value: T | int) int\n  if const number = value as int -> return number\n  return 1\nexit(consume(Pinned{value = 1}, 42))", .kind = null },
+    };
+    for (cases) |case| {
+        const source = try std.mem.concat(testing.allocator, u8, &.{ "struct Pinned\n  move = none\n  value: int\nfunc make(value: int) Pinned -> Pinned{value = value}\n", case.body });
+        defer testing.allocator.free(source);
+        const fixture = try Fixture.init(source, &.{});
+        defer fixture.deinit();
+        if (case.kind) |kind| try fixture.expectDiagnostic(0, kind) else try fixture.expectExit(0, 42);
+    }
+}
+
+test "borrowed variant arguments construct through control flow" {
+    const cases = [_]struct { expression: []const u8, zero_result: i32 = 0 }{
+        .{ .expression = "if flag == 1 -> make(42) else none" },
+        .{ .expression = "if flag == 1 -> producer(42) else none" },
+        .{ .expression = "if flag == 1 -> Pinned{value = 42} else none" },
+        .{ .expression = "if flag == 1 -> (if flag == 1 -> make(42) else none) else none" },
+        .{ .expression = "loop\n    if flag == 1 -> break make(42)\n    break none\n  " },
+        .{ .expression = "loop\n    break if flag == 1 -> make(42) else none\n  " },
+        .{ .expression = "if flag == 1 -> existing else make(42)", .zero_result = 42 },
+    };
+    for (cases) |case| {
+        const source = try std.fmt.allocPrint(testing.allocator,
+            \\struct Pinned
+            \\  move = none
+            \\  copy = func(imm self: Pinned) Pinned -> exit(90)
+            \\  value: int
+            \\  drop = func(deinit self: Pinned) -> ()
+            \\func make(value: int) Pinned -> Pinned{{value = value}}
+            \\func look(imm item: Pinned | none) int
+            \\  if item is Pinned -> return 42
+            \\  return 0
+            \\func run(flag: int) int
+            \\  const producer = make
+            \\  const existing: Pinned | none = make(42)
+            \\  const callee = look
+            \\  return callee({s})
+            \\static compiled = comptime -> run(1) + run(0)
+            \\exit(run(1) + run(0) + compiled - 42 - {d})
+        , .{ case.expression, 2 * case.zero_result });
+        defer testing.allocator.free(source);
+        const fixture = try Fixture.init(source, &.{});
+        defer fixture.deinit();
+        try fixture.expectExit(0, 42);
+        try expectNoRelocation(fixture, "run");
+    }
+}
+
+test "borrowed control flow cannot relocate narrower existing values" {
+    const expressions = [_][]const u8{
+        "if 1 == 1 -> pinned else none",
+        "loop\n    if 1 == 1 -> break pinned\n    break none",
+    };
+    for (expressions) |expression| {
+        const source = try std.fmt.allocPrint(testing.allocator,
+            \\struct Pinned
+            \\  move = none
+            \\  value: int
+            \\func look(imm item: Pinned | none) int -> 42
+            \\const pinned = Pinned{{value = 42}}
+            \\exit(look({s}))
+        , .{expression});
+        defer testing.allocator.free(source);
+        const fixture = try Fixture.init(source, &.{});
+        defer fixture.deinit();
+        try fixture.expectDiagnostic(0, .relocation_requires_direct_move);
+    }
+}
+
+test "borrowed argument widening preserves transfer rejection and owner cleanup" {
+    const fixture = try Fixture.init(
+        \\struct Pinned
+        \\  move = none
+        \\struct Movable
+        \\  copy = none
+        \\  value: int
+        \\  drop = func(deinit self: Movable)
+        \\    if self.value == 20 -> () else exit(90)
+        \\    self.value = 50
+        \\func make() Movable -> Movable{value = 20}
+        \\func look(imm item: Movable | Pinned | none) int -> 42
+        \\func run(flag: int) int
+        \\  const existing = make()
+        \\  return look(if flag == 1 -> existing else make())
+        \\static compiled = comptime -> run(1) + run(0)
+        \\exit(run(1) + run(0) + compiled - 126)
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+
+    const rejected = try Fixture.init(
+        \\struct Pinned
+        \\  move = none
+        \\func look(imm item: int | Pinned) int -> 42
+        \\const number = 42
+        \\exit(look(number^))
+    , &.{});
+    defer rejected.deinit();
+    try rejected.expectDiagnostic(0, .ownership_transfer_requires_owning_context);
+}
+
+test "borrowed fresh control-flow temporaries clean up on later failure" {
+    for ([_]u8{ 0, 1 }) |flag| {
+        const source = try std.fmt.allocPrint(testing.allocator,
+            \\struct Pinned
+            \\  move = none
+            \\  value: int
+            \\  drop = func(deinit self: Pinned) -> exit(self.value)
+            \\func make() Pinned -> Pinned{{value = 42}}
+            \\func look(imm item: Pinned | none, marker: int) -> ()
+            \\fallible fail() int
+            \\  1 == 0
+            \\  return 0
+            \\fallible run(flag: int) unit
+            \\  look(if flag == 1 -> make() else none, fail())
+            \\if run({d}) -> exit(1) else exit(2)
+        , .{flag});
+        defer testing.allocator.free(source);
+        const fixture = try Fixture.init(source, &.{});
+        defer fixture.deinit();
+        try fixture.expectExit(0, if (flag == 1) 42 else 2);
+    }
+}
+
+test "borrowed argument construction follows movability edits" {
+    const source =
+        \\struct Item
+        \\  move = $move
+        \\  value: int
+        \\func make() Item -> Item{value = 42}
+        \\func look(imm item: Item | none) int
+        \\  if item is Item -> return 42
+        \\  return 0
+        \\func run() int
+        \\  const existing = make()
+        \\  return look(if 1 == 1 -> $result else none)
+        \\static compiled = comptime -> run()
+        \\exit(run() + compiled - 42)
+    ;
+    const cases = [_]struct { movement: []const u8, result: []const u8, rejects_relocation: bool = false }{
+        .{ .movement = "fieldwise", .result = "existing" },
+        .{ .movement = "none", .result = "existing", .rejects_relocation = true },
+        .{ .movement = "none", .result = "make()" },
+        .{ .movement = "fieldwise", .result = "make()" },
+        .{ .movement = "none", .result = "make()" },
+    };
+    const fixture = try Fixture.init("", &.{});
+    defer fixture.deinit();
+    for (cases) |case| {
+        const edited = try test_sources.renderTemplate(testing.allocator, source, .{ .move = case.movement, .result = case.result });
+        defer testing.allocator.free(edited);
+        try fixture.db.setInput(queries.SourceText, 0, edited);
+        if (case.rejects_relocation) try fixture.expectDiagnostic(0, .relocation_requires_direct_move) else try fixture.expectExit(0, 42);
+    }
+}
+
+test "borrowed conditional arguments view their source storage" {
+    const fixture = try Fixture.init(
+        \\struct Pinned
+        \\  move = none
+        \\  copy = func(imm self: Pinned) Pinned -> exit(90)
+        \\  value: int
+        \\func look(imm pinned: Pinned) int -> pinned.value
+        \\func run(flag: int) int
+        \\  const first = Pinned{value = 40}
+        \\  const second = Pinned{value = 2}
+        \\  return look(if flag == 1 -> first else second) + look(if flag == 0 -> first else second)
+        \\exit(run(1))
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+    try expectNoRelocation(fixture, "run");
+}
+
+test "mutable locals that cannot move directly keep their storage" {
+    const fixture = try Fixture.init(
+        \\struct Tracked
+        \\  move = none
+        \\  value: int
+        \\  drop = func(deinit self: Tracked) -> ()
+        \\struct Pair
+        \\  first: Tracked
+        \\  count: int
+        \\func make(value: int) Tracked -> Tracked{value = value}
+        \\func bump(mut tracked: Tracked)
+        \\  tracked.value += 1
+        \\func reset(mut tracked: Tracked)
+        \\  tracked = make(10)
+        \\func count(mut value: int)
+        \\  value += 1
+        \\func run() int
+        \\  var pair = Pair{first = make(0), count = 0}
+        \\  var index = 0
+        \\  loop
+        \\    index += 1
+        \\    bump(pair.first)
+        \\    count(pair.count)
+        \\    if index == 3 -> reset(pair.first)
+        \\    if index == 5
+        \\      const current = pair.first.value
+        \\      pair.first = make(pair.count + current)
+        \\      break
+        \\  var single = make(1)
+        \\  bump(single)
+        \\  single.value += 10
+        \\  const current = single.value
+        \\  single = make(current - 3)
+        \\  return pair.first.value + single.value + 16
+        \\exit(run())
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+    try expectNoRelocation(fixture, "run");
+    try expectNoRelocation(fixture, "bump");
+    try expectNoRelocation(fixture, "reset");
+    const types: queries.TypeFacts(*query.Database) = .{ .ctx = fixture.db };
+    const run = (try fixture.db.get(queries.BuildModuleScope, 0)).*.?.resolveFunction("run").?;
+    const body = (try fixture.db.get(queries.AnalyzeFunctionInstance, .{ .item = run })).*.?;
+    for (body.block_argument_types) |type_id| try testing.expectEqual(structures.ArgumentPassing.direct, try types.argumentPassing(type_id));
+}
+
+test "replacing storage in place ends the old value before the right-hand side" {
+    const cases = [_]struct { body: []const u8, kind: ?std.meta.Tag(structures.Diagnostic.Kind) }{
+        .{ .body = "var tracked = make(1)\ntracked = make(tracked.value)\nexit(tracked.value)", .kind = .replaced_value_used },
+        .{ .body = "var pair = Pair{first = make(1), count = 2}\npair.first = make(pair.first.value)\nexit(1)", .kind = .replaced_value_used },
+        .{ .body = "var pair = Pair{first = make(1), count = 2}\npair.first = make(helper(pair))\nexit(1)", .kind = .replaced_value_used },
+        .{ .body = "func refill(mut tracked: Tracked)\n  tracked = make(tracked.value)\nvar tracked = make(1)\nrefill(tracked)\nexit(1)", .kind = .replaced_value_used },
+        .{ .body = "var pair = Pair{first = make(1), count = 41}\npair.first = make(pair.count + 1)\nexit(pair.first.value)", .kind = null },
+        .{ .body = "var tracked = make(20)\nconst previous = tracked.value\ntracked = make(previous + 22)\nexit(tracked.value)", .kind = null },
+        .{ .body = "var moved = Moved{value = 40}\nconst old = moved^\nmoved = next(old^)\nexit(moved.value)", .kind = null },
+    };
+    for (cases) |case| {
+        const source = try std.mem.concat(testing.allocator, u8, &.{
+            \\struct Tracked
+            \\  move = none
+            \\  value: int
+            \\struct Pair
+            \\  first: Tracked
+            \\  count: int
+            \\struct Moved
+            \\  value: int
+            \\  move = func(deinit self: Moved) Moved -> Moved{value = self.value + 1}
+            \\func make(value: int) Tracked -> Tracked{value = value}
+            \\func helper(imm pair: Pair) int -> pair.count
+            \\func next(var moved: Moved) Moved -> Moved{value = moved.value}
+            \\
+            ,
+            case.body,
+        });
+        defer testing.allocator.free(source);
+        const fixture = try Fixture.init(source, &.{});
+        defer fixture.deinit();
+        if (case.kind) |kind| try fixture.expectDiagnostic(0, kind) else try fixture.expectExit(0, 42);
+    }
+}
+
+test "in-place replacement ends the old value before constructing the new one" {
+    const cases = [_]struct { body: []const u8, status: u8 }{
+        .{ .body = "var tracked = Tracked{value = 42}\ntracked = noisy()", .status = 42 },
+        .{ .body = "var pair = Pair{first = Tracked{value = 42}, count = 1}\npair.first = noisy()", .status = 42 },
+        .{ .body = "var pair = Pair{first = Tracked{value = 42}, count = 1}\npair = Pair{first = noisy(), count = 2}", .status = 42 },
+        .{ .body = "var tracked = Tracked{value = 42}\nreset(tracked)", .status = 42 },
+        .{ .body = "var pair = Pair{first = Tracked{value = 42}, count = 1}\nreset(pair.first)", .status = 42 },
+        .{ .body = "var tracked = Tracked{value = 7}\nvar index = 0\nloop\n  index += 1\n  if index == 3 -> break\n  tracked = Tracked{value = 40 + index}", .status = 7 },
+    };
+    for (cases) |case| {
+        const source = try std.mem.concat(testing.allocator, u8, &.{
+            \\struct Tracked
+            \\  move = none
+            \\  value: int
+            \\  drop = func(deinit self: Tracked) -> exit(self.value)
+            \\struct Pair
+            \\  first: Tracked
+            \\  count: int
+            \\func noisy() Tracked -> exit(1)
+            \\func reset(mut tracked: Tracked)
+            \\  tracked = noisy()
+            \\
+            ,
+            case.body,
+            "\nexit(2)",
+        });
+        defer testing.allocator.free(source);
+        const fixture = try Fixture.init(source, &.{});
+        defer fixture.deinit();
+        try fixture.expectExit(0, case.status);
+    }
+}
+
+test "mutable parameters replaced in loops end each earlier value once" {
+    for ([_][]const u8{ "move = none", "copy = none" }) |movement| {
+        const source = try std.fmt.allocPrint(testing.allocator,
+            \\struct Tracked
+            \\  {s}
+            \\  value: int
+            \\  drop = func(deinit self: Tracked)
+            \\    if self.value == 50 -> exit(50)
+            \\    self.value = 50
+            \\func make(value: int) Tracked -> Tracked{{value = value}}
+            \\func refill(mut tracked: Tracked, count: int)
+            \\  var index = 0
+            \\  loop
+            \\    index += 1
+            \\    if index > count -> break
+            \\    tracked = make(index + 39)
+            \\func run(count: int) int
+            \\  var tracked = make(7)
+            \\  refill(tracked, count)
+            \\  return tracked.value
+            \\exit(run(3) - run(0) + 7)
+        , .{movement});
+        defer testing.allocator.free(source);
+        const fixture = try Fixture.init(source, &.{});
+        defer fixture.deinit();
+        try fixture.expectExit(0, 42);
+    }
+}
+
+test "a right-hand side that leaves early leaves the replaced place ended once" {
+    const cases = [_]struct { body: []const u8, kind: ?std.meta.Tag(structures.Diagnostic.Kind) = null, status: u8 = 0 }{
+        .{ .body = "func run(c: int) int\n  var pair = Pair{first = make(1), count = 7}\n  pair.first = if c == 1 -> make(2) else return pair.count\n  return pair.first.value\nexit(run(1) * 10 + run(0))", .status = 27 },
+        .{ .body = "func run(c: int) int\n  var tracked = make(1)\n  tracked = if c == 1 -> make(2) else return 7\n  return tracked.value\nexit(run(1) * 10 + run(0))", .status = 27 },
+        .{ .body = "fallible run(c: int) int\n  var pair = Pair{first = make(1), count = 3}\n  pair.first = checked(c)\n  return pair.first.value\nif const result = run(0) -> exit(result) else exit(3)", .status = 3 },
+        .{ .body = "func run(c: int) int\n  var pair = Pair{first = make(1), count = 3}\n  var index = 0\n  loop\n    index += 1\n    pair.first = if index == c -> break else make(index + 1)\n    if index == 5 -> break\n  return pair.count\nexit(run(1))", .status = 3 },
+        .{ .body = "func reset(mut tracked: Tracked, c: int)\n  tracked = if c == 1 -> make(2) else return\nvar tracked = make(1)\nreset(tracked, 0)\nexit(1)", .kind = .replaced_value_used },
+        .{ .body = "func reset(mut tracked: Tracked, c: int)\n  var index = 0\n  loop\n    index += 1\n    tracked = if index == c -> break else make(index)\n    if index == 3 -> break\nvar tracked = make(1)\nreset(tracked, 1)\nexit(1)", .kind = .possibly_transferred },
+        .{ .body = "func run(c: int) int\n  var tracked = make(1)\n  var index = 0\n  loop\n    index += 1\n    tracked = if index == c -> break else make(index)\n    if index == 5 -> break\n  return tracked.value\nexit(run(1))", .kind = .possibly_transferred },
+        .{ .body = "func run() int\n  var pair = Pair{first = make(20), count = 1}\n  borrow first = pair.first\n  pair.first = make(first.value + 22)\n  return pair.first.value\nexit(run())", .kind = .borrow_outlives_source },
+    };
+    for (cases) |case| {
+        const source = try std.mem.concat(testing.allocator, u8, &.{
+            \\struct Tracked
+            \\  move = none
+            \\  value: int
+            \\  drop = func(deinit self: Tracked)
+            \\    if self.value == 50 -> exit(50)
+            \\    self.value = 50
+            \\struct Pair
+            \\  first: Tracked
+            \\  count: int
+            \\func make(value: int) Tracked -> Tracked{value = value}
+            \\fallible checked(value: int) Tracked
+            \\  value > 0
+            \\  return Tracked{value = value}
+            \\
+            ,
+            case.body,
+        });
+        defer testing.allocator.free(source);
+        const fixture = try Fixture.init(source, &.{});
+        defer fixture.deinit();
+        if (case.kind) |kind| try fixture.expectDiagnostic(0, kind) else try fixture.expectExit(0, case.status);
+    }
+}
+
+test "joins place copies of existing values without early cleanup" {
+    const fixture = try Fixture.init(
+        \\struct Tracked
+        \\  move = none
+        \\  copy = trivial
+        \\  value: int
+        \\  drop = func(deinit self: Tracked)
+        \\    if self.value == 50 -> exit(50)
+        \\    self.value = 50
+        \\func make(value: int) Tracked -> Tracked{value = value}
+        \\func look(imm tracked: Tracked) int -> tracked.value
+        \\func bind(c: int) int
+        \\  const a = make(1)
+        \\  const b = if c == 1 -> a else make(2)
+        \\  return b.value * 10 + a.value
+        \\func select(n: int) int
+        \\  const a = make(1)
+        \\  var index = 0
+        \\  const b: Tracked = loop
+        \\    index += 1
+        \\    if index == n -> break a
+        \\    if index == 5 -> break make(3)
+        \\  return b.value * 10 + a.value
+        \\func early(c: int) Tracked
+        \\  const a = make(4)
+        \\  const b = if c == 1
+        \\    return a
+        \\  else
+        \\    make(2)
+        \\  return make(b.value + 3)
+        \\func borrowed(c: int) int
+        \\  const a = make(1)
+        \\  return look(if c == 1 -> a else make(2)) * 10 + a.value
+        \\func total() int -> bind(1) + bind(0) + select(2) + select(7) + early(1).value + early(0).value + borrowed(1) + borrowed(0)
+        \\static compiled = comptime -> total()
+        \\exit(total() + compiled - 188)
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+test "variant copies and transfers construct member by member" {
+    const fixture = try Fixture.init(
+        \\struct Counted
+        \\  value: int
+        \\  copy = func(imm self: Counted) Counted -> Counted{value = self.value + 1}
+        \\  move = func(deinit self: Counted) Counted -> Counted{value = self.value + 10}
+        \\struct Pinned
+        \\  move = none
+        \\  copy = trivial
+        \\  value: int
+        \\func widen() int
+        \\  const small: Counted | none = Counted{value = 0}
+        \\  const copied: Counted | none | int = small
+        \\  var source: Counted | none = Counted{value = 0}
+        \\  const moved: Counted | none | int = source^
+        \\  var total = 0
+        \\  if const counted = copied as Counted -> total += counted.value
+        \\  if const counted = moved as Counted -> total += counted.value
+        \\  return total
+        \\func narrow() int
+        \\  const wide: Counted | Pinned | none = Pinned{value = 20}
+        \\  if const narrowed = wide as Counted | Pinned
+        \\    if const pinned = narrowed as Pinned -> return pinned.value
+        \\  return 0
+        \\exit(widen() + narrow())
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 33);
+    try expectNoRelocation(fixture, "widen");
+    try expectNoRelocation(fixture, "narrow");
+}
+
+test "variant storage changes its immovable member during compile-time execution" {
+    const fixture = try Fixture.init(
+        \\struct First
+        \\  move = none
+        \\  copy = trivial
+        \\  value: int
+        \\struct Second
+        \\  move = none
+        \\  copy = trivial
+        \\  value: int
+        \\func run() int
+        \\  var item: First | Second = First{value = 2}
+        \\  var total = 0
+        \\  if const first = item as First -> total += first.value
+        \\  item = Second{value = 30}
+        \\  if const second = item as Second -> total += second.value
+        \\  item = First{value = 10}
+        \\  if const first = item as First -> total += first.value
+        \\  return total
+        \\static compiled = comptime -> run()
+        \\exit(run() + compiled - 42)
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+test "inferred factories construct fields from their static types in order" {
+    const fixture = try Fixture.init(
+        \\struct Pinned
+        \\  move = none
+        \\  value: int
+        \\struct Holder(T: type)
+        \\  item: T
+        \\  count: int
+        \\fallible step(mut order: int, expected: int) int
+        \\  order == expected
+        \\  order += 1
+        \\  return order
+        \\fallible make(mut order: int, expected: int) Pinned -> Pinned{value = step(order, expected)}
+        \\fallible run() int
+        \\  var order = 0
+        \\  const holder = Holder{item = make(order, 0), count = step(order, 1)}
+        \\  return holder.item.value + holder.count + 39
+        \\if const result = run() -> exit(result) else exit(1)
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+    try expectNoRelocation(fixture, "run");
+}
+
+test "fields end in place when a join transfers them on another path" {
+    const cases = [_][]const u8{ "move = func(deinit self: Item) Item -> exit(90)", "move = none" };
+    for (cases) |movement| {
+        const source = try std.fmt.allocPrint(testing.allocator,
+            \\struct Item
+            \\  value: int
+            \\  {s}
+            \\  drop = func(deinit self: Item) -> exit(self.value)
+            \\struct Holder
+            \\  item: Item
+            \\  count: int
+            \\func take(deinit item: Item) -> ()
+            \\func finish(deinit holder: Holder, flag: int) int
+            \\  if flag == 1 -> take(holder.item)
+            \\  return 7
+            \\exit(finish(Holder{{item = Item{{value = 42}}, count = 2}}, 0))
+        , .{movement});
+        defer testing.allocator.free(source);
+        const fixture = try Fixture.init(source, &.{});
+        defer fixture.deinit();
+        try fixture.expectExit(0, 42);
+    }
+}
+
+test "borrowed standard results copy into a destination" {
+    const fixture = try Fixture.init(
+        \\import std.memory.{read}
+        \\struct Pinned
+        \\  move = none
+        \\  copy = trivial
+        \\  value: int
+        \\fallible run() int
+        \\  const owner = Box(Pinned).new(Pinned{value = 42})
+        \\  const copied: Pinned = read(Pinned, false, owner.borrow())
+        \\  return copied.value
+        \\if const result = run() -> exit(result) else exit(1)
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+test "compile-time field reads skip unfinished sibling construction" {
+    const fixture = try Fixture.init(
+        \\struct Pinned
+        \\  move = none
+        \\  first: int
+        \\  second: int
+        \\struct Holder
+        \\  item: Pinned | none
+        \\  count: int
+        \\struct Outer
+        \\  holder: Holder
+        \\func run(flag: int) int
+        \\  var outer = Outer{holder = Holder{item = none, count = 42}}
+        \\  loop
+        \\    outer.holder.item = Pinned{first = 7, second = if flag == 1 -> break else 2}
+        \\    break
+        \\  return outer.holder.count
+        \\static compiled = comptime -> run(1) + run(0)
+        \\exit(run(1) + run(0) + compiled - 126)
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+test "compile-time joins preserve storage identity before later writes" {
+    const selections = [_][]const u8{
+        "if 1 == 1 -> item else other",
+        "(loop\n    if 1 == 1 -> break item\n    break other\n  )",
+    };
+    for (selections) |selection| {
+        const source = try std.fmt.allocPrint(testing.allocator,
+            \\struct Pinned
+            \\  move = none
+            \\  copy = none
+            \\  value: int
+            \\func make() Pinned -> Pinned{{value = 20}}
+            \\func look(imm item: Pinned, marker: int) int -> item.value
+            \\func from_result() int
+            \\  var item = make()
+            \\  const other = make()
+            \\  return look({s}, if 1 == 1
+            \\    item.value = 42
+            \\    0
+            \\  else 0)
+            \\func from_parameter(mut item: Pinned) int
+            \\  const other = make()
+            \\  return look({s}, if 1 == 1
+            \\    item.value = 42
+            \\    0
+            \\  else 0)
+            \\func run() int
+            \\  var item = make()
+            \\  return from_result() + from_parameter(item)
+            \\static compiled = comptime -> run()
+            \\exit(run() + compiled - 126)
+        , .{ selection, selection });
+        defer testing.allocator.free(source);
+        const fixture = try Fixture.init(source, &.{});
+        defer fixture.deinit();
+        try fixture.expectExit(0, 42);
+    }
+}
+
+test "compile-time execution updates storage in place" {
+    const fixture = try Fixture.init(
+        \\struct Tracked
+        \\  move = none
+        \\  value: int
+        \\struct Pair
+        \\  first: Tracked
+        \\  count: int
+        \\func make(value: int) Tracked -> Tracked{value = value}
+        \\func bump(mut tracked: Tracked)
+        \\  tracked.value += 1
+        \\func look(imm tracked: Tracked) int -> tracked.value
+        \\func run() int
+        \\  var pair = Pair{first = make(0), count = 0}
+        \\  var index = 0
+        \\  loop
+        \\    index += 1
+        \\    bump(pair.first)
+        \\    pair.count += 1
+        \\    if index == 3 -> break
+        \\  pair.first = make(pair.count + 30)
+        \\  const other = make(9)
+        \\  return look(if index == 3 -> pair.first else other) + look(pair.first) - 24
+        \\struct A
+        \\  move = none
+        \\  copy = trivial
+        \\  value: int
+        \\struct B
+        \\  move = none
+        \\  copy = trivial
+        \\  value: int
+        \\func switch_member() int
+        \\  var either: A | B = A{value = 1}
+        \\  var total = 0
+        \\  if const a = either as A -> total += a.value
+        \\  either = B{value = 40}
+        \\  if const b = either as B -> total += b.value
+        \\  return total + 1
+        \\static result = comptime -> run() + switch_member()
+        \\exit(result + run() + switch_member() - 126)
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+test "in-place construction failure cleans completed results" {
+    const cases = [_][]const u8{
+        \\fallible build(value: int) Pair -> Pair{first = Tracked{value = 42}, second = checked(value)}
+        \\if build(0) -> exit(1) else exit(2)
+        ,
+        \\fallible run() int
+        \\  const tracked = checked(42)
+        \\  return 1
+        \\if const result = run() -> exit(result) else exit(2)
+        ,
+        \\fallible run() int
+        \\  if const tracked = checked(42) -> return 1
+        \\  return 2
+        \\if const result = run() -> exit(result) else exit(3)
+        ,
+    };
+    for (cases) |body| {
+        const source = try std.mem.concat(testing.allocator, u8, &.{
+            \\struct Tracked
+            \\  move = none
+            \\  value: int
+            \\  drop = func(deinit self: Tracked) -> exit(self.value)
+            \\struct Pair
+            \\  first: Tracked
+            \\  second: Tracked
+            \\fallible checked(value: int) Tracked
+            \\  value > 0
+            \\  return Tracked{value = value}
+            \\
+            ,
+            body,
+        });
+        defer testing.allocator.free(source);
+        const fixture = try Fixture.init(source, &.{});
+        defer fixture.deinit();
+        try fixture.expectExit(0, 42);
+    }
+}
+
+test "compile-time execution constructs results in their destinations" {
+    const fixture = try Fixture.init(
+        \\struct Cell
+        \\  value: int
+        \\  move = func(deinit self: Cell) Cell -> Cell{value = self.value + 100}
+        \\struct Pair
+        \\  first: Cell
+        \\  second: Cell | none
+        \\func make(value: int) Cell -> Cell{value = value}
+        \\func build(flag: int) Pair -> Pair{first = make(20), second = if flag == 1 -> make(22) else none}
+        \\func total(imm pair: Pair) int
+        \\  if pair.second is Cell -> return pair.first.value + 22
+        \\  return pair.first.value
+        \\func run() int
+        \\  const pair = build(1)
+        \\  const maybe: Cell | none = make(0)
+        \\  if maybe is Cell -> return total(pair)
+        \\  return 0
+        \\static result = comptime -> run()
+        \\exit(result + run() - 42)
     , &.{});
     defer fixture.deinit();
     try fixture.expectExit(0, 42);
@@ -5433,7 +6340,7 @@ test "custom copies and moves retain all possible field origins" {
         \\struct Pair
         \\  first: Ref(Item, true)
         \\  second: Ref(Item, true)
-        \\  {hook}
+        \\  $hook
         \\    return Pair{first = self.second, second = self.first}
         \\fallible run() int
         \\  var first_owner = Box.new(Item{value = 17})
@@ -5441,9 +6348,9 @@ test "custom copies and moves retain all possible field origins" {
         \\  const first = first_owner.borrow_mut()
         \\  const second = second_owner.borrow_mut()
         \\  const source = Pair{first = first, second = second}
-        \\  const copied = {operand}
+        \\  const copied = $operand
         \\  const handle = copied.first
-        \\  {s}
+        \\  $replacement
         \\  return handle[].value
         \\if const result = run() -> exit(result) else exit(1)
     ;
@@ -5451,12 +6358,12 @@ test "custom copies and moves retain all possible field origins" {
         .{ .hook = "copy = func(imm self: Pair) Pair", .operand = "source" },
         .{ .hook = "move = func(deinit self: Pair) Pair", .operand = "source^" },
     }) |case| {
-        const hooked = try std.mem.replaceOwned(u8, testing.allocator, source, "{hook}", case.hook);
-        defer testing.allocator.free(hooked);
-        const operation = try std.mem.replaceOwned(u8, testing.allocator, hooked, "{operand}", case.operand);
-        defer testing.allocator.free(operation);
         inline for (.{ false, true }) |replace_owner| {
-            const edited = try std.mem.replaceOwned(u8, testing.allocator, operation, "{s}", if (replace_owner) "second_owner = Box.new(Item{value = 42})" else "");
+            const edited = try test_sources.renderTemplate(testing.allocator, source, .{
+                .hook = case.hook,
+                .operand = case.operand,
+                .replacement = if (replace_owner) "second_owner = Box.new(Item{value = 42})" else "",
+            });
             defer testing.allocator.free(edited);
             const fixture = try Fixture.init(edited, &.{});
             defer fixture.deinit();

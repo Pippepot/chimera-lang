@@ -142,25 +142,45 @@ static Result = int | none
 static Empty: type = none # annotation disambiguates a type from the value none
 static Default = 40
 
+# Static bindings are also allowed in function and block scope. Their
+# initializers are evaluated at compile time, may use enclosing static
+# parameters and lexically visible local static bindings, and cannot capture
+# runtime parameters or locals. They are immutable and lexically scoped;
+# they do not declare persistent mutable runtime storage.
+func answer(static base: int) int
+    static computed = base + 2
+    return computed
+
 # A variable keeps its declared or inferred type. Assignment evaluates its
 # right-hand side once, widens it to that type when permitted, updates the
 # variable, and evaluates to the updated value. Compound assignment uses the
 # current value as the left operand of the corresponding operation.
 # A field target denotes a path into its mutable root. Compound assignment reads
-# the old leaf before evaluating the right-hand side. The final update rebuilds
-# from the root's value after right-hand-side evaluation, so changes to sibling
+# the old leaf before evaluating the right-hand side. The final update writes
+# the leaf into the root after right-hand-side evaluation, so changes to sibling
 # fields made by that evaluation are preserved.
 c = 40
 c += 2
 
-# 'comptime' evaluates its body at compile time.
+# A static initializer may call an ordinary function. Multi-statement
+# computations belong in the function body.
+func compute() int
+    const value = 40
+    return value + 2
+static result = compute()
+
+# 'comptime' currently evaluates its body at compile time. Once local static
+# bindings and ordinary function-call initializers cover every comptime use
+# case with the same semantics, remove the comptime keyword from the language.
+# Until that coverage is verified, retain it; local static bindings above are
+# required language behavior, not a claim of current compiler support.
 const computed = comptime -> 40 + 2
 const computed_block = comptime
     const value = 40
     value + 2
 
 # Compile-time execution is demand-driven. Static initializers, static call
-# arguments, direct calls used in type positions, and explicit 'comptime'
+# arguments, direct calls used in type positions, and explicit comptime
 # expressions are evaluated only when a consumer needs their result. They use
 # the same typed operations, control flow, calls, evaluation order, coercions,
 # and ownership behavior as runtime code.
@@ -171,11 +191,12 @@ const computed_block = comptime
 # parameter slots, while interpreted arguments are passed through the function's
 # ordinary typed parameter slots for that evaluation.
 #
-# A comptime expression may reference module statics and functions, the
-# enclosing function's static parameters, and bindings declared inside its own
-# body. It cannot capture an enclosing runtime parameter or local, including an
-# immutable local whose current value happens to be known by the compiler.
-# Its result must be representable as a compile-time value.
+# A static initializer or comptime expression may reference module statics and
+# functions, enclosing static parameters, lexically visible local static
+# bindings, and bindings declared inside its own body. It cannot capture an
+# enclosing runtime parameter or local, including an immutable local whose
+# current value happens to be known by the compiler. Its result must be
+# representable as a compile-time value.
 #
 # Compile-time execution is deterministic and has no ambient foreign calls,
 # filesystem or console I/O, clocks, randomness, environment access, or target
@@ -359,9 +380,10 @@ take(a^) # transfer ownership; any subsequent access to 'a' is an error
 # Borrowed aliases and Refs do not grant ownership of their referents.
 #
 # The caller loses access when its deinit argument is prepared. The original
-# storage remains valid through the call and required cleanup. Conflicting
-# borrows are rejected; references to that parameter's own storage cannot
-# escape its lifetime. Contained references retain their independent origins.
+# storage remains valid through the call and required cleanup. Later arguments
+# cannot overwrite that storage. Conflicting borrows are rejected; references
+# to that parameter's own storage cannot escape its lifetime. Contained
+# references retain their independent origins.
 # Later argument failure does not restore ownership; prepared arguments must
 # have valid cleanup, including explicit-drop obligations.
 #
@@ -482,6 +504,23 @@ _ = resource
 # An immovable object retains its address throughout its lifetime, including
 # destruction. Address stability does not extend or retarget existing borrows.
 #
+# A value that cannot move directly is identified with its storage. Field reads
+# view that storage, and a conditional or loop result selecting an existing
+# place borrows it without relocation. A mutable local keeps one storage for
+# its lifetime; field updates, mut arguments, and replacements write in place.
+# Widening such a completed value would relocate it. Copying or transferring it
+# into a larger variant constructs its active member in that destination, and
+# extraction to a smaller variant copies the member. A fresh member result
+# constructs in the larger destination's member storage, but a fresh result of
+# a narrower variant is already complete and cannot widen. The destination type
+# must be known before construction: from an annotation, an expected type, or
+# conditional branches whose types are known without evaluation. Loop breaks of
+# different types therefore need an annotation, as do arguments that infer
+# static parameters, which are evaluated before their parameter types are known.
+# An imm argument of a narrower type borrows a temporary of the parameter type
+# valid through the call. A fresh argument constructs there; an existing value
+# is viewed there only if it can move directly.
+#
 # An ordinary named local is an existing object, not a pending initializer.
 # Returning it bare copies; returning it with '^' requests movement. Last use
 # does not implicitly transfer it, and optional named-return elision cannot
@@ -505,6 +544,17 @@ func make_named() Immovable
 # does not permit destroying a source before copying it, overlapping source
 # and destination storage, or staging and relocating an immovable value.
 # Replacement forms without a valid lifetime and storage plan are rejected.
+# Replacing a value that cannot move directly, or a field of such a type,
+# constructs the right-hand side in the same storage. The old value therefore
+# ends before construction, and the right-hand side cannot use the replaced
+# place, a place containing it, or a borrow of either; sibling fields remain
+# usable. Read or transfer the old value in an earlier statement instead:
+const current = item.value
+item = make(current + 1)
+# A path that leaves the right-hand side early, by return, failure, break, or
+# continue, leaves the place uninitialized as after a transfer. A replaced field
+# therefore needs parents that permit a missing field, and a mut parameter
+# cannot return from within its own replacement.
 
 
 # Deferred initializer parameters
@@ -720,8 +770,7 @@ func forward_initializer(static T: type, init item: T) T
 # borrow_local(T, imm item: T) borrows the storage of a named local, parameter,
 # alias, or a field path rooted in one of them; it rejects temporary projections.
 # The borrow refers to the original storage. Replacing or transferring the root
-# or any of its fields invalidates the borrow, including changes to siblings:
-# local field updates rebuild the aggregate rather than updating pinned storage.
+# or any of its fields invalidates the borrow, including changes to siblings.
 # A direct-passed parameter's storage belongs to the callee and cannot escape.
 # An optional `from(name, ...)` after a function's borrowed return type names
 # all parameters whose origins the result may retain. Every returned path must
@@ -856,6 +905,40 @@ const inferred_wrapper = Wrapper{value = 42}
 # factory's static parameters and is specialized with that generated type.
 # A struct directly returned from a function uses the function's name in
 # diagnostics, including when its result is stored in a static alias.
+
+# Static structs
+# 'static struct' is a struct expression modifier: it produces a nominal struct
+# type whose instances may exist only during compile-time execution. The named
+# declaration 'static struct Name' is sugar for 'static Name = static struct'.
+# The binding's static modifier governs evaluation and immutability of the
+# binding; the struct's static modifier governs runtime eligibility of instances.
+# A parameterized static struct declares a type-valued factory returning a
+# static struct, with every factory parameter implicitly static.
+# Declared and generated static structs follow ordinary struct identity,
+# specialization, initialization, visibility, namespace, and ownership rules.
+# The modifier is preserved through aliases and factory specializations; it
+# does not introduce structural identity or change the source-site identity rule.
+#
+# Static struct instances are compile-time data, not deferred expressions.
+# They may be stored in static bindings, supplied as static arguments, and
+# constructed, read, mutated, copied, moved, and dropped during compile-time
+# execution as their ordinary access and ownership capabilities permit. Local
+# const and var bindings inside compile-time execution may hold such instances;
+# the struct modifier does not itself make instances or fields immutable.
+# They have no runtime storage layout, rather than a zero-sized runtime layout,
+# and cannot be materialized in runtime bindings, arguments, results, or storage.
+# An ordinary parameter or result of a compile-time-only type restricts that
+# function to compile-time execution. A static parameter of that type does not
+# prevent runtime execution of the specialized function.
+#
+# Structs, tuples, and variants whose stored contents include a compile-time-only
+# type are themselves compile-time-only, even without an explicit modifier.
+# Namespace declarations do not contribute stored contents. Ordinary structs
+# remain usable during compile-time execution without the modifier. Static
+# structs do not force their uses to execute at compile time; a use requiring
+# runtime materialization is a source error. Namespace functions are not
+# implicitly compile-time-only and may produce runtime-capable values using
+# static arguments without carrying static struct instances into runtime storage.
 
 # Every struct definition introduces a distinct nominal type. Static aliases
 # preserve that identity; equal field names and types do not make separately
@@ -1043,10 +1126,15 @@ reassigned = int_or_float_value
 # value parameter, which receives the converted expression; every other
 # parameter is static and inferred from the source and target types together.
 # A static parameter that neither type determines is an error. The value
-# parameter's mode follows its type: static for a compile-time-only type such as
-# int_literal, init for collection_literal, and imm otherwise, so inserting a
-# converter never consumes an existing value. Converters are not fallible.
+# parameter's mode follows its type: static for a compile-time-only type,
+# including static structs and int_literal, init for collection_literal, and
+# imm otherwise, so inserting a converter never consumes an existing value.
+# Converters are not fallible.
 # Bodies, `where` clauses, and reference origins follow ordinary function rules.
+# A static source argument is evaluated at compile time; it does not require
+# the converter body to execute at compile time. A converter may construct a
+# runtime-capable result at runtime, but cannot retain compile-time-only values
+# in that result's runtime storage.
 struct Degrees
     value: float
 struct Radians
@@ -1100,6 +1188,10 @@ const read_only = Ref(int, false)(handle)
 # of type T, consumed only through init parameters, including converters. It
 # cannot be bound or stored. Construction evaluates the elements in source order
 # into N consecutive element destinations.
+# This is a construction-only expression, not a static struct value. Its shape
+# is known during compilation, but its elements execute in the phase where
+# construction occurs, including runtime expressions during runtime construction.
+# Constant elements alone do not force compile-time execution.
 #
 # When the selected converter's target determines T, each element is checked
 # against T with its own conversion. Otherwise elements take their default types

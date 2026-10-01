@@ -2131,7 +2131,7 @@ test "ownership effects compose across calls joins scopes and partial aggregates
             \\inspect(if 1 < 2 -> resource else Resource{})
             \\exit(0)
             ,
-            .expected = 0,
+            .expected = 42,
         },
         .{
             .source =
@@ -8403,19 +8403,86 @@ test "deinit mode edits invalidate caller and callee calling conventions" {
     const db = try testDatabase(1);
     defer db.deinit();
     const source =
-        \\func take({mode} value: int) int -> value
+        \\func take($mode value: int) int -> value
         \\func answer() int
         \\  const callee = take
         \\  return callee(42)
     ;
     for ([_][]const u8{ "imm", "deinit", "imm" }, 0..) |mode, index| {
-        const edited = try std.mem.replaceOwned(u8, testing.allocator, source, "{mode}", mode);
+        const edited = try test_sources.renderTemplate(testing.allocator, source, .{ .mode = mode });
         defer testing.allocator.free(edited);
         if (index == 0) try addSource(db, 1, edited) else try setSource(db, 1, edited);
         try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "take" }, 42);
         const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
         const body = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = scope.resolveFunction("take").? })).*.?;
         try testing.expectEqual(if (index == 1) structures.ParameterMode.deinit else .imm, body.parameter_modes[0]);
+    }
+}
+
+test "movability edits switch results between value and in-place construction" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    const source =
+        \\static Item = struct
+        \\  move = $move
+        \\  value: int
+        \\func make() Item -> Item{value = 42}
+        \\func answer() int
+        \\  const item = make()
+        \\  return item.value
+    ;
+    for ([_][]const u8{ "fieldwise", "none", "fieldwise" }, 0..) |move, index| {
+        const edited = try test_sources.renderTemplate(testing.allocator, source, .{ .move = move });
+        defer testing.allocator.free(edited);
+        if (index == 0) try addSource(db, 1, edited) else try setSource(db, 1, edited);
+        try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "make" }, 42);
+        const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
+        const body = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = scope.resolveFunction("make").? })).*.?;
+        var constructed_in_place = false;
+        var initialized_value = false;
+        for (body.instructions) |instruction| {
+            if (instruction == .result_storage) constructed_in_place = true;
+            if (instruction == .struct_init) initialized_value = true;
+        }
+        try testing.expectEqual(index == 1, constructed_in_place);
+        try testing.expectEqual(index != 1, initialized_value);
+    }
+}
+
+test "movability edits switch mutable locals between rebuilt and in-place updates" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    const source =
+        \\static Item = struct
+        \\  move = $move
+        \\  value: int
+        \\func bump(mut item: Item)
+        \\  item.value += 1
+        \\func answer() int
+        \\  var item = Item{value = 39}
+        \\  bump(item)
+        \\  item.value += 1
+        \\  const current = item.value
+        \\  item = Item{value = current + 1}
+        \\  return item.value
+    ;
+    for ([_][]const u8{ "fieldwise", "none", "fieldwise" }, 0..) |move, index| {
+        const edited = try test_sources.renderTemplate(testing.allocator, source, .{ .move = move });
+        defer testing.allocator.free(edited);
+        if (index == 0) try addSource(db, 1, edited) else try setSource(db, 1, edited);
+        try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "bump" }, 42);
+        const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
+        const body = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = scope.resolveFunction("answer").? })).*.?;
+        var updated_in_place = false;
+        var rebuilt = false;
+        for (body.instructions) |instruction| switch (instruction) {
+            .local_storage => updated_in_place = true,
+            .call_mut_argument => |argument| try testing.expectEqual(index == 1, argument.destination != null),
+            .field_update => rebuilt = true,
+            else => {},
+        };
+        try testing.expectEqual(index == 1, updated_in_place);
+        try testing.expectEqual(index != 1, rebuilt);
     }
 }
 

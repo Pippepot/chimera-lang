@@ -170,7 +170,11 @@ fn renderInstruction(
             try renderType(extraction.target_type, writer);
             try writer.writeByte('\n');
         },
-        .callable_coerce => |coercion| try writer.print("    %{d} = callable_coerce %{d}\n", .{ result, @intFromEnum(coercion.operand) }),
+        .callable_coerce => |coercion| {
+            try writer.print("    %{d} = callable_coerce %{d}", .{ result, @intFromEnum(coercion.operand) });
+            if (coercion.destination) |storage| try writer.print(" into %{d}", .{@intFromEnum(storage)});
+            try writer.writeByte('\n');
+        },
         .struct_init => |operation| {
             try writer.print("    %{d} = struct_init ", .{result});
             try renderType(operation.type_id, writer);
@@ -184,6 +188,16 @@ fn renderInstruction(
         .box_init => |operation| {
             try writer.print("    %{d} = box_init %{d} ", .{ result, @intFromEnum(operation.allocation) });
             try renderType(operation.box_type, writer);
+            try writer.writeByte('\n');
+        },
+        .local_storage => |type_id| {
+            try writer.print("    %{d} = local_storage ", .{result});
+            try renderType(type_id, writer);
+            try writer.writeByte('\n');
+        },
+        .result_storage => |type_id| {
+            try writer.print("    %{d} = result_storage ", .{result});
+            try renderType(type_id, writer);
             try writer.writeByte('\n');
         },
         .storage_projection => |operation| {
@@ -233,7 +247,11 @@ fn renderInstruction(
             operation.parameter_index,
             @intFromEnum(operation.value),
         }),
-        .call_mut_argument => |operation| try writer.print("    %{d} = call_mut_argument {d}\n", .{ result, operation.argument_index }),
+        .call_mut_argument => |operation| {
+            try writer.print("    %{d} = call_mut_argument {d}", .{ result, operation.argument_index });
+            if (operation.destination) |storage| try writer.print(" into %{d}", .{@intFromEnum(storage)});
+            try writer.writeByte('\n');
+        },
         .call => |call| {
             try writer.print("    %{d} = call ", .{result});
             try renderCallTarget(db, call.target, writer);

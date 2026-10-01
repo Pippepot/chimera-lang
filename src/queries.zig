@@ -2671,6 +2671,7 @@ fn internInterpretedValue(ctx: anytype, result_type: structures.TypeId, value: c
             break :blk ctx.intern(CompileTimeValues, .{ .type = type_id });
         },
         .runtime => |runtime| ctx.intern(CompileTimeValues, .{ .runtime = .{ .type_id = result_type, .value = runtime } }),
+        .place => unreachable,
     };
 }
 
@@ -2822,6 +2823,17 @@ fn ComptimeCallExecutor(comptime Context: type) type {
 
         pub fn variantMembers(self: *@This(), type_id: structures.TypeId) !?[]const structures.TypeId {
             return lookupVariantMembers(self.ctx, type_id);
+        }
+
+        pub fn argumentPassing(self: *@This(), type_id: structures.TypeId) !structures.ArgumentPassing {
+            const facts: TypeFacts(Context) = .{ .ctx = self.ctx };
+            return facts.argumentPassing(type_id);
+        }
+
+        pub fn structFieldCount(self: *@This(), type_id: structures.TypeId) !?usize {
+            const facts: TypeFacts(Context) = .{ .ctx = self.ctx };
+            const definition = (try facts.structDefinition(type_id)) orelse return null;
+            return definition.fields.len;
         }
     };
 }

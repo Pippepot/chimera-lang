@@ -1163,6 +1163,7 @@ pub const CallMutArgument = struct {
     return_type: TypeId,
     argument_index: u32,
     type_id: TypeId,
+    destination: ?FunctionValueId = null,
 };
 
 pub const FunctionInstruction = union(enum) {
@@ -1179,6 +1180,8 @@ pub const FunctionInstruction = union(enum) {
     callable_coerce: VariantOperation,
     struct_init: StructOperation,
     box_init: BoxInitOperation,
+    local_storage: TypeId,
+    result_storage: TypeId,
     storage_projection: StorageProjection,
     allocation_element: AllocationElement,
     borrow_box: BorrowOperation,
@@ -1199,7 +1202,7 @@ pub const FunctionInstruction = union(enum) {
 
     pub fn operands(self: *FunctionInstruction) [2]?*FunctionValueId {
         return switch (self.*) {
-            .const_int, .const_byte, .const_bool, .const_type, .const_unit, .const_none, .function_ref, .struct_init, .call_mut_argument => .{ null, null },
+            .const_int, .const_byte, .const_bool, .const_type, .const_unit, .const_none, .function_ref, .struct_init, .local_storage, .result_storage => .{ null, null },
             .variant_tag, .negi => |*operand| .{ operand, null },
             .variant_coerce, .variant_extract, .callable_coerce => |*operation| .{ &operation.operand, if (operation.destination) |*destination| destination else null },
             .box_init => |*operation| .{ &operation.allocation, null },
@@ -1209,6 +1212,7 @@ pub const FunctionInstruction = union(enum) {
             .borrow_address => |*operation| .{ &operation.source, null },
             .borrow_write => |*operation| .{ &operation.reference, &operation.value },
             .value_copy => |*operation| .{ &operation.source, if (operation.destination) |*destination| destination else null },
+            .call_mut_argument => |*operation| .{ if (operation.destination) |*destination| destination else null, null },
             .field_access => |*operation| .{ &operation.operand, null },
             .field_update => |*operation| .{ &operation.operand, &operation.value },
             .mut_parameter_write => |*operation| .{ &operation.value, null },
@@ -1229,6 +1233,7 @@ pub const FunctionInstruction = union(enum) {
             .variant_coerce, .variant_extract, .callable_coerce => |operation| if (operation.destination == null) operation.target_type else .unit,
             .struct_init => |operation| operation.type_id,
             .box_init => |operation| operation.box_type,
+            .local_storage, .result_storage => |type_id| type_id,
             .storage_projection => |operation| operation.type_id,
             .allocation_element => |operation| operation.type_id,
             .borrow_box, .borrow_read => |operation| operation.type_id,
@@ -1238,7 +1243,7 @@ pub const FunctionInstruction = union(enum) {
             .field_access => |operation| operation.field_type,
             .field_update => |operation| operation.type_id,
             .mut_parameter_write => .unit,
-            .call_mut_argument => |operation| operation.type_id,
+            .call_mut_argument => |operation| if (operation.destination == null) operation.type_id else .unit,
             .call => |call| if (call.destination == null) call.return_type else .unit,
         };
     }
@@ -1549,6 +1554,8 @@ pub const Diagnostic = struct {
         overlapping_mutable_arguments,
         use_after_transfer,
         possibly_transferred,
+        replaced_value_used,
+        consumed_storage_in_use,
         borrow_outlives_source,
         invalid_return_origin,
         return_origin_not_declared,
@@ -1558,6 +1565,7 @@ pub const Diagnostic = struct {
         reference_not_writable,
         transferred_value_not_restored_before_loop_backedge,
         type_not_movable: TypeId,
+        relocation_requires_direct_move: TypeId,
         type_not_copyable: TypeNotCopyable,
         buffer_cannot_store_borrow_element: TypeId,
         buffer_requires_automatic_drop: TypeId,

@@ -15,7 +15,16 @@
   types share operation selection; runtime and compile-time calls invoke the
   selected hooks once. Reserved names and invalid ownership definitions are
   checked before availability, including capability edits and snapshot reuse.
-  General final-destination construction remains part of milestone 1.
+- Owning initialization of a type that cannot move directly constructs in its
+  final destination: bindings, owned arguments, assignments, struct fields,
+  variant payloads, conditional and loop results, direct, indirect, and fallible
+  call results, ownership members, and function results. Named locals copy or
+  explicitly move into a destination, partial construction cleans completed
+  fields, and runtime and compile-time execution share the typed destinations.
+  Such values keep their storage: field reads and joins view it, mutable locals
+  update fields, `mut` arguments, and replacements in place, variant copies and
+  transfers construct member by member, and fresh `imm` arguments construct in
+  widened temporaries.
 - Typed SSA covers calls, static specialization, callable values, variants, joins, loops, divergence, and fallible control flow. Compile-time thunks and specialized calls evaluate through typed IR, including structs, hooks, and type-valued functions; local captures remain unsupported.
 - Ownership tracks root and supported field transfers, borrowed and owned parameters, mutable copy-back, inferred `Ref` origins, and path-sensitive ASAP cleanup. `deinit` consumes owned places in place, rejects borrowed sources, and lets custom move hooks transfer fields. Unfinished sources clean up remaining automatic fields without waiving explicit-field obligations. Fresh variant arguments, later argument failure, compile-time execution, and parameter-mode edits across query/cache reuse are covered. The internal calling convention derives direct or address-passed arguments from ownership capabilities and consuming access; codegen owns physical argument layout. `Box` and `Buffer` provide host storage; `Ref` and scoped aliases retain checked origins for named places and supported fields, but not temporary projections.
 - Compiler-provided `extern func` declarations use named std identities and ordinary calls. `std.exit.exit` is exported by the prelude, with distinct runtime termination and compile-time compiler control.
@@ -46,14 +55,8 @@ Implement the accepted construction and ownership rules in
 [syntax&semantics.txt](syntax&semantics.txt). Replace the current Box-specific
 construction paths and ownership-hook conventions with this general model.
 
-- Generalize destination construction across bindings, fields, variants,
-  control-flow results, owned parameters, direct/indirect calls, returns, and
-  allocations. Keep copy and move capabilities independent. Fresh results need
-  no intermediate move; returning a named local still copies or explicitly
-  moves it. Do not make validity depend on optional return-value elision.
 - Complete `deinit` consuming access across every place and result shape,
-  including source and result lifetime rules. Extend general destination
-  construction through the existing `T.copy` and `T.move` callable boundaries.
+  including source and result lifetime rules.
 - Add nonescaping `init` parameters: each successful path constructs or
   forwards each parameter exactly once, while earlier failure may skip it.
   Construction occurs when a destination is supplied; forwarding does not
@@ -95,13 +98,27 @@ It replaces the temporary name-matched opaque storage owners in `std.memory`.
 
 ### 3. Converters and literal types
 
+- Implement `static struct` expressions and named and parameterized declaration
+  sugar from [syntax&semantics.txt](syntax&semantics.txt). Preserve ordinary
+  nominal identity, visibility, namespace, and ownership rules. Track
+  compile-time-only eligibility independently of ownership and propagate it
+  through stored struct fields, tuple elements, and variant members; reject
+  runtime materialization at the owning type boundary, not as a backend layout
+  failure. Static parameters may still feed runtime-capable specializations.
+- Verify static struct construction, local mutation, hooks, ordinary calls
+  during compile-time execution, static arguments used by runtime functions,
+  runtime storage and call rejection, aggregate propagation, aliases, and
+  generated identities. Cover diagnostics, incremental recomputation, and
+  cache reuse when the modifier or a contained type's runtime eligibility changes.
 - Add `converter` declarations owned by the module of their source or target
   type, with pub/private visibility, static parameters inferred from both
   types, and `imm`, `static`, or `init` value parameters as the spec requires.
   Insert conversions only at known expected types, including one variant
   member followed by widening; report missing and ambiguous candidates at the
   use. Add explicit `T(value)`. Publish inserted conversions as ordinary typed
-  calls.
+  calls. Static struct sources use static value parameters; their converters
+  may construct runtime-capable results at runtime without retaining
+  compile-time-only values in runtime storage.
 - Give integer literals the `int_literal` type, fold a directly applied unary
   minus into the literal, and replace the compiler's byte literal rule with a
   `std` converter whose `where` clause checks the range.
@@ -131,7 +148,9 @@ It replaces the temporary name-matched opaque storage owners in `std.memory`.
 - Add `[a, b]` collection literals typed `collection_literal(T, N)`. List's
   `init` converter allocates before constructing elements in place through
   `unsafe_initialize_all`. Reject literals without an expected type until
-  `Array(T, N)` exists as their default.
+  `Array(T, N)` exists as their default. Keep deferred construction distinct
+  from static struct data: elements execute in the construction phase and may
+  be runtime expressions.
 - Define an open iteration contract for Range, List, and user types before
   implementing `for x in iterable`; do not hard-code iterable types or assume
   traits. Start with read-only items, then specify mutation/consumption,
@@ -177,6 +196,18 @@ It replaces the temporary name-matched opaque storage owners in `std.memory`.
 
 ## Deferred or independent work
 
+- Implement local `static` bindings specified in
+  [syntax&semantics.txt](syntax&semantics.txt), including ordinary function-call
+  initializers, lexical scope, enclosing static parameters, and references to
+  local static bindings. The parser currently accepts local bindings, but
+  semantic analysis rejects them as nested declarations. Verify that static
+  bindings, extracting multi-statement computations into ordinary functions
+  where needed, cover every `comptime` use case: inline and block results,
+  type-valued results, specialization, runtime-capture rejection, demand-driven
+  evaluation, fallible and diverging control flow, ownership, diagnostics,
+  incremental recomputation, and cache reuse. If static bindings cover all cases,
+  remove the `comptime` keyword from the language and migrate its uses; retain
+  it until equivalence is established.
 - Borrowing temporary projections needs a lifetime-extension rule beyond the
   currently supported named places and dereferenced Refs.
 - Shared owners require specified atomic ownership, weak-reference, and cycle

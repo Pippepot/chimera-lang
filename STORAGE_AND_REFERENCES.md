@@ -24,9 +24,9 @@ The implemented host API provides typed allocation and unsafe indexed access,
 `Box(T)` owners, copyable `Ref(T, writable)` handles, scoped aliases, and
 `Buffer(T)` with checked element access and borrowed `BufferView(T)` slices.
 The accepted ownership, access, construction, and failure rules are recorded in
-[syntax&semantics.txt](syntax&semantics.txt). General destination construction,
-deferred `init` arguments, and consuming access through `deinit` are accepted
-changes awaiting implementation in [milestone 1](ROADMAP.md#1-destination-construction-and-consuming-access).
+[syntax&semantics.txt](syntax&semantics.txt). Deferred `init` arguments and the
+Box constructor built on them are accepted changes awaiting implementation in
+[milestone 1](ROADMAP.md#1-destination-construction-and-consuming-access).
 The target, provider, location, and address-space contract below is accepted,
 but provider selection, device locations, and address spaces are not public APIs.
 
@@ -198,8 +198,8 @@ relocated into a Box.
 
 `Box.new(owner.borrow()[])` explicitly creates a distinct allocation by copying
 the pointee. The general constructor replaces the separate duplication API and
-Box-specific initializer preparation. Current compiler support covers only a
-subset of destination construction; milestone 1 completes the general contract.
+Box-specific initializer preparation, which the compiler still uses until
+milestone 1 provides `init` parameters.
 
 An eventual shared owner (name unsettled) would share ownership of one initialized
 `T` and its control block.

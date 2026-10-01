@@ -301,6 +301,7 @@ fn validFunctionBody(body: structures.FunctionBodyAnalysis) bool {
         const valid = switch (instruction) {
             .variant_coerce, .variant_extract, .callable_coerce => |operation| validVariantOperation(operation, body),
             .struct_init => |operation| validRange(operation.fields, body.struct_field_values.len),
+            .result_storage => |type_id| type_id == body.return_type,
             .borrow_address => |operation| validRange(operation.fields, body.borrow_fields.len),
             .mut_parameter_write => |operation| operation.parameter_index < entry.argument_end - entry.argument_start,
             .call_mut_argument => |operation| validRange(operation.arguments, body.call_arguments.len) and
@@ -472,6 +473,11 @@ test "cached body validation rejects invalid control flow and argument indexes" 
     try std.testing.expect(!(try validReferenceOperations(db, body)));
 
     instructions[0] = .{ .value_copy = .{ .source = @enumFromInt(0), .type_id = variant_type, .destination = @enumFromInt(999) } };
+    try std.testing.expect(!validFunctionBody(body));
+
+    instructions[0] = .{ .result_storage = .unit };
+    try std.testing.expect(validFunctionBody(body));
+    instructions[0] = .{ .result_storage = pair_type };
     try std.testing.expect(!validFunctionBody(body));
 
     const reference_item = (try db.get(queries.ModuleDeclarations, module)).*.?.resolveStatic("IntRef").?;
@@ -666,6 +672,96 @@ test "in-place Box initializer bodies restore from disk" {
     try std.testing.expect(has_in_place_fields);
     const restored = (try second.get(queries.BuildExecutable, 0)).* orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualSlices(u8, original.bytes, restored.bytes);
+}
+
+test "in-place bodies restore and invalidate movability edits" {
+    const modules = @import("modules.zig");
+    const runtime = @import("runtime.zig");
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const source =
+        \\struct Item
+        \\  move = none
+        \\  value: int
+        \\struct Pair
+        \\  first: Item
+        \\  second: Item | none
+        \\func make(value: int) Item -> Item{value = value}
+        \\func bump(mut item: Item)
+        \\  item.value += 1
+        \\func build() Pair -> Pair{first = make(20), second = if 1 < 2 -> make(22) else none}
+        \\func update() int
+        \\  var pair = build()
+        \\  var index = 0
+        \\  loop
+        \\    index += 1
+        \\    bump(pair.first)
+        \\    if index == 2 -> break
+        \\  const current = pair.first.value
+        \\  pair.first = make(current)
+        \\  return pair.first.value
+        \\exit(update() + 20)
+    ;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(directory);
+    const digest = cache.querySnapshotKey(try cache.compilerDigest(io), "main.chi", &.{});
+
+    const first = try query.Database.init(allocator, .{ .worker_count = 2 });
+    defer first.deinit();
+    try modules.registerSources(first, allocator, source, &.{}, &.{});
+    const original = (try first.get(queries.BuildExecutable, 0)).* orelse return error.TestUnexpectedResult;
+    const first_scope = (try first.get(queries.BuildModuleScope, 0)).*.?;
+    const original_build = (try first.get(queries.AnalyzeFunctionInstance, .{ .item = first_scope.resolveFunction("build").? })).*.?;
+    const original_update = (try first.get(queries.AnalyzeFunctionInstance, .{ .item = first_scope.resolveFunction("update").? })).*.?;
+    try save(io, allocator, directory, digest, first);
+    const payload = (try cache.load(io, allocator, directory, digest)) orelse return error.TestUnexpectedResult;
+    defer allocator.free(payload);
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+
+    const second = try query.Database.init(allocator, .{ .worker_count = 2 });
+    defer second.deinit();
+    const offset = try restoreInterns(second, allocator, payload);
+    try modules.registerSources(second, allocator, source, &.{}, &.{});
+    const imported = try restoreQueries(second, payload, offset);
+    try std.testing.expect(imported > 0);
+    const second_scope = (try second.get(queries.BuildModuleScope, 0)).*.?;
+    const restored_build = (try second.get(queries.AnalyzeFunctionInstance, .{ .item = second_scope.resolveFunction("build").? })).*.?;
+    const restored_update = (try second.get(queries.AnalyzeFunctionInstance, .{ .item = second_scope.resolveFunction("update").? })).*.?;
+    try std.testing.expect(structures.FunctionBodyAnalysis.eql(original_build, restored_build));
+    try std.testing.expect(structures.FunctionBodyAnalysis.eql(original_update, restored_update));
+    var constructed_in_place = false;
+    for (restored_build.instructions) |instruction| if (instruction == .result_storage) {
+        constructed_in_place = true;
+    };
+    try std.testing.expect(constructed_in_place);
+    var updated_in_place = false;
+    for (restored_update.instructions) |instruction| if (instruction == .call_mut_argument) {
+        updated_in_place = instruction.call_mut_argument.destination != null;
+    };
+    try std.testing.expect(updated_in_place);
+    const restored = (try second.get(queries.BuildExecutable, 0)).* orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, original.bytes, restored.bytes);
+    try runtime.writeProgram(io, restored.bytes);
+    try std.testing.expectEqual(@as(u8, 42), try runtime.runProg(io, allocator, &.{}));
+
+    const edited_source = try std.mem.replaceOwned(u8, allocator, source, "move = none", "move = fieldwise");
+    defer allocator.free(edited_source);
+    const third = try query.Database.init(allocator, .{ .worker_count = 2 });
+    defer third.deinit();
+    const edited_offset = try restoreInterns(third, allocator, payload);
+    try modules.registerSources(third, allocator, edited_source, &.{}, &.{});
+    try std.testing.expect((try restoreQueries(third, payload, edited_offset)) < imported);
+    const edited = (try third.get(queries.BuildExecutable, 0)).* orelse return error.TestUnexpectedResult;
+    const cold = try query.Database.init(allocator, .{ .worker_count = 2 });
+    defer cold.deinit();
+    try modules.registerSources(cold, allocator, edited_source, &.{}, &.{});
+    const rebuilt = (try cold.get(queries.BuildExecutable, 0)).* orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, rebuilt.bytes, edited.bytes);
+    try std.testing.expect(!std.mem.eql(u8, original.bytes, edited.bytes));
+    try runtime.writeProgram(io, edited.bytes);
+    try std.testing.expectEqual(@as(u8, 42), try runtime.runProg(io, allocator, &.{}));
 }
 
 test "deinit bodies restore and invalidate when parameter modes change" {
