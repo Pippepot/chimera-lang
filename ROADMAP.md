@@ -26,7 +26,7 @@
   transfers construct member by member, and fresh `imm` arguments construct in
   widened temporaries.
 - Typed SSA covers calls, static specialization, callable values, variants, joins, loops, divergence, and fallible control flow. Compile-time thunks and specialized calls evaluate through typed IR, including structs, hooks, and type-valued functions; local captures remain unsupported.
-- Ownership tracks root and supported field transfers, borrowed and owned parameters, mutable copy-back, inferred `Ref` origins, and path-sensitive ASAP cleanup. `deinit` consumes owned places in place, rejects borrowed sources, and lets custom move hooks transfer fields. Unfinished sources clean up remaining automatic fields without waiving explicit-field obligations. Fresh variant arguments, later argument failure, compile-time execution, and parameter-mode edits across query/cache reuse are covered. The internal calling convention derives direct or address-passed arguments from ownership capabilities and consuming access; codegen owns physical argument layout. `Box` and `Buffer` provide host storage; `Ref` and scoped aliases retain checked origins for named places and supported fields, but not temporary projections.
+- Ownership tracks root and supported field transfers, borrowed and owned parameters, mutable copy-back, inferred `Ref` origins, and path-sensitive ASAP cleanup. `deinit` consumes owned roots and fields in place, including conditional and loop selections, constructs fresh arguments in call-lived storage, rejects borrowed sources, and lets custom move hooks transfer fields. Storage joins retain addresses independently of movability. Unfinished sources clean up remaining automatic fields without waiving explicit-field obligations. Later argument failure, contained reference origins, runtime and compile-time execution, and parameter-mode and movability edits across query/cache reuse are covered. The internal calling convention derives direct or address-passed arguments from ownership capabilities and consuming access; codegen owns physical argument layout. `Box` and `Buffer` provide host storage; `Ref` and scoped aliases retain checked origins for named places and supported fields, but not temporary projections.
 - Compiler-provided `extern func` declarations use named std identities and ordinary calls. `std.exit.exit` is exported by the prelude, with distinct runtime termination and compile-time compiler control.
 - Host-only `std.memory` provides checked typed allocation, unsafe indexed
   transfers and destruction, `Box(T)` with automatic destruction, copyable
@@ -55,8 +55,6 @@ Implement the accepted construction and ownership rules in
 [syntax&semantics.txt](syntax&semantics.txt). Replace the current Box-specific
 construction paths and ownership-hook conventions with this general model.
 
-- Complete `deinit` consuming access across every place and result shape,
-  including source and result lifetime rules.
 - Add nonescaping `init` parameters: each successful path constructs or
   forwards each parameter exactly once, while earlier failure may skip it.
   Construction occurs when a destination is supplied; forwarding does not

@@ -378,12 +378,19 @@ take(a^) # transfer ownership; any subsequent access to 'a' is an error
 # Binding the parameter invokes no copy or move hook and does not require
 # movability. A fresh argument constructs in storage valid through the call.
 # Borrowed aliases and Refs do not grant ownership of their referents.
+# Consuming access follows conditional results and loop break results: only
+# the selected owning place is consumed, and its original storage reaches the
+# callee. Fresh results construct in call-lived storage. An existing place must
+# have exactly the parameter type; widening must not relocate it. A known
+# parameter type supplies the construction context for fresh selected results.
 #
 # The caller loses access when its deinit argument is prepared. The original
 # storage remains valid through the call and required cleanup. Later arguments
 # cannot overwrite that storage. Conflicting borrows are rejected; references
 # to that parameter's own storage cannot escape its lifetime. Contained
 # references retain their independent origins.
+# After a selection, a source is available only if every incoming path retains
+# it. Later arguments cannot overwrite any source the selection may consume.
 # Later argument failure does not restore ownership; prepared arguments must
 # have valid cleanup, including explicit-drop obligations.
 #
@@ -506,8 +513,10 @@ _ = resource
 #
 # A value that cannot move directly is identified with its storage. Field reads
 # view that storage, and a conditional or loop result selecting an existing
-# place borrows it without relocation. A mutable local keeps one storage for
-# its lifetime; field updates, mut arguments, and replacements write in place.
+# place borrows it without relocation in an ordinary expression; a deinit
+# argument instead propagates consuming access to the selected result.
+# A mutable local keeps one storage for its lifetime; field updates, mut
+# arguments, and replacements write in place.
 # Widening such a completed value would relocate it. Copying or transferring it
 # into a larger variant constructs its active member in that destination, and
 # extraction to a smaller variant copies the member. A fresh member result

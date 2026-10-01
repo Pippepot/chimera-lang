@@ -93,16 +93,16 @@ fn ensureAddressableStackRange(offset: u32, byte_size: u32) error{FunctionTooLar
     if (last_byte > std.math.maxInt(i32)) return error.FunctionTooLarge;
 }
 
-fn blockArgumentLayout(types: anytype, type_id: structures.TypeId) !structures.TypeLayout {
-    if (try types.facts().argumentPassing(type_id) == .indirect) return indirect_layout;
-    return types.layout(type_id);
+fn blockArgumentLayout(types: anytype, argument: structures.FunctionBlockArgument) !structures.TypeLayout {
+    if (try argumentByAddress(types, argument.type_id, argument.is_storage)) return indirect_layout;
+    return types.layout(argument.type_id);
 }
 
 fn branchStorageEnd(ssa: *const structures.FunctionBodyAnalysis, types: anytype, branch: structures.FunctionBranch, start: u32) !u32 {
     const target = ssa.blocks[@intFromEnum(branch.target)];
     var end = start;
-    for (ssa.block_argument_types[target.argument_start..target.argument_end]) |type_id| {
-        _ = try reserveStack(&end, try blockArgumentLayout(types, type_id));
+    for (ssa.block_arguments[target.argument_start..target.argument_end]) |argument| {
+        _ = try reserveStack(&end, try blockArgumentLayout(types, argument));
     }
     return end;
 }
@@ -183,9 +183,15 @@ const LocationPlan = struct {
         ssa: *const structures.FunctionBodyAnalysis,
         branch: structures.FunctionBranch,
         needed: []Usage,
+        addressable: []bool,
     ) void {
         const arguments = ssa.branch_arguments[branch.arguments.start..branch.arguments.end];
-        for (arguments) |argument| needed[@intFromEnum(argument.value)] = .used;
+        const target = ssa.blocks[@intFromEnum(branch.target)];
+        for (arguments, ssa.block_arguments[target.argument_start..target.argument_end]) |argument, parameter| {
+            const index = @intFromEnum(argument.value);
+            needed[index] = .used;
+            if (parameter.is_storage) addressable[index] = true;
+        }
     }
 
     fn markCallArguments(ssa: *const structures.FunctionBodyAnalysis, call: structures.FunctionCall, needed: []Usage, addressable: []bool) void {
@@ -205,7 +211,7 @@ const LocationPlan = struct {
         @memset(addressable, false);
         const value_types = try gpa.alloc(structures.TypeId, ssa.valueCount());
         errdefer gpa.free(value_types);
-        @memcpy(value_types[0..ssa.block_argument_types.len], ssa.block_argument_types);
+        for (ssa.block_arguments, value_types[0..ssa.block_arguments.len]) |argument, *type_id| type_id.* = argument.type_id;
 
         for (ssa.instructions, 0..) |original, instruction_index| {
             var instruction = original;
@@ -238,10 +244,10 @@ const LocationPlan = struct {
                 needed[@intFromEnum(value.*)] = .used;
             };
             switch (terminator) {
-                .branch => |branch| markBranchArguments(ssa, branch, needed),
+                .branch => |branch| markBranchArguments(ssa, branch, needed, addressable),
                 .predicate_branch => |predicate| {
-                    markBranchArguments(ssa, predicate.then_branch, needed);
-                    markBranchArguments(ssa, predicate.else_branch, needed);
+                    markBranchArguments(ssa, predicate.then_branch, needed, addressable);
+                    markBranchArguments(ssa, predicate.else_branch, needed, addressable);
                 },
                 .fallible_call => |fallible| markCallArguments(ssa, fallible.call, needed, addressable),
                 .return_unit, .return_value, .return_failure, .diverge => {},
@@ -287,17 +293,17 @@ const LocationPlan = struct {
         const local_start = edge_scratch_end;
         const locations = try gpa.alloc(ValueLocation, ssa.valueCount());
         errdefer gpa.free(locations);
-        @memset(locations[0..ssa.block_argument_types.len], .discarded);
+        @memset(locations[0..ssa.block_arguments.len], .discarded);
         var local_end = local_start;
         const entry_index = @intFromEnum(ssa.entry);
         std.debug.assert(entry_index < ssa.blocks.len);
         for (ssa.blocks, 0..) |block, block_index| {
             std.debug.assert(block.argument_start <= block.argument_end);
-            std.debug.assert(block.argument_end <= ssa.block_argument_types.len);
+            std.debug.assert(block.argument_end <= ssa.block_arguments.len);
             if (block_index == entry_index) continue;
             for (block.argument_start..block.argument_end) |argument_index| {
                 if (needed[argument_index] == .unused) continue;
-                if (try types.facts().argumentPassing(value_types[argument_index]) == .indirect) {
+                if (try argumentByAddress(types, value_types[argument_index], ssa.block_arguments[argument_index].is_storage)) {
                     locations[argument_index] = .{ .indirect = try reserveStack(&local_end, indirect_layout) };
                     continue;
                 }
@@ -306,7 +312,7 @@ const LocationPlan = struct {
                 locations[argument_index] = .{ .stack = try reserveStack(&local_end, if (layout.byte_size == 0) zero_sized_address_layout else layout) };
             }
         }
-        for (ssa.instructions, locations[ssa.block_argument_types.len..], 0..) |instruction, *location, instruction_index| {
+        for (ssa.instructions, locations[ssa.block_arguments.len..], 0..) |instruction, *location, instruction_index| {
             const value_index = @intFromEnum(ssa.instructionValue(instruction_index));
             location.* = location_blk: {
                 switch (instruction) {
@@ -351,7 +357,7 @@ const LocationPlan = struct {
         const incoming_addresses = try gpa.alloc(bool, ssa.parameter_modes.len);
         defer gpa.free(incoming_addresses);
         for (ssa.parameter_modes, incoming_addresses) |mode, *source_address| source_address.* = mode == .deinit;
-        var incoming = try CallLayout.init(types, ssa.return_type, ssa.block_argument_types[entry.argument_start..entry.argument_end], incoming_addresses, gpa);
+        var incoming = try CallLayout.init(types, ssa.return_type, value_types[entry.argument_start..entry.argument_end], incoming_addresses, gpa);
         errdefer incoming.deinit(gpa);
         var return_buffer_offset: ?u32 = null;
         const caller_stack_offset = std.math.add(u32, stack_size, @sizeOf(u64)) catch return error.FunctionTooLarge;
@@ -646,7 +652,7 @@ fn FunctionEmitter(comptime Types: type) type {
             const arguments = self.branch_arguments[branch.arguments.start..branch.arguments.end];
             std.debug.assert(arguments.len == target.argument_end - target.argument_start);
             if (arguments.len == 1) {
-                const type_id = ssa.block_argument_types[target.argument_start];
+                const type_id = ssa.block_arguments[target.argument_start].type_id;
                 const destination = self.locations[target.argument_start];
                 if (destination == .indirect) {
                     try self.loadArgumentAddress(arguments[0]);
@@ -656,8 +662,7 @@ fn FunctionEmitter(comptime Types: type) type {
             }
             var scratch_end = self.edge_scratch_offset;
             for (arguments, 0..) |argument, argument_offset| {
-                const type_id = ssa.block_argument_types[target.argument_start + argument_offset];
-                const scratch_offset = try reserveStack(&scratch_end, try blockArgumentLayout(self.types, type_id));
+                const scratch_offset = try reserveStack(&scratch_end, try blockArgumentLayout(self.types, ssa.block_arguments[target.argument_start + argument_offset]));
                 const destination = self.locations[target.argument_start + argument_offset];
                 if (destination == .indirect) {
                     try self.loadArgumentAddress(argument);
@@ -666,8 +671,8 @@ fn FunctionEmitter(comptime Types: type) type {
             }
             scratch_end = self.edge_scratch_offset;
             for (arguments, 0..) |_, argument_offset| {
-                const type_id = ssa.block_argument_types[target.argument_start + argument_offset];
-                const scratch_offset = try reserveStack(&scratch_end, try blockArgumentLayout(self.types, type_id));
+                const type_id = ssa.block_arguments[target.argument_start + argument_offset].type_id;
+                const scratch_offset = try reserveStack(&scratch_end, try blockArgumentLayout(self.types, ssa.block_arguments[target.argument_start + argument_offset]));
                 const destination = self.locations[target.argument_start + argument_offset];
                 if (destination == .indirect) {
                     try self.encoder.offset(.mov_rax_rsp, scratch_offset);

@@ -5607,7 +5607,7 @@ test "variant branch joins form structural unions and preserve selected values" 
                 const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
                 const body = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = scope.resolve("choose").? })).*;
                 try testing.expect(body != null);
-                const joined = body.?.block_argument_types[0];
+                const joined = body.?.block_arguments[0].type_id;
                 const variant = try db.lookupInterned(queries.Types, joined.interned().?);
                 try testing.expectEqualSlices(structures.TypeId, case.members, variant.variant.members);
                 try testing.expect((try db.get(queries.BuildExecutable, 1)).* != null);
@@ -5635,7 +5635,7 @@ test "variant branch joins retain equal results and track changed member sets" {
     const instance: structures.InstanceId = .{ .item = target };
     const body = try db.get(queries.AnalyzeFunctionInstance, .{ .item = target });
     try testing.expect(body.* != null);
-    const joined = body.*.?.block_argument_types[1];
+    const joined = body.*.?.block_arguments[1].type_id;
     try testing.expectEqual(body.*.?.return_type, joined);
     const compiled = try db.get(queries.CompileFunction, instance);
     try testing.expect(compiled.* != null);
@@ -5650,14 +5650,14 @@ test "variant branch joins retain equal results and track changed member sets" {
     defer testing.allocator.free(changed);
     try setSource(db, 1, changed);
     const updated = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = target })).*.?;
-    const narrower = updated.block_argument_types[1];
+    const narrower = updated.block_arguments[1].type_id;
     try testing.expect(narrower != joined);
     try testing.expectEqualSlices(structures.TypeId, &.{ .int, .none }, (try db.lookupInterned(queries.Types, narrower.interned().?)).variant.members);
     try expectCompiledVariantWord(db, 1, "choose", &.{ "choose", "noop" }, 0, 2);
 
     try setSource(db, 1, source);
     const restored = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = target })).*.?;
-    try testing.expectEqual(joined, restored.block_argument_types[1]);
+    try testing.expectEqual(joined, restored.block_arguments[1].type_id);
     try expectCompiledVariantWord(db, 1, "choose", &.{ "choose", "noop" }, 0, 2);
 }
 
@@ -5824,7 +5824,7 @@ test "declared unit functions analyze lower compile and execute as ordinary call
     try expectImmParameters(&.{.int}, leaf_signature.parameters);
     try testing.expectEqual(structures.TypeId.unit, leaf_signature.return_type);
     const leaf_body = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = leaf_id })).*.?;
-    try testing.expectEqualSlices(structures.TypeId, &.{.int}, leaf_body.block_argument_types);
+    try testing.expectEqualSlices(structures.FunctionBlockArgument, &.{.{ .type_id = .int }}, leaf_body.block_arguments);
     try testing.expectEqual(structures.FunctionBodyAnalysis.Terminator.return_unit, leaf_body.blocks[0].terminator);
 
     const caller_body = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = caller_id })).*.?;
@@ -6009,7 +6009,7 @@ test "fallible integer if joins branch values through a block argument" {
     const choose_id = scope.resolve("choose").?;
     const body = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = choose_id })).*.?;
 
-    try testing.expectEqualSlices(structures.TypeId, &.{ .int, .int }, body.block_argument_types);
+    try testing.expectEqualSlices(structures.FunctionBlockArgument, &.{ .{ .type_id = .int }, .{ .type_id = .int } }, body.block_arguments);
     try testing.expectEqual(@as(usize, 4), body.blocks.len);
     try testing.expectEqual(@as(usize, 2), body.branch_arguments.len);
     const predicate = body.blocks[0].terminator.predicate_branch;
@@ -6782,8 +6782,8 @@ test "no-else if joins its body with implicit unit" {
     );
     const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
     const selected = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = scope.resolve("selected").? })).*.?;
-    try testing.expectEqual(@as(usize, 1), selected.block_argument_types.len);
-    const result_type = selected.block_argument_types[0];
+    try testing.expectEqual(@as(usize, 1), selected.block_arguments.len);
+    const result_type = selected.block_arguments[0].type_id;
     try testing.expectEqual(selected.return_type, result_type);
     const members = (try db.lookupInterned(queries.Types, result_type.interned().?)).variant.members;
     try testing.expectEqualSlices(structures.TypeId, &.{ .int, .unit }, members);
@@ -6966,7 +6966,7 @@ test "parameters and nested call arguments form one typed value graph" {
     const add_signature = (try db.get(queries.FunctionSignature, add_id)).*.?;
     try expectImmParameters(&.{ .int, .int }, add_signature.parameters);
     const add = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = add_id })).*.?;
-    try testing.expectEqualSlices(structures.TypeId, &.{ .int, .int }, add.block_argument_types);
+    try testing.expectEqualSlices(structures.FunctionBlockArgument, &.{ .{ .type_id = .int }, .{ .type_id = .int } }, add.block_arguments);
     try testing.expectEqual(@as(u32, 0), add.blocks[0].argument_start);
     try testing.expectEqual(@as(u32, 2), add.blocks[0].argument_end);
     try testing.expectEqual(@as(u32, 0), @intFromEnum(add.instructions[0].addi.lhs));
@@ -7258,7 +7258,7 @@ test "loop break values join and bare break contributes unit" {
     var found_return = false;
     for (selected.blocks) |block| switch (block.terminator) {
         .return_value => |returned| {
-            try testing.expectEqual(selected.return_type, selected.block_argument_types[@intFromEnum(returned.value)]);
+            try testing.expectEqual(selected.return_type, selected.block_arguments[@intFromEnum(returned.value)].type_id);
             found_return = true;
         },
         else => {},

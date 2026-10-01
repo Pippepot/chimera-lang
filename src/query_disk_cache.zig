@@ -5,7 +5,7 @@ const query = @import("query/engine.zig");
 const queries = @import("queries.zig");
 const structures = @import("structures.zig");
 
-const format = "CHIQRY08";
+const format = "CHIQRY09";
 const max_records = 1_000_000;
 
 pub fn save(io: std.Io, allocator: std.mem.Allocator, directory: []const u8, key: cache.Key, db: *query.Database) !void {
@@ -225,10 +225,10 @@ fn validReferenceOperations(db: *query.Database, body: structures.FunctionBodyAn
 
 fn validBorrowFields(types: anytype, body: structures.FunctionBodyAnalysis, operation: structures.BorrowAddressOperation) !bool {
     const source_index = @intFromEnum(operation.source);
-    var type_id = if (source_index < body.block_argument_types.len)
-        body.block_argument_types[source_index]
+    var type_id = if (source_index < body.block_arguments.len)
+        body.block_arguments[source_index].type_id
     else
-        body.instructions[source_index - body.block_argument_types.len].resultType();
+        body.instructions[source_index - body.block_arguments.len].resultType();
     if (operation.base_is_reference) type_id = (try types.borrowElement(type_id)) orelse return false;
     for (body.borrow_fields[operation.fields.start..operation.fields.end]) |field_index| {
         const definition = (try types.structDefinition(type_id)) orelse return false;
@@ -240,7 +240,7 @@ fn validBorrowFields(types: anytype, body: structures.FunctionBodyAnalysis, oper
 
 fn validStorageProjection(types: anytype, body: structures.FunctionBodyAnalysis, operation: structures.StorageProjection) !bool {
     const index = @intFromEnum(operation.owner);
-    const type_id = if (index < body.block_argument_types.len) body.block_argument_types[index] else body.instructions[index - body.block_argument_types.len].resultType();
+    const type_id = if (index < body.block_arguments.len) body.block_arguments[index].type_id else body.instructions[index - body.block_arguments.len].resultType();
     switch (operation.projection) {
         .dereference => return true,
         .field => |field| {
@@ -274,8 +274,12 @@ fn validCall(call: structures.FunctionCall, body: structures.FunctionBodyAnalysi
 fn validBranch(branch: structures.FunctionBranch, body: structures.FunctionBodyAnalysis) bool {
     if (@intFromEnum(branch.target) >= body.blocks.len or !validRange(branch.arguments, body.branch_arguments.len)) return false;
     const target = body.blocks[@intFromEnum(branch.target)];
-    if (target.argument_start > target.argument_end or target.argument_end > body.block_argument_types.len) return false;
-    return branch.arguments.end - branch.arguments.start == target.argument_end - target.argument_start;
+    if (target.argument_start > target.argument_end or target.argument_end > body.block_arguments.len) return false;
+    if (branch.arguments.end - branch.arguments.start != target.argument_end - target.argument_start) return false;
+    for (body.branch_arguments[branch.arguments.start..branch.arguments.end], body.block_arguments[target.argument_start..target.argument_end]) |use, argument| {
+        if (argument.is_storage and use.coerce_to != null) return false;
+    }
+    return true;
 }
 
 fn validVariantOperation(operation: structures.VariantOperation, body: structures.FunctionBodyAnalysis) bool {
@@ -291,7 +295,7 @@ fn validFunctionBody(body: structures.FunctionBodyAnalysis) bool {
     for (body.branch_arguments) |use| if (!validUse(use, body)) return false;
     for (body.call_arguments) |argument| if (!validUse(argument.valueUse(), body)) return false;
     const entry = body.blocks[@intFromEnum(body.entry)];
-    if (entry.argument_start > entry.argument_end or entry.argument_end > body.block_argument_types.len) return false;
+    if (entry.argument_start > entry.argument_end or entry.argument_end > body.block_arguments.len) return false;
     if (body.parameter_modes.len != entry.argument_end - entry.argument_start) return false;
     for (body.instructions) |original| {
         var instruction = original;
@@ -312,7 +316,7 @@ fn validFunctionBody(body: structures.FunctionBodyAnalysis) bool {
         if (!valid) return false;
     }
     for (body.blocks) |block| {
-        if (block.argument_start > block.argument_end or block.argument_end > body.block_argument_types.len or
+        if (block.argument_start > block.argument_end or block.argument_end > body.block_arguments.len or
             block.instruction_start > block.instruction_end or block.instruction_end > body.instructions.len) return false;
         var terminator = block.terminator;
         for (terminator.operands()) |operand| if (operand) |value| {
@@ -339,8 +343,8 @@ fn validFallibleTargets(success: structures.FunctionBlockId, failure: structures
     if (@intFromEnum(success) >= body.blocks.len or @intFromEnum(failure) >= body.blocks.len) return false;
     const success_block = body.blocks[@intFromEnum(success)];
     const failure_block = body.blocks[@intFromEnum(failure)];
-    if (success_block.argument_start > success_block.argument_end or success_block.argument_end > body.block_argument_types.len or
-        failure_block.argument_start > failure_block.argument_end or failure_block.argument_end > body.block_argument_types.len) return false;
+    if (success_block.argument_start > success_block.argument_end or success_block.argument_end > body.block_arguments.len or
+        failure_block.argument_start > failure_block.argument_end or failure_block.argument_end > body.block_arguments.len) return false;
     return success_block.argument_end - success_block.argument_start == 1 and
         failure_block.argument_end == failure_block.argument_start;
 }
@@ -385,9 +389,9 @@ test "query restore rejects an offset past the payload" {
 }
 
 test "cached body validation rejects invalid control flow and argument indexes" {
-    var argument_types = [_]structures.TypeId{.int};
+    var block_arguments = [_]structures.FunctionBlockArgument{.{ .type_id = .int }};
     var parameter_modes = [_]structures.ParameterMode{.imm};
-    var branch_arguments: [0]structures.FunctionValueUse = .{};
+    var branch_arguments = [_]structures.FunctionValueUse{.{ .value = @enumFromInt(0) }};
     var call_arguments: [0]structures.FunctionCallArgument = .{};
     var instructions = [_]structures.FunctionInstruction{.{ .mut_parameter_write = .{
         .parameter_index = 1,
@@ -404,8 +408,8 @@ test "cached body validation rejects invalid control flow and argument indexes" 
     var body: structures.FunctionBodyAnalysis = .{
         .return_type = .unit,
         .parameter_modes = &parameter_modes,
-        .block_argument_types = &argument_types,
-        .branch_arguments = &branch_arguments,
+        .block_arguments = &block_arguments,
+        .branch_arguments = branch_arguments[0..0],
         .call_arguments = &call_arguments,
         .instructions = instructions[0..0],
         .blocks = &blocks,
@@ -415,6 +419,15 @@ test "cached body validation rejects invalid control flow and argument indexes" 
 
     blocks[0].terminator = .{ .branch = .{ .target = @enumFromInt(0), .arguments = .{ .start = 0, .end = 0 } } };
     try std.testing.expect(!validFunctionBody(body));
+
+    body.branch_arguments = &branch_arguments;
+    blocks[0].terminator.branch.arguments.end = 1;
+    block_arguments[0].is_storage = true;
+    try std.testing.expect(validFunctionBody(body));
+    branch_arguments[0].coerce_to = .none;
+    try std.testing.expect(!validFunctionBody(body));
+    branch_arguments[0].coerce_to = null;
+    block_arguments[0].is_storage = false;
 
     blocks[0].terminator = .return_unit;
     blocks[0].instruction_end = 1;
@@ -459,14 +472,14 @@ test "cached body validation rejects invalid control flow and argument indexes" 
     const module = try db.intern(queries.ModulePaths, .{ .path = "" });
     const pair = (try db.get(queries.ModuleDeclarations, module)).*.?.resolveStatic("Pair").?;
     const pair_type = structures.TypeId.fromInterned(try db.intern(queries.Types, .{ .structure = .{ .declared = pair } }));
-    argument_types[0] = pair_type;
+    block_arguments[0].type_id = pair_type;
     instructions[0].storage_projection.projection = .{ .field = 0 };
     try std.testing.expect(try validReferenceOperations(db, body));
     instructions[0].storage_projection.projection = .{ .field = 7 };
     try std.testing.expect(!(try validReferenceOperations(db, body)));
 
     const variant_type = structures.TypeId.fromInterned(try db.intern(queries.Types, .{ .variant = .{ .members = &.{ .int, .byte } } }));
-    argument_types[0] = variant_type;
+    block_arguments[0].type_id = variant_type;
     instructions[0].storage_projection.projection = .variant;
     try std.testing.expect(try validReferenceOperations(db, body));
     instructions[0].storage_projection.type_id = .bool;
@@ -485,7 +498,7 @@ test "cached body validation rejects invalid control flow and argument indexes" 
     const reference_type = (try db.lookupInterned(queries.CompileTimeValues, reference_value)).type;
     var path = [_]u32{0};
     body.borrow_fields = &path;
-    argument_types[0] = pair_type;
+    block_arguments[0].type_id = pair_type;
     instructions[0] = .{ .borrow_address = .{
         .source = @enumFromInt(0),
         .type_id = reference_type,
@@ -773,8 +786,12 @@ test "deinit bodies restore and invalidate when parameter modes change" {
         \\func take(deinit value: int | none) int
         \\  if const number = value as int -> return number
         \\  return 1
-        \\const callback = take
-        \\exit(callback(42))
+        \\func pick(flag: int) int
+        \\  const first: int | none = 20
+        \\  const second: int | none = 22
+        \\  const callback = take
+        \\  return callback(if flag == 1 -> first else second)
+        \\exit(pick(1) + pick(0))
     ;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -788,6 +805,8 @@ test "deinit bodies restore and invalidate when parameter modes change" {
     const original = (try first.get(queries.BuildExecutable, 0)).* orelse return error.TestUnexpectedResult;
     const take = (try first.get(queries.BuildModuleScope, 0)).*.?.resolveFunction("take").?;
     const original_body = (try first.get(queries.AnalyzeFunctionInstance, .{ .item = take })).*.?;
+    const pick = (try first.get(queries.BuildModuleScope, 0)).*.?.resolveFunction("pick").?;
+    const original_pick = (try first.get(queries.AnalyzeFunctionInstance, .{ .item = pick })).*.?;
     try save(io, allocator, directory, digest, first);
     const payload = (try cache.load(io, allocator, directory, digest)) orelse return error.TestUnexpectedResult;
     defer allocator.free(payload);
@@ -801,6 +820,9 @@ test "deinit bodies restore and invalidate when parameter modes change" {
     const restored_take = (try second.get(queries.BuildModuleScope, 0)).*.?.resolveFunction("take").?;
     const restored_body = (try second.get(queries.AnalyzeFunctionInstance, .{ .item = restored_take })).*.?;
     try std.testing.expect(structures.FunctionBodyAnalysis.eql(original_body, restored_body));
+    const restored_pick_item = (try second.get(queries.BuildModuleScope, 0)).*.?.resolveFunction("pick").?;
+    const restored_pick = (try second.get(queries.AnalyzeFunctionInstance, .{ .item = restored_pick_item })).*.?;
+    try std.testing.expect(structures.FunctionBodyAnalysis.eql(original_pick, restored_pick));
     const restored = (try second.get(queries.BuildExecutable, 0)).* orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualSlices(u8, original.bytes, restored.bytes);
     try runtime.writeProgram(io, restored.bytes);

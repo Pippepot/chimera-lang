@@ -47,7 +47,7 @@ pub fn execute(
     gpa: std.mem.Allocator,
 ) !Result {
     const slot_count = body.valueCount();
-    const branch_scratch_count = body.block_argument_types.len;
+    const branch_scratch_count = body.block_arguments.len;
     const frame = try gpa.alloc(Value, slot_count + branch_scratch_count + body.call_arguments.len);
     defer gpa.free(frame);
     const slots = frame[0..slot_count];
@@ -289,8 +289,8 @@ fn executeFallibleCall(
 
 fn valueType(body: *const structures.FunctionBodyAnalysis, value: structures.FunctionValueId) structures.TypeId {
     const index = @intFromEnum(value);
-    if (index < body.block_argument_types.len) return body.block_argument_types[index];
-    return body.instructions[index - body.block_argument_types.len].resultType();
+    if (index < body.block_arguments.len) return body.block_arguments[index].type_id;
+    return body.instructions[index - body.block_arguments.len].resultType();
 }
 
 fn store(slots: []Value, own: usize, destination: ?structures.FunctionValueId, value: Value) void {
@@ -597,8 +597,8 @@ fn branchTarget(
     const target = body.blocks[@intFromEnum(branch.target)];
     const arguments = body.branch_arguments[branch.arguments.start..branch.arguments.end];
     std.debug.assert(arguments.len == target.argument_end - target.argument_start);
-    for (arguments, scratch[0..arguments.len], body.block_argument_types[target.argument_start..target.argument_end]) |argument, *temporary, type_id| {
-        if (try executor.argumentPassing(type_id) == .indirect) {
+    for (arguments, scratch[0..arguments.len], body.block_arguments[target.argument_start..target.argument_end]) |argument, *temporary, parameter| {
+        if (parameter.is_storage or try executor.argumentPassing(parameter.type_id) == .indirect) {
             std.debug.assert(argument.coerce_to == null);
             temporary.* = .{ .place = try storageCell(body, slots, argument.value, storage) };
             continue;

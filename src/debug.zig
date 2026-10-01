@@ -77,7 +77,8 @@ fn renderSsaFunction(
         for (block.argument_start..block.argument_end) |argument_index| {
             if (argument_index != block.argument_start) try writer.writeAll(", ");
             try writer.print("%{d}: ", .{argument_index});
-            try renderType(ssa.block_argument_types[argument_index], writer);
+            if (ssa.block_arguments[argument_index].is_storage) try writer.writeAll("storage ");
+            try renderType(ssa.block_arguments[argument_index].type_id, writer);
         }
         try writer.writeByte(')');
         if (block_index == @intFromEnum(ssa.entry)) try writer.writeAll(" [entry]");

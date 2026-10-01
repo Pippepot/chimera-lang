@@ -4480,6 +4480,270 @@ test "ownership members invalidate retained callables after capability edits" {
     try fixture.expectExit(0, 42);
 }
 
+test "deinit selects original storage through conditional and loop results" {
+    const expressions = [_][]const u8{
+        "if flag == 1 -> first else second",
+        "if flag == 1 -> first^ else second^",
+        "if flag == 1 -> (if flag == 1 -> first else second) else second",
+        "loop\n    if flag == 1 -> break first\n    break second\n  ",
+        "if flag == 1 -> first else make(1)",
+        "if flag == 1 -> producer(41) else make(1)",
+        "if flag == 1 -> holder.first else holder.second",
+    };
+    const movements = [_][]const u8{ "fieldwise", "none", "func(deinit self: Item) Item -> exit(91)" };
+    for (movements) |movement| for (expressions) |expression| {
+        const source = try std.fmt.allocPrint(testing.allocator,
+            \\struct Item
+            \\  move = {s}
+            \\  copy = func(imm self: Item) Item -> exit(90)
+            \\  value: int
+            \\  drop = func(deinit self: Item) -> ()
+            \\struct Holder
+            \\  move = none
+            \\  first: Item
+            \\  second: Item
+            \\func make(value: int) Item -> Item{{value = value}}
+            \\func consume(deinit item: Item, marker: int) int -> item.value
+            \\func run(flag: int) int
+            \\  const first = make(41)
+            \\  const second = make(1)
+            \\  const holder = Holder{{first = make(41), second = make(1)}}
+            \\  const producer = make
+            \\  const callee: func(deinit Item, int) int = consume
+            \\  return callee({s}, 0)
+            \\static compiled = comptime -> run(1) + run(0)
+            \\exit(run(1) + run(0) + compiled - 42)
+        , .{ movement, expression });
+        defer testing.allocator.free(source);
+        const fixture = try Fixture.init(source, &.{});
+        defer fixture.deinit();
+        try fixture.expectExit(0, 42);
+    };
+}
+
+test "fresh consuming selections construct in the known variant context" {
+    const expressions = [_][]const u8{
+        "if flag == 1 -> Item{value = 41} else none",
+        "if flag == 1 -> producer(41) else none",
+        "loop\n    if flag == 1 -> break producer(41)\n    break none\n  ",
+        "if flag == 1 -> first else none",
+    };
+    for ([_][]const u8{ "fieldwise", "none" }) |movement| for (expressions) |expression| {
+        const source = try std.fmt.allocPrint(testing.allocator,
+            \\struct Item
+            \\  move = {s}
+            \\  copy = func(imm self: Item) Item -> exit(90)
+            \\  value: int
+            \\func make(value: int) Item -> Item{{value = value}}
+            \\func consume(deinit item: Item | none) int
+            \\  if item is Item -> return 41
+            \\  return 1
+            \\func run(flag: int) int
+            \\  const first: Item | none = Item{{value = 41}}
+            \\  const producer = make
+            \\  const callee = consume
+            \\  return callee({s})
+            \\static compiled = comptime -> run(1) + run(0)
+            \\exit(run(1) + run(0) + compiled - 42)
+        , .{ movement, expression });
+        defer testing.allocator.free(source);
+        const fixture = try Fixture.init(source, &.{});
+        defer fixture.deinit();
+        try fixture.expectExit(0, 42);
+    };
+}
+
+test "fresh consuming selections retain static type inference" {
+    for ([_][]const u8{
+        "if flag == 1 -> 41 else none",
+        "if flag == 1 -> producer(41) else none",
+        "loop\n    if flag == 1 -> break producer(41)\n    break none\n  ",
+    }) |expression| {
+        const source = try std.fmt.allocPrint(testing.allocator,
+            \\func make(value: int) int -> value
+            \\func consume(static T: type, deinit item: T) int
+            \\  if const value = item as int -> return value
+            \\  return 1
+            \\func run(flag: int) int
+            \\  const producer = make
+            \\  return consume({s})
+            \\static compiled = comptime -> run(1) + run(0)
+            \\exit(run(1) + run(0) + compiled - 42)
+        , .{expression});
+        defer testing.allocator.free(source);
+        const fixture = try Fixture.init(source, &.{});
+        defer fixture.deinit();
+        try fixture.expectExit(0, 42);
+    }
+}
+
+test "consuming selections retain sources and reject borrowed authority" {
+    const cases = [_]struct { body: []const u8, kind: std.meta.Tag(structures.Diagnostic.Kind) }{
+        .{ .body =
+        \\func run(flag: int) int
+        \\  const first = make(41)
+        \\  const second = make(1)
+        \\  const result = consume(if flag == 1 -> first else second, 0)
+        \\  return first.value + result
+        \\exit(run(1))
+        , .kind = .possibly_transferred },
+        .{ .body =
+        \\func run(flag: int) int
+        \\  var first = make(41)
+        \\  const second = make(1)
+        \\  return consume(if flag == 1 -> first else second, if flag == 1
+        \\    first = make(7)
+        \\    0
+        \\  else 0)
+        \\exit(run(1))
+        , .kind = .consumed_storage_in_use },
+        .{ .body =
+        \\func run(flag: int) int
+        \\  const item = make(41)
+        \\  borrow alias = item
+        \\  return consume(if flag == 1 -> alias else make(1), 0)
+        \\exit(run(1))
+        , .kind = .ownership_transfer_requires_owned_place },
+        .{ .body =
+        \\func run(imm item: Item, flag: int) int
+        \\  return consume(if flag == 1 -> item else make(1), 0)
+        \\exit(run(make(41), 1))
+        , .kind = .ownership_transfer_requires_owned_place },
+        .{ .body =
+        \\fallible run() int
+        \\  const owner = Box.new(make(42))
+        \\  return consume(owner.borrow()[], 0)
+        \\if const result = run() -> exit(result) else exit(1)
+        , .kind = .ownership_transfer_requires_owned_place },
+        .{ .body =
+        \\func wider(deinit item: Item | none) int -> 42
+        \\func run(flag: int) int
+        \\  const item = make(41)
+        \\  return wider(if flag == 1 -> item else make(1))
+        \\exit(run(1))
+        , .kind = .call_argument_type_mismatch },
+    };
+    for (cases) |case| {
+        const source = try std.mem.concat(testing.allocator, u8, &.{
+            \\struct Item
+            \\  move = none
+            \\  copy = trivial
+            \\  value: int
+            \\func make(value: int) Item -> Item{value = value}
+            \\func consume(deinit item: Item, marker: int) int -> item.value
+            \\
+            ,
+            case.body,
+        });
+        defer testing.allocator.free(source);
+        const fixture = try Fixture.init(source, &.{});
+        defer fixture.deinit();
+        try fixture.expectDiagnostic(0, case.kind);
+    }
+}
+
+test "zero-sized consuming selections keep addressable storage" {
+    const fixture = try Fixture.init(
+        \\struct Item
+        \\  move = fieldwise
+        \\func consume(deinit item: Item) int -> 42
+        \\func run(flag: int) int
+        \\  const first = Item{}
+        \\  const second = Item{}
+        \\  return consume(if flag == 1 -> first else second)
+        \\static compiled = comptime -> run(1) + run(0)
+        \\exit(run(1) + run(0) + compiled - 126)
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+test "consuming selection cleanup distinguishes successful calls from later failure" {
+    const fixture = try Fixture.init(
+        \\struct Item
+        \\  move = none
+        \\  value: int
+        \\  counter: Ref(int, true)
+        \\  drop = func(deinit self: Item)
+        \\    self.counter[] = self.counter[] + self.value
+        \\func consume(deinit item: Item, marker: int) -> ()
+        \\fallible fail() int
+        \\  1 == 0
+        \\  return 0
+        \\fallible prepare(imm counter: Ref(int, true), named: int, fails: int) unit
+        \\  const item = Item{value = 20, counter = counter}
+        \\  if fails == 1
+        \\    consume(if named == 1 -> item else Item{value = 22, counter = counter}, fail())
+        \\  else
+        \\    consume(if named == 1 -> item else Item{value = 22, counter = counter}, 0)
+        \\fallible probe(named: int, fails: int) int
+        \\  var counter = Box.new(0)
+        \\  if prepare(counter.borrow_mut(), named, fails) -> ()
+        \\  return counter.borrow()[]
+        \\fallible run() int -> probe(1, 0) + probe(0, 0) + probe(1, 1) + probe(0, 1) - 40
+        \\if const result = run() -> exit(result) else exit(1)
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+test "consuming selection storage follows movability edits" {
+    const source =
+        \\struct Item
+        \\  move = $move
+        \\  value: int
+        \\func make(value: int) Item -> Item{value = value}
+        \\func consume(deinit item: Item) int -> item.value
+        \\func run(flag: int) int
+        \\  const first = make(41)
+        \\  const second = make(1)
+        \\  const callee = consume
+        \\  return callee(if flag == 1 -> first else second)
+        \\static compiled = comptime -> run(1) + run(0)
+        \\exit(run(1) + run(0) + compiled - 42)
+    ;
+    const fixture = try Fixture.init("", &.{});
+    defer fixture.deinit();
+    for ([_][]const u8{ "fieldwise", "none", "func(deinit self: Item) Item -> exit(90)", "fieldwise" }) |movement| {
+        const edited = try test_sources.renderTemplate(testing.allocator, source, .{ .move = movement });
+        defer testing.allocator.free(edited);
+        try fixture.db.setInput(queries.SourceText, 0, edited);
+        try fixture.expectExit(0, 42);
+    }
+}
+
+test "consuming selections preserve contained reference origins" {
+    const fixture = try Fixture.init(
+        \\struct Item
+        \\  move = none
+        \\  handle: Ref(int, false)
+        \\func take(deinit item: Item) Ref(int, false) from(item) -> item.handle
+        \\fallible run(flag: int) int
+        \\  const first_owner = Box.new(20)
+        \\  const second_owner = Box.new(22)
+        \\  const first = Item{handle = first_owner.borrow()}
+        \\  const second = Item{handle = second_owner.borrow()}
+        \\  const handle = take(if flag == 1 -> first else second)
+        \\  return handle[]
+        \\fallible answer() int -> run(1) + run(0)
+        \\if const result = answer() -> exit(result) else exit(1)
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+
+    const rejected = try Fixture.init(
+        \\import std.memory.{borrow_local}
+        \\struct Item
+        \\  move = none
+        \\  value: int
+        \\func invalid(deinit item: Item) Ref(Item, false) from(item) -> borrow_local(Item, item)
+        \\const handle = invalid(Item{value = 42})
+        \\exit(handle[].value)
+    , &.{});
+    defer rejected.deinit();
+    try rejected.expectDiagnostic(0, .borrow_outlives_source);
+}
+
 test "deinit completes an explicit-drop root" {
     const fixture = try Fixture.init(
         \\struct Item
@@ -4794,8 +5058,8 @@ fn expectNoRelocation(fixture: Fixture, name: []const u8) !void {
     for (body.blocks) |block| if (block.terminator == .return_value) {
         const returned = block.terminator.return_value;
         try testing.expect(returned.coerce_to == null);
-        try testing.expect(@intFromEnum(returned.value) >= body.block_argument_types.len);
-        try testing.expect(body.instructions[@intFromEnum(returned.value) - body.block_argument_types.len] == .result_storage);
+        try testing.expect(@intFromEnum(returned.value) >= body.block_arguments.len);
+        try testing.expect(body.instructions[@intFromEnum(returned.value) - body.block_arguments.len] == .result_storage);
     };
 }
 
@@ -5115,7 +5379,7 @@ test "mutable locals that cannot move directly keep their storage" {
     const types: queries.TypeFacts(*query.Database) = .{ .ctx = fixture.db };
     const run = (try fixture.db.get(queries.BuildModuleScope, 0)).*.?.resolveFunction("run").?;
     const body = (try fixture.db.get(queries.AnalyzeFunctionInstance, .{ .item = run })).*.?;
-    for (body.block_argument_types) |type_id| try testing.expectEqual(structures.ArgumentPassing.direct, try types.argumentPassing(type_id));
+    for (body.block_arguments) |argument| try testing.expectEqual(structures.ArgumentPassing.direct, try types.argumentPassing(argument.type_id));
 }
 
 test "replacing storage in place ends the old value before the right-hand side" {

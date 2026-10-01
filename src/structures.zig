@@ -1006,6 +1006,12 @@ pub const FunctionBlock = struct {
     terminator: FunctionTerminator,
 };
 
+pub const FunctionBlockArgument = struct {
+    type_id: TypeId,
+    /// Preserve selected storage even when the type can move directly.
+    is_storage: bool = false,
+};
+
 /// Function-signature query outputs own `parameters`; interned callable types
 /// clone the same value shape into session-stable storage.
 pub const FunctionSignature = CallableType;
@@ -1256,7 +1262,7 @@ pub const FunctionBodyAnalysis = struct {
     return_type: TypeId,
     is_fallible: bool = false,
     parameter_modes: []ParameterMode,
-    block_argument_types: []TypeId,
+    block_arguments: []FunctionBlockArgument,
     variant_coercion_tags: []const u32 = &.{},
     struct_field_values: []StructFieldValue = &.{},
     borrow_fields: []u32 = &.{},
@@ -1276,11 +1282,11 @@ pub const FunctionBodyAnalysis = struct {
 
     pub fn instructionValue(self: @This(), instruction_index: usize) ValueId {
         std.debug.assert(instruction_index < self.instructions.len);
-        return functionInstructionValue(self.block_argument_types.len, instruction_index);
+        return functionInstructionValue(self.block_arguments.len, instruction_index);
     }
 
     pub fn valueCount(self: @This()) usize {
-        return self.block_argument_types.len + self.instructions.len;
+        return self.block_arguments.len + self.instructions.len;
     }
 
     pub fn eql(a: @This(), b: @This()) bool {
@@ -1288,7 +1294,7 @@ pub const FunctionBodyAnalysis = struct {
             a.return_type != b.return_type or
             a.is_fallible != b.is_fallible or
             !std.mem.eql(ParameterMode, a.parameter_modes, b.parameter_modes) or
-            !std.mem.eql(TypeId, a.block_argument_types, b.block_argument_types) or
+            a.block_arguments.len != b.block_arguments.len or
             !std.mem.eql(u32, a.variant_coercion_tags, b.variant_coercion_tags) or
             a.struct_field_values.len != b.struct_field_values.len or
             !std.mem.eql(u32, a.borrow_fields, b.borrow_fields) or
@@ -1298,6 +1304,9 @@ pub const FunctionBodyAnalysis = struct {
             !sourceSpansEql(a.instruction_spans, b.instruction_spans) or
             !sourceSpansEql(a.terminator_spans, b.terminator_spans) or
             a.blocks.len != b.blocks.len) return false;
+        for (a.block_arguments, b.block_arguments) |left, right| {
+            if (!std.meta.eql(left, right)) return false;
+        }
         for (a.struct_field_values, b.struct_field_values) |left, right| {
             if (!std.meta.eql(left, right)) return false;
         }
@@ -1336,7 +1345,7 @@ pub const FunctionBodyAnalysis = struct {
 
     pub fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
         gpa.free(self.parameter_modes);
-        gpa.free(self.block_argument_types);
+        gpa.free(self.block_arguments);
         gpa.free(self.variant_coercion_tags);
         gpa.free(self.struct_field_values);
         gpa.free(self.borrow_fields);

@@ -104,7 +104,7 @@ fn functionSsa(
     return .{
         .return_type = return_type,
         .parameter_modes = &.{},
-        .block_argument_types = &.{},
+        .block_arguments = &.{},
         .branch_arguments = &.{},
         .call_arguments = &.{},
         .instructions = instructions,
@@ -138,6 +138,43 @@ test "single aligned function artifact builds and runs without borrowing code" {
     try runtime.writeProgram(io, executable.bytes);
     defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
     try std.testing.expectEqual(@as(u8, 0), runtime.runProg(io, std.testing.allocator, &.{}));
+}
+
+test "storage joins keep the source address for directly movable values" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const exit_function: structures.InstanceId = .{ .item = @enumFromInt(1) };
+    var arguments = [_]structures.FunctionBlockArgument{.{ .type_id = .int, .is_storage = true }};
+    var uses = [_]structures.FunctionValueUse{.{ .value = @enumFromInt(1) }};
+    var call_arguments = [_]structures.FunctionCallArgument{.{ .prepared = .{ .value = @enumFromInt(1) } }};
+    var instructions = [_]structures.FunctionInstruction{
+        integerConstant(10),
+        integerConstant(42),
+        .{ .value_copy = .{ .source = @enumFromInt(2), .type_id = .int, .destination = @enumFromInt(0) } },
+        .{ .call = .{ .target = .{ .direct = exit_function }, .arguments = .{ .start = 0, .end = 1 }, .return_type = .never } },
+    };
+    var blocks = [_]structures.FunctionBlock{
+        .{ .instruction_start = 0, .instruction_end = 1, .terminator = .{ .branch = .{ .target = @enumFromInt(1), .arguments = .{ .start = 0, .end = 1 } } } },
+        .{ .argument_start = 0, .argument_end = 1, .instruction_start = 1, .instruction_end = 4, .terminator = .diverge },
+    };
+    var body = functionSsa(&instructions, &blocks);
+    body.block_arguments = &arguments;
+    body.branch_arguments = &uses;
+    body.call_arguments = &call_arguments;
+    var artifact = try codegen.compileFunction(&body, TestTypes{}, allocator);
+    defer artifact.deinit(allocator);
+    var exit_artifact = try codegen.compileExternalExit(allocator);
+    defer exit_artifact.deinit(allocator);
+    const entry: structures.InstanceId = .{ .item = @enumFromInt(0) };
+    const functions = [_]codegen.ReachableFunction{
+        .{ .instance = entry, .artifact = artifact },
+        .{ .instance = exit_function, .artifact = exit_artifact },
+    };
+    var executable = try codegen.buildExecutable(entry, &functions, allocator);
+    defer executable.deinit(allocator);
+    try runtime.writeProgram(io, executable.bytes);
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    try std.testing.expectEqual(@as(u8, 42), try runtime.runProg(io, allocator, &.{}));
 }
 
 test "ordinary function artifacts encode signed 32-bit literal returns" {
@@ -227,7 +264,7 @@ test "function references relocate absolute addresses for indirect calls" {
     const ssa: structures.FunctionBodyAnalysis = .{
         .return_type = .int,
         .parameter_modes = &.{},
-        .block_argument_types = &.{},
+        .block_arguments = &.{},
         .branch_arguments = &.{},
         .call_arguments = &.{},
         .instructions = &instructions,
@@ -359,7 +396,7 @@ test "typed expression values survive calls and execute every integer arithmetic
 }
 
 test "cyclic CFG accepts multi-value parallel backedge copies" {
-    var block_argument_types = [_]structures.TypeId{ .int, .int, .int, .int, .int };
+    var block_arguments = [_]structures.FunctionBlockArgument{ .{ .type_id = .int }, .{ .type_id = .int }, .{ .type_id = .int }, .{ .type_id = .int }, .{ .type_id = .int } };
     var parameter_modes = [_]structures.ParameterMode{ .imm, .imm };
     var branch_arguments = [_]structures.FunctionValueUse{
         .{ .value = @enumFromInt(0) },
@@ -400,7 +437,7 @@ test "cyclic CFG accepts multi-value parallel backedge copies" {
     const ssa: structures.FunctionBodyAnalysis = .{
         .return_type = .int,
         .parameter_modes = &parameter_modes,
-        .block_argument_types = &block_argument_types,
+        .block_arguments = &block_arguments,
         .branch_arguments = &branch_arguments,
         .call_arguments = &.{},
         .instructions = &instructions,
@@ -426,7 +463,7 @@ test "variant subset call construction cleans up every allocation failure" {
 }
 
 test "variant injection copies an arbitrary-size non-variant interned payload" {
-    var block_argument_types = [_]structures.TypeId{seven_byte_payload};
+    var block_arguments = [_]structures.FunctionBlockArgument{.{ .type_id = seven_byte_payload }};
     var parameter_modes = [_]structures.ParameterMode{.imm};
     var instructions = [_]structures.FunctionBodyAnalysis.Instruction{.{ .variant_coerce = .{
         .operand = @enumFromInt(0),
@@ -442,7 +479,7 @@ test "variant injection copies an arbitrary-size non-variant interned payload" {
     const ssa: structures.FunctionBodyAnalysis = .{
         .return_type = payload_variant,
         .parameter_modes = &parameter_modes,
-        .block_argument_types = &block_argument_types,
+        .block_arguments = &block_arguments,
         .variant_coercion_tags = &.{1},
         .branch_arguments = &.{},
         .call_arguments = &.{},
@@ -458,7 +495,7 @@ test "variant injection copies an arbitrary-size non-variant interned payload" {
 }
 
 fn testCompileVariantSubsetCallAllocations(gpa: std.mem.Allocator) !void {
-    var block_argument_types = [_]structures.TypeId{small_variant};
+    var block_arguments = [_]structures.FunctionBlockArgument{.{ .type_id = small_variant }};
     var parameter_modes = [_]structures.ParameterMode{.imm};
     var call_arguments = [_]structures.FunctionCallArgument{.{ .prepared = .{
         .value = @enumFromInt(0),
@@ -479,7 +516,7 @@ fn testCompileVariantSubsetCallAllocations(gpa: std.mem.Allocator) !void {
     const ssa: structures.FunctionBodyAnalysis = .{
         .return_type = wide_variant,
         .parameter_modes = &parameter_modes,
-        .block_argument_types = &block_argument_types,
+        .block_arguments = &block_arguments,
         .variant_coercion_tags = &.{ 0, 2 },
         .branch_arguments = &.{},
         .call_arguments = &call_arguments,
