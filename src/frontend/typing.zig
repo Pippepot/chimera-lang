@@ -248,6 +248,23 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 allocator.free(self.completed_consumptions);
                 self.* = undefined;
             }
+
+            /// Flow facts join independently of value and storage selection.
+            fn joinFlow(self: State, other: State) void {
+                for (self.availability, other.availability) |*left, right| left.* = joinAvailability(left.*, right);
+                for (self.field_availability, other.field_availability) |*left, right| left.* = joinAvailability(left.*, right);
+                for (self.initializers, other.initializers) |*left, right| {
+                    if (left.* != right) left.* = .maybe_consumed;
+                }
+                for (self.completed_consumptions, other.completed_consumptions) |*left, right| left.* = left.* and right;
+            }
+
+            fn copyFlowFrom(self: State, other: State) void {
+                @memcpy(self.availability, other.availability);
+                @memcpy(self.field_availability, other.field_availability);
+                @memcpy(self.initializers, other.initializers);
+                @memcpy(self.completed_consumptions, other.completed_consumptions);
+            }
         };
         const Expression = semantic.UnresolvedBody.Expression;
         const StateId = enum(u32) { _ };
@@ -3097,12 +3114,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 const resolved = try self.resolveReferenceOrigins(origins, &pending);
                 var effects: std.ArrayList(LifetimeEffect) = .empty;
                 defer effects.deinit(self.ctx.allocator());
-                if (!pending) try self.collectReferenceUses(resolved, .{
-                    .values = self.local_values,
-                    .availability = self.local_availability,
-                    .field_availability = self.field_availability,
-                    .initializers = self.init_availability,
-                }, self.activeLifetimeSpan(), &effects, &pending);
+                if (!pending) try self.collectReferenceUses(resolved, self.currentState(), self.activeLifetimeSpan(), &effects, &pending);
                 if (pending) {
                     try self.pending_reference_uses.append(self.ctx.allocator(), .{
                         .origins = origins,
@@ -3741,10 +3753,23 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             return self.withCleanupCondition(result);
         }
 
+        /// Borrow the current arrays; snapshots acquire ownership through clone.
+        fn currentState(self: *Self) State {
+            return .{
+                .values = self.local_values,
+                .availability = self.local_availability,
+                .field_availability = self.field_availability,
+                .initializers = self.init_availability,
+                .completed_consumptions = self.completed_consumptions,
+            };
+        }
+
         fn captureState(self: *Self) !StateId {
             var count = self.local_values.len;
             while (count > 0 and self.local_values[count - 1] == null) count -= 1;
-            var state = try (State{ .values = self.local_values[0..count], .availability = self.local_availability, .field_availability = self.field_availability, .initializers = self.init_availability, .completed_consumptions = self.completed_consumptions }).clone(self.ctx.allocator());
+            var current = self.currentState();
+            current.values = current.values[0..count];
+            var state = try current.clone(self.ctx.allocator());
             errdefer state.deinit(self.ctx.allocator());
             return self.appendState(state);
         }
@@ -3762,10 +3787,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             const state = self.states.items[@intFromEnum(id)];
             @memcpy(self.local_values[0..state.values.len], state.values);
             @memset(self.local_values[state.values.len..], null);
-            @memcpy(self.local_availability, state.availability);
-            @memcpy(self.field_availability, state.field_availability);
-            @memcpy(self.init_availability, state.initializers);
-            @memcpy(self.completed_consumptions, state.completed_consumptions);
+            self.currentState().copyFlowFrom(state);
         }
 
         fn activeStateValues(self: *Self, id: StateId) !std.ArrayList(Value) {
@@ -4012,10 +4034,12 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 state_argument += 1;
             }
             const output_state = try self.stateWithArguments(baseline, exit_state_start);
-            @memcpy(self.states.items[@intFromEnum(output_state)].completed_consumptions, self.states.items[@intFromEnum(breaks[0].state)].completed_consumptions);
-            for (breaks[1..]) |break_edge| joinCompletedConsumptions(self.states.items[@intFromEnum(output_state)].completed_consumptions, self.states.items[@intFromEnum(break_edge.state)].completed_consumptions);
-            @memcpy(self.states.items[@intFromEnum(output_state)].initializers, self.states.items[@intFromEnum(breaks[0].state)].initializers);
-            for (breaks[1..]) |break_edge| joinInitializers(self.states.items[@intFromEnum(output_state)].initializers, self.states.items[@intFromEnum(break_edge.state)].initializers);
+            const output_flow = self.states.items[@intFromEnum(output_state)];
+            output_flow.copyFlowFrom(self.states.items[@intFromEnum(breaks[0].state)]);
+            for (breaks[1..]) |break_edge| output_flow.joinFlow(self.states.items[@intFromEnum(break_edge.state)]);
+            for (output_flow.availability, self.states.items[@intFromEnum(baseline)].availability) |*availability, initial| {
+                if (initial == .unbound) availability.* = .unbound;
+            }
             for (in_place_slots.items) |in_place| {
                 for (breaks, incoming_generations) |break_edge, *generation| {
                     generation.* = self.states.items[@intFromEnum(break_edge.state)].values[in_place.slot].?.owned_generation;
@@ -4043,19 +4067,6 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 self.states.items[@intFromEnum(output_state)].values[slot].?.reference_origins = origins;
                 self.states.items[@intFromEnum(output_state)].values[slot].?.binding_identity = identity;
                 self.states.items[@intFromEnum(output_state)].values[slot].?.storage_identity = storage_identity;
-            }
-            for (self.states.items[@intFromEnum(output_state)].availability, 0..) |*availability, index| {
-                if (self.states.items[@intFromEnum(baseline)].availability[index] == .unbound) continue;
-                availability.* = self.states.items[@intFromEnum(breaks[0].state)].availability[index];
-                for (breaks[1..]) |break_edge| {
-                    availability.* = joinAvailability(availability.*, self.states.items[@intFromEnum(break_edge.state)].availability[index]);
-                }
-            }
-            for (self.states.items[@intFromEnum(output_state)].field_availability, 0..) |*availability, index| {
-                availability.* = self.states.items[@intFromEnum(breaks[0].state)].field_availability[index];
-                for (breaks[1..]) |break_edge| {
-                    availability.* = joinAvailability(availability.*, self.states.items[@intFromEnum(break_edge.state)].field_availability[index]);
-                }
             }
             var any_borrowed = false;
             var all_borrowed = true;
@@ -6924,10 +6935,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             for (generation_only_joins.items) |generation_join| {
                 values[generation_join.slot].?.owned_generation = generation_join.destination;
             }
-            for (state.availability, second_state.availability) |*output, right| output.* = joinAvailability(output.*, right);
-            for (state.field_availability, second_state.field_availability) |*output, right| output.* = joinAvailability(output.*, right);
-            joinCompletedConsumptions(state.completed_consumptions, second_state.completed_consumptions);
-            joinInitializers(state.initializers, second_state.initializers);
+            state.joinFlow(second_state);
             const state_id = try self.appendState(state);
             return .{ .block = merged, .state = state_id };
         }
@@ -7327,29 +7335,24 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             const source = if (first) |exit| exit.state else second.?.state;
             const baseline_state = self.states.items[@intFromEnum(baseline)];
             const source_state = self.states.items[@intFromEnum(source)];
-            var state = try (State{ .values = baseline_state.values, .availability = source_state.availability, .field_availability = source_state.field_availability, .initializers = source_state.initializers, .completed_consumptions = source_state.completed_consumptions }).clone(self.ctx.allocator());
+            var initial = source_state;
+            initial.values = baseline_state.values;
+            var state = try initial.clone(self.ctx.allocator());
             errdefer state.deinit(self.ctx.allocator());
             const values = state.values;
             for (values, 0..) |*output, slot| {
                 if (output.* != null) {
                     output.* = source_state.values[slot].?;
                     if (first != null and second != null) {
-                        output.*.?.stable_reference_root = sharedStableReferenceRoot(
-                            self.states.items[@intFromEnum(first.?.state)].values[slot].?.stable_reference_root,
-                            self.states.items[@intFromEnum(second.?.state)].values[slot].?.stable_reference_root,
-                        );
-                        output.*.?.reference_origins = try self.mergeReferenceOrigins(
-                            self.states.items[@intFromEnum(first.?.state)].values[slot].?.reference_origins,
-                            self.states.items[@intFromEnum(second.?.state)].values[slot].?.reference_origins,
-                        );
-                        const first_identity = self.states.items[@intFromEnum(first.?.state)].values[slot].?.binding_identity;
-                        const second_identity = self.states.items[@intFromEnum(second.?.state)].values[slot].?.binding_identity;
+                        const left = self.states.items[@intFromEnum(first.?.state)].values[slot].?;
+                        const right = self.states.items[@intFromEnum(second.?.state)].values[slot].?;
+                        try self.mergeValueReferences(&output.*.?, left, right);
                         output.*.?.storage_identity = try self.joinBindingIdentities(
-                            self.states.items[@intFromEnum(first.?.state)].values[slot].?.storage_identity orelse first_identity,
-                            self.states.items[@intFromEnum(second.?.state)].values[slot].?.storage_identity orelse second_identity,
+                            left.storage_identity orelse left.binding_identity,
+                            right.storage_identity orelse right.binding_identity,
                         );
-                        output.*.?.binding_identity = if (std.meta.eql(first_identity, second_identity))
-                            first_identity
+                        output.*.?.binding_identity = if (std.meta.eql(left.binding_identity, right.binding_identity))
+                            left.binding_identity
                         else
                             try self.newBindingIdentity();
                     }
@@ -7367,24 +7370,9 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 };
             }
             if (first != null and second != null) {
-                const other = self.states.items[@intFromEnum(second.?.state)].availability;
-                for (state.availability, other) |*output, right| output.* = joinAvailability(output.*, right);
-                joinInitializers(state.initializers, self.states.items[@intFromEnum(second.?.state)].initializers);
-                joinCompletedConsumptions(state.completed_consumptions, self.states.items[@intFromEnum(second.?.state)].completed_consumptions);
-                const other_fields = self.states.items[@intFromEnum(second.?.state)].field_availability;
-                for (state.field_availability, other_fields) |*output, right| output.* = joinAvailability(output.*, right);
+                state.joinFlow(self.states.items[@intFromEnum(second.?.state)]);
             }
             return self.appendState(state);
-        }
-
-        fn joinInitializers(output: []InitAvailability, other: []const InitAvailability) void {
-            for (output, other) |*left, right| {
-                if (left.* != right) left.* = .maybe_consumed;
-            }
-        }
-
-        fn joinCompletedConsumptions(output: []bool, other: []const bool) void {
-            for (output, other) |*left, right| left.* = left.* and right;
         }
 
         fn joinAvailability(left: Availability, right: Availability) Availability {

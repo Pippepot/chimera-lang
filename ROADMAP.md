@@ -58,36 +58,16 @@
 
 ## Priority and dependencies
 
-Keep milestone 1 as the completed foundation. Milestone 2 is the next priority:
-make initializer failure explicit and prohibit caller-directed exits across
-deferred construction. All later milestones are lower priority and retain their
-relative order, expanding the host storage and reference foundation toward text,
-generic collections, and ordinary iteration. Each language slice covers
-diagnostics, execution, ownership, and incremental recomputation; reject
-unsupported forms at their owning boundary.
+Milestone 1 is the next priority: make initializer failure explicit and prohibit
+caller-directed exits across deferred construction. All later milestones are
+lower priority and retain their relative order, expanding the host storage and
+reference foundation toward text, generic collections, and ordinary iteration.
+Each language slice covers diagnostics, execution, ownership, and incremental
+recomputation; reject unsupported forms at their owning boundary.
 
 ## Ordered milestones
 
-### 1. Destination construction and consuming access
-
-Complete. Fresh results construct in their destinations; named locals copy or
-explicitly move, and `deinit` consumes existing storage in place. Nonescaping
-`init` parameters cover whole-expression inference, capture effects, guarded
-transfers, forwarding, and caller-directed return, break, and continue in native
-execution and the supported compile-time subset.
-
-`Box.new(init item: T)` and raw slot initialization use ordinary init calls.
-Allocation precedes the entire expression through aliases and callable values.
-Query/cache restoration and incremental edits retain hook effects, named-local
-returns, skipped evaluation, single use, partial cleanup, consumption before
-later failure, and lexical outcomes.
-
-[ARCHITECTURE.md](ARCHITECTURE.md#deferred-construction) owns the representation
-and cleanup contracts. General compile-time references and allocation and
-unsupported live-storage replacement remain outside this milestone; their
-current limits are documented in [STORAGE_AND_REFERENCES.md](STORAGE_AND_REFERENCES.md).
-
-### 2. Explicit initializer failure and control flow
+### 1. Explicit initializer failure and control flow
 
 Revise the deferred initializer rules in
 [syntax&semantics.txt](syntax&semantics.txt) before implementation. The current
@@ -133,7 +113,7 @@ implicit failure propagation and caller-directed lexical exits.
   [STORAGE_AND_REFERENCES.md](STORAGE_AND_REFERENCES.md) as the implementation and
   cleanup contracts change.
 
-### 3. Field visibility
+### 2. Field visibility
 
 Implement field visibility from [syntax&semantics.txt](syntax&semantics.txt).
 It replaces the temporary name-matched opaque storage owners in `std.memory`.
@@ -153,7 +133,7 @@ It replaces the temporary name-matched opaque storage owners in `std.memory`.
   with private fields; compile-time execution; and incremental recomputation
   when a field gains or loses `pub`.
 
-### 4. Converters and literal types
+### 3. Converters and literal types
 
 - Implement `static struct` expressions and named and parameterized declaration
   sugar from [syntax&semantics.txt](syntax&semantics.txt). Preserve ordinary
@@ -183,7 +163,7 @@ It replaces the temporary name-matched opaque storage owners in `std.memory`.
   execution, and incremental recomputation when either owning module adds or
   removes a converter.
 
-### 5. Text and basic I/O
+### 4. Text and basic I/O
 
 - Define UTF-8 string literals through the literal-type converter model and a
   `std` **String** exported through
@@ -195,7 +175,7 @@ It replaces the temporary name-matched opaque storage owners in `std.memory`.
   borrowing for slices, and cleanup. Compile-time execution retains no ambient
   I/O.
 
-### 6. Ranges, List, and iteration
+### 5. Ranges, List, and iteration
 
 - Implement exclusive/inclusive ascending ranges and empty-range behavior.
   Decide endpoint types, descending iteration, steps, overflow-safe termination,
@@ -214,20 +194,20 @@ It replaces the temporary name-matched opaque storage owners in `std.memory`.
   iterator state and invalidation, loop results, and cleanup on every exit path.
   Range-only iteration may precede List if it uses that contract.
 
-### 7. Structural tuples
+### 6. Structural tuples
 
 - Implement ordered structural identity for `(foo, bar)` with type spelling,
   access, destructuring, layout, and elementwise ownership. Resolve grouping
   and singleton syntax alongside `()`; tuples support multiple results and
   later Map iteration.
 
-### 8. Match
+### 7. Match
 
 - Evaluate the subject once; add literal, wildcard, binding, `pattern as name`,
   and `is Type` patterns. Diagnose redundancy and non-exhaustiveness using
   existing branch joins and variant mappings.
 
-### 9. Numeric foundations
+### 8. Numeric foundations
 
 - Add named numeric conversion functions (wrap, truncate, round, saturate,
   widen) with specified overflow and failure behavior; converters never relate
@@ -242,7 +222,7 @@ It replaces the temporary name-matched opaque storage owners in `std.memory`.
   Extend to float and user structs after their semantics are settled; do not
   assume general overloading follows from operator lookup.
 
-### 10. Collections and algorithms
+### 9. Collections and algorithms
 
 - Add **Map**, **Set**, **Queue**, and **Stack** on established storage and
   iteration contracts. Specify hashing/equality, ordering, mutation, and

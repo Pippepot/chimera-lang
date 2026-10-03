@@ -6,6 +6,16 @@ const std = @import("std");
 // independent from parser/query/analyzer/codegen modules so shared result types
 // can be imported without creating compiler dependency cycles.
 
+/// Compare slice contents using fieldwise equality, ignoring struct padding.
+/// Elements with owned slices still need their own content comparison.
+fn sliceItemsEql(comptime T: type, a: []const T, b: []const T) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (!std.meta.eql(left, right)) return false;
+    }
+    return true;
+}
+
 pub const Token = struct {
     tag: Tag,
     loc: Location,
@@ -271,9 +281,7 @@ pub const Ast = struct {
     pub fn eql(a: Ast, b: Ast) bool {
         if (a.file_id != b.file_id) return false;
         if (a.tokens.len != b.tokens.len or a.nodes.len != b.nodes.len or a.node_refs.len != b.node_refs.len) return false;
-        for (a.tokens, b.tokens) |left, right| {
-            if (!std.meta.eql(left, right)) return false;
-        }
+        if (!sliceItemsEql(Token, a.tokens, b.tokens)) return false;
         for (a.nodes, b.nodes) |left, right| {
             if (left.tag != right.tag or left.token_index != right.token_index) return false;
             switch (left.tag) {
@@ -476,9 +484,7 @@ pub const ModuleItemIndex = struct {
     }
 
     pub fn eql(a: ModuleItemIndex, b: ModuleItemIndex) bool {
-        if (a.entries.len != b.entries.len) return false;
-        for (a.entries, b.entries) |left, right| if (!std.meta.eql(left, right)) return false;
-        return true;
+        return sliceItemsEql(Entry, a.entries, b.entries);
     }
 
     pub fn deinit(self: *ModuleItemIndex, gpa: std.mem.Allocator) void {
@@ -716,14 +722,6 @@ pub const CallableParameter = struct {
     type_id: TypeId,
 };
 
-fn callableParametersEql(a: []const CallableParameter, b: []const CallableParameter) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |left, right| {
-        if (left.mode != right.mode or left.type_id != right.type_id) return false;
-    }
-    return true;
-}
-
 pub const CallableType = struct {
     parameters: []const CallableParameter,
     return_type: TypeId,
@@ -731,7 +729,7 @@ pub const CallableType = struct {
     return_origins: ?[]const u32 = null,
 
     pub fn parametersEql(a: CallableType, b: CallableType) bool {
-        return callableParametersEql(a.parameters, b.parameters);
+        return sliceItemsEql(CallableParameter, a.parameters, b.parameters);
     }
 
     pub fn eql(a: CallableType, b: CallableType) bool {
@@ -742,6 +740,14 @@ pub const CallableType = struct {
             else
                 b.return_origins == null) and
             a.parametersEql(b);
+    }
+
+    pub fn clone(self: CallableType, gpa: std.mem.Allocator) !CallableType {
+        var cloned = self;
+        cloned.parameters = try gpa.dupe(CallableParameter, self.parameters);
+        errdefer gpa.free(cloned.parameters);
+        cloned.return_origins = if (self.return_origins) |origins| try gpa.dupe(u32, origins) else null;
+        return cloned;
     }
 
     pub fn deinit(self: *CallableType, gpa: std.mem.Allocator) void {
@@ -1083,12 +1089,8 @@ pub const FunctionShape = struct {
     parameters: []const FunctionParameterShape,
 
     pub fn eql(a: FunctionShape, b: FunctionShape) bool {
-        if (a.returns_type != b.returns_type) return false;
-        if (a.parameters.len != b.parameters.len) return false;
-        for (a.parameters, b.parameters) |left, right| {
-            if (!std.meta.eql(left, right)) return false;
-        }
-        return true;
+        return a.returns_type == b.returns_type and
+            sliceItemsEql(FunctionParameterShape, a.parameters, b.parameters);
     }
 
     pub fn deinit(self: *FunctionShape, gpa: std.mem.Allocator) void {
@@ -1363,54 +1365,18 @@ pub const FunctionBodyAnalysis = struct {
             a.initializer_regions.len != b.initializer_regions.len or
             !std.mem.eql(FunctionValueId, a.initializer_captures, b.initializer_captures) or
             !std.mem.eql(ParameterMode, a.parameter_modes, b.parameter_modes) or
-            a.block_arguments.len != b.block_arguments.len or
+            !sliceItemsEql(FunctionBlockArgument, a.block_arguments, b.block_arguments) or
             !std.mem.eql(u32, a.variant_coercion_tags, b.variant_coercion_tags) or
-            a.struct_field_values.len != b.struct_field_values.len or
+            !sliceItemsEql(StructFieldValue, a.struct_field_values, b.struct_field_values) or
             !std.mem.eql(u32, a.borrow_fields, b.borrow_fields) or
-            !valueUsesEql(a.branch_arguments, b.branch_arguments) or
-            !callArgumentsEql(a.call_arguments, b.call_arguments) or
-            a.instructions.len != b.instructions.len or
-            !sourceSpansEql(a.instruction_spans, b.instruction_spans) or
-            !sourceSpansEql(a.terminator_spans, b.terminator_spans) or
-            a.blocks.len != b.blocks.len) return false;
-        for (a.block_arguments, b.block_arguments) |left, right| {
-            if (!std.meta.eql(left, right)) return false;
-        }
+            !sliceItemsEql(FunctionValueUse, a.branch_arguments, b.branch_arguments) or
+            !sliceItemsEql(FunctionCallArgument, a.call_arguments, b.call_arguments) or
+            !sliceItemsEql(Instruction, a.instructions, b.instructions) or
+            !sliceItemsEql(SourceSpan, a.instruction_spans, b.instruction_spans) or
+            !sliceItemsEql(SourceSpan, a.terminator_spans, b.terminator_spans) or
+            !sliceItemsEql(Block, a.blocks, b.blocks)) return false;
         for (a.initializer_regions, b.initializer_regions) |left, right| {
             if (!eql(left, right)) return false;
-        }
-        for (a.struct_field_values, b.struct_field_values) |left, right| {
-            if (!std.meta.eql(left, right)) return false;
-        }
-        for (a.instructions, b.instructions) |left, right| {
-            if (!std.meta.eql(left, right)) return false;
-        }
-        for (a.blocks, b.blocks) |left, right| {
-            if (!std.meta.eql(left, right)) return false;
-        }
-        return true;
-    }
-
-    fn valueUsesEql(left: []const FunctionValueUse, right: []const FunctionValueUse) bool {
-        if (left.len != right.len) return false;
-        for (left, right) |left_use, right_use| {
-            if (!std.meta.eql(left_use, right_use)) return false;
-        }
-        return true;
-    }
-
-    fn callArgumentsEql(left: []const FunctionCallArgument, right: []const FunctionCallArgument) bool {
-        if (left.len != right.len) return false;
-        for (left, right) |left_argument, right_argument| {
-            if (!std.meta.eql(left_argument, right_argument)) return false;
-        }
-        return true;
-    }
-
-    fn sourceSpansEql(left: []const SourceSpan, right: []const SourceSpan) bool {
-        if (left.len != right.len) return false;
-        for (left, right) |left_span, right_span| {
-            if (!std.meta.eql(left_span, right_span)) return false;
         }
         return true;
     }
@@ -1465,11 +1431,7 @@ pub const ReachableInstances = struct {
     instances: []const InstanceId,
 
     pub fn eql(a: ReachableInstances, b: ReachableInstances) bool {
-        if (a.instances.len != b.instances.len) return false;
-        for (a.instances, b.instances) |left, right| {
-            if (!std.meta.eql(left, right)) return false;
-        }
-        return true;
+        return sliceItemsEql(InstanceId, a.instances, b.instances);
     }
 
     pub fn deinit(self: *ReachableInstances, gpa: std.mem.Allocator) void {
@@ -1503,20 +1465,10 @@ pub const CompiledFunction = struct {
     };
 
     pub fn eql(a: CompiledFunction, b: CompiledFunction) bool {
-        if (a.required_alignment != b.required_alignment or
-            !std.mem.eql(u8, a.code, b.code) or
-            a.relocations.len != b.relocations.len or
-            a.referenced_instances.len != b.referenced_instances.len)
-        {
-            return false;
-        }
-        for (a.relocations, b.relocations) |left, right| {
-            if (!std.meta.eql(left, right)) return false;
-        }
-        for (a.referenced_instances, b.referenced_instances) |left, right| {
-            if (!std.meta.eql(left, right)) return false;
-        }
-        return true;
+        return a.required_alignment == b.required_alignment and
+            std.mem.eql(u8, a.code, b.code) and
+            sliceItemsEql(Relocation, a.relocations, b.relocations) and
+            sliceItemsEql(InstanceId, a.referenced_instances, b.referenced_instances);
     }
 
     pub fn deinit(self: *CompiledFunction, gpa: std.mem.Allocator) void {

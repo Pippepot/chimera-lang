@@ -248,35 +248,23 @@ pub const Types = struct {
     }
 
     pub fn clone(gpa: std.mem.Allocator, value: Value) !Value {
-        return switch (value) {
-            .variant => |variant| blk: {
+        switch (value) {
+            .variant => |variant| {
                 std.debug.assert(variant.members.len >= 2);
                 for (variant.members, 0..) |member, index| {
                     if (index > 0) std.debug.assert(@intFromEnum(variant.members[index - 1]) < @intFromEnum(member));
                 }
-                break :blk .{ .variant = .{ .members = try gpa.dupe(structures.TypeId, variant.members) } };
+                return .{ .variant = .{ .members = try gpa.dupe(structures.TypeId, variant.members) } };
             },
-            .callable => |callable| blk: {
-                const parameters = try gpa.dupe(structures.CallableParameter, callable.parameters);
-                errdefer gpa.free(parameters);
-                break :blk .{ .callable = .{
-                    .parameters = parameters,
-                    .return_type = callable.return_type,
-                    .is_fallible = callable.is_fallible,
-                    .return_origins = if (callable.return_origins) |origins| try gpa.dupe(u32, origins) else null,
-                } };
-            },
-            .structure => |identity| .{ .structure = identity },
-        };
+            .callable => |callable| return .{ .callable = try callable.clone(gpa) },
+            .structure => |identity| return .{ .structure = identity },
+        }
     }
 
     pub fn deinit(gpa: std.mem.Allocator, value: *Value) void {
         switch (value.*) {
             .variant => |variant| gpa.free(variant.members),
-            .callable => |callable| {
-                gpa.free(callable.parameters);
-                if (callable.return_origins) |origins| gpa.free(origins);
-            },
+            .callable => |*callable| callable.deinit(gpa),
             .structure => {},
         }
         value.* = undefined;
@@ -1108,12 +1096,7 @@ pub fn AnalysisContext(comptime Context: type) type {
             return .{
                 .target = instance.item,
                 .specialization = instance.specialization,
-                .type_id = try self.facts().internCallable(.{
-                    .parameters = signature.parameters,
-                    .return_type = signature.return_type,
-                    .is_fallible = signature.is_fallible,
-                    .return_origins = signature.return_origins,
-                }),
+                .type_id = try self.facts().internCallable(signature),
             };
         }
     };

@@ -1861,13 +1861,7 @@ fn analyzeType(
     if (node.tag == .type or node.tag == .identifier) {
         const span = tokenSpan(ast, node.token_index);
         const name = source[span.start..span.end];
-        if (std.mem.eql(u8, name, "int")) return .{ .success = .int };
-        if (std.mem.eql(u8, name, "byte")) return .{ .success = .byte };
-        if (std.mem.eql(u8, name, "bool")) return .{ .success = .bool };
-        if (std.mem.eql(u8, name, "unit")) return .{ .success = .unit };
-        if (std.mem.eql(u8, name, "none")) return .{ .success = .none };
-        if (std.mem.eql(u8, name, "never")) return .{ .success = .never };
-        if (std.mem.eql(u8, name, "type")) return .{ .success = .type };
+        if (std.meta.stringToEnum(structures.TypeId, name)) |type_id| return .{ .success = type_id };
         if (std.mem.eql(u8, name, "float")) return .{ .unsupported = .{ .span = span, .kind = .float_type_not_supported } };
     }
     if (node.tag == .type or node.tag == .identifier or node.tag == .field_access) {

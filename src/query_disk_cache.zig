@@ -25,19 +25,16 @@ pub fn restoreInterns(db: *query.Database, allocator: std.mem.Allocator, payload
     for (0..count) |index| {
         const name = try reader.read([]const u8);
         defer allocator.free(name);
-        if (std.mem.eql(u8, name, @typeName(queries.ModulePaths))) {
-            try restoreIntern(queries.ModulePaths, db, &reader, index);
-        } else if (std.mem.eql(u8, name, @typeName(queries.ItemLocations))) {
-            try restoreIntern(queries.ItemLocations, db, &reader, index);
-        } else if (std.mem.eql(u8, name, @typeName(queries.Types))) {
-            try restoreIntern(queries.Types, db, &reader, index);
-        } else if (std.mem.eql(u8, name, @typeName(queries.CompileTimeValues))) {
-            try restoreIntern(queries.CompileTimeValues, db, &reader, index);
-        } else if (std.mem.eql(u8, name, @typeName(queries.CompileTimeValueTuples))) {
-            try restoreIntern(queries.CompileTimeValueTuples, db, &reader, index);
-        } else return error.InvalidCache;
+        try restoreNamedIntern(name, db, &reader, index);
     }
     return reader.offset;
+}
+
+fn restoreNamedIntern(name: []const u8, db: *query.Database, reader: *codec.Reader, index: usize) !void {
+    inline for (.{ queries.ModulePaths, queries.ItemLocations, queries.Types, queries.CompileTimeValues, queries.CompileTimeValueTuples }) |I| {
+        if (std.mem.eql(u8, name, @typeName(I))) return restoreIntern(I, db, reader, index);
+    }
+    return error.InvalidCache;
 }
 
 fn restoreIntern(comptime I: type, db: *query.Database, reader: *codec.Reader, index: usize) !void {
@@ -87,46 +84,14 @@ fn restoreQuery(comptime Q: type, db: *query.Database, reader: *codec.Reader) !u
             try validateIds(Q.Output, db, output) and
             try validOutput(Q, db, output);
         for (0..dep_count) |_| {
-            const name = try reader.read([]const u8);
-            defer reader.allocator.free(name);
-            const matched = if (std.mem.eql(u8, name, @typeName(queries.SourceText)))
-                try restoreInput(queries.SourceText, db, reader, valid)
-            else if (std.mem.eql(u8, name, @typeName(queries.FileModule)))
-                try restoreInput(queries.FileModule, db, reader, valid)
-            else if (std.mem.eql(u8, name, @typeName(queries.ModuleMembers)))
-                try restoreInput(queries.ModuleMembers, db, reader, valid)
-            else if (std.mem.eql(u8, name, @typeName(queries.ModuleCatalog)))
-                try restoreInput(queries.ModuleCatalog, db, reader, valid)
-            else if (std.mem.eql(u8, name, @typeName(queries.StandardPreludeModule)))
-                try restoreInput(queries.StandardPreludeModule, db, reader, valid)
-            else if (std.mem.eql(u8, name, @typeName(queries.StandardFile)))
-                try restoreInput(queries.StandardFile, db, reader, valid)
-            else
-                return error.InvalidCache;
+            const matched = try restoreNamedInput(db, reader, valid);
             if (matched) |dep| {
                 try deps.append(reader.allocator, dep);
             } else valid = false;
         }
         const query_dep_count = try readCount(reader);
         for (0..query_dep_count) |_| {
-            const name = try reader.read([]const u8);
-            defer reader.allocator.free(name);
-            const matched = if (std.mem.eql(u8, name, @typeName(queries.BuildModuleScope)))
-                try restoreQueryDependency(queries.BuildModuleScope, db, reader, valid)
-            else if (std.mem.eql(u8, name, @typeName(queries.ModuleDeclarations)))
-                try restoreQueryDependency(queries.ModuleDeclarations, db, reader, valid)
-            else if (std.mem.eql(u8, name, @typeName(queries.IndexModuleItems)))
-                try restoreQueryDependency(queries.IndexModuleItems, db, reader, valid)
-            else if (std.mem.eql(u8, name, @typeName(queries.ResolveItem)))
-                try restoreQueryDependency(queries.ResolveItem, db, reader, valid)
-            else if (std.mem.eql(u8, name, @typeName(queries.FunctionSignature)))
-                try restoreQueryDependency(queries.FunctionSignature, db, reader, valid)
-            else if (std.mem.eql(u8, name, @typeName(queries.FunctionInstanceSignature)))
-                try restoreQueryDependency(queries.FunctionInstanceSignature, db, reader, valid)
-            else if (std.mem.eql(u8, name, @typeName(queries.AnalyzeFunctionInstance)))
-                try restoreQueryDependency(queries.AnalyzeFunctionInstance, db, reader, valid)
-            else
-                return error.InvalidCache;
+            const matched = try restoreNamedQueryDependency(db, reader, valid);
             if (matched) |dep| {
                 try query_deps.append(reader.allocator, dep);
             } else valid = false;
@@ -138,6 +103,24 @@ fn restoreQuery(comptime Q: type, db: *query.Database, reader: *codec.Reader) !u
         }
     }
     return imported_count;
+}
+
+fn restoreNamedInput(db: *query.Database, reader: *codec.Reader, check: bool) !?query.PersistedInputRef {
+    const name = try reader.read([]const u8);
+    defer reader.allocator.free(name);
+    inline for (.{ queries.SourceText, queries.FileModule, queries.ModuleMembers, queries.ModuleCatalog, queries.StandardPreludeModule, queries.StandardFile }) |I| {
+        if (std.mem.eql(u8, name, @typeName(I))) return restoreInput(I, db, reader, check);
+    }
+    return error.InvalidCache;
+}
+
+fn restoreNamedQueryDependency(db: *query.Database, reader: *codec.Reader, check: bool) !?query.PersistedQueryRef {
+    const name = try reader.read([]const u8);
+    defer reader.allocator.free(name);
+    inline for (.{ queries.BuildModuleScope, queries.ModuleDeclarations, queries.IndexModuleItems, queries.ResolveItem, queries.FunctionSignature, queries.FunctionInstanceSignature, queries.AnalyzeFunctionInstance }) |Q| {
+        if (std.mem.eql(u8, name, @typeName(Q))) return restoreQueryDependency(Q, db, reader, check);
+    }
+    return error.InvalidCache;
 }
 
 fn restoreQueryDependency(comptime Q: type, db: *query.Database, reader: *codec.Reader, check: bool) !?query.PersistedQueryRef {

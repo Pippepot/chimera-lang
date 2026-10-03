@@ -141,16 +141,7 @@ fn compileAndRun(
         if (try cache.load(io, gpa, input.cache_directory.?, digest)) |bytes| {
             defer gpa.free(bytes);
             timings.mark(io, "cache hit");
-            var prepared = try runtime.prepareProgram(io, gpa, bytes);
-            defer prepared.deinit(io);
-            timings.mark(io, "write program");
-            const status = try prepared.run(io, input.program_args);
-            timings.mark(io, "run program");
-            if (input.debug_flags.timing) {
-                try timings.print(io, errors);
-                try errors.flush();
-            }
-            return .{ .program = status };
+            return runExecutable(io, gpa, input, bytes, &timings, errors);
         }
     }
     const worker_count = if (input.worker_count == 0)
@@ -281,7 +272,11 @@ fn compileAndRun(
     timings.mark(io, "save queries");
     if (cache_key) |digest| cache.save(io, gpa, input.cache_directory.?, digest, executable.bytes) catch {};
 
-    var prepared = try runtime.prepareProgram(io, gpa, executable.bytes);
+    return runExecutable(io, gpa, input, executable.bytes, &timings, errors);
+}
+
+fn runExecutable(io: std.Io, gpa: std.mem.Allocator, input: RunInput, bytes: []const u8, timings: *diagnostics.TimingLog, errors: *std.Io.Writer) !RunOutcome {
+    var prepared = try runtime.prepareProgram(io, gpa, bytes);
     defer prepared.deinit(io);
     timings.mark(io, "write program");
     const exit_code = try prepared.run(io, input.program_args);

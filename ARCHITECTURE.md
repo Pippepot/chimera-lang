@@ -134,7 +134,7 @@ coercion metadata; Box element projections and indexed allocation destinations
 match their owner's element type. Physical layouts remain backend-owned.
 
 Implementation status and priorities are tracked in
-[ROADMAP.md](ROADMAP.md#1-destination-construction-and-consuming-access).
+[ROADMAP.md](ROADMAP.md).
 
 ## Ownership and layout
 
@@ -145,7 +145,7 @@ Implementation status and priorities are tracked in
 - `AnalysisContext` derives `copy` and `move` member availability from validated ownership capabilities and specializes private declarations in `std/ownership.chi`. These use ordinary instance identities and canonical callable types, with capability checks also applied when their signatures are demanded. Typing builds their bodies with the existing selected ownership operations and lifetime machinery; runtime codegen and compile-time interpretation consume ordinary typed IR. No member query, recursive source wrapper, or backend ownership dispatch is added.
 - Typing tracks ownership at control-flow edges. Lifetime effects are recorded in a boundary of the block where their operation executes; block statements and results never record into an enclosing expression's boundary. A `mut` parameter root is caller-owned and carries no generation; a value assigned to the whole root passes to the caller's place. After constructing the graph, `src/frontend/lifetime.zig` plans path-sensitive cleanup and explicit-drop obligations from query-local metadata. Typing rejects abandonment before materializing the plan as ordinary typed operations; neither the solver's state nor a generic destruction operation enters published IR.
 - Cleanup values retain reference provenance through ownership forwarding. After materialization, typing checks paths from expression-borrow reads through mutating destructor calls to later uses, stopping at fresh reads. Fieldwise and standard Box destruction visit only contained destructors; user hooks conservatively receive all writable references in their argument. Read identities and cleanup effects are query-local and do not enter cached IR.
-- Immutable local-binding metadata has one allocation owner. Query-local snapshots retain only the value prefix through the last bound local, with full-sized availability arrays; restoring a snapshot clears the omitted tail. `State` owns cloning and cleanup of these slices. Lifetime tables remain dense. Opt-in `BodyMeasurements` records their footprint without changing cached IR or publishing accumulators; `zig build flow-benchmark -Doptimize=ReleaseFast` exercises branch scaling.
+- Immutable local-binding metadata has one allocation owner. Query-local snapshots retain only the value prefix through the last bound local, with full-sized availability arrays; restoring a snapshot clears the omitted tail. `State` owns cloning, cleanup, and joining the independent flow facts: local and field availability, initializer consumption, and definite consumption completion. Value and storage selection remain with the control-flow builder. Lifetime tables remain dense. Opt-in `BodyMeasurements` records their footprint without changing cached IR or publishing accumulators; `zig build flow-benchmark -Doptimize=ReleaseFast` exercises branch scaling.
 
 ## Backend and execution
 

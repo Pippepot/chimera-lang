@@ -91,83 +91,87 @@ pub const Reader = struct {
         if (self.nesting == 256) return error.InvalidCache;
         self.nesting += 1;
         defer self.nesting -= 1;
-        return switch (@typeInfo(T)) {
-            .void => {},
-            .bool => blk: {
-                const byte = (try self.take(1))[0];
-                if (byte > 1) return error.InvalidCache;
-                break :blk byte == 1;
-            },
-            .int => |info| blk: {
+        switch (@typeInfo(T)) {
+            .void => return {},
+            .bool => return self.readBool(),
+            .int => |info| {
                 if (info.bits > 64) @compileError("disk codec supports integers up to 64 bits");
-                break :blk try self.readInt(T);
+                return self.readInt(T);
             },
-            .@"enum" => |info| blk: {
-                const raw = try self.read(info.tag_type);
-                if (info.is_exhaustive) {
-                    inline for (info.fields) |field| {
-                        if (raw == field.value) break :blk @enumFromInt(raw);
-                    }
-                    return error.InvalidCache;
-                }
-                break :blk @enumFromInt(raw);
+            .@"enum" => return self.readEnum(T),
+            .optional => |info| {
+                if (!(try self.read(bool))) return null;
+                return try self.read(info.child);
             },
-            .optional => |info| blk: {
-                if (!(try self.read(bool))) break :blk null;
-                break :blk try self.read(info.child);
-            },
-            .array => |info| blk: {
+            .array => {
                 var result: T = undefined;
-                var initialized: usize = 0;
-                errdefer for (result[0..initialized]) |*element| freeValue(info.child, self.allocator, element);
-                for (&result) |*element| {
-                    element.* = try self.read(info.child);
-                    initialized += 1;
-                }
-                break :blk result;
+                try self.readElements(@typeInfo(T).array.child, &result);
+                return result;
             },
-            .@"struct" => |info| blk: {
-                var result: T = undefined;
-                var initialized: usize = 0;
-                errdefer inline for (info.fields, 0..) |field, index| {
-                    if (!field.is_comptime and index < initialized) freeValue(field.type, self.allocator, &@field(result, field.name));
-                };
-                inline for (info.fields) |field| {
-                    if (!field.is_comptime) {
-                        @field(result, field.name) = try self.read(field.type);
-                        initialized += 1;
-                    }
-                }
-                break :blk result;
-            },
-            .@"union" => |info| blk: {
+            .@"struct" => return self.readStruct(T),
+            .@"union" => |info| {
                 const Tag = info.tag_type orelse @compileError("untagged unions cannot be persisted");
                 const tag = try self.read(Tag);
-                break :blk switch (tag) {
-                    inline else => |active| @unionInit(T, @tagName(active), try self.read(@FieldType(T, @tagName(active)))),
-                };
+                switch (tag) {
+                    inline else => |active| return @unionInit(T, @tagName(active), try self.read(@FieldType(T, @tagName(active)))),
+                }
             },
-            .pointer => |info| blk: {
-                if (info.size != .slice) @compileError("only owned slices can be persisted");
-                const count = std.math.cast(usize, try self.read(u64)) orelse return error.InvalidCache;
-                if (count > self.bytes.len - self.offset) return error.InvalidCache;
-                if (info.child == u8) {
-                    break :blk try self.allocator.dupe(u8, try self.take(count));
-                }
-                const values = try self.allocator.alloc(info.child, count);
-                var initialized: usize = 0;
-                errdefer {
-                    for (values[0..initialized]) |*element| freeValue(info.child, self.allocator, element);
-                    self.allocator.free(values);
-                }
-                for (values) |*element| {
-                    element.* = try self.read(info.child);
-                    initialized += 1;
-                }
-                break :blk values;
-            },
+            .pointer => return self.readSlice(T),
             else => @compileError("unsupported disk cache value: " ++ @typeName(T)),
+        }
+    }
+
+    fn readBool(self: *Reader) !bool {
+        const byte = (try self.take(1))[0];
+        if (byte > 1) return error.InvalidCache;
+        return byte == 1;
+    }
+
+    fn readEnum(self: *Reader, comptime T: type) !T {
+        const info = @typeInfo(T).@"enum";
+        const raw = try self.read(info.tag_type);
+        if (!info.is_exhaustive) return @enumFromInt(raw);
+        inline for (info.fields) |field| {
+            if (raw == field.value) return @enumFromInt(raw);
+        }
+        return error.InvalidCache;
+    }
+
+    fn readStruct(self: *Reader, comptime T: type) !T {
+        const fields = @typeInfo(T).@"struct".fields;
+        var result: T = undefined;
+        var initialized: usize = 0;
+        errdefer inline for (fields, 0..) |field, index| {
+            if (!field.is_comptime and index < initialized) freeValue(field.type, self.allocator, &@field(result, field.name));
         };
+        inline for (fields, 0..) |field, index| {
+            if (!field.is_comptime) {
+                @field(result, field.name) = try self.read(field.type);
+                initialized = index + 1;
+            }
+        }
+        return result;
+    }
+
+    fn readSlice(self: *Reader, comptime T: type) !T {
+        const info = @typeInfo(T).pointer;
+        if (info.size != .slice) @compileError("only owned slices can be persisted");
+        const count = std.math.cast(usize, try self.read(u64)) orelse return error.InvalidCache;
+        if (count > self.bytes.len - self.offset) return error.InvalidCache;
+        if (info.child == u8) return self.allocator.dupe(u8, try self.take(count));
+        const values = try self.allocator.alloc(info.child, count);
+        errdefer self.allocator.free(values);
+        try self.readElements(info.child, values);
+        return values;
+    }
+
+    fn readElements(self: *Reader, comptime T: type, values: []T) !void {
+        var initialized: usize = 0;
+        errdefer for (values[0..initialized]) |*element| freeValue(T, self.allocator, element);
+        for (values) |*element| {
+            element.* = try self.read(T);
+            initialized += 1;
+        }
     }
 
     pub fn finished(self: Reader) bool {
@@ -228,4 +232,45 @@ test "disk codec bounds recursive owned values and cleans up a truncated region"
     var deep: Reader = .{ .allocator = std.testing.allocator, .bytes = writer.bytes.items, .nesting = 255 };
     try std.testing.expectError(error.InvalidCache, deep.read(Node));
     try std.testing.expectEqual(@as(usize, 255), deep.nesting);
+}
+
+test "disk codec cleans up partial aggregates with comptime fields" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testPartialAggregates, .{});
+}
+
+fn testPartialAggregates(allocator: std.mem.Allocator) !void {
+    const Element = struct {
+        comptime label: []const u8 = "metadata",
+        name: []const u8,
+        comptime version: u32 = 1,
+        suffix: []const u8,
+    };
+    const elements = [_]Element{
+        .{ .name = "first", .suffix = "one" },
+        .{ .name = "second", .suffix = "two" },
+    };
+    // Exercise both owners of the shared element-reading cleanup path.
+    inline for (.{ @TypeOf(elements), []const Element }) |T| {
+        var writer: Writer = .{ .allocator = allocator };
+        defer writer.deinit();
+        try writer.write(T, if (T == @TypeOf(elements)) elements else &elements);
+        for (0..writer.bytes.items.len) |length| {
+            var reader: Reader = .{ .allocator = allocator, .bytes = writer.bytes.items[0..length] };
+            var unexpected = reader.read(T) catch |err| {
+                if (err != error.InvalidCache) return err;
+                try std.testing.expectEqual(@as(usize, 0), reader.nesting);
+                continue;
+            };
+            defer freeValue(T, allocator, &unexpected);
+            return error.TestExpectedError;
+        }
+        var reader: Reader = .{ .allocator = allocator, .bytes = writer.bytes.items };
+        var decoded = try reader.read(T);
+        defer freeValue(T, allocator, &decoded);
+        try std.testing.expect(reader.finished());
+        for (elements, decoded) |expected, actual| {
+            try std.testing.expectEqualStrings(expected.name, actual.name);
+            try std.testing.expectEqualStrings(expected.suffix, actual.suffix);
+        }
+    }
 }

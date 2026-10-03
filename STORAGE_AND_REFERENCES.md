@@ -28,8 +28,7 @@ The accepted ownership, access, construction, and failure rules are recorded in
 evaluating their initializer through general init forwarding and destination
 construction, including aliases and indirect calls. Nonescaping init parameters
 retain captured writes, transfers, checked-reference results, failure, and
-caller-directed lexical exits. Further allocating-consumer verification remains
-in [milestone 1](ROADMAP.md#1-destination-construction-and-consuming-access).
+caller-directed lexical exits.
 The target, provider, location, and address-space contract below is accepted,
 but provider selection, device locations, and address spaces are not public APIs.
 
@@ -361,9 +360,7 @@ it does not require Box-specific expression recognition.
 These operations do not transfer storage ownership; initialized state and
 bounds are the caller's obligation at this low level.
 
-The accepted safe host owner and borrowed access use that core. The constructor's
-`init` mode and the consuming-access interpretation of `deinit` belong to
-milestone 1:
+The accepted safe host owner and borrowed access use that core:
 
 ```text
 struct Box(T: type)

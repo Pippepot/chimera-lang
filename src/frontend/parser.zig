@@ -101,12 +101,8 @@ const ParserState = struct {
     }
 
     pub fn expect(self: *@This(), token: Token.Tag) !Token {
-        const tok = self.tokens[self.index];
-        if (tok.tag == token) {
-            self.index += 1;
-            return tok;
-        }
-        try self.addError(.{ .expected_token = .{ .expected = token, .found = tok.tag } });
+        if (self.eat(token)) |matched| return matched;
+        try self.addError(.{ .expected_token = .{ .expected = token, .found = self.tokens[self.index].tag } });
         return error.ParseError;
     }
 
