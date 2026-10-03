@@ -610,13 +610,26 @@ func forward_initializer(static T: type, init item: T) T
 #
 # Initializer evaluation follows ordinary fallible control flow at its
 # construction site: failure must be handled or propagated there. Forwarding
-# preserves that possibility without triggering it. Partial construction cleans
-# up completed subobjects, with dependents before owners and otherwise reverse
-# initialization order. A completed nested object receives its normal drop;
+# preserves that possibility without triggering it. An ordinary 'func' consumer
+# may propagate failure from an init parameter as a deferred call outcome; this
+# does not authorize ordinary fallible statements without a fallible declaration.
+# Partial construction cleans up completed subobjects, with dependents before
+# owners and otherwise reverse initialization order. A completed nested object
+# receives its normal drop;
 # an incomplete object's whole-object drop hook is never called. Explicit-drop
 # obligations must be discharged on failure too. A successfully completed
 # aggregate uses its ordinary destruction order, not partial-construction order.
 # Runtime and compile-time execution obey the same rules.
+#
+# A return inside a deferred expression targets its lexically enclosing caller
+# function. Break and continue target the nearest lexically enclosing loop,
+# including a loop inside the deferred expression. Exit payloads are typed and
+# constructed against that lexical destination, independently of the init T.
+# A lexical exit first cleans partial construction and the initializer's locals,
+# then every receiving or forwarding frame, then the caller scopes it leaves.
+# It is not fallible failure and cannot be handled by an if-call else branch.
+# Deferred writes and completed transfers are not rolled back. Reference escape,
+# mutable copyback, and explicit-drop obligations apply to these exits too.
 
 
 # Borrowed views and host storage

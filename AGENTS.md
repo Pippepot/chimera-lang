@@ -21,4 +21,6 @@ Build clear, correct code with the least total machinery.
 
 - Test behavior, ownership, and incremental recomputation, not type-system guarantees. Keep large cross-module suites in `*_test.zig`.
 - Use [docs/COMPILER.md](docs/COMPILER.md) for test commands; run relevant tests, formatting checks, and `git diff --check`.
+- Batch related edits before focused checks. Verify isolated changes with affected suites; run the full suite once for changes spanning stages or shared representations. Documentation-only edits need no compiler tests.
+- Use default caches and fixed `--seed 0`. Repeat passing checks only for relevant changes or unresolved concerns. Collaborating agents share results for the same source state; one agent owns the final full-suite run.
 - Update the document that owns a changed fact; replace obsolete roadmap details rather than accumulating history.

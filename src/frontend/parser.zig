@@ -519,7 +519,7 @@ fn parseParamList(parser: *ParserState, parameters_are_static: bool) !Node.Index
         if (parser.eat(.r_paren) != null) break;
 
         const access_token_index = parser.index;
-        const opt_access = if (parameters_are_static) null else parser.eatAny(&.{ .keyword_imm, .keyword_mut, .keyword_var, .keyword_deinit, .keyword_static });
+        const opt_access = if (parameters_are_static) null else parser.eatAny(&.{ .keyword_imm, .keyword_mut, .keyword_var, .keyword_deinit, .keyword_init, .keyword_static });
         _ = try parser.expect(.identifier);
         const identifier_index = parser.index - 1;
         const type_annotation = try parseTypeAnnotation(parser);
@@ -604,7 +604,7 @@ fn parseTypeList(parser: *ParserState) !Node.Index {
         if (parser.eat(.r_paren) != null) break;
 
         const access_token_index = parser.index;
-        const access = parser.eatAny(&.{ .keyword_imm, .keyword_mut, .keyword_var, .keyword_deinit });
+        const access = parser.eatAny(&.{ .keyword_imm, .keyword_mut, .keyword_var, .keyword_deinit, .keyword_init });
         const ty = try parseType(parser);
         const parameter = if (access != null) blk: {
             const mode = try parser.addNode(.{ .tag = .access, .token_index = access_token_index, .data = .{ .none = {} } });

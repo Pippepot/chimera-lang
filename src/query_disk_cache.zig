@@ -5,7 +5,7 @@ const query = @import("query/engine.zig");
 const queries = @import("queries.zig");
 const structures = @import("structures.zig");
 
-const format = "CHIQRY09";
+const format = "CHIQRY12";
 const max_records = 1_000_000;
 
 pub fn save(io: std.Io, allocator: std.mem.Allocator, directory: []const u8, key: cache.Key, db: *query.Database) !void {
@@ -162,7 +162,7 @@ fn readCount(reader: *codec.Reader) !usize {
     return @intCast(count);
 }
 
-fn validateIds(comptime T: type, db: *query.Database, value: T) !bool {
+fn validateIds(comptime T: type, db: *query.Database, value: T) anyerror!bool {
     if (T == u8) return true;
     if (T == structures.ModuleId) return (try db.lookupInternedAs(queries.ModulePaths, value)) != null;
     if (T == structures.ItemId) return (try db.lookupInternedAs(queries.ItemLocations, value)) != null;
@@ -204,31 +204,34 @@ fn validateIds(comptime T: type, db: *query.Database, value: T) !bool {
 
 fn validOutput(comptime Q: type, db: *query.Database, output: Q.Output) !bool {
     if (Q == queries.CompileFunction) return validCompiledFunction(output.?);
+    if (output.?.is_initializer_region) return false;
     if (!validFunctionBody(output.?)) return false;
-    return validReferenceOperations(db, output.?) catch |err| switch (err) {
+    return validStorageOperations(db, output.?) catch |err| switch (err) {
         error.Unavailable => false,
         else => return err,
     };
 }
 
-fn validReferenceOperations(db: *query.Database, body: structures.FunctionBodyAnalysis) !bool {
+fn validStorageOperations(db: *query.Database, body: structures.FunctionBodyAnalysis) anyerror!bool {
     const types: queries.TypeFacts(*query.Database) = .{ .ctx = db };
     for (body.instructions) |instruction| {
-        if (instruction == .borrow_address) {
-            if (!try validBorrowFields(types, body, instruction.borrow_address)) return false;
-            continue;
+        switch (instruction) {
+            .borrow_address => |operation| if (!try validBorrowFields(types, body, operation)) return false,
+            .storage_projection => |operation| if (!try validStorageProjection(types, body, operation)) return false,
+            .allocation_element => |operation| {
+                if (body.valueType(operation.index) != .int) return false;
+                const element = (try types.allocationElement(body.valueType(operation.allocation))) orelse return false;
+                if (element != operation.type_id) return false;
+            },
+            else => {},
         }
-        if (instruction == .storage_projection and !try validStorageProjection(types, body, instruction.storage_projection)) return false;
     }
+    for (body.initializer_regions) |region| if (!try validStorageOperations(db, region)) return false;
     return true;
 }
 
 fn validBorrowFields(types: anytype, body: structures.FunctionBodyAnalysis, operation: structures.BorrowAddressOperation) !bool {
-    const source_index = @intFromEnum(operation.source);
-    var type_id = if (source_index < body.block_arguments.len)
-        body.block_arguments[source_index].type_id
-    else
-        body.instructions[source_index - body.block_arguments.len].resultType();
+    var type_id = body.valueType(operation.source);
     if (operation.base_is_reference) type_id = (try types.borrowElement(type_id)) orelse return false;
     for (body.borrow_fields[operation.fields.start..operation.fields.end]) |field_index| {
         const definition = (try types.structDefinition(type_id)) orelse return false;
@@ -239,10 +242,9 @@ fn validBorrowFields(types: anytype, body: structures.FunctionBodyAnalysis, oper
 }
 
 fn validStorageProjection(types: anytype, body: structures.FunctionBodyAnalysis, operation: structures.StorageProjection) !bool {
-    const index = @intFromEnum(operation.owner);
-    const type_id = if (index < body.block_arguments.len) body.block_arguments[index].type_id else body.instructions[index - body.block_arguments.len].resultType();
+    const type_id = body.valueType(operation.owner);
     switch (operation.projection) {
-        .dereference => return true,
+        .box_element => return operation.type_id == ((try types.boxElement(type_id)) orelse return false),
         .field => |field| {
             const definition = (try types.structDefinition(type_id)) orelse return false;
             return field < definition.fields.len and definition.fields[field].type_id == operation.type_id;
@@ -263,12 +265,49 @@ fn validValue(value: structures.FunctionValueId, body: structures.FunctionBodyAn
 }
 
 fn validUse(use: structures.FunctionValueUse, body: structures.FunctionBodyAnalysis) bool {
-    return validValue(use.value, body) and
+    return validOrdinaryValue(use.value, body) and
         (use.variant_tag_mapping == null or validRange(use.variant_tag_mapping.?, body.variant_coercion_tags.len));
 }
 
+fn validOrdinaryValue(value: structures.FunctionValueId, body: structures.FunctionBodyAnalysis) bool {
+    if (!validValue(value, body)) return false;
+    const representation = valueRepresentation(body, value);
+    return representation != .initializer and representation != .continuation;
+}
+
+fn validBranchUse(use: structures.FunctionValueUse, body: structures.FunctionBodyAnalysis) bool {
+    if (validContinuation(use.value, body)) return use.coerce_to == null and use.variant_tag_mapping == null;
+    return validUse(use, body);
+}
+
+fn validCallArgument(argument: structures.FunctionCallArgument, body: structures.FunctionBodyAnalysis) bool {
+    return switch (argument) {
+        .prepared => |use| validUse(use, body),
+        .deinit => |value| validOrdinaryValue(value, body),
+        .initializer => |value| validValue(value, body) and valueRepresentation(body, value) == .initializer,
+    };
+}
+
 fn validCall(call: structures.FunctionCall, body: structures.FunctionBodyAnalysis) bool {
-    return validRange(call.arguments, body.call_arguments.len);
+    if (!validRange(call.arguments, body.call_arguments.len)) return false;
+    if (call.destination) |destination| if (!validOrdinaryValue(destination, body) or body.valueType(destination) != call.return_type) return false;
+    if (call.target == .indirect and !validOrdinaryValue(call.target.indirect, body)) return false;
+    if (call.target == .initializer) {
+        const value = call.target.initializer;
+        if (!validValue(value, body)) return false;
+        return call.arguments.start == call.arguments.end and valueRepresentation(body, value) == .initializer and body.valueType(value) == call.return_type;
+    }
+    return true;
+}
+
+fn valueRepresentation(body: structures.FunctionBodyAnalysis, value: structures.FunctionValueId) structures.ValueRepresentation {
+    const index = @intFromEnum(value);
+    if (index < body.block_arguments.len) return body.block_arguments[index].representation;
+    return switch (body.instructions[index - body.block_arguments.len]) {
+        .initializer_ref => .initializer,
+        .continuation_ref => .continuation,
+        else => .value,
+    };
 }
 
 fn validBranch(branch: structures.FunctionBranch, body: structures.FunctionBodyAnalysis) bool {
@@ -277,7 +316,10 @@ fn validBranch(branch: structures.FunctionBranch, body: structures.FunctionBodyA
     if (target.argument_start > target.argument_end or target.argument_end > body.block_arguments.len) return false;
     if (branch.arguments.end - branch.arguments.start != target.argument_end - target.argument_start) return false;
     for (body.branch_arguments[branch.arguments.start..branch.arguments.end], body.block_arguments[target.argument_start..target.argument_end]) |use, argument| {
-        if (argument.is_storage and use.coerce_to != null) return false;
+        if (argument.representation == .initializer) return false;
+        if ((argument.representation == .continuation) != validContinuation(use.value, body)) return false;
+        if ((use.coerce_to orelse body.valueType(use.value)) != argument.type_id) return false;
+        if (argument.representation == .storage and (use.coerce_to != null or use.variant_tag_mapping != null)) return false;
     }
     return true;
 }
@@ -286,31 +328,77 @@ fn validVariantOperation(operation: structures.VariantOperation, body: structure
     return operation.tag_mapping == null or validRange(operation.tag_mapping.?, body.variant_coercion_tags.len);
 }
 
+fn validCallMutArgument(operation: structures.CallMutArgument, body: structures.FunctionBodyAnalysis) bool {
+    if (!validRange(operation.arguments, body.call_arguments.len) or
+        operation.argument_index >= operation.arguments.end - operation.arguments.start) return false;
+    const argument = body.call_arguments[operation.arguments.start + operation.argument_index];
+    if (argument != .prepared) return false;
+    const prepared_type = argument.prepared.coerce_to orelse body.valueType(argument.prepared.value);
+    if (operation.type_id != prepared_type) return false;
+    if (operation.destination) |destination| {
+        if (!validOrdinaryValue(destination, body) or body.valueType(destination) != operation.type_id) return false;
+    }
+    var found = false;
+    for (body.instructions) |instruction| {
+        if (instruction != .call) continue;
+        const call = instruction.call;
+        if (!std.meta.eql(call.arguments, operation.arguments)) continue;
+        if (call.return_type != operation.return_type) return false;
+        found = true;
+    }
+    for (body.blocks) |block| {
+        if (block.terminator != .fallible_call) continue;
+        const call = block.terminator.fallible_call.call;
+        if (!std.meta.eql(call.arguments, operation.arguments)) continue;
+        if (call.return_type != operation.return_type) return false;
+        found = true;
+    }
+    return found;
+}
+
 fn validFunctionBody(body: structures.FunctionBodyAnalysis) bool {
     if (body.blocks.len == 0 or @intFromEnum(body.entry) >= body.blocks.len) return false;
     if (body.valueCount() > std.math.maxInt(u32)) return false;
     if (body.instruction_spans.len != 0 and body.instruction_spans.len != body.instructions.len) return false;
     if (body.terminator_spans.len != 0 and body.terminator_spans.len != body.blocks.len) return false;
-    for (body.struct_field_values) |field| if (!validValue(field.value, body)) return false;
-    for (body.branch_arguments) |use| if (!validUse(use, body)) return false;
-    for (body.call_arguments) |argument| if (!validUse(argument.valueUse(), body)) return false;
+    for (body.struct_field_values) |field| if (!validOrdinaryValue(field.value, body)) return false;
+    for (body.branch_arguments) |use| if (!validBranchUse(use, body)) return false;
+    for (body.call_arguments) |argument| if (!validCallArgument(argument, body)) return false;
+    for (body.initializer_captures) |capture| if (!validValue(capture, body)) return false;
+    for (body.initializer_regions) |region| {
+        if (!region.is_initializer_region or !validFunctionBody(region)) return false;
+    }
     const entry = body.blocks[@intFromEnum(body.entry)];
-    if (entry.argument_start > entry.argument_end or entry.argument_end > body.block_arguments.len) return false;
+    if (entry.argument_start != 0 or entry.argument_end > body.block_arguments.len) return false;
     if (body.parameter_modes.len != entry.argument_end - entry.argument_start) return false;
+    for (body.parameter_modes, body.block_arguments[entry.argument_start..entry.argument_end]) |mode, argument| {
+        if ((mode == .init) != (argument.representation == .initializer)) return false;
+        if (mode == .init and !body.is_fallible) return false;
+        if (argument.representation == .continuation and (!body.is_initializer_region or mode != .imm or argument.type_id != .unit)) return false;
+        if (body.is_initializer_region and ((mode != .imm and mode != .mut and mode != .init) or
+            (argument.representation != .storage and argument.representation != .continuation and argument.representation != .initializer))) return false;
+    }
+    for (body.block_arguments[entry.argument_end..]) |argument| if (argument.representation == .initializer) return false;
     for (body.instructions) |original| {
         var instruction = original;
         for (instruction.operands()) |operand| if (operand) |value| {
             if (!validValue(value.*, body)) return false;
+            if (valueRepresentation(body, value.*) == .initializer and instruction != .call) return false;
+            if (valueRepresentation(body, value.*) == .continuation and instruction != .continuation_storage and instruction != .continuation_select) return false;
         };
         const valid = switch (instruction) {
+            .initializer_ref => |reference| validInitializerReference(reference, body),
+            .continuation_ref => |payload| payload == null or validOrdinaryValue(payload.?, body),
+            .continuation_storage => |operation| validContinuationDescriptor(operation.token, body) and operation.type_id != .never,
+            .continuation_select => |operation| body.is_initializer_region and validContinuationDescriptor(operation.token, body) and validOrdinaryValue(operation.storage, body),
             .variant_coerce, .variant_extract, .callable_coerce => |operation| validVariantOperation(operation, body),
             .struct_init => |operation| validRange(operation.fields, body.struct_field_values.len),
             .result_storage => |type_id| type_id == body.return_type,
             .borrow_address => |operation| validRange(operation.fields, body.borrow_fields.len),
-            .mut_parameter_write => |operation| operation.parameter_index < entry.argument_end - entry.argument_start,
-            .call_mut_argument => |operation| validRange(operation.arguments, body.call_arguments.len) and
-                operation.argument_index < operation.arguments.end - operation.arguments.start,
-            .call => |call| validCall(call, body),
+            .mut_parameter_write => |operation| operation.parameter_index < body.parameter_modes.len and
+                body.parameter_modes[operation.parameter_index] == .mut,
+            .call_mut_argument => |operation| validCallMutArgument(operation, body),
+            .call => |call| validCall(call, body) and !call.hasInitializer(body.call_arguments),
             else => true,
         };
         if (!valid) return false;
@@ -321,6 +409,8 @@ fn validFunctionBody(body: structures.FunctionBodyAnalysis) bool {
         var terminator = block.terminator;
         for (terminator.operands()) |operand| if (operand) |value| {
             if (!validValue(value.*, body)) return false;
+            if (valueRepresentation(body, value.*) == .initializer and terminator != .fallible_call) return false;
+            if (valueRepresentation(body, value.*) == .continuation and terminator != .continuation_branch and terminator != .return_lexical) return false;
         };
         for (terminator.successors()) |successor| if (successor) |target| {
             if (@intFromEnum(target.*) >= body.blocks.len) return false;
@@ -329,24 +419,94 @@ fn validFunctionBody(body: structures.FunctionBodyAnalysis) bool {
             .branch => |branch| validBranch(branch, body),
             .predicate_branch => |branch| validBranch(branch.then_branch, body) and validBranch(branch.else_branch, body),
             .fallible_call => |branch| validCall(branch.call, body) and
-                validFallibleTargets(branch.success, branch.failure, body),
+                validFallibleTargets(branch.call, branch.success, branch.failure, body) and
+                (branch.call.hasInitializer(body.call_arguments) == (branch.lexical_exit != null)) and
+                (branch.lexical_exit == null or validLexicalTarget(branch.lexical_exit.?, body)),
+            .continuation_branch => |branch| validContinuation(branch.token, body) and validContinuationDescriptor(branch.target, body) and
+                body.blocks[@intFromEnum(branch.match)].argument_start == body.blocks[@intFromEnum(branch.match)].argument_end and
+                body.blocks[@intFromEnum(branch.mismatch)].argument_start == body.blocks[@intFromEnum(branch.mismatch)].argument_end,
             .return_value => |use| validUse(use, body),
+            .return_lexical => |token| validContinuation(token, body) and (body.is_initializer_region or std.mem.indexOfScalar(structures.ParameterMode, body.parameter_modes, .init) != null),
             .return_failure => body.is_fallible,
             .return_unit, .diverge => true,
         };
         if (!valid) return false;
     }
+    for (body.instructions, 0..) |instruction, index| {
+        if (instruction != .continuation_ref) continue;
+        const payload = instruction.continuation_ref;
+        if (!validContinuationUses(body, body.instructionValue(index), if (payload) |storage| body.valueType(storage) else null)) return false;
+    }
     return true;
 }
 
-fn validFallibleTargets(success: structures.FunctionBlockId, failure: structures.FunctionBlockId, body: structures.FunctionBodyAnalysis) bool {
-    if (@intFromEnum(success) >= body.blocks.len or @intFromEnum(failure) >= body.blocks.len) return false;
+fn validContinuationUses(body: structures.FunctionBodyAnalysis, token: structures.FunctionValueId, payload_type: ?structures.TypeId) bool {
+    for (body.instructions) |instruction| {
+        switch (instruction) {
+            .continuation_storage => |operation| {
+                if (operation.token == token and payload_type != operation.type_id) return false;
+            },
+            .continuation_select => |operation| {
+                if (operation.token == token and payload_type != body.valueType(operation.storage)) return false;
+            },
+            .initializer_ref => |reference| {
+                const region = body.initializer_regions[reference.region];
+                for (body.initializer_captures[reference.captures.start..reference.captures.end], 0..) |capture, parameter| {
+                    if (capture == token and !validContinuationUses(region, @enumFromInt(parameter), payload_type)) return false;
+                }
+            },
+            else => {},
+        }
+    }
+    return true;
+}
+
+fn validContinuation(value: structures.FunctionValueId, body: structures.FunctionBodyAnalysis) bool {
+    if (!validValue(value, body)) return false;
+    const index = @intFromEnum(value);
+    return if (index < body.block_arguments.len) body.block_arguments[index].representation == .continuation else body.instructions[index - body.block_arguments.len] == .continuation_ref;
+}
+
+fn validContinuationDescriptor(value: structures.FunctionValueId, body: structures.FunctionBodyAnalysis) bool {
+    if (!validContinuation(value, body)) return false;
+    const index = @intFromEnum(value);
+    return index >= body.block_arguments.len or index < body.blocks[@intFromEnum(body.entry)].argument_end;
+}
+
+fn validLexicalTarget(target: structures.FunctionBlockId, body: structures.FunctionBodyAnalysis) bool {
+    const block = body.blocks[@intFromEnum(target)];
+    return block.argument_start < body.block_arguments.len and block.argument_end == block.argument_start + 1 and
+        body.block_arguments[block.argument_start].representation == .continuation and
+        body.block_arguments[block.argument_start].type_id == .unit;
+}
+
+fn validInitializerReference(reference: @FieldType(structures.FunctionInstruction, "initializer_ref"), body: structures.FunctionBodyAnalysis) bool {
+    if (reference.region >= body.initializer_regions.len or !validRange(reference.captures, body.initializer_captures.len)) return false;
+    const region = body.initializer_regions[reference.region];
+    if (reference.type_id != region.return_type or reference.captures.end - reference.captures.start != region.parameter_modes.len) return false;
+    const entry = region.blocks[@intFromEnum(region.entry)];
+    for (body.initializer_captures[reference.captures.start..reference.captures.end], region.block_arguments[entry.argument_start..entry.argument_end]) |capture, argument| {
+        if (body.valueType(capture) != argument.type_id) return false;
+        if ((argument.representation == .continuation) != validContinuation(capture, body)) return false;
+        if (argument.representation == .continuation and !validContinuationDescriptor(capture, body)) return false;
+        if ((argument.representation == .initializer) != (valueRepresentation(body, capture) == .initializer)) return false;
+    }
+    return true;
+}
+
+fn validFallibleTargets(call: structures.FunctionCall, success: structures.FunctionBlockId, failure: ?structures.FunctionBlockId, body: structures.FunctionBodyAnalysis) bool {
+    if (@intFromEnum(success) >= body.blocks.len) return false;
     const success_block = body.blocks[@intFromEnum(success)];
-    const failure_block = body.blocks[@intFromEnum(failure)];
     if (success_block.argument_start > success_block.argument_end or success_block.argument_end > body.block_arguments.len or
-        failure_block.argument_start > failure_block.argument_end or failure_block.argument_end > body.block_arguments.len) return false;
-    return success_block.argument_end - success_block.argument_start == 1 and
-        failure_block.argument_end == failure_block.argument_start;
+        success_block.argument_end - success_block.argument_start != 1) return false;
+    const result = body.block_arguments[success_block.argument_start];
+    if (result.representation != .value or result.type_id != (if (call.destination == null) call.return_type else .unit)) return false;
+    if (failure) |target| {
+        if (@intFromEnum(target) >= body.blocks.len) return false;
+        const block = body.blocks[@intFromEnum(target)];
+        if (block.argument_end > body.block_arguments.len or block.argument_end != block.argument_start) return false;
+    }
+    return true;
 }
 
 fn validCompiledFunction(artifact: structures.CompiledFunction) bool {
@@ -422,12 +582,12 @@ test "cached body validation rejects invalid control flow and argument indexes" 
 
     body.branch_arguments = &branch_arguments;
     blocks[0].terminator.branch.arguments.end = 1;
-    block_arguments[0].is_storage = true;
+    block_arguments[0].representation = .storage;
     try std.testing.expect(validFunctionBody(body));
     branch_arguments[0].coerce_to = .none;
     try std.testing.expect(!validFunctionBody(body));
     branch_arguments[0].coerce_to = null;
-    block_arguments[0].is_storage = false;
+    block_arguments[0].representation = .value;
 
     blocks[0].terminator = .return_unit;
     blocks[0].instruction_end = 1;
@@ -460,13 +620,16 @@ test "cached body validation rejects invalid control flow and argument indexes" 
     try std.testing.expect(validFunctionBody(body));
     const db = try query.Database.init(std.testing.allocator, .{ .worker_count = 1 });
     defer db.deinit();
-    try std.testing.expect(!(try validReferenceOperations(db, body)));
+    try std.testing.expect(!(try validStorageOperations(db, body)));
 
     const modules = @import("modules.zig");
     try modules.registerSources(db, std.testing.allocator,
+        \\import std.memory.{Allocation}
         \\struct Pair
         \\  value: int
         \\static IntRef = Ref(int, false)
+        \\static IntBox = Box(int)
+        \\static IntSlots = Allocation(int)
         \\exit(42)
     , &.{}, &.{});
     const module = try db.intern(queries.ModulePaths, .{ .path = "" });
@@ -474,16 +637,50 @@ test "cached body validation rejects invalid control flow and argument indexes" 
     const pair_type = structures.TypeId.fromInterned(try db.intern(queries.Types, .{ .structure = .{ .declared = pair } }));
     block_arguments[0].type_id = pair_type;
     instructions[0].storage_projection.projection = .{ .field = 0 };
-    try std.testing.expect(try validReferenceOperations(db, body));
+    try std.testing.expect(try validStorageOperations(db, body));
     instructions[0].storage_projection.projection = .{ .field = 7 };
-    try std.testing.expect(!(try validReferenceOperations(db, body)));
+    try std.testing.expect(!(try validStorageOperations(db, body)));
 
     const variant_type = structures.TypeId.fromInterned(try db.intern(queries.Types, .{ .variant = .{ .members = &.{ .int, .byte } } }));
     block_arguments[0].type_id = variant_type;
     instructions[0].storage_projection.projection = .variant;
-    try std.testing.expect(try validReferenceOperations(db, body));
+    try std.testing.expect(try validStorageOperations(db, body));
     instructions[0].storage_projection.type_id = .bool;
-    try std.testing.expect(!(try validReferenceOperations(db, body)));
+    try std.testing.expect(!(try validStorageOperations(db, body)));
+
+    const box_item = (try db.get(queries.ModuleDeclarations, module)).*.?.resolveStatic("IntBox").?;
+    const box_value = (try db.get(queries.ResolveStatic, box_item)).*.?;
+    block_arguments[0].type_id = (try db.lookupInterned(queries.CompileTimeValues, box_value)).type;
+    instructions[0].storage_projection.projection = .box_element;
+    instructions[0].storage_projection.type_id = .int;
+    try std.testing.expect(try validStorageOperations(db, body));
+    instructions[0].storage_projection.type_id = .bool;
+    try std.testing.expect(!(try validStorageOperations(db, body)));
+    instructions[0].storage_projection.type_id = .int;
+    block_arguments[0].type_id = pair_type;
+    try std.testing.expect(!(try validStorageOperations(db, body)));
+
+    const allocation_item = (try db.get(queries.ModuleDeclarations, module)).*.?.resolveStatic("IntSlots").?;
+    const allocation_value = (try db.get(queries.ResolveStatic, allocation_item)).*.?;
+    block_arguments[0].type_id = (try db.lookupInterned(queries.CompileTimeValues, allocation_value)).type;
+    var slot_instructions = [_]structures.FunctionInstruction{
+        .{ .const_int = 0 },
+        .{ .allocation_element = .{ .allocation = @enumFromInt(0), .index = body.instructionValue(0), .type_id = .int } },
+    };
+    body.instructions = &slot_instructions;
+    blocks[0].instruction_end = slot_instructions.len;
+    try std.testing.expect(validFunctionBody(body));
+    try std.testing.expect(try validStorageOperations(db, body));
+    slot_instructions[1].allocation_element.type_id = .bool;
+    try std.testing.expect(!(try validStorageOperations(db, body)));
+    slot_instructions[1].allocation_element.type_id = .int;
+    slot_instructions[0] = .{ .const_bool = false };
+    try std.testing.expect(!(try validStorageOperations(db, body)));
+    slot_instructions[0] = .{ .const_int = 0 };
+    block_arguments[0].type_id = pair_type;
+    try std.testing.expect(!(try validStorageOperations(db, body)));
+    body.instructions = &instructions;
+    blocks[0].instruction_end = instructions.len;
 
     instructions[0] = .{ .value_copy = .{ .source = @enumFromInt(0), .type_id = variant_type, .destination = @enumFromInt(999) } };
     try std.testing.expect(!validFunctionBody(body));
@@ -505,15 +702,15 @@ test "cached body validation rejects invalid control flow and argument indexes" 
         .fields = .{ .start = 0, .end = 1 },
     } };
     try std.testing.expect(validFunctionBody(body));
-    try std.testing.expect(try validReferenceOperations(db, body));
+    try std.testing.expect(try validStorageOperations(db, body));
     path[0] = 1;
-    try std.testing.expect(!(try validReferenceOperations(db, body)));
+    try std.testing.expect(!(try validStorageOperations(db, body)));
     path[0] = 0;
     instructions[0].borrow_address.fields.end = 2;
     try std.testing.expect(!validFunctionBody(body));
     instructions[0].borrow_address.fields.end = 1;
     instructions[0].borrow_address.type_id = .int;
-    try std.testing.expect(!(try validReferenceOperations(db, body)));
+    try std.testing.expect(!(try validStorageOperations(db, body)));
 }
 
 test "typed bodies and code survive an edit to another file" {
@@ -642,49 +839,6 @@ test "Box and Ref alias bodies restore and invalidate after a binding edit" {
     try std.testing.expect(wrote_referent);
     const edited = (try third.get(queries.BuildExecutable, 0)).* orelse return error.TestUnexpectedResult;
     try std.testing.expect(!std.mem.eql(u8, original.bytes, edited.bytes));
-}
-
-test "in-place Box initializer bodies restore from disk" {
-    const modules = @import("modules.zig");
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    const source =
-        \\struct Immovable
-        \\  move = none
-        \\  value: int
-        \\fallible run() unit
-        \\  const owner = Box.new(Immovable{value = 42})
-        \\  _ = owner
-        \\if run() -> exit(42) else exit(1)
-    ;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const directory = try tmp.dir.realPathFileAlloc(io, ".", allocator);
-    defer allocator.free(directory);
-    const digest = cache.querySnapshotKey(try cache.compilerDigest(io), "main.chi", &.{});
-
-    const first = try query.Database.init(allocator, .{ .worker_count = 2 });
-    defer first.deinit();
-    try modules.registerSources(first, allocator, source, &.{}, &.{});
-    const original = (try first.get(queries.BuildExecutable, 0)).* orelse return error.TestUnexpectedResult;
-    try save(io, allocator, directory, digest, first);
-    const payload = (try cache.load(io, allocator, directory, digest)) orelse return error.TestUnexpectedResult;
-    defer allocator.free(payload);
-
-    const second = try query.Database.init(allocator, .{ .worker_count = 2 });
-    defer second.deinit();
-    const offset = try restoreInterns(second, allocator, payload);
-    try modules.registerSources(second, allocator, source, &.{}, &.{});
-    try std.testing.expect((try restoreQueries(second, payload, offset)) > 0);
-    const run = (try second.get(queries.BuildModuleScope, 0)).*.?.resolveFunction("run").?;
-    const body = (try second.get(queries.AnalyzeFunctionInstance, .{ .item = run })).*.?;
-    var has_in_place_fields = false;
-    for (body.instructions) |instruction| if (instruction == .value_copy and instruction.value_copy.destination != null) {
-        has_in_place_fields = true;
-    };
-    try std.testing.expect(has_in_place_fields);
-    const restored = (try second.get(queries.BuildExecutable, 0)).* orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualSlices(u8, original.bytes, restored.bytes);
 }
 
 test "in-place bodies restore and invalidate movability edits" {
@@ -926,4 +1080,399 @@ test "invalid machine-code cache shapes are rejected" {
     damaged = valid;
     damaged.relocations = &.{.{ .offset = 0, .kind = .call_relative_32, .reference = @enumFromInt(1), .addend = 0 }};
     try std.testing.expect(!validCompiledFunction(damaged));
+}
+
+test {
+    _ = @import("query_disk_cache_test.zig");
+}
+
+test "cached mutable result requires a matching producer" {
+    var instructions = [_]structures.FunctionInstruction{
+        .{ .const_int = 42 },
+        .{ .call_mut_argument = .{
+            .arguments = .{ .start = 0, .end = 1 },
+            .argument_index = 0,
+            .return_type = .unit,
+            .type_id = .int,
+        } },
+    };
+    var call_arguments = [_]structures.FunctionCallArgument{.{ .prepared = .{ .value = @enumFromInt(0) } }};
+    var blocks = [_]structures.FunctionBlock{.{
+        .argument_start = 0,
+        .argument_end = 0,
+        .instruction_start = 0,
+        .instruction_end = instructions.len,
+        .terminator = .return_unit,
+    }};
+    const body: structures.FunctionBodyAnalysis = .{
+        .return_type = .unit,
+        .parameter_modes = &.{},
+        .block_arguments = &.{},
+        .call_arguments = &call_arguments,
+        .branch_arguments = &.{},
+        .instructions = &instructions,
+        .blocks = &blocks,
+        .entry = @enumFromInt(0),
+    };
+    try std.testing.expect(!validFunctionBody(body));
+}
+
+test "cached mutable result validates types and destinations across outcomes" {
+    const call: structures.FunctionCall = .{
+        .target = .{ .direct = .{ .item = @enumFromInt(0) } },
+        .arguments = .{ .start = 0, .end = 1 },
+        .return_type = .unit,
+    };
+    const result: structures.CallMutArgument = .{
+        .arguments = call.arguments,
+        .argument_index = 0,
+        .return_type = .unit,
+        .type_id = .int,
+    };
+    var instructions = [_]structures.FunctionInstruction{
+        .{ .const_int = 42 },
+        .{ .const_byte = 7 },
+        .{ .call = call },
+        .{ .call_mut_argument = result },
+        .{ .call_mut_argument = result },
+    };
+    var block_arguments = [_]structures.FunctionBlockArgument{.{ .type_id = .unit }};
+    var call_arguments = [_]structures.FunctionCallArgument{.{ .prepared = .{ .value = @enumFromInt(1) } }};
+    var blocks = [_]structures.FunctionBlock{
+        .{ .argument_start = 0, .argument_end = 0, .instruction_start = 0, .instruction_end = instructions.len, .terminator = .return_unit },
+        .{ .argument_start = 0, .argument_end = 1, .instruction_start = 3, .instruction_end = 4, .terminator = .return_unit },
+        .{ .argument_start = 1, .argument_end = 1, .instruction_start = 4, .instruction_end = 5, .terminator = .return_unit },
+    };
+    var body: structures.FunctionBodyAnalysis = .{
+        .return_type = .unit,
+        .is_fallible = true,
+        .parameter_modes = &.{},
+        .block_arguments = &block_arguments,
+        .call_arguments = &call_arguments,
+        .branch_arguments = &.{},
+        .instructions = &instructions,
+        .blocks = blocks[0..1],
+        .entry = @enumFromInt(0),
+    };
+    try std.testing.expect(validFunctionBody(body));
+    instructions[3].call_mut_argument.return_type = .int;
+    try std.testing.expect(!validFunctionBody(body));
+    instructions[3].call_mut_argument = result;
+    instructions[2].call.arguments.end = 0;
+    try std.testing.expect(!validFunctionBody(body));
+    instructions[2].call = call;
+    instructions[3].call_mut_argument.type_id = .byte;
+    try std.testing.expect(!validFunctionBody(body));
+    instructions[3].call_mut_argument = result;
+    instructions[3].call_mut_argument.destination = @enumFromInt(2);
+    try std.testing.expect(!validFunctionBody(body));
+    instructions[3].call_mut_argument.destination = @enumFromInt(1);
+    try std.testing.expect(validFunctionBody(body));
+    instructions[3].call_mut_argument = result;
+
+    call_arguments[0].prepared = .{ .value = @enumFromInt(2), .coerce_to = .int };
+    try std.testing.expect(validFunctionBody(body));
+    call_arguments[0].prepared.coerce_to = null;
+    instructions[3].call_mut_argument.type_id = .byte;
+    instructions[4].call_mut_argument.type_id = .byte;
+    try std.testing.expect(validFunctionBody(body));
+    instructions[4].call_mut_argument.type_id = .int;
+    try std.testing.expect(!validFunctionBody(body));
+    call_arguments[0].prepared = .{ .value = @enumFromInt(1) };
+    instructions[3].call_mut_argument = result;
+    instructions[4].call_mut_argument = result;
+
+    instructions[2] = .const_unit;
+    blocks[0].instruction_end = 3;
+    blocks[0].terminator = .{ .fallible_call = .{ .call = call, .success = @enumFromInt(1), .failure = @enumFromInt(2) } };
+    body.blocks = &blocks;
+    try std.testing.expect(validFunctionBody(body));
+    blocks[0].terminator.fallible_call.call.return_type = .int;
+    try std.testing.expect(!validFunctionBody(body));
+    blocks[0].terminator.fallible_call.call = call;
+    try std.testing.expect(validFunctionBody(body));
+}
+
+test "cached initializer handles stay out of ordinary operands and mutable writes" {
+    var parameter_modes = [_]structures.ParameterMode{.init};
+    var block_arguments = [_]structures.FunctionBlockArgument{.{ .type_id = .int, .representation = .initializer }};
+    var instructions = [_]structures.FunctionInstruction{.{ .const_int = 42 }};
+    var blocks = [_]structures.FunctionBlock{
+        .{ .argument_start = 0, .argument_end = 1, .instruction_start = 0, .instruction_end = 1, .terminator = .diverge },
+        .{ .argument_start = 1, .argument_end = 1, .instruction_start = 1, .instruction_end = 1, .terminator = .diverge },
+    };
+    var body: structures.FunctionBodyAnalysis = .{
+        .return_type = .unit,
+        .is_fallible = true,
+        .parameter_modes = &parameter_modes,
+        .block_arguments = &block_arguments,
+        .call_arguments = &.{},
+        .branch_arguments = &.{},
+        .instructions = &instructions,
+        .blocks = &blocks,
+        .entry = @enumFromInt(0),
+    };
+    try std.testing.expect(validFunctionBody(body));
+    body.is_fallible = false;
+    try std.testing.expect(!validFunctionBody(body));
+    body.is_fallible = true;
+
+    var fields = [_]structures.StructFieldValue{.{ .field_index = 0, .value = @enumFromInt(0) }};
+    body.struct_field_values = &fields;
+    try std.testing.expect(!validFunctionBody(body));
+    fields[0].value = @enumFromInt(1);
+    try std.testing.expect(validFunctionBody(body));
+    body.struct_field_values = &.{};
+
+    const branch: structures.FunctionBranch = .{ .target = @enumFromInt(1), .arguments = .{ .start = 0, .end = 0 } };
+    blocks[0].terminator = .{ .predicate_branch = .{
+        .operation = .eqi,
+        .operands = .{ .lhs = @enumFromInt(0), .rhs = @enumFromInt(1) },
+        .then_branch = branch,
+        .else_branch = branch,
+    } };
+    try std.testing.expect(!validFunctionBody(body));
+    blocks[0].terminator.predicate_branch.operands.lhs = @enumFromInt(1);
+    try std.testing.expect(validFunctionBody(body));
+    blocks[0].terminator = .diverge;
+
+    var arguments = [_]structures.FunctionCallArgument{.{ .initializer = @enumFromInt(0) }};
+    body.call_arguments = &arguments;
+    instructions[0] = .{ .call_mut_argument = .{
+        .arguments = .{ .start = 0, .end = 1 },
+        .return_type = .int,
+        .argument_index = 0,
+        .type_id = .int,
+    } };
+    try std.testing.expect(!validFunctionBody(body));
+
+    var writes = [_]structures.FunctionInstruction{
+        .{ .const_int = 42 },
+        .{ .mut_parameter_write = .{ .parameter_index = 0, .value = @enumFromInt(1), .type_id = .int } },
+    };
+    body.instructions = &writes;
+    blocks[0].instruction_end = 2;
+    blocks[1].instruction_start = 2;
+    blocks[1].instruction_end = 2;
+    try std.testing.expect(!validFunctionBody(body));
+    body.call_arguments = &.{};
+    parameter_modes[0] = .mut;
+    block_arguments[0].representation = .value;
+    try std.testing.expect(validFunctionBody(body));
+}
+
+test "cached lexical outcomes reject missing edges and invalid continuation operands" {
+    const modules = @import("modules.zig");
+    const allocator = std.testing.allocator;
+    const db = try query.Database.init(allocator, .{ .worker_count = 1 });
+    defer db.deinit();
+    try modules.registerSources(db, allocator,
+        \\func materialize(init item: int) int -> return item
+        \\func run() int
+        \\    return materialize(if 1 == 1 -> return 42 else 0)
+        \\exit(run())
+    , &.{}, &.{});
+    const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;
+    const original = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = scope.resolveFunction("run").? })).*.?;
+    var writer: codec.Writer = .{ .allocator = allocator };
+    defer writer.deinit();
+    try writer.write(structures.FunctionBodyAnalysis, original);
+    var reader: codec.Reader = .{ .allocator = allocator, .bytes = writer.bytes.items };
+    var body = try reader.read(structures.FunctionBodyAnalysis);
+    defer body.deinit(allocator);
+    try std.testing.expect(validFunctionBody(body));
+    var call_index: usize = 0;
+    for (body.blocks, 0..) |block, index| if (block.terminator == .fallible_call) {
+        call_index = index;
+        break;
+    };
+    const call = &body.blocks[call_index].terminator.fallible_call;
+    const lexical = call.lexical_exit;
+    call.lexical_exit = null;
+    try std.testing.expect(!validFunctionBody(body));
+    call.lexical_exit = lexical;
+    const success = call.success;
+    call.success = lexical.?;
+    try std.testing.expect(!validFunctionBody(body));
+    call.success = success;
+    const success_argument = &body.block_arguments[body.blocks[@intFromEnum(success)].argument_start];
+    const success_type = success_argument.type_id;
+    success_argument.type_id = .bool;
+    try std.testing.expect(!validFunctionBody(body));
+    success_argument.type_id = success_type;
+    success_argument.representation = .storage;
+    try std.testing.expect(!validFunctionBody(body));
+    success_argument.representation = .value;
+    const token = &body.block_arguments[body.blocks[@intFromEnum(lexical.?)].argument_start];
+    token.type_id = .int;
+    try std.testing.expect(!validFunctionBody(body));
+    token.type_id = .unit;
+    token.representation = .value;
+    try std.testing.expect(!validFunctionBody(body));
+    token.representation = .continuation;
+    try std.testing.expect(validFunctionBody(body));
+    var descriptor_index: usize = 0;
+    for (body.instructions, 0..) |instruction, index| if (instruction == .continuation_ref) {
+        descriptor_index = index;
+        break;
+    };
+    const descriptor = body.instructionValue(descriptor_index);
+    const instruction = body.instructions[descriptor_index];
+    body.instructions[descriptor_index] = .const_unit;
+    try std.testing.expect(!validFunctionBody(body));
+    body.instructions[descriptor_index] = instruction;
+    try std.testing.expect(validFunctionBody(body));
+    for (body.instructions) |*operation| {
+        if (operation.* != .continuation_storage) continue;
+        const original_token = operation.continuation_storage.token;
+        operation.continuation_storage.token = @enumFromInt(body.blocks[@intFromEnum(lexical.?)].argument_start);
+        try std.testing.expect(!validFunctionBody(body));
+        operation.continuation_storage.token = original_token;
+    }
+    const argument = body.call_arguments[0];
+    body.call_arguments[0] = .{ .prepared = .{ .value = descriptor } };
+    try std.testing.expect(!validFunctionBody(body));
+    body.call_arguments[0] = argument;
+    const region = &body.initializer_regions[0];
+    for (region.instructions) |*operation| {
+        if (operation.* != .continuation_storage) continue;
+        const original_type = operation.continuation_storage.type_id;
+        operation.continuation_storage.type_id = .bool;
+        try std.testing.expect(!validFunctionBody(body));
+        operation.continuation_storage.type_id = original_type;
+    }
+    for (region.blocks) |*block| {
+        if (block.terminator != .return_lexical) continue;
+        const original_token = block.terminator.return_lexical;
+        block.terminator.return_lexical = region.instructionValue(0);
+        try std.testing.expect(!validFunctionBody(body));
+        block.terminator.return_lexical = original_token;
+    }
+    try std.testing.expect(validFunctionBody(body));
+}
+
+test "cached nested handles reject changed capture representations" {
+    const modules = @import("modules.zig");
+    const allocator = std.testing.allocator;
+    const db = try query.Database.init(allocator, .{ .worker_count = 1 });
+    defer db.deinit();
+    try modules.registerSources(db, allocator,
+        \\func materialize(init item: int) int -> return item
+        \\func forward(init item: int) int -> return materialize(materialize(item))
+        \\exit(forward(42))
+    , &.{}, &.{});
+    const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;
+    const original = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = scope.resolveFunction("forward").? })).*.?;
+    var writer: codec.Writer = .{ .allocator = allocator };
+    defer writer.deinit();
+    try writer.write(structures.FunctionBodyAnalysis, original);
+    var reader: codec.Reader = .{ .allocator = allocator, .bytes = writer.bytes.items };
+    var body = try reader.read(structures.FunctionBodyAnalysis);
+    defer body.deinit(allocator);
+    try std.testing.expect(validFunctionBody(body));
+    const region = &body.initializer_regions[0];
+    try std.testing.expectEqual(structures.ValueRepresentation.initializer, region.block_arguments[0].representation);
+    region.block_arguments[0].representation = .storage;
+    region.parameter_modes[0] = .imm;
+    try std.testing.expect(!validFunctionBody(body));
+    region.block_arguments[0].representation = .initializer;
+    region.parameter_modes[0] = .init;
+    try std.testing.expect(validFunctionBody(body));
+}
+
+test "cached query outputs cannot adopt a private initializer calling convention" {
+    const db = try query.Database.init(std.testing.allocator, .{ .worker_count = 1 });
+    defer db.deinit();
+    var modes = [_]structures.ParameterMode{.imm};
+    var arguments = [_]structures.FunctionBlockArgument{.{ .type_id = .int, .representation = .storage }};
+    var blocks = [_]structures.FunctionBlock{.{ .argument_start = 0, .argument_end = 1, .instruction_start = 0, .instruction_end = 0, .terminator = .diverge }};
+    const body: structures.FunctionBodyAnalysis = .{
+        .is_initializer_region = true,
+        .return_type = .unit,
+        .parameter_modes = &modes,
+        .block_arguments = &arguments,
+        .call_arguments = &.{},
+        .branch_arguments = &.{},
+        .instructions = &.{},
+        .blocks = &blocks,
+        .entry = @enumFromInt(0),
+    };
+    try std.testing.expect(validFunctionBody(body));
+    try std.testing.expect(!(try validOutput(queries.AnalyzeFunctionInstance, db, body)));
+}
+
+test "cached initializers reject changed regions captures and value representation" {
+    const modules = @import("modules.zig");
+    const allocator = std.testing.allocator;
+    const db = try query.Database.init(allocator, .{ .worker_count = 1 });
+    defer db.deinit();
+    try modules.registerSources(db, allocator,
+        \\func materialize(init item: int) int -> return item
+        \\func run(imm value: int) int -> return materialize(value + 2)
+        \\exit(run(40))
+    , &.{}, &.{});
+    const executable = (try db.get(queries.BuildExecutable, 0)).*;
+    try std.testing.expect(executable != null);
+    const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;
+    var writer: codec.Writer = .{ .allocator = allocator };
+    defer writer.deinit();
+    const original = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = scope.resolveFunction("run").? })).*.?;
+    try writer.write(structures.FunctionBodyAnalysis, original);
+    var reader: codec.Reader = .{ .allocator = allocator, .bytes = writer.bytes.items };
+    var body = try reader.read(structures.FunctionBodyAnalysis);
+    defer body.deinit(allocator);
+    try std.testing.expect(validFunctionBody(body));
+    const reference = &body.instructions[0].initializer_ref;
+    const old_region = reference.region;
+    reference.region = @intCast(body.initializer_regions.len);
+    try std.testing.expect(!validFunctionBody(body));
+    reference.region = old_region;
+    reference.captures.end += 1;
+    try std.testing.expect(!validFunctionBody(body));
+    reference.captures.end -= 1;
+    body.initializer_regions[0].return_type = .bool;
+    try std.testing.expect(!validFunctionBody(body));
+    body.initializer_regions[0].return_type = .int;
+    body.initializer_regions[0].block_arguments[0].type_id = .bool;
+    try std.testing.expect(!validFunctionBody(body));
+    body.initializer_regions[0].block_arguments[0].type_id = .int;
+    try std.testing.expect(validFunctionBody(body));
+    body.call_arguments[0] = .{ .prepared = .{ .value = original.call_arguments[0].valueId() } };
+    try std.testing.expect(!validFunctionBody(body));
+}
+
+test "cached storage joins reject mismatched types and coercion metadata" {
+    var modes = [_]structures.ParameterMode{.imm};
+    var arguments = [_]structures.FunctionBlockArgument{
+        .{ .type_id = .int },
+        .{ .type_id = .int, .representation = .storage },
+    };
+    var uses = [_]structures.FunctionValueUse{.{ .value = @enumFromInt(0) }};
+    var tags = [_]u32{0};
+    var blocks = [_]structures.FunctionBlock{
+        .{ .argument_start = 0, .argument_end = 1, .instruction_start = 0, .instruction_end = 0, .terminator = .{ .branch = .{ .target = @enumFromInt(1), .arguments = .{ .start = 0, .end = 1 } } } },
+        .{ .argument_start = 1, .argument_end = 2, .instruction_start = 0, .instruction_end = 0, .terminator = .return_unit },
+    };
+    const body: structures.FunctionBodyAnalysis = .{
+        .return_type = .unit,
+        .parameter_modes = &modes,
+        .block_arguments = &arguments,
+        .variant_coercion_tags = &tags,
+        .branch_arguments = &uses,
+        .call_arguments = &.{},
+        .instructions = &.{},
+        .blocks = &blocks,
+        .entry = @enumFromInt(0),
+    };
+    try std.testing.expect(validFunctionBody(body));
+    arguments[1].type_id = .bool;
+    try std.testing.expect(!validFunctionBody(body));
+    arguments[1].type_id = .int;
+    uses[0].coerce_to = .int;
+    try std.testing.expect(!validFunctionBody(body));
+    uses[0].coerce_to = null;
+    uses[0].variant_tag_mapping = .{ .start = 0, .end = 1 };
+    try std.testing.expect(!validFunctionBody(body));
+    uses[0].variant_tag_mapping = null;
+    try std.testing.expect(validFunctionBody(body));
 }

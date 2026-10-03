@@ -25,21 +25,31 @@
   update fields, `mut` arguments, and replacements in place, variant copies and
   transfers construct member by member, and fresh `imm` arguments construct in
   widened temporaries.
-- Typed SSA covers calls, static specialization, callable values, variants, joins, loops, divergence, and fallible control flow. Compile-time thunks and specialized calls evaluate through typed IR, including structs, hooks, and type-valued functions; local captures remain unsupported.
+- Typed SSA covers calls, static specialization, callable values, variants, joins, loops, divergence, and fallible control flow. Compile-time thunks and specialized calls evaluate through typed IR, including structs, hooks, and type-valued functions; ordinary compile-time thunks cannot capture runtime locals.
+- Nonescaping `init` parameters construct or forward exactly once on successful
+  paths through direct, generic, and indirect calls. Complete expression inference,
+  immovable destinations, captured writes, guarded root/field transfers, and
+  caller-directed return, break, and continue work in native execution and the
+  interpreter's scalar/aggregate subset. Source failure can skip construction;
+  writes survive failure and partial fields clean before receiving frames unwind.
+  Native checked references cross forwarding; general compile-time reference and
+  allocation execution remains unsupported. Query/cache reuse and incremental
+  edits cover modes, effects, ownership capabilities, and lexical exits.
+  Box construction and raw slot initialization are ordinary init consumers,
+  including aliases and callable values.
 - Ownership tracks root and supported field transfers, borrowed and owned parameters, mutable copy-back, inferred `Ref` origins, and path-sensitive ASAP cleanup. `deinit` consumes owned roots and fields in place, including conditional and loop selections, constructs fresh arguments in call-lived storage, rejects borrowed sources, and lets custom move hooks transfer fields. Storage joins retain addresses independently of movability. Unfinished sources clean up remaining automatic fields without waiving explicit-field obligations. Later argument failure, contained reference origins, runtime and compile-time execution, and parameter-mode and movability edits across query/cache reuse are covered. The internal calling convention derives direct or address-passed arguments from ownership capabilities and consuming access; codegen owns physical argument layout. `Box` and `Buffer` provide host storage; `Ref` and scoped aliases retain checked origins for named places and supported fields, but not temporary projections.
 - Compiler-provided `extern func` declarations use named std identities and ordinary calls. `std.exit.exit` is exported by the prelude, with distinct runtime termination and compile-time compiler control.
 - Host-only `std.memory` provides checked typed allocation, unsafe indexed
-  transfers and destruction, `Box(T)` with automatic destruction, copyable
-  `Ref(T, writable)` handles with checked origins, and `Buffer(T)` with borrowed
-  `BufferView(T)` slices. Known direct `Box.new` calls allocate before evaluating
-  the entire initializer, then use general destination construction for nested
-  fields, producers, copies, moves, variants, conditionals, and loop results.
-  Unfinished construction cleans completed fields before releasing storage;
-  initializer failure reaches the constructor's failure continuation, and early
-  return, break, and continue release unfinished storage. Inference requires an
-  unevaluated result type; `Box(T).new` supplies it for loops and block-local
-  results. Separate duplication APIs remain, and consuming extraction requires
-  directly movable values.
+  construction, transfers and destruction, `Box(T)` with automatic destruction,
+  copyable `Ref(T, writable)` handles with checked origins, and `Buffer(T)` with
+  borrowed `BufferView(T)` slices. `Box.new(init item: T)` allocates before the
+  entire initializer through ordinary calls, aliases, and callable values, then
+  forwards to `unsafe_initialize` for construction in the final slot. Library
+  storage guards release unfinished allocations after partial fields clean on
+  failure or lexical exit. Inference requires an unevaluated result type;
+  `Box(T).new` supplies it for loops and block-local results. Copying into a new
+  Box uses ordinary initialization; consuming extraction requires directly
+  movable values. Live-reference replacement retains its existing restrictions.
   `Box` and `Ref` are prelude exports. Scoped writable aliases and checked
   `Buffer.get_mut` are supported. [STORAGE_AND_REFERENCES.md](STORAGE_AND_REFERENCES.md)
   records the host storage model and accepted cross-target design.
@@ -48,74 +58,82 @@
 
 ## Priority and dependencies
 
-Build on the host storage and reference foundation to expand the language toward
-text, generic collections, and ordinary iteration. Independent slices can
-proceed earlier. Each language slice covers diagnostics, execution, ownership,
-and incremental recomputation; reject unsupported forms at their owning boundary.
+Keep milestone 1 as the completed foundation. Milestone 2 is the next priority:
+make initializer failure explicit and prohibit caller-directed exits across
+deferred construction. All later milestones are lower priority and retain their
+relative order, expanding the host storage and reference foundation toward text,
+generic collections, and ordinary iteration. Each language slice covers
+diagnostics, execution, ownership, and incremental recomputation; reject
+unsupported forms at their owning boundary.
 
 ## Ordered milestones
 
 ### 1. Destination construction and consuming access
 
-Implement the accepted construction and ownership rules in
-[syntax&semantics.txt](syntax&semantics.txt). Replace the current Box-specific
-construction paths and ownership-hook conventions with this general model.
+Complete. Fresh results construct in their destinations; named locals copy or
+explicitly move, and `deinit` consumes existing storage in place. Nonescaping
+`init` parameters cover whole-expression inference, capture effects, guarded
+transfers, forwarding, and caller-directed return, break, and continue in native
+execution and the supported compile-time subset.
 
-- Add nonescaping `init` parameters: each successful path constructs or
-  forwards each parameter exactly once, while earlier failure may skip it.
-  Construction occurs when a destination is supplied; forwarding does not
-  evaluate the expression.
-  Retain parameter modes and deferred borrow, consumption, and failure effects
-  across callable boundaries, including indirect calls. This does not require
-  public capturing closures or a separate producer-based Box API.
-- Express `Box.new(init item: T)` and raw storage initialization through general
-  `init` parameters, extending the allocation-before-evaluation behavior of
-  known direct constructors across acquisition and indirect calls. Preserve
-  nested cleanup and reference origins. Once this works, remove `Box.duplicate`, public
-  `duplicate`, private `copy_into_box`, and the duplicate-specific compiler
-  handling. Keep unsupported live-storage replacement cases rejected.
-- Verify exact hook effects, stable addresses through destruction, named-local
-  returns, required single use of `init` on successful paths, deferred
-  evaluation and forwarding, skipped initializers on failure, partial
-  construction failure, and consumption before later failure. Cover runtime
-  and compile-time execution, diagnostics, incremental recomputation, and cache
-  reuse for changed signatures and ownership capabilities.
+`Box.new(init item: T)` and raw slot initialization use ordinary init calls.
+Allocation precedes the entire expression through aliases and callable values.
+Query/cache restoration and incremental edits retain hook effects, named-local
+returns, skipped evaluation, single use, partial cleanup, consumption before
+later failure, and lexical outcomes.
 
-#### Implementation order for the remaining `init` work
+[ARCHITECTURE.md](ARCHITECTURE.md#deferred-construction) owns the representation
+and cleanup contracts. General compile-time references and allocation and
+unsupported live-storage replacement remain outside this milestone; their
+current limits are documented in [STORAGE_AND_REFERENCES.md](STORAGE_AND_REFERENCES.md).
 
-1. Establish the general parameter contract together with a working
-   `materialize(init item: T)` and forwarding path. Keep `init` in callable
-   identity and static inference. Track each parameter's pending/consumed state
-   independently of T's ownership capabilities; check every successful exit and
-   loop backedge. Acquiring a callable must preserve this contract.
-2. Type deferred expressions in their caller's lexical context and publish their
-   construction regions and captures. Support the complete expression shapes
-   required by milestone 1, using the planned
-   [deferred construction boundaries](ARCHITECTURE.md#deferred-construction-planned).
-3. Apply the expression's reads, writes, transfers, and reference origins across
-   eager argument preparation, receiving calls, and forwarding. Preserve skipped
-   and completed transfers separately for cleanup, including fields and shared
-   failure continuations. Check the argument contract without inspecting the
-   receiving callee's body.
-4. Give native execution and compile-time interpretation the same construction
-   and forwarding operations, including indirect calls, deferred failure, and
-   lexical exits. Implement the private outcome protocol and frame-local
-   interpretation before using general `init` in allocating library functions.
-5. Express Box and raw slot initialization as ordinary `init` consumers. Remove
-   the direct-constructor interception and the duplication APIs and compiler
-   behavior together. Verify allocation precedes the entire initializer through
-   aliases, acquisition, and indirect calls as well as direct syntax.
-6. Verify query ownership, equality, dependency tracking, cache round trips, and
-   invalidation for modes, capture effects, and typed regions. Cover nested
-   initializers, partial failure, skipped and completed transfers, writable
-   captures, lexical exits, and ownership hooks in both execution paths. Review
-   the complete implementation and remove superseded temporary machinery.
+### 2. Explicit initializer failure and control flow
 
-These are dependencies within one feature. The first implementation checkpoint
-must execute construction and forwarding; accepting the modifier alone does not
-establish support. Each checkpoint includes diagnostics and focused tests.
+Revise the deferred initializer rules in
+[syntax&semantics.txt](syntax&semantics.txt) before implementation. The current
+foundation above describes the existing behavior; this milestone replaces its
+implicit failure propagation and caller-directed lexical exits.
 
-### 2. Field visibility
+- Keep `init` as the single parameter modifier. Treat consumption into a
+  destination as potentially fallible for every initializer, including literals
+  and expressions that cannot actually fail. Handle failure locally or propagate
+  it from a declared `fallible` function; remove the exception that lets an
+  ordinary `func` propagate failure from an initializer. Forwarding does not
+  evaluate the expression; construction handles its potential failure, and
+  forwarding calls obey the receiving callable's declared fallibility.
+- Make a deferred initializer a control-flow boundary. Reject `return` targeting
+  its caller and `break` or `continue` targeting loops outside the initializer;
+  do not retarget these exits. Loops inside the initializer retain their own
+  `break` and `continue`, and called functions return normally. Ordinary eager
+  argument expressions retain their existing caller-directed exits. Preserve
+  the boundary through forwarding, aliases, and indirect calls.
+- Make raw slot initialization explicitly `fallible`, including
+  `unsafe_initialize` and the planned `unsafe_initialize_all`. Use ordinary
+  failure handling in `Box.new` to release the allocation after partial
+  construction cleanup, and publish the Box only after successful construction.
+  Remove `UninitializedStorage` and its helper when direct allocation and
+  failure cleanup discharge every ownership path. Settle explicit failure
+  propagation after cleanup without manufacturing a failing comparison.
+- Preserve allocation-before-evaluation, destination construction, exactly-once
+  consumption on successful paths, skipped evaluation on allocation failure,
+  and partial-subobject cleanup before storage release. Initializer writes and
+  completed transfers are not rolled back. Audit infallible ownership hooks and
+  future converters: consuming an initializer must handle failure rather than
+  acquire a hidden failure outcome.
+- Verify handled and propagated failure, rejected unhandled consumption in
+  `func`, infallible arguments accepted by the same fallible consumer, raw
+  allocation cleanup, and caller-directed exit rejection versus allowed local
+  loop exits and eager argument exits. Cover direct, forwarded, aliased, and
+  indirect calls, native execution, the supported compile-time subset, and
+  incremental recomputation and cache reuse when modes or fallibility change.
+- Defer type-level `where` assertions proving initializer infallibility and any
+  effect polymorphism. No `init fallible` modifier or parallel infallible and
+  fallible constructor APIs are required. Update
+  [ARCHITECTURE.md](ARCHITECTURE.md#deferred-construction) and
+  [STORAGE_AND_REFERENCES.md](STORAGE_AND_REFERENCES.md) as the implementation and
+  cleanup contracts change.
+
+### 3. Field visibility
 
 Implement field visibility from [syntax&semantics.txt](syntax&semantics.txt).
 It replaces the temporary name-matched opaque storage owners in `std.memory`.
@@ -135,7 +153,7 @@ It replaces the temporary name-matched opaque storage owners in `std.memory`.
   with private fields; compile-time execution; and incremental recomputation
   when a field gains or loses `pub`.
 
-### 3. Converters and literal types
+### 4. Converters and literal types
 
 - Implement `static struct` expressions and named and parameterized declaration
   sugar from [syntax&semantics.txt](syntax&semantics.txt). Preserve ordinary
@@ -165,7 +183,7 @@ It replaces the temporary name-matched opaque storage owners in `std.memory`.
   execution, and incremental recomputation when either owning module adds or
   removes a converter.
 
-### 4. Text and basic I/O
+### 5. Text and basic I/O
 
 - Define UTF-8 string literals through the literal-type converter model and a
   `std` **String** exported through
@@ -177,7 +195,7 @@ It replaces the temporary name-matched opaque storage owners in `std.memory`.
   borrowing for slices, and cleanup. Compile-time execution retains no ambient
   I/O.
 
-### 5. Ranges, List, and iteration
+### 6. Ranges, List, and iteration
 
 - Implement exclusive/inclusive ascending ranges and empty-range behavior.
   Decide endpoint types, descending iteration, steps, overflow-safe termination,
@@ -196,20 +214,20 @@ It replaces the temporary name-matched opaque storage owners in `std.memory`.
   iterator state and invalidation, loop results, and cleanup on every exit path.
   Range-only iteration may precede List if it uses that contract.
 
-### 6. Structural tuples
+### 7. Structural tuples
 
 - Implement ordered structural identity for `(foo, bar)` with type spelling,
   access, destructuring, layout, and elementwise ownership. Resolve grouping
   and singleton syntax alongside `()`; tuples support multiple results and
   later Map iteration.
 
-### 7. Match
+### 8. Match
 
 - Evaluate the subject once; add literal, wildcard, binding, `pattern as name`,
   and `is Type` patterns. Diagnose redundancy and non-exhaustiveness using
   existing branch joins and variant mappings.
 
-### 8. Numeric foundations
+### 9. Numeric foundations
 
 - Add named numeric conversion functions (wrap, truncate, round, saturate,
   widen) with specified overflow and failure behavior; converters never relate
@@ -224,7 +242,7 @@ It replaces the temporary name-matched opaque storage owners in `std.memory`.
   Extend to float and user structs after their semantics are settled; do not
   assume general overloading follows from operator lookup.
 
-### 9. Collections and algorithms
+### 10. Collections and algorithms
 
 - Add **Map**, **Set**, **Queue**, and **Stack** on established storage and
   iteration contracts. Specify hashing/equality, ordering, mutation, and

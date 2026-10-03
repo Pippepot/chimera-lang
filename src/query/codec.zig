@@ -21,7 +21,7 @@ pub const Writer = struct {
         try self.bytes.appendSlice(self.allocator, &encoded);
     }
 
-    pub fn write(self: *Writer, comptime T: type, value: T) !void {
+    pub fn write(self: *Writer, comptime T: type, value: T) std.mem.Allocator.Error!void {
         switch (@typeInfo(T)) {
             .void => {},
             .bool => try self.bytes.append(self.allocator, @intFromBool(value)),
@@ -64,6 +64,7 @@ pub const Reader = struct {
     allocator: std.mem.Allocator,
     bytes: []const u8,
     offset: usize = 0,
+    nesting: usize = 0,
 
     pub fn take(self: *Reader, count: usize) error{InvalidCache}![]const u8 {
         if (self.offset > self.bytes.len) return error.InvalidCache;
@@ -85,6 +86,11 @@ pub const Reader = struct {
     }
 
     pub fn read(self: *Reader, comptime T: type) anyerror!T {
+        // Owned initializer regions make bodies recursive. Damaged snapshots
+        // must fail at this boundary rather than exhaust the compiler's stack.
+        if (self.nesting == 256) return error.InvalidCache;
+        self.nesting += 1;
+        defer self.nesting -= 1;
         return switch (@typeInfo(T)) {
             .void => {},
             .bool => blk: {
@@ -206,4 +212,20 @@ test "disk codec roundtrips nested owned values and rejects invalid tags" {
     try testing.expectError(error.InvalidCache, invalid.read(bool));
     invalid.offset = 0;
     try testing.expectError(error.InvalidCache, invalid.read(union(enum) { none, number: i32 }));
+}
+
+test "disk codec bounds recursive owned values and cleans up a truncated region" {
+    const Node = struct { children: []const @This() };
+    const leaf: Node = .{ .children = &.{} };
+    const child: Node = .{ .children = &.{leaf} };
+    const root: Node = .{ .children = &.{child} };
+    var writer: Writer = .{ .allocator = std.testing.allocator };
+    defer writer.deinit();
+    try writer.write(Node, root);
+    var short: Reader = .{ .allocator = std.testing.allocator, .bytes = writer.bytes.items[0 .. writer.bytes.items.len - 1] };
+    try std.testing.expectError(error.InvalidCache, short.read(Node));
+    try std.testing.expectEqual(@as(usize, 0), short.nesting);
+    var deep: Reader = .{ .allocator = std.testing.allocator, .bytes = writer.bytes.items, .nesting = 255 };
+    try std.testing.expectError(error.InvalidCache, deep.read(Node));
+    try std.testing.expectEqual(@as(usize, 255), deep.nesting);
 }

@@ -113,6 +113,18 @@ fn functionSsa(
     };
 }
 
+test "divergence traps before a following block can execute" {
+    var instructions: [0]structures.FunctionInstruction = .{};
+    var blocks = [_]structures.FunctionBlock{
+        .{ .instruction_start = 0, .instruction_end = 0, .terminator = .diverge },
+        .{ .instruction_start = 0, .instruction_end = 0, .terminator = .return_unit },
+    };
+    const body = functionSsa(&instructions, &blocks);
+    var artifact = try codegen.compileFunction(&body, TestTypes{}, std.testing.allocator);
+    defer artifact.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.startsWith(u8, artifact.code, &.{ 0x0F, 0x0B }));
+}
+
 test "single aligned function artifact builds and runs without borrowing code" {
     const io = std.testing.io;
     var executable = blk: {
@@ -144,7 +156,7 @@ test "storage joins keep the source address for directly movable values" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const exit_function: structures.InstanceId = .{ .item = @enumFromInt(1) };
-    var arguments = [_]structures.FunctionBlockArgument{.{ .type_id = .int, .is_storage = true }};
+    var arguments = [_]structures.FunctionBlockArgument{.{ .type_id = .int, .representation = .storage }};
     var uses = [_]structures.FunctionValueUse{.{ .value = @enumFromInt(1) }};
     var call_arguments = [_]structures.FunctionCallArgument{.{ .prepared = .{ .value = @enumFromInt(1) } }};
     var instructions = [_]structures.FunctionInstruction{

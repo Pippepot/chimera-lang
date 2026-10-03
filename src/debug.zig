@@ -77,7 +77,12 @@ fn renderSsaFunction(
         for (block.argument_start..block.argument_end) |argument_index| {
             if (argument_index != block.argument_start) try writer.writeAll(", ");
             try writer.print("%{d}: ", .{argument_index});
-            if (ssa.block_arguments[argument_index].is_storage) try writer.writeAll("storage ");
+            switch (ssa.block_arguments[argument_index].representation) {
+                .value => {},
+                .storage => try writer.writeAll("storage "),
+                .initializer => try writer.writeAll("init "),
+                .continuation => try writer.writeAll("continuation "),
+            }
             try renderType(ssa.block_arguments[argument_index].type_id, writer);
         }
         try writer.writeByte(')');
@@ -104,10 +109,10 @@ fn renderSsaFunction(
                 try writer.writeAll("    fcall ");
                 try renderCallTarget(db, fallible.call.target, writer);
                 if (fallible.call.destination) |storage| try writer.print(" into %{d}", .{@intFromEnum(storage)});
-                try writer.print(" -> b{d}, b{d}\n", .{
-                    @intFromEnum(fallible.success),
-                    @intFromEnum(fallible.failure),
-                });
+                try writer.print(" -> b{d}", .{@intFromEnum(fallible.success)});
+                if (fallible.failure) |failure| try writer.print(", failure b{d}", .{@intFromEnum(failure)});
+                if (fallible.lexical_exit) |target| try writer.print(", lexical b{d}", .{@intFromEnum(target)});
+                try writer.writeByte('\n');
             },
             .return_unit => try writer.writeAll("    ret\n"),
             .return_value => |value| {
@@ -116,6 +121,8 @@ fn renderSsaFunction(
                 try writer.writeByte('\n');
             },
             .return_failure => try writer.writeAll("    fail\n"),
+            .return_lexical => |token| try writer.print("    lexical v{d}\n", .{@intFromEnum(token)}),
+            .continuation_branch => |branch| try writer.print("    continuation v{d} == v{d}: bb{d}, bb{d}\n", .{ @intFromEnum(branch.token), @intFromEnum(branch.target), @intFromEnum(branch.match), @intFromEnum(branch.mismatch) }),
             .diverge => try writer.writeAll("    diverge\n"),
         }
     }
@@ -155,6 +162,18 @@ fn renderInstruction(
         },
         .const_unit => try writer.print("    %{d} = const_unit\n", .{result}),
         .const_none => try writer.print("    %{d} = const_none\n", .{result}),
+        .initializer_ref => |reference| try writer.print("    %{d} = initializer_ref region {d}, captures {d}..{d}\n", .{ result, reference.region, reference.captures.start, reference.captures.end }),
+        .continuation_ref => |payload| {
+            try writer.print("    %{d} = continuation_ref", .{result});
+            if (payload) |storage| try writer.print(" payload %{d}", .{@intFromEnum(storage)});
+            try writer.writeByte('\n');
+        },
+        .continuation_storage => |operation| {
+            try writer.print("    %{d} = continuation_storage %{d} : ", .{ result, @intFromEnum(operation.token) });
+            try renderType(operation.type_id, writer);
+            try writer.writeByte('\n');
+        },
+        .continuation_select => |operation| try writer.print("    %{d} = continuation_select %{d}, %{d}\n", .{ result, @intFromEnum(operation.token), @intFromEnum(operation.storage) }),
         .function_ref => |reference| {
             const target = try db.lookupInterned(queries.ItemLocations, reference.target);
             try writer.print("    %{d} = function_ref @{s}\n", .{ result, target.name });
@@ -186,11 +205,6 @@ fn renderInstruction(
             }
             try writer.writeAll(")\n");
         },
-        .box_init => |operation| {
-            try writer.print("    %{d} = box_init %{d} ", .{ result, @intFromEnum(operation.allocation) });
-            try renderType(operation.box_type, writer);
-            try writer.writeByte('\n');
-        },
         .local_storage => |type_id| {
             try writer.print("    %{d} = local_storage ", .{result});
             try renderType(type_id, writer);
@@ -204,7 +218,7 @@ fn renderInstruction(
         .storage_projection => |operation| {
             try writer.print("    %{d} = storage_projection %{d}", .{ result, @intFromEnum(operation.owner) });
             switch (operation.projection) {
-                .dereference => try writer.writeAll("[]"),
+                .box_element => try writer.writeAll(".element"),
                 .field => |index| try writer.print(".{d}", .{index}),
                 .variant => try writer.writeAll(".payload"),
             }
@@ -282,6 +296,7 @@ fn renderCallTarget(db: *query.Database, target: @FieldType(structures.FunctionC
             try writer.print("@{s}", .{location.name});
         },
         .indirect => |value| try writer.print("%{d}", .{@intFromEnum(value)}),
+        .initializer => |value| try writer.print("init %{d}", .{@intFromEnum(value)}),
     }
 }
 

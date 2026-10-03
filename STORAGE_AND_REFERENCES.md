@@ -24,10 +24,12 @@ The implemented host API provides typed allocation and unsafe indexed access,
 `Box(T)` owners, copyable `Ref(T, writable)` handles, scoped aliases, and
 `Buffer(T)` with checked element access and borrowed `BufferView(T)` slices.
 The accepted ownership, access, construction, and failure rules are recorded in
-[syntax&semantics.txt](syntax&semantics.txt). Known direct Box constructors now
-allocate before evaluating their initializer and use general destination
-construction. Deferred `init` arguments across ordinary and indirect calls
-remain in [milestone 1](ROADMAP.md#1-destination-construction-and-consuming-access).
+[syntax&semantics.txt](syntax&semantics.txt). Box constructors allocate before
+evaluating their initializer through general init forwarding and destination
+construction, including aliases and indirect calls. Nonescaping init parameters
+retain captured writes, transfers, checked-reference results, failure, and
+caller-directed lexical exits. Further allocating-consumer verification remains
+in [milestone 1](ROADMAP.md#1-destination-construction-and-consuming-access).
 The target, provider, location, and address-space contract below is accepted,
 but provider selection, device locations, and address spaces are not public APIs.
 
@@ -190,7 +192,7 @@ API; decide their representation when those operations have a concrete use.
 storage. It does not copy implicitly. Construction combines allocation and
 initialization and is therefore fallible; destruction destroys `T` and
 deallocates the storage. Moving the owner preserves the allocation and its
-location. Under the accepted `Box.new(init value: T)` contract, allocation
+location. Under the implemented `Box.new(init value: T)` contract, allocation
 precedes evaluation of the entire initializer expression. Fresh values construct
 directly in the allocation, existing copyable values copy into it, and explicit
 transfers require move support. This also permits copying an existing immovable
@@ -198,9 +200,12 @@ value when it supports copy. A named, noncopyable immovable value cannot be
 relocated into a Box.
 
 `Box.new(owner.borrow()[])` explicitly creates a distinct allocation by copying
-the pointee. Known direct calls already share ordinary destination construction,
-including partial cleanup and reference origins. The remaining constructor
-interception and separate duplication APIs await general `init` parameters.
+the pointee. The ordinary library constructor allocates a temporary storage
+owner, forwards the initializer to raw slot initialization, and consumes the
+storage owner into a Box after successful construction. Aliases and indirect
+calls use the same deferred capture and lexical-exit protocol. Partial fields
+clean before receiving frames release unfinished storage. There is no separate
+duplication API.
 
 An eventual shared owner (name unsettled) would share ownership of one initialized
 `T` and its control block.
@@ -349,7 +354,7 @@ unsafe_borrow_element(T, allocation, index)      # storable Ref(T, false)
 allocation, including zero-sized elements; it does not expose storage fields.
 
 Accessors for layout and location remain design sketches.
-The accepted `unsafe_initialize` contract takes its value as an `init` parameter
+The implemented `unsafe_initialize` contract takes its value as an `init` parameter
 and constructs directly in the uninitialized element slot, including immovable
 values. This is the general storage primitive used by owning abstractions;
 it does not require Box-specific expression recognition.

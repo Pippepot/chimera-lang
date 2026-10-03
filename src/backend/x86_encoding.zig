@@ -18,7 +18,10 @@ pub const Encoding = struct {
 };
 
 const instructions = .{
+    .lea_rax_rip = Encoding{ .prefix = &.{ 0x48, 0x8D, 0x05 }, .operand = .rel, .asm_prefix = "lea rax, [rip+", .asm_suffix = "]" },
+    .mov_rax_rdi = Encoding{ .prefix = &.{ 0x48, 0x8B, 0x87 }, .operand = .u32, .asm_prefix = "mov rax, [rdi+", .asm_suffix = "]" },
     .ret = Encoding{ .prefix = &.{0xC3}, .asm_prefix = "ret" },
+    .ud2 = Encoding{ .prefix = &.{ 0x0F, 0x0B }, .asm_prefix = "ud2" },
     .zero_edi = Encoding{ .prefix = &.{ 0x31, 0xFF }, .asm_prefix = "xor edi, edi" },
     .cdq = Encoding{ .prefix = &.{0x99}, .asm_prefix = "cdq" },
     .idiv_ecx = Encoding{ .prefix = &.{ 0xF7, 0xF9 }, .asm_prefix = "idiv ecx" },
@@ -54,6 +57,11 @@ const instructions = .{
     .jge = Encoding{ .prefix = &.{ 0x0F, 0x8D }, .operand = .rel, .asm_prefix = "jge " },
     .nop = Encoding{ .prefix = &.{0x90}, .asm_prefix = "nop" },
     .test_edx = Encoding{ .prefix = &.{ 0x85, 0xD2 }, .asm_prefix = "test edx, edx" },
+    .cmp_edx = Encoding{ .prefix = &.{ 0x81, 0xFA }, .operand = .i32, .asm_prefix = "cmp edx, " },
+    .cmp_rax_rcx = Encoding{ .prefix = &.{ 0x48, 0x39, 0xC8 }, .asm_prefix = "cmp rax, rcx" },
+    .mov_rcx_rax = Encoding{ .prefix = &.{ 0x48, 0x89, 0xC1 }, .asm_prefix = "mov rcx, rax" },
+    .mov_rax_rax_offset = Encoding{ .prefix = &.{ 0x48, 0x8B, 0x80 }, .operand = .u32, .asm_prefix = "mov rax, [rax+", .asm_suffix = "]" },
+    .mov_rax_rcx_offset = Encoding{ .prefix = &.{ 0x48, 0x89, 0x88 }, .operand = .u32, .asm_prefix = "mov [rax+", .asm_suffix = "], rcx" },
     .cmp_eax_rsp = Encoding{ .prefix = &.{ 0x3B, 0x84, 0x24 }, .operand = .u32, .asm_prefix = "cmp eax, [rsp+", .asm_suffix = "]" },
     .movzx_eax_rsp = Encoding{ .prefix = &.{ 0x0F, 0xB6, 0x84, 0x24 }, .operand = .u32, .asm_prefix = "movzx eax, byte [rsp+", .asm_suffix = "]" },
     .mov_rsp_al = Encoding{ .prefix = &.{ 0x88, 0x84, 0x24 }, .operand = .u32, .asm_prefix = "mov [rsp+", .asm_suffix = "], al" },

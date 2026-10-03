@@ -134,7 +134,7 @@ const GenerationBits = struct {
 
 pub const Solver = struct {
     const BlockEdges = struct {
-        outgoing: [2]?usize = .{ null, null },
+        outgoing: [3]?usize = .{ null, null, null },
         first_incoming: ?usize = null,
     };
 
@@ -854,11 +854,11 @@ pub const Solver = struct {
         for (self.blocks, 0..) |block, block_index| {
             if (!self.reachable[block_index]) continue;
             switch (block.terminator orelse unreachable) {
-                .return_unit, .return_value, .return_failure => {
+                .return_unit, .return_value, .return_failure, .return_lexical => {
                     const open = self.blockSet(self.live_out, @enumFromInt(block_index));
                     for (open) |word| std.debug.assert(word == 0);
                 },
-                .branch, .predicate_branch, .fallible_call, .diverge => {},
+                .branch, .predicate_branch, .fallible_call, .continuation_branch, .diverge => {},
             }
         }
         self.validateEndingApplications(planned_cleanups, explicit_abandonments);

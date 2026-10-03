@@ -2,6 +2,7 @@ prog
 main
 chimera.asm
 chimera.o
+zig-out/
 .zig-cache/
 .chi-cache/
 .chi-run-*

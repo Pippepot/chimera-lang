@@ -75,6 +75,7 @@ pub const Token = struct {
         keyword_const,
         keyword_continue,
         keyword_deinit,
+        keyword_init,
         keyword_else,
         keyword_extern,
         keyword_fallible,
@@ -109,6 +110,7 @@ pub const Token = struct {
         .{ "const", .keyword_const },
         .{ "continue", .keyword_continue },
         .{ "deinit", .keyword_deinit },
+        .{ "init", .keyword_init },
         .{ "else", .keyword_else },
         .{ "extern", .keyword_extern },
         .{ "fallible", .keyword_fallible },
@@ -706,6 +708,7 @@ pub const ParameterMode = enum {
     mut,
     @"var",
     deinit,
+    init,
 };
 
 pub const CallableParameter = struct {
@@ -917,11 +920,12 @@ pub const FunctionValueUse = struct {
 pub const FunctionCallArgument = union(enum) {
     prepared: FunctionValueUse,
     deinit: FunctionValueId,
+    initializer: FunctionValueId,
 
     pub fn valueUse(self: @This()) FunctionValueUse {
         return switch (self) {
             .prepared => |use| use,
-            .deinit => |source| .{ .value = source },
+            .deinit, .initializer => |source| .{ .value = source },
         };
     }
 
@@ -932,7 +936,7 @@ pub const FunctionCallArgument = union(enum) {
     pub fn operand(self: *@This()) *FunctionValueId {
         return switch (self.*) {
             .prepared => |*use| &use.value,
-            .deinit => |*source| source,
+            .deinit, .initializer => |*source| source,
         };
     }
 };
@@ -955,6 +959,8 @@ pub const FunctionBranch = struct {
     arguments: FunctionValueRange,
 };
 
+pub const CallOutcome = enum(u8) { failure = 0, success = 1, lexical_exit = 2 };
+
 pub const FunctionTerminator = union(enum) {
     branch: FunctionBranch,
     predicate_branch: struct {
@@ -966,35 +972,61 @@ pub const FunctionTerminator = union(enum) {
     fallible_call: struct {
         call: FunctionCall,
         success: FunctionBlockId,
-        failure: FunctionBlockId,
+        failure: ?FunctionBlockId,
+        lexical_exit: ?FunctionBlockId = null,
+    },
+    continuation_branch: struct {
+        token: FunctionValueId,
+        target: FunctionValueId,
+        match: FunctionBlockId,
+        mismatch: FunctionBlockId,
     },
     return_unit,
     return_value: FunctionValueUse,
     return_failure,
+    return_lexical: FunctionValueId,
     diverge,
 
     pub fn operands(self: *FunctionTerminator) [2]?*FunctionValueId {
         return switch (self.*) {
             .predicate_branch => |*branch| .{ &branch.operands.lhs, &branch.operands.rhs },
             .fallible_call => |*fallible| fallible.call.operands(),
+            .continuation_branch => |*branch| .{ &branch.token, &branch.target },
+            .return_lexical => |*token| .{ token, null },
             .return_value => |*use| .{ &use.value, null },
             .branch, .return_unit, .return_failure, .diverge => .{ null, null },
         };
     }
 
-    pub fn successors(self: *FunctionTerminator) [2]?*FunctionBlockId {
+    pub fn successors(self: *FunctionTerminator) [3]?*FunctionBlockId {
         return switch (self.*) {
-            .branch => |*branch| .{ &branch.target, null },
-            .predicate_branch => |*branch| .{ &branch.then_branch.target, &branch.else_branch.target },
-            .fallible_call => |*call| .{ &call.success, &call.failure },
-            .return_unit, .return_value, .return_failure, .diverge => .{ null, null },
+            .branch => |*branch| .{ &branch.target, null, null },
+            .predicate_branch => |*branch| .{ &branch.then_branch.target, &branch.else_branch.target, null },
+            .fallible_call => |*call| callSuccessors(call),
+            .continuation_branch => |*branch| .{ &branch.match, &branch.mismatch, null },
+            .return_unit, .return_value, .return_failure, .return_lexical, .diverge => .{ null, null, null },
         };
     }
 
     pub fn successorCount(self: FunctionTerminator) u2 {
         var terminator = self;
         const targets = terminator.successors();
-        return @as(u2, @intFromBool(targets[0] != null)) + @intFromBool(targets[1] != null);
+        return @as(u2, @intFromBool(targets[0] != null)) + @intFromBool(targets[1] != null) + @intFromBool(targets[2] != null);
+    }
+
+    fn callSuccessors(call: *@FieldType(FunctionTerminator, "fallible_call")) [3]?*FunctionBlockId {
+        var targets: [3]?*FunctionBlockId = .{ null, null, null };
+        var count: usize = 0;
+        if (call.call.return_type != .never) {
+            targets[count] = &call.success;
+            count += 1;
+        }
+        if (call.failure) |*failure| {
+            targets[count] = failure;
+            count += 1;
+        }
+        if (call.lexical_exit) |*lexical| targets[count] = lexical;
+        return targets;
     }
 };
 
@@ -1006,10 +1038,13 @@ pub const FunctionBlock = struct {
     terminator: FunctionTerminator,
 };
 
+pub const ValueRepresentation = enum { value, storage, initializer, continuation };
+
 pub const FunctionBlockArgument = struct {
     type_id: TypeId,
-    /// Preserve selected storage even when the type can move directly.
-    is_storage: bool = false,
+    /// Pending construction and selected storage are independent of T's layout
+    /// and movement capabilities.
+    representation: ValueRepresentation = .value,
 };
 
 /// Function-signature query outputs own `parameters`; interned callable types
@@ -1020,7 +1055,6 @@ pub const CallBehavior = enum {
     ordinary,
     box_new,
     box_value,
-    box_duplicate,
     box_borrow,
     box_borrow_mut,
     local_borrow,
@@ -1064,14 +1098,33 @@ pub const FunctionShape = struct {
 };
 
 pub const FunctionCall = struct {
-    target: union(enum) { direct: InstanceId, indirect: FunctionValueId },
+    target: union(enum) { direct: InstanceId, indirect: FunctionValueId, initializer: FunctionValueId },
     arguments: FunctionValueRange,
     return_type: TypeId,
     destination: ?FunctionValueId = null,
 
+    pub fn hasInitializer(self: @This(), arguments: []const FunctionCallArgument) bool {
+        if (self.target == .initializer) return true;
+        for (arguments[self.arguments.start..self.arguments.end]) |argument| if (argument == .initializer) return true;
+        return false;
+    }
+
+    pub fn usesInitializer(self: @This(), initializer: ?FunctionValueId, arguments: []const FunctionCallArgument) bool {
+        const value = initializer orelse return false;
+        if (self.target == .initializer and self.target.initializer == value) return true;
+        for (arguments[self.arguments.start..self.arguments.end]) |argument| {
+            if (argument == .initializer and argument.initializer == value) return true;
+        }
+        return false;
+    }
+
     pub fn operands(self: *FunctionCall) [2]?*FunctionValueId {
         return .{
-            if (self.target == .indirect) &self.target.indirect else null,
+            switch (self.target) {
+                .indirect => &self.target.indirect,
+                .initializer => &self.target.initializer,
+                .direct => null,
+            },
             if (self.destination) |*destination| destination else null,
         };
     }
@@ -1104,15 +1157,10 @@ pub const StructOperation = struct {
     type_id: TypeId,
 };
 
-pub const BoxInitOperation = struct {
-    allocation: FunctionValueId,
-    box_type: TypeId,
-};
-
 pub const StorageProjection = struct {
     owner: FunctionValueId,
     type_id: TypeId,
-    projection: union(enum) { dereference, field: u32, variant } = .dereference,
+    projection: union(enum) { box_element, field: u32, variant },
 };
 
 pub const AllocationElement = struct {
@@ -1180,12 +1228,15 @@ pub const FunctionInstruction = union(enum) {
     const_unit,
     const_none,
     function_ref: FunctionReference,
+    continuation_ref: ?FunctionValueId,
+    continuation_storage: struct { token: FunctionValueId, type_id: TypeId },
+    continuation_select: struct { token: FunctionValueId, storage: FunctionValueId },
+    initializer_ref: struct { region: u32, captures: FunctionValueRange, type_id: TypeId },
     variant_tag: FunctionValueId,
     variant_coerce: VariantOperation,
     variant_extract: VariantOperation,
     callable_coerce: VariantOperation,
     struct_init: StructOperation,
-    box_init: BoxInitOperation,
     local_storage: TypeId,
     result_storage: TypeId,
     storage_projection: StorageProjection,
@@ -1208,10 +1259,12 @@ pub const FunctionInstruction = union(enum) {
 
     pub fn operands(self: *FunctionInstruction) [2]?*FunctionValueId {
         return switch (self.*) {
-            .const_int, .const_byte, .const_bool, .const_type, .const_unit, .const_none, .function_ref, .struct_init, .local_storage, .result_storage => .{ null, null },
+            .const_int, .const_byte, .const_bool, .const_type, .const_unit, .const_none, .function_ref, .initializer_ref, .struct_init, .local_storage, .result_storage => .{ null, null },
+            .continuation_ref => |*destination| .{ if (destination.*) |*value| value else null, null },
+            .continuation_storage => |*operation| .{ &operation.token, null },
+            .continuation_select => |*operation| .{ &operation.token, &operation.storage },
             .variant_tag, .negi => |*operand| .{ operand, null },
             .variant_coerce, .variant_extract, .callable_coerce => |*operation| .{ &operation.operand, if (operation.destination) |*destination| destination else null },
-            .box_init => |*operation| .{ &operation.allocation, null },
             .storage_projection => |*operation| .{ &operation.owner, null },
             .allocation_element => |*operation| .{ &operation.allocation, &operation.index },
             .borrow_box, .borrow_read => |*operation| .{ &operation.source, null },
@@ -1233,12 +1286,13 @@ pub const FunctionInstruction = union(enum) {
             .const_byte => .byte,
             .const_bool => .bool,
             .const_type => .type,
-            .const_unit => .unit,
+            .const_unit, .continuation_ref, .continuation_select => .unit,
+            .continuation_storage => |operation| operation.type_id,
             .const_none => .none,
             .function_ref => |reference| reference.type_id,
+            .initializer_ref => |reference| reference.type_id,
             .variant_coerce, .variant_extract, .callable_coerce => |operation| if (operation.destination == null) operation.target_type else .unit,
             .struct_init => |operation| operation.type_id,
-            .box_init => |operation| operation.box_type,
             .local_storage, .result_storage => |type_id| type_id,
             .storage_projection => |operation| operation.type_id,
             .allocation_element => |operation| operation.type_id,
@@ -1260,7 +1314,13 @@ pub const FunctionInstruction = union(enum) {
 /// and terminator. Calls retain declaration identities until code emission.
 pub const FunctionBodyAnalysis = struct {
     return_type: TypeId,
+    /// Includes private initializer outcomes; source declarations retain their
+    /// own fallibility in CallableType.
     is_fallible: bool = false,
+    /// Region entry arguments are addresses supplied by its private environment.
+    is_initializer_region: bool = false,
+    initializer_regions: []FunctionBodyAnalysis = &.{},
+    initializer_captures: []FunctionValueId = &.{},
     parameter_modes: []ParameterMode,
     block_arguments: []FunctionBlockArgument,
     variant_coercion_tags: []const u32 = &.{},
@@ -1285,6 +1345,12 @@ pub const FunctionBodyAnalysis = struct {
         return functionInstructionValue(self.block_arguments.len, instruction_index);
     }
 
+    pub fn valueType(self: @This(), value: ValueId) TypeId {
+        const index = @intFromEnum(value);
+        std.debug.assert(index < self.valueCount());
+        return if (index < self.block_arguments.len) self.block_arguments[index].type_id else self.instructions[index - self.block_arguments.len].resultType();
+    }
+
     pub fn valueCount(self: @This()) usize {
         return self.block_arguments.len + self.instructions.len;
     }
@@ -1293,6 +1359,9 @@ pub const FunctionBodyAnalysis = struct {
         if (a.entry != b.entry or
             a.return_type != b.return_type or
             a.is_fallible != b.is_fallible or
+            a.is_initializer_region != b.is_initializer_region or
+            a.initializer_regions.len != b.initializer_regions.len or
+            !std.mem.eql(FunctionValueId, a.initializer_captures, b.initializer_captures) or
             !std.mem.eql(ParameterMode, a.parameter_modes, b.parameter_modes) or
             a.block_arguments.len != b.block_arguments.len or
             !std.mem.eql(u32, a.variant_coercion_tags, b.variant_coercion_tags) or
@@ -1306,6 +1375,9 @@ pub const FunctionBodyAnalysis = struct {
             a.blocks.len != b.blocks.len) return false;
         for (a.block_arguments, b.block_arguments) |left, right| {
             if (!std.meta.eql(left, right)) return false;
+        }
+        for (a.initializer_regions, b.initializer_regions) |left, right| {
+            if (!eql(left, right)) return false;
         }
         for (a.struct_field_values, b.struct_field_values) |left, right| {
             if (!std.meta.eql(left, right)) return false;
@@ -1351,6 +1423,9 @@ pub const FunctionBodyAnalysis = struct {
         gpa.free(self.borrow_fields);
         gpa.free(self.branch_arguments);
         gpa.free(self.call_arguments);
+        for (self.initializer_regions) |*region| region.deinit(gpa);
+        gpa.free(self.initializer_regions);
+        gpa.free(self.initializer_captures);
         gpa.free(self.instructions);
         gpa.free(self.instruction_spans);
         gpa.free(self.terminator_spans);
@@ -1528,6 +1603,13 @@ pub const Diagnostic = struct {
         generic_struct_requires_specialization,
         function_annotation_not_supported,
         parameter_mode_not_supported,
+        initializer_not_consumed,
+        initializer_already_consumed,
+        initializer_requires_construction,
+        initializer_consumed_in_loop,
+        initializer_capture_not_supported,
+        initializer_escape_not_supported,
+        initializer_capture_conflict,
         static_parameter_requires_specialization,
         static_argument_cannot_be_inferred,
         static_argument_inference_conflict,

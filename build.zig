@@ -73,10 +73,10 @@ pub fn build(b: *std.Build) void {
         test_module.addImport("standard_library", standard_library);
         test_module.addImport("test_sources", test_sources_module);
         const test_binary = b.addTest(.{ .root_module = test_module, .filters = if (test_filter) |filter| &.{filter} else &.{} });
+        // Disk-cache tests identify the compiler image without hashing the whole binary.
+        test_binary.build_id = .sha1;
         const run_test = b.addRunArtifact(test_binary);
-        const workdir = b.addWriteFiles();
-        _ = workdir.add(".test-suite", source);
-        run_test.setCwd(workdir.getDirectory());
+        run_test.setCwd(test_binary.getEmittedBin().dirname());
         test_step.dependOn(&run_test.step);
     }
 }

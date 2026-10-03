@@ -394,7 +394,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 runtime_index += 1;
                 try self.parameter_spans.append(self.gpa, span);
                 const local: Local = switch (runtime_parameter.mode) {
-                    .imm => .{ .value = @enumFromInt(parameter_value_index) },
+                    .imm, .init => .{ .value = @enumFromInt(parameter_value_index) },
                     .mut, .@"var", .deinit => blk: {
                         const id: UnresolvedBody.LocalId = @enumFromInt(self.local_count);
                         self.local_count += 1;
@@ -1746,8 +1746,10 @@ pub fn analyzeFunctionInstanceSignature(
             } },
         } };
     }
+    const owned_parameters = try parameters.toOwnedSlice(gpa);
+    errdefer gpa.free(owned_parameters);
     return .{ .success = .{
-        .parameters = try parameters.toOwnedSlice(gpa),
+        .parameters = owned_parameters,
         .return_type = return_type,
         .is_fallible = is_fallible,
         .return_origins = if (has_origin_contract) try origin_indices.toOwnedSlice(gpa) else null,
@@ -1763,6 +1765,7 @@ fn parameterMode(ast: *const structures.Ast, parameter: structures.Node) ?struct
         .keyword_mut => .mut,
         .keyword_var => .@"var",
         .keyword_deinit => .deinit,
+        .keyword_init => .init,
         else => null,
     };
 }

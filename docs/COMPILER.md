@@ -68,14 +68,32 @@ Standalone integration and backend suites live in `tests/`. Local tests that nee
 
 ## Verify
 
-Run the complete suite with:
+Full suite:
 
 ```sh
-zig build test
-git diff --check
+zig build test --seed 0 -Doptimize=ReleaseSafe
 ```
 
-The default runner uses four roots: one for all inline tests and three standalone suites. Each inline test runs once. Test binaries have separate working directories so they can write `./prog` in parallel. Use `zig build test -Dtest-source=tests/modules_test.zig` for one suite, or another source path for local tests and their imports. Add `-Dtest-filter="test name fragment"` to narrow the run. Use these build entrypoints for the required module imports. Check modified Zig files with `zig fmt --check <files>`. Keep temporary verification files outside the repository.
+Focused checks:
+
+```sh
+zig build test --seed 0 -Dtest-source=src/frontend/tokenizer.zig
+zig build test --seed 0 -Dtest-source=tests/modules_test.zig -Dtest-filter="name fragment"
+```
+
+These entrypoints supply required module imports. The full suite runs inline
+tests once and three standalone suites, each in its own binary's directory.
+
+A fixed seed enables caching successful runs; Zig 0.16 defaults to a random seed.
+Keep caches and options stable; `--summary all` shows cache hits. Direct `zig test`
+caches compilation but reruns tests. ReleaseSafe speeds up allocation checks,
+with a slower first compile.
+
+Use focused checks during edits; run the full suite once for changes spanning
+stages or shared representations. Documentation-only edits need no compiler tests.
+
+Check modified Zig files with `zig fmt --check <files>` and run `git diff --check`.
+Keep temporary verification files outside the repository.
 
 ## Benchmark
 
@@ -93,10 +111,10 @@ lifetime-table bytes for functions with 8, 32, 128, and 256 branches:
 zig build flow-benchmark -Doptimize=ReleaseFast
 ```
 
-The 256-branch fixture retains 23,667,201 bytes of snapshots and 3,248,256 bytes
-of lifetime tables. Omitting trailing unbound value slots reduced snapshot
-storage by 49% from 46,540,901 bytes without changing the graph or lifetime
-tables. These are logical allocated slice sizes, not process RSS.
+Snapshot measurements count retained value slots, source availability,
+initializer state, and definite consumption completion. Trailing unbound value
+slots are omitted; lifetime tables remain dense. These are logical allocated
+slice sizes, not process RSS.
 
 For cold multi-file worker scaling and warm and edited disk cache reuse against
 uncached runs, build an optimized compiler and run the generated benchmark fixture.
