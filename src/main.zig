@@ -641,8 +641,8 @@ test "CLI core renders compile-time call traces from the failure outward" {
     const exit_code = try compileAndRun(io, std.testing.allocator, .{
         .source_path = "trace.chi",
         .source =
-        \\static fail = func() int -> 42 / 0
-        \\static middle = func() int -> fail()
+        \\static fail_value = func() int -> 42 / 0
+        \\static middle = func() int -> fail_value()
         \\static bad = middle()
         \\exit(bad)
         ,

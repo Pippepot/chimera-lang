@@ -81,7 +81,6 @@ fn renderSsaFunction(
                 .value => {},
                 .storage => try writer.writeAll("storage "),
                 .initializer => try writer.writeAll("init "),
-                .continuation => try writer.writeAll("continuation "),
             }
             try renderType(ssa.block_arguments[argument_index].type_id, writer);
         }
@@ -111,7 +110,6 @@ fn renderSsaFunction(
                 if (fallible.call.destination) |storage| try writer.print(" into %{d}", .{@intFromEnum(storage)});
                 try writer.print(" -> b{d}", .{@intFromEnum(fallible.success)});
                 if (fallible.failure) |failure| try writer.print(", failure b{d}", .{@intFromEnum(failure)});
-                if (fallible.lexical_exit) |target| try writer.print(", lexical b{d}", .{@intFromEnum(target)});
                 try writer.writeByte('\n');
             },
             .return_unit => try writer.writeAll("    ret\n"),
@@ -121,8 +119,6 @@ fn renderSsaFunction(
                 try writer.writeByte('\n');
             },
             .return_failure => try writer.writeAll("    fail\n"),
-            .return_lexical => |token| try writer.print("    lexical v{d}\n", .{@intFromEnum(token)}),
-            .continuation_branch => |branch| try writer.print("    continuation v{d} == v{d}: bb{d}, bb{d}\n", .{ @intFromEnum(branch.token), @intFromEnum(branch.target), @intFromEnum(branch.match), @intFromEnum(branch.mismatch) }),
             .diverge => try writer.writeAll("    diverge\n"),
         }
     }
@@ -163,17 +159,6 @@ fn renderInstruction(
         .const_unit => try writer.print("    %{d} = const_unit\n", .{result}),
         .const_none => try writer.print("    %{d} = const_none\n", .{result}),
         .initializer_ref => |reference| try writer.print("    %{d} = initializer_ref region {d}, captures {d}..{d}\n", .{ result, reference.region, reference.captures.start, reference.captures.end }),
-        .continuation_ref => |payload| {
-            try writer.print("    %{d} = continuation_ref", .{result});
-            if (payload) |storage| try writer.print(" payload %{d}", .{@intFromEnum(storage)});
-            try writer.writeByte('\n');
-        },
-        .continuation_storage => |operation| {
-            try writer.print("    %{d} = continuation_storage %{d} : ", .{ result, @intFromEnum(operation.token) });
-            try renderType(operation.type_id, writer);
-            try writer.writeByte('\n');
-        },
-        .continuation_select => |operation| try writer.print("    %{d} = continuation_select %{d}, %{d}\n", .{ result, @intFromEnum(operation.token), @intFromEnum(operation.storage) }),
         .function_ref => |reference| {
             const target = try db.lookupInterned(queries.ItemLocations, reference.target);
             try writer.print("    %{d} = function_ref @{s}\n", .{ result, target.name });

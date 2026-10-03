@@ -2175,7 +2175,6 @@ fn validateWhereConditions(
         var arguments: [0]comptime_interpreter.Value = .{};
         var executor: ComptimeCallExecutor(@TypeOf(ctx)) = .{ .ctx = ctx, .owner = instance.item };
         switch (try comptime_interpreter.execute(&body, &arguments, &executor, ctx.allocator())) {
-            .lexical_exit => unreachable,
             .returned => {},
             .failure => {
                 try ctx.emit(structures.Diagnostic, .{ .file_id = resolved.file_id, .span = nodeSpan(parsed, condition), .kind = .where_condition_failed });
@@ -2228,7 +2227,8 @@ fn validateExternalSignature(ctx: anytype, item: structures.ItemId, file_id: str
         .allocation_count => !signature.is_fallible and signature.return_type == .int and signature.parameters.len == 1 and
             signature.parameters[0].mode == .imm and (try allocationElementType(ctx, signature.parameters[0].type_id)) != null,
         .unsafe_initialize, .unsafe_take, .unsafe_destroy, .unsafe_borrow_initialized, .unsafe_borrow_element, .unsafe_borrow_mut_element => blk: {
-            if (signature.is_fallible or signature.parameters.len != (if (symbol == .unsafe_initialize) @as(usize, 3) else 2)) break :blk false;
+            if (signature.is_fallible != (symbol == .unsafe_initialize)) break :blk false;
+            if (signature.parameters.len != (if (symbol == .unsafe_initialize) @as(usize, 3) else 2)) break :blk false;
             const allocation = signature.parameters[0];
             if (allocation.mode != (if (symbol == .unsafe_borrow_initialized or symbol == .unsafe_borrow_element or symbol == .unsafe_borrow_mut_element) structures.ParameterMode.imm else .mut)) break :blk false;
             const element_type = (try allocationElementType(ctx, allocation.type_id)) orelse break :blk false;
@@ -2603,7 +2603,6 @@ pub const ExecuteComptimeThunk = struct {
         const result = try comptime_interpreter.execute(&body, &arguments, &executor, ctx.allocator());
         return switch (result) {
             .returned => |value| .{ .returned = try internInterpretedValue(ctx, body.return_type, value) },
-            .lexical_exit => unreachable,
             .failure => blk: {
                 const resolved = (try ctx.get(ResolveItem, site.owner.item)).* orelse return null;
                 const parsed = (try ctx.get(ParseFile, resolved.file_id)).* orelse return null;
@@ -2635,7 +2634,7 @@ fn internInterpretedValue(ctx: anytype, result_type: structures.TypeId, value: c
             break :blk ctx.intern(CompileTimeValues, .{ .type = type_id });
         },
         .runtime => |runtime| ctx.intern(CompileTimeValues, .{ .runtime = .{ .type_id = result_type, .value = runtime } }),
-        .place, .initializer, .continuation => unreachable,
+        .place, .initializer => unreachable,
     };
 }
 
@@ -2684,7 +2683,6 @@ pub const ExecuteComptimeCall = struct {
         const result = try comptime_interpreter.execute(&body, arguments, &executor, ctx.allocator());
         const outcome: structures.CompileTimeOutcome = switch (result) {
             .returned => |value| structures.CompileTimeOutcome{ .returned = try internInterpretedValue(ctx, body.return_type, value) },
-            .lexical_exit => unreachable,
             .failure => structures.CompileTimeOutcome.failure,
             .exit => |status| structures.CompileTimeOutcome{ .exit = status },
             .execution_error => |execution_error| {
@@ -2797,7 +2795,6 @@ fn ComptimeCallExecutor(comptime Context: type) type {
         fn cycleInput(self: *@This(), argument: comptime_interpreter.Value, storage: std.mem.Allocator) !?comptime_interpreter.Value {
             switch (argument) {
                 .runtime, .type => return argument,
-                .continuation => return .{ .runtime = .unit },
                 .place => |cell| {
                     if (cell.contents == .uninitialized) return .{ .runtime = .unit };
                     const value = (try comptime_interpreter.materialize(cell, self, self.ctx.allocator())) orelse return null;
@@ -2821,7 +2818,7 @@ fn ComptimeCallExecutor(comptime Context: type) type {
             if (std.meta.activeTag(left) != std.meta.activeTag(right)) return false;
             return switch (left) {
                 .initializer => |initializer| sameInitializer(initializer, right.initializer),
-                .runtime, .type, .continuation => std.meta.eql(left, right),
+                .runtime, .type => std.meta.eql(left, right),
                 .place => unreachable,
             };
         }

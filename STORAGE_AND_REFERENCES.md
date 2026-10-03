@@ -27,8 +27,14 @@ The accepted ownership, access, construction, and failure rules are recorded in
 [syntax&semantics.txt](syntax&semantics.txt). Box constructors allocate before
 evaluating their initializer through general init forwarding and destination
 construction, including aliases and indirect calls. Nonescaping init parameters
-retain captured writes, transfers, checked-reference results, failure, and
-caller-directed lexical exits.
+retain captured writes, transfers, checked-reference results, and ordinary
+failure. Every consumption into a destination is potentially fallible, even for
+a literal; it must handle failure locally or propagate from a declared
+`fallible` function. Forwarding obeys the receiving callable's signature without
+evaluating the expression. An initializer cannot return to the caller or break
+or continue a loop outside itself; local loop exits remain valid. Its pending
+handle cannot escape the receiving call. Writes and completed transfers survive
+failure without rollback.
 The target, provider, location, and address-space contract below is accepted,
 but provider selection, device locations, and address spaces are not public APIs.
 
@@ -126,6 +132,14 @@ initializing, destroying, or accessing an element through `Allocation` is
 unsafe unless the caller establishes its current state. Higher-level containers
 track their initialized range as part of their own invariants.
 
+`unsafe_initialize` and `Allocation(T).unsafe_init` are explicitly fallible init
+consumers. They construct directly into an uninitialized slot, including for
+immovable values. Failed construction cleans completed subobjects before
+returning ordinary failure; it does not create a live element or undo captured
+writes and completed transfers. The caller must handle failure and discharge the
+allocation's explicit-drop obligation. Bare `fail` propagates ordinary failure
+after local cleanup, only in a fallible function or initializer region.
+
 The current `unsafe_borrow_initialized` is expression-only. The separate
 `unsafe_borrow_element` produces a storable `Ref(T, false)` whose lifetime
 depends on the allocation. Consuming or mutating
@@ -199,12 +213,24 @@ value when it supports copy. A named, noncopyable immovable value cannot be
 relocated into a Box.
 
 `Box.new(owner.borrow()[])` explicitly creates a distinct allocation by copying
-the pointee. The ordinary library constructor allocates a temporary storage
-owner, forwards the initializer to raw slot initialization, and consumes the
-storage owner into a Box after successful construction. Aliases and indirect
-calls use the same deferred capture and lexical-exit protocol. Partial fields
-clean before receiving frames release unfinished storage. There is no separate
-duplication API.
+the pointee. The ordinary fallible library constructor directly allocates one
+slot, forwards the initializer to `unsafe_initialize`, and transfers the
+allocation into a Box only on success. On initialization failure, partial fields
+clean before the constructor explicitly deallocates storage and propagates with
+`fail`. Aliases and indirect calls use the same deferred capture and ordinary
+failure protocol. There is no separate duplication API.
+
+`Buffer.reserve` allocates replacement storage before disturbing existing
+elements, so allocation failure leaves the original contents intact. Relocation
+proceeds in reverse index order: `unsafe_take` extracts an item, then
+`self.initialized = index` records the old buffer's retained prefix before
+fallible `unsafe_initialize` constructs the item in the replacement. On success,
+relocation continues. On initialization failure, the completed replacement suffix
+is destroyed, replacement storage is deallocated, and `fail` propagates. The old
+buffer still owns its original allocation and a valid initialized prefix; removed
+elements are not restored. Supported moves are infallible, so the standard move
+path does not actually fail initialization, but the conservative init contract
+still requires this cleanup path.
 
 An eventual shared owner (name unsettled) would share ownership of one initialized
 `T` and its control block.
@@ -353,10 +379,13 @@ unsafe_borrow_element(T, allocation, index)      # storable Ref(T, false)
 allocation, including zero-sized elements; it does not expose storage fields.
 
 Accessors for layout and location remain design sketches.
-The implemented `unsafe_initialize` contract takes its value as an `init` parameter
-and constructs directly in the uninitialized element slot, including immovable
-values. This is the general storage primitive used by owning abstractions;
-it does not require Box-specific expression recognition.
+The implemented `unsafe_initialize` and corresponding `Allocation(T).unsafe_init`
+are `fallible`, take their value as an `init` parameter, and construct directly
+in the uninitialized element slot, including immovable values. All consuming
+invocations must handle or propagate ordinary failure, regardless of the supplied
+expression. This is the general storage primitive used by owning abstractions;
+it does not require Box-specific expression recognition. A fallible bulk
+`unsafe_initialize_all` remains planned with collection literals.
 These operations do not transfer storage ownership; initialized state and
 bounds are the caller's obligation at this low level.
 
@@ -364,8 +393,13 @@ The accepted safe host owner and borrowed access use that core:
 
 ```text
 struct Box(T: type)
-  fallible new(init value: T) Box(T)
-    ...
+  fallible new(init item: T) Box(T)
+    var storage = allocate(T, 1)
+    if unsafe_initialize(T, storage, 0, item)
+      return unsafe_own_box(T, storage)
+    else
+      deallocate(T, storage)
+      fail
 
 func borrow_box(static T: type, imm owner: Box(T)) Ref(T, false)
 func borrow_mut_box(static T: type, mut owner: Box(T)) Ref(T, true)
@@ -379,6 +413,9 @@ const explicit = Box(T).new(value)
 const borrowed = borrow_box(T, owner)
 const extracted = value(T, owner^)
 ```
+
+`unsafe_own_box` is the constructor's internal ownership transfer, not a public
+constructor API.
 
 `value` consumes the owner in place because its parameter is `deinit`. Both
 `value(T, owner)` and `value(T, owner^)` supply that consuming access without

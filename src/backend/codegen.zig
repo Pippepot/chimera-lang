@@ -57,7 +57,6 @@ fn argumentByAddress(types: anytype, type_id: structures.TypeId, representation:
 
 fn argumentLayout(types: anytype, type_id: structures.TypeId, representation: structures.ValueRepresentation) !structures.TypeLayout {
     if (representation == .initializer) return initializer_layout;
-    if (representation == .continuation) return indirect_layout;
     return if (try argumentByAddress(types, type_id, representation)) indirect_layout else try types.layout(type_id);
 }
 
@@ -254,10 +253,6 @@ const LocationPlan = struct {
                     }
                 },
                 .local_storage => addressable[value_index] = true,
-                .continuation_ref => |storage| if (storage) |value| {
-                    addressable[@intFromEnum(value)] = true;
-                },
-                .continuation_select => |operation| addressable[@intFromEnum(operation.storage)] = true,
                 .mut_parameter_write => |operation| if (ssa.is_initializer_region) {
                     needed[operation.parameter_index] = .used;
                 },
@@ -283,7 +278,7 @@ const LocationPlan = struct {
                     markBranchArguments(ssa, predicate.else_branch, needed, addressable);
                 },
                 .fallible_call => |fallible| markCallArguments(ssa, fallible.call, needed, addressable),
-                .return_unit, .return_value, .return_failure, .return_lexical, .continuation_branch, .diverge => {},
+                .return_unit, .return_value, .return_failure, .diverge => {},
             }
         }
         for (ssa.blocks) |block| {
@@ -336,10 +331,6 @@ const LocationPlan = struct {
             if (block_index == entry_index) continue;
             for (block.argument_start..block.argument_end) |argument_index| {
                 if (needed[argument_index] == .unused) continue;
-                if (ssa.block_arguments[argument_index].representation == .continuation) {
-                    locations[argument_index] = .{ .stack = try reserveStack(&local_end, indirect_layout) };
-                    continue;
-                }
                 if (try argumentByAddress(types, value_types[argument_index], ssa.block_arguments[argument_index].representation)) {
                     locations[argument_index] = .{ .indirect = try reserveStack(&local_end, indirect_layout) };
                     continue;
@@ -357,14 +348,13 @@ const LocationPlan = struct {
                     .const_byte => |value| if (!addressable[value_index]) break :location_blk .{ .immediate = value },
                     .const_bool => |value| if (!addressable[value_index]) break :location_blk .{ .immediate = @intFromBool(value) },
                     .const_type => unreachable,
-                    .continuation_ref => break :location_blk .{ .stack = try reserveStack(&local_end, initializer_layout) },
                     .initializer_ref => |operation| break :location_blk .{ .stack = try reserveStack(&local_end, try initializerSlotLayout(operation.captures)) },
                     .const_unit, .const_none => if (!addressable[value_index]) break :location_blk .discarded,
                     .call => |call| if (call.return_type == .unit and !addressable[value_index]) {
                         break :location_blk .discarded;
                     },
                     .result_storage => break :location_blk .discarded,
-                    .storage_projection, .allocation_element, .borrow_read, .continuation_storage => if (needed[value_index] != .unused) {
+                    .storage_projection, .allocation_element, .borrow_read => if (needed[value_index] != .unused) {
                         break :location_blk .{ .indirect = try reserveStack(&local_end, indirect_layout) };
                     } else break :location_blk .discarded,
                     else => {},
@@ -588,26 +578,6 @@ fn FunctionEmitter(comptime Types: type) type {
                     .const_type => unreachable,
                     .function_ref => |reference| try self.emitFunctionReference(reference, destination),
                     .initializer_ref => |reference| try self.emitInitializerReference(ssa, reference, destination),
-                    .continuation_ref => |storage| {
-                        if (storage) |value| {
-                            try self.loadValueAddress(self.locations[@intFromEnum(value)]);
-                            try self.encoder.offset(.mov_rsp_rax, destination.stack + 8);
-                        }
-                        try self.encoder.offset(.lea_rax_rsp, destination.stack);
-                        try self.encoder.offset(.mov_rsp_rax, destination.stack);
-                    },
-                    .continuation_storage => |operation| {
-                        if (destination == .discarded) continue;
-                        try self.loadAddress(self.locations[@intFromEnum(operation.token)]);
-                        try self.encoder.offset(.mov_rax_rax_offset, 8);
-                        try self.encoder.offset(.mov_rsp_rax, destination.indirect);
-                    },
-                    .continuation_select => |operation| {
-                        try self.loadValueAddress(self.locations[@intFromEnum(operation.storage)]);
-                        try self.encoder.emit(.mov_rcx_rax);
-                        try self.loadAddress(self.locations[@intFromEnum(operation.token)]);
-                        try self.encoder.offset(.mov_rax_rcx_offset, 8);
-                    },
                     .variant_tag => |operand| {
                         try self.loadComponent(self.locations[@intFromEnum(operand)], 0);
                         try self.storeResult(destination);
@@ -676,7 +646,7 @@ fn FunctionEmitter(comptime Types: type) type {
                     .field_update => |operation| try self.emitFieldUpdate(operation, destination),
                     .mut_parameter_write => |operation| try self.emitMutParameterWrite(ssa, operation),
                     .call_mut_argument => |operation| try self.emitCallMutArgument(operation, destination),
-                    .call => |call| try self.emitCall(call, destination, null),
+                    .call => |call| try self.emitCall(call, destination),
                     .negi => |operand| {
                         try self.loadValue(self.locations[@intFromEnum(operand)]);
                         try self.encoder.emit(.neg_eax);
@@ -699,11 +669,9 @@ fn FunctionEmitter(comptime Types: type) type {
                 },
                 .predicate_branch => |predicate| try self.emitPredicateBranch(ssa, predicate),
                 .fallible_call => |fallible| try self.emitFallibleCall(ssa, fallible),
-                .continuation_branch => |branch| try self.emitContinuationBranch(branch),
                 .return_unit => try self.emitReturn(null, .unit),
                 .return_value => |value| try self.emitReturn(value, ssa.return_type),
                 .return_failure => try self.emitFailureReturn(),
-                .return_lexical => |token| try self.emitLexicalReturn(token),
                 .diverge => try self.encoder.emit(.ud2),
             }
         }
@@ -712,14 +680,7 @@ fn FunctionEmitter(comptime Types: type) type {
             const success = ssa.blocks[@intFromEnum(fallible.success)];
             std.debug.assert(success.argument_end - success.argument_start == 1);
             std.debug.assert(fallible.call.destination != null or self.locations[success.argument_start] != .indirect);
-            const token_location = if (fallible.lexical_exit) |target| self.locations[ssa.blocks[@intFromEnum(target)].argument_start] else null;
-            try self.emitCall(fallible.call, self.locations[success.argument_start], token_location);
-            if (fallible.lexical_exit) |target| {
-                try self.encoder.immediate(.cmp_edx, @intFromEnum(structures.CallOutcome.lexical_exit));
-                const ordinary_field = try self.encoder.conditionalJumpRelative32(.nei, 0);
-                try self.emitJump(target);
-                try self.patchJump(ordinary_field, @intCast(self.encoder.code.items.len));
-            }
+            try self.emitCall(fallible.call, self.locations[success.argument_start]);
             if (fallible.failure) |failure| {
                 try self.encoder.emit(.test_edx);
                 const success_field = try self.encoder.conditionalJumpRelative32(.nei, 0);
@@ -728,24 +689,6 @@ fn FunctionEmitter(comptime Types: type) type {
                 try self.patchJump(success_field, success_offset);
             }
             try self.emitJump(fallible.success);
-        }
-
-        fn emitContinuationBranch(self: *Self, branch: @FieldType(structures.FunctionTerminator, "continuation_branch")) !void {
-            try self.loadAddress(self.locations[@intFromEnum(branch.target)]);
-            try self.encoder.emit(.mov_rcx_rax);
-            try self.loadAddress(self.locations[@intFromEnum(branch.token)]);
-            try self.encoder.emit(.cmp_rax_rcx);
-            const match_field = try self.encoder.conditionalJumpRelative32(.eqi, 0);
-            try self.emitJump(branch.mismatch);
-            try self.patchJump(match_field, @intCast(self.encoder.code.items.len));
-            try self.emitJump(branch.match);
-        }
-
-        fn emitLexicalReturn(self: *Self, token: structures.FunctionValueId) !void {
-            try self.loadAddress(self.locations[@intFromEnum(token)]);
-            try self.encoder.immediate(.mov_edx, @intFromEnum(structures.CallOutcome.lexical_exit));
-            if (self.stack_size != 0) try self.encoder.offset(.add_rsp, self.stack_size);
-            try self.encoder.emit(.ret);
         }
 
         fn emitPredicateBranch(
@@ -771,11 +714,6 @@ fn FunctionEmitter(comptime Types: type) type {
             if (arguments.len == 1) {
                 const type_id = ssa.block_arguments[target.argument_start].type_id;
                 const destination = self.locations[target.argument_start];
-                if (ssa.block_arguments[target.argument_start].representation == .continuation) {
-                    try self.loadAddress(self.locations[@intFromEnum(arguments[0].value)]);
-                    try self.storeAddress(destination);
-                    return;
-                }
                 if (destination == .indirect) {
                     try self.loadArgumentAddress(arguments[0]);
                     try self.encoder.offset(.mov_rsp_rax, destination.indirect);
@@ -786,10 +724,7 @@ fn FunctionEmitter(comptime Types: type) type {
             for (arguments, 0..) |argument, argument_offset| {
                 const scratch_offset = try reserveStack(&scratch_end, try blockArgumentLayout(self.types, ssa.block_arguments[target.argument_start + argument_offset]));
                 const destination = self.locations[target.argument_start + argument_offset];
-                if (ssa.block_arguments[target.argument_start + argument_offset].representation == .continuation) {
-                    try self.loadAddress(self.locations[@intFromEnum(argument.value)]);
-                    try self.encoder.offset(.mov_rsp_rax, scratch_offset);
-                } else if (destination == .indirect) {
+                if (destination == .indirect) {
                     try self.loadArgumentAddress(argument);
                     try self.encoder.offset(.mov_rsp_rax, scratch_offset);
                 } else if (destination != .discarded) try self.emitUseToMemory(argument, scratch_offset);
@@ -799,10 +734,7 @@ fn FunctionEmitter(comptime Types: type) type {
                 const type_id = ssa.block_arguments[target.argument_start + argument_offset].type_id;
                 const scratch_offset = try reserveStack(&scratch_end, try blockArgumentLayout(self.types, ssa.block_arguments[target.argument_start + argument_offset]));
                 const destination = self.locations[target.argument_start + argument_offset];
-                if (ssa.block_arguments[target.argument_start + argument_offset].representation == .continuation) {
-                    try self.encoder.offset(.mov_rax_rsp, scratch_offset);
-                    try self.storeAddress(destination);
-                } else if (destination == .indirect) {
+                if (destination == .indirect) {
                     try self.encoder.offset(.mov_rax_rsp, scratch_offset);
                     try self.encoder.offset(.mov_rsp_rax, destination.indirect);
                 } else if (destination != .discarded) try self.copyValue(type_id, .{ .stack = scratch_offset }, destination);
@@ -852,7 +784,7 @@ fn FunctionEmitter(comptime Types: type) type {
             try self.encoder.emit(.ret);
         }
 
-        fn emitCall(self: *Self, call: structures.FunctionCall, result: ValueLocation, token: ?ValueLocation) !void {
+        fn emitCall(self: *Self, call: structures.FunctionCall, result: ValueLocation) !void {
             const destination = if (call.destination) |storage| self.locations[@intFromEnum(storage)] else result;
             try self.emitCallArguments(call, destination);
             switch (call.target) {
@@ -868,7 +800,6 @@ fn FunctionEmitter(comptime Types: type) type {
                 },
             }
             const layout = self.call_layouts.get(.{ .arguments = call.arguments, .return_type = call.return_type }).?;
-            if (token) |location| if (location != .discarded) try self.encoder.offset(.mov_rsp_rax, location.stack);
             if (layout.return_register) |offset| try self.encoder.offset(.mov_rsp_eax, offset);
             for (layout.arguments, layout.mut_results) |argument, saved| {
                 const snapshot = saved orelse continue;
@@ -877,17 +808,12 @@ fn FunctionEmitter(comptime Types: type) type {
                     try self.encoder.offset(.mov_rsp_rax, snapshot.location.indirect);
                 } else try self.copyValue(snapshot.type_id, argument, snapshot.location);
             }
-            const lexical_field = if (call.hasInitializer(self.call_arguments)) blk: {
-                try self.encoder.immediate(.cmp_edx, @intFromEnum(structures.CallOutcome.lexical_exit));
-                break :blk try self.encoder.conditionalJumpRelative32(.eqi, 0);
-            } else null;
             switch (layout.result) {
                 .indirect => {},
                 .stack => try self.copyValue(call.return_type, layout.result, destination),
                 .eax => try self.copyValue(call.return_type, if (layout.return_register) |offset| .{ .stack = offset } else .eax, destination),
                 else => unreachable,
             }
-            if (lexical_field) |field| try self.patchJump(field, @intCast(self.encoder.code.items.len));
         }
 
         fn emitCallArguments(self: *Self, call: structures.FunctionCall, destination: ValueLocation) !void {

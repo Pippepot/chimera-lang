@@ -124,7 +124,10 @@ test "typed allocation transfers initialized values into and out of storage" {
         \\import std.memory.{allocate, deallocate, unsafe_initialize, unsafe_take}
         \\fallible round_trip() unit
         \\  var allocation = allocate(int, 3)
-        \\  unsafe_initialize(int, allocation, 1, 42)
+        \\  if unsafe_initialize(int, allocation, 1, 42) -> ()
+        \\  else
+        \\    deallocate(int, allocation^)
+        \\    fail
         \\  const value = unsafe_take(int, allocation, 1)
         \\  deallocate(int, allocation^)
         \\  value == 42
@@ -142,11 +145,17 @@ test "typed allocation transfers byte and aggregate elements" {
         \\  second: byte
         \\fallible transfer() unit
         \\  var bytes = allocate(byte, 2)
-        \\  unsafe_initialize(byte, bytes, 1, 7)
+        \\  if unsafe_initialize(byte, bytes, 1, 7) -> ()
+        \\  else
+        \\    deallocate(byte, bytes^)
+        \\    fail
         \\  const number = unsafe_take(byte, bytes, 1)
         \\  deallocate(byte, bytes^)
         \\  var pairs = allocate(Pair, 2)
-        \\  unsafe_initialize(Pair, pairs, 1, Pair{first = 42, second = number})
+        \\  if unsafe_initialize(Pair, pairs, 1, Pair{first = 42, second = number}) -> ()
+        \\  else
+        \\    deallocate(Pair, pairs^)
+        \\    fail
         \\  const pair = unsafe_take(Pair, pairs, 1)
         \\  deallocate(Pair, pairs^)
         \\  pair.first == 42
@@ -177,7 +186,10 @@ test "typed allocation borrows an initialized element without copying it" {
         \\func inspect(imm item: Tracked) int -> item.value
         \\fallible run() unit
         \\  var allocation = allocate(Tracked, 2)
-        \\  unsafe_initialize(Tracked, allocation, 1, Tracked{value = 42})
+        \\  if unsafe_initialize(Tracked, allocation, 1, Tracked{value = 42}) -> ()
+        \\  else
+        \\    deallocate(Tracked, allocation^)
+        \\    fail
         \\  const observed = inspect(unsafe_borrow_initialized(Tracked, allocation, 1))
         \\  unsafe_destroy(Tracked, allocation, 1)
         \\  deallocate(Tracked, allocation^)
@@ -193,7 +205,10 @@ test "indexed scalar borrowing works in arithmetic and comparisons" {
         \\import std.memory.{allocate, deallocate, unsafe_initialize, unsafe_destroy, unsafe_borrow_initialized}
         \\fallible run() unit
         \\  var allocation = allocate(int, 2)
-        \\  unsafe_initialize(int, allocation, 1, 40)
+        \\  if unsafe_initialize(int, allocation, 1, 40) -> ()
+        \\  else
+        \\    deallocate(int, allocation^)
+        \\    fail
         \\  const result = 1 + unsafe_borrow_initialized(int, allocation, 1) + 1
         \\  var equal = 0
         \\  if 40 == unsafe_borrow_initialized(int, allocation, 1) -> equal = 1
@@ -212,8 +227,15 @@ test "indexed boolean borrowing reads only the selected element" {
         \\import std.memory.{allocate, deallocate, unsafe_initialize, unsafe_destroy, unsafe_borrow_initialized}
         \\fallible run() unit
         \\  var allocation = allocate(bool, 2)
-        \\  unsafe_initialize(bool, allocation, 0, true)
-        \\  unsafe_initialize(bool, allocation, 1, true)
+        \\  if unsafe_initialize(bool, allocation, 0, true) -> ()
+        \\  else
+        \\    deallocate(bool, allocation^)
+        \\    fail
+        \\  if unsafe_initialize(bool, allocation, 1, true) -> ()
+        \\  else
+        \\    unsafe_destroy(bool, allocation, 0)
+        \\    deallocate(bool, allocation^)
+        \\    fail
         \\  var observed = 0
         \\  if unsafe_borrow_initialized(bool, allocation, 0) == true -> observed += 21
         \\  if true == unsafe_borrow_initialized(bool, allocation, 0) -> observed += 21
@@ -235,7 +257,10 @@ test "indexed borrowed noncopyable value cannot become an owned local" {
         \\  value: int
         \\fallible run() unit
         \\  var allocation = allocate(Tracked, 1)
-        \\  unsafe_initialize(Tracked, allocation, 0, Tracked{value = 42})
+        \\  if unsafe_initialize(Tracked, allocation, 0, Tracked{value = 42}) -> ()
+        \\  else
+        \\    deallocate(Tracked, allocation^)
+        \\    fail
         \\  const invalid = unsafe_borrow_initialized(Tracked, allocation, 0)
         \\  _ = invalid
         \\  deallocate(Tracked, allocation^)
@@ -250,7 +275,10 @@ test "copying an indexed borrowed scalar snapshots it before destruction" {
         \\import std.memory.{allocate, deallocate, unsafe_initialize, unsafe_destroy, unsafe_borrow_initialized}
         \\fallible run() int
         \\  var allocation = allocate(int, 1)
-        \\  unsafe_initialize(int, allocation, 0, 42)
+        \\  if unsafe_initialize(int, allocation, 0, 42) -> ()
+        \\  else
+        \\    deallocate(int, allocation^)
+        \\    fail
         \\  const snapshot = unsafe_borrow_initialized(int, allocation, 0)
         \\  unsafe_destroy(int, allocation, 0)
         \\  deallocate(int, allocation^)
@@ -266,7 +294,10 @@ test "an indexed allocation element yields a storable Ref" {
         \\import std.memory.{allocate, deallocate, unsafe_initialize, unsafe_destroy, unsafe_borrow_element, read}
         \\fallible run() int
         \\  var allocation = allocate(int, 2)
-        \\  unsafe_initialize(int, allocation, 1, 42)
+        \\  if unsafe_initialize(int, allocation, 1, 42) -> ()
+        \\  else
+        \\    deallocate(int, allocation^)
+        \\    fail
         \\  const reference: Ref(int, false) = unsafe_borrow_element(int, allocation, 1)
         \\  const observed = read(int, false, reference)
         \\  unsafe_destroy(int, allocation, 1)
@@ -286,7 +317,10 @@ test "typed allocation destroys a nonzero indexed element in place" {
         \\  drop = func(deinit self: Tracked) -> exit(self.value)
         \\fallible run() unit
         \\  var allocation = allocate(Tracked, 2)
-        \\  unsafe_initialize(Tracked, allocation, 1, Tracked{value = 42})
+        \\  if unsafe_initialize(Tracked, allocation, 1, Tracked{value = 42}) -> ()
+        \\  else
+        \\    deallocate(Tracked, allocation^)
+        \\    fail
         \\  unsafe_destroy(Tracked, allocation, 1)
         \\  deallocate(Tracked, allocation^)
         \\  exit(1)
@@ -301,7 +335,10 @@ test "destroying an allocation element invalidates a Ref of it" {
         \\import std.memory.{allocate, deallocate, unsafe_initialize, unsafe_destroy, unsafe_borrow_element, read}
         \\fallible run() int
         \\  var allocation = allocate(int, 1)
-        \\  unsafe_initialize(int, allocation, 0, 42)
+        \\  if unsafe_initialize(int, allocation, 0, 42) -> ()
+        \\  else
+        \\    deallocate(int, allocation^)
+        \\    fail
         \\  const reference = unsafe_borrow_element(int, allocation, 0)
         \\  unsafe_destroy(int, allocation, 0)
         \\  const observed = read(int, false, reference)
@@ -320,7 +357,10 @@ test "typed allocation destroys a zero-sized initialized element" {
         \\  drop = func(deinit self: Empty) -> exit(42)
         \\fallible run() unit
         \\  var allocation = allocate(Empty, 2)
-        \\  unsafe_initialize(Empty, allocation, 1, Empty{})
+        \\  if unsafe_initialize(Empty, allocation, 1, Empty{}) -> ()
+        \\  else
+        \\    deallocate(Empty, allocation^)
+        \\    fail
         \\  unsafe_destroy(Empty, allocation, 1)
         \\  deallocate(Empty, allocation^)
         \\  exit(1)
@@ -540,7 +580,10 @@ test "Allocation methods keep raw storage explicitly managed" {
         \\import std.memory.{Allocation}
         \\fallible run() int
         \\  var storage = Allocation(int).allocate_raw(1)
-        \\  storage.unsafe_init(0, 42)
+        \\  if storage.unsafe_init(0, 42) -> ()
+        \\  else
+        \\    storage^.release()
+        \\    fail
         \\  const observed = storage.unsafe_ref(0)[]
         \\  const removed = storage.unsafe_remove(0)
         \\  storage^.release()
@@ -974,7 +1017,10 @@ test "initialized raw allocation contents cannot outlive their owner" {
         \\fallible leak() Allocation(Ref(int, false))
         \\  const owner = Box.new(42)
         \\  var slots = allocate(Ref(int, false), 1)
-        \\  unsafe_initialize(Ref(int, false), slots, 0, owner.borrow())
+        \\  if unsafe_initialize(Ref(int, false), slots, 0, owner.borrow()) -> ()
+        \\  else
+        \\    deallocate(Ref(int, false), slots^)
+        \\    fail
         \\  return slots^
         \\if const slots = leak()
         \\  deallocate(Ref(int, false), slots^)
@@ -1832,7 +1878,10 @@ test "an indexed borrow argument cannot outlive a nested allocation transfer" {
         \\func inspect(imm item: int, imm ignored: int) int -> item
         \\fallible run() int
         \\  var allocation = allocate(int, 1)
-        \\  unsafe_initialize(int, allocation, 0, 42)
+        \\  if unsafe_initialize(int, allocation, 0, 42) -> ()
+        \\  else
+        \\    deallocate(int, allocation^)
+        \\    fail
         \\  return inspect(unsafe_borrow_initialized(int, allocation, 0), dispose(allocation^))
         \\if const result = run() -> exit(result) else exit(1)
     , &.{});
@@ -1848,7 +1897,10 @@ test "an indexed arithmetic operand cannot outlive a nested allocation transfer"
         \\  return 0
         \\fallible run() int
         \\  var allocation = allocate(int, 1)
-        \\  unsafe_initialize(int, allocation, 0, 42)
+        \\  if unsafe_initialize(int, allocation, 0, 42) -> ()
+        \\  else
+        \\    deallocate(int, allocation^)
+        \\    fail
         \\  return unsafe_borrow_initialized(int, allocation, 0) + dispose(allocation^)
         \\if const result = run() -> exit(result) else exit(1)
     , &.{});
@@ -1864,7 +1916,10 @@ test "an indexed comparison operand cannot outlive a nested allocation transfer"
         \\  return 42
         \\fallible run() int
         \\  var allocation = allocate(int, 1)
-        \\  unsafe_initialize(int, allocation, 0, 42)
+        \\  if unsafe_initialize(int, allocation, 0, 42) -> ()
+        \\  else
+        \\    deallocate(int, allocation^)
+        \\    fail
         \\  if unsafe_borrow_initialized(int, allocation, 0) == dispose(allocation^) -> return 1
         \\  return 0
         \\if const result = run() -> exit(result) else exit(1)
@@ -1898,7 +1953,10 @@ test "an indexed callable cannot outlive a nested allocation transfer" {
         \\  return 0
         \\fallible run() int
         \\  var allocation = allocate(Callback, 1)
-        \\  unsafe_initialize(Callback, allocation, 0, answer)
+        \\  if unsafe_initialize(Callback, allocation, 0, answer) -> ()
+        \\  else
+        \\    deallocate(Callback, allocation^)
+        \\    fail
         \\  return unsafe_borrow_initialized(Callback, allocation, 0)(dispose(allocation^))
         \\if const result = run() -> exit(result) else exit(1)
     , &.{});
@@ -2158,7 +2216,10 @@ test "a drop hook can consume an allocation field" {
         \\    deallocate(int, self.allocation^)
         \\fallible run() int
         \\  var allocation = allocate(int, 1)
-        \\  unsafe_initialize(int, allocation, 0, 41)
+        \\  if unsafe_initialize(int, allocation, 0, 41) -> ()
+        \\  else
+        \\    deallocate(int, allocation^)
+        \\    fail
         \\  const buffer = Buffer{allocation = allocation^, length = 1}
         \\  return read(int, false, unsafe_borrow_element(int, buffer.allocation, 0)) + buffer.length
         \\if const result = run() -> exit(result) else exit(1)
@@ -4250,7 +4311,7 @@ test "Box infers member call results without evaluating their receivers or argum
         const forbidden_receiver = try std.mem.replaceOwned(u8, testing.allocator, forbidden_copy, "func make_factory() Factory -> Factory{create = make}", "func make_factory() Factory -> exit(92)");
         defer testing.allocator.free(forbidden_receiver);
         try fixture.db.setInput(queries.SourceText, 0, forbidden_receiver);
-        try replaceAllocationSource(fixture, "    return UninitializedStorage(T){allocation = allocate(T, 1)}", "    exit(43)");
+        try replaceAllocationSource(fixture, "        var storage = allocate(T, 1)", "        exit(43)\n        var storage = allocate(T, 1)");
         try fixture.expectExit(0, 43);
     }
 }
@@ -4287,9 +4348,18 @@ test "Box obtains storage before producer arguments conditions and ownership hoo
         defer testing.allocator.free(source);
         const fixture = try Fixture.init(source, &.{});
         defer fixture.deinit();
-        try replaceAllocationSource(fixture, "    return UninitializedStorage(T){allocation = allocate(T, 1)}", "    exit(42)");
+        try replaceAllocationSource(fixture, "        var storage = allocate(T, 1)", "        exit(42)\n        var storage = allocate(T, 1)");
         try fixture.expectExit(0, 42);
     }
+}
+
+test "init consumption requires declared failure even for literal arguments" {
+    const fixture = try Fixture.init(
+        \\func materialize(init item: int) int -> item
+        \\exit(materialize(42))
+    , &.{});
+    defer fixture.deinit();
+    try fixture.expectDiagnostic(0, .fallible_expression_outside_fallible_function);
 }
 
 test "allocating init consumers preserve Box ordering through aliases and indirect calls" {
@@ -4312,7 +4382,7 @@ test "allocating init consumers preserve Box ordering through aliases and indire
         defer testing.allocator.free(source);
         const fixture = try Fixture.init(source, &.{});
         defer fixture.deinit();
-        try replaceAllocationSource(fixture, "allocation = allocate(T, 1)", "allocation = allocate(T, -1)");
+        try replaceAllocationSource(fixture, "var storage = allocate(T, 1)", "var storage = allocate(T, -1)");
         try fixture.expectExit(0, 42);
     }
 }
@@ -4321,7 +4391,7 @@ test "allocating init consumers construct immovable raw slots through aliases an
     const cases = .{
         .{ .setup = "", .call = "unsafe_initialize(Item, storage, 1, make(41))" },
         .{ .setup = "", .call = "initialize_alias(storage, 1, make(41))" },
-        .{ .setup = "const initialize: func(mut Allocation(Item), int, init Item) unit = Allocation(Item).unsafe_init", .call = "initialize(storage, 1, make(41))" },
+        .{ .setup = "const initialize: fallible(mut Allocation(Item), int, init Item) unit = Allocation(Item).unsafe_init", .call = "initialize(storage, 1, make(41))" },
         .{ .setup = "", .call = "storage.unsafe_init(1, make(41))" },
     };
     inline for (cases) |case| {
@@ -4337,7 +4407,10 @@ test "allocating init consumers construct immovable raw slots through aliases an
             \\fallible run()
             \\  var storage = allocate(Item, 2)
             \\  {s}
-            \\  {s}
+            \\  if {s} -> ()
+            \\  else
+            \\    deallocate(Item, storage)
+            \\    fail
             \\  const value = unsafe_borrow_initialized(Item, storage, 1).value
             \\  if value == 42
             \\    unsafe_destroy(Item, storage, 1)
@@ -4363,12 +4436,12 @@ test "allocating init consumers clean raw slot partial fields before receiving f
         \\  move = none
         \\  first: Leaf
         \\  second: int
-        \\fallible fail() int
+        \\fallible fail_value() int
         \\  1 == 0
         \\  return 0
         \\fallible run()
         \\  var storage = allocate(Item, 1)
-        \\  if unsafe_initialize(Item, storage, 0, Item{first = Leaf{}, second = fail()})
+        \\  if unsafe_initialize(Item, storage, 0, Item{first = Leaf{}, second = fail_value()})
         \\    deallocate(Item, storage)
         \\    exit(90)
         \\  deallocate(Item, storage)
@@ -4393,7 +4466,7 @@ test "Box allocation failure skips initialization and preserves its source" {
         \\exit(run())
     , &.{});
     defer fixture.deinit();
-    try replaceAllocationSource(fixture, "allocation = allocate(T, 1)", "allocation = allocate(T, -1)");
+    try replaceAllocationSource(fixture, "var storage = allocate(T, 1)", "var storage = allocate(T, -1)");
     try fixture.expectExit(0, 42);
 }
 
@@ -4418,7 +4491,7 @@ test "Box destination construction recomputes after copy capability and allocato
     try fixture.expectDiagnostic(0, .type_not_copyable);
     try fixture.db.setInput(queries.SourceText, 0, source);
     try fixture.expectExit(0, 42);
-    try replaceAllocationSource(fixture, "allocation = allocate(T, 1)", "allocation = allocate(T, -1)");
+    try replaceAllocationSource(fixture, "var storage = allocate(T, 1)", "var storage = allocate(T, -1)");
     try fixture.expectExit(0, 43);
     const file = (try fixture.db.input(queries.StandardFile, @intFromEnum(standard_library.File.memory_allocation))).*;
     try fixture.db.setInput(queries.SourceText, file, standard_library.source("memory/allocation.chi"));
@@ -4436,29 +4509,27 @@ test "Box initializer failure cleans partial fields before releasing storage" {
         \\  leaf: Leaf
         \\  marker: int
         \\  drop = func(deinit self: Item) -> exit(91)
-        \\fallible fail() int
+        \\fallible fail_value() int
         \\  1 == 0
         \\  return 0
-        \\if Box.new(Item{leaf = Leaf{value = 42}, marker = fail()}) -> exit(1) else exit(2)
+        \\if Box.new(Item{leaf = Leaf{value = 42}, marker = fail_value()}) -> exit(1) else exit(2)
     , &.{});
     defer fixture.deinit();
-    try replaceAllocationSource(fixture, "drop = func(deinit self: UninitializedStorage(T)) -> deallocate(T, self.allocation)", "drop = func(deinit self: UninitializedStorage(T))\n        deallocate(T, self.allocation)\n        exit(90)");
+    try replaceAllocationSource(fixture, "            deallocate(T, storage)", "            deallocate(T, storage)\n            exit(90)");
     try fixture.expectExit(0, 42);
 }
 
-test "Box releases uninitialized storage on failure return break and continue" {
+test "Box releases uninitialized raw storage on initializer failure" {
     const initializers = [_][]const u8{
-        "if 1 == 1\n      fail()\n      Item{}\n    else Item{}",
-        "if 1 == 1\n      return 7\n    else Item{}",
-        "if 1 == 1\n      break 7\n    else Item{}",
-        "if 1 == 1\n      continue\n    else Item{}",
+        "if 1 == 1\n      fail_value()\n      Item{}\n    else Item{}",
+        "if 1 == 1\n      fail\n    else Item{}",
     };
     for (initializers) |initializer| {
         const source = try std.fmt.allocPrint(testing.allocator,
             \\struct Item
             \\  move = none
             \\  drop = func(deinit self: Item) -> exit(90)
-            \\fallible fail() int
+            \\fallible fail_value() int
             \\  1 == 0
             \\  return 0
             \\func run() int
@@ -4470,7 +4541,7 @@ test "Box releases uninitialized storage on failure return break and continue" {
         defer testing.allocator.free(source);
         const fixture = try Fixture.init(source, &.{});
         defer fixture.deinit();
-        try replaceAllocationSource(fixture, "drop = func(deinit self: UninitializedStorage(T)) -> deallocate(T, self.allocation)", "drop = func(deinit self: UninitializedStorage(T))\n        deallocate(T, self.allocation)\n        exit(42)");
+        try replaceAllocationSource(fixture, "            deallocate(T, storage)", "            deallocate(T, storage)\n            exit(42)");
         try fixture.expectExit(0, 42);
     }
 }
@@ -5061,13 +5132,13 @@ test "consuming selection cleanup distinguishes successful calls from later fail
         \\  drop = func(deinit self: Item)
         \\    self.counter[] = self.counter[] + self.value
         \\func consume(deinit item: Item, marker: int) -> ()
-        \\fallible fail() int
+        \\fallible fail_value() int
         \\  1 == 0
         \\  return 0
         \\fallible prepare(imm counter: Ref(int, true), named: int, fails: int) unit
         \\  const item = Item{value = 20, counter = counter}
         \\  if fails == 1
-        \\    consume(if named == 1 -> item else Item{value = 22, counter = counter}, fail())
+        \\    consume(if named == 1 -> item else Item{value = 22, counter = counter}, fail_value())
         \\  else
         \\    consume(if named == 1 -> item else Item{value = 22, counter = counter}, 0)
         \\fallible probe(named: int, fails: int) int
@@ -5346,13 +5417,13 @@ test "deinit source is cleaned when a later argument fails" {
         \\struct Item
         \\  value: int
         \\  drop = func(deinit self: Item) -> exit(self.value)
-        \\fallible fail() int
+        \\fallible fail_value() int
         \\  1 == 0
         \\  return 0
         \\func take(deinit item: Item, value: int) -> ()
         \\fallible run() unit
         \\  const item = Item{value = 42}
-        \\  take(item, fail())
+        \\  take(item, fail_value())
         \\if run() -> exit(1) else exit(2)
     , &.{});
     defer fixture.deinit();
@@ -5368,11 +5439,11 @@ test "deinit forwarding retains residual cleanup when a later argument fails" {
         \\  child: Child
         \\  drop = func(deinit self: Item) -> exit(1)
         \\func take(deinit item: Item, value: int) -> ()
-        \\fallible fail() int
+        \\fallible fail_value() int
         \\  1 == 0
         \\  return 0
         \\fallible forward(deinit item: Item) unit
-        \\  take(item, fail())
+        \\  take(item, fail_value())
         \\if forward(Item{child = Child{value = 42}}) -> exit(2) else exit(3)
     , &.{});
     defer fixture.deinit();
@@ -5385,11 +5456,11 @@ test "deinit fresh variant cleanup survives later argument failure" {
         \\  value: int
         \\  drop = func(deinit self: Item) -> exit(self.value)
         \\func take(deinit item: Item | none, value: int) -> ()
-        \\fallible fail() int
+        \\fallible fail_value() int
         \\  1 == 0
         \\  return 0
         \\fallible run() unit
-        \\  take(Item{value = 42}, fail())
+        \\  take(Item{value = 42}, fail_value())
         \\if run() -> exit(1) else exit(2)
     , &.{});
     defer fixture.deinit();
@@ -5401,12 +5472,12 @@ test "deinit explicit arguments cannot be abandoned by later argument failure" {
         \\struct Item
         \\  drop = explicit
         \\func take(deinit item: Item, value: int) -> ()
-        \\fallible fail() int
+        \\fallible fail_value() int
         \\  1 == 0
         \\  return 0
         \\fallible run() unit
         \\  const item = Item{}
-        \\  take(item, fail())
+        \\  take(item, fail_value())
         \\if run() -> exit(1) else exit(2)
     , &.{});
     defer fixture.deinit();
@@ -5665,11 +5736,11 @@ test "borrowed fresh control-flow temporaries clean up on later failure" {
             \\  drop = func(deinit self: Pinned) -> exit(self.value)
             \\func make() Pinned -> Pinned{{value = 42}}
             \\func look(imm item: Pinned | none, marker: int) -> ()
-            \\fallible fail() int
+            \\fallible fail_value() int
             \\  1 == 0
             \\  return 0
             \\fallible run(flag: int) unit
-            \\  look(if flag == 1 -> make() else none, fail())
+            \\  look(if flag == 1 -> make() else none, fail_value())
             \\if run({d}) -> exit(1) else exit(2)
         , .{flag});
         defer testing.allocator.free(source);
@@ -6433,7 +6504,7 @@ test "Box allocation failure skips fresh producer arguments" {
         \\if run() -> exit(1) else exit(42)
     , &.{});
     defer fixture.deinit();
-    try replaceAllocationSource(fixture, "allocation = allocate(T, 1)", "allocation = allocate(T, -1)");
+    try replaceAllocationSource(fixture, "var storage = allocate(T, 1)", "var storage = allocate(T, -1)");
     try fixture.expectExit(0, 42);
 }
 
@@ -6567,12 +6638,12 @@ test "inferred nested Box initialization cleans up leaves before later fields" {
         \\  move = none
         \\  item: T
         \\  later: int
-        \\fallible fail() int
+        \\fallible fail_value() int
         \\  const storage = allocate(int, -1)
         \\  deallocate(int, storage^)
         \\  return 1
         \\fallible run() unit
-        \\  const owner = Box.new(Container{item = Inner{leaf = Tracked{value = 42}}, later = fail()})
+        \\  const owner = Box.new(Container{item = Inner{leaf = Tracked{value = 42}}, later = fail_value()})
         \\  _ = owner
         \\if run() -> exit(1) else exit(2)
     , &.{});
@@ -6593,12 +6664,12 @@ test "nested in-place Box initialization cleans up leaves on failure" {
         \\  move = none
         \\  inner: Inner
         \\  later: int
-        \\fallible fail() int
+        \\fallible fail_value() int
         \\  const storage = allocate(int, -1)
         \\  deallocate(int, storage^)
         \\  return 1
         \\fallible run() unit
-        \\  const owner = Box.new(Outer{inner = Inner{leaf = Tracked{value = 42}}, later = fail()})
+        \\  const owner = Box.new(Outer{inner = Inner{leaf = Tracked{value = 42}}, later = fail_value()})
         \\  _ = owner
         \\if run() -> exit(1) else exit(2)
     , &.{});
@@ -6720,12 +6791,12 @@ test "Box in-place initializer cleans up fields when a later field fails" {
         \\  move = none
         \\  first: Tracked
         \\  second: int
-        \\fallible fail() int
+        \\fallible fail_value() int
         \\  const storage = allocate(int, -1)
         \\  deallocate(int, storage^)
         \\  return 7
         \\fallible run() unit
-        \\  const owner = Box(Immovable).new(Immovable{first = Tracked{value = 42}, second = fail()})
+        \\  const owner = Box(Immovable).new(Immovable{first = Tracked{value = 42}, second = fail_value()})
         \\  _ = owner
         \\if run() -> exit(1) else exit(2)
     , &.{});
@@ -8680,43 +8751,43 @@ test "filesystem refresh observes module and source additions and removals" {
 
 test "init checkpoint constructs and forwards through callable values" {
     try Fixture.expectSourceExit(
-        \\func materialize(init item: int) int
+        \\fallible materialize(init item: int) int
         \\    return item
-        \\func forward(init item: int) int
+        \\fallible forward(init item: int) int
         \\    return materialize(item)
-        \\func invoke(imm callback: func(init int) int, init item: int) int
+        \\fallible invoke(imm callback: fallible(init int) int, init item: int) int
         \\    return callback(item)
-        \\exit(invoke(forward, 42))
+        \\if const status = invoke(forward, 42) -> exit(status) else exit(97)
     , 42);
 }
 
 test "init checkpoint generic construction has runtime and comptime parity" {
     try Fixture.expectSourceExit(
-        \\func materialize(static T: type, init item: T) T
+        \\fallible materialize(static T: type, init item: T) T
         \\    return item
-        \\func forward(static T: type, init item: T) T
+        \\fallible forward(static T: type, init item: T) T
         \\    return materialize(T, item)
-        \\static answer = forward(40 + 2)
-        \\exit(forward(answer))
+        \\static answer = if const computed = forward(40 + 2) -> computed else 97
+        \\if const status = forward(answer) -> exit(status) else exit(97)
     , 42);
 }
 
 test "init checkpoint defers the entire producer and its arguments" {
     const sources = [_][]const u8{
         \\func producer(imm argument: int) int -> return argument
-        \\func receiver(init item: int, imm eager: int) int -> return item
+        \\fallible receiver(init item: int, imm eager: int) int -> return item
         \\func skipped() int -> exit(99)
         \\func stop() int -> exit(42)
-        \\exit(receiver(producer(skipped()), stop()))
+        \\if const status = receiver(producer(skipped()), stop()) -> exit(status) else exit(97)
         ,
         \\func producer() int -> exit(99)
-        \\func receiver(init item: int) int -> exit(42)
-        \\exit(receiver(producer()))
+        \\fallible receiver(init item: int) int -> exit(42)
+        \\if const status = receiver(producer()) -> exit(status) else exit(97)
         ,
         \\func producer() int -> exit(42)
-        \\func receiver(init item: int) int
+        \\fallible receiver(init item: int) int
         \\    return item
-        \\exit(receiver(producer()))
+        \\if const status = receiver(producer()) -> exit(status) else exit(97)
     };
     for (sources) |source| {
         try Fixture.expectSourceExit(source, 42);
@@ -8730,40 +8801,40 @@ test "init checkpoint constructs immovable results through forwarded callables" 
         \\    move = none
         \\    copy = none
         \\func producer(imm value: int) Pinned -> return Pinned{value = value}
-        \\func materialize(init item: Pinned) Pinned -> return item
-        \\func forward(init item: Pinned) Pinned -> return materialize(item)
-        \\func receiver(imm callback: func(init Pinned) Pinned, init item: Pinned) int
+        \\fallible materialize(init item: Pinned) Pinned -> return item
+        \\fallible forward(init item: Pinned) Pinned -> return materialize(item)
+        \\fallible receiver(imm callback: fallible(init Pinned) Pinned, init item: Pinned) int
         \\    const value = callback(item)
         \\    return value.value
-        \\exit(receiver(forward, producer(42)))
+        \\if const status = receiver(forward, producer(42)) -> exit(status) else exit(97)
     , 42);
 }
 
 test "init checkpoint read captures retain their caller context" {
     try Fixture.expectSourceExit(
-        \\func materialize(init item: int) int -> return item
-        \\func calculate(imm base: int) int
+        \\fallible materialize(init item: int) int -> return item
+        \\fallible calculate(imm base: int) int
         \\    var extra = 2
         \\    const immutable = base + 1
         \\    return materialize(immutable + extra)
-        \\static answer = calculate(39)
-        \\exit(calculate(answer - 3))
+        \\static answer = if const computed = calculate(39) -> computed else 97
+        \\if const status = calculate(answer - 3) -> exit(status) else exit(97)
     , 42);
 }
 
 test "init capture writes update caller storage through forwarding" {
     try Fixture.expectSourceExit(
-        \\func materialize(init item: int) int -> return item
-        \\func forward(init item: int) int -> return materialize(item)
-        \\func run() int
+        \\fallible materialize(init item: int) int -> return item
+        \\fallible forward(init item: int) int -> return materialize(item)
+        \\fallible run() int
         \\    var value = 1
         \\    const result = forward(if value == 1
         \\        value = 40
         \\        2
         \\    else 0)
         \\    return value + result
-        \\static answer = run()
-        \\exit(run() + answer - 42)
+        \\static answer = if const computed = run() -> computed else 97
+        \\if const status = run() -> exit(status + answer - 42) else exit(97)
     , 42);
 }
 
@@ -8772,29 +8843,29 @@ test "init capture mutable calls update caller storage through forwarding" {
         \\func change(mut value: int) int
         \\    value = 40
         \\    return 2
-        \\func materialize(init item: int) int -> return item
-        \\func forward(init item: int) int -> return materialize(item)
-        \\func run() int
+        \\fallible materialize(init item: int) int -> return item
+        \\fallible forward(init item: int) int -> return materialize(item)
+        \\fallible run() int
         \\    var value = 1
         \\    const result = forward(change(value))
         \\    return value + result
-        \\static answer = run()
-        \\exit(run() + answer - 42)
+        \\static answer = if const computed = run() -> computed else 97
+        \\if const status = run() -> exit(status + answer - 42) else exit(97)
     , 42);
 }
 
 test "init capture checked references survive generic indirect forwarding" {
     try Fixture.expectSourceExit(
         \\import std.memory.{borrow_local}
-        \\func materialize(static T: type, init item: T) T from(item) -> return item
-        \\func forward(init item: Ref(int, false)) Ref(int, false) from(item) -> return materialize(item)
-        \\func indirect(imm callback: func(init Ref(int, false)) Ref(int, false), init item: Ref(int, false)) Ref(int, false) from(item) -> return callback(item)
-        \\func run() int
+        \\fallible materialize(static T: type, init item: T) T from(item) -> return item
+        \\fallible forward(init item: Ref(int, false)) Ref(int, false) from(item) -> return materialize(item)
+        \\fallible indirect(imm callback: fallible(init Ref(int, false)) Ref(int, false), init item: Ref(int, false)) Ref(int, false) from(item) -> return callback(item)
+        \\fallible run() int
         \\    var value = 42
         \\    const reference = borrow_local(int, value)
         \\    const result = indirect(forward, reference)
         \\    return result[]
-        \\exit(run())
+        \\if const status = run() -> exit(status) else exit(97)
     , 42);
 }
 
@@ -8811,12 +8882,12 @@ test "init capture root transfers distinguish skipped and completed construction
         \\    const value = item
         \\    1 == 0
         \\    return value.value
-        \\func run(imm construct: bool) int
+        \\fallible run(imm construct: bool) int
         \\    const source = Item{value = if construct == true -> 41 else 42}
         \\    if const value = receive(source^, construct) -> return value
         \\    return 21
-        \\static answer = run(false) + run(true)
-        \\exit(run(false) + run(true) + answer - 42)
+        \\static answer = if const computed = run(false) -> if const additional_computed = run(true) -> computed + additional_computed else 97 else 97
+        \\if const status = run(false) -> if const additional_status = run(true) -> exit(status + additional_status + answer - 42) else exit(97) else exit(97)
     , 42);
 }
 
@@ -8832,25 +8903,25 @@ test "init capture field transfers clean partial region failure and residual fie
         \\    move = none
         \\    first: Item
         \\    second: Item
-        \\fallible fail() Item
+        \\fallible fail_value() Item
         \\    1 == 0
         \\    return Item{value = 99}
-        \\func materialize(init item: Pair) Pair -> return item
-        \\func forward(init item: Pair) Pair -> return materialize(item)
-        \\func run() int
+        \\fallible materialize(init item: Pair) Pair -> return item
+        \\fallible forward(init item: Pair) Pair -> return materialize(item)
+        \\fallible run() int
         \\    const source = Pair{first = Item{value = 41}, second = Item{value = 42}}
-        \\    if const result = forward(Pair{first = source.first^, second = fail()}) -> return result.second.value
+        \\    if const result = forward(Pair{first = source.first^, second = fail_value()}) -> return result.second.value
         \\    return 42
-        \\static answer = run()
-        \\exit(run() + answer - 42)
+        \\static answer = if const computed = run() -> computed else 97
+        \\if const status = run() -> exit(status + answer - 42) else exit(97)
     , 42);
 }
 
 test "init capture deferred effects reject overlapping eager inputs and callee" {
     const sources = [_][]const u8{
-        "func receive(imm eager: int, init item: int) int -> return item\nfunc run() int\n    var value = 1\n    return receive(value, if true == true\n        value = 42\n        0\n    else 0)\nexit(run())",
-        "func receive(init item: int, imm eager: int) int -> return item\nfunc run() int\n    var value = 1\n    return receive(value^, value)\nexit(run())",
-        "func receive(init item: int) int -> return item\nfunc other(init item: int) int -> return item\nfunc run() int\n    var callback: func(init int) int = receive\n    return callback(if true == true\n        callback = other\n        42\n    else 0)\nexit(run())",
+        "fallible receive(imm eager: int, init item: int) int -> return item\nfallible run() int\n    var value = 1\n    return receive(value, if true == true\n        value = 42\n        0\n    else 0)\nif const status = run() -> exit(status) else exit(97)",
+        "fallible receive(init item: int, imm eager: int) int -> return item\nfallible run() int\n    var value = 1\n    return receive(value^, value)\nif const status = run() -> exit(status) else exit(97)",
+        "fallible receive(init item: int) int -> return item\nfallible other(init item: int) int -> return item\nfallible run() int\n    var callback: fallible(init int) int = receive\n    return callback(if true == true\n        callback = other\n        42\n    else 0)\nif const status = run() -> exit(status) else exit(97)",
     };
     for (sources) |source| {
         try Fixture.expectSourceDiagnostic(source, .initializer_capture_conflict);
@@ -8867,17 +8938,17 @@ test "init capture consuming fields stay caller owned until the consuming call" 
         \\struct Pair
         \\    first: Item
         \\    second: Item
-        \\fallible fail() int
+        \\fallible fail_value() int
         \\    1 == 0
         \\    return 0
         \\func consume(deinit item: Item, imm unused: int) int -> return item.value
-        \\func materialize(init item: int) int -> return item
-        \\func run() int
+        \\fallible materialize(init item: int) int -> return item
+        \\fallible run() int
         \\    const source = Pair{first = Item{value = 42}, second = Item{value = 42}}
-        \\    if const value = materialize(consume(source.first, fail())) -> return value
+        \\    if const value = materialize(consume(source.first, fail_value())) -> return value
         \\    return materialize(consume(source.second, 0))
-        \\static answer = run()
-        \\exit(run() + answer - 42)
+        \\static answer = if const computed = run() -> computed else 97
+        \\if const status = run() -> exit(status + answer - 42) else exit(97)
     , 42);
 }
 
@@ -8887,14 +8958,14 @@ test "init capture writes survive failure after deferred mutable calls" {
         \\    value = 42
         \\    1 == 0
         \\    return 0
-        \\func materialize(init item: int) int -> return item
-        \\func forward(init item: int) int -> return materialize(item)
-        \\func run() int
+        \\fallible materialize(init item: int) int -> return item
+        \\fallible forward(init item: int) int -> return materialize(item)
+        \\fallible run() int
         \\    var value = 1
         \\    if const result = forward(change(value)) -> return result
         \\    return value
-        \\static answer = run()
-        \\exit(run() + answer - 42)
+        \\static answer = if const computed = run() -> computed else 97
+        \\if const status = run() -> exit(status + answer - 42) else exit(97)
     , 42);
 }
 
@@ -8903,7 +8974,7 @@ test "init capture reference writes execute only during construction" {
         \\func change(imm reference: Ref(int, true)) int
         \\    reference[] = 42
         \\    return 0
-        \\func materialize(init item: int) int -> return item
+        \\fallible materialize(init item: int) int -> return item
         \\fallible skip(init item: int) int
         \\    1 == 0
         \\    return item
@@ -8928,12 +8999,12 @@ test "init capture conditional consuming fields select independent completion st
         \\    first: Item
         \\    second: Item
         \\func consume(deinit item: Item) int -> return item.value
-        \\func materialize(init item: int) int -> return item
-        \\func run(imm flag: bool) int
+        \\fallible materialize(init item: int) int -> return item
+        \\fallible run(imm flag: bool) int
         \\    const source = Pair{first = Item{value = 21}, second = Item{value = 21}}
         \\    return materialize(consume(if flag == true -> source.first else source.second))
-        \\static answer = run(true) + run(false)
-        \\exit(run(true) + run(false) + answer - 42)
+        \\static answer = if const computed = run(true) -> if const additional_computed = run(false) -> computed + additional_computed else 97 else 97
+        \\if const status = run(true) -> if const additional_status = run(false) -> exit(status + additional_status + answer - 42) else exit(97) else exit(97)
     , 42);
 }
 
@@ -8944,13 +9015,13 @@ test "init capture loop consuming places preserve selected completion state" {
         \\    drop = func(deinit self: Item)
         \\        if self.value == 21 -> return else exit(99)
         \\func consume(deinit item: Item) int -> return item.value
-        \\func materialize(init item: int) int -> return item
-        \\func run(imm flag: bool) int
+        \\fallible materialize(init item: int) int -> return item
+        \\fallible run(imm flag: bool) int
         \\    const first = Item{value = 21}
         \\    const second = Item{value = 21}
         \\    return materialize(consume(loop -> break if flag == true -> first else second))
-        \\static answer = run(true) + run(false)
-        \\exit(run(true) + run(false) + answer - 42)
+        \\static answer = if const computed = run(true) -> if const additional_computed = run(false) -> computed + additional_computed else 97 else 97
+        \\if const status = run(true) -> if const additional_status = run(false) -> exit(status + additional_status + answer - 42) else exit(97) else exit(97)
     , 42);
 }
 
@@ -8968,7 +9039,7 @@ test "init capture transfer hooks run exactly once across skipped and failed con
         \\    move = none
         \\    first: Item
         \\    second: Item
-        \\fallible fail(imm counter: Ref(int, true)) Item from(counter)
+        \\fallible fail_value(imm counter: Ref(int, true)) Item from(counter)
         \\    1 == 0
         \\    return Item{counter = counter}
         \\fallible receive(init item: Item, imm construct: bool) int
@@ -8976,7 +9047,7 @@ test "init capture transfer hooks run exactly once across skipped and failed con
         \\    const value = item
         \\    1 == 0
         \\    return 99
-        \\func materialize(init item: Pair) Pair -> return item
+        \\fallible materialize(init item: Pair) Pair -> return item
         \\fallible root(imm construct: bool) int
         \\    var counter = Box.new(0)
         \\    const source = Item{counter = counter.borrow_mut()}
@@ -8985,7 +9056,7 @@ test "init capture transfer hooks run exactly once across skipped and failed con
         \\fallible field() int
         \\    var counter = Box.new(0)
         \\    const source = Pair{first = Item{counter = counter.borrow_mut()}, second = Item{counter = counter.borrow_mut()}}
-        \\    if const unused = materialize(Pair{first = source.first^, second = fail(counter.borrow_mut())}) -> return 99
+        \\    if const unused = materialize(Pair{first = source.first^, second = fail_value(counter.borrow_mut())}) -> return 99
         \\    return counter.borrow()[]
         \\fallible run() int
         \\    const skipped = root(false)
@@ -8999,8 +9070,8 @@ test "init capture transfer hooks run exactly once across skipped and failed con
 
 test "init capture shared failure continuations retain possible transfer diagnostics" {
     const sources = [_][]const u8{
-        "fallible receive(init item: int, imm construct: bool) int\n    construct == true\n    const value = item\n    1 == 0\n    return value\nfunc run(imm flag: bool) int\n    var value = 42\n    if const unused = receive(value^, flag) -> return unused\n    return value\nexit(run(false))",
-        "struct Pair\n    first: int\n    second: int\nfallible receive(init item: int, imm construct: bool) int\n    construct == true\n    const value = item\n    1 == 0\n    return value\nfunc run(imm flag: bool) int\n    const value = Pair{first = 42, second = 0}\n    if const unused = receive(value.first^, flag) -> return unused\n    return value.first\nexit(run(false))",
+        "fallible receive(init item: int, imm construct: bool) int\n    construct == true\n    const value = item\n    1 == 0\n    return value\nfallible run(imm flag: bool) int\n    var value = 42\n    if const unused = receive(value^, flag) -> return unused\n    return value\nif const status = run(false) -> exit(status) else exit(97)",
+        "struct Pair\n    first: int\n    second: int\nfallible receive(init item: int, imm construct: bool) int\n    construct == true\n    const value = item\n    1 == 0\n    return value\nfallible run(imm flag: bool) int\n    const value = Pair{first = 42, second = 0}\n    if const unused = receive(value.first^, flag) -> return unused\n    return value.first\nif const status = run(false) -> exit(status) else exit(97)",
     };
     for (sources) |source| {
         try Fixture.expectSourceDiagnostic(source, .possibly_transferred);
@@ -9019,16 +9090,16 @@ test "init capture nested regions share transfer completion without owning captu
         \\    move = none
         \\    first: Item
         \\    second: Item
-        \\fallible fail() Item
+        \\fallible fail_value() Item
         \\    1 == 0
         \\    return Item{value = 99}
-        \\func materialize(init item: Pair) Pair -> return item
-        \\func run() int
+        \\fallible materialize(init item: Pair) Pair -> return item
+        \\fallible run() int
         \\    const source = Pair{first = Item{value = 41}, second = Item{value = 42}}
-        \\    if const unused = materialize(materialize(Pair{first = source.first^, second = fail()})) -> return 98
+        \\    if const unused = materialize(materialize(Pair{first = source.first^, second = fail_value()})) -> return 98
         \\    return 42
-        \\static answer = run()
-        \\exit(run() + answer - 42)
+        \\static answer = if const computed = run() -> computed else 97
+        \\if const status = run() -> exit(status + answer - 42) else exit(97)
     , 42);
 }
 
@@ -9037,8 +9108,8 @@ test "init capture repeated writes retain their original storage parameter" {
         \\func increment(mut value: int) int
         \\    value += 1
         \\    return 0
-        \\func materialize(init item: int) int -> return item
-        \\func run() int
+        \\fallible materialize(init item: int) int -> return item
+        \\fallible run() int
         \\    var value = 0
         \\    const unused = materialize(if true == true
         \\        value = 20
@@ -9046,16 +9117,16 @@ test "init capture repeated writes retain their original storage parameter" {
         \\        increment(value)
         \\    else 0)
         \\    return value
-        \\static answer = run()
-        \\exit(run() + answer - 42)
+        \\static answer = if const computed = run() -> computed else 97
+        \\if const status = run() -> exit(status + answer - 42) else exit(97)
     , 42);
 }
 
 test "init capture writes refresh returned references to caller storage" {
     try Fixture.expectSourceExit(
         \\import std.memory.{borrow_local}
-        \\func materialize(init item: Ref(int, false)) Ref(int, false) from(item) -> return item
-        \\func run() int
+        \\fallible materialize(init item: Ref(int, false)) Ref(int, false) from(item) -> return item
+        \\fallible run() int
         \\    var value = 1
         \\    borrow mut alias = value
         \\    const reference = materialize(if true == true
@@ -9064,14 +9135,14 @@ test "init capture writes refresh returned references to caller storage" {
         \\    else borrow_local(int, value))
         \\    alias = 7
         \\    return reference[] + 35
-        \\exit(run())
+        \\if const status = run() -> exit(status) else exit(97)
     , 42);
 }
 
 test "init capture explicit drop obligations survive possible skipped transfers" {
     const sources = [_][]const u8{
-        "struct Item\n    value: int\n    drop = explicit\nfunc consume(deinit value: Item) int -> return value.value\nfunc materialize(init item: int) int -> return item\nfallible skip(init item: int) int\n    1 == 0\n    return item\nfunc run() int\n    const source = Item{value = 42}\n    if const value = skip(consume(source)) -> return value\n    return 0\nexit(run())",
-        "struct Item\n    value: int\n    drop = explicit\nstruct Pair\n    first: Item\n    second: int\nfunc consume(deinit value: Item) int -> return value.value\nfallible skip(init item: int) int\n    1 == 0\n    return item\nfunc run() int\n    const source = Pair{first = Item{value = 42}, second = 0}\n    if const value = skip(consume(source.first)) -> return value\n    return 0\nexit(run())",
+        "struct Item\n    value: int\n    drop = explicit\nfunc consume(deinit value: Item) int -> return value.value\nfallible materialize(init item: int) int -> return item\nfallible skip(init item: int) int\n    1 == 0\n    return item\nfallible run() int\n    const source = Item{value = 42}\n    if const value = skip(consume(source)) -> return value\n    return 0\nif const status = run() -> exit(status) else exit(97)",
+        "struct Item\n    value: int\n    drop = explicit\nstruct Pair\n    first: Item\n    second: int\nfunc consume(deinit value: Item) int -> return value.value\nfallible skip(init item: int) int\n    1 == 0\n    return item\nfallible run() int\n    const source = Pair{first = Item{value = 42}, second = 0}\n    if const value = skip(consume(source.first)) -> return value\n    return 0\nif const status = run() -> exit(status) else exit(97)",
     };
     for (sources) |source| {
         try Fixture.expectSourceDiagnostic(source, .value_requires_explicit_drop);
@@ -9085,16 +9156,16 @@ test "init capture writes do not remove caller transfer authority" {
         \\    copy = none
         \\    drop = func(deinit self: Item)
         \\        if self.value == 42 -> return else exit(99)
-        \\func materialize(init item: Item) Item -> return item
-        \\func run() int
+        \\fallible materialize(init item: Item) Item -> return item
+        \\fallible run() int
         \\    var source = Item{value = 41}
         \\    const destination = materialize(if true == true
         \\        source.value = 42
         \\        source^
         \\    else Item{value = 42})
         \\    return destination.value
-        \\static answer = run()
-        \\exit(run() + answer - 42)
+        \\static answer = if const computed = run() -> computed else 97
+        \\if const status = run() -> exit(status + answer - 42) else exit(97)
     , 42);
 }
 
@@ -9104,20 +9175,73 @@ test "init capture owned replacements survive later region failure" {
         \\    counter: Ref(int, true)
         \\    drop = func(deinit self: Item)
         \\        self.counter[] = self.counter[] + 10
-        \\fallible fail() int
+        \\fallible fail_value() int
         \\    1 == 0
         \\    return 0
-        \\func materialize(init item: int) int -> return item
+        \\fallible materialize(init item: int) int -> return item
         \\fallible run() int
         \\    var counter = Box.new(0)
         \\    var source = Item{counter = counter.borrow_mut()}
         \\    if const unused = materialize(if true == true
         \\        source = Item{counter = counter.borrow_mut()}
-        \\        fail()
+        \\        fail_value()
         \\    else 0) -> return 99
         \\    return counter.borrow()[] + 22
         \\if const answer = run() -> exit(answer) else exit(98)
     , 42);
+}
+
+test "init captured replacement does not revive stale references" {
+    const source =
+        \\fallible materialize(init item: Ref(int, false)) Ref(int, false) from(item) -> return item
+        \\fallible run() int
+        \\    var owner = Box.new(1)
+        \\    const reference = owner.borrow()
+        \\    const observed = reference[]
+        \\    const result = materialize(if observed == 1
+        \\        owner = Box.new(2)
+        \\        reference
+        \\    else reference)
+        \\    return result[]
+        \\if const result = run() -> exit(result) else exit(97)
+    ;
+    const unchanged_source = try std.mem.replaceOwned(u8, testing.allocator, source, "owner = Box.new(2)", "const replacement = Box.new(2)");
+    defer testing.allocator.free(unchanged_source);
+    try Fixture.expectSourceExit(unchanged_source, 1);
+
+    const fresh_branch = try std.mem.replaceOwned(u8, testing.allocator, source, "        reference", "        owner.borrow()");
+    defer testing.allocator.free(fresh_branch);
+    const fresh_source = try std.mem.replaceOwned(u8, testing.allocator, fresh_branch, "else reference", "else owner.borrow()");
+    defer testing.allocator.free(fresh_source);
+    try Fixture.expectSourceExit(fresh_source, 2);
+
+    try Fixture.expectSourceDiagnostic(
+        \\fallible materialize(init item: Ref(int, false)) Ref(int, false) from(item) -> return item
+        \\fallible run() int
+        \\    var owner = Box.new(1)
+        \\    const result = materialize(if 1 == 1
+        \\        const reference = owner.borrow()
+        \\        owner = Box.new(2)
+        \\        reference
+        \\    else owner.borrow())
+        \\    return result[]
+        \\if const result = run() -> exit(result) else exit(97)
+    , .borrow_outlives_source);
+
+    const fixture = try Fixture.init(source, &.{});
+    defer fixture.deinit();
+    try testing.expect((try fixture.db.get(queries.BuildExecutable, 0)).* == null);
+    const diagnostics = try fixture.db.transitiveAccumulatorValues(queries.BuildExecutable, 0, structures.Diagnostic, testing.allocator);
+    defer testing.allocator.free(diagnostics);
+    for (diagnostics) |diagnostic| {
+        if (diagnostic.file_id != 0) continue;
+        switch (diagnostic.kind) {
+            .borrow_outlives_source, .initializer_capture_conflict => return,
+            else => {},
+        }
+    }
+    for (diagnostics) |diagnostic| std.debug.print("file {d} at {d}: {s}\n", .{ diagnostic.file_id, (if (diagnostic.span) |span| span.start else 0), @tagName(diagnostic.kind) });
+    return error.ExpectedDiagnostic;
 }
 
 test "init capture restoration after transfer restores caller cleanup" {
@@ -9128,17 +9252,17 @@ test "init capture restoration after transfer restores caller cleanup" {
         \\    drop = func(deinit self: Item)
         \\        self.counter[] = self.counter[] + self.weight
         \\func take(var item: Item) int -> return 0
-        \\fallible fail() int
+        \\fallible fail_value() int
         \\    1 == 0
         \\    return 0
-        \\func materialize(init item: int) int -> return item
+        \\fallible materialize(init item: int) int -> return item
         \\fallible run() int
         \\    var counter = Box.new(0)
         \\    var source = Item{counter = counter.borrow_mut(), weight = 10}
         \\    if const unused = materialize(if true == true
         \\        take(source^)
         \\        source = Item{counter = counter.borrow_mut(), weight = 32}
-        \\        fail()
+        \\        fail_value()
         \\    else 0) -> return 99
         \\    return counter.borrow()[]
         \\if const answer = run() -> exit(answer) else exit(98)
@@ -9153,8 +9277,8 @@ test "init capture restored sources support successive receiving calls" {
         \\    drop = func(deinit self: Item)
         \\        if self.value == 42 -> return else exit(99)
         \\func take(var item: Item) int -> return item.value
-        \\func materialize(static T: type, init item: T) T -> return item
-        \\func run() int
+        \\fallible materialize(static T: type, init item: T) T -> return item
+        \\fallible run() int
         \\    var source = Item{value = 42}
         \\    const first = materialize(int, if true == true
         \\        take(source^)
@@ -9163,8 +9287,8 @@ test "init capture restored sources support successive receiving calls" {
         \\    else 0)
         \\    const second = materialize(Item, source^)
         \\    return first + second.value
-        \\static answer = run()
-        \\exit(run() + answer - 42)
+        \\static answer = if const computed = run() -> computed else 97
+        \\if const status = run() -> exit(status + answer - 42) else exit(97)
     , 42);
 }
 
@@ -9179,17 +9303,17 @@ test "init capture restored fields keep caller cleanup on later failure" {
         \\    first: Item
         \\    second: int
         \\func take(var item: Item) int -> return 0
-        \\fallible fail() int
+        \\fallible fail_value() int
         \\    1 == 0
         \\    return 0
-        \\func materialize(init item: int) int -> return item
+        \\fallible materialize(init item: int) int -> return item
         \\fallible run() int
         \\    var counter = Box.new(0)
         \\    var source = Pair{first = Item{counter = counter.borrow_mut(), weight = 10}, second = 0}
         \\    if const unused = materialize(if true == true
         \\        take(source.first^)
         \\        source.first = Item{counter = counter.borrow_mut(), weight = 32}
-        \\        fail()
+        \\        fail_value()
         \\    else 0) -> return 99
         \\    return counter.borrow()[]
         \\if const answer = run() -> exit(answer) else exit(98)
@@ -9207,14 +9331,14 @@ test "init capture root and field alternatives share failure cleanup" {
         \\    second: Item
         \\func consume_pair(var item: Pair) int -> return 0
         \\func consume_item(var item: Item) int -> return 0
-        \\fallible fail() int
+        \\fallible fail_value() int
         \\    1 == 0
         \\    return 0
-        \\func materialize(init item: int) int -> return item
+        \\fallible materialize(init item: int) int -> return item
         \\fallible run(imm whole: bool) int
         \\    var counter = Box.new(0)
         \\    const source = Pair{first = Item{counter = counter.borrow_mut()}, second = Item{counter = counter.borrow_mut()}}
-        \\    if const unused = materialize(if whole == true -> consume_pair(source^) + fail() else consume_item(source.first^) + fail()) -> return 99
+        \\    if const unused = materialize(if whole == true -> consume_pair(source^) + fail_value() else consume_item(source.first^) + fail_value()) -> return 99
         \\    return counter.borrow()[] + 1
         \\fallible calculate() int
         \\    const whole = run(true)
@@ -9237,14 +9361,14 @@ test "init capture ancestor and nested field alternatives share failure cleanup"
         \\    pair: Pair
         \\func take_pair(var item: Pair) int -> return 0
         \\func take_item(var item: Item) int -> return 0
-        \\fallible fail() int
+        \\fallible fail_value() int
         \\    1 == 0
         \\    return 0
-        \\func materialize(init item: int) int -> return item
+        \\fallible materialize(init item: int) int -> return item
         \\fallible run(imm whole: bool) int
         \\    var counter = Box.new(0)
         \\    const source = Outer{pair = Pair{first = Item{counter = counter.borrow_mut()}, second = Item{counter = counter.borrow_mut()}}}
-        \\    if const unused = materialize(if whole == true -> take_pair(source.pair^) + fail() else take_item(source.pair.first^) + fail()) -> return 99
+        \\    if const unused = materialize(if whole == true -> take_pair(source.pair^) + fail_value() else take_item(source.pair.first^) + fail_value()) -> return 99
         \\    return counter.borrow()[] + 1
         \\fallible calculate() int -> return run(true) + run(false)
         \\if const answer = calculate() -> exit(answer) else exit(98)
@@ -9253,8 +9377,8 @@ test "init capture ancestor and nested field alternatives share failure cleanup"
 
 test "init capture scoped aliases preserve deferred place access" {
     try Fixture.expectSourceExit(
-        \\func materialize(init item: int) int -> return item
-        \\func run() int
+        \\fallible materialize(init item: int) int -> return item
+        \\fallible run() int
         \\    var value = 1
         \\    borrow mut alias = value
         \\    const result = materialize(if true == true
@@ -9262,7 +9386,7 @@ test "init capture scoped aliases preserve deferred place access" {
         \\        alias
         \\    else 0)
         \\    return value + result - 42
-        \\exit(run())
+        \\if const status = run() -> exit(status) else exit(97)
     , 42);
 }
 
@@ -9274,28 +9398,28 @@ test "init capture nested reference projections survive selection and wrapping" 
         \\    copy = trivial
         \\struct Outer
         \\    inner: Inner
-        \\func materialize(static T: type, init item: T) T from(item) -> return item
-        \\func forward(static T: type, init item: T) T from(item) -> return materialize(T, item)
-        \\func run() int
+        \\fallible materialize(static T: type, init item: T) T from(item) -> return item
+        \\fallible forward(static T: type, init item: T) T from(item) -> return materialize(T, item)
+        \\fallible run() int
         \\    var value = 42
         \\    const source = Outer{inner = Inner{reference = borrow_local(int, value)}}
         \\    const selected = forward(Ref(int, false), source.inner.reference)
         \\    const wrapped = forward(Outer, Outer{inner = source.inner})
         \\    return selected[] + wrapped.inner.reference[] - 42
-        \\exit(run())
+        \\if const status = run() -> exit(status) else exit(97)
     , 42);
     const selected = try Fixture.init(
         \\import std.memory.{borrow_local}
         \\struct References
         \\    external: Ref(int, false)
         \\    local: Ref(int, false)
-        \\func materialize(init item: Ref(int, false)) Ref(int, false) from(item) -> return item
-        \\func select(imm external: Ref(int, false)) Ref(int, false) from(external)
+        \\fallible materialize(init item: Ref(int, false)) Ref(int, false) from(item) -> return item
+        \\fallible select(imm external: Ref(int, false)) Ref(int, false) from(external)
         \\    var local = 1
         \\    const source = References{external = external, local = borrow_local(int, local)}
         \\    return materialize(source.external)
         \\var value = 42
-        \\exit(select(borrow_local(int, value))[])
+        \\if const status = select(borrow_local(int, value)) -> exit(status[]) else exit(97)
     , &.{});
     defer selected.deinit();
     try selected.expectExit(0, 42);
@@ -9306,12 +9430,12 @@ test "init capture nested reference projections survive selection and wrapping" 
         \\    copy = trivial
         \\struct Outer
         \\    inner: Inner
-        \\func materialize(init item: Outer) Outer from(item) -> return item
-        \\func escape() Ref(int, false)
+        \\fallible materialize(init item: Outer) Outer from(item) -> return item
+        \\fallible escape() Ref(int, false)
         \\    var value = 42
         \\    const source = Inner{reference = borrow_local(int, value)}
         \\    return materialize(Outer{inner = source}).inner.reference
-        \\exit(escape()[])
+        \\if const status = escape() -> exit(status[]) else exit(97)
     , .borrow_outlives_source);
 }
 
@@ -9344,30 +9468,30 @@ test "init capture multiple receiving calls share exact failure cleanup" {
 test "init capture receiving mutable reference outputs preserve initializer origins" {
     try Fixture.expectSourceExit(
         \\import std.memory.{borrow_local}
-        \\func install(init input: Ref(int, false), mut output: Ref(int, false))
+        \\fallible install(init input: Ref(int, false), mut output: Ref(int, false))
         \\    output = input
-        \\func forward(init input: Ref(int, false), mut output: Ref(int, false))
+        \\fallible forward(init input: Ref(int, false), mut output: Ref(int, false))
         \\    install(input, output)
-        \\func run() int
+        \\fallible run() int
         \\    var old = 1
         \\    var value = 42
         \\    var output = borrow_local(int, old)
-        \\    const callback: func(init Ref(int, false), mut Ref(int, false)) unit = forward
+        \\    const callback: fallible(init Ref(int, false), mut Ref(int, false)) unit = forward
         \\    callback(borrow_local(int, value), output)
         \\    return output[]
-        \\exit(run())
+        \\if const status = run() -> exit(status) else exit(97)
     , 42);
     try Fixture.expectSourceDiagnostic(
         \\import std.memory.{borrow_local}
-        \\func install(init input: Ref(int, false), mut output: Ref(int, false))
+        \\fallible install(init input: Ref(int, false), mut output: Ref(int, false))
         \\    output = input
-        \\func escape(imm previous: Ref(int, false)) Ref(int, false) from(previous)
+        \\fallible escape(imm previous: Ref(int, false)) Ref(int, false) from(previous)
         \\    var local = 42
         \\    var output = previous
         \\    install(borrow_local(int, local), output)
         \\    return output
         \\var value = 1
-        \\exit(escape(borrow_local(int, value))[])
+        \\if const status = escape(borrow_local(int, value)) -> exit(status[]) else exit(97)
     , .borrow_outlives_source);
 }
 
@@ -9378,14 +9502,14 @@ test "init capture consuming joins keep mixed captured and local owners separate
         \\    drop = func(deinit self: Item)
         \\        self.counter[] = self.counter[] + 10
         \\func consume(deinit item: Item, imm eager: int) int -> return 0
-        \\fallible fail() int
+        \\fallible fail_value() int
         \\    1 == 0
         \\    return 0
-        \\func materialize(init item: int) int -> return item
+        \\fallible materialize(init item: int) int -> return item
         \\fallible run(imm captured: bool) int
         \\    var counter = Box.new(0)
         \\    const source = Item{counter = counter.borrow_mut()}
-        \\    if const unused = materialize(consume(if captured == true -> source else Item{counter = counter.borrow_mut()}, fail())) -> return 99
+        \\    if const unused = materialize(consume(if captured == true -> source else Item{counter = counter.borrow_mut()}, fail_value())) -> return 99
         \\    return counter.borrow()[]
         \\fallible calculate() int
         \\    const captured = run(true)
@@ -9399,14 +9523,14 @@ test "init capture consuming joins keep mixed captured and local owners separate
         \\    drop = func(deinit self: Item)
         \\        self.counter[] = self.counter[] + 10
         \\func consume(deinit item: Item, imm eager: int) int -> return 0
-        \\fallible fail() int
+        \\fallible fail_value() int
         \\    1 == 0
         \\    return 0
-        \\func materialize(init item: int) int -> return item
+        \\fallible materialize(init item: int) int -> return item
         \\fallible run(imm captured: bool) int
         \\    var counter = Box.new(0)
         \\    const source = Item{counter = counter.borrow_mut()}
-        \\    if const unused = materialize(consume(loop -> break if captured == true -> source else Item{counter = counter.borrow_mut()}, fail())) -> return 99
+        \\    if const unused = materialize(consume(loop -> break if captured == true -> source else Item{counter = counter.borrow_mut()}, fail_value())) -> return 99
         \\    return counter.borrow()[]
         \\fallible calculate() int
         \\    const captured = run(true)
@@ -9421,14 +9545,14 @@ test "init capture consuming joins keep mixed captured and local owners separate
 test "init checkpoint enforces one construction on every successful path" {
     const Case = struct { source: []const u8, diagnostic: std.meta.Tag(structures.Diagnostic.Kind) };
     const cases = [_]Case{
-        .{ .source = "func bad(init item: int) int -> return 42\nexit(bad(7))", .diagnostic = .initializer_not_consumed },
-        .{ .source = "func bad(init item: int) int\n    const first = item\n    return item\nexit(bad(7))", .diagnostic = .initializer_already_consumed },
-        .{ .source = "func bad(init item: int) int -> return item + 1\nexit(bad(7))", .diagnostic = .initializer_requires_construction },
-        .{ .source = "func read(imm item: int) int -> return item\nfunc bad(init item: int) int -> return read(item)\nexit(bad(7))", .diagnostic = .initializer_requires_construction },
-        .{ .source = "func bad(init item: int, imm flag: int) int\n    if flag == 1\n        const value = item\n    return 42\nexit(bad(7, 0))", .diagnostic = .initializer_not_consumed },
-        .{ .source = "func bad(init item: int) int\n    loop\n        const value = item\n        continue\nexit(bad(7))", .diagnostic = .initializer_consumed_in_loop },
-        .{ .source = "struct Item\n    field: int\nfunc bad(init item: Item) int -> return item.field\nexit(bad(Item{field = 42}))", .diagnostic = .initializer_requires_construction },
-        .{ .source = "func good(init item: int) int -> return item\nfunc bad(init item: int) int\n    const first = good(item)\n    return good(item)\nexit(bad(7))", .diagnostic = .initializer_already_consumed },
+        .{ .source = "fallible bad(init item: int) int -> return 42\nif const status = bad(7) -> exit(status) else exit(97)", .diagnostic = .initializer_not_consumed },
+        .{ .source = "fallible bad(init item: int) int\n    const first = item\n    return item\nif const status = bad(7) -> exit(status) else exit(97)", .diagnostic = .initializer_already_consumed },
+        .{ .source = "fallible bad(init item: int) int -> return item + 1\nif const status = bad(7) -> exit(status) else exit(97)", .diagnostic = .initializer_requires_construction },
+        .{ .source = "func read(imm item: int) int -> return item\nfallible bad(init item: int) int -> return read(item)\nif const status = bad(7) -> exit(status) else exit(97)", .diagnostic = .initializer_requires_construction },
+        .{ .source = "fallible bad(init item: int, imm flag: int) int\n    if flag == 1\n        const value = item\n    return 42\nif const status = bad(7, 0) -> exit(status) else exit(97)", .diagnostic = .initializer_not_consumed },
+        .{ .source = "fallible bad(init item: int) int\n    loop\n        const value = item\n        continue\nif const status = bad(7) -> exit(status) else exit(97)", .diagnostic = .initializer_consumed_in_loop },
+        .{ .source = "struct Item\n    field: int\nfallible bad(init item: Item) int -> return item.field\nif const status = bad(Item{field = 42}) -> exit(status) else exit(97)", .diagnostic = .initializer_requires_construction },
+        .{ .source = "fallible good(init item: int) int -> return item\nfallible bad(init item: int) int\n    const first = good(item)\n    return good(item)\nif const status = bad(7) -> exit(status) else exit(97)", .diagnostic = .initializer_already_consumed },
     };
     for (cases) |case| {
         try Fixture.expectSourceDiagnostic(case.source, case.diagnostic);
@@ -9437,22 +9561,22 @@ test "init checkpoint enforces one construction on every successful path" {
 
 test "init checkpoint consumes independently on conditional and loop exits" {
     try Fixture.expectSourceExit(
-        \\func materialize(init item: int) int -> return item
-        \\func choose(init item: int, imm flag: int) int
+        \\fallible materialize(init item: int) int -> return item
+        \\fallible choose(init item: int, imm flag: int) int
         \\    if flag == 1 -> return materialize(item) else return item
-        \\func leave(init item: int) int
+        \\fallible leave(init item: int) int
         \\    return loop -> break item
-        \\static answer = choose(20, 1) + leave(22)
-        \\exit(choose(20, 0) + leave(answer - 20))
+        \\static answer = if const computed = choose(20, 1) -> if const additional_computed = leave(22) -> computed + additional_computed else 97 else 97
+        \\if const status = choose(20, 0) -> if const additional_status = leave(answer - 20) -> exit(status + additional_status) else exit(97) else exit(97)
     , 42);
 }
 
 test "init checkpoint rejects eager mutations and transfers of pending captures" {
     const Case = struct { source: []const u8, diagnostic: std.meta.Tag(structures.Diagnostic.Kind) };
     const cases = [_]Case{
-        .{ .source = "func materialize(init item: int, imm eager: int) int -> return item\nfunc run() int\n    var value = 42\n    return materialize(value, if 1 == 1\n        value = 7\n        0\n    else 0)\nexit(run())", .diagnostic = .initializer_capture_conflict },
-        .{ .source = "func take(deinit value: int) int -> return value\nfunc materialize(init item: int, imm eager: int) int -> return item\nfunc run() int\n    var value = 42\n    return materialize(value, take(value))\nexit(run())", .diagnostic = .initializer_capture_conflict },
-        .{ .source = "func change(mut value: int) int\n    value = 7\n    return 0\nfunc materialize(init item: int, imm eager: int) int -> return item\nfunc run() int\n    var value = 42\n    return materialize(value, change(value))\nexit(run())", .diagnostic = .initializer_capture_conflict },
+        .{ .source = "fallible materialize(init item: int, imm eager: int) int -> return item\nfallible run() int\n    var value = 42\n    return materialize(value, if 1 == 1\n        value = 7\n        0\n    else 0)\nif const status = run() -> exit(status) else exit(97)", .diagnostic = .initializer_capture_conflict },
+        .{ .source = "func take(deinit value: int) int -> return value\nfallible materialize(init item: int, imm eager: int) int -> return item\nfallible run() int\n    var value = 42\n    return materialize(value, take(value))\nif const status = run() -> exit(status) else exit(97)", .diagnostic = .initializer_capture_conflict },
+        .{ .source = "func change(mut value: int) int\n    value = 7\n    return 0\nfallible materialize(init item: int, imm eager: int) int -> return item\nfallible run() int\n    var value = 42\n    return materialize(value, change(value))\nif const status = run() -> exit(status) else exit(97)", .diagnostic = .initializer_capture_conflict },
     };
     for (cases) |case| {
         try Fixture.expectSourceDiagnostic(case.source, case.diagnostic);
@@ -9461,16 +9585,16 @@ test "init checkpoint rejects eager mutations and transfers of pending captures"
 
 test "init checkpoint supports handled failure and skipped construction" {
     try Fixture.expectSourceExit(
-        \\fallible fail() int
+        \\fallible fail_value() int
         \\    1 == 0
         \\    return 0
-        \\func materialize(init item: int) int -> return item
+        \\fallible materialize(init item: int) int -> return item
         \\fallible skip(init item: int) int
-        \\    fail()
+        \\    fail_value()
         \\    return item
         \\func producer() int -> exit(99)
         \\if skip(producer()) -> exit(1)
-        \\exit(materialize(if const result = fail() -> result else 42))
+        \\if const status = materialize(if const result = fail_value() -> result else 42) -> exit(status) else exit(97)
     , 42);
 }
 
@@ -9480,11 +9604,11 @@ test "init checkpoint retains captured owners and defers copy hooks" {
         \\    value: int
         \\    copy = func(imm self: Source) Source -> exit(99)
         \\    drop = func(deinit self: Source) -> exit(98)
-        \\func skip(init item: Source) int -> exit(42)
-        \\func run() int
+        \\fallible skip(init item: Source) int -> exit(42)
+        \\fallible run() int
         \\    var source = Source{value = 7}
         \\    return skip(source)
-        \\exit(run())
+        \\if const status = run() -> exit(status) else exit(97)
     , 42);
 }
 
@@ -9496,16 +9620,16 @@ test "init checkpoint copies captured values once and leaves fresh results in pl
         \\struct Pinned
         \\    value: int
         \\    move = func(deinit self: Pinned) Pinned -> return Pinned{value = self.value + 7}
-        \\func copy_item(init item: Copied) Copied -> return item
-        \\func pin_item(init item: Pinned) Pinned -> return item
+        \\fallible copy_item(init item: Copied) Copied -> return item
+        \\fallible pin_item(init item: Pinned) Pinned -> return item
         \\func produce() Pinned -> return Pinned{value = 42}
-        \\func run() int
+        \\fallible run() int
         \\    var original = Copied{value = 41}
         \\    const copied = copy_item(original)
         \\    const pinned = pin_item(produce())
         \\    return copied.value + pinned.value - 42
-        \\static answer = run()
-        \\exit(run() + answer - 42)
+        \\static answer = if const computed = run() -> computed else 97
+        \\if const status = run() -> exit(status + answer - 42) else exit(97)
     , 42);
 }
 
@@ -9514,17 +9638,17 @@ test "init lexical ordinary consuming break retains cleanup before call" {
         \\struct Source
         \\    value: int
         \\    drop = func(deinit self: Source) -> exit(31)
-        \\func materialize(init item: int) int -> return item
+        \\fallible materialize(init item: int) int -> return item
         \\func consume(deinit item: Source, imm eager: int) int -> return item.value
-        \\fallible fail() int
+        \\fallible fail_value() int
         \\    1 == 0
         \\    return 0
         \\fallible run() int
         \\    const source = Source{value = 42}
         \\    return consume(loop
-        \\        const unused = materialize(if 1 == 1 -> break source else 0)
+        \\        if 1 == 1 -> break source
         \\        break Source{value = 99}
-        \\    , fail())
+        \\    , fail_value())
         \\if const result = run() -> exit(result) else exit(99)
     , 31);
 }
@@ -9532,18 +9656,18 @@ test "init lexical ordinary consuming break retains cleanup before call" {
 test "init lexical pending consumption preserves roots and fields across joins" {
     const expressions = [_][]const u8{
         \\loop
-        \\        const unused = materialize(if captured == true -> break selected else 0)
+        \\        if captured == true -> break selected
         \\        break Source{counter = counter.borrow_mut(), weight = 10}
         \\    , eager(succeeds)
         ,
         \\if captured == true -> loop
-        \\        const unused = materialize(if 1 == 1 -> break selected else 0)
+        \\        if 1 == 1 -> break selected
         \\        break Source{counter = counter.borrow_mut(), weight = 99}
         \\    else Source{counter = counter.borrow_mut(), weight = 10}, eager(succeeds)
         ,
         \\loop
         \\        break loop
-        \\            const unused = materialize(if captured == true -> break selected else 0)
+        \\            if captured == true -> break selected
         \\            break Source{counter = counter.borrow_mut(), weight = 10}
         \\    , eager(succeeds)
         ,
@@ -9597,8 +9721,8 @@ test "init lexical pending consumption preserves roots and fields across joins" 
                     \\struct Pair
                     \\    selected: Source
                     \\    sibling: Source
-                    \\func materialize(init item: int) int -> return item
-                    \\func receiver(init item: int) int -> return item
+                    \\fallible materialize(init item: int) int -> return item
+                    \\fallible receiver(init item: int) int -> return item
                     \\func dispose(var item: Source) -> ()
                     \\func consume(deinit item: Source, imm extra: int) int
                     \\    const result = item.weight
@@ -9624,7 +9748,11 @@ test "init lexical pending consumption preserves roots and fields across joins" 
                     \\if const answer = run() -> exit(answer) else exit(98)
                 });
                 defer testing.allocator.free(source);
-                try Fixture.expectSourceExit(source, 42);
+                if (!deferred and std.mem.eql(u8, place.payload, "pair.selected") and std.mem.startsWith(u8, expression, "if captured")) {
+                    try Fixture.expectSourceDiagnostic(source, .partial_field_transfer_not_supported);
+                } else {
+                    try Fixture.expectSourceExit(source, 42);
+                }
             }
         }
     }
@@ -9635,21 +9763,21 @@ test "init lexical pending consumption discharges explicit ownership only at cal
         \\struct Manual
         \\    value: int
         \\    drop = explicit
-        \\func materialize(init item: int) int -> return item
+        \\fallible materialize(init item: int) int -> return item
         \\func consume(deinit item: Manual, imm extra: int) int -> return item.value
-        \\fallible fail() int
+        \\fallible fail_value() int
         \\    1 == 0
         \\    return 0
         \\fallible run() int
         \\    const source = Manual{value = 42}
         \\    return consume(loop
-        \\        const unused = materialize(if 1 == 1 -> break source else 0)
+        \\        if 1 == 1 -> break source
         \\        break source
         \\    , eager)
         \\if const answer = run() -> exit(answer) else exit(98)
     ;
     for ([_]bool{ false, true }) |fails| {
-        const fixture_source = try std.mem.replaceOwned(u8, testing.allocator, source, "eager", if (fails) "fail()" else "0");
+        const fixture_source = try std.mem.replaceOwned(u8, testing.allocator, source, "eager", if (fails) "fail_value()" else "0");
         defer testing.allocator.free(fixture_source);
         const fixture = try Fixture.init(fixture_source, &.{});
         defer fixture.deinit();
@@ -9669,124 +9797,117 @@ test "init lexical review consuming captured break keeps caller cleanup ownershi
         \\struct Guard
         \\    value: int
         \\    drop = func(deinit self: Guard) -> exit(23)
-        \\func materialize(init item: int) int -> return item
-        \\func receiver(init item: int) int
+        \\fallible materialize(init item: int) int -> return item
+        \\fallible receiver(init item: int) int
         \\    const guard = Guard{value = 1}
         \\    const result = item
         \\    return result + guard.value
         \\func consume(deinit item: Source, imm eager: int) int -> return item.value
-        \\fallible fail() int
+        \\fallible fail_value() int
         \\    1 == 0
         \\    return 0
-        \\func run() int
+        \\fallible run() int
         \\    const source = Source{value = 42}
         \\    if const result = receiver(consume(loop
-        \\        const unused = materialize(if 1 == 1 -> break source else 0)
+        \\        if 1 == 1 -> break source
         \\        break Source{value = 99}
-        \\    , fail())) -> return result
+        \\    , fail_value())) -> return result
         \\    return 99
-        \\exit(run())
+        \\if const status = run() -> exit(status) else exit(97)
     , 23);
 }
 
-test "init lexical review return transfer does not contaminate normal continuation" {
-    try Fixture.expectSourceExit(
+test "init lexical rejects caller return even on an unselected transfer branch" {
+    try Fixture.expectSourceDiagnostic(
         \\struct Item
         \\    value: int
         \\func take(deinit item: Item) int -> return item.value
-        \\func materialize(init item: int) int -> return item
-        \\func run(imm leave: bool) int
+        \\fallible materialize(init item: int) int -> return item
+        \\fallible run(imm leave: bool) int
         \\    const source = Item{value = 42}
         \\    const unused = materialize(if leave == true
         \\        const taken = take(source)
         \\        return taken
         \\    else 0)
         \\    return source.value
-        \\exit(run(false))
-    , 42);
+        \\if const status = run(false) -> exit(status) else exit(97)
+    , .initializer_exit_outside_boundary);
 }
 
-test "init lexical review recursive wrapped handles preserve finite recursion" {
-    try Fixture.expectSourceExit(
-        \\func materialize(init item: int) int
+test "init lexical rejects caller return through recursive wrapped handles" {
+    try Fixture.expectSourceDiagnostic(
+        \\fallible materialize(init item: int) int
         \\    const result = item
         \\    return result + 100
-        \\func recurse(imm depth: int, init item: int) int
+        \\fallible recurse(imm depth: int, init item: int) int
         \\    if depth == 0 -> return materialize(item) + 100
         \\    return recurse(depth - 1, materialize(item)) + 100
-        \\func run() int
+        \\fallible run() int
         \\    const unused = recurse(3, materialize(if 1 == 1 -> return 42 else 0))
         \\    return 99
-        \\static answer = run()
-        \\exit(run() + answer - 42)
-    , 42);
+        \\static answer = if const computed = run() -> computed else 97
+        \\if const status = run() -> exit(status + answer - 42) else exit(97)
+    , .initializer_exit_outside_boundary);
 }
 
-test "init lexical review byte and zero size payloads retain runtime and comptime parity" {
+test "init lexical rejects byte and zero sized caller return and break payloads" {
     const fixture = try Fixture.init(
         \\struct Empty
         \\    move = none
         \\    copy = none
-        \\func materialize(init item: bool) bool -> return item
-        \\func byte_return() byte
+        \\fallible materialize(init item: bool) bool -> return item
+        \\fallible byte_return() byte
         \\    const unused = materialize(if 1 == 1 -> return 42 else false)
         \\    return 99
-        \\func byte_break() byte
+        \\fallible byte_break() byte
         \\    return loop
         \\        const unused = materialize(if 1 == 1 -> break 42 else false)
         \\        break 99
-        \\func empty_return() Empty
+        \\fallible empty_return() Empty
         \\    const unused = materialize(if 1 == 1 -> return Empty{} else false)
         \\    return Empty{}
-        \\func empty_break() Empty
+        \\fallible empty_break() Empty
         \\    return loop
         \\        const unused = materialize(if 1 == 1 -> break Empty{} else false)
         \\        break Empty{}
         \\func accept(deinit item: Empty) int -> return 21
-        \\func calculate() int
+        \\fallible calculate() int
         \\    const first = byte_return()
         \\    const second = byte_break()
         \\    return accept(empty_return()) + accept(empty_break())
-        \\static answer = byte_return()
-        \\static loop_answer = byte_break()
-        \\static empty_answer = calculate()
-        \\exit(calculate() + empty_answer - 42)
+        \\static answer = if const computed = byte_return() -> computed else 97
+        \\static loop_answer = if const computed = byte_break() -> computed else 97
+        \\static empty_answer = if const computed = calculate() -> computed else 97
+        \\if const status = calculate() -> exit(status + empty_answer - 42) else exit(97)
     , &.{});
     defer fixture.deinit();
-    try fixture.expectExit(0, 42);
-    const scope = (try fixture.db.get(queries.BuildModuleScope, 0)).*.?;
-    for ([_][]const u8{ "answer", "loop_answer" }) |name| {
-        const value_id = (try fixture.db.get(queries.ResolveStatic, scope.resolveStatic(name).?)).*.?;
-        const value = (try fixture.db.lookupInterned(queries.CompileTimeValues, value_id)).runtime;
-        try testing.expectEqual(structures.TypeId.byte, value.type_id);
-        try testing.expectEqual(@as(u8, 42), value.value.byte);
-    }
+    try fixture.expectDiagnostic(0, .initializer_exit_outside_boundary);
 }
 
-test "init lexical review mutable copyback and calling cleanups preserve the token" {
+test "init capture mutable copyback and calling cleanups preserve normal results" {
     const source =
         \\func disturb(imm value: int) int -> return value * 3 + 1
         \\struct Guard
         \\    value: int
         \\    drop = func(deinit self: Guard)
         \\        const unused = disturb(self.value)
-        \\func receiver(mut count: int, init item: int) int
+        \\fallible receiver(mut count: int, init item: int) int
         \\    const guard = Guard{value = count}
         \\    count = count + 1
         \\    const result = item
         \\    return result + guard.value
-        \\func forward(mut count: int, init item: int) int
+        \\fallible forward(mut count: int, init item: int) int
         \\    const guard = Guard{value = count}
         \\    count = count + 1
         \\    return receiver(count, item) + guard.value
-        \\func run(mut count: int) int
-        \\    return forward(count, if 1 == 1 -> return 40 else 0)
-        \\func calculate() int
+        \\fallible run(mut count: int) int
+        \\    return forward(count, 39)
+        \\fallible calculate() int
         \\    var count = 0
         \\    const result = run(count)
         \\    return result + count
     ;
-    for ([_][]const u8{ "exit(calculate())", "static answer = calculate()\nexit(answer)" }) |suffix| {
+    for ([_][]const u8{ "if const answer = calculate() -> exit(answer) else exit(97)", "static answer = if const value = calculate() -> value else 97\nexit(answer)" }) |suffix| {
         const program = try std.fmt.allocPrint(testing.allocator, "{s}\n{s}", .{ source, suffix });
         defer testing.allocator.free(program);
         const fixture = try Fixture.init(program, &.{});
@@ -9798,55 +9919,55 @@ test "init lexical review mutable copyback and calling cleanups preserve the tok
     }
 }
 
-test "init lexical return unwinds indirect forwarding with runtime and comptime parity" {
-    try Fixture.expectSourceExit(
-        \\func materialize(init item: int) int
+test "init lexical rejects caller return through indirect forwarding" {
+    try Fixture.expectSourceDiagnostic(
+        \\fallible materialize(init item: int) int
         \\    const result = item
         \\    return result + 100
-        \\func forward(init item: int) int -> return materialize(item)
-        \\func invoke(imm callback: func(init int) int, init item: int) int
+        \\fallible forward(init item: int) int -> return materialize(item)
+        \\fallible invoke(imm callback: fallible(init int) int, init item: int) int
         \\    return callback(item) + 100
-        \\func run() int
+        \\fallible run() int
         \\    const result = invoke(forward, if 1 == 1 -> return 42 else 0)
         \\    return result + 100
-        \\static answer = run()
-        \\exit(run() + answer - 42)
-    , 42);
+        \\static answer = if const computed = run() -> computed else 97
+        \\if const status = run() -> exit(status + answer - 42) else exit(97)
+    , .initializer_exit_outside_boundary);
 }
 
 test "init checkpoint rejects unchecked deferred failure" {
     const Case = struct { source: []const u8, diagnostic: std.meta.Tag(structures.Diagnostic.Kind) };
     const cases = [_]Case{
-        .{ .source = "fallible fail() int\n    1 == 0\n    return 0\nfunc materialize(init item: int) int -> return item\nexit(materialize(fail()))", .diagnostic = .fallible_expression_outside_fallible_function },
+        .{ .source = "fallible fail_value() int\n    1 == 0\n    return 0\nfallible materialize(init item: int) int -> return item\nexit(materialize(fail_value()))", .diagnostic = .fallible_expression_outside_fallible_function },
     };
     for (cases) |case| {
         try Fixture.expectSourceDiagnostic(case.source, case.diagnostic);
     }
 }
 
-test "init lexical returns use the caller result type and permit unit exits" {
-    try Fixture.expectSourceExit(
-        \\func materialize(init item: bool) bool -> return item
-        \\func run() int
+test "init lexical rejects caller value and unit returns" {
+    try Fixture.expectSourceDiagnostic(
+        \\fallible materialize(init item: bool) bool -> return item
+        \\fallible run() int
         \\    const unused = materialize(if 1 == 1 -> return 42 else false)
         \\    return 100
-        \\func finish()
+        \\fallible finish()
         \\    const unused = materialize(if 1 == 1 -> return else false)
         \\    exit(99)
-        \\static answer = run()
-        \\static completed = finish()
-        \\finish()
-        \\exit(run() + answer - 42)
-    , 42);
+        \\static answer = if const computed = run() -> computed else 97
+        \\static completed = if const computed = finish() -> computed else unit
+        \\if finish() -> ()
+        \\if const status = run() -> exit(status + answer - 42) else exit(97)
+    , .initializer_exit_outside_boundary);
 }
 
-test "init lexical break values and bare breaks bypass consumer arithmetic" {
-    try Fixture.expectSourceExit(
-        \\func materialize(init item: int) int
+test "init lexical rejects caller value and bare breaks" {
+    try Fixture.expectSourceDiagnostic(
+        \\fallible materialize(init item: int) int
         \\    const result = item
         \\    return result + 100
-        \\func forward(init item: int) int -> return materialize(item) + 100
-        \\func run() int
+        \\fallible forward(init item: int) int -> return materialize(item) + 100
+        \\fallible run() int
         \\    const result = loop
         \\        const unused = forward(if 1 == 1 -> break 42 else 0)
         \\        break 99
@@ -9854,17 +9975,17 @@ test "init lexical break values and bare breaks bypass consumer arithmetic" {
         \\        const unused = materialize(if 1 == 1 -> break else 0)
         \\        exit(98)
         \\    return result
-        \\static answer = run()
-        \\exit(run() + answer - 42)
-    , 42);
+        \\static answer = if const computed = run() -> computed else 97
+        \\if const status = run() -> exit(status + answer - 42) else exit(97)
+    , .initializer_exit_outside_boundary);
 }
 
-test "init lexical continue copies captured updates back before the backedge" {
-    try Fixture.expectSourceExit(
-        \\func materialize(init item: int) int
+test "init lexical rejects caller continue after captured writes" {
+    try Fixture.expectSourceDiagnostic(
+        \\fallible materialize(init item: int) int
         \\    const result = item
         \\    return result + 100
-        \\func run() int
+        \\fallible run() int
         \\    var count = 0
         \\    return loop
         \\        if count == 3 -> break 42
@@ -9873,15 +9994,15 @@ test "init lexical continue copies captured updates back before the backedge" {
         \\            continue
         \\        else 0)
         \\        break 99
-        \\static answer = run()
-        \\exit(run() + answer - 42)
-    , 42);
+        \\static answer = if const computed = run() -> computed else 97
+        \\if const status = run() -> exit(status + answer - 42) else exit(97)
+    , .initializer_exit_outside_boundary);
 }
 
 test "init lexical region local loops remain distinct from caller loops" {
     try Fixture.expectSourceExit(
-        \\func materialize(init item: int) int -> return item
-        \\func run() int
+        \\fallible materialize(init item: int) int -> return item
+        \\fallible run() int
         \\    return loop
         \\        const value = materialize(loop
         \\            var count = 0
@@ -9892,57 +10013,57 @@ test "init lexical region local loops remain distinct from caller loops" {
         \\            break 42
         \\        )
         \\        break value
-        \\static answer = run()
-        \\exit(run() + answer - 42)
+        \\static answer = if const computed = run() -> computed else 97
+        \\if const status = run() -> exit(status + answer - 42) else exit(97)
     , 42);
 }
 
-test "init lexical nested regions and recursive consumers retain destination instances" {
-    try Fixture.expectSourceExit(
-        \\func materialize(init item: int) int
+test "init lexical rejects caller return through recursive consumers" {
+    try Fixture.expectSourceDiagnostic(
+        \\fallible materialize(init item: int) int
         \\    const result = item
         \\    return result + 100
-        \\func recurse(imm depth: int, init item: int) int
+        \\fallible recurse(imm depth: int, init item: int) int
         \\    if depth == 0 -> return materialize(item) + 100
         \\    return recurse(depth - 1, item) + 100
-        \\func run() int
+        \\fallible run() int
         \\    const unused = recurse(3, materialize(if 1 == 1 -> return 42 else 0))
         \\    return 99
-        \\static answer = run()
-        \\exit(run() + answer - 42)
-    , 42);
+        \\static answer = if const computed = run() -> computed else 97
+        \\if const status = run() -> exit(status + answer - 42) else exit(97)
+    , .initializer_exit_outside_boundary);
 }
 
-test "init lexical exits cannot be caught as source failure" {
-    try Fixture.expectSourceExit(
+test "init lexical forbidden caller exits remain invalid under a failure handler" {
+    try Fixture.expectSourceDiagnostic(
         \\fallible materialize(init item: int) int -> return item
-        \\func run() int
+        \\fallible run() int
         \\    if const value = materialize(if 1 == 1 -> return 42 else 0)
         \\        return value + 100
         \\    else
         \\        return 99
-        \\static answer = run()
-        \\exit(run() + answer - 42)
-    , 42);
+        \\static answer = if const computed = run() -> computed else 97
+        \\if const status = run() -> exit(status + answer - 42) else exit(97)
+    , .initializer_exit_outside_boundary);
 }
 
-test "init lexical ordinary consumer failure skips the deferred exit" {
-    try Fixture.expectSourceExit(
+test "init lexical early consumer failure does not authorize a forbidden deferred exit" {
+    try Fixture.expectSourceDiagnostic(
         \\fallible materialize(init item: int) int
         \\    1 == 0
         \\    return item
-        \\func run() int
+        \\fallible run() int
         \\    if const value = materialize(if 1 == 1 -> return 99 else 0)
         \\        return value
         \\    else
         \\        return 42
-        \\static answer = run()
-        \\exit(run() + answer - 42)
-    , 42);
+        \\static answer = if const computed = run() -> computed else 97
+        \\if const status = run() -> exit(status + answer - 42) else exit(97)
+    , .initializer_exit_outside_boundary);
 }
 
-test "init lexical cleanup unwinds partial fields receivers and caller scopes in order" {
-    try Fixture.expectSourceExit(
+test "init lexical rejects caller return during partial aggregate construction" {
+    try Fixture.expectSourceDiagnostic(
         \\struct Marker
         \\    counter: Ref(int, true)
         \\    step: int
@@ -9952,11 +10073,11 @@ test "init lexical cleanup unwinds partial fields receivers and caller scopes in
         \\    first: Marker
         \\    last: int
         \\    drop = func(deinit self: Pending) -> exit(98)
-        \\func receive(init marker: Marker, init item: Pending) int
+        \\fallible receive(init marker: Marker, init item: Pending) int
         \\    const held = marker
         \\    const value = item
         \\    return value.last + held.step
-        \\func run(imm trace: Ref(int, true)) int
+        \\fallible run(imm trace: Ref(int, true)) int
         \\    const caller = Marker{counter = trace, step = 3}
         \\    const unused = receive(Marker{counter = trace, step = 2}, Pending{first = Marker{counter = trace, step = 1}, last = if 1 == 1 -> return 42 else 0})
         \\    return unused + caller.step
@@ -9966,170 +10087,166 @@ test "init lexical cleanup unwinds partial fields receivers and caller scopes in
         \\    if counter.borrow()[] == 123 -> return answer
         \\    return 99
         \\if const answer = calculate() -> exit(answer) else exit(97)
-    , 42);
+    , .initializer_exit_outside_boundary);
 }
 
-test "init lexical aggregate returns construct immovable caller results with parity" {
-    try Fixture.expectSourceExit(
+test "init lexical rejects immovable caller return payloads" {
+    try Fixture.expectSourceDiagnostic(
         \\struct Pinned
         \\    value: int
         \\    move = none
         \\    copy = none
-        \\func materialize(static T: type, init item: T) T -> return item
-        \\func run() Pinned
+        \\fallible materialize(static T: type, init item: T) T -> return item
+        \\fallible run() Pinned
         \\    const unused = materialize(if 1 == 1 -> return Pinned{value = 42} else false)
         \\    return Pinned{value = 99}
-        \\func calculate() int
+        \\fallible calculate() int
         \\    const result = run()
         \\    return result.value
-        \\static answer = calculate()
-        \\exit(calculate() + answer - 42)
-    , 42);
+        \\static answer = if const computed = calculate() -> computed else 97
+        \\if const status = calculate() -> exit(status + answer - 42) else exit(97)
+    , .initializer_exit_outside_boundary);
 }
 
-test "init lexical aggregate loop breaks use immovable construction destinations with parity" {
-    try Fixture.expectSourceExit(
+test "init lexical rejects immovable caller break payloads" {
+    try Fixture.expectSourceDiagnostic(
         \\struct Pinned
         \\    value: int
         \\    move = none
         \\    copy = none
-        \\func materialize(init item: int) int -> return item
-        \\func run() Pinned
+        \\fallible materialize(init item: int) int -> return item
+        \\fallible run() Pinned
         \\    return loop
         \\        const unused = materialize(if 1 == 1 -> break Pinned{value = 42} else 0)
         \\        break Pinned{value = 99}
-        \\func calculate() int
+        \\fallible calculate() int
         \\    const result = run()
         \\    return result.value
-        \\static answer = calculate()
-        \\exit(calculate() + answer - 42)
-    , 42);
+        \\static answer = if const computed = calculate() -> computed else 97
+        \\if const status = calculate() -> exit(status + answer - 42) else exit(97)
+    , .initializer_exit_outside_boundary);
 }
 
-test "init lexical break payloads join independently of initializer types" {
-    try Fixture.expectSourceExit(
-        \\func materialize(init item: bool) bool -> return item
-        \\func run(imm choose: bool) int
+test "init lexical rejects caller break payloads with variant types" {
+    try Fixture.expectSourceDiagnostic(
+        \\fallible materialize(init item: bool) bool -> return item
+        \\fallible run(imm choose: bool) int
         \\    const selected = loop
         \\        const unused = materialize(if choose == true -> break 42 else break none)
         \\        break 99
         \\    if const result = selected as int -> return result
         \\    return 0
-        \\static answer = run(true) + run(false)
-        \\exit(run(true) + run(false) + answer - 42)
-    , 42);
+        \\static answer = if const computed = run(true) -> if const additional_computed = run(false) -> computed + additional_computed else 97 else 97
+        \\if const status = run(true) -> if const additional_status = run(false) -> exit(status + additional_status + answer - 42) else exit(97) else exit(97)
+    , .initializer_exit_outside_boundary);
 }
 
-test "init lexical nested consumers target region local loops" {
-    try Fixture.expectSourceExit(
-        \\func materialize(init item: int) int -> return item
-        \\func run() int
+test "init lexical rejects exits to a loop in an enclosing initializer region" {
+    try Fixture.expectSourceDiagnostic(
+        \\fallible materialize(init item: int) int -> return item
+        \\fallible run() int
         \\    return materialize(loop
         \\        const unused = materialize(if 1 == 1 -> break 42 else 0)
         \\        break 99
         \\    )
-        \\static answer = run()
-        \\exit(run() + answer - 42)
-    , 42);
+        \\static answer = if const computed = run() -> computed else 97
+        \\if const status = run() -> exit(status + answer - 42) else exit(97)
+    , .initializer_exit_outside_boundary);
 }
 
-test "init lexical recursive callers retain their own return tokens" {
-    try Fixture.expectSourceExit(
-        \\func materialize(init item: int) int -> return item
-        \\func run(imm depth: int) int
+test "init lexical rejects caller returns within recursive callers" {
+    try Fixture.expectSourceDiagnostic(
+        \\fallible materialize(init item: int) int -> return item
+        \\fallible run(imm depth: int) int
         \\    if depth == 0 -> return 39
         \\    const previous = run(depth - 1)
         \\    const unused = materialize(if 1 == 1 -> return previous + 1 else 0)
         \\    return 99
-        \\static answer = run(3)
-        \\exit(run(3) + answer - 42)
-    , 42);
+        \\static answer = if const computed = run(3) -> computed else 97
+        \\if const status = run(3) -> exit(status + answer - 42) else exit(97)
+    , .initializer_exit_outside_boundary);
 }
 
-test "init lexical returns preserve declared checked reference origins" {
-    try Fixture.expectSourceExit(
+test "init lexical rejects caller returns of checked references" {
+    try Fixture.expectSourceDiagnostic(
         \\import std.memory.{borrow_local}
-        \\func materialize(init item: int) int -> return item
-        \\func select(imm reference: Ref(int, false)) Ref(int, false) from(reference)
+        \\fallible materialize(init item: int) int -> return item
+        \\fallible select(imm reference: Ref(int, false)) Ref(int, false) from(reference)
         \\    const unused = materialize(if 1 == 1 -> return reference else 0)
         \\    return reference
         \\var value = 42
-        \\exit(select(borrow_local(int, value))[])
-    , 42);
+        \\if const status = select(borrow_local(int, value)) -> exit(status[]) else exit(97)
+    , .initializer_exit_outside_boundary);
 }
 
-test "init lexical source exits enforce reference and explicit drop obligations" {
-    const cases = [_]struct { source: []const u8, diagnostic: std.meta.Tag(structures.Diagnostic.Kind) }{
-        .{ .source = "import std.memory.{borrow_local}\nfunc materialize(init item: int) int -> return item\nfunc run() Ref(int, false)\n    const unused = materialize(if 1 == 1\n        var local = 42\n        return borrow_local(int, local)\n    else 0)\n    exit(99)\nrun()", .diagnostic = .borrow_outlives_source },
-        .{ .source = "import std.memory.{borrow_local}\nfunc materialize(init item: int) int -> return item\nfunc select(imm allowed: Ref(int, false), imm other: Ref(int, false)) Ref(int, false) from(allowed)\n    const unused = materialize(if 1 == 1 -> return other else 0)\n    return allowed\nvar value = 42\nselect(borrow_local(int, value), borrow_local(int, value))", .diagnostic = .return_origin_not_declared },
-        .{ .source = "struct Manual\n    value: int\n    drop = explicit\nfunc consume(deinit value: Manual) -> ()\nfunc receive(init item: int) int\n    const guard = Manual{value = 1}\n    const result = item\n    consume(guard)\n    return result\nfunc run() int\n    return receive(if 1 == 1 -> return 42 else 0)\nexit(run())", .diagnostic = .value_requires_explicit_drop },
-        .{ .source = "struct Manual\n    value: int\n    drop = explicit\nstruct Pending\n    first: Manual\n    last: int\nfunc materialize(init item: Pending) int\n    const result = item\n    return result.last\nfunc run() int\n    return materialize(Pending{first = Manual{value = 1}, last = if 1 == 1 -> return 42 else 0})\nexit(run())", .diagnostic = .value_requires_explicit_drop },
-        .{ .source = "func materialize(init item: int) int -> return item\nfunc run() int -> return materialize(if 1 == 1 -> break 42 else 0)\nexit(run())", .diagnostic = .break_outside_loop },
-        .{ .source = "func materialize(init item: int) int -> return item\nfunc run() int -> return materialize(if 1 == 1 -> continue else 0)\nexit(run())", .diagnostic = .continue_outside_loop },
+test "init lexical rejects checked reference caller returns in blocks and multi reference callers" {
+    const sources = [_][]const u8{
+        "import std.memory.{borrow_local}\nfallible materialize(init item: int) int -> return item\nfallible run(imm reference: Ref(int, false)) Ref(int, false) from(reference)\n    const unused = materialize(if 1 == 1\n        return reference\n    else 0)\n    exit(99)\nvar value = 42\nif run(borrow_local(int, value)) -> ()",
+        "import std.memory.{borrow_local}\nfallible materialize(init item: int) int -> return item\nfallible select(imm allowed: Ref(int, false), imm other: Ref(int, false)) Ref(int, false) from(allowed)\n    const unused = materialize(if 1 == 1 -> return allowed else 0)\n    return allowed\nvar value = 42\nif select(borrow_local(int, value), borrow_local(int, value)) -> ()",
     };
-    for (cases) |case| {
-        try Fixture.expectSourceDiagnostic(case.source, case.diagnostic);
+    for (sources) |source| {
+        try Fixture.expectSourceDiagnostic(source, .initializer_exit_outside_boundary);
     }
 }
 
-test "init lexical completed explicit transfers discharge caller obligations" {
-    try Fixture.expectSourceExit(
+test "init lexical rejects caller return after explicit consumption" {
+    try Fixture.expectSourceDiagnostic(
         \\struct Manual
         \\    value: int
         \\    drop = explicit
         \\func consume(deinit item: Manual) int -> return item.value
-        \\func materialize(init item: int) never
+        \\fallible materialize(init item: int) never
         \\    const result = item
         \\    exit(result)
-        \\func run() int
+        \\fallible run() int
         \\    const source = Manual{value = 42}
         \\    return materialize(if 1 == 1
         \\        const consumed = consume(source)
         \\        return consumed
         \\    else consume(source))
-        \\static answer = run()
-        \\exit(run() + answer - 42)
-    , 42);
+        \\static answer = if const computed = run() -> computed else 97
+        \\if const status = run() -> exit(status + answer - 42) else exit(97)
+    , .initializer_exit_outside_boundary);
 }
 
-test "init lexical consuming loop breaks preserve existing immovable storage" {
-    try Fixture.expectSourceExit(
+test "init lexical rejects caller consuming breaks with captured immovable storage" {
+    try Fixture.expectSourceDiagnostic(
         \\struct Pinned
         \\    value: int
         \\    move = none
         \\    copy = none
-        \\func materialize(init item: int) int -> return item
+        \\fallible materialize(init item: int) int -> return item
         \\func consume(deinit item: Pinned) int -> return item.value
-        \\func run() int
+        \\fallible run() int
         \\    const source = Pinned{value = 42}
         \\    return consume(loop
         \\        const unused = materialize(if 1 == 1 -> break source else 0)
         \\        break Pinned{value = 99}
         \\    )
-        \\static answer = run()
-        \\exit(run() + answer - 42)
-    , 42);
+        \\static answer = if const computed = run() -> computed else 97
+        \\if const status = run() -> exit(status + answer - 42) else exit(97)
+    , .initializer_exit_outside_boundary);
 }
 
-test "init lexical consuming loop breaks construct fresh immovable values in caller storage" {
-    try Fixture.expectSourceExit(
+test "init lexical rejects caller consuming breaks with fresh immovable storage" {
+    try Fixture.expectSourceDiagnostic(
         \\struct Pinned
         \\    value: int
         \\    move = none
         \\    copy = none
-        \\func materialize(init item: int) int -> return item
+        \\fallible materialize(init item: int) int -> return item
         \\func consume(deinit item: Pinned) int -> return item.value
-        \\func run() int
+        \\fallible run() int
         \\    return consume(loop
         \\        const unused = materialize(if 1 == 1 -> break Pinned{value = 42} else 0)
         \\        break Pinned{value = 99}
         \\    )
-        \\static answer = run()
-        \\exit(run() + answer - 42)
-    , 42);
+        \\static answer = if const computed = run() -> computed else 97
+        \\if const status = run() -> exit(status + answer - 42) else exit(97)
+    , .initializer_exit_outside_boundary);
 }
 
-test "init lexical completed root and field transfers retain exact native cleanup" {
+test "init capture completed root and field transfers retain exact native cleanup" {
     try Fixture.expectSourceExit(
         \\struct Item
         \\    counter: Ref(int, true)
@@ -10140,19 +10257,19 @@ test "init lexical completed root and field transfers retain exact native cleanu
         \\    first: Item
         \\    second: Item
         \\func take(var item: Item) -> ()
-        \\func materialize(init item: int) int -> return item
-        \\func run(imm counter: Ref(int, true)) int
+        \\fallible materialize(init item: int) int -> return item
+        \\fallible run(imm counter: Ref(int, true)) int
         \\    const source = Pair{first = Item{counter = counter, weight = 10}, second = Item{counter = counter, weight = 20}}
         \\    const unused = materialize(if 1 == 1
         \\        take(source.first^)
-        \\        return 42
+        \\        42
         \\    else 0)
         \\    return unused
-        \\func run_root(imm counter: Ref(int, true)) int
+        \\fallible run_root(imm counter: Ref(int, true)) int
         \\    const source = Item{counter = counter, weight = 12}
         \\    const unused = materialize(if 1 == 1
         \\        take(source^)
-        \\        return 42
+        \\        42
         \\    else 0)
         \\    return unused
         \\fallible calculate() int
@@ -10164,8 +10281,8 @@ test "init lexical completed root and field transfers retain exact native cleanu
     , 42);
 }
 
-test "init lexical loop exits clean partial fields and receiver scopes before caller scopes" {
-    try Fixture.expectSourceExit(
+test "init lexical rejects caller loop exits during partial aggregate construction" {
+    try Fixture.expectSourceDiagnostic(
         \\struct Marker
         \\    counter: Ref(int, true)
         \\    step: int
@@ -10175,11 +10292,11 @@ test "init lexical loop exits clean partial fields and receiver scopes before ca
         \\    first: Marker
         \\    last: int
         \\    drop = func(deinit self: Pending) -> exit(98)
-        \\func receive(init marker: Marker, init item: Pending) int
+        \\fallible receive(init marker: Marker, init item: Pending) int
         \\    const held = marker
         \\    const value = item
         \\    return value.last + held.step
-        \\func run(imm trace: Ref(int, true)) int
+        \\fallible run(imm trace: Ref(int, true)) int
         \\    var pass = 0
         \\    return loop
         \\        pass = pass + 1
@@ -10192,10 +10309,10 @@ test "init lexical loop exits clean partial fields and receiver scopes before ca
         \\    if counter.borrow()[] == 123123 -> return result
         \\    return 99
         \\if const result = calculate() -> exit(result) else exit(97)
-    , 42);
+    , .initializer_exit_outside_boundary);
 }
 
-test "init lexical restored roots and fields clean once after nested returns" {
+test "init capture restored roots and fields clean once after nested construction" {
     try Fixture.expectSourceExit(
         \\struct Item
         \\    counter: Ref(int, true)
@@ -10206,21 +10323,21 @@ test "init lexical restored roots and fields clean once after nested returns" {
         \\    first: Item
         \\    second: Item
         \\func take(var item: Item) -> ()
-        \\func materialize(init item: int) int -> return item
-        \\func run(imm counter: Ref(int, true)) int
+        \\fallible materialize(init item: int) int -> return item
+        \\fallible run(imm counter: Ref(int, true)) int
         \\    var source = Pair{first = Item{counter = counter, weight = 10}, second = Item{counter = counter, weight = 15}}
         \\    const unused = materialize(materialize(if 1 == 1
         \\        take(source.first^)
         \\        source.first = Item{counter = counter, weight = 2}
-        \\        return 42
+        \\        42
         \\    else 0))
         \\    return unused
-        \\func run_root(imm counter: Ref(int, true)) int
+        \\fallible run_root(imm counter: Ref(int, true)) int
         \\    var source = Item{counter = counter, weight = 10}
         \\    const unused = materialize(materialize(if 1 == 1
         \\        take(source^)
         \\        source = Item{counter = counter, weight = 5}
-        \\        return 42
+        \\        42
         \\    else 0))
         \\    return unused
         \\fallible calculate() int
@@ -10232,53 +10349,53 @@ test "init lexical restored roots and fields clean once after nested returns" {
     , 42);
 }
 
-test "init lexical mutable copyback occurs in every forwarding frame" {
+test "init capture mutable copyback occurs in every forwarding frame" {
     try Fixture.expectSourceExit(
-        \\func materialize(mut value: int, init item: int) int
+        \\fallible materialize(mut value: int, init item: int) int
         \\    value = value + 1
         \\    return item
-        \\func forward(mut value: int, init item: int) int
+        \\fallible forward(mut value: int, init item: int) int
         \\    value = value + 1
         \\    return materialize(value, item)
-        \\func run(mut value: int) int
-        \\    return forward(value, if 1 == 1 -> return 40 else 0)
-        \\func calculate() int
+        \\fallible run(mut value: int) int
+        \\    return forward(value, 40)
+        \\fallible calculate() int
         \\    var value = 0
         \\    const result = run(value)
         \\    return result + value
-        \\static answer = calculate()
-        \\exit(calculate() + answer - 42)
+        \\static answer = if const computed = calculate() -> computed else 97
+        \\if const status = calculate() -> exit(status + answer - 42) else exit(97)
     , 42);
 }
 
-test "init lexical consuming breaks select captured or fresh caller owned storage" {
-    try Fixture.expectSourceExit(
+test "init lexical rejects caller consuming breaks selecting captured or fresh storage" {
+    try Fixture.expectSourceDiagnostic(
         \\struct Pinned
         \\    value: int
         \\    move = none
         \\    copy = none
         \\func produce() Pinned -> return Pinned{value = 42}
-        \\func materialize(init item: int) int -> return item
+        \\fallible materialize(init item: int) int -> return item
         \\func consume(deinit item: Pinned) int -> return item.value
-        \\func run(imm choose: bool) int
+        \\fallible run(imm choose: bool) int
         \\    const source = Pinned{value = 42}
         \\    return consume(loop
         \\        const unused = materialize(if 1 == 1 -> break (if choose == true -> source else produce()) else 0)
         \\        break Pinned{value = 99}
         \\    )
-        \\static answer = run(true) + run(false)
-        \\exit(run(true) + run(false) + answer - 126)
-    , 42);
+        \\static answer = if const computed = run(true) -> if const additional_computed = run(false) -> computed + additional_computed else 97 else 97
+        \\if const status = run(true) -> if const additional_status = run(false) -> exit(status + additional_status + answer - 126) else exit(97) else exit(97)
+    , .initializer_exit_outside_boundary);
 }
 
-test "init lexical region local consuming results relocate only when movable" {
-    try Fixture.expectSourceExit(
+test "init lexical rejects caller consuming breaks for movable and immovable region locals" {
+    try Fixture.expectSourceDiagnostic(
         \\struct Item
         \\    value: int
         \\    move = trivial
-        \\func materialize(init item: int) int -> return item
+        \\fallible materialize(init item: int) int -> return item
         \\func consume(deinit item: Item) int -> return item.value
-        \\func run() int
+        \\fallible run() int
         \\    return consume(loop
         \\        const unused = materialize(if 1 == 1
         \\            const local = Item{value = 42}
@@ -10286,17 +10403,17 @@ test "init lexical region local consuming results relocate only when movable" {
         \\        else 0)
         \\        break Item{value = 99}
         \\    )
-        \\static answer = run()
-        \\exit(run() + answer - 42)
-    , 42);
+        \\static answer = if const computed = run() -> computed else 97
+        \\if const status = run() -> exit(status + answer - 42) else exit(97)
+    , .initializer_exit_outside_boundary);
     try Fixture.expectSourceDiagnostic(
         \\struct Pinned
         \\    value: int
         \\    move = none
         \\    copy = none
-        \\func materialize(init item: int) int -> return item
+        \\fallible materialize(init item: int) int -> return item
         \\func consume(deinit item: Pinned) int -> return item.value
-        \\func run() int
+        \\fallible run() int
         \\    return consume(loop
         \\        const unused = materialize(if 1 == 1
         \\            const local = Pinned{value = 42}
@@ -10304,14 +10421,14 @@ test "init lexical region local consuming results relocate only when movable" {
         \\        else 0)
         \\        break Pinned{value = 99}
         \\    )
-        \\exit(run())
-    , .type_not_movable);
+        \\if const status = run() -> exit(status) else exit(97)
+    , .initializer_exit_outside_boundary);
 }
 
-test "init lexical nested pending handles retain caller exits through regions" {
+test "init checkpoint nested pending handles preserve ordinary construction" {
     try Fixture.expectSourceExit(
-        \\func materialize(init item: int) int -> return item
-        \\func wrap(init item: int) int
+        \\fallible materialize(init item: int) int -> return item
+        \\fallible wrap(init item: int) int
         \\    return materialize(if 1 == 1
         \\        const result = item
         \\        result
@@ -10319,21 +10436,20 @@ test "init lexical nested pending handles retain caller exits through regions" {
         \\        const result = item
         \\        result
         \\    )
-        \\func pair(init first: int, init second: int) int
+        \\fallible pair(init first: int, init second: int) int
         \\    const left = materialize(wrap(first))
         \\    const right = materialize(wrap(second))
         \\    return left + right
-        \\func run() int
-        \\    const unused = wrap(if 1 == 1 -> return 42 else 0)
-        \\    return unused + 100
-        \\static answer = run()
-        \\static ordinary = pair(20, 22)
-        \\exit(run() + answer + pair(20, 22) + ordinary - 126)
+        \\fallible run() int
+        \\    return wrap(42)
+        \\static answer = if const computed = run() -> computed else 97
+        \\static ordinary = if const computed = pair(20, 22) -> computed else 97
+        \\if const status = run() -> if const additional_status = pair(20, 22) -> exit(status + answer + additional_status + ordinary - 126) else exit(97) else exit(97)
     , 42);
 }
 
-test "init lexical consuming explicit moves construct caller storage with parity" {
-    try Fixture.expectSourceExit(
+test "init lexical rejects caller consuming breaks with explicit root or field moves" {
+    try Fixture.expectSourceDiagnostic(
         \\struct Item
         \\    value: int
         \\    move = func(deinit self: Item) Item -> return Item{value = self.value}
@@ -10341,48 +10457,48 @@ test "init lexical consuming explicit moves construct caller storage with parity
         \\struct Pair
         \\    item: Item
         \\    other: int
-        \\func materialize(init item: int) int -> return item
+        \\fallible materialize(init item: int) int -> return item
         \\func consume(deinit item: Item) int -> return item.value
-        \\func pick(deinit pair: Pair, imm root: bool) int
+        \\fallible pick(deinit pair: Pair, imm root: bool) int
         \\    const source = Item{value = 42}
         \\    return consume(loop
         \\        const unused = materialize(if 1 == 1 -> break (if root == true -> source^ else pair.item^) else 0)
         \\        break Item{value = 99}
         \\    )
-        \\func run(imm root: bool) int -> return pick(Pair{item = Item{value = 42}, other = 0}, root)
-        \\static answer = run(true) + run(false)
-        \\exit(run(true) + run(false) + answer - 126)
-    , 42);
+        \\fallible run(imm root: bool) int -> return pick(Pair{item = Item{value = 42}, other = 0}, root)
+        \\static answer = if const computed = run(true) -> if const additional_computed = run(false) -> computed + additional_computed else 97 else 97
+        \\if const status = run(true) -> if const additional_status = run(false) -> exit(status + additional_status + answer - 126) else exit(97) else exit(97)
+    , .initializer_exit_outside_boundary);
 }
 
-test "init lexical exits while evaluating exit payloads retain their own destinations" {
-    try Fixture.expectSourceExit(
-        \\func materialize(init item: int) int -> return item
-        \\func run() int
+test "init lexical rejects nested exits while evaluating caller exit payloads" {
+    try Fixture.expectSourceDiagnostic(
+        \\fallible materialize(init item: int) int -> return item
+        \\fallible run() int
         \\    const unused = materialize(if 1 == 1 -> return (if 1 == 1 -> return 42 else return 42) else 0)
         \\    return unused + 100
-        \\func loop_result() int
+        \\fallible loop_result() int
         \\    return loop
         \\        const unused = materialize(if 1 == 1 -> break (if 1 == 1 -> break 42 else break 42) else 0)
         \\        break unused + 100
-        \\static answer = run() + loop_result()
-        \\exit(run() + loop_result() + answer - 126)
-    , 42);
+        \\static answer = if const computed = run() -> if const additional_computed = loop_result() -> computed + additional_computed else 97 else 97
+        \\if const status = run() -> if const additional_status = loop_result() -> exit(status + additional_status + answer - 126) else exit(97) else exit(97)
+    , .initializer_exit_outside_boundary);
 }
 
 test "init lexical nested handle captures retain single use obligations" {
     try Fixture.expectSourceDiagnostic(
-        \\func materialize(init item: int) int -> return item
-        \\func wrap(init item: int) int
+        \\fallible materialize(init item: int) int -> return item
+        \\fallible wrap(init item: int) int
         \\    const first = materialize(materialize(item))
         \\    return materialize(item)
-        \\exit(wrap(42))
+        \\if const status = wrap(42) -> exit(status) else exit(97)
     , .initializer_already_consumed);
     try Fixture.expectSourceDiagnostic(
-        \\func materialize(init item: int) int -> return item
-        \\func wrap(imm choose: bool, init item: int) int
+        \\fallible materialize(init item: int) int -> return item
+        \\fallible wrap(imm choose: bool, init item: int) int
         \\    return materialize(if choose == true -> materialize(item) else 42)
-        \\exit(wrap(true, 42))
+        \\if const status = wrap(true, 42) -> exit(status) else exit(97)
     , .initializer_not_consumed);
 }
 
@@ -10391,44 +10507,44 @@ test "init checkpoint keeps static parameter cleanup in the caller" {
         \\struct Marker
         \\    value: int
         \\    drop = func(deinit self: Marker) -> exit(99)
-        \\func materialize(init item: int) int -> return item
+        \\fallible materialize(init item: int) int -> return item
         \\func stop() int -> exit(42)
-        \\func run(static marker: Marker) int
+        \\fallible run(static marker: Marker) int
         \\    return materialize(if marker.value == 0 -> stop() else 0)
-        \\exit(run(Marker{value = 0}))
+        \\if const status = run(Marker{value = 0}) -> exit(status) else exit(97)
     , 42);
 }
 
 test "init checkpoint preserves mutable copy back and finite forwarding recursion" {
     try Fixture.expectSourceExit(
-        \\func receive(mut count: int, init item: int) int
+        \\fallible receive(mut count: int, init item: int) int
         \\    count += 1
         \\    const value = item
         \\    return value + count
-        \\func walk(init item: int, imm depth: int) int
+        \\fallible walk(init item: int, imm depth: int) int
         \\    if depth == 0 -> return item
         \\    return walk(item, depth - 1)
-        \\func run() int
+        \\fallible run() int
         \\    var count = 0
         \\    const value = receive(count, walk(40, 3))
         \\    return value + count
-        \\static answer = run()
-        \\exit(run() + answer - 42)
+        \\static answer = if const computed = run() -> computed else 97
+        \\if const status = run() -> exit(status + answer - 42) else exit(97)
     , 42);
 }
 
 test "init checkpoint handles zero sized and diverging construction" {
     const sources = [_][]const u8{
-        \\func materialize(init item: unit) unit -> return item
-        \\func run() int
+        \\fallible materialize(init item: unit) unit -> return item
+        \\fallible run() int
         \\    const value = materialize(unit)
         \\    return 42
-        \\static answer = run()
+        \\static answer = if const computed = run() -> computed else 97
         \\exit(answer)
         ,
-        \\func materialize(init item: never) int -> return item
+        \\fallible materialize(init item: never) int -> return item
         \\func stop() never -> exit(42)
-        \\exit(materialize(stop()))
+        \\if const status = materialize(stop()) -> exit(status) else exit(97)
     };
     for (sources) |source| {
         try Fixture.expectSourceExit(source, 42);
@@ -10441,9 +10557,9 @@ test "init inference analyzes blocks loops and unreachable branch results" {
         \\    value: int
         \\    move = none
         \\    copy = none
-        \\func materialize(static T: type, init item: T) T -> return item
+        \\fallible materialize(static T: type, init item: T) T -> return item
         \\func stop() never -> exit(99)
-        \\func run(imm flag: int) int
+        \\fallible run(imm flag: int) int
         \\    const value = materialize(if flag == 1
         \\        var first = 20
         \\        const second = materialize(loop -> break first + 1)
@@ -10453,8 +10569,8 @@ test "init inference analyzes blocks loops and unreachable branch results" {
         \\        Pinned{value = 0}.missing
         \\    )
         \\    return value.value
-        \\static answer = run(1)
-        \\exit(run(1) + answer)
+        \\static answer = if const computed = run(1) -> computed else 97
+        \\if const status = run(1) -> exit(status + answer) else exit(97)
     , 42);
 }
 
@@ -10464,17 +10580,17 @@ test "init inference determines fresh immovable variants before selecting storag
         \\    value: int
         \\    move = none
         \\    copy = none
-        \\func materialize(static T: type, init item: T) T -> return item
-        \\func choose(imm flag: int) int
+        \\fallible materialize(static T: type, init item: T) T -> return item
+        \\fallible choose(imm flag: int) int
         \\    const value = materialize(if flag == 1 -> Pinned{value = 21} else none)
         \\    if value is Pinned -> return 21 else return 0
-        \\func leave(imm flag: int) int
+        \\fallible leave(imm flag: int) int
         \\    const value = materialize(loop
         \\        if flag == 1 -> break Pinned{value = 21} else break none
         \\    )
         \\    if value is Pinned -> return 21 else return 0
-        \\static answer = choose(1) + leave(1)
-        \\exit(choose(0) + leave(0) + answer)
+        \\static answer = if const computed = choose(1) -> if const additional_computed = leave(1) -> computed + additional_computed else 97 else 97
+        \\if const status = choose(0) -> if const additional_status = leave(0) -> exit(status + additional_status + answer) else exit(97) else exit(97)
     , 42);
 }
 
@@ -10482,17 +10598,19 @@ fn checkInitializerAllocations(gpa: std.mem.Allocator) !void {
     const db = try query.Database.init(gpa, .{ .worker_count = 1 });
     defer db.deinit();
     try modules.registerSources(db, gpa,
-        \\func materialize(static T: type, init item: T) T -> return item
-        \\func forward(init item: int) int -> return materialize(item)
-        \\func run(imm input: int) int
+        \\fallible materialize(static T: type, init item: T) T -> return item
+        \\fallible forward(init item: int) int -> return materialize(item)
+        \\fallible run(imm input: int) int
         \\    const unused = 0
         \\    const captured = input + 1
         \\    return forward(materialize(loop -> break captured))
-        \\static answer = run(41)
+        \\static answer = if const computed = run(41) -> computed else 97
         \\fallible run_box() int
         \\    const owner = Box.new(42)
         \\    return materialize(owner.borrow()[])
-        \\if const boxed = run_box() -> exit(run(41) + answer + boxed - 84) else exit(1)
+        \\if const boxed = run_box()
+        \\    if const result = run(41) -> exit(result + answer + boxed - 84) else exit(1)
+        \\else exit(1)
     , &.{}, &.{});
     try testing.expect((try db.get(queries.BuildExecutable, 0)).* != null);
 }
@@ -10506,14 +10624,14 @@ test "init failure propagates through ordinary generic and indirect consumers" {
         \\fallible produce(imm flag: int) int
         \\    flag == 1
         \\    return 21
-        \\func materialize(static T: type, init item: T) T -> return item
-        \\func forward(init item: int) int -> return materialize(item)
-        \\func invoke(imm callback: func(init int) int, init item: int) int -> return callback(item)
-        \\func run(imm flag: int) int
+        \\fallible materialize(static T: type, init item: T) T -> return item
+        \\fallible forward(init item: int) int -> return materialize(item)
+        \\fallible invoke(imm callback: fallible(init int) int, init item: int) int -> return callback(item)
+        \\fallible run(imm flag: int) int
         \\    if const value = invoke(forward, produce(flag)) -> return value
         \\    return 0
-        \\static answer = run(1) + run(0)
-        \\exit(run(1) + run(0) + answer)
+        \\static answer = if const computed = run(1) -> if const additional_computed = run(0) -> computed + additional_computed else 97 else 97
+        \\if const status = run(1) -> if const additional_status = run(0) -> exit(status + additional_status + answer) else exit(97) else exit(97)
     , 42);
 }
 
@@ -10529,26 +10647,26 @@ test "init failure cleans partial construction before the receiving frame" {
         \\    drop = func(deinit self: Pair) -> exit(99)
         \\struct Guard
         \\    drop = func(deinit self: Guard) -> exit(98)
-        \\fallible fail() int
+        \\fallible fail_value() int
         \\    1 == 0
         \\    return 0
-        \\func materialize(init item: Pair) int
+        \\fallible materialize(init item: Pair) int
         \\    const guard = Guard{}
         \\    const value = item
         \\    _ = guard
         \\    return value.second
-        \\if const value = materialize(Pair{first = Field{value = 1}, second = fail()}) -> exit(1)
+        \\if const value = materialize(Pair{first = Field{value = 1}, second = fail_value()}) -> exit(1)
         \\exit(2)
     , 42);
 }
 
 test "init failure permission does not authorize ordinary fallible statements" {
     try Fixture.expectSourceDiagnostic(
-        \\fallible fail() int
+        \\fallible fail_value() int
         \\    1 == 0
         \\    return 0
         \\func materialize(init item: int) int
-        \\    const unexpected = fail()
+        \\    const unexpected = fail_value()
         \\    return item
         \\exit(materialize(42))
     , .fallible_expression_outside_fallible_function);
@@ -10563,18 +10681,18 @@ test "init failure preserves final storage and mutable copy back" {
         \\fallible produce(imm flag: int) Pinned
         \\    flag == 1
         \\    return Pinned{value = 21}
-        \\func materialize(static T: type, init item: T) T -> return item
-        \\func receive(mut count: int, init item: Pinned) int
+        \\fallible materialize(static T: type, init item: T) T -> return item
+        \\fallible receive(mut count: int, init item: Pinned) int
         \\    count += 1
         \\    const value = materialize(item)
         \\    return value.value
-        \\func run() int
+        \\fallible run() int
         \\    var count = 0
         \\    if const unused = receive(count, produce(0)) -> return 99
         \\    if const value = receive(count, produce(1)) -> return value + count - 2
         \\    return 98
-        \\static answer = run()
-        \\exit(run() + answer)
+        \\static answer = if const computed = run() -> computed else 97
+        \\if const status = run() -> exit(status + answer) else exit(97)
     , 42);
 }
 
@@ -10584,11 +10702,11 @@ test "init failure still permits skipped construction on earlier consumer failur
         \\fallible skip(init item: int) int
         \\    1 == 0
         \\    return item
-        \\func run() int
+        \\fallible run() int
         \\    if const value = skip(unwanted()) -> return value
         \\    return 42
-        \\static answer = run()
-        \\exit(run() + answer - 42)
+        \\static answer = if const computed = run() -> computed else 97
+        \\if const status = run() -> exit(status + answer - 42) else exit(97)
     , 42);
 }
 
@@ -10602,14 +10720,14 @@ test "init failure partial cleanup has compile time parity" {
         \\    first: Field
         \\    second: int
         \\    drop = func(deinit self: Pair) -> exit(99)
-        \\fallible fail() int
+        \\fallible fail_value() int
         \\    1 == 0
         \\    return 0
-        \\func materialize(init item: Pair) Pair -> return item
-        \\func run() int
-        \\    if const value = materialize(Pair{first = Field{value = 1}, second = fail()}) -> return value.second
+        \\fallible materialize(init item: Pair) Pair -> return item
+        \\fallible run() int
+        \\    if const value = materialize(Pair{first = Field{value = 1}, second = fail_value()}) -> return value.second
         \\    return 98
-        \\static stopped = run()
+        \\static stopped = if const computed = run() -> computed else 97
     , &.{});
     defer f.deinit();
     const item = (try f.db.get(queries.BuildModuleScope, 0)).*.?.resolveStatic("stopped").?;
@@ -10624,7 +10742,7 @@ test "init failure edits recompute the caller while retaining the consumer" {
         \\fallible produce(imm flag: int) int
         \\    flag == 1
         \\    return 21
-        \\func materialize(init item: int) int -> return item
+        \\fallible materialize(init item: int) int -> return item
         \\fallible run(imm flag: int) int
         \\    return materialize(if const value = produce(flag) -> value else 0)
         \\func observe() int
@@ -10677,7 +10795,7 @@ test "init captures reject reference writes and implicit cleanup across eager ar
             \\func change(imm reference: Ref(int, true)) int
             \\    reference[] = 7
             \\    return 0
-            \\func receive(init item: int, imm eager: int) int -> return item
+            \\fallible receive(init item: int, imm eager: int) int -> return item
             \\fallible run() int
             \\    var owner = Box.new(42)
             \\    const reference = owner.borrow_mut()
@@ -10691,8 +10809,8 @@ test "init captures reject reference writes and implicit cleanup across eager ar
 
 test "init captures read owned storage through checked internal references" {
     try Fixture.expectSourceExit(
-        \\func receive(init item: int) int -> return item
-        \\func read_parameter(imm owner: Box(int)) int -> return receive(owner.borrow()[])
+        \\fallible receive(init item: int) int -> return item
+        \\fallible read_parameter(imm owner: Box(int)) int -> return receive(owner.borrow()[])
         \\fallible run() int
         \\    const owner = Box.new(42)
         \\    return receive(owner.borrow()[]) + read_parameter(owner) - 42
@@ -10702,24 +10820,24 @@ test "init captures read owned storage through checked internal references" {
 
 test "init failure handles unit and never outcomes" {
     const sources = [_][]const u8{
-        \\fallible fail() unit
+        \\fallible fail_value() unit
         \\    1 == 0
-        \\func materialize(init item: unit) unit -> return item
-        \\func run() int
-        \\    if materialize(fail()) -> return 99
+        \\fallible materialize(init item: unit) unit -> return item
+        \\fallible run() int
+        \\    if materialize(fail_value()) -> return 99
         \\    return 42
-        \\static answer = run()
-        \\exit(run() + answer - 42)
+        \\static answer = if const computed = run() -> computed else 97
+        \\if const status = run() -> exit(status + answer - 42) else exit(97)
         ,
-        \\fallible fail() never
+        \\fallible fail_value() never
         \\    1 == 0
         \\    exit(99)
-        \\func materialize(init item: never) int -> return item
-        \\func run() int
-        \\    if materialize(fail()) -> return 98
+        \\fallible materialize(init item: never) int -> return item
+        \\fallible run() int
+        \\    if materialize(fail_value()) -> return 98
         \\    return 42
-        \\static answer = run()
-        \\exit(run() + answer - 42)
+        \\static answer = if const computed = run() -> computed else 97
+        \\if const status = run() -> exit(status + answer - 42) else exit(97)
     };
     for (sources) |source| {
         try Fixture.expectSourceExit(source, 42);
@@ -10732,7 +10850,7 @@ test "init captures allow unrelated reference effects and writes after construct
         \\    target: Ref(int, true)
         \\    drop = func(deinit self: Guard)
         \\        self.target[] = 7
-        \\func receive(init item: int, imm eager: int) int -> return item
+        \\fallible receive(init item: int, imm eager: int) int -> return item
         \\fallible run() int
         \\    var owner = Box.new(42)
         \\    var other = Box.new(0)
@@ -10750,32 +10868,32 @@ test "init captures allow unrelated reference effects and writes after construct
 
 test "init comptime cycle checks recognize fresh environments with the same values" {
     try Fixture.expectSourceDiagnostic(
-        \\func repeat(init item: int) int
+        \\fallible repeat(init item: int) int
         \\    const value = item
         \\    return repeat(value)
-        \\static answer = repeat(42)
+        \\static answer = if const computed = repeat(42) -> computed else 97
         \\exit(answer)
     , .compile_time_call_cycle);
 }
 
 test "init comptime cycle checks permit fresh environments with changing values" {
     try Fixture.expectSourceExit(
-        \\func walk(init item: int) int
+        \\fallible walk(init item: int) int
         \\    const value = item
         \\    if value == 0 -> return 42
         \\    return walk(value - 1)
-        \\static answer = walk(3)
-        \\exit(walk(3) + answer - 42)
+        \\static answer = if const computed = walk(3) -> computed else 97
+        \\if const status = walk(3) -> exit(status + answer - 42) else exit(97)
     , 42);
 }
 
 test "init comptime cycle checks detect repeated nested wrapped captures" {
     try Fixture.expectSourceDiagnostic(
-        \\func materialize(init item: int) int -> return item
-        \\func repeat(imm depth: int, init item: int) int
+        \\fallible materialize(init item: int) int -> return item
+        \\fallible repeat(imm depth: int, init item: int) int
         \\    if depth == 0 -> return repeat(depth, item)
         \\    return repeat(depth - 1, materialize(item))
-        \\static answer = repeat(3, 42)
+        \\static answer = if const computed = repeat(3, 42) -> computed else 97
         \\exit(answer)
     , .compile_time_call_cycle);
 }
@@ -10786,9 +10904,9 @@ test "init comptime cycle checks compare fresh aggregate inputs by value" {
         \\    first: int
         \\    second: int
         \\    third: int
-        \\func repeat(init item: int, imm state: State) int
+        \\fallible repeat(init item: int, imm state: State) int
         \\    return repeat(item, State{first = state.first, second = state.second, third = state.third})
-        \\static answer = repeat(42, State{first = 1, second = 2, third = 3})
+        \\static answer = if const computed = repeat(42, State{first = 1, second = 2, third = 3}) -> computed else 97
         \\exit(answer)
     , .compile_time_call_cycle);
 }
@@ -10799,15 +10917,15 @@ test "init comptime cycle checks snapshot changing mutable aggregate inputs" {
         \\    remaining: int
         \\    second: int
         \\    third: int
-        \\func walk(mut state: State, init item: int) int
+        \\fallible walk(mut state: State, init item: int) int
         \\    if state.remaining == 0 -> return item
         \\    state.remaining -= 1
         \\    return walk(state, item)
-        \\func run() int
+        \\fallible run() int
         \\    var state = State{remaining = 3, second = 0, third = 0}
         \\    return walk(state, 42) + state.remaining
-        \\static answer = run()
-        \\exit(run() + answer - 42)
+        \\static answer = if const computed = run() -> computed else 97
+        \\if const status = run() -> exit(status + answer - 42) else exit(97)
     , 42);
 }
 
@@ -10824,12 +10942,12 @@ test "init inference supports deeply nested generic immovable construction" {
         \\    value: int
         \\    move = none
         \\    copy = none
-        \\func materialize(static T: type, init item: T) T -> return item
-        \\func run() int
+        \\fallible materialize(static T: type, init item: T) T -> return item
+        \\fallible run() int
         \\    const value = $expression
         \\    return value.value
-        \\static answer = run()
-        \\exit(run() + answer)
+        \\static answer = if const computed = run() -> computed else 97
+        \\if const status = run() -> exit(status + answer) else exit(97)
     , .{ .expression = expression });
     defer testing.allocator.free(source);
     try Fixture.expectSourceExit(source, 42);
@@ -10840,8 +10958,8 @@ test "init captures reject possibly aliased borrowed parameters" {
         \\func change(imm reference: Ref(int, true)) int
         \\    reference[] = 7
         \\    return 0
-        \\func receive(init item: int, imm eager: int) int -> return item
-        \\func relay(imm owner: Box(int), imm reference: Ref(int, true)) int
+        \\fallible receive(init item: int, imm eager: int) int -> return item
+        \\fallible relay(imm owner: Box(int), imm reference: Ref(int, true)) int
         \\    return receive(owner.borrow()[], change(reference))
         \\fallible run() int
         \\    var owner = Box.new(42)
@@ -10857,8 +10975,8 @@ test "init captures reject cleanup through possibly aliased borrowed parameters"
         \\    target: Ref(int, true)
         \\    drop = func(deinit self: Guard)
         \\        self.target[] = 7
-        \\func receive(init item: int, imm eager: int) int -> return item
-        \\func relay(imm owner: Box(int), imm reference: Ref(int, true)) int
+        \\fallible receive(init item: int, imm eager: int) int -> return item
+        \\fallible relay(imm owner: Box(int), imm reference: Ref(int, true)) int
         \\    return receive(owner.borrow()[], if 1 == 1
         \\        const guard = Guard{target = reference}
         \\        0
@@ -10876,8 +10994,8 @@ test "init captures permit scalar parameter copies beside reference writes" {
         \\func change(imm reference: Ref(int, true)) int
         \\    reference[] = 7
         \\    return 0
-        \\func receive(init item: int, imm eager: int) int -> return item
-        \\func relay(imm value: int, imm reference: Ref(int, true)) int
+        \\fallible receive(init item: int, imm eager: int) int -> return item
+        \\fallible relay(imm value: int, imm reference: Ref(int, true)) int
         \\    return receive(value, change(reference))
         \\fallible run() int
         \\    var owner = Box.new(42)
@@ -10894,14 +11012,14 @@ test "init captures preserve booleans callables and aggregate storage" {
         \\    second: int
         \\    third: int
         \\func increment(imm value: int) int -> return value + 1
-        \\func materialize(static T: type, init item: T) T -> return item
-        \\func run(imm flag: bool, imm callback: func(int) int) int
+        \\fallible materialize(static T: type, init item: T) T -> return item
+        \\fallible run(imm flag: bool, imm callback: func(int) int) int
         \\    const payload = Payload{first = 20, second = 21, third = 1}
         \\    const saved = materialize(callback)
         \\    const stable = materialize(flag)
         \\    return materialize(if stable == true -> saved(payload.first + payload.second) else 0)
-        \\static answer = run(true, increment)
-        \\exit(run(true, increment) + run(false, increment) + answer - 42)
+        \\static answer = if const computed = run(true, increment) -> computed else 97
+        \\if const status = run(true, increment) -> if const additional_status = run(false, increment) -> exit(status + additional_status + answer - 42) else exit(97) else exit(97)
     , 42);
 }
 
@@ -10922,20 +11040,20 @@ test "init handled failure preserves guarded root and field cleanup on receiver 
             \\struct Pair
             \\    first: Item
             \\    second: Item
-            \\fallible fail() never
+            \\fallible fail_value() never
             \\    1 == 0
             \\    exit(99)
-            \\func materialize(init item: int) int -> return item
-            \\func forward(init item: int) int -> return materialize(item)
-            \\func receive(init item: int) int
+            \\fallible materialize(init item: int) int -> return item
+            \\fallible forward(init item: int) int -> return materialize(item)
+            \\fallible receive(init item: int) int
             \\    if const result = forward(item) -> return result else return 0
             \\fallible run(imm flag: bool) int
             \\    var counter = Box.new(0)
             \\    const source: $type_name = $initializer
-            \\    const callback: func(init int) int = receive
+            \\    const callback: fallible(init int) int = receive
             \\    if const result = callback(if flag == true
             \\        const moved = $transfer
-            \\        fail()
+            \\        fail_value()
             \\        0
             \\    else 0) -> () else return 99
             \\    return counter.borrow()[]
@@ -10958,20 +11076,20 @@ test "init handled failure cannot restore transferred capture access on receiver
         const source = try test_sources.renderTemplate(testing.allocator,
             \\struct Pair
             \\    first: int
-            \\fallible fail() never
+            \\fallible fail_value() never
             \\    1 == 0
             \\    exit(99)
-            \\func materialize(init item: int) int -> return item
-            \\func receive(init item: int) int
+            \\fallible materialize(init item: int) int -> return item
+            \\fallible receive(init item: int) int
             \\    if const result = materialize(item) -> return result else return 0
-            \\func run(imm flag: bool) int
+            \\fallible run(imm flag: bool) int
             \\    $binding
             \\    if const result = receive(if flag == true
             \\        const moved = $transfer
-            \\        fail()
+            \\        fail_value()
             \\        0
             \\    else 0) -> return $read + result else return 99
-            \\exit(run(true))
+            \\if const status = run(true) -> exit(status) else exit(97)
         , .{ .binding = binding, .transfer = transfer, .read = read });
         defer testing.allocator.free(source);
         try Fixture.expectSourceDiagnostic(source, .possibly_transferred);
@@ -10984,41 +11102,41 @@ test "init comptime cycle checks materialize aggregate and variant captures" {
         \\    value: int
         \\    move = none
         \\    copy = none
-        \\func walk(imm remaining: int, init item: int) int
+        \\fallible walk(imm remaining: int, init item: int) int
         \\    if remaining == 0 -> return item
         \\    return walk(remaining - 1, item)
-        \\func run() int
+        \\fallible run() int
         \\    const owner = Pinned{value = 42}
         \\    return walk(2, owner.value)
-        \\static answer = run()
-        \\exit(run() + answer - 42)
+        \\static answer = if const computed = run() -> computed else 97
+        \\if const status = run() -> exit(status + answer - 42) else exit(97)
         ,
         \\struct Pinned
         \\    value: int
         \\    move = none
         \\    copy = none
-        \\func walk(imm remaining: int, init item: int) int
+        \\fallible walk(imm remaining: int, init item: int) int
         \\    if remaining == 0 -> return item
         \\    return walk(remaining - 1, item)
-        \\func run() int
+        \\fallible run() int
         \\    const owner: Pinned | none = Pinned{value = 42}
         \\    return walk(2, if owner is Pinned -> 42 else 0)
-        \\static answer = run()
-        \\exit(run() + answer - 42)
+        \\static answer = if const computed = run() -> computed else 97
+        \\if const status = run() -> exit(status + answer - 42) else exit(97)
         ,
         \\struct Empty
         \\    move = none
         \\    copy = trivial
-        \\func walk(imm remaining: int, init item: Empty) int
+        \\fallible walk(imm remaining: int, init item: Empty) int
         \\    if remaining == 0
         \\        const value = item
         \\        return 42
         \\    return walk(remaining - 1, item)
-        \\func run() int
+        \\fallible run() int
         \\    const owner = Empty{}
         \\    return walk(2, owner)
-        \\static answer = run()
-        \\exit(run() + answer - 42)
+        \\static answer = if const computed = run() -> computed else 97
+        \\if const status = run() -> exit(status + answer - 42) else exit(97)
         ,
     };
     for (sources) |source| {
@@ -11032,11 +11150,11 @@ test "init comptime cycle checks diagnose cycles through aggregate captures" {
         \\    value: int
         \\    move = none
         \\    copy = none
-        \\func repeat(init item: int) int -> return repeat(item)
-        \\func run() int
+        \\fallible repeat(init item: int) int -> return repeat(item)
+        \\fallible run() int
         \\    const owner = Pinned{value = 42}
         \\    return repeat(owner.value)
-        \\static answer = run()
+        \\static answer = if const computed = run() -> computed else 97
         \\exit(answer)
     , .compile_time_call_cycle);
 }
@@ -11052,7 +11170,7 @@ test "init handled forwarding failure retains skipped capture cleanup on receive
         \\    construct == true
         \\    const value = item
         \\    return 0
-        \\func receive(init item: Item, imm construct: bool) int
+        \\fallible receive(init item: Item, imm construct: bool) int
         \\    if const result = forward(item, construct) -> return result else return 0
         \\fallible run(imm construct: bool) int
         \\    var counter = Box.new(0)
@@ -11072,13 +11190,13 @@ test "init handled forwarding failure leaves skipped and transferred access join
         \\fallible forward(init item: int, imm construct: bool) int
         \\    construct == true
         \\    return item
-        \\func receive(init item: int, imm construct: bool) int
+        \\fallible receive(init item: int, imm construct: bool) int
         \\    if const result = forward(item, construct) -> return result else return 0
-        \\func run(imm construct: bool) int
+        \\fallible run(imm construct: bool) int
         \\    const source = 42
         \\    const result = receive(source^, construct)
         \\    return source + result
-        \\exit(run(false))
+        \\if const status = run(false) -> exit(status) else exit(97)
     , .possibly_transferred);
 }
 
@@ -11090,4 +11208,260 @@ test "allocating init callable acquisition preserves field capability diagnostic
         \\const callback: fallible(init Item) Box(Item) = Box(Item).new
         \\exit(42)
     , .struct_ownership_property_incompatible_with_fields);
+}
+
+test "init milestone1 rejects caller exits across direct aliased forwarded and indirect boundaries" {
+    const cases = [_]struct { declaration: []const u8, setup: []const u8, call: []const u8 }{
+        .{ .declaration = "", .setup = "", .call = "materialize" },
+        .{ .declaration = "static alias = materialize", .setup = "", .call = "alias" },
+        .{ .declaration = "fallible forward(init item: int) int -> return materialize(item)", .setup = "", .call = "forward" },
+        .{ .declaration = "", .setup = "const callback: fallible(init int) int = materialize", .call = "callback" },
+    };
+    for (cases) |case| {
+        for ([_][]const u8{ "return 42", "break 42", "continue" }) |exit_statement| {
+            const source = try test_sources.renderTemplate(testing.allocator,
+                \\fallible materialize(init item: int) int -> return item
+                \\$declaration
+                \\fallible run() int
+                \\    $setup
+                \\    return loop
+                \\        const unused = $call(if 1 == 1 -> $exit_statement else 0)
+                \\        break 0
+                \\if const result = run() -> exit(result) else exit(99)
+            , .{ .declaration = case.declaration, .setup = case.setup, .call = case.call, .exit_statement = exit_statement });
+            defer testing.allocator.free(source);
+            errdefer std.debug.print("boundary case: {s}, {s}\n", .{ case.call, exit_statement });
+            try Fixture.expectSourceDiagnostic(source, .initializer_exit_outside_boundary);
+        }
+    }
+}
+
+test "init milestone1 ordinary eager caller exits remain valid across callable forms" {
+    const cases = [_]struct { declaration: []const u8, setup: []const u8, call: []const u8 }{
+        .{ .declaration = "", .setup = "", .call = "receive" },
+        .{ .declaration = "static alias = receive", .setup = "", .call = "alias" },
+        .{ .declaration = "fallible forward(init item: int, imm eager: int) int -> return receive(item, eager)", .setup = "", .call = "forward" },
+        .{ .declaration = "", .setup = "const callback: fallible(init int, int) int = receive", .call = "callback" },
+    };
+    for (cases) |case| {
+        for ([_][]const u8{ "return 42", "break 42", "continue" }) |exit_statement| {
+            const source = try test_sources.renderTemplate(testing.allocator,
+                \\func forbidden() int -> exit(99)
+                \\fallible receive(init item: int, imm eager: int) int
+                \\    const value = item
+                \\    return value + eager
+                \\$declaration
+                \\func run() int
+                \\    $setup
+                \\    var count = 0
+                \\    return loop
+                \\        if count == 1 -> break 42
+                \\        if const unused = $call(forbidden(), if 1 == 1
+                \\            count += 1
+                \\            $exit_statement
+                \\        else 0) -> break 98
+                \\        break 97
+                \\static answer = run()
+                \\exit(run() + answer - 42)
+            , .{ .declaration = case.declaration, .setup = case.setup, .call = case.call, .exit_statement = exit_statement });
+            defer testing.allocator.free(source);
+            errdefer std.debug.print("eager case: {s}, {s}\n", .{ case.call, exit_statement });
+            try Fixture.expectSourceExit(source, 42);
+        }
+    }
+}
+
+test "init milestone1 called producer returns and local nested loop exits remain valid" {
+    try Fixture.expectSourceExit(
+        \\func produce() int -> return 42
+        \\fallible materialize(init item: int) int -> return item
+        \\fallible forward(init item: int) int -> return materialize(item)
+        \\fallible run() int
+        \\    const producer: func() int = produce
+        \\    const callback: fallible(init int) int = forward
+        \\    return callback(loop
+        \\        var count = 0
+        \\        loop
+        \\            count += 1
+        \\            if count == 2 -> break
+        \\            continue
+        \\        break producer()
+        \\    )
+        \\static answer = if const result = run() -> result else 99
+        \\if const result = run() -> exit(result + answer - 42) else exit(98)
+    , 42);
+}
+
+test "init milestone1 explicit fail is handled and propagated with native and comptime parity" {
+    try Fixture.expectSourceExit(
+        \\fallible fail_value() int -> fail
+        \\fallible materialize(init item: int) int -> return item
+        \\fallible forward(init item: int) int -> return materialize(item)
+        \\fallible propagate() int -> return forward(fail_value())
+        \\func handled() int
+        \\    const callback: fallible(init int) int = forward
+        \\    if const unused = callback(if 1 == 1 -> fail else 0) -> return 99
+        \\    if const unused = propagate() -> return 98
+        \\    if const unused = fail_value() -> return 97
+        \\    return 42
+        \\static answer = handled()
+        \\exit(handled() + answer - 42)
+    , 42);
+}
+
+test "init milestone1 pending root and field consumption cleans exactly once on failure" {
+    const cases = [_]struct { binding: []const u8, place: []const u8 }{
+        .{ .binding = "const source = Item{counter = trace, weight = 42}", .place = "source" },
+        .{ .binding = "const source = Pair{first = Item{counter = trace, weight = 21}, second = Item{counter = trace, weight = 21}}", .place = "source.first" },
+    };
+    for (cases) |case| {
+        const source = try test_sources.renderTemplate(testing.allocator,
+            \\struct Item
+            \\    counter: Ref(int, true)
+            \\    weight: int
+            \\    copy = none
+            \\    drop = func(deinit self: Item)
+            \\        self.counter[] = self.counter[] + self.weight
+            \\struct Pair
+            \\    first: Item
+            \\    second: Item
+            \\func dispose(var item: Item) -> ()
+            \\func consume(deinit item: Item, imm eager: int) int
+            \\    const value = item.weight
+            \\    dispose(item^)
+            \\    return value + eager
+            \\fallible fail_value() int -> fail
+            \\fallible forward(init item: int) int -> return item
+            \\fallible receive(init item: int) int
+            \\    const value = forward(item)
+            \\    fail
+            \\func attempt(imm trace: Ref(int, true), imm complete: bool)
+            \\    $binding
+            \\    const callback: fallible(init int) int = receive
+            \\    if const unused = callback(consume($place, if complete == true -> 0 else fail_value())) -> exit(99)
+            \\fallible run(imm complete: bool) int
+            \\    var counter = Box.new(0)
+            \\    attempt(counter.borrow_mut(), complete)
+            \\    return counter.borrow()[]
+            \\if const first = run(false)
+            \\    if first == 42
+            \\        if const second = run(true) -> exit(second) else exit(98)
+            \\    else exit(first)
+            \\else exit(97)
+        , .{ .binding = case.binding, .place = case.place });
+        defer testing.allocator.free(source);
+        try Fixture.expectSourceExit(source, 42);
+    }
+}
+
+test "init milestone1 raw allocation failure destroys completed elements and releases both allocations" {
+    try Fixture.expectSourceExit(
+        \\import std.memory.{allocate, deallocate, unsafe_initialize, unsafe_destroy}
+        \\struct Item
+        \\    counter: Ref(int, true)
+        \\    weight: int
+        \\    move = none
+        \\    copy = none
+        \\    drop = func(deinit self: Item)
+        \\        self.counter[] = self.counter[] + self.weight
+        \\fallible fail_value() int -> fail
+        \\fallible attempt(imm trace: Ref(int, true))
+        \\    var separate = Box.new(0)
+        \\    var first = allocate(Item, 2)
+        \\    var second = if const storage = allocate(Item, 1) -> storage^
+        \\    else
+        \\        deallocate(Item, first^)
+        \\        fail
+        \\    if unsafe_initialize(Item, first, 0, Item{counter = trace, weight = 10}) -> ()
+        \\    else
+        \\        deallocate(Item, second^)
+        \\        deallocate(Item, first^)
+        \\        fail
+        \\    if unsafe_initialize(Item, second, 0, Item{counter = trace, weight = 20}) -> ()
+        \\    else
+        \\        unsafe_destroy(Item, first, 0)
+        \\        deallocate(Item, second^)
+        \\        deallocate(Item, first^)
+        \\        fail
+        \\    if unsafe_initialize(Item, first, 1, Item{counter = separate.borrow_mut(), weight = fail_value()})
+        \\        unsafe_destroy(Item, first, 1)
+        \\        unsafe_destroy(Item, second, 0)
+        \\        unsafe_destroy(Item, first, 0)
+        \\        deallocate(Item, second^)
+        \\        deallocate(Item, first^)
+        \\        _ = separate
+        \\        exit(99)
+        \\    unsafe_destroy(Item, second, 0)
+        \\    unsafe_destroy(Item, first, 0)
+        \\    deallocate(Item, second^)
+        \\    deallocate(Item, first^)
+        \\    _ = separate
+        \\    fail
+        \\fallible run() int
+        \\    var counter = Box.new(0)
+        \\    if attempt(counter.borrow_mut()) -> return 98
+        \\    return counter.borrow()[] + 12
+        \\if const result = run() -> exit(result) else exit(97)
+    , 42);
+}
+
+test "init milestone1 signature and forbidden exit edits recompute acceptance" {
+    const source =
+        \\func materialize(init item: int) int -> return item
+        \\fallible run() int -> return materialize(42)
+        \\if const result = run() -> exit(result) else exit(99)
+    ;
+    const fixture = try Fixture.init(source, &.{});
+    defer fixture.deinit();
+    try fixture.expectDiagnostic(0, .fallible_expression_outside_fallible_function);
+    const declared = try std.mem.replaceOwned(u8, testing.allocator, source, "func materialize", "fallible materialize");
+    defer testing.allocator.free(declared);
+    try fixture.db.setInput(queries.SourceText, 0, declared);
+    try fixture.expectExit(0, 42);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectDiagnostic(0, .fallible_expression_outside_fallible_function);
+    for ([_][]const u8{ "return 42", "break 42", "continue" }) |exit_statement| {
+        const forbidden = try test_sources.renderTemplate(testing.allocator,
+            \\fallible materialize(init item: int) int -> return item
+            \\fallible run() int
+            \\    return loop
+            \\        const value = materialize(if 1 == 1 -> $exit_statement else 0)
+            \\        break value
+            \\if const result = run() -> exit(result) else exit(99)
+        , .{ .exit_statement = exit_statement });
+        defer testing.allocator.free(forbidden);
+        try fixture.db.setInput(queries.SourceText, 0, forbidden);
+        try fixture.expectDiagnostic(0, .initializer_exit_outside_boundary);
+        const expression = try std.fmt.allocPrint(testing.allocator, "if 1 == 1 -> {s} else 0", .{exit_statement});
+        defer testing.allocator.free(expression);
+        const allowed = try std.mem.replaceOwned(u8, testing.allocator, forbidden, expression, "42");
+        defer testing.allocator.free(allowed);
+        try fixture.db.setInput(queries.SourceText, 0, allowed);
+        try fixture.expectExit(0, 42);
+    }
+}
+
+test "init milestone1 ownership hooks cannot consume potentially failing initializers" {
+    const cases = [_]struct { hook: []const u8, parameter: []const u8, result: []const u8, body: []const u8, operation: []const u8 }{
+        .{ .hook = "copy", .parameter = "imm", .result = " Item", .body = "return Item{value = constructed}", .operation = "const copied = source\n    return copied.value" },
+        .{ .hook = "move", .parameter = "deinit", .result = " Item", .body = "return Item{value = constructed}", .operation = "const moved = source^\n    return moved.value" },
+        .{ .hook = "drop", .parameter = "deinit", .result = "", .body = "_ = constructed", .operation = "return 42" },
+    };
+    for (cases) |case| {
+        const source = try test_sources.renderTemplate(testing.allocator,
+            \\fallible materialize(init item: int) int -> return item
+            \\struct Item
+            \\    value: int
+            \\    $hook = func($parameter self: Item)$result
+            \\        const constructed = materialize(42)
+            \\        $body
+            \\func run() int
+            \\    const source = Item{value = 42}
+            \\    $operation
+            \\exit(run())
+        , .{ .hook = case.hook, .parameter = case.parameter, .result = case.result, .body = case.body, .operation = case.operation });
+        defer testing.allocator.free(source);
+        errdefer std.debug.print("ownership hook: {s}\n", .{case.hook});
+        try Fixture.expectSourceDiagnostic(source, .fallible_expression_outside_fallible_function);
+    }
 }

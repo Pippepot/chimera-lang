@@ -29,24 +29,32 @@
 - Nonescaping `init` parameters construct or forward exactly once on successful
   paths through direct, generic, and indirect calls. Complete expression inference,
   immovable destinations, captured writes, guarded root/field transfers, and
-  caller-directed return, break, and continue work in native execution and the
-  interpreter's scalar/aggregate subset. Source failure can skip construction;
-  writes survive failure and partial fields clean before receiving frames unwind.
+  ordinary success/failure work in native execution and the interpreter's
+  scalar/aggregate subset. All consumption into a destination is potentially
+  fallible, including for literals; `func` cannot acquire hidden failure.
+  Initializers reject caller-directed return, break, and continue while permitting
+  local loop exits. Bare `fail` propagates ordinary failure from fallible
+  functions and initializer regions. Failure can skip construction; writes and
+  completed transfers survive it, and partial fields clean before receiving frames unwind.
   Native checked references cross forwarding; general compile-time reference and
   allocation execution remains unsupported. Query/cache reuse and incremental
-  edits cover modes, effects, ownership capabilities, and lexical exits.
+  edits account for modes, effects, ownership capabilities, boundaries, and fallibility.
   Box construction and raw slot initialization are ordinary init consumers,
   including aliases and callable values.
 - Ownership tracks root and supported field transfers, borrowed and owned parameters, mutable copy-back, inferred `Ref` origins, and path-sensitive ASAP cleanup. `deinit` consumes owned roots and fields in place, including conditional and loop selections, constructs fresh arguments in call-lived storage, rejects borrowed sources, and lets custom move hooks transfer fields. Storage joins retain addresses independently of movability. Unfinished sources clean up remaining automatic fields without waiving explicit-field obligations. Later argument failure, contained reference origins, runtime and compile-time execution, and parameter-mode and movability edits across query/cache reuse are covered. The internal calling convention derives direct or address-passed arguments from ownership capabilities and consuming access; codegen owns physical argument layout. `Box` and `Buffer` provide host storage; `Ref` and scoped aliases retain checked origins for named places and supported fields, but not temporary projections.
-- Compiler-provided `extern func` declarations use named std identities and ordinary calls. `std.exit.exit` is exported by the prelude, with distinct runtime termination and compile-time compiler control.
+- Compiler-provided `extern` declarations use named std identities and ordinary calls, with fallibility determined by their signatures. `std.exit.exit` is exported by the prelude, with distinct runtime termination and compile-time compiler control.
 - Host-only `std.memory` provides checked typed allocation, unsafe indexed
   construction, transfers and destruction, `Box(T)` with automatic destruction,
   copyable `Ref(T, writable)` handles with checked origins, and `Buffer(T)` with
   borrowed `BufferView(T)` slices. `Box.new(init item: T)` allocates before the
   entire initializer through ordinary calls, aliases, and callable values, then
-  forwards to `unsafe_initialize` for construction in the final slot. Library
-  storage guards release unfinished allocations after partial fields clean on
-  failure or lexical exit. Inference requires an unevaluated result type;
+  forwards to explicitly fallible `unsafe_initialize` for construction in the
+  final slot; `Allocation.unsafe_init` is fallible too. The constructor explicitly
+  deallocates unfinished storage after partial fields clean and propagates with
+  `fail`. Buffer growth relocates in reverse order and retains a valid old-buffer
+  prefix on initialization failure while destroying the completed replacement
+  suffix and releasing its storage. Allocation failure preserves the original
+  contents. Inference requires an unevaluated result type;
   `Box(T).new` supplies it for loops and block-local results. Copying into a new
   Box uses ordinary initialization; consuming extraction requires directly
   movable values. Live-reference replacement retains its existing restrictions.
@@ -58,10 +66,10 @@
 
 ## Priority and dependencies
 
-Milestone 1 is the next priority: make initializer failure explicit and prohibit
-caller-directed exits across deferred construction. All later milestones are
-lower priority and retain their relative order, expanding the host storage and
-reference foundation toward text, generic collections, and ordinary iteration.
+Milestone 1 is completed and verified. Milestone 2 is the next implementation
+priority. Later
+milestones retain their relative order, expanding the host storage and reference
+foundation toward text, generic collections, and ordinary iteration.
 Each language slice covers diagnostics, execution, ownership, and incremental
 recomputation; reject unsupported forms at their owning boundary.
 
@@ -69,49 +77,37 @@ recomputation; reject unsupported forms at their owning boundary.
 
 ### 1. Explicit initializer failure and control flow
 
-Revise the deferred initializer rules in
-[syntax&semantics.txt](syntax&semantics.txt) before implementation. The current
-foundation above describes the existing behavior; this milestone replaces its
-implicit failure propagation and caller-directed lexical exits.
+Completed according to [syntax&semantics.txt](syntax&semantics.txt), with the
+full compiler and standalone snapshot suites, CLI build, and formatting checks
+passing.
 
-- Keep `init` as the single parameter modifier. Treat consumption into a
-  destination as potentially fallible for every initializer, including literals
-  and expressions that cannot actually fail. Handle failure locally or propagate
-  it from a declared `fallible` function; remove the exception that lets an
-  ordinary `func` propagate failure from an initializer. Forwarding does not
-  evaluate the expression; construction handles its potential failure, and
-  forwarding calls obey the receiving callable's declared fallibility.
-- Make a deferred initializer a control-flow boundary. Reject `return` targeting
-  its caller and `break` or `continue` targeting loops outside the initializer;
-  do not retarget these exits. Loops inside the initializer retain their own
-  `break` and `continue`, and called functions return normally. Ordinary eager
-  argument expressions retain their existing caller-directed exits. Preserve
-  the boundary through forwarding, aliases, and indirect calls.
-- Make raw slot initialization explicitly `fallible`, including
-  `unsafe_initialize` and the planned `unsafe_initialize_all`. Use ordinary
-  failure handling in `Box.new` to release the allocation after partial
-  construction cleanup, and publish the Box only after successful construction.
-  Remove `UninitializedStorage` and its helper when direct allocation and
-  failure cleanup discharge every ownership path. Settle explicit failure
-  propagation after cleanup without manufacturing a failing comparison.
-- Preserve allocation-before-evaluation, destination construction, exactly-once
-  consumption on successful paths, skipped evaluation on allocation failure,
-  and partial-subobject cleanup before storage release. Initializer writes and
-  completed transfers are not rolled back. Audit infallible ownership hooks and
-  future converters: consuming an initializer must handle failure rather than
-  acquire a hidden failure outcome.
-- Verify handled and propagated failure, rejected unhandled consumption in
-  `func`, infallible arguments accepted by the same fallible consumer, raw
-  allocation cleanup, and caller-directed exit rejection versus allowed local
-  loop exits and eager argument exits. Cover direct, forwarded, aliased, and
-  indirect calls, native execution, the supported compile-time subset, and
-  incremental recomputation and cache reuse when modes or fallibility change.
-- Defer type-level `where` assertions proving initializer infallibility and any
-  effect polymorphism. No `init fallible` modifier or parallel infallible and
-  fallible constructor APIs are required. Update
-  [ARCHITECTURE.md](ARCHITECTURE.md#deferred-construction) and
-  [STORAGE_AND_REFERENCES.md](STORAGE_AND_REFERENCES.md) as the implementation and
-  cleanup contracts change.
+- `init` remains the single parameter modifier. Every consumption into a
+  destination is potentially fallible, even for literals. Failure is handled
+  locally or propagated from a declared `fallible` function. Function signatures
+  alone determine call fallibility; initializer regions are always fallible.
+  Forwarding does not evaluate the expression and obeys the receiving callable's
+  declared fallibility. No `init fallible` modifier or parallel constructor
+  signatures are introduced.
+- Deferred initializers are control-flow boundaries through forwarding, aliases,
+  and indirect calls. Caller-directed `return`, `break`, and `continue` are
+  rejected; local loop exits remain valid. Ordinary eager argument expressions
+  retain caller-directed exits. IR and the calling convention have only ordinary
+  success/failure outcomes, without nonlocal initializer continuations.
+- Bare `fail` propagates ordinary failure after cleanup in a fallible function or
+  initializer region. `unsafe_initialize` and `Allocation.unsafe_init` are
+  explicitly fallible. `Box.new` directly allocates one slot, initializes it,
+  transfers it into a Box on success, or deallocates and fails after partial
+  construction cleanup. Bulk `unsafe_initialize_all` remains planned and fallible.
+- Allocation-before-evaluation, destination construction, successful-path
+  exactly-once consumption, and partial-subobject cleanup remain intact.
+  Captured writes and completed transfers are not rolled back. Infallible
+  ownership hooks and future consuming converters must handle initialization
+  failure locally rather than acquire hidden failure.
+- Verification covers handled and propagated failure, rejected unhandled
+  consumption in `func`, infallible expressions passed to fallible consumers,
+  allocation cleanup, boundary rejection, local and eager exits, forwarding,
+  aliases, indirect calls, supported compile-time execution, and incremental
+  recomputation and cache reuse after mode or fallibility edits.
 
 ### 2. Field visibility
 
@@ -155,7 +151,9 @@ It replaces the temporary name-matched opaque storage owners in `std.memory`.
   use. Add explicit `T(value)`. Publish inserted conversions as ordinary typed
   calls. Static struct sources use static value parameters; their converters
   may construct runtime-capable results at runtime without retaining
-  compile-time-only values in runtime storage.
+  compile-time-only values in runtime storage. Converters remain infallible;
+  consuming converters must handle potentially failing initialization locally,
+  not propagate it or acquire hidden failure. Converter support remains planned.
 - Give integer literals the `int_literal` type, fold a directly applied unary
   minus into the literal, and replace the compiler's byte literal rule with a
   `std` converter whose `where` clause checks the range.
@@ -184,7 +182,9 @@ It replaces the temporary name-matched opaque storage owners in `std.memory`.
   replacement/removal, and cleanup.
 - Add `[a, b]` collection literals typed `collection_literal(T, N)`. List's
   `init` converter allocates before constructing elements in place through
-  `unsafe_initialize_all`. Reject literals without an expected type until
+  fallible `unsafe_initialize_all`. Settle local handling of allocation and
+  initialization failure before implementing this infallible converter.
+  Reject literals without an expected type until
   `Array(T, N)` exists as their default. Keep deferred construction distinct
   from static struct data: elements execute in the construction phase and may
   be runtime expressions.
@@ -233,6 +233,9 @@ It replaces the temporary name-matched opaque storage owners in `std.memory`.
 
 ## Deferred or independent work
 
+- Type-level `where` assertions proving initializer infallibility and effect
+  polymorphism remain deferred. Keep one `init` mode rather than adding an
+  `init fallible` modifier or parallel infallible/fallible constructor signatures.
 - Implement local `static` bindings specified in
   [syntax&semantics.txt](syntax&semantics.txt), including ordinary function-call
   initializers, lexical scope, enclosing static parameters, and references to

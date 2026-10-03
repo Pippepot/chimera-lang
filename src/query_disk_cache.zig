@@ -5,7 +5,7 @@ const query = @import("query/engine.zig");
 const queries = @import("queries.zig");
 const structures = @import("structures.zig");
 
-const format = "CHIQRY12";
+const format = "CHIQRY13";
 const max_records = 1_000_000;
 
 pub fn save(io: std.Io, allocator: std.mem.Allocator, directory: []const u8, key: cache.Key, db: *query.Database) !void {
@@ -254,13 +254,7 @@ fn validUse(use: structures.FunctionValueUse, body: structures.FunctionBodyAnaly
 
 fn validOrdinaryValue(value: structures.FunctionValueId, body: structures.FunctionBodyAnalysis) bool {
     if (!validValue(value, body)) return false;
-    const representation = valueRepresentation(body, value);
-    return representation != .initializer and representation != .continuation;
-}
-
-fn validBranchUse(use: structures.FunctionValueUse, body: structures.FunctionBodyAnalysis) bool {
-    if (validContinuation(use.value, body)) return use.coerce_to == null and use.variant_tag_mapping == null;
-    return validUse(use, body);
+    return valueRepresentation(body, value) != .initializer;
 }
 
 fn validCallArgument(argument: structures.FunctionCallArgument, body: structures.FunctionBodyAnalysis) bool {
@@ -288,7 +282,6 @@ fn valueRepresentation(body: structures.FunctionBodyAnalysis, value: structures.
     if (index < body.block_arguments.len) return body.block_arguments[index].representation;
     return switch (body.instructions[index - body.block_arguments.len]) {
         .initializer_ref => .initializer,
-        .continuation_ref => .continuation,
         else => .value,
     };
 }
@@ -300,7 +293,6 @@ fn validBranch(branch: structures.FunctionBranch, body: structures.FunctionBodyA
     if (branch.arguments.end - branch.arguments.start != target.argument_end - target.argument_start) return false;
     for (body.branch_arguments[branch.arguments.start..branch.arguments.end], body.block_arguments[target.argument_start..target.argument_end]) |use, argument| {
         if (argument.representation == .initializer) return false;
-        if ((argument.representation == .continuation) != validContinuation(use.value, body)) return false;
         if ((use.coerce_to orelse body.valueType(use.value)) != argument.type_id) return false;
         if (argument.representation == .storage and (use.coerce_to != null or use.variant_tag_mapping != null)) return false;
     }
@@ -341,11 +333,12 @@ fn validCallMutArgument(operation: structures.CallMutArgument, body: structures.
 
 fn validFunctionBody(body: structures.FunctionBodyAnalysis) bool {
     if (body.blocks.len == 0 or @intFromEnum(body.entry) >= body.blocks.len) return false;
+    if (body.is_initializer_region and !body.is_fallible) return false;
     if (body.valueCount() > std.math.maxInt(u32)) return false;
     if (body.instruction_spans.len != 0 and body.instruction_spans.len != body.instructions.len) return false;
     if (body.terminator_spans.len != 0 and body.terminator_spans.len != body.blocks.len) return false;
     for (body.struct_field_values) |field| if (!validOrdinaryValue(field.value, body)) return false;
-    for (body.branch_arguments) |use| if (!validBranchUse(use, body)) return false;
+    for (body.branch_arguments) |use| if (!validUse(use, body)) return false;
     for (body.call_arguments) |argument| if (!validCallArgument(argument, body)) return false;
     for (body.initializer_captures) |capture| if (!validValue(capture, body)) return false;
     for (body.initializer_regions) |region| {
@@ -356,10 +349,8 @@ fn validFunctionBody(body: structures.FunctionBodyAnalysis) bool {
     if (body.parameter_modes.len != entry.argument_end - entry.argument_start) return false;
     for (body.parameter_modes, body.block_arguments[entry.argument_start..entry.argument_end]) |mode, argument| {
         if ((mode == .init) != (argument.representation == .initializer)) return false;
-        if (mode == .init and !body.is_fallible) return false;
-        if (argument.representation == .continuation and (!body.is_initializer_region or mode != .imm or argument.type_id != .unit)) return false;
         if (body.is_initializer_region and ((mode != .imm and mode != .mut and mode != .init) or
-            (argument.representation != .storage and argument.representation != .continuation and argument.representation != .initializer))) return false;
+            (argument.representation != .storage and argument.representation != .initializer))) return false;
     }
     for (body.block_arguments[entry.argument_end..]) |argument| if (argument.representation == .initializer) return false;
     for (body.instructions) |original| {
@@ -367,13 +358,9 @@ fn validFunctionBody(body: structures.FunctionBodyAnalysis) bool {
         for (instruction.operands()) |operand| if (operand) |value| {
             if (!validValue(value.*, body)) return false;
             if (valueRepresentation(body, value.*) == .initializer and instruction != .call) return false;
-            if (valueRepresentation(body, value.*) == .continuation and instruction != .continuation_storage and instruction != .continuation_select) return false;
         };
         const valid = switch (instruction) {
             .initializer_ref => |reference| validInitializerReference(reference, body),
-            .continuation_ref => |payload| payload == null or validOrdinaryValue(payload.?, body),
-            .continuation_storage => |operation| validContinuationDescriptor(operation.token, body) and operation.type_id != .never,
-            .continuation_select => |operation| body.is_initializer_region and validContinuationDescriptor(operation.token, body) and validOrdinaryValue(operation.storage, body),
             .variant_coerce, .variant_extract, .callable_coerce => |operation| validVariantOperation(operation, body),
             .struct_init => |operation| validRange(operation.fields, body.struct_field_values.len),
             .result_storage => |type_id| type_id == body.return_type,
@@ -381,7 +368,7 @@ fn validFunctionBody(body: structures.FunctionBodyAnalysis) bool {
             .mut_parameter_write => |operation| operation.parameter_index < body.parameter_modes.len and
                 body.parameter_modes[operation.parameter_index] == .mut,
             .call_mut_argument => |operation| validCallMutArgument(operation, body),
-            .call => |call| validCall(call, body) and !call.hasInitializer(body.call_arguments),
+            .call => |call| validCall(call, body) and call.target != .initializer,
             else => true,
         };
         if (!valid) return false;
@@ -393,7 +380,6 @@ fn validFunctionBody(body: structures.FunctionBodyAnalysis) bool {
         for (terminator.operands()) |operand| if (operand) |value| {
             if (!validValue(value.*, body)) return false;
             if (valueRepresentation(body, value.*) == .initializer and terminator != .fallible_call) return false;
-            if (valueRepresentation(body, value.*) == .continuation and terminator != .continuation_branch and terminator != .return_lexical) return false;
         };
         for (terminator.successors()) |successor| if (successor) |target| {
             if (@intFromEnum(target.*) >= body.blocks.len) return false;
@@ -402,65 +388,14 @@ fn validFunctionBody(body: structures.FunctionBodyAnalysis) bool {
             .branch => |branch| validBranch(branch, body),
             .predicate_branch => |branch| validBranch(branch.then_branch, body) and validBranch(branch.else_branch, body),
             .fallible_call => |branch| validCall(branch.call, body) and
-                validFallibleTargets(branch.call, branch.success, branch.failure, body) and
-                (branch.call.hasInitializer(body.call_arguments) == (branch.lexical_exit != null)) and
-                (branch.lexical_exit == null or validLexicalTarget(branch.lexical_exit.?, body)),
-            .continuation_branch => |branch| validContinuation(branch.token, body) and validContinuationDescriptor(branch.target, body) and
-                body.blocks[@intFromEnum(branch.match)].argument_start == body.blocks[@intFromEnum(branch.match)].argument_end and
-                body.blocks[@intFromEnum(branch.mismatch)].argument_start == body.blocks[@intFromEnum(branch.mismatch)].argument_end,
+                validFallibleTargets(branch.call, branch.success, branch.failure, body),
             .return_value => |use| validUse(use, body),
-            .return_lexical => |token| validContinuation(token, body) and (body.is_initializer_region or std.mem.indexOfScalar(structures.ParameterMode, body.parameter_modes, .init) != null),
             .return_failure => body.is_fallible,
             .return_unit, .diverge => true,
         };
         if (!valid) return false;
     }
-    for (body.instructions, 0..) |instruction, index| {
-        if (instruction != .continuation_ref) continue;
-        const payload = instruction.continuation_ref;
-        if (!validContinuationUses(body, body.instructionValue(index), if (payload) |storage| body.valueType(storage) else null)) return false;
-    }
     return true;
-}
-
-fn validContinuationUses(body: structures.FunctionBodyAnalysis, token: structures.FunctionValueId, payload_type: ?structures.TypeId) bool {
-    for (body.instructions) |instruction| {
-        switch (instruction) {
-            .continuation_storage => |operation| {
-                if (operation.token == token and payload_type != operation.type_id) return false;
-            },
-            .continuation_select => |operation| {
-                if (operation.token == token and payload_type != body.valueType(operation.storage)) return false;
-            },
-            .initializer_ref => |reference| {
-                const region = body.initializer_regions[reference.region];
-                for (body.initializer_captures[reference.captures.start..reference.captures.end], 0..) |capture, parameter| {
-                    if (capture == token and !validContinuationUses(region, @enumFromInt(parameter), payload_type)) return false;
-                }
-            },
-            else => {},
-        }
-    }
-    return true;
-}
-
-fn validContinuation(value: structures.FunctionValueId, body: structures.FunctionBodyAnalysis) bool {
-    if (!validValue(value, body)) return false;
-    const index = @intFromEnum(value);
-    return if (index < body.block_arguments.len) body.block_arguments[index].representation == .continuation else body.instructions[index - body.block_arguments.len] == .continuation_ref;
-}
-
-fn validContinuationDescriptor(value: structures.FunctionValueId, body: structures.FunctionBodyAnalysis) bool {
-    if (!validContinuation(value, body)) return false;
-    const index = @intFromEnum(value);
-    return index >= body.block_arguments.len or index < body.blocks[@intFromEnum(body.entry)].argument_end;
-}
-
-fn validLexicalTarget(target: structures.FunctionBlockId, body: structures.FunctionBodyAnalysis) bool {
-    const block = body.blocks[@intFromEnum(target)];
-    return block.argument_start < body.block_arguments.len and block.argument_end == block.argument_start + 1 and
-        body.block_arguments[block.argument_start].representation == .continuation and
-        body.block_arguments[block.argument_start].type_id == .unit;
 }
 
 fn validInitializerReference(reference: @FieldType(structures.FunctionInstruction, "initializer_ref"), body: structures.FunctionBodyAnalysis) bool {
@@ -470,8 +405,6 @@ fn validInitializerReference(reference: @FieldType(structures.FunctionInstructio
     const entry = region.blocks[@intFromEnum(region.entry)];
     for (body.initializer_captures[reference.captures.start..reference.captures.end], region.block_arguments[entry.argument_start..entry.argument_end]) |capture, argument| {
         if (body.valueType(capture) != argument.type_id) return false;
-        if ((argument.representation == .continuation) != validContinuation(capture, body)) return false;
-        if (argument.representation == .continuation and !validContinuationDescriptor(capture, body)) return false;
         if ((argument.representation == .initializer) != (valueRepresentation(body, capture) == .initializer)) return false;
     }
     return true;
@@ -503,6 +436,13 @@ fn validCompiledFunction(artifact: structures.CompiledFunction) bool {
         if (relocation.offset > artifact.code.len or width > artifact.code.len - relocation.offset) return false;
     }
     return true;
+}
+
+test "query restore rejects the obsolete lexical IR format" {
+    const allocator = std.testing.allocator;
+    const db = try query.Database.init(allocator, .{ .worker_count = 1 });
+    defer db.deinit();
+    try std.testing.expectError(error.InvalidCache, restoreInterns(db, allocator, "CHIQRY12"));
 }
 
 test "restoring a malformed canonical type rejects the snapshot" {
@@ -1197,7 +1137,7 @@ test "cached initializer handles stay out of ordinary operands and mutable write
     };
     try std.testing.expect(validFunctionBody(body));
     body.is_fallible = false;
-    try std.testing.expect(!validFunctionBody(body));
+    try std.testing.expect(validFunctionBody(body));
     body.is_fallible = true;
 
     var fields = [_]structures.StructFieldValue{.{ .field_index = 0, .value = @enumFromInt(0) }};
@@ -1244,19 +1184,33 @@ test "cached initializer handles stay out of ordinary operands and mutable write
     try std.testing.expect(validFunctionBody(body));
 }
 
-test "cached lexical outcomes reject missing edges and invalid continuation operands" {
-    const modules = @import("modules.zig");
+test "cached initializer failures reject invalid ordinary targets and result representations" {
     const allocator = std.testing.allocator;
-    const db = try query.Database.init(allocator, .{ .worker_count = 1 });
-    defer db.deinit();
-    try modules.registerSources(db, allocator,
-        \\func materialize(init item: int) int -> return item
-        \\func run() int
-        \\    return materialize(if 1 == 1 -> return 42 else 0)
-        \\exit(run())
-    , &.{}, &.{});
-    const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;
-    const original = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = scope.resolveFunction("run").? })).*.?;
+    var modes = [_]structures.ParameterMode{.init};
+    var arguments = [_]structures.FunctionBlockArgument{
+        .{ .type_id = .int, .representation = .initializer },
+        .{ .type_id = .int },
+    };
+    var blocks = [_]structures.FunctionBlock{
+        .{ .argument_start = 0, .argument_end = 1, .instruction_start = 0, .instruction_end = 0, .terminator = .{ .fallible_call = .{
+            .call = .{ .target = .{ .initializer = @enumFromInt(0) }, .arguments = .{ .start = 0, .end = 0 }, .return_type = .int },
+            .success = @enumFromInt(1),
+            .failure = @enumFromInt(2),
+        } } },
+        .{ .argument_start = 1, .argument_end = 2, .instruction_start = 0, .instruction_end = 0, .terminator = .{ .return_value = .{ .value = @enumFromInt(1) } } },
+        .{ .argument_start = 2, .argument_end = 2, .instruction_start = 0, .instruction_end = 0, .terminator = .return_failure },
+    };
+    const original: structures.FunctionBodyAnalysis = .{
+        .return_type = .int,
+        .is_fallible = true,
+        .parameter_modes = &modes,
+        .block_arguments = &arguments,
+        .branch_arguments = &.{},
+        .call_arguments = &.{},
+        .instructions = &.{},
+        .blocks = &blocks,
+        .entry = @enumFromInt(0),
+    };
     var writer: codec.Writer = .{ .allocator = allocator };
     defer writer.deinit();
     try writer.write(structures.FunctionBodyAnalysis, original);
@@ -1264,18 +1218,10 @@ test "cached lexical outcomes reject missing edges and invalid continuation oper
     var body = try reader.read(structures.FunctionBodyAnalysis);
     defer body.deinit(allocator);
     try std.testing.expect(validFunctionBody(body));
-    var call_index: usize = 0;
-    for (body.blocks, 0..) |block, index| if (block.terminator == .fallible_call) {
-        call_index = index;
-        break;
-    };
-    const call = &body.blocks[call_index].terminator.fallible_call;
-    const lexical = call.lexical_exit;
-    call.lexical_exit = null;
-    try std.testing.expect(!validFunctionBody(body));
-    call.lexical_exit = lexical;
+    const call = &body.blocks[0].terminator.fallible_call;
     const success = call.success;
-    call.success = lexical.?;
+    const failure = call.failure;
+    call.success = failure.?;
     try std.testing.expect(!validFunctionBody(body));
     call.success = success;
     const success_argument = &body.block_arguments[body.blocks[@intFromEnum(success)].argument_start];
@@ -1286,51 +1232,16 @@ test "cached lexical outcomes reject missing edges and invalid continuation oper
     success_argument.representation = .storage;
     try std.testing.expect(!validFunctionBody(body));
     success_argument.representation = .value;
-    const token = &body.block_arguments[body.blocks[@intFromEnum(lexical.?)].argument_start];
-    token.type_id = .int;
+    call.failure = success;
     try std.testing.expect(!validFunctionBody(body));
-    token.type_id = .unit;
-    token.representation = .value;
+    call.failure = @enumFromInt(body.blocks.len);
     try std.testing.expect(!validFunctionBody(body));
-    token.representation = .continuation;
+    call.failure = null;
     try std.testing.expect(validFunctionBody(body));
-    var descriptor_index: usize = 0;
-    for (body.instructions, 0..) |instruction, index| if (instruction == .continuation_ref) {
-        descriptor_index = index;
-        break;
-    };
-    const descriptor = body.instructionValue(descriptor_index);
-    const instruction = body.instructions[descriptor_index];
-    body.instructions[descriptor_index] = .const_unit;
+    call.failure = failure;
+    body.is_fallible = false;
     try std.testing.expect(!validFunctionBody(body));
-    body.instructions[descriptor_index] = instruction;
-    try std.testing.expect(validFunctionBody(body));
-    for (body.instructions) |*operation| {
-        if (operation.* != .continuation_storage) continue;
-        const original_token = operation.continuation_storage.token;
-        operation.continuation_storage.token = @enumFromInt(body.blocks[@intFromEnum(lexical.?)].argument_start);
-        try std.testing.expect(!validFunctionBody(body));
-        operation.continuation_storage.token = original_token;
-    }
-    const argument = body.call_arguments[0];
-    body.call_arguments[0] = .{ .prepared = .{ .value = descriptor } };
-    try std.testing.expect(!validFunctionBody(body));
-    body.call_arguments[0] = argument;
-    const region = &body.initializer_regions[0];
-    for (region.instructions) |*operation| {
-        if (operation.* != .continuation_storage) continue;
-        const original_type = operation.continuation_storage.type_id;
-        operation.continuation_storage.type_id = .bool;
-        try std.testing.expect(!validFunctionBody(body));
-        operation.continuation_storage.type_id = original_type;
-    }
-    for (region.blocks) |*block| {
-        if (block.terminator != .return_lexical) continue;
-        const original_token = block.terminator.return_lexical;
-        block.terminator.return_lexical = region.instructionValue(0);
-        try std.testing.expect(!validFunctionBody(body));
-        block.terminator.return_lexical = original_token;
-    }
+    body.is_fallible = true;
     try std.testing.expect(validFunctionBody(body));
 }
 
@@ -1340,9 +1251,9 @@ test "cached nested handles reject changed capture representations" {
     const db = try query.Database.init(allocator, .{ .worker_count = 1 });
     defer db.deinit();
     try modules.registerSources(db, allocator,
-        \\func materialize(init item: int) int -> return item
-        \\func forward(init item: int) int -> return materialize(materialize(item))
-        \\exit(forward(42))
+        \\fallible materialize(init item: int) int -> return item
+        \\fallible forward(init item: int) int -> return materialize(materialize(item))
+        \\if const result = forward(42) -> exit(result) else exit(99)
     , &.{}, &.{});
     const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;
     const original = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = scope.resolveFunction("forward").? })).*.?;
@@ -1369,8 +1280,9 @@ test "cached query outputs cannot adopt a private initializer calling convention
     var modes = [_]structures.ParameterMode{.imm};
     var arguments = [_]structures.FunctionBlockArgument{.{ .type_id = .int, .representation = .storage }};
     var blocks = [_]structures.FunctionBlock{.{ .argument_start = 0, .argument_end = 1, .instruction_start = 0, .instruction_end = 0, .terminator = .diverge }};
-    const body: structures.FunctionBodyAnalysis = .{
+    var body: structures.FunctionBodyAnalysis = .{
         .is_initializer_region = true,
+        .is_fallible = true,
         .return_type = .unit,
         .parameter_modes = &modes,
         .block_arguments = &arguments,
@@ -1382,6 +1294,8 @@ test "cached query outputs cannot adopt a private initializer calling convention
     };
     try std.testing.expect(validFunctionBody(body));
     try std.testing.expect(!(try validOutput(queries.AnalyzeFunctionInstance, db, body)));
+    body.is_fallible = false;
+    try std.testing.expect(!validFunctionBody(body));
 }
 
 test "cached initializers reject changed regions captures and value representation" {
@@ -1390,9 +1304,9 @@ test "cached initializers reject changed regions captures and value representati
     const db = try query.Database.init(allocator, .{ .worker_count = 1 });
     defer db.deinit();
     try modules.registerSources(db, allocator,
-        \\func materialize(init item: int) int -> return item
-        \\func run(imm value: int) int -> return materialize(value + 2)
-        \\exit(run(40))
+        \\fallible materialize(init item: int) int -> return item
+        \\fallible run(imm value: int) int -> return materialize(value + 2)
+        \\if const result = run(40) -> exit(result) else exit(99)
     , &.{}, &.{});
     const executable = (try db.get(queries.BuildExecutable, 0)).*;
     try std.testing.expect(executable != null);

@@ -115,6 +115,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             stable: bool = false,
             read: ?u31 = null,
             deferred_capture: bool = false,
+            initializer_owner: ?structures.FunctionValueId = null,
             transform: ?u32 = null,
             next: ?u32 = null,
         };
@@ -157,7 +158,6 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             materialize_on_copy: bool = false,
             explicit_transfer: bool = false,
             initializer_parameter: ?u32 = null,
-            initializer_can_fail: bool = false,
             consumption_completion: ?structures.FunctionValueId = null,
             pending_consumption_owners: ?u32 = null,
             // Consuming an existing place keeps its address across result joins.
@@ -170,21 +170,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         };
         const InitAvailability = enum { absent, pending, consumed, maybe_consumed };
         const InitializerTypeKey = struct { expression: semantic.UnresolvedBody.ValueId, expected: ?structures.TypeId };
-        const LexicalTarget = union(enum) { return_function, break_loop: semantic.UnresolvedBody.BlockId, continue_loop: semantic.UnresolvedBody.BlockId };
-        const LexicalExitShape = struct { span: structures.SourceSpan, target: LexicalTarget, type_id: structures.TypeId };
-        const InitializerTypeInfo = struct { type_id: structures.TypeId, exits: []LexicalExitShape };
-        const InitializerTypes = std.AutoHashMapUnmanaged(InitializerTypeKey, InitializerTypeInfo);
-        const LexicalPayloadOwnership = struct { nonowning: Value, completion: Value };
-        const LexicalBinding = struct { shape: LexicalExitShape, token: Value, owner: *Self, destination: u32, origins: ?u32 = null, completion: ?StateId = null, payload_ownership: ?LexicalPayloadOwnership = null };
-        const LexicalDestination = struct {
-            shape: LexicalExitShape,
-            token: Value,
-            initializer: ?structures.FunctionValueId = null,
-            context: ?LoopContext = null,
-            origins: ?u32 = null,
-            completion: ?StateId = null,
-            payload_ownership: ?LexicalPayloadOwnership = null,
-        };
+        const InitializerTypes = std.AutoHashMapUnmanaged(InitializerTypeKey, structures.TypeId);
         const CaptureTransfer = struct { local: semantic.UnresolvedBody.LocalId, parameter: u32, field: ?usize = null };
         const PendingConsumptionOwner = struct {
             generation: ?GenerationId,
@@ -320,7 +306,6 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         const ConditionFlow = struct {
             success: ?FlowExit,
             failure: ?FlowExit,
-            lexical_exit: ?FlowExit = null,
             diverged: ?Value = null,
         };
         const LoopContext = struct {
@@ -415,10 +400,6 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         // preparation still checks ownership and effects in each context.
         shared_initializer_types: ?*InitializerTypes = null,
         is_initializer_region: bool = false,
-        lexical_parent: ?*Self = null,
-        lexical_exit_shapes: std.ArrayList(LexicalExitShape) = .empty,
-        lexical_bindings: std.ArrayList(LexicalBinding) = .empty,
-        lexical_destinations: std.ArrayList(LexicalDestination) = .empty,
         captured_locals: []?u32 = &.{},
         captured_values: []bool = &.{},
         initializer_writes: std.ArrayList(InitializerWrite) = .empty,
@@ -516,7 +497,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 }
                 switch (parameter.mode) {
                     .init => {
-                        self.values[index] = .{ .id = entry_value.id, .type_id = entry_value.type_id, .initializer_parameter = @intCast(index), .initializer_can_fail = true, .reference_origins = if (try self.type_interner.canStoreBorrow(parameter.type_id)) try self.addReferenceOrigin(null, .{ .parameter = @intCast(index) }) else null };
+                        self.values[index] = .{ .id = entry_value.id, .type_id = entry_value.type_id, .initializer_parameter = @intCast(index), .reference_origins = if (try self.type_interner.canStoreBorrow(parameter.type_id)) try self.addReferenceOrigin(null, .{ .parameter = @intCast(index) }) else null };
                         self.init_availability[index] = .pending;
                     },
                     .imm => {
@@ -551,7 +532,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             }
             const entry = try self.newBlock(0, @intCast(parameters.len));
             self.enterBlock(entry);
-            // A region receives already established lexical bindings through
+            // A region receives already established values through
             // captures. Rebuilding static parameter values here would create
             // unused owned objects and repeat their cleanup effects.
             if (!self.is_initializer_region) for (0..self.unresolved.static_expression_count) |static_index| {
@@ -618,12 +599,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             self.ordinary_completion_states.deinit(gpa);
             for (self.initializer_regions.items) |*region| region.deinit(gpa);
             self.initializer_regions.deinit(gpa);
-            self.lexical_exit_shapes.deinit(gpa);
-            self.lexical_bindings.deinit(gpa);
-            self.lexical_destinations.deinit(gpa);
             self.initializer_captures.deinit(gpa);
-            var initializer_types = self.initializer_types.valueIterator();
-            while (initializer_types.next()) |info| gpa.free(info.exits);
             self.initializer_types.deinit(gpa);
             gpa.free(self.local_values);
             self.locals.deinit(gpa);
@@ -822,6 +798,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     .continue_loop => |span| try self.continueLoop(span),
                     .return_nothing => |span| try self.returnNothing(span),
                     .return_value => |returned| try self.returnExpression(returned.value, returned.span),
+                    .failure => |span| try self.failFunction(span),
                 }
             }
             if (self.current_block == null) return null;
@@ -973,133 +950,8 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             _ = try self.borrowValue(value_to_discard, span);
         }
 
-        fn lexicalOwner(self: *Self, target: LexicalTarget) *Self {
-            var owner = self;
-            while (true) {
-                switch (target) {
-                    .return_function => if (!owner.is_initializer_region) return owner,
-                    .break_loop, .continue_loop => |body| {
-                        for (owner.loop_stack.items) |context| if (context.body == body) return owner;
-                    },
-                }
-                owner = owner.lexical_parent orelse unreachable;
-            }
-        }
-
-        fn enclosingLexicalLoop(self: *Self) *Self {
-            var owner = self.lexical_parent orelse unreachable;
-            while (owner.loop_stack.items.len == 0) owner = owner.lexical_parent orelse unreachable;
-            return owner;
-        }
-
-        fn lexicalBinding(self: *Self, shape: LexicalExitShape) ?*LexicalBinding {
-            for (self.lexical_bindings.items) |*binding| {
-                if (std.meta.eql(binding.shape.span, shape.span) and std.meta.eql(binding.shape.target, shape.target)) return binding;
-            }
-            return null;
-        }
-
-        fn lexicalReturn(self: *Self, expression: ?semantic.UnresolvedBody.ValueId, span: structures.SourceSpan) !void {
-            const owner = self.lexicalOwner(.return_function);
-            const shape: LexicalExitShape = .{ .span = span, .target = .return_function, .type_id = owner.return_type };
-            const binding = if (self.type_check_only) null else self.lexicalBinding(shape);
-            const storage = if (binding) |bound|
-                try self.appendInstruction(.{ .continuation_storage = .{ .token = bound.token.id, .type_id = shape.type_id } })
-            else
-                try self.localStorage(shape.type_id);
-            const result = if (expression) |payload_expression|
-                try self.construct(payload_expression, span, .{ .storage = storage, .site = .return_value })
-            else bare: {
-                const unit = try self.appendInstruction(.const_unit);
-                if (try self.coerceValue(unit.id, .unit, shape.type_id) == null)
-                    return self.reject(span, .{ .missing_return_value = shape.type_id });
-                break :bare try self.placeValue(unit, span, .{ .storage = storage, .site = .return_value });
-            };
-            if (result.type_id == .never) return;
-            if (binding) |bound| return self.finishLexicalValue(bound, result, span);
-            std.debug.assert(self.type_check_only);
-            try self.lexical_exit_shapes.append(self.ctx.allocator(), shape);
-            try self.finishFunctionExit(span, .diverge);
-        }
-
-        fn lexicalBreak(self: *Self, expression: semantic.UnresolvedBody.ValueId) !void {
-            const owner = self.enclosingLexicalLoop();
-            const context = owner.loop_stack.getLast();
-            const span = self.valueSpan(expression);
-            const target: LexicalTarget = .{ .break_loop = context.body };
-            const mode: BranchResult = if (context.result == .destination)
-                .{ .value = .{ .expected_type = context.result.destination.storage.type_id, .access = .initialize } }
-            else
-                context.result;
-            if (self.type_check_only) {
-                const result = try self.branchResult(expression, mode);
-                if (result.type_id == .never) return;
-                try self.lexical_exit_shapes.append(self.ctx.allocator(), .{ .span = span, .target = target, .type_id = if (mode == .discard) .unit else result.type_id });
-                try self.finishFunctionExit(span, .diverge);
-                return;
-            }
-            const binding = self.lexicalBinding(.{ .span = span, .target = target, .type_id = .unit }) orelse {
-                const result = try self.branchResult(expression, mode);
-                std.debug.assert(result.type_id == .never);
-                return;
-            };
-            if (mode == .discard) {
-                const discarded = try self.discardResult(try self.branchResult(expression, mode), span);
-                if (discarded.type_id == .never) return;
-                return self.finishLexicalValue(binding, discarded, span);
-            }
-            const storage = try self.appendInstruction(.{ .continuation_storage = .{ .token = binding.token.id, .type_id = binding.shape.type_id } });
-            var result: Value = undefined;
-            if (mode == .value and mode.value.access == .consume) {
-                var consume_context = mode.value;
-                consume_context.expected_type = binding.shape.type_id;
-                consume_context.fresh_destination = storage;
-                const selected = try self.valueWithContext(expression, consume_context);
-                if (selected.type_id == .never) return;
-                if (selected.preserves_storage or try self.constructsInPlace(selected.type_id)) {
-                    _ = try self.appendInstruction(.{ .continuation_select = .{ .token = binding.token.id, .storage = selected.id } });
-                    result = selected;
-                } else result = try self.placeValue(selected, span, .{ .storage = storage, .site = .return_value });
-            } else result = try self.construct(expression, span, .{ .storage = storage, .site = .return_value });
-            if (result.type_id == .never) return;
-            try self.finishLexicalValue(binding, result, span);
-        }
-
-        fn lexicalContinue(self: *Self, span: structures.SourceSpan) !void {
-            const owner = self.enclosingLexicalLoop();
-            const shape: LexicalExitShape = .{ .span = span, .target = .{ .continue_loop = owner.loop_stack.getLast().body }, .type_id = .unit };
-            if (self.type_check_only) {
-                try self.lexical_exit_shapes.append(self.ctx.allocator(), shape);
-                return self.finishFunctionExit(span, .diverge);
-            }
-            const binding = self.lexicalBinding(shape).?;
-            binding.completion = try self.captureState();
-            try self.finishFunctionExit(span, .{ .return_lexical = binding.token.id });
-        }
-
-        fn finishLexicalValue(self: *Self, binding: *LexicalBinding, result: Value, span: structures.SourceSpan) !void {
-            try self.validateEscapingBorrows(result, span, binding.shape.target == .return_function);
-            binding.origins = try self.mergeReferenceOrigins(binding.origins, result.reference_origins);
-            binding.completion = try self.captureState();
-            var transferred = result;
-            if (binding.payload_ownership) |ownership| {
-                const nonowning: Value = .{ .id = result.borrow_condition orelse (try self.appendInstruction(.{ .const_bool = hasNonowningPath(result) })).id, .type_id = .bool };
-                _ = try self.copyBits(nonowning, ownership.nonowning);
-                if (result.consumption_completion) |completion| {
-                    _ = try self.appendInstruction(.{ .continuation_select = .{ .token = ownership.completion.id, .storage = completion } });
-                } else {
-                    const storage = try self.appendInstruction(.{ .continuation_storage = .{ .token = ownership.completion.id, .type_id = .bool } });
-                    _ = try self.copyBits(try self.appendInstruction(.{ .const_bool = true }), storage);
-                }
-                transferred.consumption_completion = null;
-                transferred.pending_consumption_owners = null;
-            }
-            try self.recordConsume(transferred);
-            try self.finishFunctionExit(span, .{ .return_lexical = binding.token.id });
-        }
-
         fn breakLoop(self: *Self, value_id: semantic.UnresolvedBody.ValueId) !void {
-            if (self.is_initializer_region and self.loop_stack.items.len == 0) return self.lexicalBreak(value_id);
+            if (self.is_initializer_region and self.loop_stack.items.len == 0) return self.reject(self.valueSpan(value_id), .initializer_exit_outside_boundary);
             const context = self.loop_stack.getLast();
             var value_to_break = try self.branchResult(value_id, context.result);
             if (value_to_break.type_id == .never) return;
@@ -1111,7 +963,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         }
 
         fn continueLoop(self: *Self, span: structures.SourceSpan) !void {
-            if (self.is_initializer_region and self.loop_stack.items.len == 0) return self.lexicalContinue(span);
+            if (self.is_initializer_region and self.loop_stack.items.len == 0) return self.reject(span, .initializer_exit_outside_boundary);
             const context = self.loop_stack.getLast();
             self.unbindLocalsSince(context.baseline);
             try self.normalizeLoopBackedge(context, span);
@@ -1121,7 +973,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         }
 
         fn returnNothing(self: *Self, span: structures.SourceSpan) !void {
-            if (self.is_initializer_region) return self.lexicalReturn(null, span);
+            if (self.is_initializer_region) return self.reject(span, .initializer_exit_outside_boundary);
             if (self.return_type == .unit) {
                 try self.finishFunctionExit(span, .return_unit);
                 return;
@@ -1133,7 +985,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         }
 
         fn returnExpression(self: *Self, id: semantic.UnresolvedBody.ValueId, span: structures.SourceSpan) !void {
-            if (self.is_initializer_region) return self.lexicalReturn(id, span);
+            if (self.is_initializer_region) return self.reject(span, .initializer_exit_outside_boundary);
             if (self.infer_return_type or !try self.constructsInPlace(self.return_type))
                 return self.returnValue(try self.valueWithContext(id, .{ .expected_type = self.return_type, .access = .initialize }), span);
             const storage = try self.appendInstruction(.{ .result_storage = self.return_type });
@@ -1207,6 +1059,11 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
 
         fn propagateFailure(self: *Self, failure: FlowExit, span: structures.SourceSpan) !void {
             try self.enterFlowExit(failure);
+            try self.finishFunctionExit(span, .return_failure);
+        }
+
+        fn failFunction(self: *Self, span: structures.SourceSpan) !void {
+            if (!self.is_fallible) return self.reject(span, .fallible_expression_outside_fallible_function);
             try self.finishFunctionExit(span, .return_failure);
         }
 
@@ -1910,16 +1767,6 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             self.init_availability[parameter] = .consumed;
         }
 
-        fn hasInitParameters(self: *const Self) bool {
-            for (self.init_availability) |availability| if (availability != .absent) return true;
-            return false;
-        }
-
-        fn hasFailureExit(self: *const Self) bool {
-            for (self.blocks.items) |block_value| if (block_value.terminator.? == .return_failure) return true;
-            return false;
-        }
-
         fn constructInitializer(self: *Self, initializer: Value, span: structures.SourceSpan, destination: ?Value) !Value {
             if (destination) |storage| if (storage.type_id != initializer.type_id) {
                 const member = try self.memberDestination(.{ .storage = storage, .site = .local }, initializer.type_id, span, .fresh);
@@ -1941,8 +1788,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     .return_type = initializer.type_id,
                 },
                 .behavior = .ordinary,
-                .is_fallible = false,
-                .initializer_can_fail = initializer.initializer_can_fail,
+                .is_fallible = true,
                 .mut_arguments = .{ .start = 0, .end = 0 },
                 .consumed_arguments = .{ .start = 0, .end = 0 },
                 .writable_references = .{ .start = 0, .end = 0 },
@@ -1962,7 +1808,6 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 .return_type = return_type,
                 .is_fallible = true,
                 .is_initializer_region = true,
-                .lexical_parent = self,
                 .shared_initializer_types = self.shared_initializer_types orelse &self.initializer_types,
             };
         }
@@ -1971,11 +1816,10 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             source: Value,
             local: ?semantic.UnresolvedBody.LocalId = null,
             mode: structures.ParameterMode = .imm,
-            representation: structures.ValueRepresentation = .storage,
         }) !u32 {
             const gpa = self.ctx.allocator();
             const argument = try self.appendBlockArgument(capture.source.type_id, null);
-            self.block_arguments.items[argument].representation = capture.representation;
+            self.block_arguments.items[argument].representation = .storage;
             try self.parameter_modes.append(gpa, capture.mode);
             try captures.append(gpa, capture.source);
             try capture_locals.append(gpa, capture.local);
@@ -2003,7 +1847,6 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                         .type_id = source.type_id,
                         .borrowed_type = if (parameter.mode == .init) null else source.type_id,
                         .initializer_parameter = source.initializer_parameter,
-                        .initializer_can_fail = source.initializer_can_fail,
                         .reference_origins = region.values[index].?.reference_origins,
                     };
                     region.captured_values[index] = true;
@@ -2045,7 +1888,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             if (self.values[@intFromEnum(raw.value)]) |pending| if (pending.initializer_parameter != null) return pending.type_id;
             const types = self.shared_initializer_types orelse &self.initializer_types;
             const key: InitializerTypeKey = .{ .expression = raw.value, .expected = expected_type };
-            if (types.get(key)) |info| return info.type_id;
+            if (types.get(key)) |type_id| return type_id;
             var region = self.initializerRegion(.unit);
             region.infer_return_type = true;
             region.type_check_only = true;
@@ -2061,63 +1904,8 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             // executing its IR. The specialized call then checks ownership and
             // builds the region with its actual construction destination.
             const type_id = (try region.valueWithContext(raw.value, .{ .expected_type = expected_type, .access = .initialize })).type_id;
-            const exits = try region.lexical_exit_shapes.toOwnedSlice(self.ctx.allocator());
-            errdefer self.ctx.allocator().free(exits);
-            try types.put(self.ctx.allocator(), key, .{ .type_id = type_id, .exits = exits });
+            try types.put(self.ctx.allocator(), key, type_id);
             return type_id;
-        }
-
-        fn bindLexicalExits(self: *Self, region: *Self, shapes: []const LexicalExitShape, captures: *std.ArrayList(Value), capture_locals: *std.ArrayList(?semantic.UnresolvedBody.LocalId)) !void {
-            const gpa = self.ctx.allocator();
-            for (shapes) |shape| {
-                var duplicate = false;
-                for (region.lexical_bindings.items) |binding| {
-                    if (std.meta.eql(binding.shape, shape)) duplicate = true;
-                }
-                if (duplicate) continue;
-                var inherited: ?LexicalBinding = null;
-                for (self.lexical_bindings.items) |binding| {
-                    if (std.meta.eql(binding.shape, shape)) inherited = binding;
-                }
-                var binding: LexicalBinding = undefined;
-                if (inherited) |parent| {
-                    binding = parent;
-                    binding.origins = null;
-                    binding.completion = null;
-                } else {
-                    std.debug.assert(self.lexicalOwner(shape.target) == self);
-                    const context = if (shape.target == .return_function) null else self.loop_stack.getLast();
-                    var payload: ?Value = null;
-                    if (shape.target != .continue_loop) {
-                        if (context != null and context.?.result == .destination) {
-                            payload = context.?.result.destination.storage;
-                        } else if (shape.target == .return_function and try self.constructsInPlace(shape.type_id)) {
-                            payload = try self.appendInstruction(.{ .result_storage = shape.type_id });
-                        } else payload = try self.localStorage(shape.type_id);
-                    }
-                    const token = try self.appendInstruction(.{ .continuation_ref = if (payload) |storage| storage.id else null });
-                    var payload_ownership: ?LexicalPayloadOwnership = null;
-                    if (context) |loop_context| if (loop_context.result == .value and loop_context.result.value.access == .consume) {
-                        const nonowning = try self.localStorage(.bool);
-                        const completion = try self.localStorage(.bool);
-                        _ = try self.copyBits(try self.appendInstruction(.{ .const_bool = true }), completion);
-                        payload_ownership = .{ .nonowning = nonowning, .completion = try self.appendInstruction(.{ .continuation_ref = completion.id }) };
-                    };
-                    const destination: u32 = @intCast(self.lexical_destinations.items.len);
-                    try self.lexical_destinations.append(gpa, .{ .shape = shape, .token = token, .context = context, .payload_ownership = payload_ownership });
-                    binding = .{ .shape = shape, .token = token, .owner = self, .destination = destination, .payload_ownership = payload_ownership };
-                }
-                const capture = try region.appendRegionCapture(captures, capture_locals, .{ .source = binding.token, .representation = .continuation });
-                binding.token = .{ .id = @enumFromInt(capture), .type_id = .unit };
-                if (binding.payload_ownership) |*ownership| {
-                    const nonowning = try region.appendRegionCapture(captures, capture_locals, .{ .source = ownership.nonowning });
-                    ownership.nonowning = .{ .id = @enumFromInt(nonowning), .type_id = .bool };
-                    const completion = try region.appendRegionCapture(captures, capture_locals, .{ .source = ownership.completion, .representation = .continuation });
-                    ownership.completion = .{ .id = @enumFromInt(completion), .type_id = .unit };
-                }
-                try region.lexical_bindings.append(gpa, binding);
-            }
-            region.blocks.items[0].argument_end = @intCast(captures.items.len);
         }
 
         fn prepareInitializer(self: *Self, raw: semantic.UnresolvedBody.ValueUse, type_id: structures.TypeId) !Value {
@@ -2127,13 +1915,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 return pending;
             };
             _ = try self.inferInitializerType(raw, type_id);
-            const types = self.shared_initializer_types orelse &self.initializer_types;
-            const info = types.get(.{ .expression = raw.value, .expected = type_id }).?;
             if (self.type_check_only) {
-                for (info.exits) |shape| {
-                    if (self.lexicalOwner(shape.target) == self) continue;
-                    try self.lexical_exit_shapes.append(self.ctx.allocator(), shape);
-                }
                 return self.appendInstruction(.{ .initializer_ref = .{ .region = 0, .captures = .{ .start = 0, .end = 0 }, .type_id = type_id } });
             }
             var region = self.initializerRegion(type_id);
@@ -2145,7 +1927,6 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             var capture_locals: std.ArrayList(?semantic.UnresolvedBody.LocalId) = .empty;
             defer capture_locals.deinit(gpa);
             try self.bindRegionCaptures(&region, &captures, &capture_locals);
-            try self.bindLexicalExits(&region, info.exits, &captures, &capture_locals);
             if (try region.constructsInPlace(type_id)) {
                 const storage = try region.appendInstruction(.{ .result_storage = type_id });
                 const constructed = try region.construct(raw.value, raw.span, .{ .storage = storage, .site = .return_value });
@@ -2182,31 +1963,13 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 .captures = .{ .start = capture_start, .end = @intCast(self.initializer_captures.items.len) },
                 .type_id = type_id,
             } });
-            initializer.initializer_can_fail = body.is_fallible;
-            for (region.lexical_bindings.items) |binding| {
-                const origins = try self.importInitializerOrigins(&region, captures.items, binding.origins);
-                const completion = try self.importLexicalCompletion(&region, binding.completion);
-                if (binding.owner == self) {
-                    const target = &self.lexical_destinations.items[binding.destination];
-                    target.initializer = initializer.id;
-                    target.origins = try self.mergeReferenceOrigins(target.origins, origins);
-                    target.completion = completion;
-                } else {
-                    for (self.lexical_bindings.items) |*parent| {
-                        if (parent.owner == binding.owner and parent.destination == binding.destination) {
-                            parent.origins = try self.mergeReferenceOrigins(parent.origins, origins);
-                            parent.completion = completion;
-                        }
-                    }
-                }
-            }
-            initializer.reference_origins = try self.importInitializerOrigins(&region, captures.items, region.returned_reference_origins);
+            initializer.reference_origins = try self.importInitializerOrigins(&region, captures.items, region.returned_reference_origins, initializer.id);
             try self.prepareInitializerTransfers(&region, captures.items, kept, initializer.id, raw.span);
             var outputs = region.capture_output_origins.iterator();
             while (outputs.next()) |output| {
                 const local = capture_locals.items[output.key_ptr.*] orelse continue;
                 try self.validateInitializerWrite(local, raw.span);
-                try self.initializer_writes.append(gpa, .{ .initializer = initializer.id, .local = local, .origins = try self.importInitializerOrigins(&region, captures.items, output.value_ptr.*) });
+                try self.initializer_writes.append(gpa, .{ .initializer = initializer.id, .local = local, .origins = try self.importInitializerOrigins(&region, captures.items, output.value_ptr.*, initializer.id) });
             }
             for (region.capture_reference_writes.items) |write| {
                 var incomplete = false;
@@ -2218,7 +1981,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     current = origin.next;
                     if (origin.parameter != null) external = try region.addReferenceOrigin(external, origin);
                 }
-                const origins = try self.importInitializerOrigins(&region, captures.items, external);
+                const origins = try self.importInitializerOrigins(&region, captures.items, external, initializer.id);
                 if (origins == null) continue;
                 try self.initializer_reference_writes.append(gpa, .{ .initializer = initializer.id, .reference = .{ .id = initializer.id, .type_id = write.type_id, .reference_origins = origins } });
             }
@@ -2311,23 +2074,6 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             }
         }
 
-        fn importLexicalCompletion(self: *Self, region: *Self, completion: ?StateId) !?StateId {
-            const source = region.states.items[@intFromEnum(completion orelse return null)];
-            const result = try self.captureState();
-            const destination = &self.states.items[@intFromEnum(result)];
-            for (region.captured_locals, 0..) |capture, local| {
-                if (capture == null) continue;
-                destination.availability[local] = source.availability[local];
-                destination.completed_consumptions[local] = source.completed_consumptions[local];
-            }
-            for (self.field_places, 0..) |place, field| {
-                if (region.captured_locals[@intFromEnum(place.local)] == null) continue;
-                destination.field_availability[field] = source.field_availability[field];
-                destination.completed_consumptions[self.local_values.len + field] = source.completed_consumptions[region.local_values.len + field];
-            }
-            return result;
-        }
-
         fn importInitializerProjection(self: *Self, region: *Self, projection: ?u32) anyerror!?u32 {
             const index = projection orelse return null;
             const source = region.reference_projections.items[index];
@@ -2350,7 +2096,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             };
         }
 
-        fn importInitializerOrigins(self: *Self, region: *Self, captures: []const Value, head: ?u32) !?u32 {
+        fn importInitializerOrigins(self: *Self, region: *Self, captures: []const Value, head: ?u32, initializer: structures.FunctionValueId) !?u32 {
             var incomplete = false;
             var current = try region.resolveReferenceOrigins(head, &incomplete);
             std.debug.assert(!incomplete);
@@ -2368,6 +2114,8 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 while (source) |source_index| {
                     var mapped = self.reference_origins.items[source_index];
                     source = mapped.next;
+                    if (origin.root != null and capture.borrow_root != null and mapped.root == capture.borrow_root)
+                        mapped.initializer_owner = initializer;
                     if (origin.projection != null) mapped.projection = try self.importInitializerProjection(region, origin.projection);
                     result = try self.addReferenceOrigin(result, mapped);
                 }
@@ -4878,7 +4626,6 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             operation: structures.FunctionCall,
             behavior: structures.CallBehavior,
             is_fallible: bool,
-            initializer_can_fail: bool = false,
             mut_arguments: structures.FunctionValueRange,
             consumed_arguments: structures.FunctionValueRange,
             writable_references: structures.FunctionValueRange,
@@ -5141,14 +4888,12 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             var mut_reference_origins: ?u32 = null;
             var mut_return_origin = false;
             const extracts_box = behavior == .box_value;
-            var initializer_can_fail = false;
             // Finish each argument before evaluating the next one. Nested copy
             // hooks may publish their own calls, so the outer operands stay in
             // local storage until their complete contiguous range is known.
             for (raw_arguments, signature.parameters, 0..) |raw, expected, argument_index| {
                 if (expected.mode == .init) {
                     const initializer = try self.prepareInitializer(raw, expected.type_id);
-                    initializer_can_fail = initializer_can_fail or initializer.initializer_can_fail;
                     try arguments_to_publish.append(self.ctx.allocator(), .{ .initializer = initializer.id });
                     try argument_places.append(self.ctx.allocator(), null);
                     try argument_reference_origins.append(self.ctx.allocator(), initializer.reference_origins);
@@ -5354,7 +5099,6 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     .return_type = signature.return_type,
                 },
                 .is_fallible = signature.is_fallible,
-                .initializer_can_fail = initializer_can_fail,
                 .mut_arguments = mut_arguments,
                 .consumed_arguments = consumed_arguments,
                 .writable_references = writable_range,
@@ -5512,17 +5256,15 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
 
         fn ordinaryCallValue(self: *Self, resolved: ResolvedCallable, span: structures.SourceSpan, destination: ?Value) !Value {
             var callable = resolved;
-            if (callable.is_fallible or callable.initializer_can_fail or callable.operation.hasInitializer(self.call_arguments.items)) {
-                if ((callable.is_fallible or callable.initializer_can_fail) and !self.is_fallible and
-                    (callable.is_fallible or !self.hasInitParameters())) return self.reject(span, .fallible_expression_outside_fallible_function);
+            if (callable.is_fallible) {
+                if (!self.is_fallible)
+                    return self.reject(span, .fallible_expression_outside_fallible_function);
                 try self.recordCallArgumentConsumes(callable.consumed_arguments);
                 const storage = destination orelse try self.inPlaceStorage(callable.operation.return_type);
                 if (storage) |result_storage| callable.operation.destination = result_storage.id;
-                var flow = try self.lowerFallibleCall(callable.operation, span, callable.is_fallible or callable.initializer_can_fail);
+                var flow = try self.lowerFallibleCall(callable.operation, span);
                 try self.finishCallExits(&flow, callable, span);
-                if (callable.is_fallible or callable.initializer_can_fail) {
-                    try self.propagateFailure(flow.failure.?, span);
-                }
+                try self.propagateFailure(flow.failure.?, span);
                 try self.enterFlowExit(flow.success.?);
                 if (flow.success.?.constructed) |constructed| return constructed;
                 const success_block = self.blocks.items[@intFromEnum(flow.success.?.block)];
@@ -5549,14 +5291,12 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         }
 
         fn finishCallEffects(self: *Self, callable: ResolvedCallable, succeeded: bool) !?u32 {
-            try self.applyCallMutArguments(callable.operation, callable.mut_arguments);
-            var returned_origins = try self.mergeReferenceOrigins(
-                callable.reference_origins,
-                try self.mutReturnOrigins(callable.mut_arguments),
-            );
+            var returned_origins = callable.reference_origins;
             for (self.call_arguments.items[callable.operation.arguments.start..callable.operation.arguments.end]) |argument| {
-                if (argument == .initializer) try self.finishInitializerEffects(argument.initializer, succeeded, &returned_origins);
+                if (argument == .initializer) try self.finishInitializerEffects(argument.initializer, succeeded, &returned_origins, callable.mut_arguments);
             }
+            try self.applyCallMutArguments(callable.operation, callable.mut_arguments);
+            returned_origins = try self.mergeReferenceOrigins(returned_origins, try self.mutReturnOrigins(callable.mut_arguments));
             try self.invalidateWritableReferences(
                 self.writable_call_references.items[callable.writable_references.start..callable.writable_references.end],
                 .{ .slots = &returned_origins },
@@ -5564,7 +5304,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             return returned_origins;
         }
 
-        fn finishInitializerEffects(self: *Self, initializer: structures.FunctionValueId, succeeded: bool, returned_origins: *?u32) !void {
+        fn finishInitializerEffects(self: *Self, initializer: structures.FunctionValueId, succeeded: bool, returned_origins: *?u32, mut_arguments: structures.FunctionValueRange) !void {
             for (self.initializer_transfers.items) |transfer| {
                 if (transfer.initializer != initializer) continue;
                 const availability = if (succeeded) transfer.call_availability else .maybe_transferred;
@@ -5599,7 +5339,12 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 const local = &self.local_values[@intFromEnum(write.local)].?;
                 local.reference_origins = try self.mergeReferenceOrigins(local.reference_origins, write.origins);
                 try self.rememberCleanupOrigins(local.*);
-                try self.advanceReferenceRoot(write.local, null, .{ .value = returned_origins });
+                try self.advanceReferenceRoot(write.local, null, null);
+                const identity = self.local_values[@intFromEnum(write.local)].?.binding_identity;
+                returned_origins.* = try self.refreshInitializerOwnerOrigins(returned_origins.*, initializer, write.local, identity);
+                for (self.pending_mut_arguments.items[mut_arguments.start..mut_arguments.end]) |*pending| {
+                    pending.reference_origins = try self.refreshInitializerOwnerOrigins(pending.reference_origins, initializer, write.local, identity);
+                }
             }
             for (self.initializer_reference_writes.items) |write| {
                 if (write.initializer != initializer) continue;
@@ -5615,128 +5360,12 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         ) !void {
             if (flow.success) |*success| try self.finishCallExit(success, callable, span, callable.operation.destination, true);
             if (flow.failure) |*failure| try self.finishCallExit(failure, callable, span, null, false);
-            if (flow.lexical_exit) |lexical| try self.finishLexicalCallExit(lexical, callable, span);
-        }
-
-        fn finishLexicalCallExit(self: *Self, exit: FlowExit, callable: ResolvedCallable, span: structures.SourceSpan) !void {
-            try self.enterFlowExit(exit);
-            const forwards_lexical = self.hasInitParameters() or self.is_initializer_region;
-            var last_destination: ?usize = null;
-            if (!forwards_lexical) for (self.lexical_destinations.items, 0..) |destination, index| {
-                if (callable.operation.usesInitializer(destination.initializer, self.call_arguments.items)) last_destination = index;
-            };
-            if (!forwards_lexical and last_destination == null) {
-                // Caller-owned regions without lexical exits cannot return a
-                // token. Retain storage at this invariant trap; no source
-                // cleanup or explicit-drop obligation belongs to this path.
-                const block_value = &self.blocks.items[@intFromEnum(exit.block)];
-                for (self.local_values, self.local_availability) |maybe_owner, availability| {
-                    if (availability == .transferred or availability == .unbound) continue;
-                    const owner = maybe_owner orelse continue;
-                    const generation = owner.owned_generation orelse continue;
-                    try block_value.terminator_effects.append(self.ctx.allocator(), .{ .use = .{ .generation = generation, .cleanup_value = owner.id } });
-                }
-                self.terminate(.diverge);
-                return;
-            }
-            const parent_boundary = self.current_boundary;
-            const boundary = try self.newBoundary(span);
-            self.current_boundary = boundary;
-            defer self.current_boundary = parent_boundary;
-            _ = try self.finishCallEffects(callable, false);
-            try self.appendBoundary(boundary);
-            const state = try self.captureState();
-            const token: structures.FunctionValueId = @enumFromInt(self.blocks.items[@intFromEnum(exit.block)].argument_start);
-            const destination_count = self.lexical_destinations.items.len;
-            for (0..destination_count) |index| {
-                const destination = self.lexical_destinations.items[index];
-                if (!callable.operation.usesInitializer(destination.initializer, self.call_arguments.items)) continue;
-                if (last_destination == index) return self.landLexicalExit(destination);
-                const argument_start: u32 = @intCast(self.block_arguments.items.len);
-                const match = try self.newBlock(argument_start, argument_start);
-                const mismatch = try self.newBlock(argument_start, argument_start);
-                self.terminate(.{ .continuation_branch = .{ .token = token, .target = destination.token.id, .match = match, .mismatch = mismatch } });
-                self.enterBlock(match);
-                self.restoreState(state);
-                try self.landLexicalExit(destination);
-                self.enterBlock(mismatch);
-                self.restoreState(state);
-            }
-            if (forwards_lexical) {
-                try self.finishFunctionExit(span, .{ .return_lexical = token });
-            } else self.terminate(.diverge);
-        }
-
-        fn applyLexicalCompletion(self: *Self, destination: LexicalDestination) !void {
-            const completed = self.states.items[@intFromEnum(destination.completion orelse return)];
-            for (self.initializer_transfers.items) |transfer| {
-                if (transfer.initializer != destination.initializer) continue;
-                const availability = if (transfer.field) |field| completed.field_availability[field] else completed.availability[@intFromEnum(transfer.local)];
-                if (transfer.field) |field| {
-                    self.field_availability[field] = availability;
-                } else self.local_availability[@intFromEnum(transfer.local)] = availability;
-                const place = if (transfer.field) |field| self.local_values.len + field else @intFromEnum(transfer.local);
-                self.completed_consumptions[place] = completed.completed_consumptions[place];
-                if (self.completed_consumptions[place]) try self.recordConsume(transfer.owner);
-            }
         }
 
         fn retireGuardedOwner(self: *Self, owner: Value) !void {
             const generation = owner.owned_generation orelse return;
             const predicate = self.generations.items[@intFromEnum(generation)].cleanup_condition orelse return;
             _ = try self.copyBits(try self.appendInstruction(.{ .const_bool = true }), .{ .id = predicate, .type_id = .bool });
-        }
-
-        fn landLexicalExit(self: *Self, destination: LexicalDestination) !void {
-            const span = destination.shape.span;
-            const parent_boundary = self.current_boundary;
-            const boundary = try self.newBoundary(span);
-            self.current_boundary = boundary;
-            defer self.current_boundary = parent_boundary;
-            try self.applyLexicalCompletion(destination);
-            if (destination.shape.target == .continue_loop) {
-                try self.appendBoundary(boundary);
-                return self.continueLoop(span);
-            }
-            var payload = if (destination.shape.type_id == .unit)
-                try self.appendInstruction(.const_unit)
-            else
-                try self.appendInstruction(.{ .continuation_storage = .{ .token = destination.token.id, .type_id = destination.shape.type_id } });
-            payload.reference_origins = destination.origins;
-            payload = try self.defineOwnedValue(payload, span, false);
-            if (destination.payload_ownership) |ownership| {
-                payload.borrow_condition = ownership.nonowning.id;
-                const completion = try self.appendInstruction(.{ .continuation_storage = .{ .token = ownership.completion.id, .type_id = .bool } });
-                payload.consumption_completion = completion.id;
-                for (self.initializer_transfers.items) |transfer| {
-                    if (transfer.initializer != destination.initializer) continue;
-                    const place = if (transfer.field) |field| self.local_values.len + field else @intFromEnum(transfer.local);
-                    if (self.completed_consumptions[place]) continue;
-                    payload.pending_consumption_owners = try self.addPendingConsumptionOwner(payload.pending_consumption_owners, .{
-                        .generation = transfer.owner.owned_generation,
-                        .cleanup_value = transfer.owner.id,
-                        .local = transfer.local,
-                        .field = transfer.field,
-                    });
-                }
-                payload = self.withCleanupCondition(payload);
-            }
-            if (destination.shape.target == .return_function) {
-                if (payload.type_id == .unit) {
-                    try self.recordConsume(payload);
-                    try self.appendBoundary(boundary);
-                    return self.finishFunctionExit(span, .return_unit);
-                }
-                try self.appendBoundary(boundary);
-                return self.returnConstructed(payload, span);
-            }
-            const context = destination.context.?;
-            if (context.result == .value and context.result.value.access == .consume) payload.preserves_storage = true;
-            payload = try self.ownValueEscapingSince(payload, context.baseline, span);
-            self.unbindLocalsSince(context.baseline);
-            const state = try self.captureState();
-            try self.appendBoundary(boundary);
-            try self.loop_breaks.append(self.ctx.allocator(), .{ .block = self.suspendBlock(), .state = state, .value = payload });
         }
 
         fn finishCallExit(
@@ -5883,6 +5512,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     existing.parameter == origin.parameter and existing.loop == origin.loop and
                     existing.stable == origin.stable and existing.read == origin.read and
                     existing.deferred_capture == origin.deferred_capture and
+                    existing.initializer_owner == origin.initializer_owner and
                     self.sameReferenceProjection(existing.projection, origin.projection) and
                     self.sameReferenceTransform(existing.transform, origin.transform)) return head;
                 cursor = existing.next;
@@ -6428,6 +6058,18 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             return updated;
         }
 
+        fn refreshInitializerOwnerOrigins(self: *Self, origins: ?u32, initializer: structures.FunctionValueId, root: semantic.UnresolvedBody.LocalId, identity: BindingIdentity) !?u32 {
+            var updated: ?u32 = null;
+            var current = origins;
+            while (current) |index| {
+                var origin = self.reference_origins.items[index];
+                if (origin.root == root and origin.initializer_owner == initializer) origin.binding_identity = identity;
+                updated = try self.addReferenceOrigin(updated, origin);
+                current = origin.next;
+            }
+            return updated;
+        }
+
         fn assignReference(self: *Self, reference: Value, value_use: semantic.UnresolvedBody.ValueUse, span: structures.SourceSpan) !Value {
             const access = (try self.type_interner.facts().borrowAccess(reference.type_id)) orelse
                 return self.reject(span, .{ .dereference_requires_ref = reference.type_id });
@@ -6590,24 +6232,18 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             return updated;
         }
 
-        fn lowerFallibleCall(self: *Self, call: structures.FunctionCall, span: structures.SourceSpan, can_fail: bool) !ConditionFlow {
+        fn lowerFallibleCall(self: *Self, call: structures.FunctionCall, span: structures.SourceSpan) !ConditionFlow {
             const argument_start: u32 = @intCast(self.block_arguments.items.len);
             const produced_generation = if (call.destination == null) try self.allocateGeneration(call.return_type, span, false) else null;
             _ = try self.appendBlockArgument(if (call.destination == null) call.return_type else .unit, produced_generation);
             const success = try self.newBlock(argument_start, argument_start + 1);
-            const failure = if (can_fail) try self.newBlock(argument_start + 1, argument_start + 1) else null;
-            const lexical = if (call.hasInitializer(self.call_arguments.items)) blk: {
-                const token = try self.appendBlockArgument(.unit, null);
-                self.block_arguments.items[token].representation = .continuation;
-                break :blk try self.newBlock(token, token + 1);
-            } else null;
+            const failure = try self.newBlock(argument_start + 1, argument_start + 1);
             try self.moveCurrentBoundaryEffectsToTerminator();
-            self.terminate(.{ .fallible_call = .{ .call = call, .success = success, .failure = failure, .lexical_exit = lexical } });
+            self.terminate(.{ .fallible_call = .{ .call = call, .success = success, .failure = failure } });
             const state = try self.captureState();
             return .{
                 .success = .{ .block = success, .state = state },
-                .failure = if (failure) |target| .{ .block = target, .state = state } else null,
-                .lexical_exit = if (lexical) |target| .{ .block = target, .state = state } else null,
+                .failure = .{ .block = failure, .state = state },
             };
         }
 
@@ -6637,11 +6273,11 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             const resolved = try self.resolveCall(call, call.span);
             return switch (resolved) {
                 .diverged => |value_to_return| .{ .success = null, .failure = null, .diverged = value_to_return },
-                .callable => |resolved_callable| if (resolved_callable.is_fallible or resolved_callable.initializer_can_fail) blk: {
+                .callable => |resolved_callable| if (resolved_callable.is_fallible) blk: {
                     var callable = resolved_callable;
                     try self.recordCallArgumentConsumes(callable.consumed_arguments);
                     if (try self.inPlaceStorage(callable.operation.return_type)) |storage| callable.operation.destination = storage.id;
-                    var flow = try self.lowerFallibleCall(callable.operation, call.span, true);
+                    var flow = try self.lowerFallibleCall(callable.operation, call.span);
                     try self.finishCallExits(&flow, callable, call.span);
                     if (binding) |success_binding| flow.success.?.binding = .{ .call = success_binding };
                     break :blk flow;
@@ -7450,11 +7086,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                             if (target) |successor| try self.appendProducedOwnershipEdge(predecessor, @intCast(ordinal), successor.*);
                         }
                     },
-                    .continuation_branch => |branch| {
-                        try self.appendProducedOwnershipEdge(predecessor, 0, branch.match);
-                        try self.appendProducedOwnershipEdge(predecessor, 1, branch.mismatch);
-                    },
-                    .return_unit, .return_value, .return_failure, .return_lexical, .diverge => {},
+                    .return_unit, .return_value, .return_failure, .diverge => {},
                 }
             }
             for (self.ownership_forward_hints.items) |hint| {
@@ -8113,7 +7745,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             const branches = try self.branch_arguments.toOwnedSlice(gpa);
             const body: structures.FunctionBodyAnalysis = .{
                 .return_type = self.return_type,
-                .is_fallible = if (self.is_initializer_region) self.hasFailureExit() else self.is_fallible or self.hasInitParameters(),
+                .is_fallible = self.is_fallible,
                 .is_initializer_region = self.is_initializer_region,
                 .initializer_regions = initializer_regions,
                 .initializer_captures = initializer_captures,

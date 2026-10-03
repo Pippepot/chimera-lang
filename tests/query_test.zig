@@ -2083,12 +2083,12 @@ test "ownership effects compose across calls joins scopes and partial aggregates
             .source =
             \\struct Resource
             \\  drop = func(deinit self: Resource) -> exit(42)
-            \\fallible fail() int
+            \\fallible fail_value() int
             \\  1 < 0
             \\  return 1
             \\fallible attempt() int
             \\  const resource = Resource{}
-            \\  const value = fail()
+            \\  const value = fail_value()
             \\  return value
             \\if attempt() -> exit(1) else exit(0)
             ,
@@ -2178,10 +2178,10 @@ test "ownership effects compose across calls joins scopes and partial aggregates
             \\struct Pair
             \\  first: Resource
             \\  second: int
-            \\fallible fail() int
+            \\fallible fail_value() int
             \\  1 < 0
             \\  return 1
-            \\fallible attempt() Pair -> Pair{first = Resource{}, second = fail()}
+            \\fallible attempt() Pair -> Pair{first = Resource{}, second = fail_value()}
             \\if attempt() -> exit(1) else exit(0)
             ,
             .expected = 42,
@@ -2239,12 +2239,12 @@ test "failure and condition results enforce explicit drop" {
     const cases = [_][]const u8{
         \\struct Resource
         \\  drop = explicit
-        \\fallible fail() int
+        \\fallible fail_value() int
         \\  1 < 0
         \\  return 1
         \\fallible attempt() int
         \\  const resource = Resource{}
-        \\  const value = fail()
+        \\  const value = fail_value()
         \\  return value
         \\if attempt() -> exit(1) else exit(0)
         ,
@@ -4823,8 +4823,8 @@ test "compile-time execution errors include every call site" {
     defer db.deinit();
 
     const source =
-        \\static fail = func() int -> 42 / 0
-        \\static middle = func() int -> fail()
+        \\static fail_value = func() int -> 42 / 0
+        \\static middle = func() int -> fail_value()
         \\static bad = middle()
     ;
     try addSource(db, 1, source);

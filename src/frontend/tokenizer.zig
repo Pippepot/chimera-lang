@@ -495,7 +495,7 @@ pub const Tokenizer = struct {
 };
 
 test "keywords" {
-    try testTokenize("if else const var imm mut deinit return true false comptime static func struct is as and or not none sizeof test loop break continue import pub", &.{
+    try testTokenize("if else const var imm mut deinit return fail true false comptime static func struct is as and or not none sizeof test loop break continue import pub", &.{
         .keyword_if,
         .keyword_else,
         .keyword_const,
@@ -504,6 +504,7 @@ test "keywords" {
         .keyword_mut,
         .keyword_deinit,
         .keyword_return,
+        .keyword_fail,
         .keyword_true,
         .keyword_false,
         .keyword_comptime,
@@ -525,6 +526,15 @@ test "keywords" {
         .keyword_pub,
     });
     try testTokenize("read", &.{.identifier});
+}
+
+test "fail keyword preserves identifier boundaries" {
+    try testTokenize("fail failure fail_value fallible", &.{
+        .keyword_fail,
+        .identifier,
+        .identifier,
+        .keyword_fallible,
+    });
 }
 
 test "function indentation" {

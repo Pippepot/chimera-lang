@@ -78,6 +78,11 @@ The same rule applies to a standalone fallible call inside a fallible function:
 success continues to the next statement, while failure makes the enclosing
 function fail too. Use `if` when you want to handle failure at that point.
 
+Use the bare statement `fail` to propagate failure explicitly, including after
+local cleanup. It is allowed in a `fallible` function or a deferred initializer,
+not an ordinary `func`. Consuming a deferred initializer is always potentially
+fallible, so its construction site must handle or propagate that failure.
+
 ## Compile-time code is still code
 
 ```chi

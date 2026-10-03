@@ -589,10 +589,10 @@ item = make(current + 1)
 # before construction. Constructing it into a local consumes the initializer
 # and establishes that local as the value's destination. An immovable local
 # cannot subsequently be relocated into another destination.
-func materialize(static T: type, init item: T) T
+fallible materialize(static T: type, init item: T) T
     return item # constructs directly in this call's result destination
 
-func forward_initializer(static T: type, init item: T) T
+fallible forward_initializer(static T: type, init item: T) T
     return materialize(T, item) # forwards once, without early construction
 #
 # Deferred expressions retain the lexical bindings and access needed for later
@@ -608,11 +608,13 @@ func forward_initializer(static T: type, init item: T) T
 # failure after a transfer does not undo it. A shared failure continuation may
 # therefore see the source as possibly consumed.
 #
-# Initializer evaluation follows ordinary fallible control flow at its
-# construction site: failure must be handled or propagated there. Forwarding
-# preserves that possibility without triggering it. An ordinary 'func' consumer
-# may propagate failure from an init parameter as a deferred call outcome; this
-# does not authorize ordinary fallible statements without a fallible declaration.
+# Consuming any init parameter into a destination is potentially fallible,
+# including one supplied with a literal or an expression that cannot fail.
+# Failure must be handled at the construction site or propagated from a declared
+# fallible function. An ordinary func cannot acquire a hidden failure outcome.
+# Forwarding does not evaluate the expression; its call obeys the receiving
+# callable's declared fallibility. No initializer infallibility assertion or
+# additional parameter modifier is currently provided.
 # Partial construction cleans up completed subobjects, with dependents before
 # owners and otherwise reverse initialization order. A completed nested object
 # receives its normal drop;
@@ -621,15 +623,14 @@ func forward_initializer(static T: type, init item: T) T
 # aggregate uses its ordinary destruction order, not partial-construction order.
 # Runtime and compile-time execution obey the same rules.
 #
-# A return inside a deferred expression targets its lexically enclosing caller
-# function. Break and continue target the nearest lexically enclosing loop,
-# including a loop inside the deferred expression. Exit payloads are typed and
-# constructed against that lexical destination, independently of the init T.
-# A lexical exit first cleans partial construction and the initializer's locals,
-# then every receiving or forwarding frame, then the caller scopes it leaves.
-# It is not fallible failure and cannot be handled by an if-call else branch.
-# Deferred writes and completed transfers are not rolled back. Reference escape,
-# mutable copyback, and explicit-drop obligations apply to these exits too.
+# A deferred initializer is a control-flow boundary: it produces its value,
+# fails, or diverges. Return targeting the caller and break or continue targeting
+# a loop outside the initializer are errors, not retargeted exits. Loops inside
+# the initializer retain their own break and continue; called functions return
+# normally. Forwarding, aliases, and indirect calls preserve this boundary.
+# Ordinary eager argument expressions retain caller-directed exits.
+# Deferred writes and completed transfers are not rolled back on failure.
+# Reference escape, mutable copyback, and explicit-drop obligations still apply.
 
 
 # Borrowed views and host storage
@@ -726,6 +727,8 @@ func forward_initializer(static T: type, init item: T) T
 # completed subobjects are cleaned up under the partial-construction rules,
 # then the allocation is released. No destructor runs on an uninitialized T.
 # Only successful construction publishes a Box owning the live T and storage.
+# The ordinary fallible constructor directly allocates one slot, handles
+# unsafe_initialize failure by deallocating it, then propagates with bare fail.
 # Earlier transfers and other initializer effects are not rolled back. Explicit
 # drop obligations created during evaluation must have a valid failure path.
 # These guarantees use general init and storage initialization semantics, not
@@ -748,11 +751,15 @@ func forward_initializer(static T: type, init item: T) T
 # Alignment is at least the natural alignment for T in that domain. Overflow
 # fails before allocation. The logical count remains separate from the byte layout.
 # It must be consumed by deallocation, which releases storage but does not
-# destroy elements. unsafe_initialize(T, mut allocation, index, init value)
+# destroy elements. fallible unsafe_initialize(T, mut allocation, index, init value)
 # consumes an initializer into an uninitialized element slot using the general
 # destination rules. Allocation and index arguments evaluate eagerly; the value
-# expression is deferred until slot initialization.
-# unsafe_initialize_all(T, N, mut allocation, init value: collection_literal(T, N))
+# expression is deferred until slot initialization. Allocation(T).unsafe_init
+# is also explicitly fallible. Every consumption must handle or propagate
+# failure, even for an expression that cannot actually fail. Failed construction
+# cleans completed subobjects and leaves no initialized element; captured writes
+# and completed transfers are not rolled back.
+# Planned fallible unsafe_initialize_all(T, N, mut allocation, init value: collection_literal(T, N))
 # constructs the literal's elements in order into slots 0 through N - 1; the
 # caller proves capacity and that those slots are uninitialized.
 # unsafe_take(T, mut allocation, index) still requires directly movable T in
@@ -821,8 +828,16 @@ func forward_initializer(static T: type, init item: T) T
 # may be appended or relocated by the initial buffer API. Ref-containing
 # elements are not supported until mutation can track their referent origins.
 # Buffer growth allocates replacement storage before disturbing initialized
-# elements; allocation failure leaves the original contents intact. Once
-# relocation begins, no further fallible operation may intervene. `get(index)`
+# elements; allocation failure leaves the original contents intact. reserve
+# relocates in reverse index order: unsafe_take extracts each item and
+# self.initialized = index records the retained old-buffer prefix before
+# fallible unsafe_initialize constructs the item in replacement storage.
+# Successful initialization continues relocation. On initialization failure,
+# the completed replacement suffix is destroyed, replacement storage is
+# deallocated, and fail propagates. The original allocation retains a valid
+# initialized prefix, without restoring removed elements. Supported moves are
+# infallible, so the standard move path does not actually fail initialization;
+# the conservative init contract still requires the cleanup path. `get(index)`
 # checks 0 <= index < length and returns Ref(T, false); `get_mut(index)` also
 # checks bounds and returns Ref(T, true) from a mutable Buffer place. An empty
 # Buffer has no initialized element, even for an immovable T; append still
@@ -1143,6 +1158,7 @@ reassigned = int_or_float_value
 
 
 # Converters
+# Converter support is planned; these rules do not describe an implemented API.
 # A converter declares an implicit conversion from a source type to a target
 # type. It has no name and is not called directly. Its signature has exactly one
 # value parameter, which receives the converted expression; every other
@@ -1151,7 +1167,10 @@ reassigned = int_or_float_value
 # parameter's mode follows its type: static for a compile-time-only type,
 # including static structs and int_literal, init for collection_literal, and
 # imm otherwise, so inserting a converter never consumes an existing value.
-# Converters are not fallible.
+# Converters are not fallible. An init converter must handle potentially failing
+# initialization locally; it cannot propagate failure or acquire a hidden
+# failure outcome. Type-level where proofs of initializer infallibility remain
+# deferred, rather than adding another init mode or parallel signatures.
 # Bodies, `where` clauses, and reference origins follow ordinary function rules.
 # A static source argument is evaluated at compile time; it does not require
 # the converter body to execute at compile time. A converter may construct a
@@ -1222,6 +1241,8 @@ const read_only = Ref(int, false)(handle)
 # type, a collection literal will default to Array(T, N); until Array exists it
 # is an error.
 # std: pub converter(static T: type, static N: int, init value: collection_literal(T, N)) List(T)
+# Local handling of allocation and initialization failure in this planned
+# infallible List converter remains to be specified before implementation.
 const bytes: List(byte) = [1, 2] # T = byte; each element converts
 const numbers: List(int | float) = [1, 2.5]
 # Without an expected type, [1, 2.5] has type collection_literal(int | float, 2).
@@ -1251,6 +1272,14 @@ static widened_identity: fallible(int) int = identity
 # Named declarations follow the same sugar as ordinary functions.
 fallible accept(arg: int) int
     return arg
+
+# Bare fail is a statement that propagates ordinary failure with no value.
+# It is permitted only in a fallible enclosing function or initializer region,
+# including after explicit cleanup. It is not an expression or a separate
+# nonlocal outcome. Initializer regions are always fallible; ordinary function
+# and call fallibility comes solely from the declared signature.
+fallible reject()
+    fail
 
 # 'is' succeeds when the active variant member belongs to the given type.
 # 'as' also carries the narrowed value on success.

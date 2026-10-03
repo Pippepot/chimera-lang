@@ -207,6 +207,7 @@ fn parseExpression(parser: *ParserState) ParseError!Node.Index {
         .keyword_import => try parseImport(parser),
         .keyword_func, .keyword_fallible, .keyword_extern => try parseFunction(parser),
         .keyword_return => try parseReturn(parser),
+        .keyword_fail => try parseTokenNode(parser, .keyword_fail, .fail_expr),
         .keyword_break => try parseBreak(parser),
         .keyword_continue => try parseTokenNode(parser, .keyword_continue, .continue_expr),
         .number_literal,
@@ -248,7 +249,7 @@ fn parseCallableBody(parser: *ParserState) !Node.Index {
         return error.ParseError;
     }
     return switch (parser.nodes.items[expression.index()].tag) {
-        .break_nothing, .break_expr, .continue_expr, .return_nothing, .return_expr => expression,
+        .break_nothing, .break_expr, .continue_expr, .return_nothing, .return_expr, .fail_expr => expression,
         else => parser.addNode(.{
             .tag = .return_expr,
             .token_index = parser.nodes.items[expression.index()].token_index,
@@ -952,7 +953,7 @@ fn renderNode(gpa: std.mem.Allocator, node_index: Node.Index, ast: *const Ast, s
     const new_indent = if (at_root) "" else try std.mem.concat(gpa, u8, &.{ indent, if (is_last) "  " else "│ " });
     defer if (!at_root) gpa.free(new_indent);
     switch (node.tag) {
-        .break_nothing, .continue_expr, .return_nothing => try writer.writeByte('\n'),
+        .break_nothing, .continue_expr, .return_nothing, .fail_expr => try writer.writeByte('\n'),
         .access, .bool_literal, .identifier, .none_literal, .type, .number_literal => {
             const loc = ast.tokens[node.token_index].loc;
             try writer.print(" : {s}\n", .{source[loc.start..loc.end]});
@@ -1134,6 +1135,45 @@ test "parse inline bare return before another declaration" {
     const first_binding = parsed.nodes[parsed.node_refs[root.data.ref.start].index()];
     const first_function = parsed.nodes[first_binding.data.node_node.b.index()];
     try std.testing.expectEqual(Node.Tag.return_nothing, parsed.nodes[first_function.data.node_node.b.index()].tag);
+    try std.testing.expectEqual(Node.Tag.static_binding, parsed.nodes[parsed.node_refs[root.data.ref.start + 1].index()].tag);
+}
+
+test "parse bare fail" {
+    const source =
+        \\fallible reject() int
+        \\  fail
+        \\  return 1
+    ;
+    var report = try parseReport(std.testing.allocator, 1, source);
+    defer report.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len);
+    const parsed = report.ast.?;
+    const binding = parsed.nodes[parsed.node_refs[parsed.nodes[0].data.ref.start].index()];
+    const function = parsed.nodes[binding.data.node_node.b.index()];
+    const body = parsed.nodes[function.data.node_node.b.index()];
+    try std.testing.expectEqual(Node.Tag.block, body.tag);
+    try std.testing.expectEqual(@as(u32, 2), body.data.ref.end - body.data.ref.start);
+    const failure = parsed.nodes[parsed.node_refs[body.data.ref.start].index()];
+    try std.testing.expectEqual(Node.Tag.fail_expr, failure.tag);
+    try std.testing.expectEqual(Token.Tag.keyword_fail, parsed.tokens[failure.token_index].tag);
+    try std.testing.expectEqual(Node.Tag.return_expr, parsed.nodes[parsed.node_refs[body.data.ref.start + 1].index()].tag);
+    try std.testing.expect(Ast.eql(parsed, parsed));
+}
+
+test "parse inline bare fail before another declaration" {
+    const source =
+        \\fallible reject() int -> fail
+        \\func value() int -> 1
+    ;
+    var report = try parseReport(std.testing.allocator, 1, source);
+    defer report.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len);
+    const parsed = report.ast.?;
+    const root = parsed.nodes[0];
+    try std.testing.expectEqual(@as(u32, 2), root.data.ref.end - root.data.ref.start);
+    const binding = parsed.nodes[parsed.node_refs[root.data.ref.start].index()];
+    const function = parsed.nodes[binding.data.node_node.b.index()];
+    try std.testing.expectEqual(Node.Tag.fail_expr, parsed.nodes[function.data.node_node.b.index()].tag);
     try std.testing.expectEqual(Node.Tag.static_binding, parsed.nodes[parsed.node_refs[root.data.ref.start + 1].index()].tag);
 }
 

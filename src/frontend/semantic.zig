@@ -82,6 +82,7 @@ pub const UnresolvedBody = struct {
         continue_loop: structures.SourceSpan,
         return_nothing: structures.SourceSpan,
         return_value: ValueUse,
+        failure: structures.SourceSpan,
     };
     pub const PredicateOperation = enum { lt, gt, le, ge, eq, ne };
     pub const Call = struct {
@@ -442,6 +443,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                     self.reject(index, .top_level_return)
                 else
                     .{ .return_value = try self.appendUse(node.data.node, self.returns_type) },
+                .fail_expr => .{ .failure = span },
                 .break_nothing, .break_expr => try self.buildBreak(index, result_is_type),
                 .continue_expr => try self.buildContinue(index),
                 .assign => if (self.isDiscardAssignment(index))
@@ -1042,7 +1044,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
 
             const node = self.ast.nodes[index.index()];
             if (node.tag != .block) {
-                if (node.tag == .return_nothing or node.tag == .return_expr or node.tag == .break_nothing or node.tag == .break_expr or node.tag == .continue_expr) {
+                if (node.tag == .return_nothing or node.tag == .return_expr or node.tag == .break_nothing or node.tag == .break_expr or node.tag == .continue_expr or node.tag == .fail_expr) {
                     var statements = [_]UnresolvedBody.Statement{try self.buildStatement(index, result_is_type)};
                     return self.finishBlock(&statements, null, tokenSpan(self.ast, node.token_index));
                 }
@@ -1060,7 +1062,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             const last = children[children.len - 1];
             const last_node = self.ast.nodes[last.index()];
             const result: ?ValueId = switch (last_node.tag) {
-                .const_binding, .var_binding, .borrow_binding, .borrow_mut_binding, .return_nothing, .return_expr, .break_nothing, .break_expr, .continue_expr => blk: {
+                .const_binding, .var_binding, .borrow_binding, .borrow_mut_binding, .return_nothing, .return_expr, .break_nothing, .break_expr, .continue_expr, .fail_expr => blk: {
                     try statements.append(self.gpa, try self.buildStatement(last, result_is_type));
                     break :blk null;
                 },
@@ -2590,6 +2592,58 @@ test "discard assignment has distinct unresolved statement" {
     const statement = unresolved.statements[root.statements.start];
     try std.testing.expectEqual(UnresolvedBody.ValueId, @TypeOf(statement.lifetime_extend.value));
     try std.testing.expectEqual(@as(u32, 0), @intFromEnum(statement.lifetime_extend.value));
+}
+
+test "fail has terminal unresolved statements in function and branch bodies" {
+    const parser = @import("parser.zig");
+    const cases = [_]struct { source: []const u8, failure_count: usize }{
+        .{ .source = "fallible reject() int -> fail", .failure_count = 1 },
+        .{
+            .source =
+            \\fallible reject() int
+            \\  if 1 < 2 -> fail else fail
+            ,
+            .failure_count = 2,
+        },
+        .{
+            .source =
+            \\fallible reject() int
+            \\  if 1 < 2
+            \\    fail
+            \\  else
+            \\    fail
+            ,
+            .failure_count = 2,
+        },
+    };
+    for (cases) |case| {
+        var report = try parser.parseReport(std.testing.allocator, 1, case.source);
+        defer report.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len);
+        const parsed = &report.ast.?;
+        const declaration = parsed.node_refs[parsed.nodes[0].data.ref.start];
+        const result = try buildUnresolvedBody(parsed, case.source, declaration.index(), .function, &.{}, TestTypeInterner{}, std.testing.allocator);
+        var unresolved = switch (result) {
+            .success => |value| value,
+            .unsupported => unreachable,
+        };
+        defer unresolved.deinit(std.testing.allocator);
+
+        var failure_count: usize = 0;
+        for (unresolved.blocks) |block| {
+            for (unresolved.statements[block.statements.start..block.statements.end]) |statement| {
+                switch (statement) {
+                    .failure => |span| {
+                        failure_count += 1;
+                        try std.testing.expectEqualStrings("fail", case.source[span.start..span.end]);
+                        try std.testing.expectEqual(@as(?UnresolvedBody.ValueId, null), block.result);
+                    },
+                    else => {},
+                }
+            }
+        }
+        try std.testing.expectEqual(case.failure_count, failure_count);
+    }
 }
 
 test "function signature cleans up every allocation failure" {

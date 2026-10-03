@@ -1,7 +1,7 @@
 const std = @import("std");
 const structures = @import("../structures.zig");
 
-test "lexical payload cell subtrees survive the constructing region storage" {
+test "initializer capture cell subtrees survive the constructing region storage" {
     const outer_type: structures.TypeId = @enumFromInt(100);
     const nested_type: structures.TypeId = @enumFromInt(101);
     const variant_type: structures.TypeId = @enumFromInt(102);
@@ -45,29 +45,128 @@ test "lexical payload cell subtrees survive the constructing region storage" {
             .{ .variant = .{ .member_type = nested_type, .payload = @enumFromInt(0) } }
         else
             .{ .structure = @enumFromInt(0) } };
-        var token: Continuation = .{ .destination = cell };
-        var arguments = [_]Value{.{ .continuation = &token }};
+        var arguments = [_]Value{.{ .place = cell }};
         var parameters = [_]structures.ParameterMode{.imm};
-        var block_arguments = [_]structures.FunctionBlockArgument{.{ .type_id = .unit, .representation = .continuation }};
+        var block_arguments = [_]structures.FunctionBlockArgument{.{ .type_id = cell.type_id, .representation = .storage }};
         var instructions = [_]structures.FunctionInstruction{
-            .{ .continuation_storage = .{ .token = @enumFromInt(0), .type_id = cell.type_id } },
-            .{ .storage_projection = .{ .owner = @enumFromInt(1), .type_id = nested_type, .projection = if (variant) .variant else .{ .field = 0 } } },
-            .{ .storage_projection = .{ .owner = @enumFromInt(2), .type_id = .int, .projection = .{ .field = 0 } } },
+            .{ .storage_projection = .{ .owner = @enumFromInt(0), .type_id = nested_type, .projection = if (variant) .variant else .{ .field = 0 } } },
+            .{ .storage_projection = .{ .owner = @enumFromInt(1), .type_id = .int, .projection = .{ .field = 0 } } },
             .{ .const_int = 42 },
-            .{ .value_copy = .{ .source = @enumFromInt(4), .destination = @enumFromInt(3), .type_id = .int } },
+            .{ .value_copy = .{ .source = @enumFromInt(3), .destination = @enumFromInt(2), .type_id = .int } },
         };
-        var blocks = [_]structures.FunctionBlock{.{ .argument_start = 0, .argument_end = 1, .instruction_start = 0, .instruction_end = instructions.len, .terminator = .{ .return_lexical = @enumFromInt(0) } }};
-        const body: structures.FunctionBodyAnalysis = .{ .return_type = .unit, .is_fallible = true, .is_initializer_region = true, .parameter_modes = &parameters, .block_arguments = &block_arguments, .branch_arguments = &.{}, .call_arguments = &.{}, .instructions = &instructions, .blocks = &blocks, .entry = @enumFromInt(0) };
+        var blocks = [_]structures.FunctionBlock{.{ .argument_start = 0, .argument_end = 1, .instruction_start = 0, .instruction_end = instructions.len, .terminator = .return_unit }};
+        const body: structures.FunctionBodyAnalysis = .{ .return_type = .unit, .is_initializer_region = true, .parameter_modes = &parameters, .block_arguments = &block_arguments, .branch_arguments = &.{}, .call_arguments = &.{}, .instructions = &instructions, .blocks = &blocks, .entry = @enumFromInt(0) };
         var region_bytes: [8192]u8 = undefined;
         var region_storage: std.heap.FixedBufferAllocator = .init(&region_bytes);
         const result = try execute(&body, &arguments, &executor, region_storage.allocator());
-        try std.testing.expect(result == .lexical_exit);
-        try std.testing.expect(result.lexical_exit == &token);
+        try std.testing.expect(result == .returned);
+        try std.testing.expect(result.returned.runtime == .unit);
         @memset(&region_bytes, 0);
         const nested = if (variant) cell.contents.variant_payload else &cell.contents.fields[0];
         try std.testing.expect(nested.contents == .fields);
         try std.testing.expectEqual(@as(i32, 42), nested.contents.fields[0].contents.value.int);
     };
+}
+
+test "fallible initializer calls route ordinary failure without a value" {
+    const Executor = struct {
+        pub fn call(_: *@This(), _: structures.InstanceId, _: []Value, _: ?structures.SourceSpan) !Result {
+            unreachable;
+        }
+        pub fn structFieldCount(_: *@This(), _: structures.TypeId) !?usize {
+            unreachable;
+        }
+        pub fn lookupTuple(_: *@This(), _: structures.CompileTimeValueTupleId) ![]const structures.CompileTimeValueId {
+            unreachable;
+        }
+        pub fn lookupRuntime(_: *@This(), _: structures.CompileTimeValueId) !?structures.CompileTimeValue.Runtime {
+            unreachable;
+        }
+        pub fn internRuntime(_: *@This(), _: structures.TypeId, _: structures.CompileTimeValue.RuntimeValue) !structures.CompileTimeValueId {
+            unreachable;
+        }
+        pub fn internTuple(_: *@This(), _: []const structures.CompileTimeValueId) !structures.CompileTimeValueTupleId {
+            unreachable;
+        }
+        pub fn variantMembers(_: *@This(), _: structures.TypeId) !?[]const structures.TypeId {
+            unreachable;
+        }
+        pub fn argumentPassing(_: *@This(), _: structures.TypeId) !structures.ArgumentPassing {
+            unreachable;
+        }
+    };
+    var executor: Executor = .{};
+    var region_blocks = [_]structures.FunctionBlock{.{ .instruction_start = 0, .instruction_end = 0, .terminator = .return_failure }};
+    const region: structures.FunctionBodyAnalysis = .{
+        .return_type = .int,
+        .is_fallible = true,
+        .is_initializer_region = true,
+        .parameter_modes = &.{},
+        .block_arguments = &.{},
+        .branch_arguments = &.{},
+        .call_arguments = &.{},
+        .instructions = &.{},
+        .blocks = &region_blocks,
+        .entry = @enumFromInt(0),
+    };
+    var arguments = [_]Value{.{ .initializer = .{ .body = &region, .captures = &.{} } }};
+    var modes = [_]structures.ParameterMode{.init};
+    var block_arguments = [_]structures.FunctionBlockArgument{
+        .{ .type_id = .int, .representation = .initializer },
+        .{ .type_id = .int },
+    };
+    var blocks = [_]structures.FunctionBlock{
+        .{ .argument_end = 1, .instruction_start = 0, .instruction_end = 0, .terminator = .{ .fallible_call = .{
+            .call = .{ .target = .{ .initializer = @enumFromInt(0) }, .arguments = .{ .start = 0, .end = 0 }, .return_type = .int },
+            .success = @enumFromInt(1),
+            .failure = @enumFromInt(2),
+        } } },
+        .{ .argument_start = 1, .argument_end = 2, .instruction_start = 0, .instruction_end = 0, .terminator = .{ .return_value = .{ .value = @enumFromInt(1) } } },
+        .{ .argument_start = 2, .argument_end = 2, .instruction_start = 0, .instruction_end = 0, .terminator = .return_failure },
+    };
+    const body: structures.FunctionBodyAnalysis = .{
+        .return_type = .int,
+        .is_fallible = true,
+        .parameter_modes = &modes,
+        .block_arguments = &block_arguments,
+        .branch_arguments = &.{},
+        .call_arguments = &.{},
+        .instructions = &.{},
+        .blocks = &blocks,
+        .entry = @enumFromInt(0),
+    };
+    const result = try execute(&body, &arguments, &executor, std.testing.allocator);
+    try std.testing.expect(result == .failure);
+}
+
+test "explicit fail evaluates in direct nested and initializer calls" {
+    const modules = @import("../modules.zig");
+    const query = @import("../query/engine.zig");
+    const queries = @import("../queries.zig");
+    const allocator = std.testing.allocator;
+    const db = try query.Database.init(allocator, .{ .worker_count = 1 });
+    defer db.deinit();
+    try modules.registerSources(db, allocator,
+        \\fallible fail_value() int -> fail
+        \\fallible nested() int -> fail_value()
+        \\fallible materialize(init item: int) int -> return item
+        \\fallible initialized() int -> materialize(if true == true -> fail else 0)
+        \\func handled() int -> if const value = initialized() -> value else 42
+    , &.{}, &.{});
+    const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;
+    const arguments = try db.intern(queries.CompileTimeValueTuples, .{ .values = &.{} });
+    for ([_][]const u8{ "fail_value", "nested", "initialized", "handled" }) |name| {
+        const result = (try db.get(queries.ExecuteComptimeCall, .{
+            .instance = .{ .item = scope.resolveFunction(name).? },
+            .arguments = arguments,
+        })).*.?;
+        try std.testing.expect(result == .completed);
+        if (std.mem.eql(u8, name, "handled")) {
+            try std.testing.expect(result.completed.outcome == .returned);
+            const value = (try db.lookupInterned(queries.CompileTimeValues, result.completed.outcome.returned)).*;
+            try std.testing.expectEqual(@as(i32, 42), value.runtime.value.int);
+        } else try std.testing.expect(result.completed.outcome == .failure);
+    }
 }
 
 pub const ExecutionErrorReason = enum {
@@ -86,11 +185,8 @@ pub const Value = union(enum) {
     runtime: structures.CompileTimeValue.RuntimeValue,
     type: structures.TypeId,
     place: *Cell,
-    continuation: *Continuation,
     initializer: struct { body: *const structures.FunctionBodyAnalysis, captures: []Value },
 };
-
-pub const Continuation = struct { destination: ?*Cell };
 
 pub const Cell = struct {
     type_id: structures.TypeId,
@@ -106,7 +202,6 @@ pub const Cell = struct {
 pub const Result = union(enum) {
     returned: Value,
     failure,
-    lexical_exit: *Continuation,
     exit: i32,
     execution_error: ExecutionError,
     reported_error,
@@ -152,13 +247,6 @@ pub fn execute(
                 .const_none => slots[destination] = .{ .runtime = .none },
                 .function_ref => |reference| slots[destination] = .{ .runtime = .{ .function_ref = reference } },
                 .initializer_ref => |reference| slots[destination] = try initializerValue(body, slots, reference, storage),
-                .continuation_ref => |payload| {
-                    const token = try storage.create(Continuation);
-                    token.* = .{ .destination = if (payload) |value| slots[@intFromEnum(value)].place else null };
-                    slots[destination] = .{ .continuation = token };
-                },
-                .continuation_storage => |operation| slots[destination] = .{ .place = slots[@intFromEnum(operation.token)].continuation.destination.? },
-                .continuation_select => |operation| slots[@intFromEnum(operation.token)].continuation.destination = slots[@intFromEnum(operation.storage)].place,
                 .callable_coerce => |operation| {
                     var reference = scalar(slots, operation.operand).function_ref;
                     reference.type_id = operation.target_type;
@@ -245,10 +333,8 @@ pub fn execute(
             .return_unit => return .{ .returned = .{ .runtime = .unit } },
             .return_value => |value_use| return valueUse(body, slots, value_use, executor, gpa),
             .return_failure => return .failure,
-            .return_lexical => |token| return .{ .lexical_exit = slots[@intFromEnum(token)].continuation },
-            .continuation_branch => |branch| block_id = if (slots[@intFromEnum(branch.token)].continuation == slots[@intFromEnum(branch.target)].continuation) branch.match else branch.mismatch,
             .diverge => unreachable,
-            .fallible_call => |fallible| switch (try executeFallibleCall(body, slots, call_scratch, fallible.call, fallible.success, fallible.failure, fallible.lexical_exit, terminatorSpan(body, block_id), executor, gpa)) {
+            .fallible_call => |fallible| switch (try executeFallibleCall(body, slots, call_scratch, fallible.call, fallible.success, fallible.failure, terminatorSpan(body, block_id), executor, gpa)) {
                 .next => |next| block_id = next,
                 .result => |result| return result,
             },
@@ -274,7 +360,7 @@ fn terminatorSpan(body: *const structures.FunctionBodyAnalysis, block_id: struct
 fn initializerValue(body: *const structures.FunctionBodyAnalysis, slots: []Value, reference: @FieldType(structures.FunctionInstruction, "initializer_ref"), storage: std.mem.Allocator) !Value {
     const source = body.initializer_captures[reference.captures.start..reference.captures.end];
     const captures = try storage.alloc(Value, source.len);
-    for (source, captures) |capture, *value| value.* = if (slots[@intFromEnum(capture)] == .continuation or slots[@intFromEnum(capture)] == .initializer) slots[@intFromEnum(capture)] else .{ .place = try storageCell(body, slots, capture, storage) };
+    for (source, captures) |capture, *value| value.* = if (slots[@intFromEnum(capture)] == .initializer) slots[@intFromEnum(capture)] else .{ .place = try storageCell(body, slots, capture, storage) };
     return .{ .initializer = .{ .body = &body.initializer_regions[reference.region], .captures = captures } };
 }
 
@@ -286,7 +372,7 @@ fn scalar(slots: []const Value, value: structures.FunctionValueId) structures.Co
     return switch (slots[@intFromEnum(value)]) {
         .runtime => |runtime| runtime,
         .place => |cell| cell.contents.value,
-        .type, .initializer, .continuation => unreachable,
+        .type, .initializer => unreachable,
     };
 }
 
@@ -362,7 +448,6 @@ fn executeReturningCall(
             break :blk null;
         },
         .failure => unreachable,
-        .lexical_exit => unreachable,
         .exit => |status| .{ .exit = status },
         .execution_error => |value| .{ .execution_error = value },
         .reported_error => .reported_error,
@@ -382,7 +467,6 @@ fn executeFallibleCall(
     call: structures.FunctionCall,
     success_id: structures.FunctionBlockId,
     failure_id: ?structures.FunctionBlockId,
-    lexical_id: ?structures.FunctionBlockId,
     call_span: ?structures.SourceSpan,
     executor: anytype,
     gpa: std.mem.Allocator,
@@ -395,11 +479,6 @@ fn executeFallibleCall(
             break :blk .{ .next = success_id };
         },
         .failure => .{ .next = failure_id orelse unreachable },
-        .lexical_exit => |token| blk: {
-            const target = lexical_id orelse unreachable;
-            slots[body.blocks[@intFromEnum(target)].argument_start] = .{ .continuation = token };
-            break :blk .{ .next = target };
-        },
         .exit => |status| .{ .result = .{ .exit = status } },
         .execution_error => |value| .{ .result = .{ .execution_error = value } },
         .reported_error => .{ .result = .reported_error },
@@ -415,7 +494,7 @@ fn store(slots: []Value, own: usize, destination: ?structures.FunctionValueId, v
     switch (slots[@intFromEnum(storage)]) {
         .place => |cell| cell.contents = .{ .value = value.runtime },
         .runtime => slots[@intFromEnum(storage)] = value,
-        .type, .initializer, .continuation => unreachable,
+        .type, .initializer => unreachable,
     }
     slots[own] = .{ .runtime = .unit };
 }
@@ -712,10 +791,6 @@ fn branchTarget(
     const arguments = body.branch_arguments[branch.arguments.start..branch.arguments.end];
     std.debug.assert(arguments.len == target.argument_end - target.argument_start);
     for (arguments, scratch[0..arguments.len], body.block_arguments[target.argument_start..target.argument_end]) |argument, *temporary, parameter| {
-        if (parameter.representation == .continuation) {
-            temporary.* = slots[@intFromEnum(argument.value)];
-            continue;
-        }
         if (parameter.representation == .storage or try executor.argumentPassing(parameter.type_id) == .indirect) {
             std.debug.assert(argument.coerce_to == null);
             temporary.* = .{ .place = try storageCell(body, slots, argument.value, storage) };
