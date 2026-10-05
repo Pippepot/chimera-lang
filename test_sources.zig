@@ -51,6 +51,7 @@ test {
     _ = @import("src/frontend/parser.zig");
     _ = @import("src/frontend/semantic.zig");
     _ = @import("src/frontend/comptime_interpreter.zig");
+    _ = @import("src/frontend/flow_snapshot.zig");
     _ = @import("src/frontend/lifetime.zig");
     _ = @import("src/frontend/typing.zig");
     _ = @import("src/query/codec.zig");

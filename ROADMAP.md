@@ -59,55 +59,44 @@
   Box uses ordinary initialization; consuming extraction requires directly
   movable values. Live-reference replacement retains its existing restrictions.
   `Box` and `Ref` are prelude exports. Scoped writable aliases and checked
-  `Buffer.get_mut` are supported. [STORAGE_AND_REFERENCES.md](STORAGE_AND_REFERENCES.md)
-  records the host storage model and accepted cross-target design.
+  `Buffer.get_mut` are supported. [syntax&semantics.txt](syntax&semantics.txt)
+  owns host storage and cross-target contracts; [ARCHITECTURE.md](ARCHITECTURE.md)
+  records representation boundaries and future API design.
 - Successful whole-program executables, typed runtime function bodies, and compiled functions persist in a content-addressed cache. Query snapshots restore interned identities and validate observed source inputs and equal-result query boundaries before reuse. Cache publication is atomic across compiler processes. Independent file and function queries use multiple workers.
 - Aggregate reference origins retain field, variant, and owned-element projections through copies and joins. Writable effects apply across ordinary, indirect, and fallible calls, custom copy/move hooks, and scheduled destructor hooks; Box construction and extraction preserve contained origins. Initialized raw-allocation contents retain conservative origins, while empty allocations do not imply live elements.
 
 ## Priority and dependencies
 
-Milestone 1 is completed and verified. Milestone 2 is the next implementation
-priority. Later
-milestones retain their relative order, expanding the host storage and reference
-foundation toward text, generic collections, and ordinary iteration.
+Milestone 1, context-sensitive fallible-call syntax, is the next implementation
+priority. Later milestones retain their relative order, expanding the host
+storage and reference foundation toward text, generic collections, and ordinary
+iteration.
 Each language slice covers diagnostics, execution, ownership, and incremental
 recomputation; reject unsupported forms at their owning boundary.
 
 ## Ordered milestones
 
-### 1. Explicit initializer failure and control flow
+### 1. Context-sensitive fallible-call syntax
 
-Completed according to [syntax&semantics.txt](syntax&semantics.txt), with the
-full compiler and standalone snapshot suites, CLI build, and formatting checks
-passing.
+Implement `callee?(args)` according to
+[syntax&semantics.txt](syntax&semantics.txt).
 
-- `init` remains the single parameter modifier. Every consumption into a
-  destination is potentially fallible, even for literals. Failure is handled
-  locally or propagated from a declared `fallible` function. Function signatures
-  alone determine call fallibility; initializer regions are always fallible.
-  Forwarding does not evaluate the expression and obeys the receiving callable's
-  declared fallibility. No `init fallible` modifier or parallel constructor
-  signatures are introduced.
-- Deferred initializers are control-flow boundaries through forwarding, aliases,
-  and indirect calls. Caller-directed `return`, `break`, and `continue` are
-  rejected; local loop exits remain valid. Ordinary eager argument expressions
-  retain caller-directed exits. IR and the calling convention have only ordinary
-  success/failure outcomes, without nonlocal initializer continuations.
-- Bare `fail` propagates ordinary failure after cleanup in a fallible function or
-  initializer region. `unsafe_initialize` and `Allocation.unsafe_init` are
-  explicitly fallible. `Box.new` directly allocates one slot, initializes it,
-  transfers it into a Box on success, or deallocates and fails after partial
-  construction cleanup. Bulk `unsafe_initialize_all` remains planned and fallible.
-- Allocation-before-evaluation, destination construction, successful-path
-  exactly-once consumption, and partial-subobject cleanup remain intact.
-  Captured writes and completed transfers are not rolled back. Infallible
-  ownership hooks and future consuming converters must handle initialization
-  failure locally rather than acquire hidden failure.
-- Verification covers handled and propagated failure, rejected unhandled
-  consumption in `func`, infallible expressions passed to fallible consumers,
-  allocation cleanup, boundary rejection, local and eager exits, forwarding,
-  aliases, indirect calls, supported compile-time execution, and incremental
-  recomputation and cache reuse after mode or fallibility edits.
+- Require the marker when invoking a fallible callable unless the context
+  requires that specific call expression to be fallible. `if foo()` and
+  `if const x = foo() -> use(x)` are exempt; ordinary expression contexts,
+  `foo?() < 0`, and `foo?() as int` require it. Fallibility of an enclosing
+  expression or function does not grant the exemption.
+- Preserve the distinction between expression structure and callable
+  fallibility for direct, namespace, and instance calls, aliases, static
+  specializations, and callable values. Validate the rule at the source-analysis
+  boundary; downstream IR retains ordinary success/failure control flow.
+  The marker is not a general failure-propagation operator.
+- Verify required and omitted markers, nested calls in independently fallible
+  comparisons and extractions, condition and binding-condition exemptions,
+  deferred initializer expressions, runtime and compile-time execution,
+  cleanup, and incremental recomputation and cache reuse after context or
+  callable fallibility edits. Migrate standard-library, test, and documentation
+  call sites with the implementation.
 
 ### 2. Field visibility
 
@@ -250,15 +239,22 @@ It replaces the temporary name-matched opaque storage owners in `std.memory`.
   it until equivalence is established.
 - Borrowing temporary projections needs a lifetime-extension rule beyond the
   currently supported named places and dereferenced Refs.
-- Shared owners require specified atomic ownership, weak-reference, and cycle
-  behavior before implementation.
-- General overloading, function literals, closures, postfix `?`, `sizeof`,
+- Shared owners remain unnamed and deferred. The proposed control block holds
+  one initialized value and synchronized reference counts: copying increments,
+  ending an owner decrements, and the final owner destroys the value and releases
+  storage. This does not synchronize value access. Specify provider and location
+  atomic support and whether strong cycles are forbidden by API design or leak;
+  no upgradeable weak-reference type is currently proposed.
+- General overloading, function literals, closures, `sizeof`,
   and return-type inference need separate language decisions.
 - Extra targets need use cases. Before enabling non-host allocation for one,
   resolve its layout and compatible types for its location, provide a
   resource-backed allocator and supported address-space access, and verify
   its zero-byte success or failure behavior. Do not reuse host layout or
-  pointer-based access. Keep raw-address and foreign-memory operations deferred.
+  pointer-based access. Start device buffers with validated scalar elements,
+  not arbitrary host structs. Settle address-space spelling and larger count
+  types for that concrete target before adding layout queries or a general
+  provider dispatcher. Keep raw-address and foreign-memory operations deferred.
 - Finer-grained invalidation needs measurements. Decide separately whether
   unreachable declarations should be validated
   (currently only demanded signatures, bodies, and values are diagnosed).

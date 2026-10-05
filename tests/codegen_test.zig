@@ -3,6 +3,7 @@ const test_sources = @import("test_sources");
 const codegen = test_sources.codegen;
 const runtime = test_sources.runtime;
 const structures = test_sources.structures;
+var allocation_failure_backing: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
 
 const small_variant = structures.TypeId.fromInterned(@enumFromInt(0));
 const wide_variant = structures.TypeId.fromInterned(@enumFromInt(1));
@@ -463,15 +464,15 @@ test "cyclic CFG accepts multi-value parallel backedge copies" {
 }
 
 test "direct call artifact construction cleans up every allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testCompileDirectCallAllocations, .{});
+    try std.testing.checkAllAllocationFailures(allocation_failure_backing.allocator(), testCompileDirectCallAllocations, .{});
 }
 
 test "expression artifact construction cleans up every allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testCompileExpressionAllocations, .{});
+    try std.testing.checkAllAllocationFailures(allocation_failure_backing.allocator(), testCompileExpressionAllocations, .{});
 }
 
 test "variant subset call construction cleans up every allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testCompileVariantSubsetCallAllocations, .{});
+    try std.testing.checkAllAllocationFailures(allocation_failure_backing.allocator(), testCompileVariantSubsetCallAllocations, .{});
 }
 
 test "variant injection copies an arbitrary-size non-variant interned payload" {
@@ -868,11 +869,11 @@ test "executable builder rejects a displacement outside the signed 32-bit range"
 }
 
 test "executable construction cleans up every allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testBuildExecutableAllocations, .{});
+    try std.testing.checkAllAllocationFailures(allocation_failure_backing.allocator(), testBuildExecutableAllocations, .{});
 }
 
 test "linked executable construction cleans up every allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testBuildExecutableWithCalleeAllocations, .{});
+    try std.testing.checkAllAllocationFailures(allocation_failure_backing.allocator(), testBuildExecutableWithCalleeAllocations, .{});
 }
 
 fn testBuildExecutableWithCalleeAllocations(gpa: std.mem.Allocator) !void {

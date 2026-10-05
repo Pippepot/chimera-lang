@@ -2,6 +2,7 @@ const std = @import("std");
 const structures = @import("../structures.zig");
 const semantic = @import("semantic.zig");
 const lifetime = @import("lifetime.zig");
+const flow_snapshot = @import("flow_snapshot.zig");
 
 const GenerationId = lifetime.GenerationId;
 const BoundaryId = lifetime.BoundaryId;
@@ -207,16 +208,21 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             fields: []const semantic.UnresolvedBody.FieldName,
             moves_owner: bool = false,
         };
+        const StateValues = flow_snapshot.Snapshot(?Value, 16);
         const State = struct {
-            values: []?Value,
+            values: StateValues,
             availability: []Availability,
             field_availability: []Availability,
             initializers: []InitAvailability,
             completed_consumptions: []bool = &.{},
 
             fn clone(self: State, allocator: std.mem.Allocator) !State {
-                const values = try allocator.dupe(?Value, self.values);
-                errdefer allocator.free(values);
+                return self.capture(allocator, null);
+            }
+
+            fn capture(self: State, allocator: std.mem.Allocator, previous: ?StateValues) !State {
+                var values = try self.values.capture(allocator, previous);
+                errdefer values.deinit(allocator);
                 const availability = try allocator.dupe(Availability, self.availability);
                 errdefer allocator.free(availability);
                 const fields = try allocator.dupe(Availability, self.field_availability);
@@ -227,7 +233,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             }
 
             fn deinit(self: *State, allocator: std.mem.Allocator) void {
-                allocator.free(self.values);
+                self.values.deinit(allocator);
                 allocator.free(self.availability);
                 allocator.free(self.field_availability);
                 allocator.free(self.initializers);
@@ -608,7 +614,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             for (self.field_places) |place| gpa.free(place.fields);
             gpa.free(self.field_places);
             gpa.free(self.field_availability);
-            for (self.states.items) |*state| state.deinit(gpa);
+            for (self.states.items) |*state| state.deinit(self.ctx.allocator());
             self.states.deinit(gpa);
             self.block_arguments.deinit(gpa);
             self.parameter_modes.deinit(gpa);
@@ -682,11 +688,16 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             try self.validateCleanupReferenceUses();
             if (measurements) |output| {
                 output.snapshots = self.states.items.len;
+                var pages: std.AutoHashMap(*StateValues.Page, void) = .init(self.ctx.allocator());
+                defer pages.deinit();
                 for (self.states.items) |state| {
-                    output.snapshot_bytes += std.mem.sliceAsBytes(state.values).len +
+                    output.snapshot_bytes += state.values.retainedBytes() +
                         std.mem.sliceAsBytes(state.availability).len + std.mem.sliceAsBytes(state.field_availability).len +
                         std.mem.sliceAsBytes(state.initializers).len +
                         std.mem.sliceAsBytes(state.completed_consumptions).len;
+                    for (state.values.retainedPages()) |page| {
+                        if (!(try pages.getOrPut(page)).found_existing) output.snapshot_bytes += @sizeOf(StateValues.Page);
+                    }
                 }
                 output.blocks = self.blocks.items.len;
                 output.generations = self.generations.items.len;
@@ -2906,9 +2917,9 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     }
                     const expected = try self.resolveBindingIdentity(origin.binding_identity);
                     const actual_identity = if (origin.stable)
-                        state.values[slot].?.storage_identity orelse state.values[slot].?.binding_identity
+                        state.values.get(slot).?.storage_identity orelse state.values.get(slot).?.binding_identity
                     else
-                        state.values[slot].?.binding_identity;
+                        state.values.get(slot).?.binding_identity;
                     const actual = try self.resolveBindingIdentity(actual_identity);
                     if (expected.incomplete or actual.incomplete) {
                         incomplete.* = true;
@@ -2918,8 +2929,8 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     if (!((origin.stable or origin.deferred_capture) and std.meta.eql(origin.binding_identity, actual_identity)) and
                         (expected.conflicting or actual.conflicting or expected.value == null or expected.value != actual.value))
                         return self.reject(span, if (origin.deferred_capture) .initializer_capture_conflict else .borrow_outlives_source);
-                    generation = state.values[slot].?.owned_generation;
-                    cleanup_value = state.values[slot].?.id;
+                    generation = state.values.get(slot).?.owned_generation;
+                    cleanup_value = state.values.get(slot).?.id;
                 }
                 if (generation) |available_generation| try effects.append(self.ctx.allocator(), .{ .use = .{
                     .generation = available_generation,
@@ -3504,7 +3515,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         /// Borrow the current arrays; snapshots acquire ownership through clone.
         fn currentState(self: *Self) State {
             return .{
-                .values = self.local_values,
+                .values = StateValues.borrowed(self.local_values),
                 .availability = self.local_availability,
                 .field_availability = self.field_availability,
                 .initializers = self.init_availability,
@@ -3516,8 +3527,9 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             var count = self.local_values.len;
             while (count > 0 and self.local_values[count - 1] == null) count -= 1;
             var current = self.currentState();
-            current.values = current.values[0..count];
-            var state = try current.clone(self.ctx.allocator());
+            current.values.len = count;
+            const previous = if (self.states.items.len == 0) null else self.states.items[self.states.items.len - 1].values;
+            var state = try current.capture(self.ctx.allocator(), previous);
             errdefer state.deinit(self.ctx.allocator());
             return self.appendState(state);
         }
@@ -3533,7 +3545,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
 
         fn restoreState(self: *Self, id: StateId) void {
             const state = self.states.items[@intFromEnum(id)];
-            @memcpy(self.local_values[0..state.values.len], state.values);
+            state.values.copyTo(self.local_values[0..state.values.len]);
             @memset(self.local_values[state.values.len..], null);
             self.currentState().copyFlowFrom(state);
         }
@@ -3541,7 +3553,9 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         fn activeStateValues(self: *Self, id: StateId) !std.ArrayList(Value) {
             var values: std.ArrayList(Value) = .empty;
             errdefer values.deinit(self.ctx.allocator());
-            for (self.states.items[@intFromEnum(id)].values, 0..) |value_in_state, slot| {
+            const snapshot = self.states.items[@intFromEnum(id)].values;
+            for (0..snapshot.len) |slot| {
+                const value_in_state = snapshot.get(slot);
                 if (self.locals.items(.mutable)[slot]) if (value_in_state) |value_to_append| {
                     if (!try self.constructsInPlace(value_to_append.type_id)) try values.append(self.ctx.allocator(), value_to_append);
                 };
@@ -3553,17 +3567,17 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             var state = try self.states.items[@intFromEnum(baseline)].clone(self.ctx.allocator());
             errdefer state.deinit(self.ctx.allocator());
             var argument = argument_start;
-            for (state.values, 0..) |*value_in_state, slot| {
-                if (!self.locals.items(.mutable)[slot] or value_in_state.* == null) continue;
-                const current = value_in_state.*.?;
+            for (0..state.values.len) |slot| {
+                if (!self.locals.items(.mutable)[slot] or state.values.get(slot) == null) continue;
+                const current = state.values.get(slot).?;
                 const in_place = try self.constructsInPlace(current.type_id);
-                value_in_state.* = .{
+                try state.values.set(self.ctx.allocator(), slot, .{
                     .id = if (in_place) current.id else @enumFromInt(argument),
                     .type_id = current.type_id,
                     .owned_generation = if (in_place) current.owned_generation else self.block_argument_generations.items[argument],
                     .binding_identity = current.binding_identity,
                     .storage_identity = current.storage_identity,
-                };
+                });
                 if (!in_place) argument += 1;
             }
             return self.appendState(state);
@@ -3581,7 +3595,8 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
 
             var in_place_slots: std.ArrayList(InPlaceLoopSlot) = .empty;
             defer in_place_slots.deinit(self.ctx.allocator());
-            for (self.states.items[@intFromEnum(baseline)].values, 0..) |initial, slot| {
+            for (0..self.states.items[@intFromEnum(baseline)].values.len) |slot| {
+                const initial = self.states.items[@intFromEnum(baseline)].values.get(slot);
                 const carried = initial orelse continue;
                 if (!self.locals.items(.mutable)[slot] or !try self.constructsInPlace(carried.type_id)) continue;
                 try in_place_slots.append(self.ctx.allocator(), .{
@@ -3623,7 +3638,8 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
 
             const header_state = try self.stateWithArguments(baseline, state_type_start);
             const identity_start = self.binding_joins.items.len;
-            for (self.states.items[@intFromEnum(baseline)].values, 0..) |initial, slot| {
+            for (0..self.states.items[@intFromEnum(baseline)].values.len) |slot| {
+                const initial = self.states.items[@intFromEnum(baseline)].values.get(slot);
                 const mutable = self.locals.items(.mutable)[slot];
                 if (!mutable or initial == null) continue;
                 const index: u32 = @intCast(self.binding_joins.items.len);
@@ -3631,18 +3647,21 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     .slot = @intCast(slot),
                     .initial = initial.?.binding_identity,
                 });
-                self.states.items[@intFromEnum(header_state)].values[slot].?.binding_identity = .{ .join = index };
+                var header_value = self.states.items[@intFromEnum(header_state)].values.get(slot).?;
+                header_value.binding_identity = .{ .join = index };
                 const storage_index: u32 = @intCast(self.binding_joins.items.len);
                 try self.binding_joins.append(self.ctx.allocator(), .{
                     .slot = @intCast(slot),
                     .storage = true,
                     .initial = initial.?.storage_identity orelse initial.?.binding_identity,
                 });
-                self.states.items[@intFromEnum(header_state)].values[slot].?.storage_identity = .{ .join = storage_index };
+                header_value.storage_identity = .{ .join = storage_index };
+                try self.states.items[@intFromEnum(header_state)].values.set(self.ctx.allocator(), slot, header_value);
             }
             const identity_end = self.binding_joins.items.len;
             const origin_start = self.loop_reference_origins.items.len;
-            for (self.states.items[@intFromEnum(baseline)].values, 0..) |initial, slot| {
+            for (0..self.states.items[@intFromEnum(baseline)].values.len) |slot| {
+                const initial = self.states.items[@intFromEnum(baseline)].values.get(slot);
                 const mutable = self.locals.items(.mutable)[slot];
                 if (!mutable or initial == null or !try self.typeContainsBorrow(initial.?.type_id)) continue;
                 const origin_index: u32 = @intCast(self.loop_reference_origins.items.len);
@@ -3650,8 +3669,9 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     .slot = @intCast(slot),
                     .origins = initial.?.reference_origins,
                 });
-                self.states.items[@intFromEnum(header_state)].values[slot].?.reference_origins =
-                    try self.addReferenceOrigin(null, .{ .loop = origin_index });
+                var header_value = self.states.items[@intFromEnum(header_state)].values.get(slot).?;
+                header_value.reference_origins = try self.addReferenceOrigin(null, .{ .loop = origin_index });
+                try self.states.items[@intFromEnum(header_state)].values.set(self.ctx.allocator(), slot, header_value);
             }
             const origin_end = self.loop_reference_origins.items.len;
 
@@ -3694,7 +3714,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             for (in_place_slots.items) |in_place| try self.reconcileInPlaceLoopHeader(
                 in_place,
                 entry_predecessor,
-                self.states.items[@intFromEnum(baseline)].values[in_place.slot].?,
+                self.states.items[@intFromEnum(baseline)].values.get(in_place.slot).?,
                 self.loop_backedges.items[backedge_start..],
                 loop_state_start,
                 loop_boundary_start,
@@ -3706,7 +3726,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             );
             for (self.binding_joins.items[identity_start..identity_end]) |*join| {
                 for (self.loop_backedges.items[backedge_start..]) |backedge| {
-                    const value_on_edge = self.states.items[@intFromEnum(backedge.state)].values[join.slot.?].?;
+                    const value_on_edge = self.states.items[@intFromEnum(backedge.state)].values.get(join.slot.?).?;
                     try join.alternatives.append(self.ctx.allocator(), if (join.storage)
                         value_on_edge.storage_identity orelse value_on_edge.binding_identity
                     else
@@ -3716,7 +3736,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             }
             for (self.loop_reference_origins.items[origin_start..origin_end]) |*loop_origins| {
                 for (self.loop_backedges.items[backedge_start..]) |backedge| {
-                    loop_origins.origins = try self.mergeReferenceOrigins(loop_origins.origins, self.states.items[@intFromEnum(backedge.state)].values[loop_origins.slot].?.reference_origins);
+                    loop_origins.origins = try self.mergeReferenceOrigins(loop_origins.origins, self.states.items[@intFromEnum(backedge.state)].values.get(loop_origins.slot).?.reference_origins);
                 }
                 loop_origins.complete = true;
             }
@@ -3771,12 +3791,13 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 }
             }
             var state_argument = exit_state_start;
-            for (self.states.items[@intFromEnum(baseline)].values, 0..) |initial, slot| {
+            for (0..self.states.items[@intFromEnum(baseline)].values.len) |slot| {
+                const initial = self.states.items[@intFromEnum(baseline)].values.get(slot);
                 const mutable = self.locals.items(.mutable)[slot];
                 if (!mutable or initial == null or try self.constructsInPlace(initial.?.type_id)) continue;
                 const state_type = self.block_arguments.items[state_argument].type_id;
                 for (breaks, incoming_generations) |break_edge, *generation| {
-                    generation.* = self.states.items[@intFromEnum(break_edge.state)].values[slot].?.owned_generation;
+                    generation.* = self.states.items[@intFromEnum(break_edge.state)].values.get(slot).?.owned_generation;
                 }
                 self.block_argument_generations.items[state_argument] = try self.joinGenerationGroup(state_type, exit_span, incoming_generations);
                 state_argument += 1;
@@ -3790,31 +3811,35 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             }
             for (in_place_slots.items) |in_place| {
                 for (breaks, incoming_generations) |break_edge, *generation| {
-                    generation.* = self.states.items[@intFromEnum(break_edge.state)].values[in_place.slot].?.owned_generation;
+                    generation.* = self.states.items[@intFromEnum(break_edge.state)].values.get(in_place.slot).?.owned_generation;
                 }
-                const output = &self.states.items[@intFromEnum(output_state)].values[in_place.slot].?;
+                var output = self.states.items[@intFromEnum(output_state)].values.get(in_place.slot).?;
                 output.owned_generation = try self.joinGenerationGroup(output.type_id, exit_span, incoming_generations);
+                try self.states.items[@intFromEnum(output_state)].values.set(self.ctx.allocator(), in_place.slot, output);
                 if (output.owned_generation) |generation| for (breaks, incoming_generations) |break_edge, incoming| {
                     try self.recordGenerationOnlyForward(break_edge.block, 0, incoming, generation);
                 };
             }
-            for (self.states.items[@intFromEnum(baseline)].values, 0..) |initial, slot| {
+            for (0..self.states.items[@intFromEnum(baseline)].values.len) |slot| {
+                const initial = self.states.items[@intFromEnum(baseline)].values.get(slot);
                 const mutable = self.locals.items(.mutable)[slot];
                 if (!mutable or initial == null) continue;
                 var origins: ?u32 = null;
-                var identity = self.states.items[@intFromEnum(breaks[0].state)].values[slot].?.binding_identity;
-                var storage_identity = self.states.items[@intFromEnum(breaks[0].state)].values[slot].?.storage_identity orelse identity;
+                var identity = self.states.items[@intFromEnum(breaks[0].state)].values.get(slot).?.binding_identity;
+                var storage_identity = self.states.items[@intFromEnum(breaks[0].state)].values.get(slot).?.storage_identity orelse identity;
                 for (breaks) |break_edge| {
-                    origins = try self.mergeReferenceOrigins(origins, self.states.items[@intFromEnum(break_edge.state)].values[slot].?.reference_origins);
+                    origins = try self.mergeReferenceOrigins(origins, self.states.items[@intFromEnum(break_edge.state)].values.get(slot).?.reference_origins);
                 }
                 for (breaks[1..]) |break_edge| {
-                    identity = try self.joinBindingIdentities(identity, self.states.items[@intFromEnum(break_edge.state)].values[slot].?.binding_identity);
-                    const value_on_edge = self.states.items[@intFromEnum(break_edge.state)].values[slot].?;
+                    identity = try self.joinBindingIdentities(identity, self.states.items[@intFromEnum(break_edge.state)].values.get(slot).?.binding_identity);
+                    const value_on_edge = self.states.items[@intFromEnum(break_edge.state)].values.get(slot).?;
                     storage_identity = try self.joinBindingIdentities(storage_identity, value_on_edge.storage_identity orelse value_on_edge.binding_identity);
                 }
-                self.states.items[@intFromEnum(output_state)].values[slot].?.reference_origins = origins;
-                self.states.items[@intFromEnum(output_state)].values[slot].?.binding_identity = identity;
-                self.states.items[@intFromEnum(output_state)].values[slot].?.storage_identity = storage_identity;
+                var output = self.states.items[@intFromEnum(output_state)].values.get(slot).?;
+                output.reference_origins = origins;
+                output.binding_identity = identity;
+                output.storage_identity = storage_identity;
+                try self.states.items[@intFromEnum(output_state)].values.set(self.ctx.allocator(), slot, output);
             }
             var any_borrowed = false;
             var all_borrowed = true;
@@ -3923,7 +3948,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 )).?;
                 try self.copyMissingFields(joined, missing, null, null);
                 self.block_argument_generations.items[argument] = joined;
-                self.remapLoopGeneration(
+                try self.remapLoopGeneration(
                     provisional,
                     joined,
                     state_start,
@@ -3955,7 +3980,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             var cleanup_fields = if (provisional) |generation| self.generations.items[@intFromEnum(generation)].cleanup_fields else false;
             const missing = if (provisional) |generation| self.generations.items[@intFromEnum(generation)].missing_fields else &.{};
             for (backedges) |backedge| {
-                const backedge_generation = self.states.items[@intFromEnum(backedge.state)].values[in_place.slot].?.owned_generation;
+                const backedge_generation = self.states.items[@intFromEnum(backedge.state)].values.get(in_place.slot).?.owned_generation;
                 const backedge_missing = if (backedge_generation) |generation| self.generations.items[@intFromEnum(generation)].missing_fields else &.{};
                 if (!sameMissingFields(missing, backedge_missing)) return self.reject(span, .partial_field_transfer_not_supported);
                 all_equal = all_equal and backedge_generation == provisional;
@@ -3965,12 +3990,12 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             std.debug.assert(provisional != null);
             const joined = (try self.allocateGenerationAt(initial.type_id, span, cleanup_fields, in_place.start_order)).?;
             try self.copyMissingFields(joined, missing, null, null);
-            self.remapLoopGeneration(provisional, joined, state_start, boundary_start, block_start, block_argument_start, branch_argument_start, break_start);
+            try self.remapLoopGeneration(provisional, joined, state_start, boundary_start, block_start, block_argument_start, branch_argument_start, break_start);
             try self.recordGenerationOnlyForward(entry_predecessor, 0, provisional, joined);
             for (backedges) |backedge| try self.recordGenerationOnlyForward(
                 backedge.block,
                 0,
-                self.states.items[@intFromEnum(backedge.state)].values[in_place.slot].?.owned_generation,
+                self.states.items[@intFromEnum(backedge.state)].values.get(in_place.slot).?.owned_generation,
                 joined,
             );
         }
@@ -3989,11 +4014,13 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             block_argument_start: usize,
             branch_argument_start: usize,
             break_start: usize,
-        ) void {
+        ) !void {
             if (source == null) return;
             for (self.states.items[state_start..]) |state| {
-                for (state.values) |*state_value| if (state_value.*) |*resolved| {
-                    remapValueGeneration(resolved, source.?, destination);
+                for (0..state.values.len) |slot| if (state.values.get(slot)) |saved| {
+                    var resolved = saved;
+                    remapValueGeneration(&resolved, source.?, destination);
+                    try state.values.set(self.ctx.allocator(), slot, resolved);
                 };
             }
             for (self.boundaries.items[boundary_start..]) |*boundary| {
@@ -4095,7 +4122,8 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             else
                 unreachable;
             var type_index = type_start;
-            for (self.states.items[@intFromEnum(context.baseline)].values, 0..) |initial, slot| {
+            for (0..self.states.items[@intFromEnum(context.baseline)].values.len) |slot| {
+                const initial = self.states.items[@intFromEnum(context.baseline)].values.get(slot);
                 const current = self.local_values[slot];
                 const mutable = self.locals.items(.mutable)[slot];
                 if (!mutable or initial == null or try self.constructsInPlace(initial.?.type_id)) continue;
@@ -5894,9 +5922,9 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     if (projection.step == .element) origin.projection = projection.next;
                 } else if (origin.stable) {
                     if (origin.root) |root| {
-                        const values_at_read = if (state) |state_id| self.states.items[@intFromEnum(state_id)].values else self.local_values;
+                        const values_at_read = if (state) |state_id| self.states.items[@intFromEnum(state_id)].values else StateValues.borrowed(self.local_values);
                         if (@intFromEnum(root) < values_at_read.len) {
-                            if (values_at_read[@intFromEnum(root)]) |value_at_read| origin.binding_identity = value_at_read.binding_identity;
+                            if (values_at_read.get(@intFromEnum(root))) |value_at_read| origin.binding_identity = value_at_read.binding_identity;
                         }
                     }
                     origin.stable = false;
@@ -6504,7 +6532,9 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             var generation_only_joins: std.ArrayList(GenerationOnlyJoin) = .empty;
             defer generation_only_joins.deinit(self.ctx.allocator());
             const argument_start: u32 = @intCast(self.block_arguments.items.len);
-            for (first_state.values, second_state.values, 0..) |first_value, second_value, slot| {
+            for (0..first_state.values.len) |slot| {
+                const first_value = first_state.values.get(slot);
+                const second_value = second_state.values.get(slot);
                 std.debug.assert((first_value == null) == (second_value == null));
                 const left = first_value orelse continue;
                 const right = second_value.?;
@@ -6539,8 +6569,8 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             self.enterPendingBlock(second.block);
             self.terminate(.{ .branch = try self.valuesBranch(merged, second_values.items) });
             for (generation_only_joins.items) |generation_join| {
-                const left = first_state.values[generation_join.slot].?;
-                const right = second_state.values[generation_join.slot].?;
+                const left = first_state.values.get(generation_join.slot).?;
+                const right = second_state.values.get(generation_join.slot).?;
                 try self.recordGenerationOnlyForward(first.block, 0, left.owned_generation, generation_join.destination);
                 try self.recordGenerationOnlyForward(second.block, 0, right.owned_generation, generation_join.destination);
             }
@@ -6548,17 +6578,19 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             var state = try first_state.clone(self.ctx.allocator());
             errdefer state.deinit(self.ctx.allocator());
             const values = state.values;
-            for (values, second_state.values) |*first_value, second_value| {
-                if (first_value.*) |*left| {
-                    const right = second_value.?;
-                    try self.mergeValueReferences(left, left.*, right);
+            for (0..values.len) |slot| {
+                if (values.get(slot)) |saved| {
+                    var left = saved;
+                    const right = second_state.values.get(slot).?;
+                    try self.mergeValueReferences(&left, left, right);
                     left.storage_identity = try self.joinBindingIdentities(left.storage_identity orelse left.binding_identity, right.storage_identity orelse right.binding_identity);
                     left.binding_identity = try self.joinBindingIdentities(left.binding_identity, right.binding_identity);
+                    try values.set(self.ctx.allocator(), slot, left);
                 }
             }
             for (changed_slots.items, argument_start..) |slot, argument| {
-                const joined = values[slot].?;
-                values[slot] = .{
+                const joined = values.get(slot).?;
+                try values.set(self.ctx.allocator(), slot, .{
                     .id = @enumFromInt(argument),
                     .type_id = self.block_arguments.items[argument].type_id,
                     .owned_generation = self.block_argument_generations.items[argument],
@@ -6566,10 +6598,12 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     .stable_reference_root = joined.stable_reference_root,
                     .binding_identity = joined.binding_identity,
                     .storage_identity = joined.storage_identity,
-                };
+                });
             }
             for (generation_only_joins.items) |generation_join| {
-                values[generation_join.slot].?.owned_generation = generation_join.destination;
+                var joined = values.get(generation_join.slot).?;
+                joined.owned_generation = generation_join.destination;
+                try values.set(self.ctx.allocator(), generation_join.slot, joined);
             }
             state.joinFlow(second_state);
             const state_id = try self.appendState(state);
@@ -6663,11 +6697,11 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             defer generation_only_joins.deinit(self.ctx.allocator());
             for (changed_slots.items) |slot| {
                 const first_state_value = if (then_exit) |exit|
-                    self.states.items[@intFromEnum(exit.state)].values[slot].?
+                    self.states.items[@intFromEnum(exit.state)].values.get(slot).?
                 else
-                    self.states.items[@intFromEnum(else_exit.?.state)].values[slot].?;
+                    self.states.items[@intFromEnum(else_exit.?.state)].values.get(slot).?;
                 const second_state_value = if (else_exit) |exit|
-                    self.states.items[@intFromEnum(exit.state)].values[slot].?
+                    self.states.items[@intFromEnum(exit.state)].values.get(slot).?
                 else
                     first_state_value;
                 _ = try self.appendBlockArgument(
@@ -6696,17 +6730,19 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 if (else_exit) |exit| try self.recordGenerationOnlyForward(else_predecessor.?, 0, exit.value.owned_generation, generation);
             };
             for (generation_only_joins.items) |generation_join| {
-                self.states.items[@intFromEnum(output_state)].values[generation_join.slot].?.owned_generation = generation_join.destination;
+                var joined_value = self.states.items[@intFromEnum(output_state)].values.get(generation_join.slot).?;
+                joined_value.owned_generation = generation_join.destination;
+                try self.states.items[@intFromEnum(output_state)].values.set(self.ctx.allocator(), generation_join.slot, joined_value);
                 if (then_exit) |exit| try self.recordGenerationOnlyForward(
                     then_predecessor.?,
                     0,
-                    self.states.items[@intFromEnum(exit.state)].values[generation_join.slot].?.owned_generation,
+                    self.states.items[@intFromEnum(exit.state)].values.get(generation_join.slot).?.owned_generation,
                     generation_join.destination,
                 );
                 if (else_exit) |exit| try self.recordGenerationOnlyForward(
                     else_predecessor.?,
                     0,
-                    self.states.items[@intFromEnum(exit.state)].values[generation_join.slot].?.owned_generation,
+                    self.states.items[@intFromEnum(exit.state)].values.get(generation_join.slot).?.owned_generation,
                     generation_join.destination,
                 );
             }
@@ -6846,10 +6882,11 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             const baseline_state = self.states.items[@intFromEnum(baseline)].values;
             const first_state = self.states.items[@intFromEnum(first.?.state)].values;
             const second_state = self.states.items[@intFromEnum(second.?.state)].values;
-            for (baseline_state, 0..) |initial, slot| {
+            for (0..baseline_state.len) |slot| {
+                const initial = baseline_state.get(slot);
                 if (initial == null) continue;
-                const left = first_state[slot];
-                const right = second_state[slot];
+                const left = first_state.get(slot);
+                const right = second_state.get(slot);
                 std.debug.assert(left != null and right != null);
                 std.debug.assert(left.?.type_id == right.?.type_id);
                 if (left.?.id != right.?.id) try slots.append(self.ctx.allocator(), @intCast(slot));
@@ -6869,10 +6906,11 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             const baseline_state = self.states.items[@intFromEnum(baseline)].values;
             const first_state = self.states.items[@intFromEnum(first.?.state)].values;
             const second_state = self.states.items[@intFromEnum(second.?.state)].values;
-            for (baseline_state, 0..) |initial, slot| {
+            for (0..baseline_state.len) |slot| {
+                const initial = baseline_state.get(slot);
                 if (initial == null) continue;
-                const left = first_state[slot];
-                const right = second_state[slot];
+                const left = first_state.get(slot);
+                const right = second_state.get(slot);
                 std.debug.assert(left != null and right != null);
                 if (left.?.id != right.?.id or left.?.owned_generation == right.?.owned_generation) continue;
                 const destination = (try self.joinGenerations(
@@ -6956,7 +6994,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             if (borrow_condition) |borrow_predicate| try self.appendBranchArgument(.{ .value = borrow_predicate }, null);
             if (consumption_completion) |completion| try self.appendBranchArgument(.{ .value = completion }, null);
             const state = self.states.items[@intFromEnum(exit.state)].values;
-            for (changed_slots) |slot| try self.appendBranchArgument(.{ .value = state[slot].?.id }, state[slot].?.owned_generation);
+            for (changed_slots) |slot| try self.appendBranchArgument(.{ .value = state.get(slot).?.id }, state.get(slot).?.owned_generation);
             return .{ .target = target, .arguments = .{ .start = start, .end = @intCast(self.branch_arguments.items.len) } };
         }
 
@@ -6976,34 +7014,36 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             var state = try initial.clone(self.ctx.allocator());
             errdefer state.deinit(self.ctx.allocator());
             const values = state.values;
-            for (values, 0..) |*output, slot| {
-                if (output.* != null) {
-                    output.* = source_state.values[slot].?;
+            for (0..values.len) |slot| {
+                if (values.get(slot) != null) {
+                    var output = source_state.values.get(slot).?;
                     if (first != null and second != null) {
-                        const left = self.states.items[@intFromEnum(first.?.state)].values[slot].?;
-                        const right = self.states.items[@intFromEnum(second.?.state)].values[slot].?;
-                        try self.mergeValueReferences(&output.*.?, left, right);
-                        output.*.?.storage_identity = try self.joinBindingIdentities(
+                        const left = self.states.items[@intFromEnum(first.?.state)].values.get(slot).?;
+                        const right = self.states.items[@intFromEnum(second.?.state)].values.get(slot).?;
+                        try self.mergeValueReferences(&output, left, right);
+                        output.storage_identity = try self.joinBindingIdentities(
                             left.storage_identity orelse left.binding_identity,
                             right.storage_identity orelse right.binding_identity,
                         );
-                        output.*.?.binding_identity = if (std.meta.eql(left.binding_identity, right.binding_identity))
+                        output.binding_identity = if (std.meta.eql(left.binding_identity, right.binding_identity))
                             left.binding_identity
                         else
                             try self.newBindingIdentity();
                     }
+                    try values.set(self.ctx.allocator(), slot, output);
                 }
             }
             for (changed_slots, argument_start..) |slot, argument| {
-                values[slot] = .{
+                const previous = values.get(slot).?;
+                try values.set(self.ctx.allocator(), slot, .{
                     .id = @enumFromInt(argument),
                     .type_id = self.block_arguments.items[argument].type_id,
                     .owned_generation = self.block_argument_generations.items[argument],
-                    .reference_origins = values[slot].?.reference_origins,
-                    .stable_reference_root = values[slot].?.stable_reference_root,
-                    .binding_identity = values[slot].?.binding_identity,
-                    .storage_identity = values[slot].?.storage_identity,
-                };
+                    .reference_origins = previous.reference_origins,
+                    .stable_reference_root = previous.stable_reference_root,
+                    .binding_identity = previous.binding_identity,
+                    .storage_identity = previous.storage_identity,
+                });
             }
             if (first != null and second != null) {
                 state.joinFlow(self.states.items[@intFromEnum(second.?.state)]);
@@ -7060,6 +7100,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         fn finishOwnershipMetadata(self: *Self) !void {
             std.debug.assert(self.ownership_forwards.items.len == 0);
             std.debug.assert(self.ownership_edges.items.len == 0);
+            std.sort.block(OwnershipForwardHint, self.ownership_forward_hints.items, {}, ownershipHintLessThan);
             const start_orders = try self.ctx.allocator().alloc(bool, self.next_generation_start_order);
             defer self.ctx.allocator().free(start_orders);
             @memset(start_orders, false);
@@ -7089,12 +7130,15 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     .return_unit, .return_value, .return_failure, .diverge => {},
                 }
             }
+            var edge_index: usize = 0;
             for (self.ownership_forward_hints.items) |hint| {
-                var matching_edges: usize = 0;
-                for (self.ownership_edges.items) |edge| {
-                    if (edge.predecessor == hint.predecessor and edge.successor_ordinal == hint.successor_ordinal) matching_edges += 1;
-                }
-                std.debug.assert(matching_edges == 1);
+                const key = ownershipEdgeKey(hint.predecessor, hint.successor_ordinal);
+                while (edge_index < self.ownership_edges.items.len and
+                    ownershipEdgeKey(self.ownership_edges.items[edge_index].predecessor, self.ownership_edges.items[edge_index].successor_ordinal) < key) : (edge_index += 1)
+                {}
+                std.debug.assert(edge_index < self.ownership_edges.items.len);
+                std.debug.assert(self.ownership_edges.items[edge_index].predecessor == hint.predecessor);
+                std.debug.assert(self.ownership_edges.items[edge_index].successor_ordinal == hint.successor_ordinal);
             }
             try self.validateGenerationOrigins();
         }
@@ -7534,8 +7578,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     try self.ownership_forwards.append(self.ctx.allocator(), .{ .unowned = destination });
                 }
             }
-            for (self.ownership_forward_hints.items) |hint| {
-                if (hint.predecessor != predecessor or hint.successor_ordinal != successor_ordinal) continue;
+            for (self.ownershipHints(predecessor, successor_ordinal)) |hint| {
                 if (hint.source) |source| {
                     try self.ownership_forwards.append(self.ctx.allocator(), .{ .forward = .{
                         .source = source,
@@ -7567,6 +7610,30 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 .source = source,
                 .destination = destination,
             });
+        }
+
+        fn ownershipEdgeKey(predecessor: structures.FunctionBlockId, ordinal: u2) u64 {
+            return (@as(u64, @intFromEnum(predecessor)) << 2) | ordinal;
+        }
+
+        fn ownershipHintLessThan(_: void, left: OwnershipForwardHint, right: OwnershipForwardHint) bool {
+            return ownershipEdgeKey(left.predecessor, left.successor_ordinal) < ownershipEdgeKey(right.predecessor, right.successor_ordinal);
+        }
+
+        fn ownershipHints(self: *const Self, predecessor: structures.FunctionBlockId, ordinal: u2) []const OwnershipForwardHint {
+            const hints = self.ownership_forward_hints.items;
+            const key = ownershipEdgeKey(predecessor, ordinal);
+            var start: usize = 0;
+            var end = hints.len;
+            while (start < end) {
+                const middle = start + (end - start) / 2;
+                if (ownershipEdgeKey(hints[middle].predecessor, hints[middle].successor_ordinal) < key) {
+                    start = middle + 1;
+                } else end = middle;
+            }
+            end = start;
+            while (end < hints.len and ownershipEdgeKey(hints[end].predecessor, hints[end].successor_ordinal) == key) : (end += 1) {}
+            return hints[start..end];
         }
 
         fn appendProducedOwnershipEdge(

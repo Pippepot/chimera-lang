@@ -149,6 +149,7 @@ pub const Solver = struct {
     previous_incoming: []?usize,
     entry: structures.FunctionBlockId,
     reachable: []bool,
+    dirty_blocks: []bool,
     available_in: []u64,
     available_out: []u64,
     representations_in: []?structures.FunctionValueId,
@@ -188,6 +189,8 @@ pub const Solver = struct {
         const matrix_len = std.math.mul(usize, blocks.len, words_per_block) catch return error.AnalysisTooLarge;
         const reachable = try gpa.alloc(bool, blocks.len);
         errdefer gpa.free(reachable);
+        const dirty_blocks = try gpa.alloc(bool, blocks.len);
+        errdefer gpa.free(dirty_blocks);
         const available_in = try gpa.alloc(u64, matrix_len);
         errdefer gpa.free(available_in);
         const available_out = try gpa.alloc(u64, matrix_len);
@@ -228,6 +231,7 @@ pub const Solver = struct {
             .previous_incoming = previous_incoming,
             .entry = entry,
             .reachable = reachable,
+            .dirty_blocks = dirty_blocks,
             .available_in = available_in,
             .available_out = available_out,
             .representations_in = representations_in,
@@ -246,6 +250,7 @@ pub const Solver = struct {
         self.gpa.free(self.block_edges);
         self.gpa.free(self.previous_incoming);
         self.gpa.free(self.reachable);
+        self.gpa.free(self.dirty_blocks);
         self.gpa.free(self.available_in);
         self.gpa.free(self.available_out);
         self.gpa.free(self.representations_in);
@@ -297,13 +302,15 @@ pub const Solver = struct {
     }
 
     fn solveDemand(self: *Solver) void {
+        @memcpy(self.dirty_blocks, self.reachable);
         var changed = true;
         while (changed) {
             changed = false;
             var block_index = self.blocks.len;
             while (block_index > 0) {
                 block_index -= 1;
-                if (!self.reachable[block_index]) continue;
+                if (!self.dirty_blocks[block_index]) continue;
+                self.dirty_blocks[block_index] = false;
                 const block_id: structures.FunctionBlockId = @enumFromInt(block_index);
                 const block_value = self.blocks[block_index];
                 GenerationBits.clear(self.scratch);
@@ -318,7 +325,6 @@ pub const Solver = struct {
                 }
                 if (!std.mem.eql(u64, self.blockSet(self.live_out, block_id), self.scratch)) {
                     GenerationBits.copy(self.blockSet(self.live_out, block_id), self.scratch);
-                    changed = true;
                 }
                 self.scanEffectsBackward(self.scratch, block_value.terminator_effects.items);
                 var item_index = block_value.items.items.len;
@@ -334,6 +340,11 @@ pub const Solver = struct {
                 }
                 if (!std.mem.eql(u64, self.blockSet(self.live_in, block_id), self.scratch)) {
                     GenerationBits.copy(self.blockSet(self.live_in, block_id), self.scratch);
+                    var incoming = self.block_edges[block_index].first_incoming;
+                    while (incoming) |edge_index| : (incoming = self.previous_incoming[edge_index]) {
+                        const predecessor = @intFromEnum(self.ownership_edges[edge_index].predecessor);
+                        if (self.reachable[predecessor]) self.dirty_blocks[predecessor] = true;
+                    }
                     changed = true;
                 }
             }
@@ -341,11 +352,13 @@ pub const Solver = struct {
     }
 
     fn solveAvailability(self: *Solver) void {
+        @memcpy(self.dirty_blocks, self.reachable);
         var changed = true;
         while (changed) {
             changed = false;
             for (self.blocks, 0..) |block_value, block_index| {
-                if (!self.reachable[block_index]) continue;
+                if (!self.dirty_blocks[block_index]) continue;
+                self.dirty_blocks[block_index] = false;
                 const block_id: structures.FunctionBlockId = @enumFromInt(block_index);
                 GenerationBits.clear(self.scratch);
                 if (block_id != self.entry) {
@@ -360,7 +373,6 @@ pub const Solver = struct {
                 }
                 if (!std.mem.eql(u64, self.blockSet(self.available_in, block_id), self.scratch)) {
                     GenerationBits.copy(self.blockSet(self.available_in, block_id), self.scratch);
-                    changed = true;
                 }
                 for (block_value.items.items) |item| switch (item) {
                     .instruction => {},
@@ -372,6 +384,7 @@ pub const Solver = struct {
                 self.scanEffectsForward(self.scratch, block_value.terminator_effects.items);
                 if (!std.mem.eql(u64, self.blockSet(self.available_out, block_id), self.scratch)) {
                     GenerationBits.copy(self.blockSet(self.available_out, block_id), self.scratch);
+                    self.markSuccessorsDirty(block_index);
                     changed = true;
                 }
             }
@@ -379,11 +392,13 @@ pub const Solver = struct {
     }
 
     fn solveRepresentations(self: *Solver) void {
+        @memcpy(self.dirty_blocks, self.reachable);
         var changed = true;
         while (changed) {
             changed = false;
             for (self.blocks, 0..) |block_value, block_index| {
-                if (!self.reachable[block_index]) continue;
+                if (!self.dirty_blocks[block_index]) continue;
+                self.dirty_blocks[block_index] = false;
                 const block_id: structures.FunctionBlockId = @enumFromInt(block_index);
                 @memset(self.representation_scratch, null);
                 if (block_id != self.entry) {
@@ -414,7 +429,6 @@ pub const Solver = struct {
                 }
                 if (!std.mem.eql(?structures.FunctionValueId, self.blockRepresentations(self.representations_in, block_id), self.representation_scratch)) {
                     @memcpy(self.blockRepresentations(self.representations_in, block_id), self.representation_scratch);
-                    changed = true;
                 }
                 for (block_value.items.items) |item| switch (item) {
                     .instruction => {},
@@ -426,6 +440,7 @@ pub const Solver = struct {
                 self.scanRepresentationsForward(self.representation_scratch, block_value.terminator_effects.items);
                 if (!std.mem.eql(?structures.FunctionValueId, self.blockRepresentations(self.representations_out, block_id), self.representation_scratch)) {
                     @memcpy(self.blockRepresentations(self.representations_out, block_id), self.representation_scratch);
+                    self.markSuccessorsDirty(block_index);
                     changed = true;
                 }
             }
@@ -458,6 +473,15 @@ pub const Solver = struct {
                 },
                 .unowned => {},
             };
+        }
+    }
+
+    fn markSuccessorsDirty(self: *Solver, block_index: usize) void {
+        for (self.block_edges[block_index].outgoing) |maybe_edge| {
+            const edge_index = maybe_edge orelse continue;
+            const successor = @intFromEnum(self.ownership_edges[edge_index].successor);
+            std.debug.assert(self.reachable[successor]);
+            self.dirty_blocks[successor] = true;
         }
     }
 
@@ -1215,6 +1239,41 @@ test "lifetime solver reaches a fixed point across continue and break" {
         .generation = @enumFromInt(0),
         .cleanup_value = @enumFromInt(10),
         .location = .{ .edge = .{ .predecessor = @enumFromInt(1), .successor_ordinal = 1 } },
+    }} });
+}
+
+test "lifetime solver propagates through reordered blocks and ignores unreachable predecessors" {
+    const generations = [_]Generation{
+        testSolverGeneration(0, false),
+        testSolverGeneration(1, false),
+        testSolverGeneration(2, false),
+    };
+    const boundaries = [_][]const LifetimeEffect{
+        &.{.{ .define = .{ .generation = @enumFromInt(0), .value = @enumFromInt(10) } }},
+        &.{.{ .use = .{ .generation = @enumFromInt(1), .cleanup_value = @enumFromInt(0) } }},
+        &.{.{ .define = .{ .generation = @enumFromInt(2), .value = @enumFromInt(20) } }},
+    };
+    const blocks = [_]TestSolverBlock{
+        .{ .boundaries = &.{0}, .terminator = .{ .branch = .{ .target = @enumFromInt(4), .arguments = .{ .start = 0, .end = 0 } } } },
+        .{ .boundaries = &.{1}, .terminator = .return_unit, .argument_start = 0, .argument_end = 1 },
+        .{ .terminator = .{ .branch = .{ .target = @enumFromInt(1), .arguments = .{ .start = 0, .end = 0 } } } },
+        .{ .boundaries = &.{2}, .terminator = .{ .branch = .{ .target = @enumFromInt(2), .arguments = .{ .start = 0, .end = 0 } } } },
+        .{ .terminator = .{ .branch = .{ .target = @enumFromInt(2), .arguments = .{ .start = 0, .end = 0 } } } },
+    };
+    const forwards = [_]OwnershipForward{.{ .forward = .{
+        .source = @enumFromInt(0),
+        .destination = @enumFromInt(1),
+    } }};
+    const edges = [_]OwnershipEdge{
+        .{ .predecessor = @enumFromInt(0), .successor_ordinal = 0, .successor = @enumFromInt(4), .mappings = .{ .start = 0, .end = 0 } },
+        .{ .predecessor = @enumFromInt(2), .successor_ordinal = 0, .successor = @enumFromInt(1), .mappings = .{ .start = 0, .end = 1 } },
+        .{ .predecessor = @enumFromInt(3), .successor_ordinal = 0, .successor = @enumFromInt(2), .mappings = .{ .start = 0, .end = 0 } },
+        .{ .predecessor = @enumFromInt(4), .successor_ordinal = 0, .successor = @enumFromInt(2), .mappings = .{ .start = 0, .end = 0 } },
+    };
+    try testExpectLifetimePlan(std.testing.allocator, &generations, &boundaries, &blocks, &.{@enumFromInt(1)}, &forwards, &edges, .{ .cleanups = &.{.{
+        .generation = @enumFromInt(1),
+        .cleanup_value = @enumFromInt(0),
+        .location = .{ .boundary = @enumFromInt(1) },
     }} });
 }
 

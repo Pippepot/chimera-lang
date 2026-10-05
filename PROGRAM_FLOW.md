@@ -96,6 +96,12 @@ selection is the opt-out form. This happens over module/query data, never by
 rewriting source.
 The CLI labels loaded ASTs and reachable SSA/assembly functions with their source
 paths. Timing follows normal demand and never analyzes unused bodies.
+Timing rows are dependency-inclusive wall-clock intervals: `validate modules`
+covers module-graph validation; `analyze entry` covers entry selection and entry
+body analysis; `compile reachable functions (includes callee analysis)` covers
+reachable compilation, including any callee typing it demands. These are not
+exclusive per-stage totals, and compile-time work is charged to the interval
+that first demands it.
 
 ## Revisions and failures
 

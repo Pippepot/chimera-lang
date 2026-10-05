@@ -10,7 +10,69 @@ const Context = query.Context;
 const Database = query.Database;
 const Handle = query.Handle;
 const testing = std.testing;
+var allocation_failure_backing: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
 const DiagnosticKind = std.meta.Tag(structures.Diagnostic.Kind);
+
+fn flowSnapshotLoopSource(allocator: std.mem.Allocator, owning: bool, threshold: u32) ![]u8 {
+    var source: std.ArrayList(u8) = .empty;
+    errdefer source.deinit(allocator);
+    if (owning) try source.appendSlice(allocator, "struct Item\n  value: int\n  drop = func(deinit self: Item) -> return\n");
+    try source.appendSlice(allocator, "static probe = func(flag: int) int\n  var total = 0\n");
+    for (0..320) |index| {
+        const line = if (owning)
+            try std.fmt.allocPrint(allocator, "  var v{d} = Item{{value = 1}}\n", .{index})
+        else
+            try std.fmt.allocPrint(allocator, "  var v{d} = 1\n", .{index});
+        defer allocator.free(line);
+        try source.appendSlice(allocator, line);
+    }
+    const field = if (owning) ".value" else "";
+    const body = try std.fmt.allocPrint(
+        allocator,
+        "  var step = 0\n  loop\n    if step == 2 -> break\n    if flag < {d} -> v0{s} += 2 else v319{s} += 1\n    step += 1\n",
+        .{ threshold, field, field },
+    );
+    defer allocator.free(body);
+    try source.appendSlice(allocator, body);
+    for (0..320) |index| {
+        const line = try std.fmt.allocPrint(allocator, "  total += v{d}{s}\n", .{ index, field });
+        defer allocator.free(line);
+        try source.appendSlice(allocator, line);
+    }
+    try source.appendSlice(allocator, "  return total\nstatic answer = probe(1)\nexit(probe(1) + answer - 500)\n");
+    return source.toOwnedSlice(allocator);
+}
+
+fn expectFlowSnapshotExit(db: *Database, expected: u8) !void {
+    const executable = (try db.get(queries.BuildExecutable, 0)).*;
+    try testing.expect(executable != null);
+    var program = try runtime.prepareProgram(testing.io, testing.allocator, executable.?.bytes);
+    defer program.deinit(testing.io);
+    defer std.Io.Dir.cwd().deleteFile(testing.io, "prog") catch {};
+    try testing.expectEqual(std.process.Child.Term{ .exited = expected }, try program.run(testing.io, &.{}));
+}
+
+fn checkFlowSnapshotLoop(owning: bool) !void {
+    const allocator = testing.allocator;
+    const db = try Database.init(allocator, .{ .worker_count = 2 });
+    defer db.deinit();
+    const original = try flowSnapshotLoopSource(allocator, owning, 0);
+    defer allocator.free(original);
+    try test_sources.modules.registerSources(db, allocator, original, &.{}, &.{});
+    try expectFlowSnapshotExit(db, 144);
+    const changed = try flowSnapshotLoopSource(allocator, owning, 2);
+    defer allocator.free(changed);
+    try db.setInput(queries.SourceText, 0, changed);
+    try expectFlowSnapshotExit(db, 148);
+}
+
+test "paged scalar flow snapshots preserve loops and incremental execution" {
+    try checkFlowSnapshotLoop(false);
+}
+
+test "paged owning flow snapshots preserve generations and incremental execution" {
+    try checkFlowSnapshotLoop(true);
+}
 
 const Counter = struct {
     value: std.atomic.Value(usize) = .init(0),
@@ -1260,7 +1322,7 @@ test "item relocation drops dependencies on removed source files" {
 }
 
 test "import resolution cleans up every allocation failure" {
-    try testing.checkAllAllocationFailures(testing.allocator, testImportAllocations, .{});
+    try testing.checkAllAllocationFailures(allocation_failure_backing.allocator(), testImportAllocations, .{});
 }
 
 fn testImportAllocations(gpa: std.mem.Allocator) !void {
@@ -4933,7 +4995,7 @@ test "static declaration edits invalidate actual consumers and retain equal resu
 }
 
 test "static declaration resolution cleans up every allocation failure" {
-    try testing.checkAllAllocationFailures(testing.allocator, testStaticDeclarationAllocations, .{});
+    try testing.checkAllAllocationFailures(allocation_failure_backing.allocator(), testStaticDeclarationAllocations, .{});
 }
 
 fn testStaticDeclarationAllocations(gpa: std.mem.Allocator) !void {
@@ -5086,7 +5148,7 @@ test "module scope preserves stable identity and canonical equality" {
 }
 
 test "module scope construction cleans up every allocation failure" {
-    try testing.checkAllAllocationFailures(testing.allocator, testModuleScopeAllocations, .{});
+    try testing.checkAllAllocationFailures(allocation_failure_backing.allocator(), testModuleScopeAllocations, .{});
 }
 
 fn testModuleScopeAllocations(gpa: std.mem.Allocator) !void {
@@ -5662,7 +5724,7 @@ test "variant branch joins retain equal results and track changed member sets" {
 }
 
 test "variant branch join analysis cleans up every allocation failure" {
-    try testing.checkAllAllocationFailures(testing.allocator, testVariantJoinAllocations, .{});
+    try testing.checkAllAllocationFailures(allocation_failure_backing.allocator(), testVariantJoinAllocations, .{});
 }
 
 fn testVariantJoinAllocations(gpa: std.mem.Allocator) !void {
@@ -6740,7 +6802,7 @@ test "variant inspection edits retain equal artifacts and recover diagnostics" {
 }
 
 test "variant inspection compilation cleans up every allocation failure" {
-    try testing.checkAllAllocationFailures(testing.allocator, testVariantInspectionAllocations, .{});
+    try testing.checkAllAllocationFailures(allocation_failure_backing.allocator(), testVariantInspectionAllocations, .{});
 }
 
 fn testVariantInspectionAllocations(gpa: std.mem.Allocator) !void {
@@ -10528,7 +10590,7 @@ test "redundant variant binding annotations retain typed and compiled results" {
 }
 
 test "typed expression graph construction cleans up every allocation failure" {
-    try testing.checkAllAllocationFailures(testing.allocator, testTypedExpressionAllocations, .{});
+    try testing.checkAllAllocationFailures(allocation_failure_backing.allocator(), testTypedExpressionAllocations, .{});
 }
 
 fn testTypedExpressionAllocations(gpa: std.mem.Allocator) !void {
@@ -10725,7 +10787,7 @@ test "ownership strategies require bare strategy names" {
 }
 
 test "adding a previously missing input invalidates cached fallback results" {
-    try testing.checkAllAllocationFailures(testing.allocator, testMissingInputRegistration, .{});
+    try testing.checkAllAllocationFailures(allocation_failure_backing.allocator(), testMissingInputRegistration, .{});
 }
 
 fn testMissingInputRegistration(gpa: std.mem.Allocator) !void {

@@ -129,14 +129,136 @@ Implementation status and priorities are tracked in
 
 ## Ownership and layout
 
-- Declared and generated structs publish a common definition with fields and validated ownership hooks. `OwnershipCapabilities(TypeId)` validates logical by-value containment and composes move, copy, and drop facts without requesting physical layout. Layout consumes that validated fact before determining size, alignment, and field or variant placement. Direct movement is derived from these capabilities, not stored separately. `HostTypeLayout(TypeId)` describes the x86-64 host representation; a non-host layout must be derived for its target's location-specific layout domain, never inferred from host layout. The accepted provider, location, layout, and access contracts are in [STORAGE_AND_REFERENCES.md](STORAGE_AND_REFERENCES.md).
+- Declared and generated structs publish a common definition with fields and validated ownership hooks. `OwnershipCapabilities(TypeId)` validates logical by-value containment and composes move, copy, and drop facts without requesting physical layout. Layout consumes that validated fact before determining size, alignment, and field or variant placement. Direct movement is derived from these capabilities, not stored separately. `HostTypeLayout(TypeId)` describes the x86-64 host representation; a non-host layout must be derived for its target's location-specific layout domain, never inferred from host layout. [syntax&semantics.txt](syntax&semantics.txt) owns the provider, location, layout, and access contracts.
 - Typed borrowed places carry field-index paths, not byte offsets. Borrowing, consuming arguments, and receiver resolution share source-place traversal and field-name and visibility validation; codegen resolves physical offsets from the trusted path. Reference origins retain independent field, variant, and owned-element projections. Slot-storage identity is separate from the current contents' identity, including at loop joins.
 - Custom copy and move hooks may rearrange reference-bearing fields, so their results conservatively retain all possible source origins rather than assuming field correspondence. Hook effects invalidate writable referents, including during in-place copies. Call arguments retain the provenance of their prepared values, and indirect callees retain borrow metadata through argument evaluation.
 - `deinit` call arguments carry exact-typed source storage; typing propagates consuming access through conditional and loop results and materializes fresh argument coercions before publishing their addresses. Storage joins preserve the selected address in codegen and the selected cell in compile-time interpretation, including directly movable and zero-sized types. Preparing an owned root retains its generation until the call or failure cleanup. Typing rejects overlapping writes to any retained source while later arguments are prepared. Move hooks receive consuming access, and nested hooks dispatch normally. Local deinit authority is separate from a generation's fields-only cleanup policy. Typing derives remaining explicit-field obligations before lifetime planning; the solver does not interpret structural ownership. Deferred `init` capture effects are checked at callable acquisition and argument preparation, with published regions and cleanup surviving query/cache reuse; the language document owns those contracts.
 - `AnalysisContext` derives `copy` and `move` member availability from validated ownership capabilities and specializes private declarations in `std/ownership.chi`. These use ordinary instance identities and canonical callable types, with capability checks also applied when their signatures are demanded. Typing builds their bodies with the existing selected ownership operations and lifetime machinery; runtime codegen and compile-time interpretation consume ordinary typed IR. No member query, recursive source wrapper, or backend ownership dispatch is added.
 - Typing tracks ownership at control-flow edges. Lifetime effects are recorded in a boundary of the block where their operation executes; block statements and results never record into an enclosing expression's boundary. A `mut` parameter root is caller-owned and carries no generation; a value assigned to the whole root passes to the caller's place. After constructing the graph, `src/frontend/lifetime.zig` plans path-sensitive cleanup and explicit-drop obligations from query-local metadata. Typing rejects abandonment before materializing the plan as ordinary typed operations; neither the solver's state nor a generic destruction operation enters published IR.
 - Cleanup values retain reference provenance through ownership forwarding. After materialization, typing checks paths from expression-borrow reads through mutating destructor calls to later uses, stopping at fresh reads. Fieldwise and standard Box destruction visit only contained destructors; user hooks conservatively receive all writable references in their argument. Read identities and cleanup effects are query-local and do not enter cached IR.
-- Immutable local-binding metadata has one allocation owner. Query-local snapshots retain only the value prefix through the last bound local, with full-sized availability arrays; restoring a snapshot clears the omitted tail. `State` owns cloning, cleanup, and joining the independent flow facts: local and field availability, initializer consumption, and definite consumption completion. Value and storage selection remain with the control-flow builder. Lifetime tables remain dense. Opt-in `BodyMeasurements` records their footprint without changing cached IR or publishing accumulators; `zig build flow-benchmark -Doptimize=ReleaseFast` exercises branch scaling.
+- Immutable local-binding metadata has one allocation owner. Live local values remain contiguous. Query-local snapshots retain only the prefix through the last bound local: up to 256 slots use independent contiguous copies; larger states share reference-counted 16-slot pages and copy a page before mutation. Capturing live values reuses equal pages from the preceding snapshot; restoring a snapshot clears the omitted tail. `State` owns cloning, cleanup, and joining the independent flow facts: local and field availability, initializer consumption, and definite consumption completion. Those arrays remain full-sized and independent of value-page sharing. Value and storage selection remain with the control-flow builder.
+- Lifetime tables remain dense. Each fixed-point solver tracks dirty blocks and propagates dirtiness only when relevant output or input facts change, skipping unchanged transfer work without changing joins or cleanup semantics. Ownership forwarding hints are stably grouped by predecessor and successor ordinal, so edge lowering visits only matching hints. Opt-in `BodyMeasurements` records snapshot and dense lifetime-table allocations without changing cached IR or publishing accumulators; `zig build flow-benchmark -Doptimize=ReleaseFast` exercises branch scaling.
+
+## Storage design
+
+The implemented host API fixes execution target, provider, and location
+implicitly. `Allocation(T)` retains logical element count separately from
+mapped byte size; public counts are `int`, while checked byte-size arithmetic
+uses wider unsigned storage. For a zero-byte request the host provider reserves
+one byte for a distinct stable address and records the reserved size for
+deallocation without changing the logical count or layout.
+
+`Allocation` is explicit-drop and owns deallocation facts, not element
+initialization state. It needs no runtime initialization bitmap: unsafe indexed
+operations require caller-proven bounds and initialization, while containers
+track initialized ranges. `Box` retains a complete one-element allocation;
+`Buffer` derives capacity from its allocation and tracks only its initialized
+prefix. Do not introduce a thin allocation handle until retaining layout and
+location has a demonstrated material cost. Compiler storage and lifetime checks
+need not be expressible as ordinary library code.
+
+### Future allocation interface
+
+This is a conceptual interface, not public non-host declarations. Layout
+resolution binds a target, location, type, count, and alignment before a provider
+receives the request. Keep resolved byte `AllocationLayout` separate from that
+typed request so a host layout cannot be paired with device storage, or a count
+with inconsistent bytes:
+
+```text
+fallible resolve_layout(
+		static T: type,
+		target,
+		location,
+		count,
+		alignment = natural_for(T, target, location),
+) ResolvedAllocationLayout(T)
+
+fallible allocate(
+		mut provider,
+		resolved: ResolvedAllocationLayout(T),
+) Allocation(T)
+
+func deallocate(static T: type, deinit allocation: Allocation(T))
+```
+
+Prefer `allocate` and `deallocate`; `release` is ambiguous with decrementing
+shared ownership. The allocation retains the resolved request and provider
+authority directly or through lifetime dependencies. Layout and location
+accessors remain sketches. Host low-level operations stay under `std.memory`,
+with matching `Allocation` methods; `Box` and `Ref` are prelude exports.
+`unsafe_own_box` is internal ownership transfer, not a public constructor.
+Consuming `value(T, owner)` uses deinit access without preliminary owner
+relocation; `get_value` would obscure borrowing versus copying versus transfer.
+`Ref.copy` copies only the handle; `Ref.read` requires pointee copy support.
+
+Convenience wrappers may bind location and provider without merging them:
+
+```text
+host.allocate(layout, using = allocator)
+device.allocate(layout)
+copy(source, mut destination)
+```
+
+These spellings remain conceptual. `device` is a runtime resource for one
+device, not an enum case. A kernel boundary produces an address-space-qualified
+Ref or view with a representation validated for that target; host code cannot
+dereference device-only memory. Workgroup and private storage remain explicit
+kernel declarations. Non-host layouts must be keyed by type and the target's
+location-specific layout domain. Add neither a device layout query nor a
+general provider dispatcher until a concrete target needs them; start with
+validated scalar elements. The roadmap owns remaining prerequisites and the
+deferred shared-owner design.
+
+### Mojo comparison
+
+The storage design was informed by Modular's repository at commit
+[`975baa7`](https://github.com/modular/modular/tree/975baa793c02665a36194c285496e133c9452068),
+inspected on 2026-09-17. Bracketed parameter lists and *origin* below are Mojo
+terminology, not proposed Chimera syntax.
+
+- Mojo's [allocation API](https://github.com/modular/modular/blob/975baa793c02665a36194c285496e133c9452068/Mojo/stdlib/std/memory/alloc.mojo)
+	uses `Layout[T, alignment]` with runtime element count and compile-time
+	alignment, deriving byte size. `Allocation[T]` owns storage and deallocation
+	layout; consuming it invalidates dependent origins. `ThinAllocation` retains
+	only the owning pointer and requires unsafe reattachment of the exact layout.
+	`ManagedAllocation` frees storage automatically but accepts only trivially
+	destructible elements because freeing does not run destructors. Allocation
+	failure and negative counts abort; zero-sized types use a dangling sentinel.
+	Chimera instead retains complete deallocation facts, uses ordinary fallible
+	failure, and requires distinct stable identities for successful zero-byte
+	allocations.
+- Mojo's [Pointer](https://github.com/modular/modular/blob/975baa793c02665a36194c285496e133c9452068/Mojo/stdlib/std/memory/pointer.mojo)
+	combines pointee type, mutability, origin, and address space. It is non-null;
+	arithmetic, raw-address access, initialization, and destruction are unsafe.
+	`UnsafePointer` is a deprecated alias. This supports one non-owning Chimera
+	Ref abstraction, with permission granted only by its access path.
+	[OwnedPointer](https://github.com/modular/modular/blob/975baa793c02665a36194c285496e133c9452068/Mojo/stdlib/std/memory/owned_pointer.mojo)
+	allocates a single-element layout, copies or moves its value, and destroys it
+	before deallocation; interior origins depend on the owner. Chimera's Box uses
+	the same ownership model but initially retains a complete allocation rather
+	than a thin handle with reconstructed layout.
+- Mojo's [ArcPointer](https://github.com/modular/modular/blob/975baa793c02665a36194c285496e133c9452068/Mojo/stdlib/std/memory/arc_pointer.mojo)
+	has a control block containing payload and atomic strong and weak counts.
+	This bookkeeping does not synchronize payload access. Only the control-block
+	pattern informs a future Chimera shared owner, not the Arc/WeakPointer names
+	or upgradeable weak semantics.
+- Mojo's [AddressSpace](https://github.com/modular/modular/blob/975baa793c02665a36194c285496e133c9452068/Mojo/stdlib/std/memory/address_space.mojo)
+	defines `GENERIC`, `GLOBAL`, `SHARED`, `CONSTANT`, and `LOCAL` as pointer
+	parameters; [stack_allocation](https://github.com/modular/modular/blob/975baa793c02665a36194c285496e133c9452068/Mojo/stdlib/std/memory/stack_allocation.mojo)
+	lowers GPU shared, constant, and local storage by compile-time address space.
+	Address space and dynamic allocation policy remain separate dimensions.
+- Mojo's [DeviceContext and DeviceBuffer](https://github.com/modular/modular/blob/975baa793c02665a36194c285496e133c9452068/max/mojo/max/gpu/host/device_context.mojo)
+	form a separate host-side GPU API, not a location-generalized `alloc`.
+	A device-global buffer is freed through its context and becomes a device
+	Pointer at a kernel boundary. Copies are explicit and asynchronous; pinned
+	HostBuffer is also available. DeviceBuffer accepts scalar `DType` elements,
+	not arbitrary host types, and kernel arguments use a
+	`DevicePassable.device_type` mapping with target-aware ABI checks. This
+	prevents host dereference of inaccessible memory but duplicates allocation
+	surfaces without a general location model; unlike `alloc`, buffer creation
+	is fallible. Chimera keeps location separate and initially requires
+	synchronous transfers unless a completion resource retains both allocations.
 
 ## Backend and execution
 

@@ -53,9 +53,8 @@ Top-level code is the entry point; a function named `main` is ordinary. The CLI 
 | --- | --- |
 | [syntax&semantics.txt](../syntax&semantics.txt) | Language rules and examples; authoritative but incomplete |
 | [ROADMAP.md](../ROADMAP.md) | Verified implementation status, gaps, and ordered next steps |
-| [ARCHITECTURE.md](../ARCHITECTURE.md) | Compiler boundaries, ownership, and representation contracts |
+| [ARCHITECTURE.md](../ARCHITECTURE.md) | Compiler boundaries, ownership, representation contracts, and storage design |
 | [PROGRAM_FLOW.md](../PROGRAM_FLOW.md) | Current query flow, invalidation, and result lifetimes |
-| [STORAGE_AND_REFERENCES.md](../STORAGE_AND_REFERENCES.md) | Implemented host API and accepted future storage design |
 | [AGENTS.md](../AGENTS.md) | Contribution and review rules |
 
 Specification examples describe the target, not a promise of compiler support. Parser support alone does not establish semantics. Resolve missing language decisions in `syntax&semantics.txt` before implementing them; neither legacy behavior nor an old test overrides it.
@@ -101,20 +100,33 @@ The compile-time execution benchmark reports analysis, execution, publication,
 cached lookup, and incremental recomputation times in CSV form:
 
 ```sh
-zig build benchmark -Doptimize=ReleaseFast
+zig build benchmark --seed 0 -Doptimize=ReleaseFast
 ```
 
 The flow benchmark reports typing time, retained snapshot bytes, and dense
-lifetime-table bytes for functions with 8, 32, 128, and 256 branches:
+lifetime-table bytes for scalar and owning functions with 8, 32, 128, 256,
+and 512 branches:
 
 ```sh
-zig build flow-benchmark -Doptimize=ReleaseFast
+zig build flow-benchmark --seed 0 -Doptimize=ReleaseFast
 ```
 
-Snapshot measurements count retained value slots, source availability,
-initializer state, and definite consumption completion. Trailing unbound value
-slots are omitted; lifetime tables remain dense. These are logical allocated
-slice sizes, not process RSS.
+Each row is the median of five fresh one-worker databases. Signature resolution
+and unresolved semantic-body construction happen before the timed typing call;
+body teardown and code generation are excluded. Allocation statistics come from
+a separate sixth database, so footprint-accounting work is excluded from the
+timing samples. Typing includes ownership lowering and lifetime planning.
+Owning fixtures keep all generations live, so their dense tables deliberately
+represent a demanding case rather than a promise that sparse storage would help.
+
+Snapshot measurements count retained contiguous value slots or page-pointer
+arrays, each unique shared value page once (including its reference-count
+header), local and field availability, initializer state, and definite
+consumption completion. Trailing unbound value slots are omitted. Lifetime
+measurements count dense solver tables, not dirty-block flags or other scratch.
+Neither measurement is process RSS or an allocation-traffic counter. Value-page
+sharing reduces copying but does not remove the remaining snapshot-by-slot
+arrays or block-by-generation tables.
 
 For cold multi-file worker scaling and warm and edited disk cache reuse against
 uncached runs, build an optimized compiler and run the generated benchmark fixture.

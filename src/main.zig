@@ -113,12 +113,14 @@ fn buildWithStageTimings(db: *query.Database, io: std.Io, timings: *diagnostics.
     _ = try db.get(queries.IndexItems, file_id);
     timings.mark(io, "discover items");
     const root = try db.intern(queries.ModulePaths, .{ .path = "" });
-    if (!(try db.get(queries.ValidateModuleGraph, root)).*) return;
+    const modules_valid = (try db.get(queries.ValidateModuleGraph, root)).*;
+    timings.mark(io, "validate modules");
+    if (!modules_valid) return;
     if ((try db.get(queries.SelectEntry, file_id)).*) |entry|
         _ = try db.get(queries.AnalyzeFunctionInstance, .{ .item = entry });
-    timings.mark(io, "analyze bodies");
+    timings.mark(io, "analyze entry");
     _ = try db.get(queries.CollectReachableInstances, file_id);
-    timings.mark(io, "compile functions");
+    timings.mark(io, "compile reachable functions (includes callee analysis)");
 }
 
 fn compileAndRun(
@@ -596,8 +598,11 @@ test "CLI core renders debug output and runs the compiled program" {
     try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "timing\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "database init") != null);
     try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "parse") != null);
-    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "analyze bodies") != null);
-    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "compile functions") != null);
+    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "validate modules") != null);
+    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "analyze entry") != null);
+    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "compile reachable functions (includes callee analysis)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "analyze bodies") == null);
+    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "compile functions") == null);
     try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "link executable") != null);
     try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "collect diagnostics") != null);
 }

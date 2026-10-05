@@ -593,7 +593,7 @@ fallible materialize(static T: type, init item: T) T
     return item # constructs directly in this call's result destination
 
 fallible forward_initializer(static T: type, init item: T) T
-    return materialize(T, item) # forwards once, without early construction
+    return materialize?(T, item) # forwards once, without early construction
 #
 # Deferred expressions retain the lexical bindings and access needed for later
 # evaluation. Their possible reads, writes, transfers, reference origins, and
@@ -652,8 +652,7 @@ fallible forward_initializer(static T: type, init item: T) T
 # variable: rebinding a var Ref does not retarget an existing alias. A derived
 # Ref borrowed through an alias also addresses the original referent. Ending,
 # moving, or replacing its referent's storage while the alias is used is
-# rejected. A borrowed return retains its possible origins; `from(...)` can
-# narrow them, while calls without a contract retain borrowed inputs.
+# rejected. A borrowed return retains its possible origins;
 # A bare borrow binding used to initialize an owned value copies T if T is
 # copyable; transferring ownership through the binding is not allowed.
 #
@@ -850,21 +849,6 @@ fallible forward_initializer(static T: type, init item: T) T
 # and view borrows, whether or not growth occurred. BufferView(byte) is a raw
 # borrowed byte slice, not validated UTF-8 text. Later List and text views must
 # retain the same backing-owner and storage-change dependencies.
-# A typed allocation selects a provider, a concrete memory location, and a
-# resolved byte layout independently. The execution target and location must
-# support the chosen representation of T; a host layout is not valid in another
-# layout domain without an explicit compatibility guarantee. The provider may
-# reject an unsupported location or layout, but cannot redefine T's representation.
-# The owning handle retains the location, element count, and all authority and
-# layout facts needed to deallocate. Address space belongs to a typed access
-# path, not to T or its provider; the location identifies the actual resource,
-# such as a particular device. Access requires a compatible execution context
-# and address space.
-# For every supported location, a successful zero-byte allocation has a distinct,
-# stable identity suitable for zero-sized element access and destruction. A
-# provider unable to supply one fails the allocation. Other locations have no
-# public allocation or access APIs until their target layout and access rules
-# are implemented. Raw-address and foreign-memory operations remain deferred.
 #
 # A returned or stored Ref depends on every owner it may refer to. The
 # result of a bodyless function without a `from(...)` contract conservatively
@@ -902,6 +886,75 @@ fallible forward_initializer(static T: type, init item: T) T
 # be proved safe, the compiler rejects the view. Other view type syntax remains open;
 # adopting these guarantees does not require Mojo's exact spelling. Device
 # storage and raw foreign addresses are deferred.
+
+
+# Storage domains and future allocation
+# These contracts extend the host model; provider selection, non-host locations,
+# and address spaces have no public API yet. Keep these dimensions independent:
+# - Value type: the meaning and operations of T.
+# - Target representation: layout rules for the target's storage domain.
+# - Allocation provider: policy and mechanism for obtaining and releasing storage.
+# - Memory location: the concrete memory domain and accessible execution contexts.
+# - Allocation layout: resolved byte size and alignment at that location.
+# - Address space: the target-level access class, such as global or workgroup.
+# - Lifetime dependency: every owner and resource required to remain live for access.
+# Stack and heap are allocation or lifetime strategies, not memory locations or
+# address spaces. A particular device is a location, not an address space: two
+# devices may both offer global space while their allocations are inaccessible
+# to each other. T does not change with its storage location or strategy;
+# storage and reference abstractions carry the facts needed to access it.
+# Construction uses its context's destination, not an allocation strategy chosen
+# by a struct initializer. Separately managed dynamic storage is explicit:
+# allocation does not construct values, and construction does not allocate
+# unless the called owning abstraction does so. Registers, inline or automatic
+# storage, or no storage may be used whenever the difference is unobservable.
+#
+# A typed allocation selects a provider, a concrete location, and a resolved
+# byte layout independently. The execution target and location select the
+# compatible layout domain, not the provider or value type. The representation
+# includes element stride and field or variant offsets. Compatibility must be
+# established for T and its contained types; coincidental host size is not proof.
+# Access from a second target requires a verified compatible representation or
+# explicit elementwise conversion, not an assumed bytewise copy.
+#
+# A resolved AllocationLayout contains byte size and alignment, not logical
+# element count. A typed request binds it to T, its target representation,
+# location, and nonnegative count. Alignment is a nonzero power of two and at
+# least T's natural alignment in that domain; element stride is a multiple of
+# that alignment, including for zero-count requests. Count times stride is
+# checked before calling the provider. The provider may reject a stricter
+# alignment, location, or layout it cannot support, or reserve extra storage
+# internally; success satisfies the requested size and alignment. It cannot
+# change the element stride or reinterpret another target's representation.
+#
+# Allocation is fallible and grants exclusive ownership of uninitialized storage.
+# The handle retains location, count, original layout, and deallocation authority.
+# That authority is self-contained or depends on provider and location resources
+# that must remain alive; dependent references retain those resources too.
+# Allocation failure leaves provider and location ownership with the caller.
+# A resolved request cannot outlive resources needed to validate its location.
+# A convenience API may bind provider and location without erasing their separate
+# meanings. A device context may supply both location authority and the resource
+# used by a provider, without making device identity an allocation strategy.
+# For every supported location, successful zero-byte allocation has a distinct,
+# stable identity suitable for zero-sized element access and destruction, or
+# allocation fails. This grants no raw-address arithmetic or foreign-memory access.
+#
+# Address space belongs on a typed Ref access path, not on T or its provider,
+# independently of writable permission. Each target defines its supported spaces
+# and their accessible locations. Concrete device identity remains runtime state
+# retained by an allocation or device resource, not a distinct T for each device.
+# Access requires a compatible execution context and address space; host code
+# cannot dereference device-only storage. Cross-location transfer is explicit,
+# not a cast of the value or reference type. Initial transfers are synchronous;
+# asynchronous transfer needs an explicit completion resource keeping both
+# allocations alive until completion.
+# Device allocation is initially host-side; it does not imply allocation from a
+# kernel. Workgroup and private storage have different lifetime and scheduling
+# rules and use explicit kernel storage constructs, not dynamic allocation.
+# Other locations have no public allocation or access APIs until their target
+# layouts and access rules are implemented. Raw-address and foreign-memory
+# operations remain deferred.
 
 
 # Structs
@@ -1272,6 +1325,25 @@ static widened_identity: fallible(int) int = identity
 # Named declarations follow the same sugar as ordinary functions.
 fallible accept(arg: int) int
     return arg
+
+# A call to a fallible callable must use fallible-call syntax `callee?(args)`
+# unless the call expression itself appears in a context that requires a
+# fallible expression. The exemption applies only when the context requires
+# that specific call to be fallible, not merely because an enclosing or
+# containing expression is fallible. Direct calls, namespace and instance
+# calls, aliases, and callable values obey the same rule.
+foo?()          # required: ordinary expression context
+foo?() < 0      # required: the comparison is fallible independently of foo
+foo?() as int   # required: `as` is fallible independently of foo
+
+if foo()        # no `?`: the condition itself must be fallible
+    run()
+if const x = foo() -> use(x) # no `?`: the binding condition requires a fallible expression
+# `?` marks a fallible invocation only where the call's fallibility would
+# otherwise be indistinguishable from an ordinary call. It is not a general
+# failure-propagation operator. Handling and propagation follow the ordinary
+# fallible control-flow rules; a fallible enclosing function alone does not
+# exempt a call from the marker.
 
 # Bare fail is a statement that propagates ordinary failure with no value.
 # It is permitted only in a fallible enclosing function or initializer region,

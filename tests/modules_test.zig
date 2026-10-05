@@ -7,6 +7,7 @@ const structures = test_sources.structures;
 const modules = test_sources.modules;
 const runtime = test_sources.runtime;
 const testing = std.testing;
+var allocation_failure_backing: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
 
 const Fixture = struct {
     db: *query.Database,
@@ -8543,7 +8544,7 @@ fn checkModuleAllocations(gpa: std.mem.Allocator) !void {
 }
 
 test "module scope namespace and refresh queries release every failed allocation" {
-    try testing.checkAllAllocationFailures(testing.allocator, checkModuleAllocations, .{});
+    try testing.checkAllAllocationFailures(allocation_failure_backing.allocator(), checkModuleAllocations, .{});
 }
 
 fn checkCleanupEffectAllocations(gpa: std.mem.Allocator) !void {
@@ -8570,7 +8571,7 @@ fn checkCleanupEffectAllocations(gpa: std.mem.Allocator) !void {
 }
 
 test "implicit drop effect analysis releases every failed allocation" {
-    try testing.checkAllAllocationFailures(testing.allocator, checkCleanupEffectAllocations, .{});
+    try testing.checkAllAllocationFailures(allocation_failure_backing.allocator(), checkCleanupEffectAllocations, .{});
 }
 
 test "type and compile-time scopes never fall back past a shadowing runtime binding" {
@@ -10594,29 +10595,45 @@ test "init inference determines fresh immovable variants before selecting storag
     , 42);
 }
 
-fn checkInitializerAllocations(gpa: std.mem.Allocator) !void {
+fn checkInitializerAllocations(gpa: std.mem.Allocator, source: []const u8) !void {
     const db = try query.Database.init(gpa, .{ .worker_count = 1 });
     defer db.deinit();
-    try modules.registerSources(db, gpa,
+    try modules.registerSources(db, gpa, source, &.{}, &.{});
+    try testing.expect((try db.get(queries.BuildExecutable, 0)).* != null);
+}
+
+test "init regions release every failed allocation during inference and outlining" {
+    try testing.checkAllAllocationFailures(allocation_failure_backing.allocator(), checkInitializerAllocations, .{
         \\fallible materialize(static T: type, init item: T) T -> return item
         \\fallible forward(init item: int) int -> return materialize(item)
         \\fallible run(imm input: int) int
         \\    const unused = 0
         \\    const captured = input + 1
         \\    return forward(materialize(loop -> break captured))
+        \\if const result = run(41) -> exit(result) else exit(1)
+    });
+}
+
+test "init regions release every failed allocation during compile-time execution" {
+    try testing.checkAllAllocationFailures(allocation_failure_backing.allocator(), checkInitializerAllocations, .{
+        \\fallible materialize(static T: type, init item: T) T -> return item
+        \\fallible forward(init item: int) int -> return materialize(item)
+        \\fallible run(imm input: int) int
+        \\    const captured = input + 1
+        \\    return forward(materialize(loop -> break captured))
         \\static answer = if const computed = run(41) -> computed else 97
+        \\exit(answer)
+    });
+}
+
+test "init regions release every failed allocation when materializing borrowed storage" {
+    try testing.checkAllAllocationFailures(allocation_failure_backing.allocator(), checkInitializerAllocations, .{
+        \\fallible materialize(static T: type, init item: T) T -> return item
         \\fallible run_box() int
         \\    const owner = Box.new(42)
         \\    return materialize(owner.borrow()[])
-        \\if const boxed = run_box()
-        \\    if const result = run(41) -> exit(result + answer + boxed - 84) else exit(1)
-        \\else exit(1)
-    , &.{}, &.{});
-    try testing.expect((try db.get(queries.BuildExecutable, 0)).* != null);
-}
-
-test "init regions release every failed allocation during inference execution and outlining" {
-    try testing.checkAllAllocationFailures(testing.allocator, checkInitializerAllocations, .{});
+        \\if const boxed = run_box() -> exit(boxed) else exit(1)
+    });
 }
 
 test "init failure propagates through ordinary generic and indirect consumers" {
