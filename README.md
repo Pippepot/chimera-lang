@@ -74,9 +74,14 @@ computed and ignored. In Chimera, comparisons succeed or fail.
 The caller uses `if const` to name the successful result `quotient`. If the call
 fails, `else` runs instead. Try `divide(84, 0)` to take the failure branch.
 
-The same rule applies to a standalone fallible call inside a fallible function:
-success continues to the next statement, while failure makes the enclosing
-function fail too. Use `if` when you want to handle failure at that point.
+A fallible call uses `divide?(84, 2)` in an ordinary expression context. The
+marker can be omitted when the call itself must be fallible, as in the `if const`
+above or `if divide(84, 2)`. A containing comparison or extraction does not grant
+that exemption: `divide?(84, 2) < 50` still needs the marker.
+
+For a standalone marked call inside a fallible function, success continues to
+the next statement and failure makes the enclosing function fail too. The `?`
+marks the invocation, not failure propagation; use `if` to handle failure locally.
 
 Use the bare statement `fail` to propagate failure explicitly, including after
 local cleanup. It is allowed in a `fallible` function or a deferred initializer,

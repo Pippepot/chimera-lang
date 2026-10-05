@@ -678,9 +678,9 @@ test "CLI rejects unsupported compile-time borrowing and allocation with diagnos
         \\exit(answer)
         ,
         \\fallible compute() int
-        \\  const owner = Box.new(42)
+        \\  const owner = Box.new?(42)
         \\  return owner.borrow()[]
-        \\static answer = compute()
+        \\static answer = compute?()
         \\exit(answer)
         ,
     }) |source| {

@@ -4788,7 +4788,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             return true;
         }
 
-        fn resolveCall(self: *Self, call: semantic.UnresolvedBody.Call, span: structures.SourceSpan) !ResolvedCall {
+        fn resolveCall(self: *Self, call: semantic.UnresolvedBody.Call, span: structures.SourceSpan, requires_fallible: bool) !ResolvedCall {
             // Earlier deinit arguments retain their storage while later arguments,
             // including nested calls, are evaluated.
             const initializer_owner_start = self.pending_initializer_owners.items.len;
@@ -4813,6 +4813,8 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 .direct => |instance| {
                     raw_arguments = self.unresolved.call_arguments[call.arguments.start..call.arguments.end];
                     target = .{ .direct = instance };
+                    const shape = (try self.type_interner.functionShape(instance.item)) orelse return error.Unavailable;
+                    try self.validateCallSyntax(call, shape.is_fallible, requires_fallible);
                     signature = try self.type_interner.functionSignature(instance) orelse return error.Unavailable;
                 },
                 .inferred => |instance| {
@@ -4827,13 +4829,14 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     target = .{ .indirect = callee };
                 },
                 .member => |member| {
-                    if (try self.resolveMemberCall(call, member, &argument_storage, &target, &signature)) |diverged|
+                    if (try self.resolveMemberCall(call, member, requires_fallible, &argument_storage, &target, &signature)) |diverged|
                         return .{ .diverged = diverged };
                     raw_arguments = argument_storage.items;
                 },
             }
             if (target == .inferred) {
                 const shape = (try self.type_interner.functionShape(target.inferred.item)) orelse return error.Unavailable;
+                try self.validateCallSyntax(call, shape.is_fallible, requires_fallible);
                 for (shape.parameters) |parameter| if (parameter.mode == .init) {
                     const specialized = (try self.unevaluatedSpecialization(target.inferred, raw_arguments)) orelse
                         return self.reject(span, .static_argument_cannot_be_inferred);
@@ -4841,7 +4844,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     signature = (try self.type_interner.functionSignature(specialized)) orelse return error.Unavailable;
                     break;
                 };
-            }
+            } else try self.validateCallSyntax(call, signature.is_fallible, requires_fallible);
             var inferred_call = false;
             const PreparedArgument = struct { operand: Value, owned: ?Value };
             var prepared_arguments: std.ArrayList(PreparedArgument) = .empty;
@@ -5138,6 +5141,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             self: *Self,
             call: semantic.UnresolvedBody.Call,
             member: semantic.UnresolvedBody.MemberCall,
+            requires_fallible: bool,
             arguments: *std.ArrayList(semantic.UnresolvedBody.ValueUse),
             target: *CallTarget,
             signature: *structures.CallableType,
@@ -5155,6 +5159,8 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             if (std.meta.stringToEnum(structures.OwnershipMember, member.name)) |operation| {
                 const instance = (try self.type_interner.ownershipMember(receiver_type, operation)) orelse
                     return self.reject(call.span, .unknown_namespace_member);
+                const shape = (try self.type_interner.functionShape(instance.item)) orelse return error.Unavailable;
+                try self.validateCallSyntax(call, shape.is_fallible, requires_fallible);
                 signature.* = (try self.type_interner.functionSignature(instance)) orelse return error.Unavailable;
                 target.* = .{ .direct = instance };
                 try arguments.append(self.ctx.allocator(), member.receiver);
@@ -5184,6 +5190,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 for (method_arguments) |argument| try arguments.append(self.ctx.allocator(), argument.value);
                 return null;
             };
+            try self.validateCallSyntax(call, shape.is_fallible, requires_fallible);
             target.* = try self.resolveMethodArguments(instance, shape, method_arguments, call.span, arguments);
             if (target.* == .direct)
                 signature.* = (try self.type_interner.functionSignature(target.direct)) orelse return error.Unavailable;
@@ -5234,7 +5241,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         const CallResult = union(enum) { value, destination: Destination, borrowed: structures.TypeId, consumed: ?structures.TypeId };
 
         fn callFunction(self: *Self, call: semantic.UnresolvedBody.Call, span: structures.SourceSpan, mode: CallResult) !Value {
-            const resolved = try self.resolveCall(call, span);
+            const resolved = try self.resolveCall(call, span, false);
             switch (resolved) {
                 .diverged => |value_to_return| return value_to_return,
                 .callable => |callable| return self.resolvedCallResult(callable, call, span, mode),
@@ -6298,7 +6305,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         }
 
         fn callCondition(self: *Self, call: semantic.UnresolvedBody.Call, binding: ?semantic.UnresolvedBody.ConditionBinding) !ConditionFlow {
-            const resolved = try self.resolveCall(call, call.span);
+            const resolved = try self.resolveCall(call, call.span, true);
             return switch (resolved) {
                 .diverged => |value_to_return| .{ .success = null, .failure = null, .diverged = value_to_return },
                 .callable => |resolved_callable| if (resolved_callable.is_fallible) blk: {
@@ -6311,6 +6318,11 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     break :blk flow;
                 } else self.reject(call.span, .if_condition_not_fallible),
             };
+        }
+
+        fn validateCallSyntax(self: *Self, call: semantic.UnresolvedBody.Call, is_fallible: bool, requires_fallible: bool) !void {
+            if (semantic.callSyntaxIssue(call.fallible_syntax, is_fallible, requires_fallible)) |kind|
+                return self.reject(call.span, kind);
         }
 
         fn comparisonCondition(self: *Self, comparison: @FieldType(semantic.UnresolvedBody.Condition, "comparison")) !ConditionFlow {

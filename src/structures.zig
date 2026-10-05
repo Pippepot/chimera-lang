@@ -219,7 +219,6 @@ pub const Node = struct {
         unit_literal,
         param,
         param_list,
-        query_op,
         move_expr,
         break_nothing,
         break_expr,
@@ -289,7 +288,7 @@ pub const Ast = struct {
             if (left.tag != right.tag or left.token_index != right.token_index) return false;
             switch (left.tag) {
                 .break_nothing, .continue_expr, .return_nothing, .fail_expr, .access, .implicit_static, .bool_literal, .identifier, .none_literal, .number_literal, .unit_literal, .type, .implicit_type => {},
-                .break_expr, .return_expr, .loop, .not, .neg, .query_op, .move_expr, .comptime_expr, .sizeof_expr, .field_access, .deref, .struct_field, .struct_property, .struct_init_field, .@"pub" => {
+                .break_expr, .return_expr, .loop, .not, .neg, .move_expr, .comptime_expr, .sizeof_expr, .field_access, .deref, .struct_field, .struct_property, .struct_init_field, .@"pub" => {
                     if (left.data.node != right.data.node) return false;
                 },
                 .add, .sub, .mul, .div, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .@"and", .@"or", .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .call, .const_binding, .var_binding, .borrow_binding, .borrow_mut_binding, .static_binding, .namespace_declaration, .func, .param, .return_origins, .type_func, .@"if" => {
@@ -1071,15 +1070,17 @@ pub const FunctionParameterShape = struct {
     is_meta_type: bool,
 };
 
-/// Declaration-level parameter modes. Unlike `FunctionSignature`, this keeps
+/// Declaration-level callable facts. Unlike `FunctionSignature`, this keeps
 /// static parameters and does not require dependent runtime types to have been
 /// substituted yet.
 pub const FunctionShape = struct {
     returns_type: bool = false,
+    is_fallible: bool = false,
     parameters: []const FunctionParameterShape,
 
     pub fn eql(a: FunctionShape, b: FunctionShape) bool {
         return a.returns_type == b.returns_type and
+            a.is_fallible == b.is_fallible and
             sliceItemsEql(FunctionParameterShape, a.parameters, b.parameters);
     }
 
@@ -1619,6 +1620,8 @@ pub const Diagnostic = struct {
         equality_operand_not_supported: TypeId,
         equality_operand_type_mismatch: TypeMismatch,
         fallible_expression_outside_fallible_function,
+        fallible_call_requires_marker,
+        fallible_call_not_fallible,
         missing_return_value: TypeId,
         return_type_mismatch: TypeMismatch,
         unknown_function,

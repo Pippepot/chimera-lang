@@ -711,8 +711,8 @@ fallible forward_initializer(static T: type, init item: T) T
 # Box(T).new has the signature fallible(init item: T) Box(T). Box.new may infer
 # T from the unevaluated initializer's type. The constructor obtains storage
 # before evaluating any part of item, for every T and every initializer shape.
-# Box.new(make(argument())) orders allocation before argument() and make().
-# Box.new(if condition -> first else second) allocates before the condition.
+# Box.new?(make(argument())) orders allocation before argument() and make().
+# Box.new?(if condition -> first else second) allocates before the condition.
 # Nested Box construction follows the same rule, with the outer allocation first.
 #
 # Struct initializers and function results construct directly in that storage.
@@ -733,7 +733,7 @@ fallible forward_initializer(static T: type, init item: T) T
 # These guarantees use general init and storage initialization semantics, not
 # Box-specific expression recognition or optional optimization.
 #
-# Box.new(owner.borrow()[]) copies a copyable pointee into a distinct allocation.
+# Box.new?(owner.borrow()[]) copies a copyable pointee into a distinct allocation.
 # Box has no separate duplication API. Consuming value(T, owner) or
 # value(T, owner^) uses deinit access to the Box; extraction of T still
 # requires direct movement in the host API.
@@ -1070,8 +1070,8 @@ func S.read_a(imm value: S) int -> value.a
 # do not contribute fields or execute when a struct value is initialized.
 # A generic struct factory's namespace can be used before specializing the
 # factory. A direct member call infers its missing factory parameters from the
-# member's argument types, including unevaluated init arguments in Box.new(value).
-# The caller may specialize the factory first, as with Box(T).new(value).
+# member's argument types, including unevaluated init arguments in Box.new?(value).
+# The caller may specialize the factory first, as with Box(T).new?(value).
 # Missing members are namespace errors even when the factory is not specialized.
 # In a nested namespace, enclosing factories must be specialized before inferring the
 # immediate factory's arguments.
@@ -1344,6 +1344,9 @@ if const x = foo() -> use(x) # no `?`: the binding condition requires a fallible
 # failure-propagation operator. Handling and propagation follow the ordinary
 # fallible control-flow rules; a fallible enclosing function alone does not
 # exempt a call from the marker.
+# The marker requires a fallible callable; it does not implicitly widen an
+# ordinary callable to a fallible one. Explicit callable widening still applies
+# before invocation according to the callable compatibility rules above.
 
 # Bare fail is a statement that propagates ordinary failure with no value.
 # It is permitted only in a fallible enclosing function or initializer region,

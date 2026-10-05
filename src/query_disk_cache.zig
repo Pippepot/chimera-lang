@@ -706,14 +706,14 @@ test "Box and Ref alias bodies restore and invalidate after a binding edit" {
     const io = std.testing.io;
     const initial_source =
         \\fallible run() int
-        \\  var owner = Box.new(17)
+        \\  var owner = Box.new?(17)
         \\  borrow item = owner.borrow()[]
         \\  return item
         \\if const result = run() -> exit(result) else exit(1)
     ;
     const edited_source =
         \\fallible run() int
-        \\  var owner = Box.new(17)
+        \\  var owner = Box.new?(17)
         \\  borrow mut item = owner.borrow_mut()[]
         \\  item = 42
         \\  return item
@@ -1252,7 +1252,7 @@ test "cached nested handles reject changed capture representations" {
     defer db.deinit();
     try modules.registerSources(db, allocator,
         \\fallible materialize(init item: int) int -> return item
-        \\fallible forward(init item: int) int -> return materialize(materialize(item))
+        \\fallible forward(init item: int) int -> return materialize?(materialize?(item))
         \\if const result = forward(42) -> exit(result) else exit(99)
     , &.{}, &.{});
     const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;
@@ -1305,7 +1305,7 @@ test "cached initializers reject changed regions captures and value representati
     defer db.deinit();
     try modules.registerSources(db, allocator,
         \\fallible materialize(init item: int) int -> return item
-        \\fallible run(imm value: int) int -> return materialize(value + 2)
+        \\fallible run(imm value: int) int -> return materialize?(value + 2)
         \\if const result = run(40) -> exit(result) else exit(99)
     , &.{}, &.{});
     const executable = (try db.get(queries.BuildExecutable, 0)).*;

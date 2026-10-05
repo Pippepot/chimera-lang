@@ -148,9 +148,9 @@ test "explicit fail evaluates in direct nested and initializer calls" {
     defer db.deinit();
     try modules.registerSources(db, allocator,
         \\fallible fail_value() int -> fail
-        \\fallible nested() int -> fail_value()
+        \\fallible nested() int -> fail_value?()
         \\fallible materialize(init item: int) int -> return item
-        \\fallible initialized() int -> materialize(if true == true -> fail else 0)
+        \\fallible initialized() int -> materialize?(if true == true -> fail else 0)
         \\func handled() int -> if const value = initialized() -> value else 42
     , &.{}, &.{});
     const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;

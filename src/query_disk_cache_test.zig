@@ -85,7 +85,7 @@ test "initializer failure writes survive snapshots and failure single use and mo
     const allocator = std.testing.allocator;
     const source =
         \\fallible materialize(init item: int) int -> return item
-        \\fallible forward(init item: int) int -> return materialize(materialize(item))
+        \\fallible forward(init item: int) int -> return materialize?(materialize?(item))
         \\func run() int
         \\    var value = 0
         \\    const callback: fallible(init int) int = forward
@@ -115,7 +115,7 @@ test "initializer failure writes survive snapshots and failure single use and mo
     try fixture.expectExit(156);
     try std.testing.expectEqual(consumer_body, try Fixture.functionBody(second, "materialize"));
 
-    const single_use_edit = try std.mem.replaceOwned(u8, allocator, source, "fallible forward(init item: int) int -> return materialize(materialize(item))", "fallible forward(init item: int) int\n    const first = materialize(item)\n    return materialize(item)");
+    const single_use_edit = try std.mem.replaceOwned(u8, allocator, source, "fallible forward(init item: int) int -> return materialize?(materialize?(item))", "fallible forward(init item: int) int\n    const first = materialize?(item)\n    return materialize?(item)");
     defer allocator.free(single_use_edit);
     try second.setInput(queries.SourceText, 0, single_use_edit);
     try std.testing.expect((try second.get(queries.BuildExecutable, 0)).* == null);
@@ -142,12 +142,12 @@ test "initializer capture effects survive snapshots and capability edits" {
         \\    drop = func(deinit self: Item)
         \\        if self.value == 2 -> return else exit(99)
         \\fallible materialize(init item: Item) Item -> return item
-        \\fallible forward(init item: Item) Item -> return materialize(item)
+        \\fallible forward(init item: Item) Item -> return materialize?(item)
         \\fallible run() int
         \\    var value = 1
         \\    const source = Item{value = 2}
         \\    const callback: fallible(init Item) Item = forward
-        \\    const result = callback(if true == true
+        \\    const result = callback?(if true == true
         \\        value = 40
         \\        source^
         \\    else Item{value = 0})
@@ -183,11 +183,11 @@ test "initializer regions and native callbacks survive cache reuse and mode edit
         \\    value > 0
         \\    return value
         \\fallible materialize(init item: int) int -> return item
-        \\fallible forward(init item: int) int -> return materialize(item)
+        \\fallible forward(init item: int) int -> return materialize?(item)
         \\func run(imm base: int) int
         \\    var offset = 2
         \\    const callback: fallible(init int) int = forward
-        \\    if const value = callback(materialize(produce(base + offset))) -> return value
+        \\    if const value = callback(materialize?(produce?(base + offset))) -> return value
         \\    return 0
         \\exit(run(40))
     ;
@@ -220,7 +220,7 @@ test "allocating initializer snapshots retain named return hooks and invalidate 
         \\    move = func(deinit self: Item) Item -> Item{value = self.value + 2}
         \\static Owner = Box(Item)
         \\static create = Owner.new
-        \\fallible own(init item: Item) Box(Item) -> create(item)
+        \\fallible own(init item: Item) Box(Item) -> create?(item)
         \\func copied() Item
         \\    const local = Item{value = 19}
         \\    return local
@@ -229,8 +229,8 @@ test "allocating initializer snapshots retain named return hooks and invalidate 
         \\    return local^
         \\fallible run() int
         \\    const callback: fallible(init Item) Box(Item) = own
-        \\    const first = callback(copied())
-        \\    const second = callback(moved())
+        \\    const first = callback?(copied())
+        \\    const second = callback?(moved())
         \\    return first.borrow()[].value + second.borrow()[].value
         \\if const value = run() -> exit(value) else exit(99)
     ;
@@ -246,11 +246,11 @@ test "allocating initializer snapshots retain named return hooks and invalidate 
     for ([_][]const u8{
         "copy = func(imm self: Item) Item -> Item{value = self.value + 1}",
         "move = func(deinit self: Item) Item -> Item{value = self.value + 2}",
-        "fallible own(init item: Item) Box(Item) -> create(item)",
+        "fallible own(init item: Item) Box(Item) -> create?(item)",
     }, [_][]const u8{
         "copy = none",
         "move = none",
-        "fallible own(init item: Item) Box(Item)\n    const first = create(item)\n    return create(item)",
+        "fallible own(init item: Item) Box(Item)\n    const first = create?(item)\n    return create?(item)",
     }) |original, replacement| {
         const edit = try std.mem.replaceOwned(u8, std.testing.allocator, source, original, replacement);
         defer std.testing.allocator.free(edit);
@@ -276,7 +276,7 @@ test "allocating initializer snapshots retain skipped evaluation after allocator
     const body = try Fixture.functionBody(fixture.db, "run");
     const allocation_file = (try fixture.db.input(queries.StandardFile, @intFromEnum(standard_library.File.memory_allocation))).*;
     const allocation_source = (try fixture.db.input(queries.SourceText, allocation_file)).*;
-    const edit = try std.mem.replaceOwned(u8, std.testing.allocator, allocation_source, "var storage = allocate(T, 1)", "var storage = allocate(T, -1)");
+    const edit = try std.mem.replaceOwned(u8, std.testing.allocator, allocation_source, "var storage = allocate?(T, 1)", "var storage = allocate?(T, -1)");
     defer std.testing.allocator.free(edit);
     try fixture.db.setInput(queries.SourceText, allocation_file, edit);
     try fixture.expectExit(42);
@@ -286,7 +286,7 @@ test "allocating initializer snapshots retain skipped evaluation after allocator
 }
 
 test "allocating initializer snapshots retain partial cleanup and consumption on failure" {
-    for ([_][]const u8{ "fail_value()", "fail" }) |completion| {
+    for ([_][]const u8{ "fail_value?()", "fail" }) |completion| {
         errdefer std.debug.print("allocating completion: {s}\n", .{completion});
         const source = try std.fmt.allocPrint(std.testing.allocator,
             \\struct Leaf
@@ -303,7 +303,7 @@ test "allocating initializer snapshots retain partial cleanup and consumption on
             \\    1 == 0
             \\    return 0
             \\fallible run() int
-            \\    var count = Box.new(40)
+            \\    var count = Box.new?(40)
             \\    const callback: fallible(init Item) Box(Item) = Box(Item).new
             \\    const leaf = Leaf{{count = count.borrow_mut()}}
             \\    if callback(Item{{first = leaf^, second = if true == true -> {s} else 0}}) -> return 99
@@ -314,7 +314,7 @@ test "allocating initializer snapshots retain partial cleanup and consumption on
         const fixture = try Fixture.restore(source);
         defer fixture.db.deinit();
         try fixture.expectExit(42);
-        const edit = try std.mem.replaceOwned(u8, std.testing.allocator, source, "Box.new(40)", "Box.new(39)");
+        const edit = try std.mem.replaceOwned(u8, std.testing.allocator, source, "Box.new?(40)", "Box.new?(39)");
         defer std.testing.allocator.free(edit);
         try fixture.db.setInput(queries.SourceText, 0, edit);
         try fixture.expectExit(41);
@@ -329,9 +329,9 @@ test "raw slot initializer snapshots retain immovable destruction and recompute 
         \\    value: int
         \\    drop = func(deinit self: Item) -> exit(self.value)
         \\func make(value: int) Item -> Item{value = value}
-        \\fallible initialize(mut storage: Allocation(Item), init item: Item) -> storage.unsafe_init(1, item)
+        \\fallible initialize(mut storage: Allocation(Item), init item: Item) -> storage.unsafe_init?(1, item)
         \\fallible run()
-        \\    var storage = allocate(Item, 2)
+        \\    var storage = allocate?(Item, 2)
         \\    const callback: fallible(mut Allocation(Item), init Item) unit = initialize
         \\    if callback(storage, make(42)) -> ()
         \\    else

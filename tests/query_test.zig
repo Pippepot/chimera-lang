@@ -2150,7 +2150,7 @@ test "ownership effects compose across calls joins scopes and partial aggregates
             \\  return 1
             \\fallible attempt() int
             \\  const resource = Resource{}
-            \\  const value = fail_value()
+            \\  const value = fail_value?()
             \\  return value
             \\if attempt() -> exit(1) else exit(0)
             ,
@@ -2243,7 +2243,7 @@ test "ownership effects compose across calls joins scopes and partial aggregates
             \\fallible fail_value() int
             \\  1 < 0
             \\  return 1
-            \\fallible attempt() Pair -> Pair{first = Resource{}, second = fail_value()}
+            \\fallible attempt() Pair -> Pair{first = Resource{}, second = fail_value?()}
             \\if attempt() -> exit(1) else exit(0)
             ,
             .expected = 42,
@@ -2306,7 +2306,7 @@ test "failure and condition results enforce explicit drop" {
         \\  return 1
         \\fallible attempt() int
         \\  const resource = Resource{}
-        \\  const value = fail_value()
+        \\  const value = fail_value?()
         \\  return value
         \\if attempt() -> exit(1) else exit(0)
         ,
@@ -4087,9 +4087,9 @@ test "compile-time interpreter propagates fallible call outcomes" {
         \\  return value
         \\static identity = func(value: int) int -> value
         \\static checked: fallible(int) int = identity
-        \\static good = positive(42)
-        \\static bad = positive(0)
-        \\static indirect = checked(42)
+        \\static good = positive?(42)
+        \\static bad = positive?(0)
+        \\static indirect = checked?(42)
     );
     const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
     try testing.expectEqual(
@@ -6318,9 +6318,9 @@ test "fallible calls preserve success payloads across propagation" {
         \\fallible positive(value: int) int
         \\  value > 0
         \\  return value
-        \\fallible sum() int -> positive(20) + positive(22)
+        \\fallible sum() int -> positive?(20) + positive?(22)
         \\fallible answer() unit
-        \\  sum() == 42
+        \\  sum?() == 42
         \\if answer() -> exit(42) else exit(1)
     );
     const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
@@ -6339,7 +6339,7 @@ test "fallible call failure propagates without later effects" {
         \\  value < 0
         \\  return value
         \\fallible caller() int
-        \\  const value = negative(1)
+        \\  const value = negative?(1)
         \\  exit(99)
         \\  return value
         \\if caller() -> exit(1) else exit(42)
@@ -6360,11 +6360,11 @@ test "fallible calls preserve zero-sized and memory-returned payloads" {
         \\  value > 0
         \\  return value
         \\fallible inspect() unit
-        \\  const produced = produce(7)
+        \\  const produced = produce?(7)
         \\  produced is int
         \\  return
         \\fallible forward() unit
-        \\  inspect()
+        \\  inspect?()
         \\if forward() -> exit(42) else exit(1)
     );
     const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
@@ -6380,7 +6380,7 @@ test "unhandled fallible calls are rejected from ordinary functions" {
 
     try addSource(db, 1,
         \\fallible checked() int -> 42
-        \\static bad = func() int -> checked()
+        \\static bad = func() int -> checked?()
     );
     const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
     const bad = scope.resolve("bad").?;
@@ -6397,7 +6397,7 @@ test "fallibility edits invalidate signatures and callers" {
 
     try addSource(db, 1,
         \\fallible target() int -> 42
-        \\fallible caller() int -> target()
+        \\fallible caller() int -> target?()
     );
     const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
     const target = scope.resolve("target").?;
@@ -6420,13 +6420,235 @@ test "fallibility edits invalidate signatures and callers" {
 
     try setSource(db, 1,
         \\fallible target() int -> 42
-        \\func caller() int -> target()
+        \\func caller() int -> target?()
     );
     try testing.expect((try db.get(queries.AnalyzeFunctionInstance, .{ .item = caller })).* == null);
     const diagnostics = try db.transitiveAccumulatorValues(queries.AnalyzeFunctionInstance, .{ .item = caller }, structures.Diagnostic, testing.allocator);
     defer freeDiagnostics(diagnostics);
     try testing.expectEqual(@as(usize, 1), diagnostics.len);
     try testing.expectEqual(DiagnosticKind.fallible_expression_outside_fallible_function, std.meta.activeTag(diagnostics[0].kind));
+}
+
+test "fallible call syntax marker edits invalidate and recover expression results" {
+    const cases = [_]struct { result_type: []const u8, unmarked: []const u8, marked: []const u8 }{
+        .{ .result_type = "int", .unmarked = "target()", .marked = "target?()" },
+        .{ .result_type = "int", .unmarked = "target() + 0", .marked = "target?() + 0" },
+        .{ .result_type = "int", .unmarked = "if target() == 42 -> 42 else 0", .marked = "if target?() == 42 -> 42 else 0" },
+        .{ .result_type = "int | none", .unmarked = "if const value = target() as int -> value else 0", .marked = "if const value = target?() as int -> value else 0" },
+    };
+    for (cases) |case| {
+        const db = try testDatabase(2);
+        defer db.deinit();
+        const invalid = try std.fmt.allocPrint(testing.allocator,
+            \\fallible target() {s} -> 42
+            \\fallible caller() int -> {s}
+        , .{ case.result_type, case.unmarked });
+        defer testing.allocator.free(invalid);
+        const valid = try std.fmt.allocPrint(testing.allocator,
+            \\fallible target() {s} -> 42
+            \\fallible caller() int -> {s}
+        , .{ case.result_type, case.marked });
+        defer testing.allocator.free(valid);
+        try addSource(db, 1, invalid);
+        const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
+        const caller: structures.InstanceId = .{ .item = scope.resolveFunction("caller").? };
+        const signature = try db.get(queries.FunctionSignature, scope.resolveFunction("target").?);
+
+        for (0..2) |_| {
+            try testing.expect((try db.get(queries.AnalyzeFunctionInstance, .{ .item = caller.item })).* == null);
+            try testing.expect((try db.get(queries.CompileFunction, caller)).* == null);
+            const diagnostics = try db.transitiveAccumulatorValues(queries.CompileFunction, caller, structures.Diagnostic, testing.allocator);
+            defer freeDiagnostics(diagnostics);
+            try testing.expectEqual(@as(usize, 1), diagnostics.len);
+            try testing.expectEqual(DiagnosticKind.fallible_call_requires_marker, std.meta.activeTag(diagnostics[0].kind));
+
+            try setSource(db, 1, valid);
+            const body = try db.get(queries.AnalyzeFunctionInstance, .{ .item = caller.item });
+            const artifact = try db.get(queries.CompileFunction, caller);
+            try testing.expect(body.* != null);
+            try testing.expect(artifact.* != null);
+            try testing.expectEqual(body, try db.get(queries.AnalyzeFunctionInstance, .{ .item = caller.item }));
+            try testing.expectEqual(artifact, try db.get(queries.CompileFunction, caller));
+            try testing.expectEqual(signature, try db.get(queries.FunctionSignature, scope.resolveFunction("target").?));
+            const recovered = try db.transitiveAccumulatorValues(queries.CompileFunction, caller, structures.Diagnostic, testing.allocator);
+            defer freeDiagnostics(recovered);
+            try testing.expectEqual(@as(usize, 0), recovered.len);
+            try expectCompiledFunctionResult(db, 1, "caller", &.{ "caller", "target" }, 42);
+            try setSource(db, 1, invalid);
+        }
+        try testing.expect((try db.get(queries.CompileFunction, caller)).* == null);
+    }
+}
+
+test "fallible call syntax early validation recovers after static and where edits" {
+    const cases = [_]struct { setup: []const u8, invalid: []const u8, valid: []const u8 }{
+        .{
+            .setup = "fallible target(static value: int) int -> value",
+            .invalid = "target(exit(99))",
+            .valid = "if const value = target(42) -> value else 0",
+        },
+        .{
+            .setup = "fallible stop() unit -> exit(99)\nfallible target() int where stop() -> 42",
+            .invalid = "target()",
+            .valid = "if const value = target() -> value else 0",
+        },
+    };
+    for (cases, 0..) |case, case_index| {
+        const db = try testDatabase(2);
+        defer db.deinit();
+        const invalid = try std.fmt.allocPrint(testing.allocator, "{s}\nfunc caller() int -> {s}", .{ case.setup, case.invalid });
+        defer testing.allocator.free(invalid);
+        const valid_setup = if (case_index == 1) "fallible stop() unit -> ()\nfallible target() int where stop() -> 42" else case.setup;
+        const valid = try std.fmt.allocPrint(testing.allocator, "{s}\nfunc caller() int -> {s}", .{ valid_setup, case.valid });
+        defer testing.allocator.free(valid);
+        try addSource(db, 1, invalid);
+        const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
+        const caller: structures.InstanceId = .{ .item = scope.resolveFunction("caller").? };
+        for (0..2) |_| {
+            try testing.expect((try db.get(queries.CompileFunction, caller)).* == null);
+            const rejected = try db.transitiveAccumulatorValues(queries.CompileFunction, caller, structures.Diagnostic, testing.allocator);
+            defer freeDiagnostics(rejected);
+            try testing.expectEqual(@as(usize, 1), rejected.len);
+            try testing.expectEqual(DiagnosticKind.fallible_call_requires_marker, std.meta.activeTag(rejected[0].kind));
+            try setSource(db, 1, valid);
+            const artifact = try db.get(queries.CompileFunction, caller);
+            try testing.expect(artifact.* != null);
+            try testing.expectEqual(artifact, try db.get(queries.CompileFunction, caller));
+            const recovered = try db.transitiveAccumulatorValues(queries.CompileFunction, caller, structures.Diagnostic, testing.allocator);
+            defer freeDiagnostics(recovered);
+            try testing.expectEqual(@as(usize, 0), recovered.len);
+            try setSource(db, 1, invalid);
+        }
+        try testing.expect((try db.get(queries.CompileFunction, caller)).* == null);
+    }
+}
+
+test "fallible call syntax generic shape edits invalidate marker validation" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+    const invalid = "func target(static T: type, value: T) T -> value\nfallible caller() int -> target?(42)";
+    const valid = "fallible target(static T: type, value: T) T -> value\nfallible caller() int -> target?(42)";
+    try addSource(db, 1, invalid);
+    const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
+    const target = scope.resolveFunction("target").?;
+    const caller: structures.InstanceId = .{ .item = scope.resolveFunction("caller").? };
+    for (0..2) |_| {
+        const old_shape = try db.get(queries.FunctionShape, target);
+        try testing.expect(!old_shape.*.?.is_fallible);
+        try testing.expect((try db.get(queries.CompileFunction, caller)).* == null);
+        const diagnostics = try db.transitiveAccumulatorValues(queries.CompileFunction, caller, structures.Diagnostic, testing.allocator);
+        defer freeDiagnostics(diagnostics);
+        try testing.expectEqual(@as(usize, 1), diagnostics.len);
+        try testing.expectEqual(DiagnosticKind.fallible_call_not_fallible, std.meta.activeTag(diagnostics[0].kind));
+        try setSource(db, 1, valid);
+        const new_shape = try db.get(queries.FunctionShape, target);
+        try testing.expect(new_shape.*.?.is_fallible);
+        try testing.expect(old_shape != new_shape);
+        const artifact = try db.get(queries.CompileFunction, caller);
+        try testing.expect(artifact.* != null);
+        try testing.expectEqual(artifact, try db.get(queries.CompileFunction, caller));
+        const recovered = try db.transitiveAccumulatorValues(queries.CompileFunction, caller, structures.Diagnostic, testing.allocator);
+        defer freeDiagnostics(recovered);
+        try testing.expectEqual(@as(usize, 0), recovered.len);
+        try setSource(db, 1, invalid);
+    }
+    try testing.expect((try db.get(queries.CompileFunction, caller)).* == null);
+}
+
+test "fallible call syntax context edits preserve direct condition exemptions" {
+    const cases = [_]struct { unmarked: []const u8, marked: []const u8 }{
+        .{ .unmarked = "if target() -> 42 else 0", .marked = "if target?() -> 42 else 0" },
+        .{ .unmarked = "if const value = target() -> value else 0", .marked = "if const value = target?() -> value else 0" },
+    };
+    for (cases) |case| {
+        const db = try testDatabase(2);
+        defer db.deinit();
+        const invalid = "fallible target() int -> 42\nfunc caller() int -> target()";
+        const unmarked = try std.fmt.allocPrint(testing.allocator, "fallible target() int -> 42\nfunc caller() int -> {s}", .{case.unmarked});
+        defer testing.allocator.free(unmarked);
+        const marked = try std.fmt.allocPrint(testing.allocator, "fallible target() int -> 42\nfunc caller() int -> {s}", .{case.marked});
+        defer testing.allocator.free(marked);
+        try addSource(db, 1, invalid);
+        const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
+        const caller: structures.InstanceId = .{ .item = scope.resolveFunction("caller").? };
+        try testing.expect((try db.get(queries.CompileFunction, caller)).* == null);
+        const diagnostics = try db.transitiveAccumulatorValues(queries.CompileFunction, caller, structures.Diagnostic, testing.allocator);
+        defer freeDiagnostics(diagnostics);
+        try testing.expectEqual(@as(usize, 1), diagnostics.len);
+        try testing.expectEqual(DiagnosticKind.fallible_call_requires_marker, std.meta.activeTag(diagnostics[0].kind));
+
+        try setSource(db, 1, unmarked);
+        const artifact = try db.get(queries.CompileFunction, caller);
+        try testing.expect(artifact.* != null);
+        try testing.expectEqual(artifact, try db.get(queries.CompileFunction, caller));
+        try expectCompiledFunctionResult(db, 1, "caller", &.{ "caller", "target" }, 42);
+        try setSource(db, 1, marked);
+        try testing.expectEqual(artifact, try db.get(queries.CompileFunction, caller));
+        const recovered = try db.transitiveAccumulatorValues(queries.CompileFunction, caller, structures.Diagnostic, testing.allocator);
+        defer freeDiagnostics(recovered);
+        try testing.expectEqual(@as(usize, 0), recovered.len);
+        try expectCompiledFunctionResult(db, 1, "caller", &.{ "caller", "target" }, 42);
+
+        try setSource(db, 1, invalid);
+        try testing.expect((try db.get(queries.CompileFunction, caller)).* == null);
+        const rejected = try db.transitiveAccumulatorValues(queries.CompileFunction, caller, structures.Diagnostic, testing.allocator);
+        defer freeDiagnostics(rejected);
+        try testing.expectEqual(@as(usize, 1), rejected.len);
+        try testing.expectEqual(DiagnosticKind.fallible_call_requires_marker, std.meta.activeTag(rejected[0].kind));
+        try setSource(db, 1, unmarked);
+        try testing.expect((try db.get(queries.CompileFunction, caller)).* != null);
+    }
+}
+
+test "fallible call syntax signature edits invalidate and recover marked and ordinary calls" {
+    const cases = [_]struct { invalid: []const u8, valid: []const u8, kind: DiagnosticKind, is_fallible: bool }{
+        .{
+            .invalid = "func target() int -> 42\nfallible caller() int -> target?()",
+            .valid = "fallible target() int -> 42\nfallible caller() int -> target?()",
+            .kind = .fallible_call_not_fallible,
+            .is_fallible = true,
+        },
+        .{
+            .invalid = "fallible target() int -> 42\nfallible caller() int -> target()",
+            .valid = "func target() int -> 42\nfallible caller() int -> target()",
+            .kind = .fallible_call_requires_marker,
+            .is_fallible = false,
+        },
+    };
+    for (cases) |case| {
+        const db = try testDatabase(2);
+        defer db.deinit();
+        try addSource(db, 1, case.invalid);
+        const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
+        const target = scope.resolveFunction("target").?;
+        const caller: structures.InstanceId = .{ .item = scope.resolveFunction("caller").? };
+        for (0..2) |_| {
+            const invalid_signature = try db.get(queries.FunctionSignature, target);
+            try testing.expectEqual(!case.is_fallible, invalid_signature.*.?.is_fallible);
+            try testing.expect((try db.get(queries.CompileFunction, caller)).* == null);
+            const diagnostics = try db.transitiveAccumulatorValues(queries.CompileFunction, caller, structures.Diagnostic, testing.allocator);
+            defer freeDiagnostics(diagnostics);
+            try testing.expectEqual(@as(usize, 1), diagnostics.len);
+            try testing.expectEqual(case.kind, std.meta.activeTag(diagnostics[0].kind));
+
+            try setSource(db, 1, case.valid);
+            const valid_signature = try db.get(queries.FunctionSignature, target);
+            try testing.expectEqual(case.is_fallible, valid_signature.*.?.is_fallible);
+            try testing.expect(invalid_signature != valid_signature);
+            const body = try db.get(queries.AnalyzeFunctionInstance, .{ .item = caller.item });
+            const artifact = try db.get(queries.CompileFunction, caller);
+            try testing.expect(body.* != null);
+            try testing.expect(artifact.* != null);
+            try testing.expectEqual(body, try db.get(queries.AnalyzeFunctionInstance, .{ .item = caller.item }));
+            try testing.expectEqual(artifact, try db.get(queries.CompileFunction, caller));
+            const recovered = try db.transitiveAccumulatorValues(queries.CompileFunction, caller, structures.Diagnostic, testing.allocator);
+            defer freeDiagnostics(recovered);
+            try testing.expectEqual(@as(usize, 0), recovered.len);
+            try expectCompiledFunctionResult(db, 1, "caller", &.{ "caller", "target" }, 42);
+            try setSource(db, 1, case.invalid);
+        }
+        try testing.expect((try db.get(queries.CompileFunction, caller)).* == null);
+    }
 }
 
 test "every integer comparison selects the fallible success edge" {
@@ -6632,15 +6854,32 @@ test "if validates conditions and expected result types" {
     }
 }
 
-test "if conditions separate unimplemented and non-fallible forms" {
+test "fallible call syntax removed postfix queries retain parse-only diagnostics" {
+    const sources = [_][]const u8{
+        "static bad = func(v: int) int -> return if v? -> 1 else 2",
+        "static bad = func(v: int) int -> return if const x = v? -> x else 2",
+    };
+    for (sources) |source| {
+        const db = try testDatabase(2);
+        defer db.deinit();
+        try addSource(db, 1, source);
+        try testing.expect((try db.get(queries.ParseFile, 1)).* == null);
+        try testing.expect((try db.get(queries.BuildExecutable, 1)).* == null);
+        const marker_start = std.mem.lastIndexOf(u8, source, "->").?;
+        const span: structures.SourceSpan = .{ .start = marker_start, .end = marker_start + 2 };
+        const kind: structures.Diagnostic.Kind = .{ .expected_token = .{ .expected = .l_paren, .found = .arrow } };
+        try expectSingleQueryDiagnostic(db, queries.ParseFile, 1, true, 1, span, kind);
+        try expectSingleQueryDiagnostic(db, queries.BuildExecutable, 1, false, 1, span, kind);
+    }
+}
+
+test "if conditions reject non-fallible forms" {
     const db = try testDatabase(2);
     defer db.deinit();
 
     const cases = [_]struct { file_id: structures.FileId, source: []const u8, marker: []const u8, kind: structures.Diagnostic.Kind }{
-        .{ .file_id = 3, .source = "static bad = func(v: int) int -> return if v? -> 1 else 2", .marker = "?", .kind = .fallible_condition_not_supported },
         .{ .file_id = 4, .source = "static bad = func(v: int) int -> return if v < 1 and v -> 1 else 2", .marker = "v", .kind = .if_condition_not_fallible },
         .{ .file_id = 5, .source = "static bad = func(v: int) int -> return if not v -> 1 else 2", .marker = "v", .kind = .if_condition_not_fallible },
-        .{ .file_id = 7, .source = "static bad = func(v: int) int -> return if const x = v? -> x else 2", .marker = "?", .kind = .fallible_condition_not_supported },
         .{ .file_id = 8, .source = "static bad = func(v: int) int -> return if const x = v -> x else 2", .marker = "v", .kind = .if_condition_not_fallible },
     };
     for (cases) |case| {
@@ -8193,7 +8432,7 @@ test "fallible owned results originate only on success edges" {
         \\  value > 0
         \\  return Resource{value = value}
         \\fallible answer() int
-        \\  const resource = make(42)
+        \\  const resource = make?(42)
         \\  return resource.value
         \\if answer() -> exit(42) else exit(1)
     );

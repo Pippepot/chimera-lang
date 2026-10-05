@@ -3,10 +3,10 @@ pub struct Allocation(T: type)
     count: int
     drop = explicit
 
-    pub fallible allocate_raw(count: int) Allocation(T) -> allocate(T, count)
+    pub fallible allocate_raw(count: int) Allocation(T) -> allocate?(T, count)
     pub func release(deinit self: Allocation(T)) -> deallocate(T, self^)
     pub func capacity(imm self: Allocation(T)) int -> allocation_count(T, self)
-    pub fallible unsafe_init(mut self: Allocation(T), index: int, init item: T) -> unsafe_initialize(T, self, index, item)
+    pub fallible unsafe_init(mut self: Allocation(T), index: int, init item: T) -> unsafe_initialize?(T, self, index, item)
     pub func unsafe_remove(mut self: Allocation(T), index: int) T -> unsafe_take(T, self, index)
     pub func unsafe_drop(mut self: Allocation(T), index: int) -> unsafe_destroy(T, self, index)
     pub func unsafe_ref(imm self: Allocation(T), index: int) Ref(T, false) from(self) -> unsafe_borrow_element(T, self, index)
@@ -32,7 +32,7 @@ pub struct Buffer(T: type)
         deallocate(T, self.storage^)
 
     pub fallible new(reserved: int) Buffer(T)
-        const storage = allocate(T, reserved)
+        const storage = allocate?(T, reserved)
         return Buffer(T){storage = storage^, initialized = 0}
 
     pub func len(imm self: Buffer(T)) int -> self.initialized
@@ -58,7 +58,7 @@ pub struct Buffer(T: type)
     pub fallible reserve(mut self: Buffer(T), minimum_capacity: int)
         minimum_capacity >= 0
         if minimum_capacity <= self.capacity() -> return
-        var replacement = allocate(T, minimum_capacity)
+        var replacement = allocate?(T, minimum_capacity)
         const initialized = self.initialized
         var index = initialized
         loop
@@ -87,8 +87,8 @@ pub struct Buffer(T: type)
             if capacity > 0
                 if capacity <= 1073741823 -> next_capacity = capacity * 2
                 else next_capacity = 2147483647
-            self.reserve(next_capacity)
-        unsafe_initialize(T, self.storage, self.initialized, item^)
+            self.reserve?(next_capacity)
+        unsafe_initialize?(T, self.storage, self.initialized, item^)
         self.initialized += 1
 
 pub struct BufferView(T: type)
@@ -101,7 +101,7 @@ pub struct BufferView(T: type)
     pub fallible get(imm self: BufferView(T), index: int) Ref(T, false)
         index >= 0
         index < self.size
-        return read(Buffer(T), false, self.backing).get(self.start + index)
+        return read(Buffer(T), false, self.backing).get?(self.start + index)
 
 pub struct Box(T: type)
     allocation: Allocation(T)
@@ -110,7 +110,7 @@ pub struct Box(T: type)
         deallocate_box(T, self^)
 
     pub fallible new(init item: T) Box(T)
-        var storage = allocate(T, 1)
+        var storage = allocate?(T, 1)
         if unsafe_initialize(T, storage, 0, item)
             return unsafe_own_box(T, storage)
         else

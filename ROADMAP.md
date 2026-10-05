@@ -26,6 +26,15 @@
   transfers construct member by member, and fresh `imm` arguments construct in
   widened temporaries.
 - Typed SSA covers calls, static specialization, callable values, variants, joins, loops, divergence, and fallible control flow. Compile-time thunks and specialized calls evaluate through typed IR, including structs, hooks, and type-valued functions; ordinary compile-time thunks cannot capture runtime locals.
+- Fallible invocations use `callee?(args)` in ordinary expression contexts;
+  only a context requiring that specific call to be fallible permits omission.
+  Direct and binding conditions, logical conditions, and `where` conditions
+  retain unmarked calls; comparisons and extraction require markers on their
+  call operands. Direct, namespace, instance, indirect, specialized, returned,
+  deferred, and type-valued calls share the rule. Markers on ordinary callables
+  and general postfix `?` are rejected. Validation precedes eager arguments
+  once the callable's fallibility is known. Runtime, compile-time, ownership,
+  incremental recomputation, and snapshot reuse retain ordinary failure behavior.
 - Nonescaping `init` parameters construct or forward exactly once on successful
   paths through direct, generic, and indirect calls. Complete expression inference,
   immovable destinations, captured writes, guarded root/field transfers, and
@@ -67,8 +76,8 @@
 
 ## Priority and dependencies
 
-Milestone 1, context-sensitive fallible-call syntax, is the next implementation
-priority. Later milestones retain their relative order, expanding the host
+Field visibility is the next implementation priority. Later milestones retain
+their relative order, expanding the host
 storage and reference foundation toward text, generic collections, and ordinary
 iteration.
 Each language slice covers diagnostics, execution, ownership, and incremental
@@ -76,29 +85,7 @@ recomputation; reject unsupported forms at their owning boundary.
 
 ## Ordered milestones
 
-### 1. Context-sensitive fallible-call syntax
-
-Implement `callee?(args)` according to
-[syntax&semantics.txt](syntax&semantics.txt).
-
-- Require the marker when invoking a fallible callable unless the context
-  requires that specific call expression to be fallible. `if foo()` and
-  `if const x = foo() -> use(x)` are exempt; ordinary expression contexts,
-  `foo?() < 0`, and `foo?() as int` require it. Fallibility of an enclosing
-  expression or function does not grant the exemption.
-- Preserve the distinction between expression structure and callable
-  fallibility for direct, namespace, and instance calls, aliases, static
-  specializations, and callable values. Validate the rule at the source-analysis
-  boundary; downstream IR retains ordinary success/failure control flow.
-  The marker is not a general failure-propagation operator.
-- Verify required and omitted markers, nested calls in independently fallible
-  comparisons and extractions, condition and binding-condition exemptions,
-  deferred initializer expressions, runtime and compile-time execution,
-  cleanup, and incremental recomputation and cache reuse after context or
-  callable fallibility edits. Migrate standard-library, test, and documentation
-  call sites with the implementation.
-
-### 2. Field visibility
+### 1. Field visibility
 
 Implement field visibility from [syntax&semantics.txt](syntax&semantics.txt).
 It replaces the temporary name-matched opaque storage owners in `std.memory`.
@@ -118,7 +105,7 @@ It replaces the temporary name-matched opaque storage owners in `std.memory`.
   with private fields; compile-time execution; and incremental recomputation
   when a field gains or loses `pub`.
 
-### 3. Converters and literal types
+### 2. Converters and literal types
 
 - Implement `static struct` expressions and named and parameterized declaration
   sugar from [syntax&semantics.txt](syntax&semantics.txt). Preserve ordinary
@@ -150,7 +137,7 @@ It replaces the temporary name-matched opaque storage owners in `std.memory`.
   execution, and incremental recomputation when either owning module adds or
   removes a converter.
 
-### 4. Text and basic I/O
+### 3. Text and basic I/O
 
 - Define UTF-8 string literals through the literal-type converter model and a
   `std` **String** exported through
@@ -162,7 +149,7 @@ It replaces the temporary name-matched opaque storage owners in `std.memory`.
   borrowing for slices, and cleanup. Compile-time execution retains no ambient
   I/O.
 
-### 5. Ranges, List, and iteration
+### 4. Ranges, List, and iteration
 
 - Implement exclusive/inclusive ascending ranges and empty-range behavior.
   Decide endpoint types, descending iteration, steps, overflow-safe termination,
@@ -183,20 +170,20 @@ It replaces the temporary name-matched opaque storage owners in `std.memory`.
   iterator state and invalidation, loop results, and cleanup on every exit path.
   Range-only iteration may precede List if it uses that contract.
 
-### 6. Structural tuples
+### 5. Structural tuples
 
 - Implement ordered structural identity for `(foo, bar)` with type spelling,
   access, destructuring, layout, and elementwise ownership. Resolve grouping
   and singleton syntax alongside `()`; tuples support multiple results and
   later Map iteration.
 
-### 7. Match
+### 6. Match
 
 - Evaluate the subject once; add literal, wildcard, binding, `pattern as name`,
   and `is Type` patterns. Diagnose redundancy and non-exhaustiveness using
   existing branch joins and variant mappings.
 
-### 8. Numeric foundations
+### 7. Numeric foundations
 
 - Add named numeric conversion functions (wrap, truncate, round, saturate,
   widen) with specified overflow and failure behavior; converters never relate
@@ -211,7 +198,7 @@ It replaces the temporary name-matched opaque storage owners in `std.memory`.
   Extend to float and user structs after their semantics are settled; do not
   assume general overloading follows from operator lookup.
 
-### 9. Collections and algorithms
+### 8. Collections and algorithms
 
 - Add **Map**, **Set**, **Queue**, and **Stack** on established storage and
   iteration contracts. Specify hashing/equality, ordering, mutation, and

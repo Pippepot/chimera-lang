@@ -616,6 +616,8 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
             try writeMismatch(types, writer, mismatch);
         },
         .fallible_expression_outside_fallible_function => try writer.writeAll("this expression can fail; handle it with `if` or use it inside a `fallible` function"),
+        .fallible_call_requires_marker => try writer.writeAll("fallible invocation requires `?(...)` unless this call itself is required to be fallible"),
+        .fallible_call_not_fallible => try writer.writeAll("`?(...)` requires a fallible callable; this callable is infallible"),
         .missing_return_value => |expected| {
             try writer.writeAll("function must return ");
             try writeType(types, writer, expected);

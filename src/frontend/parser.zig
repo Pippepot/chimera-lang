@@ -564,14 +564,11 @@ fn parseType(parser: *ParserState) ParseError!Node.Index {
 fn parseTypePrimary(parser: *ParserState) ParseError!Node.Index {
     return switch (parser.tokens[parser.index].tag) {
         .identifier => blk: {
-            const is_call = parser.tokens[parser.index + 1].tag == .l_paren;
+            const is_call = parser.tokens[parser.index + 1].tag == .l_paren or parser.tokens[parser.index + 1].tag == .question_mark;
             var value = try parseTokenNode(parser, .identifier, if (is_call) .identifier else .type);
             while (parser.tokens[parser.index].tag == .period) value = try parseFieldAccess(parser, value);
-            if (parser.tokens[parser.index].tag == .l_paren) {
-                const token_index = parser.index;
-                const arguments = try parseCallArgList(parser);
-                value = try parser.addNode(.{ .tag = .call, .token_index = token_index, .data = .{ .node_node = .{ .a = value, .b = arguments } } });
-            }
+            if (parser.tokens[parser.index].tag == .l_paren or parser.tokens[parser.index].tag == .question_mark)
+                value = try parseCall(parser, value);
             break :blk value;
         },
         .keyword_none => try parseTokenNode(parser, .keyword_none, .type),
@@ -688,11 +685,7 @@ fn parsePostfix(parser: *ParserState) ParseError!Node.Index {
 
     while (true) {
         switch (parser.tokens[parser.index].tag) {
-            .l_paren => {
-                const token_index = parser.index;
-                const args = try parseCallArgList(parser);
-                lhs = try parser.addNode(.{ .tag = .call, .token_index = token_index, .data = .{ .node_node = .{ .a = lhs, .b = args } } });
-            },
+            .l_paren, .question_mark => lhs = try parseCall(parser, lhs),
             .l_brace => lhs = try parseStructInit(parser, lhs),
             .l_bracket => {
                 const token_index = parser.index;
@@ -701,13 +694,19 @@ fn parsePostfix(parser: *ParserState) ParseError!Node.Index {
                 lhs = try parser.addNode(.{ .tag = .deref, .token_index = token_index, .data = .{ .node = lhs } });
             },
             .period => lhs = try parseFieldAccess(parser, lhs),
-            .question_mark => lhs = try parsePostfixNode(parser, lhs, .query_op),
             .caret => lhs = try parsePostfixNode(parser, lhs, .move_expr),
             else => break,
         }
     }
 
     return lhs;
+}
+
+fn parseCall(parser: *ParserState, callee: Node.Index) ParseError!Node.Index {
+    const token_index = parser.index;
+    _ = parser.eat(.question_mark);
+    const arguments = try parseCallArgList(parser);
+    return parser.addNode(.{ .tag = .call, .token_index = token_index, .data = .{ .node_node = .{ .a = callee, .b = arguments } } });
 }
 
 fn parsePrimary(parser: *ParserState) ParseError!Node.Index {
@@ -960,7 +959,7 @@ fn renderNode(gpa: std.mem.Allocator, node_index: Node.Index, ast: *const Ast, s
         },
         .unit_literal => try writer.writeAll(" : ()\n"),
         .implicit_static, .implicit_type => try writer.writeByte('\n'),
-        .break_expr, .return_expr, .loop, .not, .neg, .query_op, .move_expr, .comptime_expr, .sizeof_expr, .field_access, .deref, .struct_field, .struct_property, .struct_init_field, .@"pub" => {
+        .break_expr, .return_expr, .loop, .not, .neg, .move_expr, .comptime_expr, .sizeof_expr, .field_access, .deref, .struct_field, .struct_property, .struct_init_field, .@"pub" => {
             if (node.tag == .field_access or node.tag == .struct_field or node.tag == .struct_property or node.tag == .struct_init_field) {
                 const loc = ast.tokens[node.token_index].loc;
                 try writer.print(" : {s}", .{source[loc.start..loc.end]});
@@ -1327,6 +1326,29 @@ test "parse function signatures with compound types" {
         \\    └─return_expr
         \\      └─none_literal : none
     );
+}
+
+test "parse fallible call syntax" {
+    for ([_][]const u8{ "callee?(1)", "owner.method?(1)" }) |source| {
+        var report = try parseReport(std.testing.allocator, 1, source);
+        defer report.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len);
+        const ast = &report.ast.?;
+        const call = ast.nodes[ast.node_refs[ast.nodes[0].data.ref.start].index()];
+        try std.testing.expectEqual(Node.Tag.call, call.tag);
+        try std.testing.expectEqual(Token.Tag.question_mark, ast.tokens[call.token_index].tag);
+        try std.testing.expectEqual(Node.Tag.number_literal, ast.nodes[ast.nodeList(call.data.node_node.b)[0].index()].tag);
+    }
+}
+
+test "parse fallible call syntax rejects general postfix question marks" {
+    for ([_][]const u8{ "callee?", "callee()?", "1?", "callee??()" }) |source| {
+        var report = try parseReport(std.testing.allocator, 1, source);
+        defer report.deinit(std.testing.allocator);
+        try std.testing.expect(report.ast == null);
+        try std.testing.expectEqual(@as(usize, 1), report.diagnostics.len);
+        try std.testing.expectEqual(Token.Tag.l_paren, report.diagnostics[0].kind.expected_token.expected);
+    }
 }
 
 test "parse direct calls in type positions" {
@@ -1774,15 +1796,15 @@ test "not binds below comparisons and above logical operators" {
     );
 }
 
-test "parse query and move postfix operators" {
+test "parse fallible calls and move postfix operators" {
     try testParsing(
-        \\const a = value?
+        \\const a = value?()
         \\const b = a^
         \\take(b^)
-        \\if const v = maybe? -> print(v)
+        \\if const v = maybe?() -> print(v)
     ,
         \\const_binding
-        \\└─query_op
+        \\└─call
         \\  └─identifier : value
         \\const_binding
         \\└─move_expr
@@ -1794,7 +1816,7 @@ test "parse query and move postfix operators" {
         \\    └─identifier : b
         \\if
         \\├─const_binding
-        \\│ └─query_op
+        \\│ └─call
         \\│   └─identifier : maybe
         \\└─call
         \\  ├─identifier : print

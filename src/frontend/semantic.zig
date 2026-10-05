@@ -89,6 +89,7 @@ pub const UnresolvedBody = struct {
         target: Target,
         arguments: structures.FunctionValueRange,
         span: structures.SourceSpan,
+        fallible_syntax: bool = false,
 
         pub const Target = union(enum) {
             direct: structures.InstanceId,
@@ -959,7 +960,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             const condition = if (value_node.tag == .as)
                 try self.buildVariantMembership(value_node, binding)
             else
-                try self.appendCondition(.{ .call = .{ .target = try self.buildCall(value_index), .binding = binding } });
+                try self.appendCondition(.{ .call = .{ .target = try self.buildCall(value_index, true), .binding = binding } });
 
             try self.locals.put(self.gpa, name, .{ .place = .{ .id = local, .mutable = false } });
             try self.local_names.append(self.gpa, name);
@@ -986,7 +987,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                         .{ .disjunction = .{ .lhs = lhs, .rhs = rhs } });
                 },
                 .not => self.appendCondition(.{ .negation = try self.buildCondition(node.data.node) }),
-                .call => self.appendCondition(.{ .call = .{ .target = try self.buildCall(index) } }),
+                .call => self.appendCondition(.{ .call = .{ .target = try self.buildCall(index, true) } }),
                 else => self.rejectCondition(index),
             };
         }
@@ -1104,14 +1105,15 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
 
         fn appendCall(self: *Self, index: structures.Node.Index) !ValueId {
             const node = self.ast.nodes[index.index()];
-            return self.appendExpression(node.data.node_node.a, .{ .call = try self.buildCall(index) });
+            return self.appendExpression(node.data.node_node.a, .{ .call = try self.buildCall(index, false) });
         }
 
-        fn buildCall(self: *Self, index: structures.Node.Index) !UnresolvedBody.Call {
+        fn buildCall(self: *Self, index: structures.Node.Index, requires_fallible: bool) !UnresolvedBody.Call {
             const node = self.ast.nodes[index.index()];
             const callee_index = node.data.node_node.a;
             const callee = self.ast.nodes[callee_index.index()];
             const span = nodeFocusSpan(self.ast, callee_index);
+            const fallible_syntax = self.ast.tokens[node.token_index].tag == .question_mark;
             const DirectTarget = struct {
                 instance: structures.InstanceId,
                 shape: structures.FunctionShape,
@@ -1135,6 +1137,10 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                     break :target .unknown_function;
                 break :target .{ .value = try self.appendUse(callee_index, false) };
             };
+            if (pending_target == .direct) {
+                if (callSyntaxIssue(fallible_syntax, pending_target.direct.shape.is_fallible, requires_fallible)) |kind|
+                    return self.reject(callee_index, kind);
+            }
             const argument_nodes = self.ast.nodeList(node.data.node_node.b);
             const parameter_shapes: ?[]const structures.FunctionParameterShape = switch (pending_target) {
                 .direct => |direct| direct.shape.parameters,
@@ -1218,6 +1224,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 .target = target,
                 .arguments = .{ .start = start, .end = @intCast(self.call_arguments.items.len) },
                 .span = span,
+                .fallible_syntax = fallible_syntax,
             };
         }
 
@@ -1246,6 +1253,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 } },
                 .arguments = .{ .start = start, .end = @intCast(self.method_call_arguments.items.len) },
                 .span = name_span,
+                .fallible_syntax = self.ast.tokens[call.token_index].tag == .question_mark,
             };
         }
 
@@ -1353,6 +1361,7 @@ pub fn analyzeFunctionShape(
     return .{ .success = .{
         .parameters = try parameters.toOwnedSlice(gpa),
         .returns_type = if (signatureReturnType(ast, signature).unwrap()) |annotation| isMetaTypeAnnotation(ast, source, annotation) else false,
+        .is_fallible = declaredFallibility(ast, ast.nodes[parts.function.index()]),
     } };
 }
 
@@ -1725,9 +1734,7 @@ pub fn analyzeFunctionInstanceSignature(
     }
 
     const function = ast.nodes[parts.function.index()];
-    const is_fallible = ast.tokens[function.token_index].tag == .keyword_fallible or
-        (ast.tokens[function.token_index].tag == .keyword_extern and
-            ast.tokens[function.token_index + 1].tag == .keyword_fallible);
+    const is_fallible = declaredFallibility(ast, function);
     const annotation = if (binding.tag == .static_binding) binding.data.node_node.a.unwrap() else null;
     if (annotation) |annotation_index| {
         const expected = switch (try analyzeType(ast, source, annotation_index, type_interner, gpa, .function_annotation_not_supported)) {
@@ -1758,6 +1765,18 @@ pub fn analyzeFunctionInstanceSignature(
     } };
 }
 
+fn declaredFallibility(ast: *const structures.Ast, function: structures.Node) bool {
+    return ast.tokens[function.token_index].tag == .keyword_fallible or
+        (ast.tokens[function.token_index].tag == .keyword_extern and
+            ast.tokens[function.token_index + 1].tag == .keyword_fallible);
+}
+
+pub fn callSyntaxIssue(fallible_syntax: bool, is_fallible: bool, requires_fallible: bool) ?structures.Diagnostic.Kind {
+    if (fallible_syntax and !is_fallible) return .fallible_call_not_fallible;
+    if (is_fallible and !requires_fallible and !fallible_syntax) return .fallible_call_requires_marker;
+    return null;
+}
+
 fn parameterMode(ast: *const structures.Ast, parameter: structures.Node) ?structures.ParameterMode {
     const access = parameter.data.node_node.a.unwrap() orelse return .imm;
     if (ast.nodes[access.index()].tag == .implicit_static) return .static;
@@ -1774,7 +1793,7 @@ fn parameterMode(ast: *const structures.Ast, parameter: structures.Node) ?struct
 
 fn isFallibleExpression(tag: structures.Node.Tag) bool {
     return switch (tag) {
-        .lt, .gt, .le, .ge, .eq, .ne, .is, .as, .query_op, .@"and", .@"or", .not => true,
+        .lt, .gt, .le, .ge, .eq, .ne, .is, .as, .@"and", .@"or", .not => true,
         else => false,
     };
 }
@@ -1787,7 +1806,7 @@ fn runtimeReference(ast: *const structures.Ast, source: []const u8, index: struc
             const span = tokenSpan(ast, node.token_index);
             return if (scope.runtimeName(source[span.start..span.end])) present else null;
         },
-        .break_expr, .return_expr, .loop, .not, .neg, .query_op, .move_expr, .comptime_expr, .sizeof_expr, .field_access, .deref, .struct_field, .struct_property, .struct_init_field, .@"pub" => return runtimeReference(ast, source, node.data.node, scope),
+        .break_expr, .return_expr, .loop, .not, .neg, .move_expr, .comptime_expr, .sizeof_expr, .field_access, .deref, .struct_field, .struct_property, .struct_init_field, .@"pub" => return runtimeReference(ast, source, node.data.node, scope),
         .return_origins => return runtimeReference(ast, source, node.data.node_node.a, scope),
         .signature => return runtimeReference(ast, source, node.data.signature.parameters, scope) orelse runtimeReference(ast, source, node.data.signature.return_type, scope) orelse runtimeReference(ast, source, node.data.signature.where_clauses, scope),
         .add, .sub, .mul, .div, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .@"and", .@"or", .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .call, .const_binding, .var_binding, .borrow_binding, .borrow_mut_binding, .static_binding, .namespace_declaration, .func, .param, .type_func, .@"if" => return runtimeReference(ast, source, node.data.node_node.a, scope) orelse runtimeReference(ast, source, node.data.node_node.b, scope),
@@ -2454,7 +2473,7 @@ fn discoverGeneratedStructItems(gpa: std.mem.Allocator, items: *std.ArrayList(st
                 const site = @as(i64, index.index()) - @as(i64, declaration.index());
                 try discoverStructItems(gpa, items, ast, source, module, index, parent, site);
             },
-            .break_expr, .return_expr, .loop, .not, .neg, .query_op, .move_expr, .comptime_expr, .sizeof_expr, .field_access, .deref, .struct_field, .struct_property, .struct_init_field, .@"pub" => {
+            .break_expr, .return_expr, .loop, .not, .neg, .move_expr, .comptime_expr, .sizeof_expr, .field_access, .deref, .struct_field, .struct_property, .struct_init_field, .@"pub" => {
                 if (node.data.node.unwrap()) |child| try pending.append(gpa, child);
             },
             .signature => {
