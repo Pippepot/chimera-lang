@@ -758,6 +758,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             if (runtimeReference(self.ast, self.source, index, self) != null) return null;
             return resolveNamedExpression(self.ast, self.source, index, self.type_interner) catch |err| switch (err) {
                 error.QueryCycle => return self.reject(index, .declaration_cycle),
+                error.PublicFieldPrivateType => return self.reject(index, .public_field_private_type),
                 else => return err,
             };
         }
@@ -1499,7 +1500,8 @@ fn structFactoryFieldAnnotation(ast: *const structures.Ast, source: []const u8, 
     const body = ast.nodes[parts.body.index()];
     const struct_node = ast.nodes[body.data.node.index()];
     for (ast.node_refs[struct_node.data.ref.start..struct_node.data.ref.end]) |member_index| {
-        const member = ast.nodes[member_index.index()];
+        const item = ast.nodes[member_index.index()];
+        const member = if (item.tag == .@"pub") ast.nodes[item.data.node.index()] else item;
         if (member.tag != .struct_field) continue;
         const span = tokenSpan(ast, member.token_index);
         if (std.mem.eql(u8, name, source[span.start..span.end])) return member.data.node;
@@ -1841,10 +1843,10 @@ pub fn resolveNamedExpression(ast: *const structures.Ast, source: []const u8, in
     const node = ast.nodes[index.index()];
     const span = tokenSpan(ast, node.token_index);
     switch (node.tag) {
-        .identifier, .type => return type_interner.resolveName(source[span.start..span.end]),
+        .identifier, .type => return annotationReference(try type_interner.resolveName(source[span.start..span.end]), type_interner),
         .field_access => {
             const left = (try resolveNamedExpression(ast, source, node.data.node, type_interner)) orelse return null;
-            return type_interner.resolveMember(left, source[span.start..span.end], span);
+            return annotationReference(try type_interner.resolveMember(left, source[span.start..span.end], span), type_interner);
         },
         .call => {
             const callee = (try resolveNamedExpression(ast, source, node.data.node_node.a, type_interner)) orelse return null;
@@ -1856,6 +1858,14 @@ pub fn resolveNamedExpression(ast: *const structures.Ast, source: []const u8, in
         },
         else => return null,
     }
+}
+
+fn annotationReference(reference: ?structures.NameReference, type_interner: anytype) !?structures.NameReference {
+    if (reference) |resolved| {
+        if (type_interner.public_annotation and !try type_interner.isPublicAnnotationReference(resolved))
+            return error.PublicFieldPrivateType;
+    }
+    return reference;
 }
 
 fn analyzeType(
@@ -1888,6 +1898,7 @@ fn analyzeType(
     if (node.tag == .type or node.tag == .identifier or node.tag == .field_access) {
         const reference = resolveNamedExpression(ast, source, node_index, type_interner) catch |err| switch (err) {
             error.QueryCycle => return .{ .unsupported = issueAt(ast, node_index.index(), .declaration_cycle) },
+            error.PublicFieldPrivateType => return .{ .unsupported = issueAt(ast, node_index.index(), .public_field_private_type) },
             else => return err,
         };
         const target = reference orelse return .{ .unsupported = issueAt(ast, node_index.index(), .unknown_type) };
@@ -2152,17 +2163,24 @@ fn analyzeStructMembers(
 
         const name_span = tokenSpan(ast, member.token_index);
         const name = source[name_span.start..name_span.end];
-        const field_type = switch (try analyzeType(ast, source, member.data.node, type_interner, gpa, .struct_field_type_not_supported)) {
+        var field_interner = type_interner;
+        field_interner.public_annotation = item.tag == .@"pub";
+        const field_type = switch (try analyzeType(ast, source, member.data.node, field_interner, gpa, .struct_field_type_not_supported)) {
             .success => |type_id| type_id,
             .unsupported => |issue| return .{ .unsupported = issue },
         };
         if (field_type == .type) return .{ .unsupported = issueAt(ast, member.data.node.index(), .struct_field_type_not_supported) };
+        if (item.tag == .@"pub") {
+            if (!try type_interner.isPublicType(field_type))
+                return .{ .unsupported = issueAt(ast, member.data.node.index(), .public_field_private_type) };
+        }
         try fields.ensureUnusedCapacity(gpa, 1);
         const owned_name = try gpa.dupe(u8, name);
         fields.appendAssumeCapacity(.{
             .name = owned_name,
             .type_id = field_type,
             .span = name_span,
+            .is_public = item.tag == .@"pub",
         });
     }
 
@@ -2673,11 +2691,34 @@ test "struct definition cleans up every allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, testStructDefinitionAllocations, .{});
 }
 
+test "struct factory independent inference unwraps public fields" {
+    const parser = @import("parser.zig");
+    const source =
+        \\struct Factory(T: type)
+        \\  pub value: T
+        \\  pub amount: int
+    ;
+    var report = try parser.parseReport(std.testing.allocator, 1, source);
+    defer report.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len);
+    const parsed = &report.ast.?;
+    const wrapped = parsed.node_refs[parsed.nodes[0].data.ref.start];
+    const declaration = if (parsed.nodes[wrapped.index()].tag == .@"pub") parsed.nodes[wrapped.index()].data.node else wrapped;
+    const annotation = structFactoryFieldAnnotation(parsed, source, declaration.index(), "value").?;
+    const span = tokenSpan(parsed, parsed.nodes[annotation.index()].token_index);
+    try std.testing.expectEqualStrings("T", source[span.start..span.end]);
+    const independent = try analyzeIndependentStructFieldType(parsed, source, declaration.index(), "amount", TestTypeInterner{}, std.testing.allocator);
+    switch (independent) {
+        .success => |type_id| try std.testing.expectEqual(@as(?structures.TypeId, .int), type_id),
+        .unsupported => return error.UnexpectedSemanticIssue,
+    }
+}
+
 fn testStructDefinitionAllocations(gpa: std.mem.Allocator) !void {
     const parser = @import("parser.zig");
     const source =
         \\static Record = struct
-        \\  first: int
+        \\  pub first: int
         \\  second: bool
         \\  third: none
     ;
@@ -2750,6 +2791,7 @@ fn testUnresolvedFunctionBodyAllocations(gpa: std.mem.Allocator) !void {
 }
 
 const TestTypeInterner = struct {
+    public_annotation: bool = false,
     pub fn facts(self: @This()) @This() {
         return self;
     }
@@ -2844,6 +2886,12 @@ const TestTypeInterner = struct {
 
     pub fn resolveName(_: @This(), _: []const u8) !?structures.NameReference {
         return null;
+    }
+    pub fn isPublicAnnotationReference(_: @This(), _: structures.NameReference) !bool {
+        return true;
+    }
+    pub fn isPublicType(_: @This(), type_id: structures.TypeId) !bool {
+        return type_id.isPrimitive();
     }
     pub fn resolveMember(_: @This(), _: structures.NameReference, _: []const u8, _: structures.SourceSpan) !?structures.NameReference {
         return null;

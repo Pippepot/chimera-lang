@@ -63,6 +63,7 @@ pub fn build(b: *std.Build) void {
         "tests/query_test.zig",
         "tests/codegen_test.zig",
         "tests/modules_test.zig",
+        "tests/query_disk_cache_test.zig",
     };
     for (test_sources) |source| {
         const test_module = b.createModule(.{

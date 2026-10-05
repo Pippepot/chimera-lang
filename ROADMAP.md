@@ -7,6 +7,16 @@
 - Incremental queries retain stable declaration and type identities, diagnostics, owned results, and equal-result reuse.
 - Folder modules, file-scoped imports, re-exports, qualified lookup, entry-only execution, and directory refresh are implemented. The embedded `std.prelude` is implicitly imported by user files, with an explicit-import override.
 - Named and generated structs have nominal identity, namespace members and instance calls, layout, field operations, and validated move/copy/drop hooks.
+- Struct fields are private to their defining module by default; `pub` publishes
+  individual fields in declared and generated definitions. Initialization,
+  reads, writes, borrows, consuming moves, and callable fields share privacy
+  checks, distinct from unknown names. Factory specialization and re-export
+  preserve the defining module; every file there can access private fields.
+  Public field annotations reject hidden declaration names and private nominal
+  types, including callable and variant components and generated type arguments.
+  Whole-value ownership operations retain private fields. Runtime, compile-time,
+  incremental visibility edits, and snapshot reuse are covered. `std.memory`
+  storage fields use this general rule without name-matched exceptions.
 - Function signatures support ordered `where` conditions checked at specialization
   using static values, including type and namespace member tests with `is`.
 - Capability-backed `T.copy` and `T.move` support type-qualified and instance
@@ -76,7 +86,7 @@
 
 ## Priority and dependencies
 
-Field visibility is the next implementation priority. Later milestones retain
+Converters and literal types are the next implementation priority. Later milestones retain
 their relative order, expanding the host
 storage and reference foundation toward text, generic collections, and ordinary
 iteration.
@@ -85,27 +95,7 @@ recomputation; reject unsupported forms at their owning boundary.
 
 ## Ordered milestones
 
-### 1. Field visibility
-
-Implement field visibility from [syntax&semantics.txt](syntax&semantics.txt).
-It replaces the temporary name-matched opaque storage owners in `std.memory`.
-
-- Accept `pub` on declared and generated struct fields and publish visibility
-  with the struct definition. Check it at every field projection and
-  initializer field name against the defining module of the struct or its
-  factory; report privacy distinctly from unknown fields. Reject a `pub` field
-  whose type names a declaration hidden from importing modules.
-- Remove `accessible_fields`, its name list, and its file-scoped exception.
-  `std.memory` fields stay private through the general rule; standard type
-  recognition keeps using registered identities. Mark fields `pub` where
-  existing tests and examples access imported structs.
-- Verify rejected initialization, reads, writes, borrows, and consuming moves
-  from other modules; access from every file of the defining module; foreign
-  specializations and re-exports; whole-value move, copy, and drop of values
-  with private fields; compile-time execution; and incremental recomputation
-  when a field gains or loses `pub`.
-
-### 2. Converters and literal types
+### 1. Converters and literal types
 
 - Implement `static struct` expressions and named and parameterized declaration
   sugar from [syntax&semantics.txt](syntax&semantics.txt). Preserve ordinary
@@ -137,7 +127,7 @@ It replaces the temporary name-matched opaque storage owners in `std.memory`.
   execution, and incremental recomputation when either owning module adds or
   removes a converter.
 
-### 3. Text and basic I/O
+### 2. Text and basic I/O
 
 - Define UTF-8 string literals through the literal-type converter model and a
   `std` **String** exported through
@@ -149,7 +139,7 @@ It replaces the temporary name-matched opaque storage owners in `std.memory`.
   borrowing for slices, and cleanup. Compile-time execution retains no ambient
   I/O.
 
-### 4. Ranges, List, and iteration
+### 3. Ranges, List, and iteration
 
 - Implement exclusive/inclusive ascending ranges and empty-range behavior.
   Decide endpoint types, descending iteration, steps, overflow-safe termination,
@@ -170,20 +160,20 @@ It replaces the temporary name-matched opaque storage owners in `std.memory`.
   iterator state and invalidation, loop results, and cleanup on every exit path.
   Range-only iteration may precede List if it uses that contract.
 
-### 5. Structural tuples
+### 4. Structural tuples
 
 - Implement ordered structural identity for `(foo, bar)` with type spelling,
   access, destructuring, layout, and elementwise ownership. Resolve grouping
   and singleton syntax alongside `()`; tuples support multiple results and
   later Map iteration.
 
-### 6. Match
+### 5. Match
 
 - Evaluate the subject once; add literal, wildcard, binding, `pattern as name`,
   and `is Type` patterns. Diagnose redundancy and non-exhaustiveness using
   existing branch joins and variant mappings.
 
-### 7. Numeric foundations
+### 6. Numeric foundations
 
 - Add named numeric conversion functions (wrap, truncate, round, saturate,
   widen) with specified overflow and failure behavior; converters never relate
@@ -198,7 +188,7 @@ It replaces the temporary name-matched opaque storage owners in `std.memory`.
   Extend to float and user structs after their semantics are settled; do not
   assume general overloading follows from operator lookup.
 
-### 8. Collections and algorithms
+### 7. Collections and algorithms
 
 - Add **Map**, **Set**, **Queue**, and **Stack** on established storage and
   iteration contracts. Specify hashing/equality, ordering, mutation, and

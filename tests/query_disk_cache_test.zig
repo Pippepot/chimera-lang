@@ -1,22 +1,27 @@
 const std = @import("std");
-const cache = @import("cache.zig");
-const modules = @import("modules.zig");
-const query = @import("query/engine.zig");
-const queries = @import("queries.zig");
-const query_disk_cache = @import("query_disk_cache.zig");
-const structures = @import("structures.zig");
-const runtime = @import("runtime.zig");
+const test_sources = @import("test_sources");
+const cache = test_sources.cache;
+const modules = test_sources.modules;
+const query = test_sources.query;
+const queries = test_sources.queries;
+const query_disk_cache = test_sources.query_disk_cache;
+const structures = test_sources.structures;
+const runtime = test_sources.runtime;
 const standard_library = @import("standard_library");
 
 const Fixture = struct {
     db: *query.Database,
 
     fn restore(source: []const u8) !Fixture {
+        return restoreSources(source, &.{}, &.{}, null);
+    }
+
+    fn restoreSources(source: []const u8, files: []const modules.SourceFile, restored_files: []const modules.SourceFile, rejected: ?std.meta.Tag(structures.Diagnostic.Kind)) !Fixture {
         const allocator = std.testing.allocator;
         const io = std.testing.io;
         const first = try query.Database.init(allocator, .{ .worker_count = 2 });
         defer first.deinit();
-        try modules.registerSources(first, allocator, source, &.{}, &.{});
+        try modules.registerSources(first, allocator, source, files, &.{});
         const original = try executable(first);
         const original_body = try functionBody(first, "run");
         var tmp = std.testing.tmpDir(.{});
@@ -30,8 +35,13 @@ const Fixture = struct {
         const second = try query.Database.init(allocator, .{ .worker_count = 2 });
         errdefer second.deinit();
         const offset = try query_disk_cache.restoreInterns(second, allocator, payload);
-        try modules.registerSources(second, allocator, source, &.{}, &.{});
+        try modules.registerSources(second, allocator, source, restored_files, &.{});
         try std.testing.expect(try query_disk_cache.restoreQueries(second, payload, offset) > 0);
+        if (rejected) |kind| {
+            const fixture: Fixture = .{ .db = second };
+            try fixture.expectDiagnostic(kind);
+            return fixture;
+        }
         if (!structures.FunctionBodyAnalysis.eql(original_body.*.?, (try functionBody(second, "run")).*.?)) {
             std.debug.print("restored run body changed\n", .{});
             return error.TestUnexpectedResult;
@@ -53,6 +63,14 @@ const Fixture = struct {
         try std.testing.expectEqual(status, try runtime.runProg(std.testing.io, std.testing.allocator, &.{}));
     }
 
+    fn expectDiagnostic(self: Fixture, kind: std.meta.Tag(structures.Diagnostic.Kind)) !void {
+        try std.testing.expect((try self.db.get(queries.BuildExecutable, 0)).* == null);
+        const diagnostics = try self.db.transitiveAccumulatorValues(queries.BuildExecutable, 0, structures.Diagnostic, std.testing.allocator);
+        defer std.testing.allocator.free(diagnostics);
+        try std.testing.expectEqual(@as(usize, 1), diagnostics.len);
+        try std.testing.expectEqual(kind, std.meta.activeTag(diagnostics[0].kind));
+    }
+
     fn executable(db: *query.Database) !structures.Executable {
         if ((try db.get(queries.BuildExecutable, 0)).*) |artifact| return artifact;
         const diagnostics = try db.transitiveAccumulatorValues(queries.BuildExecutable, 0, structures.Diagnostic, std.testing.allocator);
@@ -62,6 +80,117 @@ const Fixture = struct {
         return error.TestUnexpectedResult;
     }
 };
+
+fn checkFieldVisibilitySnapshot(generated: bool) !void {
+    const allocator = std.testing.allocator;
+    const public_source = if (generated)
+        \\pub func Cell(static T: type) type
+        \\  return struct
+        \\    pub value: T
+        \\pub func make() Cell(int) -> Cell(int){value = 40}
+    else
+        \\pub struct Cell
+        \\  pub value: int
+        \\pub func make() Cell -> Cell{value = 40}
+    ;
+    const private_source = try std.mem.replaceOwned(u8, allocator, public_source, "pub value", "value");
+    defer allocator.free(private_source);
+    const source = try std.fmt.allocPrint(allocator,
+        \\import library
+        \\static Selected = library.Cell{s}
+        \\func run() int
+        \\  var item = library.make()
+        \\  item.value += 1
+        \\  return item.value + Selected{{value = 1}}.value
+        \\static answer = run()
+        \\exit(run() + answer - 42)
+    , .{if (generated) "(int)" else ""});
+    defer allocator.free(source);
+    const public_files = [_]modules.SourceFile{.{ .path = "library/cell.chi", .module_path = "library", .source = public_source }};
+    const private_files = [_]modules.SourceFile{.{ .path = "library/cell.chi", .module_path = "library", .source = private_source }};
+    const fixture = try Fixture.restoreSources(source, &public_files, &public_files, null);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    for ([_]bool{ false, true, false, true }) |is_public| {
+        try fixture.db.setInput(queries.SourceText, 1, if (is_public) public_source else private_source);
+        if (is_public) {
+            try fixture.expectExit(42);
+        } else {
+            try fixture.expectDiagnostic(.private_struct_field);
+        }
+    }
+
+    const denied = try Fixture.restoreSources(source, &public_files, &private_files, .private_struct_field);
+    defer denied.db.deinit();
+    try denied.db.setInput(queries.SourceText, 1, public_source);
+    try denied.expectExit(42);
+}
+
+test "field visibility declared snapshots restore public fields and invalidate denied foreign access" {
+    try checkFieldVisibilitySnapshot(false);
+}
+
+test "field visibility foreign generated snapshots restore public fields and invalidate denied access" {
+    try checkFieldVisibilitySnapshot(true);
+}
+
+fn checkFieldVisibilityAnnotationSnapshot(generated: bool) !void {
+    const allocator = std.testing.allocator;
+    const public_source = if (generated)
+        \\static Hidden = int
+        \\pub static Visible = int
+        \\pub func Cell(static T: type) type
+        \\  return struct
+        \\    pub value: Visible
+        \\pub func make() Cell(int) -> Cell(int){value = 42}
+    else
+        \\static Hidden = int
+        \\pub static Visible = int
+        \\pub struct Cell
+        \\  pub value: Visible
+        \\pub func make() Cell -> Cell{value = 42}
+    ;
+    const hidden_source = try std.mem.replaceOwned(u8, allocator, public_source, "pub value: Visible", "pub value: Hidden");
+    defer allocator.free(hidden_source);
+    const private_source = try std.mem.replaceOwned(u8, allocator, hidden_source, "pub value", "value");
+    defer allocator.free(private_source);
+    const source = try std.fmt.allocPrint(allocator,
+        \\import library
+        \\static Selected = library.Cell{s}
+        \\func run() int
+        \\  const item: Selected = library.make()
+        \\  return 42
+        \\static answer = run()
+        \\exit(run() + answer - 42)
+    , .{if (generated) "(int)" else ""});
+    defer allocator.free(source);
+    const public_files = [_]modules.SourceFile{.{ .path = "library/cell.chi", .module_path = "library", .source = public_source }};
+    const hidden_files = [_]modules.SourceFile{.{ .path = "library/cell.chi", .module_path = "library", .source = hidden_source }};
+    const fixture = try Fixture.restoreSources(source, &public_files, &public_files, null);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    try fixture.db.setInput(queries.SourceText, 1, hidden_source);
+    try fixture.expectDiagnostic(.public_field_private_type);
+    try fixture.db.setInput(queries.SourceText, 1, private_source);
+    try fixture.expectExit(42);
+    try fixture.db.setInput(queries.SourceText, 1, hidden_source);
+    try fixture.expectDiagnostic(.public_field_private_type);
+    try fixture.db.setInput(queries.SourceText, 1, public_source);
+    try fixture.expectExit(42);
+
+    const denied = try Fixture.restoreSources(source, &public_files, &hidden_files, .public_field_private_type);
+    defer denied.db.deinit();
+    try denied.db.setInput(queries.SourceText, 1, public_source);
+    try denied.expectExit(42);
+}
+
+test "field visibility declared snapshots invalidate public hidden type annotations and recover" {
+    try checkFieldVisibilityAnnotationSnapshot(false);
+}
+
+test "field visibility generated snapshots invalidate public hidden type annotations and recover" {
+    try checkFieldVisibilityAnnotationSnapshot(true);
+}
 
 test "infallible initializer consumers handle failure and survive snapshots" {
     const source =

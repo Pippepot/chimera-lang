@@ -76,12 +76,16 @@ zig build test --seed 0 -Doptimize=ReleaseSafe
 Focused checks:
 
 ```sh
-zig build test --seed 0 -Dtest-source=src/frontend/tokenizer.zig
+zig build test --seed 0 -Dtest-source=test_sources.zig -Dtest-filter=tokenizer
 zig build test --seed 0 -Dtest-source=tests/modules_test.zig -Dtest-filter="name fragment"
+zig build test --seed 0 -Doptimize=ReleaseSafe -Dtest-source=tests/query_disk_cache_test.zig -Dtest-filter="field visibility" --summary all
 ```
 
 These entrypoints supply required module imports. The full suite runs inline
-tests once and three standalone suites, each in its own binary's directory.
+tests once and four standalone suites (five roots total), each in its own
+binary's directory. Private disk-cache tests remain inline in
+`src/query_disk_cache.zig`; its snapshot integration suite lives in
+`tests/query_disk_cache_test.zig`.
 
 A fixed seed enables caching successful runs; Zig 0.16 defaults to a random seed.
 Keep caches and options stable; `--summary all` shows cache hits. Direct `zig test`

@@ -65,7 +65,7 @@ const Fixture = struct {
 
 const physics = modules.SourceFile{ .path = "physics/body.chi", .module_path = "physics", .source =
     \\pub struct Body
-    \\  x: int
+    \\  pub x: int
     \\pub func make(imm x: int) Body -> return Body{x = x}
     \\pub func get(imm body: Body) int -> return body.x
     \\pub func identity(static T: type, imm value: T) T -> return value
@@ -74,6 +74,214 @@ const physics = modules.SourceFile{ .path = "physics/body.chi", .module_path = "
     \\unknown_top_level_call()
     \\exit(99)
 };
+
+test "field visibility rejects foreign initialization projections borrows and transfers" {
+    const library = modules.SourceFile{ .path = "lib/value.chi", .module_path = "lib", .source =
+        \\pub struct Value
+        \\    secret: int
+        \\    pub visible: int
+        \\pub func make() Value -> Value{secret = 40, visible = 2}
+    };
+    const operations = [_][]const u8{
+        "const value = Value{secret = 40, visible = 2}\nexit(value.visible)",
+        "const value = Value{visible = 2}\nexit(value.visible)",
+        "const value = Value{}\nexit(value.visible)",
+        "const value = make()\nexit(value.secret)",
+        "var value = make()\nvalue.secret = 42\nexit(value.visible)",
+        "const value = make()\nconst field = borrow_local(int, value.secret)\nexit(field[])",
+        "var value = make()\nborrow mut field = value.secret\nfield = 42\nexit(value.visible)",
+        "var value = make()\nconst moved = value.secret^\nexit(moved)",
+        "func consume(deinit item: int) int -> item\nvar value = make()\nexit(consume(value.secret))",
+        "const value = make()\nconst reference = borrow_local(Value, value)\nexit(reference[].secret)",
+        "static answer = make().secret\nexit(answer)",
+        "const answer = comptime -> make().secret\nexit(answer)",
+    };
+    for (operations) |operation| {
+        const source = try std.fmt.allocPrint(testing.allocator, "import lib.{{Value, make}}\nimport std.memory.{{borrow_local}}\n{s}", .{operation});
+        defer testing.allocator.free(source);
+        const fixture = try Fixture.init(source, &.{library});
+        defer fixture.deinit();
+        try fixture.expectDiagnostic(0, .private_struct_field);
+    }
+}
+
+test "field visibility distinguishes unknown names from private fields" {
+    for ([_]struct { expression: []const u8, diagnostic: std.meta.Tag(structures.Diagnostic.Kind) }{
+        .{ .expression = "value.secret", .diagnostic = .private_struct_field },
+        .{ .expression = "value.missing", .diagnostic = .unknown_field },
+        .{ .expression = "lib.Value{missing = 42}", .diagnostic = .unknown_struct_field },
+    }) |case| {
+        const source = try std.fmt.allocPrint(testing.allocator, "import lib\nconst value = lib.make()\n_ = {s}\nexit(42)", .{case.expression});
+        defer testing.allocator.free(source);
+        const fixture = try Fixture.init(source, &.{.{ .path = "lib/value.chi", .module_path = "lib", .source =
+            \\pub struct Value
+            \\    secret: int
+            \\pub func make() Value -> Value{secret = 42}
+        }});
+        defer fixture.deinit();
+        try fixture.expectDiagnostic(0, case.diagnostic);
+    }
+}
+
+test "field visibility permits public initialization reads writes borrows and moves" {
+    const fixture = try Fixture.init(
+        \\import lib.{Value}
+        \\import std.memory.{borrow_local}
+        \\var value = Value{first = 20, second = 21}
+        \\value.first = 20
+        \\borrow mut field = value.first
+        \\field = 21
+        \\const reference = borrow_local(int, value.first)
+        \\const observed = reference[]
+        \\const moved = value.second^
+        \\exit(observed + moved)
+    , &.{.{ .path = "lib/value.chi", .module_path = "lib", .source =
+        \\pub struct Value
+        \\    pub first: int
+        \\    pub second: int
+    }});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+test "field visibility belongs to the module across files and foreign specializations" {
+    const files = [_]modules.SourceFile{
+        .{ .path = "lib/types.chi", .module_path = "lib", .source =
+        \\pub struct Value
+        \\    secret: int
+        \\pub struct Cell(T: type)
+        \\    secret: T
+        },
+        .{ .path = "lib/build.chi", .module_path = "lib", .source =
+        \\pub func make() Value -> Value{secret = 21}
+        \\pub func cell(static T: type, item: T) Cell(T) -> Cell(T){secret = item}
+        },
+        .{ .path = "lib/read.chi", .module_path = "lib", .source =
+        \\import std.memory.{borrow_local}
+        \\pub func read(mut value: Value) int
+        \\    borrow mut field = value.secret
+        \\    field = 22
+        \\    const reference = borrow_local(int, value.secret)
+        \\    return reference[]
+        \\pub func take(static T: type, var value: Cell(T)) T -> value.secret^
+        },
+    };
+    const fixture = try Fixture.init(
+        \\import lib
+        \\var value = lib.make()
+        \\const cell = lib.cell(int, 20)
+        \\exit(lib.read(value) + lib.take(int, cell^))
+    , &files);
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+    try fixture.db.setInput(queries.SourceText, 0,
+        \\import lib
+        \\static answer = lib.take(int, lib.cell(int, 42))
+        \\exit(answer)
+    );
+    try fixture.expectExit(0, 42);
+}
+
+test "field visibility stays with the defining module through reexports" {
+    const files = [_]modules.SourceFile{
+        .{ .path = "lib/value.chi", .module_path = "lib", .source =
+        \\pub struct Value
+        \\    secret: int
+        \\pub func make() Value -> Value{secret = 42}
+        \\pub func read(imm item: Value) int -> item.secret
+        },
+        .{ .path = "api/export.chi", .module_path = "api", .source = "pub import lib.{Value, make, read}" },
+    };
+    const fixture = try Fixture.init("import api\nexit(api.read(api.make()))", &files);
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+    try fixture.db.setInput(queries.SourceText, 0, "import api\nexit(api.make().secret)");
+    try fixture.expectDiagnostic(0, .private_struct_field);
+    try fixture.db.setInput(queries.SourceText, 0, "import api\nexit(api.inspect())");
+    try fixture.db.setInput(queries.SourceText, 2,
+        \\pub import lib.{Value, make, read}
+        \\pub func inspect() int -> make().secret
+    );
+    try fixture.expectDiagnostic(2, .private_struct_field);
+}
+
+test "field visibility rejects foreign generic bodies and inferred immovable initialization" {
+    const library = modules.SourceFile{ .path = "lib/value.chi", .module_path = "lib", .source =
+        \\pub struct Cell(T: type)
+        \\    move = none
+        \\    secret: T
+        \\pub func make(static T: type, item: T) Cell(T) -> Cell(T){secret = item}
+    };
+    for ([_][]const u8{
+        "const cell = lib.Cell{secret = 42}\nexit(42)",
+        "func accept(init cell: lib.Cell(int)) int -> 42\nfallible run() int -> accept(lib.Cell{secret = 42})\nif const result = run() -> exit(result) else exit(1)",
+        "func read(static T: type, imm cell: T) int -> cell.secret\nconst cell = lib.make(int, 42)\nexit(read(lib.Cell(int), cell))",
+    }) |body| {
+        const source = try std.fmt.allocPrint(testing.allocator, "import lib\n{s}", .{body});
+        defer testing.allocator.free(source);
+        const fixture = try Fixture.init(source, &.{library});
+        defer fixture.deinit();
+        try fixture.expectDiagnostic(0, .private_struct_field);
+    }
+}
+
+test "field visibility allows whole value copy move and custom hooks in runtime and comptime" {
+    const library = modules.SourceFile{ .path = "lib/value.chi", .module_path = "lib", .source =
+        \\pub struct Value
+        \\    secret: int
+        \\    copy = func(imm self: Value) Value -> Value{secret = self.secret + 1}
+        \\    move = func(deinit self: Value) Value -> Value{secret = self.secret + 2}
+        \\pub func make() Value -> Value{secret = 39}
+        \\pub func read(imm item: Value) int -> item.secret
+    };
+    for ([_][]const u8{ "exit(run())", "static answer = run()\nexit(answer)" }) |entry| {
+        const source = try std.fmt.allocPrint(
+            testing.allocator,
+            "import lib\nfunc run() int\n    const original = lib.make()\n    const copied = original\n    const moved = copied^\n    return lib.read(moved)\n{s}",
+            .{entry},
+        );
+        defer testing.allocator.free(source);
+        const fixture = try Fixture.init(source, &.{library});
+        defer fixture.deinit();
+        try fixture.expectExit(0, 42);
+    }
+}
+
+test "field visibility allows automatic fieldwise cleanup and custom drop across modules" {
+    const fixture = try Fixture.init(
+        \\import lib
+        \\const value = lib.make()
+        \\_ = lib.read(value)
+        \\exit(1)
+    , &.{.{ .path = "lib/value.chi", .module_path = "lib", .source =
+        \\struct Child
+        \\    secret: int
+        \\    drop = func(deinit self: Child) -> exit(self.secret)
+        \\pub struct Value
+        \\    child: Child
+        \\pub func make() Value -> Value{child = Child{secret = 42}}
+        \\pub func read(imm self: Value) int -> self.child.secret
+    }});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+test "field visibility permits empty structs and validates callable field access" {
+    const library = modules.SourceFile{ .path = "lib/value.chi", .module_path = "lib", .source =
+        \\pub struct Empty
+        \\    pub static answer = 42
+        \\pub struct Callbacks
+        \\    operation: func() int
+        \\    pub visible: func() int
+        \\func answer() int -> 42
+        \\pub func make() Callbacks -> Callbacks{operation = answer, visible = answer}
+    };
+    const fixture = try Fixture.init("import lib\nconst empty = lib.Empty{}\nconst callbacks = lib.make()\nexit(callbacks.visible())", &.{library});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+    try fixture.db.setInput(queries.SourceText, 0, "import lib\nconst callbacks = lib.make()\nexit(callbacks.operation())");
+    try fixture.expectDiagnostic(0, .private_struct_field);
+}
 
 test "fallible call syntax requires markers in ordinary expression contexts" {
     for ([_][]const u8{
@@ -3110,7 +3318,7 @@ test "buffer initialization metadata is opaque outside std.memory" {
         \\if run() -> exit(1) else exit(2)
     , &.{});
     defer fixture.deinit();
-    try fixture.expectDiagnostic(0, .opaque_struct_access);
+    try fixture.expectDiagnostic(0, .private_struct_field);
 }
 
 test "buffer appends into free slots and grows from zero" {
@@ -3374,7 +3582,7 @@ test "buffer view range metadata is opaque outside std.memory" {
         \\if run() -> exit(1) else exit(2)
     , &.{});
     defer fixture.deinit();
-    try fixture.expectDiagnostic(0, .opaque_struct_access);
+    try fixture.expectDiagnostic(0, .private_struct_field);
 }
 
 test "buffer view construction retains its range length" {
@@ -5164,7 +5372,7 @@ test "ownership members invalidate retained callables after capability edits" {
     const original =
         \\pub struct Item
         \\  copy = trivial
-        \\  value: int
+        \\  pub value: int
     ;
     const fixture = try Fixture.init(
         \\import lib
@@ -5181,7 +5389,7 @@ test "ownership members invalidate retained callables after capability edits" {
     try fixture.db.setInput(queries.SourceText, 1,
         \\pub struct Item
         \\  copy = none
-        \\  value: int
+        \\  pub value: int
     );
     try fixture.expectDiagnostic(0, .unknown_namespace_member);
     try testing.expect((try fixture.db.get(queries.FunctionInstanceSignature, reference.instance())).* == null);
@@ -5192,7 +5400,7 @@ test "ownership members invalidate retained callables after capability edits" {
     try fixture.db.setInput(queries.SourceText, 1,
         \\pub struct Item
         \\  copy = func(imm self: Item) Item -> Item{value = self.value + 1}
-        \\  value: int
+        \\  pub value: int
     );
     try fixture.expectExit(0, 43);
     try fixture.db.setInput(queries.SourceText, 1, original);
@@ -7647,7 +7855,7 @@ test "Box cannot be forged or accessed through its storage field" {
     for (sources) |source| {
         const fixture = try Fixture.init(source, &.{});
         defer fixture.deinit();
-        try fixture.expectDiagnostic(0, .opaque_struct_access);
+        try fixture.expectDiagnostic(0, .private_struct_field);
     }
 }
 
@@ -7719,7 +7927,7 @@ test "typed allocation cannot be forged or have its storage metadata changed" {
     for (sources) |source| {
         const fixture = try Fixture.init(source, &.{});
         defer fixture.deinit();
-        try fixture.expectDiagnostic(0, .opaque_struct_access);
+        try fixture.expectDiagnostic(0, .private_struct_field);
     }
 }
 
@@ -7974,7 +8182,7 @@ test "struct namespace declarations and instance fields dispatch separately" {
         \\exit(S.identity(int, s.x))
     , &.{.{ .path = "shapes/s.chi", .module_path = "shapes", .source =
         \\pub struct S
-        \\  x: int
+        \\  pub x: int
         \\  pub static answer = 42
         \\  pub func identity(static T: type, imm value: T) T -> return value
     }});
@@ -7989,7 +8197,7 @@ test "struct namespace members require pub across modules" {
         \\exit(shapes.S.answer + s.read())
     , &.{.{ .path = "shapes/s.chi", .module_path = "shapes", .source =
         \\pub struct S
-        \\  value: int
+        \\  pub value: int
         \\  pub static answer = 2
         \\  pub func read(imm self: S) int -> return self.value
         \\  static secret = 7
@@ -8024,7 +8232,7 @@ test "qualified struct members retain visibility across module files" {
     , &.{
         .{ .path = "lib/s.chi", .module_path = "lib", .source =
         \\pub struct S
-        \\  value: int
+        \\  pub value: int
         },
         .{ .path = "lib/methods.chi", .module_path = "lib", .source =
         \\pub func S.read(imm self: S) int -> return self.value
@@ -8745,7 +8953,7 @@ test "moving declarations changes defining file imports and crossing modules cha
     var registry: modules.SourceRegistry = .{};
     defer registry.deinit(testing.allocator);
     const entry = "import api\nvar value: api.Body = api.Body{x = 42}\nexit(value.x)";
-    const body = modules.SourceFile{ .path = "physics/body.chi", .module_path = "physics", .source = "pub struct Body\n  x: int" };
+    const body = modules.SourceFile{ .path = "physics/body.chi", .module_path = "physics", .source = "pub struct Body\n  pub x: int" };
     const api = modules.SourceFile{ .path = "api/a.chi", .module_path = "api", .source = "pub import physics.{Body}" };
     const f = Fixture{ .db = db };
     try registry.update(db, testing.allocator, entry, &.{ body, api }, &.{});
@@ -8852,7 +9060,7 @@ test "qualified factories work in signatures fields initializers and compile tim
         \\exit(read(lib.Box(int){value = answer}))
     , &.{.{ .path = "lib/a.chi", .module_path = "lib", .source =
         \\pub struct Box(T: type)
-        \\  value: T
+        \\  pub value: T
         \\pub func identity(static T: type, imm value: T) T -> return value
     }});
     defer f.deinit();
@@ -8913,7 +9121,7 @@ test "nested generated namespace declarations preserve their enclosing static en
     , &.{.{ .path = "lib/a.chi", .module_path = "lib", .source =
         \\pub struct Outer(T: type)
         \\  pub struct Inner
-        \\    value: T
+        \\    pub value: T
         \\    pub func make(imm value: T) T -> return value
     }});
     defer f.deinit();

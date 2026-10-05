@@ -798,12 +798,12 @@ pub const StructField = struct {
     name: []const u8,
     type_id: TypeId,
     span: SourceSpan,
+    is_public: bool = false,
 };
 
 pub const StructDefinition = struct {
     fields: []StructField,
     ownership: StructOwnershipProperties = .{},
-    accessible_fields: bool = true,
 
     pub const ResolvedField = struct {
         index: u32,
@@ -821,9 +821,10 @@ pub const StructDefinition = struct {
     }
 
     pub fn eql(a: StructDefinition, b: StructDefinition) bool {
-        if (a.fields.len != b.fields.len or !std.meta.eql(a.ownership, b.ownership) or a.accessible_fields != b.accessible_fields) return false;
+        if (a.fields.len != b.fields.len or !std.meta.eql(a.ownership, b.ownership)) return false;
         for (a.fields, b.fields) |left, right| {
             if (left.type_id != right.type_id or
+                left.is_public != right.is_public or
                 !std.meta.eql(left.span, right.span) or
                 !std.mem.eql(u8, left.name, right.name)) return false;
         }
@@ -1383,6 +1384,7 @@ pub const CompileTimeSite = struct {
     owner: InstanceId,
     node: Node.Index,
     expected_type: ?TypeId = null,
+    public_annotation: bool = false,
 };
 
 /// Identity of one concrete compile-time function invocation. Ordinary
@@ -1593,7 +1595,8 @@ pub const Diagnostic = struct {
         missing_struct_initializer_field: MissingStructInitializerField,
         struct_initializer_field_type_mismatch: TypeMismatch,
         field_access_not_struct: TypeId,
-        opaque_struct_access: TypeId,
+        private_struct_field: TypeId,
+        public_field_private_type,
         unknown_field,
         duplicate_local_binding,
         local_type_not_supported,

@@ -472,6 +472,7 @@ pub fn AnalysisContext(comptime Context: type) type {
         file_id: ?structures.FileId = null,
         instance: ?structures.InstanceId = null,
         prior_static_arguments: ?[]const structures.CompileTimeValueId = null,
+        public_annotation: bool = false,
 
         pub fn facts(self: @This()) TypeFacts(Context) {
             return .{ .ctx = self.ctx };
@@ -479,18 +480,18 @@ pub fn AnalysisContext(comptime Context: type) type {
 
         pub fn structDefinition(self: @This(), type_id: structures.TypeId) !?structures.StructDefinition {
             const identity = (try self.structIdentity(type_id)) orelse return null;
-            var definition = (try getStructDefinition(self.ctx, identity)) orelse return error.Unavailable;
-            if (!definition.accessible_fields and identity == .generated) {
-                const factory = identity.generated.owner.item;
-                const location = try self.ctx.lookupInterned(ItemLocations, factory);
-                if (std.mem.eql(u8, location.name, @tagName(standard_library.Structure.Buffer)) or
-                    std.mem.eql(u8, location.name, @tagName(standard_library.Structure.BufferView)))
-                {
-                    const resolved = (try self.ctx.get(ResolveItem, factory)).* orelse return error.Unavailable;
-                    if (resolved.file_id == self.file_id) definition.accessible_fields = true;
-                }
-            }
-            return definition;
+            return (try getStructDefinition(self.ctx, identity)) orelse return error.Unavailable;
+        }
+
+        pub fn canAccessPrivateFields(self: @This(), type_id: structures.TypeId) !bool {
+            const identity = (try self.structIdentity(type_id)) orelse return false;
+            const location = try self.ctx.lookupInterned(ItemLocations, structOwnerItem(identity));
+            const module = switch (location.origin) {
+                .module => |module| module,
+                .entry => |file_id| (try self.ctx.input(FileModule, file_id)).*,
+            };
+            const file_id = self.file_id orelse unreachable;
+            return module == (try self.ctx.input(FileModule, file_id)).*;
         }
 
         pub fn structIdentity(self: @This(), type_id: structures.TypeId) !?structures.StructIdentity {
@@ -857,7 +858,12 @@ pub fn AnalysisContext(comptime Context: type) type {
 
         pub fn executeComptimeWithType(self: @This(), node: structures.Node.Index, expected_type: ?structures.TypeId) !?structures.CompileTimeValueId {
             const owner = self.instance orelse unreachable;
-            const outcome = (try self.ctx.get(ExecuteComptimeThunk, .{ .owner = owner, .node = node, .expected_type = expected_type })).* orelse return null;
+            const outcome = (try self.ctx.get(ExecuteComptimeThunk, .{
+                .owner = owner,
+                .node = node,
+                .expected_type = expected_type,
+                .public_annotation = self.public_annotation,
+            })).* orelse return null;
             return switch (outcome) {
                 .returned => |value| value,
                 .failure, .exit => null,
@@ -879,7 +885,11 @@ pub fn AnalysisContext(comptime Context: type) type {
                     switch (owner) {
                         .type => |type_id| if (try self.structNamespaceMember(type_id, name, span) == null) return false,
                         .runtime => |runtime| if (try self.structDefinition(runtime.type_id)) |definition| {
-                            if (definition.accessible_fields and definition.resolveField(name) == null) return false;
+                            const field = definition.resolveField(name) orelse return false;
+                            if (!definition.fields[field.index].is_public and !try self.canAccessPrivateFields(runtime.type_id)) {
+                                try rejectImport(self.ctx, .{ .file_id = file_id, .span = span }, .{ .private_struct_field = runtime.type_id });
+                                return error.Unavailable;
+                            }
                         },
                     }
                 }
@@ -976,6 +986,67 @@ pub fn AnalysisContext(comptime Context: type) type {
             if (std.meta.stringToEnum(structures.TypeId, name)) |type_id|
                 return .{ .constant = try self.ctx.intern(CompileTimeValues, .{ .type = type_id }) };
             return null;
+        }
+
+        pub fn isPublicAnnotationReference(self: @This(), reference: structures.NameReference) !bool {
+            return switch (reference) {
+                .declaration => |instance| self.declarationIsPublic(instance.item),
+                .constant, .namespace => true,
+            };
+        }
+
+        fn declarationIsPublic(self: @This(), item_id: structures.ItemId) !bool {
+            var current = item_id;
+            while (true) {
+                const location = try self.ctx.lookupInterned(ItemLocations, current);
+                const module = switch (location.origin) {
+                    .module => |module| module,
+                    .entry => return false,
+                };
+                const scope = if (location.owner) |owner| scope: {
+                    const identity: structures.StructIdentity = if (location.source_site) |site|
+                        .{ .generated = .{ .owner = .{ .item = owner }, .node_offset = site } }
+                    else
+                        .{ .declared = owner };
+                    break :scope (try self.ctx.get(StructNamespace, identity)).* orelse return error.Unavailable;
+                } else (try self.ctx.get(ModuleDeclarations, module)).* orelse return error.Unavailable;
+                const entry = scope.resolveEntry(location.name) orelse return error.Unavailable;
+                std.debug.assert(entry.item_id == current);
+                if (!entry.is_public) return false;
+                current = location.owner orelse return true;
+            }
+        }
+
+        pub fn isPublicType(self: @This(), type_id: structures.TypeId) anyerror!bool {
+            if (type_id.isPrimitive()) return true;
+            const data = (try self.ctx.lookupInternedAs(Types, type_id.interned().?)) orelse return error.Unavailable;
+            switch (data.*) {
+                .structure => |identity| {
+                    if (!try self.declarationIsPublic(structOwnerItem(identity))) return false;
+                    if (identity == .generated) {
+                        if (identity.generated.owner.specialization) |tuple| {
+                            const arguments = (try self.ctx.lookupInterned(CompileTimeValueTuples, tuple)).values;
+                            for (arguments) |argument| {
+                                const value = (try self.ctx.lookupInterned(CompileTimeValues, argument)).*;
+                                if (value == .type and !try self.isPublicType(value.type)) return false;
+                            }
+                        }
+                    }
+                    return true;
+                },
+                .variant => |variant| {
+                    for (variant.members) |member| {
+                        if (!try self.isPublicType(member)) return false;
+                    }
+                    return true;
+                },
+                .callable => |callable| {
+                    for (callable.parameters) |parameter| {
+                        if (!try self.isPublicType(parameter.type_id)) return false;
+                    }
+                    return self.isPublicType(callable.return_type);
+                },
+            }
         }
 
         pub fn staticItem(self: @This(), instance: structures.InstanceId) !?structures.CompileTimeValueId {
@@ -2377,7 +2448,6 @@ fn allocationElementType(ctx: anytype, type_id: structures.TypeId) !?structures.
     if (element_type == .type) return null;
     const definition = (try ctx.get(GeneratedStructDefinition, instance.generated)).* orelse return null;
     if (definition.fields.len != 2 or
-        definition.accessible_fields or
         definition.ownership.move != null or definition.ownership.copy != null or
         definition.ownership.drop == null or definition.ownership.drop.?.capability != .explicit)
     {
@@ -2398,7 +2468,7 @@ fn boxElementType(ctx: anytype, type_id: structures.TypeId) !?structures.TypeId 
     const instance = (try standardMemoryInstance(ctx, type_id, .Box)) orelse return null;
     const element_type = instance.element_type;
     const definition = (try ctx.get(GeneratedStructDefinition, instance.generated)).* orelse return null;
-    if (definition.fields.len != 1 or definition.accessible_fields or
+    if (definition.fields.len != 1 or
         definition.ownership.move != null or definition.ownership.copy != null or definition.ownership.drop == null or
         definition.ownership.drop.?.capability != .custom or
         !std.mem.eql(u8, definition.fields[0].name, "allocation") or
@@ -2428,7 +2498,7 @@ fn borrowAccessType(ctx: anytype, type_id: structures.TypeId) !?BorrowAccessType
         else => return null,
     };
     const definition = (try ctx.get(GeneratedStructDefinition, instance.generated)).* orelse return null;
-    if (definition.fields.len != 2 or definition.accessible_fields or
+    if (definition.fields.len != 2 or
         definition.ownership.move != null or definition.ownership.copy == null or
         definition.ownership.copy.?.capability != .trivial or definition.ownership.drop != null or
         !std.mem.eql(u8, definition.fields[0].name, "address_low") or definition.fields[0].type_id != .int or
@@ -2559,6 +2629,7 @@ pub const AnalyzeComptimeThunk = struct {
             .ctx = ctx,
             .file_id = resolved.file_id,
             .instance = site.owner,
+            .public_annotation = site.public_annotation,
         };
         const result = semantic.buildUnresolvedComptimeThunk(
             &parsed,
@@ -2941,7 +3012,8 @@ pub const StructNamespace = struct {
         defer names.deinit();
         const struct_node = parsed.nodes[struct_index.index()];
         for (parsed.node_refs[struct_node.data.ref.start..struct_node.data.ref.end]) |member_index| {
-            const member = parsed.nodes[member_index.index()];
+            const item = parsed.nodes[member_index.index()];
+            const member = if (item.tag == .@"pub") parsed.nodes[item.data.node.index()] else item;
             if (member.tag != .struct_field) continue;
             const token = parsed.tokens[member.token_index];
             try names.put(source[token.loc.start..token.loc.end], {});
@@ -3035,18 +3107,7 @@ pub const GeneratedStructDefinition = struct {
             else => return err,
         };
         return switch (result) {
-            .success => |definition| blk: {
-                var owned = definition;
-                if (std.mem.eql(u8, loc.name, @tagName(standard_library.Structure.Allocation)) or
-                    std.mem.eql(u8, loc.name, @tagName(standard_library.Structure.Buffer)) or
-                    std.mem.eql(u8, loc.name, @tagName(standard_library.Structure.BufferView)) or
-                    std.mem.eql(u8, loc.name, @tagName(standard_library.Structure.Box)) or
-                    std.mem.eql(u8, loc.name, @tagName(standard_library.Structure.Ref)))
-                {
-                    if ((try standardFile(ctx, .memory_allocation)) == resolved.file_id) owned.accessible_fields = false;
-                }
-                break :blk owned;
-            },
+            .success => |definition| definition,
             .unsupported => |issue| blk: {
                 try typing.emitSemanticIssue(ctx, resolved.file_id, issue);
                 break :blk null;
@@ -3325,3 +3386,209 @@ pub const BuildExecutable = struct {
         return try codegen.buildExecutable(entry, functions.items, ctx.allocator());
     }
 };
+
+test "struct public field annotations preserve declaration visibility" {
+    const query = @import("query/engine.zig");
+    const modules = @import("modules.zig");
+    const cases = [_]struct { source: []const u8, accepted: bool }{
+        .{ .source = "static Hidden = int\npub struct Visible\n  pub value: Hidden", .accepted = false },
+        .{ .source = "pub static Alias = int\npub struct Visible\n  pub value: Alias", .accepted = true },
+        .{ .source = "struct Parent\n  pub static Alias = int\npub struct Visible\n  pub value: Parent.Alias", .accepted = false },
+        .{ .source = "pub struct Parent\n  static Hidden = int\npub struct Visible\n  pub value: Parent.Hidden", .accepted = false },
+        .{ .source = "pub struct Parent\n  pub static Alias = int\npub struct Visible\n  pub value: Parent.Alias", .accepted = true },
+        .{ .source = "static Hidden = int\npub struct Visible\n  pub value: Hidden | none", .accepted = false },
+        .{ .source = "static Hidden = int\npub struct Visible\n  pub value: func(Hidden) int", .accepted = false },
+        .{ .source = "static Hidden = int\npub struct Visible\n  pub value: func(int) Hidden", .accepted = false },
+        .{ .source = "struct Hidden\n  value: int\npub struct Visible\n  pub value: Hidden", .accepted = false },
+        .{ .source = "struct Factory(T: type)\n  value: T\npub struct Visible\n  pub value: Factory(int)", .accepted = false },
+        .{ .source = "static Hidden = int\npub struct Factory(T: type)\n  value: T\npub struct Visible\n  pub value: Factory(Hidden)", .accepted = false },
+        .{ .source = "pub struct Factory(T: type)\n  value: T\npub struct Visible\n  pub value: Factory(int)", .accepted = true },
+        .{ .source = "static hidden_count = 1\npub struct Sized(n: int)\n  value: int\npub struct Visible\n  pub value: Sized(hidden_count)", .accepted = false },
+        .{ .source = "pub static count = 1\npub struct Sized(n: int)\n  value: int\npub struct Visible\n  pub value: Sized(count)", .accepted = true },
+        .{ .source = "static hidden_count = 1\npub struct Sized(n: int)\n  value: int\npub struct Visible\n  pub value: Sized(hidden_count + 1)", .accepted = false },
+        .{ .source = "static hidden_count = 1\npub struct Sized(n: int)\n  value: int\npub struct Visible\n  pub value: Sized(2 * (3 - hidden_count) / 2)", .accepted = false },
+        .{ .source = "static hidden_count = 1\npub struct Sized(n: int)\n  value: int\npub struct Visible\n  pub value: Sized(-hidden_count)", .accepted = false },
+        .{ .source = "pub static count = 1\npub struct Sized(n: int)\n  value: int\npub struct Visible\n  pub value: Sized(-(count + 1) * 2 / 2)", .accepted = true },
+        .{ .source = "pub struct Counts\n  static hidden_count = 1\npub struct Sized(n: int)\n  value: int\npub struct Visible\n  pub value: Sized(Counts.hidden_count + 1)", .accepted = false },
+        .{ .source = "pub struct Counts\n  pub static count = 1\npub struct Sized(n: int)\n  value: int\npub struct Visible\n  pub value: Sized(Counts.count + 1)", .accepted = true },
+        .{ .source = "static hidden_count = 1\npub func increment(n: int) int -> n + 1\npub struct Sized(n: int)\n  value: int\npub struct Visible\n  pub value: Sized(increment(hidden_count))", .accepted = false },
+        .{ .source = "pub static count = 1\npub func increment(n: int) int -> n + 1\npub struct Sized(n: int)\n  value: int\npub struct Visible\n  pub value: Sized(increment(count))", .accepted = true },
+        .{ .source = "func hidden_count() int -> 1\npub struct Sized(n: int)\n  value: int\npub struct Visible\n  pub value: Sized(hidden_count())", .accepted = false },
+        .{ .source = "static hidden_count = 1\npub func Sized(n: int) type -> int\npub struct Visible\n  pub value: Sized(hidden_count)", .accepted = false },
+        .{ .source = "pub static count = 1\npub func Sized(n: int) type -> int\npub struct Visible\n  pub value: Sized(count)", .accepted = true },
+        .{ .source = "static hidden_count = 1\npub struct Sized(n: int)\n  value: int\npub struct Visible\n  pub value: Sized(if hidden_count > 0 -> 1 else 2)", .accepted = false },
+        .{ .source = "static hidden_count = 1\npub struct Sized(n: int)\n  value: int\npub struct Visible\n  pub value: Sized(if 0 < 1 -> 1 else hidden_count)", .accepted = false },
+        .{ .source = "pub static count = 1\npub struct Sized(n: int)\n  value: int\npub struct Visible\n  pub value: Sized(if count > 0 -> count else 2)", .accepted = true },
+        .{ .source = "import std.exit as counts\npub struct Count\n  copy = trivial\n  pub value: int\npub static optional: Count | none = Count{value = 1}\npub struct Sized(n: int)\n  value: int\npub struct Visible\n  pub value: Sized(if const counts = optional as Count -> counts.value else 0)", .accepted = true },
+        .{ .source = "static hidden_count = 1\npub struct Sized(n: int)\n  value: int\npub struct Visible\n  pub value: Sized(comptime -> hidden_count + 1)", .accepted = false },
+        .{ .source = "pub static count = 1\npub struct Sized(n: int)\n  value: int\npub struct Visible\n  pub value: Sized(comptime -> count + 1)", .accepted = true },
+        .{ .source = "static hidden_count = 1\npub struct Count\n  pub value: int\npub struct Sized(n: Count)\n  value: int\npub struct Visible\n  pub value: Sized(Count{value = hidden_count})", .accepted = false },
+        .{ .source = "pub static count = 1\npub struct Count\n  pub value: int\npub struct Sized(n: Count)\n  value: int\npub struct Visible\n  pub value: Sized(Count{value = count})", .accepted = true },
+        .{ .source = "pub struct Sized(n: int)\n  static unused = unknown()\n  value: int\npub struct Visible\n  pub value: Sized(1)", .accepted = true },
+        .{ .source = "struct Hidden\n  value: int\npub struct Phantom(T: type)\n  value: int\npub static Alias = Phantom(Hidden)\npub struct Visible\n  pub value: Alias", .accepted = false },
+        .{ .source = "pub struct Published\n  value: int\npub struct Phantom(T: type)\n  value: int\npub static Alias = Phantom(Published)\npub struct Visible\n  pub value: Alias", .accepted = true },
+        .{ .source = "struct Hidden\n  value: int\npub struct Factory(T: type)\n  pub struct Phantom(U: type)\n    value: int\npub static Alias = Factory(Hidden).Phantom(int)\npub struct Visible\n  pub value: Alias", .accepted = false },
+        .{ .source = "pub struct Published\n  value: int\npub struct Factory(T: type)\n  pub struct Phantom(U: type)\n    value: int\npub static Alias = Factory(Published).Phantom(int)\npub struct Visible\n  pub value: Alias", .accepted = true },
+        .{ .source = "static Hidden = int\npub struct Visible\n  value: Hidden\nfunc unused() int -> unknown()", .accepted = true },
+    };
+    for (cases) |case| {
+        const db = try query.Database.init(std.testing.allocator, .{ .worker_count = 1 });
+        defer db.deinit();
+        try modules.registerSources(db, std.testing.allocator, case.source, &.{}, &.{});
+        const module = (try db.input(FileModule, 0)).*;
+        const scope = (try db.get(ModuleDeclarations, module)).*.?;
+        const item = scope.resolve("Visible").?;
+        const definition = (try db.get(StructDefinition, item)).*;
+        const diagnostics = try db.transitiveAccumulatorValues(StructDefinition, item, structures.Diagnostic, std.testing.allocator);
+        defer std.testing.allocator.free(diagnostics);
+        if (case.accepted != (definition != null)) {
+            std.debug.print("public field annotation source:\n{s}\n", .{case.source});
+            for (diagnostics) |diagnostic| std.debug.print("at {d}: {s}\n", .{ if (diagnostic.span) |span| span.start else 0, @tagName(diagnostic.kind) });
+        }
+        try std.testing.expectEqual(case.accepted, definition != null);
+        if (case.accepted) {
+            try std.testing.expectEqual(@as(usize, 0), diagnostics.len);
+        } else {
+            try std.testing.expectEqual(@as(usize, 1), diagnostics.len);
+            try std.testing.expectEqual(structures.Diagnostic.Kind.public_field_private_type, diagnostics[0].kind);
+        }
+    }
+}
+
+test "public annotation thunks do not reuse ordinary visibility results" {
+    const query = @import("query/engine.zig");
+    const modules = @import("modules.zig");
+    const source =
+        \\static hidden_count = 1
+        \\pub func select(count: int) type -> int
+        \\struct Example
+        \\    value: select(hidden_count)
+    ;
+    for ([_]bool{ false, true }) |public_first| {
+        const db = try query.Database.init(std.testing.allocator, .{ .worker_count = 1 });
+        defer db.deinit();
+        try modules.registerSources(db, std.testing.allocator, source, &.{}, &.{});
+        const scope = (try db.get(BuildModuleScope, 0)).*.?;
+        const owner: structures.InstanceId = .{ .item = scope.resolve("Example").? };
+        const parsed = (try db.get(ParseFile, 0)).*.?;
+        const node = for (parsed.nodes) |candidate| {
+            if (candidate.tag == .struct_field) break candidate.data.node;
+        } else unreachable;
+        for ([_]bool{ public_first, !public_first, public_first }) |public_annotation| {
+            const site: structures.CompileTimeSite = .{
+                .owner = owner,
+                .node = node,
+                .public_annotation = public_annotation,
+            };
+            const result = (try db.get(ExecuteComptimeThunk, site)).*;
+            const diagnostics = try db.transitiveAccumulatorValues(ExecuteComptimeThunk, site, structures.Diagnostic, std.testing.allocator);
+            defer std.testing.allocator.free(diagnostics);
+            if (public_annotation) {
+                try std.testing.expect(result == null);
+                try std.testing.expectEqual(@as(usize, 1), diagnostics.len);
+                try std.testing.expectEqual(structures.Diagnostic.Kind.public_field_private_type, diagnostics[0].kind);
+            } else {
+                try std.testing.expectEqual(structures.TypeId.int, (try db.lookupInterned(CompileTimeValues, result.?.returned)).type);
+                try std.testing.expectEqual(@as(usize, 0), diagnostics.len);
+            }
+        }
+    }
+}
+
+test "generated struct public annotations validate names and nominal substitutions" {
+    const query = @import("query/engine.zig");
+    const modules = @import("modules.zig");
+    const cases = [_]struct { annotation: []const u8, hidden_argument: bool, accepted: bool }{
+        .{ .annotation = "T", .hidden_argument = false, .accepted = true },
+        .{ .annotation = "T", .hidden_argument = true, .accepted = false },
+        .{ .annotation = "T | none", .hidden_argument = true, .accepted = false },
+        .{ .annotation = "func(T) int", .hidden_argument = true, .accepted = false },
+        .{ .annotation = "func(int) T", .hidden_argument = true, .accepted = false },
+        .{ .annotation = "HiddenAlias", .hidden_argument = false, .accepted = false },
+        .{ .annotation = "PublicAlias", .hidden_argument = false, .accepted = true },
+    };
+    for (cases) |case| {
+        const source = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "struct Hidden\n  value: int\nstatic HiddenAlias = int\npub static PublicAlias = int\npub struct Factory(T: type)\n  pub value: {s}\n  private: int",
+            .{case.annotation},
+        );
+        defer std.testing.allocator.free(source);
+        const db = try query.Database.init(std.testing.allocator, .{ .worker_count = 1 });
+        defer db.deinit();
+        try modules.registerSources(db, std.testing.allocator, source, &.{}, &.{});
+        const module = (try db.input(FileModule, 0)).*;
+        const scope = (try db.get(ModuleDeclarations, module)).*.?;
+        const factory = scope.resolve("Factory").?;
+        const argument_type: structures.TypeId = if (case.hidden_argument) try internStructType(db, scope.resolve("Hidden").?) else .int;
+        const argument = try db.intern(CompileTimeValues, .{ .type = argument_type });
+        const tuple = try db.intern(CompileTimeValueTuples, .{ .values = &.{argument} });
+        const resolved = (try db.get(ResolveItem, factory)).*.?;
+        const parsed = (try db.get(ParseFile, resolved.file_id)).*.?;
+        const identity: structures.GeneratedStructIdentity = .{
+            .owner = .{ .item = factory, .specialization = tuple },
+            .node_offset = semantic.parameterizedStructSite(&parsed, resolved.declaration).?,
+        };
+        const definition = (try db.get(GeneratedStructDefinition, identity)).*;
+        try std.testing.expectEqual(case.accepted, definition != null);
+        const diagnostics = try db.transitiveAccumulatorValues(GeneratedStructDefinition, identity, structures.Diagnostic, std.testing.allocator);
+        defer std.testing.allocator.free(diagnostics);
+        if (case.accepted) {
+            try std.testing.expectEqual(@as(usize, 0), diagnostics.len);
+            try std.testing.expect(definition.?.fields[0].is_public);
+            try std.testing.expect(!definition.?.fields[1].is_public);
+        } else {
+            try std.testing.expectEqual(@as(usize, 1), diagnostics.len);
+            try std.testing.expectEqual(structures.Diagnostic.Kind.public_field_private_type, diagnostics[0].kind);
+        }
+    }
+}
+
+test "struct private field access uses defining module and definitions recompute visibility" {
+    const query = @import("query/engine.zig");
+    const modules = @import("modules.zig");
+    const db = try query.Database.init(std.testing.allocator, .{ .worker_count = 1 });
+    defer db.deinit();
+    try modules.registerSources(db, std.testing.allocator, "", &.{
+        .{ .path = "lib/a.chi", .module_path = "lib", .source = "pub struct Visible\n  value: int\npub struct Factory(T: type)\n  value: T" },
+        .{ .path = "lib/b.chi", .module_path = "lib", .source = "" },
+        .{ .path = "api/a.chi", .module_path = "api", .source = "pub import lib.{Visible}" },
+    }, &.{});
+    const module = (try db.input(FileModule, 1)).*;
+    const scope = (try db.get(ModuleDeclarations, module)).*.?;
+    const item = scope.resolve("Visible").?;
+    const type_id = try internStructType(db, item);
+    const factory = scope.resolve("Factory").?;
+    const argument = try db.intern(CompileTimeValues, .{ .type = .int });
+    const tuple = try db.intern(CompileTimeValueTuples, .{ .values = &.{argument} });
+    const resolved = (try db.get(ResolveItem, factory)).*.?;
+    const parsed = (try db.get(ParseFile, resolved.file_id)).*.?;
+    const generated_type = try internGeneratedStructType(db, .{
+        .owner = .{ .item = factory, .specialization = tuple },
+        .node_offset = semantic.parameterizedStructSite(&parsed, resolved.declaration).?,
+    });
+    for ([_]structures.FileId{ 0, 1, 2, 3 }) |file_id| {
+        const analysis: AnalysisContext(@TypeOf(db)) = .{ .ctx = db, .file_id = file_id };
+        try std.testing.expectEqual(file_id == 1 or file_id == 2, try analysis.canAccessPrivateFields(type_id));
+        try std.testing.expectEqual(file_id == 1 or file_id == 2, try analysis.canAccessPrivateFields(generated_type));
+    }
+    try std.testing.expect(!(try db.get(StructDefinition, item)).*.?.fields[0].is_public);
+    try db.setInput(SourceText, 1, "pub struct Visible\n  pub value: int\npub struct Factory(T: type)\n  value: T");
+    try std.testing.expect((try db.get(StructDefinition, item)).*.?.fields[0].is_public);
+}
+
+test "struct namespace reserves pub wrapped field names for qualified members" {
+    const query = @import("query/engine.zig");
+    const modules = @import("modules.zig");
+    const db = try query.Database.init(std.testing.allocator, .{ .worker_count = 1 });
+    defer db.deinit();
+    try modules.registerSources(db, std.testing.allocator, "struct Visible\n  pub value: int\nfunc Visible.value() int -> 42", &.{}, &.{});
+    const module = (try db.input(FileModule, 0)).*;
+    const item = (try db.get(ModuleDeclarations, module)).*.?.resolve("Visible").?;
+    const identity: structures.StructIdentity = .{ .declared = item };
+    try std.testing.expect((try db.get(StructNamespace, identity)).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(StructNamespace, identity, structures.Diagnostic, std.testing.allocator);
+    defer std.testing.allocator.free(diagnostics);
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try std.testing.expectEqual(structures.Diagnostic.Kind.duplicate_struct_member, diagnostics[0].kind);
+}

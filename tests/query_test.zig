@@ -3467,6 +3467,154 @@ test "struct value analysis tracks definition edits and recovers" {
     try expectCompiledFunctionResult(db, 1, "answer", &.{"answer"}, 42);
 }
 
+fn checkFieldVisibilityIncremental(generated: bool, initially_public: bool) !void {
+    const public_source = if (generated)
+        \\pub func Cell(static T: type) type
+        \\  return struct
+        \\    pub value: T
+        \\pub func make() Cell(int) -> Cell(int){value = 40}
+    else
+        \\pub struct Cell
+        \\  pub value: int
+        \\pub func make() Cell -> Cell{value = 40}
+    ;
+    const private_source = try std.mem.replaceOwned(u8, testing.allocator, public_source, "pub value", "value");
+    defer testing.allocator.free(private_source);
+    const source = try std.fmt.allocPrint(testing.allocator,
+        \\import library
+        \\static Selected = library.Cell{s}
+        \\func construct() int -> Selected{{value = 42}}.value
+        \\func read(item: Selected) int -> item.value
+        \\func write(mut item: Selected) int
+        \\  item.value += 2
+        \\  return item.value
+        \\func run() int
+        \\  var item = library.make()
+        \\  return construct() + read(item) + write(item) - 82
+        \\static answer = run()
+        \\exit(run() + answer - 42)
+    , .{if (generated) "(int)" else ""});
+    defer testing.allocator.free(source);
+    const db = try testDatabase(1);
+    defer db.deinit();
+    const library = try addModuleFile(db, 1, "library", if (initially_public) public_source else private_source);
+    const entry = try addModuleFile(db, 2, "", source);
+    try addModuleMembers(db, library, &.{1});
+    try addModuleMembers(db, entry, &.{2});
+    const scope = (try db.get(queries.BuildModuleScope, 2)).*.?;
+    const selected = scope.resolveStatic("Selected").?;
+    const answer = scope.resolveStatic("answer").?;
+    const selected_type = try resolvedStaticType(db, selected);
+
+    for ([_]bool{ initially_public, !initially_public, initially_public }, 0..) |is_public, index| {
+        if (index != 0) try setSource(db, 1, if (is_public) public_source else private_source);
+        try testing.expectEqual(selected_type, try resolvedStaticType(db, selected));
+        for ([_][]const u8{ "construct", "read", "write" }) |name| {
+            const instance: structures.InstanceId = .{ .item = scope.resolveFunction(name).? };
+            try testing.expectEqual(is_public, (try db.get(queries.AnalyzeFunctionInstance, instance)).* != null);
+            const diagnostics = try db.transitiveAccumulatorValues(queries.AnalyzeFunctionInstance, instance, structures.Diagnostic, testing.allocator);
+            defer freeDiagnostics(diagnostics);
+            try testing.expectEqual(@as(usize, if (is_public) 0 else 1), diagnostics.len);
+            if (!is_public) {
+                try testing.expectEqual(@as(structures.FileId, 2), diagnostics[0].file_id);
+                try testing.expectEqual(structures.Diagnostic.Kind{ .private_struct_field = selected_type }, diagnostics[0].kind);
+            }
+        }
+        try testing.expectEqual(is_public, (try db.get(queries.ResolveStatic, answer)).* != null);
+        try testing.expectEqual(is_public, (try db.get(queries.BuildExecutable, 2)).* != null);
+        if (is_public) {
+            try testing.expectEqual(@as(i32, 42), (try resolvedStaticValue(db, answer)).runtime.value.int);
+            try expectCompiledFunctionResult(db, 2, "run", &.{ "run", "construct", "read", "write" }, 42);
+        }
+    }
+}
+
+test "field visibility declared structs invalidate public private public foreign uses" {
+    try checkFieldVisibilityIncremental(false, true);
+}
+
+test "field visibility declared structs recover private public private foreign uses" {
+    try checkFieldVisibilityIncremental(false, false);
+}
+
+test "field visibility foreign generated specializations invalidate public private public uses" {
+    try checkFieldVisibilityIncremental(true, true);
+}
+
+test "field visibility foreign generated specializations recover private public private uses" {
+    try checkFieldVisibilityIncremental(true, false);
+}
+
+fn checkFieldVisibilityAnnotationEdits(generated: bool) !void {
+    const original = if (generated)
+        \\static Hidden = int
+        \\pub static Visible = int
+        \\pub func Cell(static T: type) type
+        \\  return struct
+        \\    value: Hidden
+        \\pub func make() Cell(int) -> Cell(int){value = 42}
+    else
+        \\static Hidden = int
+        \\pub static Visible = int
+        \\pub struct Cell
+        \\  value: Hidden
+        \\pub func make() Cell -> Cell{value = 42}
+    ;
+    const source = try std.fmt.allocPrint(testing.allocator,
+        \\import library
+        \\static Selected = library.Cell{s}
+        \\func run() int
+        \\  const item: Selected = library.make()
+        \\  return 42
+        \\static answer = run()
+        \\exit(run() + answer - 42)
+    , .{if (generated) "(int)" else ""});
+    defer testing.allocator.free(source);
+    const db = try testDatabase(1);
+    defer db.deinit();
+    const library = try addModuleFile(db, 1, "library", original);
+    const entry = try addModuleFile(db, 2, "", source);
+    try addModuleMembers(db, library, &.{1});
+    try addModuleMembers(db, entry, &.{2});
+    const answer = (try db.get(queries.BuildModuleScope, 2)).*.?.resolveStatic("answer").?;
+
+    for ([_]struct { field: []const u8, export_hidden: bool = false, accepted: bool }{
+        .{ .field = "value: Hidden", .accepted = true },
+        .{ .field = "pub value: Hidden", .accepted = false },
+        .{ .field = "pub value: Visible", .accepted = true },
+        .{ .field = "pub value: Hidden", .accepted = false },
+        .{ .field = "pub value: Hidden", .export_hidden = true, .accepted = true },
+        .{ .field = "pub value: Hidden", .accepted = false },
+        .{ .field = "value: Hidden", .accepted = true },
+    }) |edit| {
+        const annotation_edit = try std.mem.replaceOwned(u8, testing.allocator, original, "value: Hidden", edit.field);
+        defer testing.allocator.free(annotation_edit);
+        const changed = try std.mem.replaceOwned(u8, testing.allocator, annotation_edit, "static Hidden", if (edit.export_hidden) "pub static Hidden" else "static Hidden");
+        defer testing.allocator.free(changed);
+        try setSource(db, 1, changed);
+        try testing.expectEqual(edit.accepted, (try db.get(queries.BuildExecutable, 2)).* != null);
+        try testing.expectEqual(edit.accepted, (try db.get(queries.ResolveStatic, answer)).* != null);
+        const diagnostics = try db.transitiveAccumulatorValues(queries.BuildExecutable, 2, structures.Diagnostic, testing.allocator);
+        defer freeDiagnostics(diagnostics);
+        try testing.expectEqual(@as(usize, if (edit.accepted) 0 else 1), diagnostics.len);
+        if (edit.accepted) {
+            try testing.expectEqual(@as(i32, 42), (try resolvedStaticValue(db, answer)).runtime.value.int);
+            try expectCompiledFunctionResult(db, 2, "run", &.{"run"}, 42);
+        } else {
+            try testing.expectEqual(@as(structures.FileId, 1), diagnostics[0].file_id);
+            try testing.expectEqual(structures.Diagnostic.Kind.public_field_private_type, diagnostics[0].kind);
+        }
+    }
+}
+
+test "field visibility declared private annotations invalidate when exposed and recover after type edits" {
+    try checkFieldVisibilityAnnotationEdits(false);
+}
+
+test "field visibility generated private annotations invalidate when exposed and recover after type edits" {
+    try checkFieldVisibilityAnnotationEdits(true);
+}
+
 test "struct identity definitions and layouts recompute incrementally" {
     const db = try testDatabase(1);
     defer db.deinit();

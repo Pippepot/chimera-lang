@@ -554,10 +554,12 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
             try writer.writeAll("field access requires a struct value, found ");
             try writeType(types, writer, found);
         },
-        .opaque_struct_access => |type_id| {
-            try writer.writeAll("cannot construct or access fields of opaque storage owner ");
+        .private_struct_field => |type_id| {
+            try writer.writeAll("cannot name a private field of ");
             try writeType(types, writer, type_id);
+            try writer.writeAll(" outside its defining module");
         },
+        .public_field_private_type => try writer.writeAll("a public field's type cannot name a private declaration"),
         .unknown_field => try writeSourceLabel(writer, "unknown struct field", source, span),
         .duplicate_local_binding => {
             try writeSourceLabel(writer, "binding is already declared in this scope", source, span);

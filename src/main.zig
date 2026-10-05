@@ -886,7 +886,7 @@ test "missing field diagnostics use the struct definition's source file" {
     const outcome = try compileAndRun(std.testing.io, std.testing.allocator, .{
         .source_path = "/project/main.chi",
         .source = "import lib\nconst s = lib.S{}",
-        .source_files = &.{.{ .path = "lib/s.chi", .module_path = "lib", .source = "pub struct S\n  required: int" }},
+        .source_files = &.{.{ .path = "lib/s.chi", .module_path = "lib", .source = "pub struct S\n  pub required: int" }},
         .program_args = &.{},
         .debug_flags = .{},
         .started = std.Io.Clock.awake.now(std.testing.io),

@@ -1632,9 +1632,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
 
         fn constructFields(self: *Self, expression: Expression, type_id: structures.TypeId, storage: Value) !Value {
             const initializer = expression.operation.struct_init;
-            const definition = (try self.type_interner.structDefinition(type_id)) orelse
-                return self.reject(initializer.type_span, .{ .struct_initializer_not_struct = type_id });
-            if (!definition.accessible_fields) return self.reject(initializer.type_span, .{ .opaque_struct_access = type_id });
+            const definition = try self.structInitializerDefinition(initializer, type_id);
             const seen = try self.ctx.allocator().alloc(bool, definition.fields.len);
             defer self.ctx.allocator().free(seen);
             @memset(seen, false);
@@ -1642,8 +1640,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             defer fields.deinit(self.ctx.allocator());
             var reference_origins: ?u32 = null;
             for (self.unresolved.struct_field_values[initializer.fields.start..initializer.fields.end]) |source_field| {
-                const field = definition.resolveField(source_field.name) orelse
-                    return self.reject(source_field.name_span, .unknown_struct_field);
+                const field = definition.resolveField(source_field.name).?;
                 if (seen[field.index]) return self.reject(source_field.name_span, .duplicate_struct_initializer_field);
                 seen[field.index] = true;
                 const field_storage = try self.projectStorage(storage, field.type_id, .{ .field = field.index });
@@ -3149,9 +3146,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         fn prepareStructInit(self: *Self, expression: Expression, type_id: structures.TypeId) !StructInitResult {
             const initializer = expression.operation.struct_init;
             const source_fields = self.unresolved.struct_field_values[initializer.fields.start..initializer.fields.end];
-            const definition = (try self.type_interner.structDefinition(type_id)) orelse
-                return self.reject(initializer.type_span, .{ .struct_initializer_not_struct = type_id });
-            if (!definition.accessible_fields) return self.reject(initializer.type_span, .{ .opaque_struct_access = type_id });
+            const definition = try self.structInitializerDefinition(initializer, type_id);
             const seen = try self.ctx.allocator().alloc(bool, definition.fields.len);
             defer self.ctx.allocator().free(seen);
             @memset(seen, false);
@@ -3161,8 +3156,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             defer field_values.deinit(self.ctx.allocator());
             var reference_origins: ?u32 = null;
             for (source_fields) |source_field| {
-                const field = definition.resolveField(source_field.name) orelse
-                    return self.reject(source_field.name_span, .unknown_struct_field);
+                const field = definition.resolveField(source_field.name).?;
                 if (seen[field.index]) return self.reject(source_field.name_span, .duplicate_struct_initializer_field);
                 seen[field.index] = true;
                 const operand = try self.valueWithContext(source_field.value.value, .{ .expected_type = field.type_id, .access = .initialize });
@@ -3210,12 +3204,10 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                         const operand = try self.valueWithType(id, expected_type);
                         return if (operand.type_id == .never) .{ .diverged = operand } else .{ .type_id = operand.type_id };
                     }
+                    const definition = try self.structInitializerDefinition(initializer, type_id);
                     if (initializer.target == .concrete) {
-                        const definition = (try self.type_interner.structDefinition(type_id)) orelse
-                            return self.reject(initializer.type_span, .{ .struct_initializer_not_struct = type_id });
-                        if (!definition.accessible_fields) return self.reject(initializer.type_span, .{ .opaque_struct_access = type_id });
                         for (self.unresolved.struct_field_values[initializer.fields.start..initializer.fields.end]) |field| {
-                            const resolved_field = definition.resolveField(field.name) orelse return self.reject(field.name_span, .unknown_struct_field);
+                            const resolved_field = definition.resolveField(field.name).?;
                             const field_result = try self.inPlaceStructFieldType(field.value.value, resolved_field.type_id);
                             if (field_result == .diverged) return field_result;
                         }
@@ -4307,9 +4299,26 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         fn resolvePlaceField(self: *Self, parent_type: structures.TypeId, name: []const u8, parent_span: structures.SourceSpan, field_span: structures.SourceSpan) !PlaceField {
             const definition = (try self.type_interner.structDefinition(parent_type)) orelse
                 return self.reject(parent_span, .{ .field_access_not_struct = parent_type });
-            if (!definition.accessible_fields) return self.reject(field_span, .{ .opaque_struct_access = parent_type });
             const field = definition.resolveField(name) orelse return self.reject(field_span, .unknown_field);
+            if (!definition.fields[field.index].is_public and !try self.type_interner.canAccessPrivateFields(parent_type))
+                return self.reject(field_span, .{ .private_struct_field = parent_type });
             return .{ .index = field.index, .type_id = field.type_id, .name = name };
+        }
+
+        fn structInitializerDefinition(self: *Self, initializer: @FieldType(Expression.Operation, "struct_init"), type_id: structures.TypeId) !structures.StructDefinition {
+            const definition = (try self.type_interner.structDefinition(type_id)) orelse
+                return self.reject(initializer.type_span, .{ .struct_initializer_not_struct = type_id });
+            const private_access = try self.type_interner.canAccessPrivateFields(type_id);
+            for (self.unresolved.struct_field_values[initializer.fields.start..initializer.fields.end]) |source_field| {
+                const field = definition.resolveField(source_field.name) orelse
+                    return self.reject(source_field.name_span, .unknown_struct_field);
+                if (!definition.fields[field.index].is_public and !private_access)
+                    return self.reject(source_field.name_span, .{ .private_struct_field = type_id });
+            }
+            if (!private_access) for (definition.fields) |field| {
+                if (!field.is_public) return self.reject(initializer.type_span, .{ .private_struct_field = type_id });
+            };
+            return definition;
         }
 
         fn assignment(self: *Self, expression: Expression) !Value {

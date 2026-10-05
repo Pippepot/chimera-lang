@@ -1005,10 +1005,6 @@ test "invalid machine-code cache shapes are rejected" {
     try std.testing.expect(!validCompiledFunction(damaged));
 }
 
-test {
-    _ = @import("query_disk_cache_test.zig");
-}
-
 test "cached mutable result requires a matching producer" {
     var instructions = [_]structures.FunctionInstruction{
         .{ .const_int = 42 },

@@ -130,6 +130,21 @@ Implementation status and priorities are tracked in
 
 ## Ownership and layout
 
+- Struct definitions publish per-field visibility as a source fact. `AnalysisContext`
+	derives a struct's defining module from its declared identity or generated
+	factory identity and compares it with the accessing file's module; no separate
+	visibility query or caller-specific definition is cached. Existing semantic
+	name resolution validates public annotation references; computed annotations
+	use the ordinary expression builder and lexical scopes. Their compile-time
+	site keys retain the public-annotation policy so ordinary evaluated expressions
+	cannot bypass it. Called function bodies retain their own module authority.
+	Resolved nominal types are validated separately, including variants, callables,
+	and generated type arguments. Typing checks initializer
+	field names before field values and shares field projection validation across
+	reads, writes, borrows, moves, and callable fields. Layout, ownership operations,
+	codegen, and interpretation trust validated field indices and visit private
+	fields normally. Standard storage types use the same privacy rule; compiler
+	recognition remains tied to registered standard identities.
 - Declared and generated structs publish a common definition with fields and validated ownership hooks. `OwnershipCapabilities(TypeId)` validates logical by-value containment and composes move, copy, and drop facts without requesting physical layout. Layout consumes that validated fact before determining size, alignment, and field or variant placement. Direct movement is derived from these capabilities, not stored separately. `HostTypeLayout(TypeId)` describes the x86-64 host representation; a non-host layout must be derived for its target's location-specific layout domain, never inferred from host layout. [syntax&semantics.txt](syntax&semantics.txt) owns the provider, location, layout, and access contracts.
 - Typed borrowed places carry field-index paths, not byte offsets. Borrowing, consuming arguments, and receiver resolution share source-place traversal and field-name and visibility validation; codegen resolves physical offsets from the trusted path. Reference origins retain independent field, variant, and owned-element projections. Slot-storage identity is separate from the current contents' identity, including at loop joins.
 - Custom copy and move hooks may rearrange reference-bearing fields, so their results conservatively retain all possible source origins rather than assuming field correspondence. Hook effects invalidate writable referents, including during in-place copies. Call arguments retain the provenance of their prepared values, and indirect callees retain borrow metadata through argument evaluation.

@@ -797,6 +797,15 @@ fn parseStructValue(parser: *ParserState, token_index: u32) ParseError!Node.Inde
 
 fn parseStructItem(parser: *ParserState) ParseError!Node.Index {
     if ((try parseBinding(parser)).unwrap()) |binding| return binding;
+    if (parser.tokens[parser.index].tag == .keyword_pub and
+        parser.tokens[parser.index + 1].tag == .identifier and
+        parser.tokens[parser.index + 2].tag == .colon)
+    {
+        const token_index = parser.index;
+        parser.index += 1;
+        const field = try parseStructField(parser);
+        return parser.addNode(.{ .tag = .@"pub", .token_index = token_index, .data = .{ .node = field } });
+    }
     if (parser.tokens[parser.index].tag == .keyword_pub) return parsePublic(parser);
     if (parser.tokens[parser.index].tag == .keyword_func or parser.tokens[parser.index].tag == .keyword_fallible or parser.tokens[parser.index].tag == .keyword_struct) {
         return parseExpression(parser);
@@ -1396,6 +1405,24 @@ test "parse struct declaration" {
         \\  └─struct_field : y
         \\    └─type : float
     );
+}
+
+test "parse public declared and generated struct fields" {
+    for ([_][:0]const u8{
+        "struct S\n  pub x: int\n  y: int",
+        "static Factory = func(static T: type) type\n  return struct\n    pub x: T\n    y: int",
+    }) |source| {
+        var report = try parseReport(std.testing.allocator, 1, source);
+        defer report.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len);
+        const ast = &report.ast.?;
+        var public_fields: usize = 0;
+        for (ast.nodes) |node| {
+            if (node.tag == .@"pub" and ast.nodes[node.data.node.index()].tag == .struct_field)
+                public_fields += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 1), public_fields);
+    }
 }
 
 test "parse struct properties" {
@@ -2268,7 +2295,7 @@ test "diagnostic tag for malformed struct item" {
     , .{ .expected_token = .{ .expected = .colon, .found = .identifier } });
     try testExpectDiagnosticTag(
         \\static S = struct
-        \\  pub x: int
+        \\  pub x int
     , .{ .invalid_expression = .identifier });
 }
 

@@ -1,9 +1,11 @@
 const std = @import("std");
 
+pub const cache = @import("src/cache.zig");
 pub const codegen = @import("src/backend/codegen.zig");
 pub const modules = @import("src/modules.zig");
 pub const query = @import("src/query/engine.zig");
 pub const queries = @import("src/queries.zig");
+pub const query_disk_cache = @import("src/query_disk_cache.zig");
 pub const runtime = @import("src/runtime.zig");
 pub const structures = @import("src/structures.zig");
 
@@ -43,8 +45,8 @@ test "source templates substitute named dollar markers" {
 
 test {
     _ = @import("src/main.zig");
-    _ = @import("src/cache.zig");
-    _ = @import("src/query_disk_cache.zig");
+    _ = cache;
+    _ = query_disk_cache;
     _ = modules;
     _ = runtime;
     _ = @import("src/frontend/tokenizer.zig");
