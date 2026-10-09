@@ -36,12 +36,57 @@
 # Reordering is allowed only when unobservable.
 
 
+# Operation functions
+# An operation function is a type-namespace member with a compiler-specified
+# signature. Namespace visibility and ordinary call/specialization rules apply;
+# lookup uses the left operand's defining namespace, independently of imports.
+# No fallback to the right operand, conversion, or general function overloading
+# participates in selection. Operands evaluate once, left to right.
+# Comparisons and logical expressions produce bool values. A bool value or an
+# ordinary bool-returning call may be a condition; fallible calls retain their
+# success/failure condition semantics. and/or skip the right operand when the
+# left operand determines their result.
+# The complete current inventory is +, -, *, /, ==, <>, <, >, <=, >=, unary
+# negation and not, and read/write indexing. Unary arithmetic negation is named
+# neg, distinct from binary -. Parentheses do not change operator precedence.
+# For receiver type Self, the exact signatures are:
+# +, -, *, /: func (imm Self, imm Self) Self
+# ==, <>, <, >, <=, >=: func (imm Self, imm Self) bool
+# neg: func (imm Self) Self; not: func (imm Self) bool
+# []: func or fallible (imm Self, index: int) Result
+# []=: func or fallible (mut Self, index: int, init value: Element) unit
+# Inherited namespace static arguments and inferable static parameters use
+# ordinary specialization; they do not count as runtime operands or permit
+# extra runtime operands. Signature validation rejects mismatches even for
+# explicit calls and callable values: addition with three operands is invalid.
+# Arithmetic/comparison/unary operation functions cannot fail. Indexers may
+# fail; indexed expressions propagate ordinary failure in a fallible function
+# and can be handled by ordinary binding conditions. Writable indexing calls
+# []= rather than treating a by-value [] result as a writable place. A failed
+# bounds check skips the deferred replacement initializer. Ref[] still means
+# dereference, not indexing. User-defined indexers own their bounds policy.
+# Standard Array, List, Buffer, and BufferView reads return an ordinary copy of
+# the element and require its copy capability. Array, List, and Buffer writes
+# use checked reference replacement: elements must move directly, contain no
+# borrowed references, and permit automatic drop. Immovable elements still
+# construct in containers, but cannot use these copied-read/replacement APIs;
+# get/get_mut remain available for checked borrowed access. BufferView is read-only.
+# Assignment remains ownership-aware replacement; compound assignments combine
+# the corresponding binary operation and assignment. and/or remain short-
+# circuit control flow; is/as remain type membership/extraction. Transfer ^,
+# fallible call ?, field access, and initialization retain their dedicated
+# semantics and are not eager operation functions. Equality of compile-time
+# type metadata remains compiler identity comparison. Tokens with no language
+# semantics yet (such as remainder, bitwise operators, and shifts) are not added
+# by this contract. Later numeric types use the same operation signatures.
+
+
 # Numeric conversions (open)
-# Converters are infallible, so conversions between numeric runtime types that
-# wrap, truncate, round, saturate, or widen are named functions instead. Their
-# names, overflow and failure behavior, other numeric widths, and float literal
-# typing remain open. Existing variant widening and 'as' extraction do not
-# define numeric conversion behavior.
+# Ordinary value converters are infallible. Conversions between numeric runtime
+# types that wrap, truncate, round, saturate, or widen are named functions instead.
+# Their names, overflow and failure behavior, other numeric widths, and float
+# literal typing remain open. Existing variant widening and 'as' extraction do
+# not define numeric conversion behavior.
 
 
 # Structural tuples
@@ -330,7 +375,7 @@ func between(a: int, static T: type, value: T) T -> value
 const middle = between(1, 42)         # T is int
 
 # A function signature may end with one or more `where` clauses after its
-# return type and optional `from(...)` origin contract. Each clause contains
+# return type. Each clause contains
 # one fallible condition, on the signature line or on a following line at the
 # same indentation as the declaration. Clauses are checked in source order
 # when the function instance is specialized, before its body is used; they do
@@ -608,13 +653,21 @@ fallible forward_initializer(static T: type, init item: T) T
 # failure after a transfer does not undo it. A shared failure continuation may
 # therefore see the source as possibly consumed.
 #
-# Consuming any init parameter into a destination is potentially fallible,
-# including one supplied with a literal or an expression that cannot fail.
-# Failure must be handled at the construction site or propagated from a declared
-# fallible function. An ordinary func cannot acquire a hidden failure outcome.
-# Forwarding does not evaluate the expression; its call obeys the receiving
-# callable's declared fallibility. No initializer infallibility assertion or
-# additional parameter modifier is currently provided.
+# init describes deferred construction and ownership, not a promise of success
+# or a policy for allocation failure. An abstract init parameter is conservatively
+# allowed to fail. A concrete initializer's ordinary failure effect is determined
+# without evaluating it, from the operations it may execute, including nested
+# initializers and selected element conversions. Declared fallible operations
+# remain fallible; inspecting a particular callee body does not waive its contract.
+# A provably infallible initializer needs no ordinary failure handling merely
+# because it is deferred or consumed through init. Deferral and forwarding
+# preserve the supplied initializer's effect rather than introducing failure.
+# Possible ordinary failure must be handled at the construction site or propagated
+# from a declared fallible function. An ordinary func cannot acquire a hidden
+# failure outcome. A forwarding call still obeys the receiving callable's declared
+# fallibility; an infallible argument does not make a declared fallible call ordinary.
+# Keep one init mode, without separate infallible/fallible parameter modifiers.
+# Explicit type-level assertions of initializer infallibility remain unspecified.
 # Partial construction cleans up completed subobjects, with dependents before
 # owners and otherwise reverse initialization order. A completed nested object
 # receives its normal drop;
@@ -670,6 +723,10 @@ fallible forward_initializer(static T: type, init item: T) T
 # place cannot produce a writable Ref. Multiple writable handles may coexist:
 # there is no global exclusive mutable-borrow rule. Calls still reject a mut
 # argument overlapping any borrowed argument that might refer to it.
+# Mutable calls through writable aliases update the referent and conservatively
+# retain newly stored reference origins on its tracked local owners. A call
+# through a dereferenced alias cannot store borrowed handles when the referent's
+# owner is not tracked locally, such as through an external Ref parameter.
 # The pointee must remain initialized and its owner and storage valid for every
 # use, including use through copied or returned handles and aggregate fields.
 # A read-only Ref limits access through that handle; it does not freeze the
@@ -754,8 +811,9 @@ fallible forward_initializer(static T: type, init item: T) T
 # consumes an initializer into an uninitialized element slot using the general
 # destination rules. Allocation and index arguments evaluate eagerly; the value
 # expression is deferred until slot initialization. Allocation(T).unsafe_init
-# is also explicitly fallible. Every consumption must handle or propagate
-# failure, even for an expression that cannot actually fail. Failed construction
+# is also explicitly fallible. Calls obey these declared fallible signatures,
+# even when the supplied initializer is infallible; this does not make the
+# initializer itself fallible. Failed construction
 # cleans completed subobjects and leaves no initialized element; captured writes
 # and completed transfers are not rolled back.
 # Planned fallible unsafe_initialize_all(T, N, mut allocation, init value: collection_literal(T, N))
@@ -770,7 +828,7 @@ fallible forward_initializer(static T: type, init item: T) T
 # borrow. These operations require caller-proven bounds and initialization
 # state; destruction and borrowing also require the caller to prevent
 # conflicting aliases or invalidation during use. They are not safe initialized
-# access. Box and Ref are in std.prelude; raw allocation requires an explicit
+# access. Box, Ref, and List are in std.prelude; raw allocation requires an explicit
 # std.memory import. Ref(T, writable: bool) is a non-null, non-owning host
 # reference with a required static permission. Ref(T, false) is read-only;
 # Ref(T, true) permits writing the referent. Either handle can be copied
@@ -800,11 +858,7 @@ fallible forward_initializer(static T: type, init item: T) T
 # The borrow refers to the original storage. Replacing or transferring the root
 # or any of its fields invalidates the borrow, including changes to siblings.
 # A direct-passed parameter's storage belongs to the callee and cannot escape.
-# An optional `from(name, ...)` after a function's borrowed return type names
-# all parameters whose origins the result may retain. Every returned path must
-# derive only from these parameters; a contract may overapproximate the body.
-# A caller retains only the named origins. Without a contract, calls retain all
-# borrowed inputs conservatively. Contracts belong to callable type identity,
+# Contracts belong to callable type identity,
 # including callable values. A named `mut` parameter refers to the caller's
 # owner after copy-back, including a replacement made by the callee. On failure,
 # the caller still receives the updated owner but no borrowed return value.
@@ -851,10 +905,10 @@ fallible forward_initializer(static T: type, init item: T) T
 # retain the same backing-owner and storage-change dependencies.
 #
 # A returned or stored Ref depends on every owner it may refer to. The
-# result of a bodyless function without a `from(...)` contract conservatively
-# depends on every borrowed input; without a safe borrowed origin, returning
-# Ref is a compile error. A contract narrows these origins but must cover
-# every return path. Any returned or stored borrow whose origin the compiler
+# result of every function conservatively depends on all inputs capable of
+# supplying a borrowed origin. There is no explicit origin annotation to narrow
+# these dependencies. Without a safe borrowed origin, returning Ref is a compile
+# error. Any returned or stored borrow whose origin the compiler
 # cannot prove safe is also a compile error. Borrowed
 # access cannot outlive or overlap destruction of an owner or invalidation by
 # storage replacement. Current imm/mut call arguments alone do not establish
@@ -867,8 +921,7 @@ fallible forward_initializer(static T: type, init item: T) T
 # cannot return a Ref of an owned parameter's storage, a local binding, or a
 # temporary that ends with the call. A call returning a value containing Ref
 # conservatively retains the origins of every borrowed input or owned Ref
-# handle capable of supplying it unless a `from(...)` contract narrows them;
-# this includes calls without analyzed bodies and calls through callable values.
+# handle capable of supplying it
 # All possible origins must remain valid through each subsequent use. Rebinding
 # a local invalidates a borrow of its own storage even when its type has trivial
 # destruction. Moving an owner currently invalidates borrows made through that
@@ -1211,7 +1264,8 @@ reassigned = int_or_float_value
 
 
 # Converters
-# Converter support is planned; these rules do not describe an implemented API.
+# imm and static value converters and consuming collection init converters are
+# implemented. ROADMAP.md records implementation limits separately from these rules.
 # A converter declares an implicit conversion from a source type to a target
 # type. It has no name and is not called directly. Its signature has exactly one
 # value parameter, which receives the converted expression; every other
@@ -1220,10 +1274,20 @@ reassigned = int_or_float_value
 # parameter's mode follows its type: static for a compile-time-only type,
 # including static structs and int_literal, init for collection_literal, and
 # imm otherwise, so inserting a converter never consumes an existing value.
-# Converters are not fallible. An init converter must handle potentially failing
-# initialization locally; it cannot propagate failure or acquire a hidden
-# failure outcome. Type-level where proofs of initializer infallibility remain
-# deferred, rather than adding another init mode or parallel signatures.
+# Ordinary value converters are infallible. A consuming init converter may
+# propagate ordinary failure from its supplied initializer, with the required
+# partial-construction cleanup. This construction effect is separate from the
+# converter's own operations: the converter cannot introduce unrelated ordinary
+# failure, and must handle such failures locally. The implicit initialization
+# inherits the supplied initializer's actual effect; an abstract initializer
+# remains conservatively allowed to fail. A provably infallible initializer does
+# not make the conversion fallible merely because its parameter mode is init.
+# Failure is handled by the enclosing binding condition or propagated within a
+# declared fallible function; it never silently makes an ordinary func fallible.
+# Implicit conversion needs no explicit construction function or call marker.
+# Explicitly written fallible calls retain their ordinary marker requirements.
+# No general fallible converter declaration or additional init mode is introduced.
+# Allocation panic policy belongs to the consuming constructor, not to init.
 # Bodies, `where` clauses, and reference origins follow ordinary function rules.
 # A static source argument is evaluated at compile time; it does not require
 # the converter body to execute at compile time. A converter may construct a
@@ -1277,6 +1341,43 @@ const explicit = Radians(degrees)
 const read_only = Ref(int, false)(handle)
 
 
+# Inline arrays
+# Array(T, N), exported by std.prelude, stores N consecutive elements of T
+# inline without a separate allocation. N is a nonnegative static int.
+# Local arrays use local storage; fields and boxed arrays follow their owner's
+# storage. Results construct into the receiving destination. Element stride
+# and alignment are those of T; checked layout and function resource limits
+# still apply. Zero-length arrays have zero size and retain T's alignment.
+# Zero-sized elements still have logical identity and run ownership hooks.
+# Array identity includes T and N; it does not depend on constructor availability.
+#
+# Array(T, N).filled(imm value: T) is an ordinary, non-failing factory available
+# when T supports copying. The argument evaluates once, including when N is 0.
+# Each element is constructed in its final destination by one ordinary copy,
+# invoking custom copy hooks rather than copying their bytes. The source is not
+# consumed. There is no default constructor or assumption that zeroed memory
+# represents a T. A completed array always has all N elements initialized.
+#
+# Array move/copy/drop operate elementwise and require the corresponding
+# element capability; trivial elements permit trivial aggregate operations.
+# Empty arrays have trivial ownership, but filled still requires copyable T.
+# Explicit-drop elements impose explicit-drop obligations on nonempty arrays.
+# Arrays containing immovable elements cannot move directly. No operation in
+# this initial API consumes individual elements or exposes uninitialized slots.
+#
+# len(imm self) returns N. get(imm self, index: int) and get_mut(mut self,
+# index: int) are fallible and succeed only for 0 <= index < N. They return
+# Ref(T, false) and Ref(T, true), respectively, originating from self. Element
+# references cannot outlive, move with, or survive destruction of their array.
+# Replacing an element uses ordinary Ref replacement and cleanup rules.
+# Contained reference origins survive aggregate operations; dynamic element
+# effects may conservatively apply to the whole array. Native and compile-time
+# execution share this API and its checked-reference semantics.
+# Collection construction and iteration are specified separately below.
+var repeated = Array(int, 4).filled(7)
+const first = repeated.get?(0)
+
+
 # Collection literals
 # [a, b] has type collection_literal(T, N): pending construction of N elements
 # of type T, consumed only through init parameters, including converters. It
@@ -1291,14 +1392,44 @@ const read_only = Ref(int, false)(handle)
 # against T with its own conversion. Otherwise elements take their default types
 # and then join like conditional branches. Joining no elements does not produce
 # never, so [] requires an expected type that determines T. Without an expected
-# type, a collection literal will default to Array(T, N); until Array exists it
-# is an error.
+# type, a collection literal defaults to Array(T, N). The pending literal cannot
+# itself be bound or stored; an owning binding stores the completed collection.
+# Elements construct directly into their final destinations, without first
+# building and relocating an intermediate Array or requiring copyable elements.
+#
+# Collection construction has the ordinary failure effect of its elements,
+# including their initializers and conversions. For infallible element operations,
+# [1, 2, 3] is infallible construction and needs no binding condition or other
+# ordinary failure handling. An Array literal performs no separate allocation,
+# but may still fail when an element initializer fails. On ordinary failure,
+# first clean any partially constructed current element, then destroy the
+# completed element prefix in reverse initialization order. Do not evaluate
+# remaining elements. Captured writes and completed transfers are not rolled back.
+#
 # std: pub converter(static T: type, static N: int, init value: collection_literal(T, N)) List(T)
-# Local handling of allocation and initialization failure in this planned
-# infallible List converter remains to be specified before implementation.
+# List's consuming converter obtains the required storage before evaluating any
+# elements, then constructs them in place. Allocation failure in this convenient
+# implicit construction causes a runtime panic, not ordinary failure. Panic
+# terminates runtime execution and cannot be recovered through fallible control
+# flow; it is not a compiler invariant violation. This policy does not change
+# explicitly fallible allocation APIs, and recoverable allocation remains an
+# opt-in operation rather than a requirement at every literal use.
+# Ordinary element failure is not a panic: clean partial construction and the
+# completed prefix, release the List allocation, and propagate that failure.
+# The allocation panic policy therefore adds no ordinary failure effect to a
+# literal with infallible elements. No explicit function call is needed to
+# construct a List from a literal with a known expected type.
+# The explicit alternative List(T).from([elements]) is a fallible factory whose
+# static length is inferred from the literal. Allocation failure returns ordinary
+# failure before evaluating elements. Element failure remains ordinary failure
+# with the same reverse cleanup and allocation release. This explicitly fallible
+# API retains its declared call requirements even for infallible elements.
+const values: List(int) = [1, 2, 3] # ordinary initialization; allocation may panic
 const bytes: List(byte) = [1, 2] # T = byte; each element converts
 const numbers: List(int | float) = [1, 2.5]
-# Without an expected type, [1, 2.5] has type collection_literal(int | float, 2).
+const mixed = [1, 2.5] # defaults to Array(int | float, 2)
+if const parsed: List(int) = [parse_number?(text), 42] -> use(parsed)
+else -> handle_failure() # ordinary element failure, not allocation panic
 
 
 # Fallibility
@@ -1351,8 +1482,10 @@ if const x = foo() -> use(x) # no `?`: the binding condition requires a fallible
 # Bare fail is a statement that propagates ordinary failure with no value.
 # It is permitted only in a fallible enclosing function or initializer region,
 # including after explicit cleanup. It is not an expression or a separate
-# nonlocal outcome. Initializer regions are always fallible; ordinary function
-# and call fallibility comes solely from the declared signature.
+# nonlocal outcome. Initializer regions permit failure, but being a region does
+# not itself add an ordinary failure effect. A possible fail contributes that
+# effect to the initializer. Functions retain their declared fallibility; implicit
+# init conversion additionally preserves its supplied initializer's effect.
 fallible reject()
     fail
 

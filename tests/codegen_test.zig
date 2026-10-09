@@ -3,13 +3,13 @@ const test_sources = @import("test_sources");
 const codegen = test_sources.codegen;
 const runtime = test_sources.runtime;
 const structures = test_sources.structures;
-var allocation_failure_backing: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+const allocation_failure_allocator = test_sources.allocation_failure_allocator;
 
-const small_variant = structures.TypeId.fromInterned(@enumFromInt(0));
-const wide_variant = structures.TypeId.fromInterned(@enumFromInt(1));
-const seven_byte_payload = structures.TypeId.fromInterned(@enumFromInt(2));
-const payload_variant = structures.TypeId.fromInterned(@enumFromInt(3));
-const callable_type = structures.TypeId.fromInterned(@enumFromInt(4));
+const small_variant = structures.TypeId.fromInterned(@fromBackingInt(@intCast(0)));
+const wide_variant = structures.TypeId.fromInterned(@fromBackingInt(@intCast(1)));
+const seven_byte_payload = structures.TypeId.fromInterned(@fromBackingInt(@intCast(2)));
+const payload_variant = structures.TypeId.fromInterned(@fromBackingInt(@intCast(3)));
+const callable_type = structures.TypeId.fromInterned(@fromBackingInt(@intCast(4)));
 
 const TestTypes = struct {
     pub fn facts(self: @This()) @This() {
@@ -36,6 +36,10 @@ const TestTypes = struct {
     }
 
     pub fn structDefinition(_: @This(), _: structures.TypeId) !?structures.StructDefinition {
+        return null;
+    }
+
+    pub fn arrayType(_: @This(), _: structures.TypeId) !?structures.ArrayType {
         return null;
     }
 
@@ -75,15 +79,15 @@ fn directCall(target: structures.InstanceId) structures.FunctionBodyAnalysis.Ins
 }
 
 fn integerNegate(operand: u32) structures.FunctionBodyAnalysis.Instruction {
-    return .{ .negi = @enumFromInt(operand) };
+    return .{ .negi = @fromBackingInt(@intCast(operand)) };
 }
 
 const IntegerBinaryOperation = enum { add, subtract, multiply, divide_signed };
 
 fn integerBinary(operation: IntegerBinaryOperation, lhs: u32, rhs: u32) structures.FunctionBodyAnalysis.Instruction {
     const operands: structures.BinaryOperands = .{
-        .lhs = @enumFromInt(lhs),
-        .rhs = @enumFromInt(rhs),
+        .lhs = @fromBackingInt(@intCast(lhs)),
+        .rhs = @fromBackingInt(@intCast(rhs)),
     };
     return switch (operation) {
         .add => .{ .addi = operands },
@@ -110,8 +114,215 @@ fn functionSsa(
         .call_arguments = &.{},
         .instructions = instructions,
         .blocks = blocks,
-        .entry = @enumFromInt(0),
+        .entry = @fromBackingInt(@intCast(0)),
     };
+}
+
+const array_copy_type = structures.TypeId.fromInterned(@fromBackingInt(@intCast(5)));
+const array_wrapper_type = structures.TypeId.fromInterned(@fromBackingInt(@intCast(6)));
+const array_reference_type = structures.TypeId.fromInterned(@fromBackingInt(@intCast(7)));
+const reference_reference_type = structures.TypeId.fromInterned(@fromBackingInt(@intCast(8)));
+
+const ArrayCopyTypes = struct {
+    array_length: u32 = 1024,
+    field_offsets: [2]u32 = .{ 0, 4 },
+
+    pub fn facts(self: *@This()) *@This() {
+        return self;
+    }
+
+    pub fn layout(self: *@This(), type_id: structures.TypeId) !structures.TypeLayout {
+        if (type_id == array_copy_type) return .{ .byte_size = self.array_length * 4, .byte_alignment = 4 };
+        if (type_id == array_wrapper_type) return .{ .byte_size = self.array_length * 4 + 4, .byte_alignment = 4 };
+        if (type_id == array_reference_type or type_id == reference_reference_type) return .{ .byte_size = 8, .byte_alignment = 8 };
+        return (TestTypes{}).layout(type_id);
+    }
+
+    pub fn structLayout(self: *@This(), type_id: structures.TypeId) !?structures.StructLayout {
+        return if (type_id == array_wrapper_type)
+            .{ .layout = try self.layout(type_id), .field_offsets = &self.field_offsets }
+        else
+            null;
+    }
+
+    pub fn structDefinition(_: *@This(), _: structures.TypeId) !?structures.StructDefinition {
+        return null;
+    }
+
+    pub fn arrayType(self: *@This(), type_id: structures.TypeId) !?structures.ArrayType {
+        return if (type_id == array_copy_type) .{ .element_type = .int, .length = self.array_length } else null;
+    }
+
+    pub fn borrowElement(_: *@This(), type_id: structures.TypeId) !?structures.TypeId {
+        if (type_id == array_reference_type) return array_copy_type;
+        if (type_id == reference_reference_type) return array_reference_type;
+        return null;
+    }
+
+    pub fn argumentPassing(_: *@This(), type_id: structures.TypeId) !structures.ArgumentPassing {
+        return if (type_id == array_copy_type or type_id == array_wrapper_type) .indirect else .direct;
+    }
+
+    pub fn variantMembers(_: *@This(), type_id: structures.TypeId) !?[]const structures.TypeId {
+        return (TestTypes{}).variantMembers(type_id);
+    }
+
+    pub fn variantLayout(_: *@This(), type_id: structures.TypeId) !structures.VariantLayout {
+        return (TestTypes{}).variantLayout(type_id);
+    }
+
+    pub fn callable(_: *@This(), type_id: structures.TypeId) !?structures.CallableType {
+        return (TestTypes{}).callable(type_id);
+    }
+};
+
+fn expectArtifactExitCode(artifact: structures.CompiledFunction, expected: u8) !void {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const entry: structures.InstanceId = .{ .item = @fromBackingInt(@intCast(0)) };
+    const exit_function: structures.InstanceId = .{ .item = @fromBackingInt(@intCast(1)) };
+    var exit_artifact = try codegen.compileExternalExit(allocator);
+    defer exit_artifact.deinit(allocator);
+    const functions = [_]codegen.ReachableFunction{
+        .{ .instance = entry, .artifact = artifact },
+        .{ .instance = exit_function, .artifact = exit_artifact },
+    };
+    var executable = try codegen.buildExecutable(entry, &functions, allocator);
+    defer executable.deinit(allocator);
+    try runtime.writeProgram(io, executable.bytes);
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    try std.testing.expectEqual(expected, try runtime.runProg(io, allocator, &.{}));
+}
+
+test "native array projections scale runtime indices and large copies remain bounded" {
+    for ([_]u32{ 65, 1024 }) |array_length| {
+        var types: ArrayCopyTypes = .{ .array_length = array_length };
+        var modes = [_]structures.ParameterMode{.imm};
+        var arguments = [_]structures.FunctionBlockArgument{.{ .type_id = .int }};
+        var instructions = [_]structures.FunctionInstruction{
+            .{ .local_storage = array_copy_type },
+            .{ .local_storage = array_copy_type },
+            .{ .value_copy = .{ .source = @fromBackingInt(@intCast(1)), .destination = @fromBackingInt(@intCast(2)), .type_id = array_copy_type } },
+            .{ .array_element = .{ .array = @fromBackingInt(@intCast(2)), .index = @fromBackingInt(@intCast(0)), .type_id = .int } },
+            .{ .value_copy = .{ .source = @fromBackingInt(@intCast(4)), .type_id = .int } },
+        };
+        var blocks = [_]structures.FunctionBlock{.{
+            .argument_end = 1,
+            .instruction_start = 0,
+            .instruction_end = instructions.len,
+            .terminator = .{ .return_value = .{ .value = @fromBackingInt(@intCast(5)) } },
+        }};
+        var body = functionSsa(&instructions, &blocks);
+        body.parameter_modes = &modes;
+        body.block_arguments = &arguments;
+        var artifact = try codegen.compileFunction(&body, &types, std.testing.allocator);
+        defer artifact.deinit(std.testing.allocator);
+        try std.testing.expect(artifact.code.len < 256);
+        try std.testing.expect(std.mem.indexOf(u8, artifact.code, &.{ 0xf3, 0xa4 }) != null);
+        try std.testing.expect(std.mem.indexOf(u8, artifact.code, &.{ 0x48, 0x69, 0xc9, 4, 0, 0, 0 }) != null);
+    }
+}
+
+test "large struct wrapping array copies remain bounded and preserve field offsets" {
+    const exit_function: structures.InstanceId = .{ .item = @fromBackingInt(@intCast(1)) };
+    var previous_code_size: ?usize = null;
+    for ([_]u32{ 65, 1024 }) |array_length| {
+        var types: ArrayCopyTypes = .{ .array_length = array_length };
+        var instructions = [_]structures.FunctionInstruction{
+            .{ .local_storage = array_copy_type },
+            integerConstant(11),
+            integerConstant(31),
+            integerConstant(7),
+            integerConstant(0),
+            integerConstant(@intCast(array_length - 1)),
+            .{ .array_element = .{ .array = @fromBackingInt(@intCast(0)), .index = @fromBackingInt(@intCast(4)), .type_id = .int } },
+            .{ .value_copy = .{ .source = @fromBackingInt(@intCast(1)), .destination = @fromBackingInt(@intCast(6)), .type_id = .int } },
+            .{ .array_element = .{ .array = @fromBackingInt(@intCast(0)), .index = @fromBackingInt(@intCast(5)), .type_id = .int } },
+            .{ .value_copy = .{ .source = @fromBackingInt(@intCast(2)), .destination = @fromBackingInt(@intCast(8)), .type_id = .int } },
+            .{ .struct_init = .{ .fields = .{ .start = 0, .end = 2 }, .type_id = array_wrapper_type } },
+            .{ .value_copy = .{ .source = @fromBackingInt(@intCast(10)), .type_id = array_wrapper_type } },
+            .{ .field_access = .{ .operand = @fromBackingInt(@intCast(11)), .field_index = 1, .field_type = array_copy_type } },
+            .{ .array_element = .{ .array = @fromBackingInt(@intCast(12)), .index = @fromBackingInt(@intCast(4)), .type_id = .int } },
+            .{ .value_copy = .{ .source = @fromBackingInt(@intCast(13)), .type_id = .int } },
+            .{ .array_element = .{ .array = @fromBackingInt(@intCast(12)), .index = @fromBackingInt(@intCast(5)), .type_id = .int } },
+            .{ .value_copy = .{ .source = @fromBackingInt(@intCast(15)), .type_id = .int } },
+            .{ .field_access = .{ .operand = @fromBackingInt(@intCast(11)), .field_index = 0, .field_type = .int } },
+            integerBinary(.add, 14, 16),
+            integerBinary(.add, 18, 17),
+            .{ .call = .{ .target = .{ .direct = exit_function }, .arguments = .{ .start = 0, .end = 1 }, .return_type = .never } },
+        };
+        var fields = [_]structures.StructFieldValue{
+            .{ .field_index = 0, .value = @fromBackingInt(@intCast(3)) },
+            .{ .field_index = 1, .value = @fromBackingInt(@intCast(0)) },
+        };
+        var call_arguments = [_]structures.FunctionCallArgument{.{ .prepared = .{ .value = @fromBackingInt(@intCast(19)) } }};
+        var blocks = [_]structures.FunctionBlock{.{
+            .instruction_start = 0,
+            .instruction_end = instructions.len,
+            .terminator = .diverge,
+        }};
+        var body = functionSsa(&instructions, &blocks);
+        body.struct_field_values = &fields;
+        body.call_arguments = &call_arguments;
+        var artifact = try codegen.compileFunction(&body, &types, std.testing.allocator);
+        defer artifact.deinit(std.testing.allocator);
+        try std.testing.expect(artifact.code.len < 1024);
+        try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, artifact.code, &.{ 0xf3, 0xa4 }));
+        if (previous_code_size) |expected_size| try std.testing.expectEqual(expected_size, artifact.code.len);
+        previous_code_size = artifact.code.len;
+        try expectArtifactExitCode(artifact, 49);
+    }
+}
+
+test "borrowed writes preserve indirect storage and pointer-valued addresses" {
+    const exit_function: structures.InstanceId = .{ .item = @fromBackingInt(@intCast(1)) };
+    for ([_]u32{ 3, 64, 65, 1024 }) |array_length| {
+        var types: ArrayCopyTypes = .{ .array_length = array_length };
+        var instructions = [_]structures.FunctionInstruction{
+            .{ .local_storage = array_copy_type },
+            .{ .local_storage = array_copy_type },
+            integerConstant(11),
+            integerConstant(31),
+            integerConstant(0),
+            integerConstant(@intCast(array_length - 1)),
+            .{ .array_element = .{ .array = @fromBackingInt(@intCast(0)), .index = @fromBackingInt(@intCast(4)), .type_id = .int } },
+            .{ .value_copy = .{ .source = @fromBackingInt(@intCast(2)), .destination = @fromBackingInt(@intCast(6)), .type_id = .int } },
+            .{ .array_element = .{ .array = @fromBackingInt(@intCast(0)), .index = @fromBackingInt(@intCast(5)), .type_id = .int } },
+            .{ .value_copy = .{ .source = @fromBackingInt(@intCast(3)), .destination = @fromBackingInt(@intCast(8)), .type_id = .int } },
+            .{ .borrow_address = .{ .source = @fromBackingInt(@intCast(0)), .type_id = array_reference_type } },
+            .{ .borrow_read = .{ .source = @fromBackingInt(@intCast(10)), .type_id = array_copy_type } },
+            .{ .borrow_address = .{ .source = @fromBackingInt(@intCast(1)), .type_id = array_reference_type } },
+            .{ .borrow_write = .{ .reference = @fromBackingInt(@intCast(12)), .value = @fromBackingInt(@intCast(11)), .type_id = array_copy_type } },
+            .{ .array_element = .{ .array = @fromBackingInt(@intCast(1)), .index = @fromBackingInt(@intCast(4)), .type_id = .int } },
+            .{ .value_copy = .{ .source = @fromBackingInt(@intCast(14)), .type_id = .int } },
+            .{ .borrow_address = .{ .source = @fromBackingInt(@intCast(12)), .type_id = reference_reference_type } },
+            .{ .borrow_read = .{ .source = @fromBackingInt(@intCast(16)), .type_id = array_reference_type } },
+            integerConstant(17),
+            .{ .value_copy = .{ .source = @fromBackingInt(@intCast(18)), .destination = @fromBackingInt(@intCast(6)), .type_id = .int } },
+            .{ .borrow_write = .{ .reference = @fromBackingInt(@intCast(17)), .value = @fromBackingInt(@intCast(11)), .type_id = array_copy_type } },
+            .{ .array_element = .{ .array = @fromBackingInt(@intCast(1)), .index = @fromBackingInt(@intCast(4)), .type_id = .int } },
+            .{ .value_copy = .{ .source = @fromBackingInt(@intCast(21)), .type_id = .int } },
+            .{ .array_element = .{ .array = @fromBackingInt(@intCast(1)), .index = @fromBackingInt(@intCast(5)), .type_id = .int } },
+            .{ .value_copy = .{ .source = @fromBackingInt(@intCast(23)), .type_id = .int } },
+            integerBinary(.add, 15, 22),
+            integerBinary(.add, 25, 24),
+            .{ .call = .{ .target = .{ .direct = exit_function }, .arguments = .{ .start = 0, .end = 1 }, .return_type = .never } },
+        };
+        var call_arguments = [_]structures.FunctionCallArgument{.{ .prepared = .{ .value = @fromBackingInt(@intCast(26)) } }};
+        var blocks = [_]structures.FunctionBlock{.{
+            .instruction_start = 0,
+            .instruction_end = instructions.len,
+            .terminator = .diverge,
+        }};
+        var body = functionSsa(&instructions, &blocks);
+        body.call_arguments = &call_arguments;
+        var artifact = try codegen.compileFunction(&body, &types, std.testing.allocator);
+        defer artifact.deinit(std.testing.allocator);
+        const large_copy = array_length > 64;
+        try std.testing.expectEqual(@as(usize, if (large_copy) 2 else 0), std.mem.count(u8, artifact.code, &.{ 0xf3, 0xa4 }));
+        if (large_copy) try std.testing.expect(artifact.code.len < 1024);
+        try expectArtifactExitCode(artifact, 59);
+    }
 }
 
 test "divergence traps before a following block can execute" {
@@ -138,7 +349,7 @@ test "single aligned function artifact builds and runs without borrowing code" {
         var artifact = try codegen.compileFunction(&ssa, TestTypes{}, std.testing.allocator);
         defer artifact.deinit(std.testing.allocator);
         artifact.required_alignment = 16;
-        const entry: structures.InstanceId = .{ .item = @enumFromInt(0) };
+        const entry: structures.InstanceId = .{ .item = @fromBackingInt(@intCast(0)) };
         const functions = [_]codegen.ReachableFunction{.{ .instance = entry, .artifact = artifact }};
         break :blk try codegen.buildExecutable(entry, &functions, std.testing.allocator);
     };
@@ -156,18 +367,18 @@ test "single aligned function artifact builds and runs without borrowing code" {
 test "storage joins keep the source address for directly movable values" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const exit_function: structures.InstanceId = .{ .item = @enumFromInt(1) };
+    const exit_function: structures.InstanceId = .{ .item = @fromBackingInt(@intCast(1)) };
     var arguments = [_]structures.FunctionBlockArgument{.{ .type_id = .int, .representation = .storage }};
-    var uses = [_]structures.FunctionValueUse{.{ .value = @enumFromInt(1) }};
-    var call_arguments = [_]structures.FunctionCallArgument{.{ .prepared = .{ .value = @enumFromInt(1) } }};
+    var uses = [_]structures.FunctionValueUse{.{ .value = @fromBackingInt(@intCast(1)) }};
+    var call_arguments = [_]structures.FunctionCallArgument{.{ .prepared = .{ .value = @fromBackingInt(@intCast(1)) } }};
     var instructions = [_]structures.FunctionInstruction{
         integerConstant(10),
         integerConstant(42),
-        .{ .value_copy = .{ .source = @enumFromInt(2), .type_id = .int, .destination = @enumFromInt(0) } },
+        .{ .value_copy = .{ .source = @fromBackingInt(@intCast(2)), .type_id = .int, .destination = @fromBackingInt(@intCast(0)) } },
         .{ .call = .{ .target = .{ .direct = exit_function }, .arguments = .{ .start = 0, .end = 1 }, .return_type = .never } },
     };
     var blocks = [_]structures.FunctionBlock{
-        .{ .instruction_start = 0, .instruction_end = 1, .terminator = .{ .branch = .{ .target = @enumFromInt(1), .arguments = .{ .start = 0, .end = 1 } } } },
+        .{ .instruction_start = 0, .instruction_end = 1, .terminator = .{ .branch = .{ .target = @fromBackingInt(@intCast(1)), .arguments = .{ .start = 0, .end = 1 } } } },
         .{ .argument_start = 0, .argument_end = 1, .instruction_start = 1, .instruction_end = 4, .terminator = .diverge },
     };
     var body = functionSsa(&instructions, &blocks);
@@ -178,7 +389,7 @@ test "storage joins keep the source address for directly movable values" {
     defer artifact.deinit(allocator);
     var exit_artifact = try codegen.compileExternalExit(allocator);
     defer exit_artifact.deinit(allocator);
-    const entry: structures.InstanceId = .{ .item = @enumFromInt(0) };
+    const entry: structures.InstanceId = .{ .item = @fromBackingInt(@intCast(0)) };
     const functions = [_]codegen.ReachableFunction{
         .{ .instance = entry, .artifact = artifact },
         .{ .instance = exit_function, .artifact = exit_artifact },
@@ -198,7 +409,7 @@ test "ordinary function artifacts encode signed 32-bit literal returns" {
         var blocks = [_]structures.FunctionBodyAnalysis.Block{.{
             .instruction_start = 0,
             .instruction_end = 1,
-            .terminator = .{ .return_value = .{ .value = @enumFromInt(0) } },
+            .terminator = .{ .return_value = .{ .value = @fromBackingInt(@intCast(0)) } },
         }};
         const ssa = functionSsa(&instructions, &blocks);
         var artifact = try codegen.compileFunction(&ssa, TestTypes{}, std.testing.allocator);
@@ -228,7 +439,7 @@ test "external exit artifact reads its argument from the call stack" {
 }
 
 test "direct call artifacts own exact relocation metadata" {
-    const target: structures.InstanceId = .{ .item = @enumFromInt(0xdeadbeef) };
+    const target: structures.InstanceId = .{ .item = @fromBackingInt(@intCast(0xdeadbeef)) };
     var instructions = [_]structures.FunctionBodyAnalysis.Instruction{
         directCall(target),
     };
@@ -251,7 +462,7 @@ test "direct call artifacts own exact relocation metadata" {
     try std.testing.expect(first.referenced_instances.ptr != second.referenced_instances.ptr);
     try std.testing.expect(structures.CompiledFunction.eql(first, second));
 
-    instructions[0] = directCall(.{ .item = @enumFromInt(1) });
+    instructions[0] = directCall(.{ .item = @fromBackingInt(@intCast(1)) });
     var different_target = try codegen.compileFunction(&ssa, TestTypes{}, std.testing.allocator);
     defer different_target.deinit(std.testing.allocator);
     try std.testing.expectEqualSlices(u8, first.code, different_target.code);
@@ -260,11 +471,11 @@ test "direct call artifacts own exact relocation metadata" {
 }
 
 test "function references relocate absolute addresses for indirect calls" {
-    const target: structures.InstanceId = .{ .item = @enumFromInt(0xabcdef01) };
+    const target: structures.InstanceId = .{ .item = @fromBackingInt(@intCast(0xabcdef01)) };
     var instructions = [_]structures.FunctionBodyAnalysis.Instruction{
         .{ .function_ref = .{ .target = target.item, .type_id = callable_type } },
         .{ .call = .{
-            .target = .{ .indirect = @enumFromInt(0) },
+            .target = .{ .indirect = @fromBackingInt(@intCast(0)) },
             .arguments = .{ .start = 0, .end = 0 },
             .return_type = .int,
         } },
@@ -272,7 +483,7 @@ test "function references relocate absolute addresses for indirect calls" {
     var blocks = [_]structures.FunctionBodyAnalysis.Block{.{
         .instruction_start = 0,
         .instruction_end = instructions.len,
-        .terminator = .{ .return_value = .{ .value = @enumFromInt(1) } },
+        .terminator = .{ .return_value = .{ .value = @fromBackingInt(@intCast(1)) } },
     }};
     const ssa: structures.FunctionBodyAnalysis = .{
         .return_type = .int,
@@ -282,7 +493,7 @@ test "function references relocate absolute addresses for indirect calls" {
         .call_arguments = &.{},
         .instructions = &instructions,
         .blocks = &blocks,
-        .entry = @enumFromInt(0),
+        .entry = @fromBackingInt(@intCast(0)),
     };
 
     var artifact = try codegen.compileFunction(&ssa, TestTypes{}, std.testing.allocator);
@@ -300,13 +511,13 @@ fn expectDirectCallArtifact(artifact: structures.CompiledFunction, target: struc
     try std.testing.expectEqual(@as(usize, 1), artifact.relocations.len);
     try std.testing.expectEqual(@as(u32, 1), artifact.relocations[0].offset);
     try std.testing.expectEqual(structures.CompiledFunction.RelocationKind.call_relative_32, artifact.relocations[0].kind);
-    try std.testing.expectEqual(@as(u32, 0), @intFromEnum(artifact.relocations[0].reference));
+    try std.testing.expectEqual(@as(u32, 0), @backingInt(artifact.relocations[0].reference));
     try std.testing.expectEqual(@as(i64, 0), artifact.relocations[0].addend);
     try std.testing.expectEqualSlices(structures.InstanceId, &.{target}, artifact.referenced_instances);
 }
 
 test "multiple calls produce ordered relocations and deduplicate references" {
-    const target: structures.InstanceId = .{ .item = @enumFromInt(7) };
+    const target: structures.InstanceId = .{ .item = @fromBackingInt(@intCast(7)) };
     var instructions = [_]structures.FunctionBodyAnalysis.Instruction{
         directCall(target),
         directCall(target),
@@ -315,7 +526,7 @@ test "multiple calls produce ordered relocations and deduplicate references" {
     var blocks = [_]structures.FunctionBodyAnalysis.Block{.{
         .instruction_start = 0,
         .instruction_end = instructions.len,
-        .terminator = .{ .return_value = .{ .value = @enumFromInt(2) } },
+        .terminator = .{ .return_value = .{ .value = @fromBackingInt(@intCast(2)) } },
     }};
     const ssa = functionSsa(&instructions, &blocks);
 
@@ -332,15 +543,15 @@ test "multiple calls produce ordered relocations and deduplicate references" {
     try std.testing.expectEqual(@as(usize, 2), artifact.relocations.len);
     try std.testing.expectEqual(@as(u32, 1), artifact.relocations[0].offset);
     try std.testing.expectEqual(@as(u32, 6), artifact.relocations[1].offset);
-    try std.testing.expectEqual(@intFromEnum(artifact.relocations[0].reference), @intFromEnum(artifact.relocations[1].reference));
+    try std.testing.expectEqual(@backingInt(artifact.relocations[0].reference), @backingInt(artifact.relocations[1].reference));
     try std.testing.expectEqualSlices(structures.InstanceId, &.{target}, artifact.referenced_instances);
 }
 
 test "typed expression values survive calls and execute every integer arithmetic operator" {
-    const entry_id: structures.InstanceId = .{ .item = @enumFromInt(3) };
-    const expression_id: structures.InstanceId = .{ .item = @enumFromInt(2) };
-    const left_id: structures.InstanceId = .{ .item = @enumFromInt(1) };
-    const right_id: structures.InstanceId = .{ .item = @enumFromInt(0) };
+    const entry_id: structures.InstanceId = .{ .item = @fromBackingInt(@intCast(3)) };
+    const expression_id: structures.InstanceId = .{ .item = @fromBackingInt(@intCast(2)) };
+    const left_id: structures.InstanceId = .{ .item = @fromBackingInt(@intCast(1)) };
+    const right_id: structures.InstanceId = .{ .item = @fromBackingInt(@intCast(0)) };
     var instructions = [_]structures.FunctionBodyAnalysis.Instruction{
         directCall(left_id),
         directCall(right_id),
@@ -357,7 +568,7 @@ test "typed expression values survive calls and execute every integer arithmetic
     var blocks = [_]structures.FunctionBodyAnalysis.Block{.{
         .instruction_start = 0,
         .instruction_end = instructions.len,
-        .terminator = .{ .return_value = .{ .value = @enumFromInt(10) } },
+        .terminator = .{ .return_value = .{ .value = @fromBackingInt(@intCast(10)) } },
     }};
     const ssa = functionSsa(&instructions, &blocks);
     var expression = try codegen.compileFunction(&ssa, TestTypes{}, std.testing.allocator);
@@ -371,7 +582,7 @@ test "typed expression values survive calls and execute every integer arithmetic
     const entry_relocations = [_]structures.CompiledFunction.Relocation{.{
         .offset = 1,
         .kind = .call_relative_32,
-        .reference = @enumFromInt(0),
+        .reference = @fromBackingInt(@intCast(0)),
         .addend = 0,
     }};
     const entry_references = [_]structures.InstanceId{expression_id};
@@ -412,11 +623,11 @@ test "cyclic CFG accepts multi-value parallel backedge copies" {
     var block_arguments = [_]structures.FunctionBlockArgument{ .{ .type_id = .int }, .{ .type_id = .int }, .{ .type_id = .int }, .{ .type_id = .int }, .{ .type_id = .int } };
     var parameter_modes = [_]structures.ParameterMode{ .imm, .imm };
     var branch_arguments = [_]structures.FunctionValueUse{
-        .{ .value = @enumFromInt(0) },
-        .{ .value = @enumFromInt(1) },
-        .{ .value = @enumFromInt(3) },
-        .{ .value = @enumFromInt(2) },
-        .{ .value = @enumFromInt(2) },
+        .{ .value = @fromBackingInt(@intCast(0)) },
+        .{ .value = @fromBackingInt(@intCast(1)) },
+        .{ .value = @fromBackingInt(@intCast(3)) },
+        .{ .value = @fromBackingInt(@intCast(2)) },
+        .{ .value = @fromBackingInt(@intCast(2)) },
     };
     var instructions = [_]structures.FunctionBodyAnalysis.Instruction{integerConstant(0)};
     var blocks = [_]structures.FunctionBodyAnalysis.Block{
@@ -425,7 +636,7 @@ test "cyclic CFG accepts multi-value parallel backedge copies" {
             .argument_end = 2,
             .instruction_start = 0,
             .instruction_end = 0,
-            .terminator = .{ .branch = .{ .target = @enumFromInt(1), .arguments = .{ .start = 0, .end = 2 } } },
+            .terminator = .{ .branch = .{ .target = @fromBackingInt(@intCast(1)), .arguments = .{ .start = 0, .end = 2 } } },
         },
         .{
             .argument_start = 2,
@@ -434,9 +645,9 @@ test "cyclic CFG accepts multi-value parallel backedge copies" {
             .instruction_end = 1,
             .terminator = .{ .predicate_branch = .{
                 .operation = .gti,
-                .operands = .{ .lhs = @enumFromInt(2), .rhs = @enumFromInt(5) },
-                .then_branch = .{ .target = @enumFromInt(2), .arguments = .{ .start = 4, .end = 5 } },
-                .else_branch = .{ .target = @enumFromInt(1), .arguments = .{ .start = 2, .end = 4 } },
+                .operands = .{ .lhs = @fromBackingInt(@intCast(2)), .rhs = @fromBackingInt(@intCast(5)) },
+                .then_branch = .{ .target = @fromBackingInt(@intCast(2)), .arguments = .{ .start = 4, .end = 5 } },
+                .else_branch = .{ .target = @fromBackingInt(@intCast(1)), .arguments = .{ .start = 2, .end = 4 } },
             } },
         },
         .{
@@ -444,7 +655,7 @@ test "cyclic CFG accepts multi-value parallel backedge copies" {
             .argument_end = 5,
             .instruction_start = 1,
             .instruction_end = 1,
-            .terminator = .{ .return_value = .{ .value = @enumFromInt(4) } },
+            .terminator = .{ .return_value = .{ .value = @fromBackingInt(@intCast(4)) } },
         },
     };
     const ssa: structures.FunctionBodyAnalysis = .{
@@ -455,7 +666,7 @@ test "cyclic CFG accepts multi-value parallel backedge copies" {
         .call_arguments = &.{},
         .instructions = &instructions,
         .blocks = &blocks,
-        .entry = @enumFromInt(0),
+        .entry = @fromBackingInt(@intCast(0)),
     };
 
     var artifact = try codegen.compileFunction(&ssa, TestTypes{}, std.testing.allocator);
@@ -464,22 +675,22 @@ test "cyclic CFG accepts multi-value parallel backedge copies" {
 }
 
 test "direct call artifact construction cleans up every allocation failure" {
-    try std.testing.checkAllAllocationFailures(allocation_failure_backing.allocator(), testCompileDirectCallAllocations, .{});
+    try std.testing.checkAllAllocationFailures(allocation_failure_allocator, testCompileDirectCallAllocations, .{});
 }
 
 test "expression artifact construction cleans up every allocation failure" {
-    try std.testing.checkAllAllocationFailures(allocation_failure_backing.allocator(), testCompileExpressionAllocations, .{});
+    try std.testing.checkAllAllocationFailures(allocation_failure_allocator, testCompileExpressionAllocations, .{});
 }
 
 test "variant subset call construction cleans up every allocation failure" {
-    try std.testing.checkAllAllocationFailures(allocation_failure_backing.allocator(), testCompileVariantSubsetCallAllocations, .{});
+    try std.testing.checkAllAllocationFailures(allocation_failure_allocator, testCompileVariantSubsetCallAllocations, .{});
 }
 
 test "variant injection copies an arbitrary-size non-variant interned payload" {
     var block_arguments = [_]structures.FunctionBlockArgument{.{ .type_id = seven_byte_payload }};
     var parameter_modes = [_]structures.ParameterMode{.imm};
     var instructions = [_]structures.FunctionBodyAnalysis.Instruction{.{ .variant_coerce = .{
-        .operand = @enumFromInt(0),
+        .operand = @fromBackingInt(@intCast(0)),
         .target_type = payload_variant,
         .tag_mapping = .{ .start = 0, .end = 1 },
     } }};
@@ -487,7 +698,7 @@ test "variant injection copies an arbitrary-size non-variant interned payload" {
         .argument_end = 1,
         .instruction_start = 0,
         .instruction_end = 1,
-        .terminator = .{ .return_value = .{ .value = @enumFromInt(1) } },
+        .terminator = .{ .return_value = .{ .value = @fromBackingInt(@intCast(1)) } },
     }};
     const ssa: structures.FunctionBodyAnalysis = .{
         .return_type = payload_variant,
@@ -498,7 +709,7 @@ test "variant injection copies an arbitrary-size non-variant interned payload" {
         .call_arguments = &.{},
         .instructions = &instructions,
         .blocks = &blocks,
-        .entry = @enumFromInt(0),
+        .entry = @fromBackingInt(@intCast(0)),
     };
     var artifact = try codegen.compileFunction(&ssa, TestTypes{}, std.testing.allocator);
     defer artifact.deinit(std.testing.allocator);
@@ -511,12 +722,12 @@ fn testCompileVariantSubsetCallAllocations(gpa: std.mem.Allocator) !void {
     var block_arguments = [_]structures.FunctionBlockArgument{.{ .type_id = small_variant }};
     var parameter_modes = [_]structures.ParameterMode{.imm};
     var call_arguments = [_]structures.FunctionCallArgument{.{ .prepared = .{
-        .value = @enumFromInt(0),
+        .value = @fromBackingInt(@intCast(0)),
         .coerce_to = wide_variant,
         .variant_tag_mapping = .{ .start = 0, .end = 2 },
     } }};
     var instructions = [_]structures.FunctionBodyAnalysis.Instruction{.{ .call = .{
-        .target = .{ .direct = .{ .item = @enumFromInt(0) } },
+        .target = .{ .direct = .{ .item = @fromBackingInt(@intCast(0)) } },
         .arguments = .{ .start = 0, .end = 1 },
         .return_type = wide_variant,
     } }};
@@ -524,7 +735,7 @@ fn testCompileVariantSubsetCallAllocations(gpa: std.mem.Allocator) !void {
         .argument_end = 1,
         .instruction_start = 0,
         .instruction_end = 1,
-        .terminator = .{ .return_value = .{ .value = @enumFromInt(1) } },
+        .terminator = .{ .return_value = .{ .value = @fromBackingInt(@intCast(1)) } },
     }};
     const ssa: structures.FunctionBodyAnalysis = .{
         .return_type = wide_variant,
@@ -535,7 +746,7 @@ fn testCompileVariantSubsetCallAllocations(gpa: std.mem.Allocator) !void {
         .call_arguments = &call_arguments,
         .instructions = &instructions,
         .blocks = &blocks,
-        .entry = @enumFromInt(0),
+        .entry = @fromBackingInt(@intCast(0)),
     };
     var artifact = try codegen.compileFunction(&ssa, TestTypes{}, gpa);
     defer artifact.deinit(gpa);
@@ -543,7 +754,7 @@ fn testCompileVariantSubsetCallAllocations(gpa: std.mem.Allocator) !void {
 
 fn testCompileExpressionAllocations(gpa: std.mem.Allocator) !void {
     var instructions = [_]structures.FunctionBodyAnalysis.Instruction{
-        directCall(.{ .item = @enumFromInt(0) }),
+        directCall(.{ .item = @fromBackingInt(@intCast(0)) }),
         integerConstant(2),
         integerBinary(.multiply, 0, 1),
         integerConstant(1),
@@ -552,7 +763,7 @@ fn testCompileExpressionAllocations(gpa: std.mem.Allocator) !void {
     var blocks = [_]structures.FunctionBodyAnalysis.Block{.{
         .instruction_start = 0,
         .instruction_end = instructions.len,
-        .terminator = .{ .return_value = .{ .value = @enumFromInt(4) } },
+        .terminator = .{ .return_value = .{ .value = @fromBackingInt(@intCast(4)) } },
     }};
     const ssa = functionSsa(&instructions, &blocks);
     var artifact = try codegen.compileFunction(&ssa, TestTypes{}, gpa);
@@ -561,7 +772,7 @@ fn testCompileExpressionAllocations(gpa: std.mem.Allocator) !void {
 
 fn testCompileDirectCallAllocations(gpa: std.mem.Allocator) !void {
     var instructions = [_]structures.FunctionBodyAnalysis.Instruction{
-        directCall(.{ .item = @enumFromInt(0) }),
+        directCall(.{ .item = @fromBackingInt(@intCast(0)) }),
     };
     var blocks = [_]structures.FunctionBodyAnalysis.Block{.{
         .instruction_start = 0,
@@ -580,7 +791,7 @@ test "ordinary function compilation cleans up allocation failure" {
     var blocks = [_]structures.FunctionBodyAnalysis.Block{.{
         .instruction_start = 0,
         .instruction_end = 1,
-        .terminator = .{ .return_value = .{ .value = @enumFromInt(0) } },
+        .terminator = .{ .return_value = .{ .value = @fromBackingInt(@intCast(0)) } },
     }};
     const ssa = functionSsa(&instructions, &blocks);
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
@@ -591,15 +802,15 @@ test "ordinary function compilation cleans up allocation failure" {
 
 test "executable builder rejects artifact metadata independently" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-    const entry: structures.InstanceId = .{ .item = @enumFromInt(1) };
+    const entry: structures.InstanceId = .{ .item = @fromBackingInt(@intCast(1)) };
     const code = [_]u8{0xC3};
     const relocations = [_]structures.CompiledFunction.Relocation{.{
         .offset = 0,
         .kind = .call_relative_32,
-        .reference = @enumFromInt(0),
+        .reference = @fromBackingInt(@intCast(0)),
         .addend = 0,
     }};
-    const references = [_]structures.InstanceId{.{ .item = @enumFromInt(0) }};
+    const references = [_]structures.InstanceId{.{ .item = @fromBackingInt(@intCast(0)) }};
 
     const with_relocation: structures.CompiledFunction = .{
         .code = &code,
@@ -622,8 +833,8 @@ test "executable builder rejects artifact metadata independently" {
 }
 
 test "executable builder requires the entry and every referenced artifact" {
-    const entry: structures.InstanceId = .{ .item = @enumFromInt(1) };
-    const leaf_id: structures.InstanceId = .{ .item = @enumFromInt(0) };
+    const entry: structures.InstanceId = .{ .item = @fromBackingInt(@intCast(1)) };
+    const leaf_id: structures.InstanceId = .{ .item = @fromBackingInt(@intCast(0)) };
     const leaf_code = [_]u8{0xC3};
     const leaf: structures.CompiledFunction = .{
         .code = &leaf_code,
@@ -638,7 +849,7 @@ test "executable builder requires the entry and every referenced artifact" {
     const relocations = [_]structures.CompiledFunction.Relocation{.{
         .offset = 1,
         .kind = .call_relative_32,
-        .reference = @enumFromInt(0),
+        .reference = @fromBackingInt(@intCast(0)),
         .addend = 0,
     }};
     const references = [_]structures.InstanceId{leaf_id};
@@ -653,13 +864,13 @@ test "executable builder requires the entry and every referenced artifact" {
 }
 
 test "executable builder resolves a direct call to its callee's file offset" {
-    const entry_id: structures.InstanceId = .{ .item = @enumFromInt(1) };
-    const callee_id: structures.InstanceId = .{ .item = @enumFromInt(0) };
+    const entry_id: structures.InstanceId = .{ .item = @fromBackingInt(@intCast(1)) };
+    const callee_id: structures.InstanceId = .{ .item = @fromBackingInt(@intCast(0)) };
     const call_code = [_]u8{ 0xE8, 0, 0, 0, 0, 0xC3 };
     const relocations = [_]structures.CompiledFunction.Relocation{.{
         .offset = 1,
         .kind = .call_relative_32,
-        .reference = @enumFromInt(0),
+        .reference = @fromBackingInt(@intCast(0)),
         .addend = 0,
     }};
     const references = [_]structures.InstanceId{callee_id};
@@ -708,12 +919,12 @@ test "executable builder resolves a direct call to its callee's file offset" {
 }
 
 test "executable builder patches multiple relocations to one shared artifact" {
-    const entry_id: structures.InstanceId = .{ .item = @enumFromInt(1) };
-    const shared_id: structures.InstanceId = .{ .item = @enumFromInt(0) };
+    const entry_id: structures.InstanceId = .{ .item = @fromBackingInt(@intCast(1)) };
+    const shared_id: structures.InstanceId = .{ .item = @fromBackingInt(@intCast(0)) };
     const entry_code = [_]u8{ 0xE8, 0, 0, 0, 0, 0xE8, 0, 0, 0, 0, 0xC3 };
     const relocations = [_]structures.CompiledFunction.Relocation{
-        .{ .offset = 1, .kind = .call_relative_32, .reference = @enumFromInt(0), .addend = 0 },
-        .{ .offset = 6, .kind = .call_relative_32, .reference = @enumFromInt(0), .addend = 0 },
+        .{ .offset = 1, .kind = .call_relative_32, .reference = @fromBackingInt(@intCast(0)), .addend = 0 },
+        .{ .offset = 6, .kind = .call_relative_32, .reference = @fromBackingInt(@intCast(0)), .addend = 0 },
     };
     const references = [_]structures.InstanceId{shared_id};
     const entry: structures.CompiledFunction = .{
@@ -749,14 +960,14 @@ test "executable builder patches multiple relocations to one shared artifact" {
 }
 
 test "executable builder resolves cyclic artifact graphs" {
-    const entry_id: structures.InstanceId = .{ .item = @enumFromInt(2) };
-    const first_id: structures.InstanceId = .{ .item = @enumFromInt(1) };
-    const second_id: structures.InstanceId = .{ .item = @enumFromInt(0) };
+    const entry_id: structures.InstanceId = .{ .item = @fromBackingInt(@intCast(2)) };
+    const first_id: structures.InstanceId = .{ .item = @fromBackingInt(@intCast(1)) };
+    const second_id: structures.InstanceId = .{ .item = @fromBackingInt(@intCast(0)) };
     const call_code = [_]u8{ 0xE8, 0, 0, 0, 0, 0xC3 };
     const relocation = [_]structures.CompiledFunction.Relocation{.{
         .offset = 1,
         .kind = .call_relative_32,
-        .reference = @enumFromInt(0),
+        .reference = @fromBackingInt(@intCast(0)),
         .addend = 0,
     }};
     const entry_references = [_]structures.InstanceId{first_id};
@@ -774,13 +985,13 @@ test "executable builder resolves cyclic artifact graphs" {
 }
 
 test "executable builder rejects a relocation outside entry code bounds" {
-    const entry_id: structures.InstanceId = .{ .item = @enumFromInt(1) };
-    const callee_id: structures.InstanceId = .{ .item = @enumFromInt(0) };
+    const entry_id: structures.InstanceId = .{ .item = @fromBackingInt(@intCast(1)) };
+    const callee_id: structures.InstanceId = .{ .item = @fromBackingInt(@intCast(0)) };
     const call_code = [_]u8{ 0xE8, 0, 0, 0, 0, 0xC3 };
     const relocations = [_]structures.CompiledFunction.Relocation{.{
         .offset = 3,
         .kind = .call_relative_32,
-        .reference = @enumFromInt(0),
+        .reference = @fromBackingInt(@intCast(0)),
         .addend = 0,
     }};
     const references = [_]structures.InstanceId{callee_id};
@@ -805,13 +1016,13 @@ test "executable builder rejects a relocation outside entry code bounds" {
 }
 
 test "executable builder rejects a reference index outside referenced_instances" {
-    const entry_id: structures.InstanceId = .{ .item = @enumFromInt(1) };
-    const callee_id: structures.InstanceId = .{ .item = @enumFromInt(0) };
+    const entry_id: structures.InstanceId = .{ .item = @fromBackingInt(@intCast(1)) };
+    const callee_id: structures.InstanceId = .{ .item = @fromBackingInt(@intCast(0)) };
     const call_code = [_]u8{ 0xE8, 0, 0, 0, 0, 0xC3 };
     const relocations = [_]structures.CompiledFunction.Relocation{.{
         .offset = 1,
         .kind = .call_relative_32,
-        .reference = @enumFromInt(1),
+        .reference = @fromBackingInt(@intCast(1)),
         .addend = 0,
     }};
     const references = [_]structures.InstanceId{callee_id};
@@ -836,13 +1047,13 @@ test "executable builder rejects a reference index outside referenced_instances"
 }
 
 test "executable builder rejects a displacement outside the signed 32-bit range" {
-    const entry_id: structures.InstanceId = .{ .item = @enumFromInt(1) };
-    const callee_id: structures.InstanceId = .{ .item = @enumFromInt(0) };
+    const entry_id: structures.InstanceId = .{ .item = @fromBackingInt(@intCast(1)) };
+    const callee_id: structures.InstanceId = .{ .item = @fromBackingInt(@intCast(0)) };
     const call_code = [_]u8{ 0xE8, 0, 0, 0, 0, 0xC3 };
     const relocations = [_]structures.CompiledFunction.Relocation{.{
         .offset = 1,
         .kind = .call_relative_32,
-        .reference = @enumFromInt(0),
+        .reference = @fromBackingInt(@intCast(0)),
         // Forces the patched displacement past the signed 32-bit range
         // directly, without requiring a huge (real) address layout.
         .addend = std.math.maxInt(i64),
@@ -869,21 +1080,21 @@ test "executable builder rejects a displacement outside the signed 32-bit range"
 }
 
 test "executable construction cleans up every allocation failure" {
-    try std.testing.checkAllAllocationFailures(allocation_failure_backing.allocator(), testBuildExecutableAllocations, .{});
+    try std.testing.checkAllAllocationFailures(allocation_failure_allocator, testBuildExecutableAllocations, .{});
 }
 
 test "linked executable construction cleans up every allocation failure" {
-    try std.testing.checkAllAllocationFailures(allocation_failure_backing.allocator(), testBuildExecutableWithCalleeAllocations, .{});
+    try std.testing.checkAllAllocationFailures(allocation_failure_allocator, testBuildExecutableWithCalleeAllocations, .{});
 }
 
 fn testBuildExecutableWithCalleeAllocations(gpa: std.mem.Allocator) !void {
-    const entry_id: structures.InstanceId = .{ .item = @enumFromInt(1) };
-    const callee_id: structures.InstanceId = .{ .item = @enumFromInt(0) };
+    const entry_id: structures.InstanceId = .{ .item = @fromBackingInt(@intCast(1)) };
+    const callee_id: structures.InstanceId = .{ .item = @fromBackingInt(@intCast(0)) };
     const call_code = [_]u8{ 0xE8, 0, 0, 0, 0, 0xC3 };
     const relocations = [_]structures.CompiledFunction.Relocation{.{
         .offset = 1,
         .kind = .call_relative_32,
-        .reference = @enumFromInt(0),
+        .reference = @fromBackingInt(@intCast(0)),
         .addend = 0,
     }};
     const references = [_]structures.InstanceId{callee_id};
@@ -909,7 +1120,7 @@ fn testBuildExecutableWithCalleeAllocations(gpa: std.mem.Allocator) !void {
 }
 
 fn testBuildExecutableAllocations(gpa: std.mem.Allocator) !void {
-    const entry: structures.InstanceId = .{ .item = @enumFromInt(0) };
+    const entry: structures.InstanceId = .{ .item = @fromBackingInt(@intCast(0)) };
     const code = [_]u8{0xC3};
     const artifact: structures.CompiledFunction = .{
         .code = &code,

@@ -1,0 +1,33 @@
+import std.memory.{Ref}
+
+pub struct collection_literal(T: type, N: int)
+    move = none
+    copy = none
+
+pub struct Array(T: type, N: int)
+    pub func filled(imm value: T) Array(T, N) where T.copy is func(imm T) T -> array_filled(T, N, value)
+    pub func len(imm self: Array(T, N)) int -> N
+
+    pub fallible get(imm self: Array(T, N), index: int) Ref(T, false)
+        index >= 0
+        index < N
+        return array_borrow(T, N, self, index)
+
+    pub fallible get_mut(mut self: Array(T, N), index: int) Ref(T, true)
+        index >= 0
+        index < N
+        return array_borrow_mut(T, N, self, index)
+
+    pub fallible [](imm self: Array(T, N), index: int) T
+        const element = self.get?(index)
+        return element[]
+
+    pub fallible []=(mut self: Array(T, N), index: int, init value: T) unit
+        const element = self.get_mut?(index)
+        element[] = value
+
+extern func array_filled(static T: type, static N: int, imm value: T) Array(T, N)
+extern func array_from(static T: type, static N: int, init value: collection_literal(T, N)) Array(T, N)
+pub converter(static T: type, static N: int, init value: collection_literal(T, N)) Array(T, N) -> array_from(T, N, value)
+extern func array_borrow(static T: type, static N: int, imm value: Array(T, N), index: int) Ref(T, false)
+extern func array_borrow_mut(static T: type, static N: int, mut value: Array(T, N), index: int) Ref(T, true)

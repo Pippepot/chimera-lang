@@ -5,7 +5,7 @@ const query = @import("query/engine.zig");
 const queries = @import("queries.zig");
 const structures = @import("structures.zig");
 
-const format = "CHIQRY13";
+const format = "CHIQRY18";
 const max_records = 1_000_000;
 
 pub fn save(io: std.Io, allocator: std.mem.Allocator, directory: []const u8, key: cache.Key, db: *query.Database) !void {
@@ -25,7 +25,10 @@ pub fn restoreInterns(db: *query.Database, allocator: std.mem.Allocator, payload
     for (0..count) |index| {
         const name = try reader.read([]const u8);
         defer allocator.free(name);
-        try restoreNamedIntern(name, db, &reader, index);
+        restoreNamedIntern(name, db, &reader, index) catch |err| switch (err) {
+            error.InvalidInternId => return error.InvalidCache,
+            else => return err,
+        };
     }
     return reader.offset;
 }
@@ -41,12 +44,14 @@ fn restoreIntern(comptime I: type, db: *query.Database, reader: *codec.Reader, i
     var value = try reader.read(I.Value);
     defer codec.freeValue(I.Value, reader.allocator, &value);
     if (!(try validateIds(I.Value, db, value))) return error.InvalidCache;
+    if (I == queries.CompileTimeValues and !(try validArrayRuntime(db, value))) return error.InvalidCache;
     if (I == queries.Types) {
         switch (value) {
+            .array => |array| if (!try validArrayType(db, array)) return error.InvalidCache,
             .variant => |variant| {
                 if (variant.members.len < 2) return error.InvalidCache;
                 for (variant.members[1..], 1..) |member, member_index| {
-                    if (@intFromEnum(variant.members[member_index - 1]) >= @intFromEnum(member))
+                    if (@backingInt(variant.members[member_index - 1]) >= @backingInt(member))
                         return error.InvalidCache;
                 }
             },
@@ -54,7 +59,7 @@ fn restoreIntern(comptime I: type, db: *query.Database, reader: *codec.Reader, i
         }
     }
     const id = try db.intern(I, value);
-    if (@intFromEnum(id) != index) return error.InvalidCache;
+    if (@backingInt(id) != index) return error.InvalidCache;
 }
 
 pub fn restoreQueries(db: *query.Database, payload: []const u8, offset: usize) !usize {
@@ -145,6 +150,38 @@ fn readCount(reader: *codec.Reader) !usize {
     return @intCast(count);
 }
 
+fn validArrayType(db: *query.Database, array: structures.ArrayType) !bool {
+    return array.length <= std.math.maxInt(i32) and try validArrayElementType(db, array.element_type);
+}
+
+fn validArrayElementType(db: *query.Database, type_id: structures.TypeId) anyerror!bool {
+    if (type_id.isPrimitive()) return type_id != .type;
+    const interned = type_id.interned() orelse return false;
+    const data = (try db.lookupInternedAs(queries.Types, interned)) orelse return false;
+    switch (data.*) {
+        .structure, .callable => return true,
+        .array => |array| return validArrayType(db, array),
+        .variant => |variant| {
+            for (variant.members) |member| if (!try validArrayElementType(db, member)) return false;
+            return true;
+        },
+    }
+}
+
+fn validArrayRuntime(db: *query.Database, value: structures.CompileTimeValue) !bool {
+    if (value != .runtime) return true;
+    const types: queries.TypeFacts(*query.Database) = .{ .ctx = db };
+    const array = (try types.arrayType(value.runtime.type_id)) orelse return true;
+    if (value.runtime.value != .structure) return false;
+    const tuple = (try db.lookupInternedAs(queries.CompileTimeValueTuples, value.runtime.value.structure)) orelse return false;
+    if (tuple.values.len != array.length) return false;
+    for (tuple.values) |element_id| {
+        const element = (try db.lookupInternedAs(queries.CompileTimeValues, element_id)) orelse return false;
+        if (element.* != .runtime or element.runtime.type_id != array.element_type) return false;
+    }
+    return true;
+}
+
 fn validateIds(comptime T: type, db: *query.Database, value: T) anyerror!bool {
     if (T == u8) return true;
     if (T == structures.ModuleId) return (try db.lookupInternedAs(queries.ModulePaths, value)) != null;
@@ -160,8 +197,8 @@ fn validateIds(comptime T: type, db: *query.Database, value: T) anyerror!bool {
     return switch (@typeInfo(T)) {
         .optional => |info| if (value) |present| try validateIds(info.child, db, present) else true,
         .@"struct" => |info| blk: {
-            inline for (info.fields) |field| {
-                if (!field.is_comptime and !(try validateIds(field.type, db, @field(value, field.name)))) break :blk false;
+            inline for (info.field_names, info.field_types, info.field_attrs) |field_name, FieldType, attrs| {
+                if (!attrs.@"comptime" and !(try validateIds(FieldType, db, @field(value, field_name)))) break :blk false;
             }
             break :blk true;
         },
@@ -197,8 +234,15 @@ fn validOutput(comptime Q: type, db: *query.Database, output: Q.Output) !bool {
 
 fn validStorageOperations(db: *query.Database, body: structures.FunctionBodyAnalysis) anyerror!bool {
     const types: queries.TypeFacts(*query.Database) = .{ .ctx = db };
+    if (!try validArrayStorageType(db, types, body.return_type)) return false;
+    for (body.block_arguments) |argument| if (!try validArrayStorageType(db, types, argument.type_id)) return false;
     for (body.instructions) |instruction| {
+        if (!try validArrayStorageType(db, types, instruction.resultType())) return false;
         switch (instruction) {
+            .static_conversion => return false,
+            .initializer_ref => |reference| if (!try validInitializerResult(db, types, body, reference)) return false,
+            .const_type => |type_id| if (!try validArrayStorageType(db, types, type_id)) return false,
+            .struct_init => |operation| if (try types.arrayType(operation.type_id) != null) return false,
             .borrow_address => |operation| if (!try validBorrowFields(types, body, operation)) return false,
             .storage_projection => |operation| if (!try validStorageProjection(types, body, operation)) return false,
             .allocation_element => |operation| {
@@ -206,11 +250,28 @@ fn validStorageOperations(db: *query.Database, body: structures.FunctionBodyAnal
                 const element = (try types.allocationElement(body.valueType(operation.allocation))) orelse return false;
                 if (element != operation.type_id) return false;
             },
+            .array_element => |operation| {
+                if (body.valueType(operation.index) != .int) return false;
+                const array = (try types.arrayType(body.valueType(operation.array))) orelse return false;
+                if (array.element_type != operation.type_id) return false;
+            },
             else => {},
         }
     }
     for (body.initializer_regions) |region| if (!try validStorageOperations(db, region)) return false;
     return true;
+}
+
+fn validArrayStorageType(db: *query.Database, types: queries.TypeFacts(*query.Database), type_id: structures.TypeId) anyerror!bool {
+    const array = (try types.arrayType(type_id)) orelse {
+        if (try types.variantMembers(type_id)) |members| {
+            for (members) |member| if (!try validArrayStorageType(db, types, member)) return false;
+        }
+        return true;
+    };
+    if (!try validArrayType(db, array)) return false;
+    if (!try validArrayStorageType(db, types, array.element_type)) return false;
+    return try types.ownershipCapabilities(array.element_type) != null;
 }
 
 fn validBorrowFields(types: anytype, body: structures.FunctionBodyAnalysis, operation: structures.BorrowAddressOperation) !bool {
@@ -224,10 +285,24 @@ fn validBorrowFields(types: anytype, body: structures.FunctionBodyAnalysis, oper
     return type_id == ((try types.borrowElement(operation.type_id)) orelse return false);
 }
 
+fn validInitializerResult(db: *query.Database, types: anytype, body: structures.FunctionBodyAnalysis, reference: @FieldType(structures.FunctionInstruction, "initializer_ref")) !bool {
+    const result = body.initializer_regions[reference.region].return_type;
+    if (reference.type_id == result) return true;
+    const analysis: queries.AnalysisContext(*query.Database) = .{ .ctx = db };
+    const collection = (try analysis.collectionLiteralType(reference.type_id)) orelse return false;
+    const array = (try types.arrayType(result)) orelse return false;
+    return std.meta.eql(collection, array);
+}
+
 fn validStorageProjection(types: anytype, body: structures.FunctionBodyAnalysis, operation: structures.StorageProjection) !bool {
     const type_id = body.valueType(operation.owner);
     switch (operation.projection) {
         .box_element => return operation.type_id == ((try types.boxElement(type_id)) orelse return false),
+        .allocation_array => {
+            const element = (try types.allocationElement(type_id)) orelse return false;
+            const array = (try types.arrayType(operation.type_id)) orelse return false;
+            return array.element_type == element;
+        },
         .field => |field| {
             const definition = (try types.structDefinition(type_id)) orelse return false;
             return field < definition.fields.len and definition.fields[field].type_id == operation.type_id;
@@ -244,7 +319,7 @@ fn validRange(range: structures.FunctionValueRange, length: usize) bool {
 }
 
 fn validValue(value: structures.FunctionValueId, body: structures.FunctionBodyAnalysis) bool {
-    return @intFromEnum(value) < body.valueCount();
+    return @backingInt(value) < body.valueCount();
 }
 
 fn validUse(use: structures.FunctionValueUse, body: structures.FunctionBodyAnalysis) bool {
@@ -278,7 +353,7 @@ fn validCall(call: structures.FunctionCall, body: structures.FunctionBodyAnalysi
 }
 
 fn valueRepresentation(body: structures.FunctionBodyAnalysis, value: structures.FunctionValueId) structures.ValueRepresentation {
-    const index = @intFromEnum(value);
+    const index = @backingInt(value);
     if (index < body.block_arguments.len) return body.block_arguments[index].representation;
     return switch (body.instructions[index - body.block_arguments.len]) {
         .initializer_ref => .initializer,
@@ -287,8 +362,8 @@ fn valueRepresentation(body: structures.FunctionBodyAnalysis, value: structures.
 }
 
 fn validBranch(branch: structures.FunctionBranch, body: structures.FunctionBodyAnalysis) bool {
-    if (@intFromEnum(branch.target) >= body.blocks.len or !validRange(branch.arguments, body.branch_arguments.len)) return false;
-    const target = body.blocks[@intFromEnum(branch.target)];
+    if (@backingInt(branch.target) >= body.blocks.len or !validRange(branch.arguments, body.branch_arguments.len)) return false;
+    const target = body.blocks[@backingInt(branch.target)];
     if (target.argument_start > target.argument_end or target.argument_end > body.block_arguments.len) return false;
     if (branch.arguments.end - branch.arguments.start != target.argument_end - target.argument_start) return false;
     for (body.branch_arguments[branch.arguments.start..branch.arguments.end], body.block_arguments[target.argument_start..target.argument_end]) |use, argument| {
@@ -332,7 +407,7 @@ fn validCallMutArgument(operation: structures.CallMutArgument, body: structures.
 }
 
 fn validFunctionBody(body: structures.FunctionBodyAnalysis) bool {
-    if (body.blocks.len == 0 or @intFromEnum(body.entry) >= body.blocks.len) return false;
+    if (body.blocks.len == 0 or @backingInt(body.entry) >= body.blocks.len) return false;
     if (body.is_initializer_region and !body.is_fallible) return false;
     if (body.valueCount() > std.math.maxInt(u32)) return false;
     if (body.instruction_spans.len != 0 and body.instruction_spans.len != body.instructions.len) return false;
@@ -344,7 +419,7 @@ fn validFunctionBody(body: structures.FunctionBodyAnalysis) bool {
     for (body.initializer_regions) |region| {
         if (!region.is_initializer_region or !validFunctionBody(region)) return false;
     }
-    const entry = body.blocks[@intFromEnum(body.entry)];
+    const entry = body.blocks[@backingInt(body.entry)];
     if (entry.argument_start != 0 or entry.argument_end > body.block_arguments.len) return false;
     if (body.parameter_modes.len != entry.argument_end - entry.argument_start) return false;
     for (body.parameter_modes, body.block_arguments[entry.argument_start..entry.argument_end]) |mode, argument| {
@@ -382,7 +457,7 @@ fn validFunctionBody(body: structures.FunctionBodyAnalysis) bool {
             if (valueRepresentation(body, value.*) == .initializer and terminator != .fallible_call) return false;
         };
         for (terminator.successors()) |successor| if (successor) |target| {
-            if (@intFromEnum(target.*) >= body.blocks.len) return false;
+            if (@backingInt(target.*) >= body.blocks.len) return false;
         };
         const valid = switch (block.terminator) {
             .branch => |branch| validBranch(branch, body),
@@ -401,8 +476,9 @@ fn validFunctionBody(body: structures.FunctionBodyAnalysis) bool {
 fn validInitializerReference(reference: @FieldType(structures.FunctionInstruction, "initializer_ref"), body: structures.FunctionBodyAnalysis) bool {
     if (reference.region >= body.initializer_regions.len or !validRange(reference.captures, body.initializer_captures.len)) return false;
     const region = body.initializer_regions[reference.region];
-    if (reference.type_id != region.return_type or reference.captures.end - reference.captures.start != region.parameter_modes.len) return false;
-    const entry = region.blocks[@intFromEnum(region.entry)];
+    if (reference.type_id != region.return_type and (reference.type_id.isPrimitive() or region.return_type.isPrimitive())) return false;
+    if (reference.captures.end - reference.captures.start != region.parameter_modes.len) return false;
+    const entry = region.blocks[@backingInt(region.entry)];
     for (body.initializer_captures[reference.captures.start..reference.captures.end], region.block_arguments[entry.argument_start..entry.argument_end]) |capture, argument| {
         if (body.valueType(capture) != argument.type_id) return false;
         if ((argument.representation == .initializer) != (valueRepresentation(body, capture) == .initializer)) return false;
@@ -411,15 +487,15 @@ fn validInitializerReference(reference: @FieldType(structures.FunctionInstructio
 }
 
 fn validFallibleTargets(call: structures.FunctionCall, success: structures.FunctionBlockId, failure: ?structures.FunctionBlockId, body: structures.FunctionBodyAnalysis) bool {
-    if (@intFromEnum(success) >= body.blocks.len) return false;
-    const success_block = body.blocks[@intFromEnum(success)];
+    if (@backingInt(success) >= body.blocks.len) return false;
+    const success_block = body.blocks[@backingInt(success)];
     if (success_block.argument_start > success_block.argument_end or success_block.argument_end > body.block_arguments.len or
         success_block.argument_end - success_block.argument_start != 1) return false;
     const result = body.block_arguments[success_block.argument_start];
     if (result.representation != .value or result.type_id != (if (call.destination == null) call.return_type else .unit)) return false;
     if (failure) |target| {
-        if (@intFromEnum(target) >= body.blocks.len) return false;
-        const block = body.blocks[@intFromEnum(target)];
+        if (@backingInt(target) >= body.blocks.len) return false;
+        const block = body.blocks[@backingInt(target)];
         if (block.argument_end > body.block_arguments.len or block.argument_end != block.argument_start) return false;
     }
     return true;
@@ -428,7 +504,7 @@ fn validFallibleTargets(call: structures.FunctionCall, success: structures.Funct
 fn validCompiledFunction(artifact: structures.CompiledFunction) bool {
     if (artifact.code.len == 0 or artifact.required_alignment == 0 or !std.math.isPowerOfTwo(artifact.required_alignment)) return false;
     for (artifact.relocations) |relocation| {
-        if (@intFromEnum(relocation.reference) >= artifact.referenced_instances.len) return false;
+        if (@backingInt(relocation.reference) >= artifact.referenced_instances.len) return false;
         const width: usize = switch (relocation.kind) {
             .call_relative_32 => 4,
             .address_absolute_64 => 8,
@@ -474,11 +550,11 @@ test "query restore rejects an offset past the payload" {
 test "cached body validation rejects invalid control flow and argument indexes" {
     var block_arguments = [_]structures.FunctionBlockArgument{.{ .type_id = .int }};
     var parameter_modes = [_]structures.ParameterMode{.imm};
-    var branch_arguments = [_]structures.FunctionValueUse{.{ .value = @enumFromInt(0) }};
+    var branch_arguments = [_]structures.FunctionValueUse{.{ .value = @fromBackingInt(@intCast(0)) }};
     var call_arguments: [0]structures.FunctionCallArgument = .{};
     var instructions = [_]structures.FunctionInstruction{.{ .mut_parameter_write = .{
         .parameter_index = 1,
-        .value = @enumFromInt(0),
+        .value = @fromBackingInt(@intCast(0)),
         .type_id = .int,
     } }};
     var blocks = [_]structures.FunctionBlock{.{
@@ -496,11 +572,11 @@ test "cached body validation rejects invalid control flow and argument indexes" 
         .call_arguments = &call_arguments,
         .instructions = instructions[0..0],
         .blocks = &blocks,
-        .entry = @enumFromInt(0),
+        .entry = @fromBackingInt(@intCast(0)),
     };
     try std.testing.expect(validFunctionBody(body));
 
-    blocks[0].terminator = .{ .branch = .{ .target = @enumFromInt(0), .arguments = .{ .start = 0, .end = 0 } } };
+    blocks[0].terminator = .{ .branch = .{ .target = @fromBackingInt(@intCast(0)), .arguments = .{ .start = 0, .end = 0 } } };
     try std.testing.expect(!validFunctionBody(body));
 
     body.branch_arguments = &branch_arguments;
@@ -533,7 +609,7 @@ test "cached body validation rejects invalid control flow and argument indexes" 
     try std.testing.expect(validFunctionBody(body));
 
     instructions[0] = .{ .storage_projection = .{
-        .owner = @enumFromInt(0),
+        .owner = @fromBackingInt(@intCast(0)),
         .projection = .{ .field = 7 },
         .type_id = .int,
     } };
@@ -588,7 +664,7 @@ test "cached body validation rejects invalid control flow and argument indexes" 
     block_arguments[0].type_id = (try db.lookupInterned(queries.CompileTimeValues, allocation_value)).type;
     var slot_instructions = [_]structures.FunctionInstruction{
         .{ .const_int = 0 },
-        .{ .allocation_element = .{ .allocation = @enumFromInt(0), .index = body.instructionValue(0), .type_id = .int } },
+        .{ .allocation_element = .{ .allocation = @fromBackingInt(@intCast(0)), .index = body.instructionValue(0), .type_id = .int } },
     };
     body.instructions = &slot_instructions;
     blocks[0].instruction_end = slot_instructions.len;
@@ -605,7 +681,7 @@ test "cached body validation rejects invalid control flow and argument indexes" 
     body.instructions = &instructions;
     blocks[0].instruction_end = instructions.len;
 
-    instructions[0] = .{ .value_copy = .{ .source = @enumFromInt(0), .type_id = variant_type, .destination = @enumFromInt(999) } };
+    instructions[0] = .{ .value_copy = .{ .source = @fromBackingInt(@intCast(0)), .type_id = variant_type, .destination = @fromBackingInt(@intCast(999)) } };
     try std.testing.expect(!validFunctionBody(body));
 
     instructions[0] = .{ .result_storage = .unit };
@@ -620,7 +696,7 @@ test "cached body validation rejects invalid control flow and argument indexes" 
     body.borrow_fields = &path;
     block_arguments[0].type_id = pair_type;
     instructions[0] = .{ .borrow_address = .{
-        .source = @enumFromInt(0),
+        .source = @fromBackingInt(@intCast(0)),
         .type_id = reference_type,
         .fields = .{ .start = 0, .end = 1 },
     } };
@@ -993,15 +1069,15 @@ test "invalid machine-code cache shapes are rejected" {
     const valid: structures.CompiledFunction = .{
         .code = &.{ 0, 0, 0, 0 },
         .required_alignment = 1,
-        .relocations = &.{.{ .offset = 0, .kind = .call_relative_32, .reference = @enumFromInt(0), .addend = 0 }},
-        .referenced_instances = &.{.{ .item = @enumFromInt(0) }},
+        .relocations = &.{.{ .offset = 0, .kind = .call_relative_32, .reference = @fromBackingInt(@intCast(0)), .addend = 0 }},
+        .referenced_instances = &.{.{ .item = @fromBackingInt(@intCast(0)) }},
     };
     try std.testing.expect(validCompiledFunction(valid));
     var damaged = valid;
-    damaged.relocations = &.{.{ .offset = 1, .kind = .call_relative_32, .reference = @enumFromInt(0), .addend = 0 }};
+    damaged.relocations = &.{.{ .offset = 1, .kind = .call_relative_32, .reference = @fromBackingInt(@intCast(0)), .addend = 0 }};
     try std.testing.expect(!validCompiledFunction(damaged));
     damaged = valid;
-    damaged.relocations = &.{.{ .offset = 0, .kind = .call_relative_32, .reference = @enumFromInt(1), .addend = 0 }};
+    damaged.relocations = &.{.{ .offset = 0, .kind = .call_relative_32, .reference = @fromBackingInt(@intCast(1)), .addend = 0 }};
     try std.testing.expect(!validCompiledFunction(damaged));
 }
 
@@ -1015,7 +1091,7 @@ test "cached mutable result requires a matching producer" {
             .type_id = .int,
         } },
     };
-    var call_arguments = [_]structures.FunctionCallArgument{.{ .prepared = .{ .value = @enumFromInt(0) } }};
+    var call_arguments = [_]structures.FunctionCallArgument{.{ .prepared = .{ .value = @fromBackingInt(@intCast(0)) } }};
     var blocks = [_]structures.FunctionBlock{.{
         .argument_start = 0,
         .argument_end = 0,
@@ -1031,14 +1107,14 @@ test "cached mutable result requires a matching producer" {
         .branch_arguments = &.{},
         .instructions = &instructions,
         .blocks = &blocks,
-        .entry = @enumFromInt(0),
+        .entry = @fromBackingInt(@intCast(0)),
     };
     try std.testing.expect(!validFunctionBody(body));
 }
 
 test "cached mutable result validates types and destinations across outcomes" {
     const call: structures.FunctionCall = .{
-        .target = .{ .direct = .{ .item = @enumFromInt(0) } },
+        .target = .{ .direct = .{ .item = @fromBackingInt(@intCast(0)) } },
         .arguments = .{ .start = 0, .end = 1 },
         .return_type = .unit,
     };
@@ -1056,7 +1132,7 @@ test "cached mutable result validates types and destinations across outcomes" {
         .{ .call_mut_argument = result },
     };
     var block_arguments = [_]structures.FunctionBlockArgument{.{ .type_id = .unit }};
-    var call_arguments = [_]structures.FunctionCallArgument{.{ .prepared = .{ .value = @enumFromInt(1) } }};
+    var call_arguments = [_]structures.FunctionCallArgument{.{ .prepared = .{ .value = @fromBackingInt(@intCast(1)) } }};
     var blocks = [_]structures.FunctionBlock{
         .{ .argument_start = 0, .argument_end = 0, .instruction_start = 0, .instruction_end = instructions.len, .terminator = .return_unit },
         .{ .argument_start = 0, .argument_end = 1, .instruction_start = 3, .instruction_end = 4, .terminator = .return_unit },
@@ -1071,7 +1147,7 @@ test "cached mutable result validates types and destinations across outcomes" {
         .branch_arguments = &.{},
         .instructions = &instructions,
         .blocks = blocks[0..1],
-        .entry = @enumFromInt(0),
+        .entry = @fromBackingInt(@intCast(0)),
     };
     try std.testing.expect(validFunctionBody(body));
     instructions[3].call_mut_argument.return_type = .int;
@@ -1083,13 +1159,13 @@ test "cached mutable result validates types and destinations across outcomes" {
     instructions[3].call_mut_argument.type_id = .byte;
     try std.testing.expect(!validFunctionBody(body));
     instructions[3].call_mut_argument = result;
-    instructions[3].call_mut_argument.destination = @enumFromInt(2);
+    instructions[3].call_mut_argument.destination = @fromBackingInt(@intCast(2));
     try std.testing.expect(!validFunctionBody(body));
-    instructions[3].call_mut_argument.destination = @enumFromInt(1);
+    instructions[3].call_mut_argument.destination = @fromBackingInt(@intCast(1));
     try std.testing.expect(validFunctionBody(body));
     instructions[3].call_mut_argument = result;
 
-    call_arguments[0].prepared = .{ .value = @enumFromInt(2), .coerce_to = .int };
+    call_arguments[0].prepared = .{ .value = @fromBackingInt(@intCast(2)), .coerce_to = .int };
     try std.testing.expect(validFunctionBody(body));
     call_arguments[0].prepared.coerce_to = null;
     instructions[3].call_mut_argument.type_id = .byte;
@@ -1097,13 +1173,13 @@ test "cached mutable result validates types and destinations across outcomes" {
     try std.testing.expect(validFunctionBody(body));
     instructions[4].call_mut_argument.type_id = .int;
     try std.testing.expect(!validFunctionBody(body));
-    call_arguments[0].prepared = .{ .value = @enumFromInt(1) };
+    call_arguments[0].prepared = .{ .value = @fromBackingInt(@intCast(1)) };
     instructions[3].call_mut_argument = result;
     instructions[4].call_mut_argument = result;
 
     instructions[2] = .const_unit;
     blocks[0].instruction_end = 3;
-    blocks[0].terminator = .{ .fallible_call = .{ .call = call, .success = @enumFromInt(1), .failure = @enumFromInt(2) } };
+    blocks[0].terminator = .{ .fallible_call = .{ .call = call, .success = @fromBackingInt(@intCast(1)), .failure = @fromBackingInt(@intCast(2)) } };
     body.blocks = &blocks;
     try std.testing.expect(validFunctionBody(body));
     blocks[0].terminator.fallible_call.call.return_type = .int;
@@ -1129,33 +1205,33 @@ test "cached initializer handles stay out of ordinary operands and mutable write
         .branch_arguments = &.{},
         .instructions = &instructions,
         .blocks = &blocks,
-        .entry = @enumFromInt(0),
+        .entry = @fromBackingInt(@intCast(0)),
     };
     try std.testing.expect(validFunctionBody(body));
     body.is_fallible = false;
     try std.testing.expect(validFunctionBody(body));
     body.is_fallible = true;
 
-    var fields = [_]structures.StructFieldValue{.{ .field_index = 0, .value = @enumFromInt(0) }};
+    var fields = [_]structures.StructFieldValue{.{ .field_index = 0, .value = @fromBackingInt(@intCast(0)) }};
     body.struct_field_values = &fields;
     try std.testing.expect(!validFunctionBody(body));
-    fields[0].value = @enumFromInt(1);
+    fields[0].value = @fromBackingInt(@intCast(1));
     try std.testing.expect(validFunctionBody(body));
     body.struct_field_values = &.{};
 
-    const branch: structures.FunctionBranch = .{ .target = @enumFromInt(1), .arguments = .{ .start = 0, .end = 0 } };
+    const branch: structures.FunctionBranch = .{ .target = @fromBackingInt(@intCast(1)), .arguments = .{ .start = 0, .end = 0 } };
     blocks[0].terminator = .{ .predicate_branch = .{
         .operation = .eqi,
-        .operands = .{ .lhs = @enumFromInt(0), .rhs = @enumFromInt(1) },
+        .operands = .{ .lhs = @fromBackingInt(@intCast(0)), .rhs = @fromBackingInt(@intCast(1)) },
         .then_branch = branch,
         .else_branch = branch,
     } };
     try std.testing.expect(!validFunctionBody(body));
-    blocks[0].terminator.predicate_branch.operands.lhs = @enumFromInt(1);
+    blocks[0].terminator.predicate_branch.operands.lhs = @fromBackingInt(@intCast(1));
     try std.testing.expect(validFunctionBody(body));
     blocks[0].terminator = .diverge;
 
-    var arguments = [_]structures.FunctionCallArgument{.{ .initializer = @enumFromInt(0) }};
+    var arguments = [_]structures.FunctionCallArgument{.{ .initializer = @fromBackingInt(@intCast(0)) }};
     body.call_arguments = &arguments;
     instructions[0] = .{ .call_mut_argument = .{
         .arguments = .{ .start = 0, .end = 1 },
@@ -1167,7 +1243,7 @@ test "cached initializer handles stay out of ordinary operands and mutable write
 
     var writes = [_]structures.FunctionInstruction{
         .{ .const_int = 42 },
-        .{ .mut_parameter_write = .{ .parameter_index = 0, .value = @enumFromInt(1), .type_id = .int } },
+        .{ .mut_parameter_write = .{ .parameter_index = 0, .value = @fromBackingInt(@intCast(1)), .type_id = .int } },
     };
     body.instructions = &writes;
     blocks[0].instruction_end = 2;
@@ -1189,11 +1265,11 @@ test "cached initializer failures reject invalid ordinary targets and result rep
     };
     var blocks = [_]structures.FunctionBlock{
         .{ .argument_start = 0, .argument_end = 1, .instruction_start = 0, .instruction_end = 0, .terminator = .{ .fallible_call = .{
-            .call = .{ .target = .{ .initializer = @enumFromInt(0) }, .arguments = .{ .start = 0, .end = 0 }, .return_type = .int },
-            .success = @enumFromInt(1),
-            .failure = @enumFromInt(2),
+            .call = .{ .target = .{ .initializer = @fromBackingInt(@intCast(0)) }, .arguments = .{ .start = 0, .end = 0 }, .return_type = .int },
+            .success = @fromBackingInt(@intCast(1)),
+            .failure = @fromBackingInt(@intCast(2)),
         } } },
-        .{ .argument_start = 1, .argument_end = 2, .instruction_start = 0, .instruction_end = 0, .terminator = .{ .return_value = .{ .value = @enumFromInt(1) } } },
+        .{ .argument_start = 1, .argument_end = 2, .instruction_start = 0, .instruction_end = 0, .terminator = .{ .return_value = .{ .value = @fromBackingInt(@intCast(1)) } } },
         .{ .argument_start = 2, .argument_end = 2, .instruction_start = 0, .instruction_end = 0, .terminator = .return_failure },
     };
     const original: structures.FunctionBodyAnalysis = .{
@@ -1205,7 +1281,7 @@ test "cached initializer failures reject invalid ordinary targets and result rep
         .call_arguments = &.{},
         .instructions = &.{},
         .blocks = &blocks,
-        .entry = @enumFromInt(0),
+        .entry = @fromBackingInt(@intCast(0)),
     };
     var writer: codec.Writer = .{ .allocator = allocator };
     defer writer.deinit();
@@ -1220,7 +1296,7 @@ test "cached initializer failures reject invalid ordinary targets and result rep
     call.success = failure.?;
     try std.testing.expect(!validFunctionBody(body));
     call.success = success;
-    const success_argument = &body.block_arguments[body.blocks[@intFromEnum(success)].argument_start];
+    const success_argument = &body.block_arguments[body.blocks[@backingInt(success)].argument_start];
     const success_type = success_argument.type_id;
     success_argument.type_id = .bool;
     try std.testing.expect(!validFunctionBody(body));
@@ -1230,7 +1306,7 @@ test "cached initializer failures reject invalid ordinary targets and result rep
     success_argument.representation = .value;
     call.failure = success;
     try std.testing.expect(!validFunctionBody(body));
-    call.failure = @enumFromInt(body.blocks.len);
+    call.failure = @fromBackingInt(@intCast(body.blocks.len));
     try std.testing.expect(!validFunctionBody(body));
     call.failure = null;
     try std.testing.expect(validFunctionBody(body));
@@ -1286,7 +1362,7 @@ test "cached query outputs cannot adopt a private initializer calling convention
         .branch_arguments = &.{},
         .instructions = &.{},
         .blocks = &blocks,
-        .entry = @enumFromInt(0),
+        .entry = @fromBackingInt(@intCast(0)),
     };
     try std.testing.expect(validFunctionBody(body));
     try std.testing.expect(!(try validOutput(queries.AnalyzeFunctionInstance, db, body)));
@@ -1340,10 +1416,10 @@ test "cached storage joins reject mismatched types and coercion metadata" {
         .{ .type_id = .int },
         .{ .type_id = .int, .representation = .storage },
     };
-    var uses = [_]structures.FunctionValueUse{.{ .value = @enumFromInt(0) }};
+    var uses = [_]structures.FunctionValueUse{.{ .value = @fromBackingInt(@intCast(0)) }};
     var tags = [_]u32{0};
     var blocks = [_]structures.FunctionBlock{
-        .{ .argument_start = 0, .argument_end = 1, .instruction_start = 0, .instruction_end = 0, .terminator = .{ .branch = .{ .target = @enumFromInt(1), .arguments = .{ .start = 0, .end = 1 } } } },
+        .{ .argument_start = 0, .argument_end = 1, .instruction_start = 0, .instruction_end = 0, .terminator = .{ .branch = .{ .target = @fromBackingInt(@intCast(1)), .arguments = .{ .start = 0, .end = 1 } } } },
         .{ .argument_start = 1, .argument_end = 2, .instruction_start = 0, .instruction_end = 0, .terminator = .return_unit },
     };
     const body: structures.FunctionBodyAnalysis = .{
@@ -1355,7 +1431,7 @@ test "cached storage joins reject mismatched types and coercion metadata" {
         .call_arguments = &.{},
         .instructions = &.{},
         .blocks = &blocks,
-        .entry = @enumFromInt(0),
+        .entry = @fromBackingInt(@intCast(0)),
     };
     try std.testing.expect(validFunctionBody(body));
     arguments[1].type_id = .bool;
@@ -1368,4 +1444,147 @@ test "cached storage joins reject mismatched types and coercion metadata" {
     try std.testing.expect(!validFunctionBody(body));
     uses[0].variant_tag_mapping = null;
     try std.testing.expect(validFunctionBody(body));
+}
+
+test "snapshots reject the previous IR format" {
+    const db = try query.Database.init(std.testing.allocator, .{ .worker_count = 1 });
+    defer db.deinit();
+    try std.testing.expectError(error.InvalidCache, restoreInterns(db, std.testing.allocator, "CHIQRY16"));
+}
+
+test "array snapshot interns reject unavailable elements unsupported storage and oversized counts" {
+    const allocator = std.testing.allocator;
+    for ([_]structures.ArrayType{
+        .{ .element_type = .type, .length = 0 },
+        .{ .element_type = .int, .length = @as(u32, std.math.maxInt(i32)) + 1 },
+        .{ .element_type = .fromInterned(@fromBackingInt(@intCast(0))), .length = 1 },
+        .{ .element_type = @fromBackingInt(@intCast(8)), .length = 0 },
+    }) |array| {
+        const db = try query.Database.init(allocator, .{ .worker_count = 1 });
+        defer db.deinit();
+        var writer: codec.Writer = .{ .allocator = allocator };
+        defer writer.deinit();
+        try writer.bytes.appendSlice(allocator, format);
+        try writer.write(u64, 1);
+        try writer.write([]const u8, @typeName(queries.Types));
+        try writer.write(queries.Types.Value, .{ .array = array });
+        try std.testing.expectError(error.InvalidCache, restoreInterns(db, allocator, writer.bytes.items));
+    }
+}
+
+test "array snapshot storage eligibility descends into variant and array elements" {
+    const allocator = std.testing.allocator;
+    const db = try query.Database.init(allocator, .{ .worker_count = 1 });
+    defer db.deinit();
+    const variant: structures.TypeId = .fromInterned(try db.intern(queries.Types, .{ .variant = .{ .members = &.{ .int, .type } } }));
+    const nested: structures.TypeId = .fromInterned(try db.intern(queries.Types, .{ .array = .{ .element_type = variant, .length = 0 } }));
+    try std.testing.expect(!try validArrayType(db, .{ .element_type = variant, .length = 0 }));
+    try std.testing.expect(!try validArrayType(db, .{ .element_type = nested, .length = 2 }));
+    try std.testing.expect(try validArrayType(db, .{ .element_type = .never, .length = 0 }));
+    try std.testing.expect(try validArrayType(db, .{ .element_type = .int, .length = std.math.maxInt(i32) }));
+}
+
+test "array runtime snapshot tuples require the declared shape and runtime element type" {
+    const allocator = std.testing.allocator;
+    for (0..5) |case_index| {
+        const first = try query.Database.init(allocator, .{ .worker_count = 1 });
+        defer first.deinit();
+        const type_id: structures.TypeId = .fromInterned(try first.intern(queries.Types, .{ .array = .{ .element_type = .int, .length = 2 } }));
+        const number = try first.intern(queries.CompileTimeValues, .{ .runtime = .{ .type_id = .int, .value = .{ .int = 42 } } });
+        const wrong = try first.intern(queries.CompileTimeValues, .{ .runtime = .{ .type_id = .bool, .value = .{ .bool = true } } });
+        const type_value = try first.intern(queries.CompileTimeValues, .{ .type = .int });
+        const elements: []const structures.CompileTimeValueId = switch (case_index) {
+            0 => &.{ number, number },
+            1 => &.{number},
+            2 => &.{ number, number, number },
+            3 => &.{ number, wrong },
+            4 => &.{ number, type_value },
+            else => unreachable,
+        };
+        const tuple = try first.intern(queries.CompileTimeValueTuples, .{ .values = elements });
+        _ = try first.intern(queries.CompileTimeValues, .{ .runtime = .{ .type_id = type_id, .value = .{ .structure = tuple } } });
+        var writer: codec.Writer = .{ .allocator = allocator };
+        defer writer.deinit();
+        try writer.bytes.appendSlice(allocator, format);
+        try first.writeInternedValues(&writer);
+        const second = try query.Database.init(allocator, .{ .worker_count = 1 });
+        defer second.deinit();
+        if (case_index == 0) {
+            try std.testing.expectEqual(writer.bytes.items.len, try restoreInterns(second, allocator, writer.bytes.items));
+        } else {
+            try std.testing.expectError(error.InvalidCache, restoreInterns(second, allocator, writer.bytes.items));
+        }
+    }
+    const db = try query.Database.init(allocator, .{ .worker_count = 1 });
+    defer db.deinit();
+    const type_id: structures.TypeId = .fromInterned(try db.intern(queries.Types, .{ .array = .{ .element_type = .int, .length = 0 } }));
+    try std.testing.expect(!try validArrayRuntime(db, .{ .runtime = .{ .type_id = type_id, .value = .{ .int = 42 } } }));
+}
+
+test "cached array projections validate operands shape index and result and round trip IR" {
+    const allocator = std.testing.allocator;
+    const db = try query.Database.init(allocator, .{ .worker_count = 1 });
+    defer db.deinit();
+    const type_id: structures.TypeId = .fromInterned(try db.intern(queries.Types, .{ .array = .{ .element_type = .int, .length = 3 } }));
+    var modes = [_]structures.ParameterMode{.imm};
+    var arguments = [_]structures.FunctionBlockArgument{.{ .type_id = type_id, .representation = .storage }};
+    var instructions = [_]structures.FunctionInstruction{
+        .{ .const_int = 1 },
+        .{ .array_element = .{ .array = @fromBackingInt(@intCast(0)), .index = @fromBackingInt(@intCast(1)), .type_id = .int } },
+    };
+    var blocks = [_]structures.FunctionBlock{.{ .argument_start = 0, .argument_end = 1, .instruction_start = 0, .instruction_end = 2, .terminator = .return_unit }};
+    const body: structures.FunctionBodyAnalysis = .{
+        .return_type = .unit,
+        .parameter_modes = &modes,
+        .block_arguments = &arguments,
+        .instructions = &instructions,
+        .call_arguments = &.{},
+        .branch_arguments = &.{},
+        .blocks = &blocks,
+        .entry = @fromBackingInt(@intCast(0)),
+    };
+    try std.testing.expect(try validOutput(queries.AnalyzeFunctionInstance, db, body));
+    var writer: codec.Writer = .{ .allocator = allocator };
+    defer writer.deinit();
+    try writer.write(structures.FunctionBodyAnalysis, body);
+    var reader: codec.Reader = .{ .allocator = allocator, .bytes = writer.bytes.items };
+    var restored = try reader.read(structures.FunctionBodyAnalysis);
+    defer restored.deinit(allocator);
+    try std.testing.expect(structures.FunctionBodyAnalysis.eql(body, restored));
+    try std.testing.expect(try validOutput(queries.AnalyzeFunctionInstance, db, restored));
+    instructions[1].array_element.array = @fromBackingInt(@intCast(99));
+    try std.testing.expect(!validFunctionBody(body));
+    instructions[1].array_element.array = @fromBackingInt(@intCast(0));
+    instructions[1].array_element.index = @fromBackingInt(@intCast(99));
+    try std.testing.expect(!validFunctionBody(body));
+    instructions[1].array_element.index = @fromBackingInt(@intCast(1));
+    instructions[1].array_element.type_id = .bool;
+    try std.testing.expect(!try validOutput(queries.AnalyzeFunctionInstance, db, body));
+    instructions[1].array_element.type_id = .int;
+    instructions[0] = .{ .const_bool = false };
+    try std.testing.expect(!try validOutput(queries.AnalyzeFunctionInstance, db, body));
+    instructions[0] = .{ .const_int = 1 };
+    arguments[0].type_id = .int;
+    try std.testing.expect(!try validOutput(queries.AnalyzeFunctionInstance, db, body));
+    arguments[0].type_id = type_id;
+    instructions[1] = .{ .struct_init = .{ .type_id = type_id, .fields = .{ .start = 0, .end = 0 } } };
+    try std.testing.expect(!try validOutput(queries.AnalyzeFunctionInstance, db, body));
+}
+
+test "cached array storage rejects recursive containment even through zero length arrays" {
+    const modules = @import("modules.zig");
+    const allocator = std.testing.allocator;
+    for ([_]u32{ 0, 1 }) |length| {
+        const source = try allocator.print("import std.array.{{Array}}\nstruct Node\n    children: Array(Node, {d})\nexit(42)", .{length});
+        defer allocator.free(source);
+        const db = try query.Database.init(allocator, .{ .worker_count = 1 });
+        defer db.deinit();
+        try modules.registerSources(db, allocator, source, &.{}, &.{});
+        const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;
+        const node = try queries.internStructType(db, scope.resolve("Node").?);
+        const nested: structures.TypeId = .fromInterned(try db.intern(queries.Types, .{ .array = .{ .element_type = node, .length = 0 } }));
+        const outer: structures.TypeId = .fromInterned(try db.intern(queries.Types, .{ .array = .{ .element_type = nested, .length = length } }));
+        const types: queries.TypeFacts(*query.Database) = .{ .ctx = db };
+        try std.testing.expect(!try validArrayStorageType(db, types, outer));
+    }
 }

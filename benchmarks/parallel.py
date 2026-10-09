@@ -43,7 +43,7 @@ def clear_query_snapshot(project: pathlib.Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("compiler", type=pathlib.Path, help="path to a ReleaseFast chi binary")
+    parser.add_argument("compiler", type=pathlib.Path, help="path to a chi binary built with -Doptimize=fast")
     parser.add_argument("--samples", type=int, default=7)
     parser.add_argument("--temp-dir", type=pathlib.Path, help="filesystem on which to create the benchmark fixture")
     args = parser.parse_args()

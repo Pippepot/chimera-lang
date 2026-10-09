@@ -81,6 +81,211 @@ const Fixture = struct {
     }
 };
 
+test "operation snapshots restore calls indexers and invalidate signature and visibility edits" {
+    const library =
+        \\pub struct Value
+        \\    copy = fieldwise
+        \\    pub value: int
+        \\    pub func +(imm left: Value, imm right: Value) Value -> Value{value = left.value + right.value}
+    ;
+    const source =
+        \\import library.{Value}
+        \\fallible calculate() int
+        \\    var values = [19, 23]
+        \\    values[0] += 1
+        \\    const sum = Value{value = values[0]} + Value{value = values[1]}
+        \\    return sum.value - 1
+        \\func run() int
+        \\    if const calculated = calculate() -> return calculated
+        \\    return 90
+        \\static answer = run()
+        \\exit(run() + answer - 42)
+    ;
+    const files = [_]modules.SourceFile{.{ .path = "library/value.chi", .module_path = "library", .source = library }};
+    const fixture = try Fixture.restoreSources(source, &files, &files, null);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const invalid = try std.mem.replaceOwned(u8, std.testing.allocator, library, "imm right: Value)", "imm right: Value, imm extra: Value)");
+    defer std.testing.allocator.free(invalid);
+    try fixture.db.setInput(queries.SourceText, 1, invalid);
+    try fixture.expectDiagnostic(.invalid_operation_signature);
+    try fixture.db.setInput(queries.SourceText, 1, library);
+    try fixture.expectExit(42);
+    const private = try std.mem.replaceOwned(u8, std.testing.allocator, library, "pub func +", "func +");
+    defer std.testing.allocator.free(private);
+    const private_files = [_]modules.SourceFile{.{ .path = "library/value.chi", .module_path = "library", .source = private }};
+    const denied = try Fixture.restoreSources(source, &files, &private_files, .private_access);
+    defer denied.db.deinit();
+    try denied.db.setInput(queries.SourceText, 1, library);
+    try denied.expectExit(42);
+}
+
+test "collection snapshots restore pending carriers heap destinations and initializer effects" {
+    const source =
+        \\func element() int -> 19
+        \\func run() int
+        \\    const fixed: Array(int, 1) = [element()]
+        \\    const values: List(int) = [23]
+        \\    if const first = fixed.get(0)
+        \\        if const second = values.get(0)
+        \\            return first[] + second[]
+        \\    return 90
+        \\exit(run())
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const fallible = try std.mem.replaceOwned(u8, std.testing.allocator, source, "func element()", "fallible element()");
+    defer std.testing.allocator.free(fallible);
+    const changed = try std.mem.replaceOwned(u8, std.testing.allocator, fallible, "[element()]", "[element?()]");
+    defer std.testing.allocator.free(changed);
+    try fixture.db.setInput(queries.SourceText, 0, changed);
+    try fixture.expectDiagnostic(.fallible_expression_outside_fallible_function);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(42);
+}
+
+test "converter snapshots restore calls literals and invalidate owner edits" {
+    const library =
+        \\pub struct Source
+        \\    copy = trivial
+        \\    pub value: int
+        \\pub struct Target
+        \\    copy = trivial
+        \\    pub value: int
+        \\pub converter(value: Source) Target -> Target{value = value.value}
+    ;
+    const source =
+        \\import library.{Source, Target}
+        \\func run() int
+        \\    const converted: Target = Source{value = 42}
+        \\    const literal: byte = 255
+        \\    return converted.value
+        \\static answer = run()
+        \\exit(run() + answer - 42)
+    ;
+    const files = [_]modules.SourceFile{.{ .path = "library/types.chi", .module_path = "library", .source = library }};
+    const fixture = try Fixture.restoreSources(source, &files, &files, null);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const private = try std.mem.replaceOwned(u8, std.testing.allocator, library, "pub converter", "converter");
+    defer std.testing.allocator.free(private);
+    try fixture.db.setInput(queries.SourceText, 1, private);
+    try fixture.expectDiagnostic(.local_type_mismatch);
+    try fixture.db.setInput(queries.SourceText, 1, library);
+    try fixture.expectExit(42);
+    const private_files = [_]modules.SourceFile{.{ .path = "library/types.chi", .module_path = "library", .source = private }};
+    const denied = try Fixture.restoreSources(source, &files, &private_files, .local_type_mismatch);
+    defer denied.db.deinit();
+    try denied.db.setInput(queries.SourceText, 1, library);
+    try denied.expectExit(42);
+}
+
+test "staged static conversion snapshots track source and converter changes" {
+    const source =
+        \\static struct Source
+        \\    copy = trivial
+        \\    value: int
+        \\struct Target
+        \\    copy = trivial
+        \\    value: int
+        \\converter(static source: Source) Target -> Target{value = source.value}
+        \\func compute() int
+        \\    var source = Source{value = 40}
+        \\    source.value += 2
+        \\    const target: Target = source
+        \\    var literal: int_literal = 40
+        \\    literal = 42
+        \\    const defaulted: int = literal
+        \\    return target.value + defaulted - 42
+        \\static answer = compute()
+        \\func run() int -> answer
+        \\exit(run())
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const source_edit = try std.mem.replaceOwned(u8, std.testing.allocator, source, "source.value += 2", "source.value += 3");
+    defer std.testing.allocator.free(source_edit);
+    try fixture.db.setInput(queries.SourceText, 0, source_edit);
+    try fixture.expectExit(43);
+    const converter_edit = try std.mem.replaceOwned(u8, std.testing.allocator, source, "Target{value = source.value}", "Target{value = source.value + 1}");
+    defer std.testing.allocator.free(converter_edit);
+    try fixture.db.setInput(queries.SourceText, 0, converter_edit);
+    try fixture.expectExit(43);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(42);
+}
+
+test "converter snapshot probes retain inferred types and annotated literal locals" {
+    const library =
+        \\pub struct Source
+        \\    copy = trivial
+        \\    pub value: int
+        \\pub struct Target
+        \\    copy = trivial
+        \\    pub value: int
+        \\pub converter(static T: type, value: Source) T where T == Target -> T{value = value.value}
+        \\pub converter(static value: int_literal) Target -> Target{value = value}
+    ;
+    const source =
+        \\import library.{Source, Target}
+        \\func compute() Target
+        \\    var literal: int_literal = 19
+        \\    literal = 21
+        \\    return literal
+        \\static answer = compute()
+        \\func run() int
+        \\    const converted: Target = Source{value = 21}
+        \\    return converted.value + answer.value
+        \\exit(run())
+    ;
+    const files = [_]modules.SourceFile{.{ .path = "library/types.chi", .module_path = "library", .source = library }};
+    const fixture = try Fixture.restoreSources(source, &files, &files, null);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const literal_edit = try std.mem.replaceOwned(u8, std.testing.allocator, source, "literal = 21", "literal = 22");
+    defer std.testing.allocator.free(literal_edit);
+    try fixture.db.setInput(queries.SourceText, 0, literal_edit);
+    try fixture.expectExit(43);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    const converter_edit = try std.mem.replaceOwned(u8, std.testing.allocator, library, "T{value = value.value}", "T{value = value.value + 1}");
+    defer std.testing.allocator.free(converter_edit);
+    try fixture.db.setInput(queries.SourceText, 1, converter_edit);
+    try fixture.expectExit(43);
+    try fixture.db.setInput(queries.SourceText, 1, library);
+    try fixture.expectExit(42);
+}
+
+test "static struct modifier edits invalidate restored runtime bodies" {
+    const library =
+        \\pub struct Data
+        \\    copy = trivial
+        \\    pub value: int
+        \\pub func make() Data -> Data{value = 42}
+    ;
+    const source =
+        \\import library.{make}
+        \\func run() int -> make().value
+        \\exit(run())
+    ;
+    const static_library = try std.mem.replaceOwned(u8, std.testing.allocator, library, "pub struct Data", "pub static struct Data");
+    defer std.testing.allocator.free(static_library);
+    const files = [_]modules.SourceFile{.{ .path = "library/types.chi", .module_path = "library", .source = library }};
+    const static_files = [_]modules.SourceFile{.{ .path = "library/types.chi", .module_path = "library", .source = static_library }};
+    const fixture = try Fixture.restoreSources(source, &files, &files, null);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    try fixture.db.setInput(queries.SourceText, 1, static_library);
+    try fixture.expectDiagnostic(.compile_time_only_type);
+    try fixture.db.setInput(queries.SourceText, 1, library);
+    try fixture.expectExit(42);
+    const denied = try Fixture.restoreSources(source, &files, &static_files, .compile_time_only_type);
+    defer denied.db.deinit();
+    try denied.db.setInput(queries.SourceText, 1, library);
+    try denied.expectExit(42);
+}
+
 fn checkFieldVisibilitySnapshot(generated: bool) !void {
     const allocator = std.testing.allocator;
     const public_source = if (generated)
@@ -95,7 +300,7 @@ fn checkFieldVisibilitySnapshot(generated: bool) !void {
     ;
     const private_source = try std.mem.replaceOwned(u8, allocator, public_source, "pub value", "value");
     defer allocator.free(private_source);
-    const source = try std.fmt.allocPrint(allocator,
+    const source = try allocator.print(
         \\import library
         \\static Selected = library.Cell{s}
         \\func run() int
@@ -154,7 +359,7 @@ fn checkFieldVisibilityAnnotationSnapshot(generated: bool) !void {
     defer allocator.free(hidden_source);
     const private_source = try std.mem.replaceOwned(u8, allocator, hidden_source, "pub value", "value");
     defer allocator.free(private_source);
-    const source = try std.fmt.allocPrint(allocator,
+    const source = try allocator.print(
         \\import library
         \\static Selected = library.Cell{s}
         \\func run() int
@@ -403,7 +608,7 @@ test "allocating initializer snapshots retain skipped evaluation after allocator
     defer fixture.db.deinit();
     try fixture.expectExit(90);
     const body = try Fixture.functionBody(fixture.db, "run");
-    const allocation_file = (try fixture.db.input(queries.StandardFile, @intFromEnum(standard_library.File.memory_allocation))).*;
+    const allocation_file = (try fixture.db.input(queries.StandardFile, @backingInt(standard_library.File.memory_allocation))).*;
     const allocation_source = (try fixture.db.input(queries.SourceText, allocation_file)).*;
     const edit = try std.mem.replaceOwned(u8, std.testing.allocator, allocation_source, "var storage = allocate?(T, 1)", "var storage = allocate?(T, -1)");
     defer std.testing.allocator.free(edit);
@@ -417,7 +622,7 @@ test "allocating initializer snapshots retain skipped evaluation after allocator
 test "allocating initializer snapshots retain partial cleanup and consumption on failure" {
     for ([_][]const u8{ "fail_value?()", "fail" }) |completion| {
         errdefer std.debug.print("allocating completion: {s}\n", .{completion});
-        const source = try std.fmt.allocPrint(std.testing.allocator,
+        const source = try std.testing.allocator.print(
             \\struct Leaf
             \\    count: Ref(int, true)
             \\    move = fieldwise
@@ -484,5 +689,210 @@ test "raw slot initializer snapshots retain immovable destruction and recompute 
     try fixture.db.setInput(queries.SourceText, 0, mode_edit);
     try std.testing.expect((try fixture.db.get(queries.BuildExecutable, 0)).* == null);
     try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(42);
+}
+
+test "array snapshots restore native and comptime fill reads writes and bounds" {
+    const source =
+        \\import std.array.{Array}
+        \\func run() int
+        \\    var values = Array(int, 3).filled(20)
+        \\    if const middle = values.get_mut(1) -> middle.replace(22)
+        \\    else return 90
+        \\    if values.get(-1) -> return 91
+        \\    if values.get(3) -> return 92
+        \\    if values.get_mut(-1) -> return 93
+        \\    if values.get_mut(3) -> return 94
+        \\    if const first = values.get(0)
+        \\        if const middle = values.get(1) -> return first[] + middle[]
+        \\    return 95
+    ;
+    for ([_][]const u8{ "exit(run())", "static answer = run()\nexit(answer)", "static answer = run()\nexit(run() + answer - 42)" }) |entry| {
+        const program = try std.testing.allocator.print("{s}\n{s}", .{ source, entry });
+        defer std.testing.allocator.free(program);
+        const fixture = try Fixture.restore(program);
+        defer fixture.db.deinit();
+        try fixture.expectExit(42);
+    }
+}
+
+test "array snapshots restore empty and nested runtime tuple shapes" {
+    for ([_]u32{ 0, 2 }) |length| {
+        const source = try std.testing.allocator.print(
+            \\import std.array.{{Array}}
+            \\func run() int
+            \\    const row = Array(int, {d}).filled(40)
+            \\    const matrix = Array(Array(int, {d}), 2).filled(row)
+            \\    if const selected = matrix.get(1)
+            \\        if const cell = selected[].get(0) -> return cell[] + selected[].len()
+            \\        return 42
+            \\    return 90
+            \\static answer = run()
+            \\exit(run() + answer - 42)
+        , .{ length, length });
+        defer std.testing.allocator.free(source);
+        const fixture = try Fixture.restore(source);
+        defer fixture.db.deinit();
+        try fixture.expectExit(42);
+    }
+}
+
+test "array snapshots recompute element types and counts and retain canonical interning" {
+    const allocator = std.testing.allocator;
+    const source =
+        \\import std.array.{Array}
+        \\static Element = int
+        \\static Count = 2
+        \\static Shape = Array(Element, Count)
+        \\func number(value: int | none) int
+        \\    if const selected = value as int -> return selected
+        \\    return 90
+        \\func run() int
+        \\    const values = Shape.filled(40)
+        \\    if const selected = values.get(1) -> return number(selected[]) + values.len()
+        \\    return 91
+        \\static answer = run()
+        \\exit(run() + answer - 42)
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const scope = (try fixture.db.get(queries.BuildModuleScope, 0)).*.?;
+    const shape_item = scope.resolveStatic("Shape").?;
+    const shape_value = (try fixture.db.get(queries.ResolveStatic, shape_item)).*.?;
+    const original_type = (try fixture.db.lookupInterned(queries.CompileTimeValues, shape_value)).type;
+    const types: queries.TypeFacts(*query.Database) = .{ .ctx = fixture.db };
+    for ([_][]const u8{ "static Element = int", "static Count = 2" }, [_][]const u8{ "static Element = int | none", "static Count = 3" }, [_]u8{ 42, 44 }) |original, replacement, status| {
+        const edit = try std.mem.replaceOwned(u8, allocator, source, original, replacement);
+        defer allocator.free(edit);
+        try fixture.db.setInput(queries.SourceText, 0, edit);
+        try fixture.expectExit(status);
+        const edited_scope = (try fixture.db.get(queries.BuildModuleScope, 0)).*.?;
+        const edited_value = (try fixture.db.get(queries.ResolveStatic, edited_scope.resolveStatic("Shape").?)).*.?;
+        const edited_type = (try fixture.db.lookupInterned(queries.CompileTimeValues, edited_value)).type;
+        try std.testing.expect(edited_type != original_type);
+        const array = (try types.arrayType(edited_type)).?;
+        try std.testing.expectEqual(edited_type, structures.TypeId.fromInterned(try fixture.db.intern(queries.Types, .{ .array = array })));
+        try fixture.db.setInput(queries.SourceText, 0, source);
+        try fixture.expectExit(42);
+        const restored_scope = (try fixture.db.get(queries.BuildModuleScope, 0)).*.?;
+        const restored_value = (try fixture.db.get(queries.ResolveStatic, restored_scope.resolveStatic("Shape").?)).*.?;
+        try std.testing.expectEqual(original_type, (try fixture.db.lookupInterned(queries.CompileTimeValues, restored_value)).type);
+    }
+}
+
+test "array snapshots invalidate element copy hook bodies and capabilities" {
+    const allocator = std.testing.allocator;
+    const source =
+        \\import std.array.{Array}
+        \\struct Item
+        \\    value: int
+        \\    copy = func(imm self: Item) Item -> Item{value = self.value + 1}
+        \\func run() int
+        \\    const original = Item{value = 40}
+        \\    const values = Array(Item, 2).filled(original)
+        \\    const copied = values.copy()
+        \\    if const selected = copied.get(1) -> return selected[].value
+        \\    return 90
+        \\static answer = run()
+        \\exit(run() + answer - 42)
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const hook_edit = try std.mem.replaceOwned(u8, allocator, source, "self.value + 1", "self.value + 2");
+    defer allocator.free(hook_edit);
+    try fixture.db.setInput(queries.SourceText, 0, hook_edit);
+    try fixture.expectExit(46);
+    const capability_edit = try std.mem.replaceOwned(u8, allocator, source, "copy = func(imm self: Item) Item -> Item{value = self.value + 1}", "copy = none");
+    defer allocator.free(capability_edit);
+    try fixture.db.setInput(queries.SourceText, 0, capability_edit);
+    try std.testing.expect((try fixture.db.get(queries.BuildExecutable, 0)).* == null);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(42);
+}
+
+test "array snapshots invalidate source indices and standard bounds checks" {
+    const allocator = std.testing.allocator;
+    const source =
+        \\import std.array.{Array}
+        \\func run() int
+        \\    const values = Array(int, 2).filled(42)
+        \\    if const selected = values.get(1) -> return selected[]
+        \\    return 89
+        \\static answer = run()
+        \\exit(run() + answer - 42)
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const index_edit = try std.mem.replaceOwned(u8, allocator, source, "values.get(1)", "values.get(2)");
+    defer allocator.free(index_edit);
+    try fixture.db.setInput(queries.SourceText, 0, index_edit);
+    try fixture.expectExit(136);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(42);
+    const array_file = (try fixture.db.input(queries.StandardFile, @backingInt(standard_library.File.array))).*;
+    const array_source = try allocator.dupe(u8, (try fixture.db.input(queries.SourceText, array_file)).*);
+    defer allocator.free(array_source);
+    const bounds_edit = try std.mem.replaceOwned(u8, allocator, array_source, "index < N", "index < N - 1");
+    defer allocator.free(bounds_edit);
+    try std.testing.expect(!std.mem.eql(u8, array_source, bounds_edit));
+    try fixture.db.setInput(queries.SourceText, array_file, bounds_edit);
+    try fixture.expectExit(136);
+    try fixture.db.setInput(queries.SourceText, array_file, array_source);
+    try fixture.expectExit(42);
+}
+
+test "array intern snapshots preserve nested tuple values and reuse identical type identities" {
+    const allocator = std.testing.allocator;
+    const first = try query.Database.init(allocator, .{ .worker_count = 1 });
+    defer first.deinit();
+    const row_data: structures.TypeData = .{ .array = .{ .element_type = .int, .length = 0 } };
+    const row_id = try first.intern(queries.Types, row_data);
+    const row_type: structures.TypeId = .fromInterned(row_id);
+    const empty_tuple = try first.intern(queries.CompileTimeValueTuples, .{ .values = &.{} });
+    const row_value = try first.intern(queries.CompileTimeValues, .{ .runtime = .{ .type_id = row_type, .value = .{ .structure = empty_tuple } } });
+    const matrix_data: structures.TypeData = .{ .array = .{ .element_type = row_type, .length = 2 } };
+    const matrix_id = try first.intern(queries.Types, matrix_data);
+    const matrix_type: structures.TypeId = .fromInterned(matrix_id);
+    const tuple = try first.intern(queries.CompileTimeValueTuples, .{ .values = &.{ row_value, row_value } });
+    const matrix_value = try first.intern(queries.CompileTimeValues, .{ .runtime = .{ .type_id = matrix_type, .value = .{ .structure = tuple } } });
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(directory);
+    const digest = cache.querySnapshotKey(try cache.compilerDigest(std.testing.io), "main.chi", &.{});
+    try query_disk_cache.save(std.testing.io, allocator, directory, digest, first);
+    const payload = (try cache.load(std.testing.io, allocator, directory, digest)) orelse return error.TestUnexpectedResult;
+    defer allocator.free(payload);
+    const next_value: structures.CompileTimeValue = .{ .runtime = .{ .type_id = .int, .value = .{ .int = 31337 } } };
+    const next_id = try first.intern(queries.CompileTimeValues, next_value);
+    const second = try query.Database.init(allocator, .{ .worker_count = 1 });
+    defer second.deinit();
+    const offset = try query_disk_cache.restoreInterns(second, allocator, payload);
+    try std.testing.expectEqual(@as(usize, 0), try query_disk_cache.restoreQueries(second, payload, offset));
+    try std.testing.expectEqual(row_id, try second.intern(queries.Types, row_data));
+    try std.testing.expectEqual(matrix_id, try second.intern(queries.Types, matrix_data));
+    const restored = (try second.lookupInterned(queries.CompileTimeValues, matrix_value)).runtime;
+    try std.testing.expectEqual(matrix_type, restored.type_id);
+    try std.testing.expectEqual(tuple, restored.value.structure);
+    try std.testing.expectEqualSlices(structures.CompileTimeValueId, &.{ row_value, row_value }, (try second.lookupInterned(queries.CompileTimeValueTuples, tuple)).values);
+    try std.testing.expectEqual(matrix_value, try second.intern(queries.CompileTimeValues, .{ .runtime = restored }));
+    try std.testing.expectEqual(next_id, try second.intern(queries.CompileTimeValues, next_value));
+}
+
+test "array snapshots publish static nested values into runtime storage" {
+    const fixture = try Fixture.restore(
+        \\static row = Array(int, 2).filled(20)
+        \\static matrix = Array(Array(int, 2), 2).filled(row)
+        \\func run() int
+        \\    const values = matrix
+        \\    if const selected = values.get(1)
+        \\        if const value = selected[].get(0) -> return value[] + row.len() + 20
+        \\    return 90
+        \\exit(run())
+    );
+    defer fixture.db.deinit();
     try fixture.expectExit(42);
 }

@@ -38,9 +38,9 @@ const RunOutcome = union(enum) {
 };
 
 fn trySetDebugFlag(flags: *DebugFlags, name: []const u8) bool {
-    inline for (@typeInfo(DebugFlags).@"struct".fields) |field| {
-        if (std.mem.eql(u8, name, field.name)) {
-            @field(flags, field.name) = true;
+    inline for (@typeInfo(DebugFlags).@"struct".field_names) |field_name| {
+        if (std.mem.eql(u8, name, field_name)) {
+            @field(flags, field_name) = true;
             return true;
         }
     }
@@ -396,8 +396,8 @@ fn reportProgramTermination(output: *std.Io.Writer, errors: *std.Io.Writer, term
             try output.flush();
             return true;
         },
-        .signal => |signal| try printError(errors, "generated program terminated by signal {d}", .{@intFromEnum(signal)}),
-        .stopped => |signal| try printError(errors, "generated program stopped by signal {d}", .{@intFromEnum(signal)}),
+        .signal => |signal| try printError(errors, "generated program terminated by signal {d}", .{@backingInt(signal)}),
+        .stopped => |signal| try printError(errors, "generated program stopped by signal {d}", .{@backingInt(signal)}),
         .unknown => |status| try printError(errors, "generated program terminated with unknown status {d}", .{status}),
     }
     try errors.flush();
@@ -667,9 +667,16 @@ test "CLI core renders compile-time call traces from the failure outward" {
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, rendered, "called at compile time from here"));
 }
 
-test "CLI rejects unsupported compile-time borrowing and allocation with diagnostics" {
+test "CLI supports compile-time local borrowing" {
     const io = std.testing.io;
-    for ([_][]const u8{
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var errors: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer errors.deinit();
+    const result = try compileAndRun(io, std.testing.allocator, .{
+        .source_path = "borrowing.chi",
+        .source =
         \\func compute() int
         \\  const number = 42
         \\  borrow item = number
@@ -677,28 +684,36 @@ test "CLI rejects unsupported compile-time borrowing and allocation with diagnos
         \\static answer = compute()
         \\exit(answer)
         ,
+        .program_args = &.{},
+        .debug_flags = .{},
+        .started = std.Io.Clock.awake.now(io),
+    }, &output.writer, &errors.writer);
+    try std.testing.expectEqual(RunOutcome{ .program = .{ .exited = 42 } }, result);
+    try std.testing.expectEqual(@as(usize, 0), errors.writer.buffered().len);
+}
+
+test "CLI rejects unsupported compile-time allocation with diagnostics" {
+    const io = std.testing.io;
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var errors: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer errors.deinit();
+    const result = try compileAndRun(io, std.testing.allocator, .{
+        .source_path = "unsupported.chi",
+        .source =
         \\fallible compute() int
         \\  const owner = Box.new?(42)
         \\  return owner.borrow()[]
         \\static answer = compute?()
         \\exit(answer)
         ,
-    }) |source| {
-        var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
-        defer output.deinit();
-        var errors: std.Io.Writer.Allocating = .init(std.testing.allocator);
-        defer errors.deinit();
-        const result = try compileAndRun(io, std.testing.allocator, .{
-            .source_path = "unsupported.chi",
-            .source = source,
-            .program_args = &.{},
-            .debug_flags = .{},
-            .started = std.Io.Clock.awake.now(io),
-        }, &output.writer, &errors.writer);
-        try std.testing.expectEqual(RunOutcome.rejected, result);
-        try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "operation is not supported during compile-time execution") != null);
-        try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "unsupported.chi:") != null);
-    }
+        .program_args = &.{},
+        .debug_flags = .{},
+        .started = std.Io.Clock.awake.now(io),
+    }, &output.writer, &errors.writer);
+    try std.testing.expectEqual(RunOutcome.rejected, result);
+    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "operation is not supported during compile-time execution") != null);
+    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "unsupported.chi:") != null);
 }
 
 test "CLI core handles compile-time exit without producing an artifact" {

@@ -462,7 +462,7 @@ pub const Database = struct {
     /// interner. An out-of-range ID still returns InvalidInternId.
     pub fn lookupInternedAs(db: *Database, comptime I: type, id: I.Id) QueryError!?*const I.Value {
         validateInterner(I);
-        const index: usize = @intFromEnum(id);
+        const index: usize = @backingInt(id);
 
         db.lock();
         defer db.unlock();
@@ -1236,15 +1236,15 @@ fn typeContainsPointer(comptime T: type) bool {
         .optional => |info| typeContainsPointer(info.child),
         .array => |info| typeContainsPointer(info.child),
         .error_union => |info| typeContainsPointer(info.payload),
-        .@"struct" => |info| fieldsContainPointer(info.fields),
-        .@"union" => |info| fieldsContainPointer(info.fields),
+        .@"struct" => |info| fieldsContainPointer(info.field_types),
+        .@"union" => |info| fieldsContainPointer(info.field_types),
         else => false,
     };
 }
 
-fn fieldsContainPointer(comptime fields: anytype) bool {
-    for (fields) |field| {
-        if (typeContainsPointer(field.type)) return true;
+fn fieldsContainPointer(comptime field_types: []const type) bool {
+    for (field_types) |FieldType| {
+        if (typeContainsPointer(FieldType)) return true;
     }
     return false;
 }
@@ -1293,7 +1293,7 @@ fn internCacheKey(comptime I: type, value_ptr: *const I.Value, value_hash: u64) 
 }
 
 fn internId(comptime I: type, index: u32) I.Id {
-    return @enumFromInt(@as(@typeInfo(I.Id).@"enum".tag_type, @intCast(index)));
+    return @fromBackingInt(@intCast(index));
 }
 
 fn destroyInternedValueFn(comptime I: type) DestroyOpaqueFn {

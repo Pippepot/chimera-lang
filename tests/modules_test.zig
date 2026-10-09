@@ -7,7 +7,7 @@ const structures = test_sources.structures;
 const modules = test_sources.modules;
 const runtime = test_sources.runtime;
 const testing = std.testing;
-var allocation_failure_backing: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+const allocation_failure_allocator = test_sources.allocation_failure_allocator;
 
 const Fixture = struct {
     db: *query.Database,
@@ -49,7 +49,7 @@ const Fixture = struct {
     }
 
     fn expectLibraryDiagnostic(self: Fixture, kind: std.meta.Tag(structures.Diagnostic.Kind)) !void {
-        const file = (try self.db.input(queries.StandardFile, @intFromEnum(standard_library.File.memory_allocation))).*;
+        const file = (try self.db.input(queries.StandardFile, @backingInt(standard_library.File.memory_allocation))).*;
         try self.expectDiagnostic(file, kind);
     }
 
@@ -75,6 +75,262 @@ const physics = modules.SourceFile{ .path = "physics/body.chi", .module_path = "
     \\exit(99)
 };
 
+test "operation functions explicit calls have native and compile-time parity" {
+    for ([_][]const u8{ "exit(run())", "static result = run()\nexit(result)" }) |entry| {
+        const source = try testing.allocator.print(
+            \\struct Value
+            \\    value: int
+            \\    pub func +(imm left: Value, imm right: Value) Value -> Value{{value = left.value + right.value}}
+            \\func run() int -> Value.+(Value{{value = 40}}, Value{{value = 2}}).value
+            \\{s}
+        , .{entry});
+        defer testing.allocator.free(source);
+        try Fixture.expectSourceExit(source, 42);
+    }
+}
+
+test "operation functions arithmetic expressions have native and compile-time parity" {
+    for ([_][]const u8{ "exit(run())", "static result = run()\nexit(result)" }) |entry| {
+        const source = try testing.allocator.print(
+            \\struct Value
+            \\    value: int
+            \\    pub func +(imm left: Value, imm right: Value) Value -> Value{{value = left.value + right.value}}
+            \\    pub func -(imm left: Value, imm right: Value) Value -> Value{{value = left.value - right.value}}
+            \\    pub func *(imm left: Value, imm right: Value) Value -> Value{{value = left.value * right.value}}
+            \\    pub func /(imm left: Value, imm right: Value) Value -> Value{{value = left.value / right.value}}
+            \\    pub func neg(imm self: Value) Value -> Value{{value = -self.value}}
+            \\func run() int
+            \\    const first = Value{{value = 40}} + Value{{value = 2}}
+            \\    const second = first - Value{{value = 2}}
+            \\    const third = second * Value{{value = 2}}
+            \\    const fourth = third / Value{{value = 2}}
+            \\    const negative = -fourth
+            \\    return -negative.value + 2
+            \\{s}
+        , .{entry});
+        defer testing.allocator.free(source);
+        try Fixture.expectSourceExit(source, 42);
+    }
+}
+
+test "operation functions comparisons not and logical values preserve parity and short circuit" {
+    for ([_][]const u8{ "exit(run())", "static result = run()\nexit(result)" }) |entry| {
+        const source = try testing.allocator.print(
+            \\struct Value
+            \\    value: int
+            \\    pub func ==(imm left: Value, imm right: Value) bool -> left.value == right.value
+            \\    pub func <>(imm left: Value, imm right: Value) bool -> left.value <> right.value
+            \\    pub func <(imm left: Value, imm right: Value) bool -> left.value < right.value
+            \\    pub func >(imm left: Value, imm right: Value) bool -> left.value > right.value
+            \\    pub func <=(imm left: Value, imm right: Value) bool -> left.value <= right.value
+            \\    pub func >=(imm left: Value, imm right: Value) bool -> left.value >= right.value
+            \\    pub func not(imm self: Value) bool -> self.value == 0
+            \\func skipped() bool
+            \\    exit(91)
+            \\func zero_value(mut count: int) Value
+            \\    count += 1
+            \\    return Value{{value = 0}}
+            \\fallible missing() unit -> fail
+            \\func run() int
+            \\    const left = Value{{value = 19}}
+            \\    const right = Value{{value = 23}}
+            \\    const comparisons = left <> right and left < right and right > left and left <= left and right >= right and left == left
+            \\    const zero = Value{{value = 0}}
+            \\    const inverted = not zero
+            \\    var count = 0
+            \\    const inverted_call = not zero_value(count)
+            \\    const short_or = true or skipped()
+            \\    const short_and = false and skipped()
+            \\    if comparisons and inverted and inverted_call and count == 1 and short_or and not short_and and not missing() -> return 42
+            \\    return 90
+            \\{s}
+        , .{entry});
+        defer testing.allocator.free(source);
+        try Fixture.expectSourceExit(source, 42);
+    }
+}
+
+test "operation functions compound assignment supports user roots and fields" {
+    for ([_][]const u8{ "exit(run())", "static result = run()\nexit(result)" }) |entry| {
+        const source = try testing.allocator.print(
+            \\struct Value
+            \\    value: int
+            \\    pub func +(imm left: Value, imm right: Value) Value -> Value{{value = left.value + right.value}}
+            \\    pub func -(imm left: Value, imm right: Value) Value -> Value{{value = left.value - right.value}}
+            \\    pub func *(imm left: Value, imm right: Value) Value -> Value{{value = left.value * right.value}}
+            \\    pub func /(imm left: Value, imm right: Value) Value -> Value{{value = left.value / right.value}}
+            \\struct Holder
+            \\    item: Value
+            \\func run() int
+            \\    var value = Value{{value = 20}}
+            \\    value += Value{{value = 2}}
+            \\    value *= Value{{value = 2}}
+            \\    value -= Value{{value = 2}}
+            \\    value /= Value{{value = 2}}
+            \\    var holder = Holder{{item = Value{{value = 20}}}}
+            \\    holder.item += Value{{value = 1}}
+            \\    return value.value + holder.item.value
+            \\{s}
+        , .{entry});
+        defer testing.allocator.free(source);
+        try Fixture.expectSourceExit(source, 42);
+    }
+}
+
+test "operation functions primitive namespace calls and callable values have parity" {
+    for ([_][]const u8{ "exit(run())", "static result = run()\nexit(result)" }) |entry| {
+        const source = try testing.allocator.print(
+            \\func run() int
+            \\    const add = int.+
+            \\    const total = add(19, 23)
+            \\    const difference = int.-(total, 2)
+            \\    const product = int.*(difference, 2)
+            \\    const quotient = int./(product, 2)
+            \\    const negative = int.neg(quotient)
+            \\    if int.==(total, 42) and int.<>(total, quotient) and int.<(quotient, total) and int.>(total, quotient) and int.<=(quotient, total) and int.>=(total, quotient) and bool.==(true, true) and bool.<>(false, true) and bool.not(false)
+            \\        return -negative + 2
+            \\    return 90
+            \\{s}
+        , .{entry});
+        defer testing.allocator.free(source);
+        try Fixture.expectSourceExit(source, 42);
+    }
+}
+
+test "operation functions immovable results construct in their final destination" {
+    for ([_][]const u8{ "exit(run())", "static result = run()\nexit(result)" }) |entry| {
+        const source = try testing.allocator.print(
+            \\struct Value
+            \\    move = none
+            \\    copy = none
+            \\    value: int
+            \\    pub func +(imm left: Value, imm right: Value) Value -> Value{{value = left.value + right.value}}
+            \\func run() int
+            \\    const sum = Value{{value = 19}} + Value{{value = 23}}
+            \\    return sum.value
+            \\{s}
+        , .{entry});
+        defer testing.allocator.free(source);
+        try Fixture.expectSourceExit(source, 42);
+    }
+}
+
+test "operation functions user indexers and qualified explicit bracket calls have parity" {
+    for ([_][]const u8{ "exit(run())", "static result = run()\nexit(result)" }) |entry| {
+        const source = try testing.allocator.print(
+            \\struct Value
+            \\    value: int
+            \\fallible Value.[](imm self: Value, index: int) int
+            \\    index == 0
+            \\    return self.value
+            \\fallible Value.[]=(mut self: Value, index: int, init replacement: int) unit
+            \\    index == 0
+            \\    self.value = replacement
+            \\fallible calculate() int
+            \\    var value = Value{{value = 19}}
+            \\    value[0] += 2
+            \\    Value.[]=? (value, 0, 21)
+            \\    return Value.[]?(value, 0) + value[0]
+            \\func run() int
+            \\    if const calculated = calculate() -> return calculated
+            \\    return 90
+            \\{s}
+        , .{entry});
+        defer testing.allocator.free(source);
+        try Fixture.expectSourceExit(source, 42);
+    }
+}
+
+test "operation functions conditional compound indexing permits an infallible getter" {
+    for ([_][]const u8{ "exit(run())", "static result = run()\nexit(result)" }) |entry| {
+        const source = try testing.allocator.print(
+            \\struct Value
+            \\    value: int
+            \\    pub func [](imm self: Value, index: int) int -> self.value
+            \\    pub fallible []=(mut self: Value, index: int, init item: int) unit
+            \\        index == 0
+            \\        self.value = item
+            \\func run() int
+            \\    var value = Value{{value = 40}}
+            \\    if value[0] += 2 -> return value.value
+            \\    return 90
+            \\{s}
+        , .{entry});
+        defer testing.allocator.free(source);
+        try Fixture.expectSourceExit(source, 42);
+    }
+}
+
+test "operation functions reject signatures with extra operands modes results and failure" {
+    for ([_][]const u8{
+        "func +(imm left: Value, imm right: Value, imm extra: Value) Value -> left",
+        "func +(mut left: Value, imm right: Value) Value -> left",
+        "func +(imm left: Value, imm right: int) Value -> left",
+        "func +(imm left: Value, imm right: Value) int -> 42",
+        "fallible +(imm left: Value, imm right: Value) Value -> left",
+        "func +(imm left: Value) Value -> left",
+        "func +(imm left: Value, imm right: Value, init extra: Value) Value -> left",
+    }) |declaration| {
+        const source = try testing.allocator.print("struct Value\n    value: int\n    {s}\nconst operation = Value.+\nexit(42)", .{declaration});
+        defer testing.allocator.free(source);
+        try Fixture.expectSourceDiagnostic(source, .invalid_operation_signature);
+    }
+}
+
+test "operation functions explicit three operand calls cannot bypass signature validation" {
+    for ([_][]const u8{
+        "_ = Value.+(Value{value = 19}, Value{value = 21}, Value{value = 2})",
+        "const operation = Value.+\n_ = operation(Value{value = 19}, Value{value = 21}, Value{value = 2})",
+    }) |call| {
+        const source = try testing.allocator.print(
+            \\struct Value
+            \\    value: int
+            \\    pub func +(imm left: Value, imm right: Value, imm extra: Value) Value -> left
+            \\{s}
+            \\exit(42)
+        , .{call});
+        defer testing.allocator.free(source);
+        try Fixture.expectSourceDiagnostic(source, .invalid_operation_signature);
+    }
+}
+
+test "operation functions generic type lookup specializes without importing its namespace" {
+    const library: modules.SourceFile = .{ .path = "lib/value.chi", .module_path = "lib", .source =
+        \\pub struct Value(T: type)
+        \\    pub value: T
+        \\    pub func +(imm left: Value(T), imm right: Value(T)) Value(T) -> Value(T){value = left.value + right.value}
+        \\pub func make(imm value: int) Value(int) -> Value(int){value = value}
+    };
+    for ([_][]const u8{ "exit(run())", "static result = run()\nexit(result)" }) |entry| {
+        const source = try testing.allocator.print(
+            \\import lib.{{make}}
+            \\func run() int
+            \\    const calculated = make(19) + make(23)
+            \\    return calculated.value
+            \\{s}
+        , .{entry});
+        defer testing.allocator.free(source);
+        const fixture = try Fixture.init(source, &.{library});
+        defer fixture.deinit();
+        try fixture.expectExit(0, 42);
+    }
+}
+
+test "operation functions reject comparison unary and indexer signature mismatches" {
+    for ([_]struct { name: []const u8, declaration: []const u8 }{
+        .{ .name = "==", .declaration = "func ==(imm left: Value, imm right: Value) Value -> left" },
+        .{ .name = "neg", .declaration = "func neg(imm left: Value, imm right: Value) Value -> left" },
+        .{ .name = "not", .declaration = "func not(imm self: Value) Value -> self" },
+        .{ .name = "[]", .declaration = "fallible [](imm self: Value, index: bool) int -> 42" },
+        .{ .name = "[]=", .declaration = "fallible []=(imm self: Value, index: int, init replacement: int) unit -> fail" },
+        .{ .name = "[]=", .declaration = "fallible []=(mut self: Value, index: int, replacement: int) unit -> fail" },
+    }) |case| {
+        const source = try testing.allocator.print("struct Value\n    value: int\n    {s}\nconst operation = Value.{s}\nexit(42)", .{ case.declaration, case.name });
+        defer testing.allocator.free(source);
+        try Fixture.expectSourceDiagnostic(source, .invalid_operation_signature);
+    }
+}
+
 test "field visibility rejects foreign initialization projections borrows and transfers" {
     const library = modules.SourceFile{ .path = "lib/value.chi", .module_path = "lib", .source =
         \\pub struct Value
@@ -97,7 +353,7 @@ test "field visibility rejects foreign initialization projections borrows and tr
         "const answer = comptime -> make().secret\nexit(answer)",
     };
     for (operations) |operation| {
-        const source = try std.fmt.allocPrint(testing.allocator, "import lib.{{Value, make}}\nimport std.memory.{{borrow_local}}\n{s}", .{operation});
+        const source = try testing.allocator.print("import lib.{{Value, make}}\nimport std.memory.{{borrow_local}}\n{s}", .{operation});
         defer testing.allocator.free(source);
         const fixture = try Fixture.init(source, &.{library});
         defer fixture.deinit();
@@ -111,7 +367,7 @@ test "field visibility distinguishes unknown names from private fields" {
         .{ .expression = "value.missing", .diagnostic = .unknown_field },
         .{ .expression = "lib.Value{missing = 42}", .diagnostic = .unknown_struct_field },
     }) |case| {
-        const source = try std.fmt.allocPrint(testing.allocator, "import lib\nconst value = lib.make()\n_ = {s}\nexit(42)", .{case.expression});
+        const source = try testing.allocator.print("import lib\nconst value = lib.make()\n_ = {s}\nexit(42)", .{case.expression});
         defer testing.allocator.free(source);
         const fixture = try Fixture.init(source, &.{.{ .path = "lib/value.chi", .module_path = "lib", .source =
             \\pub struct Value
@@ -217,7 +473,7 @@ test "field visibility rejects foreign generic bodies and inferred immovable ini
         "func accept(init cell: lib.Cell(int)) int -> 42\nfallible run() int -> accept(lib.Cell{secret = 42})\nif const result = run() -> exit(result) else exit(1)",
         "func read(static T: type, imm cell: T) int -> cell.secret\nconst cell = lib.make(int, 42)\nexit(read(lib.Cell(int), cell))",
     }) |body| {
-        const source = try std.fmt.allocPrint(testing.allocator, "import lib\n{s}", .{body});
+        const source = try testing.allocator.print("import lib\n{s}", .{body});
         defer testing.allocator.free(source);
         const fixture = try Fixture.init(source, &.{library});
         defer fixture.deinit();
@@ -235,8 +491,7 @@ test "field visibility allows whole value copy move and custom hooks in runtime 
         \\pub func read(imm item: Value) int -> item.secret
     };
     for ([_][]const u8{ "exit(run())", "static answer = run()\nexit(answer)" }) |entry| {
-        const source = try std.fmt.allocPrint(
-            testing.allocator,
+        const source = try testing.allocator.print(
             "import lib\nfunc run() int\n    const original = lib.make()\n    const copied = original\n    const moved = copied^\n    return lib.read(moved)\n{s}",
             .{entry},
         );
@@ -292,8 +547,7 @@ test "fallible call syntax requires markers in ordinary expression contexts" {
         "if const value = variant() as int -> return value\n    return 1",
         "if accepts(number()) -> return 42\n    return 1",
     }) |body| {
-        const source = try std.fmt.allocPrint(
-            testing.allocator,
+        const source = try testing.allocator.print(
             "fallible number() int -> 42\nfallible variant() int | none -> 42\nfallible accepts(value: int) unit -> ()\nfallible run() int\n    {s}\nif const result = run() -> exit(result) else exit(1)",
             .{body},
         );
@@ -324,7 +578,7 @@ test "fallible call syntax does not itself handle failure" {
 
 test "fallible call syntax rejects markers on infallible callables" {
     for ([_][]const u8{ "exit(number?())", "if number?() -> exit(1) else exit(2)" }) |body| {
-        const source = try std.fmt.allocPrint(testing.allocator, "func number() int -> 42\n{s}", .{body});
+        const source = try testing.allocator.print("func number() int -> 42\n{s}", .{body});
         defer testing.allocator.free(source);
         try Fixture.expectSourceDiagnostic(source, .fallible_call_not_fallible);
     }
@@ -377,8 +631,7 @@ test "fallible call syntax follows specialized and returned callable signatures"
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
     for ([_][]const u8{ "identity(21)", "select()()", "select?()()", "select()?()" }) |call| {
-        const source = try std.fmt.allocPrint(
-            testing.allocator,
+        const source = try testing.allocator.print(
             "fallible identity(static T: type, value: T) T -> value\nfallible number() int -> 42\nfallible select() fallible() int -> number\nfallible run() int -> {s}\nif const result = run() -> exit(result) else exit(1)",
             .{call},
         );
@@ -482,7 +735,7 @@ test "fallible call syntax validates resolved targets before diverging arguments
         .{ .setup = "fallible take(static T: type, value: T) unit -> ()", .call = "take(exit(42))", .diagnostic = .fallible_call_requires_marker },
     };
     for (cases) |case| {
-        const source = try std.fmt.allocPrint(testing.allocator, "{s}\n{s}", .{ case.setup, case.call });
+        const source = try testing.allocator.print("{s}\n{s}", .{ case.setup, case.call });
         defer testing.allocator.free(source);
         try Fixture.expectSourceDiagnostic(source, case.diagnostic);
     }
@@ -502,7 +755,7 @@ test "fallible call syntax validates before explicit static argument exits" {
         .{ .setup = "func stop(static value: int) int -> value\nfunc take(value: int) unit -> ()", .call = "take?(stop(exit(42)))", .diagnostic = .fallible_call_not_fallible },
     };
     for (cases) |case| {
-        const source = try std.fmt.allocPrint(testing.allocator, "{s}\n{s}", .{ case.setup, case.call });
+        const source = try testing.allocator.print("{s}\n{s}", .{ case.setup, case.call });
         defer testing.allocator.free(source);
         try Fixture.expectSourceDiagnostic(source, case.diagnostic);
     }
@@ -530,7 +783,7 @@ test "fallible call syntax validates before signature where exits" {
         .{ .setup = "fallible take(static T: type, value: T) unit where stop() -> ()", .call = "take(42)", .diagnostic = .fallible_call_requires_marker },
     };
     for (cases) |case| {
-        const source = try std.fmt.allocPrint(testing.allocator, "fallible stop() unit -> exit(42)\n{s}\n{s}", .{ case.setup, case.call });
+        const source = try testing.allocator.print("fallible stop() unit -> exit(42)\n{s}\n{s}", .{ case.setup, case.call });
         defer testing.allocator.free(source);
         try Fixture.expectSourceDiagnostic(source, case.diagnostic);
     }
@@ -1580,7 +1833,7 @@ test "a failing indirect in-place producer invalidates replaced references" {
 
 test "a replacing call cannot return an unrelated Ref into its old pointee" {
     const fixture = try Fixture.init(
-        \\fallible replace(imm handle: Ref(Box(int), true), imm old: Ref(int, false)) Ref(int, false) from(old)
+        \\fallible replace(imm handle: Ref(Box(int), true), imm old: Ref(int, false)) Ref(int, false)
         \\  handle[] = Box.new?(42)
         \\  return old
         \\fallible run() int
@@ -3798,10 +4051,10 @@ test "copied writable Ref handles update stable Box storage" {
     try fixture.expectExit(0, 42);
 }
 
-test "a writable Ref can be returned through a declared handle origin" {
+test "a writable Ref can be returned through its runtime handle input" {
     const fixture = try Fixture.init(
         \\import std.memory.{borrow_mut_box, read, write}
-        \\func forward(imm reference: Ref(int, true)) Ref(int, true) from(reference) -> reference
+        \\func forward(imm reference: Ref(int, true)) Ref(int, true) -> reference
         \\fallible run() int
         \\  var owner = Box.new?(17)
         \\  const reference = forward(borrow_mut_box(int, owner))
@@ -3816,7 +4069,7 @@ test "a writable Ref can be returned through a declared handle origin" {
 test "a writable Ref returned from a mut Box follows its copied-back owner" {
     const fixture = try Fixture.init(
         \\import std.memory.{borrow_mut_box, borrow_box, read, write}
-        \\func view(mut owner: Box(int)) Ref(int, true) from(owner) -> borrow_mut_box(int, owner)
+        \\func view(mut owner: Box(int)) Ref(int, true) -> borrow_mut_box(int, owner)
         \\fallible run() int
         \\  var owner = Box.new?(17)
         \\  const reference = view(owner)
@@ -3831,7 +4084,7 @@ test "a writable Ref returned from a mut Box follows its copied-back owner" {
 test "a fallible returned writable Ref follows the replacement mut owner" {
     const fixture = try Fixture.init(
         \\import std.memory.{borrow_mut_box, borrow_box, read}
-        \\fallible view(mut owner: Box(int)) Ref(int, true) from(owner)
+        \\fallible view(mut owner: Box(int)) Ref(int, true)
         \\  owner = Box.new?(42)
         \\  return borrow_mut_box(int, owner)
         \\fallible run() int
@@ -3963,83 +4216,174 @@ test "writing a custom-drop pointee destroys the previous value" {
     try fixture.expectExit(0, 42);
 }
 
-test "a return origin contract excludes unrelated borrowed arguments" {
-    const fixture = try Fixture.init(
+test "a direct returned Ref conservatively depends on every runtime input" {
+    const source =
         \\import std.memory.{borrow_box, read}
-        \\func select(imm first: Ref(int, false), imm second: Ref(int, false)) Ref(int, false) from(first) -> first
+        \\func select(imm first: Ref(int, false), imm second: Ref(int, false)) Ref(int, false) -> first
         \\fallible run() int
-        \\  const first = Box.new?(42)
-        \\  const second = Box.new?(17)
+        \\  var first = Box.new?(42)
+        \\  var second = Box.new?(17)
         \\  const selected = select(borrow_box(int, first), borrow_box(int, second))
-        \\  const moved = second^
-        \\  _ = moved
+        \\  $invalidate
         \\  return read(int, false, selected)
         \\if const result = run() -> exit(result) else exit(1)
-    , &.{});
-    defer fixture.deinit();
-    try fixture.expectExit(0, 42);
+    ;
+    for ([_]struct { invalidate: []const u8, diagnostic: std.meta.Tag(structures.Diagnostic.Kind) }{
+        .{ .invalidate = "const moved = first^\n  _ = moved", .diagnostic = .use_after_transfer },
+        .{ .invalidate = "const moved = second^\n  _ = moved", .diagnostic = .use_after_transfer },
+        .{ .invalidate = "first = Box.new?(23)", .diagnostic = .borrow_outlives_source },
+        .{ .invalidate = "second = Box.new?(23)", .diagnostic = .borrow_outlives_source },
+    }) |case| {
+        const entry = try test_sources.renderTemplate(testing.allocator, source, .{ .invalidate = case.invalidate });
+        defer testing.allocator.free(entry);
+        const fixture = try Fixture.init(entry, &.{});
+        defer fixture.deinit();
+        try fixture.expectDiagnostic(0, case.diagnostic);
+    }
 }
 
-test "an indirect call retains only its declared return origins" {
-    const fixture = try Fixture.init(
+test "an indirect returned Ref conservatively depends on every runtime input" {
+    const source =
         \\import std.memory.{borrow_box, read}
-        \\func select(imm first: Ref(int, false), imm second: Ref(int, false)) Ref(int, false) from(first) -> first
+        \\func select(imm first: Ref(int, false), imm second: Ref(int, false)) Ref(int, false) -> first
         \\fallible run() int
-        \\  const first = Box.new?(42)
-        \\  const second = Box.new?(17)
+        \\  var first = Box.new?(42)
+        \\  var second = Box.new?(17)
         \\  const function = select
         \\  const selected = function(borrow_box(int, first), borrow_box(int, second))
-        \\  const moved = second^
-        \\  _ = moved
+        \\  $invalidate
         \\  return read(int, false, selected)
         \\if const result = run() -> exit(result) else exit(1)
-    , &.{});
-    defer fixture.deinit();
-    try fixture.expectExit(0, 42);
+    ;
+    for ([_]struct { invalidate: []const u8, diagnostic: std.meta.Tag(structures.Diagnostic.Kind) }{
+        .{ .invalidate = "const moved = first^\n  _ = moved", .diagnostic = .use_after_transfer },
+        .{ .invalidate = "const moved = second^\n  _ = moved", .diagnostic = .use_after_transfer },
+        .{ .invalidate = "first = Box.new?(23)", .diagnostic = .borrow_outlives_source },
+        .{ .invalidate = "second = Box.new?(23)", .diagnostic = .borrow_outlives_source },
+    }) |case| {
+        const entry = try test_sources.renderTemplate(testing.allocator, source, .{ .invalidate = case.invalidate });
+        defer testing.allocator.free(entry);
+        const fixture = try Fixture.init(entry, &.{});
+        defer fixture.deinit();
+        try fixture.expectDiagnostic(0, case.diagnostic);
+    }
 }
 
-test "a mut Ref writeback does not widen a declared return origin" {
-    const fixture = try Fixture.init(
+test "a returned Ref conservatively depends on mut Ref writeback inputs" {
+    const source =
         \\import std.memory.{borrow_box, read}
-        \\func select(imm first: Ref(int, false), mut output: Ref(int, false), imm second: Ref(int, false)) Ref(int, false) from(first)
+        \\func select(imm first: Ref(int, false), mut output: Ref(int, false), imm second: Ref(int, false)) Ref(int, false)
         \\  output = second
         \\  return first
         \\fallible run() int
-        \\  const first = Box.new?(42)
-        \\  const second = Box.new?(17)
-        \\  const other = Box.new?(1)
+        \\  var first = Box.new?(42)
+        \\  var second = Box.new?(17)
+        \\  var other = Box.new?(1)
         \\  var output = borrow_box(int, other)
         \\  const selected = select(borrow_box(int, first), output, borrow_box(int, second))
-        \\  const moved = second^
-        \\  _ = moved
+        \\  $invalidate
         \\  return read(int, false, selected)
         \\if const result = run() -> exit(result) else exit(1)
-    , &.{});
-    defer fixture.deinit();
-    try fixture.expectExit(0, 42);
+    ;
+    for ([_]struct { invalidate: []const u8, diagnostic: ?std.meta.Tag(structures.Diagnostic.Kind) }{
+        .{ .invalidate = "_ = read(int, false, output)", .diagnostic = null },
+        .{ .invalidate = "const moved = first^\n  _ = moved", .diagnostic = .use_after_transfer },
+        .{ .invalidate = "const moved = second^\n  _ = moved", .diagnostic = .use_after_transfer },
+        .{ .invalidate = "const moved = other^\n  _ = moved", .diagnostic = .use_after_transfer },
+        .{ .invalidate = "first = Box.new?(23)", .diagnostic = .borrow_outlives_source },
+        .{ .invalidate = "second = Box.new?(23)", .diagnostic = .borrow_outlives_source },
+        .{ .invalidate = "other = Box.new?(23)", .diagnostic = .borrow_outlives_source },
+    }) |case| {
+        const entry = try test_sources.renderTemplate(testing.allocator, source, .{ .invalidate = case.invalidate });
+        defer testing.allocator.free(entry);
+        const fixture = try Fixture.init(entry, &.{});
+        defer fixture.deinit();
+        if (case.diagnostic) |diagnostic| {
+            try fixture.expectDiagnostic(0, diagnostic);
+        } else {
+            try fixture.expectExit(0, 42);
+        }
+    }
 }
 
-test "a return origin contract rejects an unlisted owner" {
-    const fixture = try Fixture.init(
+test "a returned Ref conservatively depends on unchanged mut Ref inputs" {
+    const source =
         \\import std.memory.{borrow_box, read}
-        \\func select(imm first: Ref(int, false), imm second: Ref(int, false)) Ref(int, false) from(first) -> second
+        \\func select(imm first: Ref(int, false), mut output: Ref(int, false)) Ref(int, false) -> first
+        \\fallible run() int
+        \\  const first = Box.new?(42)
+        \\  var other = Box.new?(17)
+        \\  var output = borrow_box(int, other)
+        \\  const function = select
+        \\  const selected = $callee(borrow_box(int, first), output)
+        \\  $invalidate
+        \\  return read(int, false, selected)
+        \\if const result = run() -> exit(result) else exit(1)
+    ;
+    for ([_][]const u8{ "select", "function" }) |callee| {
+        for ([_]struct { invalidate: []const u8, diagnostic: ?std.meta.Tag(structures.Diagnostic.Kind) }{
+            .{ .invalidate = "_ = read(int, false, output)", .diagnostic = null },
+            .{ .invalidate = "const moved = other^\n  _ = moved", .diagnostic = .use_after_transfer },
+            .{ .invalidate = "other = Box.new?(23)", .diagnostic = .borrow_outlives_source },
+        }) |case| {
+            const entry = try test_sources.renderTemplate(testing.allocator, source, .{ .callee = callee, .invalidate = case.invalidate });
+            defer testing.allocator.free(entry);
+            const fixture = try Fixture.init(entry, &.{});
+            defer fixture.deinit();
+            if (case.diagnostic) |diagnostic| {
+                try fixture.expectDiagnostic(0, diagnostic);
+            } else {
+                try fixture.expectExit(0, 42);
+            }
+        }
+    }
+}
+
+test "a returned Ref may select either runtime input while both owners live" {
+    const source =
+        \\import std.memory.{borrow_box, read}
+        \\func select(imm first: Ref(int, false), imm second: Ref(int, false)) Ref(int, false) -> $selected
         \\fallible run() int
         \\  const first = Box.new?(17)
         \\  const second = Box.new?(42)
-        \\  return read(int, false, select(borrow_box(int, first), borrow_box(int, second)))
+        \\  const function = select
+        \\  return read(int, false, $callee(borrow_box(int, first), borrow_box(int, second)))
         \\if const result = run() -> exit(result) else exit(1)
-    , &.{});
-    defer fixture.deinit();
-    try fixture.expectDiagnostic(0, .return_origin_not_declared);
+    ;
+    for ([_][]const u8{ "select", "function" }) |callee| {
+        for ([_]struct { selected: []const u8, status: u8 }{
+            .{ .selected = "first", .status = 17 },
+            .{ .selected = "second", .status = 42 },
+        }) |case| {
+            const entry = try test_sources.renderTemplate(testing.allocator, source, .{ .callee = callee, .selected = case.selected });
+            defer testing.allocator.free(entry);
+            const fixture = try Fixture.init(entry, &.{});
+            defer fixture.deinit();
+            try fixture.expectExit(0, case.status);
+        }
+    }
 }
 
-test "an origin contract requires a borrowed result" {
-    const fixture = try Fixture.init(
-        \\func number(imm input: int) int from(input) -> input
-        \\exit(number(42))
-    , &.{});
+test "removed from return origin syntax produces a parse diagnostic" {
+    for ([_][]const u8{
+        "func number(imm input: int) int from(input) -> input\nexit(number(42))",
+        "func forward(imm reference: Ref(int, false)) Ref(int, false) from(reference) -> reference",
+        "fallible forward(imm reference: Ref(int, false)) Ref(int, false) from(reference) -> return reference",
+    }) |source| {
+        const fixture = try Fixture.init(source, &.{});
+        defer fixture.deinit();
+        try testing.expect((try fixture.db.get(queries.ParseFile, 0)).* == null);
+        const diagnostics = try fixture.db.transitiveAccumulatorValues(queries.ParseFile, 0, structures.Diagnostic, testing.allocator);
+        defer testing.allocator.free(diagnostics);
+        try testing.expectEqual(@as(usize, 1), diagnostics.len);
+        try testing.expectEqual(@as(structures.FileId, 0), diagnostics[0].file_id);
+    }
+    const fixture = try Fixture.init("extern func forward(imm reference: Ref(int, false)) Ref(int, false) from(reference)", &.{});
     defer fixture.deinit();
-    try fixture.expectDiagnostic(0, .invalid_return_origin);
+    try testing.expect((try fixture.db.get(queries.BuildExecutable, 0)).* == null);
+    const diagnostics = try fixture.db.transitiveAccumulatorValues(queries.BuildExecutable, 0, structures.Diagnostic, testing.allocator);
+    defer testing.allocator.free(diagnostics);
+    try testing.expect(diagnostics.len != 0);
 }
 
 test "a returned Ref can depend on an immutable owner aggregate" {
@@ -4622,7 +4966,7 @@ test "Box destination construction covers nested producers and loop results" {
         "make(42)",
         "loop\n    if flag == 1 -> break make(42)\n    break Item{leaf = producer(1)}\n  ",
     }) |initializer| {
-        const source = try std.fmt.allocPrint(testing.allocator,
+        const source = try testing.allocator.print(
             \\struct Leaf
             \\  move = none
             \\  value: int
@@ -4650,7 +4994,7 @@ test "Box destination construction copies immovable places and moves once" {
         .{ .movement = "func(deinit self: Item) Item -> Item{value = self.value + 1}", .copy = "none", .initializer = "original^" },
     };
     for (cases) |case| {
-        const source = try std.fmt.allocPrint(testing.allocator,
+        const source = try testing.allocator.print(
             \\struct Item
             \\  move = {s}
             \\  copy = {s}
@@ -4701,7 +5045,7 @@ test "unevaluated initializer inference preserves lookup diagnostics" {
         .{ .expression = "number[]", .kind = .dereference_requires_ref },
     };
     for (cases) |case| for ([_][]const u8{ "Box.new", "Box(int).new" }) |constructor| {
-        const source = try std.fmt.allocPrint(testing.allocator,
+        const source = try testing.allocator.print(
             \\struct Item
             \\  value: int
             \\static Item.bad = 42
@@ -4719,7 +5063,7 @@ test "unevaluated initializer inference preserves lookup diagnostics" {
 
 test "unevaluated result inference preserves divergence before lookup" {
     for ([_][]const u8{ "stop().field", "stop().method()", "stop()[]", "stop()()" }) |expression| {
-        const source = try std.fmt.allocPrint(testing.allocator,
+        const source = try testing.allocator.print(
             \\struct Pinned
             \\  move = none
             \\  value: int
@@ -4744,7 +5088,7 @@ test "Box infers member call results without evaluating their receivers or argum
         "make_factory().build(42)",
         "original.copy()",
     }) |initializer| {
-        const source = try std.fmt.allocPrint(testing.allocator,
+        const source = try testing.allocator.print(
             \\struct Item
             \\  move = none
             \\  value: int
@@ -4779,12 +5123,12 @@ test "Box infers member call results without evaluating their receivers or argum
 }
 
 fn replaceAllocationSource(fixture: Fixture, original: []const u8, replacement: []const u8) !void {
-    const file = (try fixture.db.input(queries.StandardFile, @intFromEnum(standard_library.File.memory_allocation))).*;
+    const file = (try fixture.db.input(queries.StandardFile, @backingInt(standard_library.File.memory_allocation))).*;
     const source = (try fixture.db.input(queries.SourceText, file)).*;
     try testing.expect(std.mem.indexOf(u8, source, original) != null);
     const edited = try std.mem.replaceOwned(u8, testing.allocator, source, original, replacement);
     defer testing.allocator.free(edited);
-    const with_exit = try std.fmt.allocPrint(testing.allocator, "import std.exit.{{exit}}\n\n{s}", .{edited});
+    const with_exit = try testing.allocator.print("import std.exit.{{exit}}\n\n{s}", .{edited});
     defer testing.allocator.free(with_exit);
     try fixture.db.setInput(queries.SourceText, file, with_exit);
 }
@@ -4797,7 +5141,7 @@ test "Box obtains storage before producer arguments conditions and ownership hoo
         "Box(Item).new?(original^)",
         "Box.new?(Box.new?(make(forbidden())))",
     }) |call| {
-        const source = try std.fmt.allocPrint(testing.allocator,
+        const source = try testing.allocator.print(
             \\struct Item
             \\  value: int
             \\  copy = func(imm self: Item) Item -> exit(90)
@@ -4832,7 +5176,7 @@ test "allocating init consumers preserve Box ordering through aliases and indire
         .{ .setup = "fallible invoke(imm create: fallible(init Item) Box(Item), init item: Item) Box(Item) -> create?(item)", .call = "invoke?(Box(Item).new, make(forbidden()))" },
     };
     inline for (cases) |case| {
-        const source = try std.fmt.allocPrint(testing.allocator,
+        const source = try testing.allocator.print(
             \\struct Item
             \\  move = none
             \\  value: int
@@ -4857,7 +5201,7 @@ test "allocating init consumers construct immovable raw slots through aliases an
         .{ .setup = "", .call = "storage.unsafe_init?(1, make(41))" },
     };
     inline for (cases) |case| {
-        const source = try std.fmt.allocPrint(testing.allocator,
+        const source = try testing.allocator.print(
             \\import std.memory.{{Allocation, allocate, deallocate, unsafe_initialize, unsafe_destroy, unsafe_borrow_initialized}}
             \\struct Item
             \\  move = none
@@ -4955,7 +5299,7 @@ test "Box destination construction recomputes after copy capability and allocato
     try fixture.expectExit(0, 42);
     try replaceAllocationSource(fixture, "var storage = allocate?(T, 1)", "var storage = allocate?(T, -1)");
     try fixture.expectExit(0, 43);
-    const file = (try fixture.db.input(queries.StandardFile, @intFromEnum(standard_library.File.memory_allocation))).*;
+    const file = (try fixture.db.input(queries.StandardFile, @backingInt(standard_library.File.memory_allocation))).*;
     try fixture.db.setInput(queries.SourceText, file, standard_library.source("memory/allocation.chi"));
     try fixture.expectExit(0, 42);
 }
@@ -4987,7 +5331,7 @@ test "Box releases uninitialized raw storage on initializer failure" {
         "if 1 == 1\n      fail\n    else Item{}",
     };
     for (initializers) |initializer| {
-        const source = try std.fmt.allocPrint(testing.allocator,
+        const source = try testing.allocator.print(
             \\struct Item
             \\  move = none
             \\  drop = func(deinit self: Item) -> exit(90)
@@ -5276,7 +5620,7 @@ test "ownership members participate in where type tests" {
 
 test "ownership members with missing capabilities fail where conditions" {
     for ([_][]const u8{ "copy", "move" }) |name| {
-        const source = try std.fmt.allocPrint(testing.allocator,
+        const source = try testing.allocator.print(
             \\struct Item
             \\  copy = none
             \\  move = none
@@ -5336,7 +5680,7 @@ test "ownership members execute selected operations at compile time" {
 
 test "ownership members preserve reference origins" {
     for ([_][]const u8{ "copy", "move" }) |name| {
-        const source = try std.fmt.allocPrint(testing.allocator,
+        const source = try testing.allocator.print(
             \\fallible run() int
             \\  const owner = Box.new?(42)
             \\  const original = owner.borrow()
@@ -5419,7 +5763,7 @@ test "deinit selects original storage through conditional and loop results" {
     };
     const movements = [_][]const u8{ "fieldwise", "none", "func(deinit self: Item) Item -> exit(91)" };
     for (movements) |movement| for (expressions) |expression| {
-        const source = try std.fmt.allocPrint(testing.allocator,
+        const source = try testing.allocator.print(
             \\struct Item
             \\  move = {s}
             \\  copy = func(imm self: Item) Item -> exit(90)
@@ -5456,7 +5800,7 @@ test "fresh consuming selections construct in the known variant context" {
         "if flag == 1 -> first else none",
     };
     for ([_][]const u8{ "fieldwise", "none" }) |movement| for (expressions) |expression| {
-        const source = try std.fmt.allocPrint(testing.allocator,
+        const source = try testing.allocator.print(
             \\struct Item
             \\  move = {s}
             \\  copy = func(imm self: Item) Item -> exit(90)
@@ -5486,7 +5830,7 @@ test "fresh consuming selections retain static type inference" {
         "if flag == 1 -> producer(41) else none",
         "loop\n    if flag == 1 -> break producer(41)\n    break none\n  ",
     }) |expression| {
-        const source = try std.fmt.allocPrint(testing.allocator,
+        const source = try testing.allocator.print(
             \\func make(value: int) int -> value
             \\func consume(static T: type, deinit item: T) int
             \\  if const value = item as int -> return value
@@ -5644,7 +5988,7 @@ test "consuming selections preserve contained reference origins" {
         \\struct Item
         \\  move = none
         \\  handle: Ref(int, false)
-        \\func take(deinit item: Item) Ref(int, false) from(item) -> item.handle
+        \\func take(deinit item: Item) Ref(int, false) -> item.handle
         \\fallible run(flag: int) int
         \\  const first_owner = Box.new?(20)
         \\  const second_owner = Box.new?(22)
@@ -5663,7 +6007,7 @@ test "consuming selections preserve contained reference origins" {
         \\struct Item
         \\  move = none
         \\  value: int
-        \\func invalid(deinit item: Item) Ref(Item, false) from(item) -> borrow_local(Item, item)
+        \\func invalid(deinit item: Item) Ref(Item, false) -> borrow_local(Item, item)
         \\const handle = invalid(Item{value = 42})
         \\exit(handle[].value)
     , &.{});
@@ -5795,7 +6139,7 @@ test "pending deinit arguments retain their storage during argument evaluation" 
         .{ .call = "take", .source = "item", .replacement = "take_int(holder.count, if 1 == 1\n      item = Pinned{value = 7}\n      0\n    else 0)" },
     };
     for (cases) |case| {
-        const source = try std.fmt.allocPrint(testing.allocator,
+        const source = try testing.allocator.print(
             \\struct Pinned
             \\  move = none
             \\  value: int
@@ -5985,8 +6329,8 @@ fn expectNoRelocation(fixture: Fixture, name: []const u8) !void {
     for (body.blocks) |block| if (block.terminator == .return_value) {
         const returned = block.terminator.return_value;
         try testing.expect(returned.coerce_to == null);
-        try testing.expect(@intFromEnum(returned.value) >= body.block_arguments.len);
-        try testing.expect(body.instructions[@intFromEnum(returned.value) - body.block_arguments.len] == .result_storage);
+        try testing.expect(@backingInt(returned.value) >= body.block_arguments.len);
+        try testing.expect(body.instructions[@backingInt(returned.value) - body.block_arguments.len] == .result_storage);
     };
 }
 
@@ -6055,7 +6399,7 @@ test "a named immovable result copies only with copy capability" {
         .{ .copy = "trivial", .result = "pinned", .kind = null },
     };
     for (cases) |case| {
-        const source = try std.fmt.allocPrint(testing.allocator,
+        const source = try testing.allocator.print(
             \\struct Pinned
             \\  move = none
             \\  copy = {s}
@@ -6087,7 +6431,7 @@ test "results that cannot move directly select, widen, or reject without relocat
         .{ .body = "func maybe() Pinned | none -> Pinned{value = 1}\nfunc widen() Pinned | none | int -> maybe()\nconst widened = widen()\nexit(42)", .kind = .relocation_requires_direct_move },
         .{ .body = "func look(imm value: Pinned | none) int\n  if value is Pinned -> return 1\n  return 42\nexit(look(none))", .kind = null },
         .{ .body = "func keep(static T: type, var t: T, var value: Pinned | none) int\n  if value is Pinned -> return 1\n  return t\nexit(keep(42, none))", .kind = null },
-        .{ .body = "func keep(static T: type, var t: T, var value: Pinned | none) int -> 42\nexit(keep(5, make(1)))", .kind = .relocation_requires_direct_move },
+        .{ .body = "func keep(static T: type, var t: T, var value: Pinned | none) int -> 42\nexit(keep(5, make(1)))", .kind = null },
         .{ .body = "func consume(static T: type, var t: T, deinit value: T | int) int\n  if const number = value as int -> return number\n  return 1\nexit(consume(Pinned{value = 1}, 42))", .kind = null },
     };
     for (cases) |case| {
@@ -6110,7 +6454,7 @@ test "borrowed variant arguments construct through control flow" {
         .{ .expression = "if flag == 1 -> existing else make(42)", .zero_result = 42 },
     };
     for (cases) |case| {
-        const source = try std.fmt.allocPrint(testing.allocator,
+        const source = try testing.allocator.print(
             \\struct Pinned
             \\  move = none
             \\  copy = func(imm self: Pinned) Pinned -> exit(90)
@@ -6142,7 +6486,7 @@ test "borrowed control flow cannot relocate narrower existing values" {
         "loop\n    if 1 == 1 -> break pinned\n    break none",
     };
     for (expressions) |expression| {
-        const source = try std.fmt.allocPrint(testing.allocator,
+        const source = try testing.allocator.print(
             \\struct Pinned
             \\  move = none
             \\  value: int
@@ -6191,7 +6535,7 @@ test "borrowed argument widening preserves transfer rejection and owner cleanup"
 
 test "borrowed fresh control-flow temporaries clean up on later failure" {
     for ([_]u8{ 0, 1 }) |flag| {
-        const source = try std.fmt.allocPrint(testing.allocator,
+        const source = try testing.allocator.print(
             \\struct Pinned
             \\  move = none
             \\  value: int
@@ -6379,7 +6723,7 @@ test "in-place replacement ends the old value before constructing the new one" {
 
 test "mutable parameters replaced in loops end each earlier value once" {
     for ([_][]const u8{ "move = none", "copy = none" }) |movement| {
-        const source = try std.fmt.allocPrint(testing.allocator,
+        const source = try testing.allocator.print(
             \\struct Tracked
             \\  {s}
             \\  value: int
@@ -6569,7 +6913,7 @@ test "inferred factories construct fields from their static types in order" {
 test "fields end in place when a join transfers them on another path" {
     const cases = [_][]const u8{ "move = func(deinit self: Item) Item -> exit(90)", "move = none" };
     for (cases) |movement| {
-        const source = try std.fmt.allocPrint(testing.allocator,
+        const source = try testing.allocator.print(
             \\struct Item
             \\  value: int
             \\  {s}
@@ -6637,7 +6981,7 @@ test "compile-time joins preserve storage identity before later writes" {
         "(loop\n    if 1 == 1 -> break item\n    break other\n  )",
     };
     for (selections) |selection| {
-        const source = try std.fmt.allocPrint(testing.allocator,
+        const source = try testing.allocator.print(
             \\struct Pinned
             \\  move = none
             \\  copy = none
@@ -7513,7 +7857,7 @@ test "four byte aggregates return through direct and indirect calls" {
 test "conditional reference copies preserve live origins and reject replaced owners" {
     for ([_][]const u8{ "reference", "owner.borrow()" }) |first| {
         for ([_]bool{ false, true }) |replace_owner| {
-            const source = try std.fmt.allocPrint(testing.allocator,
+            const source = try testing.allocator.print(
                 \\fallible run() int
                 \\  var owner = Box.new?(42)
                 \\  const reference = owner.borrow()
@@ -7537,7 +7881,7 @@ test "partial variant copies retain reference origins" {
         .{ .condition = "1 == 1", .replace = "owner = Box.new?(17)", .expected = null },
     };
     for (cases) |case| {
-        const source = try std.fmt.allocPrint(testing.allocator,
+        const source = try testing.allocator.print(
             \\fallible run() int
             \\  var owner = Box.new?(42)
             \\  const reference = owner.borrow()
@@ -7981,7 +8325,7 @@ test "host storage layout edits invalidate compiler-owned extern signatures" {
     try typed.expectDiagnostic(typed_allocate.file_id, .invalid_external_signature);
 }
 
-test "invalid external signatures release their return origins" {
+test "invalid external signatures recover after runtime input mode changes" {
     const fixture = try Fixture.init(
         \\import std.memory.{borrow_box}
         \\fallible run() int
@@ -7998,7 +8342,7 @@ test "invalid external signatures release their return origins" {
         testing.allocator,
         standard_library.source("memory/allocation.chi"),
         "pub extern func borrow_box(static T: type, imm owner: Box(T)) Ref(T, false)",
-        "pub extern func borrow_box(static T: type, mut owner: Box(T)) Ref(T, false) from(owner)",
+        "pub extern func borrow_box(static T: type, mut owner: Box(T)) Ref(T, false)",
     );
     defer testing.allocator.free(modified);
     try fixture.db.setInput(queries.SourceText, resolved.file_id, modified);
@@ -8464,10 +8808,10 @@ test "where clauses can repeat on one signature line" {
     try fixture.expectExit(0, 5);
 }
 
-test "where clauses follow return origin contracts" {
+test "where clauses follow borrowed return types without origin annotations" {
     const fixture = try Fixture.init(
         \\import std.memory.{borrow_mut_box, read}
-        \\func forward(static T: type, imm reference: Ref(T, true)) Ref(T, true) from(reference) where T is int -> reference
+        \\func forward(static T: type, imm reference: Ref(T, true)) Ref(T, true) where T is int -> reference
         \\fallible run() int
         \\  var owner = Box.new?(42)
         \\  return read(int, true, forward(int, borrow_mut_box(int, owner)))
@@ -8732,7 +9076,7 @@ test "generated namespace callable aliases retain inherited specialization" {
 
 test "namespace values must be callable for instance syntax" {
     for ([_][]const u8{ "42", "int" }) |value| {
-        const source = try std.fmt.allocPrint(testing.allocator, "struct S\n  i: int\nstatic S.bad = {s}\nconst s = S{{i = 1}}\nexit(s.bad())", .{value});
+        const source = try testing.allocator.print("struct S\n  i: int\nstatic S.bad = {s}\nconst s = S{{i = 1}}\nexit(s.bad())", .{value});
         defer testing.allocator.free(source);
         const f = try Fixture.init(source, &.{});
         defer f.deinit();
@@ -8972,7 +9316,10 @@ test "moving declarations changes defining file imports and crossing modules cha
     try testing.expect(old_item != new_item);
     try testing.expect(old_type != (try db.get(queries.ResolveStatic, new_item)).*.?);
     const imports = (try db.get(queries.ResolveFileImports, registry.fileId(api.path).?)).*.?;
-    try testing.expectEqual(new_item, imports.imports[0].target.declaration);
+    const imported = for (imports.imports) |binding| {
+        if (std.mem.eql(u8, binding.name, "Body")) break binding.target;
+    } else return error.TestUnexpectedResult;
+    try testing.expectEqual(new_item, imported.declaration);
 }
 
 test "dependency import edits update calls and recover from private or missing exports" {
@@ -9005,7 +9352,7 @@ fn checkModuleAllocations(gpa: std.mem.Allocator) !void {
 }
 
 test "module scope namespace and refresh queries release every failed allocation" {
-    try testing.checkAllAllocationFailures(allocation_failure_backing.allocator(), checkModuleAllocations, .{});
+    try testing.checkAllAllocationFailures(allocation_failure_allocator, checkModuleAllocations, .{});
 }
 
 fn checkCleanupEffectAllocations(gpa: std.mem.Allocator) !void {
@@ -9032,7 +9379,7 @@ fn checkCleanupEffectAllocations(gpa: std.mem.Allocator) !void {
 }
 
 test "implicit drop effect analysis releases every failed allocation" {
-    try testing.checkAllAllocationFailures(allocation_failure_backing.allocator(), checkCleanupEffectAllocations, .{});
+    try testing.checkAllAllocationFailures(allocation_failure_allocator, checkCleanupEffectAllocations, .{});
 }
 
 test "type and compile-time scopes never fall back past a shadowing runtime binding" {
@@ -9319,9 +9666,9 @@ test "init capture mutable calls update caller storage through forwarding" {
 test "init capture checked references survive generic indirect forwarding" {
     try Fixture.expectSourceExit(
         \\import std.memory.{borrow_local}
-        \\fallible materialize(static T: type, init item: T) T from(item) -> return item
-        \\fallible forward(init item: Ref(int, false)) Ref(int, false) from(item) -> return materialize?(item)
-        \\fallible indirect(imm callback: fallible(init Ref(int, false)) Ref(int, false), init item: Ref(int, false)) Ref(int, false) from(item) -> return callback?(item)
+        \\fallible materialize(static T: type, init item: T) T -> return item
+        \\fallible forward(init item: Ref(int, false)) Ref(int, false) -> return materialize?(item)
+        \\fallible indirect(imm callback: fallible(init Ref(int, false)) Ref(int, false), init item: Ref(int, false)) Ref(int, false) -> return callback?(item)
         \\fallible run() int
         \\    var value = 42
         \\    const reference = borrow_local(int, value)
@@ -9501,7 +9848,7 @@ test "init capture transfer hooks run exactly once across skipped and failed con
         \\    move = none
         \\    first: Item
         \\    second: Item
-        \\fallible fail_value(imm counter: Ref(int, true)) Item from(counter)
+        \\fallible fail_value(imm counter: Ref(int, true)) Item
         \\    1 == 0
         \\    return Item{counter = counter}
         \\fallible receive(init item: Item, imm construct: bool) int
@@ -9587,7 +9934,7 @@ test "init capture repeated writes retain their original storage parameter" {
 test "init capture writes refresh returned references to caller storage" {
     try Fixture.expectSourceExit(
         \\import std.memory.{borrow_local}
-        \\fallible materialize(init item: Ref(int, false)) Ref(int, false) from(item) -> return item
+        \\fallible materialize(init item: Ref(int, false)) Ref(int, false) -> return item
         \\fallible run() int
         \\    var value = 1
         \\    borrow mut alias = value
@@ -9655,7 +10002,7 @@ test "init capture owned replacements survive later region failure" {
 
 test "init captured replacement does not revive stale references" {
     const source =
-        \\fallible materialize(init item: Ref(int, false)) Ref(int, false) from(item) -> return item
+        \\fallible materialize(init item: Ref(int, false)) Ref(int, false) -> return item
         \\fallible run() int
         \\    var owner = Box.new?(1)
         \\    const reference = owner.borrow()
@@ -9678,7 +10025,7 @@ test "init captured replacement does not revive stale references" {
     try Fixture.expectSourceExit(fresh_source, 2);
 
     try Fixture.expectSourceDiagnostic(
-        \\fallible materialize(init item: Ref(int, false)) Ref(int, false) from(item) -> return item
+        \\fallible materialize(init item: Ref(int, false)) Ref(int, false) -> return item
         \\fallible run() int
         \\    var owner = Box.new?(1)
         \\    const result = materialize?(if 1 == 1
@@ -9860,8 +10207,8 @@ test "init capture nested reference projections survive selection and wrapping" 
         \\    copy = trivial
         \\struct Outer
         \\    inner: Inner
-        \\fallible materialize(static T: type, init item: T) T from(item) -> return item
-        \\fallible forward(static T: type, init item: T) T from(item) -> return materialize?(T, item)
+        \\fallible materialize(static T: type, init item: T) T -> return item
+        \\fallible forward(static T: type, init item: T) T -> return materialize?(T, item)
         \\fallible run() int
         \\    var value = 42
         \\    const source = Outer{inner = Inner{reference = borrow_local(int, value)}}
@@ -9875,8 +10222,8 @@ test "init capture nested reference projections survive selection and wrapping" 
         \\struct References
         \\    external: Ref(int, false)
         \\    local: Ref(int, false)
-        \\fallible materialize(init item: Ref(int, false)) Ref(int, false) from(item) -> return item
-        \\fallible select(imm external: Ref(int, false)) Ref(int, false) from(external)
+        \\fallible materialize(init item: Ref(int, false)) Ref(int, false) -> return item
+        \\fallible select(imm external: Ref(int, false)) Ref(int, false)
         \\    var local = 1
         \\    const source = References{external = external, local = borrow_local(int, local)}
         \\    return materialize?(source.external)
@@ -9892,7 +10239,7 @@ test "init capture nested reference projections survive selection and wrapping" 
         \\    copy = trivial
         \\struct Outer
         \\    inner: Inner
-        \\fallible materialize(init item: Outer) Outer from(item) -> return item
+        \\fallible materialize(init item: Outer) Outer -> return item
         \\fallible escape() Ref(int, false)
         \\    var value = 42
         \\    const source = Inner{reference = borrow_local(int, value)}
@@ -9947,7 +10294,7 @@ test "init capture receiving mutable reference outputs preserve initializer orig
         \\import std.memory.{borrow_local}
         \\fallible install(init input: Ref(int, false), mut output: Ref(int, false))
         \\    output = input
-        \\fallible escape(imm previous: Ref(int, false)) Ref(int, false) from(previous)
+        \\fallible escape(imm previous: Ref(int, false)) Ref(int, false)
         \\    var local = 42
         \\    var output = previous
         \\    install?(borrow_local(int, local), output)
@@ -10157,7 +10504,7 @@ test "init lexical pending consumption preserves roots and fields across joins" 
         },
     };
     for (places) |place| {
-        const outcomes = try std.fmt.allocPrint(testing.allocator,
+        const outcomes = try testing.allocator.print(
             \\    if const unused = attempt(counter, true, true) -> ()
             \\    if counter.borrow()[] == {d} -> () else exit(91)
             \\    if const unused = attempt(counter, false, true) -> ()
@@ -10370,7 +10717,7 @@ test "init capture mutable copyback and calling cleanups preserve normal results
         \\    return result + count
     ;
     for ([_][]const u8{ "if const answer = calculate() -> exit(answer) else exit(97)", "static answer = if const value = calculate() -> value else 97\nexit(answer)" }) |suffix| {
-        const program = try std.fmt.allocPrint(testing.allocator, "{s}\n{s}", .{ source, suffix });
+        const program = try testing.allocator.print("{s}\n{s}", .{ source, suffix });
         defer testing.allocator.free(program);
         const fixture = try Fixture.init(program, &.{});
         defer fixture.deinit();
@@ -10633,7 +10980,7 @@ test "init lexical rejects caller returns of checked references" {
     try Fixture.expectSourceDiagnostic(
         \\import std.memory.{borrow_local}
         \\fallible materialize(init item: int) int -> return item
-        \\fallible select(imm reference: Ref(int, false)) Ref(int, false) from(reference)
+        \\fallible select(imm reference: Ref(int, false)) Ref(int, false)
         \\    const unused = materialize?(if 1 == 1 -> return reference else 0)
         \\    return reference
         \\var value = 42
@@ -10643,8 +10990,8 @@ test "init lexical rejects caller returns of checked references" {
 
 test "init lexical rejects checked reference caller returns in blocks and multi reference callers" {
     const sources = [_][]const u8{
-        "import std.memory.{borrow_local}\nfallible materialize(init item: int) int -> return item\nfallible run(imm reference: Ref(int, false)) Ref(int, false) from(reference)\n    const unused = materialize?(if 1 == 1\n        return reference\n    else 0)\n    exit(99)\nvar value = 42\nif run(borrow_local(int, value)) -> ()",
-        "import std.memory.{borrow_local}\nfallible materialize(init item: int) int -> return item\nfallible select(imm allowed: Ref(int, false), imm other: Ref(int, false)) Ref(int, false) from(allowed)\n    const unused = materialize?(if 1 == 1 -> return allowed else 0)\n    return allowed\nvar value = 42\nif select(borrow_local(int, value), borrow_local(int, value)) -> ()",
+        "import std.memory.{borrow_local}\nfallible materialize(init item: int) int -> return item\nfallible run(imm reference: Ref(int, false)) Ref(int, false)\n    const unused = materialize?(if 1 == 1\n        return reference\n    else 0)\n    exit(99)\nvar value = 42\nif run(borrow_local(int, value)) -> ()",
+        "import std.memory.{borrow_local}\nfallible materialize(init item: int) int -> return item\nfallible select(imm allowed: Ref(int, false), imm other: Ref(int, false)) Ref(int, false)\n    const unused = materialize?(if 1 == 1 -> return allowed else 0)\n    return allowed\nvar value = 42\nif select(borrow_local(int, value), borrow_local(int, value)) -> ()",
     };
     for (sources) |source| {
         try Fixture.expectSourceDiagnostic(source, .initializer_exit_outside_boundary);
@@ -11064,7 +11411,7 @@ fn checkInitializerAllocations(gpa: std.mem.Allocator, source: []const u8) !void
 }
 
 test "init regions release every failed allocation during inference and outlining" {
-    try testing.checkAllAllocationFailures(allocation_failure_backing.allocator(), checkInitializerAllocations, .{
+    try testing.checkAllAllocationFailures(allocation_failure_allocator, checkInitializerAllocations, .{
         \\fallible materialize(static T: type, init item: T) T -> return item
         \\fallible forward(init item: int) int -> return materialize?(item)
         \\fallible run(imm input: int) int
@@ -11076,7 +11423,7 @@ test "init regions release every failed allocation during inference and outlinin
 }
 
 test "init regions release every failed allocation during compile-time execution" {
-    try testing.checkAllAllocationFailures(allocation_failure_backing.allocator(), checkInitializerAllocations, .{
+    try testing.checkAllAllocationFailures(allocation_failure_allocator, checkInitializerAllocations, .{
         \\fallible materialize(static T: type, init item: T) T -> return item
         \\fallible forward(init item: int) int -> return materialize?(item)
         \\fallible run(imm input: int) int
@@ -11088,7 +11435,7 @@ test "init regions release every failed allocation during compile-time execution
 }
 
 test "init regions release every failed allocation when materializing borrowed storage" {
-    try testing.checkAllAllocationFailures(allocation_failure_backing.allocator(), checkInitializerAllocations, .{
+    try testing.checkAllAllocationFailures(allocation_failure_allocator, checkInitializerAllocations, .{
         \\fallible materialize(static T: type, init item: T) T -> return item
         \\fallible run_box() int
         \\    const owner = Box.new?(42)
@@ -11411,7 +11758,7 @@ test "init inference supports deeply nested generic immovable construction" {
     var expression = try testing.allocator.dupe(u8, "Pinned{value = 21}");
     defer testing.allocator.free(expression);
     for (0..16) |_| {
-        const nested = try std.fmt.allocPrint(testing.allocator, "materialize?({s})", .{expression});
+        const nested = try testing.allocator.print("materialize?({s})", .{expression});
         testing.allocator.free(expression);
         expression = nested;
     }
@@ -11912,7 +12259,7 @@ test "init milestone1 signature and forbidden exit edits recompute acceptance" {
         defer testing.allocator.free(forbidden);
         try fixture.db.setInput(queries.SourceText, 0, forbidden);
         try fixture.expectDiagnostic(0, .initializer_exit_outside_boundary);
-        const expression = try std.fmt.allocPrint(testing.allocator, "if 1 == 1 -> {s} else 0", .{exit_statement});
+        const expression = try testing.allocator.print("if 1 == 1 -> {s} else 0", .{exit_statement});
         defer testing.allocator.free(expression);
         const allowed = try std.mem.replaceOwned(u8, testing.allocator, forbidden, expression, "42");
         defer testing.allocator.free(allowed);

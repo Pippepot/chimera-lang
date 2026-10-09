@@ -38,7 +38,7 @@ pub fn prepareProgram(io: std.Io, gpa: std.mem.Allocator, bytes: []const u8) !Pr
     var random: [16]u8 = undefined;
     io.random(&random);
     const hex = std.fmt.bytesToHex(random, .lower);
-    const filename = try std.fmt.allocPrint(gpa, "./.chi-run-{s}", .{&hex});
+    const filename = try gpa.print("./.chi-run-{s}", .{&hex});
     errdefer gpa.free(filename);
     var atomic = try writeProgramToAtomic(io, bytes);
     defer atomic.deinit(io);

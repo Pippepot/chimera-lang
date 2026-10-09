@@ -1,9 +1,11 @@
 # Chimera Compiler
 
-An experimental language compiler written in Zig 0.16, targeting Linux x86-64. The root pipeline uses incremental queries to analyze functions, emit relocatable machine code, and link an ELF executable.
+An experimental language compiler written in Zig 0.17, targeting Linux x86-64. The root pipeline uses incremental queries to analyze functions, emit relocatable machine code, and link an ELF executable.
 
 For an introduction to the language, start with the [Chimera README](../README.md).
 All commands below run from the repository root.
+
+Install Zig 0.17 and make `zig` available on `PATH`.
 
 ## Run
 
@@ -14,6 +16,21 @@ zig build run -- --debug=ast,ssa,asm,timing program.chi
 zig build run -- --workers=2 program.chi
 zig build run -- --disk-cache program.chi
 ```
+
+`zig build run` defaults to `debug`, which favors fast compiler builds and keeps
+runtime safety checks, and enables incremental compilation of the compiler.
+Use it for everyday edits. Zig caches the compiler binary,
+so changing only `.chi` files does not rebuild the Zig compiler sources. Add
+`--summary all` before `--` to see compilation time and cache hits.
+
+To rebuild and rerun when Zig sources change, use
+`zig build run --watch -- program.chi`. Stop watching with Ctrl+C.
+
+`-Doptimize=safe` takes longer to build but runs compiler code and
+allocation checks faster; it is useful for broad test runs.
+`-Doptimize=fast` is for performance measurements. Keep the same mode
+between runs to reuse its cache. These modes control the Zig-built compiler,
+not optimization of the generated Chimera program.
 
 `-h` and `--help` print usage and exit successfully when given before the source
 path. Options after the source path are passed to the generated program instead.
@@ -28,6 +45,13 @@ standard-library files do not implicitly import the prelude. An explicit
 `import std.prelude.{}` disables the defaults for a user file. Only the
 designated file's top-level statements execute. Extra arguments after the
 source path are passed to the generated program.
+
+Collection literals default to inline `Array(T, N)` or construct a known expected
+target through its consuming converter. `List(T)` is a prelude export; implicit
+List allocation failure terminates with status 134. `List(T).from([elements])`
+is the explicitly fallible alternative. Ordinary element failure cleans partial
+construction and releases List storage. List heap execution is runtime-only;
+inline Arrays and consuming converters retain interpreter support.
 
 The CLI uses two query workers by default on machines with at least two CPUs;
 `--workers=N` selects 1 through 64 workers. `--disk-cache` caches successful
@@ -65,32 +89,51 @@ Specification examples describe the target, not a promise of compiler support. P
 
 Standalone integration and backend suites live in `tests/`. Local tests that need private declarations remain beside their implementations. The project-root `test_sources.zig` collects inline stage tests and exposes one shared source module to the out-of-tree suites; Zig cannot import outside a module's root directory.
 
+Compile-time interpreter tests live in the standalone suite
+`tests/comptime_interpreter_test.zig`, using the shared `test_sources` module;
+`src/frontend/comptime_interpreter.zig` has no top-level tests.
+
 ## Verify
 
 Full suite:
 
 ```sh
-zig build test --seed 0 -Doptimize=ReleaseSafe
+zig build test --seed=0 -Doptimize=safe -j1
 ```
 
 Focused checks:
 
 ```sh
-zig build test --seed 0 -Dtest-source=test_sources.zig -Dtest-filter=tokenizer
-zig build test --seed 0 -Dtest-source=tests/modules_test.zig -Dtest-filter="name fragment"
-zig build test --seed 0 -Doptimize=ReleaseSafe -Dtest-source=tests/query_disk_cache_test.zig -Dtest-filter="field visibility" --summary all
+zig build test --seed=0 -Dtest-source=test_sources.zig -Dtest-filter=tokenizer
+zig build test --seed=0 -Dtest-source=tests/modules_test.zig -Dtest-filter="name fragment"
+zig build test --seed=0 -Doptimize=safe -Dtest-source=tests/query_disk_cache_test.zig -Dtest-filter="field visibility" --summary all
+zig build test --seed=0 -Doptimize=safe -Dtest-source=tests/array_test.zig --summary all
+zig build test --seed=0 -Doptimize=safe -Dtest-source=tests/converter_test.zig --summary all
+zig build test --seed=0 -Doptimize=safe -Dtest-source=tests/comptime_interpreter_test.zig --summary all
 ```
 
 These entrypoints supply required module imports. The full suite runs inline
-tests once and four standalone suites (five roots total), each in its own
-binary's directory. Private disk-cache tests remain inline in
+tests once through `test_sources.zig` and seven standalone suites (eight default
+roots total): `tests/array_test.zig`, `tests/converter_test.zig`, `tests/codegen_test.zig`,
+`tests/comptime_interpreter_test.zig`, `tests/modules_test.zig`,
+`tests/query_disk_cache_test.zig`, and `tests/query_test.zig`.
+Each runs in its own binary's directory.
+Private disk-cache tests remain inline in
 `src/query_disk_cache.zig`; its snapshot integration suite lives in
 `tests/query_disk_cache_test.zig`.
 
-A fixed seed enables caching successful runs; Zig 0.16 defaults to a random seed.
+Allocation failure suites share a `SafeAllocator` backing with in-place resize
+and remap disabled. This keeps failure indices repeatable and checks allocation
+failure cleanup for every growth operation.
+
+A fixed seed enables caching successful runs; Zig 0.17 defaults to a random seed.
 Keep caches and options stable; `--summary all` shows cache hits. Direct `zig test`
-caches compilation but reruns tests. ReleaseSafe speeds up allocation checks,
+caches compilation but reruns tests. The `safe` mode speeds up allocation checks,
 with a slower first compile.
+
+For quick test iteration, omit `-Doptimize=safe` and select the affected
+suite with `-Dtest-source`. The full suite builds eight separate test binaries;
+its compilation cost is different from building the CLI once.
 
 Use focused checks during edits; run the full suite once for changes spanning
 stages or shared representations. Documentation-only edits need no compiler tests.
@@ -104,7 +147,7 @@ The compile-time execution benchmark reports analysis, execution, publication,
 cached lookup, and incremental recomputation times in CSV form:
 
 ```sh
-zig build benchmark --seed 0 -Doptimize=ReleaseFast
+zig build benchmark --seed=0 -Doptimize=fast
 ```
 
 The flow benchmark reports typing time, retained snapshot bytes, and dense
@@ -112,7 +155,7 @@ lifetime-table bytes for scalar and owning functions with 8, 32, 128, 256,
 and 512 branches:
 
 ```sh
-zig build flow-benchmark --seed 0 -Doptimize=ReleaseFast
+zig build flow-benchmark --seed=0 -Doptimize=fast
 ```
 
 Each row is the median of five fresh one-worker databases. Signature resolution
@@ -134,11 +177,11 @@ arrays or block-by-generation tables.
 
 For cold multi-file worker scaling and warm and edited disk cache reuse against
 uncached runs, build an optimized compiler and run the generated benchmark fixture.
-ReleaseFast strips debug symbols; the linker build ID keeps compiler identity
+The `fast` mode strips debug symbols; the linker build ID keeps compiler identity
 checks cheap:
 
 ```sh
-zig build -Doptimize=ReleaseFast
+zig build -Doptimize=fast
 python3 benchmarks/parallel.py zig-out/bin/chi
 python3 benchmarks/parallel.py zig-out/bin/chi --temp-dir .
 ```

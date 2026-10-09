@@ -64,19 +64,19 @@ const ParserState = struct {
     }
 
     pub fn addNode(self: *@This(), node: Node) !Node.Index {
-        const idx: Node.Index = @enumFromInt(self.nodes.items.len);
+        const idx: Node.Index = @fromBackingInt(@intCast(self.nodes.items.len));
         try self.nodes.append(self.gpa, node);
         return idx;
     }
 
     pub fn reserveNode(self: *@This()) !Node.Index {
-        const index: Node.Index = @enumFromInt(self.nodes.items.len);
+        const index: Node.Index = @fromBackingInt(@intCast(self.nodes.items.len));
         try self.nodes.resize(self.gpa, self.nodes.items.len + 1);
         return index;
     }
 
     pub fn setNode(self: *@This(), i: Node.Index, node: Node) Node.Index {
-        self.nodes.items[@intFromEnum(i)] = node;
+        self.nodes.items[@backingInt(i)] = node;
         return i;
     }
 
@@ -159,7 +159,22 @@ fn parseState(gpa: std.mem.Allocator, source: []const u8) !ParserState {
 }
 
 fn parseDocument(parser: *ParserState) ParseError!void {
-    _ = try parseBlock(parser);
+    const root = try parseBlock(parser);
+    for (parser.nodes.items, 0..) |node, node_index| {
+        if (!node.is_converter) continue;
+        var top_level = false;
+        const block = parser.nodes.items[root.index()];
+        for (parser.node_refs.items[block.data.ref.start..block.data.ref.end]) |declaration| {
+            const outer = parser.nodes.items[declaration.index()];
+            const binding = if (outer.tag == .@"pub") parser.nodes.items[outer.data.node.index()] else outer;
+            if (binding.tag == .static_binding and binding.data.node_node.b.index() == node_index) top_level = true;
+        }
+        if (!top_level) {
+            parser.index = node.token_index;
+            try parser.addError(.invalid_converter);
+            return error.ParseError;
+        }
+    }
     _ = try parser.expect(.eof);
 }
 
@@ -206,6 +221,7 @@ fn parseExpression(parser: *ParserState) ParseError!Node.Index {
         .keyword_pub => try parsePublic(parser),
         .keyword_import => try parseImport(parser),
         .keyword_func, .keyword_fallible, .keyword_extern => try parseFunction(parser),
+        .keyword_converter => try parseConverter(parser),
         .keyword_return => try parseReturn(parser),
         .keyword_fail => try parseTokenNode(parser, .keyword_fail, .fail_expr),
         .keyword_break => try parseBreak(parser),
@@ -220,6 +236,7 @@ fn parseExpression(parser: *ParserState) ParseError!Node.Index {
         .keyword_struct,
         .identifier,
         .l_paren,
+        .l_bracket,
         .keyword_not,
         .minus,
         => {
@@ -301,6 +318,8 @@ fn parseComptime(parser: *ParserState) !Node.Index {
 }
 
 fn parseBinding(parser: *ParserState) !Node.Index {
+    if (parser.tokens[parser.index].tag == .keyword_static and parser.tokens[parser.index + 1].tag == .keyword_struct)
+        return parseStruct(parser);
     const borrow_binding = isBorrowBinding(parser);
     const binding_keyword = parser.eat(.keyword_const) orelse parser.eat(.keyword_var) orelse parser.eat(.keyword_static) orelse
         (if (borrow_binding) parser.eat(.identifier) else null) orelse return .null;
@@ -342,17 +361,36 @@ fn isBorrowBinding(parser: *ParserState) bool {
 }
 
 fn parseDeclarationName(parser: *ParserState, allow_qualified: bool) !DeclarationName {
-    _ = try parser.expect(.identifier);
-    var name: DeclarationName = .{ .namespace = .null, .token_index = parser.index - 1 };
+    var name: DeclarationName = .{ .namespace = .null, .token_index = try parseMemberName(parser) };
     if (!allow_qualified or parser.eat(.period) == null) return name;
 
     name.namespace = try parser.addNode(.{ .tag = .identifier, .token_index = name.token_index, .data = .{ .none = {} } });
     while (true) {
-        _ = try parser.expect(.identifier);
-        name.token_index = parser.index - 1;
+        name.token_index = try parseMemberName(parser);
         if (parser.eat(.period) == null) return name;
         name.namespace = try parser.addNode(.{ .tag = .field_access, .token_index = name.token_index, .data = .{ .node = name.namespace } });
     }
+}
+
+fn isOperationName(tag: Token.Tag) bool {
+    return switch (tag) {
+        .plus, .minus, .asterisk, .slash, .equal_equal, .angle_bracket_left_angle_bracket_right, .angle_bracket_left, .angle_bracket_right, .angle_bracket_left_equal, .angle_bracket_right_equal, .keyword_not, .l_bracket => true,
+        else => false,
+    };
+}
+
+fn parseMemberName(parser: *ParserState) !u32 {
+    const token_index = parser.index;
+    if (isOperationName(parser.tokens[token_index].tag)) {
+        parser.index += 1;
+        if (parser.tokens[token_index].tag == .l_bracket) {
+            _ = try parser.expect(.r_bracket);
+            _ = parser.eat(.equal);
+        }
+    } else {
+        _ = try parser.expect(.identifier);
+    }
+    return token_index;
 }
 
 fn parsePublic(parser: *ParserState) !Node.Index {
@@ -361,6 +399,7 @@ fn parsePublic(parser: *ParserState) !Node.Index {
     const inner = switch (parser.tokens[parser.index].tag) {
         .keyword_const, .keyword_var, .keyword_static => try parseBinding(parser),
         .keyword_func, .keyword_fallible, .keyword_extern => try parseFunction(parser),
+        .keyword_converter => try parseConverter(parser),
         .keyword_struct => try parseStruct(parser),
         .keyword_import => try parseImport(parser),
         else => {
@@ -460,7 +499,7 @@ fn parseFunction(parser: *ParserState) !Node.Index {
     } else {
         _ = parser.eatAny(&.{ .keyword_func, .keyword_fallible }).?;
     }
-    const name: ?DeclarationName = if (external or parser.tokens[parser.index].tag == .identifier)
+    const name: ?DeclarationName = if (external or parser.tokens[parser.index].tag == .identifier or isOperationName(parser.tokens[parser.index].tag))
         try parseDeclarationName(parser, true)
     else
         null;
@@ -472,6 +511,20 @@ fn parseFunction(parser: *ParserState) !Node.Index {
     return finishQualifiedDeclaration(parser, declared_name, declaration);
 }
 
+fn parseConverter(parser: *ParserState) !Node.Index {
+    const token_index = parser.index;
+    _ = try parser.expect(.keyword_converter);
+    const signature = try parseFuncSignature(parser);
+    const body = try parseCallableBody(parser);
+    const function = try parser.addNode(.{
+        .tag = .func,
+        .token_index = token_index,
+        .data = .{ .node_node = .{ .a = signature, .b = body } },
+        .is_converter = true,
+    });
+    return finishNamedDeclaration(parser, token_index, function);
+}
+
 fn parseFuncSignature(parser: *ParserState) !Node.Index {
     const token_index = parser.index;
     const params = try parseParamList(parser, false);
@@ -479,16 +532,6 @@ fn parseFuncSignature(parser: *ParserState) !Node.Index {
         .identifier, .keyword_func, .keyword_fallible, .keyword_none => try parseType(parser),
         else => .null,
     };
-    var result = return_type;
-    if (return_type != .null and parser.tokens[parser.index].tag == .identifier) {
-        const origin_token = parser.tokens[parser.index];
-        if (std.mem.eql(u8, parser.source[origin_token.loc.start..origin_token.loc.end], "from")) {
-            const origin_token_index = parser.index;
-            parser.index += 1;
-            const origins = try parseCallArgList(parser);
-            result = try parser.addNode(.{ .tag = .return_origins, .token_index = origin_token_index, .data = .{ .node_node = .{ .a = return_type, .b = origins } } });
-        }
-    }
     const where_token_index = parser.index;
     const where_start = parser.scratch_stack.items.len;
     defer parser.scratch_stack.shrinkRetainingCapacity(where_start);
@@ -501,7 +544,7 @@ fn parseFuncSignature(parser: *ParserState) !Node.Index {
         try addNodeList(parser, where_token_index, parser.scratch_stack.items[where_start..], .where_clauses);
     return parser.addNode(.{ .tag = .signature, .token_index = token_index, .data = .{ .signature = .{
         .parameters = params,
-        .return_type = result,
+        .return_type = return_type,
         .where_clauses = clauses,
     } } });
 }
@@ -690,8 +733,13 @@ fn parsePostfix(parser: *ParserState) ParseError!Node.Index {
             .l_bracket => {
                 const token_index = parser.index;
                 parser.index += 1;
-                _ = try parser.expect(.r_bracket);
-                lhs = try parser.addNode(.{ .tag = .deref, .token_index = token_index, .data = .{ .node = lhs } });
+                if (parser.eat(.r_bracket) != null) {
+                    lhs = try parser.addNode(.{ .tag = .deref, .token_index = token_index, .data = .{ .node = lhs } });
+                } else {
+                    const index = try parseRequiredExpression(parser);
+                    _ = try parser.expect(.r_bracket);
+                    lhs = try parser.addNode(.{ .tag = .index_access, .token_index = token_index, .data = .{ .node_node = .{ .a = lhs, .b = index } } });
+                }
             },
             .period => lhs = try parseFieldAccess(parser, lhs),
             .caret => lhs = try parsePostfixNode(parser, lhs, .move_expr),
@@ -705,7 +753,7 @@ fn parsePostfix(parser: *ParserState) ParseError!Node.Index {
 fn parseCall(parser: *ParserState, callee: Node.Index) ParseError!Node.Index {
     const token_index = parser.index;
     _ = parser.eat(.question_mark);
-    const arguments = try parseCallArgList(parser);
+    const arguments = try parseExpressionList(parser, .l_paren, .r_paren, .call_arg_list);
     return parser.addNode(.{ .tag = .call, .token_index = token_index, .data = .{ .node_node = .{ .a = callee, .b = arguments } } });
 }
 
@@ -720,7 +768,9 @@ fn parsePrimary(parser: *ParserState) ParseError!Node.Index {
         .keyword_comptime => try parseComptime(parser),
         .keyword_sizeof => try parseSizeof(parser),
         .keyword_struct => try parseStruct(parser),
+        .keyword_static => try parseStruct(parser),
         .identifier => try parseTokenNode(parser, .identifier, .identifier),
+        .l_bracket => try parseExpressionList(parser, .l_bracket, .r_bracket, .collection_literal),
         .l_paren => {
             const token_index = parser.index;
             _ = parser.eat(.l_paren);
@@ -738,33 +788,29 @@ fn parsePrimary(parser: *ParserState) ParseError!Node.Index {
     };
 }
 
-fn parseCallArgList(parser: *ParserState) !Node.Index {
+fn parseExpressionList(parser: *ParserState, opening: Token.Tag, closing: Token.Tag, tag: Node.Tag) ParseError!Node.Index {
     const token_index = parser.index;
-    _ = try parser.expect(.l_paren);
+    _ = try parser.expect(opening);
     const stack_top = parser.scratch_stack.items.len;
     defer parser.scratch_stack.shrinkRetainingCapacity(stack_top);
-
-    while (true) {
-        if (parser.eat(.r_paren) != null) break;
-
-        const arg = try parseExpressionPrecedence(parser, 0);
-        try parser.scratch_stack.append(parser.gpa, arg);
-
+    while (parser.eat(closing) == null) {
+        try parser.scratch_stack.append(parser.gpa, try parseExpressionPrecedence(parser, 0));
         if (parser.eat(.comma) != null) continue;
-        _ = try parser.expect(.r_paren);
+        _ = try parser.expect(closing);
         break;
     }
-
-    return try addNodeList(parser, token_index, parser.scratch_stack.items[stack_top..], .call_arg_list);
+    if (tag == .call_arg_list and parser.scratch_stack.items.len == stack_top) return .null;
+    return parser.addNode(.{ .tag = tag, .token_index = token_index, .data = try parser.listToSpan(parser.scratch_stack.items[stack_top..]) });
 }
 
 fn parseStruct(parser: *ParserState) ParseError!Node.Index {
     const token_index = parser.index;
+    const is_static = parser.eat(.keyword_static) != null;
     _ = try parser.expect(.keyword_struct);
     const name_token_index: ?u32 = if (parser.eat(.identifier) != null) parser.index - 1 else null;
     if (name_token_index != null and parser.tokens[parser.index].tag == .l_paren) {
         const parameters = try parseParamList(parser, true);
-        const value = try parseStructValue(parser, token_index);
+        const value = try parseStructValue(parser, token_index, is_static);
         const return_type = try parser.addNode(.{ .tag = .implicit_type, .token_index = token_index, .data = .{ .none = {} } });
         const signature = try parser.addNode(.{ .tag = .signature, .token_index = token_index, .data = .{ .signature = .{
             .parameters = parameters,
@@ -775,11 +821,11 @@ fn parseStruct(parser: *ParserState) ParseError!Node.Index {
         const function = try parser.addNode(.{ .tag = .func, .token_index = token_index, .data = .{ .node_node = .{ .a = signature, .b = body } } });
         return finishNamedDeclaration(parser, name_token_index, function);
     }
-    const value = try parseStructValue(parser, token_index);
+    const value = try parseStructValue(parser, token_index, is_static);
     return finishNamedDeclaration(parser, name_token_index, value);
 }
 
-fn parseStructValue(parser: *ParserState, token_index: u32) ParseError!Node.Index {
+fn parseStructValue(parser: *ParserState, token_index: u32, is_static: bool) ParseError!Node.Index {
     _ = try parser.expect(.indent);
     const stack_top = parser.scratch_stack.items.len;
     defer parser.scratch_stack.shrinkRetainingCapacity(stack_top);
@@ -792,10 +838,14 @@ fn parseStructValue(parser: *ParserState, token_index: u32) ParseError!Node.Inde
         try parser.scratch_stack.append(parser.gpa, item);
     }
 
-    return parser.addNode(.{ .tag = .@"struct", .token_index = token_index, .data = try parser.listToSpan(parser.scratch_stack.items[stack_top..]) });
+    return parser.addNode(.{ .tag = .@"struct", .token_index = token_index, .data = try parser.listToSpan(parser.scratch_stack.items[stack_top..]), .is_static_struct = is_static });
 }
 
 fn parseStructItem(parser: *ParserState) ParseError!Node.Index {
+    if (parser.tokens[parser.index].tag == .keyword_converter) {
+        try parser.addError(.invalid_converter);
+        return error.ParseError;
+    }
     if ((try parseBinding(parser)).unwrap()) |binding| return binding;
     if (parser.tokens[parser.index].tag == .keyword_pub and
         parser.tokens[parser.index + 1].tag == .identifier and
@@ -863,8 +913,7 @@ fn parseStructInitField(parser: *ParserState) ParseError!Node.Index {
 
 fn parseFieldAccess(parser: *ParserState, target: Node.Index) ParseError!Node.Index {
     _ = try parser.expect(.period);
-    const field_index = parser.index;
-    _ = try parser.expect(.identifier);
+    const field_index = try parseMemberName(parser);
     return try parser.addNode(.{ .tag = .field_access, .token_index = field_index, .data = .{ .node = target } });
 }
 
@@ -976,7 +1025,7 @@ fn renderNode(gpa: std.mem.Allocator, node_index: Node.Index, ast: *const Ast, s
             try writer.writeByte('\n');
             try renderNode(gpa, node.data.node, ast, source, writer, seen, new_indent, true, false);
         },
-        .add, .sub, .mul, .div, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .@"and", .@"or", .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .call, .const_binding, .var_binding, .borrow_binding, .borrow_mut_binding, .static_binding, .namespace_declaration, .func, .param, .return_origins, .type_func, .@"if" => {
+        .add, .sub, .mul, .div, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .@"and", .@"or", .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .call, .const_binding, .var_binding, .borrow_binding, .borrow_mut_binding, .static_binding, .namespace_declaration, .func, .param, .type_func, .@"if" => {
             if (node.tag == .param) {
                 const loc = ast.tokens[node.token_index].loc;
                 try writer.print(" : {s}", .{source[loc.start..loc.end]});
@@ -998,7 +1047,7 @@ fn renderNode(gpa: std.mem.Allocator, node_index: Node.Index, ast: *const Ast, s
             if (parts.return_type.unwrap()) |result| try renderNode(gpa, result, ast, source, writer, seen, new_indent, result == last, false);
             if (parts.where_clauses.unwrap()) |clauses| try renderNode(gpa, clauses, ast, source, writer, seen, new_indent, true, false);
         },
-        .block, .call_arg_list, .param_list, .type_list, .type_variant, .where_clauses, .if_else, .@"struct", .struct_init, .import, .selective_import => {
+        .block, .call_arg_list, .param_list, .type_list, .type_variant, .where_clauses, .if_else, .@"struct", .struct_init, .collection_literal, .import, .selective_import => {
             try writer.writeByte('\n');
             for (node.data.ref.start..node.data.ref.end) |i| {
                 try renderNode(gpa, ast.node_refs[i], ast, source, writer, seen, new_indent, i == node.data.ref.end - 1, false);
@@ -1072,6 +1121,17 @@ test "parse qualified named function declaration" {
         \\      └─field_access : i
         \\        └─identifier : self
     );
+}
+
+test "parse operation function declarations and explicit calls" {
+    for ([_][]const u8{ "+", "-", "*", "/", "==", "<>", "<", ">", "<=", ">=", "not", "[]", "[]=" }) |name| {
+        const source = try std.testing.allocator.print("func S.{s}(left: int, right: int) int -> left\nS.{s}(1, 2)", .{ name, name });
+        defer std.testing.allocator.free(source);
+        var report = try parseReport(std.testing.allocator, 0, source);
+        defer report.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len);
+        try std.testing.expect(report.ast != null);
+    }
 }
 
 test "parse fallible function declarations and callable types" {
@@ -2346,6 +2406,48 @@ test "parse report cleans up every allocation failure" {
         "const x 1",
         .{ .expected_token = .{ .expected = .equal, .found = .number_literal } },
     });
+}
+
+test "parse unnamed converter declarations" {
+    const source =
+        \\converter(value: int) byte -> value
+        \\pub converter(static T: type, value: Ref(T, true)) Ref(T, false) -> value
+    ;
+    var report = try parseReport(std.testing.allocator, 0, source);
+    defer report.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len);
+    var converters: usize = 0;
+    for (report.ast.?.nodes) |node| {
+        if (node.is_converter) {
+            try std.testing.expectEqual(Node.Tag.func, node.tag);
+            converters += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), converters);
+}
+
+test "parse static struct modifier through named generated and expression sugar" {
+    const source =
+        \\static struct Named
+        \\  value: int
+        \\pub static struct Generated(T: type)
+        \\  value: T
+        \\static Expression = static struct
+        \\  value: int
+        \\static Ordinary = struct
+        \\  value: int
+    ;
+    var report = try parseReport(std.testing.allocator, 0, source);
+    defer report.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len);
+    var marked: usize = 0;
+    var ordinary: usize = 0;
+    for (report.ast.?.nodes) |node| {
+        if (node.tag != .@"struct") continue;
+        if (node.is_static_struct) marked += 1 else ordinary += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), marked);
+    try std.testing.expectEqual(@as(usize, 1), ordinary);
 }
 
 fn testExpectDiagnosticTag(source: [:0]const u8, expected: structures.Diagnostic.Kind) !void {

@@ -1,3 +1,6 @@
+import std.array.{collection_literal}
+import std.exit.{exit}
+
 pub struct Allocation(T: type)
     storage: HostStorage
     count: int
@@ -9,7 +12,7 @@ pub struct Allocation(T: type)
     pub fallible unsafe_init(mut self: Allocation(T), index: int, init item: T) -> unsafe_initialize?(T, self, index, item)
     pub func unsafe_remove(mut self: Allocation(T), index: int) T -> unsafe_take(T, self, index)
     pub func unsafe_drop(mut self: Allocation(T), index: int) -> unsafe_destroy(T, self, index)
-    pub func unsafe_ref(imm self: Allocation(T), index: int) Ref(T, false) from(self) -> unsafe_borrow_element(T, self, index)
+    pub func unsafe_ref(imm self: Allocation(T), index: int) Ref(T, false) -> unsafe_borrow_element(T, self, index)
 
 pub extern fallible allocate(static T: type, count: int) Allocation(T)
 pub extern func deallocate(static T: type, deinit allocation: Allocation(T))
@@ -18,6 +21,57 @@ pub extern fallible unsafe_initialize(static T: type, mut allocation: Allocation
 pub extern func unsafe_take(static T: type, mut allocation: Allocation(T), index: int) T
 pub extern func unsafe_destroy(static T: type, mut allocation: Allocation(T), index: int)
 pub extern func unsafe_borrow_initialized(static T: type, imm allocation: Allocation(T), index: int) T
+
+pub struct List(T: type)
+    copy = none
+    storage: Allocation(T)
+    initialized: int
+    drop = func(deinit self: List(T))
+        var index = self.initialized
+        loop
+            if index == 0 -> break
+            index -= 1
+            unsafe_destroy(T, self.storage, index)
+        deallocate(T, self.storage^)
+
+    pub fallible from(static N: int, init values: collection_literal(T, N)) List(T)
+        var result = List(T){storage = allocate?(T, N), initialized = 0}
+        initialize_collection(T, N, result.storage, values)
+        result.initialized = N
+        return result^
+
+    pub func len(imm self: List(T)) int -> self.initialized
+    pub func capacity(imm self: List(T)) int -> self.storage.capacity()
+
+    pub fallible get(imm self: List(T), index: int) Ref(T, false)
+        index >= 0
+        index < self.initialized
+        return unsafe_borrow_element(T, self.storage, index)
+
+    pub fallible get_mut(mut self: List(T), index: int) Ref(T, true)
+        index >= 0
+        index < self.initialized
+        return unsafe_borrow_mut_element(T, self.storage, index)
+
+    pub fallible [](imm self: List(T), index: int) T
+        const element = self.get?(index)
+        return element[]
+
+    pub fallible []=(mut self: List(T), index: int, init item: T) unit
+        const element = self.get_mut?(index)
+        element[] = item
+
+func allocate_literal(static T: type, count: int) Allocation(T)
+    if const storage = allocate(T, count) -> return storage^
+    exit(134)
+
+extern func initialize_collection(static T: type, static N: int, mut storage: Allocation(T), init values: collection_literal(T, N))
+
+pub converter(static T: type, static N: int, init values: collection_literal(T, N)) List(T)
+    var result = List(T){storage = allocate_literal(T, N), initialized = 0}
+    initialize_collection(T, N, result.storage, values)
+    result.initialized = N
+    return result^
 
 pub struct Buffer(T: type)
     move = none
@@ -43,10 +97,18 @@ pub struct Buffer(T: type)
         index < self.initialized
         return unsafe_borrow_element(T, self.storage, index)
 
-    pub fallible get_mut(mut self: Buffer(T), index: int) Ref(T, true) from(self)
+    pub fallible get_mut(mut self: Buffer(T), index: int) Ref(T, true)
         index >= 0
         index < self.initialized
         return unsafe_borrow_mut_element(T, self.storage, index)
+
+    pub fallible [](imm self: Buffer(T), index: int) T
+        const element = self.get?(index)
+        return element[]
+
+    pub fallible []=(mut self: Buffer(T), index: int, init item: T) unit
+        const element = self.get_mut?(index)
+        element[] = item
 
     pub fallible view(imm self: Buffer(T), start: int, size: int) BufferView(T)
         start >= 0
@@ -103,6 +165,10 @@ pub struct BufferView(T: type)
         index < self.size
         return read(Buffer(T), false, self.backing).get?(self.start + index)
 
+    pub fallible [](imm self: BufferView(T), index: int) T
+        const element = self.get?(index)
+        return element[]
+
 pub struct Box(T: type)
     allocation: Allocation(T)
     drop = func(deinit self: Box(T))
@@ -117,8 +183,8 @@ pub struct Box(T: type)
             deallocate(T, storage)
             fail
 
-    pub func borrow(imm self: Box(T)) Ref(T, false) from(self) -> borrow_box(T, self)
-    pub func borrow_mut(mut self: Box(T)) Ref(T, true) from(self) -> borrow_mut_box(T, self)
+    pub func borrow(imm self: Box(T)) Ref(T, false) -> borrow_box(T, self)
+    pub func borrow_mut(mut self: Box(T)) Ref(T, true) -> borrow_mut_box(T, self)
     pub func into_value(deinit self: Box(T)) T -> value(T, self^)
 
 pub struct Ref(T: type, writable: bool)
@@ -126,7 +192,7 @@ pub struct Ref(T: type, writable: bool)
     address_high: int
     copy = trivial
 
-    pub func as_imm(imm self: Ref(T, true)) Ref(T, false) from(self) -> attenuate_ref(T, self)
+    pub func as_imm(imm self: Ref(T, true)) Ref(T, false) -> attenuate_ref(T, self)
     pub func read(imm self: Ref(T, writable)) T -> self[]
     pub func replace(imm self: Ref(T, true), var item: T) -> write(T, self, item^)
 

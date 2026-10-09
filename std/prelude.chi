@@ -1,2 +1,24 @@
 pub import std.exit.{exit}
-pub import std.memory.{Box, Ref}
+pub import std.memory.{Box, Ref, List}
+pub import std.array.{Array, collection_literal}
+
+extern func literal_byte(static value: int_literal) byte
+pub converter(static value: int_literal) byte where value >= 0 where value <= 255 -> literal_byte(value)
+
+struct IntOperations
+    pub func +(imm left: int, imm right: int) int -> left + right
+    pub func -(imm left: int, imm right: int) int -> left - right
+    pub func *(imm left: int, imm right: int) int -> left * right
+    pub func /(imm left: int, imm right: int) int -> left / right
+    pub func neg(imm self: int) int -> -self
+    pub func ==(imm left: int, imm right: int) bool -> left == right
+    pub func <>(imm left: int, imm right: int) bool -> left <> right
+    pub func <(imm left: int, imm right: int) bool -> left < right
+    pub func >(imm left: int, imm right: int) bool -> left > right
+    pub func <=(imm left: int, imm right: int) bool -> left <= right
+    pub func >=(imm left: int, imm right: int) bool -> left >= right
+
+struct BoolOperations
+    pub func ==(imm left: bool, imm right: bool) bool -> left == right
+    pub func <>(imm left: bool, imm right: bool) bool -> left <> right
+    pub func not(imm self: bool) bool -> not self

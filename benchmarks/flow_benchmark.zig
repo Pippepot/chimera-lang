@@ -61,7 +61,7 @@ const Measure = struct {
 };
 
 fn appendLine(source: *std.ArrayList(u8), allocator: std.mem.Allocator, comptime format: []const u8, arguments: anytype) !void {
-    const line = try std.fmt.allocPrint(allocator, format, arguments);
+    const line = try allocator.print(format, arguments);
     defer allocator.free(line);
     try source.appendSlice(allocator, line);
 }

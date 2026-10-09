@@ -7,7 +7,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
-        .strip = optimize == .ReleaseFast or optimize == .ReleaseSmall,
+        .strip = optimize == .fast or optimize == .small,
     });
     const standard_library = b.createModule(.{
         .root_source_file = b.path("std/library.zig"),
@@ -18,11 +18,12 @@ pub fn build(b: *std.Build) void {
         .name = "chi",
         .root_module = root_module,
     });
+    compiler.incremental = true;
     compiler.build_id = .sha1;
     b.installArtifact(compiler);
 
     const run = b.addRunArtifact(compiler);
-    if (b.args) |args| run.addArgs(args);
+    run.addPassthruArgs();
     const run_step = b.step("run", "Compile and run a Chi program");
     run_step.dependOn(&run.step);
 
@@ -64,6 +65,9 @@ pub fn build(b: *std.Build) void {
         "tests/codegen_test.zig",
         "tests/modules_test.zig",
         "tests/query_disk_cache_test.zig",
+        "tests/array_test.zig",
+        "tests/converter_test.zig",
+        "tests/comptime_interpreter_test.zig",
     };
     for (test_sources) |source| {
         const test_module = b.createModule(.{

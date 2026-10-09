@@ -10,7 +10,7 @@ const Context = query.Context;
 const Database = query.Database;
 const Handle = query.Handle;
 const testing = std.testing;
-var allocation_failure_backing: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+const allocation_failure_allocator = test_sources.allocation_failure_allocator;
 const DiagnosticKind = std.meta.Tag(structures.Diagnostic.Kind);
 
 fn flowSnapshotLoopSource(allocator: std.mem.Allocator, owning: bool, threshold: u32) ![]u8 {
@@ -20,22 +20,21 @@ fn flowSnapshotLoopSource(allocator: std.mem.Allocator, owning: bool, threshold:
     try source.appendSlice(allocator, "static probe = func(flag: int) int\n  var total = 0\n");
     for (0..320) |index| {
         const line = if (owning)
-            try std.fmt.allocPrint(allocator, "  var v{d} = Item{{value = 1}}\n", .{index})
+            try allocator.print("  var v{d} = Item{{value = 1}}\n", .{index})
         else
-            try std.fmt.allocPrint(allocator, "  var v{d} = 1\n", .{index});
+            try allocator.print("  var v{d} = 1\n", .{index});
         defer allocator.free(line);
         try source.appendSlice(allocator, line);
     }
     const field = if (owning) ".value" else "";
-    const body = try std.fmt.allocPrint(
-        allocator,
+    const body = try allocator.print(
         "  var step = 0\n  loop\n    if step == 2 -> break\n    if flag < {d} -> v0{s} += 2 else v319{s} += 1\n    step += 1\n",
         .{ threshold, field, field },
     );
     defer allocator.free(body);
     try source.appendSlice(allocator, body);
     for (0..320) |index| {
-        const line = try std.fmt.allocPrint(allocator, "  total += v{d}{s}\n", .{ index, field });
+        const line = try allocator.print("  total += v{d}{s}\n", .{ index, field });
         defer allocator.free(line);
         try source.appendSlice(allocator, line);
     }
@@ -99,7 +98,7 @@ fn testDatabaseWithPrelude(worker_count: usize, enable_prelude: bool) !*Database
     errdefer db.deinit();
     const sources = [_]struct { path: []const u8, text: []const u8 }{
         .{ .path = "std.exit", .text = "pub extern func exit(code: int) never" },
-        .{ .path = "std.prelude", .text = "pub import std.exit.{exit}" },
+        .{ .path = "std.prelude", .text = "pub import std.exit.{exit}\nextern func literal_byte(static value: int_literal) byte\npub converter(static value: int_literal) byte where value >= 0 where value <= 255 -> literal_byte(value)\nstruct IntOperations\n  copy = trivial\nstruct BoolOperations\n  copy = trivial" },
     };
     for (sources, 0..) |source, index| {
         const file_id: structures.FileId = 100_000 + index;
@@ -108,14 +107,19 @@ fn testDatabaseWithPrelude(worker_count: usize, enable_prelude: bool) !*Database
         try db.addInput(queries.SourceText, file_id, source.text);
         try db.addInput(queries.ModuleMembers, module, &.{file_id});
         if (index == 0) try db.addInput(queries.StandardFile, queries.standardFileKey("exit.chi"), file_id);
+        if (index == 1) try db.addInput(queries.StandardFile, queries.standardFileKey("prelude.chi"), file_id);
         if (index == 1 and enable_prelude) try db.addInput(queries.StandardPreludeModule, {}, module);
     }
+    try db.addInput(queries.ModuleCatalog, {}, &.{
+        try db.intern(queries.ModulePaths, .{ .path = "std.exit" }),
+        try db.intern(queries.ModulePaths, .{ .path = "std.prelude" }),
+    });
     return db;
 }
 
 fn addSource(db: *Database, file_id: structures.FileId, source: []const u8) !void {
     try db.addInput(queries.SourceText, file_id, source);
-    const name = try std.fmt.allocPrint(testing.allocator, "test-module-{d}", .{file_id});
+    const name = try testing.allocator.print("test-module-{d}", .{file_id});
     defer testing.allocator.free(name);
     const module = try db.intern(queries.ModulePaths, .{ .path = name });
     try db.addInput(queries.FileModule, file_id, module);
@@ -231,7 +235,7 @@ fn expectDirectCallArtifact(artifact: structures.CompiledFunction, target: struc
     try testing.expectEqual(@as(usize, 1), artifact.relocations.len);
     try testing.expectEqual(@as(u32, 1), artifact.relocations[0].offset);
     try testing.expectEqual(structures.CompiledFunction.RelocationKind.call_relative_32, artifact.relocations[0].kind);
-    try testing.expectEqual(@as(u32, 0), @intFromEnum(artifact.relocations[0].reference));
+    try testing.expectEqual(@as(u32, 0), @backingInt(artifact.relocations[0].reference));
     try testing.expectEqual(@as(i64, 0), artifact.relocations[0].addend);
     try testing.expectEqualSlices(structures.InstanceId, &.{.{ .item = target }}, artifact.referenced_instances);
 }
@@ -240,7 +244,7 @@ fn expectIntegerReturnBody(body: structures.FunctionBodyAnalysis, expected: i32)
     try testing.expectEqual(@as(usize, 1), body.instructions.len);
     try testing.expectEqual(expected, body.instructions[0].const_int);
     try testing.expectEqual(@as(usize, 1), body.blocks.len);
-    try testing.expectEqual(@as(u32, 0), @intFromEnum(body.blocks[0].terminator.return_value.value));
+    try testing.expectEqual(@as(u32, 0), @backingInt(body.blocks[0].terminator.return_value.value));
 }
 
 fn expectDirectValueUses(expected: []const structures.FunctionValueId, actual: []const structures.FunctionValueUse) !void {
@@ -295,7 +299,7 @@ fn expectCompiledFunctionResult(
     const exit_with_result_relocations = [_]structures.CompiledFunction.Relocation{.{
         .offset = 1,
         .kind = .call_relative_32,
-        .reference = @enumFromInt(0),
+        .reference = @fromBackingInt(@intCast(0)),
         .addend = 0,
     }};
     const exit_with_result_references = [_]structures.InstanceId{function_id};
@@ -360,7 +364,7 @@ fn expectCompiledVariantWord(
     const relocations = [_]structures.CompiledFunction.Relocation{.{
         .offset = 8,
         .kind = .call_relative_32,
-        .reference = @enumFromInt(0),
+        .reference = @fromBackingInt(@intCast(0)),
         .addend = 0,
     }};
     const references = [_]structures.InstanceId{function_id};
@@ -1322,7 +1326,7 @@ test "item relocation drops dependencies on removed source files" {
 }
 
 test "import resolution cleans up every allocation failure" {
-    try testing.checkAllAllocationFailures(allocation_failure_backing.allocator(), testImportAllocations, .{});
+    try testing.checkAllAllocationFailures(allocation_failure_allocator, testImportAllocations, .{});
 }
 
 fn testImportAllocations(gpa: std.mem.Allocator) !void {
@@ -1729,7 +1733,7 @@ test "struct ownership properties have precise definition diagnostics" {
     for (cases, 1..) |case, file_id| {
         const db = try testDatabase(1);
         defer db.deinit();
-        const source = try std.fmt.allocPrint(testing.allocator, "static Invalid = struct\n  {s}\n  value: int", .{case.member});
+        const source = try testing.allocator.print("static Invalid = struct\n  {s}\n  value: int", .{case.member});
         defer testing.allocator.free(source);
         try addSource(db, file_id, source);
         const item = (try db.get(queries.BuildModuleScope, file_id)).*.?.resolveStatic("Invalid").?;
@@ -2725,12 +2729,12 @@ test "byte literals, layout, calls, fields and static values" {
 
 test "byte literals reject out of range and int values do not convert implicitly" {
     const cases = [_]struct { source: []const u8, kind: DiagnosticKind }{
-        .{ .source = "func answer() byte -> return 256", .kind = .integer_literal_out_of_range },
-        .{ .source = "func answer() byte\n  var value: byte = 256\n  return value", .kind = .integer_literal_out_of_range },
-        .{ .source = "func identity(value: byte) byte -> return value\nfunc answer() byte -> return identity(256)", .kind = .integer_literal_out_of_range },
-        .{ .source = "static Pair = struct\n  field: byte\nfunc answer() byte -> return Pair{field = 256}.field", .kind = .integer_literal_out_of_range },
+        .{ .source = "func answer() byte -> return 256", .kind = .where_condition_failed },
+        .{ .source = "func answer() byte\n  var value: byte = 256\n  return value", .kind = .where_condition_failed },
+        .{ .source = "func identity(value: byte) byte -> return value\nfunc answer() byte -> return identity(256)", .kind = .where_condition_failed },
+        .{ .source = "static Pair = struct\n  field: byte\nfunc answer() byte -> return Pair{field = 256}.field", .kind = .where_condition_failed },
         .{ .source = "func answer() byte\n  const value = 255\n  return value", .kind = .return_type_mismatch },
-        .{ .source = "func answer() byte -> return -1", .kind = .return_type_mismatch },
+        .{ .source = "func answer() byte -> return -1", .kind = .where_condition_failed },
     };
     for (cases) |case| {
         const db = try testDatabase(1);
@@ -2757,7 +2761,7 @@ test "static byte literal edits invalidate and recover" {
     const diagnostics = try db.transitiveAccumulatorValues(queries.ResolveStatic, high, structures.Diagnostic, testing.allocator);
     defer freeDiagnostics(diagnostics);
     try testing.expectEqual(@as(usize, 1), diagnostics.len);
-    try testing.expectEqual(structures.Diagnostic.Kind.integer_literal_out_of_range, diagnostics[0].kind);
+    try testing.expectEqual(structures.Diagnostic.Kind.where_condition_failed, diagnostics[0].kind);
 
     try setSource(db, 1, "static high: byte = 0");
     try testing.expectEqual(@as(u8, 0), (try resolvedStaticValue(db, high)).runtime.value.byte);
@@ -2830,7 +2834,7 @@ test "static byte parameter rejects an out-of-range literal" {
     const diagnostics = try db.transitiveAccumulatorValues(queries.AnalyzeFunctionInstance, .{ .item = answer }, structures.Diagnostic, testing.allocator);
     defer freeDiagnostics(diagnostics);
     try testing.expectEqual(@as(usize, 1), diagnostics.len);
-    try testing.expectEqual(structures.Diagnostic.Kind.integer_literal_out_of_range, diagnostics[0].kind);
+    try testing.expectEqual(structures.Diagnostic.Kind.where_condition_failed, diagnostics[0].kind);
 }
 
 test "static byte parameter does not convert an int value" {
@@ -3480,7 +3484,7 @@ fn checkFieldVisibilityIncremental(generated: bool, initially_public: bool) !voi
     ;
     const private_source = try std.mem.replaceOwned(u8, testing.allocator, public_source, "pub value", "value");
     defer testing.allocator.free(private_source);
-    const source = try std.fmt.allocPrint(testing.allocator,
+    const source = try testing.allocator.print(
         \\import library
         \\static Selected = library.Cell{s}
         \\func construct() int -> Selected{{value = 42}}.value
@@ -3560,7 +3564,7 @@ fn checkFieldVisibilityAnnotationEdits(generated: bool) !void {
         \\  value: Hidden
         \\pub func make() Cell -> Cell{value = 42}
     ;
-    const source = try std.fmt.allocPrint(testing.allocator,
+    const source = try testing.allocator.print(
         \\import library
         \\static Selected = library.Cell{s}
         \\func run() int
@@ -3720,7 +3724,7 @@ test "item indexing handles empty malformed missing and duplicate inputs" {
     const entry_id = try db.intern(queries.ItemLocations, .{ .origin = .{ .entry = 8 }, .kind = .top_level_entry, .name = "$entry" });
     try testing.expectEqual(entry_id, try db.intern(queries.ItemLocations, .{ .origin = .{ .entry = 8 }, .kind = .top_level_entry, .name = "$entry" }));
     try testing.expect(entry_id != try db.intern(queries.ItemLocations, .{ .origin = .{ .entry = 9 }, .kind = .top_level_entry, .name = "$entry" }));
-    try testing.expectError(error.InvalidInternId, db.lookupInterned(queries.ItemLocations, @enumFromInt(std.math.maxInt(u32))));
+    try testing.expectError(error.InvalidInternId, db.lookupInterned(queries.ItemLocations, @fromBackingInt(@intCast(std.math.maxInt(u32)))));
 }
 
 test "variant types are structurally interned in canonical member order" {
@@ -3748,11 +3752,11 @@ test "variant types are structurally interned in canonical member order" {
 
     try testing.expect((try db.lookupInternedAs(
         queries.ItemLocations,
-        @enumFromInt(@intFromEnum(int_or_unit.interned().?)),
+        @fromBackingInt(@intCast(@backingInt(int_or_unit.interned().?))),
     )) == null);
     try testing.expectError(
         error.InvalidInternId,
-        db.lookupInternedAs(queries.ItemLocations, @enumFromInt(std.math.maxInt(u32))),
+        db.lookupInternedAs(queries.ItemLocations, @fromBackingInt(@intCast(std.math.maxInt(u32)))),
     );
 
     const widened = switch ((try db.get(InternVariantPair, .{ int_or_unit, .none })).*) {
@@ -4996,9 +5000,9 @@ test "comptime thunks inherit enclosing static specialization arguments" {
     const answer_body = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = answer })).*.?;
     const increment = answer_body.instructions[0].call.target.direct;
     const increment_body = (try db.get(queries.AnalyzeFunctionInstance, increment)).*.?;
-    try testing.expectEqual(@as(usize, 2), increment_body.instructions.len);
-    try testing.expectEqual(@as(i32, 42), increment_body.instructions[1].const_int);
-    try testing.expectEqual(@as(u32, 1), @intFromEnum(increment_body.blocks[0].terminator.return_value.value));
+    try testing.expectEqual(@as(usize, 1), increment_body.instructions.len);
+    try testing.expectEqual(@as(i32, 42), increment_body.instructions[0].const_int);
+    try testing.expectEqual(@as(u32, 0), @backingInt(increment_body.blocks[0].terminator.return_value.value));
 }
 
 test "comptime expressions cannot capture runtime locals" {
@@ -5143,7 +5147,7 @@ test "static declaration edits invalidate actual consumers and retain equal resu
 }
 
 test "static declaration resolution cleans up every allocation failure" {
-    try testing.checkAllAllocationFailures(allocation_failure_backing.allocator(), testStaticDeclarationAllocations, .{});
+    try testing.checkAllAllocationFailures(allocation_failure_allocator, testStaticDeclarationAllocations, .{});
 }
 
 fn testStaticDeclarationAllocations(gpa: std.mem.Allocator) !void {
@@ -5296,7 +5300,7 @@ test "module scope preserves stable identity and canonical equality" {
 }
 
 test "module scope construction cleans up every allocation failure" {
-    try testing.checkAllAllocationFailures(allocation_failure_backing.allocator(), testModuleScopeAllocations, .{});
+    try testing.checkAllAllocationFailures(allocation_failure_allocator, testModuleScopeAllocations, .{});
 }
 
 fn testModuleScopeAllocations(gpa: std.mem.Allocator) !void {
@@ -5338,7 +5342,7 @@ test "resolution requested before interning retries after identity issuance" {
     defer db.deinit();
 
     try addSource(db, 1, "static target = func() int -> return 1");
-    const unissued: structures.ItemId = @enumFromInt(std.math.maxInt(u32));
+    const unissued: structures.ItemId = @fromBackingInt(@intCast(std.math.maxInt(u32)));
     try testing.expectError(error.InvalidInternId, db.get(queries.ResolveItem, unissued));
     const issued = (try db.get(queries.IndexItems, 1)).*.?.ids()[0];
     try testing.expect((try db.get(queries.ResolveItem, issued)).* != null);
@@ -5679,7 +5683,7 @@ test "variant subset widening at bindings and returns preserves tags and payload
     for (cases) |case| {
         const db = try testDatabase(2);
         defer db.deinit();
-        const source = try std.fmt.allocPrint(testing.allocator,
+        const source = try testing.allocator.print(
             \\static producer = func() {s} -> return {s}
             \\static local = func() int | none | unit
             \\  const widened: int | none | unit = producer()
@@ -5715,7 +5719,7 @@ test "variant coercion rejects narrowing and non-containing variants at every bo
         for (types) |pair| {
             const db = try testDatabase(2);
             defer db.deinit();
-            const source = try std.fmt.allocPrint(testing.allocator, boundary.source, .{ pair.actual, pair.expected });
+            const source = try testing.allocator.print(boundary.source, .{ pair.actual, pair.expected });
             defer testing.allocator.free(source);
             try addSource(db, 1, source);
             const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
@@ -5737,7 +5741,7 @@ test "variant widening annotations retain equal results and recover after invali
     inline for (boundaries) |boundary| {
         const db = try testDatabase(2);
         defer db.deinit();
-        const source = try std.fmt.allocPrint(testing.allocator, boundary.source, .{"int | none | unit"});
+        const source = try testing.allocator.print(boundary.source, .{"int | none | unit"});
         defer testing.allocator.free(source);
         try addSource(db, 1, source);
         const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
@@ -5750,14 +5754,14 @@ test "variant widening annotations retain equal results and recover after invali
         const executable = try db.get(queries.BuildExecutable, 1);
         try testing.expect(executable.* != null);
 
-        const reordered = try std.fmt.allocPrint(testing.allocator, boundary.source, .{"unit | none | int"});
+        const reordered = try testing.allocator.print(boundary.source, .{"unit | none | int"});
         defer testing.allocator.free(reordered);
         try setSource(db, 1, reordered);
         try testing.expectEqual(body, try db.get(queries.AnalyzeFunctionInstance, .{ .item = target }));
         try testing.expectEqual(compiled, try db.get(queries.CompileFunction, instance));
         try testing.expectEqual(executable, try db.get(queries.BuildExecutable, 1));
 
-        const invalid = try std.fmt.allocPrint(testing.allocator, boundary.source, .{"int | unit"});
+        const invalid = try testing.allocator.print(boundary.source, .{"int | unit"});
         defer testing.allocator.free(invalid);
         try setSource(db, 1, invalid);
         try testing.expect((try db.get(queries.BuildExecutable, 1)).* == null);
@@ -5804,7 +5808,7 @@ test "variant branch joins form structural unions and preserve selected values" 
             for ([_]bool{ false, true }) |select_left| {
                 const db = try testDatabase(2);
                 defer db.deinit();
-                const source = try std.fmt.allocPrint(testing.allocator,
+                const source = try testing.allocator.print(
                     \\static noop = func() unit -> return
                     \\static choose = func() int | unit | none
                     \\  const left: {s} = none
@@ -5837,7 +5841,7 @@ test "variant branch joins retain equal results and track changed member sets" {
         \\  return if 1 < 2 -> (if 1 < 2 -> none else 42) else {s}
         \\choose()
     ;
-    const source = try std.fmt.allocPrint(testing.allocator, format, .{"noop()"});
+    const source = try testing.allocator.print(format, .{"noop()"});
     defer testing.allocator.free(source);
     try addSource(db, 1, source);
     const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
@@ -5850,13 +5854,13 @@ test "variant branch joins retain equal results and track changed member sets" {
     const compiled = try db.get(queries.CompileFunction, instance);
     try testing.expect(compiled.* != null);
 
-    const equivalent = try std.fmt.allocPrint(testing.allocator, format, .{"(noop())"});
+    const equivalent = try testing.allocator.print(format, .{"(noop())"});
     defer testing.allocator.free(equivalent);
     try setSource(db, 1, equivalent);
     try testing.expectEqual(body, try db.get(queries.AnalyzeFunctionInstance, .{ .item = target }));
     try testing.expectEqual(compiled, try db.get(queries.CompileFunction, instance));
 
-    const changed = try std.fmt.allocPrint(testing.allocator, format, .{"42"});
+    const changed = try testing.allocator.print(format, .{"42"});
     defer testing.allocator.free(changed);
     try setSource(db, 1, changed);
     const updated = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = target })).*.?;
@@ -5872,7 +5876,7 @@ test "variant branch joins retain equal results and track changed member sets" {
 }
 
 test "variant branch join analysis cleans up every allocation failure" {
-    try testing.checkAllAllocationFailures(allocation_failure_backing.allocator(), testVariantJoinAllocations, .{});
+    try testing.checkAllAllocationFailures(allocation_failure_allocator, testVariantJoinAllocations, .{});
 }
 
 fn testVariantJoinAllocations(gpa: std.mem.Allocator) !void {
@@ -6156,7 +6160,7 @@ test "unit values are rejected at int boundaries" {
         .{ .file_id = 1, .source = "static bad = func() int -> return", .kind = .missing_return_value },
         .{ .file_id = 2, .source = "static bad = func() unit -> return 1", .kind = .return_type_mismatch },
         .{ .file_id = 3, .source = "static noop = func() unit\n  return\nstatic bad = func() int -> return noop()", .kind = .return_type_mismatch },
-        .{ .file_id = 4, .source = "static noop = func() unit\n  return\nstatic bad = func() int -> return noop() + 1", .kind = .arithmetic_operand_not_int },
+        .{ .file_id = 4, .source = "static noop = func() unit\n  return\nstatic bad = func() int -> return noop() + 1", .kind = .unknown_namespace_member },
         .{ .file_id = 5, .source = "static noop = func() unit\n  return\nstatic take = func(value: int) int -> return value\nstatic bad = func() int -> return take(noop())", .kind = .call_argument_type_mismatch },
         .{ .file_id = 6, .source = "static noop = func() unit\n  return\nstatic bad = func() unit\n  const done: int = noop()\n  return", .kind = .local_type_mismatch },
     };
@@ -6188,18 +6192,18 @@ test "function expressions analyze nested arithmetic and calls as one typed valu
     try testing.expectEqual(@as(usize, 11), body.instructions.len);
     try testing.expectEqual(@as(i32, 120), body.instructions[0].const_int);
     try testing.expectEqual(scope.resolve("leaf").?, body.instructions[1].call.target.direct.item);
-    try testing.expectEqual(@as(u32, 0), @intFromEnum(body.instructions[2].divsi.lhs));
-    try testing.expectEqual(@as(u32, 1), @intFromEnum(body.instructions[2].divsi.rhs));
+    try testing.expectEqual(@as(u32, 0), @backingInt(body.instructions[2].divsi.lhs));
+    try testing.expectEqual(@as(u32, 1), @backingInt(body.instructions[2].divsi.rhs));
     try testing.expectEqual(@as(i32, 2), body.instructions[3].const_int);
     try testing.expectEqual(@as(i32, 3), body.instructions[4].const_int);
-    try testing.expectEqual(@as(u32, 3), @intFromEnum(body.instructions[5].addi.lhs));
-    try testing.expectEqual(@as(u32, 4), @intFromEnum(body.instructions[5].addi.rhs));
-    try testing.expectEqual(@as(u32, 5), @intFromEnum(body.instructions[7].muli.lhs));
-    try testing.expectEqual(@as(u32, 2), @intFromEnum(body.instructions[8].subi.lhs));
-    try testing.expectEqual(@as(u32, 7), @intFromEnum(body.instructions[8].subi.rhs));
-    try testing.expectEqual(@as(u32, 8), @intFromEnum(body.instructions[9].negi));
-    try testing.expectEqual(@as(u32, 9), @intFromEnum(body.instructions[10].negi));
-    try testing.expectEqual(@as(u32, 10), @intFromEnum(body.blocks[0].terminator.return_value.value));
+    try testing.expectEqual(@as(u32, 3), @backingInt(body.instructions[5].addi.lhs));
+    try testing.expectEqual(@as(u32, 4), @backingInt(body.instructions[5].addi.rhs));
+    try testing.expectEqual(@as(u32, 5), @backingInt(body.instructions[7].muli.lhs));
+    try testing.expectEqual(@as(u32, 2), @backingInt(body.instructions[8].subi.lhs));
+    try testing.expectEqual(@as(u32, 7), @backingInt(body.instructions[8].subi.rhs));
+    try testing.expectEqual(@as(u32, 8), @backingInt(body.instructions[9].negi));
+    try testing.expectEqual(@as(u32, 9), @backingInt(body.instructions[10].negi));
+    try testing.expectEqual(@as(u32, 10), @backingInt(body.blocks[0].terminator.return_value.value));
     try testing.expect((try db.get(queries.BuildExecutable, 1)).* != null);
 }
 
@@ -6224,11 +6228,11 @@ test "fallible integer if joins branch values through a block argument" {
     try testing.expectEqual(@as(usize, 2), body.branch_arguments.len);
     const predicate = body.blocks[0].terminator.predicate_branch;
     try testing.expectEqual(structures.PredicateOperation.lti, predicate.operation);
-    try testing.expectEqual(@as(u32, 0), @intFromEnum(predicate.operands.lhs));
-    try testing.expectEqual(@as(u32, 2), @intFromEnum(predicate.operands.rhs));
+    try testing.expectEqual(@as(u32, 0), @backingInt(predicate.operands.lhs));
+    try testing.expectEqual(@as(u32, 2), @backingInt(predicate.operands.rhs));
     try testing.expectEqual(@as(u32, 1), body.blocks[3].argument_start);
     try testing.expectEqual(@as(u32, 2), body.blocks[3].argument_end);
-    try testing.expectEqual(@as(u32, 1), @intFromEnum(body.blocks[3].terminator.return_value.value));
+    try testing.expectEqual(@as(u32, 1), @backingInt(body.blocks[3].terminator.return_value.value));
 
     try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "choose" }, 42);
 }
@@ -6587,12 +6591,12 @@ test "fallible call syntax marker edits invalidate and recover expression result
     for (cases) |case| {
         const db = try testDatabase(2);
         defer db.deinit();
-        const invalid = try std.fmt.allocPrint(testing.allocator,
+        const invalid = try testing.allocator.print(
             \\fallible target() {s} -> 42
             \\fallible caller() int -> {s}
         , .{ case.result_type, case.unmarked });
         defer testing.allocator.free(invalid);
-        const valid = try std.fmt.allocPrint(testing.allocator,
+        const valid = try testing.allocator.print(
             \\fallible target() {s} -> 42
             \\fallible caller() int -> {s}
         , .{ case.result_type, case.marked });
@@ -6644,10 +6648,10 @@ test "fallible call syntax early validation recovers after static and where edit
     for (cases, 0..) |case, case_index| {
         const db = try testDatabase(2);
         defer db.deinit();
-        const invalid = try std.fmt.allocPrint(testing.allocator, "{s}\nfunc caller() int -> {s}", .{ case.setup, case.invalid });
+        const invalid = try testing.allocator.print("{s}\nfunc caller() int -> {s}", .{ case.setup, case.invalid });
         defer testing.allocator.free(invalid);
         const valid_setup = if (case_index == 1) "fallible stop() unit -> ()\nfallible target() int where stop() -> 42" else case.setup;
-        const valid = try std.fmt.allocPrint(testing.allocator, "{s}\nfunc caller() int -> {s}", .{ valid_setup, case.valid });
+        const valid = try testing.allocator.print("{s}\nfunc caller() int -> {s}", .{ valid_setup, case.valid });
         defer testing.allocator.free(valid);
         try addSource(db, 1, invalid);
         const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
@@ -6712,9 +6716,9 @@ test "fallible call syntax context edits preserve direct condition exemptions" {
         const db = try testDatabase(2);
         defer db.deinit();
         const invalid = "fallible target() int -> 42\nfunc caller() int -> target()";
-        const unmarked = try std.fmt.allocPrint(testing.allocator, "fallible target() int -> 42\nfunc caller() int -> {s}", .{case.unmarked});
+        const unmarked = try testing.allocator.print("fallible target() int -> 42\nfunc caller() int -> {s}", .{case.unmarked});
         defer testing.allocator.free(unmarked);
-        const marked = try std.fmt.allocPrint(testing.allocator, "fallible target() int -> 42\nfunc caller() int -> {s}", .{case.marked});
+        const marked = try testing.allocator.print("fallible target() int -> 42\nfunc caller() int -> {s}", .{case.marked});
         defer testing.allocator.free(marked);
         try addSource(db, 1, invalid);
         const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
@@ -6816,7 +6820,7 @@ test "every integer comparison selects the fallible success edge" {
     try expectCompiledFunctionResult(db, 1, "answer", &.{"answer"}, 42);
 }
 
-test "bool equality selects fallible edges without truthiness" {
+test "bool equality and values select branches without integer truthiness" {
     const db = try testDatabase(2);
     defer db.deinit();
 
@@ -6824,7 +6828,9 @@ test "bool equality selects fallible edges without truthiness" {
         \\func answer() int
         \\  const equal = if true == true -> 20 else 0
         \\  const unequal = if true <> false -> 22 else 0
-        \\  return equal + unequal
+        \\  const condition = true
+        \\  const direct = if condition -> 40 else 0
+        \\  return equal + unequal + direct - 40
     );
     try expectCompiledFunctionResult(db, 1, "answer", &.{"answer"}, 42);
 
@@ -6832,7 +6838,7 @@ test "bool equality selects fallible edges without truthiness" {
         .{ .file_id = 2, .source = "func bad() int -> if true < false -> 1 else 0", .kind = .comparison_operand_not_int },
         .{ .file_id = 3, .source = "func bad() int -> if true == 1 -> 1 else 0", .kind = .equality_operand_type_mismatch },
         .{ .file_id = 4, .source = "func bad() int -> if none == none -> 1 else 0", .kind = .equality_operand_not_supported },
-        .{ .file_id = 5, .source = "func bad() int -> if true -> 1 else 0", .kind = .if_condition_not_fallible },
+        .{ .file_id = 5, .source = "func bad() int -> if 1 -> 1 else 0", .kind = .if_condition_not_fallible },
     };
     for (cases) |case| {
         try addSource(db, case.file_id, case.source);
@@ -6874,7 +6880,7 @@ test "and and or evaluate their right operand only on the required edge" {
     for (cases) |case| {
         const db = try testDatabase(1);
         defer db.deinit();
-        const source = try std.fmt.allocPrint(testing.allocator,
+        const source = try testing.allocator.print(
             \\static stop = func(code: int) int
             \\  exit(code)
             \\  return 0
@@ -6900,7 +6906,7 @@ test "short-circuit condition edges preserve mutable local state" {
     for (cases) |case| {
         const db = try testDatabase(1);
         defer db.deinit();
-        const source = try std.fmt.allocPrint(testing.allocator,
+        const source = try testing.allocator.print(
             \\var value = 5
             \\if {s} -> unit else unit
             \\exit(value)
@@ -6962,7 +6968,7 @@ test "if validates conditions and expected result types" {
     const cases = [_]struct { file_id: structures.FileId, source: []const u8, kind: DiagnosticKind }{
         .{
             .file_id = 1,
-            .source = "static bad = func() int -> return if true -> 1 else 2",
+            .source = "static bad = func() int -> return if 1 -> 1 else 2",
             .kind = .if_condition_not_fallible,
         },
         .{
@@ -7189,7 +7195,7 @@ test "variant inspection edits retain equal artifacts and recover diagnostics" {
 }
 
 test "variant inspection compilation cleans up every allocation failure" {
-    try testing.checkAllAllocationFailures(allocation_failure_backing.allocator(), testVariantInspectionAllocations, .{});
+    try testing.checkAllAllocationFailures(allocation_failure_allocator, testVariantInspectionAllocations, .{});
 }
 
 fn testVariantInspectionAllocations(gpa: std.mem.Allocator) !void {
@@ -7418,23 +7424,23 @@ test "parameters and nested call arguments form one typed value graph" {
     try testing.expectEqualSlices(structures.FunctionBlockArgument, &.{ .{ .type_id = .int }, .{ .type_id = .int } }, add.block_arguments);
     try testing.expectEqual(@as(u32, 0), add.blocks[0].argument_start);
     try testing.expectEqual(@as(u32, 2), add.blocks[0].argument_end);
-    try testing.expectEqual(@as(u32, 0), @intFromEnum(add.instructions[0].addi.lhs));
-    try testing.expectEqual(@as(u32, 1), @intFromEnum(add.instructions[0].addi.rhs));
-    try testing.expectEqual(@as(u32, 2), @intFromEnum(add.blocks[0].terminator.return_value.value));
+    try testing.expectEqual(@as(u32, 0), @backingInt(add.instructions[0].addi.lhs));
+    try testing.expectEqual(@as(u32, 1), @backingInt(add.instructions[0].addi.rhs));
+    try testing.expectEqual(@as(u32, 2), @backingInt(add.blocks[0].terminator.return_value.value));
 
     const twice = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = twice_id })).*.?;
-    try expectDirectCallArguments(&.{ @enumFromInt(0), @enumFromInt(0) }, twice.call_arguments);
+    try expectDirectCallArguments(&.{ @fromBackingInt(@intCast(0)), @fromBackingInt(@intCast(0)) }, twice.call_arguments);
     try testing.expectEqual(add_id, twice.instructions[0].call.target.direct.item);
     try testing.expectEqual(structures.FunctionValueRange{ .start = 0, .end = 2 }, twice.instructions[0].call.arguments);
-    try testing.expectEqual(@as(u32, 1), @intFromEnum(twice.blocks[0].terminator.return_value.value));
+    try testing.expectEqual(@as(u32, 1), @backingInt(twice.blocks[0].terminator.return_value.value));
 
     const answer = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = scope.resolve("answer").? })).*.?;
     try expectDirectCallArguments(&.{
-        @enumFromInt(0),
-        @enumFromInt(1),
-        @enumFromInt(2),
-        @enumFromInt(3),
-        @enumFromInt(2),
+        @fromBackingInt(@intCast(0)),
+        @fromBackingInt(@intCast(1)),
+        @fromBackingInt(@intCast(2)),
+        @fromBackingInt(@intCast(3)),
+        @fromBackingInt(@intCast(2)),
     }, answer.call_arguments);
     try testing.expectEqual(structures.FunctionValueRange{ .start = 0, .end = 2 }, answer.instructions[2].call.arguments);
     try testing.expectEqual(structures.FunctionValueRange{ .start = 2, .end = 3 }, answer.instructions[3].call.arguments);
@@ -7542,13 +7548,13 @@ test "immutable locals name typed values without adding binding instructions" {
     try testing.expectEqual(scope.resolve("leaf").?, body.instructions[1].call.target.direct.item);
     try testing.expectEqual(@as(i32, 2), body.instructions[2].const_int);
     try testing.expectEqual(@as(i32, 1), body.instructions[3].const_int);
-    try testing.expectEqual(@as(u32, 2), @intFromEnum(body.instructions[4].addi.lhs));
-    try testing.expectEqual(@as(u32, 3), @intFromEnum(body.instructions[4].addi.rhs));
-    try testing.expectEqual(@as(u32, 0), @intFromEnum(body.instructions[5].muli.lhs));
-    try testing.expectEqual(@as(u32, 4), @intFromEnum(body.instructions[5].muli.rhs));
-    try testing.expectEqual(@as(u32, 5), @intFromEnum(body.instructions[6].addi.lhs));
-    try testing.expectEqual(@as(u32, 0), @intFromEnum(body.instructions[6].addi.rhs));
-    try testing.expectEqual(@as(u32, 6), @intFromEnum(body.blocks[0].terminator.return_value.value));
+    try testing.expectEqual(@as(u32, 2), @backingInt(body.instructions[4].addi.lhs));
+    try testing.expectEqual(@as(u32, 3), @backingInt(body.instructions[4].addi.rhs));
+    try testing.expectEqual(@as(u32, 0), @backingInt(body.instructions[5].muli.lhs));
+    try testing.expectEqual(@as(u32, 4), @backingInt(body.instructions[5].muli.rhs));
+    try testing.expectEqual(@as(u32, 5), @backingInt(body.instructions[6].addi.lhs));
+    try testing.expectEqual(@as(u32, 0), @backingInt(body.instructions[6].addi.rhs));
+    try testing.expectEqual(@as(u32, 6), @backingInt(body.blocks[0].terminator.return_value.value));
     try testing.expect((try db.get(queries.BuildExecutable, 1)).* != null);
 }
 
@@ -7584,7 +7590,7 @@ test "mutable locals and compound assignments reuse ordinary SSA values" {
     const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
     const body = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = scope.resolve("answer").? })).*.?;
     try testing.expectEqual(@as(usize, 11), body.instructions.len);
-    try testing.expectEqual(@as(u32, 10), @intFromEnum(body.blocks[0].terminator.return_value.value));
+    try testing.expectEqual(@as(u32, 10), @backingInt(body.blocks[0].terminator.return_value.value));
     try expectCompiledFunctionResult(db, 1, "answer", &.{"answer"}, 42);
 }
 
@@ -7707,7 +7713,7 @@ test "loop break values join and bare break contributes unit" {
     var found_return = false;
     for (selected.blocks) |block| switch (block.terminator) {
         .return_value => |returned| {
-            try testing.expectEqual(selected.return_type, selected.block_arguments[@intFromEnum(returned.value)].type_id);
+            try testing.expectEqual(selected.return_type, selected.block_arguments[@backingInt(returned.value)].type_id);
             found_return = true;
         },
         else => {},
@@ -9300,7 +9306,7 @@ test "function analysis distinguishes entry stale restored and invalid identitie
     try testing.expect((try db.get(queries.FunctionSignature, function_id)).* != null);
     try expectIntegerReturnBody((try db.get(queries.AnalyzeFunctionInstance, .{ .item = function_id })).*.?, 7);
 
-    const invalid: structures.ItemId = @enumFromInt(std.math.maxInt(u32));
+    const invalid: structures.ItemId = @fromBackingInt(@intCast(std.math.maxInt(u32)));
     try testing.expectError(error.InvalidInternId, db.get(queries.FunctionSignature, invalid));
     try testing.expectError(error.InvalidInternId, db.get(queries.AnalyzeFunctionInstance, .{ .item = invalid }));
 }
@@ -10601,7 +10607,7 @@ test "CompileFunction supports entry retention stale restoration and invalid ins
     try testing.expect((try db.get(queries.CompileFunction, entry_instance)).* != null);
     try testing.expect((try db.get(queries.CompileFunction, function_instance)).* != null);
 
-    const invalid: structures.InstanceId = .{ .item = @enumFromInt(std.math.maxInt(u32)) };
+    const invalid: structures.InstanceId = .{ .item = @fromBackingInt(@intCast(std.math.maxInt(u32))) };
     try testing.expectError(error.InvalidInternId, db.get(queries.CompileFunction, invalid));
 }
 
@@ -10835,12 +10841,12 @@ test "failed interning publishes no partial identity" {
     var db_live = true;
     defer if (db_live) db.deinit();
 
-    const module: structures.ModuleId = @enumFromInt(0);
+    const module: structures.ModuleId = @fromBackingInt(@intCast(0));
     failing.fail_index = failing.alloc_index + 3;
     const loc: structures.ItemLoc = .{ .origin = .{ .module = module }, .kind = .function, .name = "owned" };
     try testing.expectError(error.OutOfMemory, db.intern(queries.ItemLocations, loc));
     try testing.expect(failing.has_induced_failure);
-    try testing.expectError(error.InvalidInternId, db.lookupInterned(queries.ItemLocations, @enumFromInt(0)));
+    try testing.expectError(error.InvalidInternId, db.lookupInterned(queries.ItemLocations, @fromBackingInt(@intCast(0))));
 
     failing.fail_index = std.math.maxInt(usize);
     const id = try db.intern(queries.ItemLocations, loc);
@@ -10902,7 +10908,7 @@ test "function declaration annotations validate when demanded and recover" {
     try setSource(db, 1, "static f: func() int = func() int -> return 7\nexit(f())");
     try testing.expect((try db.get(queries.BuildExecutable, 1)).* != null);
     for ([_][]const u8{ "int", "func(int) unit" }) |annotation| {
-        const source = try std.fmt.allocPrint(testing.allocator, "static f: {s} = func() int -> return 7\nexit(f())", .{annotation});
+        const source = try testing.allocator.print("static f: {s} = func() int -> return 7\nexit(f())", .{annotation});
         defer testing.allocator.free(source);
         try setSource(db, 1, source);
         try testing.expect((try db.get(queries.BuildExecutable, 1)).* == null);
@@ -10930,7 +10936,7 @@ test "expression graph preserves effects across statements arguments and selecte
     for (cases) |case| {
         const db = try testDatabase(1);
         defer db.deinit();
-        const source = try std.fmt.allocPrint(testing.allocator, "static stop = func(code: int) int\n  exit(code)\n  return 0\n" ++
+        const source = try testing.allocator.print("static stop = func(code: int) int\n  exit(code)\n  return 0\n" ++
             "static pair = func(a: int, b: int) int -> return a + b\n{s}", .{case.body});
         defer testing.allocator.free(source);
         try addSource(db, 1, source);
@@ -10977,7 +10983,7 @@ test "redundant variant binding annotations retain typed and compiled results" {
 }
 
 test "typed expression graph construction cleans up every allocation failure" {
-    try testing.checkAllAllocationFailures(allocation_failure_backing.allocator(), testTypedExpressionAllocations, .{});
+    try testing.checkAllAllocationFailures(allocation_failure_allocator, testTypedExpressionAllocations, .{});
 }
 
 fn testTypedExpressionAllocations(gpa: std.mem.Allocator) !void {
@@ -11174,7 +11180,7 @@ test "ownership strategies require bare strategy names" {
 }
 
 test "adding a previously missing input invalidates cached fallback results" {
-    try testing.checkAllAllocationFailures(allocation_failure_backing.allocator(), testMissingInputRegistration, .{});
+    try testing.checkAllAllocationFailures(allocation_failure_allocator, testMissingInputRegistration, .{});
 }
 
 fn testMissingInputRegistration(gpa: std.mem.Allocator) !void {

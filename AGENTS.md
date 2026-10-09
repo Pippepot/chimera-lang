@@ -7,7 +7,7 @@ Build clear, correct code with the least total machinery.
 - [syntax&semantics.txt](syntax&semantics.txt) is the incomplete language source of truth; [ARCHITECTURE.md](ARCHITECTURE.md) owns compiler/query boundaries and [ROADMAP.md](ROADMAP.md) owns priorities. State broader semantic interpretations before implementing them.
 - Solve the whole problem, not just the symptom. When a clean implementation needs stronger foundations, consider a focused change that also supports future work.
 - Model all required shapes and independent semantic dimensions, not just the first syntax case. Keep expression structure separate from operation typing; avoid one-variant unions and redundant type fields.
-- Use Zig 0.16 APIs, verified with the local compiler. Prefer fully qualified names except familiar shorthand such as AST.
+- Use Zig 0.17 APIs, verified with the local compiler. Prefer fully qualified names except familiar shorthand such as AST.
 - Keep switch arms at statement level; extract substantial arms into named functions.
 
 ## Boundaries and invariants
@@ -22,5 +22,5 @@ Build clear, correct code with the least total machinery.
 - Test behavior, ownership, and incremental recomputation, not type-system guarantees. Keep large cross-module suites in `*_test.zig`.
 - Use [docs/COMPILER.md](docs/COMPILER.md) for test commands; run relevant tests, formatting checks, and `git diff --check`.
 - Batch related edits before focused checks. Verify isolated changes with affected suites; run the full suite once for changes spanning stages or shared representations. Documentation-only edits need no compiler tests.
-- Use default caches and fixed `--seed 0`. Repeat passing checks only for relevant changes or unresolved concerns. Collaborating agents share results for the same source state; one agent owns the final full-suite run.
+- Use default caches and fixed `--seed=0`. Repeat passing checks only for relevant changes or unresolved concerns. Collaborating agents share results for the same source state; one agent owns the final full-suite run.
 - Update the document that owns a changed fact; replace obsolete roadmap details rather than accumulating history.

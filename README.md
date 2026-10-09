@@ -69,7 +69,9 @@ returns an integer. On failure, it returns no value.
 `<>` means "not equal." The standalone line `denominator <> 0` is a check:
 if it succeeds, execution continues to `return`. If it fails, `divide` fails
 immediately and skips the remaining body. It is not a Boolean result that gets
-computed and ignored. In Chimera, comparisons succeed or fail.
+computed and ignored in this statement position. In expressions, comparisons
+produce `bool` values, which can be named and used in conditions. `and` and `or`
+short-circuit; `not` negates a Boolean value or a fallible call's success.
 
 The caller uses `if const` to name the successful result `quotient`. If the call
 fails, `else` runs instead. Try `divide(84, 0)` to take the failure branch.
@@ -124,9 +126,30 @@ value, also written `()`. `value += 1` adds one to the existing value.
 Chimera also tracks which code owns a resource and how long references to it can
 be used. Owned resources are cleaned up automatically.
 
+## Checked indexing
+
+```chi
+var values = [19, 23]
+if values[0] = 20
+  if const first = values[0]
+    if const second = values[1]
+      exit(first + second - 1)
+exit(1)
+```
+
+Collection literals default to inline `Array` values. Indexed reads copy an
+element; writes check bounds before constructing the replacement. Failed bounds
+checks take the failure path, rather than accessing outside storage. Compound
+updates such as `values[0] += 1` use the same checks. `get` and `get_mut` remain
+available when a checked reference is needed instead of a copied element.
+
+User types define arithmetic and indexing through namespace functions such as
+`Value.+`, `Value.[]`, and `Value.[]=`. The compiler requires each operation's
+exact signature; these use ordinary visibility and static specialization.
+
 ## Try it
 
-With **Zig 0.16** installed, run a `.chi` file from the repository root:
+With **Zig 0.17** installed, run a `.chi` file from the repository root:
 
 ```sh
 zig build run -- program.chi

@@ -11,10 +11,10 @@ pub const Writer = struct {
     }
 
     fn writeInt(self: *Writer, comptime T: type, value: T) !void {
-        const U = std.meta.Int(.unsigned, @sizeOf(T) * 8);
+        const U = @Int(.unsigned, @sizeOf(T) * 8);
         var encoded: [@sizeOf(T)]u8 = undefined;
         const widened: U = if (@typeInfo(T).int.signedness == .signed)
-            @bitCast(@as(std.meta.Int(.signed, @sizeOf(T) * 8), value))
+            @bitCast(@as(@Int(.signed, @sizeOf(T) * 8), value))
         else
             value;
         std.mem.writeInt(U, &encoded, widened, .little);
@@ -29,14 +29,14 @@ pub const Writer = struct {
                 if (info.bits > 64) @compileError("disk codec supports integers up to 64 bits");
                 try self.writeInt(T, value);
             },
-            .@"enum" => try self.write(@typeInfo(T).@"enum".tag_type, @intFromEnum(value)),
+            .@"enum" => try self.write(@typeInfo(T).@"enum".tag_type, @backingInt(value)),
             .optional => |info| {
                 try self.write(bool, value != null);
                 if (value) |present| try self.write(info.child, present);
             },
             .array => |info| for (value) |element| try self.write(info.child, element),
-            .@"struct" => |info| inline for (info.fields) |field| {
-                if (!field.is_comptime) try self.write(field.type, @field(value, field.name));
+            .@"struct" => |info| inline for (info.field_names, info.field_types, info.field_attrs) |field_name, FieldType, attrs| {
+                if (!attrs.@"comptime") try self.write(FieldType, @field(value, field_name));
             },
             .@"union" => |info| {
                 const Tag = info.tag_type orelse @compileError("untagged unions cannot be persisted");
@@ -75,11 +75,11 @@ pub const Reader = struct {
     }
 
     fn readInt(self: *Reader, comptime T: type) error{InvalidCache}!T {
-        const U = std.meta.Int(.unsigned, @sizeOf(T) * 8);
+        const U = @Int(.unsigned, @sizeOf(T) * 8);
         const bytes: *const [@sizeOf(T)]u8 = @ptrCast(try self.take(@sizeOf(T)));
         const raw = std.mem.readInt(U, bytes, .little);
         const result = if (@typeInfo(T).int.signedness == .signed)
-            std.math.cast(T, @as(std.meta.Int(.signed, @sizeOf(T) * 8), @bitCast(raw)))
+            std.math.cast(T, @as(@Int(.signed, @sizeOf(T) * 8), @bitCast(raw)))
         else
             std.math.cast(T, raw);
         return result orelse error.InvalidCache;
@@ -130,23 +130,23 @@ pub const Reader = struct {
     fn readEnum(self: *Reader, comptime T: type) !T {
         const info = @typeInfo(T).@"enum";
         const raw = try self.read(info.tag_type);
-        if (!info.is_exhaustive) return @enumFromInt(raw);
-        inline for (info.fields) |field| {
-            if (raw == field.value) return @enumFromInt(raw);
+        if (info.mode == .nonexhaustive) return @fromBackingInt(@intCast(raw));
+        inline for (info.field_values) |field_value| {
+            if (raw == field_value) return @fromBackingInt(@intCast(raw));
         }
         return error.InvalidCache;
     }
 
     fn readStruct(self: *Reader, comptime T: type) !T {
-        const fields = @typeInfo(T).@"struct".fields;
+        const info = @typeInfo(T).@"struct";
         var result: T = undefined;
         var initialized: usize = 0;
-        errdefer inline for (fields, 0..) |field, index| {
-            if (!field.is_comptime and index < initialized) freeValue(field.type, self.allocator, &@field(result, field.name));
+        errdefer inline for (info.field_names, info.field_types, info.field_attrs, 0..) |field_name, FieldType, attrs, index| {
+            if (!attrs.@"comptime" and index < initialized) freeValue(FieldType, self.allocator, &@field(result, field_name));
         };
-        inline for (fields, 0..) |field, index| {
-            if (!field.is_comptime) {
-                @field(result, field.name) = try self.read(field.type);
+        inline for (info.field_names, info.field_types, info.field_attrs, 0..) |field_name, FieldType, attrs, index| {
+            if (!attrs.@"comptime") {
+                @field(result, field_name) = try self.read(FieldType);
                 initialized = index + 1;
             }
         }
@@ -183,8 +183,8 @@ pub fn freeValue(comptime T: type, allocator: std.mem.Allocator, value: *T) void
     switch (@typeInfo(T)) {
         .optional => |info| if (value.*) |*present| freeValue(info.child, allocator, present),
         .array => |info| for (value) |*element| freeValue(info.child, allocator, element),
-        .@"struct" => |info| inline for (info.fields) |field| {
-            if (!field.is_comptime) freeValue(field.type, allocator, &@field(value.*, field.name));
+        .@"struct" => |info| inline for (info.field_names, info.field_types, info.field_attrs) |field_name, FieldType, attrs| {
+            if (!attrs.@"comptime") freeValue(FieldType, allocator, &@field(value.*, field_name));
         },
         .@"union" => switch (value.*) {
             inline else => |*payload| freeValue(@TypeOf(payload.*), allocator, payload),

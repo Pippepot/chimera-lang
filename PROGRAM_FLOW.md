@@ -57,6 +57,9 @@ flowchart TD
     RS --> AB
     FS --> AB
     MS --> AB
+    MD --> AB
+    MD --> AT
+    MD --> EC
     AB --> CF["CompileFunction(InstanceId) → ?CompiledFunction"]
     VL["VariantLayout(TypeId)"] --> TL["HostTypeLayout(TypeId)"]
     SD --> SL["StructLayout(TypeId)"]
@@ -75,11 +78,22 @@ flowchart TD
 1. `ParseFile` and `DiscoverItems` identify declarations and the synthetic entry. `IndexItems` interns identities; `ModuleDeclarations` checks names across current member files, and `IndexModuleItems` publishes source locations. Building effective file scope does not demand signatures or bodies. Duplicate declarations fail even when unused.
 2. Static resolution demands referenced declarations recursively. Direct type aliases and declared struct identities can resolve without interpretation. Other initializers, explicit `comptime` expressions, static arguments, and calls in type positions use `AnalyzeComptimeThunk` then `ExecuteComptimeThunk`; the site key includes specialization and optional expected type. `ExecuteComptimeCall` keys concrete calls by instance and canonical arguments, obtaining typed bodies from `AnalyzeComptimeFunctionBody`. Mutable calls also return canonical copy-back arguments. Repeated instance-and-argument recursion is diagnosed; changing-argument recursion and loops have no step limit. Execution failures retain instruction spans and call-site notes.
 3. `AnalyzeFunctionInstance` demands its signature, effective scope, definitions, and ownership capabilities, then builds typed SSA. After deferred reference uses resolve, lifetime analysis plans cleanup, typing diagnoses explicit abandonment, and cleanup is materialized. A final reference check accounts for mutating destructors at their actual lowered positions before the body is published. All runtime instances use this same query, including unspecialized declarations; the synthetic entry supplies its own unit signature.
-4. `CompileFunction` demands the typed body and host layouts but does not compile callees. Layout consumes logical ownership validation. Codegen publishes machine code with symbolic instance references; emission and assembly rendering use the same instruction descriptions.
-5. `ValidateModuleGraph` first validates imports and public exports throughout the dependency graph without compiling or evaluating any entry body. Reachability starts only at the designated entry and compiles each referenced instance once in breadth-first order, including recursive graphs. The linker consumes that order, lays out artifacts, and patches relocations. Unreachable function bodies stay unanalyzed.
+4. `CompileFunction` demands the typed body and validates runtime eligibility, including initializer regions, before requesting host layouts; it does not compile callees. Layout consumes logical ownership validation. Codegen publishes machine code with symbolic instance references; emission and assembly rendering use the same instruction descriptions.
+5. `ValidateModuleGraph` first validates imports, public exports, and converter declaration placement, ownership, and parameter shape throughout the dependency graph without compiling or evaluating any entry body. Reachability starts only at the designated entry and compiles each referenced instance once in breadth-first order, including recursive graphs. The linker consumes that order, lays out artifacts, and patches relocations. Unreachable function bodies stay unanalyzed.
 6. The CLI handles a transitive compile-time `exit` control outcome without producing an executable, otherwise renders transitive diagnostics or optional AST/SSA/assembly/timing views, writes the executable through `src/runtime.zig`, and runs it through a private hard link to the published inode (or a private copy on filesystems without hard links). SSA debug output uses the same reachable set. The CLI registers the entry directory tree plus the embedded `std` sources and uses two workers by default where available. Module validation prefetches independent file queries, and reachability prefetches referenced function compilation.
 
 Before a mutable call returns, the callee writes final borrowed parameter values to its incoming slots. Both ordinary and fallible caller continuations reload them and rebuild root-plus-field paths, or store them into in-place local storage, before another call or cleanup can reuse the outgoing area.
+
+Known expected types discover conversions through the existing source/target
+owner module declarations and specialize through normal function signatures.
+Imports do not control the candidate set. Generic argument inference types full
+expressions without executing conversions; executable arguments and their
+selected conversions then evaluate left to right. For frame-local static-only
+sources, interpretation supplies the current canonical value to candidate
+discovery and the ordinary call executor. Selected constraints and converter
+bodies therefore contribute normal query dependencies, including after local
+mutation. Such staged operations cannot persist as runtime bodies; source and
+converter edits invalidate their published results normally.
 
 Import resolution is available as a separate query boundary. It uses the explicit
 module catalog for existence, including failed-lookup invalidation, and collected

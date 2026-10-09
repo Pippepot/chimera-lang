@@ -1,6 +1,4 @@
-struct Foo(T: type)
-  r: Ref(T)
-
-const f = Foo{r = if const owner = Ref.new(1) -> owner^ else exit(1)}
-_ = f
-exit(0)
+var values = [1, 2, 3]
+if const element = values.get_mut(2) -> element.replace(4)
+if const element = values.get(2) -> exit(element[])
+exit(1)

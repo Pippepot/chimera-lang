@@ -242,8 +242,13 @@ fn writeType(types: anytype, writer: *std.Io.Writer, type_id: structures.TypeId)
 
 fn writeTypeInner(types: anytype, writer: *std.Io.Writer, type_id: structures.TypeId) !void {
     switch (type_id) {
-        .int, .byte, .bool, .unit, .none, .never, .type => return writer.writeAll(@tagName(type_id)),
+        .int, .int_literal, .byte, .bool, .unit, .none, .never, .type => return writer.writeAll(@tagName(type_id)),
         _ => {},
+    }
+    if (try types.arrayType(type_id)) |array| {
+        try writer.writeAll("Array(");
+        try writeTypeInner(types, writer, array.element_type);
+        return writer.print(", {d})", .{array.length});
     }
     if (try types.structName(type_id)) |name| return writer.writeAll(name);
     if (try types.callable(type_id)) |callable| {
@@ -384,6 +389,7 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
         .compile_time_call_trace => try writer.writeAll("called at compile time from here"),
         .unsupported_external_declaration => try writer.writeAll("external function has no compiler-provided implementation"),
         .invalid_external_signature => try writer.writeAll("external function signature does not match its compiler-provided implementation"),
+        .invalid_operation_signature => try writer.writeAll("operation function must match its exact compiler-specified signature"),
         .struct_member_not_supported => try writer.writeAll("struct bodies support fields, namespace declarations, and `move`, `copy`, or `drop` properties"),
         .duplicate_struct_member => try writeSourceLabel(writer, "struct member is already declared", source, span),
         .reserved_ownership_member => try writeSourceLabel(writer, "`copy` and `move` are reserved for ownership capabilities", source, span),
@@ -475,8 +481,19 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
         .replaced_value_used => try writer.writeAll("cannot use this value while it is replaced in its own storage; its type cannot move directly, so read or transfer it before the replacement"),
         .consumed_storage_in_use => try writer.writeAll("cannot overwrite storage retained by a pending `deinit` argument; replace it after the call completes"),
         .borrow_outlives_source => try writer.writeAll("borrow cannot outlive the value or storage it references"),
-        .invalid_return_origin => try writer.writeAll("return origin contract must name distinct runtime parameters"),
-        .return_origin_not_declared => try writer.writeAll("returned borrow has an origin not named in its contract"),
+        .compile_time_only_type => |type_id| {
+            try writer.writeAll("compile-time-only type ");
+            try writeType(types, writer, type_id);
+            try writer.writeAll(" cannot be materialized during runtime execution");
+        },
+        .ambiguous_conversion => |mismatch| {
+            try writer.writeAll("multiple conversions apply from ");
+            try writeType(types, writer, mismatch.found);
+            try writer.writeAll(" to ");
+            try writeType(types, writer, mismatch.expected);
+        },
+        .invalid_converter => try writer.writeAll("converter must have one immutable runtime source or one compile-time-only static source and an infallible result"),
+        .invalid_converter_owner => try writer.writeAll("converter must be declared in the defining module of its source or target type"),
         .borrow_requires_place => try writer.writeAll("borrowing a value's storage requires a named local or parameter, or one of its fields"),
         .mutable_borrow_requires_writable_place => try writer.writeAll("`borrow mut` requires a mutable place or writable Ref"),
         .dereference_requires_ref => |type_id| {
@@ -708,4 +725,20 @@ pub fn renderDiagnostics(
         if (std.meta.activeTag(diagnostic.kind) != .compile_time_call_trace) continue;
         try renderDiagnostic(types, writer, sources, diagnostic);
     }
+}
+
+test "diagnostic types display array elements lengths and nested variants" {
+    const query = @import("query/engine.zig");
+    const queries = @import("queries.zig");
+    const allocator = std.testing.allocator;
+    const db = try query.Database.init(allocator, .{ .worker_count = 1 });
+    defer db.deinit();
+    const element: structures.TypeId = .fromInterned(try db.intern(queries.Types, .{ .variant = .{ .members = &.{ .int, .none } } }));
+    const row: structures.TypeId = .fromInterned(try db.intern(queries.Types, .{ .array = .{ .element_type = element, .length = 2 } }));
+    const matrix: structures.TypeId = .fromInterned(try db.intern(queries.Types, .{ .array = .{ .element_type = row, .length = 0 } }));
+    const types: queries.TypeFacts(*query.Database) = .{ .ctx = db };
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    try writeType(types, &output.writer, matrix);
+    try std.testing.expectEqualStrings("`Array(Array(int | none, 2), 0)`", output.writer.buffered());
 }

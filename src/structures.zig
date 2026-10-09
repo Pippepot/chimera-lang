@@ -83,6 +83,7 @@ pub const Token = struct {
         keyword_break,
         keyword_comptime,
         keyword_const,
+        keyword_converter,
         keyword_continue,
         keyword_deinit,
         keyword_init,
@@ -119,6 +120,7 @@ pub const Token = struct {
         .{ "break", .keyword_break },
         .{ "comptime", .keyword_comptime },
         .{ "const", .keyword_const },
+        .{ "converter", .keyword_converter },
         .{ "continue", .keyword_continue },
         .{ "deinit", .keyword_deinit },
         .{ "init", .keyword_init },
@@ -158,6 +160,8 @@ pub const Node = struct {
     tag: Tag,
     token_index: u32,
     data: Data,
+    is_static_struct: bool = false,
+    is_converter: bool = false,
 
     pub const Index = enum(u32) {
         null = 0,
@@ -168,7 +172,7 @@ pub const Node = struct {
         }
 
         pub fn index(self: @This()) u32 {
-            return @intFromEnum(self);
+            return @backingInt(self);
         }
     };
 
@@ -212,6 +216,7 @@ pub const Node = struct {
         comptime_expr,
         field_access,
         deref,
+        index_access,
         func,
         identifier,
         none_literal,
@@ -227,7 +232,6 @@ pub const Node = struct {
         return_expr,
         fail_expr,
         signature,
-        return_origins,
         where_clauses,
         sizeof_expr,
         @"struct",
@@ -243,6 +247,7 @@ pub const Node = struct {
         import,
         selective_import,
         @"pub",
+        collection_literal,
         _,
     };
 
@@ -274,10 +279,20 @@ pub const Ast = struct {
     pub fn nodeList(self: Ast, index: Node.Index) []const Node.Index {
         const node = self.nodes[(index.unwrap() orelse return &.{}).index()];
         switch (node.tag) {
-            .param_list, .type_variant, .type_list, .call_arg_list, .where_clauses => {},
+            .param_list, .type_variant, .type_list, .call_arg_list, .where_clauses, .collection_literal => {},
             else => unreachable,
         }
         return self.node_refs[node.data.ref.start..node.data.ref.end];
+    }
+
+    pub fn tokenSpan(self: *const Ast, token_index: u32) SourceSpan {
+        const token = self.tokens[token_index];
+        var end = token.loc.end;
+        if (token.tag == .l_bracket and self.tokens[token_index + 1].tag == .r_bracket) {
+            end = self.tokens[token_index + 1].loc.end;
+            if (self.tokens[token_index + 2].tag == .equal) end = self.tokens[token_index + 2].loc.end;
+        }
+        return .{ .start = token.loc.start, .end = end };
     }
 
     pub fn eql(a: Ast, b: Ast) bool {
@@ -285,17 +300,17 @@ pub const Ast = struct {
         if (a.tokens.len != b.tokens.len or a.nodes.len != b.nodes.len or a.node_refs.len != b.node_refs.len) return false;
         if (!sliceItemsEql(Token, a.tokens, b.tokens)) return false;
         for (a.nodes, b.nodes) |left, right| {
-            if (left.tag != right.tag or left.token_index != right.token_index) return false;
+            if (left.tag != right.tag or left.token_index != right.token_index or left.is_static_struct != right.is_static_struct or left.is_converter != right.is_converter) return false;
             switch (left.tag) {
                 .break_nothing, .continue_expr, .return_nothing, .fail_expr, .access, .implicit_static, .bool_literal, .identifier, .none_literal, .number_literal, .unit_literal, .type, .implicit_type => {},
                 .break_expr, .return_expr, .loop, .not, .neg, .move_expr, .comptime_expr, .sizeof_expr, .field_access, .deref, .struct_field, .struct_property, .struct_init_field, .@"pub" => {
                     if (left.data.node != right.data.node) return false;
                 },
-                .add, .sub, .mul, .div, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .@"and", .@"or", .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .call, .const_binding, .var_binding, .borrow_binding, .borrow_mut_binding, .static_binding, .namespace_declaration, .func, .param, .return_origins, .type_func, .@"if" => {
+                .add, .sub, .mul, .div, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .@"and", .@"or", .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .call, .index_access, .const_binding, .var_binding, .borrow_binding, .borrow_mut_binding, .static_binding, .namespace_declaration, .func, .param, .type_func, .@"if" => {
                     if (left.data.node_node.a != right.data.node_node.a or left.data.node_node.b != right.data.node_node.b) return false;
                 },
                 .signature => if (!std.meta.eql(left.data.signature, right.data.signature)) return false,
-                .block, .call_arg_list, .param_list, .type_list, .type_variant, .where_clauses, .if_else, .@"struct", .struct_init, .import, .selective_import => {
+                .block, .call_arg_list, .param_list, .type_list, .type_variant, .where_clauses, .if_else, .@"struct", .struct_init, .collection_literal, .import, .selective_import => {
                     if (left.data.ref.start != right.data.ref.start or left.data.ref.end != right.data.ref.end) return false;
                 },
                 else => return false,
@@ -342,6 +357,12 @@ pub const ItemKind = enum {
     structure,
     static,
     top_level_entry,
+};
+
+pub const ConversionCandidate = struct {
+    instance: InstanceId,
+    target_type: TypeId,
+    source_mode: ParameterMode,
 };
 
 /// Interned identities contain no replaceable source locations.
@@ -479,7 +500,7 @@ pub const ModuleItemIndex = struct {
     pub fn resolve(self: ModuleItemIndex, item: ItemId) ?ResolvedItem {
         const index = std.sort.binarySearch(Entry, self.entries, item, struct {
             fn compare(target: ItemId, entry: Entry) std.math.Order {
-                return std.math.order(@intFromEnum(target), @intFromEnum(entry.item));
+                return std.math.order(@backingInt(target), @backingInt(entry.item));
             }
         }.compare) orelse return null;
         return self.entries[index].location;
@@ -614,6 +635,7 @@ pub const CompileTimeValue = union(enum) {
 
     pub const RuntimeValue = union(enum) {
         int: i32,
+        int_literal: i64,
         byte: u8,
         bool: bool,
         unit,
@@ -628,6 +650,7 @@ pub const CompileTimeValue = union(enum) {
         pub fn scalarTypeId(self: @This()) ?TypeId {
             return switch (self) {
                 .int => .int,
+                .int_literal => .int_literal,
                 .byte => .byte,
                 .bool => .bool,
                 .unit => .unit,
@@ -687,22 +710,23 @@ pub const TypeId = enum(u32) {
     none,
     never,
     type,
+    int_literal,
     _,
 
     const interned_mask: u32 = 1 << 31;
 
     pub fn fromInterned(interned_id: InternedTypeId) TypeId {
-        return @enumFromInt(interned_mask | @intFromEnum(interned_id));
+        return @fromBackingInt(@intCast(interned_mask | @backingInt(interned_id)));
     }
 
     pub fn interned(self: TypeId) ?InternedTypeId {
-        const raw = @intFromEnum(self);
+        const raw = @backingInt(self);
         if (raw & interned_mask == 0) return null;
-        return @enumFromInt(@as(u31, @truncate(raw)));
+        return @fromBackingInt(@intCast(@as(u31, @truncate(raw))));
     }
 
     pub fn isPrimitive(self: TypeId) bool {
-        return self == .int or self == .bool or self == .unit or self == .none or self == .never or self == .type or self == .byte;
+        return self == .int or self == .bool or self == .unit or self == .none or self == .never or self == .type or self == .byte or self == .int_literal;
     }
 };
 
@@ -728,7 +752,6 @@ pub const CallableType = struct {
     parameters: []const CallableParameter,
     return_type: TypeId,
     is_fallible: bool,
-    return_origins: ?[]const u32 = null,
 
     pub fn parametersEql(a: CallableType, b: CallableType) bool {
         return sliceItemsEql(CallableParameter, a.parameters, b.parameters);
@@ -737,24 +760,17 @@ pub const CallableType = struct {
     pub fn eql(a: CallableType, b: CallableType) bool {
         return a.return_type == b.return_type and
             a.is_fallible == b.is_fallible and
-            (if (a.return_origins) |origins|
-                if (b.return_origins) |other| std.mem.eql(u32, origins, other) else false
-            else
-                b.return_origins == null) and
             a.parametersEql(b);
     }
 
     pub fn clone(self: CallableType, gpa: std.mem.Allocator) !CallableType {
         var cloned = self;
         cloned.parameters = try gpa.dupe(CallableParameter, self.parameters);
-        errdefer gpa.free(cloned.parameters);
-        cloned.return_origins = if (self.return_origins) |origins| try gpa.dupe(u32, origins) else null;
         return cloned;
     }
 
     pub fn deinit(self: *CallableType, gpa: std.mem.Allocator) void {
         gpa.free(self.parameters);
-        if (self.return_origins) |origins| gpa.free(origins);
         self.* = undefined;
     }
 };
@@ -773,6 +789,12 @@ pub const TypeData = union(enum) {
     variant: VariantType,
     callable: CallableType,
     structure: StructIdentity,
+    array: ArrayType,
+};
+
+pub const ArrayType = struct {
+    element_type: TypeId,
+    length: u32,
 };
 
 pub const InternVariantResult = union(enum) {
@@ -804,6 +826,7 @@ pub const StructField = struct {
 pub const StructDefinition = struct {
     fields: []StructField,
     ownership: StructOwnershipProperties = .{},
+    is_static: bool = false,
 
     pub const ResolvedField = struct {
         index: u32,
@@ -821,7 +844,7 @@ pub const StructDefinition = struct {
     }
 
     pub fn eql(a: StructDefinition, b: StructDefinition) bool {
-        if (a.fields.len != b.fields.len or !std.meta.eql(a.ownership, b.ownership)) return false;
+        if (a.fields.len != b.fields.len or !std.meta.eql(a.ownership, b.ownership) or a.is_static != b.is_static) return false;
         for (a.fields, b.fields) |left, right| {
             if (left.type_id != right.type_id or
                 left.is_public != right.is_public or
@@ -912,7 +935,7 @@ pub const FunctionValueRange = struct {
 pub const invalid_variant_tag = std.math.maxInt(u32);
 
 pub fn functionInstructionValue(argument_count: usize, instruction_index: usize) FunctionValueId {
-    return @enumFromInt(argument_count + instruction_index);
+    return @fromBackingInt(@intCast(argument_count + instruction_index));
 }
 
 pub const BinaryOperands = struct {
@@ -1139,11 +1162,17 @@ pub const StructOperation = struct {
 pub const StorageProjection = struct {
     owner: FunctionValueId,
     type_id: TypeId,
-    projection: union(enum) { box_element, field: u32, variant },
+    projection: union(enum) { box_element, field: u32, variant, allocation_array },
 };
 
 pub const AllocationElement = struct {
     allocation: FunctionValueId,
+    index: FunctionValueId,
+    type_id: TypeId,
+};
+
+pub const ArrayElement = struct {
+    array: FunctionValueId,
     index: FunctionValueId,
     type_id: TypeId,
 };
@@ -1201,6 +1230,7 @@ pub const CallMutArgument = struct {
 
 pub const FunctionInstruction = union(enum) {
     const_int: i32,
+    const_int_literal: i64,
     const_byte: u8,
     const_bool: bool,
     const_type: TypeId,
@@ -1217,6 +1247,7 @@ pub const FunctionInstruction = union(enum) {
     result_storage: TypeId,
     storage_projection: StorageProjection,
     allocation_element: AllocationElement,
+    array_element: ArrayElement,
     borrow_box: BorrowOperation,
     borrow_address: BorrowAddressOperation,
     borrow_read: BorrowOperation,
@@ -1227,6 +1258,7 @@ pub const FunctionInstruction = union(enum) {
     mut_parameter_write: MutParameterWrite,
     call_mut_argument: CallMutArgument,
     call: FunctionCall,
+    static_conversion: struct { operand: FunctionValueId, type_id: TypeId, destination: ?FunctionValueId = null },
     negi: FunctionValueId,
     addi: BinaryOperands,
     subi: BinaryOperands,
@@ -1235,11 +1267,12 @@ pub const FunctionInstruction = union(enum) {
 
     pub fn operands(self: *FunctionInstruction) [2]?*FunctionValueId {
         return switch (self.*) {
-            .const_int, .const_byte, .const_bool, .const_type, .const_unit, .const_none, .function_ref, .initializer_ref, .struct_init, .local_storage, .result_storage => .{ null, null },
+            .const_int, .const_int_literal, .const_byte, .const_bool, .const_type, .const_unit, .const_none, .function_ref, .initializer_ref, .struct_init, .local_storage, .result_storage => .{ null, null },
             .variant_tag, .negi => |*operand| .{ operand, null },
             .variant_coerce, .variant_extract, .callable_coerce => |*operation| .{ &operation.operand, if (operation.destination) |*destination| destination else null },
             .storage_projection => |*operation| .{ &operation.owner, null },
             .allocation_element => |*operation| .{ &operation.allocation, &operation.index },
+            .array_element => |*operation| .{ &operation.array, &operation.index },
             .borrow_box, .borrow_read => |*operation| .{ &operation.source, null },
             .borrow_address => |*operation| .{ &operation.source, null },
             .borrow_write => |*operation| .{ &operation.reference, &operation.value },
@@ -1249,6 +1282,7 @@ pub const FunctionInstruction = union(enum) {
             .field_update => |*operation| .{ &operation.operand, &operation.value },
             .mut_parameter_write => |*operation| .{ &operation.value, null },
             .call => |*call| call.operands(),
+            .static_conversion => |*conversion| .{ &conversion.operand, if (conversion.destination) |*destination| destination else null },
             .addi, .subi, .muli, .divsi => |*binary| .{ &binary.lhs, &binary.rhs },
         };
     }
@@ -1256,6 +1290,7 @@ pub const FunctionInstruction = union(enum) {
     pub fn resultType(self: FunctionInstruction) TypeId {
         return switch (self) {
             .const_int, .variant_tag, .negi, .addi, .subi, .muli, .divsi => .int,
+            .const_int_literal => .int_literal,
             .const_byte => .byte,
             .const_bool => .bool,
             .const_type => .type,
@@ -1268,6 +1303,7 @@ pub const FunctionInstruction = union(enum) {
             .local_storage, .result_storage => |type_id| type_id,
             .storage_projection => |operation| operation.type_id,
             .allocation_element => |operation| operation.type_id,
+            .array_element => |operation| operation.type_id,
             .borrow_box, .borrow_read => |operation| operation.type_id,
             .borrow_address => |operation| operation.type_id,
             .borrow_write => .unit,
@@ -1277,6 +1313,7 @@ pub const FunctionInstruction = union(enum) {
             .mut_parameter_write => .unit,
             .call_mut_argument => |operation| if (operation.destination == null) operation.type_id else .unit,
             .call => |call| if (call.destination == null) call.return_type else .unit,
+            .static_conversion => |conversion| if (conversion.destination == null) conversion.type_id else .unit,
         };
     }
 };
@@ -1286,7 +1323,7 @@ pub const FunctionInstruction = union(enum) {
 /// and terminator. Calls retain declaration identities until code emission.
 pub const FunctionBodyAnalysis = struct {
     return_type: TypeId,
-    /// Matches source callable fallibility; deferred initializer regions are fallible.
+    /// ABI failure permission; init regions and consuming converters may inherit failure.
     is_fallible: bool = false,
     /// Region entry arguments are addresses supplied by its private environment.
     is_initializer_region: bool = false,
@@ -1317,13 +1354,18 @@ pub const FunctionBodyAnalysis = struct {
     }
 
     pub fn valueType(self: @This(), value: ValueId) TypeId {
-        const index = @intFromEnum(value);
+        const index = @backingInt(value);
         std.debug.assert(index < self.valueCount());
         return if (index < self.block_arguments.len) self.block_arguments[index].type_id else self.instructions[index - self.block_arguments.len].resultType();
     }
 
     pub fn valueCount(self: @This()) usize {
         return self.block_arguments.len + self.instructions.len;
+    }
+
+    pub fn hasFailureExit(self: @This()) bool {
+        for (self.blocks) |block| if (block.terminator == .return_failure) return true;
+        return false;
     }
 
     pub fn eql(a: @This(), b: @This()) bool {
@@ -1508,6 +1550,7 @@ pub const Diagnostic = struct {
         compile_time_call_trace,
         unsupported_external_declaration,
         invalid_external_signature,
+        invalid_operation_signature,
         struct_member_not_supported,
         duplicate_struct_member,
         reserved_ownership_member,
@@ -1520,6 +1563,10 @@ pub const Diagnostic = struct {
         recursive_struct_containment,
         static_initializer_type_mismatch: TypeMismatch,
         type_value_used_as_runtime_value,
+        compile_time_only_type: TypeId,
+        ambiguous_conversion: TypeMismatch,
+        invalid_converter,
+        invalid_converter_owner,
         value_used_as_type,
         type_factory_requires_call,
         generic_struct_requires_specialization,
@@ -1569,8 +1616,6 @@ pub const Diagnostic = struct {
         replaced_value_used,
         consumed_storage_in_use,
         borrow_outlives_source,
-        invalid_return_origin,
-        return_origin_not_declared,
         borrow_requires_place,
         mutable_borrow_requires_writable_place,
         dereference_requires_ref: TypeId,

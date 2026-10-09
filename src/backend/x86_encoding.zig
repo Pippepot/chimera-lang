@@ -111,14 +111,14 @@ const instructions = .{
 
 pub const Operation = std.meta.FieldEnum(@TypeOf(instructions));
 pub const patterns = blk: {
-    const fields = std.meta.fields(@TypeOf(instructions));
-    var result: [fields.len]Encoding = undefined;
-    for (fields, 0..) |field, index| result[index] = @field(instructions, field.name);
+    const field_names = @typeInfo(@TypeOf(instructions)).@"struct".field_names;
+    var result: [field_names.len]Encoding = undefined;
+    for (field_names, 0..) |field_name, index| result[index] = @field(instructions, field_name);
     break :blk result;
 };
 
 pub fn encoding(operation: Operation) Encoding {
-    return patterns[@intFromEnum(operation)];
+    return patterns[@backingInt(operation)];
 }
 
 pub fn append(code: *std.ArrayList(u8), allocator: std.mem.Allocator, operation: Operation, bits: u64) !void {
