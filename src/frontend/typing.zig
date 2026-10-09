@@ -307,11 +307,6 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             reference_origins: ?u32 = null,
             constructed: ?Value = null,
         };
-        const ValueExit = struct {
-            block: structures.FunctionBlockId,
-            state: StateId,
-            value: Value,
-        };
         const ConditionFlow = struct {
             success: ?FlowExit,
             failure: ?FlowExit,
@@ -320,27 +315,12 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         const LoopContext = struct {
             body: semantic.UnresolvedBody.BlockId,
             header: structures.FunctionBlockId,
-            exit: structures.FunctionBlockId,
             baseline: StateId,
-            state_type_start: u32,
-            state_type_end: u32,
-            exit_state_start: u32,
-            consumption_completion: ?structures.FunctionValueId = null,
-            result: BranchResult,
+            result: ResultRequest,
         };
         const LoopBackedge = struct {
             block: structures.FunctionBlockId,
             state: StateId,
-        };
-        const InPlaceLoopSlot = struct {
-            slot: u32,
-            start_order: u32,
-        };
-        const LoopBreak = struct {
-            block: structures.FunctionBlockId,
-            branch: structures.FunctionBranch = undefined,
-            state: StateId,
-            value: Value,
         };
         const PlaceField = struct {
             index: u32,
@@ -466,7 +446,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         boundaries: std.ArrayList(Boundary) = .empty,
         blocks: std.ArrayList(BuildBlock) = .empty,
         loop_stack: std.ArrayList(LoopContext) = .empty,
-        loop_breaks: std.ArrayList(LoopBreak) = .empty,
+        loop_breaks: std.ArrayList(FlowExit) = .empty,
         current_block: ?structures.FunctionBlockId = null,
         current_boundary: ?BoundaryId = null,
         next_generation_start_order: u32 = 0,
@@ -879,13 +859,14 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             allow_converters: bool = true,
         };
 
-        const BranchResult = union(enum) {
-            value: ValueContext,
-            destination: Destination,
-            discard,
+        const ResultRequest = struct {
+            value: ValueContext = .{},
+            destination: ?Destination = null,
+            destination_span: ?structures.SourceSpan = null,
+            discard: bool = false,
         };
 
-        fn blockWithResult(self: *Self, block_id: semantic.UnresolvedBody.BlockId, mode: BranchResult) !?Value {
+        fn blockWithResult(self: *Self, block_id: semantic.UnresolvedBody.BlockId, mode: ResultRequest) !?Value {
             const unresolved_block = self.unresolved.blocks[@backingInt(block_id)];
             const baseline = try self.captureState();
             const enclosing_boundary = self.current_boundary;
@@ -907,9 +888,9 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             if (unresolved_block.result) |result_id| {
                 const boundary = try self.newBoundary(unresolved_block.span);
                 self.current_boundary = boundary;
-                const branch_result = try self.branchResult(result_id, mode);
+                const branch_result = try self.evaluateValue(result_id, mode);
                 if (self.current_block == null) return null;
-                result = if (mode == .discard)
+                result = if (mode.discard)
                     try self.discardResult(branch_result, unresolved_block.span)
                 else
                     try self.ownValueEscapingSince(branch_result, baseline, unresolved_block.span);
@@ -940,14 +921,6 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 else => unreachable,
             }
             if (self.current_block != null) try self.appendBoundary(boundary);
-        }
-
-        fn branchResult(self: *Self, id: semantic.UnresolvedBody.ValueId, mode: BranchResult) !Value {
-            return switch (mode) {
-                .value => |context| self.valueWithContext(id, context),
-                .destination => |destination| self.construct(id, self.valueSpan(id), destination),
-                .discard => self.discardedValue(id),
-            };
         }
 
         fn bindLocal(self: *Self, binding: @FieldType(semantic.UnresolvedBody.Statement, "bind_local")) !void {
@@ -1054,13 +1027,13 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         fn breakLoop(self: *Self, value_id: semantic.UnresolvedBody.ValueId) !void {
             if (self.is_initializer_region and self.loop_stack.items.len == 0) return self.reject(self.valueSpan(value_id), .initializer_exit_outside_boundary);
             const context = self.loop_stack.last().?;
-            var value_to_break = try self.branchResult(value_id, context.result);
+            var value_to_break = try self.evaluateValue(value_id, context.result);
             if (value_to_break.type_id == .never) return;
-            if (context.result == .discard) value_to_break = try self.discardResult(value_to_break, self.valueSpan(value_id));
+            if (context.result.discard) value_to_break = try self.discardResult(value_to_break, self.valueSpan(value_id));
             value_to_break = try self.ownValueEscapingSince(value_to_break, context.baseline, self.unresolved.blocks[@backingInt(self.unresolved.root_block)].span);
             self.unbindLocalsSince(context.baseline);
             const state = try self.captureState();
-            try self.loop_breaks.append(self.ctx.allocator(), .{ .block = self.suspendBlock(), .state = state, .value = value_to_break });
+            try self.loop_breaks.append(self.ctx.allocator(), .{ .block = self.suspendBlock(), .state = state, .constructed = value_to_break });
         }
 
         fn continueLoop(self: *Self, span: structures.SourceSpan) !void {
@@ -1069,7 +1042,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             self.unbindLocalsSince(context.baseline);
             try self.normalizeLoopBackedge(context, span);
             try self.validateLoopBackedge(context, span);
-            const branch = try self.loopBranch(context, context.header, null);
+            const branch = try self.loopBranch(context);
             self.terminate(.{ .branch = branch });
         }
 
@@ -1228,14 +1201,23 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             return self.valueWithContext(id, .{ .expected_type = expected_type });
         }
 
-        fn valueWithContext(self: *Self, id: semantic.UnresolvedBody.ValueId, requested_context: ValueContext) anyerror!Value {
+        fn valueWithContext(self: *Self, id: semantic.UnresolvedBody.ValueId, context: ValueContext) anyerror!Value {
+            return self.evaluateValue(id, .{ .value = context });
+        }
+
+        fn evaluateValue(self: *Self, id: semantic.UnresolvedBody.ValueId, request: ResultRequest) anyerror!Value {
             const index = @backingInt(id);
-            var context = requested_context;
+            if (request.destination) |destination| {
+                const span = request.destination_span orelse self.valueSpan(id);
+                if (self.values[index]) |pending| if (pending.initializer_parameter != null) return self.constructInitializer(pending, span, destination.storage);
+                if (!try self.constructsDirectly(id, destination.storage.type_id)) return self.placeEvaluated(id, span, destination);
+            }
+            var context: ValueContext = if (request.destination) |destination| .{ .expected_type = destination.storage.type_id, .access = .initialize, .fresh_destination = destination.storage } else request.value;
             if (context.expected_type == null and index >= self.unresolved.parameter_count) {
                 const operation = self.unresolved.expressions[index - self.unresolved.parameter_count].operation;
                 if (operation == .annotation) context.expected_type = operation.annotation.type_id;
             }
-            if (context.allow_converters) if (try self.staticConversion(id, context)) |converted| return converted;
+            if (request.destination == null and context.allow_converters) if (try self.staticConversion(id, context)) |converted| return converted;
             if (context.access == .borrow) std.debug.assert(context.expected_type != null);
             if (context.fresh_destination != null) std.debug.assert(context.access == .consume or context.access == .initialize);
             if (context.access == .consume) {
@@ -1279,23 +1261,31 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 .none => try self.appendInstruction(.const_none),
                 .function_ref => |reference| try self.appendInstruction(.{ .function_ref = reference }),
                 .local_read => |local| try self.readLocal(local, expression.span),
-                .local_transfer => |local| explicitTransfer(if (context.fresh_destination) |destination|
+                .local_transfer => |local| explicitTransfer(if (request.destination) |destination|
+                    try self.constructLocalTransfer(local, expression.span, destination)
+                else if (context.fresh_destination) |destination|
                     try self.constructLocalTransfer(local, expression.span, .{ .storage = destination, .site = .argument })
                 else
                     try self.transferLocal(local, expression.span, null)),
-                .field_transfer => |transfer| explicitTransfer(if (context.fresh_destination) |destination|
+                .field_transfer => |transfer| explicitTransfer(if (request.destination) |destination|
+                    try self.constructFieldTransfer(transfer, expression.span, destination)
+                else if (context.fresh_destination) |destination|
                     try self.constructFieldTransfer(transfer, expression.span, .{ .storage = destination, .site = .argument })
                 else
                     try self.transferField(transfer, expression.span)),
-                .annotation => |annotation| if ((context.access == .borrow or context.access == .consume) and expected_type != null)
+                .annotation => |annotation| if (request.destination) |destination|
+                    try self.constructAnnotated(annotation, destination)
+                else if ((context.access == .borrow or context.access == .consume) and expected_type != null)
                     try self.constructAnnotated(annotation, .{ .storage = context.fresh_destination orelse try self.localStorage(expected_type.?), .site = .argument })
                 else
                     try self.annotate(annotation, context),
-                .struct_init => if ((context.access == .borrow or context.access == .consume) and expected_type != null)
+                .struct_init => if (request.destination) |destination|
+                    try self.constructStruct(expression, destination)
+                else if ((context.access == .borrow or context.access == .consume) and expected_type != null)
                     try self.constructStruct(expression, .{ .storage = context.fresh_destination orelse try self.localStorage(expected_type.?), .site = .argument })
                 else
                     try self.structInit(expression),
-                .array_init => |initializer| try self.constructArray(expression, .{
+                .array_init => |initializer| try self.constructArray(expression, request.destination orelse .{
                     .storage = context.fresh_destination orelse try self.localStorage(initializer.type_id),
                     .site = .local,
                 }),
@@ -1316,17 +1306,13 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     if (first.type_id == .never) break :blk first;
                     break :blk try self.valueWithContext(operands.rhs.value, context);
                 },
-                .call => |call| try self.callFunction(call, expression.span, switch (context.access) {
-                    .value, .initialize => .value,
-                    .borrow => .{ .borrowed = expected_type.? },
-                    .consume => if (context.fresh_destination) |destination| .{ .destination = .{ .storage = destination, .site = .argument } } else .{ .consumed = expected_type },
-                }),
+                .call => |call| try self.callFunction(call, expression.span, .{ .value = context, .destination = request.destination orelse if (context.access == .consume and context.fresh_destination != null) .{ .storage = context.fresh_destination.?, .site = .argument } else null }),
                 .negate => |operand| try self.negate(operand),
                 .add, .subtract, .multiply, .divide => try self.binary(expression),
-                .if_else => |expression_if| try self.conditional(expression_if, .{ .value = context }),
-                .loop => |body| try self.loop(body, .{ .value = context }),
+                .if_else => |expression_if| try self.conditional(expression_if, .{ .value = context, .destination = request.destination, .discard = request.discard }),
+                .loop => |body| try self.loop(body, .{ .value = context, .destination = request.destination, .discard = request.discard }),
             };
-            const result = try self.contextualValue(resolved, context, expression.span);
+            const result = if (request.destination != null) resolved else try self.contextualValue(resolved, context, expression.span);
             if (self.current_block != null) try self.appendBoundary(boundary);
             self.values[index] = result;
             try self.rememberCleanupOrigins(result);
@@ -1399,14 +1385,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 .writable_references = .{ .start = writable_start, .end = @intCast(self.writable_call_references.items.len) },
                 .reference_origins = origins,
             };
-            const result = try self.resolvedCallResult(callable, call, span, if (context.fresh_destination) |storage|
-                .{ .destination = .{ .storage = storage, .site = .argument } }
-            else if (context.access == .borrow)
-                .{ .borrowed = context.expected_type.? }
-            else if (context.access == .consume)
-                .{ .consumed = context.expected_type }
-            else
-                .value);
+            const result = try self.resolvedCallResult(callable, call, span, .{ .value = context, .destination = if (context.fresh_destination) |storage| .{ .storage = storage, .site = .argument } else null });
             if (result.type_id == context.expected_type.?) return result;
             const widened = (try self.coerceValue(result.id, result.type_id, context.expected_type.?)).?;
             return self.coerceOwnedRepresentation(result, widened, span, if (try self.constructsInPlace(context.expected_type.?)) try self.localStorage(context.expected_type.?) else null);
@@ -1765,47 +1744,29 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         }
 
         fn construct(self: *Self, id: semantic.UnresolvedBody.ValueId, span: structures.SourceSpan, destination: Destination) anyerror!Value {
+            return self.evaluateValue(id, .{ .destination = destination, .destination_span = span });
+        }
+
+        fn constructsDirectly(self: *Self, id: semantic.UnresolvedBody.ValueId, expected_type: structures.TypeId) !bool {
             const index = @backingInt(id);
-            const expected_type = destination.storage.type_id;
-            if (self.values[index]) |pending| if (pending.initializer_parameter != null) return self.constructInitializer(pending, span, destination.storage);
             if (index < self.unresolved.parameter_count or self.values[index] != null or !try self.constructsInPlace(expected_type))
-                return self.placeEvaluated(id, span, destination);
+                return false;
             const expression = self.unresolved.expressions[index - self.unresolved.parameter_count];
             if (expression.operation == .struct_init or expression.operation == .array_init or expression.operation == .call) {
                 if (try self.unevaluatedType(id, null)) |source_type| {
                     if (source_type != expected_type and source_type != .never) {
                         if (!try semantic.canWidenTo(self.type_interner, source_type, expected_type))
-                            return self.placeEvaluated(id, span, destination);
+                            return false;
                         const candidates = try self.type_interner.conversionCandidates(source_type, expected_type, null);
                         defer self.ctx.allocator().free(candidates);
-                        if (candidates.len != 0) return self.placeEvaluated(id, span, destination);
+                        if (candidates.len != 0) return false;
                     }
                 }
             }
             switch (expression.operation) {
-                .struct_init, .array_init, .collection_literal, .call, .if_else, .loop, .annotation, .local_transfer, .field_transfer => {},
-                else => return self.placeEvaluated(id, span, destination),
+                .struct_init, .array_init, .collection_literal, .call, .if_else, .loop, .annotation, .local_transfer, .field_transfer => return true,
+                else => return false,
             }
-            const parent_boundary = self.current_boundary;
-            const boundary = try self.newBoundary(expression.span);
-            self.current_boundary = boundary;
-            defer self.current_boundary = parent_boundary;
-            const constructed = switch (expression.operation) {
-                .struct_init => try self.constructStruct(expression, destination),
-                .array_init => try self.constructArray(expression, destination),
-                .collection_literal => |elements| try self.collectionValue(id, expression, elements, .{ .expected_type = expected_type, .access = .initialize, .fresh_destination = destination.storage }),
-                .call => |call| try self.callFunction(call, expression.span, .{ .destination = destination }),
-                .if_else => |branches| try self.conditional(branches, .{ .destination = destination }),
-                .loop => |body| try self.loop(body, .{ .destination = destination }),
-                .annotation => |annotation| try self.constructAnnotated(annotation, destination),
-                .local_transfer => |local| try self.constructLocalTransfer(local, expression.span, destination),
-                .field_transfer => |transfer| try self.constructFieldTransfer(transfer, expression.span, destination),
-                else => unreachable,
-            };
-            if (self.current_block != null) try self.appendBoundary(boundary);
-            self.values[index] = constructed;
-            try self.rememberCleanupOrigins(constructed);
-            return constructed;
         }
 
         fn placeEvaluated(self: *Self, id: semantic.UnresolvedBody.ValueId, span: structures.SourceSpan, destination: Destination) !Value {
@@ -2004,22 +1965,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         }
 
         fn discardedValue(self: *Self, id: semantic.UnresolvedBody.ValueId) anyerror!Value {
-            const index = @backingInt(id);
-            if (index < self.unresolved.parameter_count or self.values[index] != null) return self.value(id);
-            const expression = self.unresolved.expressions[index - self.unresolved.parameter_count];
-            if (expression.operation != .if_else and expression.operation != .loop) return self.value(id);
-            const parent_boundary = self.current_boundary;
-            const boundary = try self.newBoundary(expression.span);
-            self.current_boundary = boundary;
-            defer self.current_boundary = parent_boundary;
-            const resolved = switch (expression.operation) {
-                .if_else => |branches| try self.conditional(branches, .discard),
-                .loop => |body| try self.loop(body, .discard),
-                else => unreachable,
-            };
-            if (self.current_block != null) try self.appendBoundary(boundary);
-            self.values[index] = resolved;
-            return resolved;
+            return self.evaluateValue(id, .{ .discard = true });
         }
 
         fn discardResult(self: *Self, result: Value, span: structures.SourceSpan) !Value {
@@ -2574,18 +2520,6 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             const capabilities = (try self.type_interner.facts().ownershipCapabilities(type_id)) orelse return error.Unavailable;
             if (!capabilities.needs_automatic_drop and !capabilities.requires_explicit_drop) return null;
             return @as(?GenerationId, try self.appendGeneration(type_id, span, cleanup_fields, try self.reserveGenerationStartOrder(), capabilities));
-        }
-
-        fn allocateGenerationAt(
-            self: *Self,
-            type_id: structures.TypeId,
-            span: structures.SourceSpan,
-            cleanup_fields: bool,
-            start_order: u32,
-        ) !?GenerationId {
-            const capabilities = (try self.type_interner.facts().ownershipCapabilities(type_id)) orelse return error.Unavailable;
-            if (!capabilities.needs_automatic_drop and !capabilities.requires_explicit_drop) return null;
-            return @as(?GenerationId, try self.appendGeneration(type_id, span, cleanup_fields, start_order, capabilities));
         }
 
         fn appendGeneration(
@@ -3727,23 +3661,62 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             return try self.type_interner.specializedStructType(try self.type_interner.specializeFunction(factory, arguments));
         }
 
-        fn unevaluatedCallType(self: *Self, call: semantic.UnresolvedBody.Call) !?structures.TypeId {
-            const instance = switch (call.target) {
+        const MemberFunction = struct {
+            instance: structures.InstanceId,
+            shape: structures.FunctionShape,
+            ownership: bool = false,
+        };
+        const MemberTarget = union(enum) {
+            field: structures.TypeId,
+            function: MemberFunction,
+            static_callable: structures.CompileTimeValue.Runtime,
+        };
+
+        fn memberTarget(self: *Self, receiver_type: structures.TypeId, member: semantic.UnresolvedBody.MemberCall, span: structures.SourceSpan) !MemberTarget {
+            if (std.meta.stringToEnum(structures.OwnershipMember, member.name)) |operation| {
+                const instance = (try self.type_interner.ownershipMember(receiver_type, operation)) orelse return self.reject(span, .unknown_namespace_member);
+                return .{ .function = .{ .instance = instance, .shape = (try self.type_interner.functionShape(instance.item)) orelse return error.Unavailable, .ownership = true } };
+            }
+            if (try self.type_interner.structDefinition(receiver_type)) |definition| {
+                if (definition.resolveField(member.name) != null)
+                    return .{ .field = (try self.resolvePlaceField(receiver_type, member.name, member.receiver.span, span)).type_id };
+            } else if (try self.type_interner.facts().arrayType(receiver_type) == null)
+                return self.reject(member.receiver.span, .{ .field_access_not_struct = receiver_type });
+            const instance = (try self.type_interner.structNamespaceMember(receiver_type, member.name, span)) orelse return self.reject(span, .unknown_namespace_member);
+            if (try self.type_interner.functionShape(instance.item)) |shape| return .{ .function = .{ .instance = instance, .shape = shape } };
+            const value_id = (try self.type_interner.staticItem(instance)) orelse return error.Unavailable;
+            const callee = try self.type_interner.lookupCompileTimeValue(value_id);
+            if (callee != .runtime) return self.reject(span, .value_not_callable);
+            return .{ .static_callable = callee.runtime };
+        }
+
+        fn operationTarget(self: *Self, receiver_type: structures.TypeId, name: []const u8, span: structures.SourceSpan) !CallTarget {
+            const instance = (try self.type_interner.structNamespaceMember(receiver_type, name, span)) orelse return self.reject(span, .unknown_namespace_member);
+            const shape = (try self.type_interner.functionShape(instance.item)) orelse return error.Unavailable;
+            if (try self.type_interner.needsInheritedInference(instance)) return .{ .inferred = instance };
+            for (shape.parameters) |parameter| if (parameter.mode == .static) return .{ .inferred = instance };
+            return .{ .direct = instance };
+        }
+
+        fn unevaluatedTargetType(self: *Self, target: CallTarget, arguments: []const semantic.UnresolvedBody.ValueUse) !?structures.TypeId {
+            const instance = switch (target) {
                 .direct => |instance| instance,
-                .inferred => |generic| (try self.unevaluatedSpecialization(generic, self.unresolved.call_arguments[call.arguments.start..call.arguments.end], null)) orelse return null,
-                .operation => blk: {
-                    const arguments = self.unresolved.call_arguments[call.arguments.start..call.arguments.end];
+                .inferred => |generic| (try self.unevaluatedSpecialization(generic, arguments, null)) orelse return null,
+                .indirect => unreachable,
+            };
+            return ((try self.type_interner.functionSignature(instance)) orelse return error.Unavailable).return_type;
+        }
+
+        fn unevaluatedCallType(self: *Self, call: semantic.UnresolvedBody.Call) !?structures.TypeId {
+            const arguments = if (call.target == .member) &.{} else self.unresolved.call_arguments[call.arguments.start..call.arguments.end];
+            const target: CallTarget = switch (call.target) {
+                .direct => |instance| .{ .direct = instance },
+                .inferred => |generic| .{ .inferred = generic },
+                .operation => |name| blk: {
                     const receiver_type = (try self.unevaluatedType(arguments[0].value, null)) orelse return null;
                     if (receiver_type == .never) return .never;
-                    if (receiver_type == .int and isArithmeticOperation(call.target.operation)) return .int;
-                    const generic = (try self.type_interner.structNamespaceMember(receiver_type, call.target.operation, call.span)) orelse return self.reject(call.span, .unknown_namespace_member);
-                    const shape = (try self.type_interner.functionShape(generic.item)) orelse return error.Unavailable;
-                    var inference = try self.type_interner.needsInheritedInference(generic);
-                    for (shape.parameters) |parameter| if (parameter.mode == .static) {
-                        inference = true;
-                    };
-                    if (!inference) break :blk generic;
-                    break :blk (try self.unevaluatedSpecialization(generic, arguments, null)) orelse return null;
+                    if (receiver_type == .int and isArithmeticOperation(name)) return .int;
+                    break :blk try self.operationTarget(receiver_type, name, call.span);
                 },
                 .value => |callee| {
                     const callee_type = (try self.unevaluatedType(callee.value, null)) orelse return null;
@@ -3753,42 +3726,24 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 .member => |member| return self.unevaluatedMemberCallType(call, member),
                 .unknown_function => return self.reject(call.span, .unknown_function),
             };
-            return ((try self.type_interner.functionSignature(instance)) orelse return error.Unavailable).return_type;
+            return self.unevaluatedTargetType(target, arguments);
         }
 
         fn unevaluatedMemberCallType(self: *Self, call: semantic.UnresolvedBody.Call, member: semantic.UnresolvedBody.MemberCall) !?structures.TypeId {
             const receiver_type = (try self.unevaluatedType(member.receiver.value, null)) orelse return null;
             if (receiver_type == .never) return .never;
-            if (std.meta.stringToEnum(structures.OwnershipMember, member.name)) |operation| {
-                const instance = (try self.type_interner.ownershipMember(receiver_type, operation)) orelse
-                    return self.reject(call.span, .unknown_namespace_member);
-                return ((try self.type_interner.functionSignature(instance)) orelse return error.Unavailable).return_type;
+            switch (try self.memberTarget(receiver_type, member, call.span)) {
+                .field => |type_id| return (try self.callableSignature(type_id, call.span)).return_type,
+                .static_callable => |callee| return (try self.callableSignature(callee.type_id, call.span)).return_type,
+                .function => |function| {
+                    if (function.ownership) return self.unevaluatedTargetType(.{ .direct = function.instance }, &.{});
+                    var arguments: std.ArrayList(semantic.UnresolvedBody.ValueUse) = .empty;
+                    defer arguments.deinit(self.ctx.allocator());
+                    try arguments.append(self.ctx.allocator(), member.receiver);
+                    const target = try self.resolveMethodArguments(function.instance, function.shape, self.unresolved.method_call_arguments[call.arguments.start..call.arguments.end], call.span, &arguments);
+                    return self.unevaluatedTargetType(target, arguments.items);
+                },
             }
-            if (try self.type_interner.structDefinition(receiver_type)) |definition| {
-                if (definition.resolveField(member.name) != null) {
-                    const field = try self.resolvePlaceField(receiver_type, member.name, member.receiver.span, call.span);
-                    return (try self.callableSignature(field.type_id, call.span)).return_type;
-                }
-            } else if (try self.type_interner.facts().arrayType(receiver_type) == null)
-                return self.reject(member.receiver.span, .{ .field_access_not_struct = receiver_type });
-            const instance = (try self.type_interner.structNamespaceMember(receiver_type, member.name, call.span)) orelse
-                return self.reject(call.span, .unknown_namespace_member);
-            const shape = (try self.type_interner.functionShape(instance.item)) orelse {
-                const value_id = (try self.type_interner.staticItem(instance)) orelse return error.Unavailable;
-                const callee = try self.type_interner.lookupCompileTimeValue(value_id);
-                if (callee != .runtime) return self.reject(call.span, .value_not_callable);
-                return (try self.callableSignature(callee.runtime.type_id, call.span)).return_type;
-            };
-            var arguments: std.ArrayList(semantic.UnresolvedBody.ValueUse) = .empty;
-            defer arguments.deinit(self.ctx.allocator());
-            try arguments.append(self.ctx.allocator(), member.receiver);
-            const target = try self.resolveMethodArguments(instance, shape, self.unresolved.method_call_arguments[call.arguments.start..call.arguments.end], call.span, &arguments);
-            const specialized = switch (target) {
-                .direct => |direct| direct,
-                .inferred => |generic| (try self.unevaluatedSpecialization(generic, arguments.items, null)) orelse return null,
-                .indirect => unreachable,
-            };
-            return ((try self.type_interner.functionSignature(specialized)) orelse return error.Unavailable).return_type;
         }
 
         fn callableSignature(self: *Self, type_id: structures.TypeId, span: structures.SourceSpan) !structures.CallableType {
@@ -4009,7 +3964,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             return values;
         }
 
-        fn stateWithArguments(self: *Self, baseline: StateId, argument_start: u32) !StateId {
+        fn stateWithArguments(self: *Self, baseline: StateId, argument_start: u32, predecessor: structures.FunctionBlockId) !StateId {
             var state = try self.states.items[@backingInt(baseline)].clone(self.ctx.allocator());
             errdefer state.deinit(self.ctx.allocator());
             var argument = argument_start;
@@ -4017,72 +3972,33 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 if (!self.locals.items(.mutable)[slot] or state.values.get(slot) == null) continue;
                 const current = state.values.get(slot).?;
                 const in_place = try self.constructsInPlace(current.type_id);
+                const generation = if (in_place) try self.loopHeaderGeneration(current) else self.block_argument_generations.items[argument];
                 try state.values.set(self.ctx.allocator(), slot, .{
                     .id = if (in_place) current.id else @fromBackingInt(@intCast(argument)),
                     .type_id = current.type_id,
-                    .owned_generation = if (in_place) current.owned_generation else self.block_argument_generations.items[argument],
+                    .owned_generation = generation,
                     .binding_identity = current.binding_identity,
                     .storage_identity = current.storage_identity,
                 });
-                if (!in_place) argument += 1;
+                if (in_place) {
+                    if (generation) |owner| try self.recordGenerationOnlyForward(predecessor, 0, current.owned_generation, owner);
+                } else argument += 1;
             }
             return self.appendState(state);
         }
 
-        fn loop(self: *Self, body: semantic.UnresolvedBody.BlockId, mode: BranchResult) !Value {
-            const constructed = if (mode == .destination) mode.destination.storage else null;
-            const carries_consumption_completion = mode == .value and mode.value.access == .consume;
+        fn loop(self: *Self, body: semantic.UnresolvedBody.BlockId, mode: ResultRequest) !Value {
             const baseline = try self.captureState();
             var initial_values = try self.activeStateValues(baseline);
             defer initial_values.deinit(self.ctx.allocator());
-            var header_start_orders: std.ArrayList(u32) = .empty;
-            defer header_start_orders.deinit(self.ctx.allocator());
-            for (initial_values.items) |_| try header_start_orders.append(self.ctx.allocator(), try self.reserveGenerationStartOrder());
-
-            var in_place_slots: std.ArrayList(InPlaceLoopSlot) = .empty;
-            defer in_place_slots.deinit(self.ctx.allocator());
-            for (0..self.states.items[@backingInt(baseline)].values.len) |slot| {
-                const initial = self.states.items[@backingInt(baseline)].values.get(slot);
-                const carried = initial orelse continue;
-                if (!self.locals.items(.mutable)[slot] or !try self.constructsInPlace(carried.type_id)) continue;
-                try in_place_slots.append(self.ctx.allocator(), .{
-                    .slot = @intCast(slot),
-                    .start_order = try self.reserveGenerationStartOrder(),
-                });
-            }
-
             const state_type_start: u32 = @intCast(self.block_arguments.items.len);
-            for (initial_values.items) |initial| _ = try self.appendBlockArgument(initial.type_id, initial.owned_generation);
+            for (initial_values.items) |initial| _ = try self.appendBlockArgument(initial.type_id, try self.loopHeaderGeneration(initial));
             const state_type_end: u32 = @intCast(self.block_arguments.items.len);
             const header = try self.newBlock(state_type_start, state_type_end);
             const initial_branch = try self.valuesBranch(header, initial_values.items);
             const entry_predecessor = self.current_block.?;
             self.terminate(.{ .branch = initial_branch });
-            const loop_state_start = self.states.items.len;
-            const loop_boundary_start = self.boundaries.items.len;
-            const loop_block_start = self.blocks.items.len;
-            const loop_branch_argument_start = self.branch_arguments.items.len;
-
-            const exit_argument_start: u32 = @intCast(self.block_arguments.items.len);
-            if (constructed == null) {
-                _ = try self.appendBlockArgument(.never, null);
-                _ = try self.appendBlockArgument(.bool, null);
-            }
-            const consumption_completion: ?structures.FunctionValueId = if (carries_consumption_completion) blk: {
-                const argument = try self.appendBlockArgument(.bool, null);
-                self.block_arguments.items[argument].representation = .storage;
-                break :blk @fromBackingInt(@intCast(argument));
-            } else null;
-            const exit_state_start: u32 = @intCast(self.block_arguments.items.len);
-            for (state_type_start..state_type_end) |type_index| {
-                _ = try self.appendBlockArgument(
-                    self.block_arguments.items[type_index].type_id,
-                    self.block_argument_generations.items[type_index],
-                );
-            }
-            const exit = try self.newBlock(exit_argument_start, @intCast(self.block_arguments.items.len));
-
-            const header_state = try self.stateWithArguments(baseline, state_type_start);
+            const header_state = try self.stateWithArguments(baseline, state_type_start, entry_predecessor);
             const identity_start = self.binding_joins.items.len;
             for (0..self.states.items[@backingInt(baseline)].values.len) |slot| {
                 const initial = self.states.items[@backingInt(baseline)].values.get(slot);
@@ -4126,12 +4042,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             try self.loop_stack.append(self.ctx.allocator(), .{
                 .body = body,
                 .header = header,
-                .exit = exit,
                 .baseline = baseline,
-                .state_type_start = state_type_start,
-                .state_type_end = state_type_end,
-                .exit_state_start = exit_state_start,
-                .consumption_completion = consumption_completion,
                 .result = mode,
             });
             self.enterBlock(header);
@@ -4140,36 +4051,12 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             if (body_value != null) {
                 try self.normalizeLoopBackedge(self.loop_stack.last().?, self.unresolved.blocks[@backingInt(body)].span);
                 try self.validateLoopBackedge(self.loop_stack.last().?, self.unresolved.blocks[@backingInt(body)].span);
-                const repeat = try self.loopBranch(self.loop_stack.last().?, header, null);
+                const repeat = try self.loopBranch(self.loop_stack.last().?);
                 self.terminate(.{ .branch = repeat });
             }
-            const loop_context = self.loop_stack.pop().?;
+            _ = self.loop_stack.pop().?;
 
-            try self.reconcileLoopHeaderGenerations(
-                header,
-                state_type_start,
-                state_type_end,
-                header_start_orders.items,
-                loop_state_start,
-                loop_boundary_start,
-                loop_block_start,
-                loop_branch_argument_start,
-                break_start,
-                self.unresolved.blocks[@backingInt(body)].span,
-            );
-            for (in_place_slots.items) |in_place| try self.reconcileInPlaceLoopHeader(
-                in_place,
-                entry_predecessor,
-                self.states.items[@backingInt(baseline)].values.get(in_place.slot).?,
-                self.loop_backedges.items[backedge_start..],
-                loop_state_start,
-                loop_boundary_start,
-                loop_block_start,
-                state_type_start,
-                loop_branch_argument_start,
-                break_start,
-                self.unresolved.blocks[@backingInt(body)].span,
-            );
+            try self.completeLoopGenerations(header_state, self.loop_backedges.items[backedge_start..], self.unresolved.blocks[@backingInt(body)].span);
             for (self.binding_joins.items[identity_start..identity_end]) |*join| {
                 for (self.loop_backedges.items[backedge_start..]) |backedge| {
                     const value_on_edge = self.states.items[@backingInt(backedge.state)].values.get(join.slot.?).?;
@@ -4188,343 +4075,45 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             }
             self.loop_backedges.shrinkRetainingCapacity(backedge_start);
 
-            const breaks = self.loop_breaks.items[break_start..];
-            if (breaks.len == 0) {
-                self.enterBlock(exit);
-                self.terminate(.diverge);
-                self.loop_breaks.shrinkRetainingCapacity(break_start);
-                return .{ .id = @fromBackingInt(@intCast(exit_argument_start)), .type_id = .never };
-            }
-
-            try self.normalizeLoopBreakFields(breaks);
-            for (breaks) |*break_edge| {
-                self.enterPendingBlock(break_edge.block);
-                self.restoreState(break_edge.state);
-                break_edge.branch = try self.loopBranch(loop_context, exit, if (constructed == null) break_edge.value else null);
-                self.terminate(.{ .branch = break_edge.branch });
-            }
-
-            var joined = if (constructed) |storage| storage.type_id else breaks[0].value.type_id;
-            var preserves_storage = false;
-            for (breaks) |break_edge| preserves_storage = preserves_storage or break_edge.value.preserves_storage;
-            if (constructed == null) {
-                for (breaks[1..]) |break_edge| joined = try joinTypes(self.type_interner, joined, break_edge.value.type_id, self.ctx.allocator());
-                if (!self.type_check_only and try self.constructsInPlace(joined)) for (breaks) |break_edge| {
-                    if (break_edge.value.type_id != joined) return self.reject(self.activeLifetimeSpan(), .{ .relocation_requires_direct_move = break_edge.value.type_id });
-                };
-                if (preserves_storage) for (breaks) |break_edge| {
-                    if (break_edge.value.type_id != joined) return self.reject(self.activeLifetimeSpan(), .{
-                        .call_argument_type_mismatch = self.typeMismatch(joined, break_edge.value.type_id),
-                    });
-                };
-                self.block_arguments.items[exit_argument_start].type_id = joined;
-                self.block_arguments.items[exit_argument_start].representation = if (preserves_storage) .storage else .value;
-            }
-            const exit_span = self.unresolved.blocks[@backingInt(body)].span;
-            const incoming_generations = try self.ctx.allocator().alloc(?GenerationId, breaks.len);
-            defer self.ctx.allocator().free(incoming_generations);
-            for (breaks, incoming_generations) |break_edge, *generation| generation.* = break_edge.value.owned_generation;
-            const result_generation = try self.joinResultGenerations(joined, exit_span, incoming_generations);
-            if (constructed != null) {
-                if (result_generation) |generation| for (breaks) |break_edge| {
-                    try self.recordGenerationOnlyForward(break_edge.block, 0, break_edge.value.owned_generation, generation);
-                };
-            } else {
-                self.block_argument_generations.items[exit_argument_start] = result_generation;
-                for (breaks) |break_edge| {
-                    self.branch_arguments.items[break_edge.branch.arguments.start] =
-                        (try self.coerceValue(break_edge.value.id, break_edge.value.type_id, joined)) orelse unreachable;
-                }
-            }
-            var state_argument = exit_state_start;
-            for (0..self.states.items[@backingInt(baseline)].values.len) |slot| {
-                const initial = self.states.items[@backingInt(baseline)].values.get(slot);
-                const mutable = self.locals.items(.mutable)[slot];
-                if (!mutable or initial == null or try self.constructsInPlace(initial.?.type_id)) continue;
-                const state_type = self.block_arguments.items[state_argument].type_id;
-                for (breaks, incoming_generations) |break_edge, *generation| {
-                    generation.* = self.states.items[@backingInt(break_edge.state)].values.get(slot).?.owned_generation;
-                }
-                self.block_argument_generations.items[state_argument] = try self.joinGenerationGroup(state_type, exit_span, incoming_generations);
-                state_argument += 1;
-            }
-            const output_state = try self.stateWithArguments(baseline, exit_state_start);
-            const output_flow = self.states.items[@backingInt(output_state)];
-            output_flow.copyFlowFrom(self.states.items[@backingInt(breaks[0].state)]);
-            for (breaks[1..]) |break_edge| output_flow.joinFlow(self.states.items[@backingInt(break_edge.state)]);
-            for (output_flow.availability, self.states.items[@backingInt(baseline)].availability) |*availability, initial| {
-                if (initial == .unbound) availability.* = .unbound;
-            }
-            for (in_place_slots.items) |in_place| {
-                for (breaks, incoming_generations) |break_edge, *generation| {
-                    generation.* = self.states.items[@backingInt(break_edge.state)].values.get(in_place.slot).?.owned_generation;
-                }
-                var output = self.states.items[@backingInt(output_state)].values.get(in_place.slot).?;
-                output.owned_generation = try self.joinGenerationGroup(output.type_id, exit_span, incoming_generations);
-                try self.states.items[@backingInt(output_state)].values.set(self.ctx.allocator(), in_place.slot, output);
-                if (output.owned_generation) |generation| for (breaks, incoming_generations) |break_edge, incoming| {
-                    try self.recordGenerationOnlyForward(break_edge.block, 0, incoming, generation);
-                };
-            }
-            for (0..self.states.items[@backingInt(baseline)].values.len) |slot| {
-                const initial = self.states.items[@backingInt(baseline)].values.get(slot);
-                const mutable = self.locals.items(.mutable)[slot];
-                if (!mutable or initial == null) continue;
-                var origins: ?u32 = null;
-                var identity = self.states.items[@backingInt(breaks[0].state)].values.get(slot).?.binding_identity;
-                var storage_identity = self.states.items[@backingInt(breaks[0].state)].values.get(slot).?.storage_identity orelse identity;
-                for (breaks) |break_edge| {
-                    origins = try self.mergeReferenceOrigins(origins, self.states.items[@backingInt(break_edge.state)].values.get(slot).?.reference_origins);
-                }
-                for (breaks[1..]) |break_edge| {
-                    identity = try self.joinBindingIdentities(identity, self.states.items[@backingInt(break_edge.state)].values.get(slot).?.binding_identity);
-                    const value_on_edge = self.states.items[@backingInt(break_edge.state)].values.get(slot).?;
-                    storage_identity = try self.joinBindingIdentities(storage_identity, value_on_edge.storage_identity orelse value_on_edge.binding_identity);
-                }
-                var output = self.states.items[@backingInt(output_state)].values.get(slot).?;
-                output.reference_origins = origins;
-                output.binding_identity = identity;
-                output.storage_identity = storage_identity;
-                try self.states.items[@backingInt(output_state)].values.set(self.ctx.allocator(), slot, output);
-            }
-            var any_borrowed = false;
-            var all_borrowed = true;
-            var has_conditional_borrow = false;
-            var contains_transfer = false;
-            var borrow_root: ?semantic.UnresolvedBody.LocalId = null;
-            var borrowed_source: ?structures.TypeId = null;
-            var borrowed_generation: ?GenerationId = null;
-            var borrowed_cleanup_value: ?structures.FunctionValueId = null;
-            var borrowed_generation_initialized = false;
-            var reference_origins: ?u32 = null;
-            var stable_reference_root = breaks[0].value.stable_reference_root;
-            var pending_consumption_owners: ?u32 = null;
-            for (breaks) |break_edge| {
-                pending_consumption_owners = try self.mergePendingConsumptionOwners(pending_consumption_owners, break_edge.value.pending_consumption_owners);
-                reference_origins = try self.mergeReferenceOrigins(reference_origins, break_edge.value.reference_origins);
-                stable_reference_root = sharedStableReferenceRoot(stable_reference_root, break_edge.value.stable_reference_root);
-                any_borrowed = any_borrowed or hasNonowningPath(break_edge.value);
-                all_borrowed = all_borrowed and hasNonowningPath(break_edge.value);
-                has_conditional_borrow = has_conditional_borrow or break_edge.value.borrow_condition != null;
-                if (break_edge.value.borrowed_type != null) {
-                    if (!borrowed_generation_initialized) {
-                        borrowed_generation = break_edge.value.borrowed_generation;
-                        borrowed_cleanup_value = break_edge.value.borrowed_cleanup_value;
-                        borrowed_generation_initialized = true;
-                    } else {
-                        if (borrowed_generation != break_edge.value.borrowed_generation) borrowed_generation = null;
-                        if (borrowed_cleanup_value != break_edge.value.borrowed_cleanup_value) borrowed_cleanup_value = null;
-                    }
-                    if (borrowed_source) |source_type| {
-                        if (source_type != break_edge.value.borrowed_type.?) borrowed_source = joined;
-                    } else {
-                        borrowed_source = break_edge.value.borrowed_type.?;
-                    }
-                    borrow_root = laterBorrowRoot(borrow_root, break_edge.value.borrow_root);
-                }
-                contains_transfer = contains_transfer or break_edge.value.explicit_transfer;
-            }
-            const needs_borrow_condition = any_borrowed and (has_conditional_borrow or !all_borrowed);
+            const merged = try self.mergeExits(baseline, self.loop_breaks.items[break_start..], mode, .loop);
             self.loop_breaks.shrinkRetainingCapacity(break_start);
-            self.enterBlock(exit);
-            self.restoreState(output_state);
-            return self.withCleanupCondition(.{
-                .id = if (constructed) |storage| storage.id else @fromBackingInt(@intCast(exit_argument_start)),
-                .type_id = joined,
-                .owned_generation = result_generation,
-                .borrowed_generation = borrowed_generation,
-                .borrowed_cleanup_value = borrowed_cleanup_value,
-                .borrowed_type = borrowed_source,
-                .borrow_condition = if (needs_borrow_condition)
-                    @fromBackingInt(@intCast(exit_argument_start + 1))
-                else
-                    null,
-                .borrow_root = borrow_root,
-                .reference_origins = reference_origins,
-                .stable_reference_root = stable_reference_root,
-                .explicit_transfer = contains_transfer,
-                .preserves_storage = preserves_storage,
-                .consumption_completion = consumption_completion,
-                .pending_consumption_owners = pending_consumption_owners,
-            });
+            try self.enterFlowExit(merged);
+            if (merged.constructed.?.type_id == .never) self.terminate(.diverge);
+            return merged.constructed.?;
         }
 
-        fn reconcileLoopHeaderGenerations(
-            self: *Self,
-            header: structures.FunctionBlockId,
-            state_type_start: u32,
-            state_type_end: u32,
-            header_start_orders: []const u32,
-            state_start: usize,
-            boundary_start: usize,
-            block_start: usize,
-            branch_argument_start: usize,
-            break_start: usize,
-            span: structures.SourceSpan,
-        ) !void {
-            std.debug.assert(header_start_orders.len == state_type_end - state_type_start);
-            for (state_type_start..state_type_end) |argument| {
-                const offset = argument - state_type_start;
-                const provisional = self.block_argument_generations.items[argument];
-                var all_equal = self.generationMatchesType(provisional, self.block_arguments.items[argument].type_id);
-                var cleanup_fields = if (provisional) |generation| self.generations.items[@backingInt(generation)].cleanup_fields else false;
-                const missing = if (provisional) |generation| self.generations.items[@backingInt(generation)].missing_fields else &.{};
-                for (self.blocks.items[block_start..]) |block_value| {
-                    const branch = switch (block_value.terminator orelse continue) {
-                        .branch => |branch| branch,
-                        else => continue,
-                    };
-                    if (branch.target != header) continue;
-                    const backedge_generation = self.branch_argument_generations.items[branch.arguments.start + offset];
-                    const backedge_missing = if (backedge_generation) |generation| self.generations.items[@backingInt(generation)].missing_fields else &.{};
-                    if (!sameMissingFields(missing, backedge_missing)) return self.reject(span, .partial_field_transfer_not_supported);
-                    all_equal = all_equal and backedge_generation == provisional;
-                    cleanup_fields = cleanup_fields and if (backedge_generation) |generation|
-                        self.generations.items[@backingInt(generation)].cleanup_fields
-                    else
-                        false;
+        fn loopHeaderGeneration(self: *Self, initial: Value) !?GenerationId {
+            const previous = initial.owned_generation orelse return null;
+            const metadata = self.generations.items[@backingInt(previous)];
+            const generation = (try self.allocateGeneration(initial.type_id, self.activeLifetimeSpan(), metadata.cleanup_fields)).?;
+            try self.copyMissingFields(generation, metadata.missing_fields, null, null);
+            return generation;
+        }
+
+        fn completeLoopGenerations(self: *Self, header_state: StateId, backedges: []const LoopBackedge, span: structures.SourceSpan) !void {
+            const values = self.states.items[@backingInt(header_state)].values;
+            for (0..values.len) |slot| {
+                if (!self.locals.items(.mutable)[slot]) continue;
+                const initial = values.get(slot) orelse continue;
+                const generation = initial.owned_generation orelse continue;
+                const missing = self.generations.items[@backingInt(generation)].missing_fields;
+                var cleanup_fields = self.generations.items[@backingInt(generation)].cleanup_fields;
+                for (backedges) |backedge| {
+                    const incoming = self.states.items[@backingInt(backedge.state)].values.get(slot).?.owned_generation;
+                    const incoming_missing = if (incoming) |owner| self.generations.items[@backingInt(owner)].missing_fields else &.{};
+                    if (!sameMissingFields(missing, incoming_missing)) return self.reject(span, .partial_field_transfer_not_supported);
+                    cleanup_fields = cleanup_fields and if (incoming) |owner| self.generations.items[@backingInt(owner)].cleanup_fields else false;
+                    if (try self.constructsInPlace(initial.type_id)) try self.recordGenerationOnlyForward(backedge.block, 0, incoming, generation);
                 }
-                if (all_equal) continue;
-                std.debug.assert(provisional != null);
-                const joined = (try self.allocateGenerationAt(
-                    self.block_arguments.items[argument].type_id,
-                    span,
-                    cleanup_fields,
-                    header_start_orders[offset],
-                )).?;
-                try self.copyMissingFields(joined, missing, null, null);
-                self.block_argument_generations.items[argument] = joined;
-                try self.remapLoopGeneration(
-                    provisional,
-                    joined,
-                    state_start,
-                    boundary_start,
-                    block_start,
-                    state_type_start,
-                    branch_argument_start,
-                    break_start,
-                );
+                if (!cleanup_fields) {
+                    self.generations.items[@backingInt(generation)].cleanup_fields = false;
+                    self.generations.items[@backingInt(generation)].requires_explicit_drop = ((try self.type_interner.facts().ownershipCapabilities(initial.type_id)) orelse return error.Unavailable).requires_explicit_drop;
+                }
             }
-        }
-
-        fn reconcileInPlaceLoopHeader(
-            self: *Self,
-            in_place: InPlaceLoopSlot,
-            entry_predecessor: structures.FunctionBlockId,
-            initial: Value,
-            backedges: []const LoopBackedge,
-            state_start: usize,
-            boundary_start: usize,
-            block_start: usize,
-            block_argument_start: usize,
-            branch_argument_start: usize,
-            break_start: usize,
-            span: structures.SourceSpan,
-        ) !void {
-            const provisional = initial.owned_generation;
-            var all_equal = true;
-            var cleanup_fields = if (provisional) |generation| self.generations.items[@backingInt(generation)].cleanup_fields else false;
-            const missing = if (provisional) |generation| self.generations.items[@backingInt(generation)].missing_fields else &.{};
-            for (backedges) |backedge| {
-                const backedge_generation = self.states.items[@backingInt(backedge.state)].values.get(in_place.slot).?.owned_generation;
-                const backedge_missing = if (backedge_generation) |generation| self.generations.items[@backingInt(generation)].missing_fields else &.{};
-                if (!sameMissingFields(missing, backedge_missing)) return self.reject(span, .partial_field_transfer_not_supported);
-                all_equal = all_equal and backedge_generation == provisional;
-                cleanup_fields = cleanup_fields and if (backedge_generation) |generation| self.generations.items[@backingInt(generation)].cleanup_fields else false;
-            }
-            if (all_equal) return;
-            std.debug.assert(provisional != null);
-            const joined = (try self.allocateGenerationAt(initial.type_id, span, cleanup_fields, in_place.start_order)).?;
-            try self.copyMissingFields(joined, missing, null, null);
-            try self.remapLoopGeneration(provisional, joined, state_start, boundary_start, block_start, block_argument_start, branch_argument_start, break_start);
-            try self.recordGenerationOnlyForward(entry_predecessor, 0, provisional, joined);
-            for (backedges) |backedge| try self.recordGenerationOnlyForward(
-                backedge.block,
-                0,
-                self.states.items[@backingInt(backedge.state)].values.get(in_place.slot).?.owned_generation,
-                joined,
-            );
         }
 
         fn generationMatchesType(self: *const Self, generation: ?GenerationId, type_id: structures.TypeId) bool {
             return generation == null or self.generations.items[@backingInt(generation.?)].type_id == type_id;
-        }
-
-        fn remapLoopGeneration(
-            self: *Self,
-            source: ?GenerationId,
-            destination: GenerationId,
-            state_start: usize,
-            boundary_start: usize,
-            block_start: usize,
-            block_argument_start: usize,
-            branch_argument_start: usize,
-            break_start: usize,
-        ) !void {
-            if (source == null) return;
-            for (self.states.items[state_start..]) |state| {
-                for (0..state.values.len) |slot| if (state.values.get(slot)) |saved| {
-                    var resolved = saved;
-                    remapValueGeneration(&resolved, source.?, destination);
-                    try state.values.set(self.ctx.allocator(), slot, resolved);
-                };
-            }
-            for (self.boundaries.items[boundary_start..]) |*boundary| {
-                for (boundary.effects.items) |*effect| remapEffectGeneration(effect, source.?, destination);
-            }
-            for (self.blocks.items[block_start..]) |*block_value| {
-                for (block_value.terminator_effects.items) |*effect| remapEffectGeneration(effect, source.?, destination);
-            }
-            for (self.block_argument_generations.items[block_argument_start..]) |*generation| {
-                if (generation.* == source) generation.* = destination;
-            }
-            for (self.branch_argument_generations.items[branch_argument_start..]) |*generation| {
-                if (generation.* == source) generation.* = destination;
-            }
-            for (self.loop_breaks.items[break_start..]) |*loop_break| {
-                remapValueGeneration(&loop_break.value, source.?, destination);
-            }
-            for (self.ownership_forward_hints.items) |*hint| {
-                if (@backingInt(hint.predecessor) < block_start) continue;
-                if (hint.source == source) hint.source = destination;
-                if (hint.destination == source.?) hint.destination = destination;
-            }
-            for (self.local_values) |*local_value| if (local_value.*) |*resolved| {
-                remapValueGeneration(resolved, source.?, destination);
-            };
-        }
-
-        fn remapValueGeneration(resolved: *Value, source: GenerationId, destination: GenerationId) void {
-            if (resolved.owned_generation == source) resolved.owned_generation = destination;
-            if (resolved.borrowed_generation == source) resolved.borrowed_generation = destination;
-        }
-
-        fn remapEffectGeneration(effect: *LifetimeEffect, source: GenerationId, destination: GenerationId) void {
-            switch (effect.*) {
-                .define => |definition| {
-                    if (definition.generation == source) effect.* = .{ .define = .{
-                        .generation = destination,
-                        .value = definition.value,
-                    } };
-                },
-                .use => |use| {
-                    if (use.generation == source) effect.* = .{ .use = .{
-                        .generation = destination,
-                        .cleanup_value = use.cleanup_value,
-                        .cleanup_condition = use.cleanup_condition,
-                    } };
-                },
-                .update => |update| {
-                    if (update.generation == source) effect.* = .{ .update = .{
-                        .generation = destination,
-                        .cleanup_value = update.cleanup_value,
-                        .cleanup_condition = update.cleanup_condition,
-                    } };
-                },
-                .consume => |generation| {
-                    if (generation == source) effect.* = .{ .consume = destination };
-                },
-            }
         }
 
         fn valuesBranch(self: *Self, target: structures.FunctionBlockId, values: []const Value) !structures.FunctionBranch {
@@ -4536,51 +4125,16 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             return .{ .target = target, .arguments = .{ .start = start, .end = @intCast(self.branch_arguments.items.len) } };
         }
 
-        fn loopBranch(
-            self: *Self,
-            context: LoopContext,
-            target: structures.FunctionBlockId,
-            result: ?Value,
-        ) !structures.FunctionBranch {
+        fn loopBranch(self: *Self, context: LoopContext) !structures.FunctionBranch {
             const start: u32 = @intCast(self.branch_arguments.items.len);
-            if (result) |result_value| {
-                try self.appendBranchArgument(.{ .value = result_value.id }, result_value.owned_generation);
-                const borrowed_on_path = result_value.borrow_condition orelse (try self.appendInstruction(.{
-                    .const_bool = hasNonowningPath(result_value),
-                })).id;
-                try self.appendBranchArgument(.{ .value = borrowed_on_path }, null);
-                if (context.consumption_completion != null) {
-                    const completion = if (result_value.consumption_completion) |completion|
-                        completion
-                    else blk: {
-                        const flag = try self.localStorage(.bool);
-                        const completed = try self.appendInstruction(.{ .const_bool = true });
-                        _ = try self.copyBits(completed, flag);
-                        break :blk flag.id;
-                    };
-                    try self.appendBranchArgument(.{ .value = completion }, null);
-                }
-            }
-            const type_start = if (target == context.header)
-                context.state_type_start
-            else if (target == context.exit)
-                context.exit_state_start
-            else
-                unreachable;
-            var type_index = type_start;
             for (0..self.states.items[@backingInt(context.baseline)].values.len) |slot| {
-                const initial = self.states.items[@backingInt(context.baseline)].values.get(slot);
-                const current = self.local_values[slot];
-                const mutable = self.locals.items(.mutable)[slot];
-                if (!mutable or initial == null or try self.constructsInPlace(initial.?.type_id)) continue;
-                const state = current.?;
-                const use = (try self.coerceValue(state.id, state.type_id, self.block_arguments.items[type_index].type_id)) orelse unreachable;
-                try self.appendBranchArgument(use, state.owned_generation);
-                type_index += 1;
+                const initial = self.states.items[@backingInt(context.baseline)].values.get(slot) orelse continue;
+                if (!self.locals.items(.mutable)[slot] or try self.constructsInPlace(initial.type_id)) continue;
+                const current = self.local_values[slot].?;
+                try self.appendBranchArgument(.{ .value = current.id }, current.owned_generation);
             }
-            std.debug.assert(type_index == type_start + context.state_type_end - context.state_type_start);
-            if (target == context.header) try self.loop_backedges.append(self.ctx.allocator(), .{ .block = self.current_block.?, .state = try self.captureState() });
-            return .{ .target = target, .arguments = .{ .start = start, .end = @intCast(self.branch_arguments.items.len) } };
+            try self.loop_backedges.append(self.ctx.allocator(), .{ .block = self.current_block.?, .state = try self.captureState() });
+            return .{ .target = context.header, .arguments = .{ .start = start, .end = @intCast(self.branch_arguments.items.len) } };
         }
 
         fn normalizeLoopBackedge(self: *Self, context: LoopContext, span: structures.SourceSpan) !void {
@@ -5267,18 +4821,8 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                         if (receiver.type_id == .never) return .{ .diverged = receiver };
                         break :blk receiver.type_id;
                     };
-                    const instance = (try self.type_interner.structNamespaceMember(receiver_type, name, span)) orelse return self.reject(span, .unknown_namespace_member);
-                    const shape = (try self.type_interner.functionShape(instance.item)) orelse return error.Unavailable;
-                    var inference = try self.type_interner.needsInheritedInference(instance);
-                    for (shape.parameters) |parameter| if (parameter.mode == .static) {
-                        inference = true;
-                    };
-                    if (inference) {
-                        target = .{ .inferred = instance };
-                    } else {
-                        target = .{ .direct = instance };
-                        signature = (try self.type_interner.functionSignature(instance)) orelse return error.Unavailable;
-                    }
+                    target = try self.operationTarget(receiver_type, name, span);
+                    if (target == .direct) signature = (try self.type_interner.functionSignature(target.direct)) orelse return error.Unavailable;
                 },
                 .direct => |instance| {
                     raw_arguments = self.unresolved.call_arguments[call.arguments.start..call.arguments.end];
@@ -5596,45 +5140,26 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 break :blk receiver.type_id;
             };
             const method_arguments = self.unresolved.method_call_arguments[call.arguments.start..call.arguments.end];
-            if (std.meta.stringToEnum(structures.OwnershipMember, member.name)) |operation| {
-                const instance = (try self.type_interner.ownershipMember(receiver_type, operation)) orelse
-                    return self.reject(call.span, .unknown_namespace_member);
-                const shape = (try self.type_interner.functionShape(instance.item)) orelse return error.Unavailable;
-                try self.validateCallSyntax(call, shape.is_fallible, requires_fallible);
-                signature.* = (try self.type_interner.functionSignature(instance)) orelse return error.Unavailable;
-                target.* = .{ .direct = instance };
-                try arguments.append(self.ctx.allocator(), member.receiver);
-                for (method_arguments) |argument| try arguments.append(self.ctx.allocator(), argument.value);
-                return null;
-            }
-            if (try self.type_interner.structDefinition(receiver_type)) |definition| {
-                if (definition.resolveField(member.name) != null) {
+            switch (try self.memberTarget(receiver_type, member, call.span)) {
+                .field => {
                     const callee = try self.borrowValue(try self.accessField(member.receiver, member.name, call.span), call.span);
                     signature.* = try self.callableSignature(callee.type_id, call.span);
                     target.* = .{ .indirect = callee };
-                    try arguments.ensureTotalCapacity(self.ctx.allocator(), method_arguments.len);
-                    for (method_arguments) |argument| arguments.appendAssumeCapacity(argument.value);
-                    return null;
-                }
-            } else if (try self.type_interner.facts().arrayType(receiver_type) == null)
-                return self.reject(member.receiver.span, .{ .field_access_not_struct = receiver_type });
-            const instance = (try self.type_interner.structNamespaceMember(receiver_type, member.name, call.span)) orelse
-                return self.reject(call.span, .unknown_namespace_member);
-            try arguments.append(self.ctx.allocator(), member.receiver);
-            const shape = (try self.type_interner.functionShape(instance.item)) orelse {
-                const value_id = (try self.type_interner.staticItem(instance)) orelse return error.Unavailable;
-                const value_to_call = try self.type_interner.lookupCompileTimeValue(value_id);
-                if (value_to_call != .runtime) return self.reject(call.span, .value_not_callable);
-                signature.* = try self.callableSignature(value_to_call.runtime.type_id, call.span);
-                const callee = try self.appendInstruction(.{ .function_ref = value_to_call.runtime.value.function_ref });
-                target.* = .{ .indirect = callee };
-                for (method_arguments) |argument| try arguments.append(self.ctx.allocator(), argument.value);
-                return null;
-            };
-            try self.validateCallSyntax(call, shape.is_fallible, requires_fallible);
-            target.* = try self.resolveMethodArguments(instance, shape, method_arguments, call.span, arguments);
-            if (target.* == .direct)
-                signature.* = (try self.type_interner.functionSignature(target.direct)) orelse return error.Unavailable;
+                },
+                .static_callable => |callee| {
+                    signature.* = try self.callableSignature(callee.type_id, call.span);
+                    target.* = .{ .indirect = try self.appendInstruction(.{ .function_ref = callee.value.function_ref }) };
+                    try arguments.append(self.ctx.allocator(), member.receiver);
+                },
+                .function => |function| {
+                    try self.validateCallSyntax(call, function.shape.is_fallible, requires_fallible);
+                    try arguments.append(self.ctx.allocator(), member.receiver);
+                    target.* = if (function.ownership) .{ .direct = function.instance } else try self.resolveMethodArguments(function.instance, function.shape, method_arguments, call.span, arguments);
+                    if (target.* == .direct) signature.* = (try self.type_interner.functionSignature(target.direct)) orelse return error.Unavailable;
+                    if (!function.ownership) return null;
+                },
+            }
+            for (method_arguments) |argument| try arguments.append(self.ctx.allocator(), argument.value);
             return null;
         }
 
@@ -5679,9 +5204,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             return .{ .direct = try self.type_interner.specializeFunction(instance, static_arguments.items) };
         }
 
-        const CallResult = union(enum) { value, destination: Destination, borrowed: structures.TypeId, consumed: ?structures.TypeId };
-
-        fn callFunction(self: *Self, call: semantic.UnresolvedBody.Call, span: structures.SourceSpan, mode: CallResult) !Value {
+        fn callFunction(self: *Self, call: semantic.UnresolvedBody.Call, span: structures.SourceSpan, mode: ResultRequest) !Value {
             if (call.target == .operation) {
                 const arguments = self.unresolved.call_arguments[call.arguments.start..call.arguments.end];
                 const receiver_type = (try self.unevaluatedType(arguments[0].value, null)) orelse (try self.value(arguments[0].value)).type_id;
@@ -5707,7 +5230,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             return self.binary(.{ .operation = operation, .span = span });
         }
 
-        fn invokeOperation(self: *Self, name: []const u8, arguments: []const semantic.UnresolvedBody.ValueUse, span: structures.SourceSpan, mode: CallResult) !Value {
+        fn invokeOperation(self: *Self, name: []const u8, arguments: []const semantic.UnresolvedBody.ValueUse, span: structures.SourceSpan, mode: ResultRequest) !Value {
             const original = self.unresolved.call_arguments;
             const storage = try self.ctx.allocator().alloc(semantic.UnresolvedBody.ValueUse, original.len + arguments.len);
             defer self.ctx.allocator().free(storage);
@@ -5722,19 +5245,15 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             }, span, mode);
         }
 
-        fn resolvedCallResult(self: *Self, callable: ResolvedCallable, call: semantic.UnresolvedBody.Call, span: structures.SourceSpan, mode: CallResult) !Value {
-            if (mode == .value) return self.resolvedCallValue(callable, call, span, null);
+        fn resolvedCallResult(self: *Self, callable: ResolvedCallable, call: semantic.UnresolvedBody.Call, span: structures.SourceSpan, request: ResultRequest) !Value {
+            if (request.destination == null and request.value.access != .borrow and request.value.access != .consume)
+                return self.resolvedCallValue(callable, call, span, null);
             const return_type = callable.operation.return_type;
             if (!lowersToCall(callable.behavior) or !try self.constructsInPlace(return_type)) {
                 const result = try self.resolvedCallValue(callable, call, span, null);
-                return if (mode == .destination) self.placeValue(result, span, mode.destination) else result;
+                return if (request.destination) |destination| self.placeValue(result, span, destination) else result;
             }
-            const target: Destination = switch (mode) {
-                .destination => |destination| destination,
-                .borrowed => |type_id| .{ .storage = try self.localStorage(type_id), .site = .argument },
-                .consumed => |type_id| .{ .storage = try self.localStorage(type_id orelse return_type), .site = .argument },
-                .value => unreachable,
-            };
+            const target = request.destination orelse Destination{ .storage = try self.localStorage(request.value.expected_type orelse return_type), .site = .argument };
             const storage = try self.memberDestination(target, return_type, span, .fresh);
             return self.finishMemberStorage(try self.resolvedCallValue(callable, call, span, storage), target.storage, span);
         }
@@ -6822,7 +6341,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             if (value_to_test.type_id == .bool or value_to_test.type_id == .never)
                 return self.booleanCondition(value_to_test, operand.span, true);
             if (value_to_test.type_id.isPrimitive()) return self.reject(operand.span, .if_condition_not_fallible);
-            return self.booleanCondition(try self.invokeOperation("not", &.{operand}, operand.span, .value), operand.span, false);
+            return self.booleanCondition(try self.invokeOperation("not", &.{operand}, operand.span, .{}), operand.span, false);
         }
 
         fn initializerCanFail(self: *Self, initializer: Value) bool {
@@ -6922,7 +6441,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     .le => "<=",
                     .ge => ">=",
                 };
-                return self.booleanCondition(try self.invokeOperation(name, &.{ comparison.operands.lhs, comparison.operands.rhs }, comparison.operands.lhs.span, .value), comparison.operands.lhs.span, false);
+                return self.booleanCondition(try self.invokeOperation(name, &.{ comparison.operands.lhs, comparison.operands.rhs }, comparison.operands.lhs.span, .{}), comparison.operands.lhs.span, false);
             }
             const rhs = try self.borrowValue(try self.valueWithContext(comparison.operands.rhs.value, context), comparison.operands.rhs.span);
             if (rhs.type_id == .never) return .{ .success = null, .failure = null, .diverged = rhs };
@@ -7135,103 +6654,148 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         }
 
         fn mergeFlowExits(self: *Self, first_exit: ?FlowExit, second_exit: ?FlowExit) !?FlowExit {
-            var first = first_exit orelse return second_exit;
-            var second = second_exit orelse return first;
-            std.debug.assert(first.binding == null);
-            std.debug.assert(second.binding == null);
-            try self.normalizeJoinedFields(&first, &second);
-            const first_state = self.states.items[@backingInt(first.state)];
-            const second_state = self.states.items[@backingInt(second.state)];
-            std.debug.assert(first_state.values.len == second_state.values.len);
+            const first = first_exit orelse return second_exit;
+            const second = second_exit orelse return first;
+            var exits = [_]FlowExit{ first, second };
+            return try self.mergeExits(first.state, &exits, null, .condition);
+        }
+        const JoinPolicy = enum { condition, branch, loop };
 
-            var first_values: std.ArrayList(Value) = .empty;
-            defer first_values.deinit(self.ctx.allocator());
-            var second_values: std.ArrayList(Value) = .empty;
-            defer second_values.deinit(self.ctx.allocator());
+        fn mergeExits(self: *Self, baseline: StateId, exits: []FlowExit, mode: ?ResultRequest, policy: JoinPolicy) !FlowExit {
+            const span = self.activeLifetimeSpan();
+            const argument_start: u32 = @intCast(self.block_arguments.items.len);
+            if (exits.len == 0) {
+                _ = try self.appendBlockArgument(.never, null);
+                const block_id = try self.newBlock(argument_start, argument_start + 1);
+                return .{ .block = block_id, .state = baseline, .constructed = .{ .id = @fromBackingInt(argument_start), .type_id = .never } };
+            }
+            for (exits) |exit| std.debug.assert(exit.binding == null);
+            try self.normalizeJoinFields(exits, policy);
+            const incoming = try self.ctx.allocator().alloc(?GenerationId, exits.len);
+            defer self.ctx.allocator().free(incoming);
+            const destination = if (mode) |request| if (request.destination) |target| target.storage else null else null;
+            var result: ?Value = null;
+            var borrow_argument: ?u32 = null;
+            var completion_argument: ?u32 = null;
+            if (mode != null) {
+                var joined_type = if (destination) |storage| storage.type_id else exits[0].constructed.?.type_id;
+                if (destination == null) for (exits[1..]) |exit| {
+                    joined_type = try joinTypes(self.type_interner, joined_type, exit.constructed.?.type_id, self.ctx.allocator());
+                };
+                var joined: Value = .{ .id = if (destination) |storage| storage.id else @fromBackingInt(argument_start), .type_id = joined_type, .stable_reference_root = exits[0].constructed.?.stable_reference_root };
+                var any_borrowed = false;
+                var all_borrowed = true;
+                var conditional_borrow = false;
+                var needs_completion = false;
+                var borrowed_generation: ??GenerationId = null;
+                var borrowed_cleanup: ??structures.FunctionValueId = null;
+                for (exits, incoming) |exit, *generation| {
+                    const value_on_edge = exit.constructed.?;
+                    generation.* = value_on_edge.owned_generation;
+                    joined.preserves_storage = joined.preserves_storage or value_on_edge.preserves_storage;
+                    joined.explicit_transfer = joined.explicit_transfer or value_on_edge.explicit_transfer;
+                    joined.reference_origins = try self.mergeReferenceOrigins(joined.reference_origins, value_on_edge.reference_origins);
+                    joined.stable_reference_root = sharedStableReferenceRoot(joined.stable_reference_root, value_on_edge.stable_reference_root);
+                    joined.pending_consumption_owners = try self.mergePendingConsumptionOwners(joined.pending_consumption_owners, value_on_edge.pending_consumption_owners);
+                    any_borrowed = any_borrowed or hasNonowningPath(value_on_edge);
+                    all_borrowed = all_borrowed and hasNonowningPath(value_on_edge);
+                    conditional_borrow = conditional_borrow or value_on_edge.borrow_condition != null;
+                    needs_completion = needs_completion or value_on_edge.consumption_completion != null;
+                    if (value_on_edge.borrowed_type) |source_type| {
+                        joinBorrowedFact(GenerationId, &borrowed_generation, value_on_edge.borrowed_generation, policy == .loop);
+                        joinBorrowedFact(structures.FunctionValueId, &borrowed_cleanup, value_on_edge.borrowed_cleanup_value, policy == .loop);
+                        if (joined.borrowed_type) |previous| {
+                            if (previous != source_type) joined.borrowed_type = joined_type;
+                        } else joined.borrowed_type = source_type;
+                        joined.borrow_root = laterBorrowRoot(joined.borrow_root, value_on_edge.borrow_root);
+                    }
+                }
+                for (exits) |exit| {
+                    const value_on_edge = exit.constructed.?;
+                    if (destination == null and !self.type_check_only and try self.constructsInPlace(joined_type) and value_on_edge.type_id != joined_type)
+                        return self.reject(span, .{ .relocation_requires_direct_move = value_on_edge.type_id });
+                    if (joined.preserves_storage and value_on_edge.type_id != joined_type)
+                        return self.reject(span, .{ .call_argument_type_mismatch = self.typeMismatch(joined_type, value_on_edge.type_id) });
+                }
+                joined.owned_generation = try self.joinResultGenerations(joined_type, span, incoming);
+                joined.borrowed_generation = borrowed_generation orelse null;
+                joined.borrowed_cleanup_value = borrowed_cleanup orelse null;
+                if (destination == null) {
+                    const argument = try self.appendBlockArgument(joined_type, joined.owned_generation);
+                    self.block_arguments.items[argument].representation = if (joined.preserves_storage) .storage else .value;
+                }
+                if (any_borrowed and (conditional_borrow or !all_borrowed)) {
+                    borrow_argument = try self.appendBlockArgument(.bool, null);
+                    joined.borrow_condition = @fromBackingInt(borrow_argument.?);
+                }
+                if (needs_completion) {
+                    completion_argument = try self.appendBlockArgument(.bool, null);
+                    self.block_arguments.items[completion_argument.?].representation = .storage;
+                    joined.consumption_completion = @fromBackingInt(completion_argument.?);
+                }
+                result = self.withCleanupCondition(joined);
+            }
+
+            var state = try self.states.items[@backingInt(baseline)].clone(self.ctx.allocator());
+            errdefer state.deinit(self.ctx.allocator());
+            state.copyFlowFrom(self.states.items[@backingInt(exits[0].state)]);
+            for (exits[1..]) |exit| state.joinFlow(self.states.items[@backingInt(exit.state)]);
+            for (state.availability, self.states.items[@backingInt(baseline)].availability) |*availability, initial| {
+                if (initial == .unbound) availability.* = .unbound;
+            }
             var changed_slots: std.ArrayList(u32) = .empty;
             defer changed_slots.deinit(self.ctx.allocator());
-            var generation_only_joins: std.ArrayList(GenerationOnlyJoin) = .empty;
-            defer generation_only_joins.deinit(self.ctx.allocator());
-            const argument_start: u32 = @intCast(self.block_arguments.items.len);
-            for (0..first_state.values.len) |slot| {
-                const first_value = first_state.values.get(slot);
-                const second_value = second_state.values.get(slot);
-                std.debug.assert((first_value == null) == (second_value == null));
-                const left = first_value orelse continue;
-                const right = second_value.?;
-                std.debug.assert(left.type_id == right.type_id);
-                if (left.id == right.id) {
-                    if (left.owned_generation != right.owned_generation) {
-                        const destination = (try self.joinGenerations(
-                            left.type_id,
-                            self.activeLifetimeSpan(),
-                            left.owned_generation,
-                            right.owned_generation,
-                        )).?;
-                        try generation_only_joins.append(self.ctx.allocator(), .{
-                            .slot = @intCast(slot),
-                            .destination = destination,
-                        });
-                    }
-                    continue;
+            var generation_only: std.ArrayList(GenerationOnlyJoin) = .empty;
+            defer generation_only.deinit(self.ctx.allocator());
+            const state_argument_start: u32 = @intCast(self.block_arguments.items.len);
+            for (0..state.values.len) |slot| {
+                if (state.values.get(slot) == null) continue;
+                if (policy == .loop and !self.locals.items(.mutable)[slot]) continue;
+                var output = self.states.items[@backingInt(exits[0].state)].values.get(slot).?;
+                var changed = false;
+                const original_identity = output.binding_identity;
+                for (exits, incoming, 0..) |exit, *generation, index| {
+                    const current = self.states.items[@backingInt(exit.state)].values.get(slot).?;
+                    std.debug.assert(output.type_id == current.type_id);
+                    generation.* = current.owned_generation;
+                    changed = changed or output.id != current.id;
+                    if (index == 0) continue;
+                    try self.mergeValueReferences(&output, output, current);
+                    output.storage_identity = try self.joinBindingIdentities(output.storage_identity orelse output.binding_identity, current.storage_identity orelse current.binding_identity);
+                    output.binding_identity = try self.joinBindingIdentities(output.binding_identity, current.binding_identity);
                 }
-                try first_values.append(self.ctx.allocator(), left);
-                try second_values.append(self.ctx.allocator(), right);
-                try changed_slots.append(self.ctx.allocator(), @intCast(slot));
-                _ = try self.appendBlockArgument(
-                    left.type_id,
-                    try self.joinGenerations(left.type_id, self.activeLifetimeSpan(), left.owned_generation, right.owned_generation),
-                );
+                if (policy == .branch and !std.meta.eql(original_identity, output.binding_identity)) output.binding_identity = try self.newBindingIdentity();
+                const generation = try self.joinGenerationGroup(output.type_id, span, incoming);
+                if (changed) {
+                    const argument = try self.appendBlockArgument(output.type_id, generation);
+                    try changed_slots.append(self.ctx.allocator(), @intCast(slot));
+                    output = .{ .id = @fromBackingInt(argument), .type_id = output.type_id, .owned_generation = generation, .reference_origins = output.reference_origins, .stable_reference_root = output.stable_reference_root, .binding_identity = output.binding_identity, .storage_identity = output.storage_identity };
+                } else if (generation != output.owned_generation) {
+                    try generation_only.append(self.ctx.allocator(), .{ .slot = @intCast(slot), .destination = generation.? });
+                    output.owned_generation = generation;
+                }
+                try state.values.set(self.ctx.allocator(), slot, output);
             }
-
             const merged = try self.newBlock(argument_start, @intCast(self.block_arguments.items.len));
-            self.enterPendingBlock(first.block);
-            self.terminate(.{ .branch = try self.valuesBranch(merged, first_values.items) });
-            self.enterPendingBlock(second.block);
-            self.terminate(.{ .branch = try self.valuesBranch(merged, second_values.items) });
-            for (generation_only_joins.items) |generation_join| {
-                const left = first_state.values.get(generation_join.slot).?;
-                const right = second_state.values.get(generation_join.slot).?;
-                try self.recordGenerationOnlyForward(first.block, 0, left.owned_generation, generation_join.destination);
-                try self.recordGenerationOnlyForward(second.block, 0, right.owned_generation, generation_join.destination);
+            for (exits) |exit| {
+                const predecessor = try self.setJoinTerminator(merged, exit, if (result != null and destination == null) result.?.type_id else null, changed_slots.items, borrow_argument != null, completion_argument != null);
+                if (destination != null) if (result.?.owned_generation) |generation| {
+                    try self.recordGenerationOnlyForward(predecessor, 0, exit.constructed.?.owned_generation, generation);
+                };
+                for (generation_only.items) |join| try self.recordGenerationOnlyForward(predecessor, 0, self.states.items[@backingInt(exit.state)].values.get(join.slot).?.owned_generation, join.destination);
             }
-
-            var state = try first_state.clone(self.ctx.allocator());
-            errdefer state.deinit(self.ctx.allocator());
-            const values = state.values;
-            for (0..values.len) |slot| {
-                if (values.get(slot)) |saved| {
-                    var left = saved;
-                    const right = second_state.values.get(slot).?;
-                    try self.mergeValueReferences(&left, left, right);
-                    left.storage_identity = try self.joinBindingIdentities(left.storage_identity orelse left.binding_identity, right.storage_identity orelse right.binding_identity);
-                    left.binding_identity = try self.joinBindingIdentities(left.binding_identity, right.binding_identity);
-                    try values.set(self.ctx.allocator(), slot, left);
-                }
-            }
-            for (changed_slots.items, argument_start..) |slot, argument| {
-                const joined = values.get(slot).?;
-                try values.set(self.ctx.allocator(), slot, .{
-                    .id = @fromBackingInt(@intCast(argument)),
-                    .type_id = self.block_arguments.items[argument].type_id,
-                    .owned_generation = self.block_argument_generations.items[argument],
-                    .reference_origins = joined.reference_origins,
-                    .stable_reference_root = joined.stable_reference_root,
-                    .binding_identity = joined.binding_identity,
-                    .storage_identity = joined.storage_identity,
-                });
-            }
-            for (generation_only_joins.items) |generation_join| {
-                var joined = values.get(generation_join.slot).?;
-                joined.owned_generation = generation_join.destination;
-                try values.set(self.ctx.allocator(), generation_join.slot, joined);
-            }
-            state.joinFlow(second_state);
-            const state_id = try self.appendState(state);
-            return .{ .block = merged, .state = state_id };
+            std.debug.assert(state_argument_start + changed_slots.items.len == self.block_arguments.items.len);
+            return .{ .block = merged, .state = try self.appendState(state), .constructed = result };
         }
 
-        fn conditional(self: *Self, expression: @FieldType(Expression.Operation, "if_else"), mode: BranchResult) anyerror!Value {
+        fn joinBorrowedFact(comptime Fact: type, joined: *??Fact, candidate: ?Fact, include_unknown: bool) void {
+            if (candidate == null and !include_unknown) return;
+            if (joined.*) |previous| {
+                if (previous != candidate) joined.* = @as(?Fact, null);
+            } else joined.* = candidate;
+        }
+
+        fn conditional(self: *Self, expression: @FieldType(Expression.Operation, "if_else"), mode: ResultRequest) anyerror!Value {
             const baseline = try self.captureState();
             const flow = try self.condition(expression.condition);
             if (flow.success == null and flow.failure == null) {
@@ -7239,226 +6803,62 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 return flow.diverged.?;
             }
 
-            var then_exit = if (flow.success) |success| blk: {
+            const then_exit = if (flow.success) |success| blk: {
                 try self.enterFlowExit(success);
                 const result = try self.blockWithResult(expression.then_block, mode);
                 if (self.current_block != null) if (success.binding) |binding|
                     self.unbindLocal(@backingInt(binding.conditionBinding().local));
                 break :blk try self.valueExit(result);
             } else null;
-            var else_exit = if (flow.failure) |failure| blk: {
+            const else_exit = if (flow.failure) |failure| blk: {
                 try self.enterFlowExit(failure);
                 break :blk try self.valueExit(try self.blockWithResult(expression.else_block, mode));
             } else null;
 
-            const argument_start: u32 = @intCast(self.block_arguments.items.len);
-            if (then_exit == null and else_exit == null) {
-                _ = try self.appendBlockArgument(.never, null);
-                const merge_block = try self.newBlock(argument_start, argument_start + 1);
-                self.enterBlock(merge_block);
-                self.terminate(.diverge);
-                return .{ .id = @fromBackingInt(@intCast(argument_start)), .type_id = .never };
-            }
-            if (then_exit) |*then_value| if (else_exit) |*else_value|
-                try self.normalizeJoinedFields(then_value, else_value);
-
-            const constructed = if (mode == .destination) mode.destination.storage else null;
-            const joined = if (constructed) |storage|
-                storage.type_id
-            else if (then_exit) |then_result|
-                if (else_exit) |else_result|
-                    try joinTypes(self.type_interner, then_result.value.type_id, else_result.value.type_id, self.ctx.allocator())
-                else
-                    then_result.value.type_id
-            else
-                else_exit.?.value.type_id;
-            if (constructed == null and !self.type_check_only and try self.constructsInPlace(joined)) {
-                if (then_exit) |exit| if (exit.value.type_id != joined) return self.reject(self.activeLifetimeSpan(), .{ .relocation_requires_direct_move = exit.value.type_id });
-                if (else_exit) |exit| if (exit.value.type_id != joined) return self.reject(self.activeLifetimeSpan(), .{ .relocation_requires_direct_move = exit.value.type_id });
-            }
-            const result_type: ?structures.TypeId = if (constructed == null) joined else null;
-            const preserves_storage = (then_exit != null and then_exit.?.value.preserves_storage) or
-                (else_exit != null and else_exit.?.value.preserves_storage);
-            if (preserves_storage) {
-                if (then_exit) |exit| if (exit.value.type_id != joined) return self.reject(self.activeLifetimeSpan(), .{
-                    .call_argument_type_mismatch = self.typeMismatch(joined, exit.value.type_id),
-                });
-                if (else_exit) |exit| if (exit.value.type_id != joined) return self.reject(self.activeLifetimeSpan(), .{
-                    .call_argument_type_mismatch = self.typeMismatch(joined, exit.value.type_id),
-                });
-            }
-            const then_is_borrowed = if (then_exit) |exit| hasNonowningPath(exit.value) else false;
-            const else_is_borrowed = if (else_exit) |exit| hasNonowningPath(exit.value) else false;
-            const any_borrowed = then_is_borrowed or else_is_borrowed;
-            const all_borrowed = (then_exit == null or then_is_borrowed) and (else_exit == null or else_is_borrowed);
-            const has_conditional_borrow = (then_exit != null and then_exit.?.value.borrow_condition != null) or
-                (else_exit != null and else_exit.?.value.borrow_condition != null);
-            const needs_borrow_condition = any_borrowed and (has_conditional_borrow or !all_borrowed);
-            const first_generation = if (then_exit) |exit| exit.value.owned_generation else else_exit.?.value.owned_generation;
-            const needs_consumption_completion = (then_exit != null and then_exit.?.value.consumption_completion != null) or
-                (else_exit != null and else_exit.?.value.consumption_completion != null);
-            const pending_consumption_owners = try self.mergePendingConsumptionOwners(
-                if (then_exit) |exit| exit.value.pending_consumption_owners else null,
-                if (else_exit) |exit| exit.value.pending_consumption_owners else null,
-            );
-            const second_generation = if (else_exit) |exit| exit.value.owned_generation else first_generation;
-            const joined_generation = try self.joinResultGenerations(joined, self.activeLifetimeSpan(), &.{ first_generation, second_generation });
-            if (result_type != null) {
-                const argument = try self.appendBlockArgument(joined, joined_generation);
-                self.block_arguments.items[argument].representation = if (preserves_storage) .storage else .value;
-            }
-            if (needs_borrow_condition) _ = try self.appendBlockArgument(.bool, null);
-            if (needs_consumption_completion) {
-                const argument = try self.appendBlockArgument(.bool, null);
-                self.block_arguments.items[argument].representation = .storage;
-            }
-            var changed_slots = try self.changedStateSlots(baseline, then_exit, else_exit);
-            defer changed_slots.deinit(self.ctx.allocator());
-            var generation_only_joins = try self.generationOnlyStateJoins(baseline, then_exit, else_exit);
-            defer generation_only_joins.deinit(self.ctx.allocator());
-            for (changed_slots.items) |slot| {
-                const first_state_value = if (then_exit) |exit|
-                    self.states.items[@backingInt(exit.state)].values.get(slot).?
-                else
-                    self.states.items[@backingInt(else_exit.?.state)].values.get(slot).?;
-                const second_state_value = if (else_exit) |exit|
-                    self.states.items[@backingInt(exit.state)].values.get(slot).?
-                else
-                    first_state_value;
-                _ = try self.appendBlockArgument(
-                    first_state_value.type_id,
-                    try self.joinGenerations(
-                        first_state_value.type_id,
-                        self.activeLifetimeSpan(),
-                        first_state_value.owned_generation,
-                        second_state_value.owned_generation,
-                    ),
-                );
-            }
-            const merge_block = try self.newBlock(argument_start, @intCast(self.block_arguments.items.len));
-            const then_predecessor = if (then_exit) |exit|
-                try self.setConditionalTerminator(merge_block, exit, result_type, changed_slots.items, needs_borrow_condition, needs_consumption_completion)
-            else
-                null;
-            const else_predecessor = if (else_exit) |exit|
-                try self.setConditionalTerminator(merge_block, exit, result_type, changed_slots.items, needs_borrow_condition, needs_consumption_completion)
-            else
-                null;
-
-            const output_state = try self.conditionalState(baseline, then_exit, else_exit, changed_slots.items, argument_start + @intFromBool(result_type != null) + @intFromBool(needs_borrow_condition) + @intFromBool(needs_consumption_completion));
-            if (constructed != null) if (joined_generation) |generation| {
-                if (then_exit) |exit| try self.recordGenerationOnlyForward(then_predecessor.?, 0, exit.value.owned_generation, generation);
-                if (else_exit) |exit| try self.recordGenerationOnlyForward(else_predecessor.?, 0, exit.value.owned_generation, generation);
-            };
-            for (generation_only_joins.items) |generation_join| {
-                var joined_value = self.states.items[@backingInt(output_state)].values.get(generation_join.slot).?;
-                joined_value.owned_generation = generation_join.destination;
-                try self.states.items[@backingInt(output_state)].values.set(self.ctx.allocator(), generation_join.slot, joined_value);
-                if (then_exit) |exit| try self.recordGenerationOnlyForward(
-                    then_predecessor.?,
-                    0,
-                    self.states.items[@backingInt(exit.state)].values.get(generation_join.slot).?.owned_generation,
-                    generation_join.destination,
-                );
-                if (else_exit) |exit| try self.recordGenerationOnlyForward(
-                    else_predecessor.?,
-                    0,
-                    self.states.items[@backingInt(exit.state)].values.get(generation_join.slot).?.owned_generation,
-                    generation_join.destination,
-                );
-            }
-            var contains_transfer = false;
-            var borrow_root: ?semantic.UnresolvedBody.LocalId = null;
-            var borrowed_source: ?structures.TypeId = null;
-            if (then_exit) |exit| {
-                contains_transfer = exit.value.explicit_transfer;
-                if (exit.value.borrowed_type) |source_type| {
-                    borrowed_source = source_type;
-                    borrow_root = exit.value.borrow_root;
-                }
-            }
-            if (else_exit) |exit| {
-                contains_transfer = contains_transfer or exit.value.explicit_transfer;
-                if (exit.value.borrowed_type) |source_type| {
-                    if (borrowed_source) |previous| {
-                        if (previous != source_type) borrowed_source = joined;
-                    } else {
-                        borrowed_source = source_type;
-                    }
-                    borrow_root = laterBorrowRoot(borrow_root, exit.value.borrow_root);
-                }
-            }
-            self.enterBlock(merge_block);
-            self.restoreState(output_state);
-            return self.withCleanupCondition(.{
-                .id = if (constructed) |storage| storage.id else @fromBackingInt(@intCast(argument_start)),
-                .type_id = joined,
-                .owned_generation = joined_generation,
-                .reference_origins = try self.mergeReferenceOrigins(
-                    if (then_exit) |exit| exit.value.reference_origins else null,
-                    if (else_exit) |exit| exit.value.reference_origins else null,
-                ),
-                .stable_reference_root = if (then_exit) |exit| if (else_exit) |other|
-                    sharedStableReferenceRoot(exit.value.stable_reference_root, other.value.stable_reference_root)
-                else
-                    exit.value.stable_reference_root else else_exit.?.value.stable_reference_root,
-                .borrowed_generation = joinedBorrowedGeneration(then_exit, else_exit),
-                .borrowed_cleanup_value = joinedBorrowedCleanupValue(then_exit, else_exit),
-                .borrowed_type = borrowed_source,
-                .borrow_condition = if (needs_borrow_condition) @fromBackingInt(@intCast(argument_start + 1)) else null,
-                .borrow_root = borrow_root,
-                .explicit_transfer = contains_transfer,
-                .preserves_storage = preserves_storage,
-                .consumption_completion = if (needs_consumption_completion) @fromBackingInt(@intCast(argument_start + @intFromBool(result_type != null) + @intFromBool(needs_borrow_condition))) else null,
-                .pending_consumption_owners = pending_consumption_owners,
-            });
+            var exits: std.ArrayList(FlowExit) = .empty;
+            defer exits.deinit(self.ctx.allocator());
+            if (then_exit) |exit| try exits.append(self.ctx.allocator(), exit);
+            if (else_exit) |exit| try exits.append(self.ctx.allocator(), exit);
+            const merged = try self.mergeExits(baseline, exits.items, mode, .branch);
+            try self.enterFlowExit(merged);
+            if (merged.constructed.?.type_id == .never) self.terminate(.diverge);
+            return merged.constructed.?;
         }
 
-        fn valueExit(self: *Self, result: ?Value) !?ValueExit {
+        fn valueExit(self: *Self, result: ?Value) !?FlowExit {
             const value_to_exit = result orelse return null;
             const state = try self.captureState();
-            return .{ .block = self.suspendBlock(), .state = state, .value = value_to_exit };
+            return .{ .block = self.suspendBlock(), .state = state, .constructed = value_to_exit };
         }
 
-        fn normalizeJoinedFields(self: *Self, first: anytype, second: @TypeOf(first)) !void {
-            for (self.field_places, 0..) |place, index| {
-                if (self.is_initializer_region and self.captured_locals[@backingInt(place.local)] != null) continue;
-                if (!place.moves_owner) continue;
-                const first_state = self.states.items[@backingInt(first.*.state)];
-                const second_state = self.states.items[@backingInt(second.*.state)];
-                const local_index = @backingInt(place.local);
-                if (first_state.availability[local_index] != .available or second_state.availability[local_index] != .available) continue;
-                const left = first_state.field_availability[index];
-                const right = second_state.field_availability[index];
-                if (left == right) continue;
-                if (left == .available and right == .transferred) {
-                    first.* = try self.endFieldBeforeJoin(first.*, place);
-                } else if (right == .available and left == .transferred) {
-                    second.* = try self.endFieldBeforeJoin(second.*, place);
-                } else {
-                    return self.reject(self.activeLifetimeSpan(), .partial_field_transfer_not_supported);
-                }
-            }
-        }
-
-        fn normalizeLoopBreakFields(self: *Self, breaks: []LoopBreak) !void {
+        fn normalizeJoinFields(self: *Self, exits: []FlowExit, policy: JoinPolicy) !void {
             for (self.field_places, 0..) |place, index| {
                 if (self.is_initializer_region and self.captured_locals[@backingInt(place.local)] != null) continue;
                 if (!place.moves_owner) continue;
                 const local_index = @backingInt(place.local);
                 var transferred = false;
-                for (breaks) |break_edge| {
-                    const state = self.states.items[@backingInt(break_edge.state)];
-                    if (state.availability[local_index] == .available and (state.field_availability[index] == .transferred or state.field_availability[index] == .replacing)) {
-                        transferred = true;
-                        break;
-                    }
+                var available = false;
+                var all_bound = true;
+                var first: ?Availability = null;
+                var different = false;
+                var unsupported = false;
+                for (exits) |exit| {
+                    const state = self.states.items[@backingInt(exit.state)];
+                    all_bound = all_bound and state.availability[local_index] == .available;
+                    if (state.availability[local_index] != .available) continue;
+                    const field = state.field_availability[index];
+                    if (first) |initial| different = different or initial != field else first = field;
+                    unsupported = unsupported or (field != .available and field != .transferred);
+                    transferred = transferred or field == .transferred or (policy == .loop and field == .replacing);
+                    available = available or field == .available;
                 }
-                if (!transferred) continue;
-                for (breaks) |*break_edge| {
-                    const state = self.states.items[@backingInt(break_edge.state)];
-                    if (state.availability[local_index] == .available and state.field_availability[index] == .available)
-                        break_edge.* = try self.endFieldBeforeJoin(break_edge.*, place);
+                if (policy != .loop and !all_bound) continue;
+                if (policy != .loop and different and unsupported) return self.reject(self.activeLifetimeSpan(), .partial_field_transfer_not_supported);
+                if (!transferred or !available) continue;
+                for (exits) |*exit| {
+                    const state = self.states.items[@backingInt(exit.state)];
+                    if (state.availability[local_index] != .available) continue;
+                    if (state.field_availability[index] == .available) exit.* = try self.endFieldBeforeJoin(exit.*, place);
                 }
             }
         }
@@ -7491,101 +6891,35 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             try self.recordConsume(field);
         }
 
-        fn changedStateSlots(
-            self: *Self,
-            baseline: StateId,
-            first: ?ValueExit,
-            second: ?ValueExit,
-        ) !std.ArrayList(u32) {
-            var slots: std.ArrayList(u32) = .empty;
-            errdefer slots.deinit(self.ctx.allocator());
-            if (first == null or second == null) return slots;
-            const baseline_state = self.states.items[@backingInt(baseline)].values;
-            const first_state = self.states.items[@backingInt(first.?.state)].values;
-            const second_state = self.states.items[@backingInt(second.?.state)].values;
-            for (0..baseline_state.len) |slot| {
-                const initial = baseline_state.get(slot);
-                if (initial == null) continue;
-                const left = first_state.get(slot);
-                const right = second_state.get(slot);
-                std.debug.assert(left != null and right != null);
-                std.debug.assert(left.?.type_id == right.?.type_id);
-                if (left.?.id != right.?.id) try slots.append(self.ctx.allocator(), @intCast(slot));
-            }
-            return slots;
-        }
-
-        fn generationOnlyStateJoins(
-            self: *Self,
-            baseline: StateId,
-            first: ?ValueExit,
-            second: ?ValueExit,
-        ) !std.ArrayList(GenerationOnlyJoin) {
-            var joins: std.ArrayList(GenerationOnlyJoin) = .empty;
-            errdefer joins.deinit(self.ctx.allocator());
-            if (first == null or second == null) return joins;
-            const baseline_state = self.states.items[@backingInt(baseline)].values;
-            const first_state = self.states.items[@backingInt(first.?.state)].values;
-            const second_state = self.states.items[@backingInt(second.?.state)].values;
-            for (0..baseline_state.len) |slot| {
-                const initial = baseline_state.get(slot);
-                if (initial == null) continue;
-                const left = first_state.get(slot);
-                const right = second_state.get(slot);
-                std.debug.assert(left != null and right != null);
-                if (left.?.id != right.?.id or left.?.owned_generation == right.?.owned_generation) continue;
-                const destination = (try self.joinGenerations(
-                    left.?.type_id,
-                    self.activeLifetimeSpan(),
-                    left.?.owned_generation,
-                    right.?.owned_generation,
-                )).?;
-                try joins.append(self.ctx.allocator(), .{ .slot = @intCast(slot), .destination = destination });
-            }
-            return joins;
-        }
-
-        fn joinedBorrowedGeneration(first: ?ValueExit, second: ?ValueExit) ?GenerationId {
-            const left = if (first) |exit| if (exit.value.borrowed_type != null) exit.value.borrowed_generation else null else null;
-            const right = if (second) |exit| if (exit.value.borrowed_type != null) exit.value.borrowed_generation else null else null;
-            if (left != null and right != null and left != right) return null;
-            return left orelse right;
-        }
-
-        fn joinedBorrowedCleanupValue(first: ?ValueExit, second: ?ValueExit) ?structures.FunctionValueId {
-            const left = if (first) |exit| if (exit.value.borrowed_type != null) exit.value.borrowed_cleanup_value else null else null;
-            const right = if (second) |exit| if (exit.value.borrowed_type != null) exit.value.borrowed_cleanup_value else null else null;
-            if (left != null and right != null and left != right) return null;
-            return left orelse right;
-        }
-
         fn sharedStableReferenceRoot(first: ?semantic.UnresolvedBody.LocalId, second: ?semantic.UnresolvedBody.LocalId) ?semantic.UnresolvedBody.LocalId {
             return if (first == second) first else null;
         }
 
-        fn setConditionalTerminator(
+        fn setJoinTerminator(
             self: *Self,
             target: structures.FunctionBlockId,
-            exit: ValueExit,
+            exit: FlowExit,
             result_type: ?structures.TypeId,
             changed_slots: []const u32,
             include_borrow_condition: bool,
             include_consumption_completion: bool,
         ) !structures.FunctionBlockId {
+            self.enterPendingBlock(exit.block);
+            self.restoreState(exit.state);
             if (!include_borrow_condition and !include_consumption_completion) {
-                self.setBlockTerminator(exit.block, .{ .branch = try self.conditionalBranch(target, exit, result_type, changed_slots, null, null) });
+                self.terminate(.{ .branch = try self.joinBranch(target, exit, result_type, changed_slots, null, null) });
                 return exit.block;
             }
             const argument_start: u32 = @intCast(self.block_arguments.items.len);
             const edge = try self.newBlock(argument_start, argument_start);
-            self.setBlockTerminator(exit.block, .{ .branch = self.emptyBranch(edge) });
+            self.terminate(.{ .branch = self.emptyBranch(edge) });
             self.enterBlock(edge);
-            const borrowed_on_path = if (include_borrow_condition) exit.value.borrow_condition orelse (try self.appendInstruction(.{
-                .const_bool = hasNonowningPath(exit.value),
+            const borrowed_on_path = if (include_borrow_condition) exit.constructed.?.borrow_condition orelse (try self.appendInstruction(.{
+                .const_bool = hasNonowningPath(exit.constructed.?),
             })).id else null;
             var completion: ?structures.FunctionValueId = null;
             if (include_consumption_completion) {
-                if (exit.value.consumption_completion) |selected| {
+                if (exit.constructed.?.consumption_completion) |selected| {
                     completion = selected;
                 } else {
                     const flag = try self.localStorage(.bool);
@@ -7594,14 +6928,14 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     completion = flag.id;
                 }
             }
-            self.terminate(.{ .branch = try self.conditionalBranch(target, exit, result_type, changed_slots, borrowed_on_path, completion) });
+            self.terminate(.{ .branch = try self.joinBranch(target, exit, result_type, changed_slots, borrowed_on_path, completion) });
             return edge;
         }
 
-        fn conditionalBranch(
+        fn joinBranch(
             self: *Self,
             target: structures.FunctionBlockId,
-            exit: ValueExit,
+            exit: FlowExit,
             result_type: ?structures.TypeId,
             changed_slots: []const u32,
             borrow_condition: ?structures.FunctionValueId,
@@ -7609,67 +6943,14 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         ) !structures.FunctionBranch {
             const start: u32 = @intCast(self.branch_arguments.items.len);
             if (result_type) |type_id| {
-                const result = (try self.coerceValue(exit.value.id, exit.value.type_id, type_id)) orelse unreachable;
-                try self.appendBranchArgument(result, exit.value.owned_generation);
+                const result = (try self.coerceValue(exit.constructed.?.id, exit.constructed.?.type_id, type_id)) orelse unreachable;
+                try self.appendBranchArgument(result, exit.constructed.?.owned_generation);
             }
             if (borrow_condition) |borrow_predicate| try self.appendBranchArgument(.{ .value = borrow_predicate }, null);
             if (consumption_completion) |completion| try self.appendBranchArgument(.{ .value = completion }, null);
             const state = self.states.items[@backingInt(exit.state)].values;
             for (changed_slots) |slot| try self.appendBranchArgument(.{ .value = state.get(slot).?.id }, state.get(slot).?.owned_generation);
             return .{ .target = target, .arguments = .{ .start = start, .end = @intCast(self.branch_arguments.items.len) } };
-        }
-
-        fn conditionalState(
-            self: *Self,
-            baseline: StateId,
-            first: ?ValueExit,
-            second: ?ValueExit,
-            changed_slots: []const u32,
-            argument_start: u32,
-        ) !StateId {
-            const source = if (first) |exit| exit.state else second.?.state;
-            const baseline_state = self.states.items[@backingInt(baseline)];
-            const source_state = self.states.items[@backingInt(source)];
-            var initial = source_state;
-            initial.values = baseline_state.values;
-            var state = try initial.clone(self.ctx.allocator());
-            errdefer state.deinit(self.ctx.allocator());
-            const values = state.values;
-            for (0..values.len) |slot| {
-                if (values.get(slot) != null) {
-                    var output = source_state.values.get(slot).?;
-                    if (first != null and second != null) {
-                        const left = self.states.items[@backingInt(first.?.state)].values.get(slot).?;
-                        const right = self.states.items[@backingInt(second.?.state)].values.get(slot).?;
-                        try self.mergeValueReferences(&output, left, right);
-                        output.storage_identity = try self.joinBindingIdentities(
-                            left.storage_identity orelse left.binding_identity,
-                            right.storage_identity orelse right.binding_identity,
-                        );
-                        output.binding_identity = if (std.meta.eql(left.binding_identity, right.binding_identity))
-                            left.binding_identity
-                        else
-                            try self.newBindingIdentity();
-                    }
-                    try values.set(self.ctx.allocator(), slot, output);
-                }
-            }
-            for (changed_slots, argument_start..) |slot, argument| {
-                const previous = values.get(slot).?;
-                try values.set(self.ctx.allocator(), slot, .{
-                    .id = @fromBackingInt(@intCast(argument)),
-                    .type_id = self.block_arguments.items[argument].type_id,
-                    .owned_generation = self.block_argument_generations.items[argument],
-                    .reference_origins = previous.reference_origins,
-                    .stable_reference_root = previous.stable_reference_root,
-                    .binding_identity = previous.binding_identity,
-                    .storage_identity = previous.storage_identity,
-                });
-            }
-            if (first != null and second != null) {
-                state.joinFlow(self.states.items[@backingInt(second.?.state)]);
-            }
-            return self.appendState(state);
         }
 
         fn joinAvailability(left: Availability, right: Availability) Availability {

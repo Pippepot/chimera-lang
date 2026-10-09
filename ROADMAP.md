@@ -17,7 +17,18 @@ is not a goal.
 - Runtime text output and fallible byte I/O through ordinary declarations.
   Define UTF-8 validation, failure, and cleanup; no ambient compile-time I/O.
 
-### 2. Ranges, List, and iteration
+### 2. Compile-time storage parity
+
+- Shared evaluation-local heap storage for allocation, element access, borrowing,
+  mutation, and deallocation. Box/List/Buffer execute ordinary library code.
+- Preserve allocation identity across nested calls, construction, failure cleanup,
+  and transient snapshots; prevent cached calls from sharing fresh allocations.
+  Define allocation failure and evaluation resource limits.
+- Verify repeated allocations, aliasing, partial construction, and cleanup against
+  runtime behavior. Initially return ordinary data from evaluation; diagnose
+  allocation-backed identities escaping into canonical values or runtime storage.
+
+### 3. Ranges, List, and iteration
 
 - Inclusive/exclusive ranges: endpoint types, direction, steps, empty ranges,
   overflow-safe termination, and library versus syntax responsibilities.
@@ -25,17 +36,17 @@ is not a goal.
 - An open `for` contract for ranges, collections, and user types. Start with
   read-only items; define mutation/consumption, loop results, and exit cleanup.
 
-### 3. Structural tuples
+### 4. Structural tuples
 
 - Tuple identity, type spelling, access, destructuring, layout, and elementwise
   ownership. Resolve grouping/singletons; support multiple results and Map items.
 
-### 4. Match
+### 5. Match
 
 - Single subject evaluation; literal, wildcard, binding, `pattern as name`, and
   `is Type` patterns. Diagnose redundancy and non-exhaustiveness.
 
-### 5. Numeric foundations
+### 6. Numeric foundations
 
 - Nondecimal integer literals and magnitudes beyond the current signed-64-bit
   literal representation; define spelling, typing, and range diagnostics.
@@ -44,7 +55,7 @@ is not a goal.
 - Float representation, literals, operations, conversions, and exceptional
   values before library math. Mixed operations and extra widths need decisions.
 
-### 6. Collections and algorithms
+### 7. Collections and algorithms
 
 - Map/Set hashing, equality, ordering, mutation, and ownership; Queue/Stack may
   reuse List. Build on storage and iteration contracts.
@@ -53,6 +64,8 @@ is not a goal.
 
 ## Deferred or independent
 
+- Publication of compile-time allocations into static/runtime storage: define
+  serialization, relocation, mutability, and ownership before allowing escape.
 - Local `static` bindings. Remove `comptime` only after verified equivalence
   across lexical scope, type-valued results, specialization, effects, and caching.
 - Type-level `where` proofs of initializer infallibility; retain one `init` mode.

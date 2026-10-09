@@ -6,6 +6,7 @@ Build clear, correct code with the least total machinery.
 
 - [syntax&semantics.txt](syntax&semantics.txt) is the incomplete language source of truth; [ARCHITECTURE.md](ARCHITECTURE.md) owns compiler/query boundaries and [ROADMAP.md](ROADMAP.md) owns priorities. State broader semantic interpretations before implementing them.
 - Solve the whole problem, not just the symptom. When a clean implementation needs stronger foundations, consider a focused change that also supports future work.
+- For simplification work, inspect the complete lifecycle and its consumers before choosing an abstraction. Look for stronger invariants that eliminate repair passes and repeated special cases.
 - Model all required shapes and independent semantic dimensions, not just the first syntax case. Keep expression structure separate from operation typing; avoid one-variant unions and redundant type fields.
 - Use Zig 0.17 APIs, verified with the local compiler. Prefer fully qualified names except familiar shorthand such as AST.
 - Keep switch arms at statement level; extract substantial arms into named functions.
