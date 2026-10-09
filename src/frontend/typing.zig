@@ -3,6 +3,7 @@ const structures = @import("../structures.zig");
 const semantic = @import("semantic.zig");
 const lifetime = @import("lifetime.zig");
 const flow_snapshot = @import("flow_snapshot.zig");
+const control_flow = @import("../control_flow.zig");
 
 const GenerationId = lifetime.GenerationId;
 const BoundaryId = lifetime.BoundaryId;
@@ -766,7 +767,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             try self.recordConsume(result);
             self.local_values[0].?.reference_origins = try self.mergeReferenceOrigins(
                 self.local_values[0].?.reference_origins,
-                try self.prefixReferenceOrigins(result.reference_origins, .element),
+                try self.transformReferenceOrigins(result.reference_origins, .{ .prefix = .element }),
             );
             try self.appendBoundary(boundary);
             self.current_boundary = null;
@@ -843,7 +844,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             if (array.length != 0) {
                 var origins = try self.copyResultOrigins(source);
                 if (capabilities.needs_custom_copy) try self.finishOwnershipEffects(source, &origins);
-                result.reference_origins = try self.prefixReferenceOrigins(origins, .element);
+                result.reference_origins = try self.transformReferenceOrigins(origins, .{ .prefix = .element });
             }
             try self.returnConstructed(result, span);
         }
@@ -1382,7 +1383,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             const argument_start: u32 = @intCast(self.call_arguments.items.len);
             if (operand) |runtime_operand| try self.call_arguments.append(self.ctx.allocator(), if (consuming) .{ .initializer = runtime_operand.id } else .{ .prepared = .{ .value = runtime_operand.id } });
             const origins = if (operand != null and try self.type_interner.canStoreBorrow(candidate.target_type))
-                try self.widenReferenceOrigins(if (consuming or try self.type_interner.facts().borrowElement(operand.?.type_id) != null) operand.?.reference_origins else try self.sourceReferenceOrigins(operand.?))
+                try self.transformReferenceOrigins(if (consuming or try self.type_interner.facts().borrowElement(operand.?.type_id) != null) operand.?.reference_origins else try self.sourceReferenceOrigins(operand.?), .widen)
             else
                 null;
             const empty_mut: u32 = @intCast(self.pending_mut_arguments.items.len);
@@ -1607,7 +1608,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             if (moves_owner and !mutable_parameter) try self.recordConsume(root);
             var field = root;
             for (fields) |part| {
-                const origins = try self.selectReferenceOrigins(field.reference_origins, .{ .field = part.index });
+                const origins = try self.transformReferenceOrigins(field.reference_origins, .{ .select = .{ .field = part.index } });
                 field = if (transfer == .consume)
                     try self.projectStorage(field, part.type_id, .{ .field = part.index })
                 else
@@ -1864,7 +1865,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             _ = try self.appendCoercion(use, destination.id);
             try self.recordConsume(member);
             var result = try self.defineOwnedValue(destination, span, false);
-            result.reference_origins = try self.prefixReferenceOrigins(member.reference_origins, .{ .variant = member.type_id });
+            result.reference_origins = try self.transformReferenceOrigins(member.reference_origins, .{ .prefix = .{ .variant = member.type_id } });
             return result;
         }
 
@@ -1898,7 +1899,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 if (field_value.type_id == .never) return field_value;
                 try fields.append(self.ctx.allocator(), field_value);
                 if (try self.type_interner.canStoreBorrow(field.type_id))
-                    reference_origins = try self.mergeReferenceOrigins(reference_origins, try self.prefixReferenceOrigins(field_value.reference_origins, .{ .field = field.index }));
+                    reference_origins = try self.mergeReferenceOrigins(reference_origins, try self.transformReferenceOrigins(field_value.reference_origins, .{ .prefix = .{ .field = field.index } }));
             }
             for (seen, 0..) |was_seen, field_index| if (!was_seen) return self.reject(initializer.type_span, .{ .missing_struct_initializer_field = .{
                 .type_id = type_id,
@@ -1968,7 +1969,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 const element = try self.construct(source.value, source.span, .{ .storage = element_storage, .site = .field });
                 if (element.type_id == .never) return element;
                 try completed.append(self.ctx.allocator(), element);
-                origins = try self.mergeReferenceOrigins(origins, try self.prefixReferenceOrigins(element.reference_origins, .element));
+                origins = try self.mergeReferenceOrigins(origins, try self.transformReferenceOrigins(element.reference_origins, .{ .prefix = .element }));
             }
             for (completed.items) |element| try self.recordConsume(element);
             var result = try self.defineOwnedValue(storage, expression.span, false);
@@ -2376,7 +2377,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     try self.validateMissingFieldParents(transfer.local, fields.items, span);
                     var projected = owner;
                     for (fields.items) |part| {
-                        const origins = try self.selectReferenceOrigins(projected.reference_origins, .{ .field = part.index });
+                        const origins = try self.transformReferenceOrigins(projected.reference_origins, .{ .select = .{ .field = part.index } });
                         projected = try self.projectStorage(projected, part.type_id, .{ .field = part.index });
                         projected.reference_origins = origins;
                     }
@@ -2445,10 +2446,10 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             const transformation = region.reference_transforms.items[index];
             const previous = try self.importInitializerTransforms(region, origins, transformation.previous);
             return switch (transformation.operation) {
-                .prefix => |step| self.prefixReferenceOrigins(previous, step),
-                .select => |step| self.selectReferenceOrigins(previous, step),
-                .exclude => |step| self.excludeReferenceOrigins(previous, step),
-                .widen => self.widenReferenceOrigins(previous),
+                .prefix => |step| self.transformReferenceOrigins(previous, .{ .prefix = step }),
+                .select => |step| self.transformReferenceOrigins(previous, .{ .select = step }),
+                .exclude => |step| self.transformReferenceOrigins(previous, .{ .exclude = step }),
+                .widen => self.transformReferenceOrigins(previous, .widen),
                 .read, .refresh => unreachable,
             };
         }
@@ -2834,7 +2835,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             if (!try self.type_interner.canStoreBorrow(source.type_id)) return null;
             const capabilities = (try self.type_interner.facts().ownershipCapabilities(source.type_id)) orelse return error.Unavailable;
             return if (capabilities.needs_custom_copy)
-                self.widenReferenceOrigins(try self.sourceReferenceOrigins(source))
+                self.transformReferenceOrigins(try self.sourceReferenceOrigins(source), .widen)
             else
                 source.reference_origins;
         }
@@ -2861,7 +2862,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             var moved = try self.defineOwnedValue(try self.moveValueBits(rawValue(source), destination), span, false);
             const capabilities = (try self.type_interner.facts().ownershipCapabilities(source.type_id)) orelse return error.Unavailable;
             moved.reference_origins = if (capabilities.needs_custom_move)
-                try self.widenReferenceOrigins(source.reference_origins)
+                try self.transformReferenceOrigins(source.reference_origins, .widen)
             else
                 source.reference_origins;
             if (capabilities.needs_custom_move) {
@@ -3063,7 +3064,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             if (array.length == 0) return;
             const array_loop = try self.beginArrayLoop(array.length, true);
             var element = try self.arrayElement(source, array_loop.index, array.element_type);
-            element.reference_origins = try self.selectReferenceOrigins(source.reference_origins, .element);
+            element.reference_origins = try self.transformReferenceOrigins(source.reference_origins, .{ .select = .element });
             try self.dropValue(element, can_deinit, span);
             try self.endArrayLoop(array_loop, true);
         }
@@ -3185,7 +3186,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 switch (operation) {
                     .drop => |drop| {
                         var extracted = try self.projectStorage(source, member, .variant);
-                        extracted.reference_origins = try self.selectReferenceOrigins(source.reference_origins, .{ .variant = member });
+                        extracted.reference_origins = try self.transformReferenceOrigins(source.reference_origins, .{ .select = .{ .variant = member } });
                         try self.dropValue(extracted, drop.can_deinit, drop.span);
                         self.terminate(.{ .branch = self.emptyBranch(join) });
                     },
@@ -3223,7 +3224,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                         field_index -= 1;
                         const field = definition.fields[field_index];
                         var field_value = try self.projectStorage(value_to_drop, field.type_id, .{ .field = @intCast(field_index) });
-                        field_value.reference_origins = try self.selectReferenceOrigins(value_to_drop.reference_origins, .{ .field = @intCast(field_index) });
+                        field_value.reference_origins = try self.transformReferenceOrigins(value_to_drop.reference_origins, .{ .select = .{ .field = @intCast(field_index) } });
                         try self.dropValue(field_value, can_deinit, span);
                     }
                 },
@@ -3598,7 +3599,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     owned;
                 try field_values.append(self.ctx.allocator(), field_value);
                 if (try self.type_interner.canStoreBorrow(field_value.type_id))
-                    reference_origins = try self.mergeReferenceOrigins(reference_origins, try self.prefixReferenceOrigins(field_value.reference_origins, .{ .field = field.index }));
+                    reference_origins = try self.mergeReferenceOrigins(reference_origins, try self.transformReferenceOrigins(field_value.reference_origins, .{ .prefix = .{ .field = field.index } }));
                 try fields.append(self.ctx.allocator(), .{ .field_index = field.index, .value = field_value.id });
             }
             for (seen, 0..) |was_seen, field_index| if (!was_seen) return self.reject(initializer.type_span, .{ .missing_struct_initializer_field = .{
@@ -3875,7 +3876,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     const source = try self.borrowValue(self.borrowLocalValue(place.local), operand_use.span);
                     var field = source;
                     for (place_fields.items[place.fields.start..]) |part| {
-                        const origins = try self.selectReferenceOrigins(field.reference_origins, .{ .field = part.index });
+                        const origins = try self.transformReferenceOrigins(field.reference_origins, .{ .select = .{ .field = part.index } });
                         field = try self.fieldView(field, part.index, part.type_id);
                         field.reference_origins = origins;
                     }
@@ -3891,7 +3892,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             if (operand.type_id == .never) return operand;
             const field = try self.resolvePlaceField(operand.type_id, name, operand_use.span, span);
             var result = try self.fieldView(operand, field.index, field.type_id);
-            result.reference_origins = try self.selectReferenceOrigins(operand.reference_origins, .{ .field = field.index });
+            result.reference_origins = try self.transformReferenceOrigins(operand.reference_origins, .{ .select = .{ .field = field.index } });
             result.binding_identity = operand.binding_identity;
             if (operand.borrowed_type != null) {
                 result.borrowed_type = field.type_id;
@@ -4670,7 +4671,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 return source.reference_origins;
             if (try self.type_interner.facts().variantMembers(source.type_id) != null) return source.reference_origins;
             const member = members[self.variant_coercion_tags.items[use.variant_tag_mapping.?.start]];
-            return self.prefixReferenceOrigins(source.reference_origins, .{ .variant = member });
+            return self.transformReferenceOrigins(source.reference_origins, .{ .prefix = .{ .variant = member } });
         }
 
         fn appendCoercion(self: *Self, use: structures.FunctionValueUse, destination: ?structures.FunctionValueId) !Value {
@@ -4990,7 +4991,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         fn fieldUpdateOrigins(self: *Self, root_origins: ?u32, fields: []const PlaceField, leaf_origins: ?u32) anyerror!?u32 {
             if (fields.len == 0) return leaf_origins;
             const step: @FieldType(ReferenceProjection, "step") = .{ .field = fields[0].index };
-            const field_origins = try self.fieldUpdateOrigins(try self.selectReferenceOrigins(root_origins, step), fields[1..], leaf_origins);
+            const field_origins = try self.fieldUpdateOrigins(try self.transformReferenceOrigins(root_origins, .{ .select = step }), fields[1..], leaf_origins);
             return self.replaceProjectedOrigins(root_origins, step, field_origins);
         }
 
@@ -5350,7 +5351,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     try argument_places.append(self.ctx.allocator(), null);
                     try argument_reference_origins.append(self.ctx.allocator(), initializer.reference_origins);
                     if (borrowed_return)
-                        reference_origins = try self.mergeReferenceOrigins(reference_origins, try self.widenReferenceOrigins(initializer.reference_origins));
+                        reference_origins = try self.mergeReferenceOrigins(reference_origins, try self.transformReferenceOrigins(initializer.reference_origins, .widen));
                     if (borrowed_mut_output) mut_reference_origins = try self.mergeReferenceOrigins(mut_reference_origins, initializer.reference_origins);
                     continue;
                 }
@@ -5417,9 +5418,9 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                         null;
                     if (contributes_to_return) {
                         const returned = if (extracts_box)
-                            try self.selectReferenceOrigins(origins, .element)
+                            try self.transformReferenceOrigins(origins, .{ .select = .element })
                         else
-                            try self.widenReferenceOrigins(origins);
+                            try self.transformReferenceOrigins(origins, .widen);
                         reference_origins = try self.mergeReferenceOrigins(reference_origins, returned);
                     }
                     if (borrowed_mut_output) mut_reference_origins = try self.mergeReferenceOrigins(mut_reference_origins, origins);
@@ -6071,99 +6072,52 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             const transformation = self.reference_transforms.items[index];
             const previous = try self.applyReferenceTransforms(origins, transformation.previous);
             return switch (transformation.operation) {
-                .prefix => |step| self.prefixReferenceOrigins(previous, step),
-                .select => |step| self.selectReferenceOrigins(previous, step),
-                .exclude => |step| self.excludeReferenceOrigins(previous, step),
-                .widen => self.widenReferenceOrigins(previous),
                 .read => |read| self.readReferenceOrigins(previous, read.state, read.instruction, false),
-                .refresh => |refresh| self.refreshStableOrigins(previous, refresh.root, refresh.previous, refresh.replacement),
+                else => self.transformReferenceOrigins(previous, transformation.operation),
             };
         }
 
-        fn prefixReferenceOrigins(self: *Self, origins: ?u32, step: @FieldType(ReferenceProjection, "step")) !?u32 {
-            var result: ?u32 = null;
-            var current = origins;
-            while (current) |index| {
-                var origin = self.reference_origins.items[index];
-                if (origin.loop != null or (self.is_initializer_region and origin.parameter != null and origin.root == null)) {
-                    try self.deferReferenceTransform(&origin, .{ .prefix = step });
-                } else {
-                    const projection: u32 = @intCast(self.reference_projections.items.len);
-                    try self.reference_projections.append(self.ctx.allocator(), .{ .step = step, .next = origin.projection });
-                    origin.projection = projection;
-                }
-                result = try self.addReferenceOrigin(result, origin);
-                current = origin.next;
-            }
-            return result;
-        }
-
-        fn selectReferenceOrigins(self: *Self, origins: ?u32, step: @FieldType(ReferenceProjection, "step")) !?u32 {
+        fn transformReferenceOrigins(self: *Self, origins: ?u32, operation: @FieldType(ReferenceTransform, "operation")) !?u32 {
+            std.debug.assert(operation != .read);
             var result: ?u32 = null;
             var current = origins;
             while (current) |index| {
                 var origin = self.reference_origins.items[index];
                 current = origin.next;
-                if (origin.loop != null or (self.is_initializer_region and origin.parameter != null and origin.root == null)) {
-                    try self.deferReferenceTransform(&origin, .{ .select = step });
-                } else if (origin.projection) |projection_index| {
-                    const projection = self.reference_projections.items[projection_index];
-                    if (!std.meta.eql(projection.step, step)) continue;
-                    origin.projection = projection.next;
+                const symbolic_parameter = self.is_initializer_region and origin.parameter != null and origin.root == null;
+                if (origin.loop != null or (operation != .refresh and symbolic_parameter)) {
+                    try self.deferReferenceTransform(&origin, operation);
+                } else switch (operation) {
+                    .prefix => |step| {
+                        const projection: u32 = @intCast(self.reference_projections.items.len);
+                        try self.reference_projections.append(self.ctx.allocator(), .{ .step = step, .next = origin.projection });
+                        origin.projection = projection;
+                    },
+                    .select => |step| if (origin.projection) |projection_index| {
+                        const projection = self.reference_projections.items[projection_index];
+                        if (!std.meta.eql(projection.step, step)) continue;
+                        origin.projection = projection.next;
+                    },
+                    .exclude => |step| if (origin.projection) |projection| {
+                        if (std.meta.eql(self.reference_projections.items[projection].step, step)) continue;
+                    },
+                    .refresh => |refresh| if (origin.root == refresh.root and origin.stable and std.meta.eql(origin.binding_identity, refresh.previous)) {
+                        origin.binding_identity = refresh.replacement;
+                    },
+                    .widen => {},
+                    .read => unreachable,
+                }
+                if (operation == .widen) {
+                    origin.projection = null;
+                    origin.stable = false;
                 }
                 result = try self.addReferenceOrigin(result, origin);
-            }
-            return result;
-        }
-
-        fn refreshStableOrigins(self: *Self, origins: ?u32, root: semantic.UnresolvedBody.LocalId, previous: BindingIdentity, replacement: BindingIdentity) !?u32 {
-            var result: ?u32 = null;
-            var current = origins;
-            while (current) |index| {
-                var origin = self.reference_origins.items[index];
-                if (origin.loop != null) {
-                    try self.deferReferenceTransform(&origin, .{ .refresh = .{ .root = root, .previous = previous, .replacement = replacement } });
-                } else if (origin.root == root and origin.stable and std.meta.eql(origin.binding_identity, previous)) {
-                    origin.binding_identity = replacement;
-                }
-                result = try self.addReferenceOrigin(result, origin);
-                current = origin.next;
             }
             return result;
         }
 
         fn replaceProjectedOrigins(self: *Self, origins: ?u32, step: @FieldType(ReferenceProjection, "step"), replacement: ?u32) !?u32 {
-            return self.mergeReferenceOrigins(try self.excludeReferenceOrigins(origins, step), try self.prefixReferenceOrigins(replacement, step));
-        }
-
-        fn excludeReferenceOrigins(self: *Self, origins: ?u32, step: @FieldType(ReferenceProjection, "step")) !?u32 {
-            var result: ?u32 = null;
-            var current = origins;
-            while (current) |index| {
-                var origin = self.reference_origins.items[index];
-                current = origin.next;
-                if (origin.loop != null or (self.is_initializer_region and origin.parameter != null and origin.root == null)) {
-                    try self.deferReferenceTransform(&origin, .{ .exclude = step });
-                } else if (origin.projection) |projection| {
-                    if (std.meta.eql(self.reference_projections.items[projection].step, step)) continue;
-                }
-                result = try self.addReferenceOrigin(result, origin);
-            }
-            return result;
-        }
-
-        fn widenReferenceOrigins(self: *Self, origins: ?u32) !?u32 {
-            var result: ?u32 = null;
-            var current = origins;
-            while (current) |index| {
-                var origin = self.reference_origins.items[index];
-                if (origin.loop != null or (self.is_initializer_region and origin.parameter != null and origin.root == null)) try self.deferReferenceTransform(&origin, .widen);
-                origin.projection = null;
-                origin.stable = false;
-                result = try self.addReferenceOrigin(result, origin);
-                current = origin.next;
-            }
-            return result;
+            return self.mergeReferenceOrigins(try self.transformReferenceOrigins(origins, .{ .exclude = step }), try self.transformReferenceOrigins(replacement, .{ .prefix = step }));
         }
 
         fn collectWritableReferences(self: *Self, value_to_check: Value, references: *std.ArrayList(Value)) anyerror!void {
@@ -6191,7 +6145,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 if (try self.type_interner.canStoreBorrow(access.element_type)) {
                     var element = value_to_check;
                     element.type_id = access.element_type;
-                    element.reference_origins = try self.selectReferenceOrigins(value_to_check.reference_origins, .element);
+                    element.reference_origins = try self.transformReferenceOrigins(value_to_check.reference_origins, .{ .select = .element });
                     try self.collectWritableReferencesAt(element, references, visiting, drop_fields);
                 }
                 return;
@@ -6199,7 +6153,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             if (try self.type_interner.facts().boxElement(value_to_check.type_id)) |element_type| {
                 var element = value_to_check;
                 element.type_id = element_type;
-                element.reference_origins = try self.selectReferenceOrigins(value_to_check.reference_origins, .element);
+                element.reference_origins = try self.transformReferenceOrigins(value_to_check.reference_origins, .{ .select = .element });
                 return self.collectWritableReferencesAt(element, references, visiting, drop_fields);
             }
             if (try self.type_interner.facts().allocationElement(value_to_check.type_id)) |element_type| {
@@ -6211,21 +6165,21 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 if (array.length == 0) return;
                 var element = value_to_check;
                 element.type_id = array.element_type;
-                element.reference_origins = try self.selectReferenceOrigins(value_to_check.reference_origins, .element);
+                element.reference_origins = try self.transformReferenceOrigins(value_to_check.reference_origins, .{ .select = .element });
                 return self.collectWritableReferencesAt(element, references, visiting, drop_fields);
             }
             if (try self.type_interner.structDefinition(value_to_check.type_id)) |definition| {
                 for (definition.fields, 0..) |field, index| {
                     var projected = value_to_check;
                     projected.type_id = field.type_id;
-                    projected.reference_origins = try self.selectReferenceOrigins(value_to_check.reference_origins, .{ .field = @intCast(index) });
+                    projected.reference_origins = try self.transformReferenceOrigins(value_to_check.reference_origins, .{ .select = .{ .field = @intCast(index) } });
                     try self.collectWritableReferencesAt(projected, references, visiting, drop_fields);
                 }
             } else if (try self.type_interner.facts().variantMembers(value_to_check.type_id)) |members| {
                 for (members) |member| {
                     var projected = value_to_check;
                     projected.type_id = member;
-                    projected.reference_origins = try self.selectReferenceOrigins(value_to_check.reference_origins, .{ .variant = member });
+                    projected.reference_origins = try self.transformReferenceOrigins(value_to_check.reference_origins, .{ .select = .{ .variant = member } });
                     try self.collectWritableReferencesAt(projected, references, visiting, drop_fields);
                 }
             }
@@ -6533,11 +6487,11 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                         other_value.*.?.reference_origins = try self.updatedRootOrigin(other_value.*.?.reference_origins, root, owner.binding_identity);
                 }
                 if (captured_handle != null)
-                    other_value.*.?.reference_origins = try self.refreshStableOrigins(other_value.*.?.reference_origins, root, previous_identity, owner.storage_identity orelse owner.binding_identity);
+                    other_value.*.?.reference_origins = try self.transformReferenceOrigins(other_value.*.?.reference_origins, .{ .refresh = .{ .root = root, .previous = previous_identity, .replacement = owner.storage_identity orelse owner.binding_identity } });
             }
             if (fresh_result_origins) |refresh| switch (refresh) {
                 .value => |origins| origins.* = try self.updatedRootOrigin(origins.*, root, owner.binding_identity),
-                .slots => |origins| origins.* = try self.refreshStableOrigins(origins.*, root, previous_identity, owner.storage_identity orelse owner.binding_identity),
+                .slots => |origins| origins.* = try self.transformReferenceOrigins(origins.*, .{ .refresh = .{ .root = root, .previous = previous_identity, .replacement = owner.storage_identity orelse owner.binding_identity } }),
             };
         }
 
@@ -6729,7 +6683,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             const owner_index = @backingInt(local);
             var owner = self.local_values[owner_index].?;
             if (!try self.type_interner.canStoreBorrow(owner.type_id)) return;
-            owner.reference_origins = try self.mergeReferenceOrigins(owner.reference_origins, try self.widenReferenceOrigins(origins));
+            owner.reference_origins = try self.mergeReferenceOrigins(owner.reference_origins, try self.transformReferenceOrigins(origins, .widen));
             self.local_values[owner_index] = owner;
             try self.writeCapturedLocal(local);
         }
@@ -6771,7 +6725,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             var current = root;
             for (fields) |field| {
                 try parents.append(self.ctx.allocator(), current);
-                const origins = try self.selectReferenceOrigins(current.reference_origins, .{ .field = field.index });
+                const origins = try self.transformReferenceOrigins(current.reference_origins, .{ .select = .{ .field = field.index } });
                 current = try self.appendInstruction(.{ .field_access = .{
                     .operand = current.id,
                     .field_index = field.index,
@@ -7172,7 +7126,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 extracted.reference_origins = if (try self.type_interner.facts().variantMembers(target_type) != null)
                     extraction.operand.reference_origins
                 else
-                    try self.selectReferenceOrigins(extraction.operand.reference_origins, .{ .variant = target_type });
+                    try self.transformReferenceOrigins(extraction.operand.reference_origins, .{ .select = .{ .variant = target_type } });
             }
             extracted.borrowed_type = target_type;
             extracted.borrowed_generation = extraction.operand.borrowed_generation orelse extraction.operand.owned_generation;
@@ -7966,7 +7920,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 if (absent) continue;
                 const field = definition.fields[field_index];
                 var child = try self.projectStorage(value_to_drop, field.type_id, .{ .field = @intCast(field_index) });
-                child.reference_origins = try self.selectReferenceOrigins(value_to_drop.reference_origins, .{ .field = @intCast(field_index) });
+                child.reference_origins = try self.transformReferenceOrigins(value_to_drop.reference_origins, .{ .select = .{ .field = @intCast(field_index) } });
                 if (nested.items.len != 0)
                     try self.dropValueExcluding(child, nested.items, can_deinit, span)
                 else
@@ -8046,7 +8000,17 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         }
 
         fn validateCleanupReferenceUses(self: *Self) !void {
-            if (self.drop_effects.count() == 0) return;
+            if (self.drop_effects.count() == 0 or self.reference_uses.items.len == 0) return;
+            var edges: std.ArrayList(control_flow.Edge) = .empty;
+            defer edges.deinit(self.ctx.allocator());
+            for (self.blocks.items, 0..) |block_value, predecessor| {
+                var terminator = block_value.terminator orelse unreachable;
+                for (terminator.successors(), 0..) |target, ordinal| if (target) |successor| {
+                    try edges.append(self.ctx.allocator(), .{ .predecessor = @fromBackingInt(@intCast(predecessor)), .successor = successor.*, .successor_ordinal = @intCast(ordinal) });
+                };
+            }
+            const graph = try control_flow.Index.init(self.ctx.allocator(), self.blocks.items.len, edges.items);
+            defer graph.deinit(self.ctx.allocator());
             for (self.reference_uses.items) |use| {
                 var incomplete = false;
                 var origins = try self.resolveReferenceOrigins(use.origins, &incomplete);
@@ -8055,7 +8019,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     const origin = self.reference_origins.items[index];
                     origins = origin.next;
                     if (origin.read == null) continue;
-                    if (try self.referenceCrossesDrop(origin, use.location)) return self.reject(use.span, if (origin.deferred_capture) .initializer_capture_conflict else .borrow_outlives_source);
+                    if (try self.referenceCrossesDrop(origin, use.location, graph, edges.items)) return self.reject(use.span, if (origin.deferred_capture) .initializer_capture_conflict else .borrow_outlives_source);
                 }
             }
         }
@@ -8083,7 +8047,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             return false;
         }
 
-        fn referenceCrossesDrop(self: *Self, origin: ReferenceOrigin, use: PendingReferenceUseLocation) !bool {
+        fn referenceCrossesDrop(self: *Self, origin: ReferenceOrigin, use: PendingReferenceUseLocation, graph: control_flow.Index, edges: []const control_flow.Edge) !bool {
             const Cursor = struct { block: structures.FunctionBlockId, end: usize, invalidated: bool = false };
             const start: Cursor = switch (use) {
                 .boundary => |location| blk: {
@@ -8120,13 +8084,10 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     invalidated = invalidated or try self.dropAffectsOrigin(item.instruction.id, origin);
                 }
                 if (reached_read) continue;
-                for (self.blocks.items, 0..) |predecessor, predecessor_index| {
-                    var terminator = predecessor.terminator.?;
-                    var reaches = false;
-                    for (terminator.successors()) |successor| if (successor) |target| {
-                        reaches = reaches or target.* == cursor.block;
-                    };
-                    if (reaches) try worklist.append(self.ctx.allocator(), .{ .block = @fromBackingInt(@intCast(predecessor_index)), .end = predecessor.items.items.len, .invalidated = invalidated });
+                var incoming = graph.blocks[block_index].first_incoming;
+                while (incoming) |edge| : (incoming = graph.previous_incoming[edge]) {
+                    const predecessor = edges[edge].predecessor;
+                    try worklist.append(self.ctx.allocator(), .{ .block = predecessor, .end = self.blocks.items[@backingInt(predecessor)].items.items.len, .invalidated = invalidated });
                 }
             }
             return false;
@@ -8451,12 +8412,6 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 if (self.publish_instruction_spans) terminator_spans[block_index] = build_block.terminator_span orelse unreachable;
             }
             std.debug.assert(instruction_index == self.instruction_count);
-            normalizeInstructions(instructions, instruction_values);
-            for (self.initializer_captures.items) |*capture| capture.* = normalizeValue(capture.*, instruction_values);
-            for (self.call_arguments.items) |*argument| argument.operand().* = normalizeValue(argument.operand().*, instruction_values);
-            for (self.struct_field_values.items) |*field| field.value = normalizeValue(field.value, instruction_values);
-            normalizeValueUses(self.branch_arguments.items, instruction_values);
-            normalizeTerminators(blocks, instruction_values);
             const block_arguments = try self.block_arguments.toOwnedSlice(gpa);
             errdefer gpa.free(block_arguments);
             const parameter_modes = try self.parameter_modes.toOwnedSlice(gpa);
@@ -8496,16 +8451,10 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 .blocks = blocks,
                 .entry = @fromBackingInt(@intCast(0)),
             };
+            body.visitValueReferences(instruction_values, normalizeValueReference);
             return body;
         }
     };
-}
-
-fn normalizeValue(value: structures.FunctionValueId, instruction_values: []const structures.FunctionValueId) structures.FunctionValueId {
-    const instruction_mask: u32 = 1 << 31;
-    const raw = @backingInt(value);
-    if (raw & instruction_mask == 0) return value;
-    return instruction_values[raw & ~instruction_mask];
 }
 
 /// Only actual reads capture caller storage. Preparing unused captures would
@@ -8517,20 +8466,10 @@ fn pruneInitializerCaptures(body: *structures.FunctionBodyAnalysis, gpa: std.mem
     const used = try gpa.alloc(bool, body.valueCount());
     defer gpa.free(used);
     @memset(used, false);
-    for (body.instructions) |original| {
-        var instruction = original;
-        for (instruction.operands()) |maybe_operand| if (maybe_operand) |operand| {
-            used[@backingInt(operand.*)] = true;
-        };
-        if (instruction == .mut_parameter_write) used[instruction.mut_parameter_write.parameter_index] = true;
-    }
-    for (body.blocks) |*block| for (block.terminator.operands()) |maybe_operand| {
-        if (maybe_operand) |operand| used[@backingInt(operand.*)] = true;
+    body.visitValueReferences(used, markValueUsed);
+    for (body.instructions) |instruction| if (instruction == .mut_parameter_write) {
+        used[instruction.mut_parameter_write.parameter_index] = true;
     };
-    for (body.call_arguments) |argument| used[@backingInt(argument.valueId())] = true;
-    for (body.branch_arguments) |argument| used[@backingInt(argument.value)] = true;
-    for (body.struct_field_values) |field| used[@backingInt(field.value)] = true;
-    for (body.initializer_captures) |capture| used[@backingInt(capture)] = true;
     var kept: std.ArrayList(u32) = .empty;
     defer kept.deinit(gpa);
     for (used[0..capture_count], 0..) |is_used, index| if (is_used) {
@@ -8552,26 +8491,15 @@ fn pruneInitializerCaptures(body: *structures.FunctionBodyAnalysis, gpa: std.mem
     }
     @memcpy(arguments[kept_captures.len..], body.block_arguments[capture_count..]);
     for (capture_count..remap.len) |index| remap[index] = @fromBackingInt(@intCast(index - removed));
-    for (body.instructions) |*instruction| {
-        for (instruction.operands()) |maybe_operand| {
-            if (maybe_operand) |operand| operand.* = remap[@backingInt(operand.*)];
-        }
-        if (instruction.* == .mut_parameter_write) {
-            const write = &instruction.mut_parameter_write;
-            write.parameter_index = @backingInt(remap[write.parameter_index]);
-        }
-    }
+    body.visitValueReferences(remap, remapValueReference);
+    for (body.instructions) |*instruction| if (instruction.* == .mut_parameter_write) {
+        const write = &instruction.mut_parameter_write;
+        write.parameter_index = @backingInt(remap[write.parameter_index]);
+    };
     for (body.blocks, 0..) |*block, index| {
-        for (block.terminator.operands()) |maybe_operand| if (maybe_operand) |operand| {
-            operand.* = remap[@backingInt(operand.*)];
-        };
         if (index != @backingInt(body.entry)) block.argument_start -= removed;
         block.argument_end -= removed;
     }
-    for (body.call_arguments) |*argument| argument.operand().* = remap[@backingInt(argument.valueId())];
-    for (body.branch_arguments) |*argument| argument.value = remap[@backingInt(argument.value)];
-    for (body.struct_field_values) |*field| field.value = remap[@backingInt(field.value)];
-    for (body.initializer_captures) |*capture| capture.* = remap[@backingInt(capture.*)];
     gpa.free(body.block_arguments);
     gpa.free(body.parameter_modes);
     body.block_arguments = arguments;
@@ -8579,28 +8507,18 @@ fn pruneInitializerCaptures(body: *structures.FunctionBodyAnalysis, gpa: std.mem
     return kept_captures;
 }
 
-fn normalizeValueUse(value_use: *structures.FunctionValueUse, instruction_values: []const structures.FunctionValueId) void {
-    value_use.value = normalizeValue(value_use.value, instruction_values);
+fn markValueUsed(used: []bool, value: *structures.FunctionValueId) void {
+    used[@backingInt(value.*)] = true;
 }
 
-fn normalizeValueUses(value_uses: []structures.FunctionValueUse, instruction_values: []const structures.FunctionValueId) void {
-    for (value_uses) |*value_use| normalizeValueUse(value_use, instruction_values);
+fn remapValueReference(mapping: []const structures.FunctionValueId, value: *structures.FunctionValueId) void {
+    value.* = mapping[@backingInt(value.*)];
 }
 
-fn normalizeInstructions(instructions: []structures.FunctionInstruction, instruction_values: []const structures.FunctionValueId) void {
-    for (instructions) |*instruction| {
-        for (instruction.operands()) |maybe_operand| {
-            if (maybe_operand) |operand| operand.* = normalizeValue(operand.*, instruction_values);
-        }
-    }
-}
-
-fn normalizeTerminators(blocks: []structures.FunctionBlock, instruction_values: []const structures.FunctionValueId) void {
-    for (blocks) |*block_value| {
-        for (block_value.terminator.operands()) |maybe_operand| {
-            if (maybe_operand) |operand| operand.* = normalizeValue(operand.*, instruction_values);
-        }
-    }
+fn normalizeValueReference(mapping: []const structures.FunctionValueId, value: *structures.FunctionValueId) void {
+    const instruction_mask: u32 = 1 << 31;
+    const raw = @backingInt(value.*);
+    if (raw & instruction_mask != 0) value.* = mapping[raw & ~instruction_mask];
 }
 
 fn intersectTypes(

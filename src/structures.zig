@@ -1,4 +1,5 @@
 const std = @import("std");
+const value_operations = @import("value.zig");
 
 // Shared compiler structures.
 //
@@ -330,14 +331,9 @@ pub const Ast = struct {
 pub const Executable = struct {
     bytes: []const u8,
 
-    pub fn eql(a: Executable, b: Executable) bool {
-        return std.mem.eql(u8, a.bytes, b.bytes);
-    }
+    pub const eql = value_operations.Owned(@This()).eql;
 
-    pub fn deinit(self: *Executable, gpa: std.mem.Allocator) void {
-        gpa.free(self.bytes);
-        self.* = undefined;
-    }
+    pub const deinit = value_operations.Owned(@This()).deinit;
 };
 
 pub const FileId = u64;
@@ -374,10 +370,7 @@ pub const ItemLoc = struct {
     kind: ItemKind,
     name: []const u8,
 
-    pub fn eql(a: ItemLoc, b: ItemLoc) bool {
-        return std.meta.eql(a.origin, b.origin) and a.owner == b.owner and
-            a.source_site == b.source_site and a.is_hook == b.is_hook and a.kind == b.kind and std.mem.eql(u8, a.name, b.name);
-    }
+    pub const eql = value_operations.Owned(@This()).eql;
 };
 
 pub const DiscoveredItem = struct {
@@ -392,29 +385,10 @@ pub const ItemTree = struct {
     file_id: FileId,
     items: []DiscoveredItem,
 
-    pub fn eql(a: ItemTree, b: ItemTree) bool {
-        if (a.file_id != b.file_id or a.items.len != b.items.len) return false;
-        for (a.items, b.items) |left, right| {
-            if (!ItemLoc.eql(left.loc, right.loc) or left.declaration != right.declaration or left.parent != right.parent or
-                !optionalStringEql(left.qualified_owner, right.qualified_owner) or left.is_public != right.is_public) return false;
-        }
-        return true;
-    }
+    pub const eql = value_operations.Owned(@This()).eql;
 
-    pub fn deinit(self: *ItemTree, gpa: std.mem.Allocator) void {
-        for (self.items) |item| {
-            gpa.free(item.loc.name);
-            if (item.qualified_owner) |owner| gpa.free(owner);
-        }
-        gpa.free(self.items);
-        self.* = undefined;
-    }
+    pub const deinit = value_operations.Owned(@This()).deinit;
 };
-
-fn optionalStringEql(a: ?[]const u8, b: ?[]const u8) bool {
-    if (a == null or b == null) return a == null and b == null;
-    return std.mem.eql(u8, a.?, b.?);
-}
 
 pub const ItemIndex = struct {
     file_id: FileId,
@@ -477,19 +451,9 @@ pub const ModuleScope = struct {
         return self.entries[index];
     }
 
-    pub fn eql(a: ModuleScope, b: ModuleScope) bool {
-        if (a.entries.len != b.entries.len) return false;
-        for (a.entries, b.entries) |left, right| {
-            if (left.item_id != right.item_id or left.kind != right.kind or left.is_public != right.is_public or !std.mem.eql(u8, left.name, right.name)) return false;
-        }
-        return true;
-    }
+    pub const eql = value_operations.Owned(@This()).eql;
 
-    pub fn deinit(self: *ModuleScope, gpa: std.mem.Allocator) void {
-        for (self.entries) |entry| gpa.free(entry.name);
-        gpa.free(self.entries);
-        self.* = undefined;
-    }
+    pub const deinit = value_operations.Owned(@This()).deinit;
 };
 
 pub const ModuleItemIndex = struct {
@@ -506,23 +470,16 @@ pub const ModuleItemIndex = struct {
         return self.entries[index].location;
     }
 
-    pub fn eql(a: ModuleItemIndex, b: ModuleItemIndex) bool {
-        return sliceItemsEql(Entry, a.entries, b.entries);
-    }
+    pub const eql = value_operations.Owned(@This()).eql;
 
-    pub fn deinit(self: *ModuleItemIndex, gpa: std.mem.Allocator) void {
-        gpa.free(self.entries);
-        self.* = undefined;
-    }
+    pub const deinit = value_operations.Owned(@This()).deinit;
 };
 
 pub const ImportName = struct {
     spelling: []const u8,
     span: SourceSpan,
 
-    pub fn eql(a: ImportName, b: ImportName) bool {
-        return std.mem.eql(u8, a.spelling, b.spelling) and std.meta.eql(a.span, b.span);
-    }
+    pub const eql = value_operations.Owned(@This()).eql;
 };
 
 /// Collected syntax owns every spelling; null and empty selections are distinct.
@@ -534,48 +491,17 @@ pub const ImportDeclaration = struct {
 
     pub const Selection = struct { original: ImportName, bound: ImportName };
 
-    pub fn deinit(self: *ImportDeclaration, gpa: std.mem.Allocator) void {
-        gpa.free(self.path.spelling);
-        if (self.alias) |alias| gpa.free(alias.spelling);
-        if (self.selective) |items| {
-            for (items) |item| {
-                gpa.free(item.original.spelling);
-                gpa.free(item.bound.spelling);
-            }
-            gpa.free(items);
-        }
-        self.* = undefined;
-    }
+    pub const deinit = value_operations.Owned(@This()).deinit;
 
-    pub fn eql(a: ImportDeclaration, b: ImportDeclaration) bool {
-        if (!ImportName.eql(a.path, b.path) or a.is_public != b.is_public) return false;
-        if ((a.alias == null) != (b.alias == null)) return false;
-        if (a.alias) |alias| if (!ImportName.eql(alias, b.alias.?)) return false;
-        if ((a.selective == null) != (b.selective == null)) return false;
-        if (a.selective) |items| {
-            if (items.len != b.selective.?.len) return false;
-            for (items, b.selective.?) |left, right| {
-                if (!ImportName.eql(left.original, right.original) or !ImportName.eql(left.bound, right.bound)) return false;
-            }
-        }
-        return true;
-    }
+    pub const eql = value_operations.Owned(@This()).eql;
 };
 
 pub const ImportDeclarations = struct {
     entries: []ImportDeclaration,
 
-    pub fn eql(a: ImportDeclarations, b: ImportDeclarations) bool {
-        if (a.entries.len != b.entries.len) return false;
-        for (a.entries, b.entries) |left, right| if (!ImportDeclaration.eql(left, right)) return false;
-        return true;
-    }
+    pub const eql = value_operations.Owned(@This()).eql;
 
-    pub fn deinit(self: *ImportDeclarations, gpa: std.mem.Allocator) void {
-        for (self.entries) |*entry| entry.deinit(gpa);
-        gpa.free(self.entries);
-        self.* = undefined;
-    }
+    pub const deinit = value_operations.Owned(@This()).deinit;
 };
 
 pub const NamespaceBinding = struct { module: ModuleId, members_visible: bool = true };
@@ -602,21 +528,9 @@ pub const FileImports = struct {
     modules: []ModuleId,
     imports: []FileImport,
 
-    pub fn eql(a: FileImports, b: FileImports) bool {
-        if (!std.mem.eql(ModuleId, a.modules, b.modules)) return false;
-        if (a.imports.len != b.imports.len) return false;
-        for (a.imports, b.imports) |left, right| {
-            if (!std.mem.eql(u8, left.name, right.name) or left.reexport != right.reexport or !std.meta.eql(left.target, right.target)) return false;
-        }
-        return true;
-    }
+    pub const eql = value_operations.Owned(@This()).eql;
 
-    pub fn deinit(self: *FileImports, gpa: std.mem.Allocator) void {
-        for (self.imports) |binding| gpa.free(binding.name);
-        gpa.free(self.imports);
-        gpa.free(self.modules);
-        self.* = undefined;
-    }
+    pub const deinit = value_operations.Owned(@This()).deinit;
 };
 
 pub const ResolvedItem = struct {
@@ -757,11 +671,7 @@ pub const CallableType = struct {
         return sliceItemsEql(CallableParameter, a.parameters, b.parameters);
     }
 
-    pub fn eql(a: CallableType, b: CallableType) bool {
-        return a.return_type == b.return_type and
-            a.is_fallible == b.is_fallible and
-            a.parametersEql(b);
-    }
+    pub const eql = value_operations.Owned(@This()).eql;
 
     pub fn clone(self: CallableType, gpa: std.mem.Allocator) !CallableType {
         var cloned = self;
@@ -769,10 +679,7 @@ pub const CallableType = struct {
         return cloned;
     }
 
-    pub fn deinit(self: *CallableType, gpa: std.mem.Allocator) void {
-        gpa.free(self.parameters);
-        self.* = undefined;
-    }
+    pub const deinit = value_operations.Owned(@This()).deinit;
 };
 
 pub const GeneratedStructIdentity = struct {
@@ -843,22 +750,9 @@ pub const StructDefinition = struct {
         return null;
     }
 
-    pub fn eql(a: StructDefinition, b: StructDefinition) bool {
-        if (a.fields.len != b.fields.len or !std.meta.eql(a.ownership, b.ownership) or a.is_static != b.is_static) return false;
-        for (a.fields, b.fields) |left, right| {
-            if (left.type_id != right.type_id or
-                left.is_public != right.is_public or
-                !std.meta.eql(left.span, right.span) or
-                !std.mem.eql(u8, left.name, right.name)) return false;
-        }
-        return true;
-    }
+    pub const eql = value_operations.Owned(@This()).eql;
 
-    pub fn deinit(self: *StructDefinition, gpa: std.mem.Allocator) void {
-        for (self.fields) |field| gpa.free(field.name);
-        gpa.free(self.fields);
-        self.* = undefined;
-    }
+    pub const deinit = value_operations.Owned(@This()).deinit;
 };
 
 pub const StructOwnershipProperties = struct {
@@ -879,14 +773,9 @@ pub const StructLayout = struct {
     layout: TypeLayout,
     field_offsets: []u32,
 
-    pub fn eql(a: StructLayout, b: StructLayout) bool {
-        return std.meta.eql(a.layout, b.layout) and std.mem.eql(u32, a.field_offsets, b.field_offsets);
-    }
+    pub const eql = value_operations.Owned(@This()).eql;
 
-    pub fn deinit(self: *StructLayout, gpa: std.mem.Allocator) void {
-        gpa.free(self.field_offsets);
-        self.* = undefined;
-    }
+    pub const deinit = value_operations.Owned(@This()).deinit;
 };
 
 pub const MoveCapability = enum {
@@ -1102,16 +991,9 @@ pub const FunctionShape = struct {
     is_fallible: bool = false,
     parameters: []const FunctionParameterShape,
 
-    pub fn eql(a: FunctionShape, b: FunctionShape) bool {
-        return a.returns_type == b.returns_type and
-            a.is_fallible == b.is_fallible and
-            sliceItemsEql(FunctionParameterShape, a.parameters, b.parameters);
-    }
+    pub const eql = value_operations.Owned(@This()).eql;
 
-    pub fn deinit(self: *FunctionShape, gpa: std.mem.Allocator) void {
-        gpa.free(self.parameters);
-        self.* = undefined;
-    }
+    pub const deinit = value_operations.Owned(@This()).deinit;
 };
 
 pub const FunctionCall = struct {
@@ -1363,52 +1245,29 @@ pub const FunctionBodyAnalysis = struct {
         return self.block_arguments.len + self.instructions.len;
     }
 
+    /// Visits stored operands in this body, including side tables and destinations.
+    /// Parameter targets and nested regions have independent identities.
+    pub fn visitValueReferences(self: @This(), context: anytype, comptime visit: anytype) void {
+        for (self.instructions) |*instruction| for (instruction.operands()) |operand| {
+            if (operand) |value| visit(context, value);
+        };
+        for (self.blocks) |*block| for (block.terminator.operands()) |operand| {
+            if (operand) |value| visit(context, value);
+        };
+        for (self.call_arguments) |*argument| visit(context, argument.operand());
+        for (self.branch_arguments) |*argument| visit(context, &argument.value);
+        for (self.struct_field_values) |*field| visit(context, &field.value);
+        for (self.initializer_captures) |*capture| visit(context, capture);
+    }
+
     pub fn hasFailureExit(self: @This()) bool {
         for (self.blocks) |block| if (block.terminator == .return_failure) return true;
         return false;
     }
 
-    pub fn eql(a: @This(), b: @This()) bool {
-        if (a.entry != b.entry or
-            a.return_type != b.return_type or
-            a.is_fallible != b.is_fallible or
-            a.is_initializer_region != b.is_initializer_region or
-            a.initializer_regions.len != b.initializer_regions.len or
-            !std.mem.eql(FunctionValueId, a.initializer_captures, b.initializer_captures) or
-            !std.mem.eql(ParameterMode, a.parameter_modes, b.parameter_modes) or
-            !sliceItemsEql(FunctionBlockArgument, a.block_arguments, b.block_arguments) or
-            !std.mem.eql(u32, a.variant_coercion_tags, b.variant_coercion_tags) or
-            !sliceItemsEql(StructFieldValue, a.struct_field_values, b.struct_field_values) or
-            !std.mem.eql(u32, a.borrow_fields, b.borrow_fields) or
-            !sliceItemsEql(FunctionValueUse, a.branch_arguments, b.branch_arguments) or
-            !sliceItemsEql(FunctionCallArgument, a.call_arguments, b.call_arguments) or
-            !sliceItemsEql(Instruction, a.instructions, b.instructions) or
-            !sliceItemsEql(SourceSpan, a.instruction_spans, b.instruction_spans) or
-            !sliceItemsEql(SourceSpan, a.terminator_spans, b.terminator_spans) or
-            !sliceItemsEql(Block, a.blocks, b.blocks)) return false;
-        for (a.initializer_regions, b.initializer_regions) |left, right| {
-            if (!eql(left, right)) return false;
-        }
-        return true;
-    }
+    pub const eql = value_operations.Owned(@This()).eql;
 
-    pub fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
-        gpa.free(self.parameter_modes);
-        gpa.free(self.block_arguments);
-        gpa.free(self.variant_coercion_tags);
-        gpa.free(self.struct_field_values);
-        gpa.free(self.borrow_fields);
-        gpa.free(self.branch_arguments);
-        gpa.free(self.call_arguments);
-        for (self.initializer_regions) |*region| region.deinit(gpa);
-        gpa.free(self.initializer_regions);
-        gpa.free(self.initializer_captures);
-        gpa.free(self.instructions);
-        gpa.free(self.instruction_spans);
-        gpa.free(self.terminator_spans);
-        gpa.free(self.blocks);
-        self.* = undefined;
-    }
+    pub const deinit = value_operations.Owned(@This()).deinit;
 };
 
 /// Callable-instance key. Static argument tuples are interned separately so
@@ -1442,14 +1301,9 @@ pub const CompileTimeCallKey = struct {
 pub const ReachableInstances = struct {
     instances: []const InstanceId,
 
-    pub fn eql(a: ReachableInstances, b: ReachableInstances) bool {
-        return sliceItemsEql(InstanceId, a.instances, b.instances);
-    }
+    pub const eql = value_operations.Owned(@This()).eql;
 
-    pub fn deinit(self: *ReachableInstances, gpa: std.mem.Allocator) void {
-        gpa.free(self.instances);
-        self.* = undefined;
-    }
+    pub const deinit = value_operations.Owned(@This()).deinit;
 };
 
 pub const CompiledFunction = struct {
@@ -1476,19 +1330,9 @@ pub const CompiledFunction = struct {
         addend: i64,
     };
 
-    pub fn eql(a: CompiledFunction, b: CompiledFunction) bool {
-        return a.required_alignment == b.required_alignment and
-            std.mem.eql(u8, a.code, b.code) and
-            sliceItemsEql(Relocation, a.relocations, b.relocations) and
-            sliceItemsEql(InstanceId, a.referenced_instances, b.referenced_instances);
-    }
+    pub const eql = value_operations.Owned(@This()).eql;
 
-    pub fn deinit(self: *CompiledFunction, gpa: std.mem.Allocator) void {
-        gpa.free(self.code);
-        gpa.free(self.relocations);
-        gpa.free(self.referenced_instances);
-        self.* = undefined;
-    }
+    pub const deinit = value_operations.Owned(@This()).deinit;
 };
 
 pub const SourceSpan = struct {

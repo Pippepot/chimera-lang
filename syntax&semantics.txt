@@ -1,5 +1,5 @@
 # Language syntax and semantics
-# Source of truth for the language, but incomplete. ROADMAP.md tracks support.
+# Source of truth for the language, but incomplete. ROADMAP.md tracks planned work.
 # Unspecified behavior remains open; parser or legacy behavior does not define it.
 # Examples are independent; undeclared names stand for surrounding context.
 # Everything after '#' to the end of a line is a comment.

@@ -275,7 +275,14 @@ fn writeTypeInner(types: anytype, writer: *std.Io.Writer, type_id: structures.Ty
     }
 }
 
-fn writeMismatch(types: anytype, writer: *std.Io.Writer, mismatch: structures.Diagnostic.TypeMismatch) !void {
+fn writeTypedMessage(types: anytype, writer: *std.Io.Writer, prefix: []const u8, type_id: structures.TypeId, suffix: []const u8) !void {
+    try writer.writeAll(prefix);
+    try writeType(types, writer, type_id);
+    try writer.writeAll(suffix);
+}
+
+fn writeMismatch(types: anytype, writer: *std.Io.Writer, prefix: []const u8, mismatch: structures.Diagnostic.TypeMismatch) !void {
+    try writer.writeAll(prefix);
     try writer.writeAll("expected ");
     try writeType(types, writer, mismatch.expected);
     try writer.writeAll(", found ");
@@ -405,10 +412,7 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
                 .drop => try writer.writeAll("; expected `trivial`, `fieldwise`, `explicit`, or a hook function"),
             }
         },
-        .struct_ownership_hook_signature_mismatch => |mismatch| {
-            try writer.writeAll("struct ownership hook signature mismatch: ");
-            try writeMismatch(types, writer, mismatch);
-        },
+        .struct_ownership_hook_signature_mismatch => |mismatch| try writeMismatch(types, writer, "struct ownership hook signature mismatch: ", mismatch),
         .struct_ownership_property_incompatible_with_fields => |reason| switch (reason) {
             .trivial_move => try writer.writeAll("`move = trivial` requires every field to be trivially movable"),
             .fieldwise_move => try writer.writeAll("`move = fieldwise` requires every field to be movable"),
@@ -419,10 +423,7 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
         },
         .struct_field_type_not_supported => try writer.writeAll("this struct field type is not supported yet"),
         .recursive_struct_containment => try writeSourceLabel(writer, "struct recursively contains itself by value through field", source, span),
-        .static_initializer_type_mismatch => |mismatch| {
-            try writer.writeAll("static initializer type mismatch: ");
-            try writeMismatch(types, writer, mismatch);
-        },
+        .static_initializer_type_mismatch => |mismatch| try writeMismatch(types, writer, "static initializer type mismatch: ", mismatch),
         .type_value_used_as_runtime_value => try writeSourceLabel(writer, "expected a value, found a type", source, span),
         .value_used_as_type => try writeSourceLabel(writer, "expected a type, found a value", source, span),
         .type_factory_requires_call => try writeSourceLabel(writer, "call this type-producing function to obtain a type", source, span),
@@ -481,11 +482,7 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
         .replaced_value_used => try writer.writeAll("cannot use this value while it is replaced in its own storage; its type cannot move directly, so read or transfer it before the replacement"),
         .consumed_storage_in_use => try writer.writeAll("cannot overwrite storage retained by a pending `deinit` argument; replace it after the call completes"),
         .borrow_outlives_source => try writer.writeAll("borrow cannot outlive the value or storage it references"),
-        .compile_time_only_type => |type_id| {
-            try writer.writeAll("compile-time-only type ");
-            try writeType(types, writer, type_id);
-            try writer.writeAll(" cannot be materialized during runtime execution");
-        },
+        .compile_time_only_type => |type_id| try writeTypedMessage(types, writer, "compile-time-only type ", type_id, " cannot be materialized during runtime execution"),
         .ambiguous_conversion => |mismatch| {
             try writer.writeAll("multiple conversions apply from ");
             try writeType(types, writer, mismatch.found);
@@ -496,86 +493,38 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
         .invalid_converter_owner => try writer.writeAll("converter must be declared in the defining module of its source or target type"),
         .borrow_requires_place => try writer.writeAll("borrowing a value's storage requires a named local or parameter, or one of its fields"),
         .mutable_borrow_requires_writable_place => try writer.writeAll("`borrow mut` requires a mutable place or writable Ref"),
-        .dereference_requires_ref => |type_id| {
-            try writer.writeAll("dereference requires a Ref, found ");
-            try writeType(types, writer, type_id);
-        },
+        .dereference_requires_ref => |type_id| try writeTypedMessage(types, writer, "dereference requires a Ref, found ", type_id, ""),
         .reference_not_writable => try writer.writeAll("cannot assign through a read-only Ref"),
         .transferred_value_not_restored_before_loop_backedge => try writer.writeAll("transferred value must be reassigned before the next loop iteration"),
-        .type_not_movable => |type_id| {
-            try writer.writeAll("cannot transfer value of immovable type ");
-            try writeType(types, writer, type_id);
-        },
-        .relocation_requires_direct_move => |type_id| {
-            try writer.writeAll("a completed value of type ");
-            try writeType(types, writer, type_id);
-            try writer.writeAll(" cannot move directly into another destination; construct it there, giving the result a known type if needed");
-        },
+        .type_not_movable => |type_id| try writeTypedMessage(types, writer, "cannot transfer value of immovable type ", type_id, ""),
+        .relocation_requires_direct_move => |type_id| try writeTypedMessage(types, writer, "a completed value of type ", type_id, " cannot move directly into another destination; construct it there, giving the result a known type if needed"),
         .type_not_copyable => |details| {
-            try writer.writeAll("cannot implicitly copy value of non-copyable type ");
-            try writeType(types, writer, details.type_id);
+            try writeTypedMessage(types, writer, "cannot implicitly copy value of non-copyable type ", details.type_id, "");
             if (details.is_movable) try writer.writeAll("; use `^` to transfer ownership");
         },
-        .buffer_cannot_store_borrow_element => |type_id| {
-            try writer.writeAll("Buffer cannot store values containing Ref yet; element type is ");
-            try writeType(types, writer, type_id);
-        },
-        .buffer_requires_automatic_drop => |type_id| {
-            try writer.writeAll("Buffer requires an automatically droppable element type; found ");
-            try writeType(types, writer, type_id);
-        },
-        .buffer_requires_direct_move => |type_id| {
-            try writer.writeAll("Buffer requires a directly movable element type for relocation; found ");
-            try writeType(types, writer, type_id);
-        },
-        .borrow_write_cannot_store_borrow => |type_id| {
-            try writer.writeAll("write cannot replace a value containing Ref yet; pointee type is ");
-            try writeType(types, writer, type_id);
-        },
-        .borrow_write_requires_automatic_drop => |type_id| {
-            try writer.writeAll("write requires an automatically droppable pointee type; found ");
-            try writeType(types, writer, type_id);
-        },
-        .borrow_write_requires_direct_move => |type_id| {
-            try writer.writeAll("write requires a directly movable pointee type; found ");
-            try writeType(types, writer, type_id);
-        },
-        .box_requires_automatic_drop => |type_id| {
-            try writer.writeAll("Box requires an automatically droppable element type; found ");
-            try writeType(types, writer, type_id);
-        },
-        .box_extraction_requires_direct_move => |type_id| {
-            try writer.writeAll("cannot extract a non-directly-movable value from Box; found ");
-            try writeType(types, writer, type_id);
-        },
+        .buffer_cannot_store_borrow_element => |type_id| try writeTypedMessage(types, writer, "Buffer cannot store values containing Ref yet; element type is ", type_id, ""),
+        .buffer_requires_automatic_drop => |type_id| try writeTypedMessage(types, writer, "Buffer requires an automatically droppable element type; found ", type_id, ""),
+        .buffer_requires_direct_move => |type_id| try writeTypedMessage(types, writer, "Buffer requires a directly movable element type for relocation; found ", type_id, ""),
+        .borrow_write_cannot_store_borrow => |type_id| try writeTypedMessage(types, writer, "write cannot replace a value containing Ref yet; pointee type is ", type_id, ""),
+        .borrow_write_requires_automatic_drop => |type_id| try writeTypedMessage(types, writer, "write requires an automatically droppable pointee type; found ", type_id, ""),
+        .borrow_write_requires_direct_move => |type_id| try writeTypedMessage(types, writer, "write requires a directly movable pointee type; found ", type_id, ""),
+        .box_requires_automatic_drop => |type_id| try writeTypedMessage(types, writer, "Box requires an automatically droppable element type; found ", type_id, ""),
+        .box_extraction_requires_direct_move => |type_id| try writeTypedMessage(types, writer, "cannot extract a non-directly-movable value from Box; found ", type_id, ""),
         .value_requires_explicit_drop => |type_id| {
             try writeType(types, writer, type_id);
             try writer.writeAll(" must be transferred with `^` or passed to a `deinit` parameter before this scope ends");
         },
         .expression_not_supported => try writer.writeAll("this expression is not supported yet"),
-        .struct_initializer_not_struct => |found| {
-            try writer.writeAll("only a struct type can be initialized with `{...}`; found ");
-            try writeType(types, writer, found);
-        },
+        .struct_initializer_not_struct => |found| try writeTypedMessage(types, writer, "only a struct type can be initialized with `{...}`; found ", found, ""),
         .unknown_struct_field => try writeSourceLabel(writer, "unknown struct field", source, span),
         .duplicate_struct_initializer_field => try writeSourceLabel(writer, "struct field is initialized more than once", source, span),
         .missing_struct_initializer_field => |details| {
             const definition = (try types.structDefinition(details.type_id)) orelse unreachable;
             try writer.print("struct initializer is missing required field `{s}`", .{definition.fields[details.field_index].name});
         },
-        .struct_initializer_field_type_mismatch => |mismatch| {
-            try writer.writeAll("struct field initializer type mismatch: ");
-            try writeMismatch(types, writer, mismatch);
-        },
-        .field_access_not_struct => |found| {
-            try writer.writeAll("field access requires a struct value, found ");
-            try writeType(types, writer, found);
-        },
-        .private_struct_field => |type_id| {
-            try writer.writeAll("cannot name a private field of ");
-            try writeType(types, writer, type_id);
-            try writer.writeAll(" outside its defining module");
-        },
+        .struct_initializer_field_type_mismatch => |mismatch| try writeMismatch(types, writer, "struct field initializer type mismatch: ", mismatch),
+        .field_access_not_struct => |found| try writeTypedMessage(types, writer, "field access requires a struct value, found ", found, ""),
+        .private_struct_field => |type_id| try writeTypedMessage(types, writer, "cannot name a private field of ", type_id, " outside its defining module"),
         .public_field_private_type => try writer.writeAll("a public field's type cannot name a private declaration"),
         .unknown_field => try writeSourceLabel(writer, "unknown struct field", source, span),
         .duplicate_local_binding => {
@@ -591,61 +540,30 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
         .assignment_to_immutable => {
             try writeSourceLabel(writer, "cannot assign to immutable binding", source, span);
         },
-        .assignment_type_mismatch => |mismatch| {
-            try writer.writeAll("assignment type mismatch: ");
-            try writeMismatch(types, writer, mismatch);
-        },
+        .assignment_type_mismatch => |mismatch| try writeMismatch(types, writer, "assignment type mismatch: ", mismatch),
         .integer_literal_not_decimal => try writer.writeAll("integer literal must use decimal notation"),
         .float_literal_not_supported => try writer.writeAll("float literals are not supported yet"),
         .integer_literal_out_of_range => try writer.writeAll("integer literal is outside the supported i32 range"),
         .fallible_condition_not_supported => try writer.writeAll("this condition syntax is not supported yet"),
         .if_condition_not_fallible => try writer.writeAll("condition must be able to fail, such as a comparison; plain values are not supported as conditions"),
         .inspection_type_not_supported => try writer.writeAll("this inspection type is not supported yet"),
-        .variant_inspection_operand_not_variant => |found| {
-            try writer.writeAll("variant inspection requires a variant value, found ");
-            try writeType(types, writer, found);
-        },
+        .variant_inspection_operand_not_variant => |found| try writeTypedMessage(types, writer, "variant inspection requires a variant value, found ", found, ""),
         .condition_binding_must_be_immutable => try writer.writeAll("an `if` binding must use `const`, not `var`"),
         .value_not_callable => {
             try writeSourceLabel(writer, "value is not callable", source, span);
         },
         .duplicate_variant_member_type => try writer.writeAll("variant contains the same member type more than once"),
-        .local_type_mismatch => |mismatch| {
-            try writer.writeAll("initializer type mismatch: ");
-            try writeMismatch(types, writer, mismatch);
-        },
-        .negation_operand_not_int => |found| {
-            try writer.writeAll("negation requires `int`, found ");
-            try writeType(types, writer, found);
-        },
-        .arithmetic_operand_not_int => |found| {
-            try writer.writeAll("arithmetic requires `int`, found ");
-            try writeType(types, writer, found);
-        },
-        .comparison_operand_not_int => |found| {
-            try writer.writeAll("comparison requires `int`, found ");
-            try writeType(types, writer, found);
-        },
-        .equality_operand_not_supported => |found| {
-            try writer.writeAll("equality is not supported for ");
-            try writeType(types, writer, found);
-        },
-        .equality_operand_type_mismatch => |mismatch| {
-            try writer.writeAll("equality operand type mismatch: ");
-            try writeMismatch(types, writer, mismatch);
-        },
+        .local_type_mismatch => |mismatch| try writeMismatch(types, writer, "initializer type mismatch: ", mismatch),
+        .negation_operand_not_int => |found| try writeTypedMessage(types, writer, "negation requires `int`, found ", found, ""),
+        .arithmetic_operand_not_int => |found| try writeTypedMessage(types, writer, "arithmetic requires `int`, found ", found, ""),
+        .comparison_operand_not_int => |found| try writeTypedMessage(types, writer, "comparison requires `int`, found ", found, ""),
+        .equality_operand_not_supported => |found| try writeTypedMessage(types, writer, "equality is not supported for ", found, ""),
+        .equality_operand_type_mismatch => |mismatch| try writeMismatch(types, writer, "equality operand type mismatch: ", mismatch),
         .fallible_expression_outside_fallible_function => try writer.writeAll("this expression can fail; handle it with `if` or use it inside a `fallible` function"),
         .fallible_call_requires_marker => try writer.writeAll("fallible invocation requires `?(...)` unless this call itself is required to be fallible"),
         .fallible_call_not_fallible => try writer.writeAll("`?(...)` requires a fallible callable; this callable is infallible"),
-        .missing_return_value => |expected| {
-            try writer.writeAll("function must return ");
-            try writeType(types, writer, expected);
-            try writer.writeAll(" on every reachable path");
-        },
-        .return_type_mismatch => |mismatch| {
-            try writer.writeAll("return type mismatch: ");
-            try writeMismatch(types, writer, mismatch);
-        },
+        .missing_return_value => |expected| try writeTypedMessage(types, writer, "function must return ", expected, " on every reachable path"),
+        .return_type_mismatch => |mismatch| try writeMismatch(types, writer, "return type mismatch: ", mismatch),
         .unknown_function => {
             try writeSourceLabel(writer, "unknown function", source, span);
         },
@@ -654,10 +572,7 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
             if (count.expected == 1) "" else "s",
             count.found,
         }),
-        .call_argument_type_mismatch => |mismatch| {
-            try writer.writeAll("argument type mismatch: ");
-            try writeMismatch(types, writer, mismatch);
-        },
+        .call_argument_type_mismatch => |mismatch| try writeMismatch(types, writer, "argument type mismatch: ", mismatch),
     }
 }
 
@@ -741,4 +656,15 @@ test "diagnostic types display array elements lengths and nested variants" {
     defer output.deinit();
     try writeType(types, &output.writer, matrix);
     try std.testing.expectEqualStrings("`Array(Array(int | none, 2), 0)`", output.writer.buffered());
+    const cases = [_]struct { kind: structures.Diagnostic.Kind, message: []const u8 }{
+        .{ .kind = .{ .compile_time_only_type = matrix }, .message = "compile-time-only type `Array(Array(int | none, 2), 0)` cannot be materialized during runtime execution" },
+        .{ .kind = .{ .return_type_mismatch = .{ .expected = matrix, .found = .int } }, .message = "return type mismatch: expected `Array(Array(int | none, 2), 0)`, found `int`" },
+        .{ .kind = .{ .type_not_copyable = .{ .type_id = matrix, .is_movable = true } }, .message = "cannot implicitly copy value of non-copyable type `Array(Array(int | none, 2), 0)`; use `^` to transfer ownership" },
+        .{ .kind = .{ .type_not_copyable = .{ .type_id = matrix, .is_movable = false } }, .message = "cannot implicitly copy value of non-copyable type `Array(Array(int | none, 2), 0)`" },
+    };
+    for (cases) |case| {
+        output.clearRetainingCapacity();
+        try writeKindMessage(types, &output.writer, "", null, case.kind);
+        try std.testing.expectEqualStrings(case.message, output.writer.buffered());
+    }
 }

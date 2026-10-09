@@ -1,6 +1,7 @@
 const std = @import("std");
 const standard_library = @import("standard_library");
 const structures = @import("structures.zig");
+const value_operations = @import("value.zig");
 const ast = @import("frontend/parser.zig");
 const codegen = @import("backend/codegen.zig");
 const comptime_interpreter = @import("frontend/comptime_interpreter.zig");
@@ -15,14 +16,9 @@ pub const SourceText = struct {
         return gpa.dupe(u8, value);
     }
 
-    pub fn eqlValue(a: Value, b: Value) bool {
-        return std.mem.eql(u8, a, b);
-    }
+    pub const eqlValue = value_operations.Owned(Value).eql;
 
-    pub fn deinitValue(gpa: std.mem.Allocator, value: *Value) void {
-        gpa.free(value.*);
-        value.* = undefined;
-    }
+    pub const deinitValue = value_operations.Owned(Value).destroy;
 };
 
 pub const ParseFile = struct {
@@ -57,14 +53,9 @@ pub const ModuleMembers = struct {
         return gpa.dupe(structures.FileId, value);
     }
 
-    pub fn eqlValue(a: Value, b: Value) bool {
-        return std.mem.eql(structures.FileId, a, b);
-    }
+    pub const eqlValue = value_operations.Owned(Value).eql;
 
-    pub fn deinitValue(gpa: std.mem.Allocator, value: *Value) void {
-        gpa.free(value.*);
-        value.* = undefined;
-    }
+    pub const deinitValue = value_operations.Owned(Value).destroy;
 };
 
 pub const ModuleCatalog = struct {
@@ -75,14 +66,9 @@ pub const ModuleCatalog = struct {
         return gpa.dupe(structures.ModuleId, value);
     }
 
-    pub fn eqlValue(a: Value, b: Value) bool {
-        return std.mem.eql(structures.ModuleId, a, b);
-    }
+    pub const eqlValue = value_operations.Owned(Value).eql;
 
-    pub fn deinitValue(gpa: std.mem.Allocator, value: *Value) void {
-        gpa.free(value.*);
-        value.* = undefined;
-    }
+    pub const deinitValue = value_operations.Owned(Value).destroy;
 };
 
 /// Identifies the compiler-owned prelude independently of the user module
@@ -118,24 +104,15 @@ pub const ModulePaths = struct {
     pub const Value = structures.ModulePath;
     pub const Id = structures.ModuleId;
 
-    pub fn hash(value: Value) u64 {
-        var hasher = std.hash.Wyhash.init(0);
-        hasher.update(value.path);
-        return hasher.final();
-    }
+    pub const hash = value_operations.Owned(Value).hash;
 
-    pub fn eql(a: Value, b: Value) bool {
-        return std.mem.eql(u8, a.path, b.path);
-    }
+    pub const eql = value_operations.Owned(Value).eql;
 
     pub fn clone(gpa: std.mem.Allocator, value: Value) !Value {
         return .{ .path = try gpa.dupe(u8, value.path) };
     }
 
-    pub fn deinit(gpa: std.mem.Allocator, value: *Value) void {
-        gpa.free(value.path);
-        value.* = undefined;
-    }
+    pub const deinit = value_operations.Owned(Value).destroy;
 };
 
 pub const DiscoverItems = struct {
@@ -180,20 +157,9 @@ pub const ItemLocations = struct {
     pub const Value = structures.ItemLoc;
     pub const Id = structures.ItemId;
 
-    pub fn hash(value: Value) u64 {
-        var hasher = std.hash.Wyhash.init(0);
-        std.hash.autoHash(&hasher, value.origin);
-        std.hash.autoHash(&hasher, value.owner);
-        std.hash.autoHash(&hasher, value.source_site);
-        std.hash.autoHash(&hasher, value.is_hook);
-        std.hash.autoHash(&hasher, value.kind);
-        hasher.update(value.name);
-        return hasher.final();
-    }
+    pub const hash = value_operations.Owned(Value).hash;
 
-    pub fn eql(a: Value, b: Value) bool {
-        return structures.ItemLoc.eql(a, b);
-    }
+    pub const eql = value_operations.Owned(Value).eql;
 
     pub fn clone(gpa: std.mem.Allocator, value: Value) !Value {
         var cloned = value;
@@ -201,48 +167,16 @@ pub const ItemLocations = struct {
         return cloned;
     }
 
-    pub fn deinit(gpa: std.mem.Allocator, value: *Value) void {
-        gpa.free(value.name);
-        value.* = undefined;
-    }
+    pub const deinit = value_operations.Owned(Value).destroy;
 };
 
 pub const Types = struct {
     pub const Value = structures.TypeData;
     pub const Id = structures.InternedTypeId;
 
-    pub fn hash(value: Value) u64 {
-        var hasher = std.hash.Wyhash.init(0);
-        std.hash.autoHash(&hasher, std.meta.activeTag(value));
-        switch (value) {
-            .variant => |variant| {
-                std.hash.autoHash(&hasher, variant.members.len);
-                for (variant.members) |member| std.hash.autoHash(&hasher, member);
-            },
-            .callable => |callable| {
-                std.hash.autoHash(&hasher, callable.parameters.len);
-                for (callable.parameters) |parameter| {
-                    std.hash.autoHash(&hasher, parameter.mode);
-                    std.hash.autoHash(&hasher, parameter.type_id);
-                }
-                std.hash.autoHash(&hasher, callable.return_type);
-                std.hash.autoHash(&hasher, callable.is_fallible);
-            },
-            .structure => |identity| std.hash.autoHash(&hasher, identity),
-            .array => |array| std.hash.autoHash(&hasher, array),
-        }
-        return hasher.final();
-    }
+    pub const hash = value_operations.Owned(Value).hash;
 
-    pub fn eql(a: Value, b: Value) bool {
-        if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
-        return switch (a) {
-            .variant => |variant| std.mem.eql(structures.TypeId, variant.members, b.variant.members),
-            .callable => |callable| structures.CallableType.eql(callable, b.callable),
-            .structure => |identity| std.meta.eql(identity, b.structure),
-            .array => |array| std.meta.eql(array, b.array),
-        };
-    }
+    pub const eql = value_operations.Owned(Value).eql;
 
     pub fn clone(gpa: std.mem.Allocator, value: Value) !Value {
         switch (value) {
@@ -259,62 +193,37 @@ pub const Types = struct {
         }
     }
 
-    pub fn deinit(gpa: std.mem.Allocator, value: *Value) void {
-        switch (value.*) {
-            .variant => |variant| gpa.free(variant.members),
-            .callable => |*callable| callable.deinit(gpa),
-            .structure, .array => {},
-        }
-        value.* = undefined;
-    }
+    pub const deinit = value_operations.Owned(Value).destroy;
 };
 
 pub const CompileTimeValues = struct {
     pub const Value = structures.CompileTimeValue;
     pub const Id = structures.CompileTimeValueId;
 
-    pub fn hash(value: Value) u64 {
-        var hasher = std.hash.Wyhash.init(0);
-        std.hash.autoHash(&hasher, value);
-        return hasher.final();
-    }
+    pub const hash = value_operations.Owned(Value).hash;
 
-    pub fn eql(a: Value, b: Value) bool {
-        return std.meta.eql(a, b);
-    }
+    pub const eql = value_operations.Owned(Value).eql;
 
     pub fn clone(_: std.mem.Allocator, value: Value) !Value {
         return value;
     }
 
-    pub fn deinit(_: std.mem.Allocator, value: *Value) void {
-        value.* = undefined;
-    }
+    pub const deinit = value_operations.Owned(Value).destroy;
 };
 
 pub const CompileTimeValueTuples = struct {
     pub const Value = structures.CompileTimeValueTuple;
     pub const Id = structures.CompileTimeValueTupleId;
 
-    pub fn hash(value: Value) u64 {
-        var hasher = std.hash.Wyhash.init(0);
-        std.hash.autoHash(&hasher, value.values.len);
-        for (value.values) |argument| std.hash.autoHash(&hasher, argument);
-        return hasher.final();
-    }
+    pub const hash = value_operations.Owned(Value).hash;
 
-    pub fn eql(a: Value, b: Value) bool {
-        return std.mem.eql(structures.CompileTimeValueId, a.values, b.values);
-    }
+    pub const eql = value_operations.Owned(Value).eql;
 
     pub fn clone(gpa: std.mem.Allocator, value: Value) !Value {
         return .{ .values = try gpa.dupe(structures.CompileTimeValueId, value.values) };
     }
 
-    pub fn deinit(gpa: std.mem.Allocator, value: *Value) void {
-        gpa.free(value.values);
-        value.* = undefined;
-    }
+    pub const deinit = value_operations.Owned(Value).destroy;
 };
 
 pub fn internVariantType(ctx: anytype, members: []const structures.TypeId) !structures.InternVariantResult {

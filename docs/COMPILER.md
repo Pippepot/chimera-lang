@@ -76,7 +76,7 @@ Top-level code is the entry point; a function named `main` is ordinary. The CLI 
 | Document | Owns |
 | --- | --- |
 | [syntax&semantics.txt](../syntax&semantics.txt) | Language rules and examples; authoritative but incomplete |
-| [ROADMAP.md](../ROADMAP.md) | Verified implementation status, gaps, and ordered next steps |
+| [ROADMAP.md](../ROADMAP.md) | Upcoming work, gaps, and priorities |
 | [ARCHITECTURE.md](../ARCHITECTURE.md) | Compiler boundaries, ownership, representation contracts, and storage design |
 | [PROGRAM_FLOW.md](../PROGRAM_FLOW.md) | Current query flow, invalidation, and result lifetimes |
 | [AGENTS.md](../AGENTS.md) | Contribution and review rules |

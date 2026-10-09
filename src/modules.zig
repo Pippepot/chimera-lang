@@ -232,7 +232,7 @@ pub const SourceRegistry = struct {
         defer gpa.free(catalog);
         std.mem.sort(structures.ModuleId, catalog, {}, struct {
             fn lessThan(_: void, a: structures.ModuleId, b: structures.ModuleId) bool {
-                return @intFromEnum(a) < @intFromEnum(b);
+                return @backingInt(a) < @backingInt(b);
             }
         }.lessThan);
         try putInput(db, queries.ModuleCatalog, {}, catalog);

@@ -179,25 +179,7 @@ pub const Reader = struct {
     }
 };
 
-pub fn freeValue(comptime T: type, allocator: std.mem.Allocator, value: *T) void {
-    switch (@typeInfo(T)) {
-        .optional => |info| if (value.*) |*present| freeValue(info.child, allocator, present),
-        .array => |info| for (value) |*element| freeValue(info.child, allocator, element),
-        .@"struct" => |info| inline for (info.field_names, info.field_types, info.field_attrs) |field_name, FieldType, attrs| {
-            if (!attrs.@"comptime") freeValue(FieldType, allocator, &@field(value.*, field_name));
-        },
-        .@"union" => switch (value.*) {
-            inline else => |*payload| freeValue(@TypeOf(payload.*), allocator, payload),
-        },
-        .pointer => |info| {
-            if (info.size != .slice) @compileError("only owned slices can be persisted");
-            for (value.*) |*element| freeValue(info.child, allocator, @constCast(element));
-            allocator.free(value.*);
-        },
-        else => {},
-    }
-    value.* = undefined;
-}
+pub const freeValue = @import("../value.zig").free;
 
 test "disk codec roundtrips nested owned values and rejects invalid tags" {
     const testing = std.testing;
