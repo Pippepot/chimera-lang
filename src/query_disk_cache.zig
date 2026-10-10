@@ -4,8 +4,9 @@ const codec = @import("query/codec.zig");
 const query = @import("query/engine.zig");
 const queries = @import("queries.zig");
 const structures = @import("structures.zig");
+const standard_library = @import("standard_library");
 
-const format = "CHIQRY21";
+const format = "CHIQRY22";
 const max_records = 1_000_000;
 
 pub fn save(io: std.Io, allocator: std.mem.Allocator, directory: []const u8, key: cache.Key, db: *query.Database) !void {
@@ -174,11 +175,11 @@ fn validArrayRuntime(db: *query.Database, value: structures.CompileTimeValue) !b
     switch (value.runtime.value) {
         .string_literal => if (value.runtime.type_id != .string_literal) return false,
         .static_data => if (value.runtime.type_id != .static_data) return false,
-        .byte_pointer => if (value.runtime.type_id != .byte_pointer) return false,
+        .storage_cursor => |cursor| if (cursor.type_id != value.runtime.type_id) return false,
         else => {},
     }
     switch (value.runtime.type_id) {
-        .string_literal, .static_data, .byte_pointer => if (value.runtime.value.scalarTypeId() != value.runtime.type_id) return false,
+        .string_literal, .static_data => if (value.runtime.value.scalarTypeId() != value.runtime.type_id) return false,
         else => {},
     }
     const types: queries.TypeFacts(*query.Database) = .{ .ctx = db };
@@ -193,13 +194,37 @@ fn validArrayRuntime(db: *query.Database, value: structures.CompileTimeValue) !b
     return true;
 }
 
+fn persistedCursorAccess(db: *query.Database, type_id: structures.TypeId) !?struct { element_type: structures.TypeId, writable: bool, reference: bool } {
+    const interned = type_id.interned() orelse return null;
+    const data = (try db.lookupInternedAs(queries.Types, interned)) orelse return null;
+    if (data.* != .structure or data.structure != .generated) return null;
+    const instance = data.structure.generated.owner;
+    const location = (try db.lookupInternedAs(queries.ItemLocations, instance.item)) orelse return null;
+    if (location.owner != null or location.origin != .module) return null;
+    const reference = std.mem.eql(u8, location.name.text(), "Ref");
+    if (!reference and !std.mem.eql(u8, location.name.text(), "StorageCursor")) return null;
+    const module = (try db.lookupInternedAs(queries.ModulePaths, location.origin.module)) orelse return null;
+    if (!std.mem.eql(u8, module.path, standard_library.File.memory_allocation.modulePath())) return null;
+    const tuple = (try db.lookupInternedAs(queries.CompileTimeValueTuples, instance.specialization orelse return null)) orelse return null;
+    if (tuple.values.len != 2) return null;
+    const element = (try db.lookupInternedAs(queries.CompileTimeValues, tuple.values[0])) orelse return null;
+    const permission = (try db.lookupInternedAs(queries.CompileTimeValues, tuple.values[1])) orelse return null;
+    if (element.* != .type or permission.* != .runtime or permission.runtime.type_id != .bool or permission.runtime.value != .bool) return null;
+    return .{ .element_type = element.type, .writable = permission.runtime.value.bool, .reference = reference };
+}
+
 fn validateIds(comptime T: type, db: *query.Database, value: T) anyerror!bool {
     if (T == u8) return true;
     if (T == structures.ModuleId) return (try db.lookupInternedAs(queries.ModulePaths, value)) != null;
     if (T == structures.ItemId) return (try db.lookupInternedAs(queries.ItemLocations, value)) != null;
-    if (T == structures.StaticBytePointer) {
-        const data = (try db.lookupInternedAs(queries.ByteStrings, value.data)) orelse return false;
-        return value.offset <= data.bytes.len;
+    if (T == structures.StaticStorageCursor) {
+        const access = (try persistedCursorAccess(db, value.type_id)) orelse return false;
+        if (value.data) |identity| {
+            if (access.element_type != .byte or access.writable) return false;
+            const data = (try db.lookupInternedAs(queries.ByteStrings, identity)) orelse return false;
+            return if (access.reference) value.offset < data.bytes.len else value.offset <= data.bytes.len;
+        }
+        return value.offset == 0 and !access.reference;
     }
     if (T == structures.ByteStringId) return (try db.lookupInternedAs(queries.ByteStrings, value)) != null;
     if (T == structures.CompileTimeValueId) return (try db.lookupInternedAs(queries.CompileTimeValues, value)) != null;
@@ -256,16 +281,26 @@ fn validStorageOperations(db: *query.Database, body: structures.FunctionBodyAnal
         if (!try validArrayStorageType(db, types, instruction.resultType())) return false;
         switch (instruction) {
             .static_conversion, .const_string_literal => return false,
-            .byte_pointer => |source| {
-                const source_type = body.valueType(source);
-                if (source_type != .static_data) {
-                    const array = try types.arrayType(source_type);
-                    if (array) |shape| {
-                        if (shape.element_type != .byte) return false;
-                    } else if ((try types.allocationElement(source_type)) != structures.TypeId.byte) return false;
-                }
+            .const_storage_cursor => |cursor| {
+                if (try types.storageCursorAccess(cursor.type_id) == null and try types.borrowAccess(cursor.type_id) == null) return false;
             },
-            .byte_offset, .byte_read => |operands| if (body.valueType(operands.lhs) != .byte_pointer or body.valueType(operands.rhs) != .int) return false,
+            .storage_cursor => |operation| {
+                const cursor = (try types.storageCursorAccess(operation.type_id)) orelse return false;
+                const source_type = body.valueType(operation.source);
+                if (source_type == .static_data) {
+                    if (cursor.element_type != .byte or cursor.writable) return false;
+                } else if (try types.arrayType(source_type)) |array| {
+                    if (cursor.element_type != array.element_type) return false;
+                } else if ((try types.allocationElement(source_type)) != cursor.element_type) return false;
+            },
+            .cursor_offset, .cursor_element => |operation| {
+                if (body.valueType(operation.index) != .int) return false;
+                const source = (try types.storageCursorAccess(body.valueType(operation.cursor))) orelse return false;
+                const target = (try types.storageAccess(operation.type_id)) orelse return false;
+                if (source.element_type != target.element_type or (target.writable and !source.writable)) return false;
+                if (instruction == .cursor_offset and try types.storageCursorAccess(operation.type_id) == null) return false;
+                if (instruction == .cursor_element and try types.borrowAccess(operation.type_id) == null) return false;
+            },
             .byte_to_int => |source| if (body.valueType(source) != .byte) return false,
             .initializer_ref => |reference| if (!try validInitializerResult(db, types, body, reference)) return false,
             .const_type => |type_id| if (!try validArrayStorageType(db, types, type_id)) return false,
@@ -1552,19 +1587,15 @@ test "array runtime snapshot tuples require the declared shape and runtime eleme
     try std.testing.expect(!try validArrayRuntime(db, .{ .runtime = .{ .type_id = type_id, .value = .{ .int = 42 } } }));
 }
 
-test "text intern restoration rejects malformed bytes IDs offsets and payload types" {
+test "text intern restoration rejects malformed bytes IDs and payload types" {
     const allocator = std.testing.allocator;
-    for (0..5) |case_index| {
+    for (0..4) |case_index| {
         const first = try query.Database.init(allocator, .{ .worker_count = 1 });
         defer first.deinit();
         const data = try first.intern(queries.ByteStrings, .{ .bytes = if (case_index == 1) "\xff" else "abc" });
-        const pointer: structures.StaticBytePointer = .{
-            .data = if (case_index == 2) @fromBackingInt(@as(u32, 99)) else data,
-            .offset = if (case_index == 3) 4 else 3,
-        };
         _ = try first.intern(queries.CompileTimeValues, .{ .runtime = .{
-            .type_id = .byte_pointer,
-            .value = if (case_index == 4) .{ .int = 42 } else .{ .byte_pointer = pointer },
+            .type_id = .static_data,
+            .value = if (case_index == 3) .{ .int = 42 } else .{ .static_data = if (case_index == 2) @fromBackingInt(@as(u32, 99)) else data },
         } });
         var writer: codec.Writer = .{ .allocator = allocator };
         defer writer.deinit();
@@ -1573,6 +1604,45 @@ test "text intern restoration rejects malformed bytes IDs offsets and payload ty
         const second = try query.Database.init(allocator, .{ .worker_count = 1 });
         defer second.deinit();
         if (case_index == 0) {
+            try std.testing.expectEqual(writer.bytes.items.len, try restoreInterns(second, allocator, writer.bytes.items));
+        } else {
+            try std.testing.expectError(error.InvalidCache, restoreInterns(second, allocator, writer.bytes.items));
+        }
+    }
+}
+
+test "cursor intern restoration validates nominal identity offsets and literal permissions" {
+    const allocator = std.testing.allocator;
+    for (0..10) |case_index| {
+        const first = try query.Database.init(allocator, .{ .worker_count = 1 });
+        defer first.deinit();
+        const module = try first.intern(queries.ModulePaths, .{ .path = if (case_index == 9) "application" else standard_library.File.memory_allocation.modulePath() });
+        const reference = case_index >= 6 and case_index <= 8;
+        const factory = try first.intern(queries.ItemLocations, .{ .origin = .{ .module = module }, .kind = .function, .name = .{ .identifier = if (reference) "Ref" else "StorageCursor" } });
+        const element = try first.intern(queries.CompileTimeValues, .{ .type = .byte });
+        const permission = try first.intern(queries.CompileTimeValues, .{ .runtime = .{ .type_id = .bool, .value = .{ .bool = case_index == 3 } } });
+        const specialization = try first.intern(queries.CompileTimeValueTuples, .{ .values = &.{ element, permission } });
+        const cursor_type: structures.TypeId = .fromInterned(try first.intern(queries.Types, .{ .structure = .{ .generated = .{ .owner = .{ .item = factory, .specialization = specialization }, .node_offset = 0 } } }));
+        const data = try first.intern(queries.ByteStrings, .{ .bytes = "abc" });
+        const cursor: structures.StaticStorageCursor = .{
+            .type_id = if (case_index == 4) .int else cursor_type,
+            .data = if (case_index == 5 or case_index == 6) null else if (case_index == 2) @fromBackingInt(@as(u32, 99)) else data,
+            .offset = switch (case_index) {
+                1 => 4,
+                5 => 1,
+                6 => 0,
+                8 => 2,
+                else => 3,
+            },
+        };
+        _ = try first.intern(queries.CompileTimeValues, .{ .runtime = .{ .type_id = cursor.type_id, .value = .{ .storage_cursor = cursor } } });
+        var writer: codec.Writer = .{ .allocator = allocator };
+        defer writer.deinit();
+        try writer.bytes.appendSlice(allocator, format);
+        try first.writeInternedValues(&writer);
+        const second = try query.Database.init(allocator, .{ .worker_count = 1 });
+        defer second.deinit();
+        if (case_index == 0 or case_index == 8) {
             try std.testing.expectEqual(writer.bytes.items.len, try restoreInterns(second, allocator, writer.bytes.items));
         } else {
             try std.testing.expectError(error.InvalidCache, restoreInterns(second, allocator, writer.bytes.items));

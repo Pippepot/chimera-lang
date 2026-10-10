@@ -675,7 +675,7 @@ pub const CompileTimeValue = union(enum) {
         int_literal: i64,
         string_literal: ByteStringId,
         static_data: ByteStringId,
-        byte_pointer: StaticBytePointer,
+        storage_cursor: StaticStorageCursor,
         byte: u8,
         bool: bool,
         unit,
@@ -693,7 +693,7 @@ pub const CompileTimeValue = union(enum) {
                 .int_literal => .int_literal,
                 .string_literal => .string_literal,
                 .static_data => .static_data,
-                .byte_pointer => .byte_pointer,
+                .storage_cursor => |cursor| cursor.type_id,
                 .byte => .byte,
                 .bool => .bool,
                 .unit => .unit,
@@ -711,7 +711,7 @@ pub const CompileTimeValueId = enum(u32) { _ };
 /// Canonical immutable bytes, owned by the database rather than source or frames.
 pub const ByteStringId = enum(u32) { _ };
 pub const ByteString = struct { bytes: []const u8 };
-pub const StaticBytePointer = struct { data: ByteStringId, offset: u32 = 0 };
+pub const StaticStorageCursor = struct { type_id: TypeId, data: ?ByteStringId = null, offset: u32 = 0 };
 
 /// Session-stable identity of one ordered tuple of canonical compile-time
 /// values. Specializations and interpreted calls share this representation.
@@ -761,7 +761,6 @@ pub const TypeId = enum(u32) {
     int_literal,
     string_literal,
     static_data,
-    byte_pointer,
     _,
 
     const interned_mask: u32 = 1 << 31;
@@ -777,7 +776,7 @@ pub const TypeId = enum(u32) {
     }
 
     pub fn isPrimitive(self: TypeId) bool {
-        return self == .int or self == .bool or self == .unit or self == .none or self == .never or self == .type or self == .byte or self == .int_literal or self == .string_literal or self == .static_data or self == .byte_pointer;
+        return self == .int or self == .bool or self == .unit or self == .none or self == .never or self == .type or self == .byte or self == .int_literal or self == .string_literal or self == .static_data;
     }
 };
 
@@ -1104,9 +1103,9 @@ pub const CallBehavior = enum {
     box_destroy,
     allocation_destroy,
     allocation_read,
-    buffer_new,
-    buffer_append,
-    buffer_reserve,
+    list_new,
+    list_append,
+    list_reserve,
 };
 
 pub const FunctionParameterShape = struct {
@@ -1180,6 +1179,12 @@ pub const ArrayElement = struct {
     type_id: TypeId,
 };
 
+pub const CursorElement = struct {
+    cursor: FunctionValueId,
+    index: FunctionValueId,
+    type_id: TypeId,
+};
+
 pub const BorrowOperation = struct {
     source: FunctionValueId,
     type_id: TypeId,
@@ -1231,10 +1236,10 @@ pub const FunctionInstruction = union(enum) {
     const_int_literal: i64,
     const_string_literal: ByteStringId,
     const_data: ByteStringId,
-    const_byte_pointer: StaticBytePointer,
-    byte_pointer: FunctionValueId,
-    byte_offset: BinaryOperands,
-    byte_read: BinaryOperands,
+    const_storage_cursor: StaticStorageCursor,
+    storage_cursor: BorrowOperation,
+    cursor_offset: CursorElement,
+    cursor_element: CursorElement,
     byte_to_int: FunctionValueId,
     const_byte: u8,
     const_bool: bool,
@@ -1270,13 +1275,14 @@ pub const FunctionInstruction = union(enum) {
 
     pub fn operands(self: *FunctionInstruction) [2]?*FunctionValueId {
         return switch (self.*) {
-            .const_int, .const_int_literal, .const_string_literal, .const_data, .const_byte_pointer, .const_byte, .const_bool, .const_type, .const_unit, .const_none, .function_ref, .initializer_ref, .local_storage, .result_storage => .{ null, null },
-            .variant_tag, .negi, .byte_pointer, .byte_to_int => |*operand| .{ operand, null },
+            .const_int, .const_int_literal, .const_string_literal, .const_data, .const_storage_cursor, .const_byte, .const_bool, .const_type, .const_unit, .const_none, .function_ref, .initializer_ref, .local_storage, .result_storage => .{ null, null },
+            .variant_tag, .negi, .byte_to_int => |*operand| .{ operand, null },
             .variant_coerce, .variant_extract, .callable_coerce => |*operation| .{ &operation.operand, if (operation.destination) |*destination| destination else null },
             .storage_projection => |*operation| .{ &operation.owner, null },
             .allocation_element => |*operation| .{ &operation.allocation, &operation.index },
             .array_element => |*operation| .{ &operation.array, &operation.index },
-            .borrow_box, .borrow_read => |*operation| .{ &operation.source, null },
+            .borrow_box, .borrow_read, .storage_cursor => |*operation| .{ &operation.source, null },
+            .cursor_offset, .cursor_element => |*operation| .{ &operation.cursor, &operation.index },
             .borrow_address => |*operation| .{ &operation.source, null },
             .borrow_write => |*operation| .{ &operation.reference, &operation.value },
             .value_copy => |*operation| .{ &operation.source, if (operation.destination) |*destination| destination else null },
@@ -1285,7 +1291,7 @@ pub const FunctionInstruction = union(enum) {
             .mut_parameter_write => |*operation| .{ &operation.value, null },
             .call => |*call| call.operands(),
             .static_conversion => |*conversion| .{ &conversion.operand, if (conversion.destination) |*destination| destination else null },
-            .addi, .subi, .muli, .divsi, .byte_offset, .byte_read => |*binary| .{ &binary.lhs, &binary.rhs },
+            .addi, .subi, .muli, .divsi => |*binary| .{ &binary.lhs, &binary.rhs },
         };
     }
 
@@ -1295,8 +1301,9 @@ pub const FunctionInstruction = union(enum) {
             .const_int_literal => .int_literal,
             .const_string_literal => .string_literal,
             .const_data => .static_data,
-            .const_byte_pointer, .byte_pointer, .byte_offset => .byte_pointer,
-            .byte_read => .byte,
+            .const_storage_cursor => |cursor| cursor.type_id,
+            .storage_cursor => |operation| operation.type_id,
+            .cursor_offset, .cursor_element => |operation| operation.type_id,
             .const_byte => .byte,
             .const_bool => .bool,
             .const_type => .type,
@@ -1592,9 +1599,9 @@ pub const Diagnostic = struct {
         type_not_movable: TypeId,
         relocation_requires_direct_move: TypeId,
         type_not_copyable: TypeNotCopyable,
-        buffer_cannot_store_borrow_element: TypeId,
-        buffer_requires_automatic_drop: TypeId,
-        buffer_requires_direct_move: TypeId,
+        list_cannot_store_borrow_element: TypeId,
+        list_requires_automatic_drop: TypeId,
+        list_requires_direct_move: TypeId,
         borrow_write_cannot_store_borrow: TypeId,
         borrow_write_requires_automatic_drop: TypeId,
         borrow_write_requires_direct_move: TypeId,

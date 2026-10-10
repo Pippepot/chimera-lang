@@ -1,5 +1,5 @@
 import std.text.{BytesView}
-import std.array.{collection_literal}
+import std.array.{Array, collection_literal}
 import std.exit.{exit}
 
 pub struct Allocation(T: type)
@@ -41,8 +41,60 @@ pub struct List(T: type)
         result.initialized = N
         return result^
 
+    pub fallible new(reserved: int) List(T)
+        const storage = allocate?(T, reserved)
+        return List(T){storage = storage^, initialized = 0}
+
     pub func len(imm self: List(T)) int -> self.initialized
     pub func capacity(imm self: List(T)) int -> self.storage.capacity()
+    pub func span(imm self: List(T)) Span(T, false) -> Span(T, false){data = allocation_cursor(T, self.storage), size = self.initialized}
+    pub func span_mut(mut self: List(T)) Span(T, true) -> Span(T, true){data = allocation_cursor_mut(T, self.storage), size = self.initialized}
+    pub fallible view(imm self: List(T), start: int, size: int) Span(T, false) -> self.span().slice?(start, size)
+    pub fallible bytes(imm self: List(byte)) BytesView -> BytesView.unsafe_from_allocation?(self.storage, self.initialized)
+    pub fallible read_bytes(mut self: List(byte), descriptor: int, count: int) int
+        count >= 0
+        count <= 2147483647 - self.initialized
+        if count == 0 -> return 0
+        self.reserve?(self.initialized + count)
+        const actual = io_read?(descriptor, self.storage, self.initialized, count)
+        self.initialized += actual
+        return actual
+
+    pub fallible reserve(mut self: List(T), minimum_capacity: int)
+        minimum_capacity >= 0
+        if minimum_capacity <= self.capacity() -> return
+        var replacement = allocate?(T, minimum_capacity)
+        const initialized = self.initialized
+        var index = initialized
+        loop
+            if index == 0 -> break
+            index -= 1
+            var item = unsafe_take(T, self.storage, index)
+            self.initialized = index
+            if unsafe_initialize(T, replacement, index, item^) -> continue
+            var cleanup = initialized
+            loop
+                if cleanup == index + 1 -> break
+                cleanup -= 1
+                unsafe_destroy(T, replacement, cleanup)
+            deallocate(T, replacement)
+            fail
+        const previous = self.storage^
+        self.storage = replacement^
+        self.initialized = initialized
+        deallocate(T, previous^)
+
+    pub fallible append(mut self: List(T), var item: T)
+        const capacity = self.capacity()
+        if self.initialized == capacity
+            capacity < 2147483647
+            var next_capacity = 1
+            if capacity > 0
+                if capacity <= 1073741823 -> next_capacity = capacity * 2
+                else next_capacity = 2147483647
+            self.reserve?(next_capacity)
+        unsafe_initialize?(T, self.storage, self.initialized, item^)
+        self.initialized += 1
 
     pub fallible get(imm self: List(T), index: int) Ref(T, false)
         index >= 0
@@ -74,112 +126,6 @@ pub converter(static T: type, static N: int, init values: collection_literal(T, 
     result.initialized = N
     return result^
 
-pub struct Buffer(T: type)
-    move = none
-    storage: Allocation(T)
-    initialized: int
-    drop = func(deinit self: Buffer(T))
-        var index = self.initialized
-        loop
-            if index == 0 -> break
-            index -= 1
-            unsafe_destroy(T, self.storage, index)
-        deallocate(T, self.storage^)
-
-    pub fallible new(reserved: int) Buffer(T)
-        const storage = allocate?(T, reserved)
-        return Buffer(T){storage = storage^, initialized = 0}
-
-    pub fallible bytes(imm self: Buffer(byte)) BytesView -> BytesView.unsafe_from_allocation?(self.storage, self.initialized)
-    pub fallible read_bytes(mut self: Buffer(byte), descriptor: int, count: int) int
-        count >= 0
-        count <= 2147483647 - self.initialized
-        if count == 0 -> return 0
-        self.reserve?(self.initialized + count)
-        const actual = io_read?(descriptor, self.storage, self.initialized, count)
-        self.initialized += actual
-        return actual
-
-    pub func len(imm self: Buffer(T)) int -> self.initialized
-    pub func capacity(imm self: Buffer(T)) int -> self.storage.capacity()
-
-    pub fallible get(imm self: Buffer(T), index: int) Ref(T, false)
-        index >= 0
-        index < self.initialized
-        return unsafe_borrow_element(T, self.storage, index)
-
-    pub fallible get_mut(mut self: Buffer(T), index: int) Ref(T, true)
-        index >= 0
-        index < self.initialized
-        return unsafe_borrow_mut_element(T, self.storage, index)
-
-    pub fallible [](imm self: Buffer(T), index: int) T
-        const element = self.get?(index)
-        return element[]
-
-    pub fallible []=(mut self: Buffer(T), index: int, init item: T) unit
-        const element = self.get_mut?(index)
-        element[] = item
-
-    pub fallible view(imm self: Buffer(T), start: int, size: int) BufferView(T)
-        start >= 0
-        size >= 0
-        start <= self.initialized
-        size <= self.initialized - start
-        return BufferView(T){backing = borrow_local(Buffer(T), self), start = start, size = size}
-
-    pub fallible reserve(mut self: Buffer(T), minimum_capacity: int)
-        minimum_capacity >= 0
-        if minimum_capacity <= self.capacity() -> return
-        var replacement = allocate?(T, minimum_capacity)
-        const initialized = self.initialized
-        var index = initialized
-        loop
-            if index == 0 -> break
-            index -= 1
-            var item = unsafe_take(T, self.storage, index)
-            self.initialized = index
-            if unsafe_initialize(T, replacement, index, item^) -> continue
-            var cleanup = initialized
-            loop
-                if cleanup == index + 1 -> break
-                cleanup -= 1
-                unsafe_destroy(T, replacement, cleanup)
-            deallocate(T, replacement)
-            fail
-        const previous = self.storage^
-        self.storage = replacement^
-        self.initialized = initialized
-        deallocate(T, previous^)
-
-    pub fallible append(mut self: Buffer(T), var item: T)
-        const capacity = self.capacity()
-        if self.initialized == capacity
-            capacity < 2147483647
-            var next_capacity = 1
-            if capacity > 0
-                if capacity <= 1073741823 -> next_capacity = capacity * 2
-                else next_capacity = 2147483647
-            self.reserve?(next_capacity)
-        unsafe_initialize?(T, self.storage, self.initialized, item^)
-        self.initialized += 1
-
-pub struct BufferView(T: type)
-    backing: Ref(Buffer(T), false)
-    start: int
-    size: int
-
-    pub func len(imm self: BufferView(T)) int -> self.size
-
-    pub fallible get(imm self: BufferView(T), index: int) Ref(T, false)
-        index >= 0
-        index < self.size
-        return read(Buffer(T), false, self.backing).get?(self.start + index)
-
-    pub fallible [](imm self: BufferView(T), index: int) T
-        const element = self.get?(index)
-        return element[]
-
 pub struct Box(T: type)
     allocation: Allocation(T)
     drop = func(deinit self: Box(T))
@@ -198,9 +144,63 @@ pub struct Box(T: type)
     pub func borrow_mut(mut self: Box(T)) Ref(T, true) -> borrow_mut_box(T, self)
     pub func into_value(deinit self: Box(T)) T -> value(T, self^)
 
-pub struct Ref(T: type, writable: bool)
+struct StorageCursor(T: type, writable: bool)
     address_low: int
     address_high: int
+    copy = trivial
+
+pub struct Span(T: type, writable: bool)
+    copy = trivial
+    data: StorageCursor(T, writable)
+    size: int
+
+    pub func empty() Span(T, writable) -> Span(T, writable){data = empty_cursor(T, writable), size = 0}
+    pub func from_array(static N: int, imm array: Array(T, N)) Span(T, false) -> Span(T, false){data = array_cursor(T, N, array), size = N}
+    pub func from_array_mut(static N: int, mut array: Array(T, N)) Span(T, true) -> Span(T, true){data = array_cursor_mut(T, N, array), size = N}
+    pub fallible unsafe_from_allocation(imm allocation: Allocation(T), initialized: int) Span(T, false)
+        initialized >= 0
+        initialized <= allocation.capacity()
+        return Span(T, false){data = allocation_cursor(T, allocation), size = initialized}
+    pub fallible unsafe_from_allocation_mut(mut allocation: Allocation(T), initialized: int) Span(T, true)
+        initialized >= 0
+        initialized <= allocation.capacity()
+        return Span(T, true){data = allocation_cursor_mut(T, allocation), size = initialized}
+    pub func unsafe_from_static(imm source: static_data, size: int) Span(byte, false) -> Span(byte, false){data = static_cursor(source), size = size}
+    pub func len(imm self: Span(T, writable)) int -> self.size
+    pub fallible get(imm self: Span(T, writable), index: int) Ref(T, false)
+        index >= 0
+        index < self.size
+        return cursor_element(T, writable, false, self.data, index)
+    pub fallible get_mut(imm self: Span(T, true), index: int) Ref(T, true)
+        index >= 0
+        index < self.size
+        return cursor_element(T, true, true, self.data, index)
+    pub fallible [](imm self: Span(T, writable), index: int) T
+        const element = self.get?(index)
+        return element[]
+    pub fallible []=(imm self: Span(T, true), index: int, init item: T) unit
+        const element = self.get_mut?(index)
+        element[] = item
+    pub fallible slice(imm self: Span(T, writable), start: int, size: int) Span(T, writable)
+        start >= 0
+        size >= 0
+        start <= self.size
+        size <= self.size - start
+        return Span(T, writable){data = cursor_offset(T, writable, self.data, start), size = size}
+    pub func as_imm(imm self: Span(T, true)) Span(T, false) -> Span(T, false){data = cursor_attenuate(T, self.data), size = self.size}
+
+extern func empty_cursor(static T: type, static writable: bool) StorageCursor(T, writable)
+extern func static_cursor(imm source: static_data) StorageCursor(byte, false)
+extern func array_cursor(static T: type, static N: int, imm array: Array(T, N)) StorageCursor(T, false)
+extern func array_cursor_mut(static T: type, static N: int, mut array: Array(T, N)) StorageCursor(T, true)
+extern func allocation_cursor(static T: type, imm allocation: Allocation(T)) StorageCursor(T, false)
+extern func allocation_cursor_mut(static T: type, mut allocation: Allocation(T)) StorageCursor(T, true)
+extern func cursor_offset(static T: type, static writable: bool, imm source: StorageCursor(T, writable), offset: int) StorageCursor(T, writable)
+extern func cursor_element(static T: type, static source_writable: bool, static writable: bool, imm source: StorageCursor(T, source_writable), index: int) Ref(T, writable)
+extern func cursor_attenuate(static T: type, imm source: StorageCursor(T, true)) StorageCursor(T, false)
+
+pub struct Ref(T: type, writable: bool)
+    cursor: StorageCursor(T, writable)
     copy = trivial
 
     pub func as_imm(imm self: Ref(T, true)) Ref(T, false) -> attenuate_ref(T, self)

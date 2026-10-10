@@ -403,6 +403,14 @@ pub fn TypeFacts(comptime Context: type) type {
             return borrowAccessType(self.ctx, type_id);
         }
 
+        pub fn storageCursorAccess(self: @This(), type_id: structures.TypeId) !?BorrowAccessType {
+            return storageCursorAccessType(self.ctx, type_id);
+        }
+
+        pub fn storageAccess(self: @This(), type_id: structures.TypeId) !?BorrowAccessType {
+            return (try self.borrowAccess(type_id)) orelse (try self.storageCursorAccess(type_id)) orelse try spanAccessType(self.ctx, type_id);
+        }
+
         pub fn allocationElement(self: @This(), type_id: structures.TypeId) !?structures.TypeId {
             return allocationElementType(self.ctx, type_id);
         }
@@ -412,9 +420,8 @@ pub fn TypeFacts(comptime Context: type) type {
         }
 
         pub fn mayContainStorage(self: @This(), type_id: structures.TypeId) anyerror!bool {
-            if (type_id == .byte_pointer) return true;
             if (type_id.isPrimitive()) return false;
-            if (try self.borrowElement(type_id) != null or try self.allocationElement(type_id) != null or try self.boxElement(type_id) != null) return true;
+            if (try self.storageAccess(type_id) != null or try self.allocationElement(type_id) != null or try self.boxElement(type_id) != null) return true;
             if (try self.arrayType(type_id)) |array| return array.length != 0 and try self.mayContainStorage(array.element_type);
             if (try self.structDefinition(type_id)) |definition| {
                 if (try standardFile(self.ctx, .memory_host) != null) {
@@ -963,9 +970,9 @@ pub fn AnalysisContext(comptime Context: type) type {
                 .{ .factory = "Box", .name = "borrow_mut", .behavior = .box_borrow_mut },
                 .{ .factory = "Ref", .name = "replace", .behavior = .reference_write },
                 .{ .factory = "Ref", .name = "as_imm", .behavior = .reference_attenuate },
-                .{ .factory = "Buffer", .name = "new", .behavior = .buffer_new },
-                .{ .factory = "Buffer", .name = "append", .behavior = .buffer_append },
-                .{ .factory = "Buffer", .name = "reserve", .behavior = .buffer_reserve },
+                .{ .factory = "List", .name = "new", .behavior = .list_new },
+                .{ .factory = "List", .name = "append", .behavior = .list_append },
+                .{ .factory = "List", .name = "reserve", .behavior = .list_reserve },
             };
             for (members) |member| {
                 if (!std.mem.eql(u8, location.name.text(), member.name)) continue;
@@ -975,11 +982,6 @@ pub fn AnalysisContext(comptime Context: type) type {
                 if (resolved.item == item) return member.behavior;
             }
             return .ordinary;
-        }
-
-        pub fn bufferElement(self: @This(), type_id: structures.TypeId) !?structures.TypeId {
-            const instance = (try standardMemoryInstance(self.ctx, type_id, .Buffer)) orelse return null;
-            return instance.element_type;
         }
 
         pub fn listElement(self: @This(), type_id: structures.TypeId) !?structures.TypeId {
@@ -1012,13 +1014,12 @@ pub fn AnalysisContext(comptime Context: type) type {
         fn containsBorrowAt(self: @This(), type_id: structures.TypeId, visited: *std.ArrayList(structures.TypeId), include_allocated_contents: bool) !bool {
             if (std.mem.indexOfScalar(structures.TypeId, visited.items, type_id) != null) return false;
             try visited.append(self.ctx.allocator(), type_id);
-            if (type_id == .byte_pointer) return true;
-            if (try self.facts().borrowElement(type_id) != null) return true;
+            if (try self.facts().storageAccess(type_id) != null) return true;
             if (try self.collectionLiteralType(type_id)) |collection|
                 return collection.length != 0 and try self.containsBorrowAt(collection.element_type, visited, include_allocated_contents);
             if (try self.arrayType(type_id)) |array|
                 return array.length != 0 and try self.containsBorrowAt(array.element_type, visited, include_allocated_contents);
-            if (try self.bufferElement(type_id)) |element| return self.containsBorrowAt(element, visited, include_allocated_contents);
+            if (try self.listElement(type_id)) |element| return self.containsBorrowAt(element, visited, include_allocated_contents);
             if (try self.listElement(type_id)) |element| return self.containsBorrowAt(element, visited, include_allocated_contents);
             if (try self.facts().allocationElement(type_id)) |element|
                 return include_allocated_contents and try self.containsBorrowAt(element, visited, true);
@@ -1565,7 +1566,7 @@ pub const HostTypeLayout = struct {
         if (!try facts.isRuntimeCapable(type_id)) return error.Unavailable;
         if (type_id == .int or type_id == .bool) return .{ .byte_size = 4, .byte_alignment = 4 };
         if (type_id == .byte) return .{ .byte_size = 1, .byte_alignment = 1 };
-        if (type_id == .static_data or type_id == .byte_pointer) return .{ .byte_size = 8, .byte_alignment = 8 };
+        if (type_id == .static_data or try storageCursorAccessType(ctx, type_id) != null) return .{ .byte_size = 8, .byte_alignment = 8 };
         if (type_id == .unit or type_id == .none or type_id == .never) return .{ .byte_size = 0, .byte_alignment = 1 };
         const data = (try ctx.lookupInternedAs(Types, type_id.interned().?)) orelse unreachable;
         switch (data.*) {
@@ -2588,7 +2589,10 @@ fn validOperationSignature(types: anytype, item: structures.ItemId, signature: s
     const receiver = signature.parameters[0];
     const association = (try types.typeNamespace(receiver.type_id)) orelse return false;
     if (association.query_key.owner() != location.owner.?) return false;
-    if (receiver.mode != (if (index_write) structures.ParameterMode.mut else .imm)) return false;
+    if (index_write and receiver.mode == .imm) {
+        const access = (try types.facts().storageAccess(receiver.type_id)) orelse return false;
+        if (!access.writable) return false;
+    } else if (receiver.mode != (if (index_write) structures.ParameterMode.mut else .imm)) return false;
     if (operation.isIndexer()) {
         if (signature.parameters[1].mode != .imm or signature.parameters[1].type_id != .int) return false;
         if (index_write and (signature.parameters[2].mode != .init or signature.return_type != .unit)) return false;
@@ -2613,17 +2617,17 @@ fn librarySignatureIssue(types: anytype, item: structures.ItemId, signature: str
             if (!capabilities.isDirectlyMovable())
                 return .{ .box_extraction_requires_direct_move = signature.return_type };
         },
-        .buffer_new => {
-            const element = (try types.bufferElement(signature.return_type)) orelse return error.Unavailable;
-            if (try types.containsBorrow(element)) return .{ .buffer_cannot_store_borrow_element = element };
+        .list_new => {
+            const element = (try types.listElement(signature.return_type)) orelse return error.Unavailable;
+            if (try types.containsBorrow(element)) return .{ .list_cannot_store_borrow_element = element };
         },
         .reference_write => return typing.referenceReplacementIssue(types, signature.parameters[1].type_id),
-        .buffer_append, .buffer_reserve => {
-            const element = (try types.bufferElement(signature.parameters[0].type_id)) orelse return error.Unavailable;
+        .list_append, .list_reserve => {
+            const element = (try types.listElement(signature.parameters[0].type_id)) orelse return error.Unavailable;
             const capabilities = (try types.facts().ownershipCapabilities(element)) orelse return error.Unavailable;
-            if (capabilities.requires_explicit_drop) return .{ .buffer_requires_automatic_drop = element };
+            if (capabilities.requires_explicit_drop) return .{ .list_requires_automatic_drop = element };
             if (!capabilities.isDirectlyMovable())
-                return .{ .buffer_requires_direct_move = element };
+                return .{ .list_requires_direct_move = element };
         },
         else => {},
     }
@@ -2677,6 +2681,7 @@ fn validateExternalSignature(ctx: anytype, item: structures.ItemId, file_id: str
             signature.parameters[0].mode == (if (symbol == .copy_value) structures.ParameterMode.imm else .deinit),
         .array_filled => try validArrayFilledSignature(ctx, signature),
         .initialize_collection => try validCollectionInitializerSignature(ctx, signature),
+        .empty_cursor, .static_cursor, .array_cursor, .array_cursor_mut, .allocation_cursor, .allocation_cursor_mut, .cursor_offset, .cursor_element, .cursor_attenuate => try validCursorSignature(ctx, symbol, signature),
         .array_from => blk: {
             if (signature.is_fallible or signature.parameters.len != 1 or signature.parameters[0].mode != .init) break :blk false;
             const analysis: AnalysisContext(@TypeOf(ctx)) = .{ .ctx = ctx };
@@ -2685,16 +2690,13 @@ fn validateExternalSignature(ctx: anytype, item: structures.ItemId, file_id: str
             break :blk std.meta.eql(shape, array);
         },
         .literal_data, .literal_size => signature.parameters.len == 0 and !signature.is_fallible and signature.return_type == (if (symbol == .literal_data) structures.TypeId.static_data else .int),
-        .static_pointer => !signature.is_fallible and signature.parameters.len == 1 and signature.parameters[0].mode == .imm and signature.parameters[0].type_id == .static_data and signature.return_type == .byte_pointer,
-        .array_bytes_pointer => blk: {
-            if (signature.is_fallible or signature.parameters.len != 1 or signature.parameters[0].mode != .imm or signature.return_type != .byte_pointer) break :blk false;
-            const shape = (try lookupArrayType(ctx, signature.parameters[0].type_id)) orelse break :blk false;
-            break :blk shape.element_type == .byte;
-        },
-        .allocation_bytes_pointer => !signature.is_fallible and signature.parameters.len == 1 and signature.parameters[0].mode == .imm and signature.return_type == .byte_pointer and (try allocationElementType(ctx, signature.parameters[0].type_id)) == structures.TypeId.byte,
-        .byte_offset, .byte_read => !signature.is_fallible and signature.parameters.len == 2 and signature.parameters[0].mode == .imm and signature.parameters[0].type_id == .byte_pointer and signature.parameters[1].mode == .imm and signature.parameters[1].type_id == .int and signature.return_type == (if (symbol == .byte_offset) structures.TypeId.byte_pointer else .byte),
         .byte_int => !signature.is_fallible and signature.parameters.len == 1 and signature.parameters[0].mode == .imm and signature.parameters[0].type_id == .byte and signature.return_type == .int,
-        .io_write => signature.is_fallible and signature.return_type == .int and signature.parameters.len == 3 and signature.parameters[0].type_id == .int and signature.parameters[1].type_id == .byte_pointer and signature.parameters[2].type_id == .int and allImmutable(signature.parameters),
+        .io_write => blk: {
+            if (!signature.is_fallible or signature.return_type != .int or signature.parameters.len != 2 or
+                signature.parameters[0].type_id != .int or !allImmutable(signature.parameters)) break :blk false;
+            const access = (try spanAccessType(ctx, signature.parameters[1].type_id)) orelse break :blk false;
+            break :blk access.element_type == .byte and !access.writable;
+        },
         .io_read => signature.is_fallible and signature.return_type == .int and signature.parameters.len == 4 and signature.parameters[0].type_id == .int and (try allocationElementType(ctx, signature.parameters[1].type_id)) == structures.TypeId.byte and signature.parameters[2].type_id == .int and signature.parameters[3].type_id == .int and allImmutable(signature.parameters),
         .literal_byte => signature.parameters.len == 0 and signature.return_type == .byte and !signature.is_fallible,
         .array_borrow, .array_borrow_mut => try validArrayBorrowSignature(ctx, symbol, signature),
@@ -2803,6 +2805,39 @@ fn validArrayFilledSignature(ctx: anytype, signature: structures.FunctionSignatu
     return signature.parameters[0].type_id == array.element_type;
 }
 
+fn validCursorSignature(ctx: anytype, symbol: standard_library.External, signature: structures.FunctionSignature) !bool {
+    if (signature.is_fallible) return false;
+    if (symbol == .empty_cursor) return signature.parameters.len == 0 and try storageCursorAccessType(ctx, signature.return_type) != null;
+    if (symbol == .cursor_element) {
+        if (signature.parameters.len != 2 or !allImmutable(signature.parameters) or signature.parameters[1].type_id != .int) return false;
+        const source = (try storageCursorAccessType(ctx, signature.parameters[0].type_id)) orelse return false;
+        const target = (try borrowAccessType(ctx, signature.return_type)) orelse return false;
+        return source.element_type == target.element_type and (!target.writable or source.writable);
+    }
+    const target = (try storageCursorAccessType(ctx, signature.return_type)) orelse return false;
+    if (symbol == .cursor_offset) {
+        return signature.parameters.len == 2 and allImmutable(signature.parameters) and
+            signature.parameters[0].type_id == signature.return_type and signature.parameters[1].type_id == .int;
+    }
+    if (signature.parameters.len != 1) return false;
+    const source = signature.parameters[0];
+    switch (symbol) {
+        .static_cursor => return source.mode == .imm and source.type_id == .static_data and target.element_type == .byte and !target.writable,
+        .array_cursor, .array_cursor_mut => {
+            const array = (try lookupArrayType(ctx, source.type_id)) orelse return false;
+            return array.element_type == target.element_type and target.writable == (symbol == .array_cursor_mut) and
+                source.mode == (if (target.writable) structures.ParameterMode.mut else .imm);
+        },
+        .allocation_cursor, .allocation_cursor_mut => return (try allocationElementType(ctx, source.type_id)) == target.element_type and
+            target.writable == (symbol == .allocation_cursor_mut) and source.mode == (if (target.writable) structures.ParameterMode.mut else .imm),
+        .cursor_attenuate => {
+            const access = (try storageCursorAccessType(ctx, source.type_id)) orelse return false;
+            return source.mode == .imm and access.writable and !target.writable and access.element_type == target.element_type;
+        },
+        else => unreachable,
+    }
+}
+
 fn validArrayBorrowSignature(ctx: anytype, symbol: standard_library.External, signature: structures.FunctionSignature) !bool {
     if (signature.is_fallible or signature.parameters.len != 2) return false;
     const writable = symbol == .array_borrow_mut;
@@ -2886,7 +2921,7 @@ fn standardMemoryInstance(ctx: anytype, type_id: structures.TypeId, structure: s
     if (resolved.file_id != registered) return null;
     const tuple = generated.owner.specialization orelse return null;
     const arguments = (try ctx.lookupInterned(CompileTimeValueTuples, tuple)).values;
-    if (arguments.len != @as(usize, if (structure == .Ref or structure == .collection_literal) 2 else 1)) return null;
+    if (arguments.len != @as(usize, if (structure == .Ref or structure == .StorageCursor or structure == .Span or structure == .collection_literal) 2 else 1)) return null;
     const element = (try ctx.lookupInterned(CompileTimeValues, arguments[0])).*;
     const element_type = switch (element) {
         .type => |value| value,
@@ -2940,6 +2975,35 @@ fn borrowElementType(ctx: anytype, type_id: structures.TypeId) !?structures.Type
 
 fn borrowAccessType(ctx: anytype, type_id: structures.TypeId) !?BorrowAccessType {
     const instance = (try standardMemoryInstance(ctx, type_id, .Ref)) orelse return null;
+    const definition = (try ctx.get(GeneratedStructDefinition, instance.generated)).* orelse return null;
+    if (definition.fields.len != 1 or
+        definition.ownership.move != null or definition.ownership.copy == null or
+        definition.ownership.copy.?.capability != .trivial or definition.ownership.drop != null or
+        !std.mem.eql(u8, definition.fields[0].name, "cursor")) return null;
+    const cursor = (try storageCursorAccessType(ctx, definition.fields[0].type_id)) orelse return null;
+    const access = (try ctx.lookupInterned(CompileTimeValues, instance.arguments[1])).*;
+    if (access != .runtime or access.runtime.value != .bool) return null;
+    if (cursor.element_type != instance.element_type or cursor.writable != access.runtime.value.bool) return null;
+    return cursor;
+}
+
+fn spanAccessType(ctx: anytype, type_id: structures.TypeId) !?BorrowAccessType {
+    const instance = (try standardMemoryInstance(ctx, type_id, .Span)) orelse return null;
+    const access = (try ctx.lookupInterned(CompileTimeValues, instance.arguments[1])).*;
+    if (access != .runtime or access.runtime.type_id != .bool or access.runtime.value != .bool) return null;
+    const definition = (try ctx.get(GeneratedStructDefinition, instance.generated)).* orelse return null;
+    if (definition.fields.len != 2 or definition.ownership.move != null or definition.ownership.drop != null or
+        definition.ownership.copy == null or definition.ownership.copy.?.capability != .trivial or
+        definition.fields[0].is_public or definition.fields[1].is_public or
+        !std.mem.eql(u8, definition.fields[0].name, "data") or
+        !std.mem.eql(u8, definition.fields[1].name, "size") or definition.fields[1].type_id != .int) return null;
+    const cursor = (try storageCursorAccessType(ctx, definition.fields[0].type_id)) orelse return null;
+    if (cursor.element_type != instance.element_type or cursor.writable != access.runtime.value.bool) return null;
+    return cursor;
+}
+
+fn storageCursorAccessType(ctx: anytype, type_id: structures.TypeId) !?BorrowAccessType {
+    const instance = (try standardMemoryInstance(ctx, type_id, .StorageCursor)) orelse return null;
     const access = (try ctx.lookupInterned(CompileTimeValues, instance.arguments[1])).*;
     const runtime = switch (access) {
         .runtime => |value| value,
@@ -2954,6 +3018,7 @@ fn borrowAccessType(ctx: anytype, type_id: structures.TypeId) !?BorrowAccessType
     if (definition.fields.len != 2 or
         definition.ownership.move != null or definition.ownership.copy == null or
         definition.ownership.copy.?.capability != .trivial or definition.ownership.drop != null or
+        definition.fields[0].is_public or definition.fields[1].is_public or
         !std.mem.eql(u8, definition.fields[0].name, "address_low") or definition.fields[0].type_id != .int or
         !std.mem.eql(u8, definition.fields[1].name, "address_high") or definition.fields[1].type_id != .int)
     {
@@ -3335,7 +3400,7 @@ fn ComptimeCallExecutor(comptime Context: type) type {
             const external = (try self.ctx.get(ExternalSymbol, instance.item)).*;
             if (external) |symbol| {
                 switch (symbol) {
-                    .primitive_operation, .copy_value, .move_value, .array_filled, .array_from, .array_borrow, .array_borrow_mut, .literal_byte, .literal_data, .literal_size, .static_pointer, .array_bytes_pointer, .allocation_bytes_pointer, .byte_offset, .byte_read, .byte_int, .initialize_collection => {},
+                    .primitive_operation, .copy_value, .move_value, .array_filled, .array_from, .array_borrow, .array_borrow_mut, .literal_byte, .literal_data, .literal_size, .byte_int, .initialize_collection, .empty_cursor, .static_cursor, .array_cursor, .array_cursor_mut, .allocation_cursor, .allocation_cursor_mut, .cursor_offset, .cursor_element, .cursor_attenuate => {},
                     .unsafe_initialize => {},
                     .allocate, .allocate_host_storage => return self.allocateStorage(symbol, signature.return_type, arguments, storage),
                     .deallocate, .deallocate_host_storage, .deallocate_box => {
@@ -3693,9 +3758,11 @@ fn analyzeFunctionBody(ctx: anytype, instance: structures.InstanceId, publish_in
         .literal_byte => .literal_byte,
         .literal_data => .literal_data,
         .literal_size => .literal_size,
-        .static_pointer, .array_bytes_pointer, .allocation_bytes_pointer => .byte_pointer,
-        .byte_offset => .byte_offset,
-        .byte_read => .byte_read,
+        .empty_cursor => .empty_cursor,
+        .static_cursor, .array_cursor, .array_cursor_mut, .allocation_cursor, .allocation_cursor_mut => .storage_cursor,
+        .cursor_offset => .cursor_offset,
+        .cursor_element => .cursor_element,
+        .cursor_attenuate => .cursor_attenuate,
         .byte_int => .byte_to_int,
         .unsafe_initialize => .initialize_slot,
         else => null,
@@ -3757,7 +3824,7 @@ pub const CompileFunction = struct {
             else
                 (try ctx.get(FunctionInstanceSignature, instance_id)).* orelse return null;
             return switch (symbol) {
-                .primitive_operation, .copy_value, .move_value, .array_filled, .array_from, .array_borrow, .array_borrow_mut, .unsafe_initialize, .literal_byte, .literal_data, .literal_size, .static_pointer, .array_bytes_pointer, .allocation_bytes_pointer, .byte_offset, .byte_read, .byte_int, .initialize_collection => try compileTypedFunction(ctx, instance_id),
+                .primitive_operation, .copy_value, .move_value, .array_filled, .array_from, .array_borrow, .array_borrow_mut, .unsafe_initialize, .literal_byte, .literal_data, .literal_size, .byte_int, .initialize_collection, .empty_cursor, .static_cursor, .array_cursor, .array_cursor_mut, .allocation_cursor, .allocation_cursor_mut, .cursor_offset, .cursor_element, .cursor_attenuate => try compileTypedFunction(ctx, instance_id),
                 .io_read, .io_write => blk: {
                     const signature = (try ctx.get(FunctionSignature, instance_id.item)).* orelse return null;
                     const types: HostTypes(@TypeOf(ctx)) = .{ .ctx = ctx };

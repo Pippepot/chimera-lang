@@ -99,7 +99,7 @@ pub const Cell = struct {
         fields: []Cell,
         variant_payload: *Cell,
         reference: *Cell,
-        byte_pointer: struct { owner: *Cell, offset: u32 },
+        storage_cursor: struct { owner: *Cell, offset: u32 },
         allocation: *Allocation,
     },
 
@@ -107,7 +107,7 @@ pub const Cell = struct {
         switch (self.contents) {
             .fields => |fields| for (fields) |*field| field.invalidate(),
             .variant_payload => |payload| payload.invalidate(),
-            .uninitialized, .value, .reference, .byte_pointer, .allocation => {},
+            .uninitialized, .value, .reference, .storage_cursor, .allocation => {},
         }
         self.contents = .uninitialized;
     }
@@ -181,7 +181,7 @@ pub const ValueSnapshot = struct {
                 .value => |value| snapshot.contents = .{ .value = value },
                 .fields => |fields| snapshot.contents = .{ .fields = try self.cloneFields(fields) },
                 .variant_payload => |payload| snapshot.contents = .{ .variant_payload = try self.cloneCell(payload) },
-                .byte_pointer => |pointer| snapshot.contents = .{ .byte_pointer = .{ .owner = try self.cloneCell(pointer.owner), .offset = pointer.offset } },
+                .storage_cursor => |pointer| snapshot.contents = .{ .storage_cursor = .{ .owner = try self.cloneCell(pointer.owner), .offset = pointer.offset } },
                 .reference => |target| snapshot.contents = .{ .reference = try self.cloneCell(target) },
                 .allocation => |allocation| snapshot.contents = .{ .allocation = try self.cloneAllocation(allocation) },
             }
@@ -250,16 +250,16 @@ pub const ValueSnapshot = struct {
                 .value => |value| return std.meta.eql(value, right.contents.value),
                 .fields => |fields| return self.sameFields(fields, right.contents.fields),
                 .variant_payload => |payload| return self.sameCell(payload, right.contents.variant_payload),
-                .byte_pointer => return self.sameBytePointer(left, right),
+                .storage_cursor => return self.sameStorageCursor(left, right),
                 .reference => |target| return self.left.sourceCell(target) == self.right.sourceCell(right.contents.reference) and
                     try self.sameCell(target, right.contents.reference),
                 .allocation => |allocation| return self.sameAllocation(allocation, right.contents.allocation),
             }
         }
 
-        fn sameBytePointer(self: *@This(), left: *const Cell, right: *const Cell) anyerror!bool {
-            const first = left.contents.byte_pointer;
-            const second = right.contents.byte_pointer;
+        fn sameStorageCursor(self: *@This(), left: *const Cell, right: *const Cell) anyerror!bool {
+            const first = left.contents.storage_cursor;
+            const second = right.contents.storage_cursor;
             if (first.offset != second.offset) return false;
             // Copied allocation descriptors still denote the same allocation;
             // inline arrays retain the identity of their original storage cell.
@@ -358,13 +358,13 @@ pub fn executeInStorage(
                 .const_int => |value| slots[destination] = .{ .runtime = .{ .int = value } },
                 .const_string_literal => |value| slots[destination] = .{ .runtime = .{ .string_literal = value } },
                 .const_data => |value| slots[destination] = .{ .runtime = .{ .static_data = value } },
-                .const_byte_pointer => |value| slots[destination] = .{ .runtime = .{ .byte_pointer = value } },
-                .byte_pointer => |source| switch (try bytePointer(body, slots, source, executor, storage)) {
+                .const_storage_cursor => |value| slots[destination] = .{ .runtime = .{ .storage_cursor = value } },
+                .storage_cursor => |operation| switch (try storageCursor(body, slots, operation, executor, storage)) {
                     .returned => |value| slots[destination] = value,
                     else => |result| return atSpan(result, instructionSpan(body, instruction_index)),
                 },
-                .byte_offset => |operands| slots[destination] = try offsetBytePointer(slots[@backingInt(operands.lhs)], @intCast(integer(slots, operands.rhs)), storage),
-                .byte_read => |operands| slots[destination] = .{ .runtime = .{ .byte = try readBytePointer(slots[@backingInt(operands.lhs)], @intCast(integer(slots, operands.rhs)), executor) } },
+                .cursor_offset => |operation| slots[destination] = try offsetStorageCursor(slots[@backingInt(operation.cursor)], operation.type_id, @intCast(integer(slots, operation.index)), storage),
+                .cursor_element => |operation| slots[destination] = try storageCursorElement(slots[@backingInt(operation.cursor)], operation.type_id, @intCast(integer(slots, operation.index)), storage),
                 .byte_to_int => |source| slots[destination] = .{ .runtime = .{ .int = scalar(slots, source).byte } },
                 .const_int_literal => |value| slots[destination] = .{ .runtime = .{ .int_literal = value } },
                 .static_conversion => |conversion| {
@@ -434,6 +434,10 @@ pub fn executeInStorage(
                     else => |result| return atSpan(result, instructionSpan(body, instruction_index)),
                 },
                 .borrow_read => |operation| {
+                    if (try readStaticReference(slots[@backingInt(operation.source)], executor)) |value| {
+                        slots[destination] = value;
+                        continue;
+                    }
                     const target = referenceTarget(slots[@backingInt(operation.source)]) orelse return executionError(.unsupported_operation, instructionSpan(body, instruction_index));
                     std.debug.assert(target.type_id == operation.type_id);
                     slots[destination] = .{ .place = target };
@@ -455,6 +459,8 @@ pub fn executeInStorage(
                 },
                 .value_copy => |operation| {
                     var copied = (try readSlot(slots, operation.source, executor, gpa)) orelse return .unavailable;
+                    if (copied == .runtime and copied.runtime == .storage_cursor)
+                        copied.runtime.storage_cursor.type_id = operation.type_id;
                     if (operation.destination == null and copied == .place) {
                         const cell = try storage.create(Cell);
                         cell.* = .{ .type_id = operation.type_id, .storage = storage, .contents = .uninitialized };
@@ -714,7 +720,7 @@ fn arrayType(executor: anytype, type_id: structures.TypeId) !?structures.ArrayTy
 
 pub fn containsReference(cell: *const Cell) bool {
     switch (cell.contents) {
-        .reference, .byte_pointer, .allocation => return true,
+        .reference, .storage_cursor, .allocation => return true,
         .fields => |fields| for (fields) |*field| {
             if (containsReference(field)) return true;
         },
@@ -765,7 +771,7 @@ pub fn assignCell(destination: *Cell, source: Value, executor: anytype) anyerror
             switch (cell.contents) {
                 .value => |runtime| try assignRuntime(destination, runtime, executor),
                 .uninitialized => destination.contents = .uninitialized,
-                .byte_pointer => |pointer| destination.contents = .{ .byte_pointer = pointer },
+                .storage_cursor => |pointer| destination.contents = .{ .storage_cursor = pointer },
                 .reference => |target| destination.contents = .{ .reference = target },
                 .allocation => |allocation| {
                     if (try arrayType(executor, cell.type_id)) |array| {
@@ -850,7 +856,7 @@ fn expandFields(cell: *Cell, executor: anytype) !bool {
             cell.contents = .{ .fields = fields };
         },
         .fields => {},
-        .variant_payload, .reference, .byte_pointer, .allocation => unreachable,
+        .variant_payload, .reference, .storage_cursor, .allocation => unreachable,
     }
     return true;
 }
@@ -900,7 +906,7 @@ fn borrowVariantCell(target: *Cell, member: structures.TypeId, executor: anytype
 fn materialize(cell: *const Cell, executor: anytype, gpa: std.mem.Allocator) !?structures.CompileTimeValue.RuntimeValue {
     switch (cell.contents) {
         .value => |value| return value,
-        .reference, .byte_pointer, .allocation => return null,
+        .reference, .storage_cursor, .allocation => return null,
         .uninitialized => {
             std.debug.assert(cell.type_id != .never);
             if (try arrayType(executor, cell.type_id)) |array| {
@@ -961,7 +967,7 @@ fn projectStorage(
                 .variant_payload => |payload| if (payload.type_id != operation.type_id) {
                     payload.* = .{ .type_id = operation.type_id, .storage = cell.storage, .contents = .uninitialized };
                 },
-                .fields, .reference, .byte_pointer, .allocation => unreachable,
+                .fields, .reference, .storage_cursor, .allocation => unreachable,
             }
             return .{ .returned = .{ .place = cell.contents.variant_payload } };
         },
@@ -1168,52 +1174,61 @@ fn branchTarget(
     return .{ .next = branch.target };
 }
 
-fn bytePointer(body: *const structures.FunctionBodyAnalysis, slots: []Value, source: structures.FunctionValueId, executor: anytype, storage: std.mem.Allocator) !Result {
-    if (body.valueType(source) == .static_data) return .{ .returned = .{ .runtime = .{ .byte_pointer = .{ .data = scalar(slots, source).static_data } } } };
-    const owner = try storageCell(body, slots, source, storage);
+fn storageCursor(body: *const structures.FunctionBodyAnalysis, slots: []Value, operation: structures.BorrowOperation, executor: anytype, storage: std.mem.Allocator) !Result {
+    if (body.valueType(operation.source) == .static_data) return .{ .returned = .{ .runtime = .{ .storage_cursor = .{ .type_id = operation.type_id, .data = scalar(slots, operation.source).static_data } } } };
+    const owner = try storageCell(body, slots, operation.source, storage);
     if (owner.contents != .allocation and !try expandFields(owner, executor)) return .unavailable;
     const cell = try storage.create(Cell);
-    cell.* = .{ .type_id = .byte_pointer, .storage = storage, .contents = .{ .byte_pointer = .{ .owner = owner, .offset = 0 } } };
+    cell.* = .{ .type_id = operation.type_id, .storage = storage, .contents = .{ .storage_cursor = .{ .owner = owner, .offset = 0 } } };
     return .{ .returned = .{ .place = cell } };
 }
 
-fn offsetBytePointer(source: Value, offset: u32, storage: std.mem.Allocator) !Value {
+fn offsetStorageCursor(source: Value, type_id: structures.TypeId, offset: u32, storage: std.mem.Allocator) !Value {
     switch (source) {
         .runtime => |runtime| {
-            var pointer = runtime.byte_pointer;
-            pointer.offset = std.math.add(u32, pointer.offset, offset) catch return error.TypeTooLarge;
-            return .{ .runtime = .{ .byte_pointer = pointer } };
+            var cursor = runtime.storage_cursor;
+            cursor.type_id = type_id;
+            cursor.offset = std.math.add(u32, cursor.offset, offset) catch return error.TypeTooLarge;
+            return .{ .runtime = .{ .storage_cursor = cursor } };
         },
         .place => |cell| {
-            if (cell.contents == .value) return offsetBytePointer(.{ .runtime = cell.contents.value }, offset, storage);
+            if (cell.contents == .value) return offsetStorageCursor(.{ .runtime = cell.contents.value }, type_id, offset, storage);
+            var cursor = cell.contents.storage_cursor;
+            cursor.offset = std.math.add(u32, cursor.offset, offset) catch return error.TypeTooLarge;
             const result = try storage.create(Cell);
-            var pointer = cell.contents.byte_pointer;
-            pointer.offset = std.math.add(u32, pointer.offset, offset) catch return error.TypeTooLarge;
-            result.* = .{ .type_id = .byte_pointer, .storage = storage, .contents = .{ .byte_pointer = pointer } };
+            result.* = .{ .type_id = type_id, .storage = storage, .contents = .{ .storage_cursor = cursor } };
             return .{ .place = result };
         },
         .type, .initializer => unreachable,
     }
 }
 
-fn readBytePointer(source: Value, offset: u32, executor: anytype) !u8 {
+fn storageCursorElement(source: Value, type_id: structures.TypeId, offset: u32, storage: std.mem.Allocator) !Value {
+    switch (source) {
+        .runtime => return offsetStorageCursor(source, type_id, offset, storage),
+        .place => |cell| {
+            if (cell.contents == .value) return storageCursorElement(.{ .runtime = cell.contents.value }, type_id, offset, storage);
+            const cursor = cell.contents.storage_cursor;
+            const index = std.math.add(u32, cursor.offset, offset) catch return error.TypeTooLarge;
+            const element = if (cursor.owner.contents == .allocation)
+                try cursor.owner.contents.allocation.element(index)
+            else
+                &cursor.owner.contents.fields[index];
+            return referenceValue(type_id, element, storage);
+        },
+        .type, .initializer => unreachable,
+    }
+}
+
+fn readStaticReference(source: Value, executor: anytype) !?Value {
     switch (source) {
         .runtime => |runtime| {
-            const pointer = runtime.byte_pointer;
-            const bytes = try executor.byteString(pointer.data);
-            return bytes[@as(usize, pointer.offset) + offset];
+            if (runtime != .storage_cursor) return null;
+            const cursor = runtime.storage_cursor;
+            const bytes = try executor.byteString(cursor.data orelse unreachable);
+            return .{ .runtime = .{ .byte = bytes[cursor.offset] } };
         },
-        .place => |cell| {
-            if (cell.contents == .value) return readBytePointer(.{ .runtime = cell.contents.value }, offset, executor);
-            const pointer = cell.contents.byte_pointer;
-            const index = @as(usize, pointer.offset) + offset;
-            const field = if (pointer.owner.contents == .allocation)
-                try pointer.owner.contents.allocation.element(@intCast(index))
-            else
-                &pointer.owner.contents.fields[index];
-            std.debug.assert(field.contents == .value);
-            return field.contents.value.byte;
-        },
+        .place => |cell| return if (cell.contents == .value) readStaticReference(.{ .runtime = cell.contents.value }, executor) else null,
         .type, .initializer => unreachable,
     }
 }

@@ -140,11 +140,11 @@ test "operation indexing replacement preserves reference origin restrictions" {
     , .borrow_write_cannot_store_borrow);
 }
 
-test "operation indexing Buffer and views use the same operator contract" {
+test "operation indexing List and views use the same operator contract" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{Buffer}
+        \\import std.memory.{List}
         \\fallible calculate() int
-        \\    var values = Buffer(int).new?(2)
+        \\    var values = List(int).new?(2)
         \\    values.append?(19)
         \\    values.append?(23)
         \\    values[0] += 1

@@ -72,6 +72,53 @@ const Fixture = struct {
     }
 };
 
+test "cursor snapshots restore literal and empty spans and recompute source edits" {
+    const source =
+        \\static empty = Span(int, true).empty().as_imm()
+        \\static bytes: BytesView = "\u{e9}"
+        \\func run() int
+        \\    const values = [19, 23]
+        \\    const view = values.span()
+        \\    if const first = view.get(0)
+        \\        if const second = view.get(1)
+        \\            return first[] + second[] + empty.len() + bytes.byte_length() - 2
+        \\    return 90
+        \\static answer = run()
+        \\exit(run() + answer - 42)
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const edited = try std.mem.replaceOwned(u8, std.testing.allocator, source, "[19, 23]", "[20, 23]");
+    defer std.testing.allocator.free(edited);
+    try fixture.db.setInput(queries.SourceText, 0, edited);
+    try fixture.expectExit(44);
+}
+
+test "returned text borrows reject conflicting writes after snapshot restoration" {
+    const source =
+        \\fallible validate(imm view: Span(byte, true)) StringView -> BytesView.from_span(view.as_imm()).validate_utf8?()
+        \\fallible inspect() int
+        \\    var bytes: Array(byte, 1) = [65]
+        \\    const writable = bytes.span_mut()
+        \\    const text = validate?(writable)
+        \\    return text.byte_length() + 41
+        \\func run() int
+        \\    if const answer = inspect() -> return answer
+        \\    return 90
+        \\exit(run())
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const edited = try std.mem.replaceOwned(u8, std.testing.allocator, source, "return text.byte_length() + 41", "writable[0] = 255\n    return text.byte_length() + 41");
+    defer std.testing.allocator.free(edited);
+    try fixture.db.setInput(queries.SourceText, 0, edited);
+    try fixture.expectDiagnostic(.borrow_outlives_source);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(42);
+}
+
 test "operation snapshots restore calls indexers and invalidate signature and visibility edits" {
     const library =
         \\pub struct Value

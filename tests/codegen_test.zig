@@ -10,6 +10,7 @@ const wide_variant = structures.TypeId.fromInterned(@fromBackingInt(@intCast(1))
 const seven_byte_payload = structures.TypeId.fromInterned(@fromBackingInt(@intCast(2)));
 const payload_variant = structures.TypeId.fromInterned(@fromBackingInt(@intCast(3)));
 const callable_type = structures.TypeId.fromInterned(@fromBackingInt(@intCast(4)));
+const byte_reference_type = structures.TypeId.fromInterned(@fromBackingInt(@intCast(5)));
 
 const TestTypes = struct {
     data: []const u8 = "a*",
@@ -22,7 +23,7 @@ const TestTypes = struct {
 
     pub fn layout(_: @This(), type_id: structures.TypeId) !structures.TypeLayout {
         if (type_id == .byte) return .{ .byte_size = 1, .byte_alignment = 1 };
-        if (type_id == .byte_pointer or type_id == .static_data) return .{ .byte_size = 8, .byte_alignment = 8 };
+        if (type_id == byte_reference_type or type_id == .static_data) return .{ .byte_size = 8, .byte_alignment = 8 };
         if (type_id == .int) return .{ .byte_size = 4, .byte_alignment = 4 };
         if (type_id == .unit or type_id == .none or type_id == .never) return .{ .byte_size = 0, .byte_alignment = 1 };
         if (type_id == small_variant or type_id == wide_variant) return .{ .byte_size = 8, .byte_alignment = 4 };
@@ -49,8 +50,12 @@ const TestTypes = struct {
         return null;
     }
 
-    pub fn borrowElement(_: @This(), _: structures.TypeId) !?structures.TypeId {
-        return null;
+    pub fn borrowElement(_: @This(), type_id: structures.TypeId) !?structures.TypeId {
+        return if (type_id == byte_reference_type) structures.TypeId.byte else null;
+    }
+
+    pub fn storageAccess(_: @This(), type_id: structures.TypeId) !?struct { element_type: structures.TypeId, writable: bool } {
+        return if (type_id == byte_reference_type) .{ .element_type = .byte, .writable = false } else null;
     }
 
     pub fn argumentPassing(_: @This(), _: structures.TypeId) !structures.ArgumentPassing {
@@ -166,6 +171,11 @@ const ArrayCopyTypes = struct {
         if (type_id == array_reference_type) return array_copy_type;
         if (type_id == reference_reference_type) return array_reference_type;
         return null;
+    }
+
+    pub fn storageAccess(self: *@This(), type_id: structures.TypeId) !?struct { element_type: structures.TypeId, writable: bool } {
+        const element = (try self.borrowElement(type_id)) orelse return null;
+        return .{ .element_type = element, .writable = true };
     }
 
     pub fn argumentPassing(_: *@This(), type_id: structures.TypeId) !structures.ArgumentPassing {
@@ -1146,23 +1156,22 @@ fn testBuildExecutableAllocations(gpa: std.mem.Allocator) !void {
     defer executable.deinit(gpa);
 }
 
-test "data relocations own deduplicated bytes and preserve pointer offsets" {
+test "data relocations own deduplicated bytes and preserve cursor offsets" {
     var bytes = [_]u8{ 'a', 42, 0 };
-    const pointer = structures.FunctionInstruction{ .const_byte_pointer = .{ .data = @fromBackingInt(0), .offset = 1 } };
+    const cursor = structures.FunctionInstruction{ .const_storage_cursor = .{ .type_id = byte_reference_type, .data = @fromBackingInt(0), .offset = 1 } };
     var instructions = [_]structures.FunctionInstruction{
-        pointer,
-        .{ .const_byte_pointer = .{ .data = @fromBackingInt(1), .offset = 1 } },
-        .{ .const_int = 0 },
-        .{ .byte_read = .{ .lhs = @fromBackingInt(0), .rhs = @fromBackingInt(2) } },
-        .{ .byte_read = .{ .lhs = @fromBackingInt(1), .rhs = @fromBackingInt(2) } },
+        cursor,
+        .{ .const_storage_cursor = .{ .type_id = byte_reference_type, .data = @fromBackingInt(1), .offset = 1 } },
+        .{ .borrow_read = .{ .source = @fromBackingInt(0), .type_id = .byte } },
+        .{ .borrow_read = .{ .source = @fromBackingInt(1), .type_id = .byte } },
+        .{ .byte_to_int = @fromBackingInt(2) },
         .{ .byte_to_int = @fromBackingInt(3) },
-        .{ .byte_to_int = @fromBackingInt(4) },
-        .{ .addi = .{ .lhs = @fromBackingInt(5), .rhs = @fromBackingInt(6) } },
+        .{ .addi = .{ .lhs = @fromBackingInt(4), .rhs = @fromBackingInt(5) } },
         .{ .call = .{ .target = .{ .direct = .{ .item = @fromBackingInt(1) } }, .arguments = .{ .start = 0, .end = 1 }, .return_type = .never } },
     };
     var blocks = [_]structures.FunctionBlock{.{ .instruction_start = 0, .instruction_end = instructions.len, .terminator = .diverge }};
     var ssa = functionSsa(&instructions, &blocks);
-    var arguments = [_]structures.FunctionCallArgument{.{ .prepared = .{ .value = @fromBackingInt(7) } }};
+    var arguments = [_]structures.FunctionCallArgument{.{ .prepared = .{ .value = @fromBackingInt(6) } }};
     ssa.call_arguments = &arguments;
     var artifact = try codegen.compileFunction(&ssa, TestTypes{ .data = &bytes }, std.testing.allocator);
     defer artifact.deinit(std.testing.allocator);

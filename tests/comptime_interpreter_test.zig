@@ -18,7 +18,7 @@ const ValueSnapshot = interpreter.ValueSnapshot;
 
 test "evaluation heap empty oversized and zero sized allocations preserve native size handling" {
     try test_sources.SourceFixture.expectParity(
-        \\import std.memory.{allocate, deallocate, Buffer}
+        \\import std.memory.{allocate, deallocate, List}
         \\struct Empty
         \\    copy = trivial
         \\fallible compute() int
@@ -33,7 +33,7 @@ test "evaluation heap empty oversized and zero sized allocations preserve native
         \\    const logical_capacity = logical.capacity()
         \\    deallocate(Empty, logical^)
         \\    if logical_capacity <> 2147483647 -> return 92
-        \\    var buffer = Buffer(Empty).new?(0)
+        \\    var buffer = List(Empty).new?(0)
         \\    if buffer.get(0) -> return 93
         \\    const empty_view = buffer.view?(0, 0)
         \\    if empty_view.get(0) -> return 94
@@ -263,7 +263,7 @@ test "evaluation heap independent workers share no storage and recursive snapsho
 
 test "evaluation heap executes independent factories nested aliases and ordinary collections" {
     try test_sources.SourceFixture.expectParity(
-        \\import std.memory.{Box, Ref, Buffer}
+        \\import std.memory.{Box, Ref, List}
         \\func factory() Box(int)
         \\    if const owner = Box(int).new(19) -> return owner^
         \\    exit(90)
@@ -275,7 +275,7 @@ test "evaluation heap executes independent factories nested aliases and ordinary
         \\    forward(first.borrow_mut())
         \\    if first.borrow()[] <> 23 -> return 91
         \\    if second.borrow()[] <> 19 -> return 92
-        \\    var buffer = Buffer(int).new?(0)
+        \\    var buffer = List(int).new?(0)
         \\    buffer.append?(19)
         \\    buffer.append?(23)
         \\    buffer.reserve?(8)
@@ -315,16 +315,16 @@ test "byte pointer snapshots preserve allocation identity contents offsets and i
     element.contents = .{ .value = .{ .byte = 42 } };
     var owner: Cell = .{ .type_id = .unit, .storage = storage, .contents = .{ .allocation = allocation } };
     var copied_owner = owner;
-    var pointer: Cell = .{ .type_id = .byte_pointer, .storage = storage, .contents = .{ .byte_pointer = .{ .owner = &owner, .offset = 0 } } };
-    var copied_pointer: Cell = .{ .type_id = .byte_pointer, .storage = storage, .contents = .{ .byte_pointer = .{ .owner = &copied_owner, .offset = 0 } } };
+    var pointer: Cell = .{ .type_id = @fromBackingInt(@as(u32, 107)), .storage = storage, .contents = .{ .storage_cursor = .{ .owner = &owner, .offset = 0 } } };
+    var copied_pointer: Cell = .{ .type_id = @fromBackingInt(@as(u32, 107)), .storage = storage, .contents = .{ .storage_cursor = .{ .owner = &copied_owner, .offset = 0 } } };
     const original = try ValueSnapshot.init(&.{.{ .place = &pointer }}, storage);
     const copied = try ValueSnapshot.init(&.{.{ .place = &copied_pointer }}, storage);
     try std.testing.expect(try original.eql(copied, std.testing.allocator));
 
-    copied_pointer.contents.byte_pointer.offset = 1;
+    copied_pointer.contents.storage_cursor.offset = 1;
     const shifted = try ValueSnapshot.init(&.{.{ .place = &copied_pointer }}, storage);
     try std.testing.expect(!try original.eql(shifted, std.testing.allocator));
-    copied_pointer.contents.byte_pointer.offset = 0;
+    copied_pointer.contents.storage_cursor.offset = 0;
     const fresh = try heap.allocate(.byte, allocation.capacity);
     (try fresh.element(0)).contents = .{ .value = .{ .byte = 42 } };
     copied_owner.contents = .{ .allocation = fresh };
@@ -343,12 +343,12 @@ test "byte pointer snapshots preserve allocation identity contents offsets and i
     var other_fields = fields;
     var inline_owner: Cell = .{ .type_id = .unit, .storage = storage, .contents = .{ .fields = &fields } };
     var other_inline_owner: Cell = .{ .type_id = .unit, .storage = storage, .contents = .{ .fields = &other_fields } };
-    pointer.contents.byte_pointer.owner = &inline_owner;
-    copied_pointer.contents.byte_pointer.owner = &inline_owner;
+    pointer.contents.storage_cursor.owner = &inline_owner;
+    copied_pointer.contents.storage_cursor.owner = &inline_owner;
     const inline_original = try ValueSnapshot.init(&.{.{ .place = &pointer }}, storage);
     const inline_repeated = try ValueSnapshot.init(&.{.{ .place = &copied_pointer }}, storage);
     try std.testing.expect(try inline_original.eql(inline_repeated, std.testing.allocator));
-    copied_pointer.contents.byte_pointer.owner = &other_inline_owner;
+    copied_pointer.contents.storage_cursor.owner = &other_inline_owner;
     const inline_copied = try ValueSnapshot.init(&.{.{ .place = &copied_pointer }}, storage);
     try std.testing.expect(!try inline_original.eql(inline_copied, std.testing.allocator));
 }
@@ -470,7 +470,7 @@ const ArrayTestExecutor = struct {
     }
 };
 
-test "byte pointer evaluation defers missing canonical elements and recovers when available" {
+test "storage cursor evaluation defers missing canonical elements and recovers when available" {
     var executor: ArrayTestExecutor = .{ .allocator = std.testing.allocator };
     defer executor.deinit();
     const first = try executor.internRuntime(.byte, .{ .byte = 11 });
@@ -479,15 +479,16 @@ test "byte pointer evaluation defers missing canonical elements and recovers whe
     var modes = [_]structures.ParameterMode{.imm};
     var parameters = [_]structures.FunctionBlockArgument{.{ .type_id = @fromBackingInt(@as(u32, 103)) }};
     var instructions = [_]structures.FunctionInstruction{
-        .{ .byte_pointer = @fromBackingInt(@as(u32, 0)) },
+        .{ .storage_cursor = .{ .source = @fromBackingInt(@as(u32, 0)), .type_id = @fromBackingInt(@as(u32, 107)) } },
         .{ .const_int = 1 },
-        .{ .byte_read = .{ .lhs = @fromBackingInt(@as(u32, 1)), .rhs = @fromBackingInt(@as(u32, 2)) } },
+        .{ .cursor_element = .{ .cursor = @fromBackingInt(@as(u32, 1)), .index = @fromBackingInt(@as(u32, 2)), .type_id = @fromBackingInt(@as(u32, 106)) } },
+        .{ .borrow_read = .{ .source = @fromBackingInt(@as(u32, 3)), .type_id = .byte } },
     };
     var blocks = [_]structures.FunctionBlock{.{
         .argument_end = 1,
         .instruction_start = 0,
         .instruction_end = instructions.len,
-        .terminator = .{ .return_value = .{ .value = @fromBackingInt(@as(u32, 3)) } },
+        .terminator = .{ .return_value = .{ .value = @fromBackingInt(@as(u32, 4)) } },
     }};
     const body: structures.FunctionBodyAnalysis = .{
         .return_type = .byte,

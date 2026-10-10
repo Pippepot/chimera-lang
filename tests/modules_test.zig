@@ -2811,10 +2811,10 @@ test "replacing a parent with a moved trivial field still destroys its owned sib
 test "a drop hook can consume an allocation field" {
     try Fixture.expectSourceExit(
         \\import std.memory.{Allocation, allocate, deallocate, unsafe_initialize, unsafe_destroy, unsafe_borrow_element, read}
-        \\struct Buffer
+        \\struct List
         \\  allocation: Allocation(int)
         \\  length: int
-        \\  drop = func(deinit self: Buffer)
+        \\  drop = func(deinit self: List)
         \\    unsafe_destroy(int, self.allocation, 0)
         \\    deallocate(int, self.allocation^)
         \\fallible run() int
@@ -2823,7 +2823,7 @@ test "a drop hook can consume an allocation field" {
         \\  else
         \\    deallocate(int, allocation^)
         \\    fail
-        \\  const buffer = Buffer{allocation = allocation^, length = 1}
+        \\  const buffer = List{allocation = allocation^, length = 1}
         \\  return read(int, false, unsafe_borrow_element(int, buffer.allocation, 0)) + buffer.length
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
@@ -3369,61 +3369,61 @@ test "nested explicit-drop fields leave no owner after successive transfers" {
     , 42);
 }
 
-test "buffer tracks initialized length separately from allocation capacity" {
+test "list tracks initialized length separately from allocation capacity" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{Buffer}
+        \\import std.memory.{List}
         \\fallible run() int
-        \\  const empty = Buffer(int).new?(0)
-        \\  const reserved = Buffer(int).new?(3)
+        \\  const empty = List(int).new?(0)
+        \\  const reserved = List(int).new?(3)
         \\  return 39 + empty.len() + empty.capacity() + reserved.len() + reserved.capacity()
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
 
-test "buffer rejects Ref elements without origin tracking across mutations" {
+test "list rejects Ref elements without origin tracking across mutations" {
     const fixture = try Fixture.initFiles(
-        \\import std.memory.{Buffer}
+        \\import std.memory.{List}
         \\fallible run() int
-        \\  const buffer = Buffer(Ref(int, false)).new?(1)
+        \\  const buffer = List(Ref(int, false)).new?(1)
         \\  return buffer.len()
         \\if const length = run() -> exit(length + 42) else exit(1)
     , &.{});
     defer fixture.deinit();
-    try fixture.expectLibraryDiagnostic(.buffer_cannot_store_borrow_element);
+    try fixture.expectLibraryDiagnostic(.list_cannot_store_borrow_element);
 }
 
-test "buffer initialization metadata is opaque outside std.memory" {
+test "list initialization metadata is opaque outside std.memory" {
     try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{Buffer}
+        \\import std.memory.{List}
         \\fallible run() unit
-        \\  var buffer = Buffer(int).new?(0)
+        \\  var buffer = List(int).new?(0)
         \\  buffer.initialized = 1
         \\if run() -> exit(1) else exit(2)
     , .private_struct_field);
 }
 
-test "buffer appends into free slots and grows from zero" {
+test "list appends into free slots and grows from zero" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{Buffer}
+        \\import std.memory.{List}
         \\fallible run() int
-        \\  var empty = Buffer(int).new?(0)
+        \\  var empty = List(int).new?(0)
         \\  empty.append?(20)
         \\  empty.append?(22)
-        \\  var reserved = Buffer(int).new?(2)
+        \\  var reserved = List(int).new?(2)
         \\  reserved.append?(42)
         \\  return empty.len() + empty.capacity() + reserved.len() + reserved.capacity() + 35
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
 
-test "buffer growth moves elements and drops the initialized prefix in reverse" {
+test "list growth moves elements and drops the initialized prefix in reverse" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{Buffer}
+        \\import std.memory.{List}
         \\struct Tracked
         \\  value: int
         \\  drop = func(deinit self: Tracked) -> exit(self.value)
         \\fallible run() unit
-        \\  var buffer = Buffer(Tracked).new?(1)
+        \\  var buffer = List(Tracked).new?(1)
         \\  buffer.append?(Tracked{value = 17})
         \\  buffer.append?(Tracked{value = 42})
         \\  exit(1)
@@ -3431,11 +3431,11 @@ test "buffer growth moves elements and drops the initialized prefix in reverse" 
     , 42);
 }
 
-test "buffer get checks bounds and borrows an initialized element" {
+test "list get checks bounds and borrows an initialized element" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{Buffer, read}
+        \\import std.memory.{List, read}
         \\fallible run() int
-        \\  var buffer = Buffer(int).new?(1)
+        \\  var buffer = List(int).new?(1)
         \\  buffer.append?(42)
         \\  const element: Ref(int, false) = buffer.get?(0)
         \\  const observed = read(int, false, element)
@@ -3446,11 +3446,11 @@ test "buffer get checks bounds and borrows an initialized element" {
     , 42);
 }
 
-test "buffer get_mut checks bounds and replaces an initialized element" {
+test "list get_mut checks bounds and replaces an initialized element" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{Buffer}
+        \\import std.memory.{List}
         \\fallible run() int
-        \\  var buffer = Buffer(int).new?(0)
+        \\  var buffer = List(int).new?(0)
         \\  if buffer.get_mut(0) -> return 1
         \\  buffer.append?(17)
         \\  if buffer.get_mut(-1) -> return 2
@@ -3462,11 +3462,11 @@ test "buffer get_mut checks bounds and replaces an initialized element" {
     , 42);
 }
 
-test "buffer get_mut invalidates earlier element and view borrows" {
+test "list get_mut invalidates earlier element and view borrows" {
     const sources = .{
-        \\import std.memory.{Buffer}
+        \\import std.memory.{List}
         \\fallible run() int
-        \\  var buffer = Buffer(int).new?(2)
+        \\  var buffer = List(int).new?(2)
         \\  buffer.append?(17)
         \\  const previous = buffer.get?(0)
         \\  const writable = buffer.get_mut?(0)
@@ -3474,9 +3474,9 @@ test "buffer get_mut invalidates earlier element and view borrows" {
         \\  return previous[]
         \\if const result = run() -> exit(result) else exit(1)
         ,
-        \\import std.memory.{Buffer}
+        \\import std.memory.{List}
         \\fallible run() int
-        \\  var buffer = Buffer(int).new?(2)
+        \\  var buffer = List(int).new?(2)
         \\  buffer.append?(17)
         \\  const view = buffer.view?(0, 1)
         \\  const writable = buffer.get_mut?(0)
@@ -3489,11 +3489,11 @@ test "buffer get_mut invalidates earlier element and view borrows" {
     }
 }
 
-test "buffer append invalidates a writable element Ref without growth" {
+test "list append invalidates a writable element Ref without growth" {
     try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{Buffer}
+        \\import std.memory.{List}
         \\fallible run() int
-        \\  var buffer = Buffer(int).new?(2)
+        \\  var buffer = List(int).new?(2)
         \\  buffer.append?(17)
         \\  const writable = buffer.get_mut?(0)
         \\  buffer.append?(7)
@@ -3503,21 +3503,21 @@ test "buffer append invalidates a writable element Ref without growth" {
     , .borrow_outlives_source);
 }
 
-test "buffer get_mut needs a mutable buffer place" {
+test "buffer get_mut needs a mutable list place" {
     try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{Buffer}
+        \\import std.memory.{List}
         \\fallible run() int
-        \\  const buffer = Buffer(int).new?(1)
+        \\  const buffer = List(int).new?(1)
         \\  return buffer.get_mut?(0)[]
         \\if const result = run() -> exit(result) else exit(1)
     , .mutable_argument_requires_mutable_place);
 }
 
-test "a scoped alias writes through checked Buffer element access" {
+test "a scoped alias writes through checked List element access" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{Buffer}
+        \\import std.memory.{List}
         \\fallible run() int
-        \\  var buffer = Buffer(int).new?(1)
+        \\  var buffer = List(int).new?(1)
         \\  buffer.append?(17)
         \\  borrow mut item = buffer.get_mut?(0)[]
         \\  item = 42
@@ -3526,25 +3526,25 @@ test "a scoped alias writes through checked Buffer element access" {
     , 42);
 }
 
-test "an empty immovable Buffer has no writable initialized element" {
+test "an empty immovable List has no writable initialized element" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{Buffer}
+        \\import std.memory.{List}
         \\struct Pinned
         \\  move = none
         \\  value: int
         \\fallible run() int
-        \\  var buffer = Buffer(Pinned).new?(0)
+        \\  var buffer = List(Pinned).new?(0)
         \\  if buffer.get_mut(0) -> return 1
         \\  return buffer.len() + 42
         \\if const result = run() -> exit(result) else exit(2)
     , 42);
 }
 
-test "appending without growth invalidates an earlier buffer element Ref" {
+test "appending without growth invalidates an earlier list element Ref" {
     try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{Buffer, read}
+        \\import std.memory.{List, read}
         \\fallible run() int
-        \\  var buffer = Buffer(int).new?(2)
+        \\  var buffer = List(int).new?(2)
         \\  buffer.append?(17)
         \\  const element = buffer.get?(0)
         \\  buffer.append?(42)
@@ -3553,11 +3553,11 @@ test "appending without growth invalidates an earlier buffer element Ref" {
     , .borrow_outlives_source);
 }
 
-test "buffer reserve preserves initialized elements on allocation failure" {
+test "list reserve preserves initialized elements on allocation failure" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{Buffer, read}
+        \\import std.memory.{List, read}
         \\fallible run() int
-        \\  var buffer = Buffer(int).new?(1)
+        \\  var buffer = List(int).new?(1)
         \\  buffer.append?(42)
         \\  if buffer.reserve(-1) -> exit(1)
         \\  if buffer.reserve(2147483647) -> exit(2)
@@ -3567,57 +3567,57 @@ test "buffer reserve preserves initialized elements on allocation failure" {
     , 42);
 }
 
-test "buffer append rejects explicitly dropped elements" {
+test "list append rejects explicitly dropped elements" {
     const fixture = try Fixture.initFiles(
-        \\import std.memory.{Buffer}
+        \\import std.memory.{List}
         \\struct Explicit
         \\  value: int
         \\  drop = explicit
         \\fallible run() unit
-        \\  var buffer = Buffer(Explicit).new?(1)
+        \\  var buffer = List(Explicit).new?(1)
         \\  buffer.append?(Explicit{value = 42})
         \\if run() -> exit(1) else exit(2)
     , &.{});
     defer fixture.deinit();
-    try fixture.expectLibraryDiagnostic(.buffer_requires_automatic_drop);
+    try fixture.expectLibraryDiagnostic(.list_requires_automatic_drop);
 }
 
-test "buffer append rejects elements with custom move" {
+test "list append rejects elements with custom move" {
     const fixture = try Fixture.initFiles(
-        \\import std.memory.{Buffer}
+        \\import std.memory.{List}
         \\struct CustomMove
         \\  value: int
         \\  move = func(deinit self: CustomMove) CustomMove -> CustomMove{value = self.value}
         \\fallible run() unit
-        \\  var buffer = Buffer(CustomMove).new?(1)
+        \\  var buffer = List(CustomMove).new?(1)
         \\  buffer.append?(CustomMove{value = 42})
         \\if run() -> exit(1) else exit(2)
     , &.{});
     defer fixture.deinit();
-    try fixture.expectLibraryDiagnostic(.buffer_requires_direct_move);
+    try fixture.expectLibraryDiagnostic(.list_requires_direct_move);
 }
 
-test "buffer reserve rejects elements with custom move" {
+test "list reserve rejects elements with custom move" {
     const source =
-        \\import std.memory.{Buffer}
+        \\import std.memory.{List}
         \\struct CustomMove
         \\  value: int
         \\  move = func(deinit self: CustomMove) CustomMove -> CustomMove{value = self.value}
         \\fallible run() unit
-        \\  var buffer = Buffer(CustomMove).new?(0)
+        \\  var buffer = List(CustomMove).new?(0)
         \\  buffer.reserve?(1)
         \\if run() -> exit(1) else exit(2)
     ;
     const fixture = try Fixture.initFiles(source, &.{});
     defer fixture.deinit();
-    try fixture.expectLibraryDiagnostic(.buffer_requires_direct_move);
+    try fixture.expectLibraryDiagnostic(.list_requires_direct_move);
 }
 
-test "a buffer view borrows a checked subrange" {
+test "a list view borrows a checked subrange" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{Buffer, read}
+        \\import std.memory.{List, read}
         \\fallible run() int
-        \\  var buffer = Buffer(int).new?(2)
+        \\  var buffer = List(int).new?(2)
         \\  buffer.append?(17)
         \\  buffer.append?(42)
         \\  const view = buffer.view?(1, 1)
@@ -3629,22 +3629,22 @@ test "a buffer view borrows a checked subrange" {
     , 42);
 }
 
-test "buffer view range metadata is opaque outside std.memory" {
+test "list view range metadata is opaque outside std.memory" {
     try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{Buffer}
+        \\import std.memory.{List}
         \\fallible run() unit
-        \\  var buffer = Buffer(int).new?(0)
+        \\  var buffer = List(int).new?(0)
         \\  var view = buffer.view?(0, 0)
         \\  view.size = 1
         \\if run() -> exit(1) else exit(2)
     , .private_struct_field);
 }
 
-test "buffer view construction retains its range length" {
+test "list view construction retains its range length" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{Buffer}
+        \\import std.memory.{List}
         \\fallible run() int
-        \\  var buffer = Buffer(int).new?(1)
+        \\  var buffer = List(int).new?(1)
         \\  buffer.append?(42)
         \\  const view = buffer.view?(0, 1)
         \\  return 41 + view.len()
@@ -3652,11 +3652,11 @@ test "buffer view construction retains its range length" {
     , 42);
 }
 
-test "buffer view reads an initialized element" {
+test "list view reads an initialized element" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{Buffer, read}
+        \\import std.memory.{List, read}
         \\fallible run() int
-        \\  var buffer = Buffer(int).new?(1)
+        \\  var buffer = List(int).new?(1)
         \\  buffer.append?(42)
         \\  const view = buffer.view?(0, 1)
         \\  return read(int, false, view.get?(0))
@@ -3664,13 +3664,13 @@ test "buffer view reads an initialized element" {
     , 42);
 }
 
-test "a buffer view returned through an immutable parameter keeps its backing owner" {
+test "a list view returned through an immutable parameter keeps its backing owner" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{Buffer, BufferView, read}
-        \\fallible tail(imm buffer: Buffer(int)) BufferView(int)
+        \\import std.memory.{List, Span, read}
+        \\fallible tail(imm buffer: List(int)) Span(int, false)
         \\  return buffer.view?(1, buffer.len() - 1)
         \\fallible run() int
-        \\  var buffer = Buffer(int).new?(2)
+        \\  var buffer = List(int).new?(2)
         \\  buffer.append?(17)
         \\  buffer.append?(42)
         \\  const view = tail?(buffer)
@@ -3679,15 +3679,15 @@ test "a buffer view returned through an immutable parameter keeps its backing ow
     , 42);
 }
 
-test "a byte buffer view can be returned and stored without copying its backing data" {
+test "a byte list view can be returned and stored without copying its backing data" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{Buffer, BufferView, read}
+        \\import std.memory.{List, Span, read}
         \\struct ByteSlice
-        \\  view: BufferView(byte)
-        \\fallible slice(imm buffer: Buffer(byte)) ByteSlice
+        \\  view: Span(byte, false)
+        \\fallible slice(imm buffer: List(byte)) ByteSlice
         \\  return ByteSlice{view = buffer.view?(1, 1)}
         \\fallible run() int
-        \\  var bytes = Buffer(byte).new?(2)
+        \\  var bytes = List(byte).new?(2)
         \\  bytes.append?(17)
         \\  bytes.append?(42)
         \\  const stored = slice?(bytes)
@@ -3698,15 +3698,15 @@ test "a byte buffer view can be returned and stored without copying its backing 
     , 42);
 }
 
-test "a stored byte buffer view is invalid after backing storage changes" {
+test "a stored byte list view is invalid after backing storage changes" {
     try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{Buffer, BufferView, read}
+        \\import std.memory.{List, Span, read}
         \\struct ByteSlice
-        \\  view: BufferView(byte)
-        \\fallible slice(imm buffer: Buffer(byte)) ByteSlice
+        \\  view: Span(byte, false)
+        \\fallible slice(imm buffer: List(byte)) ByteSlice
         \\  return ByteSlice{view = buffer.view?(0, 1)}
         \\fallible run() unit
-        \\  var bytes = Buffer(byte).new?(1)
+        \\  var bytes = List(byte).new?(1)
         \\  bytes.append?(42)
         \\  const stored = slice?(bytes)
         \\  bytes.append?(17)
@@ -3716,22 +3716,22 @@ test "a stored byte buffer view is invalid after backing storage changes" {
     , .borrow_outlives_source);
 }
 
-test "a byte buffer view cannot escape its local backing buffer" {
+test "a byte buffer view cannot escape its local backing list" {
     try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{Buffer, BufferView}
-        \\fallible escape() BufferView(byte)
-        \\  var bytes = Buffer(byte).new?(1)
+        \\import std.memory.{List, Span}
+        \\fallible escape() Span(byte, false)
+        \\  var bytes = List(byte).new?(1)
         \\  bytes.append?(42)
         \\  return bytes.view?(0, 1)
         \\if const view = escape() -> exit(view.len()) else exit(1)
     , .borrow_outlives_source);
 }
 
-test "mutating a buffer invalidates a previously borrowed view" {
+test "mutating a list invalidates a previously borrowed view" {
     try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{Buffer, read}
+        \\import std.memory.{List, read}
         \\fallible run() int
-        \\  var buffer = Buffer(int).new?(2)
+        \\  var buffer = List(int).new?(2)
         \\  buffer.append?(17)
         \\  const view = buffer.view?(0, 1)
         \\  buffer.append?(42)

@@ -1,44 +1,33 @@
-import std.memory.{Allocation, allocate, deallocate, unsafe_initialize}
+import std.memory.{Allocation, Span, allocate, deallocate, unsafe_initialize}
 import std.array.{Array}
 import std.exit.{exit}
 
 extern func literal_data(static value: string_literal) static_data
 extern func literal_size(static value: string_literal) int
-extern func static_pointer(imm data: static_data) byte_pointer
-extern func array_bytes_pointer(static N: int, imm value: Array(byte, N)) byte_pointer
-extern func allocation_bytes_pointer(imm value: Allocation(byte)) byte_pointer
-extern func byte_offset(imm data: byte_pointer, offset: int) byte_pointer
-extern func byte_read(imm data: byte_pointer, offset: int) byte
 pub extern func byte_int(value: byte) int
-extern fallible io_write(descriptor: int, data: byte_pointer, count: int) int
+extern fallible io_write(descriptor: int, imm data: Span(byte, false)) int
 
 pub struct BytesView
     copy = trivial
-    data: byte_pointer
-    size: int
+    data: Span(byte, false)
 
-    pub func from_array(static N: int, imm value: Array(byte, N)) BytesView -> BytesView{data = array_bytes_pointer(N, value), size = N}
+    pub func from_array(static N: int, imm value: Array(byte, N)) BytesView -> BytesView{data = Span(byte, false).from_array(N, value)}
     pub fallible unsafe_from_allocation(imm value: Allocation(byte), initialized: int) BytesView
-        initialized >= 0
-        initialized <= value.capacity()
-        return BytesView{data = allocation_bytes_pointer(value), size = initialized}
-    pub fallible write_to(imm self: BytesView, descriptor: int) int -> io_write?(descriptor, self.data, self.size)
-    pub func byte_length(imm self: BytesView) int -> self.size
+        return BytesView{data = Span(byte, false).unsafe_from_allocation?(value, initialized)}
+    pub func from_span(imm span: Span(byte, false)) BytesView -> BytesView{data = span}
+    pub func as_span(imm self: BytesView) Span(byte, false) -> self.data
+    pub fallible write_to(imm self: BytesView, descriptor: int) int -> io_write?(descriptor, self.data)
+    pub func byte_length(imm self: BytesView) int -> self.data.len()
     pub fallible get(imm self: BytesView, index: int) byte
-        index >= 0
-        index < self.size
-        return byte_read(self.data, index)
+        const element = self.data.get?(index)
+        return element[]
     pub fallible [](imm self: BytesView, index: int) byte -> self.get?(index)
     pub fallible slice(imm self: BytesView, start: int, size: int) BytesView
-        start >= 0
-        size >= 0
-        start <= self.size
-        size <= self.size - start
-        return BytesView{data = byte_offset(self.data, start), size = size}
+        return BytesView{data = self.data.slice?(start, size)}
     pub fallible validate_utf8(imm self: BytesView) StringView
         var index = 0
         loop
-            if index == self.size -> break
+            if index == self.byte_length() -> break
             const first = byte_int(self.get?(index))
             index += 1
             if first >= 128
@@ -56,7 +45,7 @@ pub struct BytesView
                     if first == 244 -> maximum = 143
                 else
                     fail
-                continuation <= self.size - index
+                continuation <= self.byte_length() - index
                 const second = byte_int(self.get?(index))
                 second >= minimum
                 second <= maximum
@@ -118,8 +107,9 @@ pub struct String
         if borrow owned = self.storage as OwnedBytes -> return owned.allocation.capacity()
         exit(134)
     pub func as_bytes(imm self: String) BytesView
-        if const literal = self.storage as LiteralBytes -> return BytesView{data = static_pointer(literal.data), size = literal.size}
-        if borrow owned = self.storage as OwnedBytes -> return BytesView{data = allocation_bytes_pointer(owned.allocation), size = owned.size}
+        if const literal = self.storage as LiteralBytes -> return BytesView{data = Span(byte, false).unsafe_from_static(literal.data, literal.size)}
+        if borrow owned = self.storage as OwnedBytes
+            if const bytes = BytesView.unsafe_from_allocation(owned.allocation, owned.size) -> return bytes
         exit(134)
     pub func view(imm self: String) StringView -> StringView{bytes = self.as_bytes()}
     pub fallible reserve(mut self: String, minimum_capacity: int)
@@ -166,8 +156,8 @@ pub struct String
         return result^
 
 pub converter(static value: string_literal) String -> String{storage = LiteralBytes{data = literal_data(value), size = literal_size(value)}}
-pub converter(static value: string_literal) StringView -> StringView{bytes = BytesView{data = static_pointer(literal_data(value)), size = literal_size(value)}}
-pub converter(static value: string_literal) BytesView -> BytesView{data = static_pointer(literal_data(value)), size = literal_size(value)}
+pub converter(static value: string_literal) StringView -> StringView{bytes = BytesView{data = Span(byte, false).unsafe_from_static(literal_data(value), literal_size(value))}}
+pub converter(static value: string_literal) BytesView -> BytesView{data = Span(byte, false).unsafe_from_static(literal_data(value), literal_size(value))}
 
 pub converter(imm value: String) StringView -> value.view()
 pub converter(imm value: String) BytesView -> value.as_bytes()

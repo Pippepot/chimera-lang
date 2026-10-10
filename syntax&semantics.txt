@@ -85,12 +85,13 @@ const subtract: func(imm int, imm int) int = int.-
 # []= rather than treating a by-value [] result as a writable place. A failed
 # bounds check skips the deferred replacement initializer. Ref[] still means
 # dereference, not indexing. User-defined indexers own their bounds policy.
-# Standard Array, List, Buffer, and BufferView reads return an ordinary copy of
-# the element and require its copy capability. Array, List, and Buffer writes
+# Standard Array, List, and Span reads return an ordinary copy of
+# the element and require its copy capability. Array, List, and writable Span writes
 # use checked reference replacement: elements must move directly, contain no
 # borrowed references, and permit automatic drop. Immovable elements still
 # construct in containers, but cannot use these copied-read/replacement APIs;
-# get/get_mut remain available for checked borrowed access. BufferView is read-only.
+# get/get_mut remain available for checked borrowed access. Readonly Span has no
+# writable element access.
 # Assignment remains ownership-aware replacement; compound assignments combine
 # the corresponding binary operation and assignment. and/or remain short-
 # circuit control flow; is/as remain type membership/extraction. Transfer ^,
@@ -131,10 +132,10 @@ const subtract: func(imm int, imm int) int = int.-
 # literal-backed String results refer to symbolic immutable storage, never host
 # addresses. Runtime descriptors and the referenced bytes have independent
 # storage. String has move and automatic drop, but no implicit copy; clone is
-# explicit and fallible. Allocation-backed text execution requires the later
-# compile-time storage milestone.
-# BytesView is a copyable read-only borrowed byte range. Views of arrays,
-# allocations, buffers, and Strings retain their backing owners and storage
+# explicit and fallible. Allocation-backed text also executes at compile time,
+# subject to the evaluation-local storage publication boundary.
+# BytesView is a copyable wrapper of Span(byte, false). Views of arrays,
+# allocations, Lists, and Strings retain their backing owners and storage
 # invalidation dependencies. Views of literal storage have permanent origins.
 # Empty views are valid and never dereference their base. View construction and
 # slicing use nonnegative, overflow-safe bounds checks. No raw address escapes.
@@ -148,24 +149,26 @@ const subtract: func(imm int, imm int) int = int.-
 # std.io supplies stdin/stdout/stderr handles, fallible read_bytes, write_once,
 # write_all, write_text, and print (text followed by a newline). Handles borrow
 # the process's standard descriptors; they do not close or own them. read_bytes
-# appends at most the requested bytes to a Buffer(byte), publishing only the
+# appends at most the requested bytes to a List(byte), publishing only the
 # initialized prefix. Positive progress and short reads/writes are success;
 # zero read indicates EOF for a nonempty request. A zero-size read returns zero
 # without reading. Interrupted syscalls retry. write_all advances by completed
 # counts and fails on zero progress. Output programs ignore SIGPIPE so closed
 # pipes report ordinary write failure. Other OS failures propagate ordinary
 # failure; earlier external effects are not rolled back. Reading or allocating
-# failure preserves initialized buffer contents; reservation may change capacity.
+# failure preserves initialized List contents; reservation may change capacity.
+# Writes borrow initialized readonly byte spans. Reads initialize spare allocation
+# slots, not elements of a writable initialized span.
 # Failure cleanup releases owned storage through ordinary lifetime rules.
 # Byte I/O preserves arbitrary bytes. UTF-8 validation occurs when those bytes
 # become text, so partial UTF-8 sequences can be accumulated before conversion.
 # print is an ordinary declaration and may be shadowed or used as a callable.
 # Reached compile-time I/O is an unavailable execution operation, even inside a
 # fallible condition; an unexecuted branch performs no I/O and causes no error.
-# Compiler-private static_data and byte_pointer values represent immutable
-# literal storage and bounded library byte access. Only registered primitives
-# create/access them. byte_pointer retains inferred origins; static_data always
-# denotes immutable compiler-provided bytes. Neither exposes numeric addresses.
+# Compiler-private static_data represents immutable literal storage. Ref and Span
+# use one private StorageCursor(T, writable) substrate for typed storage access.
+# Only registered storage primitives create/access cursors; cursor and handle
+# permissions cannot be escalated. Neither exposes numeric addresses.
 
 
 # Structural tuples
@@ -367,7 +370,7 @@ const computed_block = comptime
 # ordinary calls and deferred initializer regions. They share evaluation-local
 # storage. Allocation, indexed construction and access, borrowing, mutation,
 # transfer, and deallocation obey the ordinary ownership and init contracts.
-# Box, List, Buffer, and their views use their library declarations and the same
+# Box, List, Ref, Span, and text views use their library declarations and the same
 # element capability restrictions as runtime execution.
 #
 # Every successful allocation creates a fresh logical identity, including
@@ -898,10 +901,10 @@ fallible forward_initializer(static T: type, init item: T) T
 # consumed; its deallocation never destroys initialized elements. Indexed
 # initialization, access, transfer, and destruction remain unsafe unless the
 # caller proves bounds, initialization, and absence of conflicting changes.
-# Buffer(T) owns an initialized prefix of an Allocation(T); checked access
+# List(T) owns an initialized prefix of an Allocation(T); checked access
 # fails on invalid indices. Its read-only access yields Ref(T, false), and
-# `get_mut(index)` requires a mutable buffer place and yields Ref(T, true).
-# Mutable Buffer calls invalidate earlier element and view borrows even when
+# `get_mut(index)` requires a mutable List place and yields Ref(T, true).
+# Mutable List calls invalidate earlier element and view borrows even when
 # the backing allocation does not change. Growth allocates before disturbing
 # existing elements, so allocation failure preserves them. Box, Ref, and
 # Allocation methods expose the common operations alongside the low-level
@@ -1012,6 +1015,10 @@ fallible forward_initializer(static T: type, init item: T) T
 # The borrow refers to the original storage. Replacing or transferring the root
 # or any of its fields invalidates the borrow, including changes to siblings.
 # A direct-passed parameter's storage belongs to the callee and cannot escape.
+# Replacing an initialized element through a captured handle preserves its stable
+# storage identity but invalidates borrows dependent on the old contents. This
+# applies even when T has trivial drop: validated text cannot survive byte writes.
+# Nested owner replacement invalidates borrows into the replaced owned storage.
 # Contracts belong to callable type identity,
 # including callable values. A named `mut` parameter refers to the caller's
 # owner after copy-back, including a replacement made by the callee. On failure,
@@ -1025,19 +1032,20 @@ fallible forward_initializer(static T: type, init item: T) T
 # initialization and keeps referents live; destruction does not precisely remove
 # individual slots from the current origin set.
 # Allocation(T).capacity() returns its allocated element count, including for
-# zero-sized T. Buffer capacity is derived from that count rather than stored twice.
-# std.memory.Buffer(T) owns Allocation(T) and a contiguous initialized prefix
+# zero-sized T. List capacity is derived from that count rather than stored twice.
+# std.memory.List(T) owns Allocation(T) and a contiguous initialized prefix
 # of length elements within capacity allocated slots. Creation is fallible;
 # negative capacity fails. Zero capacity still owns a distinct allocation.
-# Destroying a buffer destroys only the initialized prefix, in reverse order,
+# Destroying a List destroys only the initialized prefix, in reverse order,
 # then deallocates the storage. Its allocation and counters are not exposed for
 # external mutation. Only directly movable, automatically droppable elements
-# may be appended or relocated by the initial buffer API. Ref-containing
-# elements are not supported until mutation can track their referent origins.
-# Buffer growth allocates replacement storage before disturbing initialized
+# may be appended or relocated by the dynamic List API. Literal construction
+# also supports immovable and reference-containing elements; dynamic mutation
+# of reference-containing elements remains unsupported.
+# List growth allocates replacement storage before disturbing initialized
 # elements; allocation failure leaves the original contents intact. reserve
 # relocates in reverse index order: unsafe_take extracts each item and
-# self.initialized = index records the retained old-buffer prefix before
+# self.initialized = index records the retained old-List prefix before
 # fallible unsafe_initialize constructs the item in replacement storage.
 # Successful initialization continues relocation. On initialization failure,
 # the completed replacement suffix is destroyed, replacement storage is
@@ -1046,17 +1054,31 @@ fallible forward_initializer(static T: type, init item: T) T
 # infallible, so the standard move path does not actually fail initialization;
 # the conservative init contract still requires the cleanup path. `get(index)`
 # checks 0 <= index < length and returns Ref(T, false); `get_mut(index)` also
-# checks bounds and returns Ref(T, true) from a mutable Buffer place. An empty
-# Buffer has no initialized element, even for an immovable T; append still
+# checks bounds and returns Ref(T, true) from a mutable List place. An empty
+# List has no initialized element, even for an immovable T; append still
 # rejects elements that cannot move directly. view(start, size)
 # checks that its nonnegative range lies in the initialized prefix and returns
-# BufferView(T), a copyable non-owning slice retaining a Ref(Buffer(T), false). Its
-# len() reports the slice size, and get(index) checks the slice bounds before
-# borrowing an element. Buffer and BufferView internals cannot be changed by
-# external callers. Mutable Buffer calls conservatively invalidate prior element
-# and view borrows, whether or not growth occurred. BufferView(byte) is a raw
-# borrowed byte slice, not validated UTF-8 text. Later List and text views must
-# retain the same backing-owner and storage-change dependencies.
+# Span(T, false). span() borrows the complete initialized prefix; span_mut()
+# yields Span(T, true). Mutable List calls conservatively invalidate prior element
+# and view borrows, whether or not growth occurred. Moving a List handle does not
+# inherently relocate heap elements, but owner transfer invalidates prior borrows.
+#
+# Span(T, writable) is a copyable nonowning contiguous initialized range, not an
+# allocation or a container owner. Array also supplies span()/span_mut(). Span
+# owns no destruction; Ref designates one initialized element and owns none either.
+# Span.len() is initialized length, never reserved capacity. get/get_mut check
+# bounds and return Ref; slice(start, size) checks nonnegative, overflow-safe bounds
+# and preserves permission. Empty endpoint slices are valid, including for
+# zero-sized elements. Unsafe allocation-span constructors require caller-proven
+# initialization of the complete range. No safe view exposes spare storage.
+# Permission belongs to the handle type, independently of binding mutability.
+# A writable Span's get_mut and indexed replacement work on a const handle;
+# indexed replacement borrows its descriptor immutably. Other container index
+# setters still require mutable receivers. as_imm attenuates permission.
+# Readonly access does not freeze the backing owner. All views retain backing-owner
+# and storage-change dependencies; readonly ranges additionally depend on contents.
+# Span(byte, false) and BytesView are arbitrary bytes, not validated UTF-8 text.
+# StringView maintains that additional guarantee through validation and invalidation.
 #
 # A returned or stored Ref depends on every owner it may refer to. The
 # result of every function conservatively depends on all inputs capable of

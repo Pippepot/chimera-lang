@@ -1,4 +1,4 @@
-import std.memory.{Buffer}
+import std.memory.{List}
 import std.text.{BytesView, StringView}
 
 pub struct Stream
@@ -22,4 +22,4 @@ pub fallible write_text(stream: Stream, imm text: StringView) -> write_all?(stre
 pub fallible print(imm text: StringView)
     write_text?(stdout, text)
     write_text?(stdout, "\n")
-pub fallible read_bytes(stream: Stream, mut buffer: Buffer(byte), count: int) int -> buffer.read_bytes?(stream.descriptor, count)
+pub fallible read_bytes(stream: Stream, mut bytes: List(byte), count: int) int -> bytes.read_bytes?(stream.descriptor, count)

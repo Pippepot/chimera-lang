@@ -14,7 +14,8 @@ is not a goal.
 
 - Inclusive/exclusive ranges: endpoint types, direction, steps, empty ranges,
   overflow-safe termination, and library versus syntax responsibilities.
-- List growth and replacement/removal, with alias invalidation and failure cleanup.
+- List removal and dynamic mutation of reference-containing elements, with alias
+  invalidation and failure cleanup.
 - An open `for` contract for ranges, collections, and user types. Start with
   read-only items; define mutation/consumption, loop results, and exit cleanup.
 

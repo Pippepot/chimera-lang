@@ -1,4 +1,4 @@
-import std.memory.{Ref}
+import std.memory.{Ref, Span}
 
 pub struct collection_literal(T: type, N: int)
     move = none
@@ -7,6 +7,8 @@ pub struct collection_literal(T: type, N: int)
 pub struct Array(T: type, N: int)
     pub func filled(imm value: T) Array(T, N) where T.copy is func(imm T) T -> array_filled(T, N, value)
     pub func len(imm self: Array(T, N)) int -> N
+    pub func span(imm self: Array(T, N)) Span(T, false) -> Span(T, false).from_array(N, self)
+    pub func span_mut(mut self: Array(T, N)) Span(T, true) -> Span(T, true).from_array_mut(N, self)
 
     pub fallible get(imm self: Array(T, N), index: int) Ref(T, false)
         index >= 0

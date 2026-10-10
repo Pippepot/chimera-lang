@@ -281,7 +281,7 @@ const LocationPlan = struct {
                 .storage_projection => |operation| if (operation.projection != .box_element) {
                     addressable[@backingInt(operation.owner)] = true;
                 },
-                .byte_pointer => |source| addressable[@backingInt(source)] = true,
+                .storage_cursor => |operation| addressable[@backingInt(operation.source)] = true,
                 .array_element => |operation| addressable[@backingInt(operation.array)] = true,
                 .borrow_address => |operation| if (!operation.base_is_reference) {
                     addressable[@backingInt(operation.source)] = true;
@@ -609,12 +609,22 @@ fn FunctionEmitter(comptime Types: type) type {
                     .const_unit, .const_none => {},
                     .const_type, .const_int_literal, .const_string_literal, .static_conversion => unreachable,
                     .const_data => |data| try self.emitDataAddress(data, 0, destination),
-                    .const_byte_pointer => |pointer| try self.emitDataAddress(pointer.data, pointer.offset, destination),
-                    .byte_pointer => |source| if (destination != .discarded) {
-                        if (try self.types.facts().arrayType(self.valueType(source)) != null) try self.loadValueAddress(self.locations[@backingInt(source)]) else try self.loadAddress(self.locations[@backingInt(source)]);
+                    .const_storage_cursor => |cursor| {
+                        if (cursor.data) |data| {
+                            try self.emitDataAddress(data, cursor.offset, destination);
+                        } else {
+                            try self.encoder.absolute(.mov_rax, 0);
+                            try self.storeAddress(destination);
+                        }
+                    },
+                    .storage_cursor => |operation| if (destination != .discarded) {
+                        if (try self.types.facts().arrayType(self.valueType(operation.source)) != null)
+                            try self.loadValueAddress(self.locations[@backingInt(operation.source)])
+                        else
+                            try self.loadAddress(self.locations[@backingInt(operation.source)]);
                         try self.storeAddress(destination);
                     },
-                    .byte_offset, .byte_read => |operands| try self.emitByteOperation(instruction == .byte_read, operands, destination),
+                    .cursor_offset, .cursor_element => |operation| try self.emitCursorElement(operation, destination),
                     .byte_to_int => |source| {
                         try self.loadByte(self.locations[@backingInt(source)], 0);
                         try self.storeResult(destination);
@@ -969,16 +979,19 @@ fn FunctionEmitter(comptime Types: type) type {
             try self.storeAddress(destination);
         }
 
-        fn emitByteOperation(self: *Self, read: bool, operands: structures.BinaryOperands, destination: ValueLocation) !void {
+        fn emitCursorElement(self: *Self, operation: structures.CursorElement, destination: ValueLocation) !void {
             if (destination == .discarded) return;
-            try self.loadValue(self.locations[@backingInt(operands.rhs)]);
-            try self.encoder.emit(.movsxd_rcx_eax);
-            try self.loadAddress(self.locations[@backingInt(operands.lhs)]);
-            try self.encoder.emit(.add_rax_rcx);
-            if (read) {
-                try self.encoder.offset(.movzx_eax_rax, 0);
-                try self.storeByte(destination, 0);
-            } else try self.storeAddress(destination);
+            const access = (try self.types.facts().storageAccess(operation.type_id)) orelse unreachable;
+            const layout = try self.types.layout(access.element_type);
+            if (layout.byte_size > std.math.maxInt(i32)) return error.UnsupportedElementLayout;
+            if (layout.byte_size != 0) {
+                try self.loadValue(self.locations[@backingInt(operation.index)]);
+                try self.encoder.emit(.movsxd_rcx_eax);
+                try self.encoder.immediate(.imul_rcx, @intCast(layout.byte_size));
+            }
+            try self.loadAddress(self.locations[@backingInt(operation.cursor)]);
+            if (layout.byte_size != 0) try self.encoder.emit(.add_rax_rcx);
+            try self.storeAddress(destination);
         }
 
         fn referenceIndex(self: *Self, instance: structures.InstanceId) !u32 {
@@ -1584,10 +1597,21 @@ pub fn compileExternalByteIo(read: bool, signature: structures.FunctionSignature
     defer layout.deinit(gpa);
     var encoder = try X86Encoder.init(gpa);
     defer encoder.deinit();
-    const count_offset = @as(u32, 8) + layout.arguments[ids.len - 1].stack;
-    try encoder.offset(.mov_eax_rsp, count_offset);
+    if (read) {
+        try encoder.offset(.mov_eax_rsp, 8 + layout.arguments[ids.len - 1].stack);
+    } else {
+        switch (layout.arguments[1]) {
+            .stack => |offset| try encoder.offset(.mov_eax_rsp, 8 + offset + 8),
+            .indirect => |offset| {
+                try encoder.offset(.mov_rax_rsp, 8 + offset);
+                try encoder.offset(.mov_eax_rax, 8);
+            },
+            else => unreachable,
+        }
+    }
     try encoder.immediate(.cmp_eax, 0);
     const empty = try encoder.jump(.je, 0);
+    try encoder.emit(.mov_edx_eax);
     const retry: u32 = @intCast(encoder.code.items.len);
     try encoder.offset(.mov_edi_rsp, 8 + layout.arguments[0].stack);
     if (read) {
@@ -1603,8 +1627,6 @@ pub fn compileExternalByteIo(read: bool, signature: structures.FunctionSignature
     if (address == .indirect) try encoder.emit(.mov_rax_rax);
     if (read) try encoder.emit(.add_rax_rcx);
     try encoder.emit(.mov_rsi_rax);
-    try encoder.offset(.mov_eax_rsp, count_offset);
-    try encoder.emit(.mov_edx_eax);
     try encoder.immediate(.mov_eax, if (read) 0 else 1);
     try encoder.emit(.syscall);
     try encoder.immediate(.cmp_eax, -4);

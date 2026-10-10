@@ -50,14 +50,22 @@ Collection literals default to inline `Array(T, N)` or construct a known expecte
 target through its consuming converter. `List(T)` is a prelude export; implicit
 List allocation failure terminates with status 134. `List(T).from([elements])`
 is the explicitly fallible alternative. Ordinary element failure cleans partial
-construction and releases List storage. Box, List, Buffer, and views execute at
+construction and releases List storage. Box, List, Ref, Span, and text views execute at
 compile time through their ordinary declarations. Evaluation-local storage can
 be passed between nested calls but cannot escape into published values, static
 arguments, or runtime storage; copied or extracted ordinary data can leave evaluation.
 
+`List(T).new`, `reserve`, and `append` provide fallible dynamic growth. Array and
+List expose `span()` and `span_mut()` over their initialized elements.
+`Span(T, writable)` provides checked slicing, copied indexing, and borrowed
+`get`/`get_mut` access; `as_imm()` attenuates permission. Spans own no storage and
+cannot escape local backing or survive owner transfer. Readonly spans do not
+freeze their owners; conflicting writes invalidate content-dependent views.
+
 UTF-8 literals default to the prelude `String`. Literal-backed strings allocate
 nothing; mutation grows unique owned storage, and `clone` is explicitly fallible.
-`StringView` and `BytesView` are read-only views with byte counts. `byte_int` is the
+`StringView` and `BytesView` are read-only views with byte counts; BytesView wraps
+`Span(byte, false)`, while StringView additionally guarantees UTF-8. `byte_int` is the
 named widening operation. `BytesView.validate_utf8` validates arbitrary byte
 input, and text slices check codepoint boundaries. String-to-view converters
 borrow their source; literal-to-view converters refer to permanent static bytes.
@@ -73,7 +81,7 @@ exit(1)
 
 `std.io` exports `stdin`, `stdout`, `stderr`, `read_bytes`, `write_once`,
 `write_all`, and `write_text`; `print` is also a prelude export. Reads append to
-`Buffer(byte)` and expose only the initialized prefix through `bytes()`. Short
+`List(byte)` and expose only the initialized prefix through `bytes()`. Short
 counts are successful progress; a nonempty read returning zero indicates EOF.
 Failures keep existing initialized contents and earlier I/O effects. Programs
 using output ignore SIGPIPE so a broken pipe becomes ordinary write failure.

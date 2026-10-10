@@ -242,7 +242,7 @@ fn writeType(types: anytype, writer: *std.Io.Writer, type_id: structures.TypeId)
 
 fn writeTypeInner(types: anytype, writer: *std.Io.Writer, type_id: structures.TypeId) !void {
     switch (type_id) {
-        .int, .int_literal, .string_literal, .static_data, .byte_pointer, .byte, .bool, .unit, .none, .never, .type => return writer.writeAll(@tagName(type_id)),
+        .int, .int_literal, .string_literal, .static_data, .byte, .bool, .unit, .none, .never, .type => return writer.writeAll(@tagName(type_id)),
         _ => {},
     }
     if (try types.arrayType(type_id)) |array| {
@@ -504,9 +504,9 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
             try writeTypedMessage(types, writer, "cannot implicitly copy value of non-copyable type ", details.type_id, "");
             if (details.is_movable) try writer.writeAll("; use `^` to transfer ownership");
         },
-        .buffer_cannot_store_borrow_element => |type_id| try writeTypedMessage(types, writer, "Buffer cannot store values containing Ref yet; element type is ", type_id, ""),
-        .buffer_requires_automatic_drop => |type_id| try writeTypedMessage(types, writer, "Buffer requires an automatically droppable element type; found ", type_id, ""),
-        .buffer_requires_direct_move => |type_id| try writeTypedMessage(types, writer, "Buffer requires a directly movable element type for relocation; found ", type_id, ""),
+        .list_cannot_store_borrow_element => |type_id| try writeTypedMessage(types, writer, "List cannot store values containing Ref yet; element type is ", type_id, ""),
+        .list_requires_automatic_drop => |type_id| try writeTypedMessage(types, writer, "List requires an automatically droppable element type; found ", type_id, ""),
+        .list_requires_direct_move => |type_id| try writeTypedMessage(types, writer, "List requires a directly movable element type for relocation; found ", type_id, ""),
         .borrow_write_cannot_store_borrow => |type_id| try writeTypedMessage(types, writer, "write cannot replace a value containing Ref yet; pointee type is ", type_id, ""),
         .borrow_write_requires_automatic_drop => |type_id| try writeTypedMessage(types, writer, "write requires an automatically droppable pointee type; found ", type_id, ""),
         .borrow_write_requires_direct_move => |type_id| try writeTypedMessage(types, writer, "write requires a directly movable pointee type; found ", type_id, ""),

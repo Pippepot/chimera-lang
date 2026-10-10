@@ -156,9 +156,10 @@ fn renderInstruction(
         .const_byte => |value| try writer.print("    %{d} = const_byte {d}\n", .{ result, value }),
         .const_string_literal => |value| try writer.print("    %{d} = const_string_literal @{d}\n", .{ result, @backingInt(value) }),
         .const_data => |value| try writer.print("    %{d} = const_data @{d}\n", .{ result, @backingInt(value) }),
-        .const_byte_pointer => |value| try writer.print("    %{d} = const_byte_pointer @{d}+{d}\n", .{ result, @backingInt(value.data), value.offset }),
-        .byte_pointer, .byte_to_int => |value| try writer.print("    %{d} = {s} %{d}\n", .{ result, @tagName(ssa.instructions[instruction_index]), @backingInt(value) }),
-        .byte_offset, .byte_read => |value| try writer.print("    %{d} = {s} %{d}, %{d}\n", .{ result, @tagName(ssa.instructions[instruction_index]), @backingInt(value.lhs), @backingInt(value.rhs) }),
+        .const_storage_cursor => |cursor| try writer.print("    %{d} = const_storage_cursor {any}\n", .{ result, cursor }),
+        .storage_cursor => |operation| try writer.print("    %{d} = storage_cursor %{d}\n", .{ result, @backingInt(operation.source) }),
+        .cursor_offset, .cursor_element => |operation| try writer.print("    %{d} = {s} %{d}, %{d}\n", .{ result, @tagName(ssa.instructions[instruction_index]), @backingInt(operation.cursor), @backingInt(operation.index) }),
+        .byte_to_int => |value| try writer.print("    %{d} = {s} %{d}\n", .{ result, @tagName(ssa.instructions[instruction_index]), @backingInt(value) }),
         .const_int_literal => |value| try writer.print("    %{d} = const_int_literal {d}\n", .{ result, value }),
         .static_conversion => |conversion| {
             try writer.print("    %{d} = static_conversion %{d} to ", .{ result, @backingInt(conversion.operand) });

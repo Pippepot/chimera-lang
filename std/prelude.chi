@@ -1,7 +1,7 @@
 pub import std.text.{String, StringView, BytesView, byte_int}
 pub import std.io.{print}
 pub import std.exit.{exit}
-pub import std.memory.{Box, Ref, List}
+pub import std.memory.{Box, Ref, Span, List}
 pub import std.array.{Array, collection_literal}
 
 extern func literal_byte(static value: int_literal) byte

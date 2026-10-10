@@ -250,7 +250,7 @@ Remaining work and priorities are tracked in
 	recognition remains tied to registered standard identities.
 - Declared and generated structs publish a common definition with fields and validated ownership hooks. `OwnershipCapabilities(TypeId)` validates logical by-value containment and composes move, copy, and drop facts without requesting physical layout. Arrays compose these facts from their element type and length; empty arrays are trivial, contain no reference origins, and impose no element-hook obligations. Layout consumes validated facts before determining size, alignment, and field, variant, or array placement. Array length is a nonnegative static `int`; byte size is checked at natural element alignment, including zero-length arrays and zero-sized elements. Direct movement is derived from capabilities, not stored separately, and remains independent of derived `argumentPassing`. `HostTypeLayout(TypeId)` describes the x86-64 host representation; a non-host layout must be derived for its target's location-specific layout domain, never inferred from host layout. [syntax&semantics.txt](syntax&semantics.txt) owns the provider, location, layout, and access contracts.
 - Typed borrowed places carry field-index paths, not byte offsets. Borrowing, consuming arguments, and receiver resolution share source-place traversal and field-name and visibility validation; codegen resolves physical offsets from the trusted path. Reference origins retain independent field, variant, and owned-element projections. Slot-storage identity is separate from the current contents' identity, including at loop joins.
-- Custom copy and move hooks may rearrange reference-bearing fields, so their results conservatively retain all possible source origins rather than assuming field correspondence. Hook effects invalidate writable referents, including during in-place copies. Call arguments retain the provenance of their prepared values, and indirect callees retain borrow metadata through argument evaluation.
+- Custom copy and move hooks may rearrange reference-bearing fields, so their results conservatively retain all possible source origins rather than assuming field correspondence. Their result origins use the same shape projection as ordinary calls. Hook effects invalidate writable referents, including during in-place copies. Call arguments retain the provenance of their prepared values, and indirect callees retain borrow metadata through argument evaluation.
 - Function return dependencies conservatively include all runtime inputs capable
 	of supplying origins. This covers borrowed storage and references contained
 	in prepared values; signatures have no `from` syntax or explicit contracts
@@ -285,7 +285,7 @@ Pending `collection_literal(T, N)` types have no ordinary value representation.
 Standard `[]` and `[]=` methods reuse checked `get`/`get_mut` and reference
 replacement. Reads copy elements through ordinary ownership operations; writes
 retain automatic-drop, direct-move, and reference-origin restrictions. List and
-Buffer use the same methods; BufferView only exposes copied reads. Default
+Span use the same methods, with writable indexing only on writable spans. Default
 construction and individual element consumption remain absent.
 
 `List(T)` owns an allocation and initialized count. Its literal converter obtains
@@ -295,8 +295,9 @@ failure terminates runtime execution with status 134, outside ordinary failure
 flow. Element failure cleans the prefix and releases storage normally. The
 explicitly fallible `List(T).from(...)` instead exposes allocation failure and
 retains ordinary element failure. Successful Lists destroy elements in reverse
-order and release storage. Growth and iteration are not implemented. Box, List,
-Buffer, BufferView, and heap-backed text execute their ordinary declarations in
+order and release storage. Fallible new/reserve/append maintain the initialized
+prefix and allocate replacement storage before relocation. Iteration and removal
+remain absent. Box, List, Ref, Span, and heap-backed text execute ordinary declarations in
 the interpreter using typed slot and collection initialization, including Box
 element and allocation-array projections. Host layout and checked allocation-size
 rules are shared with native execution; compiler OOM remains retryable infrastructure
@@ -313,10 +314,31 @@ deallocation without changing the logical count or layout.
 initialization state. It needs no runtime initialization bitmap: unsafe indexed
 operations require caller-proven bounds and initialization, while containers
 track initialized ranges. `Box` retains a complete one-element allocation;
-`Buffer` derives capacity from its allocation and tracks only its initialized
+`List` derives capacity from its allocation and tracks only its initialized
 prefix. Do not introduce a thin allocation handle until retaining layout and
 location has a demonstrated material cost. Compiler storage and lifetime checks
 need not be expressible as ordinary library code.
+
+`Ref(T, writable)` and `Span(T, writable)` share a private typed `StorageCursor`.
+Ref denotes one initialized element; Span adds initialized length and checked
+indexing/slicing. Their permission is independent of handle-binding mutability.
+Safe constructors borrow initialized arrays or List prefixes; unsafe allocation
+constructors leave initialization proof to the caller. Cursor identity and shape
+are validated at the standard-library analysis boundary, not inferred from field
+layout or exposed numeric addresses. Host layout lowers a cursor to one address,
+and a Span to that address plus an `int` length; element offsets use T's layout,
+including zero-sized elements.
+
+Ordinary call results and mutable outputs conservatively distribute every possible
+input origin over their borrowing fields, elements, and variant members; equal input and output
+types do not establish field correspondence. Returned readonly ranges depend on
+contents, including inside aggregates, while Ref and writable range handles retain
+storage dependencies. Writes invalidate contents even without automatic drop.
+Replacing an aggregate does not itself write through independent handles stored in it;
+effects through nested writable handles are tracked separately. Stable slot
+handles can observe replacement, while nested owner borrows and readonly ranges
+retain content dependencies. UTF-8 validation cannot outlive conflicting byte
+writes. Owner transfer still invalidates earlier borrows.
 
 ### Future allocation interface
 
@@ -434,7 +456,7 @@ deallocation without changing the logical count or layout.
 initialization state. It needs no runtime initialization bitmap: unsafe indexed
 operations require caller-proven bounds and initialization, while containers
 track initialized ranges. `Box` retains a complete one-element allocation;
-`Buffer` derives capacity from its allocation and tracks only its initialized
+`List` derives capacity from its allocation and tracks only its initialized
 prefix. Do not introduce a thin allocation handle until retaining layout and
 location has a demonstrated material cost. Compiler storage and lifetime checks
 need not be expressible as ordinary library code.
@@ -545,7 +567,7 @@ terminology, not proposed Chimera syntax.
 ## Text and basic I/O
 
 `ByteStrings` interns owned, decoded UTF-8 bytes by content. Compile-time literal
-values and static byte pointers retain interner IDs and byte offsets; canonical
+values and static storage cursors retain interner IDs and byte offsets; canonical
 values never contain evaluator or native addresses. Materializing canonical
 struct values preserves their private fields without granting source initializers
 access to them. Literal default typing selects the registered `std.text.String`
@@ -555,20 +577,27 @@ identity even when prelude exports are disabled or shadowed.
 fallible growth, byte views, UTF-8 validation, and text slicing. `std/io.chi` owns
 standard stream handles, progress loops, and printing. The only byte-access and
 OS operations are registered externs private to their owning storage modules.
-Read counts extend `Buffer(byte)`'s initialized prefix after success. Reached
+BytesView wraps a readonly byte Span; StringView adds a maintained UTF-8 guarantee.
+Writes consume initialized readonly byte spans. Reads initialize spare allocation
+slots and extend `List(byte)`'s initialized prefix only after success. Reached
 compile-time I/O is an execution capability error; ordinary fallible handling
-cannot turn it into compile-time effects. Allocation-backed strings remain part
-of the compile-time storage milestone.
+cannot turn it into compile-time effects. Allocation-backed strings execute
+within the same evaluation-local storage publication boundary as other owners.
 
 Borrow origins distinguish permanent static data from local and parameter
 storage. Scalar argument copies do not introduce owner dependencies. Temporary
 address-passed aggregates do. Taking the address of a by-value parameter through
 an alias retains its local frame dependency. Borrowed variant conditions retain a path of field
 and variant projections so aliases address the current owner through SSA joins.
-The interpreter represents array-backed byte pointers as transient cells whose
-snapshots preserve backing identity; such pointers cannot become canonical values.
-Allocation-backed pointers compare the allocation's logical identity and frozen
+The interpreter represents array-backed typed cursors as transient cells whose
+snapshots preserve backing identity; such cursors cannot become canonical values.
+Allocation-backed cursors compare the allocation's logical identity and frozen
 contents across copied descriptors; inline backing retains its original cell identity.
+Literal-backed readonly byte cursors and references instead publish symbolic
+interner IDs and checked offsets. Copying and permission attenuation retain the
+typed destination's cursor identity before publication. Snapshot format CHIQRY22
+validates their nominal standard identity, permission, bounds, and operation types, including source-free
+intern restoration; transient storage addresses are never persisted.
 
 Each compiled function owns its constant byte sequences and relocations refer
 to function or data indices. The linker deduplicates immutable bytes across
@@ -590,7 +619,7 @@ Chimera uses unique ownership and rejects ambient compile-time I/O.
 - Derived `argumentPassing` accounts for type structure and ownership capabilities: arrays and containing structs or variants pass by address even when directly movable, as do types that cannot move directly. One backend `CallLayout` supplies storage planning, argument emission, returns, mutable copy-back, and copy hooks. Mutable calls write their updated arguments back. The calling convention is internal to the compiler, not a platform ABI.
 - Aggregate construction uses addressable storage, including four-byte register returns. Constant field and variant projections of known stack storage fold into stack offsets without emitted pointers. Shared backend `copyRange` emits bulk byte copies for any aggregate when the selected operation permits them, not just arrays; nontrivial element operations retain typed loops and hooks. The encoder and assembly renderer share opcode bytes, operand widths, and display forms in `src/backend/x86_encoding.zig`; unknown bytes end decoding rather than permitting resynchronization inside an instruction. Divergence blocks emit an invalid-instruction trap so unexpected fallthrough cannot execute another block or outlined region.
 - Embedded standard-library declarations use ordinary lookup, signatures, and instance identities. Supported compiler-owned externs, including exit and host-memory operations, publish artifacts under those identities. Allocation and extraction use host-only emitters; slot construction uses ordinary typed init calls into host storage. Another location will require its own provider and access path. A compile-time exit instead propagates compiler control to the driver without producing an executable. `src/runtime.zig` publishes and runs successful executables.
-- Standard calls are classified by registered declaration identity at the analysis boundary; lowering retains the resolved behavior instead of rediscovering names. Box, Buffer, and reference-write type eligibility is checked when a signature is demanded, including acquisition as a function value. These capability constraints remain compiler-owned until the language can express them. Reference-write eligibility is shared with assignment typing. `Box.new` is an ordinary fallible library init receiver with explicit allocation cleanup. The compiler-owned fallible raw slot initializer publishes a typed body that selects an allocation element and invokes its init parameter into that destination; backend calls use the general init protocol.
+- Standard calls are classified by registered declaration identity at the analysis boundary; lowering retains the resolved behavior instead of rediscovering names. Box, List, and reference-write type eligibility is checked when a signature is demanded, including acquisition as a function value. These capability constraints remain compiler-owned until the language can express them. Reference-write eligibility is shared with assignment typing. `Box.new` is an ordinary fallible library init receiver with explicit allocation cleanup. The compiler-owned fallible raw slot initializer publishes a typed body that selects an allocation element and invokes its init parameter into that destination; backend calls use the general init protocol.
 - Standard memory structs retain nominal identity and specialization lookup over existing queries. Arrays instead retain canonical structural identity with a separate standard-source namespace association; representation and ownership checks remain type-specific.
 
 ## Persistence
