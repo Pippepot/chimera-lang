@@ -70,6 +70,7 @@ pub fn build(b: *std.Build) void {
         "tests/modules_test.zig",
         "tests/query_disk_cache_test.zig",
         "tests/array_test.zig",
+        "tests/text_test.zig",
         "tests/converter_test.zig",
         "tests/comptime_interpreter_test.zig",
     };

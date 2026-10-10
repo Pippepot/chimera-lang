@@ -36,7 +36,7 @@ flowchart TD
     MS --> AT
     AT --> ET["ExecuteComptimeThunk(CompileTimeSite) → ?CompileTimeOutcome"]
     ET --> RS
-    RI --> NS["StructNamespace"]
+    RI --> NS["TypeNamespace"]
     NS --> AB
     NS --> AT
     RI --> SD["StructDefinition(ItemId) → ?StructDefinition"]
@@ -69,6 +69,7 @@ flowchart TD
     OC --> AB
     VL --> CF
     TL --> CF
+    TL --> EC
     SE --> CR["CollectReachableInstances(FileId)"]
     CF --> CR
     CR --> BE["BuildExecutable → ?Executable"]
@@ -83,6 +84,18 @@ flowchart TD
 6. The CLI handles a transitive compile-time `exit` control outcome without producing an executable, otherwise renders transitive diagnostics or optional AST/SSA/assembly/timing views, writes the executable through `src/runtime.zig`, and runs it through a private hard link to the published inode (or a private copy on filesystems without hard links). SSA debug output uses the same reachable set. The CLI registers the entry directory tree plus the embedded `std` sources and uses two workers by default where available. Module validation prefetches independent file queries, and reachability prefetches referenced function compilation.
 
 Before a mutable call returns, the callee writes final borrowed parameter values to its incoming slots. Both ordinary and fallible caller continuations reload them and rebuild root-plus-field paths, or store them into in-place local storage, before another call or cleanup can reuse the outgoing area.
+
+Each demanded evaluation owns a logical heap shared by transient nested calls and
+initializer regions. Resolved result and mutable-parameter types participate in
+call routing, so even an argument-free allocation factory bypasses canonical
+memoization. Transient execution demands ordinary typed bodies, host element
+layouts, allocator declarations, and cleanup hooks through the requesting query
+context; their edits invalidate published scalar results normally. Recursion
+snapshots freeze allocations and their aliases independently of backing release.
+Only recursively representable results and mutable copy-back cross the canonical
+publication boundary. Evaluation-local handles never enter interners or snapshots;
+storage escape is diagnosed at its consuming expression. Compiler exit has no
+copy-back consumer, and infrastructure OOM leaves execution retryable.
 
 Known expected types discover conversions through the existing source/target
 owner module declarations and specialize through normal function signatures.
@@ -151,6 +164,7 @@ Most compiler queries return `?Output`: `null` propagates source rejection or un
 | Item names, canonical variants, callable signatures, compile-time values, and value tuples | Database interners; valid for the session |
 | AST, indexes, scopes, signatures, IR, artifacts, reachability, executable bytes | Cached outputs; valid until replacement or database destruction |
 | Expression graph, borrowed source spellings, typing and traversal scratch | One query run; freed before publication |
+| Logical allocations, element cells, references, and initializer captures | One evaluation session; backing released on deallocation, compiler identities freed on every session outcome |
 | Dependency edges and diagnostics | Entry-owned; committed or discarded with recomputation |
 | `./prog` | Atomically published executable bytes; independent of database lifetime |
 

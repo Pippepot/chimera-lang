@@ -281,6 +281,7 @@ const LocationPlan = struct {
                 .storage_projection => |operation| if (operation.projection != .box_element) {
                     addressable[@backingInt(operation.owner)] = true;
                 },
+                .byte_pointer => |source| addressable[@backingInt(source)] = true,
                 .array_element => |operation| addressable[@backingInt(operation.array)] = true,
                 .borrow_address => |operation| if (!operation.base_is_reference) {
                     addressable[@backingInt(operation.source)] = true;
@@ -371,7 +372,7 @@ const LocationPlan = struct {
                     .const_int => |value| if (!addressable[value_index]) break :location_blk .{ .immediate = value },
                     .const_byte => |value| if (!addressable[value_index]) break :location_blk .{ .immediate = value },
                     .const_bool => |value| if (!addressable[value_index]) break :location_blk .{ .immediate = @intFromBool(value) },
-                    .const_type, .const_int_literal, .static_conversion => unreachable,
+                    .const_type, .const_int_literal, .const_string_literal, .static_conversion => unreachable,
                     .initializer_ref => |operation| break :location_blk .{ .stack = try reserveStack(&local_end, try initializerSlotLayout(operation.captures)) },
                     .const_unit, .const_none => if (!addressable[value_index]) break :location_blk .discarded,
                     .call => |call| if (call.return_type == .unit and !addressable[value_index]) {
@@ -498,6 +499,7 @@ fn FunctionEmitter(comptime Types: type) type {
         encoder: X86Encoder,
         relocations: std.ArrayList(structures.CompiledFunction.Relocation) = .empty,
         referenced_instances: std.ArrayList(structures.InstanceId) = .empty,
+        constant_data: std.ArrayList(structures.ByteString) = .empty,
         // Scratch inverse of referenced_instances; relocations index the slice.
         reference_indices: std.AutoHashMapUnmanaged(structures.InstanceId, u32) = .empty,
         jump_patches: std.ArrayList(JumpPatch) = .empty,
@@ -550,6 +552,8 @@ fn FunctionEmitter(comptime Types: type) type {
             self.jump_patches.deinit(self.gpa);
             self.initializer_patches.deinit(self.gpa);
             self.referenced_instances.deinit(self.gpa);
+            for (self.constant_data.items) |data| self.gpa.free(data.bytes);
+            self.constant_data.deinit(self.gpa);
             self.reference_indices.deinit(self.gpa);
             self.relocations.deinit(self.gpa);
             self.encoder.deinit();
@@ -603,7 +607,19 @@ fn FunctionEmitter(comptime Types: type) type {
                         try self.storeResult(destination);
                     },
                     .const_unit, .const_none => {},
-                    .const_type, .const_int_literal, .static_conversion => unreachable,
+                    .const_type, .const_int_literal, .const_string_literal, .static_conversion => unreachable,
+                    .const_data => |data| try self.emitDataAddress(data, 0, destination),
+                    .const_byte_pointer => |pointer| try self.emitDataAddress(pointer.data, pointer.offset, destination),
+                    .byte_pointer => |source| if (destination != .discarded) {
+                        if (try self.types.facts().arrayType(self.valueType(source)) != null) try self.loadValueAddress(self.locations[@backingInt(source)]) else try self.loadAddress(self.locations[@backingInt(source)]);
+                        try self.storeAddress(destination);
+                    },
+                    .byte_offset, .byte_read => |operands| try self.emitByteOperation(instruction == .byte_read, operands, destination),
+                    .byte_to_int => |source| {
+                        try self.loadByte(self.locations[@backingInt(source)], 0);
+                        try self.storeResult(destination);
+                    },
+
                     .function_ref => |reference| try self.emitFunctionReference(reference, destination),
                     .initializer_ref => |reference| try self.emitInitializerReference(ssa, reference, destination),
                     .variant_tag => |operand| {
@@ -914,7 +930,10 @@ fn FunctionEmitter(comptime Types: type) type {
                 for (compiled.relocations) |relocation| {
                     var relocated = relocation;
                     relocated.offset = std.math.add(u32, start, relocation.offset) catch return error.FunctionTooLarge;
-                    relocated.reference = @fromBackingInt(@intCast(try self.referenceIndex(compiled.referenced_instances[@backingInt(relocation.reference)])));
+                    relocated.reference = switch (relocation.reference) {
+                        .function => |reference| .{ .function = @fromBackingInt(try self.referenceIndex(compiled.referenced_instances[@backingInt(reference)])) },
+                        .data => |data_index| .{ .data = try self.dataIndex(compiled.constant_data[data_index].bytes) },
+                    };
                     try self.relocations.append(self.gpa, relocated);
                 }
             }
@@ -925,9 +944,41 @@ fn FunctionEmitter(comptime Types: type) type {
             try self.relocations.append(self.gpa, .{
                 .offset = offset,
                 .kind = kind,
-                .reference = @fromBackingInt(@intCast(reference)),
+                .reference = .{ .function = @fromBackingInt(@intCast(reference)) },
                 .addend = 0,
             });
+        }
+
+        fn dataIndex(self: *Self, bytes: []const u8) !u32 {
+            for (self.constant_data.items, 0..) |data, index| if (std.mem.eql(u8, data.bytes, bytes)) return @intCast(index);
+            const index = std.math.cast(u32, self.constant_data.items.len) orelse return error.FunctionTooLarge;
+            const owned = try self.gpa.dupe(u8, bytes);
+            errdefer self.gpa.free(owned);
+            try self.constant_data.append(self.gpa, .{ .bytes = owned });
+            return index;
+        }
+
+        fn emitDataAddress(self: *Self, id: structures.ByteStringId, offset: u32, destination: ValueLocation) !void {
+            if (destination == .discarded) return;
+            const data = try self.types.byteString(id);
+            std.debug.assert(offset <= data.len);
+            const index = try self.dataIndex(data);
+            const field = std.math.cast(u32, self.encoder.code.items.len + 2) orelse return error.FunctionTooLarge;
+            try self.encoder.absolute(.mov_rax, 0);
+            try self.relocations.append(self.gpa, .{ .offset = field, .kind = .address_absolute_64, .reference = .{ .data = index }, .addend = offset });
+            try self.storeAddress(destination);
+        }
+
+        fn emitByteOperation(self: *Self, read: bool, operands: structures.BinaryOperands, destination: ValueLocation) !void {
+            if (destination == .discarded) return;
+            try self.loadValue(self.locations[@backingInt(operands.rhs)]);
+            try self.encoder.emit(.movsxd_rcx_eax);
+            try self.loadAddress(self.locations[@backingInt(operands.lhs)]);
+            try self.encoder.emit(.add_rax_rcx);
+            if (read) {
+                try self.encoder.offset(.movzx_eax_rax, 0);
+                try self.storeByte(destination, 0);
+            } else try self.storeAddress(destination);
         }
 
         fn referenceIndex(self: *Self, instance: structures.InstanceId) !u32 {
@@ -1113,12 +1164,19 @@ fn FunctionEmitter(comptime Types: type) type {
             var type_id = self.valueType(operation.source);
             if (operation.base_is_reference) type_id = (try self.types.facts().borrowElement(type_id)) orelse unreachable;
             var offset: u32 = 0;
-            for (ssa.borrow_fields[operation.fields.start..operation.fields.end]) |field_index| {
-                const definition = (try self.types.facts().structDefinition(type_id)) orelse unreachable;
-                const layout = (try self.types.structLayout(type_id)) orelse unreachable;
-                offset = std.math.add(u32, offset, layout.field_offsets[field_index]) catch return error.FunctionTooLarge;
-                type_id = definition.fields[field_index].type_id;
-            }
+            for (ssa.borrow_fields[operation.fields.start..operation.fields.end]) |projection| switch (projection) {
+                .field => |field_index| {
+                    const definition = (try self.types.facts().structDefinition(type_id)) orelse unreachable;
+                    const layout = (try self.types.structLayout(type_id)) orelse unreachable;
+                    offset = std.math.add(u32, offset, layout.field_offsets[field_index]) catch return error.FunctionTooLarge;
+                    type_id = definition.fields[field_index].type_id;
+                },
+                .variant => |member| {
+                    const layout = try self.types.variantLayout(type_id);
+                    offset = std.math.add(u32, offset, layout.payload_offset) catch return error.FunctionTooLarge;
+                    type_id = member;
+                },
+            };
             return offset;
         }
 
@@ -1332,7 +1390,13 @@ fn FunctionEmitter(comptime Types: type) type {
             errdefer self.gpa.free(relocations);
             const references = try self.referenced_instances.toOwnedSlice(self.gpa);
             errdefer self.gpa.free(references);
+            const data = try self.constant_data.toOwnedSlice(self.gpa);
+            errdefer {
+                for (data) |value| self.gpa.free(value.bytes);
+                self.gpa.free(data);
+            }
             return .{
+                .constant_data = data,
                 .code = try self.encoder.code.toOwnedSlice(self.gpa),
                 .required_alignment = 1,
                 .relocations = relocations,
@@ -1386,21 +1450,18 @@ pub fn compileExternalAllocateHostTypedStorage(gpa: std.mem.Allocator, element: 
 fn compileExternalAllocateStorage(gpa: std.mem.Allocator, element_size: u32, with_count: bool) !structures.CompiledFunction {
     var encoder = try X86Encoder.init(gpa);
     defer encoder.deinit();
-    if (element_size > std.math.maxInt(i32)) {
-        try encoder.emit(.zero_edx);
-        try encoder.emit(.ret);
-        return externalArtifact(&encoder, gpa);
-    }
     const argument_offset: u32 = if (with_count) 24 else 20;
     try encoder.offset(.mov_esi_rsp, argument_offset);
     try encoder.emit(.test_esi);
     const invalid_size = try encoder.conditionalJumpRelative32(.lti, 0);
-    if (element_size > 1) {
+    const oversized_element = if (element_size > std.math.maxInt(i32)) try encoder.conditionalJumpRelative32(.nei, 0) else null;
+    const multiply_size = element_size > 1 and element_size <= std.math.maxInt(i32);
+    if (multiply_size) {
         try encoder.immediate(.imul_rsi, @intCast(element_size));
         try encoder.immediate(.cmp_rsi, std.math.maxInt(i32));
     }
-    const size_overflow = if (element_size > 1) try encoder.jump(.ja, 0) else null;
-    if (element_size == 0) {
+    const size_overflow = if (multiply_size) try encoder.jump(.ja, 0) else null;
+    if (element_size == 0 or oversized_element != null) {
         try encoder.immediate(.mov_esi, 1);
     } else {
         try encoder.emit(.test_esi);
@@ -1432,6 +1493,7 @@ fn compileExternalAllocateStorage(gpa: std.mem.Allocator, element_size: u32, wit
     try patchRelativeDisplacement(encoder.code.items, invalid_size, failure_offset, @as(u64, invalid_size) + @sizeOf(i32), 0);
     try patchRelativeDisplacement(encoder.code.items, allocation_failed, failure_offset, @as(u64, allocation_failed) + @sizeOf(i32), 0);
     if (size_overflow) |field| try patchRelativeDisplacement(encoder.code.items, field, failure_offset, @as(u64, field) + @sizeOf(i32), 0);
+    if (oversized_element) |field| try patchRelativeDisplacement(encoder.code.items, field, failure_offset, @as(u64, field) + @sizeOf(i32), 0);
     try encoder.emit(.zero_edx);
     try encoder.emit(.ret);
     return externalArtifact(&encoder, gpa);
@@ -1511,6 +1573,58 @@ pub fn compileExternalHostSlotTake(gpa: std.mem.Allocator, allocation: structure
     return externalArtifact(&encoder, gpa);
 }
 
+pub fn compileExternalByteIo(read: bool, signature: structures.FunctionSignature, types: anytype, gpa: std.mem.Allocator) !structures.CompiledFunction {
+    const ids = try gpa.alloc(structures.TypeId, signature.parameters.len);
+    defer gpa.free(ids);
+    const representations = try gpa.alloc(structures.ValueRepresentation, ids.len);
+    defer gpa.free(representations);
+    for (ids, signature.parameters) |*id, parameter| id.* = parameter.type_id;
+    @memset(representations, .value);
+    var layout = try CallLayout.init(types, .int, ids, representations, gpa);
+    defer layout.deinit(gpa);
+    var encoder = try X86Encoder.init(gpa);
+    defer encoder.deinit();
+    const count_offset = @as(u32, 8) + layout.arguments[ids.len - 1].stack;
+    try encoder.offset(.mov_eax_rsp, count_offset);
+    try encoder.immediate(.cmp_eax, 0);
+    const empty = try encoder.jump(.je, 0);
+    const retry: u32 = @intCast(encoder.code.items.len);
+    try encoder.offset(.mov_edi_rsp, 8 + layout.arguments[0].stack);
+    if (read) {
+        try encoder.offset(.mov_eax_rsp, 8 + layout.arguments[2].stack);
+        try encoder.emit(.movsxd_rcx_eax);
+    }
+    const address = layout.arguments[1];
+    const address_offset: u32 = 8 + switch (address) {
+        .stack, .indirect => |offset| offset,
+        else => unreachable,
+    };
+    try encoder.offset(.mov_rax_rsp, address_offset);
+    if (address == .indirect) try encoder.emit(.mov_rax_rax);
+    if (read) try encoder.emit(.add_rax_rcx);
+    try encoder.emit(.mov_rsi_rax);
+    try encoder.offset(.mov_eax_rsp, count_offset);
+    try encoder.emit(.mov_edx_eax);
+    try encoder.immediate(.mov_eax, if (read) 0 else 1);
+    try encoder.emit(.syscall);
+    try encoder.immediate(.cmp_eax, -4);
+    const interrupted = try encoder.jump(.je, 0);
+    try patchRelativeDisplacement(encoder.code.items, interrupted, retry, @as(u64, interrupted) + 4, 0);
+    try encoder.immediate(.cmp_eax, 0);
+    const failed = try encoder.jump(.jl, 0);
+    const success: u32 = @intCast(encoder.code.items.len);
+    try patchRelativeDisplacement(encoder.code.items, empty, success, @as(u64, empty) + 4, 0);
+    try encoder.immediate(.mov_edx, 1);
+    try encoder.emit(.ret);
+    const failure: u32 = @intCast(encoder.code.items.len);
+    try patchRelativeDisplacement(encoder.code.items, failed, failure, @as(u64, failed) + 4, 0);
+    try encoder.emit(.zero_edx);
+    try encoder.emit(.ret);
+    var artifact = try externalArtifact(&encoder, gpa);
+    artifact.requires_sigpipe_ignore = !read;
+    return artifact;
+}
+
 fn externalArtifact(encoder: *X86Encoder, gpa: std.mem.Allocator) !structures.CompiledFunction {
     const code = try encoder.code.toOwnedSlice(gpa);
     errdefer gpa.free(code);
@@ -1540,8 +1654,13 @@ pub fn buildExecutable(
         std.debug.assert(function.artifact.required_alignment != 0);
         std.debug.assert(std.math.isPowerOfTwo(function.artifact.required_alignment));
         for (function.artifact.relocations) |relocation| {
-            const reference_index = @backingInt(relocation.reference);
-            if (reference_index >= function.artifact.referenced_instances.len) return error.RelocationOutOfBounds;
+            switch (relocation.reference) {
+                .function => |reference| if (@backingInt(reference) >= function.artifact.referenced_instances.len) return error.RelocationOutOfBounds,
+                .data => |index| {
+                    if (index >= function.artifact.constant_data.len or relocation.kind != .address_absolute_64) return error.RelocationOutOfBounds;
+                    if (relocation.addend < 0 or relocation.addend > function.artifact.constant_data[index].bytes.len) return error.RelocationOutOfBounds;
+                },
+            }
             const relocation_offset: usize = relocation.offset;
             const field_size: usize = switch (relocation.kind) {
                 .call_relative_32 => @sizeOf(i32),
@@ -1574,6 +1693,10 @@ pub fn buildExecutable(
     var encoder = try X86Encoder.init(gpa);
     defer encoder.deinit();
 
+    for (functions) |function| if (function.artifact.requires_sigpipe_ignore) {
+        try emitIgnoreSigpipe(&encoder);
+        break;
+    };
     const call_displacement_offset = encoder.code.items.len + 1;
     try encoder.immediate(.call_relative, 0);
     try encoder.emit(.zero_edi);
@@ -1594,6 +1717,17 @@ pub fn buildExecutable(
         layout.* = .{ .address = function_address, .offset = function_offset };
     }
 
+    // Data follows code in the read-only load segment. Intern by content across
+    // functions, retaining an addressable byte even for the empty sequence.
+    var data_offsets: std.StringHashMapUnmanaged(usize) = .empty;
+    defer data_offsets.deinit(gpa);
+    for (functions) |function| for (function.artifact.constant_data) |data| {
+        const entry_data = try data_offsets.getOrPut(gpa, data.bytes);
+        if (entry_data.found_existing) continue;
+        entry_data.value_ptr.* = encoder.code.items.len;
+        try encoder.code.appendSlice(gpa, data.bytes);
+        if (data.bytes.len == 0) try encoder.code.append(gpa, 0);
+    };
     const entry_layout = layouts[entry_index];
     try patchRelativeDisplacement(
         encoder.code.items,
@@ -1605,21 +1739,23 @@ pub fn buildExecutable(
 
     for (functions, layouts) |function, layout| {
         for (function.artifact.relocations) |relocation| {
-            const target = function.artifact.referenced_instances[@backingInt(relocation.reference)];
-            const target_layout = layouts[function_indices.get(target).?];
+            const target_address = switch (relocation.reference) {
+                .function => |reference| layouts[function_indices.get(function.artifact.referenced_instances[@backingInt(reference)]).?].address,
+                .data => |index| code_virtual_address + @as(u64, @intCast(data_offsets.get(function.artifact.constant_data[index].bytes).?)),
+            };
             const field_offset = layout.offset + @as(usize, relocation.offset);
             switch (relocation.kind) {
                 .call_relative_32 => try patchRelativeDisplacement(
                     encoder.code.items,
                     field_offset,
-                    target_layout.address,
+                    target_address,
                     layout.address + @as(u64, relocation.offset) + @sizeOf(i32),
                     relocation.addend,
                 ),
                 .address_absolute_64 => try patchAbsoluteAddress(
                     encoder.code.items,
                     field_offset,
-                    target_layout.address,
+                    target_address,
                     relocation.addend,
                 ),
             }
@@ -1627,6 +1763,23 @@ pub fn buildExecutable(
     }
 
     return .{ .bytes = try buildElfExecutable(encoder.code.items, gpa) };
+}
+
+// A broken stream is an ordinary fallible write, including a closed pipe.
+// Install SIG_IGN once before entry rather than changing it on every write.
+fn emitIgnoreSigpipe(encoder: *X86Encoder) !void {
+    try encoder.offset(.sub_rsp, 32);
+    try encoder.absolute(.mov_rax, 1);
+    try encoder.offset(.mov_rsp_rax, 0);
+    try encoder.absolute(.mov_rax, 0);
+    for ([_]u32{ 8, 16, 24 }) |offset| try encoder.offset(.mov_rsp_rax, offset);
+    try encoder.immediate(.mov_eax, 13); // rt_sigaction
+    try encoder.immediate(.mov_edi, 13); // SIGPIPE
+    try encoder.offset(.lea_rsi_rsp, 0);
+    try encoder.emit(.zero_edx);
+    try encoder.immediate(.mov_r10d, 8); // kernel sigset size
+    try encoder.emit(.syscall);
+    try encoder.offset(.add_rsp, 32);
 }
 
 pub fn executableCode(executable: structures.Executable) []const u8 {

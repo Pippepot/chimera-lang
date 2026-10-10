@@ -1,3 +1,4 @@
+import std.text.{BytesView}
 import std.array.{collection_literal}
 import std.exit.{exit}
 
@@ -88,6 +89,16 @@ pub struct Buffer(T: type)
     pub fallible new(reserved: int) Buffer(T)
         const storage = allocate?(T, reserved)
         return Buffer(T){storage = storage^, initialized = 0}
+
+    pub fallible bytes(imm self: Buffer(byte)) BytesView -> BytesView.unsafe_from_allocation?(self.storage, self.initialized)
+    pub fallible read_bytes(mut self: Buffer(byte), descriptor: int, count: int) int
+        count >= 0
+        count <= 2147483647 - self.initialized
+        if count == 0 -> return 0
+        self.reserve?(self.initialized + count)
+        const actual = io_read?(descriptor, self.storage, self.initialized, count)
+        self.initialized += actual
+        return actual
 
     pub func len(imm self: Buffer(T)) int -> self.initialized
     pub func capacity(imm self: Buffer(T)) int -> self.storage.capacity()
@@ -214,3 +225,5 @@ extern func unsafe_own_box(static T: type, deinit allocation: Allocation(T)) Box
 extern func unsafe_take_box(static T: type, mut owner: Box(T)) T
 extern func unsafe_destroy_box(static T: type, imm owner: Box(T))
 extern func deallocate_box(static T: type, deinit owner: Box(T))
+
+extern fallible io_read(descriptor: int, imm allocation: Allocation(byte), start: int, count: int) int

@@ -1,0 +1,173 @@
+import std.memory.{Allocation, allocate, deallocate, unsafe_initialize}
+import std.array.{Array}
+import std.exit.{exit}
+
+extern func literal_data(static value: string_literal) static_data
+extern func literal_size(static value: string_literal) int
+extern func static_pointer(imm data: static_data) byte_pointer
+extern func array_bytes_pointer(static N: int, imm value: Array(byte, N)) byte_pointer
+extern func allocation_bytes_pointer(imm value: Allocation(byte)) byte_pointer
+extern func byte_offset(imm data: byte_pointer, offset: int) byte_pointer
+extern func byte_read(imm data: byte_pointer, offset: int) byte
+pub extern func byte_int(value: byte) int
+extern fallible io_write(descriptor: int, data: byte_pointer, count: int) int
+
+pub struct BytesView
+    copy = trivial
+    data: byte_pointer
+    size: int
+
+    pub func from_array(static N: int, imm value: Array(byte, N)) BytesView -> BytesView{data = array_bytes_pointer(N, value), size = N}
+    pub fallible unsafe_from_allocation(imm value: Allocation(byte), initialized: int) BytesView
+        initialized >= 0
+        initialized <= value.capacity()
+        return BytesView{data = allocation_bytes_pointer(value), size = initialized}
+    pub fallible write_to(imm self: BytesView, descriptor: int) int -> io_write?(descriptor, self.data, self.size)
+    pub func byte_length(imm self: BytesView) int -> self.size
+    pub fallible get(imm self: BytesView, index: int) byte
+        index >= 0
+        index < self.size
+        return byte_read(self.data, index)
+    pub fallible [](imm self: BytesView, index: int) byte -> self.get?(index)
+    pub fallible slice(imm self: BytesView, start: int, size: int) BytesView
+        start >= 0
+        size >= 0
+        start <= self.size
+        size <= self.size - start
+        return BytesView{data = byte_offset(self.data, start), size = size}
+    pub fallible validate_utf8(imm self: BytesView) StringView
+        var index = 0
+        loop
+            if index == self.size -> break
+            const first = byte_int(self.get?(index))
+            index += 1
+            if first >= 128
+                var continuation = 0
+                var minimum = 128
+                var maximum = 191
+                if first >= 194 and first <= 223 -> continuation = 1
+                else if first >= 224 and first <= 239
+                    continuation = 2
+                    if first == 224 -> minimum = 160
+                    if first == 237 -> maximum = 159
+                else if first >= 240 and first <= 244
+                    continuation = 3
+                    if first == 240 -> minimum = 144
+                    if first == 244 -> maximum = 143
+                else
+                    fail
+                continuation <= self.size - index
+                const second = byte_int(self.get?(index))
+                second >= minimum
+                second <= maximum
+                index += 1
+                continuation -= 1
+                loop
+                    if continuation == 0 -> break
+                    const next = byte_int(self.get?(index))
+                    next >= 128
+                    next <= 191
+                    index += 1
+                    continuation -= 1
+        return StringView{bytes = self}
+
+pub struct StringView
+    copy = trivial
+    bytes: BytesView
+
+    pub func byte_length(imm self: StringView) int -> self.bytes.byte_length()
+    pub func as_bytes(imm self: StringView) BytesView -> self.bytes
+    pub fallible slice(imm self: StringView, start: int, size: int) StringView
+        const bytes = self.bytes.slice?(start, size)
+        if start < self.byte_length()
+            const first = byte_int(self.bytes.get?(start))
+            if first >= 128 and first < 192 -> fail
+        const end = start + size
+        if end < self.byte_length()
+            const last = byte_int(self.bytes.get?(end))
+            if last >= 128 and last < 192 -> fail
+        return StringView{bytes = bytes}
+
+struct LiteralBytes
+    copy = trivial
+    data: static_data
+    size: int
+
+struct OwnedBytes
+    copy = none
+    allocation: Allocation(byte)
+    size: int
+    drop = func(deinit self: OwnedBytes) -> deallocate(byte, self.allocation^)
+
+pub struct String
+    copy = none
+    storage: LiteralBytes | OwnedBytes
+
+    pub fallible from_utf8(imm bytes: BytesView) String
+        const text = bytes.validate_utf8?()
+        var result = String.empty()
+        result.append?(text)
+        return result^
+    pub func empty() String -> String{storage = LiteralBytes{data = literal_data(""), size = 0}}
+    pub func byte_length(imm self: String) int
+        if const literal = self.storage as LiteralBytes -> return literal.size
+        if borrow owned = self.storage as OwnedBytes -> return owned.size
+        exit(134)
+    pub func capacity(imm self: String) int
+        if const literal = self.storage as LiteralBytes -> return literal.size
+        if borrow owned = self.storage as OwnedBytes -> return owned.allocation.capacity()
+        exit(134)
+    pub func as_bytes(imm self: String) BytesView
+        if const literal = self.storage as LiteralBytes -> return BytesView{data = static_pointer(literal.data), size = literal.size}
+        if borrow owned = self.storage as OwnedBytes -> return BytesView{data = allocation_bytes_pointer(owned.allocation), size = owned.size}
+        exit(134)
+    pub func view(imm self: String) StringView -> StringView{bytes = self.as_bytes()}
+    pub fallible reserve(mut self: String, minimum_capacity: int)
+        minimum_capacity >= 0
+        if minimum_capacity <= self.capacity() -> return
+        const size = self.byte_length()
+        var capacity = minimum_capacity
+        if capacity < size -> capacity = size
+        var replacement = OwnedBytes{allocation = allocate?(byte, capacity), size = 0}
+        const bytes = self.as_bytes()
+        var index = 0
+        loop
+            if index == size -> break
+            unsafe_initialize?(byte, replacement.allocation, index, bytes.get?(index))
+            index += 1
+        replacement.size = size
+        self.storage = replacement^
+    pub fallible append(mut self: String, imm text: StringView)
+        const count = text.byte_length()
+        if count == 0 -> return
+        const size = self.byte_length()
+        count <= 2147483647 - size
+        const required = size + count
+        var capacity = self.capacity()
+        if capacity < required
+            if capacity <= 1073741823 -> capacity *= 2
+            else
+                capacity = 2147483647
+            if capacity < required -> capacity = required
+        self.reserve?(capacity)
+        const bytes = text.as_bytes()
+        if borrow mut owned = self.storage as OwnedBytes
+            var index = 0
+            loop
+                if index == count -> break
+                unsafe_initialize?(byte, owned.allocation, size + index, bytes.get?(index))
+                index += 1
+            owned.size = required
+            return
+        exit(134)
+    pub fallible clone(imm self: String) String
+        var result = String.empty()
+        result.append?(self.view())
+        return result^
+
+pub converter(static value: string_literal) String -> String{storage = LiteralBytes{data = literal_data(value), size = literal_size(value)}}
+pub converter(static value: string_literal) StringView -> StringView{bytes = BytesView{data = static_pointer(literal_data(value)), size = literal_size(value)}}
+pub converter(static value: string_literal) BytesView -> BytesView{data = static_pointer(literal_data(value)), size = literal_size(value)}
+
+pub converter(imm value: String) StringView -> value.view()
+pub converter(imm value: String) BytesView -> value.as_bytes()

@@ -692,14 +692,15 @@ test "CLI supports compile-time local borrowing" {
     try std.testing.expectEqual(@as(usize, 0), errors.writer.buffered().len);
 }
 
-test "CLI rejects unsupported compile-time allocation with diagnostics" {
+test "CLI supports compile-time allocation with scalar publication" {
     const io = std.testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
     var errors: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer errors.deinit();
     const result = try compileAndRun(io, std.testing.allocator, .{
-        .source_path = "unsupported.chi",
+        .source_path = "allocation.chi",
         .source =
         \\fallible compute() int
         \\  const owner = Box.new?(42)
@@ -711,9 +712,8 @@ test "CLI rejects unsupported compile-time allocation with diagnostics" {
         .debug_flags = .{},
         .started = std.Io.Clock.awake.now(io),
     }, &output.writer, &errors.writer);
-    try std.testing.expectEqual(RunOutcome.rejected, result);
-    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "operation is not supported during compile-time execution") != null);
-    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "unsupported.chi:") != null);
+    try std.testing.expectEqual(RunOutcome{ .program = .{ .exited = 42 } }, result);
+    try std.testing.expectEqual(@as(usize, 0), errors.writer.buffered().len);
 }
 
 test "CLI core handles compile-time exit without producing an artifact" {

@@ -9,14 +9,6 @@ const value_operations = @import("value.zig");
 
 /// Compare slice contents using fieldwise equality, ignoring struct padding.
 /// Elements with owned slices still need their own content comparison.
-fn sliceItemsEql(comptime T: type, a: []const T, b: []const T) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |left, right| {
-        if (!std.meta.eql(left, right)) return false;
-    }
-    return true;
-}
-
 pub const Token = struct {
     tag: Tag,
     loc: Location,
@@ -222,6 +214,7 @@ pub const Node = struct {
         identifier,
         none_literal,
         number_literal,
+        string_literal,
         unit_literal,
         param,
         param_list,
@@ -269,6 +262,39 @@ pub const Node = struct {
             end: u32,
         },
     };
+
+    pub fn dataTag(self: Node) ?std.meta.FieldEnum(Data) {
+        return switch (self.tag) {
+            .break_nothing, .continue_expr, .return_nothing, .fail_expr, .access, .implicit_static, .bool_literal, .identifier, .none_literal, .number_literal, .string_literal, .unit_literal, .type, .implicit_type => .none,
+            .break_expr, .return_expr, .loop, .not, .neg, .move_expr, .comptime_expr, .sizeof_expr, .field_access, .deref, .struct_field, .struct_property, .struct_init_field, .@"pub" => .node,
+            .add, .sub, .mul, .div, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .@"and", .@"or", .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .call, .index_access, .const_binding, .var_binding, .borrow_binding, .borrow_mut_binding, .static_binding, .namespace_declaration, .func, .param, .type_func, .@"if" => .node_node,
+            .signature => .signature,
+            .block, .call_arg_list, .param_list, .type_list, .type_variant, .where_clauses, .if_else, .@"struct", .struct_init, .collection_literal, .import, .selective_import => .ref,
+            else => null,
+        };
+    }
+
+    pub const Children = union(enum) {
+        fixed: [3]Index,
+        list: []const Index,
+
+        pub fn slice(self: *const Children) []const Index {
+            return switch (self.*) {
+                .fixed => |*nodes| nodes,
+                .list => |nodes| nodes,
+            };
+        }
+    };
+
+    pub fn children(self: Node, node_refs: []const Index) Children {
+        return switch (self.dataTag() orelse return .{ .list = &.{} }) {
+            .none => .{ .list = &.{} },
+            .node => .{ .fixed = .{ self.data.node, .null, .null } },
+            .node_node => .{ .fixed = .{ self.data.node_node.a, self.data.node_node.b, .null } },
+            .signature => .{ .fixed = .{ self.data.signature.parameters, self.data.signature.return_type, self.data.signature.where_clauses } },
+            .ref => .{ .list = node_refs[self.data.ref.start..self.data.ref.end] },
+        };
+    }
 };
 
 pub const Ast = struct {
@@ -299,22 +325,15 @@ pub const Ast = struct {
     pub fn eql(a: Ast, b: Ast) bool {
         if (a.file_id != b.file_id) return false;
         if (a.tokens.len != b.tokens.len or a.nodes.len != b.nodes.len or a.node_refs.len != b.node_refs.len) return false;
-        if (!sliceItemsEql(Token, a.tokens, b.tokens)) return false;
+        if (!value_operations.equal([]const Token, a.tokens, b.tokens)) return false;
         for (a.nodes, b.nodes) |left, right| {
             if (left.tag != right.tag or left.token_index != right.token_index or left.is_static_struct != right.is_static_struct or left.is_converter != right.is_converter) return false;
-            switch (left.tag) {
-                .break_nothing, .continue_expr, .return_nothing, .fail_expr, .access, .implicit_static, .bool_literal, .identifier, .none_literal, .number_literal, .unit_literal, .type, .implicit_type => {},
-                .break_expr, .return_expr, .loop, .not, .neg, .move_expr, .comptime_expr, .sizeof_expr, .field_access, .deref, .struct_field, .struct_property, .struct_init_field, .@"pub" => {
-                    if (left.data.node != right.data.node) return false;
-                },
-                .add, .sub, .mul, .div, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .@"and", .@"or", .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .call, .index_access, .const_binding, .var_binding, .borrow_binding, .borrow_mut_binding, .static_binding, .namespace_declaration, .func, .param, .type_func, .@"if" => {
-                    if (left.data.node_node.a != right.data.node_node.a or left.data.node_node.b != right.data.node_node.b) return false;
-                },
+            switch (left.dataTag() orelse return false) {
+                .none => {},
+                .node => if (left.data.node != right.data.node) return false,
+                .node_node => if (!std.meta.eql(left.data.node_node, right.data.node_node)) return false,
                 .signature => if (!std.meta.eql(left.data.signature, right.data.signature)) return false,
-                .block, .call_arg_list, .param_list, .type_list, .type_variant, .where_clauses, .if_else, .@"struct", .struct_init, .collection_literal, .import, .selective_import => {
-                    if (left.data.ref.start != right.data.ref.start or left.data.ref.end != right.data.ref.end) return false;
-                },
-                else => return false,
+                .ref => if (!std.meta.eql(left.data.ref, right.data.ref)) return false,
             }
         }
         return std.mem.eql(Node.Index, a.node_refs, b.node_refs);
@@ -348,11 +367,110 @@ pub const ItemId = enum(u32) { _ };
 
 pub const OwnershipMember = enum { copy, move };
 
+pub const Operation = enum {
+    @"+",
+    @"-",
+    @"*",
+    @"/",
+    unary_minus,
+    @"==",
+    @"<>",
+    @"<",
+    @">",
+    @"<=",
+    @">=",
+    not,
+    @"[]",
+    @"[]=",
+
+    pub fn fromName(name: []const u8, operands: ?usize) ?Operation {
+        var fallback: ?Operation = null;
+        inline for (std.enums.values(Operation)) |operation| {
+            if (std.mem.eql(u8, name, operation.spelling())) {
+                if (operands == operation.operandCount()) return operation;
+                if (fallback == null) fallback = operation;
+            }
+        }
+        return fallback;
+    }
+
+    pub fn spelling(self: Operation) []const u8 {
+        return if (self == .unary_minus) "-" else @tagName(self);
+    }
+
+    pub fn operandCount(self: Operation) usize {
+        return switch (self) {
+            .unary_minus, .not => 1,
+            .@"[]=" => 3,
+            else => 2,
+        };
+    }
+
+    pub fn isIndexer(self: Operation) bool {
+        return self == .@"[]" or self == .@"[]=";
+    }
+
+    pub fn returnsBool(self: Operation) bool {
+        return switch (self) {
+            .@"==", .@"<>", .@"<", .@">", .@"<=", .@">=", .not => true,
+            else => false,
+        };
+    }
+
+    pub fn supportsPrimitive(self: Operation, receiver: TypeId) bool {
+        return switch (receiver) {
+            .int => !self.isIndexer() and self != .not,
+            .bool => self == .@"==" or self == .@"<>" or self == .not,
+            else => false,
+        };
+    }
+};
+
+pub const Name = union(enum) {
+    identifier: []const u8,
+    operation: Operation,
+
+    pub fn fromText(spelling: []const u8, operands: ?usize) Name {
+        if (Operation.fromName(spelling, operands)) |operation| return .{ .operation = operation };
+        return .{ .identifier = spelling };
+    }
+
+    pub fn text(self: Name) []const u8 {
+        return switch (self) {
+            .identifier => |identifier| identifier,
+            .operation => |operation| operation.spelling(),
+        };
+    }
+
+    pub fn order(left: Name, right: Name) std.math.Order {
+        const spelling = std.mem.order(u8, left.text(), right.text());
+        if (spelling != .eq) return spelling;
+        if (left == .operation and right == .operation)
+            return std.math.order(left.operation.operandCount(), right.operation.operandCount());
+        return spelling;
+    }
+
+    pub const Context = struct {
+        pub fn hash(_: Context, name: Name) u64 {
+            return value_operations.Owned(Name).hash(name);
+        }
+        pub fn eql(_: Context, left: Name, right: Name) bool {
+            return value_operations.Owned(Name).eql(left, right);
+        }
+    };
+    pub const Set = std.HashMap(Name, void, Context, std.hash_map.default_max_load_percentage);
+    pub fn clone(self: Name, allocator: std.mem.Allocator) !Name {
+        return value_operations.Owned(Name).clone(allocator, self);
+    }
+    pub const deinit = value_operations.Owned(@This()).deinit;
+};
+
 pub const ItemKind = enum {
     function,
     structure,
     static,
     top_level_entry,
+    primitive,
 };
 
 pub const ConversionCandidate = struct {
@@ -368,7 +486,7 @@ pub const ItemLoc = struct {
     source_site: ?i64 = null,
     is_hook: bool = false,
     kind: ItemKind,
-    name: []const u8,
+    name: Name,
 
     pub const eql = value_operations.Owned(@This()).eql;
 };
@@ -422,7 +540,7 @@ pub const ModuleScope = struct {
     entries: []const Entry,
 
     pub const Entry = struct {
-        name: []const u8,
+        name: Name,
         item_id: ItemId,
         kind: ItemKind,
         is_public: bool = false,
@@ -443,9 +561,13 @@ pub const ModuleScope = struct {
     }
 
     pub fn resolveEntry(self: ModuleScope, name: []const u8) ?Entry {
+        return self.resolveName(.fromText(name, null));
+    }
+
+    pub fn resolveName(self: ModuleScope, name: Name) ?Entry {
         const index = std.sort.binarySearch(Entry, self.entries, name, struct {
-            fn compare(target: []const u8, entry: Entry) std.math.Order {
-                return std.mem.order(u8, target, entry.name);
+            fn compare(target: Name, entry: Entry) std.math.Order {
+                return Name.order(target, entry.name);
             }
         }.compare) orelse return null;
         return self.entries[index];
@@ -509,6 +631,7 @@ pub const NamespaceBinding = struct { module: ModuleId, members_visible: bool = 
 pub const NameReference = union(enum) {
     namespace: NamespaceBinding,
     declaration: InstanceId,
+    overloaded_function: [2]InstanceId,
     constant: CompileTimeValueId,
 };
 
@@ -550,6 +673,9 @@ pub const CompileTimeValue = union(enum) {
     pub const RuntimeValue = union(enum) {
         int: i32,
         int_literal: i64,
+        string_literal: ByteStringId,
+        static_data: ByteStringId,
+        byte_pointer: StaticBytePointer,
         byte: u8,
         bool: bool,
         unit,
@@ -565,6 +691,9 @@ pub const CompileTimeValue = union(enum) {
             return switch (self) {
                 .int => .int,
                 .int_literal => .int_literal,
+                .string_literal => .string_literal,
+                .static_data => .static_data,
+                .byte_pointer => .byte_pointer,
                 .byte => .byte,
                 .bool => .bool,
                 .unit => .unit,
@@ -578,6 +707,11 @@ pub const CompileTimeValue = union(enum) {
 
 /// Session-stable identity of one canonical compile-time value.
 pub const CompileTimeValueId = enum(u32) { _ };
+
+/// Canonical immutable bytes, owned by the database rather than source or frames.
+pub const ByteStringId = enum(u32) { _ };
+pub const ByteString = struct { bytes: []const u8 };
+pub const StaticBytePointer = struct { data: ByteStringId, offset: u32 = 0 };
 
 /// Session-stable identity of one ordered tuple of canonical compile-time
 /// values. Specializations and interpreted calls share this representation.
@@ -625,6 +759,9 @@ pub const TypeId = enum(u32) {
     never,
     type,
     int_literal,
+    string_literal,
+    static_data,
+    byte_pointer,
     _,
 
     const interned_mask: u32 = 1 << 31;
@@ -640,7 +777,7 @@ pub const TypeId = enum(u32) {
     }
 
     pub fn isPrimitive(self: TypeId) bool {
-        return self == .int or self == .bool or self == .unit or self == .none or self == .never or self == .type or self == .byte or self == .int_literal;
+        return self == .int or self == .bool or self == .unit or self == .none or self == .never or self == .type or self == .byte or self == .int_literal or self == .string_literal or self == .static_data or self == .byte_pointer;
     }
 };
 
@@ -668,16 +805,10 @@ pub const CallableType = struct {
     is_fallible: bool,
 
     pub fn parametersEql(a: CallableType, b: CallableType) bool {
-        return sliceItemsEql(CallableParameter, a.parameters, b.parameters);
+        return value_operations.equal([]const CallableParameter, a.parameters, b.parameters);
     }
 
     pub const eql = value_operations.Owned(@This()).eql;
-
-    pub fn clone(self: CallableType, gpa: std.mem.Allocator) !CallableType {
-        var cloned = self;
-        cloned.parameters = try gpa.dupe(CallableParameter, self.parameters);
-        return cloned;
-    }
 
     pub const deinit = value_operations.Owned(@This()).deinit;
 };
@@ -1054,6 +1185,8 @@ pub const BorrowOperation = struct {
     type_id: TypeId,
 };
 
+pub const BorrowProjection = union(enum) { field: u32, variant: TypeId };
+
 pub const BorrowAddressOperation = struct {
     source: FunctionValueId,
     type_id: TypeId,
@@ -1096,6 +1229,13 @@ pub const CallMutArgument = struct {
 pub const FunctionInstruction = union(enum) {
     const_int: i32,
     const_int_literal: i64,
+    const_string_literal: ByteStringId,
+    const_data: ByteStringId,
+    const_byte_pointer: StaticBytePointer,
+    byte_pointer: FunctionValueId,
+    byte_offset: BinaryOperands,
+    byte_read: BinaryOperands,
+    byte_to_int: FunctionValueId,
     const_byte: u8,
     const_bool: bool,
     const_type: TypeId,
@@ -1130,8 +1270,8 @@ pub const FunctionInstruction = union(enum) {
 
     pub fn operands(self: *FunctionInstruction) [2]?*FunctionValueId {
         return switch (self.*) {
-            .const_int, .const_int_literal, .const_byte, .const_bool, .const_type, .const_unit, .const_none, .function_ref, .initializer_ref, .local_storage, .result_storage => .{ null, null },
-            .variant_tag, .negi => |*operand| .{ operand, null },
+            .const_int, .const_int_literal, .const_string_literal, .const_data, .const_byte_pointer, .const_byte, .const_bool, .const_type, .const_unit, .const_none, .function_ref, .initializer_ref, .local_storage, .result_storage => .{ null, null },
+            .variant_tag, .negi, .byte_pointer, .byte_to_int => |*operand| .{ operand, null },
             .variant_coerce, .variant_extract, .callable_coerce => |*operation| .{ &operation.operand, if (operation.destination) |*destination| destination else null },
             .storage_projection => |*operation| .{ &operation.owner, null },
             .allocation_element => |*operation| .{ &operation.allocation, &operation.index },
@@ -1145,14 +1285,18 @@ pub const FunctionInstruction = union(enum) {
             .mut_parameter_write => |*operation| .{ &operation.value, null },
             .call => |*call| call.operands(),
             .static_conversion => |*conversion| .{ &conversion.operand, if (conversion.destination) |*destination| destination else null },
-            .addi, .subi, .muli, .divsi => |*binary| .{ &binary.lhs, &binary.rhs },
+            .addi, .subi, .muli, .divsi, .byte_offset, .byte_read => |*binary| .{ &binary.lhs, &binary.rhs },
         };
     }
 
     pub fn resultType(self: FunctionInstruction) TypeId {
         return switch (self) {
-            .const_int, .variant_tag, .negi, .addi, .subi, .muli, .divsi => .int,
+            .const_int, .variant_tag, .negi, .addi, .subi, .muli, .divsi, .byte_to_int => .int,
             .const_int_literal => .int_literal,
+            .const_string_literal => .string_literal,
+            .const_data => .static_data,
+            .const_byte_pointer, .byte_pointer, .byte_offset => .byte_pointer,
+            .byte_read => .byte,
             .const_byte => .byte,
             .const_bool => .bool,
             .const_type => .type,
@@ -1192,7 +1336,7 @@ pub const FunctionBodyAnalysis = struct {
     parameter_modes: []ParameterMode,
     block_arguments: []FunctionBlockArgument,
     variant_coercion_tags: []const u32 = &.{},
-    borrow_fields: []u32 = &.{},
+    borrow_fields: []BorrowProjection = &.{},
     branch_arguments: []FunctionValueUse,
     call_arguments: []FunctionCallArgument,
     instructions: []Instruction,
@@ -1289,6 +1433,8 @@ pub const CompiledFunction = struct {
     required_alignment: u32,
     relocations: []const Relocation,
     referenced_instances: []const InstanceId,
+    constant_data: []const ByteString = &.{},
+    requires_sigpipe_ignore: bool = false,
 
     pub const ReferenceId = enum(u32) { _ };
 
@@ -1299,10 +1445,10 @@ pub const CompiledFunction = struct {
 
     pub const Relocation = struct {
         /// Byte offset of the field to patch. Relative displacements are based
-        /// at the end of that field; `reference` indexes referenced_instances.
+        /// at the end of that field; the reference selects a function or data.
         offset: u32,
         kind: RelocationKind,
-        reference: ReferenceId,
+        reference: union(enum) { function: ReferenceId, data: u32 },
         addend: i64,
     };
 
@@ -1367,10 +1513,12 @@ pub const Diagnostic = struct {
         compile_time_division_by_zero,
         compile_time_integer_overflow,
         compile_time_unsupported_operation,
+        compile_time_escaping_storage,
         compile_time_call_trace,
         unsupported_external_declaration,
         invalid_external_signature,
         invalid_operation_signature,
+        ambiguous_operation_reference,
         struct_member_not_supported,
         duplicate_struct_member,
         reserved_ownership_member,
@@ -1474,6 +1622,8 @@ pub const Diagnostic = struct {
         integer_literal_not_decimal,
         float_literal_not_supported,
         integer_literal_out_of_range,
+        invalid_string_escape,
+        invalid_string_utf8,
         fallible_condition_not_supported,
         if_condition_not_fallible,
         inspection_type_not_supported,

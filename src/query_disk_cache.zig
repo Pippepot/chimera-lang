@@ -5,7 +5,7 @@ const query = @import("query/engine.zig");
 const queries = @import("queries.zig");
 const structures = @import("structures.zig");
 
-const format = "CHIQRY19";
+const format = "CHIQRY21";
 const max_records = 1_000_000;
 
 pub fn save(io: std.Io, allocator: std.mem.Allocator, directory: []const u8, key: cache.Key, db: *query.Database) !void {
@@ -34,7 +34,7 @@ pub fn restoreInterns(db: *query.Database, allocator: std.mem.Allocator, payload
 }
 
 fn restoreNamedIntern(name: []const u8, db: *query.Database, reader: *codec.Reader, index: usize) !void {
-    inline for (.{ queries.ModulePaths, queries.ItemLocations, queries.Types, queries.CompileTimeValues, queries.CompileTimeValueTuples }) |I| {
+    inline for (.{ queries.ModulePaths, queries.ItemLocations, queries.Types, queries.ByteStrings, queries.CompileTimeValues, queries.CompileTimeValueTuples }) |I| {
         if (std.mem.eql(u8, name, @typeName(I))) return restoreIntern(I, db, reader, index);
     }
     return error.InvalidCache;
@@ -44,6 +44,7 @@ fn restoreIntern(comptime I: type, db: *query.Database, reader: *codec.Reader, i
     var value = try reader.read(I.Value);
     defer codec.freeValue(I.Value, reader.allocator, &value);
     if (!(try validateIds(I.Value, db, value))) return error.InvalidCache;
+    if (I == queries.ByteStrings and !std.unicode.utf8ValidateSlice(value.bytes)) return error.InvalidCache;
     if (I == queries.CompileTimeValues and !(try validArrayRuntime(db, value))) return error.InvalidCache;
     if (I == queries.Types) {
         switch (value) {
@@ -170,6 +171,16 @@ fn validArrayElementType(db: *query.Database, type_id: structures.TypeId) anyerr
 
 fn validArrayRuntime(db: *query.Database, value: structures.CompileTimeValue) !bool {
     if (value != .runtime) return true;
+    switch (value.runtime.value) {
+        .string_literal => if (value.runtime.type_id != .string_literal) return false,
+        .static_data => if (value.runtime.type_id != .static_data) return false,
+        .byte_pointer => if (value.runtime.type_id != .byte_pointer) return false,
+        else => {},
+    }
+    switch (value.runtime.type_id) {
+        .string_literal, .static_data, .byte_pointer => if (value.runtime.value.scalarTypeId() != value.runtime.type_id) return false,
+        else => {},
+    }
     const types: queries.TypeFacts(*query.Database) = .{ .ctx = db };
     const array = (try types.arrayType(value.runtime.type_id)) orelse return true;
     if (value.runtime.value != .structure) return false;
@@ -186,6 +197,11 @@ fn validateIds(comptime T: type, db: *query.Database, value: T) anyerror!bool {
     if (T == u8) return true;
     if (T == structures.ModuleId) return (try db.lookupInternedAs(queries.ModulePaths, value)) != null;
     if (T == structures.ItemId) return (try db.lookupInternedAs(queries.ItemLocations, value)) != null;
+    if (T == structures.StaticBytePointer) {
+        const data = (try db.lookupInternedAs(queries.ByteStrings, value.data)) orelse return false;
+        return value.offset <= data.bytes.len;
+    }
+    if (T == structures.ByteStringId) return (try db.lookupInternedAs(queries.ByteStrings, value)) != null;
     if (T == structures.CompileTimeValueId) return (try db.lookupInternedAs(queries.CompileTimeValues, value)) != null;
     if (T == structures.CompileTimeValueTupleId) return (try db.lookupInternedAs(queries.CompileTimeValueTuples, value)) != null;
     if (T == structures.InternedTypeId) return (try db.lookupInternedAs(queries.Types, value)) != null;
@@ -239,7 +255,18 @@ fn validStorageOperations(db: *query.Database, body: structures.FunctionBodyAnal
     for (body.instructions) |instruction| {
         if (!try validArrayStorageType(db, types, instruction.resultType())) return false;
         switch (instruction) {
-            .static_conversion => return false,
+            .static_conversion, .const_string_literal => return false,
+            .byte_pointer => |source| {
+                const source_type = body.valueType(source);
+                if (source_type != .static_data) {
+                    const array = try types.arrayType(source_type);
+                    if (array) |shape| {
+                        if (shape.element_type != .byte) return false;
+                    } else if ((try types.allocationElement(source_type)) != structures.TypeId.byte) return false;
+                }
+            },
+            .byte_offset, .byte_read => |operands| if (body.valueType(operands.lhs) != .byte_pointer or body.valueType(operands.rhs) != .int) return false,
+            .byte_to_int => |source| if (body.valueType(source) != .byte) return false,
             .initializer_ref => |reference| if (!try validInitializerResult(db, types, body, reference)) return false,
             .const_type => |type_id| if (!try validArrayStorageType(db, types, type_id)) return false,
             .borrow_address => |operation| if (!try validBorrowFields(types, body, operation)) return false,
@@ -276,11 +303,18 @@ fn validArrayStorageType(db: *query.Database, types: queries.TypeFacts(*query.Da
 fn validBorrowFields(types: anytype, body: structures.FunctionBodyAnalysis, operation: structures.BorrowAddressOperation) !bool {
     var type_id = body.valueType(operation.source);
     if (operation.base_is_reference) type_id = (try types.borrowElement(type_id)) orelse return false;
-    for (body.borrow_fields[operation.fields.start..operation.fields.end]) |field_index| {
-        const definition = (try types.structDefinition(type_id)) orelse return false;
-        if (field_index >= definition.fields.len) return false;
-        type_id = definition.fields[field_index].type_id;
-    }
+    for (body.borrow_fields[operation.fields.start..operation.fields.end]) |projection| switch (projection) {
+        .field => |field_index| {
+            const definition = (try types.structDefinition(type_id)) orelse return false;
+            if (field_index >= definition.fields.len) return false;
+            type_id = definition.fields[field_index].type_id;
+        },
+        .variant => |member| {
+            const members = (try types.variantMembers(type_id)) orelse return false;
+            if (std.mem.indexOfScalar(structures.TypeId, members, member) == null) return false;
+            type_id = member;
+        },
+    };
     return type_id == ((try types.borrowElement(operation.type_id)) orelse return false);
 }
 
@@ -501,7 +535,13 @@ fn validFallibleTargets(call: structures.FunctionCall, success: structures.Funct
 fn validCompiledFunction(artifact: structures.CompiledFunction) bool {
     if (artifact.code.len == 0 or artifact.required_alignment == 0 or !std.math.isPowerOfTwo(artifact.required_alignment)) return false;
     for (artifact.relocations) |relocation| {
-        if (@backingInt(relocation.reference) >= artifact.referenced_instances.len) return false;
+        switch (relocation.reference) {
+            .function => |reference| if (@backingInt(reference) >= artifact.referenced_instances.len) return false,
+            .data => |index| {
+                if (index >= artifact.constant_data.len or relocation.kind != .address_absolute_64) return false;
+                if (relocation.addend < 0 or relocation.addend > artifact.constant_data[index].bytes.len) return false;
+            },
+        }
         const width: usize = switch (relocation.kind) {
             .call_relative_32 => 4,
             .address_absolute_64 => 8,
@@ -515,7 +555,7 @@ test "query restore rejects obsolete IR formats" {
     const allocator = std.testing.allocator;
     const db = try query.Database.init(allocator, .{ .worker_count = 1 });
     defer db.deinit();
-    for ([_][]const u8{ "CHIQRY12", "CHIQRY18" }) |obsolete|
+    for ([_][]const u8{ "CHIQRY12", "CHIQRY18", "CHIQRY20" }) |obsolete|
         try std.testing.expectError(error.InvalidCache, restoreInterns(db, allocator, obsolete));
 }
 
@@ -690,7 +730,7 @@ test "cached body validation rejects invalid control flow and argument indexes" 
     const reference_item = (try db.get(queries.ModuleDeclarations, module)).*.?.resolveStatic("IntRef").?;
     const reference_value = (try db.get(queries.ResolveStatic, reference_item)).*.?;
     const reference_type = (try db.lookupInterned(queries.CompileTimeValues, reference_value)).type;
-    var path = [_]u32{0};
+    var path = [_]structures.BorrowProjection{.{ .field = 0 }};
     body.borrow_fields = &path;
     block_arguments[0].type_id = pair_type;
     instructions[0] = .{ .borrow_address = .{
@@ -700,9 +740,9 @@ test "cached body validation rejects invalid control flow and argument indexes" 
     } };
     try std.testing.expect(validFunctionBody(body));
     try std.testing.expect(try validStorageOperations(db, body));
-    path[0] = 1;
+    path[0] = .{ .field = 1 };
     try std.testing.expect(!(try validStorageOperations(db, body)));
-    path[0] = 0;
+    path[0] = .{ .field = 0 };
     instructions[0].borrow_address.fields.end = 2;
     try std.testing.expect(!validFunctionBody(body));
     instructions[0].borrow_address.fields.end = 1;
@@ -1067,15 +1107,15 @@ test "invalid machine-code cache shapes are rejected" {
     const valid: structures.CompiledFunction = .{
         .code = &.{ 0, 0, 0, 0 },
         .required_alignment = 1,
-        .relocations = &.{.{ .offset = 0, .kind = .call_relative_32, .reference = @fromBackingInt(@intCast(0)), .addend = 0 }},
+        .relocations = &.{.{ .offset = 0, .kind = .call_relative_32, .reference = .{ .function = @fromBackingInt(@intCast(0)) }, .addend = 0 }},
         .referenced_instances = &.{.{ .item = @fromBackingInt(@intCast(0)) }},
     };
     try std.testing.expect(validCompiledFunction(valid));
     var damaged = valid;
-    damaged.relocations = &.{.{ .offset = 1, .kind = .call_relative_32, .reference = @fromBackingInt(@intCast(0)), .addend = 0 }};
+    damaged.relocations = &.{.{ .offset = 1, .kind = .call_relative_32, .reference = .{ .function = @fromBackingInt(@intCast(0)) }, .addend = 0 }};
     try std.testing.expect(!validCompiledFunction(damaged));
     damaged = valid;
-    damaged.relocations = &.{.{ .offset = 0, .kind = .call_relative_32, .reference = @fromBackingInt(@intCast(1)), .addend = 0 }};
+    damaged.relocations = &.{.{ .offset = 0, .kind = .call_relative_32, .reference = .{ .function = @fromBackingInt(@intCast(1)) }, .addend = 0 }};
     try std.testing.expect(!validCompiledFunction(damaged));
 }
 
@@ -1449,7 +1489,7 @@ test "array snapshot interns reject unavailable elements unsupported storage and
         .{ .element_type = .type, .length = 0 },
         .{ .element_type = .int, .length = @as(u32, std.math.maxInt(i32)) + 1 },
         .{ .element_type = .fromInterned(@fromBackingInt(@intCast(0))), .length = 1 },
-        .{ .element_type = @fromBackingInt(@intCast(8)), .length = 0 },
+        .{ .element_type = @fromBackingInt(@as(u32, 0x7fffffff)), .length = 0 },
     }) |array| {
         const db = try query.Database.init(allocator, .{ .worker_count = 1 });
         defer db.deinit();
@@ -1510,6 +1550,34 @@ test "array runtime snapshot tuples require the declared shape and runtime eleme
     defer db.deinit();
     const type_id: structures.TypeId = .fromInterned(try db.intern(queries.Types, .{ .array = .{ .element_type = .int, .length = 0 } }));
     try std.testing.expect(!try validArrayRuntime(db, .{ .runtime = .{ .type_id = type_id, .value = .{ .int = 42 } } }));
+}
+
+test "text intern restoration rejects malformed bytes IDs offsets and payload types" {
+    const allocator = std.testing.allocator;
+    for (0..5) |case_index| {
+        const first = try query.Database.init(allocator, .{ .worker_count = 1 });
+        defer first.deinit();
+        const data = try first.intern(queries.ByteStrings, .{ .bytes = if (case_index == 1) "\xff" else "abc" });
+        const pointer: structures.StaticBytePointer = .{
+            .data = if (case_index == 2) @fromBackingInt(@as(u32, 99)) else data,
+            .offset = if (case_index == 3) 4 else 3,
+        };
+        _ = try first.intern(queries.CompileTimeValues, .{ .runtime = .{
+            .type_id = .byte_pointer,
+            .value = if (case_index == 4) .{ .int = 42 } else .{ .byte_pointer = pointer },
+        } });
+        var writer: codec.Writer = .{ .allocator = allocator };
+        defer writer.deinit();
+        try writer.bytes.appendSlice(allocator, format);
+        try first.writeInternedValues(&writer);
+        const second = try query.Database.init(allocator, .{ .worker_count = 1 });
+        defer second.deinit();
+        if (case_index == 0) {
+            try std.testing.expectEqual(writer.bytes.items.len, try restoreInterns(second, allocator, writer.bytes.items));
+        } else {
+            try std.testing.expectError(error.InvalidCache, restoreInterns(second, allocator, writer.bytes.items));
+        }
+    }
 }
 
 test "cached array projections validate operands shape index and result and round trip IR" {

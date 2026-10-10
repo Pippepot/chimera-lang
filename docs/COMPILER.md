@@ -50,8 +50,36 @@ Collection literals default to inline `Array(T, N)` or construct a known expecte
 target through its consuming converter. `List(T)` is a prelude export; implicit
 List allocation failure terminates with status 134. `List(T).from([elements])`
 is the explicitly fallible alternative. Ordinary element failure cleans partial
-construction and releases List storage. List heap execution is runtime-only;
-inline Arrays and consuming converters retain interpreter support.
+construction and releases List storage. Box, List, Buffer, and views execute at
+compile time through their ordinary declarations. Evaluation-local storage can
+be passed between nested calls but cannot escape into published values, static
+arguments, or runtime storage; copied or extracted ordinary data can leave evaluation.
+
+UTF-8 literals default to the prelude `String`. Literal-backed strings allocate
+nothing; mutation grows unique owned storage, and `clone` is explicitly fallible.
+`StringView` and `BytesView` are read-only views with byte counts. `byte_int` is the
+named widening operation. `BytesView.validate_utf8` validates arbitrary byte
+input, and text slices check codepoint boundaries. String-to-view converters
+borrow their source; literal-to-view converters refer to permanent static bytes.
+
+```chi
+fallible output()
+    var text = "hello"
+    text.append?(" 🌍")
+    print?(text)
+if output() -> exit(0)
+exit(1)
+```
+
+`std.io` exports `stdin`, `stdout`, `stderr`, `read_bytes`, `write_once`,
+`write_all`, and `write_text`; `print` is also a prelude export. Reads append to
+`Buffer(byte)` and expose only the initialized prefix through `bytes()`. Short
+counts are successful progress; a nonempty read returning zero indicates EOF.
+Failures keep existing initialized contents and earlier I/O effects. Programs
+using output ignore SIGPIPE so a broken pipe becomes ordinary write failure.
+Pure literal/view operations execute at compile time, while reached I/O is
+rejected. Heap-backed text mutation and cloning also execute at compile time,
+subject to the same storage publication boundary.
 
 The CLI uses two query workers by default on machines with at least two CPUs;
 `--workers=N` selects 1 through 64 workers. `--disk-cache` caches successful
@@ -130,10 +158,10 @@ zig build test --seed=0 -Doptimize=safe -Dtest-source=tests/comptime_interpreter
 ```
 
 These entrypoints supply required module imports. Both suite modes run inline
-tests once through `test_sources.zig` and seven standalone suites (eight default
+tests once through `test_sources.zig` and eight standalone suites (nine default
 roots total): `tests/array_test.zig`, `tests/converter_test.zig`, `tests/codegen_test.zig`,
 `tests/comptime_interpreter_test.zig`, `tests/modules_test.zig`,
-`tests/query_disk_cache_test.zig`, and `tests/query_test.zig`.
+`tests/query_disk_cache_test.zig`, `tests/query_test.zig`, and `tests/text_test.zig`.
 Each runs in its own binary's directory.
 Private disk-cache tests remain inline in
 `src/query_disk_cache.zig`; its snapshot integration suite lives in
@@ -149,7 +177,7 @@ caches compilation but reruns tests. The `safe` mode speeds up allocation checks
 with a slower first compile.
 
 For quick test iteration, omit `-Doptimize=safe` and select the affected
-suite with `-Dtest-source`. The full suite builds eight separate test binaries;
+suite with `-Dtest-source`. The full suite builds nine separate test binaries;
 its compilation cost is different from building the CLI once.
 
 Use focused checks during edits; run the routine suite once for changes spanning

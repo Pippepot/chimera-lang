@@ -6,12 +6,82 @@ pub const ExecutionErrorReason = enum {
     division_by_zero,
     integer_overflow,
     unsupported_operation,
+    escaping_storage,
 };
 
 pub const ExecutionError = struct {
     reason: ExecutionErrorReason,
     span: ?structures.SourceSpan = null,
 };
+
+pub const Heap = struct {
+    allocator: std.mem.Allocator,
+    identities: std.heap.ArenaAllocator,
+    records: std.ArrayList(*Allocation) = .empty,
+
+    pub fn init(allocator: std.mem.Allocator) Heap {
+        return .{ .allocator = allocator, .identities = .init(allocator) };
+    }
+
+    pub fn deinit(self: *Heap) void {
+        for (self.records.items) |record| {
+            record.release();
+            self.allocator.destroy(record);
+        }
+        self.records.deinit(self.allocator);
+        self.identities.deinit();
+    }
+
+    pub fn allocate(self: *Heap, element_type: structures.TypeId, capacity: u32) !*Allocation {
+        const record = try self.allocator.create(Allocation);
+        errdefer self.allocator.destroy(record);
+        record.* = .{
+            .identity = self.records.items.len,
+            .element_type = element_type,
+            .capacity = capacity,
+            .backing = .init(self.allocator),
+            .identities = self.identities.allocator(),
+        };
+        try self.records.append(self.allocator, record);
+        return record;
+    }
+};
+
+pub const Allocation = struct {
+    identity: usize,
+    element_type: structures.TypeId,
+    capacity: u32,
+    released: bool = false,
+    backing: std.heap.ArenaAllocator,
+    identities: std.mem.Allocator,
+    elements: std.AutoHashMapUnmanaged(u32, *Cell) = .empty,
+
+    pub fn element(self: *Allocation, index: u32) !*Cell {
+        std.debug.assert(!self.released);
+        std.debug.assert(index < self.capacity);
+        if (self.elements.get(index)) |cell| return cell;
+        const cell = try self.identities.create(Cell);
+        cell.* = .{ .type_id = self.element_type, .storage = self.identities, .contents = .uninitialized };
+        try self.elements.put(self.backing.allocator(), index, cell);
+        return cell;
+    }
+
+    pub fn release(self: *Allocation) void {
+        if (self.released) return;
+        var cells = self.elements.valueIterator();
+        while (cells.next()) |cell| cell.*.invalidate();
+        self.elements = .empty;
+        self.backing.deinit();
+        self.released = true;
+    }
+};
+
+pub fn allocationByteSize(element_size: u32, count: i32) ?u32 {
+    if (count < 0) return null;
+    const size = @as(u64, element_size) * @as(u32, @intCast(count));
+    if (size > std.math.maxInt(i32)) return null;
+    return @intCast(size);
+}
 
 pub const Value = union(enum) {
     runtime: structures.CompileTimeValue.RuntimeValue,
@@ -29,7 +99,18 @@ pub const Cell = struct {
         fields: []Cell,
         variant_payload: *Cell,
         reference: *Cell,
+        byte_pointer: struct { owner: *Cell, offset: u32 },
+        allocation: *Allocation,
     },
+
+    fn invalidate(self: *Cell) void {
+        switch (self.contents) {
+            .fields => |fields| for (fields) |*field| field.invalidate(),
+            .variant_payload => |payload| payload.invalidate(),
+            .uninitialized, .value, .reference, .byte_pointer, .allocation => {},
+        }
+        self.contents = .uninitialized;
+    }
 };
 
 pub const ValueSnapshot = struct {
@@ -41,6 +122,7 @@ pub const ValueSnapshot = struct {
     pub fn init(values: []const Value, storage: std.mem.Allocator) anyerror!ValueSnapshot {
         var cloner: Cloner = .{ .storage = storage };
         defer cloner.copies.deinit(storage);
+        defer cloner.allocations.deinit(storage);
         const saved_values = try cloner.cloneValues(values);
         return .{ .values = saved_values, .sources = cloner.sources };
     }
@@ -59,6 +141,7 @@ pub const ValueSnapshot = struct {
         storage: std.mem.Allocator,
         copies: std.AutoHashMapUnmanaged(*const Cell, *Cell) = .empty,
         sources: std.AutoHashMapUnmanaged(*const Cell, *const Cell) = .empty,
+        allocations: std.AutoHashMapUnmanaged(*const Allocation, *Allocation) = .empty,
 
         fn cloneValues(self: *@This(), values: []const Value) anyerror![]Value {
             const copies = try self.storage.alloc(Value, values.len);
@@ -98,8 +181,27 @@ pub const ValueSnapshot = struct {
                 .value => |value| snapshot.contents = .{ .value = value },
                 .fields => |fields| snapshot.contents = .{ .fields = try self.cloneFields(fields) },
                 .variant_payload => |payload| snapshot.contents = .{ .variant_payload = try self.cloneCell(payload) },
+                .byte_pointer => |pointer| snapshot.contents = .{ .byte_pointer = .{ .owner = try self.cloneCell(pointer.owner), .offset = pointer.offset } },
                 .reference => |target| snapshot.contents = .{ .reference = try self.cloneCell(target) },
+                .allocation => |allocation| snapshot.contents = .{ .allocation = try self.cloneAllocation(allocation) },
             }
+        }
+
+        fn cloneAllocation(self: *@This(), allocation: *const Allocation) anyerror!*Allocation {
+            if (self.allocations.get(allocation)) |copy| return copy;
+            const copy = try self.storage.create(Allocation);
+            copy.* = .{
+                .identity = allocation.identity,
+                .element_type = allocation.element_type,
+                .capacity = allocation.capacity,
+                .released = allocation.released,
+                .backing = .init(self.storage),
+                .identities = self.storage,
+            };
+            try self.allocations.put(self.storage, allocation, copy);
+            var entries = allocation.elements.iterator();
+            while (entries.next()) |entry| try copy.elements.put(self.storage, entry.key_ptr.*, try self.cloneCell(entry.value_ptr.*));
+            return copy;
         }
 
         fn cloneFields(self: *@This(), fields: []const Cell) anyerror![]Cell {
@@ -148,9 +250,34 @@ pub const ValueSnapshot = struct {
                 .value => |value| return std.meta.eql(value, right.contents.value),
                 .fields => |fields| return self.sameFields(fields, right.contents.fields),
                 .variant_payload => |payload| return self.sameCell(payload, right.contents.variant_payload),
+                .byte_pointer => return self.sameBytePointer(left, right),
                 .reference => |target| return self.left.sourceCell(target) == self.right.sourceCell(right.contents.reference) and
                     try self.sameCell(target, right.contents.reference),
+                .allocation => |allocation| return self.sameAllocation(allocation, right.contents.allocation),
             }
+        }
+
+        fn sameBytePointer(self: *@This(), left: *const Cell, right: *const Cell) anyerror!bool {
+            const first = left.contents.byte_pointer;
+            const second = right.contents.byte_pointer;
+            if (first.offset != second.offset) return false;
+            // Copied allocation descriptors still denote the same allocation;
+            // inline arrays retain the identity of their original storage cell.
+            if (first.owner.contents == .allocation and second.owner.contents == .allocation)
+                return self.sameAllocation(first.owner.contents.allocation, second.owner.contents.allocation);
+            return self.left.sourceCell(first.owner) == self.right.sourceCell(second.owner) and
+                try self.sameCell(first.owner, second.owner);
+        }
+
+        fn sameAllocation(self: *@This(), left: *const Allocation, right: *const Allocation) anyerror!bool {
+            if (left.identity != right.identity or left.element_type != right.element_type or left.capacity != right.capacity or left.released != right.released) return false;
+            if (left.elements.count() != right.elements.count()) return false;
+            var entries = left.elements.iterator();
+            while (entries.next()) |entry| {
+                const other = right.elements.get(entry.key_ptr.*) orelse return false;
+                if (!try self.sameCell(entry.value_ptr.*, other)) return false;
+            }
+            return true;
         }
 
         fn sameFields(self: *@This(), left: []const Cell, right: []const Cell) anyerror!bool {
@@ -181,16 +308,23 @@ pub fn execute(
     var storage_arena: std.heap.ArenaAllocator = .init(gpa);
     defer storage_arena.deinit();
     const result = try executeInStorage(body, arguments, executor, gpa, storage_arena.allocator());
-    for (arguments, body.parameter_modes) |*argument, mode| {
+    return publish(result, arguments, body.parameter_modes, executor, gpa);
+}
+
+pub fn publish(result: Result, arguments: []Value, modes: []const structures.ParameterMode, executor: anytype, gpa: std.mem.Allocator) !Result {
+    if (result != .returned and result != .failure) return result;
+    for (arguments, modes) |*argument, mode| {
         if (mode != .mut or argument.* != .place) continue;
+        if (containsReference(argument.place)) return executionError(.escaping_storage, null);
         const runtime = (try materialize(argument.place, executor, gpa)) orelse return executionError(.unsupported_operation, null);
         argument.* = .{ .runtime = runtime };
     }
     if (result == .returned and result.returned == .place) {
+        if (containsReference(result.returned.place)) return executionError(.escaping_storage, null);
         const runtime = (try materialize(result.returned.place, executor, gpa)) orelse return executionError(.unsupported_operation, null);
         return .{ .returned = .{ .runtime = runtime } };
     }
-    if (result == .returned and result.returned == .initializer) return executionError(.unsupported_operation, null);
+    if (result == .returned and result.returned == .initializer) return executionError(.escaping_storage, null);
     return result;
 }
 
@@ -222,9 +356,20 @@ pub fn executeInStorage(
             const destination = @backingInt(body.instructionValue(instruction_index));
             switch (instruction) {
                 .const_int => |value| slots[destination] = .{ .runtime = .{ .int = value } },
+                .const_string_literal => |value| slots[destination] = .{ .runtime = .{ .string_literal = value } },
+                .const_data => |value| slots[destination] = .{ .runtime = .{ .static_data = value } },
+                .const_byte_pointer => |value| slots[destination] = .{ .runtime = .{ .byte_pointer = value } },
+                .byte_pointer => |source| switch (try bytePointer(body, slots, source, executor, storage)) {
+                    .returned => |value| slots[destination] = value,
+                    else => |result| return atSpan(result, instructionSpan(body, instruction_index)),
+                },
+                .byte_offset => |operands| slots[destination] = try offsetBytePointer(slots[@backingInt(operands.lhs)], @intCast(integer(slots, operands.rhs)), storage),
+                .byte_read => |operands| slots[destination] = .{ .runtime = .{ .byte = try readBytePointer(slots[@backingInt(operands.lhs)], @intCast(integer(slots, operands.rhs)), executor) } },
+                .byte_to_int => |source| slots[destination] = .{ .runtime = .{ .int = scalar(slots, source).byte } },
                 .const_int_literal => |value| slots[destination] = .{ .runtime = .{ .int_literal = value } },
                 .static_conversion => |conversion| {
                     const source = (try readSlot(slots, conversion.operand, executor, gpa)) orelse return .unavailable;
+                    if (source == .place and containsReference(source.place)) return executionError(.escaping_storage, instructionSpan(body, instruction_index));
                     const runtime = switch (source) {
                         .runtime => |value| value,
                         .place => |cell| (try materialize(cell, executor, gpa)) orelse return executionError(.unsupported_operation, instructionSpan(body, instruction_index)),
@@ -299,7 +444,15 @@ pub fn executeInStorage(
                     try assignCell(target, slots[@backingInt(operation.value)], executor);
                     slots[destination] = .{ .runtime = .unit };
                 },
-                .allocation_element, .borrow_box => return executionError(.unsupported_operation, instructionSpan(body, instruction_index)),
+                .allocation_element => |operation| {
+                    const allocation = allocationRecord(slots[@backingInt(operation.allocation)]);
+                    std.debug.assert(allocation.element_type == operation.type_id);
+                    slots[destination] = .{ .place = try allocation.element(@intCast(integer(slots, operation.index))) };
+                },
+                .borrow_box => |operation| {
+                    const allocation = allocationRecord(slots[@backingInt(operation.source)]);
+                    slots[destination] = try referenceValue(operation.type_id, try allocation.element(0), storage);
+                },
                 .value_copy => |operation| {
                     var copied = (try readSlot(slots, operation.source, executor, gpa)) orelse return .unavailable;
                     if (operation.destination == null and copied == .place) {
@@ -310,7 +463,7 @@ pub fn executeInStorage(
                     }
                     try store(slots, destination, operation.destination, copied, executor);
                 },
-                .field_access => |operation| switch (try accessField(slots[@backingInt(operation.operand)], operation, executor, gpa)) {
+                .field_access => |operation| switch (try accessField(slots[@backingInt(operation.operand)], operation, executor, gpa, storage)) {
                     .returned => |value| slots[destination] = value,
                     else => |result| return atSpan(result, instructionSpan(body, instruction_index)),
                 },
@@ -561,7 +714,7 @@ fn arrayType(executor: anytype, type_id: structures.TypeId) !?structures.ArrayTy
 
 pub fn containsReference(cell: *const Cell) bool {
     switch (cell.contents) {
-        .reference => return true,
+        .reference, .byte_pointer, .allocation => return true,
         .fields => |fields| for (fields) |*field| {
             if (containsReference(field)) return true;
         },
@@ -583,6 +736,28 @@ pub fn referenceValue(type_id: structures.TypeId, target: *Cell, storage: std.me
 }
 
 pub fn assignCell(destination: *Cell, source: Value, executor: anytype) anyerror!void {
+    if (source == .place and destination == source.place) return;
+    if (destination.contents == .allocation) {
+        if (try arrayType(executor, destination.type_id)) |array| {
+            const allocation = destination.contents.allocation;
+            std.debug.assert(array.element_type == allocation.element_type);
+            std.debug.assert(array.length <= allocation.capacity);
+            for (0..array.length) |index| {
+                const element = try allocation.element(@intCast(index));
+                if (source == .place and source.place.contents == .fields) {
+                    try assignCell(element, .{ .place = &source.place.contents.fields[index] }, executor);
+                } else if (source == .place and source.place.contents == .allocation) {
+                    try assignCell(element, .{ .place = try source.place.contents.allocation.element(@intCast(index)) }, executor);
+                } else {
+                    const runtime = if (source == .place) source.place.contents.value else source.runtime;
+                    const values = try executor.lookupTuple(runtime.structure);
+                    const value = (try executor.lookupRuntime(values[index])) orelse return error.Unavailable;
+                    try assignRuntime(element, value.value, executor);
+                }
+            }
+            return;
+        }
+    }
     switch (source) {
         .runtime => |runtime| try assignRuntime(destination, runtime, executor),
         .place => |cell| {
@@ -590,7 +765,18 @@ pub fn assignCell(destination: *Cell, source: Value, executor: anytype) anyerror
             switch (cell.contents) {
                 .value => |runtime| try assignRuntime(destination, runtime, executor),
                 .uninitialized => destination.contents = .uninitialized,
+                .byte_pointer => |pointer| destination.contents = .{ .byte_pointer = pointer },
                 .reference => |target| destination.contents = .{ .reference = target },
+                .allocation => |allocation| {
+                    if (try arrayType(executor, cell.type_id)) |array| {
+                        const copied = try destination.storage.alloc(Cell, array.length);
+                        for (copied, 0..) |*copy, index| {
+                            copy.* = .{ .type_id = array.element_type, .storage = destination.storage, .contents = .uninitialized };
+                            try assignCell(copy, .{ .place = try allocation.element(@intCast(index)) }, executor);
+                        }
+                        destination.contents = .{ .fields = copied };
+                    } else destination.contents = .{ .allocation = allocation };
+                },
                 .fields => |fields| {
                     if (destination.contents != .fields) {
                         const copied = try destination.storage.alloc(Cell, fields.len);
@@ -664,7 +850,7 @@ fn expandFields(cell: *Cell, executor: anytype) !bool {
             cell.contents = .{ .fields = fields };
         },
         .fields => {},
-        .variant_payload, .reference => unreachable,
+        .variant_payload, .reference, .byte_pointer, .allocation => unreachable,
     }
     return true;
 }
@@ -676,6 +862,7 @@ fn projectArray(body: *const structures.FunctionBodyAnalysis, slots: []Value, op
     const index = integer(slots, operation.index);
     std.debug.assert(index >= 0);
     std.debug.assert(@as(u32, @intCast(index)) < array.length);
+    if (cell.contents == .allocation) return .{ .returned = .{ .place = try cell.contents.allocation.element(@intCast(index)) } };
     if (!try expandFields(cell, executor)) return .unavailable;
     return .{ .returned = .{ .place = &cell.contents.fields[@intCast(index)] } };
 }
@@ -685,21 +872,35 @@ fn borrowAddress(body: *const structures.FunctionBodyAnalysis, slots: []Value, o
         referenceTarget(slots[@backingInt(operation.source)]) orelse return executionError(.unsupported_operation, null)
     else
         try storageCell(body, slots, operation.source, storage);
-    for (body.borrow_fields[operation.fields.start..operation.fields.end]) |index| {
-        if (!try expandFields(target, executor)) return .unavailable;
-        const field = &target.contents.fields[index];
-        if (field.type_id == .never) {
-            field.type_id = (try executor.structFieldType(target.type_id, index)) orelse return .unavailable;
-        }
-        target = field;
-    }
+    for (body.borrow_fields[operation.fields.start..operation.fields.end]) |projection| switch (projection) {
+        .field => |index| {
+            if (!try expandFields(target, executor)) return .unavailable;
+            const field = &target.contents.fields[index];
+            if (field.type_id == .never) field.type_id = (try executor.structFieldType(target.type_id, index)) orelse return .unavailable;
+            target = field;
+        },
+        .variant => |member| target = (try borrowVariantCell(target, member, executor)) orelse return .unavailable,
+    };
     return .{ .returned = try referenceValue(operation.type_id, target, storage) };
+}
+
+fn borrowVariantCell(target: *Cell, member: structures.TypeId, executor: anytype) !?*Cell {
+    if (target.contents == .value) {
+        const value = (try executor.lookupRuntime(target.contents.value.variant.payload)) orelse return null;
+        std.debug.assert(value.type_id == member);
+        const payload = try target.storage.create(Cell);
+        payload.* = .{ .type_id = member, .storage = target.storage, .contents = .{ .value = value.value } };
+        target.contents = .{ .variant_payload = payload };
+    }
+    std.debug.assert(target.contents == .variant_payload);
+    std.debug.assert(target.contents.variant_payload.type_id == member);
+    return target.contents.variant_payload;
 }
 
 fn materialize(cell: *const Cell, executor: anytype, gpa: std.mem.Allocator) !?structures.CompileTimeValue.RuntimeValue {
     switch (cell.contents) {
         .value => |value| return value,
-        .reference => return null,
+        .reference, .byte_pointer, .allocation => return null,
         .uninitialized => {
             std.debug.assert(cell.type_id != .never);
             if (try arrayType(executor, cell.type_id)) |array| {
@@ -733,7 +934,6 @@ fn projectStorage(
     executor: anytype,
     storage: std.mem.Allocator,
 ) !Result {
-    if (operation.projection == .box_element or operation.projection == .allocation_array) return executionError(.unsupported_operation, null);
     const cell = try storageCell(body, slots, operation.owner, storage);
     switch (operation.projection) {
         .field => |index| {
@@ -761,11 +961,18 @@ fn projectStorage(
                 .variant_payload => |payload| if (payload.type_id != operation.type_id) {
                     payload.* = .{ .type_id = operation.type_id, .storage = cell.storage, .contents = .uninitialized };
                 },
-                .fields, .reference => unreachable,
+                .fields, .reference, .byte_pointer, .allocation => unreachable,
             }
             return .{ .returned = .{ .place = cell.contents.variant_payload } };
         },
-        .box_element, .allocation_array => unreachable,
+        .box_element => return .{ .returned = .{ .place = try allocationRecord(.{ .place = cell }).element(0) } },
+        .allocation_array => {
+            const allocation = allocationRecord(.{ .place = cell });
+            const array = (try arrayType(executor, operation.type_id)) orelse return .unavailable;
+            std.debug.assert(array.element_type == allocation.element_type);
+            std.debug.assert(array.length <= allocation.capacity);
+            return .{ .returned = try allocationValue(operation.type_id, allocation, storage) };
+        },
     }
 }
 
@@ -774,13 +981,14 @@ fn accessField(
     operation: structures.FieldAccessOperation,
     executor: anytype,
     gpa: std.mem.Allocator,
+    storage: std.mem.Allocator,
 ) !Result {
     if (value == .place and value.place.contents == .fields) {
         const fields = value.place.contents.fields;
         std.debug.assert(operation.field_index < fields.len);
         const field = &fields[operation.field_index];
         std.debug.assert(field.type_id == operation.field_type);
-        if (containsReference(field)) return .{ .returned = .{ .place = field } };
+        if (containsReference(field)) return .{ .returned = try copyStoredValue(.{ .place = field }, operation.field_type, executor, storage) };
         const field_value = (try materialize(field, executor, gpa)) orelse return .unavailable;
         return .{ .returned = .{ .runtime = field_value } };
     }
@@ -958,4 +1166,71 @@ fn branchTarget(
     }
     @memcpy(slots[target.argument_start..target.argument_end], scratch[0..arguments.len]);
     return .{ .next = branch.target };
+}
+
+fn bytePointer(body: *const structures.FunctionBodyAnalysis, slots: []Value, source: structures.FunctionValueId, executor: anytype, storage: std.mem.Allocator) !Result {
+    if (body.valueType(source) == .static_data) return .{ .returned = .{ .runtime = .{ .byte_pointer = .{ .data = scalar(slots, source).static_data } } } };
+    const owner = try storageCell(body, slots, source, storage);
+    if (owner.contents != .allocation and !try expandFields(owner, executor)) return .unavailable;
+    const cell = try storage.create(Cell);
+    cell.* = .{ .type_id = .byte_pointer, .storage = storage, .contents = .{ .byte_pointer = .{ .owner = owner, .offset = 0 } } };
+    return .{ .returned = .{ .place = cell } };
+}
+
+fn offsetBytePointer(source: Value, offset: u32, storage: std.mem.Allocator) !Value {
+    switch (source) {
+        .runtime => |runtime| {
+            var pointer = runtime.byte_pointer;
+            pointer.offset = std.math.add(u32, pointer.offset, offset) catch return error.TypeTooLarge;
+            return .{ .runtime = .{ .byte_pointer = pointer } };
+        },
+        .place => |cell| {
+            if (cell.contents == .value) return offsetBytePointer(.{ .runtime = cell.contents.value }, offset, storage);
+            const result = try storage.create(Cell);
+            var pointer = cell.contents.byte_pointer;
+            pointer.offset = std.math.add(u32, pointer.offset, offset) catch return error.TypeTooLarge;
+            result.* = .{ .type_id = .byte_pointer, .storage = storage, .contents = .{ .byte_pointer = pointer } };
+            return .{ .place = result };
+        },
+        .type, .initializer => unreachable,
+    }
+}
+
+fn readBytePointer(source: Value, offset: u32, executor: anytype) !u8 {
+    switch (source) {
+        .runtime => |runtime| {
+            const pointer = runtime.byte_pointer;
+            const bytes = try executor.byteString(pointer.data);
+            return bytes[@as(usize, pointer.offset) + offset];
+        },
+        .place => |cell| {
+            if (cell.contents == .value) return readBytePointer(.{ .runtime = cell.contents.value }, offset, executor);
+            const pointer = cell.contents.byte_pointer;
+            const index = @as(usize, pointer.offset) + offset;
+            const field = if (pointer.owner.contents == .allocation)
+                try pointer.owner.contents.allocation.element(@intCast(index))
+            else
+                &pointer.owner.contents.fields[index];
+            std.debug.assert(field.contents == .value);
+            return field.contents.value.byte;
+        },
+        .type, .initializer => unreachable,
+    }
+}
+
+pub fn allocationRecord(value: Value) *Allocation {
+    std.debug.assert(value == .place);
+    const cell = value.place;
+    if (cell.contents == .fields) {
+        std.debug.assert(cell.contents.fields.len == 1);
+        return allocationRecord(.{ .place = &cell.contents.fields[0] });
+    }
+    std.debug.assert(cell.contents == .allocation);
+    return cell.contents.allocation;
+}
+
+pub fn allocationValue(type_id: structures.TypeId, allocation: *Allocation, storage: std.mem.Allocator) !Value {
+    const cell = try storage.create(Cell);
+    cell.* = .{ .type_id = type_id, .storage = storage, .contents = .{ .allocation = allocation } };
+    return .{ .place = cell };
 }

@@ -225,7 +225,7 @@ pub const Database = struct {
             .type_name = @typeName(I),
             .destroy_key_fn = destroyInputKeyFn(I),
             .destroy_value_fn = destroyInputValueFn(I),
-            .write_key_fn = writeInputKeyFn(I),
+            .write_key_fn = writeValueFn(I.Key),
             .fingerprint_fn = fingerprintInputFn(I),
         };
         try db.inputs.put(inputCacheKey(I, key_box, key_hash), entry);
@@ -294,7 +294,7 @@ pub const Database = struct {
             .type_name = @typeName(I),
             .value_ptr = @ptrCast(value_box),
             .destroy_value_fn = destroyInternedValueFn(I),
-            .write_value_fn = writeInternedValueFn(I),
+            .write_value_fn = writeValueFn(I.Value),
         });
         db.interns.putAssumeCapacityNoClobber(internCacheKey(I, value_box, value_hash), index);
         return internId(I, index);
@@ -579,7 +579,7 @@ pub const Database = struct {
             .destroy_input_fn = destroyBoxFn(Q.Input),
             .destroy_output_fn = destroyBoxFn(Q.Output),
             .output_eql_fn = outputEqlFn(Q),
-            .write_input_fn = writeQueryInputFn(Q),
+            .write_input_fn = writeValueFn(Q.Input),
             .fingerprint_output_fn = if (@hasDecl(Q, "disk_boundary") and Q.disk_boundary) fingerprintQueryOutputFn(Q) else null,
             .deps = .empty,
             .input_deps = .empty,
@@ -1306,29 +1306,11 @@ fn destroyInternedValueFn(comptime I: type) DestroyOpaqueFn {
     }.destroy;
 }
 
-fn writeInternedValueFn(comptime I: type) WriteOpaqueFn {
+fn writeValueFn(comptime T: type) WriteOpaqueFn {
     return struct {
         fn write(writer: *disk_codec.Writer, ptr: *const anyopaque) anyerror!void {
-            const value: *const I.Value = @ptrCast(@alignCast(ptr));
-            try writer.write(I.Value, value.*);
-        }
-    }.write;
-}
-
-fn writeInputKeyFn(comptime I: type) WriteOpaqueFn {
-    return struct {
-        fn write(writer: *disk_codec.Writer, ptr: *const anyopaque) anyerror!void {
-            const key: *const I.Key = @ptrCast(@alignCast(ptr));
-            try writer.write(I.Key, key.*);
-        }
-    }.write;
-}
-
-fn writeQueryInputFn(comptime Q: type) WriteOpaqueFn {
-    return struct {
-        fn write(writer: *disk_codec.Writer, ptr: *const anyopaque) anyerror!void {
-            const input: *const Q.Input = @ptrCast(@alignCast(ptr));
-            try writer.write(Q.Input, input.*);
+            const value: *const T = @ptrCast(@alignCast(ptr));
+            try writer.write(T, value.*);
         }
     }.write;
 }

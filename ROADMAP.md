@@ -10,24 +10,6 @@ is not a goal.
 
 ## Ordered milestones
 
-### 1. Text and basic I/O
-
-- UTF-8 literals through literal converters and a prelude `String`, with static
-  literal storage, owned growth, and borrowed views.
-- Runtime text output and fallible byte I/O through ordinary declarations.
-  Define UTF-8 validation, failure, and cleanup; no ambient compile-time I/O.
-
-### 2. Compile-time storage parity
-
-- Shared evaluation-local heap storage for allocation, element access, borrowing,
-  mutation, and deallocation. Box/List/Buffer execute ordinary library code.
-- Preserve allocation identity across nested calls, construction, failure cleanup,
-  and transient snapshots; prevent cached calls from sharing fresh allocations.
-  Define allocation failure and evaluation resource limits.
-- Verify repeated allocations, aliasing, partial construction, and cleanup against
-  runtime behavior. Initially return ordinary data from evaluation; diagnose
-  allocation-backed identities escaping into canonical values or runtime storage.
-
 ### 3. Ranges, List, and iteration
 
 - Inclusive/exclusive ranges: endpoint types, direction, steps, empty ranges,

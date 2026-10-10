@@ -111,6 +111,46 @@ test "operation snapshots restore calls indexers and invalidate signature and vi
     try denied.expectExit(42);
 }
 
+test "evaluation heap snapshots restore scalar results and recompute callee element and cleanup edits" {
+    const source =
+        \\struct Item
+        \\    move = none
+        \\    trace: Ref(int, true)
+        \\    value: int
+        \\    drop = func(deinit self: Item) -> self.trace.replace(self.trace[] + self.value)
+        \\func element() int -> 2
+        \\fallible calculate(imm trace: Ref(int, true)) int
+        \\    const owner = Box(Item).new?(Item{trace = trace, value = element()})
+        \\    return owner.borrow()[].value + 38
+        \\func run() int
+        \\    var trace = Array(int, 1).filled(0)
+        \\    if const target = trace.get_mut(0)
+        \\        if const value = calculate(target) -> return value + target[]
+        \\    return 90
+        \\static answer = run()
+        \\exit(answer)
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const callee = try std.mem.replaceOwned(u8, std.testing.allocator, source, "func element() int -> 2", "func element() int -> 3");
+    defer std.testing.allocator.free(callee);
+    try fixture.db.setInput(queries.SourceText, 0, callee);
+    try fixture.expectExit(44);
+    const cleanup = try std.mem.replaceOwned(u8, std.testing.allocator, source, "self.trace[] + self.value)", "self.trace[] + self.value + 1)");
+    defer std.testing.allocator.free(cleanup);
+    try fixture.db.setInput(queries.SourceText, 0, cleanup);
+    try fixture.expectExit(43);
+    const fields = try std.mem.replaceOwned(u8, std.testing.allocator, source, "    value: int", "    value: int\n    padding: Array(int, 2)");
+    defer std.testing.allocator.free(fields);
+    const element_type = try std.mem.replaceOwned(u8, std.testing.allocator, fields, "value = element()}", "value = element(), padding = [0, 0]}");
+    defer std.testing.allocator.free(element_type);
+    try fixture.db.setInput(queries.SourceText, 0, element_type);
+    try fixture.expectExit(42);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(42);
+}
+
 test "collection snapshots restore pending carriers heap destinations and initializer effects" {
     const source =
         \\func element() int -> 19
@@ -884,6 +924,47 @@ test "array snapshots publish static nested values into runtime storage" {
         \\    return 90
         \\exit(run())
     );
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+}
+
+test "text snapshots restore symbolic data borrowed projections and invalidate literal edits" {
+    const source =
+        \\import words.{greeting}
+        \\fallible inspect() int
+        \\    const view = greeting.view()
+        \\    const bytes = view.as_bytes()
+        \\    const first = bytes.get?(0)
+        \\    return byte_int(first) - 62
+        \\func run() int
+        \\    if const answer = inspect() -> return answer
+        \\    return 90
+        \\exit(run())
+    ;
+    const files = [_]modules.SourceFile{.{ .path = "words/text.chi", .module_path = "words", .source = "pub static greeting = \"hello\\0é\"" }};
+    const fixture = try Fixture.restoreSources(source, &files, &files, null);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    try fixture.db.setInput(queries.SourceText, 1, "pub static greeting = \"jello\\0é\"");
+    try fixture.expectExit(44);
+    try fixture.db.setInput(queries.SourceText, 1, files[0].source);
+    try fixture.expectExit(42);
+}
+
+test "text snapshots restore owned string cleanup and standard stream artifacts" {
+    const source =
+        \\import std.io.{write_text, stdout}
+        \\fallible length() int
+        \\    var text = "hé"
+        \\    text.append?("llo")
+        \\    write_text?(stdout, "")
+        \\    return text.byte_length() + 36
+        \\func run() int
+        \\    if const answer = length() -> return answer
+        \\    return 90
+        \\exit(run())
+    ;
+    const fixture = try Fixture.restore(source);
     defer fixture.db.deinit();
     try fixture.expectExit(42);
 }

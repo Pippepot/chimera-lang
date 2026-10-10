@@ -57,6 +57,37 @@ pub const SourceFixture = struct {
         try std.testing.expectEqual(status, actual_status);
     }
 
+    pub fn runIo(self: SourceFixture, input: []const u8) !std.process.RunResult {
+        const allocator = std.testing.allocator;
+        const io = std.testing.io;
+        const executable_bytes = try self.executable(0);
+        var program = try runtime.prepareProgram(io, allocator, executable_bytes.bytes);
+        defer program.deinit(io);
+        defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+        var child = try std.process.spawn(io, .{ .argv = &.{program.path}, .stdin = .pipe, .stdout = .pipe, .stderr = .pipe });
+        defer child.kill(io);
+        // Fixtures use bounded input; close it to make EOF observable.
+        std.debug.assert(input.len <= 4096);
+        try child.stdin.?.writeStreamingAll(io, input);
+        child.stdin.?.close(io);
+        child.stdin = null;
+        var buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
+        var reader: std.Io.File.MultiReader = undefined;
+        reader.init(allocator, io, buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
+        defer reader.deinit();
+        while (reader.fill(64, .none)) |_| {} else |err| {
+            switch (err) {
+                error.EndOfStream => {},
+                else => return err,
+            }
+        }
+        try reader.checkAnyError();
+        const term = try child.wait(io);
+        const stdout = try reader.toOwnedSlice(0);
+        errdefer allocator.free(stdout);
+        return .{ .term = term, .stdout = stdout, .stderr = try reader.toOwnedSlice(1) };
+    }
+
     pub fn expectSourceExit(source: []const u8, status: u8) !void {
         const fixture = try init(source);
         defer fixture.deinit();

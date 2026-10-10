@@ -12,11 +12,17 @@ const payload_variant = structures.TypeId.fromInterned(@fromBackingInt(@intCast(
 const callable_type = structures.TypeId.fromInterned(@fromBackingInt(@intCast(4)));
 
 const TestTypes = struct {
+    data: []const u8 = "a*",
+    pub fn byteString(self: @This(), _: structures.ByteStringId) ![]const u8 {
+        return self.data;
+    }
     pub fn facts(self: @This()) @This() {
         return self;
     }
 
     pub fn layout(_: @This(), type_id: structures.TypeId) !structures.TypeLayout {
+        if (type_id == .byte) return .{ .byte_size = 1, .byte_alignment = 1 };
+        if (type_id == .byte_pointer or type_id == .static_data) return .{ .byte_size = 8, .byte_alignment = 8 };
         if (type_id == .int) return .{ .byte_size = 4, .byte_alignment = 4 };
         if (type_id == .unit or type_id == .none or type_id == .never) return .{ .byte_size = 0, .byte_alignment = 1 };
         if (type_id == small_variant or type_id == wide_variant) return .{ .byte_size = 8, .byte_alignment = 4 };
@@ -124,6 +130,9 @@ const array_reference_type = structures.TypeId.fromInterned(@fromBackingInt(@int
 const reference_reference_type = structures.TypeId.fromInterned(@fromBackingInt(@intCast(8)));
 
 const ArrayCopyTypes = struct {
+    pub fn byteString(_: *@This(), id: structures.ByteStringId) ![]const u8 {
+        return (TestTypes{}).byteString(id);
+    }
     array_length: u32 = 1024,
     field_offsets: [2]u32 = .{ 0, 4 },
 
@@ -510,7 +519,7 @@ fn expectDirectCallArtifact(artifact: structures.CompiledFunction, target: struc
     try std.testing.expectEqual(@as(usize, 1), artifact.relocations.len);
     try std.testing.expectEqual(@as(u32, 1), artifact.relocations[0].offset);
     try std.testing.expectEqual(structures.CompiledFunction.RelocationKind.call_relative_32, artifact.relocations[0].kind);
-    try std.testing.expectEqual(@as(u32, 0), @backingInt(artifact.relocations[0].reference));
+    try std.testing.expectEqual(@as(u32, 0), @backingInt(artifact.relocations[0].reference.function));
     try std.testing.expectEqual(@as(i64, 0), artifact.relocations[0].addend);
     try std.testing.expectEqualSlices(structures.InstanceId, &.{target}, artifact.referenced_instances);
 }
@@ -542,7 +551,7 @@ test "multiple calls produce ordered relocations and deduplicate references" {
     try std.testing.expectEqual(@as(usize, 2), artifact.relocations.len);
     try std.testing.expectEqual(@as(u32, 1), artifact.relocations[0].offset);
     try std.testing.expectEqual(@as(u32, 6), artifact.relocations[1].offset);
-    try std.testing.expectEqual(@backingInt(artifact.relocations[0].reference), @backingInt(artifact.relocations[1].reference));
+    try std.testing.expectEqual(@backingInt(artifact.relocations[0].reference.function), @backingInt(artifact.relocations[1].reference.function));
     try std.testing.expectEqualSlices(structures.InstanceId, &.{target}, artifact.referenced_instances);
 }
 
@@ -581,7 +590,7 @@ test "typed expression values survive calls and execute every integer arithmetic
     const entry_relocations = [_]structures.CompiledFunction.Relocation{.{
         .offset = 1,
         .kind = .call_relative_32,
-        .reference = @fromBackingInt(@intCast(0)),
+        .reference = .{ .function = @fromBackingInt(@intCast(0)) },
         .addend = 0,
     }};
     const entry_references = [_]structures.InstanceId{expression_id};
@@ -809,7 +818,7 @@ test "executable builder rejects artifact metadata independently" {
     const relocations = [_]structures.CompiledFunction.Relocation{.{
         .offset = 0,
         .kind = .call_relative_32,
-        .reference = @fromBackingInt(@intCast(0)),
+        .reference = .{ .function = @fromBackingInt(@intCast(0)) },
         .addend = 0,
     }};
     const references = [_]structures.InstanceId{.{ .item = @fromBackingInt(@intCast(0)) }};
@@ -851,7 +860,7 @@ test "executable builder requires the entry and every referenced artifact" {
     const relocations = [_]structures.CompiledFunction.Relocation{.{
         .offset = 1,
         .kind = .call_relative_32,
-        .reference = @fromBackingInt(@intCast(0)),
+        .reference = .{ .function = @fromBackingInt(@intCast(0)) },
         .addend = 0,
     }};
     const references = [_]structures.InstanceId{leaf_id};
@@ -872,7 +881,7 @@ test "executable builder resolves a direct call to its callee's file offset" {
     const relocations = [_]structures.CompiledFunction.Relocation{.{
         .offset = 1,
         .kind = .call_relative_32,
-        .reference = @fromBackingInt(@intCast(0)),
+        .reference = .{ .function = @fromBackingInt(@intCast(0)) },
         .addend = 0,
     }};
     const references = [_]structures.InstanceId{callee_id};
@@ -925,8 +934,8 @@ test "executable builder patches multiple relocations to one shared artifact" {
     const shared_id: structures.InstanceId = .{ .item = @fromBackingInt(@intCast(0)) };
     const entry_code = [_]u8{ 0xE8, 0, 0, 0, 0, 0xE8, 0, 0, 0, 0, 0xC3 };
     const relocations = [_]structures.CompiledFunction.Relocation{
-        .{ .offset = 1, .kind = .call_relative_32, .reference = @fromBackingInt(@intCast(0)), .addend = 0 },
-        .{ .offset = 6, .kind = .call_relative_32, .reference = @fromBackingInt(@intCast(0)), .addend = 0 },
+        .{ .offset = 1, .kind = .call_relative_32, .reference = .{ .function = @fromBackingInt(@intCast(0)) }, .addend = 0 },
+        .{ .offset = 6, .kind = .call_relative_32, .reference = .{ .function = @fromBackingInt(@intCast(0)) }, .addend = 0 },
     };
     const references = [_]structures.InstanceId{shared_id};
     const entry: structures.CompiledFunction = .{
@@ -969,7 +978,7 @@ test "executable builder resolves cyclic artifact graphs" {
     const relocation = [_]structures.CompiledFunction.Relocation{.{
         .offset = 1,
         .kind = .call_relative_32,
-        .reference = @fromBackingInt(@intCast(0)),
+        .reference = .{ .function = @fromBackingInt(@intCast(0)) },
         .addend = 0,
     }};
     const entry_references = [_]structures.InstanceId{first_id};
@@ -993,7 +1002,7 @@ test "executable builder rejects a relocation outside entry code bounds" {
     const relocations = [_]structures.CompiledFunction.Relocation{.{
         .offset = 3,
         .kind = .call_relative_32,
-        .reference = @fromBackingInt(@intCast(0)),
+        .reference = .{ .function = @fromBackingInt(@intCast(0)) },
         .addend = 0,
     }};
     const references = [_]structures.InstanceId{callee_id};
@@ -1024,7 +1033,7 @@ test "executable builder rejects a reference index outside referenced_instances"
     const relocations = [_]structures.CompiledFunction.Relocation{.{
         .offset = 1,
         .kind = .call_relative_32,
-        .reference = @fromBackingInt(@intCast(1)),
+        .reference = .{ .function = @fromBackingInt(@intCast(1)) },
         .addend = 0,
     }};
     const references = [_]structures.InstanceId{callee_id};
@@ -1055,7 +1064,7 @@ test "executable builder rejects a displacement outside the signed 32-bit range"
     const relocations = [_]structures.CompiledFunction.Relocation{.{
         .offset = 1,
         .kind = .call_relative_32,
-        .reference = @fromBackingInt(@intCast(0)),
+        .reference = .{ .function = @fromBackingInt(@intCast(0)) },
         // Forces the patched displacement past the signed 32-bit range
         // directly, without requiring a huge (real) address layout.
         .addend = std.math.maxInt(i64),
@@ -1098,7 +1107,7 @@ fn testBuildExecutableWithCalleeAllocations(gpa: std.mem.Allocator) !void {
     const relocations = [_]structures.CompiledFunction.Relocation{.{
         .offset = 1,
         .kind = .call_relative_32,
-        .reference = @fromBackingInt(@intCast(0)),
+        .reference = .{ .function = @fromBackingInt(@intCast(0)) },
         .addend = 0,
     }};
     const references = [_]structures.InstanceId{callee_id};
@@ -1135,4 +1144,30 @@ fn testBuildExecutableAllocations(gpa: std.mem.Allocator) !void {
     const functions = [_]codegen.ReachableFunction{.{ .instance = entry, .artifact = artifact }};
     var executable = try codegen.buildExecutable(entry, &functions, gpa);
     defer executable.deinit(gpa);
+}
+
+test "data relocations own deduplicated bytes and preserve pointer offsets" {
+    var bytes = [_]u8{ 'a', 42, 0 };
+    const pointer = structures.FunctionInstruction{ .const_byte_pointer = .{ .data = @fromBackingInt(0), .offset = 1 } };
+    var instructions = [_]structures.FunctionInstruction{
+        pointer,
+        .{ .const_byte_pointer = .{ .data = @fromBackingInt(1), .offset = 1 } },
+        .{ .const_int = 0 },
+        .{ .byte_read = .{ .lhs = @fromBackingInt(0), .rhs = @fromBackingInt(2) } },
+        .{ .byte_read = .{ .lhs = @fromBackingInt(1), .rhs = @fromBackingInt(2) } },
+        .{ .byte_to_int = @fromBackingInt(3) },
+        .{ .byte_to_int = @fromBackingInt(4) },
+        .{ .addi = .{ .lhs = @fromBackingInt(5), .rhs = @fromBackingInt(6) } },
+        .{ .call = .{ .target = .{ .direct = .{ .item = @fromBackingInt(1) } }, .arguments = .{ .start = 0, .end = 1 }, .return_type = .never } },
+    };
+    var blocks = [_]structures.FunctionBlock{.{ .instruction_start = 0, .instruction_end = instructions.len, .terminator = .diverge }};
+    var ssa = functionSsa(&instructions, &blocks);
+    var arguments = [_]structures.FunctionCallArgument{.{ .prepared = .{ .value = @fromBackingInt(7) } }};
+    ssa.call_arguments = &arguments;
+    var artifact = try codegen.compileFunction(&ssa, TestTypes{ .data = &bytes }, std.testing.allocator);
+    defer artifact.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), artifact.constant_data.len);
+    try std.testing.expectEqualSlices(u8, &bytes, artifact.constant_data[0].bytes);
+    bytes[1] = 99;
+    try expectArtifactExitCode(artifact, 84);
 }

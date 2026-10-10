@@ -1,4 +1,5 @@
 const std = @import("std");
+const text_literal = @import("text_literal.zig");
 const structures = @import("../structures.zig");
 
 pub const Issue = struct {
@@ -57,6 +58,7 @@ pub const UnresolvedBody = struct {
         runtime_reference: ?structures.SourceSpan,
     };
     pub const ConditionBinding = struct {
+        borrow_mode: ?bool = null,
         local: LocalId,
         annotation_type: ?structures.TypeId,
         span: structures.SourceSpan,
@@ -134,6 +136,10 @@ pub const UnresolvedBody = struct {
 
         pub const Operation = union(enum) {
             integer_literal: i64,
+            int_literal_value: i64,
+            string_literal: structures.ByteStringId,
+            static_data: structures.ByteStringId,
+            byte_pointer: structures.StaticBytePointer,
             integer: i32,
             byte: u8,
             boolean: bool,
@@ -141,11 +147,13 @@ pub const UnresolvedBody = struct {
             unit,
             none,
             function_ref: structures.FunctionReference,
+            overloaded_function: [2]structures.InstanceId,
             local_read: LocalId,
             local_transfer: LocalId,
             field_transfer: struct { target: LocalId, fields: structures.FunctionValueRange },
             annotation: struct { value: ValueUse, type_id: structures.TypeId },
             struct_init: struct {
+                canonical: bool = false,
                 target: StructInitTarget,
                 type_span: structures.SourceSpan,
                 fields: structures.FunctionValueRange,
@@ -333,7 +341,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                     self.can_return = true;
                     try self.buildFunction(declaration);
                 },
-                .static, .structure => unreachable,
+                .static, .structure, .primitive => unreachable,
             }
         }
 
@@ -551,7 +559,10 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
         fn appendCompileTimeValue(self: *Self, index: structures.Node.Index, runtime: structures.CompileTimeValue.Runtime) !ValueId {
             const primitive = try switch (runtime.value) {
                 .int => |integer| self.appendExpression(index, .{ .integer = integer }),
-                .int_literal => |integer| self.appendExpression(index, .{ .integer_literal = integer }),
+                .int_literal => |integer| self.appendExpression(index, .{ .int_literal_value = integer }),
+                .string_literal => |data| self.appendExpression(index, .{ .string_literal = data }),
+                .static_data => |data| self.appendExpression(index, .{ .static_data = data }),
+                .byte_pointer => |data| self.appendExpression(index, .{ .byte_pointer = data }),
                 .byte => |byte| self.appendExpression(index, .{ .byte = byte }),
                 .bool => |boolean| self.appendExpression(index, .{ .boolean = boolean }),
                 .unit => self.appendExpression(index, .unit),
@@ -579,6 +590,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                     const start: u32 = @intCast(self.struct_field_values.items.len);
                     try self.struct_field_values.appendSlice(self.gpa, fields.items);
                     break :blk self.appendExpression(index, .{ .struct_init = .{
+                        .canonical = true,
                         .target = .{ .concrete = runtime.type_id },
                         .type_span = nodeFocusSpan(self.ast, index),
                         .fields = .{ .start = start, .end = @intCast(self.struct_field_values.items.len) },
@@ -651,6 +663,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             const node = self.ast.nodes[index.index()];
             switch (node.tag) {
                 .number_literal => return self.appendInteger(index),
+                .string_literal => return self.appendString(index),
                 .bool_literal => return self.appendExpression(index, .{ .boolean = self.ast.tokens[node.token_index].tag == .keyword_true }),
                 .unit_literal => return self.appendExpression(index, if (result_is_type) .{ .type_value = .unit } else .unit),
                 .none_literal => return self.appendExpression(index, if (result_is_type) .{ .type_value = .none } else .none),
@@ -687,7 +700,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                             .unsupported => |kind| self.reject(index, kind),
                         };
                     }
-                    return self.appendOperationCall(index, "neg", &.{try self.appendUse(node.data.node, false)});
+                    return self.appendOperationCall(index, "-", &.{try self.appendUse(node.data.node, false)});
                 },
                 .add, .sub, .mul, .div => return self.appendBinary(index),
                 .eq, .ne, .lt, .gt, .le, .ge, .not, .@"and", .@"or" => return self.appendConditionValue(index),
@@ -799,8 +812,12 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
         }
 
         fn namedExpression(self: *Self, index: structures.Node.Index) !?structures.NameReference {
+            return self.namedExpressionWithOperands(index, null);
+        }
+
+        fn namedExpressionWithOperands(self: *Self, index: structures.Node.Index, operands: ?usize) !?structures.NameReference {
             if (runtimeReference(self.ast, self.source, index, self) != null) return null;
-            return resolveNamedExpression(self.ast, self.source, index, self.type_interner) catch |err| switch (err) {
+            return resolveNamedExpressionWithOperands(self.ast, self.source, index, self.type_interner, operands) catch |err| switch (err) {
                 error.QueryCycle => return self.reject(index, .declaration_cycle),
                 error.PublicFieldPrivateType => return self.reject(index, .public_field_private_type),
                 else => return err,
@@ -822,6 +839,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 .namespace => return self.reject(index, .namespace_used_as_value),
                 .constant => |value| return self.appendConstant(index, value),
                 .declaration => |instance| return self.appendDeclarationReference(index, instance),
+                .overloaded_function => |choices| return self.appendExpression(index, .{ .overloaded_function = choices }),
             }
         }
 
@@ -870,6 +888,21 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             defer self.loop_depth -= 1;
             const body = try self.buildBranch(node.data.node, result_is_type);
             return self.appendExpression(index, .{ .loop = body });
+        }
+
+        fn appendString(self: *Self, index: structures.Node.Index) !ValueId {
+            const span = tokenSpan(self.ast, self.ast.nodes[index.index()].token_index);
+            const decoded = try text_literal.decode(self.gpa, self.source[span.start..span.end]);
+            switch (decoded) {
+                .bytes => |bytes| {
+                    defer self.gpa.free(bytes);
+                    return self.appendExpression(index, .{ .string_literal = try self.type_interner.internByteString(bytes) });
+                },
+                .invalid => |issue| {
+                    self.issue = .{ .span = .{ .start = span.start + issue.offset, .end = span.start + issue.offset + 1 }, .kind = issue.kind };
+                    return error.SourceRejected;
+                },
+            }
         }
 
         fn appendInteger(self: *Self, index: structures.Node.Index) !ValueId {
@@ -1033,11 +1066,17 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
 
         fn buildIfCondition(self: *Self, index: structures.Node.Index) !UnresolvedBody.ConditionId {
             const node = self.ast.nodes[index.index()];
-            if (node.tag != .const_binding and node.tag != .var_binding) return self.buildCondition(index);
+            if (node.tag != .const_binding and node.tag != .var_binding and node.tag != .borrow_binding and node.tag != .borrow_mut_binding) return self.buildCondition(index);
             if (node.tag == .var_binding) return self.reject(index, .condition_binding_must_be_immutable);
 
             const value_index = node.data.node_node.b;
             const value_node = self.ast.nodes[value_index.index()];
+            const borrow_mode: ?bool = switch (node.tag) {
+                .borrow_binding => false,
+                .borrow_mut_binding => true,
+                else => null,
+            };
+            if (borrow_mode != null and value_node.tag != .as) return self.reject(index, .borrow_requires_place);
 
             const span = tokenSpan(self.ast, node.token_index);
             const name = self.source[span.start..span.end];
@@ -1046,6 +1085,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             self.local_count += 1;
             const annotation_type = if (node.data.node_node.a.unwrap()) |annotation| try self.bindingType(annotation) else null;
             const binding: UnresolvedBody.ConditionBinding = .{
+                .borrow_mode = borrow_mode,
                 .local = local,
                 .annotation_type = annotation_type,
                 .span = nodeFocusSpan(self.ast, value_index),
@@ -1059,7 +1099,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             else
                 try self.appendCondition(.{ .initialization = .{ .value = try self.appendUse(value_index, false), .binding = binding } });
 
-            try self.locals.put(self.gpa, name, .{ .place = .{ .id = local, .mutable = false } });
+            try self.locals.put(self.gpa, name, if (borrow_mode) |writable| .{ .borrow = .{ .id = local, .writable = writable } } else .{ .place = .{ .id = local, .mutable = false } });
             try self.local_names.append(self.gpa, name);
             return condition;
         }
@@ -1126,7 +1166,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
 
         fn buildNotCondition(self: *Self, index: structures.Node.Index) anyerror!UnresolvedBody.ConditionId {
             return switch (self.ast.nodes[index.index()].tag) {
-                .lt, .gt, .le, .ge, .eq, .ne, .is, .as, .@"and", .@"or" => self.appendCondition(.{ .negation = try self.buildCondition(index) }),
+                .is, .as => self.appendCondition(.{ .negation = try self.buildCondition(index) }),
                 .call => self.appendCondition(.{ .operation_not = .{
                     .value = try self.appendExpression(index, .{ .call = try self.buildCall(index, true) }),
                     .span = nodeFocusSpan(self.ast, index),
@@ -1271,7 +1311,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             }
             const reference = (try self.namedExpression(index)) orelse return null;
             const value_id = switch (reference) {
-                .namespace => return null,
+                .namespace, .overloaded_function => return null,
                 .constant => |value| value,
                 .declaration => |instance| blk: {
                     if (try self.type_interner.functionShape(instance.item) != null) return null;
@@ -1298,7 +1338,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 value: UnresolvedBody.ValueUse,
             };
             const pending_target: PendingTarget = target: {
-                if (try self.namedExpression(callee_index)) |reference| {
+                if (try self.namedExpressionWithOperands(callee_index, self.ast.nodeList(node.data.node_node.b).len)) |reference| {
                     if (reference == .declaration) {
                         if (try self.type_interner.functionShape(reference.declaration.item)) |shape|
                             break :target .{ .direct = .{ .instance = reference.declaration, .shape = shape } };
@@ -1333,7 +1373,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                     infer_static = true;
                 } else if (infer_static and argument_nodes.len != runtime_count) {
                     return self.reject(callee_index, .static_argument_cannot_be_inferred);
-                } else if (argument_nodes.len != parameters.len) {
+                } else if (argument_nodes.len != parameters.len and runtime_count != parameters.len) {
                     return self.reject(callee_index, .{ .call_argument_count_mismatch = .{
                         .expected = @intCast(parameters.len),
                         .found = @intCast(argument_nodes.len),
@@ -1345,7 +1385,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             var static_arguments: std.ArrayList(structures.CompileTimeValueId) = .empty;
             defer static_arguments.deinit(self.gpa);
             for (argument_nodes, 0..) |argument, argument_index| {
-                if (parameter_shapes) |parameters| if (!infer_static and parameters[argument_index].mode == .static) {
+                if (parameter_shapes) |parameters| if (!infer_static and argument_index < parameters.len and parameters[argument_index].mode == .static) {
                     try self.rejectRuntimeCapture(argument);
                     const result = if (parameters[argument_index].is_meta_type)
                         try analyzeStaticTypeArgument(self.ast, self.source, argument, self.type_interner, self.gpa)
@@ -1378,7 +1418,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             const start: u32 = @intCast(self.call_arguments.items.len);
             var runtime_index: usize = 0;
             for (argument_nodes, 0..) |argument, argument_index| {
-                if (parameter_shapes) |parameters| if (!infer_static and parameters[argument_index].mode == .static) continue;
+                if (parameter_shapes) |parameters| if (!infer_static and argument_index < parameters.len and parameters[argument_index].mode == .static) continue;
                 const value = self.scratch.items[scratch_start + runtime_index];
                 runtime_index += 1;
                 try self.call_arguments.append(self.gpa, .{
@@ -2059,22 +2099,15 @@ fn isFallibleExpression(tag: structures.Node.Tag) bool {
 fn runtimeReference(ast: *const structures.Ast, source: []const u8, index: structures.Node.Index, scope: anytype) ?structures.Node.Index {
     const present = index.unwrap() orelse return null;
     const node = ast.nodes[present.index()];
-    switch (node.tag) {
-        .identifier, .type => {
-            const span = tokenSpan(ast, node.token_index);
-            return if (scope.runtimeName(source[span.start..span.end])) present else null;
-        },
-        .break_expr, .return_expr, .loop, .not, .neg, .move_expr, .comptime_expr, .sizeof_expr, .field_access, .deref, .struct_field, .struct_property, .struct_init_field, .@"pub" => return runtimeReference(ast, source, node.data.node, scope),
-        .signature => return runtimeReference(ast, source, node.data.signature.parameters, scope) orelse runtimeReference(ast, source, node.data.signature.return_type, scope) orelse runtimeReference(ast, source, node.data.signature.where_clauses, scope),
-        .add, .sub, .mul, .div, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .@"and", .@"or", .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .call, .index_access, .const_binding, .var_binding, .borrow_binding, .borrow_mut_binding, .static_binding, .namespace_declaration, .func, .param, .type_func, .@"if" => return runtimeReference(ast, source, node.data.node_node.a, scope) orelse runtimeReference(ast, source, node.data.node_node.b, scope),
-        .block, .call_arg_list, .param_list, .type_list, .type_variant, .where_clauses, .if_else, .@"struct", .struct_init, .collection_literal, .import, .selective_import => {
-            for (ast.node_refs[node.data.ref.start..node.data.ref.end]) |child| {
-                if (runtimeReference(ast, source, child, scope)) |reference| return reference;
-            }
-            return null;
-        },
-        else => return null,
+    if (node.tag == .identifier or node.tag == .type) {
+        const span = tokenSpan(ast, node.token_index);
+        return if (scope.runtimeName(source[span.start..span.end])) present else null;
     }
+    var children = node.children(ast.node_refs);
+    for (children.slice()) |child| {
+        if (runtimeReference(ast, source, child, scope)) |reference| return reference;
+    }
+    return null;
 }
 
 const ParameterScope = struct {
@@ -2095,16 +2128,20 @@ const ParameterScope = struct {
 };
 
 pub fn resolveNamedExpression(ast: *const structures.Ast, source: []const u8, index: structures.Node.Index, type_interner: anytype) anyerror!?structures.NameReference {
+    return resolveNamedExpressionWithOperands(ast, source, index, type_interner, null);
+}
+
+fn resolveNamedExpressionWithOperands(ast: *const structures.Ast, source: []const u8, index: structures.Node.Index, type_interner: anytype, operands: ?usize) anyerror!?structures.NameReference {
     const node = ast.nodes[index.index()];
     const span = tokenSpan(ast, node.token_index);
     switch (node.tag) {
         .identifier, .type => return annotationReference(try type_interner.resolveName(source[span.start..span.end]), type_interner),
         .field_access => {
             const left = (try resolveNamedExpression(ast, source, node.data.node, type_interner)) orelse return null;
-            return annotationReference(try type_interner.resolveMember(left, source[span.start..span.end], span), type_interner);
+            return annotationReference(try type_interner.resolveMemberWithOperands(left, source[span.start..span.end], span, operands), type_interner);
         },
         .call => {
-            const callee = (try resolveNamedExpression(ast, source, node.data.node_node.a, type_interner)) orelse return null;
+            const callee = (try resolveNamedExpressionWithOperands(ast, source, node.data.node_node.a, type_interner, ast.nodeList(node.data.node_node.b).len)) orelse return null;
             if (callee != .declaration) return null;
             const shape = (try type_interner.functionShape(callee.declaration.item)) orelse return null;
             if (!shape.returns_type) return null;
@@ -2159,6 +2196,7 @@ fn analyzeType(
         const target = reference orelse return .{ .unsupported = issueAt(ast, node_index.index(), .unknown_type) };
         const value_id = switch (target) {
             .namespace => return .{ .unsupported = issueAt(ast, node_index.index(), .namespace_used_as_value) },
+            .overloaded_function => return .{ .unsupported = issueAt(ast, node_index.index(), .value_used_as_type) },
             .constant => |value| value,
             .declaration => |item| (type_interner.staticItem(item) catch |err| switch (err) {
                 error.QueryCycle => return .{ .unsupported = issueAt(ast, node_index.index(), .declaration_cycle) },
@@ -2290,20 +2328,21 @@ pub fn analyzeGeneratedStructDefinition(
 }
 
 pub fn validateStructNamespace(ast: *const structures.Ast, source: []const u8, struct_index: structures.Node.Index, gpa: std.mem.Allocator) !?Issue {
-    var names = std.StringHashMap(void).init(gpa);
+    var names = structures.Name.Set.init(gpa);
     defer names.deinit();
     const node = ast.nodes[struct_index.index()];
     std.debug.assert(node.tag == .@"struct");
     for (ast.node_refs[node.data.ref.start..node.data.ref.end]) |index| {
         const item = ast.nodes[index.index()];
-        const member = if (item.tag == .@"pub") ast.nodes[item.data.node.index()] else item;
+        const member_index = if (item.tag == .@"pub") item.data.node else index;
+        const member = ast.nodes[member_index.index()];
         if (member.tag == .struct_property) continue;
         if (member.tag != .struct_field and member.tag != .static_binding)
             return issueAt(ast, index.index(), .struct_member_not_supported);
         const span = tokenSpan(ast, member.token_index);
         if (std.meta.stringToEnum(structures.OwnershipMember, source[span.start..span.end]) != null)
             return .{ .span = span, .kind = .reserved_ownership_member };
-        if ((try names.getOrPut(source[span.start..span.end])).found_existing)
+        if ((try names.getOrPut(declarationName(ast, source[span.start..span.end], member_index.index()))).found_existing)
             return .{ .span = span, .kind = .duplicate_struct_member };
     }
     return null;
@@ -2676,8 +2715,8 @@ fn collectImport(gpa: std.mem.Allocator, ast: *const structures.Ast, source: []c
 pub fn discoverItems(gpa: std.mem.Allocator, ast: *const structures.Ast, source: []const u8, module: structures.ModuleId) !structures.ItemTree {
     var items: std.ArrayList(structures.DiscoveredItem) = .empty;
     errdefer {
-        for (items.items) |item| {
-            gpa.free(item.loc.name);
+        for (items.items) |*item| {
+            item.loc.name.deinit(gpa);
             if (item.qualified_owner) |owner| gpa.free(owner);
         }
         items.deinit(gpa);
@@ -2711,7 +2750,7 @@ pub fn discoverItems(gpa: std.mem.Allocator, ast: *const structures.Ast, source:
         defer if (synthetic_name) |allocated| gpa.free(allocated);
         const name_span = tokenSpan(ast, target_node.token_index);
         const name = synthetic_name orelse source[name_span.start..name_span.end];
-        const parent = try appendItem(gpa, &items, kind, ast.file_id, module, name, target.index(), node.tag == .@"pub", null, null);
+        const parent = try appendItem(gpa, &items, kind, ast.file_id, module, declarationName(ast, name, target.index()), target.index(), node.tag == .@"pub", null, null);
         if (namespace != .null) items.items[parent].qualified_owner = try qualifiedName(gpa, ast, source, namespace);
         if (kind == .structure) {
             try discoverStructItems(gpa, &items, ast, source, module, value, parent, null);
@@ -2720,7 +2759,7 @@ pub fn discoverItems(gpa: std.mem.Allocator, ast: *const structures.Ast, source:
         }
     }
 
-    _ = try appendItem(gpa, &items, .top_level_entry, ast.file_id, module, "$entry", 0, false, null, null);
+    _ = try appendItem(gpa, &items, .top_level_entry, ast.file_id, module, .{ .identifier = "$entry" }, 0, false, null, null);
     return .{ .file_id = ast.file_id, .items = try items.toOwnedSlice(gpa) };
 }
 
@@ -2748,31 +2787,17 @@ fn discoverGeneratedStructItems(gpa: std.mem.Allocator, items: *std.ArrayList(st
     try pending.append(gpa, declaration);
     while (pending.pop()) |index| {
         const node = ast.nodes[index.index()];
-        switch (node.tag) {
-            .@"struct" => {
-                const site = @as(i64, index.index()) - @as(i64, declaration.index());
-                try discoverStructItems(gpa, items, ast, source, module, index, parent, site);
-            },
-            .break_expr, .return_expr, .loop, .not, .neg, .move_expr, .comptime_expr, .sizeof_expr, .field_access, .deref, .struct_field, .struct_property, .struct_init_field, .@"pub" => {
-                if (node.data.node.unwrap()) |child| try pending.append(gpa, child);
-            },
-            .signature => {
-                if (node.data.signature.where_clauses.unwrap()) |child| try pending.append(gpa, child);
-                if (node.data.signature.return_type.unwrap()) |child| try pending.append(gpa, child);
-                if (node.data.signature.parameters.unwrap()) |child| try pending.append(gpa, child);
-            },
-            .add, .sub, .mul, .div, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .@"and", .@"or", .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .call, .index_access, .const_binding, .var_binding, .borrow_binding, .borrow_mut_binding, .static_binding, .namespace_declaration, .func, .param, .type_func, .@"if" => {
-                if (node.data.node_node.b.unwrap()) |child| try pending.append(gpa, child);
-                if (node.data.node_node.a.unwrap()) |child| try pending.append(gpa, child);
-            },
-            .block, .call_arg_list, .param_list, .type_list, .type_variant, .where_clauses, .if_else, .struct_init, .collection_literal, .import, .selective_import => {
-                var end = node.data.ref.end;
-                while (end > node.data.ref.start) {
-                    end -= 1;
-                    try pending.append(gpa, ast.node_refs[end]);
-                }
-            },
-            else => {},
+        if (node.tag == .@"struct") {
+            const site = @as(i64, index.index()) - @as(i64, declaration.index());
+            try discoverStructItems(gpa, items, ast, source, module, index, parent, site);
+            continue;
+        }
+        var children = node.children(ast.node_refs);
+        const nodes = children.slice();
+        var end = nodes.len;
+        while (end > 0) {
+            end -= 1;
+            if (nodes[end].unwrap()) |child| try pending.append(gpa, child);
         }
     }
 }
@@ -2791,7 +2816,7 @@ fn discoverStructItems(
     std.debug.assert(struct_node.tag == .@"struct");
     var hook_names = std.StringHashMap(void).init(gpa);
     defer hook_names.deinit();
-    var declaration_names = std.StringHashMap(void).init(gpa);
+    var declaration_names = structures.Name.Set.init(gpa);
     defer declaration_names.deinit();
     for (ast.node_refs[struct_node.data.ref.start..struct_node.data.ref.end]) |item_index| {
         const item = ast.nodes[item_index.index()];
@@ -2802,18 +2827,19 @@ fn discoverStructItems(
         if (member.tag == .struct_property and ast.nodes[member.data.node.index()].tag == .func) {
             // Semantic analysis diagnoses duplicates; discovery remains indexable.
             if ((try hook_names.getOrPut(name)).found_existing) continue;
-            const child = try appendItem(gpa, items, .function, ast.file_id, module, name, member.data.node.index(), false, parent, source_site);
+            const child = try appendItem(gpa, items, .function, ast.file_id, module, .{ .identifier = name }, member.data.node.index(), false, parent, source_site);
             items.items[child].loc.is_hook = true;
             try discoverGeneratedStructItems(gpa, items, ast, source, module, member.data.node, child);
         } else if (member.tag == .static_binding) {
-            if ((try declaration_names.getOrPut(name)).found_existing) continue;
+            const member_name = declarationName(ast, name, member_index.index());
+            if ((try declaration_names.getOrPut(member_name)).found_existing) continue;
             const value = member.data.node_node.b;
             const kind: structures.ItemKind = switch (ast.nodes[value.index()].tag) {
                 .func => .function,
                 .@"struct" => .structure,
                 else => .static,
             };
-            const child = try appendItem(gpa, items, kind, ast.file_id, module, name, member_index.index(), item.tag == .@"pub", parent, source_site);
+            const child = try appendItem(gpa, items, kind, ast.file_id, module, member_name, member_index.index(), item.tag == .@"pub", parent, source_site);
             if (kind == .structure) {
                 try discoverStructItems(gpa, items, ast, source, module, value, child, null);
             } else {
@@ -2823,20 +2849,33 @@ fn discoverStructItems(
     }
 }
 
+fn declarationName(ast: *const structures.Ast, name: []const u8, declaration: u32) structures.Name {
+    const node = ast.nodes[declaration];
+    if (node.tag != .static_binding or ast.nodes[node.data.node_node.b.index()].tag != .func)
+        return .{ .identifier = name };
+    const parts = functionParts(ast, declaration);
+    var count: usize = 0;
+    for (ast.nodeList(ast.nodes[parts.signature.index()].data.signature.parameters)) |parameter|
+        if (parameterMode(ast, ast.nodes[parameter.index()]) != .static) {
+            count += 1;
+        };
+    return .fromText(name, count);
+}
+
 fn appendItem(
     gpa: std.mem.Allocator,
     items: *std.ArrayList(structures.DiscoveredItem),
     kind: structures.ItemKind,
     file_id: structures.FileId,
     module: structures.ModuleId,
-    name: []const u8,
+    name: structures.Name,
     declaration: u32,
     is_public: bool,
     parent: ?u32,
     source_site: ?i64,
 ) !u32 {
-    const owned_name = try gpa.dupe(u8, name);
-    errdefer gpa.free(owned_name);
+    var owned_name = try name.clone(gpa);
+    errdefer owned_name.deinit(gpa);
     const index: u32 = @intCast(items.items.len);
     try items.append(gpa, .{
         .loc = .{ .origin = if (kind == .top_level_entry) .{ .entry = file_id } else .{ .module = module }, .source_site = source_site, .kind = kind, .name = owned_name },
@@ -3057,6 +3096,9 @@ fn testUnresolvedFunctionBodyAllocations(gpa: std.mem.Allocator) !void {
 }
 
 const TestTypeInterner = struct {
+    pub fn internByteString(_: @This(), _: []const u8) !structures.ByteStringId {
+        unreachable;
+    }
     public_annotation: bool = false,
     pub fn facts(self: @This()) @This() {
         return self;
@@ -3164,6 +3206,9 @@ const TestTypeInterner = struct {
         return type_id.isPrimitive();
     }
     pub fn resolveMember(_: @This(), _: structures.NameReference, _: []const u8, _: structures.SourceSpan) !?structures.NameReference {
+        return null;
+    }
+    pub fn resolveMemberWithOperands(_: @This(), _: structures.NameReference, _: []const u8, _: structures.SourceSpan, _: ?usize) !?structures.NameReference {
         return null;
     }
     pub fn staticItem(_: @This(), _: structures.InstanceId) !?structures.CompileTimeValueId {

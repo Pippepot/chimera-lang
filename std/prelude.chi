@@ -1,3 +1,5 @@
+pub import std.text.{String, StringView, BytesView, byte_int}
+pub import std.io.{print}
 pub import std.exit.{exit}
 pub import std.memory.{Box, Ref, List}
 pub import std.array.{Array, collection_literal}
@@ -5,20 +7,18 @@ pub import std.array.{Array, collection_literal}
 extern func literal_byte(static value: int_literal) byte
 pub converter(static value: int_literal) byte where value >= 0 where value <= 255 -> literal_byte(value)
 
-struct IntOperations
-    pub func +(imm left: int, imm right: int) int -> left + right
-    pub func -(imm left: int, imm right: int) int -> left - right
-    pub func *(imm left: int, imm right: int) int -> left * right
-    pub func /(imm left: int, imm right: int) int -> left / right
-    pub func neg(imm self: int) int -> -self
-    pub func ==(imm left: int, imm right: int) bool -> left == right
-    pub func <>(imm left: int, imm right: int) bool -> left <> right
-    pub func <(imm left: int, imm right: int) bool -> left < right
-    pub func >(imm left: int, imm right: int) bool -> left > right
-    pub func <=(imm left: int, imm right: int) bool -> left <= right
-    pub func >=(imm left: int, imm right: int) bool -> left >= right
+pub extern func int.+(imm left: int, imm right: int) int
+pub extern func int.-(imm left: int, imm right: int) int
+pub extern func int.*(imm left: int, imm right: int) int
+pub extern func int./(imm left: int, imm right: int) int
+pub extern func int.-(imm self: int) int
+pub extern func int.==(imm left: int, imm right: int) bool
+pub extern func int.<>(imm left: int, imm right: int) bool
+pub extern func int.<(imm left: int, imm right: int) bool
+pub extern func int.>(imm left: int, imm right: int) bool
+pub extern func int.<=(imm left: int, imm right: int) bool
+pub extern func int.>=(imm left: int, imm right: int) bool
 
-struct BoolOperations
-    pub func ==(imm left: bool, imm right: bool) bool -> left == right
-    pub func <>(imm left: bool, imm right: bool) bool -> left <> right
-    pub func not(imm self: bool) bool -> not self
+pub extern func bool.==(imm left: bool, imm right: bool) bool
+pub extern func bool.<>(imm left: bool, imm right: bool) bool
+pub extern func bool.not(imm self: bool) bool

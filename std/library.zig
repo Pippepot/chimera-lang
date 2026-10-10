@@ -7,6 +7,8 @@ pub const File = enum(u32) {
     prelude,
     ownership,
     array,
+    text,
+    io,
 
     pub fn path(file: File) []const u8 {
         return switch (file) {
@@ -16,6 +18,8 @@ pub const File = enum(u32) {
             .prelude => "prelude.chi",
             .ownership => "ownership.chi",
             .array => "array.chi",
+            .text => "text.chi",
+            .io => "io.chi",
         };
     }
 
@@ -65,11 +69,25 @@ pub const External = enum {
     array_borrow_mut,
     literal_byte,
     initialize_collection,
+    literal_data,
+    literal_size,
+    static_pointer,
+    array_bytes_pointer,
+    allocation_bytes_pointer,
+    byte_offset,
+    byte_read,
+    byte_int,
+    io_read,
+    io_write,
+    primitive_operation,
 
     pub fn file(symbol: External) File {
         return switch (symbol) {
             .exit => .exit,
-            .literal_byte => .prelude,
+            .literal_byte, .primitive_operation => .prelude,
+            .literal_data, .literal_size, .static_pointer, .array_bytes_pointer, .allocation_bytes_pointer, .byte_offset, .byte_read, .byte_int => .text,
+            .io_read => .memory_allocation,
+            .io_write => .text,
             .copy_value, .move_value => .ownership,
             .array_filled, .array_from, .array_borrow, .array_borrow_mut => .array,
             .allocate_host_storage, .deallocate_host_storage => .memory_host,

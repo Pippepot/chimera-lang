@@ -57,7 +57,12 @@ fn renderItemName(db: *query.Database, item: structures.ItemId, writer: *std.Io.
         const module = try db.lookupInterned(queries.ModulePaths, loc.origin.module);
         try writer.print("{s}.", .{if (module.path.len == 0) "$entry" else module.path});
     }
-    try writer.writeAll(loc.name);
+    try renderName(loc.name, writer);
+}
+
+fn renderName(name: structures.Name, writer: *std.Io.Writer) !void {
+    try writer.writeAll(name.text());
+    if (name == .operation) try writer.print("/{d}", .{name.operation.operandCount()});
 }
 
 fn renderSsaFunction(
@@ -67,11 +72,10 @@ fn renderSsaFunction(
     writer: *std.Io.Writer,
 ) !void {
     const location = try db.lookupInterned(queries.ItemLocations, instance.item);
-    if (instance.specialization) |specialization| {
-        try writer.print("fn {s}[{d}]\n", .{ location.name, @backingInt(specialization) });
-    } else {
-        try writer.print("fn {s}\n", .{location.name});
-    }
+    try writer.writeAll("fn ");
+    try renderName(location.name, writer);
+    if (instance.specialization) |specialization| try writer.print("[{d}]", .{@backingInt(specialization)});
+    try writer.writeByte('\n');
     for (ssa.blocks, 0..) |block, block_index| {
         try writer.print("  b{d}(", .{block_index});
         for (block.argument_start..block.argument_end) |argument_index| {
@@ -150,6 +154,11 @@ fn renderInstruction(
     switch (ssa.instructions[instruction_index]) {
         .const_int => |value| try writer.print("    %{d} = const_int {d}\n", .{ result, value }),
         .const_byte => |value| try writer.print("    %{d} = const_byte {d}\n", .{ result, value }),
+        .const_string_literal => |value| try writer.print("    %{d} = const_string_literal @{d}\n", .{ result, @backingInt(value) }),
+        .const_data => |value| try writer.print("    %{d} = const_data @{d}\n", .{ result, @backingInt(value) }),
+        .const_byte_pointer => |value| try writer.print("    %{d} = const_byte_pointer @{d}+{d}\n", .{ result, @backingInt(value.data), value.offset }),
+        .byte_pointer, .byte_to_int => |value| try writer.print("    %{d} = {s} %{d}\n", .{ result, @tagName(ssa.instructions[instruction_index]), @backingInt(value) }),
+        .byte_offset, .byte_read => |value| try writer.print("    %{d} = {s} %{d}, %{d}\n", .{ result, @tagName(ssa.instructions[instruction_index]), @backingInt(value.lhs), @backingInt(value.rhs) }),
         .const_int_literal => |value| try writer.print("    %{d} = const_int_literal {d}\n", .{ result, value }),
         .static_conversion => |conversion| {
             try writer.print("    %{d} = static_conversion %{d} to ", .{ result, @backingInt(conversion.operand) });
@@ -167,7 +176,9 @@ fn renderInstruction(
         .initializer_ref => |reference| try writer.print("    %{d} = initializer_ref region {d}, captures {d}..{d}\n", .{ result, reference.region, reference.captures.start, reference.captures.end }),
         .function_ref => |reference| {
             const target = try db.lookupInterned(queries.ItemLocations, reference.target);
-            try writer.print("    %{d} = function_ref @{s}\n", .{ result, target.name });
+            try writer.print("    %{d} = function_ref @", .{result});
+            try renderName(target.name, writer);
+            try writer.writeByte('\n');
         },
         .variant_tag => |operand| try writer.print("    %{d} = variant_tag %{d}\n", .{ result, @backingInt(operand) }),
         .variant_coerce => |coercion| {
@@ -220,7 +231,13 @@ fn renderInstruction(
         .borrow_address => |operation| {
             try writer.print("    %{d} = borrow_address %{d}", .{ result, @backingInt(operation.source) });
             if (operation.base_is_reference) try writer.writeAll("[]");
-            for (ssa.borrow_fields[operation.fields.start..operation.fields.end]) |field| try writer.print(".{d}", .{field});
+            for (ssa.borrow_fields[operation.fields.start..operation.fields.end]) |projection| switch (projection) {
+                .field => |field| try writer.print(".{d}", .{field}),
+                .variant => |member| {
+                    try writer.writeAll(" as ");
+                    try renderType(db, member, writer);
+                },
+            };
             try writer.writeByte('\n');
         },
         .borrow_read => |operation| try writer.print("    %{d} = borrow_read %{d}\n", .{ result, @backingInt(operation.source) }),
@@ -274,7 +291,8 @@ fn renderCallTarget(db: *query.Database, target: @FieldType(structures.FunctionC
     switch (target) {
         .direct => |instance| {
             const location = try db.lookupInterned(queries.ItemLocations, instance.item);
-            try writer.print("@{s}", .{location.name});
+            try writer.writeByte('@');
+            try renderName(location.name, writer);
         },
         .indirect => |value| try writer.print("%{d}", .{@backingInt(value)}),
         .initializer => |value| try writer.print("init %{d}", .{@backingInt(value)}),

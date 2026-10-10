@@ -40,7 +40,7 @@ test "operation functions arithmetic expressions have native and compile-time pa
         \\    pub func -(imm left: Value, imm right: Value) Value -> Value{value = left.value - right.value}
         \\    pub func *(imm left: Value, imm right: Value) Value -> Value{value = left.value * right.value}
         \\    pub func /(imm left: Value, imm right: Value) Value -> Value{value = left.value / right.value}
-        \\    pub func neg(imm self: Value) Value -> Value{value = -self.value}
+        \\    pub func -(imm self: Value) Value -> Value{value = -self.value}
         \\func run() int
         \\    const first = Value{value = 40} + Value{value = 2}
         \\    const second = first - Value{value = 2}
@@ -113,10 +113,168 @@ test "operation functions primitive namespace calls and callable values have par
         \\    const difference = int.-(total, 2)
         \\    const product = int.*(difference, 2)
         \\    const quotient = int./(product, 2)
-        \\    const negative = int.neg(quotient)
+        \\    const negative = int.-(quotient)
         \\    if int.==(total, 42) and int.<>(total, quotient) and int.<(quotient, total) and int.>(total, quotient) and int.<=(quotient, total) and int.>=(total, quotient) and bool.==(true, true) and bool.<>(false, true) and bool.not(false)
         \\        return -negative + 2
         \\    return 90
+    , 42);
+}
+
+test "operation functions primitive externs preserve arithmetic and evaluation order without prelude imports" {
+    try Fixture.expectParity(
+        \\import std.prelude.{}
+        \\import std.exit.{exit}
+        \\static declared: int_literal = 19
+        \\func digit(mut order: int, imm value: int) int
+        \\    order = order * 10 + value
+        \\    return value
+        \\func flag(mut order: int) bool
+        \\    order = order * 10 + 5
+        \\    return false
+        \\func run() int
+        \\    var order = 0
+        \\    const sum = digit(order, 1) + digit(order, 2)
+        \\    const comparison = digit(order, 3) < digit(order, 4)
+        \\    const inverted = not flag(order)
+        \\    const less = int.<
+        \\    const invert = bool.not
+        \\    const negative = sum.-()
+        \\    const uninverted = inverted.not()
+        \\    const literal_sum = declared + 23
+        \\    const literal_negative = declared.-()
+        \\    const literal_copy = declared.copy()
+        \\    var total = 40
+        \\    total += 2
+        \\    total *= 2
+        \\    total -= 2
+        \\    total /= 2
+        \\    const minimum = 2147483647 + 1
+        \\    const maximum = minimum - 1
+        \\    const doubled = 1073741824 * 2
+        \\    if order == 12345 and sum == 3 and comparison and inverted and negative == -3 and not uninverted and literal_sum == 42 and literal_negative == -19 and literal_copy == 19 and total == 41 and minimum == -2147483648 and maximum == 2147483647 and doubled == minimum and -minimum == minimum and -7 / 3 == -2 and int./(7, -3) == -2 and less(-2, -1) and not less(-1, -2) and invert(false) and not invert(true) and not bool.==(true, false) and not bool.<>(true, true)
+        \\        return 42
+        \\    return 90
+    , 42);
+}
+
+test "operation functions primitive namespaces reject foreign extensions" {
+    for ([_][]const u8{
+        "pub extern func int.+(imm left: int, imm right: int) int",
+        "func int.helper(imm value: int) int -> value",
+        "pub extern func bool.not(imm value: bool) bool",
+        "func byte.helper(imm value: byte) byte -> value",
+    }) |declaration| {
+        const source = try testing.allocator.print("{s}\nexit(42)", .{declaration});
+        defer testing.allocator.free(source);
+        try Fixture.expectSourceDiagnostic(source, .invalid_namespace_owner);
+        const fixture = try Fixture.initFiles("import std.prelude.{}\nimport std.exit.{exit}\nexit(42)", &.{.{ .path = "std/extension.chi", .module_path = "std.prelude", .source = declaration }});
+        defer fixture.deinit();
+        const prelude = (try fixture.db.input(queries.StandardFile, queries.standardFileKey("prelude.chi"))).*;
+        try fixture.db.setInput(queries.SourceText, prelude, "");
+        try fixture.expectDiagnostic(1, .invalid_namespace_owner);
+    }
+}
+
+test "operation functions primitive division errors retain caller source locations" {
+    const cases = [_]struct { left: []const u8, right: []const u8, kind: std.meta.Tag(structures.Diagnostic.Kind) }{
+        .{ .left = "42", .right = "0", .kind = .compile_time_division_by_zero },
+        .{ .left = "-2147483648", .right = "-1", .kind = .compile_time_integer_overflow },
+    };
+    for (cases) |case| for ([_][]const u8{
+        "return $left / $right",
+        "return int./($left, $right)",
+        "const operation = int./\n    return operation($left, $right)",
+    }) |template| {
+        const body = try test_sources.renderTemplate(testing.allocator, template, .{ .left = case.left, .right = case.right });
+        defer testing.allocator.free(body);
+        const source = try testing.allocator.print("func run() int\n    {s}\nexit(comptime -> run())", .{body});
+        defer testing.allocator.free(source);
+        try Fixture.expectSourceDiagnostic(source, case.kind);
+    };
+}
+
+test "operation functions primitive signatures invalidate and recover every call form" {
+    const cases = [_]struct { valid: []const u8, invalid: []const u8, calls: []const []const u8 }{
+        .{
+            .valid = "pub extern func int.+(imm left: int, imm right: int) int",
+            .invalid = "pub extern func int.+(imm left: int, imm right: int, imm extra: int) int",
+            .calls = &.{ "return 19 + 23", "return int.+(19, 23)", "const operation = int.+\n    return operation(19, 23)" },
+        },
+        .{
+            .valid = "pub extern func int.<(imm left: int, imm right: int) bool",
+            .invalid = "pub extern func int.<(imm left: int, imm right: int) int",
+            .calls = &.{ "if 19 < 23 -> return 42\n    return 90", "if int.<(19, 23) -> return 42\n    return 90", "const operation = int.<\n    if operation(19, 23) -> return 42\n    return 90" },
+        },
+        .{
+            .valid = "pub extern func bool.not(imm value: bool) bool",
+            .invalid = "pub extern func bool.not(mut value: bool) bool",
+            .calls = &.{
+                "if not false -> return 42\n    return 90",
+                "if bool.not(false) -> return 42\n    return 90",
+                "const operation = bool.not\n    if operation(false) -> return 42\n    return 90",
+                "if not (true and false) -> return 42\n    return 90",
+                "if not (false or false) -> return 42\n    return 90",
+                "if not (true and (false or false)) -> return 42\n    return 90",
+            },
+        },
+    };
+    for (cases) |case| for (case.calls) |call| for ([_][]const u8{ "run()", "comptime -> run()" }) |entry| {
+        errdefer std.debug.print("Primitive signature: {s}\nCall: {s}\nEntry: {s}\n", .{ case.invalid, call, entry });
+        const source = try testing.allocator.print("import std.exit.{{exit}}\nfunc run() int\n    {s}\nexit({s})", .{ call, entry });
+        defer testing.allocator.free(source);
+        const fixture = try Fixture.init(source);
+        defer fixture.deinit();
+        const prelude = (try fixture.db.input(queries.StandardFile, queries.standardFileKey("prelude.chi"))).*;
+        try fixture.db.setInput(queries.SourceText, prelude, case.valid);
+        try fixture.expectExit(0, 42);
+        try fixture.db.setInput(queries.SourceText, prelude, case.invalid);
+        try fixture.expectDiagnostic(prelude, .invalid_operation_signature);
+        try fixture.db.setInput(queries.SourceText, prelude, "");
+        try fixture.expectDiagnostic(null, .unknown_namespace_member);
+        try fixture.db.setInput(queries.SourceText, prelude, case.valid["pub ".len..]);
+        try fixture.expectDiagnostic(null, .private_access);
+        try fixture.db.setInput(queries.SourceText, prelude, case.valid);
+        try fixture.expectExit(0, 42);
+    };
+}
+
+test "operation functions minus callable ambiguity and independent invalidation" {
+    try Fixture.expectSourceDiagnostic("const operation = int.-\nexit(42)", .ambiguous_operation_reference);
+    const unary = "pub extern func int.-(imm value: int) int";
+    const binary = "pub extern func int.-(imm left: int, imm right: int) int";
+    const prelude_source = unary ++ "\n" ++ binary;
+    const calls = [_][]const u8{
+        "return -(-42)",
+        "return int.-(-42)",
+        "const operation: func(imm int) int = int.-\n    return operation(-42)",
+        "const value = -42\n    return value.-()",
+    };
+    for (calls, 0..) |call, call_index| for ([_][]const u8{ "run()", "comptime -> run()" }) |entry| {
+        const source = try testing.allocator.print("import std.exit.{{exit}}\nfunc run() int\n    {s}\nexit({s})", .{ call, entry });
+        defer testing.allocator.free(source);
+        const fixture = try Fixture.init(source);
+        defer fixture.deinit();
+        const prelude = (try fixture.db.input(queries.StandardFile, queries.standardFileKey("prelude.chi"))).*;
+        try fixture.db.setInput(queries.SourceText, prelude, prelude_source);
+        try fixture.expectExit(0, 42);
+        try fixture.db.setInput(queries.SourceText, prelude, "pub extern func int.-(mut value: int) int\n" ++ binary);
+        try fixture.expectDiagnostic(prelude, .invalid_operation_signature);
+        try fixture.db.setInput(queries.SourceText, prelude, unary ++ "\npub extern func int.-(imm left: int, imm right: int) bool");
+        try fixture.expectExit(0, 42);
+        try fixture.db.setInput(queries.SourceText, prelude, "extern func int.-(imm value: int) int\n" ++ binary);
+        try fixture.expectDiagnostic(null, .private_access);
+        try fixture.db.setInput(queries.SourceText, prelude, binary);
+        try fixture.expectDiagnostic(null, if (call_index == 2) .local_type_mismatch else .unknown_namespace_member);
+        try fixture.db.setInput(queries.SourceText, prelude, prelude_source);
+        try fixture.expectExit(0, 42);
+    };
+    try Fixture.expectParity(
+        \\struct Value
+        \\    value: int
+        \\    pub func -(imm self: Value) Value -> Value{value = -self.value}
+        \\func run() int
+        \\    const operation = Value.-
+        \\    return operation(Value{value = -42}).value
     , 42);
 }
 
@@ -217,10 +375,83 @@ test "operation functions generic type lookup specializes without importing its 
     , &.{library}, 42);
 }
 
+test "operation functions unary and binary minus share spelling" {
+    try Fixture.expectParity(
+        \\struct Value
+        \\    copy = trivial
+        \\    value: int
+        \\    pub func -(imm self: Value) Value -> Value{value = -self.value}
+        \\    pub func -(imm left: Value, imm right: Value) Value -> Value{value = left.value - right.value}
+        \\    pub func neg(imm left: Value, imm right: Value) int -> left.value + right.value
+        \\func run() int
+        \\    const first = Value{value = 19}
+        \\    const negative = -first
+        \\    const explicit = Value.-(first)
+        \\    const difference = Value.-(first, Value{value = -23})
+        \\    const negate: func(imm Value) Value = Value.-
+        \\    const subtract: func(imm Value, imm Value) Value = Value.-
+        \\    const negate_int: func(imm int) int = int.-
+        \\    const subtract_int: func(imm int, imm int) int = int.-
+        \\    if negative.value == -19 and explicit.value == -19 and difference.value == 42 and negate(first).value == -19 and subtract(first, Value{value = -23}).value == 42 and negate_int(19) == -19 and subtract_int(19, -23) == 42 and first.-().value == -19 and first.-(Value{value = -23}).value == 42 and Value.neg(first, Value{value = 23}) == 42
+        \\        return (first - Value{value = -23}).value
+        \\    return 90
+    , 42);
+}
+
+test "operation functions minus methods select explicit static arguments" {
+    try Fixture.expectParity(
+        \\struct Value
+        \\    value: int
+        \\    pub func -(imm self: Value, static amount: int) Value -> Value{value = self.value - amount}
+        \\func run() int
+        \\    const value = Value{value = 44}
+        \\    const method = value.-(2)
+        \\    const qualified = Value.-(value, 2)
+        \\    return method.value + qualified.value - 42
+    , 42);
+    try Fixture.expectParity(
+        \\struct Value(T: type)
+        \\    value: T
+        \\    pub func -(imm left: Value(T), imm right: Value(T), static adjustment: int) Value(T) -> Value(T){value = left.value - right.value + adjustment}
+        \\func run() int
+        \\    const first = Value(int){value = 40}
+        \\    const second = Value(int){value = 2}
+        \\    const method = first.-(second, 4)
+        \\    const qualified = Value(int).-(first, second, 4)
+        \\    return method.value + qualified.value - 42
+    , 42);
+}
+
+test "operation functions minus method and qualified ambiguity recompute together" {
+    for ([_][]const u8{ "value.-(2)", "Value.-(value, 2)" }) |call| {
+        for ([_][]const u8{ "run()", "comptime -> run()" }) |entry| {
+            const source = try test_sources.renderTemplate(testing.allocator,
+                \\struct Value
+                \\    value: int
+                \\    pub func -(imm self: Value, static amount: int) Value -> Value{value = self.value - amount}
+                \\func run() int
+                \\    const value = Value{value = 44}
+                \\    return $call.value
+                \\exit($entry)
+            , .{ .call = call, .entry = entry });
+            defer testing.allocator.free(source);
+            const fixture = try Fixture.init(source);
+            defer fixture.deinit();
+            try fixture.expectExit(0, 42);
+            const ambiguous = try std.mem.replaceOwned(u8, testing.allocator, source, "func run() int", "    pub func -(imm left: Value, imm right: Value) Value -> Value{value = 42}\nfunc run() int");
+            defer testing.allocator.free(ambiguous);
+            try fixture.db.setInput(queries.SourceText, 0, ambiguous);
+            try fixture.expectDiagnostic(0, .ambiguous_operation_reference);
+            try fixture.db.setInput(queries.SourceText, 0, source);
+            try fixture.expectExit(0, 42);
+        }
+    }
+}
+
 test "operation functions reject comparison unary and indexer signature mismatches" {
     for ([_]struct { name: []const u8, declaration: []const u8 }{
         .{ .name = "==", .declaration = "func ==(imm left: Value, imm right: Value) Value -> left" },
-        .{ .name = "neg", .declaration = "func neg(imm left: Value, imm right: Value) Value -> left" },
+        .{ .name = "-", .declaration = "func -(mut self: Value) Value -> self" },
         .{ .name = "not", .declaration = "func not(imm self: Value) Value -> self" },
         .{ .name = "[]", .declaration = "fallible [](imm self: Value, index: bool) int -> 42" },
         .{ .name = "[]=", .declaration = "fallible []=(imm self: Value, index: int, init replacement: int) unit -> fail" },
@@ -4477,7 +4708,7 @@ test "unevaluated initializer inference preserves lookup diagnostics" {
         .{ .expression = "unknown()", .kind = .unknown_function },
         .{ .expression = "callback()", .kind = .value_not_callable },
         .{ .expression = "item.missing()", .kind = .unknown_namespace_member },
-        .{ .expression = "number.missing()", .kind = .field_access_not_struct },
+        .{ .expression = "number.missing()", .kind = .unknown_namespace_member },
         .{ .expression = "item.value()", .kind = .value_not_callable },
         .{ .expression = "item.bad()", .kind = .value_not_callable },
         .{ .expression = "item.copy()", .kind = .unknown_namespace_member },

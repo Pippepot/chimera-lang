@@ -6,9 +6,10 @@ This is a high-level map of the compiler's ownership and stage boundaries. [synt
 
 - `src/main.zig` registers source inputs and requests `BuildExecutable`. Compiler queries in `src/queries.zig` coordinate parsing, semantic analysis, typing, compile-time interpretation, and code generation; the engine in `src/query/` schedules and memoizes work without depending on compiler stages. `src/structures.zig` holds shared data, and frontend and backend stages do not import query orchestration.
 - The engine records input and query dependencies, including reads of absent inputs. It can run independent queries on workers, but a result publishes only after its dependencies settle. Recomputations commit owned results, dependencies, and diagnostics together; equal observable results stop invalidation from propagating. Inputs are refreshed only while the database is idle.
-- Plain owned results and intern values share structural content equality and recursive slice cleanup in `src/value.zig`; intern hashing follows the same fields. Result types opt into these operations explicitly, so new fields participate automatically. AST payloads, maps, borrowed source graphs, and reference-counted snapshots retain their own representation and ownership rules.
+- Plain owned inputs, results, and intern values share structural copying, content equality, and recursive slice cleanup in `src/value.zig`; intern hashing follows the same fields. Types opt into these operations explicitly, so new fields participate automatically. Inputs retain distinct declaration identities; plain interners share lifecycle implementations keyed by value and ID type. AST payloads, maps, borrowed source graphs, and reference-counted snapshots retain their own representation and ownership rules.
 - A missing optional result can mean source rejection or unavailable state; source diagnostics are emitted separately. Infrastructure failures remain errors, and broken compiler invariants use assertions. `src/diagnostics.zig` owns presentation, not semantic decisions.
 - Query orchestration shares item location and AST loading without reading source text implicitly. Semantic-result helpers emit source issues and preserve infrastructure errors; each consumer chooses whether unavailable analysis propagates as an error or a missing query result.
+- AST nodes own payload classification and child enumeration. Equality, debug rendering, and semantic walkers share this syntax shape; walkers retain their own lexical and ownership boundaries.
 
 ## Sources and identity
 
@@ -20,10 +21,27 @@ This is a high-level map of the compiler's ownership and stage boundaries. [synt
 	associates a type with its source namespace independently of `structIdentity`.
 	Arrays use the specialized standard-source namespace for member lookup while
 	their actual `structIdentity` is `null`.
-- `int` and `bool` use compiler-owned operation namespaces in the registered
-	prelude source, independently of whether a user imports its exports. Their
-	explicit members use ordinary declarations and callable identities; primitive
-	expression lowering supplies intrinsic arithmetic and predicates.
+- Primitive namespaces are compiler-owned items, separate from struct and type
+	identity. `TypeNamespace` collects their qualified declarations from the
+	registered prelude with the same member validation and visibility rules as
+	struct namespaces. `int` and `bool` operations are extern members with ordinary
+	callable identities; typing supplies their intrinsic bodies in the existing IR.
+	Operator expressions, explicit calls, and callable values use the same members,
+	independently of prelude imports. Qualified calls and methods share operation
+	selection by runtime operand count or total count including explicit static
+	arguments before specialization. Only compile-time literal predicates and type
+	identity comparisons retain direct compiler lowering.
+	Intrinsic execution failures use the caller's operation span rather than adding
+	a source diagnostic or trace frame for the compiler-generated body.
+	Unresolved expressions distinguish source decimal literals from typed
+	`int_literal` values, preserving literal predicates while applying the ordinary
+	checked `int` default before operation selection.
+- Declaration names distinguish ordinary identifiers from `Operation` identities.
+	The same operator identity owns spelling, operand count, signature shape, and
+	primitive support. Unary and binary `-` are distinct interned declarations;
+	namespace collection, duplicate checks, and ordering preserve both. Calls select
+	by shape, never argument types. Ambiguous callable references remain unresolved
+	until typing receives a function-type context and selects its operand count.
 
 ## Analysis and compile time
 
@@ -42,6 +60,8 @@ This is a high-level map of the compiler's ownership and stage boundaries. [synt
 	remain explicit control flow. Indexed mutation selects `[]=` with a deferred
 	initializer, while compound indexing freezes the index, reads the old value
 	once, and scopes its temporary across getter/setter success and failure exits.
+	Compiler-supplied bodies use the existing transient-body executor; execution
+	errors retain the caller span without publishing a generated source frame.
 - Converter discovery derives candidates from the source and target owners'
 	existing `ModuleDeclarations`, not imports or another query/cache. Additional
 	static parameters infer from both types before any conversion executes; only
@@ -61,8 +81,8 @@ This is a high-level map of the compiler's ownership and stage boundaries. [synt
 	emit native code or restore as runtime bodies. The interpreter still owns
 	logical storage; the query adapter owns specialization and dependencies.
 - `TypeFacts.isRuntimeCapable` derives eligibility from existing definitions:
-	static structs, `type`, and `int_literal` are compile-time-only, as are stored
-	aggregates containing them. Ownership, movability, and physical representation
+	static structs, `type`, `int_literal`, and `string_literal` are compile-time-only,
+	as are stored aggregates containing them. Ownership, movability, and physical representation
 	remain separate dimensions. Native compilation validates the typed body and
 	initializer regions before codegen, and allocation validates its element type
 	before layout. Static-only types have no host layout.
@@ -78,13 +98,22 @@ This is a high-level map of the compiler's ownership and stage boundaries. [synt
 	This internal materialization is separate from deferred collection literals;
 	it does not expose default construction or element consumption.
 - The compile-time interpreter owns `Cell` and `Value` storage, snapshots,
-	logical equality, recursive cycle comparison, and checked-reference cell
-	operations for the scalar/inline-array subset. Heap allocation remains
-	unsupported. The query adapter owns canonical values, call keys, and dependency
-	tracking; transient calls share frame-recursion state through one execution
-	session. Calls carrying initializer handles or transient references bypass
-	canonical argument memoization. Transient references cannot enter the intern
-	cache or published canonical values.
+	logical equality, recursive cycle comparison, and an evaluation-owned heap.
+	Allocation records have stable session identities and logical capacities;
+	indexed cells are created lazily, independently of native addresses or capacity.
+	Release invalidates owned contents and frees sparse backing storage. Cell
+	identities remain as compiler-owned tombstones until session teardown, including
+	on failure, compiler exit, or infrastructure errors. User destruction remains
+	ordinary typed cleanup, not a heap callback.
+	The query adapter owns canonical values, call keys, and dependency tracking.
+	Nested calls and initializer regions share the heap and recursion frames.
+	Calls carrying transient values, or whose resolved results or mutable parameters
+	may retain storage identities, execute transiently; argument shape alone cannot
+	make a zero-argument factory cacheable. Representable calls retain canonical
+	memoization. Publication recursively checks actual contents before interning
+	results, static arguments, conversions, and mutable copy-back. Escaping handles
+	have a consuming-expression diagnostic and never enter canonical values or disk
+	snapshots; copied or extracted ordinary data can be published.
 
 ## Deferred construction
 
@@ -152,10 +181,14 @@ forwarding copies handles and construction supplies an ordinary result destinati
 The interpreter uses the same regions and frame-local cells. Its active frames
 snapshot logical arguments and captures, recursively including aggregate fields,
 array elements, variant payloads, types, and nested handles, to detect cycles
-across fresh storage while permitting finite recursion. Snapshot cloning indexes
+across fresh storage while permitting finite recursion. Allocation snapshots freeze
+logical capacity, release state, and instantiated cells while preserving allocation
+identity and aliases, even after backing storage is released. Snapshot cloning indexes
 source and copied cells, and comparison indexes visited cell pairs, so large
 aggregate arguments do not require quadratic scans. The query adapter shares
-this transient frame recursion through the execution session. Query equality,
+this transient frame recursion through the execution session. Typing retains
+initializer backing dependencies by initializer identity and records their uses
+at consumption, including pre-acquired contextual converter initializers. Query equality,
 cleanup, validation, and cache reuse include
 nested regions and modes; published results contain no source or frame pointers.
 
@@ -262,8 +295,12 @@ failure terminates runtime execution with status 134, outside ordinary failure
 flow. Element failure cleans the prefix and releases storage normally. The
 explicitly fallible `List(T).from(...)` instead exposes allocation failure and
 retains ordinary element failure. Successful Lists destroy elements in reverse
-order and release storage. Growth and iteration are not implemented. Heap
-execution remains unsupported by the compile-time interpreter.
+order and release storage. Growth and iteration are not implemented. Box, List,
+Buffer, BufferView, and heap-backed text execute their ordinary declarations in
+the interpreter using typed slot and collection initialization, including Box
+element and allocation-array projections. Host layout and checked allocation-size
+rules are shared with native execution; compiler OOM remains retryable infrastructure
+failure rather than ordinary allocation failure.
 
 The implemented host API fixes execution target, provider, and location
 implicitly. `Allocation(T)` retains logical element count separately from
@@ -504,6 +541,48 @@ terminology, not proposed Chimera syntax.
 	surfaces without a general location model; unlike `alloc`, buffer creation
 	is fallible. Chimera keeps location separate and initially requires
 	synchronous transfers unless a completion resource retains both allocations.
+
+## Text and basic I/O
+
+`ByteStrings` interns owned, decoded UTF-8 bytes by content. Compile-time literal
+values and static byte pointers retain interner IDs and byte offsets; canonical
+values never contain evaluator or native addresses. Materializing canonical
+struct values preserves their private fields without granting source initializers
+access to them. Literal default typing selects the registered `std.text.String`
+identity even when prelude exports are disabled or shadowed.
+
+`std/text.chi` owns the literal/unique-allocation String variant, explicit clone,
+fallible growth, byte views, UTF-8 validation, and text slicing. `std/io.chi` owns
+standard stream handles, progress loops, and printing. The only byte-access and
+OS operations are registered externs private to their owning storage modules.
+Read counts extend `Buffer(byte)`'s initialized prefix after success. Reached
+compile-time I/O is an execution capability error; ordinary fallible handling
+cannot turn it into compile-time effects. Allocation-backed strings remain part
+of the compile-time storage milestone.
+
+Borrow origins distinguish permanent static data from local and parameter
+storage. Scalar argument copies do not introduce owner dependencies. Temporary
+address-passed aggregates do. Taking the address of a by-value parameter through
+an alias retains its local frame dependency. Borrowed variant conditions retain a path of field
+and variant projections so aliases address the current owner through SSA joins.
+The interpreter represents array-backed byte pointers as transient cells whose
+snapshots preserve backing identity; such pointers cannot become canonical values.
+Allocation-backed pointers compare the allocation's logical identity and frozen
+contents across copied descriptors; inline backing retains its original cell identity.
+
+Each compiled function owns its constant byte sequences and relocations refer
+to function or data indices. The linker deduplicates immutable bytes across
+functions and places them after code in the read-only ELF load segment. Empty
+sequences retain an addressable byte without making it part of their length.
+Native I/O uses the normal callable ABI, retries EINTR, and reports OS failures
+through the fallible status register. Output artifacts request one startup
+SIGPIPE disposition change. Disk snapshots validate symbolic IDs, offsets,
+projections, and data relocations under the updated format.
+
+Mojo reference: [literal storage and owned String](https://github.com/modular/modular/blob/135c332fec9b326cab8e2f3951a0b2f31d017a5d/Mojo/stdlib/std/collections/string/string.mojo),
+[UTF-8 validation](https://github.com/modular/modular/blob/135c332fec9b326cab8e2f3951a0b2f31d017a5d/Mojo/stdlib/std/collections/string/_utf8.mojo),
+and [file-descriptor progress](https://github.com/modular/modular/blob/135c332fec9b326cab8e2f3951a0b2f31d017a5d/Mojo/stdlib/std/io/file_descriptor.mojo).
+Chimera uses unique ownership and rejects ambient compile-time I/O.
 
 ## Backend and execution
 

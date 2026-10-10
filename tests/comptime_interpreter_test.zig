@@ -16,6 +16,381 @@ const referenceValue = interpreter.referenceValue;
 const referenceTarget = interpreter.referenceTarget;
 const ValueSnapshot = interpreter.ValueSnapshot;
 
+test "evaluation heap empty oversized and zero sized allocations preserve native size handling" {
+    try test_sources.SourceFixture.expectParity(
+        \\import std.memory.{allocate, deallocate, Buffer}
+        \\struct Empty
+        \\    copy = trivial
+        \\fallible compute() int
+        \\    const empty = allocate?(Array(int, 536870912), 0)
+        \\    const empty_capacity = empty.capacity()
+        \\    deallocate(Array(int, 536870912), empty^)
+        \\    if empty_capacity <> 0 -> return 90
+        \\    if const oversized = allocate(Array(int, 536870912), 1)
+        \\        deallocate(Array(int, 536870912), oversized^)
+        \\        return 91
+        \\    const logical = allocate?(Empty, 2147483647)
+        \\    const logical_capacity = logical.capacity()
+        \\    deallocate(Empty, logical^)
+        \\    if logical_capacity <> 2147483647 -> return 92
+        \\    var buffer = Buffer(Empty).new?(0)
+        \\    if buffer.get(0) -> return 93
+        \\    const empty_view = buffer.view?(0, 0)
+        \\    if empty_view.get(0) -> return 94
+        \\    buffer.append?(Empty{})
+        \\    buffer.append?(Empty{})
+        \\    if buffer.get(-1) -> return 95
+        \\    if buffer.get(2) -> return 96
+        \\    return 40 + buffer.len()
+        \\func run() int
+        \\    if const value = compute() -> return value
+        \\    return 97
+    , 42);
+    try std.testing.expectEqual(@as(?u32, 0), interpreter.allocationByteSize(std.math.maxInt(u32), 0));
+    try std.testing.expectEqual(@as(?u32, null), interpreter.allocationByteSize(1, -1));
+    try std.testing.expectEqual(@as(?u32, null), interpreter.allocationByteSize(std.math.maxInt(u32), 1));
+}
+
+test "evaluation heap immovable partial failure reverse destruction and extraction use typed cleanup" {
+    try test_sources.SourceFixture.expectParity(
+        \\struct Item
+        \\    move = none
+        \\    copy = none
+        \\    trace: Ref(int, true)
+        \\    value: int
+        \\    drop = func(deinit self: Item) -> self.trace.replace(self.trace[] * 10 + self.value)
+        \\fallible missing() Item -> fail
+        \\func forbidden() Item -> exit(90)
+        \\func run() int
+        \\    var trace = Array(int, 1).filled(0)
+        \\    if const target = trace.get_mut(0)
+        \\        if const items: List(Item) = [Item{trace = target, value = 2}, Item{trace = target, value = 4}, missing?(), forbidden()]
+        \\            return 91
+        \\        if target[] <> 42 -> return 92
+        \\        if const owner = Box(int).new(target[]) -> return owner.into_value()
+        \\    return 93
+    , 42);
+    try test_sources.SourceFixture.expectParity(
+        \\struct Leaf
+        \\    move = none
+        \\    trace: Ref(int, true)
+        \\    drop = func(deinit self: Leaf) -> self.trace.replace(42)
+        \\struct Item
+        \\    move = none
+        \\    first: Leaf
+        \\    second: int
+        \\    drop = func(deinit self: Item) -> exit(90)
+        \\fallible missing() int -> fail
+        \\func run() int
+        \\    var trace = Array(int, 1).filled(0)
+        \\    if const target = trace.get_mut(0)
+        \\        if const owner = Box(Item).new(Item{first = Leaf{trace = target}, second = missing?()}) -> return 91
+        \\        return target[]
+        \\    return 92
+    , 42);
+}
+
+test "evaluation heap escaping aggregates variants static arguments and conversions have a consuming diagnostic" {
+    const prefix =
+        \\func factory() Box(int)
+        \\    if const owner = Box(int).new(42) -> return owner^
+        \\    exit(90)
+        \\struct Holder
+        \\    owner: Box(int)
+        \\func aggregate() Holder -> Holder{owner = factory()}
+        \\func variant() int | Holder -> aggregate()
+        \\func accept(static value: Holder) int -> 42
+        \\struct Target
+        \\    value: int
+        \\converter(imm value: Holder) Target -> Target{value = 42}
+    ;
+    for ([_][]const u8{
+        "const value = comptime -> factory()",
+        "const value = comptime -> aggregate()",
+        "const value = comptime -> variant()",
+        "exit(accept(aggregate()))",
+        "const value: Target = comptime -> aggregate()",
+    }) |consumer| {
+        const source = try std.testing.allocator.print("{s}\n{s}\nexit(0)", .{ prefix, consumer });
+        defer std.testing.allocator.free(source);
+        const fixture = try test_sources.SourceFixture.init(source);
+        defer fixture.deinit();
+        try fixture.expectDiagnostic(0, .compile_time_escaping_storage);
+        const diagnostics = try fixture.db.transitiveAccumulatorValues(queries.BuildExecutable, 0, structures.Diagnostic, std.testing.allocator);
+        defer std.testing.allocator.free(diagnostics);
+        const start = std.mem.indexOf(u8, source, consumer).?;
+        for (diagnostics) |diagnostic| {
+            if (diagnostic.kind != .compile_time_escaping_storage) continue;
+            try std.testing.expect(diagnostic.span.?.start >= start);
+            try std.testing.expect(diagnostic.span.?.end <= start + consumer.len);
+        }
+    }
+}
+
+test "evaluation heap allocator edits skip deferred construction and recompute successful results" {
+    const fixture = try test_sources.SourceFixture.init(
+        \\func forbidden() int -> exit(90)
+        \\func run() int
+        \\    if const owner = Box(int).new(forbidden()) -> return owner.into_value()
+        \\    return 42
+        \\exit(comptime -> run())
+    );
+    defer fixture.deinit();
+    const standard_library = @import("standard_library");
+    const file = (try fixture.db.input(queries.StandardFile, @backingInt(standard_library.File.memory_allocation))).*;
+    const original = standard_library.source("memory/allocation.chi");
+    const failed = try std.mem.replaceOwned(u8, std.testing.allocator, original, "var storage = allocate?(T, 1)", "var storage = allocate?(T, -1)");
+    defer std.testing.allocator.free(failed);
+    try fixture.db.setInput(queries.SourceText, file, failed);
+    try fixture.expectExit(0, 42);
+    try fixture.db.setInput(queries.SourceText, file, original);
+    try std.testing.expect((try fixture.db.get(queries.BuildExecutable, 0)).* == null);
+    const controls = try fixture.db.transitiveAccumulatorValues(queries.BuildExecutable, 0, structures.CompilerControl, std.testing.allocator);
+    defer std.testing.allocator.free(controls);
+    try std.testing.expectEqual(@as(usize, 1), controls.len);
+    try std.testing.expectEqual(@as(i32, 90), controls[0].exit);
+    try fixture.db.setInput(queries.SourceText, file, failed);
+    try fixture.expectExit(0, 42);
+}
+
+test "evaluation heap compiler allocation failure is retryable without publishing storage" {
+    var failing: std.testing.FailingAllocator = .init(std.testing.allocator, .{ .fail_index = 0 });
+    var heap: interpreter.Heap = .init(failing.allocator());
+    defer heap.deinit();
+    try std.testing.expectError(error.OutOfMemory, heap.allocate(.int, 1));
+    try std.testing.expectEqual(@as(usize, 0), heap.records.items.len);
+    failing.fail_index = std.math.maxInt(usize);
+    const allocation = try heap.allocate(.int, 1);
+    try std.testing.expectEqual(@as(usize, 0), allocation.identity);
+    const cell = try allocation.element(0);
+    cell.contents = .{ .value = .{ .int = 42 } };
+    allocation.release();
+    try std.testing.expect(allocation.released);
+    try std.testing.expect(cell.contents == .uninitialized);
+    const db = try query.Database.init(failing.allocator(), .{ .worker_count = 1 });
+    defer db.deinit();
+    try modules.registerSources(db, failing.allocator(),
+        \\func compute() int
+        \\    if const owner = Box(int).new(42) -> return owner.into_value()
+        \\    return 90
+    , &.{}, &.{});
+    const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;
+    const key: queries.ExecuteComptimeCall.Input = .{
+        .instance = .{ .item = scope.resolveFunction("compute").? },
+        .arguments = try db.intern(queries.CompileTimeValueTuples, .{ .values = &.{} }),
+    };
+    _ = (try db.get(queries.AnalyzeComptimeFunctionBody, key.instance)).* orelse return error.TestUnexpectedResult;
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, db.get(queries.ExecuteComptimeCall, key));
+    failing.fail_index = std.math.maxInt(usize);
+    const result = (try db.get(queries.ExecuteComptimeCall, key)).*.?;
+    const value = (try db.lookupInterned(queries.CompileTimeValues, result.completed.outcome.returned)).*;
+    try std.testing.expectEqual(@as(i32, 42), value.runtime.value.int);
+}
+
+test "evaluation heap rejects transient mutable copy back through the canonical call boundary" {
+    const fixture = try test_sources.SourceFixture.init(
+        \\func factory() Box(int)
+        \\    if const owner = Box(int).new(42) -> return owner^
+        \\    exit(90)
+        \\func populate(mut value: int | Box(int))
+        \\    value = factory()
+        \\exit(0)
+    );
+    defer fixture.deinit();
+    const scope = (try fixture.db.get(queries.BuildModuleScope, 0)).*.?;
+    const item = scope.resolveFunction("populate").?;
+    const signature = (try fixture.db.get(queries.FunctionSignature, item)).*.?;
+    const integer = try fixture.db.intern(queries.CompileTimeValues, .{ .runtime = .{ .type_id = .int, .value = .{ .int = 0 } } });
+    const initial = try fixture.db.intern(queries.CompileTimeValues, .{ .runtime = .{
+        .type_id = signature.parameters[0].type_id,
+        .value = .{ .variant = .{ .member_type = .int, .payload = integer } },
+    } });
+    const key: queries.ExecuteComptimeCall.Input = .{
+        .instance = .{ .item = item },
+        .arguments = try fixture.db.intern(queries.CompileTimeValueTuples, .{ .values = &.{initial} }),
+    };
+    try std.testing.expect((try fixture.db.get(queries.ExecuteComptimeCall, key)).*.? == .execution_error);
+    const diagnostics = try fixture.db.transitiveAccumulatorValues(queries.ExecuteComptimeCall, key, structures.Diagnostic, std.testing.allocator);
+    defer std.testing.allocator.free(diagnostics);
+    var found = false;
+    for (diagnostics) |diagnostic| if (diagnostic.kind == .compile_time_escaping_storage) {
+        found = true;
+    };
+    try std.testing.expect(found);
+}
+
+test "evaluation heap independent workers share no storage and recursive snapshots observe mutations" {
+    const allocator = std.testing.allocator;
+    const db = try query.Database.init(allocator, .{ .worker_count = 2 });
+    defer db.deinit();
+    const source =
+        \\func factory(seed: int) Box(int)
+        \\    if const owner = Box(int).new(seed) -> return owner^
+        \\    exit(90)
+        \\func advance(imm reference: Ref(int, true)) int
+        \\    if reference[] == 0 -> return 42
+        \\    reference.replace(reference[] - 1)
+        \\    return advance(reference)
+        \\func compute(seed: int) int
+        \\    var owner = factory(seed)
+        \\    return advance(owner.borrow_mut())
+    ;
+    try modules.registerSources(db, allocator, source, &.{}, &.{});
+    const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;
+    var keys: [2]queries.ExecuteComptimeCall.Input = undefined;
+    for (&keys, 0..) |*key, index| {
+        const value = try db.intern(queries.CompileTimeValues, .{ .runtime = .{ .type_id = .int, .value = .{ .int = @intCast(index + 2) } } });
+        key.* = .{
+            .instance = .{ .item = scope.resolveFunction("compute").? },
+            .arguments = try db.intern(queries.CompileTimeValueTuples, .{ .values = &.{value} }),
+        };
+    }
+    for ([_]i32{ 42, 43 }) |expected| {
+        const handles = [_]query.Handle(queries.ExecuteComptimeCall){ try db.spawn(queries.ExecuteComptimeCall, keys[0]), try db.spawn(queries.ExecuteComptimeCall, keys[1]) };
+        for (handles) |handle| {
+            const result = (try handle.wait()).*.?;
+            const value = (try db.lookupInterned(queries.CompileTimeValues, result.completed.outcome.returned)).*;
+            try std.testing.expectEqual(expected, value.runtime.value.int);
+        }
+        if (expected == 42) {
+            const edited = try std.mem.replaceOwned(u8, allocator, source, "return 42", "return 43");
+            defer allocator.free(edited);
+            try db.setInput(queries.SourceText, 0, edited);
+        }
+    }
+}
+
+test "evaluation heap executes independent factories nested aliases and ordinary collections" {
+    try test_sources.SourceFixture.expectParity(
+        \\import std.memory.{Box, Ref, Buffer}
+        \\func factory() Box(int)
+        \\    if const owner = Box(int).new(19) -> return owner^
+        \\    exit(90)
+        \\func update(imm target: Ref(int, true)) -> target.replace(target[] + 4)
+        \\func forward(imm target: Ref(int, true)) -> update(target)
+        \\fallible compute() int
+        \\    var first = factory()
+        \\    const second = factory()
+        \\    forward(first.borrow_mut())
+        \\    if first.borrow()[] <> 23 -> return 91
+        \\    if second.borrow()[] <> 19 -> return 92
+        \\    var buffer = Buffer(int).new?(0)
+        \\    buffer.append?(19)
+        \\    buffer.append?(23)
+        \\    buffer.reserve?(8)
+        \\    const view = buffer.view?(0, 2)
+        \\    const left = view.get?(0)
+        \\    const right = view.get?(1)
+        \\    const values: List(int) = [left[], right[]]
+        \\    const first_value = values.get?(0)
+        \\    const second_value = values.get?(1)
+        \\    return first_value[] + second_value[]
+        \\func run() int
+        \\    if const result = compute() -> return result
+        \\    return 93
+    , 42);
+}
+
+test "evaluation heap regenerated byte views retain recursive call identity" {
+    try test_sources.SourceFixture.expectSourceDiagnostic(
+        \\func repeat(imm text: String, imm view: BytesView) int -> repeat(text, text.as_bytes())
+        \\fallible run() int
+        \\    var text = "hi"
+        \\    text.append?("!")
+        \\    return repeat(text, text.as_bytes())
+        \\static answer = if const value = run() -> value else 90
+        \\exit(answer)
+    , .compile_time_call_cycle);
+}
+
+test "byte pointer snapshots preserve allocation identity contents offsets and inline storage identity" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var heap: interpreter.Heap = .init(std.testing.allocator);
+    defer heap.deinit();
+    const storage = arena.allocator();
+    const allocation = try heap.allocate(.byte, 2);
+    const element = try allocation.element(0);
+    element.contents = .{ .value = .{ .byte = 42 } };
+    var owner: Cell = .{ .type_id = .unit, .storage = storage, .contents = .{ .allocation = allocation } };
+    var copied_owner = owner;
+    var pointer: Cell = .{ .type_id = .byte_pointer, .storage = storage, .contents = .{ .byte_pointer = .{ .owner = &owner, .offset = 0 } } };
+    var copied_pointer: Cell = .{ .type_id = .byte_pointer, .storage = storage, .contents = .{ .byte_pointer = .{ .owner = &copied_owner, .offset = 0 } } };
+    const original = try ValueSnapshot.init(&.{.{ .place = &pointer }}, storage);
+    const copied = try ValueSnapshot.init(&.{.{ .place = &copied_pointer }}, storage);
+    try std.testing.expect(try original.eql(copied, std.testing.allocator));
+
+    copied_pointer.contents.byte_pointer.offset = 1;
+    const shifted = try ValueSnapshot.init(&.{.{ .place = &copied_pointer }}, storage);
+    try std.testing.expect(!try original.eql(shifted, std.testing.allocator));
+    copied_pointer.contents.byte_pointer.offset = 0;
+    const fresh = try heap.allocate(.byte, allocation.capacity);
+    (try fresh.element(0)).contents = .{ .value = .{ .byte = 42 } };
+    copied_owner.contents = .{ .allocation = fresh };
+    const replaced = try ValueSnapshot.init(&.{.{ .place = &copied_pointer }}, storage);
+    try std.testing.expect(!try original.eql(replaced, std.testing.allocator));
+    copied_owner.contents = .{ .allocation = allocation };
+    element.contents.value.byte = 43;
+    const changed = try ValueSnapshot.init(&.{.{ .place = &copied_pointer }}, storage);
+    try std.testing.expect(!try original.eql(changed, std.testing.allocator));
+    try std.testing.expect(try original.eql(copied, std.testing.allocator));
+    allocation.release();
+    const released = try ValueSnapshot.init(&.{.{ .place = &copied_pointer }}, storage);
+    try std.testing.expect(!try changed.eql(released, std.testing.allocator));
+
+    var fields = [_]Cell{.{ .type_id = .byte, .storage = storage, .contents = .{ .value = .{ .byte = 42 } } }};
+    var other_fields = fields;
+    var inline_owner: Cell = .{ .type_id = .unit, .storage = storage, .contents = .{ .fields = &fields } };
+    var other_inline_owner: Cell = .{ .type_id = .unit, .storage = storage, .contents = .{ .fields = &other_fields } };
+    pointer.contents.byte_pointer.owner = &inline_owner;
+    copied_pointer.contents.byte_pointer.owner = &inline_owner;
+    const inline_original = try ValueSnapshot.init(&.{.{ .place = &pointer }}, storage);
+    const inline_repeated = try ValueSnapshot.init(&.{.{ .place = &copied_pointer }}, storage);
+    try std.testing.expect(try inline_original.eql(inline_repeated, std.testing.allocator));
+    copied_pointer.contents.byte_pointer.owner = &other_inline_owner;
+    const inline_copied = try ValueSnapshot.init(&.{.{ .place = &copied_pointer }}, storage);
+    try std.testing.expect(!try inline_original.eql(inline_copied, std.testing.allocator));
+}
+
+test "evaluation heap snapshots freeze lazy allocation identities aliases and release" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var heap: interpreter.Heap = .init(std.testing.allocator);
+    defer heap.deinit();
+    const storage = arena.allocator();
+    const allocation = try heap.allocate(.int, std.math.maxInt(u32));
+    try std.testing.expectEqual(@as(u32, 0), allocation.elements.count());
+    const element = try allocation.element(42);
+    element.contents = .{ .value = .{ .int = 17 } };
+    var handle: Cell = .{ .type_id = .unit, .storage = storage, .contents = .{ .allocation = allocation } };
+    const arguments = [_]Value{ .{ .place = &handle }, try referenceValue(.unit, element, storage) };
+    const original = try ValueSnapshot.init(&arguments, storage);
+    const repeated = try ValueSnapshot.init(&arguments, storage);
+    try std.testing.expect(try original.eql(repeated, std.testing.allocator));
+    try std.testing.expect(original.values[0].place.contents.allocation.elements.get(42).? == original.values[1].place.contents.reference);
+    element.contents.value.int = 31;
+    const changed = try ValueSnapshot.init(&arguments, storage);
+    try std.testing.expect(!try original.eql(changed, std.testing.allocator));
+    allocation.release();
+    const released = try ValueSnapshot.init(&arguments, storage);
+    try std.testing.expect(!try changed.eql(released, std.testing.allocator));
+    try std.testing.expectEqual(@as(i32, 17), original.values[1].place.contents.reference.contents.value.int);
+    const fresh = try heap.allocate(.int, allocation.capacity);
+    try std.testing.expect(fresh.identity != allocation.identity);
+    const nested = try heap.allocate(.unit, 1);
+    const root = try nested.element(0);
+    const fields = try root.storage.alloc(Cell, 1);
+    fields[0] = .{ .type_id = .int, .storage = root.storage, .contents = .{ .value = .{ .int = 42 } } };
+    root.contents = .{ .fields = fields };
+    const reference = try referenceValue(.unit, &fields[0], storage);
+    const before_release = try ValueSnapshot.init(&.{reference}, storage);
+    nested.release();
+    const after_release = try ValueSnapshot.init(&.{reference}, storage);
+    try std.testing.expect(!try before_release.eql(after_release, std.testing.allocator));
+    try std.testing.expectEqual(@as(i32, 42), before_release.values[0].place.contents.reference.contents.value.int);
+}
+
 const ArrayTestExecutor = struct {
     allocator: std.mem.Allocator,
     values: std.ArrayList(structures.CompileTimeValue.Runtime) = .empty,
@@ -33,8 +408,13 @@ const ArrayTestExecutor = struct {
             100 => .{ .element_type = .int, .length = 3 },
             101 => .{ .element_type = @fromBackingInt(@intCast(100)), .length = 2 },
             102 => .{ .element_type = .int, .length = 0 },
+            103 => .{ .element_type = .byte, .length = 2 },
             else => null,
         };
+    }
+
+    pub fn byteString(_: *@This(), _: structures.ByteStringId) ![]const u8 {
+        unreachable;
     }
 
     pub fn call(_: *@This(), _: structures.InstanceId, _: []Value, _: ?structures.SourceSpan) !Result {
@@ -59,7 +439,7 @@ const ArrayTestExecutor = struct {
     }
 
     pub fn argumentPassing(_: *@This(), type_id: structures.TypeId) !structures.ArgumentPassing {
-        return if (@backingInt(type_id) >= 100 and @backingInt(type_id) <= 102) .indirect else .direct;
+        return if (@backingInt(type_id) >= 100 and @backingInt(type_id) <= 103) .indirect else .direct;
     }
 
     pub fn variantMembers(_: *@This(), _: structures.TypeId) !?[]const structures.TypeId {
@@ -73,6 +453,7 @@ const ArrayTestExecutor = struct {
     }
 
     pub fn lookupRuntime(self: *@This(), value_id: structures.CompileTimeValueId) !?structures.CompileTimeValue.Runtime {
+        if (@backingInt(value_id) >= self.values.items.len) return null;
         return self.values.items[@backingInt(value_id)];
     }
 
@@ -88,6 +469,86 @@ const ArrayTestExecutor = struct {
         return self.tuples.items[@backingInt(tuple_id)];
     }
 };
+
+test "byte pointer evaluation defers missing canonical elements and recovers when available" {
+    var executor: ArrayTestExecutor = .{ .allocator = std.testing.allocator };
+    defer executor.deinit();
+    const first = try executor.internRuntime(.byte, .{ .byte = 11 });
+    const tuple = try executor.internTuple(&.{ first, @fromBackingInt(@as(u32, 1)) });
+    var arguments = [_]Value{.{ .runtime = .{ .structure = tuple } }};
+    var modes = [_]structures.ParameterMode{.imm};
+    var parameters = [_]structures.FunctionBlockArgument{.{ .type_id = @fromBackingInt(@as(u32, 103)) }};
+    var instructions = [_]structures.FunctionInstruction{
+        .{ .byte_pointer = @fromBackingInt(@as(u32, 0)) },
+        .{ .const_int = 1 },
+        .{ .byte_read = .{ .lhs = @fromBackingInt(@as(u32, 1)), .rhs = @fromBackingInt(@as(u32, 2)) } },
+    };
+    var blocks = [_]structures.FunctionBlock{.{
+        .argument_end = 1,
+        .instruction_start = 0,
+        .instruction_end = instructions.len,
+        .terminator = .{ .return_value = .{ .value = @fromBackingInt(@as(u32, 3)) } },
+    }};
+    const body: structures.FunctionBodyAnalysis = .{
+        .return_type = .byte,
+        .parameter_modes = &modes,
+        .block_arguments = &parameters,
+        .instructions = &instructions,
+        .blocks = &blocks,
+        .branch_arguments = &.{},
+        .call_arguments = &.{},
+        .entry = @fromBackingInt(@as(u32, 0)),
+    };
+    try std.testing.expect(try execute(&body, &arguments, &executor, std.testing.allocator) == .unavailable);
+    _ = try executor.internRuntime(.byte, .{ .byte = 42 });
+    const result = try execute(&body, &arguments, &executor, std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 42), result.returned.runtime.byte);
+}
+
+test "borrowed variant projections retain their owner's storage" {
+    var owner_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer owner_arena.deinit();
+    var call_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer call_arena.deinit();
+    var executor: ArrayTestExecutor = .{ .allocator = std.testing.allocator };
+    defer executor.deinit();
+    const payload = try executor.internRuntime(.int, .{ .int = 42 });
+    var owner: Cell = .{
+        .type_id = @fromBackingInt(@as(u32, 104)),
+        .storage = owner_arena.allocator(),
+        .contents = .{ .value = .{ .variant = .{ .member_type = .int, .payload = payload } } },
+    };
+    var arguments = [_]Value{.{ .place = &owner }};
+    var modes = [_]structures.ParameterMode{.imm};
+    var parameters = [_]structures.FunctionBlockArgument{.{ .type_id = owner.type_id }};
+    var projections = [_]structures.BorrowProjection{.{ .variant = .int }};
+    var instructions = [_]structures.FunctionInstruction{.{ .borrow_address = .{
+        .source = @fromBackingInt(@as(u32, 0)),
+        .type_id = @fromBackingInt(@as(u32, 105)),
+        .fields = .{ .start = 0, .end = 1 },
+    } }};
+    var blocks = [_]structures.FunctionBlock{.{
+        .argument_end = 1,
+        .instruction_start = 0,
+        .instruction_end = 1,
+        .terminator = .return_unit,
+    }};
+    const body: structures.FunctionBodyAnalysis = .{
+        .return_type = .unit,
+        .parameter_modes = &modes,
+        .block_arguments = &parameters,
+        .borrow_fields = &projections,
+        .instructions = &instructions,
+        .blocks = &blocks,
+        .branch_arguments = &.{},
+        .call_arguments = &.{},
+        .entry = @fromBackingInt(@as(u32, 0)),
+    };
+    try std.testing.expect(try executeInStorage(&body, &arguments, &executor, std.testing.allocator, call_arena.allocator()) == .returned);
+    try std.testing.expectEqual(owner.storage.ptr, owner.contents.variant_payload.storage.ptr);
+    _ = call_arena.reset(.free_all);
+    try std.testing.expectEqual(@as(i32, 42), owner.contents.variant_payload.contents.value.int);
+}
 
 test "interpreter value snapshots compare reference identity and frozen contents" {
     var session_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
@@ -346,7 +807,7 @@ test "interpreter array references survive nested calls and cannot be published"
     blocks[0].terminator = .{ .return_value = .{ .value = @fromBackingInt(@intCast(5)) } };
     const escaping = try execute(&body, &arguments, &executor, std.testing.allocator);
     try std.testing.expect(escaping == .execution_error);
-    try std.testing.expectEqual(ExecutionErrorReason.unsupported_operation, escaping.execution_error.reason);
+    try std.testing.expectEqual(ExecutionErrorReason.escaping_storage, escaping.execution_error.reason);
 }
 
 test "interpreter nested array copies retain destination cells and rehydrate tuples" {
@@ -415,7 +876,7 @@ test "interpreter nested array copies retain destination cells and rehydrate tup
     blocks[0].terminator = .{ .return_value = .{ .value = @fromBackingInt(@intCast(0)) } };
     const escaping = try execute(&body, &arguments, &executor, std.testing.allocator);
     try std.testing.expect(escaping == .execution_error);
-    try std.testing.expectEqual(ExecutionErrorReason.unsupported_operation, escaping.execution_error.reason);
+    try std.testing.expectEqual(ExecutionErrorReason.escaping_storage, escaping.execution_error.reason);
 }
 
 test "initializer capture cell subtrees survive the constructing region storage" {
@@ -426,6 +887,10 @@ test "initializer capture cell subtrees survive the constructing region storage"
         pub fn convertStaticValue(_: *@This(), _: structures.TypeId, _: structures.CompileTimeValue.RuntimeValue, _: structures.TypeId, _: ?structures.SourceSpan, _: std.mem.Allocator) !Result {
             unreachable;
         }
+        pub fn byteString(_: *@This(), _: structures.ByteStringId) ![]const u8 {
+            unreachable;
+        }
+
         pub fn call(_: *@This(), _: structures.InstanceId, _: []Value, _: ?structures.SourceSpan) !Result {
             unreachable;
         }
@@ -503,6 +968,10 @@ test "fallible initializer calls route ordinary failure without a value" {
         pub fn convertStaticValue(_: *@This(), _: structures.TypeId, _: structures.CompileTimeValue.RuntimeValue, _: structures.TypeId, _: ?structures.SourceSpan, _: std.mem.Allocator) !Result {
             unreachable;
         }
+        pub fn byteString(_: *@This(), _: structures.ByteStringId) ![]const u8 {
+            unreachable;
+        }
+
         pub fn call(_: *@This(), _: structures.InstanceId, _: []Value, _: ?structures.SourceSpan) !Result {
             unreachable;
         }

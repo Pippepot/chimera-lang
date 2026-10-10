@@ -1,0 +1,25 @@
+import std.memory.{Buffer}
+import std.text.{BytesView, StringView}
+
+pub struct Stream
+    copy = trivial
+    descriptor: int
+
+pub static stdin = Stream{descriptor = 0}
+pub static stdout = Stream{descriptor = 1}
+pub static stderr = Stream{descriptor = 2}
+
+pub fallible write_once(stream: Stream, imm bytes: BytesView) int -> bytes.write_to?(stream.descriptor)
+pub fallible write_all(stream: Stream, imm bytes: BytesView)
+    var offset = 0
+    loop
+        if offset == bytes.byte_length() -> break
+        const remaining = bytes.slice?(offset, bytes.byte_length() - offset)
+        const written = write_once?(stream, remaining)
+        written > 0
+        offset += written
+pub fallible write_text(stream: Stream, imm text: StringView) -> write_all?(stream, text.as_bytes())
+pub fallible print(imm text: StringView)
+    write_text?(stdout, text)
+    write_text?(stdout, "\n")
+pub fallible read_bytes(stream: Stream, mut buffer: Buffer(byte), count: int) int -> buffer.read_bytes?(stream.descriptor, count)

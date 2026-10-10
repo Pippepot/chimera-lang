@@ -8,16 +8,22 @@ const comptime_interpreter = @import("frontend/comptime_interpreter.zig");
 const semantic = @import("frontend/semantic.zig");
 const typing = @import("frontend/typing.zig");
 
+fn OwnedInterner(comptime ValueType: type, comptime IdType: type) type {
+    return struct {
+        pub const Value = ValueType;
+        pub const Id = IdType;
+        pub const hash = value_operations.Owned(Value).hash;
+        pub const eql = value_operations.Owned(Value).eql;
+        pub const clone = value_operations.Owned(Value).clone;
+        pub const deinit = value_operations.Owned(Value).destroy;
+    };
+}
+
 pub const SourceText = struct {
     pub const Key = structures.FileId;
     pub const Value = []const u8;
-
-    pub fn cloneValue(gpa: std.mem.Allocator, value: Value) !Value {
-        return gpa.dupe(u8, value);
-    }
-
+    pub const cloneValue = value_operations.Owned(Value).clone;
     pub const eqlValue = value_operations.Owned(Value).eql;
-
     pub const deinitValue = value_operations.Owned(Value).destroy;
 };
 
@@ -48,26 +54,16 @@ pub const FileModule = struct {
 pub const ModuleMembers = struct {
     pub const Key = structures.ModuleId;
     pub const Value = []const structures.FileId;
-
-    pub fn cloneValue(gpa: std.mem.Allocator, value: Value) !Value {
-        return gpa.dupe(structures.FileId, value);
-    }
-
+    pub const cloneValue = value_operations.Owned(Value).clone;
     pub const eqlValue = value_operations.Owned(Value).eql;
-
     pub const deinitValue = value_operations.Owned(Value).destroy;
 };
 
 pub const ModuleCatalog = struct {
     pub const Key = void;
     pub const Value = []const structures.ModuleId;
-
-    pub fn cloneValue(gpa: std.mem.Allocator, value: Value) !Value {
-        return gpa.dupe(structures.ModuleId, value);
-    }
-
+    pub const cloneValue = value_operations.Owned(Value).clone;
     pub const eqlValue = value_operations.Owned(Value).eql;
-
     pub const deinitValue = value_operations.Owned(Value).destroy;
 };
 
@@ -100,20 +96,7 @@ fn standardFile(ctx: anytype, file: standard_library.File) !?structures.FileId {
     return registered.*;
 }
 
-pub const ModulePaths = struct {
-    pub const Value = structures.ModulePath;
-    pub const Id = structures.ModuleId;
-
-    pub const hash = value_operations.Owned(Value).hash;
-
-    pub const eql = value_operations.Owned(Value).eql;
-
-    pub fn clone(gpa: std.mem.Allocator, value: Value) !Value {
-        return .{ .path = try gpa.dupe(u8, value.path) };
-    }
-
-    pub const deinit = value_operations.Owned(Value).destroy;
-};
+pub const ModulePaths = OwnedInterner(structures.ModulePath, structures.ModuleId);
 
 pub const DiscoverItems = struct {
     pub const Input = structures.FileId;
@@ -132,7 +115,7 @@ pub const DiscoverItems = struct {
         var has_duplicates = false;
         for (tree.items) |item| {
             if (item.loc.kind == .top_level_entry or item.parent != null or item.qualified_owner != null) continue;
-            if (!(try names.getOrPut(item.loc.name)).found_existing) continue;
+            if (!(try names.getOrPut(item.loc.name.text())).found_existing) continue;
             has_duplicates = true;
             const node = ast_value.nodes[item.declaration];
             std.debug.assert(node.tag == .static_binding);
@@ -153,22 +136,7 @@ pub const DiscoverItems = struct {
     }
 };
 
-pub const ItemLocations = struct {
-    pub const Value = structures.ItemLoc;
-    pub const Id = structures.ItemId;
-
-    pub const hash = value_operations.Owned(Value).hash;
-
-    pub const eql = value_operations.Owned(Value).eql;
-
-    pub fn clone(gpa: std.mem.Allocator, value: Value) !Value {
-        var cloned = value;
-        cloned.name = try gpa.dupe(u8, value.name);
-        return cloned;
-    }
-
-    pub const deinit = value_operations.Owned(Value).destroy;
-};
+pub const ItemLocations = OwnedInterner(structures.ItemLoc, structures.ItemId);
 
 pub const Types = struct {
     pub const Value = structures.TypeData;
@@ -179,52 +147,23 @@ pub const Types = struct {
     pub const eql = value_operations.Owned(Value).eql;
 
     pub fn clone(gpa: std.mem.Allocator, value: Value) !Value {
-        switch (value) {
-            .variant => |variant| {
-                std.debug.assert(variant.members.len >= 2);
-                for (variant.members, 0..) |member, index| {
-                    if (index > 0) std.debug.assert(@backingInt(variant.members[index - 1]) < @backingInt(member));
-                }
-                return .{ .variant = .{ .members = try gpa.dupe(structures.TypeId, variant.members) } };
-            },
-            .callable => |callable| return .{ .callable = try callable.clone(gpa) },
-            .structure => |identity| return .{ .structure = identity },
-            .array => |array| return .{ .array = array },
+        if (value == .variant) {
+            std.debug.assert(value.variant.members.len >= 2);
+            for (value.variant.members[0 .. value.variant.members.len - 1], value.variant.members[1..]) |previous, member| {
+                std.debug.assert(@backingInt(previous) < @backingInt(member));
+            }
         }
+        return value_operations.Owned(Value).clone(gpa, value);
     }
 
     pub const deinit = value_operations.Owned(Value).destroy;
 };
 
-pub const CompileTimeValues = struct {
-    pub const Value = structures.CompileTimeValue;
-    pub const Id = structures.CompileTimeValueId;
+pub const ByteStrings = OwnedInterner(structures.ByteString, structures.ByteStringId);
 
-    pub const hash = value_operations.Owned(Value).hash;
+pub const CompileTimeValues = OwnedInterner(structures.CompileTimeValue, structures.CompileTimeValueId);
 
-    pub const eql = value_operations.Owned(Value).eql;
-
-    pub fn clone(_: std.mem.Allocator, value: Value) !Value {
-        return value;
-    }
-
-    pub const deinit = value_operations.Owned(Value).destroy;
-};
-
-pub const CompileTimeValueTuples = struct {
-    pub const Value = structures.CompileTimeValueTuple;
-    pub const Id = structures.CompileTimeValueTupleId;
-
-    pub const hash = value_operations.Owned(Value).hash;
-
-    pub const eql = value_operations.Owned(Value).eql;
-
-    pub fn clone(gpa: std.mem.Allocator, value: Value) !Value {
-        return .{ .values = try gpa.dupe(structures.CompileTimeValueId, value.values) };
-    }
-
-    pub const deinit = value_operations.Owned(Value).destroy;
-};
+pub const CompileTimeValueTuples = OwnedInterner(structures.CompileTimeValueTuple, structures.CompileTimeValueTupleId);
 
 pub fn internVariantType(ctx: anytype, members: []const structures.TypeId) !structures.InternVariantResult {
     std.debug.assert(members.len >= 2);
@@ -275,7 +214,7 @@ pub fn internStructType(ctx: anytype, item_id: structures.ItemId) !structures.Ty
 
 fn internGeneratedStructType(ctx: anytype, identity: structures.GeneratedStructIdentity) !structures.TypeId {
     const location = try ctx.lookupInterned(ItemLocations, identity.owner.item);
-    if (location.owner == null and std.mem.eql(u8, location.name, "Array")) {
+    if (location.owner == null and std.mem.eql(u8, location.name.text(), "Array")) {
         const factory = try standardFunction(ctx, .array, "Array");
         if (factory == identity.owner.item) return internStandardArrayType(ctx, identity);
     }
@@ -362,8 +301,28 @@ fn validArrayElementType(ctx: anytype, type_id: structures.TypeId) anyerror!bool
     }
 }
 
+const NamespaceIdentity = union(enum) {
+    primitive: structures.ItemId,
+    declared: structures.ItemId,
+    generated: structures.GeneratedStructIdentity,
+
+    fn fromStruct(identity: structures.StructIdentity) NamespaceIdentity {
+        return switch (identity) {
+            .declared => |item| .{ .declared = item },
+            .generated => |generated| .{ .generated = generated },
+        };
+    }
+
+    fn owner(self: NamespaceIdentity) structures.ItemId {
+        return switch (self) {
+            .primitive, .declared => |item| item,
+            .generated => |generated| generated.owner.item,
+        };
+    }
+};
+
 const TypeNamespaceAssociation = struct {
-    query_key: StructNamespace.Input,
+    query_key: NamespaceIdentity,
     specialization: ?structures.CompileTimeValueTupleId = null,
 };
 
@@ -398,11 +357,11 @@ pub fn TypeFacts(comptime Context: type) type {
                 .array => return "Array",
             };
             return switch (identity) {
-                .declared => |item_id| (try self.ctx.lookupInterned(ItemLocations, item_id)).name,
+                .declared => |item_id| (try self.ctx.lookupInterned(ItemLocations, item_id)).name.text(),
                 .generated => |generated| blk: {
                     const item_source = (try itemSource(self.ctx, generated.owner.item)) orelse return error.Unavailable;
                     if (!semantic.isDirectlyReturnedStructSite(&item_source.parsed, item_source.resolved.declaration, generated.node_offset)) break :blk "anonymous struct";
-                    break :blk (try self.ctx.lookupInterned(ItemLocations, generated.owner.item)).name;
+                    break :blk (try self.ctx.lookupInterned(ItemLocations, generated.owner.item)).name.text();
                 },
             };
         }
@@ -452,12 +411,31 @@ pub fn TypeFacts(comptime Context: type) type {
             return boxElementType(self.ctx, type_id);
         }
 
+        pub fn mayContainStorage(self: @This(), type_id: structures.TypeId) anyerror!bool {
+            if (type_id == .byte_pointer) return true;
+            if (type_id.isPrimitive()) return false;
+            if (try self.borrowElement(type_id) != null or try self.allocationElement(type_id) != null or try self.boxElement(type_id) != null) return true;
+            if (try self.arrayType(type_id)) |array| return array.length != 0 and try self.mayContainStorage(array.element_type);
+            if (try self.structDefinition(type_id)) |definition| {
+                if (try standardFile(self.ctx, .memory_host) != null) {
+                    const module = try self.ctx.intern(ModulePaths, .{ .path = standard_library.File.memory_host.modulePath() });
+                    if ((try self.ctx.get(ModuleDeclarations, module)).*) |declarations| {
+                        if (try hostStorageType(self.ctx, declarations) == type_id) return true;
+                    }
+                }
+                for (definition.fields) |field| if (try self.mayContainStorage(field.type_id)) return true;
+            } else if (try self.variantMembers(type_id)) |members| {
+                for (members) |member| if (try self.mayContainStorage(member)) return true;
+            }
+            return false;
+        }
+
         pub fn ownershipCapabilities(self: @This(), type_id: structures.TypeId) !?structures.OwnershipCapabilities {
             return (try self.ctx.get(OwnershipCapabilities, type_id)).*;
         }
 
         pub fn isRuntimeCapable(self: @This(), type_id: structures.TypeId) anyerror!bool {
-            if (type_id.isPrimitive()) return type_id != .type and type_id != .int_literal;
+            if (type_id.isPrimitive()) return type_id != .type and type_id != .int_literal and type_id != .string_literal;
             if (try standardMemoryInstance(self.ctx, type_id, .collection_literal) != null) return false;
             _ = (try self.ownershipCapabilities(type_id)) orelse return error.Unavailable;
             if (try self.arrayType(type_id)) |array| return self.isRuntimeCapable(array.element_type);
@@ -498,6 +476,10 @@ pub fn HostTypes(comptime Context: type) type {
 
         pub fn variantLayout(self: @This(), type_id: structures.TypeId) !structures.VariantLayout {
             return (try self.ctx.get(VariantLayout, type_id)).*;
+        }
+
+        pub fn byteString(self: @This(), id: structures.ByteStringId) ![]const u8 {
+            return (try self.ctx.lookupInterned(ByteStrings, id)).bytes;
         }
 
         pub fn layout(self: @This(), type_id: structures.TypeId) !structures.TypeLayout {
@@ -570,22 +552,18 @@ pub fn AnalysisContext(comptime Context: type) type {
         }
 
         pub fn typeNamespace(self: @This(), type_id: structures.TypeId) !?TypeNamespaceAssociation {
-            if (type_id == .int or type_id == .bool) {
-                const name: []const u8 = if (type_id == .int) "IntOperations" else "BoolOperations";
+            if (type_id.isPrimitive()) {
                 const registered = (try standardFile(self.ctx, .prelude)) orelse return null;
                 const module = (try self.ctx.input(FileModule, registered)).*;
-                const declarations = (try self.ctx.get(ModuleDeclarations, module)).* orelse return error.Unavailable;
-                const owner = declarations.resolve(name) orelse return error.Unavailable;
-                const resolved = (try self.ctx.get(ResolveItem, owner)).* orelse return error.Unavailable;
-                if (resolved.file_id != registered) return error.Unavailable;
-                return .{ .query_key = .{ .declared = owner } };
+                const owner = try self.ctx.intern(ItemLocations, .{ .origin = .{ .module = module }, .kind = .primitive, .name = .{ .identifier = @tagName(type_id) } });
+                return .{ .query_key = .{ .primitive = owner } };
             }
             const interned = type_id.interned() orelse return null;
             const data = (try self.ctx.lookupInternedAs(Types, interned)) orelse return error.Unavailable;
             switch (data.*) {
                 .structure => |identity| {
                     switch (identity) {
-                        .declared => return .{ .query_key = identity },
+                        .declared => return .{ .query_key = .fromStruct(identity) },
                         .generated => |generated| return .{
                             .query_key = .{ .generated = .{
                                 .owner = .{ .item = generated.owner.item },
@@ -600,21 +578,33 @@ pub fn AnalysisContext(comptime Context: type) type {
             }
         }
 
-        pub fn structNamespaceMember(self: @This(), type_id: structures.TypeId, name: []const u8, span: structures.SourceSpan) !?structures.InstanceId {
+        pub fn typeNamespaceMember(self: @This(), type_id: structures.TypeId, name: []const u8, span: structures.SourceSpan) !?structures.InstanceId {
             if (std.meta.stringToEnum(structures.OwnershipMember, name)) |operation|
                 return self.ownershipMember(type_id, operation);
+            return self.namedTypeNamespaceMember(type_id, .fromText(name, null), span);
+        }
+
+        pub fn namedTypeNamespaceMember(self: @This(), type_id: structures.TypeId, name: structures.Name, span: structures.SourceSpan) !?structures.InstanceId {
             const association = (try self.typeNamespace(type_id)) orelse return null;
-            const namespace = (try self.ctx.get(StructNamespace, association.query_key)).* orelse return error.Unavailable;
+            const namespace = (try self.ctx.get(TypeNamespace, association.query_key)).* orelse return error.Unavailable;
             return .{
-                .item = (try self.visibleStructMember(namespace, name, span)) orelse return null,
+                .item = (try self.visibleTypeMember(namespace, name, span)) orelse return null,
                 .specialization = association.specialization,
             };
+        }
+
+        pub fn typeNamespaceCallMember(self: @This(), type_id: structures.TypeId, name: []const u8, operands: usize, span: structures.SourceSpan) !?structures.InstanceId {
+            const association = (try self.typeNamespace(type_id)) orelse return null;
+            const namespace = (try self.ctx.get(TypeNamespace, association.query_key)).* orelse return error.Unavailable;
+            const reference = (try self.namespaceReference(namespace, association.specialization, name, span, operands)) orelse return null;
+            std.debug.assert(reference == .declaration);
+            return reference.declaration;
         }
 
         pub fn ownershipMember(self: @This(), type_id: structures.TypeId, operation: structures.OwnershipMember) !?structures.InstanceId {
             const capabilities = (try self.facts().ownershipCapabilities(type_id)) orelse return error.Unavailable;
             if (try self.typeNamespace(type_id)) |association| {
-                if ((try self.ctx.get(StructNamespace, association.query_key)).* == null) return error.Unavailable;
+                if ((try self.ctx.get(TypeNamespace, association.query_key)).* == null) return error.Unavailable;
             }
             switch (operation) {
                 .copy => if (capabilities.copy == .none) return null,
@@ -637,15 +627,15 @@ pub fn AnalysisContext(comptime Context: type) type {
         fn genericStructNamespaceMember(self: @This(), factory: structures.InstanceId, name: []const u8, span: ?structures.SourceSpan) !?structures.InstanceId {
             const item_source = (try itemSource(self.ctx, factory.item)) orelse return null;
             const site = semantic.parameterizedStructSite(&item_source.parsed, item_source.resolved.declaration) orelse return null;
-            const namespace = (try self.ctx.get(StructNamespace, .{ .generated = .{
+            const namespace = (try self.ctx.get(TypeNamespace, .{ .generated = .{
                 .owner = factory,
                 .node_offset = site,
             } })).* orelse return error.Unavailable;
-            return .{ .item = (try self.visibleStructMember(namespace, name, span)) orelse return null, .specialization = factory.specialization };
+            return .{ .item = (try self.visibleTypeMember(namespace, .fromText(name, null), span)) orelse return null, .specialization = factory.specialization };
         }
 
-        fn visibleStructMember(self: @This(), namespace: structures.ModuleScope, name: []const u8, span: ?structures.SourceSpan) !?structures.ItemId {
-            const entry = namespace.resolveEntry(name) orelse return null;
+        fn visibleTypeMember(self: @This(), namespace: structures.ModuleScope, name: structures.Name, span: ?structures.SourceSpan) !?structures.ItemId {
+            const entry = namespace.resolveName(name) orelse return null;
             if (span) |access_span| {
                 const member = try self.ctx.lookupInterned(ItemLocations, entry.item_id);
                 const owner_module = switch (member.origin) {
@@ -764,7 +754,7 @@ pub fn AnalysisContext(comptime Context: type) type {
             const constant = switch (reference) {
                 .constant => |value| value,
                 .declaration => |instance| (try self.staticItem(instance)) orelse return false,
-                .namespace => return false,
+                .namespace, .overloaded_function => return false,
             };
             const value = try self.lookupCompileTimeValue(constant);
             return value == .type and try self.collectionLiteralType(value.type) != null;
@@ -792,7 +782,7 @@ pub fn AnalysisContext(comptime Context: type) type {
             const constant = switch (reference) {
                 .constant => |value| value,
                 .declaration => |instance| (try self.staticItem(instance)) orelse return false,
-                .namespace => return false,
+                .namespace, .overloaded_function => return false,
             };
             const value = try self.lookupCompileTimeValue(constant);
             return value == .type and !try self.facts().isRuntimeCapable(value.type);
@@ -804,7 +794,7 @@ pub fn AnalysisContext(comptime Context: type) type {
                 return (try self.ctx.input(FileModule, file)).*;
             }
             const association = (try self.typeNamespace(type_id)) orelse return null;
-            const location = try self.ctx.lookupInterned(ItemLocations, structOwnerItem(association.query_key));
+            const location = try self.ctx.lookupInterned(ItemLocations, association.query_key.owner());
             return switch (location.origin) {
                 .module => |module| module,
                 .entry => |file| (try self.ctx.input(FileModule, file)).*,
@@ -963,8 +953,8 @@ pub fn AnalysisContext(comptime Context: type) type {
                 .{ "unsafe_borrow_initialized", .allocation_read },
             });
             if (location.owner == null) {
-                const behavior = names.get(location.name) orelse return .ordinary;
-                return if (item == (try self.stdMemoryFunction(location.name))) behavior else .ordinary;
+                const behavior = names.get(location.name.text()) orelse return .ordinary;
+                return if (item == (try self.stdMemoryFunction(location.name.text()))) behavior else .ordinary;
             }
             const Member = struct { factory: []const u8, name: []const u8, behavior: structures.CallBehavior };
             const members = [_]Member{
@@ -978,7 +968,7 @@ pub fn AnalysisContext(comptime Context: type) type {
                 .{ .factory = "Buffer", .name = "reserve", .behavior = .buffer_reserve },
             };
             for (members) |member| {
-                if (!std.mem.eql(u8, location.name, member.name)) continue;
+                if (!std.mem.eql(u8, location.name.text(), member.name)) continue;
                 const factory = (try self.stdMemoryFunction(member.factory)) orelse continue;
                 if (location.owner != factory) continue;
                 const resolved = (try self.genericStructNamespaceMember(.{ .item = factory }, member.name, null)) orelse continue;
@@ -1022,6 +1012,7 @@ pub fn AnalysisContext(comptime Context: type) type {
         fn containsBorrowAt(self: @This(), type_id: structures.TypeId, visited: *std.ArrayList(structures.TypeId), include_allocated_contents: bool) !bool {
             if (std.mem.indexOfScalar(structures.TypeId, visited.items, type_id) != null) return false;
             try visited.append(self.ctx.allocator(), type_id);
+            if (type_id == .byte_pointer) return true;
             if (try self.facts().borrowElement(type_id) != null) return true;
             if (try self.collectionLiteralType(type_id)) |collection|
                 return collection.length != 0 and try self.containsBorrowAt(collection.element_type, visited, include_allocated_contents);
@@ -1058,7 +1049,7 @@ pub fn AnalysisContext(comptime Context: type) type {
             const index = (try self.ctx.get(IndexItems, resolved.file_id)).* orelse return error.Unavailable;
             for (index.ids()) |item_id| {
                 const item_loc = try self.ctx.lookupInterned(ItemLocations, item_id);
-                if (item_loc.owner == owner and item_loc.source_site == source_site and item_loc.is_hook and item_loc.kind == .function and std.mem.eql(u8, item_loc.name, name)) {
+                if (item_loc.owner == owner and item_loc.source_site == source_site and item_loc.is_hook and item_loc.kind == .function and std.mem.eql(u8, item_loc.name.text(), name)) {
                     return .{ .item = item_id, .specialization = specialization };
                 }
             }
@@ -1112,6 +1103,24 @@ pub fn AnalysisContext(comptime Context: type) type {
             };
         }
 
+        pub fn internByteString(self: @This(), bytes: []const u8) !structures.ByteStringId {
+            return self.ctx.intern(ByteStrings, .{ .bytes = bytes });
+        }
+
+        pub fn byteString(self: @This(), id: structures.ByteStringId) ![]const u8 {
+            return (try self.ctx.lookupInterned(ByteStrings, id)).bytes;
+        }
+
+        pub fn stringType(self: @This()) !structures.TypeId {
+            const registered = (try standardFile(self.ctx, .text)) orelse return error.Unavailable;
+            const module = try self.ctx.intern(ModulePaths, .{ .path = standard_library.File.text.modulePath() });
+            const scope = (try self.ctx.get(ModuleDeclarations, module)).* orelse return error.Unavailable;
+            const item = scope.resolveStatic("String") orelse return error.Unavailable;
+            const resolved = (try self.ctx.get(ResolveItem, item)).* orelse return error.Unavailable;
+            std.debug.assert(resolved.file_id == registered);
+            return internStructType(self.ctx, item);
+        }
+
         pub fn internCompileTimeValue(self: @This(), value: structures.CompileTimeValue) !structures.CompileTimeValueId {
             return self.ctx.intern(CompileTimeValues, value);
         }
@@ -1155,7 +1164,7 @@ pub fn AnalysisContext(comptime Context: type) type {
                     const span = nodeSpan(&parsed, operand);
                     const name = source[span.start..span.end];
                     switch (owner) {
-                        .type => |type_id| if (try self.structNamespaceMember(type_id, name, span) == null) return false,
+                        .type => |type_id| if (try self.typeNamespaceMember(type_id, name, span) == null) return false,
                         .runtime => |runtime| if (try self.structDefinition(runtime.type_id)) |definition| {
                             const field = definition.resolveField(name) orelse return false;
                             if (!definition.fields[field.index].is_public and !try self.canAccessPrivateFields(runtime.type_id)) {
@@ -1261,6 +1270,7 @@ pub fn AnalysisContext(comptime Context: type) type {
         pub fn isPublicAnnotationReference(self: @This(), reference: structures.NameReference) !bool {
             return switch (reference) {
                 .declaration => |instance| self.declarationIsPublic(instance.item),
+                .overloaded_function => |choices| try self.declarationIsPublic(choices[0].item) and try self.declarationIsPublic(choices[1].item),
                 .constant, .namespace => true,
             };
         }
@@ -1269,18 +1279,22 @@ pub fn AnalysisContext(comptime Context: type) type {
             var current = item_id;
             while (true) {
                 const location = try self.ctx.lookupInterned(ItemLocations, current);
+                if (location.kind == .primitive) return true;
                 const module = switch (location.origin) {
                     .module => |module| module,
                     .entry => return false,
                 };
                 const scope = if (location.owner) |owner| scope: {
-                    const identity: structures.StructIdentity = if (location.source_site) |site|
+                    const owner_location = try self.ctx.lookupInterned(ItemLocations, owner);
+                    const identity: NamespaceIdentity = if (owner_location.kind == .primitive)
+                        .{ .primitive = owner }
+                    else if (location.source_site) |site|
                         .{ .generated = .{ .owner = .{ .item = owner }, .node_offset = site } }
                     else
                         .{ .declared = owner };
-                    break :scope (try self.ctx.get(StructNamespace, identity)).* orelse return error.Unavailable;
+                    break :scope (try self.ctx.get(TypeNamespace, identity)).* orelse return error.Unavailable;
                 } else (try self.ctx.get(ModuleDeclarations, module)).* orelse return error.Unavailable;
-                const entry = scope.resolveEntry(location.name) orelse return error.Unavailable;
+                const entry = scope.resolveName(location.name) orelse return error.Unavailable;
                 std.debug.assert(entry.item_id == current);
                 if (!entry.is_public) return false;
                 current = location.owner orelse return true;
@@ -1330,22 +1344,30 @@ pub fn AnalysisContext(comptime Context: type) type {
         }
 
         pub fn resolveMember(self: @This(), reference: structures.NameReference, name: []const u8, span: structures.SourceSpan) !?structures.NameReference {
+            return self.resolveMemberWithOperands(reference, name, span, null);
+        }
+
+        pub fn resolveMemberWithOperands(self: @This(), reference: structures.NameReference, name: []const u8, span: structures.SourceSpan, operands: ?usize) !?structures.NameReference {
             switch (reference) {
                 .namespace => |namespace| return try self.moduleMember(namespace, name, span),
                 .declaration => |item| {
                     if (try self.isGenericStruct(item.item)) {
-                        if (try self.genericStructNamespaceMember(item, name, span)) |member| return .{ .declaration = member };
+                        const source = (try itemSource(self.ctx, item.item)) orelse return null;
+                        const site = semantic.parameterizedStructSite(&source.parsed, source.resolved.declaration) orelse return null;
+                        const namespace = (try self.ctx.get(TypeNamespace, .{ .generated = .{ .owner = item, .node_offset = site } })).* orelse return error.Unavailable;
+                        if (try self.namespaceReference(namespace, item.specialization, name, span, operands)) |member| return member;
                         try rejectImport(self.ctx, .{ .file_id = self.file_id.?, .span = span }, .unknown_namespace_member);
                         return error.Unavailable;
                     }
                     const value = (try self.staticItem(item)) orelse return null;
-                    return self.constantMember(value, name, span);
+                    return self.constantMember(value, name, span, operands);
                 },
-                .constant => |value| return self.constantMember(value, name, span),
+                .constant => |value| return self.constantMember(value, name, span, operands),
+                .overloaded_function => return null,
             }
         }
 
-        fn constantMember(self: @This(), value_id: structures.CompileTimeValueId, name: []const u8, span: structures.SourceSpan) !?structures.NameReference {
+        fn constantMember(self: @This(), value_id: structures.CompileTimeValueId, name: []const u8, span: structures.SourceSpan, operands: ?usize) !?structures.NameReference {
             const value = try self.lookupCompileTimeValue(value_id);
             if (value == .runtime) {
                 const definition = (try self.facts().structDefinition(value.runtime.type_id)) orelse return null;
@@ -1370,10 +1392,58 @@ pub fn AnalysisContext(comptime Context: type) type {
                 try rejectImport(self.ctx, .{ .file_id = self.file_id.?, .span = span }, .unknown_namespace_member);
                 return error.Unavailable;
             }
-            if (try self.typeNamespace(value.type) == null) return null;
-            if (try self.structNamespaceMember(value.type, name, span)) |instance| return .{ .declaration = instance };
+            const association = (try self.typeNamespace(value.type)) orelse return null;
+            const namespace = (try self.ctx.get(TypeNamespace, association.query_key)).* orelse return error.Unavailable;
+            if (try self.namespaceReference(namespace, association.specialization, name, span, operands)) |member| return member;
             try rejectImport(self.ctx, .{ .file_id = self.file_id.?, .span = span }, .unknown_namespace_member);
             return error.Unavailable;
+        }
+
+        fn namespaceReference(self: @This(), namespace: structures.ModuleScope, specialization: ?structures.CompileTimeValueTupleId, spelling: []const u8, span: structures.SourceSpan, operands: ?usize) !?structures.NameReference {
+            const first_name = structures.Name.fromText(spelling, 1);
+            const second_name = structures.Name.fromText(spelling, 2);
+            if (structures.Name.order(first_name, second_name) == .eq) {
+                return .{ .declaration = .{ .item = (try self.visibleTypeMember(namespace, first_name, span)) orelse return null, .specialization = specialization } };
+            }
+            const first = namespace.resolveName(first_name);
+            const second = namespace.resolveName(second_name);
+            if (first == null and second == null) return null;
+            if (operands) |count| {
+                var selected: ?structures.ItemId = null;
+                for ([_]?structures.ModuleScope.Entry{ first, second }) |optional| {
+                    const entry = optional orelse continue;
+                    const shape = (try self.functionShape(entry.item_id)) orelse return error.Unavailable;
+                    if (count != entry.name.operation.operandCount() and count != shape.parameters.len) continue;
+                    if (selected != null) {
+                        try rejectImport(self.ctx, .{ .file_id = self.file_id.?, .span = span }, .ambiguous_operation_reference);
+                        return error.Unavailable;
+                    }
+                    selected = (try self.visibleTypeMember(namespace, entry.name, span)).?;
+                }
+                return .{ .declaration = .{ .item = selected orelse return null, .specialization = specialization } };
+            }
+            if (first != null and second != null) return .{ .overloaded_function = .{
+                .{ .item = first.?.item_id, .specialization = specialization },
+                .{ .item = second.?.item_id, .specialization = specialization },
+            } };
+            const entry = first orelse second.?;
+            return .{ .declaration = .{ .item = (try self.visibleTypeMember(namespace, entry.name, span)).?, .specialization = specialization } };
+        }
+
+        pub fn selectFunctionOverload(self: @This(), choices: [2]structures.InstanceId, operands: usize, span: structures.SourceSpan) !?structures.FunctionReference {
+            const selected = for (choices) |instance| {
+                const location = try self.ctx.lookupInterned(ItemLocations, instance.item);
+                if (location.name.operation.operandCount() == operands) break instance;
+            } else {
+                try rejectImport(self.ctx, .{ .file_id = self.file_id.?, .span = span }, .ambiguous_operation_reference);
+                return error.Unavailable;
+            };
+            const location = try self.ctx.lookupInterned(ItemLocations, selected.item);
+            if (location.origin.module != (try self.ctx.input(FileModule, self.file_id.?)).* and !try self.declarationIsPublic(selected.item)) {
+                try rejectImport(self.ctx, .{ .file_id = self.file_id.?, .span = span }, .private_access);
+                return error.Unavailable;
+            }
+            return self.functionItemReference(selected);
         }
 
         fn moduleMember(self: @This(), namespace: structures.NamespaceBinding, name: []const u8, span: structures.SourceSpan) !structures.NameReference {
@@ -1422,15 +1492,17 @@ pub fn AnalysisContext(comptime Context: type) type {
                 const inferring = self.prior_static_arguments != null and std.meta.eql(instance, self.instance.?);
                 const parent = (try enclosingInstance(self.ctx, instance, inferring)) orelse break;
                 const parent_loc = try self.ctx.lookupInterned(ItemLocations, parent.item);
-                const identity: ?structures.StructIdentity = if (loc.source_site) |site|
+                const identity: ?NamespaceIdentity = if (parent_loc.kind == .primitive)
+                    .{ .primitive = parent.item }
+                else if (loc.source_site) |site|
                     .{ .generated = .{ .owner = parent, .node_offset = site } }
                 else if (parent_loc.kind == .structure) identity: {
                     const value = (try self.staticItem(parent)) orelse unreachable;
                     const type_id = (try self.lookupCompileTimeValue(value)).type;
-                    break :identity (try self.ctx.lookupInterned(Types, type_id.interned().?)).structure;
+                    break :identity .fromStruct((try self.ctx.lookupInterned(Types, type_id.interned().?)).structure);
                 } else null;
                 if (identity) |structure| {
-                    const namespace = (try self.ctx.get(StructNamespace, structure)).* orelse return error.Unavailable;
+                    const namespace = (try self.ctx.get(TypeNamespace, structure)).* orelse return error.Unavailable;
                     if (namespace.resolve(name)) |item| return .{ .item = item, .specialization = parent.specialization };
                 }
                 current = parent;
@@ -1493,6 +1565,7 @@ pub const HostTypeLayout = struct {
         if (!try facts.isRuntimeCapable(type_id)) return error.Unavailable;
         if (type_id == .int or type_id == .bool) return .{ .byte_size = 4, .byte_alignment = 4 };
         if (type_id == .byte) return .{ .byte_size = 1, .byte_alignment = 1 };
+        if (type_id == .static_data or type_id == .byte_pointer) return .{ .byte_size = 8, .byte_alignment = 8 };
         if (type_id == .unit or type_id == .none or type_id == .never) return .{ .byte_size = 0, .byte_alignment = 1 };
         const data = (try ctx.lookupInternedAs(Types, type_id.interned().?)) orelse unreachable;
         switch (data.*) {
@@ -1839,11 +1912,12 @@ pub const IndexItems = struct {
                 var owner: ?structures.ItemId = null;
                 while (segments.next()) |segment| {
                     std.debug.assert(segment.len != 0);
+                    const primitive = if (owner == null) std.meta.stringToEnum(structures.TypeId, segment) else null;
                     owner = try ctx.intern(ItemLocations, .{
                         .origin = .{ .module = module },
                         .owner = owner,
-                        .kind = .structure,
-                        .name = segment,
+                        .kind = if (primitive != null) .primitive else .structure,
+                        .name = .{ .identifier = segment },
                     });
                 }
                 loc.owner = owner orelse unreachable;
@@ -1876,10 +1950,10 @@ pub const ModuleDeclarations = struct {
 
         var entries: std.ArrayList(structures.ModuleScope.Entry) = .empty;
         defer {
-            for (entries.items) |entry| ctx.allocator().free(entry.name);
+            for (entries.items) |*entry| entry.name.deinit(ctx.allocator());
             entries.deinit(ctx.allocator());
         }
-        var names = std.StringHashMap(void).init(ctx.allocator());
+        var names = structures.Name.Set.init(ctx.allocator());
         defer names.deinit();
         for (members.*) |file_id| {
             const parsed = (try ctx.get(ParseFile, file_id)).* orelse return null;
@@ -1899,17 +1973,10 @@ pub const ModuleDeclarations = struct {
                     });
                     return null;
                 }
-                const name = try ctx.allocator().dupe(u8, item.loc.name);
-                errdefer ctx.allocator().free(name);
-                try entries.append(ctx.allocator(), .{ .name = name, .item_id = item_id, .kind = item.loc.kind, .is_public = item.is_public });
+                try appendScopeEntry(ctx, &entries, .{ .name = item.loc.name, .item_id = item_id, .kind = item.loc.kind, .is_public = item.is_public });
             }
         }
-        std.mem.sort(structures.ModuleScope.Entry, entries.items, {}, struct {
-            fn lessThan(_: void, left: structures.ModuleScope.Entry, right: structures.ModuleScope.Entry) bool {
-                return std.mem.order(u8, left.name, right.name) == .lt;
-            }
-        }.lessThan);
-        return .{ .entries = try entries.toOwnedSlice(ctx.allocator()) };
+        return try finishScope(ctx, &entries);
     }
 };
 
@@ -1923,31 +1990,37 @@ pub const BuildModuleScope = struct {
         const declarations = (try ctx.get(ModuleDeclarations, file_module)).* orelse return null;
         var entries: std.ArrayList(structures.ModuleScope.Entry) = .empty;
         defer {
-            for (entries.items) |entry| ctx.allocator().free(entry.name);
+            for (entries.items) |*entry| entry.name.deinit(ctx.allocator());
             entries.deinit(ctx.allocator());
         }
         for (declarations.entries) |entry| {
-            const name = try ctx.allocator().dupe(u8, entry.name);
-            errdefer ctx.allocator().free(name);
-            try entries.append(ctx.allocator(), .{ .name = name, .item_id = entry.item_id, .kind = entry.kind, .is_public = entry.is_public });
+            try appendScopeEntry(ctx, &entries, entry);
         }
         const imports = (try ctx.get(ResolveFileImports, file_id)).* orelse return null;
         for (imports.imports) |binding| {
             if (binding.target != .declaration) continue;
             const item = binding.target.declaration;
             const loc = try ctx.lookupInterned(ItemLocations, item);
-            const name = try ctx.allocator().dupe(u8, binding.name);
-            errdefer ctx.allocator().free(name);
-            try entries.append(ctx.allocator(), .{ .name = name, .item_id = item, .kind = loc.kind, .is_public = false });
+            try appendScopeEntry(ctx, &entries, .{ .name = .{ .identifier = binding.name }, .item_id = item, .kind = loc.kind });
         }
-        std.mem.sort(structures.ModuleScope.Entry, entries.items, {}, struct {
-            fn lessThan(_: void, a: structures.ModuleScope.Entry, b: structures.ModuleScope.Entry) bool {
-                return std.mem.order(u8, a.name, b.name) == .lt;
-            }
-        }.lessThan);
-        return .{ .entries = try entries.toOwnedSlice(ctx.allocator()) };
+        return try finishScope(ctx, &entries);
     }
 };
+
+fn appendScopeEntry(ctx: anytype, entries: *std.ArrayList(structures.ModuleScope.Entry), entry: structures.ModuleScope.Entry) !void {
+    var owned = try value_operations.Owned(structures.ModuleScope.Entry).clone(ctx.allocator(), entry);
+    errdefer value_operations.Owned(structures.ModuleScope.Entry).deinit(&owned, ctx.allocator());
+    try entries.append(ctx.allocator(), owned);
+}
+
+fn finishScope(ctx: anytype, entries: *std.ArrayList(structures.ModuleScope.Entry)) !structures.ModuleScope {
+    std.mem.sort(structures.ModuleScope.Entry, entries.items, {}, struct {
+        fn lessThan(_: void, left: structures.ModuleScope.Entry, right: structures.ModuleScope.Entry) bool {
+            return structures.Name.order(left.name, right.name) == .lt;
+        }
+    }.lessThan);
+    return .{ .entries = try entries.toOwnedSlice(ctx.allocator()) };
+}
 
 pub const CollectFileImports = struct {
     pub const Input = structures.FileId;
@@ -2188,7 +2261,7 @@ pub const ResolvePreludeImports = struct {
         defer names.deinit();
         const prelude_declarations = (try ctx.get(ModuleDeclarations, prelude)).* orelse return null;
         for (prelude_declarations.entries) |entry| {
-            if (entry.is_public and !std.mem.startsWith(u8, entry.name, "$converter")) try names.put(entry.name, {});
+            if (entry.is_public and !std.mem.startsWith(u8, entry.name.text(), "$converter")) try names.put(entry.name.text(), {});
         }
         for (members) |prelude_file| {
             const collected = (try ctx.get(CollectFileImports, prelude_file)).* orelse return null;
@@ -2289,6 +2362,12 @@ pub const IndexModuleItems = struct {
                 return rejectItem(ctx, entry.location, .duplicate_struct_member);
             const loc = try ctx.lookupInterned(ItemLocations, entry.item);
             if (loc.owner) |owner| {
+                const owner_location = try ctx.lookupInterned(ItemLocations, owner);
+                if (owner_location.kind == .primitive) {
+                    if (entry.location.file_id != (try standardFile(ctx, .prelude)))
+                        return rejectItem(ctx, entry.location, .invalid_namespace_owner);
+                    continue;
+                }
                 if (index.resolve(owner) == null)
                     return rejectItem(ctx, entry.location, .invalid_namespace_owner);
             }
@@ -2333,14 +2412,22 @@ const ExternalSymbol = struct {
 
     pub fn run(ctx: anytype, item: Input) anyerror!Output {
         const loc = try ctx.lookupInterned(ItemLocations, item);
-        if (loc.kind != .function or loc.owner != null) return null;
+        if (loc.kind != .function) return null;
         const item_source = (try itemSource(ctx, item)) orelse return null;
         if (!semantic.isExternalFunction(&item_source.parsed, item_source.resolved.declaration)) return null;
         const module = switch (loc.origin) {
             .module => |module_id| module_id,
             .entry => return null,
         };
-        const symbol = std.meta.stringToEnum(standard_library.External, loc.name) orelse return null;
+        const symbol = if (loc.owner) |owner| primitive: {
+            const owner_location = try ctx.lookupInterned(ItemLocations, owner);
+            if (owner_location.kind != .primitive) return null;
+            if (loc.name != .operation) return null;
+            const type_id = std.meta.stringToEnum(structures.TypeId, owner_location.name.text()) orelse unreachable;
+            if (!loc.name.operation.supportsPrimitive(type_id)) return null;
+            break :primitive standard_library.External.primitive_operation;
+        } else std.meta.stringToEnum(standard_library.External, loc.name.text()) orelse return null;
+        if (symbol == .primitive_operation and loc.owner == null) return null;
         const file = symbol.file();
         const path = (try ctx.lookupInterned(ModulePaths, module)).path;
         if (!std.mem.eql(u8, path, file.modulePath())) return null;
@@ -2492,29 +2579,24 @@ fn validateDemandedSignature(
 
 fn validOperationSignature(types: anytype, item: structures.ItemId, signature: structures.FunctionSignature) !bool {
     const location = try types.ctx.lookupInterned(ItemLocations, item);
-    const name = location.name;
-    const arithmetic = std.mem.eql(u8, name, "+") or std.mem.eql(u8, name, "-") or std.mem.eql(u8, name, "*") or std.mem.eql(u8, name, "/");
-    const comparison = std.mem.eql(u8, name, "==") or std.mem.eql(u8, name, "<>") or std.mem.eql(u8, name, "<") or std.mem.eql(u8, name, ">") or std.mem.eql(u8, name, "<=") or std.mem.eql(u8, name, ">=");
-    const negation = location.owner != null and std.mem.eql(u8, name, "neg");
-    const logical_not = std.mem.eql(u8, name, "not");
-    const index_read = std.mem.eql(u8, name, "[]");
-    const index_write = std.mem.eql(u8, name, "[]=");
-    if (!arithmetic and !comparison and !negation and !logical_not and !index_read and !index_write) return true;
+    if (location.name != .operation) return true;
+    const operation = location.name.operation;
+    const index_write = operation == .@"[]=";
     if (location.owner == null) return false;
-    const count: usize = if (negation or logical_not) 1 else if (index_write) 3 else 2;
+    const count = operation.operandCount();
     if (signature.parameters.len != count) return false;
     const receiver = signature.parameters[0];
     const association = (try types.typeNamespace(receiver.type_id)) orelse return false;
-    if (structOwnerItem(association.query_key) != location.owner.?) return false;
+    if (association.query_key.owner() != location.owner.?) return false;
     if (receiver.mode != (if (index_write) structures.ParameterMode.mut else .imm)) return false;
-    if (index_read or index_write) {
+    if (operation.isIndexer()) {
         if (signature.parameters[1].mode != .imm or signature.parameters[1].type_id != .int) return false;
         if (index_write and (signature.parameters[2].mode != .init or signature.return_type != .unit)) return false;
         return true;
     }
     if (signature.is_fallible) return false;
     if (count == 2 and (signature.parameters[1].mode != .imm or signature.parameters[1].type_id != receiver.type_id)) return false;
-    return signature.return_type == (if (comparison or logical_not) structures.TypeId.bool else receiver.type_id);
+    return signature.return_type == (if (operation.returnsBool()) structures.TypeId.bool else receiver.type_id);
 }
 
 fn librarySignatureIssue(types: anytype, item: structures.ItemId, signature: structures.FunctionSignature) !?structures.Diagnostic.Kind {
@@ -2562,7 +2644,9 @@ fn validateWhereConditions(
         var body = (try typing.resolveAndTypeBody(ctx, instance, resolved.file_id, &.{}, .unit, true, .{ .publish_instruction_spans = true, .allow_type_values = true }, type_interner, unresolved)) orelse return false;
         defer body.deinit(ctx.allocator());
         var arguments: [0]comptime_interpreter.Value = .{};
-        var executor: ComptimeCallExecutor(@TypeOf(ctx)) = .{ .ctx = ctx, .owner = instance.item };
+        var heap: comptime_interpreter.Heap = .init(ctx.allocator());
+        defer heap.deinit();
+        var executor: ComptimeCallExecutor(@TypeOf(ctx)) = .{ .ctx = ctx, .owner = instance.item, .heap = &heap };
         switch (try comptime_interpreter.execute(&body, &arguments, &executor, ctx.allocator())) {
             .returned => {},
             .failure => {
@@ -2587,6 +2671,7 @@ fn validateExternalSignature(ctx: anytype, item: structures.ItemId, file_id: str
     if (!semantic.isExternalFunction(parsed, declaration)) return signature;
     const symbol = (try ctx.get(ExternalSymbol, item)).* orelse return null;
     const valid = switch (symbol) {
+        .primitive_operation => true,
         .copy_value, .move_value => !signature.is_fallible and signature.parameters.len == 1 and
             signature.parameters[0].type_id == signature.return_type and
             signature.parameters[0].mode == (if (symbol == .copy_value) structures.ParameterMode.imm else .deinit),
@@ -2599,6 +2684,18 @@ fn validateExternalSignature(ctx: anytype, item: structures.ItemId, file_id: str
             const array = (try lookupArrayType(ctx, signature.return_type)) orelse break :blk false;
             break :blk std.meta.eql(shape, array);
         },
+        .literal_data, .literal_size => signature.parameters.len == 0 and !signature.is_fallible and signature.return_type == (if (symbol == .literal_data) structures.TypeId.static_data else .int),
+        .static_pointer => !signature.is_fallible and signature.parameters.len == 1 and signature.parameters[0].mode == .imm and signature.parameters[0].type_id == .static_data and signature.return_type == .byte_pointer,
+        .array_bytes_pointer => blk: {
+            if (signature.is_fallible or signature.parameters.len != 1 or signature.parameters[0].mode != .imm or signature.return_type != .byte_pointer) break :blk false;
+            const shape = (try lookupArrayType(ctx, signature.parameters[0].type_id)) orelse break :blk false;
+            break :blk shape.element_type == .byte;
+        },
+        .allocation_bytes_pointer => !signature.is_fallible and signature.parameters.len == 1 and signature.parameters[0].mode == .imm and signature.return_type == .byte_pointer and (try allocationElementType(ctx, signature.parameters[0].type_id)) == structures.TypeId.byte,
+        .byte_offset, .byte_read => !signature.is_fallible and signature.parameters.len == 2 and signature.parameters[0].mode == .imm and signature.parameters[0].type_id == .byte_pointer and signature.parameters[1].mode == .imm and signature.parameters[1].type_id == .int and signature.return_type == (if (symbol == .byte_offset) structures.TypeId.byte_pointer else .byte),
+        .byte_int => !signature.is_fallible and signature.parameters.len == 1 and signature.parameters[0].mode == .imm and signature.parameters[0].type_id == .byte and signature.return_type == .int,
+        .io_write => signature.is_fallible and signature.return_type == .int and signature.parameters.len == 3 and signature.parameters[0].type_id == .int and signature.parameters[1].type_id == .byte_pointer and signature.parameters[2].type_id == .int and allImmutable(signature.parameters),
+        .io_read => signature.is_fallible and signature.return_type == .int and signature.parameters.len == 4 and signature.parameters[0].type_id == .int and (try allocationElementType(ctx, signature.parameters[1].type_id)) == structures.TypeId.byte and signature.parameters[2].type_id == .int and signature.parameters[3].type_id == .int and allImmutable(signature.parameters),
         .literal_byte => signature.parameters.len == 0 and signature.return_type == .byte and !signature.is_fallible,
         .array_borrow, .array_borrow_mut => try validArrayBorrowSignature(ctx, symbol, signature),
         .exit => !signature.is_fallible and signature.return_type == .never and
@@ -3004,7 +3101,9 @@ pub const ExecuteComptimeThunk = struct {
 
     pub fn run(ctx: anytype, site: Input) anyerror!Output {
         const body = (try ctx.get(AnalyzeComptimeThunk, site)).* orelse return null;
-        var executor: ComptimeCallExecutor(@TypeOf(ctx)) = .{ .ctx = ctx, .owner = site.owner.item };
+        var heap: comptime_interpreter.Heap = .init(ctx.allocator());
+        defer heap.deinit();
+        var executor: ComptimeCallExecutor(@TypeOf(ctx)) = .{ .ctx = ctx, .owner = site.owner.item, .heap = &heap };
         var arguments: [0]comptime_interpreter.Value = .{};
         const result = try comptime_interpreter.execute(&body, &arguments, &executor, ctx.allocator());
         return switch (result) {
@@ -3069,25 +3168,23 @@ pub const ExecuteComptimeCall = struct {
             argument.* = .{ .runtime = runtime.value };
         }
 
-        if ((try ctx.get(ExternalSymbol, key.instance.item)).*) |symbol| {
-            switch (symbol) {
-                .copy_value, .move_value, .array_filled, .array_from, .array_borrow, .array_borrow_mut, .literal_byte, .initialize_collection => {},
-                .exit => return .{ .completed = .{
-                    .outcome = .{ .exit = arguments[0].runtime.int },
-                    .arguments = key.arguments,
-                } },
-                .allocate_host_storage, .deallocate_host_storage, .allocate, .deallocate, .allocation_count, .unsafe_initialize, .unsafe_take, .unsafe_destroy, .unsafe_borrow_initialized, .borrow_box, .borrow_mut_box, .borrow_local, .unsafe_borrow_element, .unsafe_borrow_mut_element, .read, .write, .attenuate_ref, .unsafe_own_box, .unsafe_take_box, .unsafe_destroy_box, .deallocate_box => {
-                    try emitComptimeExecutionIssue(ctx, key.instance.item, null, .{ .reason = .unsupported_operation });
-                    return .execution_error;
-                },
-            }
-        }
-
-        const body = (try ctx.get(AnalyzeComptimeFunctionBody, key.instance)).* orelse return null;
-        var executor: ComptimeCallExecutor(@TypeOf(ctx)) = .{ .ctx = ctx, .owner = key.instance.item };
-        const result = try comptime_interpreter.execute(&body, arguments, &executor, ctx.allocator());
+        var heap: comptime_interpreter.Heap = .init(ctx.allocator());
+        defer heap.deinit();
+        var executor: ComptimeCallExecutor(@TypeOf(ctx)) = .{ .ctx = ctx, .owner = key.instance.item, .heap = &heap };
+        var storage_arena: std.heap.ArenaAllocator = .init(ctx.allocator());
+        defer storage_arena.deinit();
+        const execution = if ((try ctx.get(ExternalSymbol, key.instance.item)).* != null)
+            try executor.callTransient(key.instance, arguments, null, storage_arena.allocator())
+        else blk: {
+            const body = (try ctx.get(AnalyzeComptimeFunctionBody, key.instance)).* orelse return null;
+            break :blk try comptime_interpreter.executeInStorage(&body, arguments, &executor, ctx.allocator(), storage_arena.allocator());
+        };
+        const modes = try ctx.allocator().alloc(structures.ParameterMode, signature.parameters.len);
+        defer ctx.allocator().free(modes);
+        for (signature.parameters, modes) |parameter, *mode| mode.* = parameter.mode;
+        const result = try comptime_interpreter.publish(execution, arguments, modes, &executor, ctx.allocator());
         const outcome: structures.CompileTimeOutcome = switch (result) {
-            .returned => |value| structures.CompileTimeOutcome{ .returned = try internInterpretedValue(ctx, body.return_type, value) },
+            .returned => |value| structures.CompileTimeOutcome{ .returned = try internInterpretedValue(ctx, signature.return_type, value) },
             .failure => structures.CompileTimeOutcome.failure,
             .exit => |status| structures.CompileTimeOutcome{ .exit = status },
             .execution_error => |execution_error| {
@@ -3098,7 +3195,7 @@ pub const ExecuteComptimeCall = struct {
             .unavailable => null,
         } orelse return null;
 
-        if (!has_mut_arguments) return .{ .completed = .{ .outcome = outcome, .arguments = key.arguments } };
+        if (!has_mut_arguments or outcome == .exit) return .{ .completed = .{ .outcome = outcome, .arguments = key.arguments } };
         const final_argument_ids = try ctx.allocator().alloc(structures.CompileTimeValueId, arguments.len);
         defer ctx.allocator().free(final_argument_ids);
         for (arguments, signature.parameters, final_argument_ids) |argument, parameter, *value_id| value_id.* =
@@ -3115,13 +3212,25 @@ fn ComptimeCallExecutor(comptime Context: type) type {
         const Frame = struct { instance: structures.InstanceId, arguments: comptime_interpreter.ValueSnapshot };
         ctx: Context,
         owner: structures.ItemId,
+        heap: *comptime_interpreter.Heap,
         transient_frames: std.ArrayList(Frame) = .empty,
 
         pub fn callInStorage(self: *@This(), instance: structures.InstanceId, arguments: []comptime_interpreter.Value, call_span: ?structures.SourceSpan, storage: std.mem.Allocator) anyerror!comptime_interpreter.Result {
+            if ((try self.ctx.get(ExternalSymbol, instance.item)).* == .primitive_operation)
+                return self.callTransient(instance, arguments, call_span, storage);
             for (arguments) |argument| switch (argument) {
                 .place, .initializer => return self.callTransient(instance, arguments, call_span, storage),
                 .runtime, .type => {},
             };
+            const signature = if (instance.specialization == null)
+                (try self.ctx.get(FunctionSignature, instance.item)).* orelse return .unavailable
+            else
+                (try self.ctx.get(FunctionInstanceSignature, instance)).* orelse return .unavailable;
+            const facts: TypeFacts(Context) = .{ .ctx = self.ctx };
+            if (try facts.mayContainStorage(signature.return_type)) return self.callTransient(instance, arguments, call_span, storage);
+            for (signature.parameters) |parameter| {
+                if (parameter.mode == .mut and try facts.mayContainStorage(parameter.type_id)) return self.callTransient(instance, arguments, call_span, storage);
+            }
             return self.call(instance, arguments, call_span);
         }
 
@@ -3223,9 +3332,21 @@ fn ComptimeCallExecutor(comptime Context: type) type {
             else
                 (try self.ctx.get(FunctionInstanceSignature, instance)).* orelse return .unavailable;
             std.debug.assert(arguments.len == signature.parameters.len);
-            if ((try self.ctx.get(ExternalSymbol, instance.item)).*) |symbol| {
+            const external = (try self.ctx.get(ExternalSymbol, instance.item)).*;
+            if (external) |symbol| {
                 switch (symbol) {
-                    .copy_value, .move_value, .array_filled, .array_from, .array_borrow, .array_borrow_mut, .literal_byte, .initialize_collection => {},
+                    .primitive_operation, .copy_value, .move_value, .array_filled, .array_from, .array_borrow, .array_borrow_mut, .literal_byte, .literal_data, .literal_size, .static_pointer, .array_bytes_pointer, .allocation_bytes_pointer, .byte_offset, .byte_read, .byte_int, .initialize_collection => {},
+                    .unsafe_initialize => {},
+                    .allocate, .allocate_host_storage => return self.allocateStorage(symbol, signature.return_type, arguments, storage),
+                    .deallocate, .deallocate_host_storage, .deallocate_box => {
+                        comptime_interpreter.allocationRecord(arguments[0]).release();
+                        return .{ .returned = .{ .runtime = .unit } };
+                    },
+                    .allocation_count => return .{ .returned = .{ .runtime = .{ .int = @intCast(comptime_interpreter.allocationRecord(arguments[0]).capacity) } } },
+                    .unsafe_take, .unsafe_borrow_initialized, .unsafe_take_box => return self.readReference(try self.storageElement(arguments, symbol == .unsafe_take_box), storage),
+                    .unsafe_borrow_element, .unsafe_borrow_mut_element, .borrow_box, .borrow_mut_box => return .{ .returned = try comptime_interpreter.referenceValue(signature.return_type, try self.storageElement(arguments, symbol == .borrow_box or symbol == .borrow_mut_box), storage) },
+                    .unsafe_own_box => return self.ownBox(signature.return_type, arguments[0], storage),
+                    .unsafe_destroy, .unsafe_destroy_box => unreachable,
                     .read, .write, .attenuate_ref => return self.referenceCall(symbol, signature.return_type, arguments, call_span, storage),
                     .borrow_local => return .{ .returned = try comptime_interpreter.referenceValue(signature.return_type, arguments[0].place, storage) },
                     .exit => return .{ .exit = switch (arguments[0]) {
@@ -3256,13 +3377,39 @@ fn ComptimeCallExecutor(comptime Context: type) type {
             const previous_owner = self.owner;
             self.owner = instance.item;
             defer self.owner = previous_owner;
-            const result = try comptime_interpreter.executeInStorage(&body, arguments, self, self.ctx.allocator(), storage);
+            var result = try comptime_interpreter.executeInStorage(&body, arguments, self, self.ctx.allocator(), storage);
+            if (external != null) {
+                if (result == .execution_error) result.execution_error.span = call_span;
+                return result;
+            }
             if (result == .execution_error) try emitComptimeExecutionIssue(self.ctx, instance.item, null, result.execution_error);
             if (result == .execution_error or result == .reported_error) {
                 try emitComptimeCallTrace(self.ctx, previous_owner, call_span);
                 return .reported_error;
             }
             return result;
+        }
+
+        fn allocateStorage(self: *@This(), symbol: standard_library.External, return_type: structures.TypeId, arguments: []comptime_interpreter.Value, storage: std.mem.Allocator) !comptime_interpreter.Result {
+            const element_type = if (symbol == .allocate) (try allocationElementType(self.ctx, return_type)) orelse return .unavailable else structures.TypeId.byte;
+            const layout = (try self.ctx.get(HostTypeLayout, element_type)).*;
+            const count = if (arguments[0] == .place) arguments[0].place.contents.value.int else arguments[0].runtime.int;
+            if (comptime_interpreter.allocationByteSize(layout.byte_size, count) == null) return .failure;
+            const allocation = try self.heap.allocate(element_type, @intCast(count));
+            return .{ .returned = try comptime_interpreter.allocationValue(return_type, allocation, storage) };
+        }
+
+        fn storageElement(_: *@This(), arguments: []comptime_interpreter.Value, boxed: bool) !*comptime_interpreter.Cell {
+            const index = if (boxed) 0 else if (arguments[1] == .place) arguments[1].place.contents.value.int else arguments[1].runtime.int;
+            return comptime_interpreter.allocationRecord(arguments[0]).element(@intCast(index));
+        }
+
+        fn ownBox(self: *@This(), type_id: structures.TypeId, allocation: comptime_interpreter.Value, storage: std.mem.Allocator) !comptime_interpreter.Result {
+            const cell = try storage.create(comptime_interpreter.Cell);
+            const fields = try storage.alloc(comptime_interpreter.Cell, 1);
+            fields[0] = .{ .type_id = (try self.structFieldType(type_id, 0)) orelse return .unavailable, .storage = storage, .contents = .{ .allocation = comptime_interpreter.allocationRecord(allocation) } };
+            cell.* = .{ .type_id = type_id, .storage = storage, .contents = .{ .fields = fields } };
+            return .{ .returned = .{ .place = cell } };
         }
 
         fn referenceCall(self: *@This(), symbol: standard_library.External, return_type: structures.TypeId, arguments: []comptime_interpreter.Value, call_span: ?structures.SourceSpan, storage: std.mem.Allocator) !comptime_interpreter.Result {
@@ -3285,6 +3432,10 @@ fn ComptimeCallExecutor(comptime Context: type) type {
             copy.* = .{ .type_id = target.type_id, .storage = storage, .contents = .uninitialized };
             try comptime_interpreter.assignCell(copy, .{ .place = target }, self);
             return .{ .returned = .{ .place = copy } };
+        }
+
+        pub fn byteString(self: *@This(), id: structures.ByteStringId) ![]const u8 {
+            return (try self.ctx.lookupInterned(ByteStrings, id)).bytes;
         }
 
         pub fn internRuntime(self: *@This(), type_id: structures.TypeId, value: structures.CompileTimeValue.RuntimeValue) !structures.CompileTimeValueId {
@@ -3358,6 +3509,7 @@ fn emitComptimeExecutionIssue(
             .division_by_zero => .compile_time_division_by_zero,
             .integer_overflow => .compile_time_integer_overflow,
             .unsupported_operation => .compile_time_unsupported_operation,
+            .escaping_storage => .compile_time_escaping_storage,
         },
     });
 }
@@ -3372,48 +3524,28 @@ fn emitComptimeCallTrace(ctx: anytype, owner: structures.ItemId, span: ?structur
     });
 }
 
-pub const StructNamespace = struct {
-    pub const Input = structures.StructIdentity;
+pub const TypeNamespace = struct {
+    pub const Input = NamespaceIdentity;
     pub const Output = ?structures.ModuleScope;
 
     pub fn run(ctx: anytype, identity: Input) anyerror!Output {
-        const owner = structOwnerItem(identity);
-        const item_source = (try itemSource(ctx, owner)) orelse return null;
-        const source = (try ctx.input(SourceText, item_source.resolved.file_id)).*;
-        const site: ?i64 = switch (identity) {
-            .declared => null,
-            .generated => |generated| generated.node_offset,
-        };
-        const struct_index: structures.Node.Index = if (site) |offset| generated: {
-            const position = std.math.cast(u32, @as(i64, item_source.resolved.declaration) + offset) orelse return null;
-            if (position >= item_source.parsed.nodes.len or item_source.parsed.nodes[position].tag != .@"struct") return null;
-            break :generated @fromBackingInt(@intCast(position));
-        } else item_source.parsed.nodes[item_source.resolved.declaration].data.node_node.b;
-        if (try semantic.validateStructNamespace(&item_source.parsed, source, struct_index, ctx.allocator())) |issue| {
-            try typing.emitSemanticIssue(ctx, item_source.resolved.file_id, issue);
-            return null;
-        }
+        const owner = identity.owner();
         const owner_loc = try ctx.lookupInterned(ItemLocations, owner);
+        const site: ?i64 = if (identity == .generated) identity.generated.node_offset else null;
         const member_site = if (owner_loc.kind == .structure) null else site;
         var entries: std.ArrayList(structures.ModuleScope.Entry) = .empty;
         defer {
-            for (entries.items) |entry| ctx.allocator().free(entry.name);
+            for (entries.items) |*entry| entry.name.deinit(ctx.allocator());
             entries.deinit(ctx.allocator());
         }
-        var names = std.StringHashMap(void).init(ctx.allocator());
+        var names = structures.Name.Set.init(ctx.allocator());
         defer names.deinit();
-        const struct_node = item_source.parsed.nodes[struct_index.index()];
-        for (item_source.parsed.node_refs[struct_node.data.ref.start..struct_node.data.ref.end]) |member_index| {
-            const item = item_source.parsed.nodes[member_index.index()];
-            const member = if (item.tag == .@"pub") item_source.parsed.nodes[item.data.node.index()] else item;
-            if (member.tag != .struct_field) continue;
-            const token = item_source.parsed.tokens[member.token_index];
-            try names.put(source[token.loc.start..token.loc.end], {});
-        }
+        if (identity != .primitive and !try reserveStructNamespaceFields(ctx, identity, &names)) return null;
         const module = switch (owner_loc.origin) {
             .module => |value| value,
             .entry => unreachable,
         };
+        if ((try ctx.get(IndexModuleItems, module)).* == null) return null;
         const files = (try ctx.input(ModuleMembers, module)).*;
         for (files) |file_id| {
             const index = (try ctx.get(IndexItems, file_id)).* orelse return null;
@@ -3422,7 +3554,7 @@ pub const StructNamespace = struct {
             for (discovered.items, index.ids()) |item, item_id| {
                 const loc = try ctx.lookupInterned(ItemLocations, item_id);
                 if (loc.owner != owner or loc.source_site != member_site or loc.is_hook) continue;
-                const reserved = std.meta.stringToEnum(structures.OwnershipMember, loc.name) != null;
+                const reserved = std.meta.stringToEnum(structures.OwnershipMember, loc.name.text()) != null;
                 if (reserved or (try names.getOrPut(loc.name)).found_existing) {
                     const member_parsed = (try ctx.get(ParseFile, file_id)).* orelse return null;
                     const declaration = index.resolve(item_id) orelse unreachable;
@@ -3434,19 +3566,35 @@ pub const StructNamespace = struct {
                     });
                     return null;
                 }
-                const name = try ctx.allocator().dupe(u8, loc.name);
-                errdefer ctx.allocator().free(name);
-                try entries.append(ctx.allocator(), .{ .name = name, .item_id = item_id, .kind = loc.kind, .is_public = item.is_public });
+                try appendScopeEntry(ctx, &entries, .{ .name = loc.name, .item_id = item_id, .kind = loc.kind, .is_public = item.is_public });
             }
         }
-        std.mem.sort(structures.ModuleScope.Entry, entries.items, {}, struct {
-            fn lessThan(_: void, a: structures.ModuleScope.Entry, b: structures.ModuleScope.Entry) bool {
-                return std.mem.order(u8, a.name, b.name) == .lt;
-            }
-        }.lessThan);
-        return .{ .entries = try entries.toOwnedSlice(ctx.allocator()) };
+        return try finishScope(ctx, &entries);
     }
 };
+
+fn reserveStructNamespaceFields(ctx: anytype, identity: NamespaceIdentity, names: *structures.Name.Set) !bool {
+    const item_source = (try itemSource(ctx, identity.owner())) orelse return false;
+    const source = (try ctx.input(SourceText, item_source.resolved.file_id)).*;
+    const struct_index: structures.Node.Index = if (identity == .generated) generated: {
+        const position = std.math.cast(u32, @as(i64, item_source.resolved.declaration) + identity.generated.node_offset) orelse return false;
+        if (position >= item_source.parsed.nodes.len or item_source.parsed.nodes[position].tag != .@"struct") return false;
+        break :generated @fromBackingInt(@intCast(position));
+    } else item_source.parsed.nodes[item_source.resolved.declaration].data.node_node.b;
+    if (try semantic.validateStructNamespace(&item_source.parsed, source, struct_index, ctx.allocator())) |issue| {
+        try typing.emitSemanticIssue(ctx, item_source.resolved.file_id, issue);
+        return false;
+    }
+    const struct_node = item_source.parsed.nodes[struct_index.index()];
+    for (item_source.parsed.node_refs[struct_node.data.ref.start..struct_node.data.ref.end]) |member_index| {
+        const item = item_source.parsed.nodes[member_index.index()];
+        const member = if (item.tag == .@"pub") item_source.parsed.nodes[item.data.node.index()] else item;
+        if (member.tag != .struct_field) continue;
+        const token = item_source.parsed.tokens[member.token_index];
+        try names.put(.{ .identifier = source[token.loc.start..token.loc.end] }, {});
+    }
+    return true;
+}
 
 pub const StructDefinition = struct {
     pub const Input = structures.ItemId;
@@ -3457,7 +3605,7 @@ pub const StructDefinition = struct {
         if (loc.kind != .structure) return null;
         const resolved = (try ctx.get(ResolveItem, item_id)).* orelse return null;
         // Validate the complete member scope, including qualified declarations.
-        _ = (try ctx.get(StructNamespace, .{ .declared = item_id })).* orelse return null;
+        _ = (try ctx.get(TypeNamespace, .{ .declared = item_id })).* orelse return null;
         const parsed = (try ctx.get(ParseFile, resolved.file_id)).* orelse return null;
         const source = (try ctx.input(SourceText, resolved.file_id)).*;
         const type_interner: AnalysisContext(@TypeOf(ctx)) = .{ .ctx = ctx, .file_id = resolved.file_id, .instance = .{ .item = item_id } };
@@ -3534,6 +3682,7 @@ fn analyzeFunctionBody(ctx: anytype, instance: structures.InstanceId, publish_in
     if ((try ctx.get(BuildModuleScope, resolved.file_id)).* == null) return null;
     const parsed = (try ctx.get(ParseFile, resolved.file_id)).* orelse return null;
     const builtin_body: ?typing.BuiltinBody = if ((try ctx.get(ExternalSymbol, instance.item)).*) |symbol| switch (symbol) {
+        .primitive_operation => .{ .primitive_operation = loc.name.operation },
         .copy_value => .copy,
         .move_value => .move,
         .array_filled => .array_filled,
@@ -3542,6 +3691,12 @@ fn analyzeFunctionBody(ctx: anytype, instance: structures.InstanceId, publish_in
         .array_borrow => .array_borrow,
         .array_borrow_mut => .array_borrow_mut,
         .literal_byte => .literal_byte,
+        .literal_data => .literal_data,
+        .literal_size => .literal_size,
+        .static_pointer, .array_bytes_pointer, .allocation_bytes_pointer => .byte_pointer,
+        .byte_offset => .byte_offset,
+        .byte_read => .byte_read,
+        .byte_int => .byte_to_int,
         .unsafe_initialize => .initialize_slot,
         else => null,
     } else null;
@@ -3554,7 +3709,7 @@ fn analyzeFunctionBody(ctx: anytype, instance: structures.InstanceId, publish_in
     };
     var unresolved = (try availableSemanticValue(ctx, resolved.file_id, semantic.buildUnresolvedBody(&parsed, source, resolved.declaration, loc.kind, parameters, type_interner, ctx.allocator()))) orelse return null;
     defer unresolved.deinit(ctx.allocator());
-    var consuming_converter = builtin_body == .array_from or builtin_body == .initialize_collection;
+    var consuming_converter = if (builtin_body) |body| body == .array_from or body == .initialize_collection else false;
     if (loc.kind == .function and parsed.nodes[parsed.nodes[resolved.declaration].data.node_node.b.index()].is_converter) {
         for (parameters) |parameter| if (parameter.mode == .init) {
             consuming_converter = true;
@@ -3602,7 +3757,12 @@ pub const CompileFunction = struct {
             else
                 (try ctx.get(FunctionInstanceSignature, instance_id)).* orelse return null;
             return switch (symbol) {
-                .copy_value, .move_value, .array_filled, .array_from, .array_borrow, .array_borrow_mut, .unsafe_initialize, .literal_byte, .initialize_collection => try compileTypedFunction(ctx, instance_id),
+                .primitive_operation, .copy_value, .move_value, .array_filled, .array_from, .array_borrow, .array_borrow_mut, .unsafe_initialize, .literal_byte, .literal_data, .literal_size, .static_pointer, .array_bytes_pointer, .allocation_bytes_pointer, .byte_offset, .byte_read, .byte_int, .initialize_collection => try compileTypedFunction(ctx, instance_id),
+                .io_read, .io_write => blk: {
+                    const signature = (try ctx.get(FunctionSignature, instance_id.item)).* orelse return null;
+                    const types: HostTypes(@TypeOf(ctx)) = .{ .ctx = ctx };
+                    break :blk try codegen.compileExternalByteIo(symbol == .io_read, signature, types, ctx.allocator());
+                },
                 .exit => try codegen.compileExternalExit(ctx.allocator()),
                 .allocate_host_storage => try codegen.compileExternalAllocateHostStorage(ctx.allocator()),
                 .deallocate_host_storage => try codegen.compileExternalDeallocateHostStorage(ctx.allocator()),
@@ -3688,27 +3848,22 @@ pub const CollectReachableInstances = struct {
         const entry_id = (try ctx.get(SelectEntry, file_id)).* orelse return null;
         const entry: structures.InstanceId = .{ .item = entry_id };
 
-        var instances: std.ArrayList(structures.InstanceId) = .empty;
+        var instances: std.AutoArrayHashMapUnmanaged(structures.InstanceId, void) = .empty;
         defer instances.deinit(ctx.allocator());
-        var seen = std.AutoHashMap(structures.InstanceId, void).init(ctx.allocator());
-        defer seen.deinit();
-
-        try instances.append(ctx.allocator(), entry);
-        try seen.put(entry, {});
+        try instances.put(ctx.allocator(), entry, {});
         var next: usize = 0;
-        while (next < instances.items.len) : (next += 1) {
-            const instance = instances.items[next];
+        while (next < instances.count()) : (next += 1) {
+            const instance = instances.keys()[next];
             const artifact = (try ctx.get(CompileFunction, instance)).* orelse return null;
             for (artifact.referenced_instances) |referenced| {
-                const result = try seen.getOrPut(referenced);
+                const result = try instances.getOrPut(ctx.allocator(), referenced);
                 if (!result.found_existing) {
-                    try instances.append(ctx.allocator(), referenced);
                     if (ctx.hasParallelWorkers()) _ = try ctx.spawn(CompileFunction, referenced);
                 }
             }
         }
 
-        return .{ .instances = try instances.toOwnedSlice(ctx.allocator()) };
+        return .{ .instances = try ctx.allocator().dupe(structures.InstanceId, instances.keys()) };
     }
 };
 
@@ -3744,7 +3899,7 @@ pub const ValidateModuleGraph = struct {
                 const parsed = (try ctx.get(ParseFile, file)).* orelse return false;
                 const source = (try ctx.input(SourceText, file)).*;
                 for (tree.items, index.ids()) |item, item_id| {
-                    if (item.loc.kind != .function or !std.mem.startsWith(u8, item.loc.name, "$converter")) continue;
+                    if (item.loc.kind != .function or !std.mem.startsWith(u8, item.loc.name.text(), "$converter")) continue;
                     const analysis: AnalysisContext(@TypeOf(ctx)) = .{ .ctx = ctx, .file_id = file, .instance = .{ .item = item_id } };
                     switch (try semantic.validateConverterDeclaration(&parsed, source, item.declaration, analysis)) {
                         .success => {},
@@ -3999,9 +4154,9 @@ test "struct namespace reserves pub wrapped field names for qualified members" {
     try modules.registerSources(db, std.testing.allocator, "struct Visible\n  pub value: int\nfunc Visible.value() int -> 42", &.{}, &.{});
     const module = (try db.input(FileModule, 0)).*;
     const item = (try db.get(ModuleDeclarations, module)).*.?.resolve("Visible").?;
-    const identity: structures.StructIdentity = .{ .declared = item };
-    try std.testing.expect((try db.get(StructNamespace, identity)).* == null);
-    const diagnostics = try db.transitiveAccumulatorValues(StructNamespace, identity, structures.Diagnostic, std.testing.allocator);
+    const identity: NamespaceIdentity = .{ .declared = item };
+    try std.testing.expect((try db.get(TypeNamespace, identity)).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(TypeNamespace, identity, structures.Diagnostic, std.testing.allocator);
     defer std.testing.allocator.free(diagnostics);
     try std.testing.expectEqual(@as(usize, 1), diagnostics.len);
     try std.testing.expectEqual(structures.Diagnostic.Kind.duplicate_struct_member, diagnostics[0].kind);
@@ -4034,13 +4189,13 @@ test "inline array canonical identity and namespace do not depend on filled avai
             try std.testing.expectEqual(@as(i32, 3), (try ctx.lookupInterned(CompileTimeValues, arguments[1])).runtime.value.int);
             const inferred = (try analysis.structFactoryArguments(.{ .item = identity.owner.item }, three)).?;
             try std.testing.expect(std.mem.eql(structures.CompileTimeValueId, arguments, inferred));
-            const filled = (try analysis.structNamespaceMember(three, "filled", .{ .start = 0, .end = 0 })).?;
+            const filled = (try analysis.typeNamespaceMember(three, "filled", .{ .start = 0, .end = 0 })).?;
             try std.testing.expectEqual(structures.CallBehavior.ordinary, try analysis.callBehavior(filled.item));
             try std.testing.expectEqual(three, (try ctx.get(FunctionInstanceSignature, filled)).*.?.return_type);
             for ([_][]const u8{ "Empty", "Nonempty" }) |name| {
                 const type_id = (try ctx.lookupInterned(CompileTimeValues, (try ctx.get(ResolveStatic, scope.resolve(name).?)).*.?)).type;
                 try std.testing.expect(try facts.arrayType(type_id) != null);
-                const unavailable = (try analysis.structNamespaceMember(type_id, "filled", .{ .start = 0, .end = 0 })).?;
+                const unavailable = (try analysis.typeNamespaceMember(type_id, "filled", .{ .start = 0, .end = 0 })).?;
                 try std.testing.expect((try ctx.get(FunctionInstanceSignature, unavailable)).* == null);
                 const diagnostics = try ctx.db.transitiveAccumulatorValues(FunctionInstanceSignature, unavailable, structures.Diagnostic, std.testing.allocator);
                 defer std.testing.allocator.free(diagnostics);
@@ -4205,12 +4360,12 @@ test "inline array namespace signatures and externs use typed builtin bodies" {
             const type_id = (try ctx.lookupInterned(CompileTimeValues, (try ctx.get(ResolveStatic, scope.resolve("Value").?)).*.?)).type;
             const analysis: AnalysisContext(@TypeOf(ctx)) = .{ .ctx = ctx, .file_id = file_id };
             const namespace = (try analysis.typeNamespace(type_id)).?;
-            const len = (try analysis.structNamespaceMember(type_id, "len", .{ .start = 0, .end = 0 })).?;
+            const len = (try analysis.typeNamespaceMember(type_id, "len", .{ .start = 0, .end = 0 })).?;
             const len_signature = (try ctx.get(FunctionInstanceSignature, len)).*.?;
             try std.testing.expect(!len_signature.is_fallible);
             try std.testing.expectEqual(structures.TypeId.int, len_signature.return_type);
             for ([_][]const u8{ "get", "get_mut" }, [_]bool{ false, true }) |name, writable| {
-                const member = (try analysis.structNamespaceMember(type_id, name, .{ .start = 0, .end = 0 })).?;
+                const member = (try analysis.typeNamespaceMember(type_id, name, .{ .start = 0, .end = 0 })).?;
                 const signature = (try ctx.get(FunctionInstanceSignature, member)).*.?;
                 try std.testing.expect(signature.is_fallible);
                 try std.testing.expectEqual(structures.CallBehavior.ordinary, try analysis.callBehavior(member.item));
@@ -4302,4 +4457,9 @@ test "inline array factory interception does not recognize unrelated Array decla
     const definition = (try facts.structDefinition(type_id)).?;
     try std.testing.expectEqual(@as(usize, 1), definition.fields.len);
     try std.testing.expectEqualStrings("value", definition.fields[0].name);
+}
+
+fn allImmutable(parameters: []const structures.CallableParameter) bool {
+    for (parameters) |parameter| if (parameter.mode != .imm) return false;
+    return true;
 }

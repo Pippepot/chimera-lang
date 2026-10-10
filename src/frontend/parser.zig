@@ -227,6 +227,7 @@ fn parseExpression(parser: *ParserState) ParseError!Node.Index {
         .keyword_break => try parseBreak(parser),
         .keyword_continue => try parseTokenNode(parser, .keyword_continue, .continue_expr),
         .number_literal,
+        .string_literal,
         .keyword_true,
         .keyword_false,
         .keyword_none,
@@ -760,6 +761,7 @@ fn parseCall(parser: *ParserState, callee: Node.Index) ParseError!Node.Index {
 fn parsePrimary(parser: *ParserState) ParseError!Node.Index {
     return switch (parser.tokens[parser.index].tag) {
         .number_literal => try parseTokenNode(parser, .number_literal, .number_literal),
+        .string_literal => try parseTokenNode(parser, .string_literal, .string_literal),
         .keyword_true => try parseTokenNode(parser, .keyword_true, .bool_literal),
         .keyword_false => try parseTokenNode(parser, .keyword_false, .bool_literal),
         .keyword_none => try parseTokenNode(parser, .keyword_none, .none_literal),
@@ -1010,50 +1012,20 @@ fn renderNode(gpa: std.mem.Allocator, node_index: Node.Index, ast: *const Ast, s
     const new_indent = if (at_root) "" else try std.mem.concat(gpa, u8, &.{ indent, if (is_last) "  " else "│ " });
     defer if (!at_root) gpa.free(new_indent);
     switch (node.tag) {
-        .break_nothing, .continue_expr, .return_nothing, .fail_expr => try writer.writeByte('\n'),
-        .access, .bool_literal, .identifier, .none_literal, .type, .number_literal => {
+        .access, .bool_literal, .identifier, .none_literal, .type, .number_literal, .string_literal, .field_access, .struct_field, .struct_property, .struct_init_field, .param => {
             const loc = ast.tokens[node.token_index].loc;
-            try writer.print(" : {s}\n", .{source[loc.start..loc.end]});
+            try writer.print(" : {s}", .{source[loc.start..loc.end]});
         },
-        .unit_literal => try writer.writeAll(" : ()\n"),
-        .implicit_static, .implicit_type => try writer.writeByte('\n'),
-        .break_expr, .return_expr, .loop, .not, .neg, .move_expr, .comptime_expr, .sizeof_expr, .field_access, .deref, .struct_field, .struct_property, .struct_init_field, .@"pub" => {
-            if (node.tag == .field_access or node.tag == .struct_field or node.tag == .struct_property or node.tag == .struct_init_field) {
-                const loc = ast.tokens[node.token_index].loc;
-                try writer.print(" : {s}", .{source[loc.start..loc.end]});
-            }
-            try writer.writeByte('\n');
-            try renderNode(gpa, node.data.node, ast, source, writer, seen, new_indent, true, false);
-        },
-        .add, .sub, .mul, .div, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .@"and", .@"or", .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .call, .const_binding, .var_binding, .borrow_binding, .borrow_mut_binding, .static_binding, .namespace_declaration, .func, .param, .type_func, .@"if" => {
-            if (node.tag == .param) {
-                const loc = ast.tokens[node.token_index].loc;
-                try writer.print(" : {s}", .{source[loc.start..loc.end]});
-            }
-            try writer.writeByte('\n');
-            const b_node = node.data.node_node.b.unwrap();
-            if (node.data.node_node.a.unwrap()) |a| {
-                try renderNode(gpa, a, ast, source, writer, seen, new_indent, b_node == null, false);
-            }
-            if (b_node) |b| {
-                try renderNode(gpa, b, ast, source, writer, seen, new_indent, true, false);
-            }
-        },
-        .signature => {
-            try writer.writeByte('\n');
-            const parts = node.data.signature;
-            const last = if (parts.where_clauses != .null) parts.where_clauses else parts.return_type;
-            if (parts.parameters.unwrap()) |parameters| try renderNode(gpa, parameters, ast, source, writer, seen, new_indent, last == .null, false);
-            if (parts.return_type.unwrap()) |result| try renderNode(gpa, result, ast, source, writer, seen, new_indent, result == last, false);
-            if (parts.where_clauses.unwrap()) |clauses| try renderNode(gpa, clauses, ast, source, writer, seen, new_indent, true, false);
-        },
-        .block, .call_arg_list, .param_list, .type_list, .type_variant, .where_clauses, .if_else, .@"struct", .struct_init, .collection_literal, .import, .selective_import => {
-            try writer.writeByte('\n');
-            for (node.data.ref.start..node.data.ref.end) |i| {
-                try renderNode(gpa, ast.node_refs[i], ast, source, writer, seen, new_indent, i == node.data.ref.end - 1, false);
-            }
-        },
-        else => try writer.print("Not implemented {}\n", .{node.tag}),
+        .unit_literal => try writer.writeAll(" : ()"),
+        else => if (node.dataTag() == null) try writer.print("Not implemented {}", .{node.tag}),
+    }
+    try writer.writeByte('\n');
+    var children = node.children(ast.node_refs);
+    const nodes = children.slice();
+    var end = nodes.len;
+    while (end > 0 and nodes[end - 1] == .null) end -= 1;
+    for (nodes[0..end], 0..) |child, index| {
+        if (child.unwrap()) |present| try renderNode(gpa, present, ast, source, writer, seen, new_indent, index == end - 1, false);
     }
 }
 
@@ -1132,6 +1104,20 @@ test "parse operation function declarations and explicit calls" {
         try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len);
         try std.testing.expect(report.ast != null);
     }
+}
+
+test "parse string literals and indexed children preserve AST equality and rendering" {
+    try testParsing(
+        \\const text = "hi"
+        \\const item = values[1]
+    ,
+        \\const_binding
+        \\└─string_literal : "hi"
+        \\const_binding
+        \\└─index_access
+        \\  ├─identifier : values
+        \\  └─number_literal : 1
+    );
 }
 
 test "parse fallible function declarations and callable types" {
@@ -2485,6 +2471,7 @@ fn testParsing(source: [:0]const u8, expected: []const u8) !void {
     defer buffer.deinit();
     var ast = try parser.intoAst(0);
     defer ast.deinit(std.testing.allocator);
+    try std.testing.expect(Ast.eql(ast, ast));
     try renderAst(std.testing.allocator, &ast, source, &buffer.writer);
     try std.testing.expectEqualStrings(expected, std.mem.trimEnd(u8, buffer.writer.buffered(), "\n"));
 }

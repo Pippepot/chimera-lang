@@ -42,23 +42,43 @@
 # lookup uses the left operand's defining namespace, independently of imports.
 # No fallback to the right operand, conversion, or general function overloading
 # participates in selection. Operands evaluate once, left to right.
+# Primitive type namespaces belong to the registered standard prelude. Their
+# operations are qualified extern declarations, with compiler-provided bodies;
+# operator syntax, explicit calls, and callable values use the same declarations.
+pub extern func int.+(imm left: int, imm right: int) int
+# Only the registered prelude may extend primitive namespaces. Other modules
+# cannot extend them, just as they cannot extend an imported struct namespace.
 # Comparisons and logical expressions produce bool values. A bool value or an
 # ordinary bool-returning call may be a condition; fallible calls retain their
 # success/failure condition semantics. and/or skip the right operand when the
 # left operand determines their result.
 # The complete current inventory is +, -, *, /, ==, <>, <, >, <=, >=, unary
-# negation and not, and read/write indexing. Unary arithmetic negation is named
-# neg, distinct from binary -. Parentheses do not change operator precedence.
+# negation and not, and read/write indexing. Unary and binary arithmetic minus
+# share the spelling -, distinguished only by runtime operand count. neg is an
+# ordinary identifier, with no compiler-defined meaning. Parentheses do not
+# change operator precedence.
 # For receiver type Self, the exact signatures are:
 # +, -, *, /: func (imm Self, imm Self) Self
 # ==, <>, <, >, <=, >=: func (imm Self, imm Self) bool
-# neg: func (imm Self) Self; not: func (imm Self) bool
+# unary -: func (imm Self) Self; not: func (imm Self) bool
 # []: func or fallible (imm Self, index: int) Result
 # []=: func or fallible (mut Self, index: int, init value: Element) unit
 # Inherited namespace static arguments and inferable static parameters use
 # ordinary specialization; they do not count as runtime operands or permit
 # extra runtime operands. Signature validation rejects mismatches even for
 # explicit calls and callable values: addition with three operands is invalid.
+# Operators have fixed identities by spelling and operand count, not argument
+# types. Both forms of - may be declared in the same namespace; duplicate forms
+# remain invalid. Ordinary named functions do not acquire overloads. Explicit
+# calls select by runtime operand count or total count with explicit static
+# arguments; a call matching both forms is ambiguous. A callable reference to
+# both forms requires a function-type context; its parameter count selects the
+# form, then ordinary signature and type checks apply. A sole form needs no
+# annotation.
+pub extern func int.-(imm value: int) int
+pub extern func int.-(imm left: int, imm right: int) int
+const negate: func(imm int) int = int.-
+const subtract: func(imm int, imm int) int = int.-
 # Arithmetic/comparison/unary operation functions cannot fail. Indexers may
 # fail; indexed expressions propagate ordinary failure in a fallible function
 # and can be handled by ordinary binding conditions. Writable indexing calls
@@ -75,9 +95,11 @@
 # the corresponding binary operation and assignment. and/or remain short-
 # circuit control flow; is/as remain type membership/extraction. Transfer ^,
 # fallible call ?, field access, and initialization retain their dedicated
-# semantics and are not eager operation functions. Equality of compile-time
-# type metadata remains compiler identity comparison. Tokens with no language
-# semantics yet (such as remainder, bitwise operators, and shifts) are not added
+# semantics and are not eager operation functions. Predicates over explicitly
+# typed compile-time-only int_literal values remain intrinsic and preserve their
+# wide literal range. Equality of compile-time type metadata remains compiler
+# identity comparison. Tokens with no language semantics yet (such as
+# remainder, bitwise operators, and shifts) are not added
 # by this contract. Later numeric types use the same operation signatures.
 
 
@@ -87,6 +109,63 @@
 # Their names, overflow and failure behavior, other numeric widths, and float
 # literal typing remain open. Existing variant widening and 'as' extraction do
 # not define numeric conversion behavior.
+
+
+# Text and basic I/O
+# A double-quoted literal has the compile-time-only type string_literal. Its
+# value is the decoded UTF-8 bytes, independent of source spelling. Supported
+# escapes are \", \\, \n, \r, \t, \0, \xHH (one byte), and \u{H...} (one
+# Unicode scalar, one through six hexadecimal digits). The complete decoded
+# literal must be valid UTF-8. Invalid escapes, malformed UTF-8, surrogates, and
+# scalars above U+10FFFF are source errors. Embedded NUL is valid text. Literal
+# decoding belongs to semantic analysis of demanded expressions.
+# Ordinary inferred bindings default a literal to std.text.String. An expected
+# type instead selects an ordinary static-source converter. Literals remain
+# string_literal when that type is explicitly expected, including static
+# parameters. The default String uses registered standard-library identity,
+# independently of prelude imports or a locally shadowing name.
+# String owns either immutable literal storage or a unique growable allocation.
+# Literal conversion allocates nothing. const controls mutation of the binding;
+# it does not select storage. var permits mutation; reserve/append obtain owned
+# storage before changing literal-backed data. static evaluates at compile time;
+# literal-backed String results refer to symbolic immutable storage, never host
+# addresses. Runtime descriptors and the referenced bytes have independent
+# storage. String has move and automatic drop, but no implicit copy; clone is
+# explicit and fallible. Allocation-backed text execution requires the later
+# compile-time storage milestone.
+# BytesView is a copyable read-only borrowed byte range. Views of arrays,
+# allocations, buffers, and Strings retain their backing owners and storage
+# invalidation dependencies. Views of literal storage have permanent origins.
+# Empty views are valid and never dereference their base. View construction and
+# slicing use nonnegative, overflow-safe bounds checks. No raw address escapes.
+# StringView wraps a BytesView whose complete range is valid UTF-8. Construction
+# from arbitrary bytes validates once and fails for malformed input; slicing
+# checks both bounds and codepoint boundaries. byte_length reports bytes, not
+# Unicode scalars or graphemes. Text mutation accepts only validated text and
+# exposes only immutable byte views. No Unicode normalization is implicit.
+# The named byte_int function widens a byte to int without failure. Numeric
+# runtime types are still not related by converters.
+# std.io supplies stdin/stdout/stderr handles, fallible read_bytes, write_once,
+# write_all, write_text, and print (text followed by a newline). Handles borrow
+# the process's standard descriptors; they do not close or own them. read_bytes
+# appends at most the requested bytes to a Buffer(byte), publishing only the
+# initialized prefix. Positive progress and short reads/writes are success;
+# zero read indicates EOF for a nonempty request. A zero-size read returns zero
+# without reading. Interrupted syscalls retry. write_all advances by completed
+# counts and fails on zero progress. Output programs ignore SIGPIPE so closed
+# pipes report ordinary write failure. Other OS failures propagate ordinary
+# failure; earlier external effects are not rolled back. Reading or allocating
+# failure preserves initialized buffer contents; reservation may change capacity.
+# Failure cleanup releases owned storage through ordinary lifetime rules.
+# Byte I/O preserves arbitrary bytes. UTF-8 validation occurs when those bytes
+# become text, so partial UTF-8 sequences can be accumulated before conversion.
+# print is an ordinary declaration and may be shadowed or used as a callable.
+# Reached compile-time I/O is an unavailable execution operation, even inside a
+# fallible condition; an unexecuted branch performs no I/O and causes no error.
+# Compiler-private static_data and byte_pointer values represent immutable
+# literal storage and bounded library byte access. Only registered primitives
+# create/access them. byte_pointer retains inferred origins; static_data always
+# denotes immutable compiler-provided bytes. Neither exposes numeric addresses.
 
 
 # Structural tuples
@@ -253,10 +332,18 @@ const computed_block = comptime
 # fallible failure is a source error; fallible calls handled within the executed
 # code retain their ordinary control-flow behavior. Query/declaration cycles are
 # source errors. A recursive call that repeats the same function instance and
-# arguments is also an exact cycle and therefore a source error. Other compile-
-# time computations run until they finish or the compiler process is interrupted.
+# arguments is also an exact cycle and therefore a source error. For cycle
+# checking, arguments include deferred initializer captures and the state of
+# reachable storage at call entry. Storage handles retain their logical identity;
+# ordinary data compares by value. Changed reachable contents or a different
+# allocation identity are different arguments. Later mutation does not change
+# an earlier call's recorded entry state. Other compile-time computations run
+# until they finish or the compiler process is interrupted.
 # The language defines no call-depth, execution-fuel, storage, or time limit;
 # interruption and machine resource exhaustion do not make the source invalid.
+# Compiler resource exhaustion is an infrastructure failure, distinct from
+# ordinary language failure and a source diagnostic. It remains retryable and
+# must not be cached as source rejection or converted into fallible failure.
 #
 # A direct call may appear in a type position when its declared return type is
 # 'type'. It is evaluated at compile time and the consumer receives its canonical
@@ -273,6 +360,67 @@ const computed_block = comptime
 # parameters. They cannot capture function-local bindings. Generated definitions
 # accept the same ownership declarations as declared structs, with custom hooks
 # specialized by the enclosing type factory.
+
+
+# Compile-time storage
+# One evaluation comprises a demanded compile-time computation and its nested
+# ordinary calls and deferred initializer regions. They share evaluation-local
+# storage. Allocation, indexed construction and access, borrowing, mutation,
+# transfer, and deallocation obey the ordinary ownership and init contracts.
+# Box, List, Buffer, and their views use their library declarations and the same
+# element capability restrictions as runtime execution.
+#
+# Every successful allocation creates a fresh logical identity, including
+# repeated calls with equal arguments and calls with no arguments. Moving an
+# owner preserves its allocation identity; copying a Ref preserves its referent
+# rather than copying or acquiring the allocation. Deallocation ends that
+# allocation's lifetime. Reusing backing memory cannot revive its identity.
+# Successful zero-count and zero-sized-element allocations also have distinct
+# identities. Logical capacity is the requested count, independent of byte size;
+# zero-sized initialized elements retain their element identities and hooks.
+# No compile-time operation exposes a compiler or target machine address.
+#
+# Allocation uses the selected host target's request rules for element
+# eligibility, layout, size, and alignment. A negative count, checked layout
+# overflow, unsupported resolved request, or provider refusal produces ordinary
+# allocation failure through the declared fallible API. Compiler memory used
+# to interpret values is an implementation resource: exhausting it is the
+# infrastructure failure described above, not an allocation-provider refusal.
+# Allocation failure skips deferred initialization. Construction failure cleans
+# completed subobjects and releases storage as required by the owning library
+# declaration; captured writes and completed transfers are not rolled back.
+# Deallocation itself never destroys elements. Ordinary scope cleanup and hooks
+# retain their runtime ordering and effects.
+#
+# Allocation-backed owners, references, and views may be passed, returned,
+# stored in aggregates or variants, and copied back through mut parameters
+# between calls within one evaluation, subject to their ordinary lifetime and
+# capability rules. A static binding, static parameter, or other consumer of a
+# canonical compile-time value instead requires publication. Publication cannot
+# retain any identity of evaluation-local storage, including local or inline
+# storage reached through a reference. This restriction applies recursively to
+# the actual stored fields, array elements, active variant payloads, and backing
+# owners of views. An inactive variant member and the element type of an empty
+# array do not themselves retain storage.
+#
+# Ordinary data copied or validly extracted from that storage may be published
+# once it retains no evaluation-local identity. Type values, callable references,
+# and symbolic immutable literal storage remain publishable under their existing
+# contracts. Returning an allocation-backed identity as a static initializer or
+# comptime result, retaining it in specialization arguments, or materializing it
+# in runtime storage is a source error. Serializing or relocating compile-time
+# allocations into persistent storage remains unspecified. Cached execution
+# must preserve these rules: a cached result cannot share a fresh allocation
+# between calls or extend storage beyond its evaluation.
+fallible make_twenty() Box(int) -> Box.new?(20)
+fallible inspect_allocations() int
+    var first = make_twenty?()
+    const second = make_twenty?()
+    first.borrow_mut()[] = 22
+    return first.borrow()[] + second.borrow()[]
+static allocated_answer = if const value = inspect_allocations() -> value else 0
+# allocated_answer is ordinary data: 42. Both Boxes are destroyed normally.
+# static escaped = make_twenty?() # source error: retains evaluation-local storage
 
 
 # Functions
@@ -706,6 +854,12 @@ fallible forward_initializer(static T: type, init item: T) T
 # Ref borrowed through an alias also addresses the original referent. Ending,
 # moving, or replacing its referent's storage while the alias is used is
 # rejected. A borrowed return retains its possible origins;
+# A variant condition may bind one member with `if borrow name = place as T`
+# or `if borrow mut name = place as T`. The successful branch aliases the
+# payload without copying it; writable borrowing requires a writable place.
+# Field and variant projections retain the owner across loop joins. Replacing
+# the owner while the payload alias is still used is rejected. Borrowed subset
+# variants require a separate representation and are not accepted.
 # A bare borrow binding used to initialize an owned value copies T if T is
 # copyable; transferring ownership through the binding is not allowed.
 #
@@ -1098,8 +1252,9 @@ static S.read_a = func(imm value: S) int -> value.a
 func S.read_a(imm value: S) int -> value.a
 # This qualified declaration form extends a non-parameterized named struct in
 # the same module. The struct and declaration may be in different files. Each
-# qualifier must name a declared struct namespace; imported types cannot be
-# extended. A function written lexically inside a struct has the same namespace
+# qualifier must name a declared struct namespace, or a primitive namespace in
+# its registered prelude; imported types cannot be extended. A function written
+# lexically inside a struct has the same namespace
 # meaning as this qualified form. Lexical declarations remain necessary for a
 # generated namespace because its identity includes the factory specialization.
 # value.function(args) desugars to S.function(value, args), where value has
@@ -1414,6 +1569,9 @@ const first = repeated.get?(0)
 # flow; it is not a compiler invariant violation. This policy does not change
 # explicitly fallible allocation APIs, and recoverable allocation remains an
 # opt-in operation rather than a requirement at every literal use.
+# At compile time, the standard converter's reached exit(134) follows the
+# compiler-control exit rules above; it does not become ordinary failure or
+# compiler resource exhaustion.
 # Ordinary element failure is not a panic: clean partial construction and the
 # completed prefix, release the List allocation, and propagate that failure.
 # The allocation panic policy therefore adds no ordinary failure effect to a

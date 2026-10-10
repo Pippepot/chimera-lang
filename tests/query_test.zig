@@ -93,12 +93,32 @@ fn testDatabase(worker_count: usize) !*Database {
     return testDatabaseWithPrelude(worker_count, true);
 }
 
+const minimal_prelude =
+    \\pub import std.exit.{exit}
+    \\extern func literal_byte(static value: int_literal) byte
+    \\pub converter(static value: int_literal) byte where value >= 0 where value <= 255 -> literal_byte(value)
+    \\pub extern func int.+(imm left: int, imm right: int) int
+    \\pub extern func int.-(imm left: int, imm right: int) int
+    \\pub extern func int.*(imm left: int, imm right: int) int
+    \\pub extern func int./(imm left: int, imm right: int) int
+    \\pub extern func int.-(imm self: int) int
+    \\pub extern func int.==(imm left: int, imm right: int) bool
+    \\pub extern func int.<>(imm left: int, imm right: int) bool
+    \\pub extern func int.<(imm left: int, imm right: int) bool
+    \\pub extern func int.>(imm left: int, imm right: int) bool
+    \\pub extern func int.<=(imm left: int, imm right: int) bool
+    \\pub extern func int.>=(imm left: int, imm right: int) bool
+    \\pub extern func bool.==(imm left: bool, imm right: bool) bool
+    \\pub extern func bool.<>(imm left: bool, imm right: bool) bool
+    \\pub extern func bool.not(imm self: bool) bool
+;
+
 fn testDatabaseWithPrelude(worker_count: usize, enable_prelude: bool) !*Database {
     const db = try Database.init(testing.allocator, .{ .worker_count = worker_count });
     errdefer db.deinit();
     const sources = [_]struct { path: []const u8, text: []const u8 }{
         .{ .path = "std.exit", .text = "pub extern func exit(code: int) never" },
-        .{ .path = "std.prelude", .text = "pub import std.exit.{exit}\nextern func literal_byte(static value: int_literal) byte\npub converter(static value: int_literal) byte where value >= 0 where value <= 255 -> literal_byte(value)\nstruct IntOperations\n  copy = trivial\nstruct BoolOperations\n  copy = trivial" },
+        .{ .path = "std.prelude", .text = minimal_prelude },
     };
     for (sources, 0..) |source, index| {
         const file_id: structures.FileId = 100_000 + index;
@@ -235,9 +255,46 @@ fn expectDirectCallArtifact(artifact: structures.CompiledFunction, target: struc
     try testing.expectEqual(@as(usize, 1), artifact.relocations.len);
     try testing.expectEqual(@as(u32, 1), artifact.relocations[0].offset);
     try testing.expectEqual(structures.CompiledFunction.RelocationKind.call_relative_32, artifact.relocations[0].kind);
-    try testing.expectEqual(@as(u32, 0), @backingInt(artifact.relocations[0].reference));
+    try testing.expectEqual(@as(u32, 0), @backingInt(artifact.relocations[0].reference.function));
     try testing.expectEqual(@as(i64, 0), artifact.relocations[0].addend);
     try testing.expectEqualSlices(structures.InstanceId, &.{.{ .item = target }}, artifact.referenced_instances);
+}
+
+fn expectPrimitiveCall(db: *Database, body: structures.FunctionBodyAnalysis, index: usize, name: []const u8, arguments: []const structures.FunctionValueId) !void {
+    try testing.expect(body.instructions[index] == .call);
+    const call = body.instructions[index].call;
+    try testing.expect(call.target == .direct);
+    try testing.expect(try isPrimitiveInstance(db, call.target.direct));
+    const location = try db.lookupInterned(queries.ItemLocations, call.target.direct.item);
+    try testing.expectEqualStrings(name, location.name.text());
+    try expectDirectCallArguments(arguments, body.call_arguments[call.arguments.start..call.arguments.end]);
+}
+
+fn isPrimitiveInstance(db: *Database, instance: structures.InstanceId) !bool {
+    const location = try db.lookupInterned(queries.ItemLocations, instance.item);
+    const owner = location.owner orelse return false;
+    return (try db.lookupInterned(queries.ItemLocations, owner)).kind == .primitive;
+}
+
+fn reachableInstancesForItem(instances: []const structures.InstanceId, item: structures.ItemId) ![]structures.InstanceId {
+    var selected: std.ArrayList(structures.InstanceId) = .empty;
+    defer selected.deinit(testing.allocator);
+    for (instances) |instance| if (instance.item == item) try selected.append(testing.allocator, instance);
+    return selected.toOwnedSlice(testing.allocator);
+}
+
+fn appendReferencedArtifacts(db: *Database, functions: *std.ArrayList(codegen.ReachableFunction)) !void {
+    var next: usize = 0;
+    while (next < functions.items.len) : (next += 1) {
+        for (functions.items[next].artifact.referenced_instances) |instance| {
+            for (functions.items) |function| {
+                if (std.meta.eql(function.instance, instance)) break;
+            } else {
+                const artifact = (try db.get(queries.CompileFunction, instance)).*.?;
+                try functions.append(testing.allocator, .{ .instance = instance, .artifact = artifact });
+            }
+        }
+    }
 }
 
 fn expectIntegerReturnBody(body: structures.FunctionBodyAnalysis, expected: i32) !void {
@@ -299,7 +356,7 @@ fn expectCompiledFunctionResult(
     const exit_with_result_relocations = [_]structures.CompiledFunction.Relocation{.{
         .offset = 1,
         .kind = .call_relative_32,
-        .reference = @fromBackingInt(@intCast(0)),
+        .reference = .{ .function = @fromBackingInt(@intCast(0)) },
         .addend = 0,
     }};
     const exit_with_result_references = [_]structures.InstanceId{function_id};
@@ -319,17 +376,7 @@ fn expectCompiledFunctionResult(
         try functions.append(testing.allocator, .{ .instance = instance, .artifact = artifact });
     }
 
-    var next: usize = 1;
-    while (next < functions.items.len) : (next += 1) {
-        for (functions.items[next].artifact.referenced_instances) |instance| {
-            for (functions.items) |function| {
-                if (std.meta.eql(function.instance, instance)) break;
-            } else {
-                const artifact = (try db.get(queries.CompileFunction, instance)).*.?;
-                try functions.append(testing.allocator, .{ .instance = instance, .artifact = artifact });
-            }
-        }
-    }
+    try appendReferencedArtifacts(db, &functions);
 
     var executable = try codegen.buildExecutable(entry_id, functions.items, testing.allocator);
     defer executable.deinit(testing.allocator);
@@ -364,7 +411,7 @@ fn expectCompiledVariantWord(
     const relocations = [_]structures.CompiledFunction.Relocation{.{
         .offset = 8,
         .kind = .call_relative_32,
-        .reference = @fromBackingInt(@intCast(0)),
+        .reference = .{ .function = @fromBackingInt(@intCast(0)) },
         .addend = 0,
     }};
     const references = [_]structures.InstanceId{function_id};
@@ -384,6 +431,7 @@ fn expectCompiledVariantWord(
         try functions.append(testing.allocator, .{ .instance = instance, .artifact = artifact });
     }
 
+    try appendReferencedArtifacts(db, &functions);
     var executable = try codegen.buildExecutable(entry_id, functions.items, testing.allocator);
     defer executable.deinit(testing.allocator);
     const io = testing.io;
@@ -661,7 +709,7 @@ const InternItemLoc = struct {
         return ctx.intern(queries.ItemLocations, .{
             .origin = .{ .module = module },
             .kind = .function,
-            .name = if (input_value % 2 == 0) "even" else "odd",
+            .name = .{ .identifier = if (input_value % 2 == 0) "even" else "odd" },
         });
     }
 };
@@ -1447,14 +1495,14 @@ test "DiscoverItems owns names across source edits" {
 
     try testing.expectEqual(@as(usize, 4), tree.items.len);
     try testing.expectEqual(structures.ItemKind.function, tree.items[0].loc.kind);
-    try testing.expectEqualStrings("first", tree.items[0].loc.name);
+    try testing.expectEqualStrings("first", tree.items[0].loc.name.text());
     try testing.expectEqual(structures.ItemKind.static, tree.items[2].loc.kind);
-    try testing.expectEqualStrings("value", tree.items[2].loc.name);
+    try testing.expectEqualStrings("value", tree.items[2].loc.name.text());
     try testing.expectEqual(structures.ItemKind.top_level_entry, tree.items[3].loc.kind);
-    try testing.expectEqualStrings("$entry", tree.items[3].loc.name);
+    try testing.expectEqualStrings("$entry", tree.items[3].loc.name.text());
 
     try setSource(db, 1, "static replacement = func() int -> return 3");
-    try testing.expectEqualStrings("first", tree.items[0].loc.name);
+    try testing.expectEqualStrings("first", tree.items[0].loc.name.text());
 }
 
 test "discovery rejects duplicate top-level names across declaration kinds" {
@@ -1530,7 +1578,7 @@ test "struct hook items have stable owner-qualified identities" {
     var right_copy: ?structures.ItemId = null;
     for (first_index.ids()) |item_id| {
         const loc = try db.lookupInterned(queries.ItemLocations, item_id);
-        if (!std.mem.eql(u8, loc.name, "copy")) continue;
+        if (!std.mem.eql(u8, loc.name.text(), "copy")) continue;
         if (loc.owner == left) left_copy = item_id;
         if (loc.owner == right) right_copy = item_id;
     }
@@ -1579,7 +1627,7 @@ test "captureless struct hook items reuse function queries" {
     const index = (try db.get(queries.IndexItems, 1)).*.?;
     const drop = for (index.ids()) |item_id| {
         const loc = try db.lookupInterned(queries.ItemLocations, item_id);
-        if (loc.owner == resource and std.mem.eql(u8, loc.name, "drop")) break item_id;
+        if (loc.owner == resource and std.mem.eql(u8, loc.name.text(), "drop")) break item_id;
     } else unreachable;
 
     const signature = (try db.get(queries.FunctionSignature, drop)).*.?;
@@ -2298,7 +2346,7 @@ test "custom hook body edits rebuild executable behavior" {
     const index = (try db.get(queries.IndexItems, 1)).*.?;
     const hook = for (index.ids()) |item_id| {
         const loc = try db.lookupInterned(queries.ItemLocations, item_id);
-        if (loc.owner == owner and std.mem.eql(u8, loc.name, "copy")) break item_id;
+        if (loc.owner == owner and std.mem.eql(u8, loc.name.text(), "copy")) break item_id;
     } else unreachable;
 
     const io = testing.io;
@@ -3254,7 +3302,7 @@ test "field assignment diagnostics validate roots paths and values" {
         .{ .source = "static Pair = struct\n  value: int\nfunc bad() int\n  var pair = Pair{value = 1}\n  pair.missing = 2\n  return pair.value", .expected = .unknown_field },
         .{ .source = "static Pair = struct\n  value: int\nfunc bad() int\n  var pair = Pair{value = 1}\n  pair.value = none\n  return pair.value", .expected = .assignment_type_mismatch },
         .{ .source = "static Pair = struct\n  value: int\nfunc bad() int\n  Pair{value = 1}.value = 2\n  return 0", .expected = .assignment_target_not_local },
-        .{ .source = "static Flags = struct\n  value: bool\nfunc bad() bool\n  var flags = Flags{value = true}\n  flags.value += 1\n  return flags.value", .expected = .arithmetic_operand_not_int },
+        .{ .source = "static Flags = struct\n  value: bool\nfunc bad() bool\n  var flags = Flags{value = true}\n  flags.value += 1\n  return flags.value", .expected = .unknown_namespace_member },
     };
     for (cases, 1..) |case, file_id| {
         const db = try testDatabase(1);
@@ -3652,16 +3700,16 @@ test "item indexing handles empty malformed missing and duplicate inputs" {
 
     const entry_module = try db.intern(queries.ModulePaths, .{ .path = "" });
     const other_module = try db.intern(queries.ModulePaths, .{ .path = "other" });
-    const base: structures.ItemLoc = .{ .origin = .{ .module = entry_module }, .kind = .function, .name = "same" };
+    const base: structures.ItemLoc = .{ .origin = .{ .module = entry_module }, .kind = .function, .name = .{ .identifier = "same" } };
     const base_id = try db.intern(queries.ItemLocations, base);
     try testing.expectEqual(base_id, try db.intern(queries.ItemLocations, base));
-    try testing.expectEqual(base_id, try db.intern(queries.ItemLocations, .{ .origin = .{ .module = entry_module }, .kind = .function, .name = "same" }));
-    try testing.expect(base_id != try db.intern(queries.ItemLocations, .{ .origin = .{ .module = other_module }, .kind = .function, .name = "same" }));
-    try testing.expect(base_id != try db.intern(queries.ItemLocations, .{ .origin = .{ .entry = 8 }, .kind = .top_level_entry, .name = "same" }));
-    try testing.expect(base_id != try db.intern(queries.ItemLocations, .{ .origin = .{ .module = entry_module }, .kind = .function, .name = "other" }));
-    const entry_id = try db.intern(queries.ItemLocations, .{ .origin = .{ .entry = 8 }, .kind = .top_level_entry, .name = "$entry" });
-    try testing.expectEqual(entry_id, try db.intern(queries.ItemLocations, .{ .origin = .{ .entry = 8 }, .kind = .top_level_entry, .name = "$entry" }));
-    try testing.expect(entry_id != try db.intern(queries.ItemLocations, .{ .origin = .{ .entry = 9 }, .kind = .top_level_entry, .name = "$entry" }));
+    try testing.expectEqual(base_id, try db.intern(queries.ItemLocations, .{ .origin = .{ .module = entry_module }, .kind = .function, .name = .{ .identifier = "same" } }));
+    try testing.expect(base_id != try db.intern(queries.ItemLocations, .{ .origin = .{ .module = other_module }, .kind = .function, .name = .{ .identifier = "same" } }));
+    try testing.expect(base_id != try db.intern(queries.ItemLocations, .{ .origin = .{ .entry = 8 }, .kind = .top_level_entry, .name = .{ .identifier = "same" } }));
+    try testing.expect(base_id != try db.intern(queries.ItemLocations, .{ .origin = .{ .module = entry_module }, .kind = .function, .name = .{ .identifier = "other" } }));
+    const entry_id = try db.intern(queries.ItemLocations, .{ .origin = .{ .entry = 8 }, .kind = .top_level_entry, .name = .{ .identifier = "$entry" } });
+    try testing.expectEqual(entry_id, try db.intern(queries.ItemLocations, .{ .origin = .{ .entry = 8 }, .kind = .top_level_entry, .name = .{ .identifier = "$entry" } }));
+    try testing.expect(entry_id != try db.intern(queries.ItemLocations, .{ .origin = .{ .entry = 9 }, .kind = .top_level_entry, .name = .{ .identifier = "$entry" } }));
     try testing.expectError(error.InvalidInternId, db.lookupInterned(queries.ItemLocations, @fromBackingInt(@intCast(std.math.maxInt(u32)))));
 }
 
@@ -3824,9 +3872,9 @@ test "module scope owns sorted declaration lookup and leaves bodies demand-drive
     );
     const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
     try testing.expectEqual(@as(usize, 3), scope.entries.len);
-    try testing.expectEqualStrings("alpha", scope.entries[0].name);
-    try testing.expectEqualStrings("value", scope.entries[1].name);
-    try testing.expectEqualStrings("zeta", scope.entries[2].name);
+    try testing.expectEqualStrings("alpha", scope.entries[0].name.text());
+    try testing.expectEqualStrings("value", scope.entries[1].name.text());
+    try testing.expectEqualStrings("zeta", scope.entries[2].name.text());
     try testing.expectEqual(scope.entries[0].item_id, scope.resolve("alpha").?);
     try testing.expectEqual(scope.entries[1].item_id, scope.resolve("value").?);
     try testing.expectEqual(scope.entries[2].item_id, scope.resolve("zeta").?);
@@ -3839,7 +3887,7 @@ test "module scope owns sorted declaration lookup and leaves bodies demand-drive
     try testing.expectEqual(@as(usize, 0), (try db.directAccumulatorValues(queries.BuildModuleScope, 1, structures.Diagnostic)).len);
 
     try setSource(db, 1, "static replacement = func() int -> return 2");
-    try testing.expectEqualStrings("alpha", scope.entries[0].name);
+    try testing.expectEqualStrings("alpha", scope.entries[0].name.text());
 }
 
 test "named type aliases and integer statics resolve on demand" {
@@ -6125,19 +6173,16 @@ test "function expressions analyze nested arithmetic and calls as one typed valu
     try testing.expectEqual(@as(usize, 11), body.instructions.len);
     try testing.expectEqual(@as(i32, 120), body.instructions[0].const_int);
     try testing.expectEqual(scope.resolve("leaf").?, body.instructions[1].call.target.direct.item);
-    try testing.expectEqual(@as(u32, 0), @backingInt(body.instructions[2].divsi.lhs));
-    try testing.expectEqual(@as(u32, 1), @backingInt(body.instructions[2].divsi.rhs));
+    try expectPrimitiveCall(db, body, 2, "/", &.{ @fromBackingInt(0), @fromBackingInt(1) });
     try testing.expectEqual(@as(i32, 2), body.instructions[3].const_int);
     try testing.expectEqual(@as(i32, 3), body.instructions[4].const_int);
-    try testing.expectEqual(@as(u32, 3), @backingInt(body.instructions[5].addi.lhs));
-    try testing.expectEqual(@as(u32, 4), @backingInt(body.instructions[5].addi.rhs));
-    try testing.expectEqual(@as(u32, 5), @backingInt(body.instructions[7].muli.lhs));
-    try testing.expectEqual(@as(u32, 2), @backingInt(body.instructions[8].subi.lhs));
-    try testing.expectEqual(@as(u32, 7), @backingInt(body.instructions[8].subi.rhs));
-    try testing.expectEqual(@as(u32, 8), @backingInt(body.instructions[9].negi));
-    try testing.expectEqual(@as(u32, 9), @backingInt(body.instructions[10].negi));
+    try expectPrimitiveCall(db, body, 5, "+", &.{ @fromBackingInt(3), @fromBackingInt(4) });
+    try expectPrimitiveCall(db, body, 7, "*", &.{ @fromBackingInt(5), @fromBackingInt(6) });
+    try expectPrimitiveCall(db, body, 8, "-", &.{ @fromBackingInt(2), @fromBackingInt(7) });
+    try expectPrimitiveCall(db, body, 9, "-", &.{@fromBackingInt(8)});
+    try expectPrimitiveCall(db, body, 10, "-", &.{@fromBackingInt(9)});
     try testing.expectEqual(@as(u32, 10), @backingInt(body.blocks[0].terminator.return_value.value));
-    try testing.expect((try db.get(queries.BuildExecutable, 1)).* != null);
+    try expectCompiledFunctionResult(db, 1, "expression", &.{ "expression", "leaf" }, 15);
 }
 
 test "fallible integer if joins branch values through a block argument" {
@@ -6160,9 +6205,10 @@ test "fallible integer if joins branch values through a block argument" {
     try testing.expectEqual(@as(usize, 4), body.blocks.len);
     try testing.expectEqual(@as(usize, 2), body.branch_arguments.len);
     const predicate = body.blocks[0].terminator.predicate_branch;
-    try testing.expectEqual(structures.PredicateOperation.lti, predicate.operation);
-    try testing.expectEqual(@as(u32, 0), @backingInt(predicate.operands.lhs));
-    try testing.expectEqual(@as(u32, 2), @backingInt(predicate.operands.rhs));
+    try testing.expectEqual(structures.PredicateOperation.eqb, predicate.operation);
+    try expectPrimitiveCall(db, body, 1, "<", &.{ @fromBackingInt(0), @fromBackingInt(2) });
+    try testing.expectEqual(body.instructionValue(1), predicate.operands.lhs);
+    try testing.expectEqual(structures.TypeId.bool, body.valueType(predicate.operands.rhs));
     try testing.expectEqual(@as(u32, 1), body.blocks[3].argument_start);
     try testing.expectEqual(@as(u32, 2), body.blocks[3].argument_end);
     try testing.expectEqual(@as(u32, 1), @backingInt(body.blocks[3].terminator.return_value.value));
@@ -6768,8 +6814,8 @@ test "bool equality and values select branches without integer truthiness" {
     try expectCompiledFunctionResult(db, 1, "answer", &.{"answer"}, 42);
 
     const cases = [_]struct { file_id: structures.FileId, source: []const u8, kind: DiagnosticKind }{
-        .{ .file_id = 2, .source = "func bad() int -> if true < false -> 1 else 0", .kind = .comparison_operand_not_int },
-        .{ .file_id = 3, .source = "func bad() int -> if true == 1 -> 1 else 0", .kind = .equality_operand_type_mismatch },
+        .{ .file_id = 2, .source = "func bad() int -> if true < false -> 1 else 0", .kind = .unknown_namespace_member },
+        .{ .file_id = 3, .source = "func bad() int -> if true == 1 -> 1 else 0", .kind = .call_argument_type_mismatch },
         .{ .file_id = 4, .source = "func bad() int -> if none == none -> 1 else 0", .kind = .equality_operand_not_supported },
         .{ .file_id = 5, .source = "func bad() int -> if 1 -> 1 else 0", .kind = .if_condition_not_fallible },
     };
@@ -7316,8 +7362,8 @@ test "edits that change return reachability update only reachable calls" {
     const answer_id = scope.resolve("answer").?;
     const leaf_id = scope.resolve("leaf").?;
     const reachable = (try db.get(queries.CollectReachableInstances, 1)).*.?;
-    try testing.expectEqual(@as(usize, 3), reachable.instances.len);
-    try testing.expectEqual(leaf_id, reachable.instances[2].item);
+    try testing.expectEqual(@as(usize, 4), reachable.instances.len);
+    try testing.expectEqual(leaf_id, reachable.instances[3].item);
 
     try setSource(db, 1,
         \\static leaf = func() int -> 42
@@ -7327,9 +7373,9 @@ test "edits that change return reachability update only reachable calls" {
         \\answer(1)
     );
     const updated = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = answer_id })).*.?;
-    try testing.expectEqual(@as(usize, 0), updated.call_arguments.len);
+    try testing.expectEqual(@as(usize, 2), updated.call_arguments.len);
     const updated_reachable = (try db.get(queries.CollectReachableInstances, 1)).*.?;
-    try testing.expectEqual(@as(usize, 2), updated_reachable.instances.len);
+    try testing.expectEqual(@as(usize, 3), updated_reachable.instances.len);
     try testing.expectEqual(answer_id, updated_reachable.instances[1].item);
 }
 
@@ -7354,8 +7400,7 @@ test "parameters and nested call arguments form one typed value graph" {
     try testing.expectEqualSlices(structures.FunctionBlockArgument, &.{ .{ .type_id = .int }, .{ .type_id = .int } }, add.block_arguments);
     try testing.expectEqual(@as(u32, 0), add.blocks[0].argument_start);
     try testing.expectEqual(@as(u32, 2), add.blocks[0].argument_end);
-    try testing.expectEqual(@as(u32, 0), @backingInt(add.instructions[0].addi.lhs));
-    try testing.expectEqual(@as(u32, 1), @backingInt(add.instructions[0].addi.rhs));
+    try expectPrimitiveCall(db, add, 0, "+", &.{ @fromBackingInt(0), @fromBackingInt(1) });
     try testing.expectEqual(@as(u32, 2), @backingInt(add.blocks[0].terminator.return_value.value));
 
     const twice = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = twice_id })).*.?;
@@ -7375,6 +7420,7 @@ test "parameters and nested call arguments form one typed value graph" {
     try testing.expectEqual(structures.FunctionValueRange{ .start = 0, .end = 2 }, answer.instructions[2].call.arguments);
     try testing.expectEqual(structures.FunctionValueRange{ .start = 2, .end = 3 }, answer.instructions[3].call.arguments);
     try testing.expectEqual(structures.FunctionValueRange{ .start = 3, .end = 5 }, answer.instructions[4].call.arguments);
+    try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "twice", "add" }, 63);
 }
 
 test "call arity and parameter scope diagnostics are reported at their owning boundary" {
@@ -7478,14 +7524,11 @@ test "immutable locals name typed values without adding binding instructions" {
     try testing.expectEqual(scope.resolve("leaf").?, body.instructions[1].call.target.direct.item);
     try testing.expectEqual(@as(i32, 2), body.instructions[2].const_int);
     try testing.expectEqual(@as(i32, 1), body.instructions[3].const_int);
-    try testing.expectEqual(@as(u32, 2), @backingInt(body.instructions[4].addi.lhs));
-    try testing.expectEqual(@as(u32, 3), @backingInt(body.instructions[4].addi.rhs));
-    try testing.expectEqual(@as(u32, 0), @backingInt(body.instructions[5].muli.lhs));
-    try testing.expectEqual(@as(u32, 4), @backingInt(body.instructions[5].muli.rhs));
-    try testing.expectEqual(@as(u32, 5), @backingInt(body.instructions[6].addi.lhs));
-    try testing.expectEqual(@as(u32, 0), @backingInt(body.instructions[6].addi.rhs));
+    try expectPrimitiveCall(db, body, 4, "+", &.{ @fromBackingInt(2), @fromBackingInt(3) });
+    try expectPrimitiveCall(db, body, 5, "*", &.{ @fromBackingInt(0), @fromBackingInt(4) });
+    try expectPrimitiveCall(db, body, 6, "+", &.{ @fromBackingInt(5), @fromBackingInt(0) });
     try testing.expectEqual(@as(u32, 6), @backingInt(body.blocks[0].terminator.return_value.value));
-    try testing.expect((try db.get(queries.BuildExecutable, 1)).* != null);
+    try expectCompiledFunctionResult(db, 1, "locals", &.{ "locals", "leaf" }, 28);
 }
 
 test "compiled immutable locals preserve reused values across a call" {
@@ -8394,16 +8437,17 @@ test "discard assignment borrows once without copy or move" {
     const body = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = answer })).*.?;
     const increment = scope.resolveFunction("increment").?;
     var increment_calls: usize = 0;
-    var direct_calls: usize = 0;
+    var non_primitive_calls: usize = 0;
     for (body.instructions) |instruction| switch (instruction) {
         .call => |call| {
-            direct_calls += 1;
+            if (call.target != .direct or !try isPrimitiveInstance(db, call.target.direct))
+                non_primitive_calls += 1;
             if (call.target == .direct and call.target.direct.item == increment) increment_calls += 1;
         },
         else => {},
     };
     try testing.expectEqual(@as(usize, 1), increment_calls);
-    try testing.expectEqual(@as(usize, 1), direct_calls);
+    try testing.expectEqual(@as(usize, 1), non_primitive_calls);
     try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "increment" }, 42);
 }
 
@@ -9810,25 +9854,27 @@ test "static type and value parameters produce canonical reachable instances" {
     const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
     const identity = scope.resolveFunction("identity").?;
     const reachable = (try db.get(queries.CollectReachableInstances, 1)).*.?;
-    try testing.expectEqual(@as(usize, 4), reachable.instances.len);
+    const identity_instances = try reachableInstancesForItem(reachable.instances, identity);
+    defer testing.allocator.free(identity_instances);
+    try testing.expectEqual(@as(usize, 2), identity_instances.len);
     try testing.expect(reachable.instances[0].specialization == null);
-    try testing.expectEqual(identity, reachable.instances[1].item);
-    try testing.expectEqual(identity, reachable.instances[2].item);
-    try testing.expect(reachable.instances[1].specialization != null);
-    try testing.expect(reachable.instances[2].specialization != null);
-    try testing.expect(reachable.instances[1].specialization != reachable.instances[2].specialization);
+    try testing.expectEqual(identity, identity_instances[0].item);
+    try testing.expectEqual(identity, identity_instances[1].item);
+    try testing.expect(identity_instances[0].specialization != null);
+    try testing.expect(identity_instances[1].specialization != null);
+    try testing.expect(identity_instances[0].specialization != identity_instances[1].specialization);
 
-    const first_arguments = try db.lookupInterned(queries.CompileTimeValueTuples, reachable.instances[1].specialization.?);
-    const second_arguments = try db.lookupInterned(queries.CompileTimeValueTuples, reachable.instances[2].specialization.?);
+    const first_arguments = try db.lookupInterned(queries.CompileTimeValueTuples, identity_instances[0].specialization.?);
+    const second_arguments = try db.lookupInterned(queries.CompileTimeValueTuples, identity_instances[1].specialization.?);
     try testing.expectEqual(structures.CompileTimeValue{ .type = .int }, try lookupCompileTimeValue(db, first_arguments.values[0]));
     try testing.expectEqual(structures.CompileTimeValue{ .runtime = .{ .type_id = .int, .value = .{ .int = 1 } } }, try lookupCompileTimeValue(db, first_arguments.values[1]));
     try testing.expectEqual(structures.CompileTimeValue{ .runtime = .{ .type_id = .int, .value = .{ .int = 2 } } }, try lookupCompileTimeValue(db, second_arguments.values[1]));
 
-    const first_signature = (try db.get(queries.FunctionInstanceSignature, reachable.instances[1])).*.?;
+    const first_signature = (try db.get(queries.FunctionInstanceSignature, identity_instances[0])).*.?;
     try expectImmParameters(&.{.int}, first_signature.parameters);
     try testing.expectEqual(structures.TypeId.int, first_signature.return_type);
-    const retained_instance = reachable.instances[1];
-    const replaced_specialization = reachable.instances[2].specialization;
+    const retained_instance = identity_instances[0];
+    const replaced_specialization = identity_instances[1].specialization;
     const retained_artifact = try db.get(queries.CompileFunction, retained_instance);
 
     const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
@@ -9845,9 +9891,11 @@ test "static type and value parameters produce canonical reachable instances" {
         \\exit(identity(int, 1, 40) + identity(Whole, 1, 1) + identity(int, 3, 1))
     );
     const updated = (try db.get(queries.CollectReachableInstances, 1)).*.?;
-    try testing.expectEqual(@as(usize, 4), updated.instances.len);
-    try testing.expectEqual(retained_instance, updated.instances[1]);
-    try testing.expect(updated.instances[2].specialization != replaced_specialization);
+    const updated_identities = try reachableInstancesForItem(updated.instances, identity);
+    defer testing.allocator.free(updated_identities);
+    try testing.expectEqual(@as(usize, 2), updated_identities.len);
+    try testing.expectEqual(retained_instance, updated_identities[0]);
+    try testing.expect(updated_identities[1].specialization != replaced_specialization);
     try testing.expectEqual(retained_artifact, try db.get(queries.CompileFunction, retained_instance));
 }
 
@@ -10560,12 +10608,12 @@ test "item locations survive body and unrelated-index edits but not renames" {
     try addSource(db, 1, "static target = func() int -> return 1");
     const initial_result = try db.get(queries.DiscoverItems, 1);
     const initial_tree = initial_result.*.?;
-    const initial_name = try testing.allocator.dupe(u8, initial_tree.items[0].loc.name);
+    const initial_name = try testing.allocator.dupe(u8, initial_tree.items[0].loc.name.text());
     defer testing.allocator.free(initial_name);
     const initial_loc: structures.ItemLoc = .{
         .origin = initial_tree.items[0].loc.origin,
         .kind = initial_tree.items[0].loc.kind,
-        .name = initial_name,
+        .name = .{ .identifier = initial_name },
     };
     const initial_declaration = initial_tree.items[0].declaration;
 
@@ -10590,7 +10638,7 @@ test "item locations survive body and unrelated-index edits but not renames" {
 
 fn findItemByName(items: []const structures.DiscoveredItem, name: []const u8) ?structures.DiscoveredItem {
     for (items) |item| {
-        if (std.mem.eql(u8, item.loc.name, name)) return item;
+        if (std.mem.eql(u8, item.loc.name.text(), name)) return item;
     }
     return null;
 }
@@ -10769,14 +10817,14 @@ test "failed interning publishes no partial identity" {
 
     const module: structures.ModuleId = @fromBackingInt(@intCast(0));
     failing.fail_index = failing.alloc_index + 3;
-    const loc: structures.ItemLoc = .{ .origin = .{ .module = module }, .kind = .function, .name = "owned" };
+    const loc: structures.ItemLoc = .{ .origin = .{ .module = module }, .kind = .function, .name = .{ .identifier = "owned" } };
     try testing.expectError(error.OutOfMemory, db.intern(queries.ItemLocations, loc));
     try testing.expect(failing.has_induced_failure);
     try testing.expectError(error.InvalidInternId, db.lookupInterned(queries.ItemLocations, @fromBackingInt(@intCast(0))));
 
     failing.fail_index = std.math.maxInt(usize);
     const id = try db.intern(queries.ItemLocations, loc);
-    try testing.expectEqualStrings("owned", (try db.lookupInterned(queries.ItemLocations, id)).name);
+    try testing.expectEqualStrings("owned", (try db.lookupInterned(queries.ItemLocations, id)).name.text());
 
     db.deinit();
     db_live = false;
@@ -11043,9 +11091,9 @@ test "generated namespace queries reject stale source positions" {
     const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
     const ty = try resolvedStaticType(db, scope.resolveStatic("S").?);
     const identity = (try db.lookupInterned(queries.Types, ty.interned().?)).structure;
-    try testing.expect((try db.get(queries.StructNamespace, identity)).* != null);
+    try testing.expect((try db.get(queries.TypeNamespace, .{ .generated = identity.generated })).* != null);
     try setSource(db, 1, "func factory() type -> int");
-    try testing.expect((try db.get(queries.StructNamespace, identity)).* == null);
+    try testing.expect((try db.get(queries.TypeNamespace, .{ .generated = identity.generated })).* == null);
     try testing.expect((try db.get(queries.GeneratedStructDefinition, identity.generated)).* == null);
 }
 
@@ -11174,9 +11222,9 @@ test "nested generated structs discover each declaration under its own owner" {
     );
     const discovered = (try db.get(queries.DiscoverItems, 1)).*.?;
     try testing.expectEqual(@as(usize, 6), discovered.items.len);
-    try testing.expectEqualStrings("outer", discovered.items[0].loc.name);
-    try testing.expectEqualStrings("inner", discovered.items[1].loc.name);
-    try testing.expectEqualStrings("answer", discovered.items[2].loc.name);
+    try testing.expectEqualStrings("outer", discovered.items[0].loc.name.text());
+    try testing.expectEqualStrings("inner", discovered.items[1].loc.name.text());
+    try testing.expectEqualStrings("answer", discovered.items[2].loc.name.text());
     try testing.expectEqual(@as(?u32, 0), discovered.items[1].parent);
     try testing.expectEqual(@as(?u32, 1), discovered.items[2].parent);
     const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
