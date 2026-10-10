@@ -381,6 +381,10 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
             try writer.writeAll("expected an expression, found ");
             try writeToken(writer, tag);
         },
+        .unsupported_syntax => |tag| {
+            try writeToken(writer, tag);
+            try writer.writeAll(" syntax is not implemented yet");
+        },
         .unexpected_indented_block => try writer.writeAll("unexpected indented block; the previous expression does not introduce a block"),
         .indented_block_after_inline_body => try writer.writeAll("indented block cannot follow an inline function body; `->` starts the body, and the return type goes before it"),
         .duplicate_top_level_declaration => {
@@ -465,6 +469,10 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
         .misplaced_pub => try writer.writeAll("pub is only allowed on top-level static, function, struct, and import declarations"),
         .namespace_used_as_value => try writer.writeAll("a module namespace is not a value"),
         .unknown_namespace_member => try writeSourceLabel(writer, "unknown struct namespace member", source, span),
+        .missing_operation => |missing| {
+            try writeType(types, writer, missing.receiver);
+            try writer.print(" does not define operation `{s}`", .{missing.operation.spelling()});
+        },
         .invalid_namespace_owner => try writer.writeAll("qualified declaration owner must be a declared struct in the same module or a primitive in the registered standard prelude"),
         .unknown_module => try writeSourceLabel(writer, "unknown module", source, span),
         .unknown_imported_name => try writeSourceLabel(writer, "unknown imported name", source, span),
@@ -661,6 +669,8 @@ test "diagnostic types display array elements lengths and nested variants" {
     try writeType(types, &output.writer, matrix);
     try std.testing.expectEqualStrings("`Array(Array(int | none, 2), 0)`", output.writer.buffered());
     const cases = [_]struct { kind: structures.Diagnostic.Kind, message: []const u8 }{
+        .{ .kind = .{ .missing_operation = .{ .receiver = .bool, .operation = .@"+" } }, .message = "`bool` does not define operation `+`" },
+        .{ .kind = .{ .unsupported_syntax = .keyword_for }, .message = "`for` syntax is not implemented yet" },
         .{ .kind = .{ .compile_time_only_type = matrix }, .message = "compile-time-only type `Array(Array(int | none, 2), 0)` cannot be materialized during runtime execution" },
         .{ .kind = .{ .return_type_mismatch = .{ .expected = matrix, .found = .int } }, .message = "return type mismatch: expected `Array(Array(int | none, 2), 0)`, found `int`" },
         .{ .kind = .{ .type_not_copyable = .{ .type_id = matrix, .is_movable = true } }, .message = "cannot implicitly copy value of non-copyable type `Array(Array(int | none, 2), 0)`; use `^` to transfer ownership" },

@@ -8,6 +8,40 @@ const query_disk_cache = test_sources.query_disk_cache;
 const structures = test_sources.structures;
 const standard_library = @import("standard_library");
 
+test "text operations remainder and precise mutable calls survive snapshots and source edits" {
+    const source =
+        \\struct Named
+        \\    pub name: StringView
+        \\    pub value: int
+        \\func touch(imm source: Named, mut target: Named)
+        \\    target.value += source.value
+        \\func run() int
+        \\    var first = Named{
+        \\        name = "first",
+        \\        value = 19,
+        \\    }
+        \\    var second = Named{
+        \\        name = "second",
+        \\        value = 23,
+        \\    }
+        \\    touch(first, second)
+        \\    touch(second, first)
+        \\    if first.name <> "first" -> return 90
+        \\    return second.value + first.value % second.value - 19
+        \\static answer = run()
+        \\exit(run() + answer - 42)
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const changed = try std.mem.replaceOwned(u8, std.testing.allocator, source, "value = 19,", "value = 20,");
+    defer std.testing.allocator.free(changed);
+    try fixture.db.setInput(queries.SourceText, 0, changed);
+    try fixture.expectExit(46);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(42);
+}
+
 const Fixture = struct {
     db: *query.Database,
 

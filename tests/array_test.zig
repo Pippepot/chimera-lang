@@ -68,7 +68,7 @@ test "operation indexing List reads replacements and bounds use ordinary calls" 
     , 42);
 }
 
-test "operation indexing bounds failure skips initialization and index evaluates once" {
+test "operation indexing evaluates owned replacements before setter bounds and freezes the index" {
     try Fixture.expectParity(
         \\func offset(mut calls: int) int
         \\    calls += 1
@@ -80,10 +80,78 @@ test "operation indexing bounds failure skips initialization and index evaluates
         \\    var calls = 0
         \\    var values = [19]
         \\    if values[1] = replacement(calls) -> return 91
-        \\    if calls <> 0 -> return 92
+        \\    if calls <> 10 -> return 92
+        \\    calls = 0
         \\    if values[offset(calls)] += replacement(calls)
         \\        if calls <> 11 -> return 93
         \\        if const stored = values[0] -> return stored + 2
+        \\    return 90
+    , 42);
+}
+
+test "indexed replacements and compound updates read the same owner across container shapes" {
+    for ([_][]const u8{
+        "var values = [10, 20]",
+        "var values: List(int) = [10, 20]",
+        "var backing = [10, 20]\n    const values = backing.span_mut()",
+    }) |binding| {
+        const source = try test_sources.renderTemplate(testing.allocator,
+            \\fallible calculate() int
+            \\    $binding
+            \\    values[1] = values[0] + 1
+            \\    values[1] += values[0]
+            \\    return values[1] * 2
+            \\func run() int
+            \\    if const result = calculate() -> return result
+            \\    return 90
+        , .{ .binding = binding });
+        defer testing.allocator.free(source);
+        try Fixture.expectParity(source, 42);
+    }
+}
+
+test "indexed nested array replacements finish conversion before mutable access" {
+    try Fixture.expectParity(
+        \\fallible calculate() int
+        \\    var values: Array(Array(int, 2), 2) = [[10, 20], [30, 40]]
+        \\    values[1] = [values[0][0] + 1, values[0][1] + 11]
+        \\    return values[1][0] + values[1][1]
+        \\func run() int
+        \\    if const result = calculate() -> return result
+        \\    return 90
+    , 42);
+}
+
+test "invalid indexed replacement cleans its prepared owned value" {
+    try Fixture.expectParity(
+        \\struct Item
+        \\    trace: Ref(int, true)
+        \\    value: int
+        \\    drop = func(deinit self: Item)
+        \\        self.trace.replace(self.trace[] + self.value)
+        \\struct Sink
+        \\    pub fallible []=(mut self: Sink, index: int, var item: Item) unit -> fail
+        \\func run() int
+        \\    var trace = [0]
+        \\    if const handle = trace.get_mut(0)
+        \\        var sink = Sink{}
+        \\        if sink[99] = Item{trace = handle, value = 42} -> return 90
+        \\        return handle[]
+        \\    return 91
+    , 42);
+}
+
+test "explicit checked reference acquisition skips the replacement on bounds failure" {
+    try Fixture.expectParity(
+        \\func replacement(mut calls: int) int
+        \\    calls += 1
+        \\    return 42
+        \\func run() int
+        \\    var values = [20]
+        \\    var calls = 0
+        \\    if const target = values.get_mut(99)
+        \\        target[] = replacement(calls)
+        \\    if const first = values[0] -> return first + calls + 22
         \\    return 90
     , 42);
 }

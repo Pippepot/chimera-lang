@@ -64,6 +64,8 @@ pub struct StringView
     copy = trivial
     bytes: BytesView
 
+    pub func ==(imm left: StringView, imm right: StringView) bool -> equal_bytes(left.bytes, right.bytes)
+    pub func <>(imm left: StringView, imm right: StringView) bool -> not equal_bytes(left.bytes, right.bytes)
     pub func byte_length(imm self: StringView) int -> self.bytes.byte_length()
     pub func as_bytes(imm self: StringView) BytesView -> self.bytes
     pub fallible slice(imm self: StringView, start: int, size: int) StringView
@@ -92,6 +94,8 @@ pub struct String
     copy = none
     storage: LiteralBytes | OwnedBytes
 
+    pub func ==(imm left: String, imm right: String) bool -> equal_bytes(left.as_bytes(), right.as_bytes())
+    pub func <>(imm left: String, imm right: String) bool -> not equal_bytes(left.as_bytes(), right.as_bytes())
     pub fallible from_utf8(imm bytes: BytesView) String
         const text = bytes.validate_utf8?()
         var result = String.empty()
@@ -154,6 +158,19 @@ pub struct String
         var result = String.empty()
         result.append?(self.view())
         return result^
+
+func equal_bytes(imm left: BytesView, imm right: BytesView) bool
+    const count = left.byte_length()
+    if count <> right.byte_length() -> return false
+    var index = 0
+    loop
+        if index == count -> return true
+        if const first = left.get(index)
+            if const second = right.get(index)
+                if byte_int(first) <> byte_int(second) -> return false
+                index += 1
+                continue
+        exit(134)
 
 pub converter(static value: string_literal) String -> String{storage = LiteralBytes{data = literal_data(value), size = literal_size(value)}}
 pub converter(static value: string_literal) StringView -> StringView{bytes = BytesView{data = Span(byte, false).unsafe_from_static(literal_data(value), literal_size(value))}}

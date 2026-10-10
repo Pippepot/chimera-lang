@@ -24,9 +24,9 @@ pub struct Array(T: type, N: int)
         const element = self.get?(index)
         return element[]
 
-    pub fallible []=(mut self: Array(T, N), index: int, init value: T) unit
+    pub fallible []=(mut self: Array(T, N), index: int, var value: T) unit
         const element = self.get_mut?(index)
-        element[] = value
+        element[] = value^
 
 extern func array_filled(static T: type, static N: int, imm value: T) Array(T, N)
 extern func array_from(static T: type, static N: int, init value: collection_literal(T, N)) Array(T, N)

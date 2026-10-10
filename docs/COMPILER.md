@@ -69,6 +69,10 @@ nothing; mutation grows unique owned storage, and `clone` is explicitly fallible
 named widening operation. `BytesView.validate_utf8` validates arbitrary byte
 input, and text slices check codepoint boundaries. String-to-view converters
 borrow their source; literal-to-view converters refer to permanent static bytes.
+`String` and `StringView` support `==` and `<>` with exact byte equality,
+including embedded NUL bytes. Integer `%` is truncating remainder (`-7 % 3`
+is `-1`), and `%=` uses the same operation. Delimited calls, arrays, struct
+initializers, imports, and parameter lists accept multiline continuation layout.
 
 ```chi
 fallible output()

@@ -192,6 +192,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             indirect: Value,
         };
         const InitAvailability = enum { absent, pending, consumed, maybe_consumed };
+        const ReplacementTarget = union(enum) { local: semantic.UnresolvedBody.LocalId, reference: Value };
         const InitializerTypeKey = struct { expression: semantic.UnresolvedBody.ValueId, expected: ?structures.TypeId, initializer_boundary: bool };
         const InitializerTypes = std.AutoHashMapUnmanaged(InitializerTypeKey, structures.TypeId);
         const CaptureTransfer = struct { local: semantic.UnresolvedBody.LocalId, parameter: u32, field: ?usize = null };
@@ -286,7 +287,9 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             boundary: struct { id: BoundaryId, effect_index: usize },
             terminator: struct { id: structures.FunctionBlockId, effect_index: usize },
         };
+        const ReferenceUseKind = enum { access, retention };
         const PendingReferenceUse = struct {
+            kind: ReferenceUseKind,
             origins: u32,
             state: StateId,
             span: structures.SourceSpan,
@@ -375,6 +378,17 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             reference_origins: ?u32 = null,
             return_origin: bool = false,
         };
+
+        const CallOriginSource = struct {
+            type_id: structures.TypeId,
+            contained: ?u32,
+            storage: ?u32 = null,
+        };
+        const PendingMutableAliasCheck = struct {
+            origins: ?u32,
+            local: semantic.UnresolvedBody.LocalId,
+            span: structures.SourceSpan,
+        };
         const OwnershipForwardHint = struct {
             predecessor: structures.FunctionBlockId,
             successor_ordinal: u2,
@@ -444,6 +458,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         cleanup_origins: std.AutoHashMapUnmanaged(structures.FunctionValueId, u32) = .empty,
         drop_effects: std.AutoHashMapUnmanaged(u31, DropEffects) = .empty,
         pending_reference_invalidations: std.ArrayList(PendingReferenceInvalidation) = .empty,
+        pending_mutable_alias_checks: std.ArrayList(PendingMutableAliasCheck) = .empty,
         pending_reference_returns: std.ArrayList(PendingReferenceReturn) = .empty,
         call_arguments: std.ArrayList(structures.FunctionCallArgument) = .empty,
         mut_argument_fields: std.ArrayList(PlaceField) = .empty,
@@ -453,6 +468,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         pending_initializer_owners: std.ArrayList(Value) = .empty,
         initializer_owners: std.ArrayList(struct { initializer: structures.FunctionValueId, owner: Value }) = .empty,
         pending_initializer_locals: std.ArrayList(semantic.UnresolvedBody.LocalId) = .empty,
+        replacement_targets: std.ArrayList(ReplacementTarget) = .empty,
         pending_deinit_places: std.ArrayList(ArgumentPlace) = .empty,
         pending_deinit_fields: std.ArrayList(PlaceField) = .empty,
         branch_arguments: std.ArrayList(structures.FunctionValueUse) = .empty,
@@ -636,6 +652,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             self.cleanup_origins.deinit(gpa);
             self.drop_effects.deinit(gpa);
             self.pending_reference_invalidations.deinit(gpa);
+            self.pending_mutable_alias_checks.deinit(gpa);
             self.pending_reference_returns.deinit(gpa);
             self.call_arguments.deinit(gpa);
             self.mut_argument_fields.deinit(gpa);
@@ -645,6 +662,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             self.pending_initializer_owners.deinit(gpa);
             self.initializer_owners.deinit(gpa);
             self.pending_initializer_locals.deinit(gpa);
+            self.replacement_targets.deinit(gpa);
             self.pending_deinit_places.deinit(gpa);
             self.pending_deinit_fields.deinit(gpa);
             self.branch_arguments.deinit(gpa);
@@ -748,6 +766,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         fn buildPrimitiveOperation(self: *Self, operation: structures.Operation) !void {
             switch (operation) {
                 .@"+", .@"-", .@"*", .@"/" => return self.buildPrimitiveArithmetic(operation),
+                .@"%" => return self.buildPrimitiveRemainder(),
                 .unary_minus => return self.returnValue(try self.appendInstruction(.{ .negi = self.values[0].?.id }), .{ .start = 0, .end = 0 }),
                 .@"==", .@"<>", .@"<", .@">", .@"<=", .@">=", .not => return self.buildPrimitivePredicate(operation),
                 .@"[]", .@"[]=" => unreachable,
@@ -764,6 +783,29 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 else => unreachable,
             };
             try self.returnValue(try self.appendInstruction(instruction), .{ .start = 0, .end = 0 });
+        }
+
+        fn buildPrimitiveRemainder(self: *Self) !void {
+            const left = self.values[0].?.id;
+            const right = self.values[1].?.id;
+            const minus_one = try self.appendInstruction(.{ .const_int = -1 });
+            const start: u32 = @intCast(self.block_arguments.items.len);
+            const zero = try self.newBlock(start, start);
+            const divide = try self.newBlock(start, start);
+            // Every integer has remainder zero with -1, including minInt.
+            // Avoid the overflowing division in that case.
+            self.terminate(.{ .predicate_branch = .{
+                .operation = .eqi,
+                .operands = .{ .lhs = right, .rhs = minus_one.id },
+                .then_branch = self.emptyBranch(zero),
+                .else_branch = self.emptyBranch(divide),
+            } });
+            self.enterBlock(zero);
+            try self.returnValue(try self.appendInstruction(.{ .const_int = 0 }), .{ .start = 0, .end = 0 });
+            self.enterBlock(divide);
+            const quotient = try self.appendInstruction(.{ .divsi = .{ .lhs = left, .rhs = right } });
+            const product = try self.appendInstruction(.{ .muli = .{ .lhs = quotient.id, .rhs = right } });
+            try self.returnValue(try self.appendInstruction(.{ .subi = .{ .lhs = left, .rhs = product.id } }), .{ .start = 0, .end = 0 });
         }
 
         fn buildPrimitivePredicate(self: *Self, operation: structures.Operation) !void {
@@ -887,7 +929,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 return;
             }
             const span = self.unresolved.parameter_spans[0];
-            const storage = if (try self.constructsInPlace(self.return_type))
+            const storage = if (try self.usesIndirectStorage(self.return_type))
                 try self.appendInstruction(.{ .result_storage = self.return_type })
             else
                 null;
@@ -905,7 +947,11 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             self.current_boundary = boundary;
             const storage = try self.appendInstruction(.{ .result_storage = self.return_type });
             const result = try self.constructInitializer(self.values[0].?, span, storage);
-            if (self.current_block != null) try self.returnConstructed(result, span);
+            if (self.current_block != null) {
+                try self.appendBoundary(boundary);
+                self.current_boundary = null;
+                try self.returnConstructed(result, span);
+            }
         }
 
         fn buildArrayFilled(self: *Self) !void {
@@ -1143,6 +1189,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             if (value_to_break.type_id == .never) return;
             if (context.result.discard) value_to_break = try self.discardResult(value_to_break, self.valueSpan(value_id));
             value_to_break = try self.ownValueEscapingSince(value_to_break, context.baseline, self.unresolved.blocks[@backingInt(self.unresolved.root_block)].span);
+            try self.finishReplacementUses(self.valueSpan(value_id));
             self.unbindLocalsSince(context.baseline);
             const state = try self.captureState();
             try self.loop_breaks.append(self.ctx.allocator(), .{ .block = self.suspendBlock(), .state = state, .constructed = value_to_break });
@@ -1151,6 +1198,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         fn continueLoop(self: *Self, span: structures.SourceSpan) !void {
             if (self.is_initializer_region and self.loop_stack.items.len == 0) return self.reject(span, .initializer_exit_outside_boundary);
             const context = self.loop_stack.last().?;
+            try self.finishReplacementUses(span);
             self.unbindLocalsSince(context.baseline);
             try self.normalizeLoopBackedge(context, span);
             try self.validateLoopBackedge(context, span);
@@ -1172,7 +1220,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
 
         fn returnExpression(self: *Self, id: semantic.UnresolvedBody.ValueId, span: structures.SourceSpan) !void {
             if (self.is_initializer_region) return self.reject(span, .initializer_exit_outside_boundary);
-            if (self.infer_return_type or !try self.constructsInPlace(self.return_type))
+            if (self.infer_return_type or !try self.usesIndirectStorage(self.return_type))
                 return self.returnValue(try self.valueWithContext(id, .{ .expected_type = self.return_type, .access = .initialize }), span);
             const storage = try self.appendInstruction(.{ .result_storage = self.return_type });
             const result = try self.construct(id, span, .{ .storage = storage, .site = .return_value });
@@ -1285,6 +1333,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             const parent_boundary = self.current_boundary;
             self.current_boundary = boundary;
             defer self.current_boundary = parent_boundary;
+            try self.recordReplacementUses();
             try self.writeMutParameters();
             self.unbindAllLocals();
             try self.appendBoundary(boundary);
@@ -1469,7 +1518,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             if (source.preserves_storage) return self.reject(span, .{ .call_argument_type_mismatch = self.typeMismatch(target_type, source.type_id) });
             const use = try self.coerceValue(source.id, source.type_id, target_type) orelse
                 return self.reject(span, .{ .call_argument_type_mismatch = self.typeMismatch(target_type, source.type_id) });
-            return self.coerceOwnedRepresentation(source, use, span, if (try self.constructsInPlace(target_type)) context.fresh_destination orelse try self.localStorage(target_type) else null);
+            return self.coerceOwnedRepresentation(source, use, span, if (try self.usesIndirectStorage(target_type)) context.fresh_destination orelse try self.localStorage(target_type) else null);
         }
 
         fn convertValue(self: *Self, source: ?Value, candidate: structures.ConversionCandidate, context: ValueContext, span: structures.SourceSpan) !Value {
@@ -1511,7 +1560,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             const result = try self.resolvedCallResult(callable, call, span, .{ .value = context, .destination = if (context.fresh_destination) |storage| .{ .storage = storage, .site = .argument } else null });
             if (result.type_id == context.expected_type.?) return result;
             const widened = (try self.coerceValue(result.id, result.type_id, context.expected_type.?)).?;
-            return self.coerceOwnedRepresentation(result, widened, span, if (try self.constructsInPlace(context.expected_type.?)) try self.localStorage(context.expected_type.?) else null);
+            return self.coerceOwnedRepresentation(result, widened, span, if (try self.usesIndirectStorage(context.expected_type.?)) try self.localStorage(context.expected_type.?) else null);
         }
 
         fn staticConversion(self: *Self, id: semantic.UnresolvedBody.ValueId, context: ValueContext) !?Value {
@@ -1846,7 +1895,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             _ = try self.appendInstruction(.{ .mut_parameter_write = .{ .parameter_index = parameter, .value = updated.id, .type_id = updated.type_id } });
         }
 
-        fn constructsInPlace(self: *Self, type_id: structures.TypeId) !bool {
+        fn usesIndirectStorage(self: *Self, type_id: structures.TypeId) !bool {
             return try self.type_interner.facts().argumentPassing(type_id) == .indirect;
         }
 
@@ -1879,7 +1928,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             const index = @backingInt(id);
             if (index < self.unresolved.parameter_count or self.values[index] != null) return false;
             const expression = self.unresolved.expressions[index - self.unresolved.parameter_count];
-            if (expression.operation != .struct_init and !try self.constructsInPlace(expected_type)) return false;
+            if (expression.operation != .struct_init and !try self.usesIndirectStorage(expected_type)) return false;
             if (expression.operation == .struct_init or expression.operation == .array_init or expression.operation == .call) {
                 if (try self.unevaluatedType(id, null)) |source_type| {
                     if (source_type != expected_type and source_type != .never) {
@@ -1912,7 +1961,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         fn placeValue(self: *Self, source: Value, span: structures.SourceSpan, destination: Destination) !Value {
             if (source.type_id == .never) return source;
             const target_type = destination.storage.type_id;
-            if (!try self.constructsInPlace(source.type_id)) {
+            if (!try self.usesIndirectStorage(source.type_id)) {
                 var use = try self.coerceValue(source.id, source.type_id, target_type) orelse
                     return self.reject(span, self.initializationMismatch(destination.site, target_type, source.type_id));
                 const owned = try self.ownValue(source, span);
@@ -2005,6 +2054,8 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         }
 
         fn collectionValue(self: *Self, id: semantic.UnresolvedBody.ValueId, expression: Expression, elements: structures.FunctionValueRange, context: ValueContext) !Value {
+            const captures = self.initializerCaptureScope();
+            defer self.endInitializerCaptureScope(captures);
             const array_type = try self.collectionArrayType(elements, context.expected_type, expression.span);
             if (!context.allow_converters) {
                 var result = try self.constructArrayElements(expression, array_type, elements, .{ .storage = context.fresh_destination orelse try self.localStorage(array_type), .site = .local });
@@ -2074,7 +2125,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
 
         fn constructLocalTransfer(self: *Self, local: semantic.UnresolvedBody.LocalId, span: structures.SourceSpan, destination: Destination) !Value {
             const source_type = try self.placeRootType(.{ .local = local });
-            if (!try self.constructsInPlace(source_type)) return self.placeValue(try self.transferLocal(local, span, null), span, destination);
+            if (!try self.usesIndirectStorage(source_type)) return self.placeValue(try self.transferLocal(local, span, null), span, destination);
             const storage = try self.memberDestination(destination, source_type, span, .existing);
             return self.finishMemberStorage(try self.transferLocal(local, span, storage), destination.storage, span);
         }
@@ -2085,7 +2136,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             const root = self.local_values[@backingInt(transfer.target)].?;
             try self.resolvePlaceFields(root.type_id, self.unresolved.assignment_fields[transfer.fields.start..transfer.fields.end], span, &fields);
             const source_type = fields.last().?.type_id;
-            if (!try self.constructsInPlace(source_type))
+            if (!try self.usesIndirectStorage(source_type))
                 return self.placeValue(try self.transferFieldPlace(transfer.target, fields.items, span, .{ .move = null }), span, destination);
             const storage = try self.memberDestination(destination, source_type, span, .existing);
             return self.finishMemberStorage(try self.transferFieldPlace(transfer.target, fields.items, span, .{ .move = storage }), destination.storage, span);
@@ -2122,6 +2173,42 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         fn validateInitializerWrite(self: *Self, local: semantic.UnresolvedBody.LocalId, span: structures.SourceSpan) !void {
             if (std.mem.indexOfScalar(semantic.UnresolvedBody.LocalId, self.pending_initializer_locals.items, local) != null)
                 return self.reject(span, .initializer_capture_conflict);
+        }
+
+        const InitializerCaptureScope = struct { owners: usize, locals: usize };
+
+        fn initializerCaptureScope(self: *const Self) InitializerCaptureScope {
+            return .{ .owners = self.pending_initializer_owners.items.len, .locals = self.pending_initializer_locals.items.len };
+        }
+
+        fn endInitializerCaptureScope(self: *Self, scope: InitializerCaptureScope) void {
+            self.pending_initializer_owners.shrinkRetainingCapacity(scope.owners);
+            self.pending_initializer_locals.shrinkRetainingCapacity(scope.locals);
+        }
+
+        fn recordReplacementUses(self: *Self) !void {
+            for (self.replacement_targets.items) |target| switch (target) {
+                .local => |local| try self.recordLocalReplacementUse(local),
+                .reference => |reference| try self.recordReferenceUses(reference, .retention),
+            };
+        }
+
+        fn recordLocalReplacementUse(self: *Self, local: semantic.UnresolvedBody.LocalId) !void {
+            const index = @backingInt(local);
+            if (self.local_availability[index] != .available) return;
+            const owner = self.local_values[index].?;
+            const generation = owner.owned_generation orelse return;
+            try self.recordEffect(.{ .use = .{ .generation = generation, .cleanup_value = owner.id } });
+        }
+
+        fn finishReplacementUses(self: *Self, span: structures.SourceSpan) !void {
+            if (self.replacement_targets.items.len == 0) return;
+            const parent_boundary = self.current_boundary;
+            const boundary = try self.newBoundary(span);
+            self.current_boundary = boundary;
+            defer self.current_boundary = parent_boundary;
+            try self.recordReplacementUses();
+            try self.appendBoundary(boundary);
         }
 
         fn validateInitializerReferenceWrite(self: *Self, reference: Value, span: structures.SourceSpan) !void {
@@ -2176,7 +2263,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             try self.consumeInitializer(initializer, span);
             const argument_start: u32 = @intCast(self.call_arguments.items.len);
             var storage = destination;
-            if (storage == null and try self.constructsInPlace(result_type)) storage = try self.localStorage(result_type);
+            if (storage == null and try self.usesIndirectStorage(result_type)) storage = try self.localStorage(result_type);
             const parent_boundary = self.current_boundary;
             const boundary = try self.newBoundary(span);
             self.current_boundary = boundary;
@@ -2354,7 +2441,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             var capture_locals: std.ArrayList(?semantic.UnresolvedBody.LocalId) = .empty;
             defer capture_locals.deinit(gpa);
             try self.bindRegionCaptures(&region, &captures, &capture_locals);
-            if (try region.constructsInPlace(constructed_type)) {
+            if (try region.usesIndirectStorage(constructed_type)) {
                 const storage = try region.appendInstruction(.{ .result_storage = constructed_type });
                 const expression = if (@backingInt(raw.value) >= self.unresolved.parameter_count) self.unresolved.expressions[@backingInt(raw.value) - self.unresolved.parameter_count] else null;
                 const constructed = if (collection != null and expression != null and expression.?.operation == .collection_literal)
@@ -2969,7 +3056,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         }
 
         fn inPlaceStorage(self: *Self, type_id: structures.TypeId) !?Value {
-            return if (try self.constructsInPlace(type_id)) try self.localStorage(type_id) else null;
+            return if (try self.usesIndirectStorage(type_id)) try self.localStorage(type_id) else null;
         }
 
         const OwnershipOperation = enum { copy, move, drop };
@@ -3141,7 +3228,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         }
 
         fn fieldView(self: *Self, owner: Value, index: u32, field_type: structures.TypeId) !Value {
-            if (try self.constructsInPlace(field_type)) return self.projectStorage(owner, field_type, .{ .field = index });
+            if (try self.usesIndirectStorage(field_type)) return self.projectStorage(owner, field_type, .{ .field = index });
             return self.appendInstruction(.{ .field_access = .{ .operand = owner.id, .field_index = index, .field_type = field_type } });
         }
 
@@ -3338,28 +3425,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         fn recordUse(self: *Self, source: Value) !void {
             if (source.initializer_parameter != null) return self.reject(self.activeLifetimeSpan(), .initializer_requires_construction);
             try self.rememberCleanupOrigins(source);
-            if (source.reference_origins) |origins| {
-                const location: PendingReferenceUseLocation = if (self.current_boundary) |boundary|
-                    .{ .boundary = .{ .id = boundary, .effect_index = self.boundaries.items[@backingInt(boundary)].effects.items.len } }
-                else blk: {
-                    const current_block = self.current_block orelse unreachable;
-                    break :blk .{ .terminator = .{ .id = current_block, .effect_index = self.blocks.items[@backingInt(current_block)].terminator_effects.items.len } };
-                };
-                try self.reference_uses.append(self.ctx.allocator(), .{ .origins = origins, .span = self.activeLifetimeSpan(), .location = location });
-                var pending = false;
-                const resolved = try self.resolveReferenceOrigins(origins, &pending);
-                var effects: std.ArrayList(LifetimeEffect) = .empty;
-                defer effects.deinit(self.ctx.allocator());
-                if (!pending) try self.collectReferenceUses(resolved, self.currentState(), self.activeLifetimeSpan(), &effects, &pending);
-                if (pending) {
-                    try self.pending_reference_uses.append(self.ctx.allocator(), .{
-                        .origins = origins,
-                        .state = try self.captureState(),
-                        .span = self.activeLifetimeSpan(),
-                        .location = location,
-                    });
-                } else for (effects.items) |effect| try self.recordEffect(effect);
-            }
+            try self.recordReferenceUses(source, .access);
             if (source.borrowed_generation) |generation| try self.recordEffect(.{ .use = .{
                 .generation = generation,
                 .cleanup_value = source.borrowed_cleanup_value orelse source.id,
@@ -3371,11 +3437,38 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             } });
         }
 
+        fn recordReferenceUses(self: *Self, source: Value, kind: ReferenceUseKind) !void {
+            if (source.reference_origins) |origins| {
+                const location: PendingReferenceUseLocation = if (self.current_boundary) |boundary|
+                    .{ .boundary = .{ .id = boundary, .effect_index = self.boundaries.items[@backingInt(boundary)].effects.items.len } }
+                else blk: {
+                    const current_block = self.current_block orelse unreachable;
+                    break :blk .{ .terminator = .{ .id = current_block, .effect_index = self.blocks.items[@backingInt(current_block)].terminator_effects.items.len } };
+                };
+                if (kind == .access) try self.reference_uses.append(self.ctx.allocator(), .{ .origins = origins, .span = self.activeLifetimeSpan(), .location = location });
+                var pending = false;
+                const resolved = try self.resolveReferenceOrigins(origins, &pending);
+                var effects: std.ArrayList(LifetimeEffect) = .empty;
+                defer effects.deinit(self.ctx.allocator());
+                if (!pending) try self.collectReferenceUses(resolved, self.currentState(), self.activeLifetimeSpan(), kind, &effects, &pending);
+                if (pending) {
+                    try self.pending_reference_uses.append(self.ctx.allocator(), .{
+                        .kind = kind,
+                        .origins = origins,
+                        .state = try self.captureState(),
+                        .span = self.activeLifetimeSpan(),
+                        .location = location,
+                    });
+                } else for (effects.items) |effect| try self.recordEffect(effect);
+            }
+        }
+
         fn collectReferenceUses(
             self: *Self,
             origins: ?u32,
             state: State,
             span: structures.SourceSpan,
+            kind: ReferenceUseKind,
             effects: *std.ArrayList(LifetimeEffect),
             incomplete: *bool,
         ) !void {
@@ -3387,27 +3480,33 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 var cleanup_value = origin.cleanup_value;
                 if (origin.root) |root| {
                     const slot = @backingInt(root);
+                    if (kind == .retention and state.availability[slot] != .available) {
+                        origin_id = origin.next;
+                        continue;
+                    }
                     switch (state.availability[slot]) {
                         .available => {},
                         .transferred, .maybe_transferred, .replacing => |availability| return self.reject(span, unavailableUse(availability)),
                         .unbound => return self.reject(span, .borrow_outlives_source),
                     }
-                    const expected = try self.resolveBindingIdentity(origin.binding_identity);
-                    const actual_identity = if (origin.stable)
-                        state.values.get(slot).?.storage_identity orelse state.values.get(slot).?.binding_identity
-                    else
-                        state.values.get(slot).?.binding_identity;
-                    const actual = try self.resolveBindingIdentity(actual_identity);
-                    if (expected.incomplete or actual.incomplete) {
-                        incomplete.* = true;
-                        origin_id = origin.next;
-                        continue;
-                    }
-                    const current_read = origin.read != null and origin.binding_identity == .join;
-                    if (!((origin.stable or origin.deferred_capture or current_read) and std.meta.eql(origin.binding_identity, actual_identity)) and
-                        (expected.conflicting or actual.conflicting or expected.value == null or expected.value != actual.value))
-                    {
-                        return self.reject(span, if (origin.deferred_capture) .initializer_capture_conflict else .borrow_outlives_source);
+                    if (kind == .access) {
+                        const expected = try self.resolveBindingIdentity(origin.binding_identity);
+                        const actual_identity = if (origin.stable)
+                            state.values.get(slot).?.storage_identity orelse state.values.get(slot).?.binding_identity
+                        else
+                            state.values.get(slot).?.binding_identity;
+                        const actual = try self.resolveBindingIdentity(actual_identity);
+                        if (expected.incomplete or actual.incomplete) {
+                            incomplete.* = true;
+                            origin_id = origin.next;
+                            continue;
+                        }
+                        const current_read = origin.read != null and origin.binding_identity == .join;
+                        if (!((origin.stable or origin.deferred_capture or current_read) and std.meta.eql(origin.binding_identity, actual_identity)) and
+                            (expected.conflicting or actual.conflicting or expected.value == null or expected.value != actual.value))
+                        {
+                            return self.reject(span, if (origin.deferred_capture) .initializer_capture_conflict else .borrow_outlives_source);
+                        }
                     }
                     generation = state.values.get(slot).?.owned_generation;
                     cleanup_value = state.values.get(slot).?.id;
@@ -3454,6 +3553,16 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         }
 
         fn resolvePendingReferenceUses(self: *Self) !void {
+            for (self.pending_mutable_alias_checks.items) |pending| {
+                var incomplete = false;
+                var origins = try self.resolveReferenceOrigins(pending.origins, &incomplete);
+                std.debug.assert(!incomplete);
+                while (origins) |index| {
+                    const origin = self.reference_origins.items[index];
+                    if (origin.root == pending.local) return self.reject(pending.span, .overlapping_mutable_arguments);
+                    origins = origin.next;
+                }
+            }
             for (self.pending_reference_invalidations.items) |pending| {
                 var incomplete = false;
                 var origins = try self.resolveReferenceOrigins(pending.origins, &incomplete);
@@ -3486,7 +3595,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 std.debug.assert(!incomplete);
                 var effects: std.ArrayList(LifetimeEffect) = .empty;
                 defer effects.deinit(self.ctx.allocator());
-                try self.collectReferenceUses(origins, self.states.items[@backingInt(pending_use.state)], pending_use.span, &effects, &incomplete);
+                try self.collectReferenceUses(origins, self.states.items[@backingInt(pending_use.state)], pending_use.span, pending_use.kind, &effects, &incomplete);
                 std.debug.assert(!incomplete);
                 switch (pending_use.location) {
                     .boundary => |location| try self.boundaries.items[@backingInt(location.id)].effects.insertSlice(
@@ -3692,7 +3801,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             if (index < self.unresolved.parameter_count or self.values[index] != null) return null;
             if (self.unresolved.expressions[index - self.unresolved.parameter_count].operation != .if_else) return null;
             const type_id = (try self.unevaluatedType(id, null)) orelse return null;
-            return if (try self.constructsInPlace(type_id)) type_id else null;
+            return if (try self.usesIndirectStorage(type_id)) type_id else null;
         }
 
         fn unevaluatedBranchType(self: *Self, block_id: semantic.UnresolvedBody.BlockId) !?structures.TypeId {
@@ -3738,7 +3847,13 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     return .{ .field = (try self.resolvePlaceField(receiver_type, member.name, member.receiver.span, span)).type_id };
             } else if (!receiver_type.isPrimitive() and try self.type_interner.facts().arrayType(receiver_type) == null)
                 return self.reject(member.receiver.span, .{ .field_access_not_struct = receiver_type });
-            const instance = (try self.type_interner.typeNamespaceCallMember(operand_type, member.name, operands, span)) orelse return self.reject(span, .unknown_namespace_member);
+            const instance = (try self.type_interner.typeNamespaceCallMember(operand_type, member.name, operands, span)) orelse {
+                const kind: structures.Diagnostic.Kind = if (structures.Operation.fromName(member.name, operands)) |operation|
+                    .{ .missing_operation = .{ .receiver = operand_type, .operation = operation } }
+                else
+                    .unknown_namespace_member;
+                return self.reject(span, kind);
+            };
             if (try self.type_interner.functionShape(instance.item)) |shape| return .{ .function = .{ .instance = instance, .shape = shape } };
             const value_id = (try self.type_interner.staticItem(instance)) orelse return error.Unavailable;
             const callee = try self.type_interner.lookupCompileTimeValue(value_id);
@@ -3754,11 +3869,20 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
 
         fn operationTarget(self: *Self, receiver_type: structures.TypeId, name: []const u8, operands: usize, span: structures.SourceSpan) !CallTarget {
             const operand_type = if (receiver_type == .int_literal) structures.TypeId.int else receiver_type;
-            const instance = (try self.type_interner.namedTypeNamespaceMember(operand_type, .fromText(name, operands), span)) orelse return self.reject(span, .unknown_namespace_member);
+            const operation = structures.Operation.fromName(name, operands).?;
+            const instance = (try self.type_interner.namedTypeNamespaceMember(operand_type, .{ .operation = operation }, span)) orelse
+                return self.reject(span, .{ .missing_operation = .{ .receiver = operand_type, .operation = operation } });
             const shape = (try self.type_interner.functionShape(instance.item)) orelse return error.Unavailable;
             if (try self.type_interner.needsInheritedInference(instance)) return .{ .inferred = instance };
             for (shape.parameters) |parameter| if (parameter.mode == .static) return .{ .inferred = instance };
             return .{ .direct = instance };
+        }
+
+        fn callOriginsForType(self: *Self, source: CallOriginSource, result_type: structures.TypeId) !?u32 {
+            if (source.storage == null) return source.contained;
+            if (source.type_id == .static_data or try self.type_interner.canBorrowStorageOf(result_type, source.type_id))
+                return self.mergeReferenceOrigins(source.contained, source.storage);
+            return source.contained;
         }
 
         fn unevaluatedTargetType(self: *Self, target: CallTarget, arguments: []const semantic.UnresolvedBody.ValueUse) !?structures.TypeId {
@@ -4020,7 +4144,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             for (0..snapshot.len) |slot| {
                 const value_in_state = snapshot.get(slot);
                 if (self.locals.items(.mutable)[slot]) if (value_in_state) |value_to_append| {
-                    if (!try self.constructsInPlace(value_to_append.type_id)) try values.append(self.ctx.allocator(), value_to_append);
+                    if (!try self.usesIndirectStorage(value_to_append.type_id)) try values.append(self.ctx.allocator(), value_to_append);
                 };
             }
             return values;
@@ -4033,7 +4157,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             for (0..state.values.len) |slot| {
                 if (!self.locals.items(.mutable)[slot] or state.values.get(slot) == null) continue;
                 const current = state.values.get(slot).?;
-                const in_place = try self.constructsInPlace(current.type_id);
+                const in_place = try self.usesIndirectStorage(current.type_id);
                 const generation = if (in_place) try self.loopHeaderGeneration(current) else self.block_argument_generations.items[argument];
                 try state.values.set(self.ctx.allocator(), slot, .{
                     .id = if (in_place) current.id else @fromBackingInt(@intCast(argument)),
@@ -4165,7 +4289,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     const incoming_missing = if (incoming) |owner| self.generations.items[@backingInt(owner)].missing_fields else &.{};
                     if (!sameMissingFields(missing, incoming_missing)) return self.reject(span, .partial_field_transfer_not_supported);
                     cleanup_fields = cleanup_fields and if (incoming) |owner| self.generations.items[@backingInt(owner)].cleanup_fields else false;
-                    if (try self.constructsInPlace(initial.type_id)) try self.recordGenerationOnlyForward(backedge.block, 0, incoming, generation);
+                    if (try self.usesIndirectStorage(initial.type_id)) try self.recordGenerationOnlyForward(backedge.block, 0, incoming, generation);
                 }
                 if (!cleanup_fields) {
                     self.generations.items[@backingInt(generation)].cleanup_fields = false;
@@ -4191,7 +4315,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             const start: u32 = @intCast(self.branch_arguments.items.len);
             for (0..self.states.items[@backingInt(context.baseline)].values.len) |slot| {
                 const initial = self.states.items[@backingInt(context.baseline)].values.get(slot) orelse continue;
-                if (!self.locals.items(.mutable)[slot] or try self.constructsInPlace(initial.type_id)) continue;
+                if (!self.locals.items(.mutable)[slot] or try self.usesIndirectStorage(initial.type_id)) continue;
                 const current = self.local_values[slot].?;
                 try self.appendBranchArgument(.{ .value = current.id }, current.owned_generation);
             }
@@ -4233,7 +4357,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         }
 
         fn annotate(self: *Self, annotation: @FieldType(Expression.Operation, "annotation"), context: ValueContext) !Value {
-            if (try self.constructsInPlace(annotation.type_id))
+            if (try self.usesIndirectStorage(annotation.type_id))
                 return self.constructAnnotated(annotation, .{ .storage = try self.localStorage(annotation.type_id), .site = .local });
             const operand = try self.valueWithContext(annotation.value.value, .{ .expected_type = annotation.type_id, .access = context.access });
             if (operand.type_id == .never) return operand;
@@ -4413,14 +4537,19 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             try self.resolvePlaceFields(root.type_id, source_fields, assignment_value.target_span, &fields);
             const target_type = if (fields.items.len == 0) root.type_id else fields.last().?.type_id;
             const target_span = if (source_fields.len == 0) assignment_value.target_span else source_fields[source_fields.len - 1].span;
-            const in_place = try self.constructsInPlace(root.type_id);
+            const in_place = try self.usesIndirectStorage(root.type_id);
             if (in_place) for (self.pending_deinit_places.items) |pending| {
                 if (pending.local != assignment_value.target) continue;
                 const consumed_fields = self.pending_deinit_fields.items[pending.fields.start..pending.fields.end];
                 if (fieldPathContains(consumed_fields, fields.items) or fieldPathContains(fields.items, consumed_fields))
                     return self.reject(target_span, .consumed_storage_in_use);
             };
-            const constructs_target = in_place and replaces and try self.constructsInPlace(target_type);
+            const target_capabilities = (try self.type_interner.facts().ownershipCapabilities(target_type)) orelse return error.Unavailable;
+            const constructs_target = replaces and !target_capabilities.isDirectlyMovable();
+            const replacement_start = self.replacement_targets.items.len;
+            defer self.replacement_targets.shrinkRetainingCapacity(replacement_start);
+            if (!constructs_target and root.owned_generation != null)
+                try self.replacement_targets.append(self.ctx.allocator(), .{ .local = assignment_value.target });
             const replaced_storage = if (constructs_target) try self.fieldStorage(rawValue(root), fields.items) else null;
             const early_replaced = if (replaced_storage) |storage| try self.beginInPlaceReplacement(assignment_value.target, storage, fields.items, source_fields, target_span) else null;
             const raw_operand = if (replaced_storage) |storage|
@@ -4444,28 +4573,32 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     return self.reject(assignment_value.value.span, .{ .assignment_type_mismatch = self.typeMismatch(target_type, operand.type_id) });
                 const owned = try self.ownValue(operand, assignment_value.value.span);
                 use.value = owned.id;
+                const prepared = if (use.coerce_to == null)
+                    owned
+                else
+                    try self.coerceOwnedRepresentation(owned, use, assignment_value.value.span, null);
+                try self.finishReplacementUses(target_span);
                 if (fields.items.len != 0) {
                     // Partial-place lifetimes are not modeled yet, so a replaced field ends here.
-                    const target_capabilities = (try self.type_interner.facts().ownershipCapabilities(latest_target.type_id)) orelse return error.Unavailable;
                     if (self.local_availability[local_index] == .maybe_transferred and target_capabilities.needs_automatic_drop) {
                         return self.reject(target_span, .possibly_transferred);
                     }
                     if (!replaced.skip_old_drop or self.local_values[local_index].?.owned_generation != null)
                         try self.dropReplacedField(self.local_values[local_index].?, latest_target, fields.items, self.locals.items(.can_deinit)[local_index], target_span);
                 }
-                break :blk if (use.coerce_to == null)
-                    owned
-                else
-                    try self.coerceOwnedRepresentation(owned, use, assignment_value.value.span, null);
+                break :blk prepared;
             };
             if (!constructs_target and fields.items.len == 0 and mut_parameter) {
                 if (!(self.is_initializer_region and self.captured_locals[local_index] != null and root_availability == .transferred))
-                    try self.dropValue(root, false, target_span);
-                try self.recordConsume(root);
+                    try self.dropValue(self.local_values[local_index].?, false, target_span);
+                try self.recordConsume(self.local_values[local_index].?);
             }
             const previous_root = self.local_values[local_index].?;
             var updated = if (fields.items.len == 0)
-                withoutOwnershipSource(result)
+                if (in_place and !constructs_target)
+                    try self.moveValue(result, target_span, rawValue(previous_root))
+                else
+                    withoutOwnershipSource(result)
             else blk: {
                 try self.recordConsume(result);
                 if (!in_place) break :blk try self.updateOwnedValue(previous_root, try self.updateFields(previous_root, fields.items, result));
@@ -4482,6 +4615,10 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             }
             if (updated.owned_generation) |generation| {
                 if (self.locals.items(.can_deinit)[local_index]) try self.setDeinitCleanup(generation);
+                // Installation is a use of the prepared generation, after the
+                // old generation's ending boundary. An unused replacement must
+                // not be destroyed while its RHS is still being prepared.
+                try self.recordEffect(.{ .use = .{ .generation = generation, .cleanup_value = updated.id } });
             }
             updated.binding_identity = try self.newBindingIdentity();
             updated.storage_identity = null;
@@ -4841,12 +4978,10 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         fn resolveCall(self: *Self, call: semantic.UnresolvedBody.Call, span: structures.SourceSpan, requires_fallible: bool) !ResolvedCall {
             // Earlier deinit arguments retain their storage while later arguments,
             // including nested calls, are evaluated.
-            const initializer_owner_start = self.pending_initializer_owners.items.len;
-            const initializer_local_start = self.pending_initializer_locals.items.len;
-            defer {
-                self.pending_initializer_owners.shrinkRetainingCapacity(initializer_owner_start);
-                self.pending_initializer_locals.shrinkRetainingCapacity(initializer_local_start);
-            }
+            const captures = self.initializerCaptureScope();
+            defer self.endInitializerCaptureScope(captures);
+            const replacement_start = self.replacement_targets.items.len;
+            defer self.replacement_targets.shrinkRetainingCapacity(replacement_start);
             const deinit_place_start = self.pending_deinit_places.items.len;
             const deinit_field_start = self.pending_deinit_fields.items.len;
             defer {
@@ -4914,6 +5049,8 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             defer argument_places.deinit(self.ctx.allocator());
             var argument_reference_origins: std.ArrayList(?u32) = .empty;
             defer argument_reference_origins.deinit(self.ctx.allocator());
+            var mut_origin_sources: std.ArrayList(CallOriginSource) = .empty;
+            defer mut_origin_sources.deinit(self.ctx.allocator());
             var writable_references: std.ArrayList(Value) = .empty;
             defer writable_references.deinit(self.ctx.allocator());
             var arguments_to_publish: std.ArrayList(structures.FunctionCallArgument) = .empty;
@@ -4928,7 +5065,6 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 if (parameter.mode == .mut and try self.type_interner.canStoreBorrow(parameter.type_id)) borrowed_mut_output = true;
             }
             var reference_origins: ?u32 = null;
-            var mut_reference_origins: ?u32 = null;
             var mut_return_origin = false;
             const extracts_box = behavior == .box_value;
             // Finish each argument before evaluating the next one. Nested copy
@@ -4942,18 +5078,18 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     try argument_reference_origins.append(self.ctx.allocator(), initializer.reference_origins);
                     if (borrowed_return)
                         reference_origins = try self.mergeReferenceOrigins(reference_origins, initializer.reference_origins);
-                    if (borrowed_mut_output) mut_reference_origins = try self.mergeReferenceOrigins(mut_reference_origins, initializer.reference_origins);
+                    if (borrowed_mut_output) try mut_origin_sources.append(self.ctx.allocator(), .{ .type_id = expected.type_id, .contained = initializer.reference_origins });
                     continue;
                 }
 
                 const raw_operand = if (expected.mode == .deinit)
                     try self.valueWithContext(raw.value, .{ .expected_type = expected.type_id, .access = .consume })
-                else if (expected.mode == .@"var" and try self.constructsInPlace(expected.type_id))
+                else if (expected.mode == .@"var" and try self.usesIndirectStorage(expected.type_id))
                     try self.construct(raw.value, raw.span, .{ .storage = try self.localStorage(expected.type_id), .site = .argument })
                 else if (expected.mode == .imm)
                     try self.valueWithContext(raw.value, .{
                         .expected_type = expected.type_id,
-                        .access = if (try self.constructsInPlace(expected.type_id) and try self.type_interner.facts().variantMembers(expected.type_id) != null) .borrow else .value,
+                        .access = if (try self.usesIndirectStorage(expected.type_id) and try self.type_interner.facts().variantMembers(expected.type_id) != null) .borrow else .value,
                     })
                 else
                     try self.valueWithContext(raw.value, .{ .expected_type = expected.type_id, .access = if (expected.mode == .@"var") .initialize else .value });
@@ -4980,7 +5116,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 }
                 var argument = try self.coerceValue(operand.id, operand.type_id, expected.type_id) orelse
                     return self.reject(raw.span, .{ .call_argument_type_mismatch = self.typeMismatch(expected.type_id, operand.type_id) });
-                if (argument.coerce_to != null and try self.constructsInPlace(expected.type_id)) {
+                if (argument.coerce_to != null and try self.usesIndirectStorage(expected.type_id)) {
                     const capabilities = (try self.type_interner.facts().ownershipCapabilities(operand.type_id)) orelse return error.Unavailable;
                     if (!capabilities.isDirectlyMovable()) return self.reject(raw.span, .{ .relocation_requires_direct_move = operand.type_id });
                     std.debug.assert(expected.mode == .imm);
@@ -4994,34 +5130,40 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     else => null,
                 };
                 const argument_value = owned orelse operand;
-                if (!extracts_box) try self.collectWritableReferences(argument_value, &writable_references);
+                if (!extracts_box) {
+                    const reference_start = writable_references.items.len;
+                    try self.collectWritableReferences(argument_value, &writable_references);
+                    for (writable_references.items[reference_start..]) |reference|
+                        try self.replacement_targets.append(self.ctx.allocator(), .{ .reference = reference });
+                }
                 try argument_reference_origins.append(self.ctx.allocator(), argument_value.reference_origins);
                 const return_origin = borrowed_return;
                 const contributes_to_return = return_origin and expected.mode != .mut;
                 if (return_origin and expected.mode == .mut) mut_return_origin = true;
                 if (contributes_to_return or borrowed_mut_output) {
-                    const origins: ?u32 = if (expected.mode == .imm and operand.type_id.isPrimitive() and operand.type_id != .static_data)
-                        null
-                    else if (expected.mode == .imm and try self.type_interner.facts().storageAccess(operand.type_id) == null)
-                        try self.sourceReferenceOrigins(operand)
-                    else if (try self.type_interner.canStoreBorrow(argument_value.type_id))
-                        argument_value.reference_origins
-                    else
-                        null;
+                    const scalar_copy = expected.mode == .imm and operand.type_id.isPrimitive() and operand.type_id != .static_data;
+                    const origin_source: CallOriginSource = .{
+                        .type_id = operand.type_id,
+                        .contained = if (!scalar_copy and try self.type_interner.canStoreBorrow(argument_value.type_id)) argument_value.reference_origins else null,
+                        .storage = if (!scalar_copy and expected.mode == .imm and try self.type_interner.facts().storageAccess(operand.type_id) == null) try self.sourceReferenceOrigins(operand) else null,
+                    };
                     if (contributes_to_return) {
+                        const origins = try self.callOriginsForType(origin_source, signature.return_type);
                         const returned = if (extracts_box)
                             try self.transformReferenceOrigins(origins, .{ .select = .element })
                         else
                             origins;
                         reference_origins = try self.mergeReferenceOrigins(reference_origins, returned);
                     }
-                    if (borrowed_mut_output) mut_reference_origins = try self.mergeReferenceOrigins(mut_reference_origins, origins);
+                    if (borrowed_mut_output) try mut_origin_sources.append(self.ctx.allocator(), origin_source);
                 }
                 if (owned) |owned_argument| {
                     argument.value = owned_argument.id;
                     try arguments_to_consume.append(self.ctx.allocator(), owned_argument);
                 } else if (expected.mode == .mut) {
                     const place = maybe_place orelse return self.reject(raw.span, .mutable_argument_requires_place);
+                    if (self.local_values[@backingInt(place.local)].?.owned_generation != null)
+                        try self.replacement_targets.append(self.ctx.allocator(), .{ .local = place.local });
                     const field_start: u32 = @intCast(self.mut_argument_fields.items.len);
                     try self.mut_argument_fields.appendSlice(self.ctx.allocator(), place_fields.items[place.fields.start..place.fields.end]);
                     try mut_arguments_to_publish.append(self.ctx.allocator(), .{
@@ -5035,7 +5177,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 }
                 try arguments_to_publish.append(self.ctx.allocator(), if (expected.mode == .deinit) .{ .deinit = argument.value } else .{ .prepared = argument });
             }
-            for (self.pending_initializer_owners.items[initializer_owner_start..]) |owner| try self.recordUse(owner);
+            for (self.pending_initializer_owners.items[captures.owners..]) |owner| try self.recordUse(owner);
             for (arguments_to_publish.items) |argument| {
                 if (argument != .initializer) continue;
                 for (self.initializer_transfers.items) |transfer| if (transfer.initializer == argument.valueId()) try self.recordUse(transfer.owner);
@@ -5095,7 +5237,11 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     if (argument_reference_origins.items[other_index] == null) continue;
                     var incomplete = false;
                     var origin_id = try self.resolveReferenceOrigins(argument_reference_origins.items[other_index], &incomplete);
-                    if (incomplete) return self.reject(raw.span, .overlapping_mutable_arguments);
+                    if (incomplete) try self.pending_mutable_alias_checks.append(self.ctx.allocator(), .{
+                        .origins = argument_reference_origins.items[other_index],
+                        .local = place.local,
+                        .span = raw.span,
+                    });
                     while (origin_id) |index| {
                         const origin = self.reference_origins.items[index];
                         if (origin.root == place.local) return self.reject(raw.span, .overlapping_mutable_arguments);
@@ -5125,8 +5271,10 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 .end = @intCast(self.pending_consumed_arguments.items.len),
             };
             if (borrowed_mut_output) for (mut_arguments_to_publish.items) |*pending| {
-                if (try self.type_interner.canStoreBorrow(signature.parameters[pending.argument_index].type_id))
-                    pending.reference_origins = mut_reference_origins;
+                const output_type = signature.parameters[pending.argument_index].type_id;
+                if (!try self.type_interner.canStoreBorrow(output_type)) continue;
+                for (mut_origin_sources.items) |source|
+                    pending.reference_origins = try self.mergeReferenceOrigins(pending.reference_origins, try self.callOriginsForType(source, output_type));
             };
             const mut_argument_start: u32 = @intCast(self.pending_mut_arguments.items.len);
             try self.pending_mut_arguments.appendSlice(self.ctx.allocator(), mut_arguments_to_publish.items);
@@ -5280,7 +5428,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             if (request.destination == null and request.value.access != .borrow and request.value.access != .consume)
                 return self.resolvedCallValue(callable, call, span, null);
             const return_type = callable.operation.return_type;
-            if (!lowersToCall(callable.behavior) or !try self.constructsInPlace(return_type)) {
+            if (!lowersToCall(callable.behavior) or !try self.usesIndirectStorage(return_type)) {
                 const result = try self.resolvedCallValue(callable, call, span, null);
                 return if (request.destination) |destination| self.placeValue(result, span, destination) else result;
             }
@@ -5342,6 +5490,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             }
             try self.recordCallArgumentConsumes(callable.consumed_arguments);
             if (destination) |storage| callable.operation.destination = storage.id;
+            if (callable.operation.return_type == .never) try self.recordReplacementUses();
             var value_to_return = try self.appendCall(callable.operation, span);
             if (value_to_return.type_id == .never) {
                 try self.moveCurrentBoundaryEffectsToTerminator();
@@ -6202,6 +6351,9 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 return self.reject(span, .{ .dereference_requires_ref = reference.type_id });
             if (!access.writable) return self.reject(span, .reference_not_writable);
             try self.validateReferenceReplacement(access.element_type, value_use.span);
+            const replacement_start = self.replacement_targets.items.len;
+            defer self.replacement_targets.shrinkRetainingCapacity(replacement_start);
+            try self.replacement_targets.append(self.ctx.allocator(), .{ .reference = reference });
             const raw_value = try self.valueWithContext(value_use.value, .{ .expected_type = access.element_type, .access = .initialize });
             if (raw_value.type_id == .never) return raw_value;
             const use = try self.coerceValue(raw_value.id, raw_value.type_id, access.element_type) orelse
@@ -6292,7 +6444,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                         projected.reference_origins = reference.reference_origins;
                         reference = projected;
                     }
-                    if (try self.constructsInPlace(leaf_type)) {
+                    if (try self.usesIndirectStorage(leaf_type)) {
                         var in_place = updated_argument;
                         in_place.destination = self.call_arguments.items[call.arguments.start + pending.argument_index].valueId();
                         _ = try self.appendInstruction(.{ .call_mut_argument = in_place });
@@ -6317,9 +6469,9 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     continue;
                 }
                 var updated_root = root;
-                if (try self.constructsInPlace(root.type_id)) {
+                if (try self.usesIndirectStorage(root.type_id)) {
                     var in_place = updated_argument;
-                    in_place.destination = if (try self.constructsInPlace(leaf_type))
+                    in_place.destination = if (try self.usesIndirectStorage(leaf_type))
                         self.call_arguments.items[call.arguments.start + pending.argument_index].valueId()
                     else
                         (try self.fieldStorage(rawValue(root), fields)).id;
@@ -6436,7 +6588,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         fn updateFields(self: *Self, root: Value, fields: []const PlaceField, updated_leaf: Value) !Value {
             if (fields.len == 0) return updated_leaf;
             // Direct values retain SSA snapshots; address-passed owners retain their storage.
-            var updated = if (try self.constructsInPlace(root.type_id)) root else try self.copyBits(root, try self.localStorage(root.type_id));
+            var updated = if (try self.usesIndirectStorage(root.type_id)) root else try self.copyBits(root, try self.localStorage(root.type_id));
             _ = try self.copyBits(updated_leaf, try self.fieldStorage(rawValue(updated), fields));
             updated.reference_origins = try self.fieldUpdateOrigins(root.reference_origins, fields, updated_leaf.reference_origins);
             return updated;
@@ -6529,6 +6681,8 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         }
 
         fn initializationCondition(self: *Self, initialization: @FieldType(semantic.UnresolvedBody.Condition, "initialization")) !ConditionFlow {
+            const captures = self.initializerCaptureScope();
+            defer self.endInitializerCaptureScope(captures);
             const expected = if (initialization.binding) |binding| binding.annotation_type else null;
             const type_id = expected orelse try self.inferInitializerType(initialization.value, null);
             const initializer = try self.prepareInitializer(initialization.value, type_id);
@@ -6605,7 +6759,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             const literal_operands = self.allow_type_values and
                 ((try self.unevaluatedType(comparison.operands.lhs.value, null)) == .int_literal or
                     (try self.unevaluatedType(comparison.operands.rhs.value, null)) == .int_literal);
-            const context: ValueContext = .{ .expected_type = if (literal_operands) .int_literal else null, .allow_converters = false };
+            const context: ValueContext = .{ .expected_type = if (literal_operands) .int_literal else null };
             const lhs = try self.borrowValue(try self.valueWithContext(comparison.operands.lhs.value, context), comparison.operands.lhs.span);
             if (lhs.type_id == .never) return .{ .success = null, .failure = null, .diverged = lhs };
             if (lhs.type_id == .int or lhs.type_id == .bool or !lhs.type_id.isPrimitive()) {
@@ -6617,7 +6771,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     .le => "<=",
                     .ge => ">=",
                 };
-                return self.booleanCondition(try self.invokeOperation(name, &.{ comparison.operands.lhs, comparison.operands.rhs }, comparison.operands.lhs.span, .{}), comparison.operands.lhs.span, false);
+                return self.booleanCondition(try self.invokeOperation(name, &.{ comparison.operands.lhs, comparison.operands.rhs }, comparison.span, .{}), comparison.span, false);
             }
             const rhs = try self.borrowValue(try self.valueWithContext(comparison.operands.rhs.value, context), comparison.operands.rhs.span);
             if (rhs.type_id == .never) return .{ .success = null, .failure = null, .diverged = rhs };
@@ -6862,7 +7016,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
 
         fn extractVariantBinding(self: *Self, extraction: PendingExtraction, span: structures.SourceSpan) !Value {
             const target_type = extraction.target_type;
-            const in_place = target_type != .never and try self.constructsInPlace(target_type);
+            const in_place = target_type != .never and try self.usesIndirectStorage(target_type);
             if (in_place and try self.type_interner.facts().variantMembers(target_type) != null) {
                 var narrowed = extraction.operand;
                 narrowed.borrowed_type = target_type;
@@ -6946,7 +7100,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 }
                 for (exits) |exit| {
                     const value_on_edge = exit.constructed.?;
-                    if (destination == null and !self.type_check_only and try self.constructsInPlace(joined_type) and value_on_edge.type_id != joined_type)
+                    if (destination == null and !self.type_check_only and try self.usesIndirectStorage(joined_type) and value_on_edge.type_id != joined_type)
                         return self.reject(span, .{ .relocation_requires_direct_move = value_on_edge.type_id });
                     if (joined.preserves_storage and value_on_edge.type_id != joined_type)
                         return self.reject(span, .{ .call_argument_type_mismatch = self.typeMismatch(joined_type, value_on_edge.type_id) });

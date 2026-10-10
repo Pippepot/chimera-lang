@@ -110,9 +110,9 @@ pub struct List(T: type)
         const element = self.get?(index)
         return element[]
 
-    pub fallible []=(mut self: List(T), index: int, init item: T) unit
+    pub fallible []=(mut self: List(T), index: int, var item: T) unit
         const element = self.get_mut?(index)
-        element[] = item
+        element[] = item^
 
 func allocate_literal(static T: type, count: int) Allocation(T)
     if const storage = allocate(T, count) -> return storage^
@@ -178,9 +178,9 @@ pub struct Span(T: type, writable: bool)
     pub fallible [](imm self: Span(T, writable), index: int) T
         const element = self.get?(index)
         return element[]
-    pub fallible []=(imm self: Span(T, true), index: int, init item: T) unit
+    pub fallible []=(imm self: Span(T, true), index: int, var item: T) unit
         const element = self.get_mut?(index)
-        element[] = item
+        element[] = item^
     pub fallible slice(imm self: Span(T, writable), start: int, size: int) Span(T, writable)
         start >= 0
         size >= 0

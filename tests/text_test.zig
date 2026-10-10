@@ -2,6 +2,135 @@ const std = @import("std");
 const test_sources = @import("test_sources");
 const SourceFixture = test_sources.SourceFixture;
 
+test "text equality compares exact UTF-8 bytes including empty strings and NUL" {
+    try SourceFixture.expectParity(
+        \\func run() int
+        \\    const view: StringView = "hé\0"
+        \\    const identical: StringView = "hé\0"
+        \\    if view <> identical -> return 90
+        \\    if view == "hé" -> return 91
+        \\    if view == "hè\0" -> return 92
+        \\    if "" <> "" -> return 93
+        \\    if "é" == "e\u{301}" -> return 94
+        \\    const equal = StringView.==(view, identical)
+        \\    const different = StringView.<>
+        \\    if equal and different(view, "hè\0") -> return 42
+        \\    return 95
+    , 42);
+}
+
+test "owned String equality survives growth cloning and literal conversion" {
+    try SourceFixture.expectParity(
+        \\fallible inspect() int
+        \\    var text = "hé"
+        \\    text.append?("\0")
+        \\    const duplicate = text.clone?()
+        \\    const view: StringView = "hé\0"
+        \\    if view <> text -> return 89
+        \\    if text <> duplicate -> return 90
+        \\    if text == "hé" -> return 91
+        \\    const equal = String.==
+        \\    if equal(text, "hé\0") -> return 42
+        \\    return 92
+        \\func run() int
+        \\    if const answer = inspect() -> return answer
+        \\    return 93
+    , 42);
+}
+
+test "independent structs with literal views permit alternating mutable calls and loops" {
+    try SourceFixture.expectParity(
+        \\struct Named
+        \\    pub name: StringView
+        \\    pub health: int
+        \\func hit(imm attacker: Named, mut defender: Named)
+        \\    defender.health -= attacker.health
+        \\func run() int
+        \\    var knight = Named{name = "knight", health = 4}
+        \\    var dragon = Named{name = "dragon", health = 10}
+        \\    hit(knight, dragon)
+        \\    hit(dragon, knight)
+        \\    var count = 0
+        \\    loop
+        \\        if count == 2 -> break
+        \\        hit(knight, dragon)
+        \\        hit(dragon, knight)
+        \\        count += 1
+        \\    if knight.name <> "knight" or dragon.name <> "dragon" -> return 90
+        \\    return knight.health + dragon.health + 52
+    , 42);
+}
+
+test "mutable view outputs still depend on compatible inline owner storage" {
+    const source =
+        \\struct Owner
+        \\    pub bytes: Array(byte, 1)
+        \\struct View
+        \\    pub text: StringView
+        \\fallible attach(imm source: Owner, mut target: View)
+        \\    target.text = BytesView.from_array(1, source.bytes).validate_utf8?()
+        \\func conflict(mut source: Owner, imm view: View) -> return
+        \\fallible inspect() int
+        \\    var owner = Owner{bytes = [65]}
+        \\    var view = View{text = "literal"}
+        \\    attach?(owner, view)
+        \\    conflict(owner, view)
+        \\    return view.text.byte_length()
+        \\if const result = inspect() -> exit(result)
+        \\exit(90)
+    ;
+    try SourceFixture.expectSourceDiagnostic(source, .overlapping_mutable_arguments);
+}
+
+test "loop alias checks reject an owner reached through a later backedge" {
+    try SourceFixture.expectSourceDiagnostic(
+        \\import std.memory.{borrow_local}
+        \\func conflict(mut owner: int, imm reference: Ref(int, false)) -> return
+        \\func run() int
+        \\    var first = 19
+        \\    var second = 23
+        \\    var reference = borrow_local(int, first)
+        \\    var count = 0
+        \\    loop
+        \\        if count == 2 -> break
+        \\        conflict(second, reference)
+        \\        reference = borrow_local(int, second)
+        \\        count += 1
+        \\    return first + second
+        \\exit(run())
+    , .overlapping_mutable_arguments);
+}
+
+test "call borrow precision recomputes when source storage types change" {
+    const source =
+        \\struct Named
+        \\    pub name: StringView
+        \\    pub health: int
+        \\func hit(imm attacker: Named, mut defender: Named)
+        \\    defender.health -= attacker.health
+        \\func run() int
+        \\    var knight = Named{name = "knight", health = 4}
+        \\    var dragon = Named{name = "dragon", health = 10}
+        \\    hit(knight, dragon)
+        \\    hit(dragon, knight)
+        \\    return knight.health + 44
+        \\exit(run())
+    ;
+    const fixture = try SourceFixture.init(source);
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+    const fields = try std.mem.replaceOwned(u8, std.testing.allocator, source, "pub health: int", "pub health: int\n    pub bytes: Array(byte, 1)");
+    defer std.testing.allocator.free(fields);
+    const first = try std.mem.replaceOwned(u8, std.testing.allocator, fields, "health = 4}", "health = 4, bytes = [65]}");
+    defer std.testing.allocator.free(first);
+    const changed = try std.mem.replaceOwned(u8, std.testing.allocator, first, "health = 10}", "health = 10, bytes = [66]}");
+    defer std.testing.allocator.free(changed);
+    try fixture.db.setInput(test_sources.queries.SourceText, 0, changed);
+    try fixture.expectDiagnostic(0, .overlapping_mutable_arguments);
+    try fixture.db.setInput(test_sources.queries.SourceText, 0, source);
+    try fixture.expectExit(0, 42);
+}
+
 test "UTF-8 literals default to String and preserve byte counts in both engines" {
     try SourceFixture.expectParity(
         \\static greeting = "é\u{1f600}\0"

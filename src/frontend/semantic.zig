@@ -110,6 +110,7 @@ pub const UnresolvedBody = struct {
         boolean: ValueUse,
         operation_not: ValueUse,
         comparison: struct {
+            span: structures.SourceSpan,
             operation: PredicateOperation,
             operands: BinaryOperands,
         },
@@ -702,9 +703,9 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                     }
                     return self.appendOperationCall(index, "-", &.{try self.appendUse(node.data.node, false)});
                 },
-                .add, .sub, .mul, .div => return self.appendBinary(index),
+                .add, .sub, .mul, .div, .rem => return self.appendBinary(index),
                 .eq, .ne, .lt, .gt, .le, .ge, .not, .@"and", .@"or" => return self.appendConditionValue(index),
-                .assign, .add_assign, .sub_assign, .mul_assign, .div_assign => return self.appendAssignment(index),
+                .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .rem_assign => return self.appendAssignment(index),
                 .@"if", .if_else => return self.appendIf(index, result_is_type),
                 .loop => return self.appendLoop(index, result_is_type),
                 .static_binding, .namespace_declaration => return self.reject(index, .nested_declaration_not_supported),
@@ -925,6 +926,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 .sub => "-",
                 .mul => "*",
                 .div => "/",
+                .rem => "%",
                 else => unreachable,
             };
             return self.appendOperationCall(index, name, &.{ operands.lhs, operands.rhs });
@@ -1024,6 +1026,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 .sub_assign => "-",
                 .mul_assign => "*",
                 .div_assign => "/",
+                .rem_assign => "%",
                 else => unreachable,
             };
         }
@@ -1119,6 +1122,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             const node = self.ast.nodes[index.index()];
             return switch (node.tag) {
                 .lt, .gt, .le, .ge, .eq, .ne => self.appendCondition(.{ .comparison = .{
+                    .span = nodeFocusSpan(self.ast, index),
                     .operation = comparisonOperation(node.tag),
                     .operands = .{
                         .lhs = try self.appendUse(node.data.node_node.a, false),
@@ -1134,10 +1138,10 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                     else
                         .{ .disjunction = .{ .lhs = lhs, .rhs = rhs } });
                 },
-                .not => self.buildNotCondition(node.data.node),
+                .not => self.buildNotCondition(index),
                 .call => self.appendCondition(.{ .call = .{ .target = try self.buildCall(index, true) } }),
                 .index_access => self.appendCondition(.{ .call = .{ .target = try self.buildIndexCall(index) } }),
-                .assign, .add_assign, .sub_assign, .mul_assign, .div_assign => self.buildIndexedAssignmentCondition(index),
+                .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .rem_assign => self.buildIndexedAssignmentCondition(index),
                 .collection_literal, .struct_init => self.appendCondition(.{ .initialization = .{ .value = try self.appendUse(index, false) } }),
                 .identifier, .bool_literal, .field_access, .deref => self.appendCondition(.{ .boolean = try self.appendUse(index, false) }),
                 else => self.rejectCondition(index),
@@ -1165,13 +1169,17 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
         }
 
         fn buildNotCondition(self: *Self, index: structures.Node.Index) anyerror!UnresolvedBody.ConditionId {
-            return switch (self.ast.nodes[index.index()].tag) {
-                .is, .as => self.appendCondition(.{ .negation = try self.buildCondition(index) }),
+            const operand = self.ast.nodes[index.index()].data.node;
+            return switch (self.ast.nodes[operand.index()].tag) {
+                .is, .as => self.appendCondition(.{ .negation = try self.buildCondition(operand) }),
                 .call => self.appendCondition(.{ .operation_not = .{
-                    .value = try self.appendExpression(index, .{ .call = try self.buildCall(index, true) }),
+                    .value = try self.appendExpression(operand, .{ .call = try self.buildCall(operand, true) }),
                     .span = nodeFocusSpan(self.ast, index),
                 } }),
-                else => self.appendCondition(.{ .operation_not = try self.appendUse(index, false) }),
+                else => self.appendCondition(.{ .operation_not = .{
+                    .value = (try self.appendUse(operand, false)).value,
+                    .span = nodeFocusSpan(self.ast, index),
+                } }),
             };
         }
 

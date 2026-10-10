@@ -3302,7 +3302,7 @@ test "field assignment diagnostics validate roots paths and values" {
         .{ .source = "static Pair = struct\n  value: int\nfunc bad() int\n  var pair = Pair{value = 1}\n  pair.missing = 2\n  return pair.value", .expected = .unknown_field },
         .{ .source = "static Pair = struct\n  value: int\nfunc bad() int\n  var pair = Pair{value = 1}\n  pair.value = none\n  return pair.value", .expected = .assignment_type_mismatch },
         .{ .source = "static Pair = struct\n  value: int\nfunc bad() int\n  Pair{value = 1}.value = 2\n  return 0", .expected = .assignment_target_not_local },
-        .{ .source = "static Flags = struct\n  value: bool\nfunc bad() bool\n  var flags = Flags{value = true}\n  flags.value += 1\n  return flags.value", .expected = .unknown_namespace_member },
+        .{ .source = "static Flags = struct\n  value: bool\nfunc bad() bool\n  var flags = Flags{value = true}\n  flags.value += 1\n  return flags.value", .expected = .missing_operation },
     };
     for (cases, 1..) |case, file_id| {
         const db = try testDatabase(1);
@@ -6141,7 +6141,7 @@ test "unit values are rejected at int boundaries" {
         .{ .file_id = 1, .source = "static bad = func() int -> return", .kind = .missing_return_value },
         .{ .file_id = 2, .source = "static bad = func() unit -> return 1", .kind = .return_type_mismatch },
         .{ .file_id = 3, .source = "static noop = func() unit\n  return\nstatic bad = func() int -> return noop()", .kind = .return_type_mismatch },
-        .{ .file_id = 4, .source = "static noop = func() unit\n  return\nstatic bad = func() int -> return noop() + 1", .kind = .unknown_namespace_member },
+        .{ .file_id = 4, .source = "static noop = func() unit\n  return\nstatic bad = func() int -> return noop() + 1", .kind = .missing_operation },
         .{ .file_id = 5, .source = "static noop = func() unit\n  return\nstatic take = func(value: int) int -> return value\nstatic bad = func() int -> return take(noop())", .kind = .call_argument_type_mismatch },
         .{ .file_id = 6, .source = "static noop = func() unit\n  return\nstatic bad = func() unit\n  const done: int = noop()\n  return", .kind = .local_type_mismatch },
     };
@@ -6814,7 +6814,7 @@ test "bool equality and values select branches without integer truthiness" {
     try expectCompiledFunctionResult(db, 1, "answer", &.{"answer"}, 42);
 
     const cases = [_]struct { file_id: structures.FileId, source: []const u8, kind: DiagnosticKind }{
-        .{ .file_id = 2, .source = "func bad() int -> if true < false -> 1 else 0", .kind = .unknown_namespace_member },
+        .{ .file_id = 2, .source = "func bad() int -> if true < false -> 1 else 0", .kind = .missing_operation },
         .{ .file_id = 3, .source = "func bad() int -> if true == 1 -> 1 else 0", .kind = .call_argument_type_mismatch },
         .{ .file_id = 4, .source = "func bad() int -> if none == none -> 1 else 0", .kind = .equality_operand_not_supported },
         .{ .file_id = 5, .source = "func bad() int -> if 1 -> 1 else 0", .kind = .if_condition_not_fallible },
@@ -7012,7 +7012,7 @@ test "if conditions reject non-fallible forms" {
 
     const cases = [_]struct { file_id: structures.FileId, source: []const u8, marker: []const u8, kind: structures.Diagnostic.Kind }{
         .{ .file_id = 4, .source = "static bad = func(v: int) int -> return if v < 1 and v -> 1 else 2", .marker = "v", .kind = .if_condition_not_fallible },
-        .{ .file_id = 5, .source = "static bad = func(v: int) int -> return if not v -> 1 else 2", .marker = "v", .kind = .if_condition_not_fallible },
+        .{ .file_id = 5, .source = "static bad = func(v: int) int -> return if not v -> 1 else 2", .marker = "not", .kind = .if_condition_not_fallible },
         .{ .file_id = 8, .source = "static bad = func(v: int) int -> return if const x = v -> x else 2", .marker = "v", .kind = .if_condition_not_fallible },
     };
     for (cases) |case| {
@@ -11119,7 +11119,7 @@ test "aggregate deinit cannot abandon an explicit-drop field" {
     try testing.expectEqual(DiagnosticKind.value_requires_explicit_drop, std.meta.activeTag(diagnostics[0].kind));
 }
 
-test "whole replacement does not extend the old generation past its last use" {
+test "whole replacement retains the old generation until replacement preparation ends" {
     const db = try testDatabase(1);
     defer db.deinit();
     try addSource(db, 1,
@@ -11136,7 +11136,7 @@ test "whole replacement does not extend the old generation past its last use" {
     const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
     defer std.Io.Dir.cwd().deleteFile(testing.io, "prog") catch {};
     try runtime.writeProgram(testing.io, executable.bytes);
-    try testing.expectEqual(@as(u8, 42), try runtime.runProg(testing.io, testing.allocator, &.{}));
+    try testing.expectEqual(@as(u8, 1), try runtime.runProg(testing.io, testing.allocator, &.{}));
 }
 
 test "ownership strategies require bare strategy names" {

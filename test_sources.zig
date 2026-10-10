@@ -104,6 +104,15 @@ pub const SourceFixture = struct {
             defer std.testing.allocator.free(program);
             const fixture = try initFiles(program, files);
             defer fixture.deinit();
+            if (std.mem.eql(u8, entry, "exit(comptime -> run())") and (try fixture.db.get(queries.BuildExecutable, 0)).* == null) {
+                const controls = try fixture.db.transitiveAccumulatorValues(queries.BuildExecutable, 0, structures.CompilerControl, std.testing.allocator);
+                defer std.testing.allocator.free(controls);
+                try std.testing.expectEqualSlices(structures.CompilerControl, &.{.{ .exit = status }}, controls);
+                const diagnostics = try fixture.db.transitiveAccumulatorValues(queries.BuildExecutable, 0, structures.Diagnostic, std.testing.allocator);
+                defer std.testing.allocator.free(diagnostics);
+                try std.testing.expectEqual(@as(usize, 0), diagnostics.len);
+                continue;
+            }
             try fixture.expectExit(0, status);
         }
     }

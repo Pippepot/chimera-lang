@@ -68,8 +68,8 @@ returns an integer. On failure, it returns no value.
 
 `<>` means "not equal." The standalone line `denominator <> 0` is a check:
 if it succeeds, execution continues to `return`. If it fails, `divide` fails
-immediately and skips the remaining body. It is not a Boolean result that gets
-computed and ignored. In Chimera, comparisons succeed or fail.
+immediately and skips the remaining body. Comparisons produce Boolean values
+in expressions; a standalone comparison in a fallible body acts as a check.
 
 The caller uses `if const` to name the successful result `quotient`. If the call
 fails, `else` runs instead. Try `divide(84, 0)` to take the failure branch.
@@ -136,8 +136,9 @@ The compiler produces a native executable, runs it, and reports its exit code.
 The current target is **Linux x86-64**.
 
 Chimera is experimental. These examples work today, but the language is still
-evolving and the standard library is small: text, basic I/O, and general-purpose
-collections are still ahead. The [roadmap](ROADMAP.md) records upcoming work
+evolving and the standard library is small. UTF-8 strings and views, byte I/O,
+Arrays, Lists, and borrowed spans work today. Formatting, parsing, iteration,
+and more collections remain ahead. The [roadmap](ROADMAP.md) records upcoming work
 and priorities.
 
 ## Go deeper

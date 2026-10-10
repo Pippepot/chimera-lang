@@ -3,6 +3,12 @@
 # Unspecified behavior remains open; parser or legacy behavior does not define it.
 # Examples are independent; undeclared names stand for surrounding context.
 # Everything after '#' to the end of a line is a comment.
+# Delimited argument, parameter, element, and initializer lists may span lines.
+# Indentation at list boundaries is continuation whitespace; commas separate
+# entries, and a final comma is allowed. Grouping and index expressions may also
+# span lines. Indented bodies introduced by if, loop, struct, or a function
+# retain their block meaning inside delimiters. A comma or closing delimiter
+# may end such an expression body before its physical dedent.
 
 
 # Types and evaluation
@@ -10,6 +16,9 @@
 # division truncates toward zero. Division by zero or the unrepresentable
 # min-int / -1 quotient is an execution error; at compile time it is a source
 # error at the executed division.
+# Remainder (%) follows truncating division: a nonzero remainder has the sign
+# of its left operand. min-int % -1 is zero. Remainder by zero is an execution
+# error, reported at the executed operation at compile time.
 # byte: distinct unsigned 8-bit integer, values 0 through 255, size and
 # alignment 1. It has trivial move, copy, and drop, but no arithmetic or
 # comparison operations yet.
@@ -52,17 +61,17 @@ pub extern func int.+(imm left: int, imm right: int) int
 # ordinary bool-returning call may be a condition; fallible calls retain their
 # success/failure condition semantics. and/or skip the right operand when the
 # left operand determines their result.
-# The complete current inventory is +, -, *, /, ==, <>, <, >, <=, >=, unary
+# The complete current inventory is +, -, *, /, %, ==, <>, <, >, <=, >=, unary
 # negation and not, and read/write indexing. Unary and binary arithmetic minus
 # share the spelling -, distinguished only by runtime operand count. neg is an
 # ordinary identifier, with no compiler-defined meaning. Parentheses do not
 # change operator precedence.
 # For receiver type Self, the exact signatures are:
-# +, -, *, /: func (imm Self, imm Self) Self
+# +, -, *, /, %: func (imm Self, imm Self) Self
 # ==, <>, <, >, <=, >=: func (imm Self, imm Self) bool
 # unary -: func (imm Self) Self; not: func (imm Self) bool
 # []: func or fallible (imm Self, index: int) Result
-# []=: func or fallible (mut Self, index: int, init value: Element) unit
+# []=: func or fallible (mut Self, index: int, var value: Element) unit
 # Inherited namespace static arguments and inferable static parameters use
 # ordinary specialization; they do not count as runtime operands or permit
 # extra runtime operands. Signature validation rejects mismatches even for
@@ -82,8 +91,14 @@ const subtract: func(imm int, imm int) int = int.-
 # Arithmetic/comparison/unary operation functions cannot fail. Indexers may
 # fail; indexed expressions propagate ordinary failure in a fallible function
 # and can be handled by ordinary binding conditions. Writable indexing calls
-# []= rather than treating a by-value [] result as a writable place. A failed
-# bounds check skips the deferred replacement initializer. Ref[] still means
+# []= rather than treating a by-value [] result as a writable place. Receiver
+# and index are evaluated once, then the replacement is eagerly prepared as an
+# owned argument before the setter checks bounds. Its effects and transfers are
+# not rolled back on bounds failure; the prepared value is cleaned up normally.
+# Compound indexing reads the old element before evaluating its RHS; failed
+# getter bounds therefore still skip that RHS. Explicit get_mut followed by a
+# reference write provides bounds-first evaluation for ordinary replacement.
+# Ref[] still means
 # dereference, not indexing. User-defined indexers own their bounds policy.
 # Standard Array, List, and Span reads return an ordinary copy of
 # the element and require its copy capability. Array, List, and writable Span writes
@@ -144,6 +159,10 @@ const subtract: func(imm int, imm int) int = int.-
 # checks both bounds and codepoint boundaries. byte_length reports bytes, not
 # Unicode scalars or graphemes. Text mutation accepts only validated text and
 # exposes only immutable byte views. No Unicode normalization is implicit.
+# String and StringView define == and <> as infallible exact byte comparison,
+# including embedded NUL bytes. Different byte lengths imply inequality.
+# These operations follow the ordinary matching-Self signatures; a StringView
+# receiver accepts a borrowed String through its existing converter.
 # The named byte_int function widens a byte to int without failure. Numeric
 # runtime types are still not related by converters.
 # std.io supplies stdin/stdout/stderr handles, fallible read_bytes, write_once,
@@ -557,6 +576,11 @@ func add1(mut a: int)
 # not overlap another imm or mut argument in the same call; paths overlap when
 # they have the same root and either field path is a prefix of the other. Distinct
 # sibling fields do not overlap.
+# Preparing a mut argument retains its owner while later eager arguments are
+# evaluated, including paths that leave argument preparation early. Writable
+# reference arguments retain their backing owners through that preparation too.
+# This retains ownership without granting additional reference access; explicit
+# transfers and writes still have their ordinary effects and alias restrictions.
 var mutable_value = 41
 add1(mutable_value)
 
@@ -644,10 +668,14 @@ take(a^) # transfer ownership; any subsequent access to 'a' is an error
 # Evaluation order is unchanged: destruction is inserted only at boundaries
 # that do not move an operation ahead of an earlier source operation.
 #
-# Assignment does not extend the old generation to the assignment itself. The
-# old generation ends after its earlier final use, or after a final use in the
-# right-hand side and before the replacement completes. A borrow produced by
-# the right-hand side keeps every owner it may refer to alive.
+# Replacement of a directly movable value retains its target through eager
+# preparation of the owned right-hand side, then ends the old generation before
+# installing the new value. This retention is an exception to earlier last-use
+# destruction. Failure or a caller-directed exit during preparation preserves
+# the target's initialization until ordinary exit cleanup. Explicit writes and
+# transfers within the RHS retain their normal effects and are not rolled back.
+# A borrow produced by the RHS keeps every owner it may refer to alive; replacing
+# a source does not permit retaining a borrow into its ended generation.
 #
 # Lifetime analysis is path-sensitive. If a value is needed only on some branch
 # successors, it is destroyed on the other outgoing edges before those branches
@@ -749,6 +777,12 @@ func make_named() Immovable
 # does not permit destroying a source before copying it, overlapping source
 # and destination storage, or staging and relocating an immovable value.
 # Replacement forms without a valid lifetime and storage plan are rejected.
+# Directly movable values use eager value replacement even when their physical
+# representation is address-passed, as for arrays and containing aggregates.
+# Mutable address-passed locals keep their existing storage across replacement;
+# the prepared value transfers into it after the old generation ends, without
+# adding copy or move hooks. Representation does not require destructive
+# construction. For values requiring construction at their final address:
 # Replacing a value that cannot move directly, or a field of such a type,
 # constructs the right-hand side in the same storage. The old value therefore
 # ends before construction, and the right-hand side cannot use the replaced
@@ -797,6 +831,9 @@ fallible forward_initializer(static T: type, init item: T) T
 # Required owners and storage must remain valid until those accesses end;
 # conflicting consumption or mutation is rejected. Merely deferring a transfer
 # does not perform it, nor does nonescaping capture require a public closure.
+# Pending capture restrictions end when the receiving construction call ends,
+# on success or failure, including collection converters and handled initializer
+# expressions. Borrowed results retain their ordinary reference origins.
 # Callable boundaries must preserve these effects rather than infer safety
 # from a particular callee body, inlining, or a direct-call spelling.
 # A caller may use a source afterward only if it remains available on every

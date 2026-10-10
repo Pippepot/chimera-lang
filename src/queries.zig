@@ -1011,6 +1011,61 @@ pub fn AnalysisContext(comptime Context: type) type {
             return self.containsBorrowAt(type_id, &visited, true);
         }
 
+        pub fn canBorrowStorageOf(self: @This(), result_type: structures.TypeId, source_type: structures.TypeId) !bool {
+            var visited: std.ArrayList(structures.TypeId) = .empty;
+            defer visited.deinit(self.ctx.allocator());
+            return self.canBorrowStorageOfAt(result_type, source_type, &visited);
+        }
+
+        fn canBorrowStorageOfAt(self: @This(), result_type: structures.TypeId, source_type: structures.TypeId, visited: *std.ArrayList(structures.TypeId)) anyerror!bool {
+            if (std.mem.indexOfScalar(structures.TypeId, visited.items, result_type) != null) return false;
+            try visited.append(self.ctx.allocator(), result_type);
+            if (try self.facts().storageAccess(result_type)) |access| {
+                var sources: std.ArrayList(structures.TypeId) = .empty;
+                defer sources.deinit(self.ctx.allocator());
+                return self.containsStorageType(source_type, access.element_type, &sources);
+            }
+            if (try self.collectionLiteralType(result_type)) |collection|
+                return collection.length != 0 and try self.canBorrowStorageOfAt(collection.element_type, source_type, visited);
+            if (try self.arrayType(result_type)) |array|
+                return array.length != 0 and try self.canBorrowStorageOfAt(array.element_type, source_type, visited);
+            if (try self.facts().allocationElement(result_type)) |element|
+                return self.canBorrowStorageOfAt(element, source_type, visited);
+            if (try self.facts().boxElement(result_type)) |element|
+                return self.canBorrowStorageOfAt(element, source_type, visited);
+            if (try self.structDefinition(result_type)) |definition| {
+                for (definition.fields) |field| if (try self.canBorrowStorageOfAt(field.type_id, source_type, visited)) return true;
+            }
+            if (try self.facts().variantMembers(result_type)) |members| {
+                for (members) |member| if (try self.canBorrowStorageOfAt(member, source_type, visited)) return true;
+            }
+            return false;
+        }
+
+        fn containsStorageType(self: @This(), source_type: structures.TypeId, referent_type: structures.TypeId, visited: *std.ArrayList(structures.TypeId)) anyerror!bool {
+            if (source_type == referent_type) return true;
+            if (std.mem.indexOfScalar(structures.TypeId, visited.items, source_type) != null) return false;
+            try visited.append(self.ctx.allocator(), source_type);
+            // A reference owns its descriptor, not its pointee. Existing
+            // contained reference origins account for that external storage.
+            if (try self.facts().storageAccess(source_type) != null) return false;
+            if (try self.collectionLiteralType(source_type)) |collection|
+                return collection.length != 0 and try self.containsStorageType(collection.element_type, referent_type, visited);
+            if (try self.arrayType(source_type)) |array|
+                return array.length != 0 and try self.containsStorageType(array.element_type, referent_type, visited);
+            if (try self.facts().allocationElement(source_type)) |element|
+                return self.containsStorageType(element, referent_type, visited);
+            if (try self.facts().boxElement(source_type)) |element|
+                return self.containsStorageType(element, referent_type, visited);
+            if (try self.structDefinition(source_type)) |definition| {
+                for (definition.fields) |field| if (try self.containsStorageType(field.type_id, referent_type, visited)) return true;
+            }
+            if (try self.facts().variantMembers(source_type)) |members| {
+                for (members) |member| if (try self.containsStorageType(member, referent_type, visited)) return true;
+            }
+            return false;
+        }
+
         fn containsBorrowAt(self: @This(), type_id: structures.TypeId, visited: *std.ArrayList(structures.TypeId), include_allocated_contents: bool) !bool {
             if (std.mem.indexOfScalar(structures.TypeId, visited.items, type_id) != null) return false;
             try visited.append(self.ctx.allocator(), type_id);
@@ -1396,7 +1451,11 @@ pub fn AnalysisContext(comptime Context: type) type {
             const association = (try self.typeNamespace(value.type)) orelse return null;
             const namespace = (try self.ctx.get(TypeNamespace, association.query_key)).* orelse return error.Unavailable;
             if (try self.namespaceReference(namespace, association.specialization, name, span, operands)) |member| return member;
-            try rejectImport(self.ctx, .{ .file_id = self.file_id.?, .span = span }, .unknown_namespace_member);
+            const kind: structures.Diagnostic.Kind = if (structures.Operation.fromName(name, operands)) |operation|
+                .{ .missing_operation = .{ .receiver = value.type, .operation = operation } }
+            else
+                .unknown_namespace_member;
+            try rejectImport(self.ctx, .{ .file_id = self.file_id.?, .span = span }, kind);
             return error.Unavailable;
         }
 
@@ -2595,7 +2654,7 @@ fn validOperationSignature(types: anytype, item: structures.ItemId, signature: s
     } else if (receiver.mode != (if (index_write) structures.ParameterMode.mut else .imm)) return false;
     if (operation.isIndexer()) {
         if (signature.parameters[1].mode != .imm or signature.parameters[1].type_id != .int) return false;
-        if (index_write and (signature.parameters[2].mode != .init or signature.return_type != .unit)) return false;
+        if (index_write and (signature.parameters[2].mode != .@"var" or signature.return_type != .unit)) return false;
         return true;
     }
     if (signature.is_fallible) return false;

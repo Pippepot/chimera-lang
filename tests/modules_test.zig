@@ -11,6 +11,149 @@ const allocation_failure_allocator = test_sources.allocation_failure_allocator;
 
 const Fixture = test_sources.SourceFixture;
 
+test "remainder signs boundary values precedence and callable syntax agree in both engines" {
+    try Fixture.expectParity(
+        \\func run() int
+        \\    const remainder = int.%
+        \\    var minimum = -2147483648
+        \\    if minimum % -1 <> 0 -> return 90
+        \\    if minimum % 3 <> -2 -> return 91
+        \\    if -7 % 3 <> -1 -> return 92
+        \\    if 7 % -3 <> 1 -> return 93
+        \\    if -7 % -3 <> -1 -> return 94
+        \\    if 0 % 3 <> 0 -> return 95
+        \\    if 2147483647 % minimum <> 2147483647 -> return 96
+        \\    var value = 17
+        \\    value %= 5
+        \\    return 30 + value + int.%(17, 5) + remainder(17, 5) + 20 % 6 * 3
+    , 42);
+    try Fixture.expectSourceDiagnostic("exit(comptime -> 7 % 0)", .compile_time_division_by_zero);
+}
+
+test "user remainder operations support expressions and compound field assignment" {
+    try Fixture.expectParity(
+        \\struct Value
+        \\    pub number: int
+        \\    pub func %(imm left: Value, imm right: Value) Value -> Value{number = left.number % right.number}
+        \\func run() int
+        \\    var value = Value{number = 17}
+        \\    value %= Value{number = 5}
+        \\    value.number %= 3
+        \\    return (value % Value{number = 3}).number + 40
+    , 42);
+}
+
+test "multiline delimited expressions preserve nested bodies and surrounding statements" {
+    try Fixture.expectParity(
+        \\struct Pair
+        \\    pub first: int
+        \\    pub second: int
+        \\func add(
+        \\    first: int,
+        \\    second: int,
+        \\) int -> first + second
+        \\fallible calculate() int
+        \\    const values = [
+        \\        if true
+        \\            const base = 19
+        \\            base + 1
+        \\        else
+        \\            90,
+        \\        add(
+        \\            20,
+        \\            2,
+        \\        ),
+        \\    ]
+        \\    const pair = Pair{
+        \\        first = values[
+        \\            0
+        \\        ],
+        \\        second = values[1],
+        \\    }
+        \\    return add(
+        \\        pair.first,
+        \\        pair.second)
+        \\func run() int
+        \\    if const answer = calculate() -> return answer
+        \\    return 91
+    , 42);
+    try Fixture.expectParity(
+        \\func run() int
+        \\    const values = [20,
+        \\        22].len()
+        \\    const next = (
+        \\        40)
+        \\    return values + next
+    , 42);
+}
+
+test "multiline imports and function type parameter lists execute in both engines" {
+    try Fixture.expectParity(
+        \\import std.prelude.{
+        \\    exit,
+        \\}
+        \\func evaluate(imm operation: func(
+        \\    imm int,
+        \\    imm int,
+        \\) int) int -> operation(19, 23)
+        \\func run() int
+        \\    const result = evaluate(
+        \\        int.+,
+        \\    )
+        \\    return result
+    , 42);
+}
+
+test "multiline headers reuse continuation indentation for genuine bodies" {
+    try Fixture.expectParity(
+        \\func add(
+        \\    first: int,
+        \\    second: int) int
+        \\    return first + second
+        \\func choose(static T: type) int -> 42
+        \\func run() int
+        \\    const answer = choose(
+        \\        int)
+        \\    if add(
+        \\        19,
+        \\        23) == answer
+        \\        return answer
+        \\    return 90
+    , 42);
+    try Fixture.expectSourceDiagnostic("func run() int -> 42\n    const stray = 1\nexit(run())", .indented_block_after_inline_body);
+}
+
+test "indexed remainder assignment uses checked getter and owned replacement" {
+    try Fixture.expectParity(
+        \\fallible calculate() int
+        \\    var values = [17, 23]
+        \\    values[0] %= 5
+        \\    if values[9] %= 5 -> return 90
+        \\    return values[0] + 40
+        \\func run() int
+        \\    if const answer = calculate() -> return answer
+        \\    return 91
+    , 42);
+}
+
+test "missing operations and unimplemented syntax report the actual source construct" {
+    const source = "struct Label\n    pub value: int\nconst label = Label{value = 1}\nif label == label -> exit(42)";
+    const fixture = try Fixture.init(source);
+    defer fixture.deinit();
+    try fixture.expectDiagnostic(0, .missing_operation);
+    const diagnostics = try fixture.db.transitiveAccumulatorValues(queries.BuildExecutable, 0, structures.Diagnostic, testing.allocator);
+    defer testing.allocator.free(diagnostics);
+    try testing.expectEqualStrings("==", source[diagnostics[0].span.?.start..diagnostics[0].span.?.end]);
+    try testing.expectEqual(structures.Operation.@"==", diagnostics[0].kind.missing_operation.operation);
+    for ([_][]const u8{ "Label.==(label, label)", "label.==(label)", "not label" }) |expression| {
+        const rejected = try testing.allocator.print("struct Label\n    pub value: int\nconst label = Label{{value = 1}}\nif {s} -> exit(42)", .{expression});
+        defer testing.allocator.free(rejected);
+        try Fixture.expectSourceDiagnostic(rejected, .missing_operation);
+    }
+    try Fixture.expectSourceDiagnostic("for item in [1, 2]\n    exit(item)", .unsupported_syntax);
+    try Fixture.expectSourceDiagnostic("const result = match 1\n    _ -> 42\nexit(result)", .unsupported_syntax);
+}
+
 const physics = modules.SourceFile{ .path = "physics/body.chi", .module_path = "physics", .source =
     \\pub struct Body
     \\  pub x: int
@@ -230,7 +373,7 @@ test "operation functions primitive signatures invalidate and recover every call
         try fixture.db.setInput(queries.SourceText, prelude, case.invalid);
         try fixture.expectDiagnostic(prelude, .invalid_operation_signature);
         try fixture.db.setInput(queries.SourceText, prelude, "");
-        try fixture.expectDiagnostic(null, .unknown_namespace_member);
+        try fixture.expectDiagnostic(null, .missing_operation);
         try fixture.db.setInput(queries.SourceText, prelude, case.valid["pub ".len..]);
         try fixture.expectDiagnostic(null, .private_access);
         try fixture.db.setInput(queries.SourceText, prelude, case.valid);
@@ -264,7 +407,7 @@ test "operation functions minus callable ambiguity and independent invalidation"
         try fixture.db.setInput(queries.SourceText, prelude, "extern func int.-(imm value: int) int\n" ++ binary);
         try fixture.expectDiagnostic(null, .private_access);
         try fixture.db.setInput(queries.SourceText, prelude, binary);
-        try fixture.expectDiagnostic(null, if (call_index == 2) .local_type_mismatch else .unknown_namespace_member);
+        try fixture.expectDiagnostic(null, if (call_index == 2) .local_type_mismatch else .missing_operation);
         try fixture.db.setInput(queries.SourceText, prelude, prelude_source);
         try fixture.expectExit(0, 42);
     };
@@ -298,7 +441,7 @@ test "operation functions user indexers and qualified explicit bracket calls hav
         \\fallible Value.[](imm self: Value, index: int) int
         \\    index == 0
         \\    return self.value
-        \\fallible Value.[]=(mut self: Value, index: int, init replacement: int) unit
+        \\fallible Value.[]=(mut self: Value, index: int, var replacement: int) unit
         \\    index == 0
         \\    self.value = replacement
         \\fallible calculate() int
@@ -317,7 +460,7 @@ test "operation functions conditional compound indexing permits an infallible ge
         \\struct Value
         \\    value: int
         \\    pub func [](imm self: Value, index: int) int -> self.value
-        \\    pub fallible []=(mut self: Value, index: int, init item: int) unit
+        \\    pub fallible []=(mut self: Value, index: int, var item: int) unit
         \\        index == 0
         \\        self.value = item
         \\func run() int
@@ -454,8 +597,8 @@ test "operation functions reject comparison unary and indexer signature mismatch
         .{ .name = "-", .declaration = "func -(mut self: Value) Value -> self" },
         .{ .name = "not", .declaration = "func not(imm self: Value) Value -> self" },
         .{ .name = "[]", .declaration = "fallible [](imm self: Value, index: bool) int -> 42" },
-        .{ .name = "[]=", .declaration = "fallible []=(imm self: Value, index: int, init replacement: int) unit -> fail" },
-        .{ .name = "[]=", .declaration = "fallible []=(mut self: Value, index: int, replacement: int) unit -> fail" },
+        .{ .name = "[]=", .declaration = "fallible []=(imm self: Value, index: int, var replacement: int) unit -> fail" },
+        .{ .name = "[]=", .declaration = "fallible []=(mut self: Value, index: int, init replacement: int) unit -> fail" },
     }) |case| {
         const source = try testing.allocator.print("struct Value\n    value: int\n    {s}\nconst operation = Value.{s}\nexit(42)", .{ case.declaration, case.name });
         defer testing.allocator.free(source);
@@ -6229,7 +6372,7 @@ test "mutable locals that cannot move directly keep their storage" {
     for (body.block_arguments) |argument| try testing.expectEqual(structures.ArgumentPassing.direct, try types.argumentPassing(argument.type_id));
 }
 
-test "replacing storage in place ends the old value before the right-hand side" {
+test "replacement requiring destination construction ends the old value before the right-hand side" {
     const cases = [_]struct { body: []const u8, kind: ?std.meta.Tag(structures.Diagnostic.Kind) }{
         .{ .body = "var tracked = make(1)\ntracked = make(tracked.value)\nexit(tracked.value)", .kind = .replaced_value_used },
         .{ .body = "var pair = Pair{first = make(1), count = 2}\npair.first = make(pair.first.value)\nexit(1)", .kind = .replaced_value_used },
@@ -11733,4 +11876,204 @@ test "init milestone1 ownership hooks cannot consume potentially failing initial
         errdefer std.debug.print("ownership hook: {s}\n", .{case.hook});
         try Fixture.expectSourceDiagnostic(source, .fallible_expression_outside_fallible_function);
     }
+}
+
+test "movable replacement reads its target independently of storage representation" {
+    for ([_][]const u8{
+        "var values = [10, 20]\n    values = [values[0], values[1] + 12]\n    return values[0] + values[1]",
+        "var pair = Pair{values = [10, 20]}\n    pair.values = [pair.values[0], pair.values[1] + 12]\n    return pair.values[0] + pair.values[1]",
+        "var pair = Pair{values = [10, 20]}\n    pair = Pair{values = [pair.values[0], pair.values[1] + 12]}\n    return pair.values[0] + pair.values[1]",
+        "var values = [10, 32]\n    values = values\n    values = values^\n    return values[0] + values[1]",
+        "var values = [10, 20]\n    refill?(values)\n    return values[0] + values[1]",
+    }) |body| {
+        const source = try test_sources.renderTemplate(testing.allocator,
+            \\struct Pair
+            \\    values: Array(int, 2)
+            \\fallible refill(mut values: Array(int, 2))
+            \\    values = [values[0], values[1] + 12]
+            \\fallible calculate() int
+            \\    $body
+            \\func run() int
+            \\    if const result = calculate() -> return result
+            \\    return 90
+        , .{ .body = body });
+        defer testing.allocator.free(source);
+        try Fixture.expectParity(source, 42);
+    }
+}
+
+test "movable replacement completes its RHS before dropping the old generation" {
+    for ([_][]const u8{
+        "var items = [Item{trace = handle, value = 1}, Item{trace = handle, value = 2}]\n        items = produce?(handle)\n        if handle[] <> 321 -> return 90\n        _ = items",
+        "var pair = Pair{items = [Item{trace = handle, value = 1}, Item{trace = handle, value = 2}]}\n        pair.items = produce?(handle)\n        if handle[] <> 321 -> return 90\n        _ = pair",
+        "var items = [Item{trace = handle, value = 1}, Item{trace = handle, value = 2}]\n        reset?(items, handle)\n        if handle[] <> 321 -> return 90\n        _ = items",
+    }) |body| {
+        const source = try test_sources.renderTemplate(testing.allocator,
+            \\struct Item
+            \\    trace: Ref(int, true)
+            \\    value: int
+            \\    drop = func(deinit self: Item)
+            \\        self.trace.replace(self.trace[] * 10 + self.value)
+            \\struct Pair
+            \\    items: Array(Item, 2)
+            \\fallible produce(imm trace: Ref(int, true)) Array(Item, 2)
+            \\    trace.replace(trace[] * 10 + 3)
+            \\    return [Item{trace = trace, value = 4}, Item{trace = trace, value = 5}]
+            \\fallible reset(mut items: Array(Item, 2), imm trace: Ref(int, true))
+            \\    items = produce?(trace)
+            \\fallible calculate() int
+            \\    var trace = [0]
+            \\    if const handle = trace.get_mut(0)
+            \\        $body
+            \\        if handle[] == 32154 -> return 42
+            \\    return 91
+            \\func run() int
+            \\    if const result = calculate() -> return result
+            \\    return 92
+        , .{ .body = body });
+        defer testing.allocator.free(source);
+        try Fixture.expectParity(source, 42);
+    }
+}
+
+test "movable replacement preserves initialization on RHS failure and caller exits" {
+    for ([_][]const u8{
+        "fallible reset(mut values: Array(int, 2))\n    values = missing?()\nfunc run() int\n    var values = [10, 32]\n    if reset(values) -> return 90\n    if const first = values[0]\n        if const second = values[1] -> return first + second\n    return 91",
+        "func reset(mut values: Array(int, 2))\n    values = if true -> return else [0, 0]\nfunc run() int\n    var values = [10, 32]\n    reset(values)\n    if const first = values[0]\n        if const second = values[1] -> return first + second\n    return 91",
+        "func reset(mut values: Array(int, 2))\n    loop\n        values = if true -> break else [0, 0]\nfunc run() int\n    var values = [10, 32]\n    reset(values)\n    if const first = values[0]\n        if const second = values[1] -> return first + second\n    return 91",
+    }) |body| {
+        const source = try std.mem.concat(testing.allocator, u8, &.{ "fallible missing() Array(int, 2) -> fail\n", body });
+        defer testing.allocator.free(source);
+        try Fixture.expectParity(source, 42);
+    }
+}
+
+test "completed collection conversions release captures on success failure and nested calls" {
+    for ([_][]const u8{
+        "const copied = [number]\n    _ = copied\n    number = 42",
+        "const copied: List(int) = [number]\n    _ = copied\n    bump(number)",
+        "if const copied = [checked?(number)] -> touch(copied)\n    number = 42",
+        "if const copied = [missing?(number)] -> return 90\n    number = 42",
+        "take(number, [number])",
+    }) |body| {
+        const source = try test_sources.renderTemplate(testing.allocator,
+            \\func touch(imm copied: Array(int, 1)) -> return
+            \\func bump(mut number: int)
+            \\    number += 22
+            \\func take(mut number: int, var copied: Array(int, 1))
+            \\    number += 22
+            \\    _ = copied
+            \\fallible checked(number: int) int -> number
+            \\fallible missing(number: int) int -> fail
+            \\func run() int
+            \\    var number = 20
+            \\    $body
+            \\    return number
+        , .{ .body = body });
+        defer testing.allocator.free(source);
+        try Fixture.expectParity(source, 42);
+    }
+}
+
+test "completed nested conversions retain pending outer initializer captures" {
+    try Fixture.expectSourceDiagnostic(
+        \\fallible take(init first: Array(int, 1), var second: Array(int, 1), mut number: int)
+        \\    const ready = first
+        \\    _ = second
+        \\    number += ready[0]
+        \\var number = 20
+        \\if take([number], [number], number) -> exit(42)
+        \\exit(90)
+    , .initializer_capture_conflict);
+}
+
+test "owned indexer callable semantics update incrementally with receiver reads" {
+    const source =
+        \\struct Value
+        \\    value: int
+        \\    pub func [](imm self: Value, index: int) int -> self.value
+        \\    pub func []=(mut self: Value, index: int, var item: int) unit
+        \\        self.value = item^
+        \\func run() int
+        \\    var value = Value{value = 20}
+        \\    const setter = Value.[]=
+        \\    setter(value, 0, value[0] + 22)
+        \\    return value.value
+        \\exit(run())
+    ;
+    const fixture = try Fixture.init(source);
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+    const edited = try std.mem.replaceOwned(u8, testing.allocator, source, "var item: int", "init item: int");
+    defer testing.allocator.free(edited);
+    try fixture.db.setInput(queries.SourceText, 0, edited);
+    try fixture.expectDiagnostic(0, .invalid_operation_signature);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(0, 42);
+}
+
+test "replacement installs even an unused result after ending the old generation" {
+    try Fixture.expectParity(
+        \\struct Item
+        \\    value: int
+        \\    drop = func(deinit self: Item) -> exit(self.value)
+        \\func run() int
+        \\    var item = Item{value = 42}
+        \\    item = Item{value = 43}
+        \\    return 90
+    , 42);
+}
+
+test "replacement retains its old generation through a divergent RHS" {
+    try Fixture.expectParity(
+        \\struct Item
+        \\    value: int
+        \\    drop = func(deinit self: Item) -> exit(self.value)
+        \\func stop() Item -> exit(42)
+        \\func run() int
+        \\    var item = Item{value = 90}
+        \\    item = stop()
+        \\    return 91
+    , 42);
+}
+
+test "reference and indexed replacement keep their owners alive through divergent preparation" {
+    for ([_]struct { binding: []const u8, replacement: []const u8 }{
+        .{ .binding = "var owner = Box.new?(Item{value = 90})", .replacement = "const target = owner.borrow_mut()\n    target[] = exit(42)" },
+        .{ .binding = "var values: List(Item) = [Item{value = 90}]", .replacement = "values[0] = exit(42)" },
+        .{ .binding = "var values = [Item{value = 90}]", .replacement = "values[0] = exit(42)" },
+        .{ .binding = "var values = [Item{value = 90}]", .replacement = "const span = values.span_mut()\n    span[0] = exit(42)" },
+    }) |case| {
+        const source = try test_sources.renderTemplate(testing.allocator,
+            \\struct Item
+            \\    value: int
+            \\    drop = func(deinit self: Item) -> exit(self.value)
+            \\fallible calculate() int
+            \\    $binding
+            \\    $replacement
+            \\    return 92
+            \\func run() int
+            \\    if const result = calculate() -> return result
+            \\    return 93
+        , .{ .binding = case.binding, .replacement = case.replacement });
+        defer testing.allocator.free(source);
+        try Fixture.expectParity(source, 42);
+    }
+}
+
+test "failed reference replacement does not roll back explicit RHS ownership transfer" {
+    try Fixture.expectParity(
+        \\fallible consume(var owner: Box(int)) int -> fail
+        \\fallible calculate() int
+        \\    var owner = Box.new?(20)
+        \\    const target = owner.borrow_mut()
+        \\    target[] = if true
+        \\        _ = consume?(owner^)
+        \\        fail
+        \\    else 0
+        \\    return 90
+        \\func run() int
+        \\    if const result = calculate() -> return result
+        \\    return 42
+    , 42);
 }
