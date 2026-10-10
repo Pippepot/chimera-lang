@@ -186,16 +186,6 @@ fn renderInstruction(
             if (coercion.destination) |storage| try writer.print(" into %{d}", .{@backingInt(storage)});
             try writer.writeByte('\n');
         },
-        .struct_init => |operation| {
-            try writer.print("    %{d} = struct_init ", .{result});
-            try renderType(db, operation.type_id, writer);
-            try writer.writeByte('(');
-            for (ssa.struct_field_values[operation.fields.start..operation.fields.end], 0..) |field, index| {
-                if (index != 0) try writer.writeAll(", ");
-                try writer.print("{d} = %{d}", .{ field.field_index, @backingInt(field.value) });
-            }
-            try writer.writeAll(")\n");
-        },
         .local_storage => |type_id| {
             try writer.print("    %{d} = local_storage ", .{result});
             try renderType(db, type_id, writer);
@@ -248,12 +238,6 @@ fn renderInstruction(
             result,
             @backingInt(operation.operand),
             operation.field_index,
-        }),
-        .field_update => |operation| try writer.print("    %{d} = field_update %{d}, {d} = %{d}\n", .{
-            result,
-            @backingInt(operation.operand),
-            operation.field_index,
-            @backingInt(operation.value),
         }),
         .mut_parameter_write => |operation| try writer.print("    mut_parameter_write {d}, %{d}\n", .{
             operation.parameter_index,

@@ -6,7 +6,6 @@ const query = test_sources.query;
 const queries = test_sources.queries;
 const query_disk_cache = test_sources.query_disk_cache;
 const structures = test_sources.structures;
-const runtime = test_sources.runtime;
 const standard_library = @import("standard_library");
 
 const Fixture = struct {
@@ -57,10 +56,7 @@ const Fixture = struct {
     }
 
     fn expectExit(self: Fixture, status: u8) !void {
-        const artifact = try executable(self.db);
-        try runtime.writeProgram(std.testing.io, artifact.bytes);
-        defer std.Io.Dir.cwd().deleteFile(std.testing.io, "prog") catch {};
-        try std.testing.expectEqual(status, try runtime.runProg(std.testing.io, std.testing.allocator, &.{}));
+        try (test_sources.SourceFixture{ .db = self.db }).expectExit(0, status);
     }
 
     fn expectDiagnostic(self: Fixture, kind: std.meta.Tag(structures.Diagnostic.Kind)) !void {
@@ -72,12 +68,7 @@ const Fixture = struct {
     }
 
     fn executable(db: *query.Database) !structures.Executable {
-        if ((try db.get(queries.BuildExecutable, 0)).*) |artifact| return artifact;
-        const diagnostics = try db.transitiveAccumulatorValues(queries.BuildExecutable, 0, structures.Diagnostic, std.testing.allocator);
-        defer std.testing.allocator.free(diagnostics);
-        for (diagnostics) |diagnostic| std.debug.print("file {d} at {d}: {s}\n", .{ diagnostic.file_id, if (diagnostic.span) |span| span.start else 0, @tagName(diagnostic.kind) });
-        std.debug.print("compiler returned no executable\n", .{});
-        return error.TestUnexpectedResult;
+        return (test_sources.SourceFixture{ .db = db }).executable(0);
     }
 };
 

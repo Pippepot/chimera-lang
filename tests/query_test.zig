@@ -841,11 +841,7 @@ test "same-module declarations are visible across files" {
     try addModuleMembers(db, module, &.{ 1, 2 });
     const entry_id = (try db.get(queries.SelectEntry, 2)).*.?;
     try testing.expect((try db.get(queries.AnalyzeFunctionInstance, .{ .item = entry_id })).* != null);
-    const executable = (try db.get(queries.BuildExecutable, 2)).*.?;
-    const io = testing.io;
-    try runtime.writeProgram(io, executable.bytes);
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
-    try testing.expectEqual(@as(u8, 40), runtime.runProg(io, testing.allocator, &.{}));
+    try (test_sources.SourceFixture{ .db = db }).expectExit(2, @as(u8, 40));
 }
 
 test "cross-file duplicates blame the second file" {
@@ -1326,6 +1322,7 @@ test "item relocation drops dependencies on removed source files" {
 }
 
 test "import resolution cleans up every allocation failure" {
+    if (!@import("test_options").allocation_failures) return error.SkipZigTest;
     try testing.checkAllAllocationFailures(allocation_failure_allocator, testImportAllocations, .{});
 }
 
@@ -1787,153 +1784,122 @@ test "struct hook signature validation updates incrementally" {
 }
 
 test "custom ownership hooks execute without active-hook redispatch" {
+    const copy_prefix =
+        \\static Box = struct
+        \\  copy = func(imm self: Box) Box -> Box{value = self.value + 1}
+        \\  value: int
+        \\func answer() int
+        \\  const source = Box{value = 41}
+        \\
+    ;
+
+    const variant_copy_prefix =
+        \\static Box = struct
+        \\  copy = func(imm self: Box) Box -> exit(self.value)
+        \\  value: int
+        \\static Token = struct
+        \\  value: int
+        \\func answer()
+        \\  const source = Box{value = 42}
+        \\
+    ;
+
+    const resource_prefix =
+        \\static Resource = struct
+        \\  drop = func(deinit self: Resource) -> exit(self.value)
+        \\  value: int
+        \\
+    ;
+
     const cases = [_]struct {
         source: []const u8,
         expected: u8,
     }{
         .{
-            .source =
-            \\static Box = struct
-            \\  copy = func(imm self: Box) Box -> Box{value = self.value + 1}
-            \\  value: int
-            \\func answer() int
-            \\  const source = Box{value = 41}
-            \\  const copied = source
-            \\  return copied.value
-            \\exit(answer())
+            .source = copy_prefix ++
+                \\  const copied = source
+                \\  return copied.value
+                \\exit(answer())
             ,
             .expected = 42,
         },
         .{
-            .source =
-            \\static Box = struct
-            \\  copy = func(imm self: Box) Box -> Box{value = self.value + 1}
-            \\  value: int
-            \\func answer() int
-            \\  const source = Box{value = 41}
-            \\  const selected = if 0 < 1 -> source else Box{value = 40}
-            \\  return selected.value
-            \\exit(answer())
+            .source = copy_prefix ++
+                \\  const selected = if 0 < 1 -> source else Box{value = 40}
+                \\  return selected.value
+                \\exit(answer())
             ,
             .expected = 42,
         },
         .{
-            .source =
-            \\static Box = struct
-            \\  copy = func(imm self: Box) Box -> Box{value = self.value + 1}
-            \\  value: int
-            \\func answer() int
-            \\  const source = Box{value = 41}
-            \\  const selected = if 1 < 0 -> source else Box{value = 40}
-            \\  return selected.value
-            \\exit(answer())
+            .source = copy_prefix ++
+                \\  const selected = if 1 < 0 -> source else Box{value = 40}
+                \\  return selected.value
+                \\exit(answer())
             ,
             .expected = 40,
         },
         .{
-            .source =
-            \\static Box = struct
-            \\  copy = func(imm self: Box) Box -> Box{value = self.value + 1}
-            \\  value: int
-            \\func answer() int
-            \\  const source = Box{value = 41}
-            \\  const selected = if 0 < 1 -> if 1 < 0 -> source else Box{value = 40} else Box{value = 39}
-            \\  return selected.value
-            \\exit(answer())
+            .source = copy_prefix ++
+                \\  const selected = if 0 < 1 -> if 1 < 0 -> source else Box{value = 40} else Box{value = 39}
+                \\  return selected.value
+                \\exit(answer())
             ,
             .expected = 40,
         },
         .{
-            .source =
-            \\static Box = struct
-            \\  copy = func(imm self: Box) Box -> exit(self.value)
-            \\  value: int
-            \\static Token = struct
-            \\  value: int
-            \\func answer()
-            \\  const source = Box{value = 42}
-            \\  const selected: Box | Token = if 0 < 1 -> source else Token{value = 40}
-            \\answer()
-            \\exit(40)
+            .source = variant_copy_prefix ++
+                \\  const selected: Box | Token = if 0 < 1 -> source else Token{value = 40}
+                \\answer()
+                \\exit(40)
             ,
             .expected = 42,
         },
         .{
-            .source =
-            \\static Box = struct
-            \\  copy = func(imm self: Box) Box -> exit(self.value)
-            \\  value: int
-            \\static Token = struct
-            \\  value: int
-            \\func answer()
-            \\  const source = Box{value = 42}
-            \\  const selected: Box | Token = if 1 < 0 -> source else Token{value = 40}
-            \\answer()
-            \\exit(40)
+            .source = variant_copy_prefix ++
+                \\  const selected: Box | Token = if 1 < 0 -> source else Token{value = 40}
+                \\answer()
+                \\exit(40)
             ,
             .expected = 40,
         },
         .{
-            .source =
-            \\static Box = struct
-            \\  copy = func(imm self: Box) Box -> Box{value = self.value + 1}
-            \\  value: int
-            \\func answer() int
-            \\  const source = Box{value = 41}
-            \\  const selected = loop
-            \\    if 0 < 1 -> break source
-            \\    break Box{value = 40}
-            \\  return selected.value
-            \\exit(answer())
+            .source = copy_prefix ++
+                \\  const selected = loop
+                \\    if 0 < 1 -> break source
+                \\    break Box{value = 40}
+                \\  return selected.value
+                \\exit(answer())
             ,
             .expected = 42,
         },
         .{
-            .source =
-            \\static Box = struct
-            \\  copy = func(imm self: Box) Box -> Box{value = self.value + 1}
-            \\  value: int
-            \\func answer() int
-            \\  const source = Box{value = 41}
-            \\  const selected = loop
-            \\    if 1 < 0 -> break source
-            \\    break Box{value = 40}
-            \\  return selected.value
-            \\exit(answer())
+            .source = copy_prefix ++
+                \\  const selected = loop
+                \\    if 1 < 0 -> break source
+                \\    break Box{value = 40}
+                \\  return selected.value
+                \\exit(answer())
             ,
             .expected = 40,
         },
         .{
-            .source =
-            \\static Box = struct
-            \\  copy = func(imm self: Box) Box -> exit(self.value)
-            \\  value: int
-            \\static Token = struct
-            \\  value: int
-            \\func answer()
-            \\  const source = Box{value = 42}
-            \\  const selected: Box | Token = loop
-            \\    if 0 < 1 -> break source
-            \\    break Token{value = 40}
-            \\answer()
-            \\exit(40)
+            .source = variant_copy_prefix ++
+                \\  const selected: Box | Token = loop
+                \\    if 0 < 1 -> break source
+                \\    break Token{value = 40}
+                \\answer()
+                \\exit(40)
             ,
             .expected = 42,
         },
         .{
-            .source =
-            \\static Box = struct
-            \\  copy = func(imm self: Box) Box -> exit(self.value)
-            \\  value: int
-            \\static Token = struct
-            \\  value: int
-            \\func answer()
-            \\  const source = Box{value = 42}
-            \\  const selected: Box | Token = loop
-            \\    if 1 < 0 -> break source
-            \\    break Token{value = 40}
-            \\answer()
-            \\exit(40)
+            .source = variant_copy_prefix ++
+                \\  const selected: Box | Token = loop
+                \\    if 1 < 0 -> break source
+                \\    break Token{value = 40}
+                \\answer()
+                \\exit(40)
             ,
             .expected = 40,
         },
@@ -1978,13 +1944,10 @@ test "custom ownership hooks execute without active-hook redispatch" {
             .expected = 42,
         },
         .{
-            .source =
-            \\static Resource = struct
-            \\  drop = func(deinit self: Resource) -> exit(self.value)
-            \\  value: int
-            \\func answer()
-            \\  const resource = Resource{value = 42}
-            \\answer()
+            .source = resource_prefix ++
+                \\func answer()
+                \\  const resource = Resource{value = 42}
+                \\answer()
             ,
             .expected = 42,
         },
@@ -2009,16 +1972,13 @@ test "custom ownership hooks execute without active-hook redispatch" {
             .expected = 42,
         },
         .{
-            .source =
-            \\static Resource = struct
-            \\  drop = func(deinit self: Resource) -> exit(self.value)
-            \\  value: int
-            \\static Pair = struct
-            \\  first: Resource
-            \\  second: Resource
-            \\func answer()
-            \\  const pair = Pair{first = Resource{value = 41}, second = Resource{value = 42}}
-            \\answer()
+            .source = resource_prefix ++
+                \\static Pair = struct
+                \\  first: Resource
+                \\  second: Resource
+                \\func answer()
+                \\  const pair = Pair{first = Resource{value = 41}, second = Resource{value = 42}}
+                \\answer()
             ,
             .expected = 42,
         },
@@ -2074,36 +2034,27 @@ test "custom ownership hooks execute without active-hook redispatch" {
             .expected = 42,
         },
         .{
-            .source =
-            \\static Resource = struct
-            \\  drop = func(deinit self: Resource) -> exit(self.value)
-            \\  value: int
-            \\func answer()
-            \\  var resource = Resource{value = 42}
-            \\  resource = Resource{value = 43}
-            \\answer()
+            .source = resource_prefix ++
+                \\func answer()
+                \\  var resource = Resource{value = 42}
+                \\  resource = Resource{value = 43}
+                \\answer()
             ,
             .expected = 42,
         },
         .{
-            .source =
-            \\static Resource = struct
-            \\  drop = func(deinit self: Resource) -> exit(self.value)
-            \\  value: int
-            \\func answer()
-            \\  Resource{value = 42}
-            \\answer()
+            .source = resource_prefix ++
+                \\func answer()
+                \\  Resource{value = 42}
+                \\answer()
             ,
             .expected = 42,
         },
         .{
-            .source =
-            \\static Resource = struct
-            \\  drop = func(deinit self: Resource) -> exit(self.value)
-            \\  value: int
-            \\func inspect(imm resource: Resource) -> return
-            \\func answer() -> inspect(Resource{value = 42})
-            \\answer()
+            .source = resource_prefix ++
+                \\func inspect(imm resource: Resource) -> return
+                \\func answer() -> inspect(Resource{value = 42})
+                \\answer()
             ,
             .expected = 42,
         },
@@ -2124,11 +2075,7 @@ test "custom ownership hooks execute without active-hook redispatch" {
         const db = try testDatabase(1);
         defer db.deinit();
         try addSource(db, file_id, case.source);
-        const executable = (try db.get(queries.BuildExecutable, file_id)).*.?;
-        const io = testing.io;
-        try runtime.writeProgram(io, executable.bytes);
-        defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
-        try testing.expectEqual(case.expected, try runtime.runProg(io, testing.allocator, &.{}));
+        try (test_sources.SourceFixture{ .db = db }).expectExit(file_id, case.expected);
     }
 }
 
@@ -2691,10 +2638,7 @@ test "the query fixture prelude is independent of call spelling" {
     try addSource(db, 1, "const terminate = exit\nterminate(42)");
     for ([_][]const u8{ "const terminate = exit\nterminate(42)", "exit (42)" }) |source| {
         try setSource(db, 1, source);
-        const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
-        try runtime.writeProgram(testing.io, executable.bytes);
-        defer std.Io.Dir.cwd().deleteFile(testing.io, "prog") catch {};
-        try testing.expectEqual(@as(u8, 42), try runtime.runProg(testing.io, testing.allocator, &.{}));
+        try (test_sources.SourceFixture{ .db = db }).expectExit(1, @as(u8, 42));
     }
 }
 
@@ -3110,12 +3054,6 @@ test "struct values initialize project pass return and execute" {
         \\  const outer = Outer{bonus = 1, pair = make(39)}
         \\  return sum(outer.pair) + outer.bonus
     );
-    const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
-    const make = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = scope.resolve("make").? })).*.?;
-    try testing.expectEqual(@as(usize, 2), make.struct_field_values.len);
-    try testing.expectEqual(@as(u32, 1), make.struct_field_values[0].field_index);
-    try testing.expectEqual(@as(u32, 0), make.struct_field_values[1].field_index);
-    try testing.expectEqual(.struct_init, std.meta.activeTag(make.instructions[1]));
     try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "make", "sum" }, 42);
 }
 
@@ -4703,11 +4641,7 @@ test "parameterized struct declarations are static type factories" {
     try testing.expectEqual(structures.TypeId.int, int_definition.fields[0].type_id);
     try testing.expectEqual(structures.TypeId.bool, bool_definition.fields[0].type_id);
 
-    const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
-    const io = testing.io;
-    try runtime.writeProgram(io, executable.bytes);
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
-    try testing.expectEqual(@as(u8, 42), runtime.runProg(io, testing.allocator, &.{}));
+    try (test_sources.SourceFixture{ .db = db }).expectExit(1, @as(u8, 42));
 
     try setSource(db, 1,
         \\static unrelated = 0
@@ -4858,11 +4792,7 @@ test "public parameterized struct hooks execute" {
         \\const copied = original
         \\exit(copied.value)
     );
-    const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
-    const io = testing.io;
-    try runtime.writeProgram(io, executable.bytes);
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
-    try testing.expectEqual(@as(u8, 42), runtime.runProg(io, testing.allocator, &.{}));
+    try (test_sources.SourceFixture{ .db = db }).expectExit(1, @as(u8, 42));
 }
 
 test "generated struct ownership declarations validate field capabilities" {
@@ -5147,6 +5077,7 @@ test "static declaration edits invalidate actual consumers and retain equal resu
 }
 
 test "static declaration resolution cleans up every allocation failure" {
+    if (!@import("test_options").allocation_failures) return error.SkipZigTest;
     try testing.checkAllAllocationFailures(allocation_failure_allocator, testStaticDeclarationAllocations, .{});
 }
 
@@ -5300,6 +5231,7 @@ test "module scope preserves stable identity and canonical equality" {
 }
 
 test "module scope construction cleans up every allocation failure" {
+    if (!@import("test_options").allocation_failures) return error.SkipZigTest;
     try testing.checkAllAllocationFailures(allocation_failure_allocator, testModuleScopeAllocations, .{});
 }
 
@@ -5876,6 +5808,7 @@ test "variant branch joins retain equal results and track changed member sets" {
 }
 
 test "variant branch join analysis cleans up every allocation failure" {
+    if (!@import("test_options").allocation_failures) return error.SkipZigTest;
     try testing.checkAllAllocationFailures(allocation_failure_allocator, testVariantJoinAllocations, .{});
 }
 
@@ -7195,6 +7128,7 @@ test "variant inspection edits retain equal artifacts and recover diagnostics" {
 }
 
 test "variant inspection compilation cleans up every allocation failure" {
+    if (!@import("test_options").allocation_failures) return error.SkipZigTest;
     try testing.checkAllAllocationFailures(allocation_failure_allocator, testVariantInspectionAllocations, .{});
 }
 
@@ -7220,11 +7154,7 @@ test "unit branch results join without a machine value" {
         \\static choose = func(value: int) unit -> return if value == 0 -> noop() else noop()
         \\choose(0)
     );
-    const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
-    const io = testing.io;
-    try runtime.writeProgram(io, executable.bytes);
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
-    try testing.expectEqual(@as(u8, 0), runtime.runProg(io, testing.allocator, &.{}));
+    try (test_sources.SourceFixture{ .db = db }).expectExit(1, @as(u8, 0));
 }
 
 test "no-else if joins its body with implicit unit" {
@@ -8894,13 +8824,10 @@ test "movability edits switch results between value and in-place construction" {
         const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
         const body = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = scope.resolveFunction("make").? })).*.?;
         var constructed_in_place = false;
-        var initialized_value = false;
         for (body.instructions) |instruction| {
             if (instruction == .result_storage) constructed_in_place = true;
-            if (instruction == .struct_init) initialized_value = true;
         }
         try testing.expectEqual(index == 1, constructed_in_place);
-        try testing.expectEqual(index != 1, initialized_value);
     }
 }
 
@@ -8928,15 +8855,14 @@ test "movability edits switch mutable locals between rebuilt and in-place update
         try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "bump" }, 42);
         const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
         const body = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = scope.resolveFunction("answer").? })).*.?;
-        var updated_in_place = false;
         var rebuilt = false;
         for (body.instructions) |instruction| switch (instruction) {
-            .local_storage => updated_in_place = true,
             .call_mut_argument => |argument| try testing.expectEqual(index == 1, argument.destination != null),
-            .field_update => rebuilt = true,
+            .value_copy => |copy| if (copy.type_id != .int) {
+                rebuilt = true;
+            },
             else => {},
         };
-        try testing.expectEqual(index == 1, updated_in_place);
         try testing.expectEqual(index != 1, rebuilt);
     }
 }
@@ -10983,6 +10909,7 @@ test "redundant variant binding annotations retain typed and compiled results" {
 }
 
 test "typed expression graph construction cleans up every allocation failure" {
+    if (!@import("test_options").allocation_failures) return error.SkipZigTest;
     try testing.checkAllAllocationFailures(allocation_failure_allocator, testTypedExpressionAllocations, .{});
 }
 
@@ -11180,6 +11107,7 @@ test "ownership strategies require bare strategy names" {
 }
 
 test "adding a previously missing input invalidates cached fallback results" {
+    if (!@import("test_options").allocation_failures) return testMissingInputRegistration(testing.allocator);
     try testing.checkAllAllocationFailures(allocation_failure_allocator, testMissingInputRegistration, .{});
 }
 

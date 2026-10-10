@@ -2,59 +2,10 @@ const std = @import("std");
 const sources = @import("test_sources");
 const testing = std.testing;
 
-const Fixture = struct {
-    db: *sources.query.Database,
-
-    fn init(source: []const u8) !Fixture {
-        return initFiles(source, &.{});
-    }
-
-    fn initFiles(source: []const u8, files: []const sources.modules.SourceFile) !Fixture {
-        const db = try sources.query.Database.init(testing.allocator, .{ .worker_count = 2 });
-        errdefer db.deinit();
-        try sources.modules.registerSources(db, testing.allocator, source, files, &.{});
-        return .{ .db = db };
-    }
-
-    fn deinit(self: Fixture) void {
-        self.db.deinit();
-    }
-
-    fn diagnostics(self: Fixture) !void {
-        const values = try self.db.transitiveAccumulatorValues(sources.queries.BuildExecutable, 0, sources.structures.Diagnostic, testing.allocator);
-        defer testing.allocator.free(values);
-        for (values) |value| std.debug.print("file {d}: {any} at {any}\n", .{ value.file_id, value.kind, value.span });
-    }
-
-    fn expectExit(source: []const u8, status: u8) !void {
-        const fixture = try init(source);
-        defer fixture.deinit();
-        try fixture.checkExit(status);
-    }
-
-    fn checkExit(self: Fixture, status: u8) !void {
-        const program = (try self.db.get(sources.queries.BuildExecutable, 0)).*;
-        if (program == null) try self.diagnostics();
-        try testing.expect(program != null);
-        try sources.runtime.writeProgram(testing.io, program.?.bytes);
-        defer std.Io.Dir.cwd().deleteFile(testing.io, "prog") catch {};
-        try testing.expectEqual(status, try sources.runtime.runProg(testing.io, testing.allocator, &.{}));
-    }
-
-    fn expectDiagnostic(source: []const u8, kind: std.meta.Tag(sources.structures.Diagnostic.Kind)) !void {
-        const fixture = try init(source);
-        defer fixture.deinit();
-        try testing.expect((try fixture.db.get(sources.queries.BuildExecutable, 0)).* == null);
-        const values = try fixture.db.transitiveAccumulatorValues(sources.queries.BuildExecutable, 0, sources.structures.Diagnostic, testing.allocator);
-        defer testing.allocator.free(values);
-        for (values) |value| if (std.meta.activeTag(value.kind) == kind) return;
-        try fixture.diagnostics();
-        return error.ExpectedDiagnostic;
-    }
-};
+const Fixture = sources.SourceFixture;
 
 test "collection literals construct infallible arrays without failure handling" {
-    try Fixture.expectExit(
+    try Fixture.expectSourceExit(
         \\func count() int
         \\    const values: Array(int, 2) = [19, 23]
         \\    return values.len()
@@ -63,7 +14,7 @@ test "collection literals construct infallible arrays without failure handling" 
 }
 
 test "consuming converters propagate initializer failure but cannot introduce unrelated failure" {
-    try Fixture.expectDiagnostic(
+    try Fixture.expectAnySourceDiagnostic(
         \\struct Target
         \\    copy = trivial
         \\    value: int
@@ -78,7 +29,7 @@ test "consuming converters propagate initializer failure but cannot introduce un
 }
 
 test "consuming collection converters inherit concrete effects with native and interpreter parity" {
-    const source =
+    try Fixture.expectParity(
         \\struct Target
         \\    copy = trivial
         \\    value: int
@@ -90,16 +41,11 @@ test "consuming collection converters inherit concrete effects with native and i
         \\    const target: Target = [19, 23]
         \\    if const failed: Target = [missing?()] -> return 91
         \\    return target.value
-    ;
-    for ([_][]const u8{ "exit(run())", "static result = run()\nexit(result)" }) |entry| {
-        const program = try testing.allocator.print("{s}\n{s}", .{ source, entry });
-        defer testing.allocator.free(program);
-        try Fixture.expectExit(program, 42);
-    }
+    , 42);
 }
 
 test "collection converters derive contextual element types including empty literals from targets" {
-    const source =
+    try Fixture.expectParity(
         \\struct Wrapper(T: type)
         \\    copy = trivial
         \\    size: int
@@ -110,16 +56,11 @@ test "collection converters derive contextual element types including empty lite
         \\    const values: Wrapper(byte) = [1, 2]
         \\    const empty: Wrapper(byte) = []
         \\    return values.size + empty.size + 40
-    ;
-    for ([_][]const u8{ "exit(run())", "static result = run()\nexit(result)" }) |entry| {
-        const program = try testing.allocator.print("{s}\n{s}", .{ source, entry });
-        defer testing.allocator.free(program);
-        try Fixture.expectExit(program, 42);
-    }
+    , 42);
 }
 
 test "static structs permit ordinary compile-time local construction and mutation" {
-    try Fixture.expectExit(
+    try Fixture.expectSourceExit(
         \\static struct Data
         \\    copy = trivial
         \\    value: int
@@ -133,7 +74,7 @@ test "static structs permit ordinary compile-time local construction and mutatio
 }
 
 test "static structs cannot occupy runtime storage" {
-    try Fixture.expectDiagnostic(
+    try Fixture.expectAnySourceDiagnostic(
         \\static struct Data
         \\    copy = trivial
         \\    value: int
@@ -162,7 +103,7 @@ test "static-only types and empty containing arrays have no native layout" {
 }
 
 test "static struct hooks aliases and namespace members obey ordinary compile-time rules" {
-    try Fixture.expectExit(
+    try Fixture.expectSourceExit(
         \\static struct Data
         \\    value: int
         \\    copy = func(imm self: Data) Data -> Data{value = self.value + 1}
@@ -181,7 +122,7 @@ test "static struct hooks aliases and namespace members obey ordinary compile-ti
 }
 
 test "static struct generated values can specialize runtime functions" {
-    try Fixture.expectExit(
+    try Fixture.expectSourceExit(
         \\static struct Data(T: type)
         \\    copy = trivial
         \\    value: T
@@ -213,7 +154,7 @@ test "static struct eligibility propagates through stored aggregates" {
         \\const data = Array(Data, 0).filled(Data{value = 42})
         \\exit(data.len())
         ,
-    }) |source| try Fixture.expectDiagnostic(source, .compile_time_only_type);
+    }) |source| try Fixture.expectAnySourceDiagnostic(source, .compile_time_only_type);
 }
 
 test "compile-time-only types reject runtime calls and raw heap storage" {
@@ -223,14 +164,14 @@ test "compile-time-only types reject runtime calls and raw heap storage" {
         \\    value: int
         \\
     ;
-    try Fixture.expectDiagnostic(declaration ++ "func make() Data -> Data{value = 42}\nconst data = make()\nexit(data.value)", .compile_time_only_type);
-    try Fixture.expectDiagnostic(declaration ++ "func use(data: Data) int -> data.value\nexit(use(Data{value = 42}))", .compile_time_only_type);
-    try Fixture.expectDiagnostic(declaration ++ "import std.memory.{Allocation}\nif const storage = Allocation(Data).allocate_raw(1)\n    storage.release()\nexit(0)", .compile_time_only_type);
-    try Fixture.expectExit(declaration ++ "func make() Data -> Data{value = 42}\nfunc compute() int -> make().value\nstatic answer = compute()\nexit(answer)", 42);
+    try Fixture.expectAnySourceDiagnostic(declaration ++ "func make() Data -> Data{value = 42}\nconst data = make()\nexit(data.value)", .compile_time_only_type);
+    try Fixture.expectAnySourceDiagnostic(declaration ++ "func use(data: Data) int -> data.value\nexit(use(Data{value = 42}))", .compile_time_only_type);
+    try Fixture.expectAnySourceDiagnostic(declaration ++ "import std.memory.{Allocation}\nif const storage = Allocation(Data).allocate_raw(1)\n    storage.release()\nexit(0)", .compile_time_only_type);
+    try Fixture.expectSourceExit(declaration ++ "func make() Data -> Data{value = 42}\nfunc compute() int -> make().value\nstatic answer = compute()\nexit(answer)", 42);
 }
 
 test "direct converters initialize expected bindings fields arguments and returns" {
-    try Fixture.expectExit(
+    try Fixture.expectSourceExit(
         \\struct Source
         \\    copy = trivial
         \\    value: int
@@ -252,7 +193,7 @@ test "direct converters initialize expected bindings fields arguments and return
 }
 
 test "explicit converter calls support aliases and specialized factories" {
-    try Fixture.expectExit(
+    try Fixture.expectSourceExit(
         \\struct Source
         \\    copy = trivial
         \\    value: int
@@ -279,12 +220,12 @@ test "converter ambiguity is diagnosed only at unequal expected uses" {
         \\converter(value: Source) Target -> Target{value = value.value + 1}
         \\
     ;
-    try Fixture.expectExit(declarations ++ "const source: Source = Source{value = 42}\nexit(source.value)", 42);
-    try Fixture.expectDiagnostic(declarations ++ "const target: Target = Source{value = 42}\nexit(target.value)", .ambiguous_conversion);
+    try Fixture.expectSourceExit(declarations ++ "const source: Source = Source{value = 42}\nexit(source.value)", 42);
+    try Fixture.expectAnySourceDiagnostic(declarations ++ "const target: Target = Source{value = 42}\nexit(target.value)", .ambiguous_conversion);
 }
 
 test "converter to a variant member widens its result" {
-    try Fixture.expectExit(
+    try Fixture.expectSourceExit(
         \\struct Source
         \\    copy = trivial
         \\    value: int
@@ -298,7 +239,7 @@ test "converter to a variant member widens its result" {
 }
 
 test "static source converter constructs runtime values without runtime source storage" {
-    try Fixture.expectExit(
+    try Fixture.expectSourceExit(
         \\static struct Source
         \\    copy = trivial
         \\    value: int
@@ -312,7 +253,7 @@ test "static source converter constructs runtime values without runtime source s
 }
 
 test "integer literal defaults and standard byte converter preserve distinct types" {
-    try Fixture.expectExit(
+    try Fixture.expectSourceExit(
         \\const minimum: int = -2147483648
         \\const byte_value: byte = 42
         \\const variant: int | byte = 42
@@ -321,14 +262,14 @@ test "integer literal defaults and standard byte converter preserve distinct typ
         \\    if minimum < 0 -> exit(selected)
         \\exit(90)
     , 42);
-    try Fixture.expectDiagnostic("const value: byte = 256\nexit(0)", .where_condition_failed);
-    try Fixture.expectDiagnostic("const value: byte = -1\nexit(0)", .where_condition_failed);
-    try Fixture.expectDiagnostic("const value = 2147483648\nexit(0)", .integer_literal_out_of_range);
-    try Fixture.expectDiagnostic("const number = 42\nconst value: byte = number\nexit(0)", .local_type_mismatch);
+    try Fixture.expectAnySourceDiagnostic("const value: byte = 256\nexit(0)", .where_condition_failed);
+    try Fixture.expectAnySourceDiagnostic("const value: byte = -1\nexit(0)", .where_condition_failed);
+    try Fixture.expectAnySourceDiagnostic("const value = 2147483648\nexit(0)", .integer_literal_out_of_range);
+    try Fixture.expectAnySourceDiagnostic("const number = 42\nconst value: byte = number\nexit(0)", .local_type_mismatch);
 }
 
 test "direct converters can return a whole variant" {
-    try Fixture.expectExit(
+    try Fixture.expectSourceExit(
         \\struct Source
         \\    copy = trivial
         \\    value: int
@@ -339,7 +280,7 @@ test "direct converters can return a whole variant" {
 }
 
 test "converter where is demanded only after selection" {
-    try Fixture.expectExit(
+    try Fixture.expectSourceExit(
         \\struct Source
         \\    copy = trivial
         \\    value: int
@@ -350,7 +291,7 @@ test "converter where is demanded only after selection" {
         \\const result: int | none = 42
         \\if const selected = result as int -> exit(selected) else exit(90)
     , 42);
-    try Fixture.expectDiagnostic(
+    try Fixture.expectAnySourceDiagnostic(
         \\struct Source
         \\    copy = trivial
         \\    value: int
@@ -378,11 +319,11 @@ test "conversion does not chain or preconvert source variants" {
         \\converter(value: Middle) Target -> Target{value = value.value}
         \\
     ;
-    try Fixture.expectDiagnostic(declarations ++ "const result: Target = Source{value = 42}\nexit(0)", .local_type_mismatch);
+    try Fixture.expectAnySourceDiagnostic(declarations ++ "const result: Target = Source{value = 42}\nexit(0)", .local_type_mismatch);
 }
 
 test "builtin widening competes with member converters" {
-    try Fixture.expectDiagnostic(
+    try Fixture.expectAnySourceDiagnostic(
         \\struct Source
         \\    copy = trivial
         \\    value: int
@@ -416,19 +357,19 @@ test "converter lookup follows type ownership across unimported sibling files an
         .{ .path = "library/conversion.chi", .module_path = "library", .source = public },
     });
     defer fixture.deinit();
-    try fixture.checkExit(42);
+    try fixture.expectExit(0, 42);
     try fixture.db.setInput(sources.queries.SourceText, 2, private);
     try testing.expect((try fixture.db.get(sources.queries.BuildExecutable, 0)).* == null);
     try fixture.db.setInput(sources.queries.SourceText, 2, public);
-    try fixture.checkExit(42);
+    try fixture.expectExit(0, 42);
     try fixture.db.setInput(sources.queries.SourceText, 2, public ++ "\n" ++ public);
     try testing.expect((try fixture.db.get(sources.queries.BuildExecutable, 0)).* == null);
     try fixture.db.setInput(sources.queries.SourceText, 2, public);
-    try fixture.checkExit(42);
+    try fixture.expectExit(0, 42);
 }
 
 test "converter inputs remain borrowed and immovable outputs construct in bindings and fields" {
-    try Fixture.expectExit(
+    try Fixture.expectSourceExit(
         \\struct Source
         \\    copy = none
         \\    value: int
@@ -449,7 +390,7 @@ test "converter inputs remain borrowed and immovable outputs construct in bindin
 }
 
 test "converters run through ordinary compile-time calls" {
-    try Fixture.expectExit(
+    try Fixture.expectSourceExit(
         \\struct Source
         \\    copy = trivial
         \\    value: int
@@ -477,25 +418,25 @@ test "converter declarations reject invalid source modes and foreign ownership e
     }) |declaration| {
         const source = try testing.allocator.print("struct Source\n    copy = trivial\n    value: int\nstruct Target\n    copy = trivial\n    value: int\n{s}\nexit(0)", .{declaration});
         defer testing.allocator.free(source);
-        try Fixture.expectDiagnostic(source, .invalid_converter);
+        try Fixture.expectAnySourceDiagnostic(source, .invalid_converter);
     }
-    try Fixture.expectDiagnostic("converter(value: int) byte -> 42\nexit(0)", .invalid_converter_owner);
+    try Fixture.expectAnySourceDiagnostic("converter(value: int) byte -> 42\nexit(0)", .invalid_converter_owner);
 }
 
 test "converter declaration parameters must infer from the source or target" {
-    try Fixture.expectDiagnostic(
+    try Fixture.expectAnySourceDiagnostic(
         \\struct Source
         \\    copy = trivial
         \\    value: int
         \\converter(static T: type, value: Source) int -> value.value
         \\exit(0)
     , .invalid_converter);
-    try Fixture.expectDiagnostic("struct Data\n    converter(value: int) byte -> 42\nexit(0)", .invalid_converter);
-    try Fixture.expectDiagnostic("func unused()\n    converter(value: int) byte -> 42\nexit(0)", .invalid_converter);
+    try Fixture.expectAnySourceDiagnostic("struct Data\n    converter(value: int) byte -> 42\nexit(0)", .invalid_converter);
+    try Fixture.expectAnySourceDiagnostic("func unused()\n    converter(value: int) byte -> 42\nexit(0)", .invalid_converter);
 }
 
 test "static converter source annotations infer generic parameters and accept calls" {
-    try Fixture.expectExit(
+    try Fixture.expectSourceExit(
         \\static struct Source(T: type)
         \\    copy = fieldwise
         \\    value: T
@@ -511,7 +452,7 @@ test "static converter source annotations infer generic parameters and accept ca
 }
 
 test "immovable converter outputs construct in returns variants branches and arguments" {
-    try Fixture.expectExit(
+    try Fixture.expectSourceExit(
         \\struct Source
         \\    copy = trivial
         \\    value: int
@@ -545,12 +486,12 @@ test "converter reference returns retain ordinary conservative input origins" {
         \\converter(value: Source) Ref(Source, false) -> borrow_local(Source, value)
         \\
     ;
-    try Fixture.expectExit(declarations ++ "const source = Source{value = 42}\nconst reference: Ref(Source, false) = source\nexit(reference[].value)", 42);
-    try Fixture.expectDiagnostic(declarations ++ "func escape() Ref(Source, false)\n    const source = Source{value = 42}\n    return source\nconst reference = escape()\nexit(reference[].value)", .borrow_outlives_source);
+    try Fixture.expectSourceExit(declarations ++ "const source = Source{value = 42}\nconst reference: Ref(Source, false) = source\nexit(reference[].value)", 42);
+    try Fixture.expectAnySourceDiagnostic(declarations ++ "func escape() Ref(Source, false)\n    const source = Source{value = 42}\n    return source\nconst reference = escape()\nexit(reference[].value)", .borrow_outlives_source);
 }
 
 test "converter constraints are not evaluated to infer a generic operation" {
-    try Fixture.expectDiagnostic(
+    try Fixture.expectAnySourceDiagnostic(
         \\struct Source
         \\    copy = trivial
         \\    value: int
@@ -564,7 +505,7 @@ test "converter constraints are not evaluated to infer a generic operation" {
 }
 
 test "initializer inference fails before converter constraints are evaluated" {
-    try Fixture.expectDiagnostic(
+    try Fixture.expectAnySourceDiagnostic(
         \\struct Source
         \\    copy = trivial
         \\    value: int
@@ -603,11 +544,11 @@ test "nested conversions defer constraints until argument inference succeeds" {
             for (cases) |case| {
                 const source = try std.fmt.allocPrint(testing.allocator, "{s}converter(value: Source) Target where {s} -> Target{{value = value.value}}\nfallible unresolved(static T: type, {s}value: {s}) int -> 42\nif const answer = unresolved({s}) -> exit(answer)\nexit(90)", .{ declarations, constraint, mode, case.parameter, case.expression });
                 defer testing.allocator.free(source);
-                try Fixture.expectDiagnostic(source, .static_argument_cannot_be_inferred);
+                try Fixture.expectAnySourceDiagnostic(source, .static_argument_cannot_be_inferred);
             }
         }
     }
-    try Fixture.expectDiagnostic(declarations ++
+    try Fixture.expectAnySourceDiagnostic(declarations ++
         \\converter(value: Source) Target where 0 == 1 -> Target{value = value.value}
         \\fallible construct(init value: Wrapper) Wrapper -> value
         \\if const answer = construct(loop -> break Wrapper{inner = Source{value = 42}}) -> exit(answer.inner.value)
@@ -629,17 +570,17 @@ test "initializer inference does not execute converters inside static sources" {
         \\    inner: Target
         \\
     ;
-    try Fixture.expectDiagnostic(declarations ++
+    try Fixture.expectAnySourceDiagnostic(declarations ++
         \\fallible unresolved(static T: type, init value: Wrapper) int -> 42
         \\if const answer = unresolved(loop -> break Wrapper{inner = Source{value = 300}}) -> exit(answer)
         \\exit(90)
     , .static_argument_cannot_be_inferred);
-    try Fixture.expectDiagnostic(declarations ++
+    try Fixture.expectAnySourceDiagnostic(declarations ++
         \\fallible construct(init value: Wrapper) Wrapper -> value
         \\if const answer = construct(loop -> break Wrapper{inner = Source{value = 300}}) -> exit(answer.inner.value)
         \\exit(90)
     , .where_condition_failed);
-    try Fixture.expectExit(declarations ++
+    try Fixture.expectSourceExit(declarations ++
         \\fallible construct(init value: Wrapper) Wrapper -> value
         \\if const answer = construct(loop -> break Wrapper{inner = Source{value = 42}}) -> exit(answer.inner.value)
         \\exit(90)
@@ -647,7 +588,7 @@ test "initializer inference does not execute converters inside static sources" {
 }
 
 test "specialized init arguments convert once only when constructed" {
-    try Fixture.expectExit(
+    try Fixture.expectSourceExit(
         \\struct Source
         \\    copy = trivial
         \\    value: int
@@ -674,7 +615,7 @@ test "specialized init arguments convert once only when constructed" {
 }
 
 test "literal converters inspect wide signed values without defaulting to int" {
-    try Fixture.expectExit(
+    try Fixture.expectSourceExit(
         \\struct Target
         \\    copy = trivial
         \\    value: int
@@ -682,7 +623,7 @@ test "literal converters inspect wide signed values without defaulting to int" {
         \\const first: Target = 9223372036854775807
         \\if first.value == 42 -> exit(first.value) else exit(90)
     , 42);
-    try Fixture.expectExit(
+    try Fixture.expectSourceExit(
         \\struct Target
         \\    copy = trivial
         \\    value: int
@@ -690,15 +631,15 @@ test "literal converters inspect wide signed values without defaulting to int" {
         \\const selected: Target = -9223372036854775808
         \\exit(selected.value)
     , 42);
-    try Fixture.expectDiagnostic("const value: byte = 9223372036854775807\nexit(0)", .where_condition_failed);
-    try Fixture.expectDiagnostic("const value: byte = -9223372036854775808\nexit(0)", .where_condition_failed);
-    try Fixture.expectDiagnostic("const value = -0xff\nexit(0)", .integer_literal_not_decimal);
-    try Fixture.expectDiagnostic("const value = -1.5\nexit(0)", .float_literal_not_supported);
-    try Fixture.expectExit("static literal: int_literal = 42\nconst value: byte = literal\nfunc take(imm item: byte) int -> 42\nexit(take(value))", 42);
+    try Fixture.expectAnySourceDiagnostic("const value: byte = 9223372036854775807\nexit(0)", .where_condition_failed);
+    try Fixture.expectAnySourceDiagnostic("const value: byte = -9223372036854775808\nexit(0)", .where_condition_failed);
+    try Fixture.expectAnySourceDiagnostic("const value = -0xff\nexit(0)", .integer_literal_not_decimal);
+    try Fixture.expectAnySourceDiagnostic("const value = -1.5\nexit(0)", .float_literal_not_supported);
+    try Fixture.expectSourceExit("static literal: int_literal = 42\nconst value: byte = literal\nfunc take(imm item: byte) int -> 42\nexit(take(value))", 42);
 }
 
 test "compile-time local literal values retain checked int defaults" {
-    try Fixture.expectExit(
+    try Fixture.expectSourceExit(
         \\func take(value: int) int -> value
         \\func infer(static T: type, value: T) int where T == int -> value
         \\func literalValue() int_literal -> 42
@@ -719,7 +660,7 @@ test "compile-time local literal values retain checked int defaults" {
         \\static answer = compute()
         \\exit(answer)
     , 42);
-    try Fixture.expectDiagnostic(
+    try Fixture.expectAnySourceDiagnostic(
         \\func compute() int
         \\    const literal: int_literal = 2147483648
         \\    const value: int = literal
@@ -730,7 +671,7 @@ test "compile-time local literal values retain checked int defaults" {
 }
 
 test "static converter candidates skip other source factories without specialization errors" {
-    try Fixture.expectExit(
+    try Fixture.expectSourceExit(
         \\static struct First(T: type)
         \\    copy = fieldwise
         \\    value: T
@@ -749,7 +690,7 @@ test "static converter candidates skip other source factories without specializa
 }
 
 test "converters accept compile-time-only aggregate source annotations" {
-    try Fixture.expectExit(
+    try Fixture.expectSourceExit(
         \\static struct Data
         \\    copy = trivial
         \\    value: int
@@ -768,7 +709,7 @@ test "converters accept compile-time-only aggregate source annotations" {
 }
 
 test "generic wrapper converter source mode follows specialized contained types" {
-    try Fixture.expectExit(
+    try Fixture.expectSourceExit(
         \\static struct Data
         \\    copy = trivial
         \\    value: int
@@ -785,7 +726,7 @@ test "generic wrapper converter source mode follows specialized contained types"
 }
 
 test "converted values cannot borrow mutable authority from the original source place" {
-    try Fixture.expectDiagnostic(
+    try Fixture.expectAnySourceDiagnostic(
         \\struct Source
         \\    copy = trivial
         \\    value: int
@@ -802,14 +743,14 @@ test "converted values cannot borrow mutable authority from the original source 
 }
 
 test "generic calls convert known parameters only after loop argument inference" {
-    try Fixture.expectExit(
+    try Fixture.expectSourceExit(
         \\func take(static T: type, value: T, literal: byte) int -> value
         \\exit(take(loop -> break 42, 255))
     , 42);
 }
 
 test "generic inference preserves converter evaluation before later argument writes" {
-    try Fixture.expectExit(
+    try Fixture.expectSourceExit(
         \\struct Source
         \\    move = none
         \\    value: int
@@ -826,7 +767,7 @@ test "generic inference preserves converter evaluation before later argument wri
 }
 
 test "static converters accept ordinary compile-time parameters" {
-    try Fixture.expectExit(
+    try Fixture.expectSourceExit(
         \\static struct Source
         \\    copy = trivial
         \\    value: int
@@ -843,7 +784,7 @@ test "static converters accept ordinary compile-time parameters" {
 }
 
 test "compile-time static-only values retain builtin variant widening" {
-    try Fixture.expectExit(
+    try Fixture.expectSourceExit(
         \\static struct Source
         \\    copy = trivial
         \\    value: int
@@ -858,7 +799,7 @@ test "compile-time static-only values retain builtin variant widening" {
 }
 
 test "static converters accept mutated compile-time local sources" {
-    try Fixture.expectExit(
+    try Fixture.expectSourceExit(
         \\static struct Source
         \\    copy = trivial
         \\    value: int
@@ -878,7 +819,7 @@ test "static converters accept mutated compile-time local sources" {
 }
 
 test "staged static field sources support immovable assignments and returns" {
-    try Fixture.expectExit(
+    try Fixture.expectSourceExit(
         \\static struct Source
         \\    copy = trivial
         \\    value: int
@@ -913,7 +854,7 @@ test "staged static conversion specializes and checks the current source value" 
         \\converter(static T: type, static source: Source(T)) Target where source.value >= 0 -> Target{value = source.value}
         \\
     ;
-    try Fixture.expectExit(declaration ++
+    try Fixture.expectSourceExit(declaration ++
         \\func compute() int
         \\    var source = Source(int){value = 40}
         \\    source.value += 2
@@ -922,7 +863,7 @@ test "staged static conversion specializes and checks the current source value" 
         \\static result = compute()
         \\exit(result)
     , 42);
-    try Fixture.expectDiagnostic(declaration ++
+    try Fixture.expectAnySourceDiagnostic(declaration ++
         \\func compute() int
         \\    var source = Source(int){value = 40}
         \\    source.value = -1
@@ -931,7 +872,7 @@ test "staged static conversion specializes and checks the current source value" 
         \\static result = compute()
         \\exit(result)
     , .where_condition_failed);
-    try Fixture.expectDiagnostic(declaration ++
+    try Fixture.expectAnySourceDiagnostic(declaration ++
         \\func compute() int
         \\    var source = Source(int){value = 40}
         \\    source.value += 2
@@ -942,7 +883,7 @@ test "staged static conversion specializes and checks the current source value" 
 }
 
 test "converter candidates match source types before validating source modes" {
-    try Fixture.expectExit(
+    try Fixture.expectSourceExit(
         \\struct RuntimeSource
         \\    copy = trivial
         \\    value: int
@@ -972,7 +913,7 @@ test "converter candidates match source types before validating source modes" {
 }
 
 test "converter signature probes retain bare inferred source and target types" {
-    try Fixture.expectExit(
+    try Fixture.expectSourceExit(
         \\struct Target
         \\    copy = trivial
         \\    value: int
@@ -984,7 +925,7 @@ test "converter signature probes retain bare inferred source and target types" {
         \\static answer = run()
         \\exit(run() + answer - 42)
     , 42);
-    try Fixture.expectExit(
+    try Fixture.expectSourceExit(
         \\struct Source
         \\    copy = trivial
         \\    value: int
@@ -996,7 +937,7 @@ test "converter signature probes retain bare inferred source and target types" {
 }
 
 test "static converter source type parameters resolve after inference" {
-    try Fixture.expectExit(
+    try Fixture.expectSourceExit(
         \\static struct Source
         \\    copy = trivial
         \\    value: int
@@ -1028,7 +969,7 @@ test "annotated compile-time literal locals retain byte conversion after mutatio
         \\exit(use(answer))
     );
     defer fixture.deinit();
-    try fixture.checkExit(42);
+    try fixture.expectExit(0, 42);
     const scope = (try fixture.db.get(sources.queries.BuildModuleScope, 0)).*.?;
     const answer = (try fixture.db.get(sources.queries.ResolveStatic, scope.resolve("answer").?)).*.?;
     const value = try fixture.db.lookupInterned(sources.queries.CompileTimeValues, answer);
@@ -1036,7 +977,7 @@ test "annotated compile-time literal locals retain byte conversion after mutatio
 }
 
 test "annotated compile-time literals preserve wide signed values for converters" {
-    try Fixture.expectExit(
+    try Fixture.expectSourceExit(
         \\struct Target
         \\    copy = trivial
         \\    value: int

@@ -196,6 +196,7 @@ fn checkSnapshotAllocations(allocator: std.mem.Allocator) !void {
 }
 
 test "flow snapshots release every failed allocation" {
+    if (!@import("test_options").allocation_failures) return error.SkipZigTest;
     try std.testing.checkAllAllocationFailures(std.testing.allocator, checkSnapshotAllocations, .{});
 }
 

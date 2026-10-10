@@ -226,6 +226,28 @@ const LocationPlan = struct {
         }
     }
 
+    fn storageProjectionLocation(
+        types: anytype,
+        operation: structures.StorageProjection,
+        value_index: usize,
+        locations: []const ValueLocation,
+        value_types: []const structures.TypeId,
+        local_end: *u32,
+    ) !ValueLocation {
+        const owner = @backingInt(operation.owner);
+        // Earlier stack locations are final; incoming arguments and
+        // result storage receive their locations after frame sizing.
+        if (owner < value_index and locations[owner] == .stack) {
+            const offset: ?u32 = switch (operation.projection) {
+                .field => |index| ((try types.structLayout(value_types[owner])) orelse return error.Unavailable).field_offsets[index],
+                .variant => (try types.variantLayout(value_types[owner])).payload_offset,
+                .box_element, .allocation_array => null,
+            };
+            if (offset) |bytes| return .{ .stack = std.math.add(u32, locations[owner].stack, bytes) catch return error.FunctionTooLarge };
+        }
+        return .{ .indirect = try reserveStack(local_end, indirect_layout) };
+    }
+
     fn init(ssa: *const structures.FunctionBodyAnalysis, types: anytype, gpa: std.mem.Allocator) !LocationPlan {
         const needed = try gpa.alloc(Usage, ssa.valueCount());
         defer gpa.free(needed);
@@ -250,11 +272,6 @@ const LocationPlan = struct {
                     for (ssa.initializer_captures[operation.captures.start..operation.captures.end]) |capture| {
                         needed[@backingInt(capture)] = .used;
                         addressable[@backingInt(capture)] = true;
-                    }
-                },
-                .struct_init => |operation| {
-                    for (ssa.struct_field_values[operation.fields.start..operation.fields.end]) |field| {
-                        needed[@backingInt(field.value)] = .used;
                     }
                 },
                 .local_storage => addressable[value_index] = true,
@@ -361,7 +378,11 @@ const LocationPlan = struct {
                         break :location_blk .discarded;
                     },
                     .result_storage => break :location_blk .discarded,
-                    .storage_projection, .allocation_element, .array_element, .borrow_read => if (needed[value_index] != .unused) {
+                    .storage_projection => |operation| if (needed[value_index] != .unused)
+                        break :location_blk try storageProjectionLocation(types, operation, value_index, locations, value_types, &local_end)
+                    else
+                        break :location_blk .discarded,
+                    .allocation_element, .array_element, .borrow_read => if (needed[value_index] != .unused) {
                         break :location_blk .{ .indirect = try reserveStack(&local_end, indirect_layout) };
                     } else break :location_blk .discarded,
                     else => {},
@@ -607,7 +628,6 @@ fn FunctionEmitter(comptime Types: type) type {
                         self.locations[@backingInt(coercion.operand)],
                         if (coercion.destination) |storage| self.locations[@backingInt(storage)] else destination,
                     ),
-                    .struct_init => |operation| try self.emitStructInit(ssa, operation, destination),
                     .local_storage, .result_storage => {},
                     .storage_projection => |operation| try self.emitStorageProjection(operation, destination),
                     .allocation_element => |operation| try self.emitAllocationElement(operation, destination),
@@ -647,7 +667,6 @@ fn FunctionEmitter(comptime Types: type) type {
                     .borrow_write => |operation| try self.emitBorrowWrite(operation),
                     .value_copy => |operation| try self.copyValue(operation.type_id, self.locations[@backingInt(operation.source)], if (operation.destination) |storage| self.locations[@backingInt(storage)] else destination),
                     .field_access => |operation| try self.emitFieldAccess(operation, destination),
-                    .field_update => |operation| try self.emitFieldUpdate(operation, destination),
                     .mut_parameter_write => |operation| try self.emitMutParameterWrite(ssa, operation),
                     .call_mut_argument => |operation| try self.emitCallMutArgument(operation, destination),
                     .call => |call| try self.emitCall(call, destination),
@@ -1066,30 +1085,8 @@ fn FunctionEmitter(comptime Types: type) type {
             try self.copyRange(source, 0, .{ .value = destination }, 0, layout.byte_size);
         }
 
-        fn emitStructInit(
-            self: *Self,
-            ssa: *const structures.FunctionBodyAnalysis,
-            operation: structures.StructOperation,
-            destination: ValueLocation,
-        ) !void {
-            if (destination == .discarded) return;
-            const layout = (try self.types.structLayout(operation.type_id)) orelse return error.Unavailable;
-            for (ssa.struct_field_values[operation.fields.start..operation.fields.end]) |field| {
-                std.debug.assert(field.field_index < layout.field_offsets.len);
-                const source_type = self.valueType(field.value);
-                const field_layout = try self.types.layout(source_type);
-                try self.copyRange(
-                    self.locations[@backingInt(field.value)],
-                    0,
-                    .{ .value = destination },
-                    layout.field_offsets[field.field_index],
-                    field_layout.byte_size,
-                );
-            }
-        }
-
         fn emitStorageProjection(self: *Self, operation: structures.StorageProjection, destination: ValueLocation) !void {
-            if (destination == .discarded) return;
+            if (destination == .discarded or destination == .stack) return;
             const offset = switch (destination) {
                 .indirect => |value| value,
                 else => unreachable,
@@ -1178,22 +1175,6 @@ fn FunctionEmitter(comptime Types: type) type {
                 layout.field_offsets[operation.field_index],
                 .{ .value = destination },
                 0,
-                field_layout.byte_size,
-            );
-        }
-
-        fn emitFieldUpdate(self: *Self, operation: structures.FieldUpdateOperation, destination: ValueLocation) !void {
-            if (destination == .discarded) return;
-            const layout = (try self.types.structLayout(operation.type_id)) orelse return error.Unavailable;
-            std.debug.assert(operation.field_index < layout.field_offsets.len);
-            try self.copyValue(operation.type_id, self.locations[@backingInt(operation.operand)], destination);
-            const field_type = self.valueType(operation.value);
-            const field_layout = try self.types.layout(field_type);
-            try self.copyRange(
-                self.locations[@backingInt(operation.value)],
-                0,
-                .{ .value = destination },
-                layout.field_offsets[operation.field_index],
                 field_layout.byte_size,
             );
         }

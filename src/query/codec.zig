@@ -217,6 +217,7 @@ test "disk codec bounds recursive owned values and cleans up a truncated region"
 }
 
 test "disk codec cleans up partial aggregates with comptime fields" {
+    if (!@import("test_options").allocation_failures) return testPartialAggregates(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, testPartialAggregates, .{});
 }
 

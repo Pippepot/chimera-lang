@@ -1,93 +1,22 @@
 const std = @import("std");
 const test_sources = @import("test_sources");
-const query = test_sources.query;
-const queries = test_sources.queries;
-const structures = test_sources.structures;
-const modules = test_sources.modules;
 const runtime = test_sources.runtime;
 const testing = std.testing;
 
-const Fixture = struct {
-    db: *query.Database,
+const Fixture = test_sources.SourceFixture;
 
-    fn init(source: []const u8) !Fixture {
-        const db = try query.Database.init(testing.allocator, .{ .worker_count = 2 });
-        errdefer db.deinit();
-        try modules.registerSources(db, testing.allocator, source, &.{}, &.{});
-        return .{ .db = db };
-    }
-
-    fn deinit(self: Fixture) void {
-        self.db.deinit();
-    }
-
-    fn printDiagnostics(self: Fixture, source: []const u8) !void {
-        std.debug.print("Chi entry source:\n{s}\n", .{source});
-        const diagnostics = try self.db.transitiveAccumulatorValues(queries.BuildExecutable, 0, structures.Diagnostic, testing.allocator);
-        defer testing.allocator.free(diagnostics);
-        for (diagnostics) |diagnostic| std.debug.print("file {d} at {d}: {s}\n", .{
-            diagnostic.file_id,
-            if (diagnostic.span) |span| span.start else 0,
-            @tagName(diagnostic.kind),
-        });
-    }
-
-    fn expectExit(source: []const u8, status: u8) !void {
-        const fixture = try Fixture.init(source);
-        defer fixture.deinit();
-        const executable = (try fixture.db.get(queries.BuildExecutable, 0)).*;
-        if (executable == null) try fixture.printDiagnostics(source);
-        try testing.expect(executable != null);
-        try runtime.writeProgram(testing.io, executable.?.bytes);
-        defer std.Io.Dir.cwd().deleteFile(testing.io, "prog") catch {};
-        const actual_status = try runtime.runProg(testing.io, testing.allocator, &.{});
-        if (actual_status != status) try fixture.printDiagnostics(source);
-        try testing.expectEqual(status, actual_status);
-    }
-
-    fn expectParity(source: []const u8, status: u8) !void {
-        for ([_][]const u8{ "exit(run())", "static answer = run()\nexit(answer)" }) |entry| {
-            const program = try testing.allocator.print("{s}\n{s}", .{ source, entry });
-            defer testing.allocator.free(program);
-            try Fixture.expectExit(program, status);
-        }
-    }
-
-    fn expectLimitedExit(source: []const u8, status: u8) !void {
-        const fixture = try Fixture.init(source);
-        defer fixture.deinit();
-        const executable = (try fixture.db.get(queries.BuildExecutable, 0)).*;
-        if (executable == null) try fixture.printDiagnostics(source);
-        try testing.expect(executable != null);
-        try runtime.writeProgram(testing.io, executable.?.bytes);
-        defer std.Io.Dir.cwd().deleteFile(testing.io, "prog") catch {};
-        var child = std.process.spawn(testing.io, .{ .argv = &.{ "prlimit", "--as=1048576", "--", "./prog" } }) catch |err| switch (err) {
-            error.FileNotFound => return error.SkipZigTest,
-            else => return err,
-        };
-        try testing.expectEqual(std.process.Child.Term{ .exited = status }, try child.wait(testing.io));
-    }
-
-    fn expectDiagnostic(source: []const u8, kind: std.meta.Tag(structures.Diagnostic.Kind)) !void {
-        const fixture = try Fixture.init(source);
-        defer fixture.deinit();
-        try testing.expect((try fixture.db.get(queries.BuildExecutable, 0)).* == null);
-        const diagnostics = try fixture.db.transitiveAccumulatorValues(queries.BuildExecutable, 0, structures.Diagnostic, testing.allocator);
-        defer testing.allocator.free(diagnostics);
-        for (diagnostics) |diagnostic| if (std.meta.activeTag(diagnostic.kind) == kind) return;
-        try fixture.printDiagnostics(source);
-        return error.ExpectedDiagnostic;
-    }
-
-    fn expectRejected(source: []const u8) !void {
-        const fixture = try Fixture.init(source);
-        defer fixture.deinit();
-        try testing.expect((try fixture.db.get(queries.BuildExecutable, 0)).* == null);
-        const diagnostics = try fixture.db.transitiveAccumulatorValues(queries.BuildExecutable, 0, structures.Diagnostic, testing.allocator);
-        defer testing.allocator.free(diagnostics);
-        try testing.expect(diagnostics.len != 0);
-    }
-};
+fn expectLimitedExit(source: []const u8, status: u8) !void {
+    const fixture = try Fixture.init(source);
+    defer fixture.deinit();
+    const executable = try fixture.executable(0);
+    try runtime.writeProgram(testing.io, executable.bytes);
+    defer std.Io.Dir.cwd().deleteFile(testing.io, "prog") catch {};
+    var child = std.process.spawn(testing.io, .{ .argv = &.{ "prlimit", "--as=1048576", "--", "./prog" } }) catch |err| switch (err) {
+        error.FileNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+    try testing.expectEqual(std.process.Child.Term{ .exited = status }, try child.wait(testing.io));
+}
 
 test "operation indexing Array reads replacements and bounds have parity" {
     try Fixture.expectParity(
@@ -126,7 +55,7 @@ test "operation indexing compound assignments and reference assignments have par
 }
 
 test "operation indexing List reads replacements and bounds use ordinary calls" {
-    try Fixture.expectExit(
+    try Fixture.expectSourceExit(
         \\fallible calculate() int
         \\    var values: List(int) = [19, 23]
         \\    values[0] += 1
@@ -160,12 +89,12 @@ test "operation indexing bounds failure skips initialization and index evaluates
 }
 
 test "operation indexing respects immutability and existing element ownership restrictions" {
-    try Fixture.expectDiagnostic(
+    try Fixture.expectAnySourceDiagnostic(
         \\const values = [19]
         \\if values[0] = 42 -> exit(91)
         \\exit(90)
     , .mutable_argument_requires_mutable_place);
-    try Fixture.expectDiagnostic(
+    try Fixture.expectAnySourceDiagnostic(
         \\struct Item
         \\    move = none
         \\    copy = none
@@ -189,7 +118,7 @@ test "operation indexing reads invoke ordinary copy hooks" {
 }
 
 test "operation indexing replacement destroys the previous element" {
-    try Fixture.expectExit(
+    try Fixture.expectSourceExit(
         \\struct Item
         \\    value: int
         \\    drop = func(deinit self: Item)
@@ -202,7 +131,7 @@ test "operation indexing replacement destroys the previous element" {
 }
 
 test "operation indexing replacement preserves reference origin restrictions" {
-    try Fixture.expectDiagnostic(
+    try Fixture.expectAnySourceDiagnostic(
         \\var original = [42]
         \\if const reference = original.get(0)
         \\    var values = [reference]
@@ -212,7 +141,7 @@ test "operation indexing replacement preserves reference origin restrictions" {
 }
 
 test "operation indexing Buffer and views use the same operator contract" {
-    try Fixture.expectExit(
+    try Fixture.expectSourceExit(
         \\import std.memory.{Buffer}
         \\fallible calculate() int
         \\    var values = Buffer(int).new?(2)
@@ -229,7 +158,7 @@ test "operation indexing Buffer and views use the same operator contract" {
 }
 
 test "List literal constructs contextual empty and byte lists in heap storage" {
-    try Fixture.expectExit(
+    try Fixture.expectSourceExit(
         \\func run() int
         \\    var values: List(int) = [19, 23]
         \\    const empty: List(int) = []
@@ -245,7 +174,7 @@ test "List literal constructs contextual empty and byte lists in heap storage" {
 }
 
 test "List literal failure drops an immovable prefix in reverse and skips later elements" {
-    try Fixture.expectExit(
+    try Fixture.expectSourceExit(
         \\struct Item
         \\    move = none
         \\    copy = none
@@ -268,7 +197,7 @@ test "List literal failure drops an immovable prefix in reverse and skips later 
 }
 
 test "List explicit fallible factory infers length and preserves ordinary element failure" {
-    try Fixture.expectExit(
+    try Fixture.expectSourceExit(
         \\fallible missing() int -> fail
         \\func run() int
         \\    if const values = List(int).from([19, 23])
@@ -282,7 +211,7 @@ test "List explicit fallible factory infers length and preserves ordinary elemen
 }
 
 test "List implicit allocation failure terminates before element evaluation and cannot be caught" {
-    try Fixture.expectLimitedExit(
+    try expectLimitedExit(
         \\fallible skipped() Array(int, 262144)
         \\    exit(91)
         \\func run() int
@@ -294,7 +223,7 @@ test "List implicit allocation failure terminates before element evaluation and 
 }
 
 test "List explicit allocation failure is recoverable and skips element evaluation" {
-    try Fixture.expectLimitedExit(
+    try expectLimitedExit(
         \\func skipped() Array(int, 262144)
         \\    exit(91)
         \\func run() int
@@ -306,7 +235,7 @@ test "List explicit allocation failure is recoverable and skips element evaluati
 }
 
 test "List cleanup releases failed allocations and destroys completed lists in reverse" {
-    try Fixture.expectLimitedExit(
+    try expectLimitedExit(
         \\struct Item
         \\    move = none
         \\    copy = none
@@ -338,7 +267,7 @@ test "List cleanup releases failed allocations and destroys completed lists in r
 }
 
 test "List construction and borrowing preserve stored external reference origins" {
-    try Fixture.expectExit(
+    try Fixture.expectSourceExit(
         \\func make(imm value: Ref(int, false)) List(Ref(int, false)) -> [value]
         \\func run() int
         \\    const original = Array(int, 1).filled(42)
@@ -353,8 +282,8 @@ test "List construction and borrowing preserve stored external reference origins
 }
 
 test "collection pending type cannot be constructed or published as a value" {
-    try Fixture.expectDiagnostic("func count(imm value: collection_literal(int, 2)) int -> 42\nconst pending = collection_literal(int, 2){}\nexit(count(pending))", .compile_time_only_type);
-    try Fixture.expectDiagnostic("func count(imm value: collection_literal(int, 2)) int -> 42\nstatic pending = collection_literal(int, 2){}\nstatic result = count(pending)\nexit(result)", .compile_time_only_type);
+    try Fixture.expectAnySourceDiagnostic("func count(imm value: collection_literal(int, 2)) int -> 42\nconst pending = collection_literal(int, 2){}\nexit(count(pending))", .compile_time_only_type);
+    try Fixture.expectAnySourceDiagnostic("func count(imm value: collection_literal(int, 2)) int -> 42\nstatic pending = collection_literal(int, 2){}\nstatic result = count(pending)\nexit(result)", .compile_time_only_type);
 }
 
 test "collection initializer consumers infer the pending shape and construct each element once" {
@@ -412,7 +341,7 @@ test "collection literal failure drops the completed prefix in reverse and skips
 }
 
 test "collection literal element failure cannot escape an ordinary function" {
-    try Fixture.expectDiagnostic(
+    try Fixture.expectAnySourceDiagnostic(
         \\fallible missing() int -> fail
         \\func run() int
         \\    const values: Array(int, 2) = [1, missing?()]
@@ -542,7 +471,7 @@ test "Array nested whole copies invoke every element custom copy" {
 }
 
 test "Array automatic cleanup drops elements in reverse index order" {
-    try Fixture.expectExit(
+    try Fixture.expectSourceExit(
         \\import std.array.{Array}
         \\struct Item
         \\    value: int
@@ -563,7 +492,7 @@ test "Array automatic cleanup drops elements in reverse index order" {
 }
 
 test "Array empty cleanup does not call element destructors" {
-    try Fixture.expectExit(
+    try Fixture.expectSourceExit(
         \\import std.array.{Array}
         \\struct Item
         \\    copy = trivial
@@ -591,7 +520,7 @@ test "Array filled rejects noncopyable elements even for zero length" {
 }
 
 test "Array owning elements retain explicit drop obligations" {
-    try Fixture.expectDiagnostic(
+    try Fixture.expectAnySourceDiagnostic(
         \\import std.array.{Array}
         \\struct Item
         \\    copy = trivial
@@ -604,7 +533,7 @@ test "Array owning elements retain explicit drop obligations" {
 }
 
 test "Array borrowed element cannot escape its local array" {
-    try Fixture.expectDiagnostic(
+    try Fixture.expectAnySourceDiagnostic(
         \\import std.array.{Array}
         \\import std.memory.{Ref}
         \\func bad() Ref(int, false)
@@ -617,7 +546,7 @@ test "Array borrowed element cannot escape its local array" {
 }
 
 test "Array fill cannot return references to a local source" {
-    try Fixture.expectDiagnostic(
+    try Fixture.expectAnySourceDiagnostic(
         \\import std.array.{Array}
         \\import std.memory.{Ref, borrow_local}
         \\func bad() Array(Ref(int, false), 2)
@@ -652,7 +581,7 @@ test "Array get_mut requires mutable source storage" {
 }
 
 test "Array whole copy hooks invalidate pending borrowed owners" {
-    try Fixture.expectDiagnostic(
+    try Fixture.expectAnySourceDiagnostic(
         \\import std.array.{Array}
         \\import std.memory.{Ref, borrow_box, borrow_mut_box}
         \\struct Handle
@@ -671,7 +600,7 @@ test "Array whole copy hooks invalidate pending borrowed owners" {
 }
 
 test "Array static nested values publish into runtime storage" {
-    try Fixture.expectExit(
+    try Fixture.expectSourceExit(
         \\static row = Array(int, 2).filled(20)
         \\static matrix = Array(Array(int, 2), 2).filled(row)
         \\func run() int
@@ -684,7 +613,7 @@ test "Array static nested values publish into runtime storage" {
 }
 
 test "Array zero-sized fill does not skip custom copy" {
-    try Fixture.expectExit(
+    try Fixture.expectSourceExit(
         \\struct Empty
         \\    copy = func(imm self: Empty) Empty -> exit(42)
         \\func run() int
@@ -710,7 +639,7 @@ test "Array embedded storage supports checked mutable access" {
 }
 
 test "Array boxed inline storage retains mutable element references" {
-    try Fixture.expectExit(
+    try Fixture.expectSourceExit(
         \\fallible run() int
         \\    var owner = Box.new?(Array(int, 3).filled(20))
         \\    borrow mut values = owner.borrow_mut()[]
@@ -739,7 +668,7 @@ test "Array variant payload copies immovable nested elements in place" {
 }
 
 test "Array zero-sized logical elements retain custom destruction" {
-    try Fixture.expectExit(
+    try Fixture.expectSourceExit(
         \\struct Empty
         \\    copy = trivial
         \\    drop = func(deinit self: Empty) -> exit(42)
@@ -763,7 +692,7 @@ test "Array whole copies retain contained reference origins" {
         \\    if const selected = values.get(1) -> return selected[][]
         \\    return 90
     , 42);
-    try Fixture.expectDiagnostic(
+    try Fixture.expectAnySourceDiagnostic(
         \\import std.memory.{borrow_local}
         \\func bad() Array(Ref(int, false), 2)
         \\    const source = 42
@@ -775,7 +704,7 @@ test "Array whole copies retain contained reference origins" {
 }
 
 test "Array element references are invalidated by whole storage replacement" {
-    try Fixture.expectDiagnostic(
+    try Fixture.expectAnySourceDiagnostic(
         \\func run() int
         \\    var values = Array(int, 2).filled(42)
         \\    if const selected = values.get(1)
@@ -787,7 +716,7 @@ test "Array element references are invalidated by whole storage replacement" {
 }
 
 test "Array fill invokes exactly N ordinary element copies" {
-    try Fixture.expectExit(
+    try Fixture.expectSourceExit(
         \\struct Item
         \\    counter: Ref(int, true)
         \\    copy = func(imm self: Item) Item
@@ -816,7 +745,7 @@ test "mutable alias call arguments write direct values back to their referents" 
 }
 
 test "Array mutable alias calls retain newly stored reference origins" {
-    try Fixture.expectDiagnostic(
+    try Fixture.expectAnySourceDiagnostic(
         \\import std.memory.{borrow_local}
         \\func overwrite(mut values: Array(Ref(int, false), 1), imm reference: Ref(int, false))
         \\    values = Array(Ref(int, false), 1).filled(reference)
@@ -834,7 +763,7 @@ test "Array mutable alias calls retain newly stored reference origins" {
 }
 
 test "Array dereferenced mutable aliases cannot retain short-lived references" {
-    try Fixture.expectDiagnostic(
+    try Fixture.expectAnySourceDiagnostic(
         \\import std.memory.{borrow_local}
         \\func overwrite(mut values: Array(Ref(int, false), 1), imm reference: Ref(int, false))
         \\    values = Array(Ref(int, false), 1).filled(reference)
@@ -853,7 +782,7 @@ test "Array dereferenced mutable aliases cannot retain short-lived references" {
 }
 
 test "Array boxed mutable aliases retain long-lived reference origins" {
-    try Fixture.expectExit(
+    try Fixture.expectSourceExit(
         \\import std.memory.{borrow_local}
         \\func overwrite(mut values: Array(Ref(int, false), 1), imm reference: Ref(int, false))
         \\    values = Array(Ref(int, false), 1).filled(reference)
@@ -872,7 +801,7 @@ test "Array boxed mutable aliases retain long-lived reference origins" {
 }
 
 test "Array mutable aliases reject reference writes without a tracked owner" {
-    try Fixture.expectDiagnostic(
+    try Fixture.expectAnySourceDiagnostic(
         \\import std.memory.{borrow_local}
         \\func overwrite(mut values: Array(Ref(int, false), 1), imm reference: Ref(int, false))
         \\    values = Array(Ref(int, false), 1).filled(reference)

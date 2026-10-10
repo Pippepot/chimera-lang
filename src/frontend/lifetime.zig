@@ -55,15 +55,10 @@ pub const CleanupLocation = union(enum) {
     block_entry: structures.FunctionBlockId,
 };
 
-pub const PlannedCleanup = struct {
+pub const PlannedEnding = struct {
     generation: GenerationId,
     cleanup_value: structures.FunctionValueId,
     cleanup_condition: ?structures.FunctionValueId = null,
-    location: CleanupLocation,
-};
-
-pub const ExplicitAbandonment = struct {
-    generation: GenerationId,
     location: CleanupLocation,
 };
 
@@ -248,11 +243,9 @@ pub const Solver = struct {
 
     pub fn solve(
         self: *Solver,
-        planned_cleanups: *std.ArrayList(PlannedCleanup),
-        explicit_abandonments: *std.ArrayList(ExplicitAbandonment),
+        endings: *std.ArrayList(PlannedEnding),
     ) !void {
-        std.debug.assert(planned_cleanups.items.len == 0);
-        std.debug.assert(explicit_abandonments.items.len == 0);
+        std.debug.assert(endings.items.len == 0);
         try self.computeReachability();
         self.control_flow.solve(self.ownership_edges, self.reachable, self.dirty_blocks, self, false, stepAvailability);
         self.control_flow.solve(self.ownership_edges, self.reachable, self.dirty_blocks, self, false, stepRepresentations);
@@ -260,8 +253,8 @@ pub const Solver = struct {
         self.control_flow.solve(self.ownership_edges, self.reachable, self.dirty_blocks, self, true, stepDemand);
         const entry_demand = self.blockSet(self.live_in, self.entry);
         for (entry_demand) |word| std.debug.assert(word == 0);
-        try self.planEndings(planned_cleanups, explicit_abandonments);
-        self.validatePathComplete(planned_cleanups.items, explicit_abandonments.items);
+        try self.planEndings(endings);
+        self.validatePathComplete(endings.items);
     }
 
     fn computeReachability(self: *Solver) !void {
@@ -489,13 +482,12 @@ pub const Solver = struct {
 
     fn planEndings(
         self: *Solver,
-        planned_cleanups: *std.ArrayList(PlannedCleanup),
-        explicit_abandonments: *std.ArrayList(ExplicitAbandonment),
+        endings: *std.ArrayList(PlannedEnding),
     ) !void {
         for (self.blocks, 0..) |block_value, block_index| {
             if (!self.reachable[block_index]) continue;
             const block_id: structures.FunctionBlockId = @fromBackingInt(@intCast(block_index));
-            try self.planEdges(block_id, block_value.terminator orelse unreachable, planned_cleanups, explicit_abandonments);
+            try self.planEdges(block_id, block_value.terminator orelse unreachable, endings);
             GenerationBits.copy(self.scratch, self.blockSet(self.live_out, block_id));
             try self.planEffectsBackward(
                 self.scratch,
@@ -503,8 +495,7 @@ pub const Solver = struct {
                 null,
                 block_id,
                 block_value.terminator orelse unreachable,
-                planned_cleanups,
-                explicit_abandonments,
+                endings,
             );
             var item_index = block_value.items.items.len;
             while (item_index > 0) {
@@ -517,22 +508,20 @@ pub const Solver = struct {
                         boundary,
                         block_id,
                         block_value.terminator orelse unreachable,
-                        planned_cleanups,
-                        explicit_abandonments,
+                        endings,
                     ),
                 }
             }
             std.debug.assert(std.mem.eql(u64, self.scratch, self.blockSet(self.live_in, block_id)));
         }
-        self.finishEndings(planned_cleanups, explicit_abandonments);
+        self.finishEndings(endings);
     }
 
     fn planEdges(
         self: *Solver,
         predecessor: structures.FunctionBlockId,
         terminator: structures.FunctionTerminator,
-        planned_cleanups: *std.ArrayList(PlannedCleanup),
-        explicit_abandonments: *std.ArrayList(ExplicitAbandonment),
+        endings: *std.ArrayList(PlannedEnding),
     ) !void {
         const available = self.blockSet(self.available_out, predecessor);
         const demanded_on_some_edge = self.blockSet(self.live_out, predecessor);
@@ -553,8 +542,7 @@ pub const Solver = struct {
                     !GenerationBits.contains(demanded_on_some_edge, generation) or
                     GenerationBits.contains(self.edge_scratch, generation)) continue;
                 try self.recordEnding(
-                    planned_cleanups,
-                    explicit_abandonments,
+                    endings,
                     generation,
                     representations[generation_index] orelse unreachable,
                     null,
@@ -565,8 +553,7 @@ pub const Solver = struct {
                 .produce => |destination| {
                     if (GenerationBits.contains(self.blockSet(self.live_in, edge.successor), destination)) continue;
                     try self.recordEnding(
-                        planned_cleanups,
-                        explicit_abandonments,
+                        endings,
                         destination,
                         self.blockRepresentations(self.representations_in, edge.successor)[@backingInt(destination)] orelse unreachable,
                         null,
@@ -585,8 +572,7 @@ pub const Solver = struct {
         boundary: ?BoundaryId,
         block: structures.FunctionBlockId,
         terminator: structures.FunctionTerminator,
-        planned_cleanups: *std.ArrayList(PlannedCleanup),
-        explicit_abandonments: *std.ArrayList(ExplicitAbandonment),
+        endings: *std.ArrayList(PlannedEnding),
     ) !void {
         var effect_index = effects.len;
         while (effect_index > 0) {
@@ -597,8 +583,7 @@ pub const Solver = struct {
                         GenerationBits.remove(demand, definition.generation);
                     } else {
                         try self.recordAfterEffect(
-                            planned_cleanups,
-                            explicit_abandonments,
+                            endings,
                             definition.generation,
                             definition.value,
                             null,
@@ -611,8 +596,7 @@ pub const Solver = struct {
                 .use, .update => |use| {
                     if (!GenerationBits.contains(demand, use.generation)) {
                         try self.recordAfterEffect(
-                            planned_cleanups,
-                            explicit_abandonments,
+                            endings,
                             use.generation,
                             use.cleanup_value,
                             use.cleanup_condition,
@@ -630,8 +614,7 @@ pub const Solver = struct {
 
     fn recordAfterEffect(
         self: *Solver,
-        planned_cleanups: *std.ArrayList(PlannedCleanup),
-        explicit_abandonments: *std.ArrayList(ExplicitAbandonment),
+        endings: *std.ArrayList(PlannedEnding),
         generation: GenerationId,
         cleanup_value: structures.FunctionValueId,
         cleanup_condition: ?structures.FunctionValueId,
@@ -641,8 +624,7 @@ pub const Solver = struct {
     ) !void {
         if (boundary) |boundary_id| {
             try self.recordEnding(
-                planned_cleanups,
-                explicit_abandonments,
+                endings,
                 generation,
                 cleanup_value,
                 cleanup_condition,
@@ -652,8 +634,7 @@ pub const Solver = struct {
         }
         for (0..terminator.successorCount()) |ordinal| {
             try self.recordEnding(
-                planned_cleanups,
-                explicit_abandonments,
+                endings,
                 generation,
                 cleanup_value,
                 cleanup_condition,
@@ -664,60 +645,45 @@ pub const Solver = struct {
 
     fn recordEnding(
         self: *Solver,
-        planned_cleanups: *std.ArrayList(PlannedCleanup),
-        explicit_abandonments: *std.ArrayList(ExplicitAbandonment),
+        endings: *std.ArrayList(PlannedEnding),
         generation: GenerationId,
         cleanup_value: structures.FunctionValueId,
         cleanup_condition: ?structures.FunctionValueId,
         location: CleanupLocation,
     ) !void {
-        const generation_data = self.generations[@backingInt(generation)];
-        const effective_condition = cleanup_condition orelse generation_data.cleanup_condition;
-        if (!generation_data.requires_explicit_drop) {
-            try planned_cleanups.append(self.gpa, .{
-                .generation = generation,
-                .cleanup_value = cleanup_value,
-                .cleanup_condition = effective_condition,
-                .location = location,
-            });
-            return;
-        }
-        std.debug.assert(generation_data.requires_explicit_drop);
-        try explicit_abandonments.append(self.gpa, .{ .generation = generation, .location = location });
+        try endings.append(self.gpa, .{
+            .generation = generation,
+            .cleanup_value = cleanup_value,
+            .cleanup_condition = cleanup_condition orelse self.generations[@backingInt(generation)].cleanup_condition,
+            .location = location,
+        });
     }
 
-    fn finishEndings(
-        self: *const Solver,
-        planned_cleanups: *std.ArrayList(PlannedCleanup),
-        explicit_abandonments: *std.ArrayList(ExplicitAbandonment),
-    ) void {
-        inline for (.{ planned_cleanups, explicit_abandonments }) |endings| {
-            const Ending = @TypeOf(endings.items[0]);
-            std.mem.sort(Ending, endings.items, self.generations, struct {
-                fn lessThan(generations: []const Generation, left: Ending, right: Ending) bool {
-                    const location_order = compareLocations(left.location, right.location);
-                    if (location_order != 0) return location_order < 0;
-                    return generations[@backingInt(left.generation)].start_order > generations[@backingInt(right.generation)].start_order;
-                }
-            }.lessThan);
-            // Start orders are unique, so repeated generation/location pairs are adjacent.
-            var unique_count: usize = 0;
-            for (endings.items) |ending| {
-                if (unique_count > 0) {
-                    const previous = endings.items[unique_count - 1];
-                    if (previous.generation == ending.generation and std.meta.eql(previous.location, ending.location)) {
-                        if (Ending == PlannedCleanup) {
-                            std.debug.assert(previous.cleanup_value == ending.cleanup_value);
-                            std.debug.assert(previous.cleanup_condition == ending.cleanup_condition);
-                        }
-                        continue;
-                    }
-                }
-                endings.items[unique_count] = ending;
-                unique_count += 1;
+    fn finishEndings(self: *const Solver, endings: *std.ArrayList(PlannedEnding)) void {
+        std.mem.sort(PlannedEnding, endings.items, self.generations, struct {
+            fn lessThan(generations: []const Generation, left: PlannedEnding, right: PlannedEnding) bool {
+                const location_order = compareLocations(left.location, right.location);
+                if (location_order != 0) return location_order < 0;
+                return generations[@backingInt(left.generation)].start_order > generations[@backingInt(right.generation)].start_order;
             }
-            endings.shrinkRetainingCapacity(unique_count);
+        }.lessThan);
+        // Start orders are unique, so repeated generation/location pairs are adjacent.
+        var unique_count: usize = 0;
+        for (endings.items) |ending| {
+            if (unique_count > 0) {
+                const previous = endings.items[unique_count - 1];
+                if (previous.generation == ending.generation and std.meta.eql(previous.location, ending.location)) {
+                    if (!self.generations[@backingInt(ending.generation)].requires_explicit_drop) {
+                        std.debug.assert(previous.cleanup_value == ending.cleanup_value);
+                        std.debug.assert(previous.cleanup_condition == ending.cleanup_condition);
+                    }
+                    continue;
+                }
+            }
+            endings.items[unique_count] = ending;
+            unique_count += 1;
         }
+        endings.shrinkRetainingCapacity(unique_count);
     }
 
     fn compareLocations(left: CleanupLocation, right: CleanupLocation) i2 {
@@ -742,8 +708,7 @@ pub const Solver = struct {
 
     fn validatePathComplete(
         self: *Solver,
-        planned_cleanups: []const PlannedCleanup,
-        explicit_abandonments: []const ExplicitAbandonment,
+        endings: []const PlannedEnding,
     ) void {
         // This pass checks compiler invariants; source obligations were planned above.
         if (!std.debug.runtime_safety) return;
@@ -762,19 +727,17 @@ pub const Solver = struct {
                         const edge = &self.ownership_edges[edge_index];
                         if (!self.reachable[@backingInt(edge.predecessor)]) continue;
                         GenerationBits.copy(self.edge_scratch, self.blockSet(self.live_out, edge.predecessor));
-                        self.remapOpenEdge(self.edge_scratch, edge, planned_cleanups, explicit_abandonments);
+                        self.remapOpenEdge(self.edge_scratch, edge, endings);
                         self.applyEndings(
                             self.edge_scratch,
                             .{ .edge = .{ .predecessor = edge.predecessor, .successor_ordinal = edge.successor_ordinal } },
-                            planned_cleanups,
-                            explicit_abandonments,
+                            endings,
                             false,
                         );
                         self.applyEndings(
                             self.edge_scratch,
                             .{ .block_entry = block_id },
-                            planned_cleanups,
-                            explicit_abandonments,
+                            endings,
                             false,
                         );
                         GenerationBits.unionWith(self.scratch, self.edge_scratch);
@@ -791,8 +754,7 @@ pub const Solver = struct {
                         self.applyEndings(
                             self.scratch,
                             .{ .boundary = boundary },
-                            planned_cleanups,
-                            explicit_abandonments,
+                            endings,
                             false,
                         );
                     },
@@ -814,13 +776,12 @@ pub const Solver = struct {
                 .branch, .predicate_branch, .fallible_call, .diverge => {},
             }
         }
-        self.validateEndingApplications(planned_cleanups, explicit_abandonments);
+        self.validateEndingApplications(endings);
     }
 
     fn validateEndingApplications(
         self: *Solver,
-        planned_cleanups: []const PlannedCleanup,
-        explicit_abandonments: []const ExplicitAbandonment,
+        endings: []const PlannedEnding,
     ) void {
         for (self.blocks, 0..) |block_value, block_index| {
             if (!self.reachable[block_index]) continue;
@@ -833,8 +794,7 @@ pub const Solver = struct {
                     self.applyEndings(
                         self.scratch,
                         .{ .boundary = boundary },
-                        planned_cleanups,
-                        explicit_abandonments,
+                        endings,
                         true,
                     );
                 },
@@ -843,19 +803,17 @@ pub const Solver = struct {
             for (0..(block_value.terminator orelse unreachable).successorCount()) |ordinal| {
                 const edge = self.findEdge(block_id, @intCast(ordinal));
                 GenerationBits.copy(self.edge_scratch, self.scratch);
-                self.remapOpenEdge(self.edge_scratch, edge, planned_cleanups, explicit_abandonments);
+                self.remapOpenEdge(self.edge_scratch, edge, endings);
                 self.applyEndings(
                     self.edge_scratch,
                     .{ .edge = .{ .predecessor = block_id, .successor_ordinal = @intCast(ordinal) } },
-                    planned_cleanups,
-                    explicit_abandonments,
+                    endings,
                     true,
                 );
                 self.applyEndings(
                     self.edge_scratch,
                     .{ .block_entry = edge.successor },
-                    planned_cleanups,
-                    explicit_abandonments,
+                    endings,
                     true,
                 );
             }
@@ -866,8 +824,7 @@ pub const Solver = struct {
         self: *const Solver,
         open: []u64,
         edge: *const OwnershipEdge,
-        planned_cleanups: []const PlannedCleanup,
-        explicit_abandonments: []const ExplicitAbandonment,
+        endings: []const PlannedEnding,
     ) void {
         const location: CleanupLocation = .{ .edge = .{
             .predecessor = edge.predecessor,
@@ -875,7 +832,7 @@ pub const Solver = struct {
         } };
         for (self.ownership_forwards[edge.mappings.start..edge.mappings.end]) |mapping| switch (mapping) {
             .forward => |forward| {
-                if (hasEnding(forward.source, location, planned_cleanups, explicit_abandonments)) {
+                if (hasEnding(forward.source, location, endings)) {
                     GenerationBits.remove(open, forward.destination);
                     continue;
                 }
@@ -889,38 +846,23 @@ pub const Solver = struct {
     }
 
     fn applyEndings(
-        _: *const Solver,
+        self: *const Solver,
         open: []u64,
         location: CleanupLocation,
-        planned_cleanups: []const PlannedCleanup,
-        explicit_abandonments: []const ExplicitAbandonment,
+        endings: []const PlannedEnding,
         validate_existing: bool,
     ) void {
-        for (planned_cleanups) |cleanup| {
-            if (!std.meta.eql(cleanup.location, location)) continue;
-            if (validate_existing and cleanup.cleanup_condition == null) {
-                std.debug.assert(GenerationBits.contains(open, cleanup.generation));
-            }
-            GenerationBits.remove(open, cleanup.generation);
-        }
-        for (explicit_abandonments) |abandonment| {
-            if (!std.meta.eql(abandonment.location, location)) continue;
-            if (validate_existing) std.debug.assert(GenerationBits.contains(open, abandonment.generation));
-            GenerationBits.remove(open, abandonment.generation);
+        for (endings) |ending| {
+            if (!std.meta.eql(ending.location, location)) continue;
+            if (validate_existing and (ending.cleanup_condition == null or self.generations[@backingInt(ending.generation)].requires_explicit_drop))
+                std.debug.assert(GenerationBits.contains(open, ending.generation));
+            GenerationBits.remove(open, ending.generation);
         }
     }
 
-    fn hasEnding(
-        generation: GenerationId,
-        location: CleanupLocation,
-        planned_cleanups: []const PlannedCleanup,
-        explicit_abandonments: []const ExplicitAbandonment,
-    ) bool {
-        for (planned_cleanups) |cleanup| {
-            if (cleanup.generation == generation and std.meta.eql(cleanup.location, location)) return true;
-        }
-        for (explicit_abandonments) |abandonment| {
-            if (abandonment.generation == generation and std.meta.eql(abandonment.location, location)) return true;
+    fn hasEnding(generation: GenerationId, location: CleanupLocation, endings: []const PlannedEnding) bool {
+        for (endings) |ending| {
+            if (ending.generation == generation and std.meta.eql(ending.location, location)) return true;
         }
         return false;
     }
@@ -966,8 +908,8 @@ const TestSolverBlock = struct {
 };
 
 const TestSolverExpected = struct {
-    cleanups: []const PlannedCleanup = &.{},
-    abandonments: []const ExplicitAbandonment = &.{},
+    cleanups: []const PlannedEnding = &.{},
+    abandonments: []const struct { generation: GenerationId, location: CleanupLocation } = &.{},
 };
 
 fn testExpectLifetimePlan(
@@ -1006,10 +948,8 @@ fn testExpectLifetimePlan(
         try block.terminator_effects.appendSlice(gpa, description.terminator_effects);
     }
 
-    var planned_cleanups: std.ArrayList(PlannedCleanup) = .empty;
-    defer planned_cleanups.deinit(gpa);
-    var explicit_abandonments: std.ArrayList(ExplicitAbandonment) = .empty;
-    defer explicit_abandonments.deinit(gpa);
+    var endings: std.ArrayList(PlannedEnding) = .empty;
+    defer endings.deinit(gpa);
     var solver = try Solver.init(
         gpa,
         generations,
@@ -1021,15 +961,24 @@ fn testExpectLifetimePlan(
         @fromBackingInt(@intCast(0)),
     );
     defer solver.deinit();
-    try solver.solve(&planned_cleanups, &explicit_abandonments);
-    try std.testing.expectEqual(expected.cleanups.len, planned_cleanups.items.len);
-    for (expected.cleanups, planned_cleanups.items) |expected_cleanup, actual| {
-        try std.testing.expect(std.meta.eql(expected_cleanup, actual));
+    try solver.solve(&endings);
+    var cleanup_index: usize = 0;
+    var abandonment_index: usize = 0;
+    for (endings.items) |ending| {
+        if (generations[@backingInt(ending.generation)].requires_explicit_drop) {
+            try std.testing.expect(abandonment_index < expected.abandonments.len);
+            const expected_abandonment = expected.abandonments[abandonment_index];
+            try std.testing.expectEqual(expected_abandonment.generation, ending.generation);
+            try std.testing.expectEqualDeep(expected_abandonment.location, ending.location);
+            abandonment_index += 1;
+        } else {
+            try std.testing.expect(cleanup_index < expected.cleanups.len);
+            try std.testing.expectEqualDeep(expected.cleanups[cleanup_index], ending);
+            cleanup_index += 1;
+        }
     }
-    try std.testing.expectEqual(expected.abandonments.len, explicit_abandonments.items.len);
-    for (expected.abandonments, explicit_abandonments.items) |expected_abandonment, actual| {
-        try std.testing.expect(std.meta.eql(expected_abandonment, actual));
-    }
+    try std.testing.expectEqual(expected.cleanups.len, cleanup_index);
+    try std.testing.expectEqual(expected.abandonments.len, abandonment_index);
 }
 
 fn testSolverGeneration(start_order: u32, explicit: bool) Generation {
@@ -1099,6 +1048,7 @@ test "lifetime solver distinguishes branch use and consume" {
 }
 
 test "lifetime solver follows ownership joins and releases every allocation failure" {
+    if (!@import("test_options").allocation_failures) return testExpectOwnershipJoinPlan(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, testExpectOwnershipJoinPlan, .{});
 }
 
@@ -1304,6 +1254,7 @@ test "lifetime solver reverses simultaneous generation start order" {
 }
 
 test "lifetime endings deduplicate requests while preserving order locations and conditions" {
+    if (!@import("test_options").allocation_failures) return testEndingDeduplication(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, testEndingDeduplication, .{});
 }
 
@@ -1314,10 +1265,8 @@ fn testEndingDeduplication(gpa: std.mem.Allocator) !void {
         // Exercise plan finalization directly, including requests from separate planning sites.
         var solver = try Solver.init(gpa, &generations, &.{}, &.{}, &.{}, &.{}, &.{}, @fromBackingInt(@intCast(0)));
         defer solver.deinit();
-        var cleanups: std.ArrayList(PlannedCleanup) = .empty;
-        defer cleanups.deinit(gpa);
-        var abandonments: std.ArrayList(ExplicitAbandonment) = .empty;
-        defer abandonments.deinit(gpa);
+        var endings: std.ArrayList(PlannedEnding) = .empty;
+        defer endings.deinit(gpa);
         const expected = [_]struct { generation: GenerationId, location: CleanupLocation }{
             .{ .generation = @fromBackingInt(@intCast(0)), .location = .{ .boundary = @fromBackingInt(@intCast(0)) } },
             .{ .generation = @fromBackingInt(@intCast(1)), .location = .{ .boundary = @fromBackingInt(@intCast(0)) } },
@@ -1329,31 +1278,22 @@ fn testEndingDeduplication(gpa: std.mem.Allocator) !void {
         for ([_]usize{ 4, 1, 3, 0, 4, 5, 2, 5, 1, 0, 2, 3 }) |index| {
             const ending = expected[index];
             try solver.recordEnding(
-                &cleanups,
-                &abandonments,
+                &endings,
                 ending.generation,
                 @fromBackingInt(@intCast(10 + @backingInt(ending.generation))),
                 null,
                 ending.location,
             );
         }
-        solver.finishEndings(&cleanups, &abandonments);
-        try std.testing.expectEqual(if (explicit) @as(usize, 0) else expected.len, cleanups.items.len);
-        try std.testing.expectEqual(if (explicit) expected.len else @as(usize, 0), abandonments.items.len);
-        for (expected, 0..) |ending, index| {
-            if (explicit) {
-                try std.testing.expectEqualDeep(ExplicitAbandonment{
-                    .generation = ending.generation,
-                    .location = ending.location,
-                }, abandonments.items[index]);
-            } else {
-                try std.testing.expectEqualDeep(PlannedCleanup{
-                    .generation = ending.generation,
-                    .cleanup_value = @fromBackingInt(@intCast(10 + @backingInt(ending.generation))),
-                    .cleanup_condition = generations[@backingInt(ending.generation)].cleanup_condition,
-                    .location = ending.location,
-                }, cleanups.items[index]);
-            }
+        solver.finishEndings(&endings);
+        try std.testing.expectEqual(expected.len, endings.items.len);
+        for (expected, endings.items) |ending, actual| {
+            try std.testing.expectEqualDeep(PlannedEnding{
+                .generation = ending.generation,
+                .cleanup_value = @fromBackingInt(@intCast(10 + @backingInt(ending.generation))),
+                .cleanup_condition = generations[@backingInt(ending.generation)].cleanup_condition,
+                .location = ending.location,
+            }, actual);
         }
     }
 }

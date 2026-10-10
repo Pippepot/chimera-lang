@@ -379,6 +379,7 @@ test "source registration groups members by module" {
 }
 
 test "module discovery and loading clean up every allocation failure" {
+    if (!@import("test_options").allocation_failures) return error.SkipZigTest;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();

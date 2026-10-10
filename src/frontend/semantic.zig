@@ -126,7 +126,6 @@ pub const UnresolvedBody = struct {
         call: struct { target: Call, binding: ?ConditionBinding = null, allow_infallible: bool = false },
         initialization: struct { value: ValueUse, binding: ?ConditionBinding = null },
     };
-    pub const AssignmentOperation = enum { replace, add, subtract, multiply, divide };
     pub const StructInitTarget = union(enum) { concrete: structures.TypeId, inferred: structures.InstanceId };
     pub const Expression = struct {
         operation: Operation,
@@ -161,7 +160,7 @@ pub const UnresolvedBody = struct {
                 target_span: structures.SourceSpan,
                 fields: structures.FunctionValueRange,
                 value: ValueUse,
-                operation: AssignmentOperation,
+                replaces: bool,
             },
             borrow_assignment: struct {
                 target: LocalId,
@@ -172,11 +171,6 @@ pub const UnresolvedBody = struct {
             reference_assignment: struct { reference: ValueUse, value: ValueUse },
             sequence: BinaryOperands,
             call: Call,
-            negate: ValueUse,
-            add: BinaryOperands,
-            subtract: BinaryOperands,
-            multiply: BinaryOperands,
-            divide: BinaryOperands,
             if_else: struct {
                 condition: ConditionId,
                 then_block: BlockId,
@@ -987,14 +981,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 .target_span = span,
                 .fields = .{ .start = field_start, .end = field_end },
                 .value = value,
-                .operation = switch (node.tag) {
-                    .assign => .replace,
-                    .add_assign => .add,
-                    .sub_assign => .subtract,
-                    .mul_assign => .multiply,
-                    .div_assign => .divide,
-                    else => unreachable,
-                },
+                .replaces = node.tag == .assign,
             } });
         }
 
@@ -2861,10 +2848,12 @@ fn appendItem(
 }
 
 test "unresolved function body cleans up every allocation failure" {
+    if (!@import("test_options").allocation_failures) return error.SkipZigTest;
     try std.testing.checkAllAllocationFailures(std.testing.allocator, testUnresolvedFunctionBodyAllocations, .{});
 }
 
 test "qualified namespace discovery cleans up every allocation failure" {
+    if (!@import("test_options").allocation_failures) return error.SkipZigTest;
     const parser = @import("parser.zig");
     const source =
         \\struct S
@@ -2959,10 +2948,12 @@ test "fail has terminal unresolved statements in function and branch bodies" {
 }
 
 test "function signature cleans up every allocation failure" {
+    if (!@import("test_options").allocation_failures) return error.SkipZigTest;
     try std.testing.checkAllAllocationFailures(std.testing.allocator, testFunctionSignatureAllocations, .{});
 }
 
 test "struct definition cleans up every allocation failure" {
+    if (!@import("test_options").allocation_failures) return error.SkipZigTest;
     try std.testing.checkAllAllocationFailures(std.testing.allocator, testStructDefinitionAllocations, .{});
 }
 

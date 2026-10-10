@@ -2398,6 +2398,7 @@ test "required expression failures stop at one diagnostic" {
 }
 
 test "parse report cleans up every allocation failure" {
+    if (!@import("test_options").allocation_failures) return error.SkipZigTest;
     try std.testing.checkAllAllocationFailures(std.testing.allocator, testParseReportAllocations, .{
         "static f = func(x: int, y: int) int\n  return x + y",
         null,

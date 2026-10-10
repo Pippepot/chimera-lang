@@ -5,7 +5,7 @@ const query = @import("query/engine.zig");
 const queries = @import("queries.zig");
 const structures = @import("structures.zig");
 
-const format = "CHIQRY18";
+const format = "CHIQRY19";
 const max_records = 1_000_000;
 
 pub fn save(io: std.Io, allocator: std.mem.Allocator, directory: []const u8, key: cache.Key, db: *query.Database) !void {
@@ -242,7 +242,6 @@ fn validStorageOperations(db: *query.Database, body: structures.FunctionBodyAnal
             .static_conversion => return false,
             .initializer_ref => |reference| if (!try validInitializerResult(db, types, body, reference)) return false,
             .const_type => |type_id| if (!try validArrayStorageType(db, types, type_id)) return false,
-            .struct_init => |operation| if (try types.arrayType(operation.type_id) != null) return false,
             .borrow_address => |operation| if (!try validBorrowFields(types, body, operation)) return false,
             .storage_projection => |operation| if (!try validStorageProjection(types, body, operation)) return false,
             .allocation_element => |operation| {
@@ -412,7 +411,6 @@ fn validFunctionBody(body: structures.FunctionBodyAnalysis) bool {
     if (body.valueCount() > std.math.maxInt(u32)) return false;
     if (body.instruction_spans.len != 0 and body.instruction_spans.len != body.instructions.len) return false;
     if (body.terminator_spans.len != 0 and body.terminator_spans.len != body.blocks.len) return false;
-    for (body.struct_field_values) |field| if (!validOrdinaryValue(field.value, body)) return false;
     for (body.branch_arguments) |use| if (!validUse(use, body)) return false;
     for (body.call_arguments) |argument| if (!validCallArgument(argument, body)) return false;
     for (body.initializer_captures) |capture| if (!validValue(capture, body)) return false;
@@ -437,7 +435,6 @@ fn validFunctionBody(body: structures.FunctionBodyAnalysis) bool {
         const valid = switch (instruction) {
             .initializer_ref => |reference| validInitializerReference(reference, body),
             .variant_coerce, .variant_extract, .callable_coerce => |operation| validVariantOperation(operation, body),
-            .struct_init => |operation| validRange(operation.fields, body.struct_field_values.len),
             .result_storage => |type_id| type_id == body.return_type,
             .borrow_address => |operation| validRange(operation.fields, body.borrow_fields.len),
             .mut_parameter_write => |operation| operation.parameter_index < body.parameter_modes.len and
@@ -514,11 +511,12 @@ fn validCompiledFunction(artifact: structures.CompiledFunction) bool {
     return true;
 }
 
-test "query restore rejects the obsolete lexical IR format" {
+test "query restore rejects obsolete IR formats" {
     const allocator = std.testing.allocator;
     const db = try query.Database.init(allocator, .{ .worker_count = 1 });
     defer db.deinit();
-    try std.testing.expectError(error.InvalidCache, restoreInterns(db, allocator, "CHIQRY12"));
+    for ([_][]const u8{ "CHIQRY12", "CHIQRY18" }) |obsolete|
+        try std.testing.expectError(error.InvalidCache, restoreInterns(db, allocator, obsolete));
 }
 
 test "restoring a malformed canonical type rejects the snapshot" {
@@ -1212,13 +1210,6 @@ test "cached initializer handles stay out of ordinary operands and mutable write
     try std.testing.expect(validFunctionBody(body));
     body.is_fallible = true;
 
-    var fields = [_]structures.StructFieldValue{.{ .field_index = 0, .value = @fromBackingInt(@intCast(0)) }};
-    body.struct_field_values = &fields;
-    try std.testing.expect(!validFunctionBody(body));
-    fields[0].value = @fromBackingInt(@intCast(1));
-    try std.testing.expect(validFunctionBody(body));
-    body.struct_field_values = &.{};
-
     const branch: structures.FunctionBranch = .{ .target = @fromBackingInt(@intCast(1)), .arguments = .{ .start = 0, .end = 0 } };
     blocks[0].terminator = .{ .predicate_branch = .{
         .operation = .eqi,
@@ -1567,7 +1558,7 @@ test "cached array projections validate operands shape index and result and roun
     arguments[0].type_id = .int;
     try std.testing.expect(!try validOutput(queries.AnalyzeFunctionInstance, db, body));
     arguments[0].type_id = type_id;
-    instructions[1] = .{ .struct_init = .{ .type_id = type_id, .fields = .{ .start = 0, .end = 0 } } };
+    instructions[1] = .{ .storage_projection = .{ .owner = @fromBackingInt(@intCast(0)), .type_id = .int, .projection = .{ .field = 0 } } };
     try std.testing.expect(!try validOutput(queries.AnalyzeFunctionInstance, db, body));
 }
 

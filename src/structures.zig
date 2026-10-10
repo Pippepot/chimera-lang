@@ -1031,16 +1031,6 @@ pub const VariantOperation = struct {
     destination: ?FunctionValueId = null,
 };
 
-pub const StructFieldValue = struct {
-    field_index: u32,
-    value: FunctionValueId,
-};
-
-pub const StructOperation = struct {
-    fields: FunctionValueRange,
-    type_id: TypeId,
-};
-
 pub const StorageProjection = struct {
     owner: FunctionValueId,
     type_id: TypeId,
@@ -1089,13 +1079,6 @@ pub const FieldAccessOperation = struct {
     field_type: TypeId,
 };
 
-pub const FieldUpdateOperation = struct {
-    operand: FunctionValueId,
-    value: FunctionValueId,
-    field_index: u32,
-    type_id: TypeId,
-};
-
 pub const MutParameterWrite = struct {
     parameter_index: u32,
     value: FunctionValueId,
@@ -1124,7 +1107,6 @@ pub const FunctionInstruction = union(enum) {
     variant_coerce: VariantOperation,
     variant_extract: VariantOperation,
     callable_coerce: VariantOperation,
-    struct_init: StructOperation,
     local_storage: TypeId,
     result_storage: TypeId,
     storage_projection: StorageProjection,
@@ -1136,7 +1118,6 @@ pub const FunctionInstruction = union(enum) {
     borrow_write: BorrowWriteOperation,
     value_copy: ValueCopy,
     field_access: FieldAccessOperation,
-    field_update: FieldUpdateOperation,
     mut_parameter_write: MutParameterWrite,
     call_mut_argument: CallMutArgument,
     call: FunctionCall,
@@ -1149,7 +1130,7 @@ pub const FunctionInstruction = union(enum) {
 
     pub fn operands(self: *FunctionInstruction) [2]?*FunctionValueId {
         return switch (self.*) {
-            .const_int, .const_int_literal, .const_byte, .const_bool, .const_type, .const_unit, .const_none, .function_ref, .initializer_ref, .struct_init, .local_storage, .result_storage => .{ null, null },
+            .const_int, .const_int_literal, .const_byte, .const_bool, .const_type, .const_unit, .const_none, .function_ref, .initializer_ref, .local_storage, .result_storage => .{ null, null },
             .variant_tag, .negi => |*operand| .{ operand, null },
             .variant_coerce, .variant_extract, .callable_coerce => |*operation| .{ &operation.operand, if (operation.destination) |*destination| destination else null },
             .storage_projection => |*operation| .{ &operation.owner, null },
@@ -1161,7 +1142,6 @@ pub const FunctionInstruction = union(enum) {
             .value_copy => |*operation| .{ &operation.source, if (operation.destination) |*destination| destination else null },
             .call_mut_argument => |*operation| .{ if (operation.destination) |*destination| destination else null, null },
             .field_access => |*operation| .{ &operation.operand, null },
-            .field_update => |*operation| .{ &operation.operand, &operation.value },
             .mut_parameter_write => |*operation| .{ &operation.value, null },
             .call => |*call| call.operands(),
             .static_conversion => |*conversion| .{ &conversion.operand, if (conversion.destination) |*destination| destination else null },
@@ -1181,7 +1161,6 @@ pub const FunctionInstruction = union(enum) {
             .function_ref => |reference| reference.type_id,
             .initializer_ref => |reference| reference.type_id,
             .variant_coerce, .variant_extract, .callable_coerce => |operation| if (operation.destination == null) operation.target_type else .unit,
-            .struct_init => |operation| operation.type_id,
             .local_storage, .result_storage => |type_id| type_id,
             .storage_projection => |operation| operation.type_id,
             .allocation_element => |operation| operation.type_id,
@@ -1191,7 +1170,6 @@ pub const FunctionInstruction = union(enum) {
             .borrow_write => .unit,
             .value_copy => |operation| if (operation.destination == null) operation.type_id else .unit,
             .field_access => |operation| operation.field_type,
-            .field_update => |operation| operation.type_id,
             .mut_parameter_write => .unit,
             .call_mut_argument => |operation| if (operation.destination == null) operation.type_id else .unit,
             .call => |call| if (call.destination == null) call.return_type else .unit,
@@ -1214,7 +1192,6 @@ pub const FunctionBodyAnalysis = struct {
     parameter_modes: []ParameterMode,
     block_arguments: []FunctionBlockArgument,
     variant_coercion_tags: []const u32 = &.{},
-    struct_field_values: []StructFieldValue = &.{},
     borrow_fields: []u32 = &.{},
     branch_arguments: []FunctionValueUse,
     call_arguments: []FunctionCallArgument,
@@ -1256,7 +1233,6 @@ pub const FunctionBodyAnalysis = struct {
         };
         for (self.call_arguments) |*argument| visit(context, argument.operand());
         for (self.branch_arguments) |*argument| visit(context, &argument.value);
-        for (self.struct_field_values) |*field| visit(context, &field.value);
         for (self.initializer_captures) |*capture| visit(context, capture);
     }
 

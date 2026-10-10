@@ -271,10 +271,6 @@ pub fn executeInStorage(
                     .returned => |value| slots[destination] = value,
                     else => |result| return atSpan(result, instructionSpan(body, instruction_index)),
                 },
-                .struct_init => |operation| switch (try initializeStruct(body, slots, operation, executor, storage)) {
-                    .returned => |value| slots[destination] = value,
-                    else => |result| return atSpan(result, instructionSpan(body, instruction_index)),
-                },
                 .local_storage, .result_storage => |type_id| {
                     const cell = try storage.create(Cell);
                     cell.* = .{ .type_id = type_id, .storage = storage, .contents = .uninitialized };
@@ -315,10 +311,6 @@ pub fn executeInStorage(
                     try store(slots, destination, operation.destination, copied, executor);
                 },
                 .field_access => |operation| switch (try accessField(slots[@backingInt(operation.operand)], operation, executor, gpa)) {
-                    .returned => |value| slots[destination] = value,
-                    else => |result| return atSpan(result, instructionSpan(body, instruction_index)),
-                },
-                .field_update => |operation| switch (try updateField(body, slots, operation, executor, storage)) {
                     .returned => |value| slots[destination] = value,
                     else => |result| return atSpan(result, instructionSpan(body, instruction_index)),
                 },
@@ -777,25 +769,6 @@ fn projectStorage(
     }
 }
 
-fn initializeStruct(
-    body: *const structures.FunctionBodyAnalysis,
-    slots: []const Value,
-    operation: structures.StructOperation,
-    executor: anytype,
-    storage: std.mem.Allocator,
-) !Result {
-    const fields = body.struct_field_values[operation.fields.start..operation.fields.end];
-    const cell = try storage.create(Cell);
-    cell.* = .{ .type_id = operation.type_id, .storage = storage, .contents = .{ .fields = try storage.alloc(Cell, fields.len) } };
-    for (fields) |field| {
-        std.debug.assert(field.field_index < cell.contents.fields.len);
-        const destination = &cell.contents.fields[field.field_index];
-        destination.* = .{ .type_id = body.valueType(field.value), .storage = storage, .contents = .uninitialized };
-        try assignCell(destination, slots[@backingInt(field.value)], executor);
-    }
-    return .{ .returned = .{ .place = cell } };
-}
-
 fn accessField(
     value: Value,
     operation: structures.FieldAccessOperation,
@@ -817,22 +790,6 @@ fn accessField(
     const field = (try executor.lookupRuntime(fields[operation.field_index])) orelse return .unavailable;
     std.debug.assert(field.type_id == operation.field_type);
     return .{ .returned = .{ .runtime = field.value } };
-}
-
-fn updateField(
-    _: *const structures.FunctionBodyAnalysis,
-    slots: []const Value,
-    operation: structures.FieldUpdateOperation,
-    executor: anytype,
-    storage: std.mem.Allocator,
-) !Result {
-    const cell = try storage.create(Cell);
-    cell.* = .{ .type_id = operation.type_id, .storage = storage, .contents = .uninitialized };
-    try assignCell(cell, slots[@backingInt(operation.operand)], executor);
-    if (!try expandFields(cell, executor)) return .unavailable;
-    std.debug.assert(operation.field_index < cell.contents.fields.len);
-    try assignCell(&cell.contents.fields[operation.field_index], slots[@backingInt(operation.value)], executor);
-    return .{ .returned = .{ .place = cell } };
 }
 
 const ActiveVariant = struct {

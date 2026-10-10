@@ -239,30 +239,29 @@ test "large struct wrapping array copies remain bounded and preserve field offse
             .{ .value_copy = .{ .source = @fromBackingInt(@intCast(1)), .destination = @fromBackingInt(@intCast(6)), .type_id = .int } },
             .{ .array_element = .{ .array = @fromBackingInt(@intCast(0)), .index = @fromBackingInt(@intCast(5)), .type_id = .int } },
             .{ .value_copy = .{ .source = @fromBackingInt(@intCast(2)), .destination = @fromBackingInt(@intCast(8)), .type_id = .int } },
-            .{ .struct_init = .{ .fields = .{ .start = 0, .end = 2 }, .type_id = array_wrapper_type } },
+            .{ .local_storage = array_wrapper_type },
+            .{ .storage_projection = .{ .owner = @fromBackingInt(@intCast(10)), .type_id = .int, .projection = .{ .field = 0 } } },
+            .{ .value_copy = .{ .source = @fromBackingInt(@intCast(3)), .destination = @fromBackingInt(@intCast(11)), .type_id = .int } },
+            .{ .storage_projection = .{ .owner = @fromBackingInt(@intCast(10)), .type_id = array_copy_type, .projection = .{ .field = 1 } } },
+            .{ .value_copy = .{ .source = @fromBackingInt(@intCast(0)), .destination = @fromBackingInt(@intCast(13)), .type_id = array_copy_type } },
             .{ .value_copy = .{ .source = @fromBackingInt(@intCast(10)), .type_id = array_wrapper_type } },
-            .{ .field_access = .{ .operand = @fromBackingInt(@intCast(11)), .field_index = 1, .field_type = array_copy_type } },
-            .{ .array_element = .{ .array = @fromBackingInt(@intCast(12)), .index = @fromBackingInt(@intCast(4)), .type_id = .int } },
-            .{ .value_copy = .{ .source = @fromBackingInt(@intCast(13)), .type_id = .int } },
-            .{ .array_element = .{ .array = @fromBackingInt(@intCast(12)), .index = @fromBackingInt(@intCast(5)), .type_id = .int } },
-            .{ .value_copy = .{ .source = @fromBackingInt(@intCast(15)), .type_id = .int } },
-            .{ .field_access = .{ .operand = @fromBackingInt(@intCast(11)), .field_index = 0, .field_type = .int } },
-            integerBinary(.add, 14, 16),
-            integerBinary(.add, 18, 17),
+            .{ .field_access = .{ .operand = @fromBackingInt(@intCast(15)), .field_index = 1, .field_type = array_copy_type } },
+            .{ .array_element = .{ .array = @fromBackingInt(@intCast(16)), .index = @fromBackingInt(@intCast(4)), .type_id = .int } },
+            .{ .value_copy = .{ .source = @fromBackingInt(@intCast(17)), .type_id = .int } },
+            .{ .array_element = .{ .array = @fromBackingInt(@intCast(16)), .index = @fromBackingInt(@intCast(5)), .type_id = .int } },
+            .{ .value_copy = .{ .source = @fromBackingInt(@intCast(19)), .type_id = .int } },
+            .{ .field_access = .{ .operand = @fromBackingInt(@intCast(15)), .field_index = 0, .field_type = .int } },
+            integerBinary(.add, 18, 20),
+            integerBinary(.add, 22, 21),
             .{ .call = .{ .target = .{ .direct = exit_function }, .arguments = .{ .start = 0, .end = 1 }, .return_type = .never } },
         };
-        var fields = [_]structures.StructFieldValue{
-            .{ .field_index = 0, .value = @fromBackingInt(@intCast(3)) },
-            .{ .field_index = 1, .value = @fromBackingInt(@intCast(0)) },
-        };
-        var call_arguments = [_]structures.FunctionCallArgument{.{ .prepared = .{ .value = @fromBackingInt(@intCast(19)) } }};
+        var call_arguments = [_]structures.FunctionCallArgument{.{ .prepared = .{ .value = @fromBackingInt(@intCast(23)) } }};
         var blocks = [_]structures.FunctionBlock{.{
             .instruction_start = 0,
             .instruction_end = instructions.len,
             .terminator = .diverge,
         }};
         var body = functionSsa(&instructions, &blocks);
-        body.struct_field_values = &fields;
         body.call_arguments = &call_arguments;
         var artifact = try codegen.compileFunction(&body, &types, std.testing.allocator);
         defer artifact.deinit(std.testing.allocator);
@@ -675,14 +674,17 @@ test "cyclic CFG accepts multi-value parallel backedge copies" {
 }
 
 test "direct call artifact construction cleans up every allocation failure" {
+    if (!@import("test_options").allocation_failures) return error.SkipZigTest;
     try std.testing.checkAllAllocationFailures(allocation_failure_allocator, testCompileDirectCallAllocations, .{});
 }
 
 test "expression artifact construction cleans up every allocation failure" {
+    if (!@import("test_options").allocation_failures) return error.SkipZigTest;
     try std.testing.checkAllAllocationFailures(allocation_failure_allocator, testCompileExpressionAllocations, .{});
 }
 
 test "variant subset call construction cleans up every allocation failure" {
+    if (!@import("test_options").allocation_failures) return error.SkipZigTest;
     try std.testing.checkAllAllocationFailures(allocation_failure_allocator, testCompileVariantSubsetCallAllocations, .{});
 }
 
@@ -1080,10 +1082,12 @@ test "executable builder rejects a displacement outside the signed 32-bit range"
 }
 
 test "executable construction cleans up every allocation failure" {
+    if (!@import("test_options").allocation_failures) return error.SkipZigTest;
     try std.testing.checkAllAllocationFailures(allocation_failure_allocator, testBuildExecutableAllocations, .{});
 }
 
 test "linked executable construction cleans up every allocation failure" {
+    if (!@import("test_options").allocation_failures) return error.SkipZigTest;
     try std.testing.checkAllAllocationFailures(allocation_failure_allocator, testBuildExecutableWithCalleeAllocations, .{});
 }
 

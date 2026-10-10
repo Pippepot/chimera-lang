@@ -132,6 +132,7 @@ test "interpreter value snapshots preserve unfinished cyclic fields variants and
 }
 
 test "interpreter snapshot allocation failures release cloning and comparison storage" {
+    if (!@import("test_options").allocation_failures) return error.SkipZigTest;
     try std.testing.checkAllAllocationFailures(test_sources.allocation_failure_allocator, expectCyclicSnapshots, .{});
 }
 

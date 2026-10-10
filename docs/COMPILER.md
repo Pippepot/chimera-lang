@@ -89,17 +89,34 @@ Specification examples describe the target, not a promise of compiler support. P
 
 Standalone integration and backend suites live in `tests/`. Local tests that need private declarations remain beside their implementations. The project-root `test_sources.zig` collects inline stage tests and exposes one shared source module to the out-of-tree suites; Zig cannot import outside a module's root directory.
 
+Reuse `test_sources.SourceFixture` for source registration, exit checks,
+diagnostics, and native/interpreter parity, and `renderTemplate` for parameterized
+fixtures. Keep cache restoration and memory-limited process setup suite-local.
+
 Compile-time interpreter tests live in the standalone suite
 `tests/comptime_interpreter_test.zig`, using the shared `test_sources` module;
 `src/frontend/comptime_interpreter.zig` has no top-level tests.
 
 ## Verify
 
-Full suite:
+Routine suite (exhaustive allocation-failure sweeps are disabled):
 
 ```sh
 zig build test --seed=0 -Doptimize=safe -j1
 ```
+
+Full backup verification, including exhaustive allocation-failure sweeps:
+
+```sh
+zig build test --seed=0 -Doptimize=safe -Dallocation-failures=true -j1
+```
+
+Allocation-failure sweeps are opt-in backup checks, not routine agent checks.
+Sweep-only tests report as skipped by default. Tests that combine ordinary
+behavior assertions with a sweep still run their non-failing case once.
+Ordinary OOM behavior tests and leak detection remain enabled in routine runs.
+Use `-Dallocation-failures=true` only when explicitly requesting backup verification;
+it also works with the focused source and name filters below.
 
 Focused checks:
 
@@ -112,7 +129,7 @@ zig build test --seed=0 -Doptimize=safe -Dtest-source=tests/converter_test.zig -
 zig build test --seed=0 -Doptimize=safe -Dtest-source=tests/comptime_interpreter_test.zig --summary all
 ```
 
-These entrypoints supply required module imports. The full suite runs inline
+These entrypoints supply required module imports. Both suite modes run inline
 tests once through `test_sources.zig` and seven standalone suites (eight default
 roots total): `tests/array_test.zig`, `tests/converter_test.zig`, `tests/codegen_test.zig`,
 `tests/comptime_interpreter_test.zig`, `tests/modules_test.zig`,
@@ -135,8 +152,9 @@ For quick test iteration, omit `-Doptimize=safe` and select the affected
 suite with `-Dtest-source`. The full suite builds eight separate test binaries;
 its compilation cost is different from building the CLI once.
 
-Use focused checks during edits; run the full suite once for changes spanning
-stages or shared representations. Documentation-only edits need no compiler tests.
+Use focused checks during edits; run the routine suite once for changes spanning
+stages or shared representations. Run the exhaustive backup checks only when
+explicitly requested. Documentation-only edits need no compiler tests.
 
 Check modified Zig files with `zig fmt --check <files>` and run `git diff --check`.
 Keep temporary verification files outside the repository.

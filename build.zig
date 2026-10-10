@@ -50,13 +50,17 @@ pub fn build(b: *std.Build) void {
     const flow_benchmark = b.addExecutable(.{ .name = "flow_benchmark", .root_module = flow_module });
     b.step("flow-benchmark", "Measure typing snapshots and lifetime tables").dependOn(&b.addRunArtifact(flow_benchmark).step);
 
-    const test_step = b.step("test", "Run all compiler tests");
+    const test_step = b.step("test", "Run compiler tests (allocation-failure sweeps are opt-in)");
+    const test_options = b.addOptions();
+    test_options.addOption(bool, "allocation_failures", b.option(bool, "allocation-failures", "Include exhaustive allocation-failure tests") orelse false);
+    const test_options_module = test_options.createModule();
     const test_sources_module = b.createModule(.{
         .root_source_file = b.path("test_sources.zig"),
         .target = target,
         .optimize = optimize,
     });
     test_sources_module.addImport("standard_library", standard_library);
+    test_sources_module.addImport("test_options", test_options_module);
     const selected_test_source = b.option([]const u8, "test-source", "Run only tests from this source file");
     const test_filter = b.option([]const u8, "test-filter", "Run tests whose names contain this text");
     const test_sources: []const []const u8 = if (selected_test_source) |source| &.{source} else &.{
@@ -77,6 +81,7 @@ pub fn build(b: *std.Build) void {
         });
         test_module.addImport("standard_library", standard_library);
         test_module.addImport("test_sources", test_sources_module);
+        test_module.addImport("test_options", test_options_module);
         const test_binary = b.addTest(.{ .root_module = test_module, .filters = if (test_filter) |filter| &.{filter} else &.{} });
         // Disk-cache tests identify the compiler image without hashing the whole binary.
         test_binary.build_id = .sha1;

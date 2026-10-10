@@ -11,8 +11,7 @@ const Generation = lifetime.Generation;
 const LifetimeEffect = lifetime.LifetimeEffect;
 const OwnershipForward = lifetime.OwnershipForward;
 const OwnershipEdge = lifetime.OwnershipEdge;
-const PlannedCleanup = lifetime.PlannedCleanup;
-const ExplicitAbandonment = lifetime.ExplicitAbandonment;
+const PlannedEnding = lifetime.PlannedEnding;
 const Boundary = lifetime.Boundary;
 const BuildInstruction = lifetime.BuildInstruction;
 const BuildItem = lifetime.BuildItem;
@@ -84,7 +83,7 @@ pub fn resolveAndTypeBody(
         error.SourceRejected, error.Unavailable => return null,
         else => return err,
     };
-    return builder.finishAnalysis(options.measurements) catch |err| switch (err) {
+    return builder.finishAnalysis(options.measurements, null) catch |err| switch (err) {
         error.SourceRejected, error.Unavailable => null,
         else => return err,
     };
@@ -412,7 +411,6 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         parameter_modes: std.ArrayList(structures.ParameterMode) = .empty,
         block_argument_generations: std.ArrayList(?GenerationId) = .empty,
         variant_coercion_tags: std.ArrayList(u32) = .empty,
-        struct_field_values: std.ArrayList(structures.StructFieldValue) = .empty,
         borrow_fields: std.ArrayList(u32) = .empty,
         reference_origins: std.ArrayList(ReferenceOrigin) = .empty,
         reference_projections: std.ArrayList(ReferenceProjection) = .empty,
@@ -441,8 +439,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         ownership_forwards: std.ArrayList(OwnershipForward) = .empty,
         ownership_edges: std.ArrayList(OwnershipEdge) = .empty,
         ownership_forward_hints: std.ArrayList(OwnershipForwardHint) = .empty,
-        planned_cleanups: std.ArrayList(PlannedCleanup) = .empty,
-        explicit_abandonments: std.ArrayList(ExplicitAbandonment) = .empty,
+        planned_endings: std.ArrayList(PlannedEnding) = .empty,
         boundaries: std.ArrayList(Boundary) = .empty,
         blocks: std.ArrayList(BuildBlock) = .empty,
         loop_stack: std.ArrayList(LoopContext) = .empty,
@@ -604,7 +601,6 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             self.parameter_modes.deinit(gpa);
             self.block_argument_generations.deinit(gpa);
             self.variant_coercion_tags.deinit(gpa);
-            self.struct_field_values.deinit(gpa);
             self.borrow_fields.deinit(gpa);
             self.reference_origins.deinit(gpa);
             self.reference_projections.deinit(gpa);
@@ -638,8 +634,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             self.ownership_forwards.deinit(gpa);
             self.ownership_edges.deinit(gpa);
             self.ownership_forward_hints.deinit(gpa);
-            self.planned_cleanups.deinit(gpa);
-            self.explicit_abandonments.deinit(gpa);
+            self.planned_endings.deinit(gpa);
             for (self.boundaries.items) |*boundary| boundary.effects.deinit(gpa);
             self.boundaries.deinit(gpa);
             for (self.blocks.items) |*block_value| {
@@ -660,7 +655,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             return .{ .expected = expected, .found = found };
         }
 
-        fn finishAnalysis(self: *Self, measurements: ?*BodyMeasurements) !structures.FunctionBodyAnalysis {
+        fn finishAnalysis(self: *Self, measurements: ?*BodyMeasurements, retained_captures: ?*std.ArrayList(u32)) !structures.FunctionBodyAnalysis {
             std.debug.assert(!self.type_check_only);
             try self.resolvePendingReferenceUses();
             if (self.generations.items.len != 0) {
@@ -668,7 +663,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 try self.analyzeLifetimes(measurements);
             }
             if (try self.emitExplicitAbandonmentDiagnostics()) return error.SourceRejected;
-            try self.materializeCleanups(self.planned_cleanups.items);
+            try self.materializeCleanups(self.planned_endings.items);
             try self.validateCleanupReferenceUses();
             if (measurements) |output| {
                 output.snapshots = self.states.items.len;
@@ -686,7 +681,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 output.blocks = self.blocks.items.len;
                 output.generations = self.generations.items.len;
             }
-            return self.finish();
+            return self.finish(retained_captures);
         }
 
         fn build(self: *Self, parameters: []const structures.CallableParameter, builtin_body: ?BuiltinBody) !void {
@@ -1307,8 +1302,6 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     break :blk try self.valueWithContext(operands.rhs.value, context);
                 },
                 .call => |call| try self.callFunction(call, expression.span, .{ .value = context, .destination = request.destination orelse if (context.access == .consume and context.fresh_destination != null) .{ .storage = context.fresh_destination.?, .site = .argument } else null }),
-                .negate => |operand| try self.negate(operand),
-                .add, .subtract, .multiply, .divide => try self.binary(expression),
                 .if_else => |expression_if| try self.conditional(expression_if, .{ .value = context, .destination = request.destination, .discard = request.discard }),
                 .loop => |body| try self.loop(body, .{ .value = context, .destination = request.destination, .discard = request.discard }),
             };
@@ -1749,9 +1742,9 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
 
         fn constructsDirectly(self: *Self, id: semantic.UnresolvedBody.ValueId, expected_type: structures.TypeId) !bool {
             const index = @backingInt(id);
-            if (index < self.unresolved.parameter_count or self.values[index] != null or !try self.constructsInPlace(expected_type))
-                return false;
+            if (index < self.unresolved.parameter_count or self.values[index] != null) return false;
             const expression = self.unresolved.expressions[index - self.unresolved.parameter_count];
+            if (expression.operation != .struct_init and !try self.constructsInPlace(expected_type)) return false;
             if (expression.operation == .struct_init or expression.operation == .array_init or expression.operation == .call) {
                 if (try self.unevaluatedType(id, null)) |source_type| {
                     if (source_type != expected_type and source_type != .never) {
@@ -1837,7 +1830,6 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 .type_id => |resolved| resolved,
             };
             if (try self.type_interner.collectionLiteralType(type_id) != null) return self.reject(expression.span, .{ .compile_time_only_type = type_id });
-            if (!try self.constructsInPlace(type_id)) return self.placeValue(try self.structInitValue(expression, type_id), expression.span, destination);
             const storage = try self.memberDestination(destination, type_id, expression.span, .fresh);
             return self.finishMemberStorage(try self.constructFields(expression, type_id, storage), destination.storage, expression.span);
         }
@@ -2239,12 +2231,12 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 const result = try region.valueWithType(raw.value, constructed_type);
                 if (region.current_block != null) try region.returnValue(result, raw.span);
             }
-            var body = try region.finishAnalysis(null);
+            var kept: std.ArrayList(u32) = .empty;
+            defer kept.deinit(gpa);
+            var body = try region.finishAnalysis(null, &kept);
             errdefer body.deinit(gpa);
-            const kept = try pruneInitializerCaptures(&body, gpa);
-            defer gpa.free(kept);
             const capture_start: u32 = @intCast(self.initializer_captures.items.len);
-            for (kept) |index| {
+            for (kept.items) |index| {
                 for (region.capture_transfers.items) |transfer| {
                     if (transfer.parameter != index) continue;
                     var fields: std.ArrayList(PlaceField) = .empty;
@@ -2268,7 +2260,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 .type_id = type_id,
             } });
             initializer.reference_origins = try self.importInitializerOrigins(&region, captures.items, region.returned_reference_origins, initializer.id);
-            try self.prepareInitializerTransfers(&region, captures.items, kept, initializer.id, raw.span);
+            try self.prepareInitializerTransfers(&region, captures.items, kept.items, initializer.id, raw.span);
             var outputs = region.capture_output_origins.iterator();
             while (outputs.next()) |output| {
                 const local = capture_locals.items[output.key_ptr.*] orelse continue;
@@ -2289,7 +2281,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 if (origins == null) continue;
                 try self.initializer_reference_writes.append(gpa, .{ .initializer = initializer.id, .reference = .{ .id = initializer.id, .type_id = write.type_id, .reference_origins = origins } });
             }
-            for (kept) |index| {
+            for (kept.items) |index| {
                 var owner = captures.items[index];
                 if (owner.initializer_parameter != null) continue;
                 if (capture_locals.items[index]) |local| {
@@ -2887,7 +2879,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 const members = (try self.type_interner.facts().variantMembers(source.type_id)) orelse return source;
                 return self.mapVariantMember(source, members, .copy, destination);
             };
-            return self.mapStructFields(source, definition, .copy, destination);
+            return self.mapStructFields(source, definition, .copy, destination orelse try self.localStorage(source.type_id));
         }
 
         fn moveStructFields(self: *Self, source: Value, destination: Value) anyerror!Value {
@@ -2903,37 +2895,18 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             source: Value,
             definition: structures.StructDefinition,
             operation: OwnershipOperation,
-            destination: ?Value,
+            destination: Value,
         ) anyerror!Value {
-            var fields: std.ArrayList(structures.StructFieldValue) = .empty;
-            defer fields.deinit(self.ctx.allocator());
             for (definition.fields, 0..) |field, index| {
-                const extracted = if (destination != null)
-                    try self.projectStorage(source, field.type_id, .{ .field = @intCast(index) })
-                else
-                    try self.appendInstruction(.{ .field_access = .{
-                        .operand = source.id,
-                        .field_index = @intCast(index),
-                        .field_type = field.type_id,
-                    } });
-                const field_destination = if (destination) |storage| try self.projectStorage(storage, field.type_id, .{ .field = @intCast(index) }) else null;
-                const owned = switch (operation) {
-                    .copy => try self.copyValueBits(extracted, field_destination),
-                    .move => try self.moveValueBits(extracted, field_destination),
+                const extracted = try self.projectStorage(source, field.type_id, .{ .field = @intCast(index) });
+                const field_destination = try self.projectStorage(destination, field.type_id, .{ .field = @intCast(index) });
+                switch (operation) {
+                    .copy => _ = try self.copyValueBits(extracted, field_destination),
+                    .move => _ = try self.moveValueBits(extracted, field_destination),
                     .drop => unreachable,
-                };
-                if (destination == null) try fields.append(self.ctx.allocator(), .{
-                    .field_index = @intCast(index),
-                    .value = owned.id,
-                });
+                }
             }
-            if (destination) |storage| return storage;
-            const field_start: u32 = @intCast(self.struct_field_values.items.len);
-            try self.struct_field_values.appendSlice(self.ctx.allocator(), fields.items);
-            return self.appendInstruction(.{ .struct_init = .{
-                .fields = .{ .start = field_start, .end = @intCast(self.struct_field_values.items.len) },
-                .type_id = source.type_id,
-            } });
+            return destination;
         }
 
         const ArrayLoop = struct {
@@ -3467,14 +3440,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             return if (@backingInt(left_id) >= @backingInt(right_id)) left_id else right_id;
         }
 
-        const PreparedStructInit = struct {
-            type_id: structures.TypeId,
-            fields: structures.FunctionValueRange,
-            values: []Value,
-            reference_origins: ?u32,
-        };
         const StructTypeResult = union(enum) { diverged: Value, type_id: structures.TypeId };
-        const StructInitResult = union(enum) { diverged: Value, prepared: PreparedStructInit };
 
         fn structInit(self: *Self, expression: Expression) !Value {
             const type_id = switch (try self.structInitType(expression.operation.struct_init)) {
@@ -3482,72 +3448,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 .type_id => |resolved| resolved,
             };
             if (try self.type_interner.collectionLiteralType(type_id) != null) return self.reject(expression.span, .{ .compile_time_only_type = type_id });
-            if (try self.constructsInPlace(type_id)) return self.constructFields(expression, type_id, try self.localStorage(type_id));
-            return self.structInitValue(expression, type_id);
-        }
-
-        fn structInitValue(self: *Self, expression: Expression, type_id: structures.TypeId) !Value {
-            const result = try self.prepareStructInit(expression, type_id);
-            const prepared = switch (result) {
-                .diverged => |diverged| return diverged,
-                .prepared => |prepared_init| prepared_init,
-            };
-            defer self.ctx.allocator().free(prepared.values);
-            for (prepared.values) |field_value| {
-                try self.recordConsume(field_value);
-            }
-            const constructed = try self.appendInstruction(.{ .struct_init = .{
-                .fields = prepared.fields,
-                .type_id = prepared.type_id,
-            } });
-            var initialized = try self.defineOwnedValue(constructed, expression.span, false);
-            initialized.reference_origins = prepared.reference_origins;
-            return initialized;
-        }
-
-        fn prepareStructInit(self: *Self, expression: Expression, type_id: structures.TypeId) !StructInitResult {
-            const initializer = expression.operation.struct_init;
-            const source_fields = self.unresolved.struct_field_values[initializer.fields.start..initializer.fields.end];
-            const definition = try self.structInitializerDefinition(initializer, type_id);
-            const seen = try self.ctx.allocator().alloc(bool, definition.fields.len);
-            defer self.ctx.allocator().free(seen);
-            @memset(seen, false);
-            var fields: std.ArrayList(structures.StructFieldValue) = .empty;
-            defer fields.deinit(self.ctx.allocator());
-            var field_values: std.ArrayList(Value) = .empty;
-            defer field_values.deinit(self.ctx.allocator());
-            var reference_origins: ?u32 = null;
-            for (source_fields) |source_field| {
-                const field = definition.resolveField(source_field.name).?;
-                if (seen[field.index]) return self.reject(source_field.name_span, .duplicate_struct_initializer_field);
-                seen[field.index] = true;
-                const operand = try self.valueWithContext(source_field.value.value, .{ .expected_type = field.type_id, .access = .initialize });
-                if (operand.type_id == .never) return .{ .diverged = operand };
-                var use = try self.coerceValue(operand.id, operand.type_id, field.type_id) orelse
-                    return self.reject(source_field.value.span, .{ .struct_initializer_field_type_mismatch = self.typeMismatch(field.type_id, operand.type_id) });
-                const owned = try self.ownValue(operand, source_field.value.span);
-                use.value = owned.id;
-                const field_value = if (use.coerce_to != null)
-                    try self.coerceOwnedRepresentation(owned, use, source_field.value.span, null)
-                else
-                    owned;
-                try field_values.append(self.ctx.allocator(), field_value);
-                if (try self.type_interner.canStoreBorrow(field_value.type_id))
-                    reference_origins = try self.mergeReferenceOrigins(reference_origins, try self.transformReferenceOrigins(field_value.reference_origins, .{ .prefix = .{ .field = field.index } }));
-                try fields.append(self.ctx.allocator(), .{ .field_index = field.index, .value = field_value.id });
-            }
-            for (seen, 0..) |was_seen, field_index| if (!was_seen) return self.reject(initializer.type_span, .{ .missing_struct_initializer_field = .{
-                .type_id = type_id,
-                .field_index = @intCast(field_index),
-            } });
-            const start: u32 = @intCast(self.struct_field_values.items.len);
-            try self.struct_field_values.appendSlice(self.ctx.allocator(), fields.items);
-            return .{ .prepared = .{
-                .type_id = type_id,
-                .fields = .{ .start = start, .end = @intCast(self.struct_field_values.items.len) },
-                .values = try field_values.toOwnedSlice(self.ctx.allocator()),
-                .reference_origins = reference_origins,
-            } };
+            return self.constructFields(expression, type_id, try self.localStorage(type_id));
         }
 
         fn inPlaceStructFieldType(self: *Self, id: semantic.UnresolvedBody.ValueId, expected_type: ?structures.TypeId) anyerror!StructTypeResult {
@@ -3587,7 +3488,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             if (self.values[index]) |resolved| return resolved.type_id;
             return switch (self.unresolved.expressions[index - self.unresolved.parameter_count].operation) {
                 .integer_literal => if (expected_type == .int_literal) .int_literal else if (expected_type == .byte) .byte else .int,
-                .integer, .negate, .add, .subtract, .multiply, .divide => .int,
+                .integer => .int,
                 .byte => .byte,
                 .boolean => .bool,
                 .unit => .unit,
@@ -3715,7 +3616,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 .operation => |name| blk: {
                     const receiver_type = (try self.unevaluatedType(arguments[0].value, null)) orelse return null;
                     if (receiver_type == .never) return .never;
-                    if (receiver_type == .int and isArithmeticOperation(name)) return .int;
+                    if (receiver_type == .int and std.meta.stringToEnum(ArithmeticOperation, name) != null) return .int;
                     break :blk try self.operationTarget(receiver_type, name, call.span);
                 },
                 .value => |callee| {
@@ -4339,7 +4240,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 self.parameter_modes.items[parameter_index] = .mut;
                 self.locals.items(.mut_parameter)[local_index] = parameter_index;
             }
-            const replaces = assignment_value.operation == .replace;
+            const replaces = assignment_value.replaces;
             const mut_parameter = self.locals.items(.mut_parameter)[local_index] != null;
             const root_availability = self.local_availability[local_index];
             if (root_availability == .replacing or (root_availability != .available and (assignment_value.fields.start != assignment_value.fields.end or !replaces)))
@@ -4628,29 +4529,6 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             if (operand.type_id == .never) return operand;
             if (operand.type_id != .int) return self.reject(operand_use.span, .{ .negation_operand_not_int = operand.type_id });
             return self.appendInstruction(.{ .negi = operand.id });
-        }
-
-        fn binary(self: *Self, expression: Expression) !Value {
-            const raw = switch (expression.operation) {
-                .add, .subtract, .multiply, .divide => |operands| operands,
-                else => unreachable,
-            };
-            const lhs = try self.borrowValue(try self.value(raw.lhs.value), raw.lhs.span);
-            if (lhs.type_id == .never) return lhs;
-            const rhs = try self.borrowValue(try self.value(raw.rhs.value), raw.rhs.span);
-            if (rhs.type_id == .never) return rhs;
-            try self.recordUse(lhs);
-            if (lhs.type_id != .int) return self.reject(raw.lhs.span, .{ .arithmetic_operand_not_int = lhs.type_id });
-            if (rhs.type_id != .int) return self.reject(raw.rhs.span, .{ .arithmetic_operand_not_int = rhs.type_id });
-            const operands: structures.BinaryOperands = .{ .lhs = lhs.id, .rhs = rhs.id };
-            const instruction: structures.FunctionInstruction = switch (expression.operation) {
-                .add => .{ .addi = operands },
-                .subtract => .{ .subi = operands },
-                .multiply => .{ .muli = operands },
-                .divide => .{ .divsi = operands },
-                else => unreachable,
-            };
-            return self.appendInstruction(instruction);
         }
 
         const ResolvedCallable = struct {
@@ -5208,7 +5086,8 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             if (call.target == .operation) {
                 const arguments = self.unresolved.call_arguments[call.arguments.start..call.arguments.end];
                 const receiver_type = (try self.unevaluatedType(arguments[0].value, null)) orelse (try self.value(arguments[0].value)).type_id;
-                if (receiver_type.isPrimitive() and isArithmeticOperation(call.target.operation)) return self.primitiveArithmetic(call, span);
+                if (receiver_type.isPrimitive()) if (std.meta.stringToEnum(ArithmeticOperation, call.target.operation)) |operation|
+                    return self.primitiveArithmetic(operation, arguments);
             }
             const resolved = try self.resolveCall(call, span, false);
             switch (resolved) {
@@ -5217,17 +5096,26 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             }
         }
 
-        fn isArithmeticOperation(name: []const u8) bool {
-            return std.mem.eql(u8, name, "+") or std.mem.eql(u8, name, "-") or std.mem.eql(u8, name, "*") or std.mem.eql(u8, name, "/") or std.mem.eql(u8, name, "neg");
-        }
+        const ArithmeticOperation = enum { @"+", @"-", @"*", @"/", neg };
 
-        fn primitiveArithmetic(self: *Self, call: semantic.UnresolvedBody.Call, span: structures.SourceSpan) !Value {
-            const arguments = self.unresolved.call_arguments[call.arguments.start..call.arguments.end];
-            const name = call.target.operation;
-            if (std.mem.eql(u8, name, "neg")) return self.negate(arguments[0]);
-            const operands: semantic.UnresolvedBody.BinaryOperands = .{ .lhs = arguments[0], .rhs = arguments[1] };
-            const operation: Expression.Operation = if (std.mem.eql(u8, name, "+")) .{ .add = operands } else if (std.mem.eql(u8, name, "-")) .{ .subtract = operands } else if (std.mem.eql(u8, name, "*")) .{ .multiply = operands } else if (std.mem.eql(u8, name, "/")) .{ .divide = operands } else unreachable;
-            return self.binary(.{ .operation = operation, .span = span });
+        fn primitiveArithmetic(self: *Self, operation: ArithmeticOperation, arguments: []const semantic.UnresolvedBody.ValueUse) !Value {
+            if (operation == .neg) return self.negate(arguments[0]);
+            const lhs = try self.borrowValue(try self.value(arguments[0].value), arguments[0].span);
+            if (lhs.type_id == .never) return lhs;
+            const rhs = try self.borrowValue(try self.value(arguments[1].value), arguments[1].span);
+            if (rhs.type_id == .never) return rhs;
+            try self.recordUse(lhs);
+            if (lhs.type_id != .int) return self.reject(arguments[0].span, .{ .arithmetic_operand_not_int = lhs.type_id });
+            if (rhs.type_id != .int) return self.reject(arguments[1].span, .{ .arithmetic_operand_not_int = rhs.type_id });
+            const operands: structures.BinaryOperands = .{ .lhs = lhs.id, .rhs = rhs.id };
+            const instruction: structures.FunctionInstruction = switch (operation) {
+                .@"+" => .{ .addi = operands },
+                .@"-" => .{ .subi = operands },
+                .@"*" => .{ .muli = operands },
+                .@"/" => .{ .divsi = operands },
+                .neg => unreachable,
+            };
+            return self.appendInstruction(instruction);
         }
 
         fn invokeOperation(self: *Self, name: []const u8, arguments: []const semantic.UnresolvedBody.ValueUse, span: structures.SourceSpan, mode: ResultRequest) !Value {
@@ -6238,34 +6126,10 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
 
         fn updateFields(self: *Self, root: Value, fields: []const PlaceField, updated_leaf: Value) !Value {
             if (fields.len == 0) return updated_leaf;
-
-            var parents: std.ArrayList(Value) = .empty;
-            defer parents.deinit(self.ctx.allocator());
-            var current = root;
-            for (fields) |field| {
-                try parents.append(self.ctx.allocator(), current);
-                const origins = try self.transformReferenceOrigins(current.reference_origins, .{ .select = .{ .field = field.index } });
-                current = try self.appendInstruction(.{ .field_access = .{
-                    .operand = current.id,
-                    .field_index = field.index,
-                    .field_type = field.type_id,
-                } });
-                current.reference_origins = origins;
-            }
-            var updated = updated_leaf;
-            var field_index = fields.len;
-            while (field_index > 0) {
-                field_index -= 1;
-                const previous = parents.items[field_index];
-                const updated_origins = try self.replaceProjectedOrigins(previous.reference_origins, .{ .field = fields[field_index].index }, updated.reference_origins);
-                updated = try self.appendInstruction(.{ .field_update = .{
-                    .operand = previous.id,
-                    .value = updated.id,
-                    .field_index = fields[field_index].index,
-                    .type_id = previous.type_id,
-                } });
-                updated.reference_origins = updated_origins;
-            }
+            // Direct values retain SSA snapshots; address-passed owners retain their storage.
+            var updated = if (try self.constructsInPlace(root.type_id)) root else try self.copyBits(root, try self.localStorage(root.type_id));
+            _ = try self.copyBits(updated_leaf, try self.fieldStorage(rawValue(updated), fields));
+            updated.reference_origins = try self.fieldUpdateOrigins(root.reference_origins, fields, updated_leaf.reference_origins);
             return updated;
         }
 
@@ -7061,21 +6925,23 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 result.lifetime_table_bytes = 2 * std.mem.sliceAsBytes(solver.representations_in).len +
                     4 * std.mem.sliceAsBytes(solver.available_in).len;
             }
-            try solver.solve(&self.planned_cleanups, &self.explicit_abandonments);
+            try solver.solve(&self.planned_endings);
         }
 
         fn emitExplicitAbandonmentDiagnostics(self: *Self) !bool {
-            if (self.explicit_abandonments.items.len == 0) return false;
-            const abandonment = self.explicit_abandonments.items[0];
-            const generation = self.generations.items[@backingInt(abandonment.generation)];
-            try emitSemanticIssue(self.ctx, self.file_id, .{
-                .span = generation.span,
-                .kind = .{ .value_requires_explicit_drop = generation.type_id },
-            });
-            return true;
+            for (self.planned_endings.items) |ending| {
+                const generation = self.generations.items[@backingInt(ending.generation)];
+                if (!generation.requires_explicit_drop) continue;
+                try emitSemanticIssue(self.ctx, self.file_id, .{
+                    .span = generation.span,
+                    .kind = .{ .value_requires_explicit_drop = generation.type_id },
+                });
+                return true;
+            }
+            return false;
         }
 
-        fn materializeCleanups(self: *Self, cleanups: []const PlannedCleanup) !void {
+        fn materializeCleanups(self: *Self, cleanups: []const PlannedEnding) !void {
             std.debug.assert(self.current_block == null);
             const LocationTag = std.meta.Tag(CleanupLocation);
             inline for ([_]LocationTag{ .edge, .boundary, .block_entry }) |location_tag| {
@@ -7103,7 +6969,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             self: *Self,
             block_id: structures.FunctionBlockId,
             suffix_item_start: usize,
-            cleanups: []const PlannedCleanup,
+            cleanups: []const PlannedEnding,
         ) !void {
             const suffix = try self.splitCompletedBlock(block_id, suffix_item_start);
             self.resumeBlock(block_id);
@@ -7116,7 +6982,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             self: *Self,
             predecessor: structures.FunctionBlockId,
             successor_ordinal: u2,
-            cleanups: []const PlannedCleanup,
+            cleanups: []const PlannedEnding,
         ) !void {
             const target = self.edgeTarget(predecessor, successor_ordinal);
             const pass_through = try self.newPassThroughBlock(target);
@@ -7126,11 +6992,11 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             self.terminate(.{ .branch = pass_through.branch });
         }
 
-        fn emitCleanupGroup(self: *Self, cleanups: []const PlannedCleanup) !void {
+        fn emitCleanupGroup(self: *Self, cleanups: []const PlannedEnding) !void {
             for (cleanups) |cleanup| try self.emitConditionalCleanup(cleanup);
         }
 
-        fn emitConditionalCleanup(self: *Self, cleanup: PlannedCleanup) !void {
+        fn emitConditionalCleanup(self: *Self, cleanup: PlannedEnding) !void {
             const cleanup_condition = cleanup.cleanup_condition orelse return self.emitDropCleanup(cleanup);
             const argument_index: u32 = @intCast(self.block_arguments.items.len);
             const borrowed = try self.newBlock(argument_index, argument_index);
@@ -7168,7 +7034,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             self.enterBlock(join);
         }
 
-        fn emitDropCleanup(self: *Self, cleanup: PlannedCleanup) !void {
+        fn emitDropCleanup(self: *Self, cleanup: PlannedEnding) !void {
             const generation = self.generations.items[@backingInt(cleanup.generation)];
             const value_to_drop: Value = .{
                 .id = cleanup.cleanup_value,
@@ -7640,12 +7506,11 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             return .{ .target = target, .arguments = .{ .start = start, .end = start } };
         }
 
-        fn finish(self: *Self) !structures.FunctionBodyAnalysis {
+        fn finish(self: *Self, retained_captures: ?*std.ArrayList(u32)) !structures.FunctionBodyAnalysis {
             std.debug.assert(self.current_block == null);
             std.debug.assert(self.block_arguments.items.len == self.block_argument_generations.items.len);
             std.debug.assert(self.branch_arguments.items.len == self.branch_argument_generations.items.len);
             const gpa = self.ctx.allocator();
-            const argument_count: u32 = @intCast(std.math.cast(u31, self.block_arguments.items.len) orelse return error.AnalysisTooLarge);
             const instruction_values = try gpa.alloc(structures.FunctionValueId, self.instruction_count);
             defer gpa.free(instruction_values);
             const block_layout = try gpa.alloc(structures.FunctionBlockId, self.blocks.items.len);
@@ -7678,7 +7543,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     .instruction => |build_instruction| {
                         instructions[instruction_index] = build_instruction.operation;
                         if (self.publish_instruction_spans) instruction_spans[instruction_index] = build_instruction.span;
-                        instruction_values[build_instruction.id] = @fromBackingInt(@intCast(argument_count + instruction_index));
+                        instruction_values[build_instruction.id] = @fromBackingInt(@intCast(instruction_index));
                         instruction_index += 1;
                     },
                     .boundary => {},
@@ -7693,113 +7558,96 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 if (self.publish_instruction_spans) terminator_spans[block_index] = build_block.terminator_span orelse unreachable;
             }
             std.debug.assert(instruction_index == self.instruction_count);
-            const block_arguments = try self.block_arguments.toOwnedSlice(gpa);
-            errdefer gpa.free(block_arguments);
-            const parameter_modes = try self.parameter_modes.toOwnedSlice(gpa);
-            errdefer gpa.free(parameter_modes);
-            const variant_coercion_tags = try self.variant_coercion_tags.toOwnedSlice(gpa);
-            errdefer gpa.free(variant_coercion_tags);
-            const struct_field_values = try self.struct_field_values.toOwnedSlice(gpa);
-            errdefer gpa.free(struct_field_values);
-            const borrow_fields = try self.borrow_fields.toOwnedSlice(gpa);
-            errdefer gpa.free(borrow_fields);
-            const call_arguments = try self.call_arguments.toOwnedSlice(gpa);
-            errdefer gpa.free(call_arguments);
-            const initializer_regions = try self.initializer_regions.toOwnedSlice(gpa);
-            errdefer {
-                for (initializer_regions) |*region| region.deinit(gpa);
-                gpa.free(initializer_regions);
-            }
-            const initializer_captures = try self.initializer_captures.toOwnedSlice(gpa);
-            errdefer gpa.free(initializer_captures);
-            const branches = try self.branch_arguments.toOwnedSlice(gpa);
-            const body: structures.FunctionBodyAnalysis = .{
+            var body: structures.FunctionBodyAnalysis = .{
                 .return_type = self.return_type,
                 .is_fallible = self.is_fallible or self.consuming_converter,
                 .is_initializer_region = self.is_initializer_region,
-                .initializer_regions = initializer_regions,
-                .initializer_captures = initializer_captures,
-                .parameter_modes = parameter_modes,
-                .block_arguments = block_arguments,
-                .variant_coercion_tags = variant_coercion_tags,
-                .struct_field_values = struct_field_values,
-                .borrow_fields = borrow_fields,
-                .call_arguments = call_arguments,
-                .branch_arguments = branches,
+                .initializer_regions = self.initializer_regions.items,
+                .initializer_captures = self.initializer_captures.items,
+                .parameter_modes = self.parameter_modes.items,
+                .block_arguments = self.block_arguments.items,
+                .variant_coercion_tags = self.variant_coercion_tags.items,
+                .borrow_fields = self.borrow_fields.items,
+                .call_arguments = self.call_arguments.items,
+                .branch_arguments = self.branch_arguments.items,
                 .instructions = instructions,
                 .instruction_spans = instruction_spans,
                 .terminator_spans = terminator_spans,
                 .blocks = blocks,
                 .entry = @fromBackingInt(@intCast(0)),
             };
-            body.visitValueReferences(instruction_values, normalizeValueReference);
+            const capture_count = if (retained_captures != null) blocks[0].argument_end else 0;
+            const capture_mapping = try gpa.alloc(?u32, capture_count);
+            defer gpa.free(capture_mapping);
+            @memset(capture_mapping, null);
+            var removed: u32 = 0;
+            if (retained_captures) |kept| {
+                std.debug.assert(self.is_initializer_region);
+                std.debug.assert(blocks[0].argument_start == 0);
+                // Only actual reads capture caller storage; unused captures must
+                // not extend caller lifetimes or change observable drop ordering.
+                body.visitValueReferences(capture_mapping, markCaptureUsed);
+                for (instructions) |instruction| if (instruction == .mut_parameter_write) {
+                    capture_mapping[instruction.mut_parameter_write.parameter_index] = 0;
+                };
+                for (capture_mapping, 0..) |*mapped, old| if (mapped.* != null) {
+                    mapped.* = @intCast(kept.items.len);
+                    try kept.append(gpa, @intCast(old));
+                    self.block_arguments.items[mapped.*.?] = self.block_arguments.items[old];
+                    self.parameter_modes.items[mapped.*.?] = self.parameter_modes.items[old];
+                };
+                removed = capture_count - @as(u32, @intCast(kept.items.len));
+                std.mem.copyForwards(structures.FunctionBlockArgument, self.block_arguments.items[kept.items.len..], self.block_arguments.items[capture_count..]);
+                self.block_arguments.shrinkRetainingCapacity(self.block_arguments.items.len - removed);
+                self.parameter_modes.shrinkRetainingCapacity(kept.items.len);
+                for (blocks, 0..) |*finished_block, index| {
+                    if (index != 0) finished_block.argument_start -= removed;
+                    finished_block.argument_end -= removed;
+                }
+                for (instructions) |*instruction| if (instruction.* == .mut_parameter_write) {
+                    const write = &instruction.mut_parameter_write;
+                    write.parameter_index = capture_mapping[write.parameter_index].?;
+                };
+            }
+            const argument_count: u32 = @intCast(std.math.cast(u31, self.block_arguments.items.len) orelse return error.AnalysisTooLarge);
+            body.visitValueReferences(.{ .instructions = instruction_values, .argument_count = argument_count, .captures = capture_mapping, .removed = removed }, normalizeValueReference);
+            body.block_arguments = try self.block_arguments.toOwnedSlice(gpa);
+            errdefer gpa.free(body.block_arguments);
+            body.parameter_modes = try self.parameter_modes.toOwnedSlice(gpa);
+            errdefer gpa.free(body.parameter_modes);
+            body.variant_coercion_tags = try self.variant_coercion_tags.toOwnedSlice(gpa);
+            errdefer gpa.free(body.variant_coercion_tags);
+            body.borrow_fields = try self.borrow_fields.toOwnedSlice(gpa);
+            errdefer gpa.free(body.borrow_fields);
+            body.call_arguments = try self.call_arguments.toOwnedSlice(gpa);
+            errdefer gpa.free(body.call_arguments);
+            body.initializer_regions = try self.initializer_regions.toOwnedSlice(gpa);
+            errdefer {
+                for (body.initializer_regions) |*region| region.deinit(gpa);
+                gpa.free(body.initializer_regions);
+            }
+            body.initializer_captures = try self.initializer_captures.toOwnedSlice(gpa);
+            errdefer gpa.free(body.initializer_captures);
+            body.branch_arguments = try self.branch_arguments.toOwnedSlice(gpa);
             return body;
         }
     };
 }
 
-/// Only actual reads capture caller storage. Preparing unused captures would
-/// otherwise extend unrelated lifetimes and change observable drop ordering.
-fn pruneInitializerCaptures(body: *structures.FunctionBodyAnalysis, gpa: std.mem.Allocator) ![]u32 {
-    const entry = &body.blocks[@backingInt(body.entry)];
-    std.debug.assert(entry.argument_start == 0);
-    const capture_count = entry.argument_end;
-    const used = try gpa.alloc(bool, body.valueCount());
-    defer gpa.free(used);
-    @memset(used, false);
-    body.visitValueReferences(used, markValueUsed);
-    for (body.instructions) |instruction| if (instruction == .mut_parameter_write) {
-        used[instruction.mut_parameter_write.parameter_index] = true;
-    };
-    var kept: std.ArrayList(u32) = .empty;
-    defer kept.deinit(gpa);
-    for (used[0..capture_count], 0..) |is_used, index| if (is_used) {
-        try kept.append(gpa, @intCast(index));
-    };
-    const removed: u32 = capture_count - @as(u32, @intCast(kept.items.len));
-    const arguments = try gpa.alloc(structures.FunctionBlockArgument, body.block_arguments.len - removed);
-    errdefer gpa.free(arguments);
-    const modes = try gpa.alloc(structures.ParameterMode, kept.items.len);
-    errdefer gpa.free(modes);
-    const remap = try gpa.alloc(structures.FunctionValueId, body.valueCount());
-    defer gpa.free(remap);
-    const kept_captures = try kept.toOwnedSlice(gpa);
-    @memset(remap, @fromBackingInt(@intCast(std.math.maxInt(u32))));
-    for (kept_captures, 0..) |old, index| {
-        arguments[index] = body.block_arguments[old];
-        modes[index] = body.parameter_modes[old];
-        remap[old] = @fromBackingInt(@intCast(index));
-    }
-    @memcpy(arguments[kept_captures.len..], body.block_arguments[capture_count..]);
-    for (capture_count..remap.len) |index| remap[index] = @fromBackingInt(@intCast(index - removed));
-    body.visitValueReferences(remap, remapValueReference);
-    for (body.instructions) |*instruction| if (instruction.* == .mut_parameter_write) {
-        const write = &instruction.mut_parameter_write;
-        write.parameter_index = @backingInt(remap[write.parameter_index]);
-    };
-    for (body.blocks, 0..) |*block, index| {
-        if (index != @backingInt(body.entry)) block.argument_start -= removed;
-        block.argument_end -= removed;
-    }
-    gpa.free(body.block_arguments);
-    gpa.free(body.parameter_modes);
-    body.block_arguments = arguments;
-    body.parameter_modes = modes;
-    return kept_captures;
+fn markCaptureUsed(mapping: []?u32, value: *structures.FunctionValueId) void {
+    const raw = @backingInt(value.*);
+    if (raw < mapping.len) mapping[raw] = 0;
 }
 
-fn markValueUsed(used: []bool, value: *structures.FunctionValueId) void {
-    used[@backingInt(value.*)] = true;
-}
-
-fn remapValueReference(mapping: []const structures.FunctionValueId, value: *structures.FunctionValueId) void {
-    value.* = mapping[@backingInt(value.*)];
-}
-
-fn normalizeValueReference(mapping: []const structures.FunctionValueId, value: *structures.FunctionValueId) void {
+fn normalizeValueReference(mapping: anytype, value: *structures.FunctionValueId) void {
     const instruction_mask: u32 = 1 << 31;
     const raw = @backingInt(value.*);
-    if (raw & instruction_mask != 0) value.* = mapping[raw & ~instruction_mask];
+    value.* = @fromBackingInt(if (raw & instruction_mask != 0)
+        mapping.argument_count + @backingInt(mapping.instructions[raw & ~instruction_mask])
+    else if (raw < mapping.captures.len)
+        mapping.captures[raw].?
+    else
+        raw - mapping.removed);
 }
 
 fn intersectTypes(
@@ -8014,7 +7862,7 @@ test "cleanup materializer inserts ordered custom drops at an interior boundary"
         },
     });
 
-    var body = try builder.finish();
+    var body = try builder.finish(null);
     defer body.deinit(context.gpa);
     try std.testing.expectEqual(@as(usize, 2), body.blocks.len);
     try std.testing.expectEqual(@as(usize, 5), body.instructions.len);
@@ -8058,7 +7906,7 @@ test "cleanup materializer finds boundaries after earlier splits" {
         },
     });
 
-    var body = try builder.finish();
+    var body = try builder.finish(null);
     defer body.deinit(context.gpa);
     try std.testing.expectEqual(@as(usize, 3), body.blocks.len);
     try std.testing.expectEqual(TestMaterializerTypes.custom_drop_hook, body.instructions[1].call.target.direct.item);
@@ -8088,7 +7936,7 @@ test "cleanup materializer emits produced cleanup at block entry" {
         .location = .{ .block_entry = target },
     }});
 
-    var body = try builder.finish();
+    var body = try builder.finish(null);
     defer body.deinit(context.gpa);
     const target_block = body.blocks[@backingInt(target)];
     try std.testing.expectEqual(@as(u32, 1), target_block.argument_end - target_block.argument_start);
@@ -8130,7 +7978,7 @@ test "cleanup materializer interposes only one predicate edge" {
         .location = .{ .edge = .{ .predecessor = entry, .successor_ordinal = 0 } },
     }});
 
-    var body = try builder.finish();
+    var body = try builder.finish(null);
     defer body.deinit(context.gpa);
     const predicate = body.blocks[@backingInt(entry)].terminator.predicate_branch;
     try std.testing.expect(predicate.then_branch.target != then_block);
@@ -8174,7 +8022,7 @@ test "cleanup materializer forwards fallible success payloads" {
         .location = .{ .edge = .{ .predecessor = entry, .successor_ordinal = 0 } },
     }});
 
-    var body = try builder.finish();
+    var body = try builder.finish(null);
     defer body.deinit(context.gpa);
     const cleanup_block = body.blocks[@backingInt(entry)].terminator.fallible_call.success;
     const cleanup = body.blocks[@backingInt(cleanup_block)];
@@ -8207,7 +8055,7 @@ test "cleanup materializer guards conditional ownership" {
         .location = .{ .boundary = boundary },
     }});
 
-    var body = try builder.finish();
+    var body = try builder.finish(null);
     defer body.deinit(context.gpa);
     const predicate = body.blocks[@backingInt(entry)].terminator.predicate_branch;
     try std.testing.expectEqual(body.instructionValue(1), predicate.operands.lhs);
@@ -8238,7 +8086,7 @@ test "cleanup materializer rejoins variant cleanup with the suffix" {
         .location = .{ .boundary = boundary },
     }});
 
-    var body = try builder.finish();
+    var body = try builder.finish(null);
     defer body.deinit(context.gpa);
     const suffix: structures.FunctionBlockId = @fromBackingInt(@intCast(1));
     var custom_drop_count: usize = 0;
@@ -8271,10 +8119,11 @@ fn testCleanupMaterializerAllocationFailures(gpa: std.mem.Allocator) !void {
         .cleanup_value = value.id,
         .location = .{ .boundary = boundary },
     }});
-    var body = try builder.finish();
+    var body = try builder.finish(null);
     defer body.deinit(gpa);
 }
 
 test "cleanup materializer releases partial CFG mutations on allocation failure" {
+    if (!@import("test_options").allocation_failures) return error.SkipZigTest;
     try std.testing.checkAllAllocationFailures(std.testing.allocator, testCleanupMaterializerAllocationFailures, .{});
 }
