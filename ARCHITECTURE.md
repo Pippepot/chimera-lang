@@ -51,13 +51,19 @@ This is a high-level map of the compiler's ownership and stage boundaries. [synt
 - Expression evaluation shares one dispatcher for access context, optional construction destination, and discarded results. Unevaluated type discovery and executed calls share member classification while retaining their separate evaluation and signature demands.
 - Generic calls infer static arguments from unevaluated argument types before
 	evaluating their arguments. The specialized call prepares each argument once,
-	in source order, through the ordinary call path.
+	in source order, through the ordinary call path. Variant annotations with one
+	dependent arm infer from the source members remaining after fixed arms are
+	removed. Fixed-only sources provide no evidence; inference does not partition
+	sources between multiple dependent arms.
 - Operation expressions select the left operand's type namespace through the
 	existing lookup and specialization APIs. Demanded signatures validate exact
 	arity, receiver ownership, modes, types, result, and fallibility. Arithmetic,
 	comparison, unary, and indexing calls reuse ordinary typed calls; no operation
 	query or new backend instruction is needed. Boolean predicates and `and`/`or`
-	remain explicit control flow. Indexed mutation selects `[]=` with an eager
+	remain explicit control flow.
+	Comparison signatures may declare a different immutable right operand type;
+	conversion remains ordinary call preparation and dispatch never swaps operands.
+	Indexed mutation selects `[]=` with an eager
 	owned argument, while compound indexing freezes the index, reads the old value
 	once, and scopes its temporary across getter/setter success and failure exits.
 	Compiler-supplied bodies use the existing transient-body executor; execution
@@ -73,6 +79,10 @@ This is a high-level map of the compiler's ownership and stage boundaries. [synt
 	for unused converters, without analyzing their bodies. Static struct sources
 	and integer literals specialize ordinary converter functions; a known static
 	argument does not force a runtime-capable converter body to run at compile time.
+	Typing considers static literal converters before runtime literal defaults and
+	prepares the selected converter input before choosing result placement. Borrowed
+	and destination-backed contexts share selection and ordinary failure capture;
+	a failure-only operand can select a converter whose input accepts `none`.
 - Frame-dependent static-only operands cannot use independent source thunks.
 	Their typed `static_conversion` operation reads the current interpreter value,
 	interns the canonical argument, and selects and invokes an ordinary converter
@@ -87,9 +97,13 @@ This is a high-level map of the compiler's ownership and stage boundaries. [synt
 	initializer regions before codegen, and allocation validates its element type
 	before layout. Static-only types have no host layout.
 - Ordinary and marked invocations share one AST call shape; the call's token records `(` or `?`. Semantic calls retain that source marker independently of their target. Source analysis requires it for fallible expression calls and permits omission only on the specific call used as a fallible condition. Semantic analysis checks declaration-known fallibility before evaluating explicit static arguments; typing checks it before signature demands, member specialization, and eager arguments can execute compile-time work or diverge. Generic declarations expose fallibility in the existing `FunctionShape` result before dependent types are specialized; shape equality includes it. Comparisons and extraction do not pass the exemption to their operands. The marker does not widen ordinary callables and does not enter published IR or change failure handling.
+- Expected variants containing `none` establish an ordinary failure continuation around the complete expression at a typed value destination. Typing joins successful conversion/construction with a constructed `none` member, retains ordinary ownership and reference origins, and continues evaluation. Calls use their parameter types to select this boundary; signatures, callable identities, and argument operands carry no separate failure-accepting qualifier. Deferred initializer regions apply the same rule when they construct their result. A later argument without an optional expected type still propagates failure and skips the call. Panic, exit, and diagnostics bypass ordinary failure capture.
+- Comparisons and logical control flow succeed with unit or fail in every expression position. Semantic predicates retain condition structure instead of synthesizing true/false values. A postfix query is a distinct AST operation from the fallible call marker and checks boolean data. Every condition owns a continuation for failures from its complete subtree. The standard `bool` converter receives the ordinary variant `unit | none`. Converter selection uses successful types before evaluation and allows builtin source widening into the converter input; an optional input establishes its usual expression boundary. There is no compiler truthiness or lazy argument behavior.
+- Failure materialized as `none` uses the existing variant representation, destinations, joins, cleanup, native ABI, interpreter storage, and cache validation. No outcome carrier or absent uninitialized payload crosses a call boundary. Successful `none` and captured failure are the same value; recovering control failure requires ordinary variant inspection or extraction. Mutable optional parameters retain the ordinary exact-place contract.
 - Shared IR owns direct operand and successor enumeration. Body-level stored-reference walking includes operand side tables, keeping parameter targets and nested regions separate. SSA finalization identifies retained initializer captures before freezing arrays and normalizes instruction and compacted argument IDs together. Cache validation checks raw ranges before traversal, and backend use marking follows operation-referenced ranges; operation legality and addressability remain with their consumers. Block arguments describe their logical type and whether the join passes storage. Storage selection is independent of a type's move capability, and cleanup edge splitting preserves it.
 - Calls share one operation with independent direct/indirect targets and optional result destinations. Owning initialization of an address-passed type constructs in the destination its consumer supplies: `local_storage` for locals, temporaries, and owned arguments, `result_storage` for the caller's result, and logical storage projections for fields, variant payloads, and array elements. Derived `argumentPassing` selects this representation for arrays and containing structs or variants as well as types that cannot move directly; it is not a duplicate ownership-capability field. Ordinary calls, copies, moves, and variant coercions write those destinations; conditional and loop results propagate them, and fallible results construct in storage instead of crossing the success edge. Typing never relocates a completed value that cannot move directly and rejects forms that would need it. Inferred-return compile-time thunks publish their result as a value instead. `Box.new` directly allocates one slot before forwarding its init parameter to fallible raw slot initialization. Success transfers the allocation into a Box; failure explicitly deallocates it after initializer cleanup and propagates with `fail`. No private storage guard, constructor interception, or Box-specific construction instruction is needed. Typing owns evaluation order, captures, and cleanup paths; codegen and the compile-time interpreter consume explicit destinations and operations.
-- An address-passed value is denoted by its storage independently of its direct movability. Field and array-element reads are storage projections, and a mutable local keeps one storage value across field updates, replacements, `mut` arguments, and loops: `call_mut_argument` writes its destination, and loops carry only the local's lifetime generation, not a block argument. Directly movable replacement prepares an owned value in separate storage, retains the target generation through preparation, and transfers into the existing storage after ending the old generation. Typing scopes local and reference targets, including mutable and writable-reference arguments during call preparation, and emits retention uses at completion and control-flow exits. Reference retention tracks live owners without treating it as access to an invalidated referent; ordinary access validation remains unchanged. Only ownership capabilities requiring destination construction select destructive replacement: the old value ends before constructing in the same storage, and a replaced field leaves its root's generation first, so an exit sees that field missing. Joins that select address-passed values pass addresses; codegen gives their block arguments address slots, and the compile-time interpreter passes storage cells, promoting a runtime slot before a storage projection or address-passed join creates a view. Compile-time field reads materialize only the selected field, so an unfinished sibling does not prevent access.
+- An address-passed value is denoted by its storage independently of its direct movability. Field and array-element reads are storage projections, and a mutable local keeps one storage value across field updates, replacements, `ref`/`mut` arguments, and loops. Reference arguments pass the caller's address directly; no mutable-result copy-back operation is needed. Loops carry only the local's lifetime generation, not a block argument. Directly movable replacement prepares an owned value in separate storage, retains the target generation through preparation, and transfers into the existing storage after ending the old generation. Typing scopes local and reference targets during call preparation and retains every argument's backing owners through call completion and control-flow exits. Reference retention tracks live owners without treating it as access to an invalidated referent; ordinary access validation remains unchanged. Only ownership capabilities requiring destination construction select destructive replacement: the old value ends before constructing in the same storage, and a replaced field leaves its root's generation first, so an exit sees that field missing. Joins that select address-passed values pass addresses; codegen gives their block arguments address slots, and the compile-time interpreter passes storage cells, promoting a runtime slot before a storage projection or address-passed join creates a view. Compile-time field reads materialize only the selected field, so an unfinished sibling does not prevent access.
+- Reference contracts preserve source and result paths through direct calls, converters, and custom ownership hooks. Fieldwise ownership preserves field correspondence; only unknown callable effects need conservative result projection. Parameter writeback merges all possible loans for each written referent before updating caller state. Slot identity, content identity, and variant-tag identity are independent, so a content write does not invalidate a surviving inline address or unchanged variant tag. Contract path walking uses physical reference-field storage, crossing internal references implicitly for structural steps and explicitly for referent outputs; snapshot validation accepts the same paths as body analysis.
 - Struct construction and fieldwise copy or move use explicit storage and field projections for every ABI representation. Updating a directly passed struct copies its root once and writes the selected field into that copy, preserving earlier SSA values. Address-passed owners keep their existing storage. These operations share the array and variant storage machinery; struct construction and field replacement require no separate typed instructions or field-value table.
 - For a borrowed variant argument that cannot move directly, its known type follows conditional results and loop breaks. Fresh initializers construct into storage of that type; existing values of the same type retain their borrowed storage. Widening an existing narrower value still requires direct movability. Typing carries the borrow context separately from an owning destination and preserves the source's cleanup and reference origins when widening directly movable values.
 - Compile-time expressions that require evaluation, including initializers, static arguments, and expressions in type positions, are typed before interpretation; direct type aliases and declared struct identities can resolve without it. Compile-time calls are memoized by concrete instance and canonical argument values. Interpreted outcomes distinguish values, fallible failure, and compiler control; type values have no runtime representation.
@@ -143,9 +157,9 @@ indirect callees, writable references, hooks, and implicit cleanup. Deferred rea
 conflict with every write to their referent; ordinary reference reads retain the
 checks for invalidated owned storage. Borrowed aggregate or owning parameters
 may alias other reference inputs; directly passed scalar copies have private
-storage. Writes, including mutable calls and scoped aliases, update caller storage
+storage. Writes, including mutable calls and explicit reference dereferences, update caller storage
 immediately and survive later failure. Mutability and transfer authority remain
-independent. Mutable alias writeback preserves the handle and merges conservative
+independent. Mutable reference writeback preserves the handle and merges conservative
 stored-reference origins into tracked local owners, including boxed referents.
 Call outputs retain incoming contained-reference origins conservatively. A
 borrow of an immutable argument's own storage adds that argument's owner only
@@ -206,8 +220,8 @@ private bulk initializer inherit only their supplied initializer's effect;
 provably infallible literals need no ordinary failure handling. Converter bodies
 must handle unrelated fallible operations locally. Forwarding leaves expressions
 unevaluated; explicitly fallible APIs retain their declared call requirements.
-Bare `fail` propagates
-ordinary failure in a fallible function or initializer region. Partial fields
+Bare `fail` propagates ordinary failure to the current failure handler, or to
+a declared fallible function or initializer region. Partial fields
 clean before receiving frames unwind, and cleanup and mutable copyback follow
 ordinary failure paths. Captured writes and completed transfers are not rolled back.
 
@@ -215,7 +229,7 @@ An initializer region is a control-flow boundary: it produces its value, fails,
 or diverges. Typing rejects `return` to the caller and `break` or `continue` to a
 loop outside the region; loops inside it retain local exits. Forwarding, aliases,
 and indirect calls preserve this boundary. Published IR has no lexical call
-outcomes or nonlocal initializer continuations. Native calls use `edx` only for
+continuations. Native calls use `edx` only for
 ordinary success (`1`) or failure (`0`), with small direct results in `eax` and
 larger or address-passed results in destination storage. There are no continuation
 tokens. Never-returning calls omit impossible success successors.
@@ -265,9 +279,38 @@ Remaining work and priorities are tracked in
 - `deinit` call arguments carry exact-typed source storage; typing propagates consuming access through conditional and loop results and materializes fresh argument coercions before publishing their addresses. Storage joins preserve the selected address in codegen and the selected cell in compile-time interpretation, including directly movable and zero-sized types. Preparing an owned root retains its generation until the call or failure cleanup. Typing rejects overlapping writes to any retained source while later arguments are prepared. Move hooks receive consuming access, and nested hooks dispatch normally. Local deinit authority is separate from a generation's fields-only cleanup policy. Typing derives remaining explicit-field obligations before lifetime planning; the solver does not interpret structural ownership. Deferred `init` capture effects are checked at callable acquisition and argument preparation, with published regions and cleanup surviving query/cache reuse; the language document owns those contracts.
 - `AnalysisContext` derives `copy` and `move` member availability from validated ownership capabilities and specializes private declarations in `std/ownership.chi`. These use ordinary instance identities and canonical callable types, with capability checks also applied when their signatures are demanded. Typing builds their bodies with the existing selected ownership operations and lifetime machinery; runtime codegen and compile-time interpretation consume ordinary typed IR. No member query, recursive source wrapper, or backend ownership dispatch is added.
 - Typing tracks ownership at control-flow edges. Lifetime effects are recorded in a boundary of the block where their operation executes; block statements and results never record into an enclosing expression's boundary. A `mut` parameter root is caller-owned and carries no generation; a value assigned to the whole root passes to the caller's place. After constructing the graph, `src/frontend/lifetime.zig` produces one path-sensitive ending plan. Each generation's explicit-drop requirement determines whether its ending is an abandonment diagnostic or automatic cleanup. Typing rejects abandonment before materializing the accepted plan as ordinary typed operations; neither the solver's state nor a generic destruction operation enters published IR.
+- Conditional bindings establish ownership effects in their success block.
+  Consuming variant extraction consumes the whole generation on that edge and
+  defines the selected payload's generation; the failure edge keeps whole-value
+  cleanup. If matched alternatives require explicit drop, failure consumes that
+  generation and drops only the unmatched automatic alternatives, using original
+  variant tags. Borrowed extraction retains copy semantics. Projections preserve
+  established reference origins rather than attaching their temporary binding
+  identity to an unrelated parameter root.
+- Source places have local, parameter, or explicit dereference roots with field
+  paths. Resolving a dereference evaluates its Ref once; it needs no anonymous
+  local or named-alias representation. Typing checks permissions and retains
+  reference origins across writes and mutable calls. Published IR uses ordinary
+  borrowed reads, addresses, and writes. Ref casts project concrete variant
+  members without copying, using the referent's tag and retaining its origins.
+  Acquiring a local address pins that local to storage; deferred captures pin
+  their local inputs as well, so loops and later references use the same slot.
+  Known local reference projections preserve field precision on mutable output.
+  Frame storage dependencies are separate from caller-owned allocated storage;
+  a reference to a copied parameter cannot escape with its frame.
+  Ordinary indexing remains the [] operation; get/get_mut return explicit Ref
+  values. Copied reads validate copy capability at the user's access boundary.
+- The registered std.memory Ref type constructor accepts one type argument,
+  optionally qualified by mut. Semantic analysis normalizes it to the private
+  RefStorage(element, writable) specialization. Recognition uses the registered
+  declaration identity, and no mutable-type runtime value is introduced. Public
+  visibility follows the referent type, not the private representation wrapper.
+- Semantic return statements preserve whether the body supplied an implicit
+  return. Typing evaluates and discards inline unit bodies with ordinary lifetime
+  effects; explicit returns and bodies with other result types check the result.
 - Conditions, branch results, and loop exits share predecessor joining for values, flow state, storage, ownership, and reference origins, with explicit policies for binding identity and borrowed facts. Loop headers establish ownership generations before typing the body; entry and backedges forward into those generations, and completion checks missing fields and cleanup policy without remapping body metadata.
 - Cleanup values retain reference provenance through ownership forwarding. After materialization, typing checks paths from expression-borrow reads through mutating destructor calls to later uses, stopping at fresh reads. Fieldwise and standard Box destruction visit only contained destructors; user hooks conservatively receive all writable references in their argument. Read identities and cleanup effects are query-local and do not enter cached IR.
-- Immutable local-binding metadata has one allocation owner. Live local values remain contiguous. Query-local snapshots retain only the prefix through the last bound local: up to 256 slots use independent contiguous copies; larger states share reference-counted 16-slot pages and copy a page before mutation. Capturing live values reuses equal pages from the preceding snapshot; restoring a snapshot clears the omitted tail. `State` owns cloning, cleanup, and joining the independent flow facts: local and field availability, initializer consumption, and definite consumption completion. Those arrays remain full-sized and independent of value-page sharing. Value and storage selection remain with the control-flow builder.
+- Immutable local-binding metadata has one allocation owner. Live local values remain contiguous. Query-local snapshots retain only the prefix through the last bound local: up to 256 slots use independent contiguous copies; larger states share reference-counted 16-slot pages and copy a page before mutation. Capturing live values reuses equal pages from the preceding snapshot; restoring a snapshot clears the omitted tail. `State` owns cloning, cleanup, and joining the independent flow facts: local and field availability, initializer consumption, and definite consumption completion. Those arrays remain full-sized and independent of value-page sharing. Value and storage selection remain with the control-flow builder. A join clears values for bindings absent on any incoming edge before selecting values or generations; lexical absence never produces a block argument.
 - Lifetime tables remain dense. `src/control_flow.zig` indexes incoming and outgoing edges without merging parallel edges and shares directional dirty-block scheduling across the three analyses. Availability and representations share forward traversal while retaining separate facts and joins. Typing rebuilds the index after cleanup insertion for backward reference checks, preserving both invalidated and valid path states. Ownership forwarding hints are stably grouped by predecessor and successor ordinal, so edge lowering visits only matching hints. Opt-in `BodyMeasurements` records snapshot and dense lifetime-table allocations without changing cached IR or publishing accumulators; `zig build flow-benchmark -Doptimize=fast` exercises branch scaling.
 
 ## Storage design
@@ -329,7 +372,7 @@ prefix. Do not introduce a thin allocation handle until retaining layout and
 location has a demonstrated material cost. Compiler storage and lifetime checks
 need not be expressible as ordinary library code.
 
-`Ref(T, writable)` and `Span(T, writable)` share a private typed `StorageCursor`.
+`Ref(T)`, `Ref(mut T)`, and `Span(T, writable)` share a private typed `StorageCursor`.
 Ref denotes one initialized element; Span adds initialized length and checked
 indexing/slicing. Their permission is independent of handle-binding mutability.
 Safe constructors borrow initialized arrays or List prefixes; unsafe allocation
@@ -585,7 +628,9 @@ identity even when prelude exports are disabled or shadowed.
 
 `std/text.chi` owns the literal/unique-allocation String variant, explicit clone,
 fallible growth, byte views, UTF-8 validation, and text slicing. `std/io.chi` owns
-standard stream handles, progress loops, and printing. The only byte-access and
+standard stream handles, fallible progress loops, and infallible printing.
+`print` handles write failure in ordinary source by exiting with panic status
+134; it has no special compiler operation. The only byte-access and
 OS operations are registered externs private to their owning storage modules.
 BytesView wraps a readonly byte Span; StringView adds a maintained UTF-8 guarantee.
 Writes consume initialized readonly byte spans. Reads initialize spare allocation

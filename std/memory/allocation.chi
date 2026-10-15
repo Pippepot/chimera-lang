@@ -1,19 +1,20 @@
 import std.text.{BytesView}
 import std.array.{Array, collection_literal}
 import std.exit.{exit}
+import std.memory
 
 pub struct Allocation(T: type)
     storage: HostStorage
     count: int
     drop = explicit
 
-    pub fallible allocate_raw(count: int) Allocation(T) -> allocate?(T, count)
-    pub func release(deinit self: Allocation(T)) -> deallocate(T, self^)
+    pub fallible allocate(count: int) Allocation(T) -> std.memory.allocate?(T, count)
+    pub func deallocate(deinit self: Allocation(T)) -> std.memory.deallocate(T, self^)
     pub func capacity(imm self: Allocation(T)) int -> allocation_count(T, self)
-    pub fallible unsafe_init(mut self: Allocation(T), index: int, init item: T) -> unsafe_initialize?(T, self, index, item)
-    pub func unsafe_remove(mut self: Allocation(T), index: int) T -> unsafe_take(T, self, index)
-    pub func unsafe_drop(mut self: Allocation(T), index: int) -> unsafe_destroy(T, self, index)
-    pub func unsafe_ref(imm self: Allocation(T), index: int) Ref(T, false) -> unsafe_borrow_element(T, self, index)
+    pub fallible unsafe_initialize(mut self: Allocation(T), index: int, init item: T) -> std.memory.unsafe_initialize?(T, self, index, item)
+    pub func unsafe_take(mut self: Allocation(T), index: int) T -> std.memory.unsafe_take(T, self, index)
+    pub func unsafe_destroy(mut self: Allocation(T), index: int) -> std.memory.unsafe_destroy(T, self, index)
+    pub func unsafe_borrow(ref self: Allocation(T), index: int) ref T -> std.memory.unsafe_borrow(T, self, index)
 
 pub extern fallible allocate(static T: type, count: int) Allocation(T)
 pub extern func deallocate(static T: type, deinit allocation: Allocation(T))
@@ -21,7 +22,7 @@ extern func allocation_count(static T: type, imm allocation: Allocation(T)) int
 pub extern fallible unsafe_initialize(static T: type, mut allocation: Allocation(T), index: int, init item: T)
 pub extern func unsafe_take(static T: type, mut allocation: Allocation(T), index: int) T
 pub extern func unsafe_destroy(static T: type, mut allocation: Allocation(T), index: int)
-pub extern func unsafe_borrow_initialized(static T: type, imm allocation: Allocation(T), index: int) T
+pub extern func unsafe_borrow(static T: type, ref allocation: Allocation(T), index: int) ref T
 
 pub struct List(T: type)
     copy = none
@@ -47,9 +48,10 @@ pub struct List(T: type)
 
     pub func len(imm self: List(T)) int -> self.initialized
     pub func capacity(imm self: List(T)) int -> self.storage.capacity()
-    pub func span(imm self: List(T)) Span(T, false) -> Span(T, false){data = allocation_cursor(T, self.storage), size = self.initialized}
-    pub func span_mut(mut self: List(T)) Span(T, true) -> Span(T, true){data = allocation_cursor_mut(T, self.storage), size = self.initialized}
-    pub fallible view(imm self: List(T), start: int, size: int) Span(T, false) -> self.span().slice?(start, size)
+    pub func span(ref self: List(T)) Span(T) -> Span(T){data = allocation_cursor(T, self.storage), size = self.initialized}
+    pub fallible view(ref self: List(T), start: int, size: int) Span(T)
+        const range = self.span()
+        return range.slice?(start, size)
     pub fallible bytes(imm self: List(byte)) BytesView -> BytesView.unsafe_from_allocation?(self.storage, self.initialized)
     pub fallible read_bytes(mut self: List(byte), descriptor: int, count: int) int
         count >= 0
@@ -96,23 +98,16 @@ pub struct List(T: type)
         unsafe_initialize?(T, self.storage, self.initialized, item^)
         self.initialized += 1
 
-    pub fallible get(imm self: List(T), index: int) Ref(T, false)
+    pub fallible get(ref self: List(T), index: int) ref T
         index >= 0
         index < self.initialized
-        return unsafe_borrow_element(T, self.storage, index)
+        return unsafe_borrow(T, self.storage, index)
 
-    pub fallible get_mut(mut self: List(T), index: int) Ref(T, true)
-        index >= 0
-        index < self.initialized
-        return unsafe_borrow_mut_element(T, self.storage, index)
-
-    pub fallible [](imm self: List(T), index: int) T
-        const element = self.get?(index)
-        return element[]
+    pub fallible [](ref self: List(T), index: int) ref T -> self.get?(index)
 
     pub fallible []=(mut self: List(T), index: int, var item: T) unit
-        const element = self.get_mut?(index)
-        element[] = item^
+        ref element = self.get?(index)
+        element = item^
 
 func allocate_literal(static T: type, count: int) Allocation(T)
     if const storage = allocate(T, count) -> return storage^
@@ -140,90 +135,67 @@ pub struct Box(T: type)
             deallocate(T, storage)
             fail
 
-    pub func borrow(imm self: Box(T)) Ref(T, false) -> borrow_box(T, self)
-    pub func borrow_mut(mut self: Box(T)) Ref(T, true) -> borrow_mut_box(T, self)
-    pub func into_value(deinit self: Box(T)) T -> value(T, self^)
+    pub func borrow(ref self: Box(T)) ref T -> std.memory.borrow(T, self)
+    pub func take(deinit self: Box(T)) T -> std.memory.take(T, self^)
 
-struct StorageCursor(T: type, writable: bool)
+struct StorageCursor(T: type)
     address_low: int
     address_high: int
     copy = trivial
 
-pub struct Span(T: type, writable: bool)
+pub struct Span(T: type)
     copy = trivial
-    data: StorageCursor(T, writable)
+    data: StorageCursor(T)
     size: int
 
-    pub func empty() Span(T, writable) -> Span(T, writable){data = empty_cursor(T, writable), size = 0}
-    pub func from_array(static N: int, imm array: Array(T, N)) Span(T, false) -> Span(T, false){data = array_cursor(T, N, array), size = N}
-    pub func from_array_mut(static N: int, mut array: Array(T, N)) Span(T, true) -> Span(T, true){data = array_cursor_mut(T, N, array), size = N}
-    pub fallible unsafe_from_allocation(imm allocation: Allocation(T), initialized: int) Span(T, false)
+    pub func empty() Span(T) -> Span(T){data = empty_cursor(T), size = 0}
+    pub func from_array(static N: int, ref array: Array(T, N)) Span(T) -> Span(T){data = array_cursor(T, N, array), size = N}
+    pub fallible unsafe_from_allocation(ref allocation: Allocation(T), initialized: int) Span(T)
         initialized >= 0
         initialized <= allocation.capacity()
-        return Span(T, false){data = allocation_cursor(T, allocation), size = initialized}
-    pub fallible unsafe_from_allocation_mut(mut allocation: Allocation(T), initialized: int) Span(T, true)
-        initialized >= 0
-        initialized <= allocation.capacity()
-        return Span(T, true){data = allocation_cursor_mut(T, allocation), size = initialized}
-    pub func unsafe_from_static(imm source: static_data, size: int) Span(byte, false) -> Span(byte, false){data = static_cursor(source), size = size}
-    pub func len(imm self: Span(T, writable)) int -> self.size
-    pub fallible get(imm self: Span(T, writable), index: int) Ref(T, false)
+        return Span(T){data = allocation_cursor(T, allocation), size = initialized}
+    pub func unsafe_from_static(imm source: static_data, size: int) Span(byte) -> Span(byte){data = static_cursor(source), size = size}
+    pub func len(imm self: Span(T)) int -> self.size
+    pub fallible get(ref self: Span(T), index: int) ref T
         index >= 0
         index < self.size
-        return cursor_element(T, writable, false, self.data, index)
-    pub fallible get_mut(imm self: Span(T, true), index: int) Ref(T, true)
-        index >= 0
-        index < self.size
-        return cursor_element(T, true, true, self.data, index)
-    pub fallible [](imm self: Span(T, writable), index: int) T
-        const element = self.get?(index)
-        return element[]
-    pub fallible []=(imm self: Span(T, true), index: int, var item: T) unit
-        const element = self.get_mut?(index)
-        element[] = item^
-    pub fallible slice(imm self: Span(T, writable), start: int, size: int) Span(T, writable)
+        return cursor_element(T, self.data, index)
+    pub fallible [](ref self: Span(T), index: int) ref T -> self.get?(index)
+    pub fallible []=(mut self: Span(T), index: int, var item: T) unit
+        ref element = self.get?(index)
+        element = item^
+    pub fallible slice(ref self: Span(T), start: int, size: int) Span(T)
         start >= 0
         size >= 0
         start <= self.size
         size <= self.size - start
-        return Span(T, writable){data = cursor_offset(T, writable, self.data, start), size = size}
-    pub func as_imm(imm self: Span(T, true)) Span(T, false) -> Span(T, false){data = cursor_attenuate(T, self.data), size = self.size}
+        return Span(T){data = cursor_offset(T, self.data, start), size = size}
+    pub func as_imm(imm self: Span(T)) Span(T) -> Span(T){data = cursor_attenuate(T, self.data), size = self.size}
 
-extern func empty_cursor(static T: type, static writable: bool) StorageCursor(T, writable)
-extern func static_cursor(imm source: static_data) StorageCursor(byte, false)
-extern func array_cursor(static T: type, static N: int, imm array: Array(T, N)) StorageCursor(T, false)
-extern func array_cursor_mut(static T: type, static N: int, mut array: Array(T, N)) StorageCursor(T, true)
-extern func allocation_cursor(static T: type, imm allocation: Allocation(T)) StorageCursor(T, false)
-extern func allocation_cursor_mut(static T: type, mut allocation: Allocation(T)) StorageCursor(T, true)
-extern func cursor_offset(static T: type, static writable: bool, imm source: StorageCursor(T, writable), offset: int) StorageCursor(T, writable)
-extern func cursor_element(static T: type, static source_writable: bool, static writable: bool, imm source: StorageCursor(T, source_writable), index: int) Ref(T, writable)
-extern func cursor_attenuate(static T: type, imm source: StorageCursor(T, true)) StorageCursor(T, false)
+extern func empty_cursor(static T: type) StorageCursor(T)
+extern func static_cursor(imm source: static_data) StorageCursor(byte)
+extern func array_cursor(static T: type, static N: int, ref array: Array(T, N)) StorageCursor(T)
+extern func allocation_cursor(static T: type, ref allocation: Allocation(T)) StorageCursor(T)
+extern func cursor_offset(static T: type, ref source: StorageCursor(T), offset: int) StorageCursor(T)
+extern func cursor_element(static T: type, ref source: StorageCursor(T), index: int) ref T
+extern func cursor_attenuate(static T: type, imm source: StorageCursor(T)) StorageCursor(T)
 
-pub struct Ref(T: type, writable: bool)
-    cursor: StorageCursor(T, writable)
+pub struct Ref(T: type)
     copy = trivial
+    pub ref value: T
 
-    pub func as_imm(imm self: Ref(T, true)) Ref(T, false) -> attenuate_ref(T, self)
-    pub func read(imm self: Ref(T, writable)) T -> self[]
-    pub func replace(imm self: Ref(T, true), var item: T) -> write(T, self, item^)
+    pub func from(ref item: T) Ref(T) -> Ref(T){value = item}
 
-pub extern func borrow_box(static T: type, imm owner: Box(T)) Ref(T, false)
-pub extern func borrow_mut_box(static T: type, mut owner: Box(T)) Ref(T, true)
-pub extern func borrow_local(static T: type, imm item: T) Ref(T, false)
-pub extern func unsafe_borrow_element(static T: type, imm allocation: Allocation(T), index: int) Ref(T, false)
-extern func unsafe_borrow_mut_element(static T: type, imm allocation: Allocation(T), index: int) Ref(T, true)
-pub extern func read(static T: type, static writable: bool, imm reference: Ref(T, writable)) T
-pub extern func write(static T: type, imm reference: Ref(T, true), var item: T)
-extern func attenuate_ref(static T: type, imm reference: Ref(T, true)) Ref(T, false)
+pub extern func borrow(static T: type, ref owner: Box(T)) ref T
 
-pub func value(static T: type, deinit owner: Box(T)) T
+pub func take(static T: type, deinit owner: Box(T)) T
     const result = unsafe_take_box(T, owner)
     deallocate_box(T, owner^)
     return result^
 
 extern func unsafe_own_box(static T: type, deinit allocation: Allocation(T)) Box(T)
 extern func unsafe_take_box(static T: type, mut owner: Box(T)) T
-extern func unsafe_destroy_box(static T: type, imm owner: Box(T))
+extern func unsafe_destroy_box(static T: type, mut owner: Box(T))
 extern func deallocate_box(static T: type, deinit owner: Box(T))
 
 extern fallible io_read(descriptor: int, imm allocation: Allocation(byte), start: int, count: int) int

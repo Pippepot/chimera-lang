@@ -42,11 +42,11 @@ test "operation indexing compound assignments and reference assignments have par
         \\    values[0] *= 2
         \\    values[0] -= 2
         \\    values[0] /= 2
-        \\    if const reference = values.get_mut(1)
-        \\        reference[] += 1
-        \\        reference[] *= 2
-        \\        reference[] -= 2
-        \\        reference[] /= 2
+        \\    if ref reference = values.get(1)
+        \\        reference += 1
+        \\        reference *= 2
+        \\        reference -= 2
+        \\        reference /= 2
         \\    return values[0] + values[1] + 11
         \\func run() int
         \\    if const calculated = calculate() -> return calculated
@@ -93,7 +93,7 @@ test "indexed replacements and compound updates read the same owner across conta
     for ([_][]const u8{
         "var values = [10, 20]",
         "var values: List(int) = [10, 20]",
-        "var backing = [10, 20]\n    const values = backing.span_mut()",
+        "var backing = [10, 20]\n    var values = backing.span()",
     }) |binding| {
         const source = try test_sources.renderTemplate(testing.allocator,
             \\fallible calculate() int
@@ -125,18 +125,18 @@ test "indexed nested array replacements finish conversion before mutable access"
 test "invalid indexed replacement cleans its prepared owned value" {
     try Fixture.expectParity(
         \\struct Item
-        \\    trace: Ref(int, true)
+        \\    trace: Ref(int)
         \\    value: int
         \\    drop = func(deinit self: Item)
-        \\        self.trace.replace(self.trace[] + self.value)
+        \\        self.trace.value = self.trace.value + self.value
         \\struct Sink
         \\    pub fallible []=(mut self: Sink, index: int, var item: Item) unit -> fail
         \\func run() int
         \\    var trace = [0]
-        \\    if const handle = trace.get_mut(0)
+        \\    if ref handle = trace.get(0)
         \\        var sink = Sink{}
-        \\        if sink[99] = Item{trace = handle, value = 42} -> return 90
-        \\        return handle[]
+        \\        if sink[99] = Item{trace = Ref.from(handle), value = 42} -> return 90
+        \\        return handle
         \\    return 91
     , 42);
 }
@@ -149,8 +149,8 @@ test "explicit checked reference acquisition skips the replacement on bounds fai
         \\func run() int
         \\    var values = [20]
         \\    var calls = 0
-        \\    if const target = values.get_mut(99)
-        \\        target[] = replacement(calls)
+        \\    if ref target = values.get(99)
+        \\        target = replacement(calls)
         \\    if const first = values[0] -> return first + calls + 22
         \\    return 90
     , 42);
@@ -198,14 +198,21 @@ test "operation indexing replacement destroys the previous element" {
     , 42);
 }
 
-test "operation indexing replacement preserves reference origin restrictions" {
-    try Fixture.expectAnySourceDiagnostic(
-        \\var original = [42]
-        \\if const reference = original.get(0)
-        \\    var values = [reference]
-        \\    if values[0] = reference -> exit(91)
-        \\exit(90)
-    , .borrow_write_cannot_store_borrow);
+test "operation indexing replacement retains stored reference origins" {
+    try Fixture.expectParity(
+        \\fallible calculate() int
+        \\    var original = [17]
+        \\    if ref item = original.get(0)
+        \\        var values = [Ref.from(item)]
+        \\        values[0] = Ref.from(item)
+        \\        ref stored = values[0]
+        \\        stored.value = 42
+        \\        return item
+        \\    return 90
+        \\func run() int
+        \\    if const answer = calculate() -> return answer
+        \\    return 91
+    , 42);
 }
 
 test "operation indexing List and views use the same operator contract" {
@@ -231,13 +238,31 @@ test "List literal constructs contextual empty and byte lists in heap storage" {
         \\    var values: List(int) = [19, 23]
         \\    const empty: List(int) = []
         \\    const bytes: List(byte) = [1, 2]
-        \\    if const first = values.get_mut(0)
-        \\        first.replace(20)
-        \\    if const first = values.get(0)
-        \\        if const second = values.get(1)
-        \\            return first[] + second[] + empty.len() + bytes.len() - 3
+        \\    if ref first = values.get(0)
+        \\        first = 20
+        \\    if ref first = values.get(0)
+        \\        if ref second = values.get(1)
+        \\            return first + second + empty.len() + bytes.len() - 3
         \\    return 90
         \\exit(run())
+    , 42);
+}
+
+test "List growth retains zero-sized logical elements and their destruction" {
+    try Fixture.expectParity(
+        \\struct Item
+        \\    drop = func(deinit self: Item) -> exit(42)
+        \\fallible exercise() int
+        \\    var values = List(Item).new?(0)
+        \\    values.append?(Item{})
+        \\    values.append?(Item{})
+        \\    values.append?(Item{})
+        \\    if values.len() <> 3 -> exit(91)
+        \\    if values.capacity() <> 4 -> exit(92)
+        \\    return 93
+        \\func run() int
+        \\    if const result = exercise() -> return result
+        \\    return 94
     , 42);
 }
 
@@ -246,19 +271,19 @@ test "List literal failure drops an immovable prefix in reverse and skips later 
         \\struct Item
         \\    move = none
         \\    copy = none
-        \\    trace: Ref(int, true)
+        \\    trace: Ref(int)
         \\    value: int
         \\    drop = func(deinit self: Item)
-        \\        self.trace.replace(self.trace[] * 10 + self.value)
-        \\fallible missing(imm trace: Ref(int, true)) Item -> fail
-        \\func skipped(imm trace: Ref(int, true)) Item
+        \\        self.trace.value = self.trace.value * 10 + self.value
+        \\fallible missing(var trace: Ref(int)) Item -> fail
+        \\func skipped(var trace: Ref(int)) Item
         \\    exit(91)
         \\func run() int
         \\    var trace = Array(int, 1).filled(0)
-        \\    if const target = trace.get_mut(0)
-        \\        if const values: List(Item) = [Item{trace = target, value = 2}, Item{trace = target, value = 4}, missing?(target), skipped(target)]
+        \\    if ref target = trace.get(0)
+        \\        if const values: List(Item) = [Item{trace = Ref.from(target), value = 2}, Item{trace = Ref.from(target), value = 4}, missing?(Ref.from(target)), skipped(Ref.from(target))]
         \\            return 92
-        \\    if const result = trace.get(0) -> return result[]
+        \\    if ref result = trace.get(0) -> return result
         \\    return 93
         \\exit(run())
     , 42);
@@ -269,10 +294,10 @@ test "List explicit fallible factory infers length and preserves ordinary elemen
         \\fallible missing() int -> fail
         \\func run() int
         \\    if const values = List(int).from([19, 23])
-        \\        if const first = values.get(0)
-        \\            if const second = values.get(1)
+        \\        if ref first = values.get(0)
+        \\            if ref second = values.get(1)
         \\                if const failed = List(int).from([missing?()]) -> return 91
-        \\                return first[] + second[]
+        \\                return first + second
         \\    return 90
         \\exit(run())
     , 42);
@@ -307,28 +332,28 @@ test "List cleanup releases failed allocations and destroys completed lists in r
         \\struct Item
         \\    move = none
         \\    copy = none
-        \\    trace: Ref(int, true)
+        \\    trace: Ref(int)
         \\    value: int
         \\    drop = func(deinit self: Item)
-        \\        self.trace.replace(self.trace[] * 10 + self.value)
-        \\fallible missing(imm trace: Ref(int, true)) Item -> fail
+        \\        self.trace.value = self.trace.value * 10 + self.value
+        \\fallible missing(var trace: Ref(int)) Item -> fail
         \\func run() int
         \\    var trace = Array(int, 1).filled(0)
-        \\    if const target = trace.get_mut(0)
+        \\    if ref target = trace.get(0)
         \\        var iteration = 0
         \\        loop
         \\            if iteration == 384 -> break
-        \\            target.replace(0)
-        \\            if const values: List(Item) = [Item{trace = target, value = 2}, Item{trace = target, value = 4}, missing?(target)]
+        \\            target = 0
+        \\            if const values: List(Item) = [Item{trace = Ref.from(target), value = 2}, Item{trace = Ref.from(target), value = 4}, missing?(Ref.from(target))]
         \\                return 91
-        \\            if target[] == 42
+        \\            if target == 42
         \\                iteration += 1
         \\            else
         \\                return 92
-        \\        target.replace(0)
-        \\        const complete: List(Item) = [Item{trace = target, value = 2}, Item{trace = target, value = 4}]
+        \\        target = 0
+        \\        const complete: List(Item) = [Item{trace = Ref.from(target), value = 2}, Item{trace = Ref.from(target), value = 4}]
         \\        complete.len()
-        \\    if const result = trace.get(0) -> return result[]
+        \\    if ref result = trace.get(0) -> return result
         \\    return 93
         \\exit(run())
     , 42);
@@ -336,14 +361,14 @@ test "List cleanup releases failed allocations and destroys completed lists in r
 
 test "List construction and borrowing preserve stored external reference origins" {
     try Fixture.expectSourceExit(
-        \\func make(imm value: Ref(int, false)) List(Ref(int, false)) -> [value]
+        \\func make(imm value: Ref(int)) List(Ref(int)) -> [value]
         \\func run() int
         \\    const original = Array(int, 1).filled(42)
-        \\    if const reference = original.get(0)
-        \\        const values = make(reference)
-        \\        if const stored = values.get(0)
-        \\            const result = stored[]
-        \\            return result[]
+        \\    if ref reference = original.get(0)
+        \\        const values = make(Ref.from(reference))
+        \\        if ref stored = values.get(0)
+        \\            const result = stored
+        \\            return result.value
         \\    return 90
         \\exit(run())
     , 42);
@@ -359,14 +384,14 @@ test "collection initializer consumers infer the pending shape and construct eac
         \\fallible count(static T: type, static N: int, init values: collection_literal(T, N)) int
         \\    const array: Array(T, N) = values
         \\    return array.len()
-        \\func element(imm trace: Ref(int, true)) int
-        \\    trace.replace(trace[] + 1)
+        \\func element(var trace: Ref(int)) int
+        \\    trace.value = trace.value + 1
         \\    return 19
         \\func run() int
         \\    var trace = Array(int, 1).filled(0)
-        \\    if const target = trace.get_mut(0)
-        \\        if const size = count([element(target), element(target)])
-        \\            return target[] + size + 38
+        \\    if ref target = trace.get(0)
+        \\        if const size = count([element(Ref.from(target)), element(Ref.from(target))])
+        \\            return target + size + 38
         \\    return 90
     , 42);
 }
@@ -378,10 +403,10 @@ test "collection literals default contextual empty nested and byte arrays have p
         \\    const empty: Array(int, 0) = []
         \\    const bytes: Array(byte, 2) = [1, 2]
         \\    const nested: Array(Array(int, 2), 1) = [[19, 23]]
-        \\    if const first = values.get(0)
-        \\        if const last = nested.get(0)
-        \\            if const second = last[].get(1)
-        \\                return first[] + second[] + empty.len() + bytes.len() - 2
+        \\    if ref first = values.get(0)
+        \\        if ref last = nested.get(0)
+        \\            if ref second = last.get(1)
+        \\                return first + second + empty.len() + bytes.len() - 2
         \\    return 90
     , 42);
 }
@@ -391,19 +416,19 @@ test "collection literal failure drops the completed prefix in reverse and skips
         \\struct Item
         \\    move = none
         \\    copy = none
-        \\    trace: Ref(int, true)
+        \\    trace: Ref(int)
         \\    value: int
         \\    drop = func(deinit self: Item)
-        \\        self.trace.replace(self.trace[] * 10 + self.value)
-        \\fallible missing(imm trace: Ref(int, true)) Item -> fail
-        \\func skipped(imm trace: Ref(int, true)) Item
+        \\        self.trace.value = self.trace.value * 10 + self.value
+        \\fallible missing(var trace: Ref(int)) Item -> fail
+        \\func skipped(var trace: Ref(int)) Item
         \\    exit(91)
         \\func run() int
         \\    var trace = Array(int, 1).filled(0)
-        \\    if const target = trace.get_mut(0)
-        \\        if const values: Array(Item, 4) = [Item{trace = target, value = 2}, Item{trace = target, value = 4}, missing?(target), skipped(target)]
+        \\    if ref target = trace.get(0)
+        \\        if const values: Array(Item, 4) = [Item{trace = Ref.from(target), value = 2}, Item{trace = Ref.from(target), value = 4}, missing?(Ref.from(target)), skipped(Ref.from(target))]
         \\            return 92
-        \\    if const result = trace.get(0) -> return result[]
+        \\    if ref result = trace.get(0) -> return result
         \\    return 93
     , 42);
 }
@@ -423,10 +448,10 @@ test "Array integer fill get and get_mut have native and comptime parity" {
         \\import std.array.{Array}
         \\func run() int
         \\    var values = Array(int, 3).filled(20)
-        \\    if const middle = values.get_mut(1) -> middle.replace(22)
+        \\    if ref middle = values.get(1) -> middle = 22
         \\    else return 90
-        \\    if const first = values.get(0)
-        \\        if const middle = values.get(1) -> return first[] + middle[]
+        \\    if ref first = values.get(0)
+        \\        if ref middle = values.get(1) -> return first + middle
         \\    return 91
     , 42);
 }
@@ -440,7 +465,7 @@ test "Array filled evaluates its source once" {
         \\func run() int
         \\    var calls = 0
         \\    const values = Array(int, 4).filled(next(calls))
-        \\    if const last = values.get(3) -> return last[] + calls
+        \\    if ref last = values.get(3) -> return last + calls
         \\    return 90
     , 42);
 }
@@ -456,7 +481,7 @@ test "Array empty fill evaluates once and all bounds fail" {
         \\    var empty = Array(int, 0).filled(next(calls))
         \\    if empty.get(-1) -> return 90
         \\    if empty.get(0) -> return 91
-        \\    if empty.get_mut(0) -> return 92
+        \\    if empty.get(0) -> return 92
         \\    if empty.len() <> 0 -> return 93
         \\    return calls + 41
     , 42);
@@ -469,9 +494,9 @@ test "Array populated bounds reject negative and past end indices" {
         \\    var values = Array(int, 2).filled(42)
         \\    if values.get(-1) -> return 90
         \\    if values.get(2) -> return 91
-        \\    if values.get_mut(-1) -> return 92
-        \\    if values.get_mut(2) -> return 93
-        \\    if const last = values.get(1) -> return last[]
+        \\    if values.get(-1) -> return 92
+        \\    if values.get(2) -> return 93
+        \\    if ref last = values.get(1) -> return last
         \\    return 94
     , 42);
 }
@@ -482,8 +507,8 @@ test "Array nested fill and element borrows retain shape" {
         \\func run() int
         \\    const row = Array(int, 3).filled(42)
         \\    const matrix = Array(Array(int, 3), 2).filled(row)
-        \\    if const selected = matrix.get(1)
-        \\        if const cell = selected[].get(2) -> return cell[]
+        \\    if ref selected = matrix.get(1)
+        \\        if ref cell = selected.get(2) -> return cell
         \\    return 90
     , 42);
 }
@@ -500,7 +525,7 @@ test "Array fill and whole copy invoke immovable element custom copies" {
         \\    const values = Array(Item, 3).filled(original)
         \\    const copied = values.copy()
         \\    if original.value <> 40 -> return 90
-        \\    if const selected = copied.get(2) -> return selected[].value
+        \\    if ref selected = copied.get(2) -> return selected.value
         \\    return 91
     , 42);
 }
@@ -516,7 +541,7 @@ test "Array whole move invokes element custom moves" {
         \\    const original = Item{value = 41}
         \\    const values = Array(Item, 3).filled(original)
         \\    const moved = values.move()
-        \\    if const selected = moved.get(2) -> return selected[].value
+        \\    if ref selected = moved.get(2) -> return selected.value
         \\    return 90
     , 42);
 }
@@ -532,8 +557,8 @@ test "Array nested whole copies invoke every element custom copy" {
         \\    const row = Array(Item, 3).filled(original)
         \\    const matrix = Array(Array(Item, 3), 2).filled(row)
         \\    const copied = matrix.copy()
-        \\    if const selected = copied.get(1)
-        \\        if const cell = selected[].get(2) -> return cell[].value
+        \\    if ref selected = copied.get(1)
+        \\        if ref cell = selected.get(2) -> return cell.value
         \\    return 90
     , 42);
 }
@@ -549,11 +574,11 @@ test "Array automatic cleanup drops elements in reverse index order" {
         \\        if self.value == 42 -> exit(42)
         \\func run()
         \\    var values = Array(Item, 2).filled(Item{value = 0})
-        \\    if const first = values.get_mut(0) -> first.replace(Item{value = 41})
-        \\    if const last = values.get_mut(1) -> last.replace(Item{value = 42})
-        \\    if const first = values.get(0)
-        \\        if const last = values.get(1)
-        \\            if first[].value + last[].value <> 83 -> exit(90)
+        \\    if ref first = values.get(0) -> first = Item{value = 41}
+        \\    if ref last = values.get(1) -> last = Item{value = 42}
+        \\    if ref first = values.get(0)
+        \\        if ref last = values.get(1)
+        \\            if first.value + last.value <> 83 -> exit(90)
         \\run()
         \\exit(91)
     , 42);
@@ -604,22 +629,22 @@ test "Array borrowed element cannot escape its local array" {
     try Fixture.expectAnySourceDiagnostic(
         \\import std.array.{Array}
         \\import std.memory.{Ref}
-        \\func bad() Ref(int, false)
+        \\func bad() Ref(int)
         \\    const values = Array(int, 2).filled(42)
-        \\    if const selected = values.get(1) -> return selected
+        \\    if ref selected = values.get(1) -> return Ref.from(selected)
         \\    return bad()
         \\const reference = bad()
-        \\exit(reference[])
+        \\exit(reference.value)
     , .borrow_outlives_source);
 }
 
 test "Array fill cannot return references to a local source" {
     try Fixture.expectAnySourceDiagnostic(
         \\import std.array.{Array}
-        \\import std.memory.{Ref, borrow_local}
-        \\func bad() Array(Ref(int, false), 2)
+        \\import std.memory.{Ref}
+        \\func bad() Array(Ref(int), 2)
         \\    const value = 42
-        \\    return Array(Ref(int, false), 2).filled(borrow_local(int, value))
+        \\    return Array(Ref(int), 2).filled(Ref.from(value))
         \\const values = bad()
         \\exit(values.len())
     , .borrow_outlives_source);
@@ -628,13 +653,13 @@ test "Array fill cannot return references to a local source" {
 test "Array fill and nested reference reads preserve runtime source dependencies" {
     try Fixture.expectParity(
         \\import std.array.{Array}
-        \\import std.memory.{Ref, borrow_local}
-        \\func fill(imm source: Ref(int, false)) Array(Ref(int, false), 2)
-        \\    return Array(Ref(int, false), 2).filled(source)
+        \\import std.memory.{Ref}
+        \\func fill(imm source: Ref(int)) Array(Ref(int), 2)
+        \\    return Array(Ref(int), 2).filled(source)
         \\func run() int
         \\    const value = 42
-        \\    const values = fill(borrow_local(int, value))
-        \\    if const selected = values.get(1) -> return selected[][]
+        \\    const values = fill(Ref.from(value))
+        \\    if ref selected = values.get(1) -> return selected.value
         \\    return 90
     , 42);
 }
@@ -643,28 +668,28 @@ test "Array get_mut requires mutable source storage" {
     try Fixture.expectRejected(
         \\import std.array.{Array}
         \\const values = Array(int, 2).filled(42)
-        \\if const selected = values.get_mut(0) -> selected.replace(1)
+        \\if ref selected = values.get(0) -> selected = 1
         \\exit(42)
     );
 }
 
-test "Array whole copy hooks invalidate pending borrowed owners" {
+test "Array copy hooks preserve transitive readonly access" {
     try Fixture.expectAnySourceDiagnostic(
         \\import std.array.{Array}
-        \\import std.memory.{Ref, borrow_box, borrow_mut_box}
+        \\import std.memory.{Ref}
         \\struct Handle
-        \\    target: Ref(Box(int), true)
+        \\    target: Ref(Box(int))
         \\    copy = func(imm self: Handle) Handle
-        \\        if const replacement = Box.new(17) -> self.target.replace(replacement^)
+        \\        if const replacement = Box.new(17) -> self.target.value = replacement^
         \\        return Handle{target = self.target}
-        \\func inspect(imm earlier: Ref(int, false), imm values: Array(Handle, 2)) int -> earlier[] + values.len()
+        \\func inspect(imm earlier: Ref(int), imm values: Array(Handle, 2)) int -> earlier.value + values.len()
         \\fallible run() int
         \\    var owner = Box.new?(Box.new?(42))
-        \\    const source = Handle{target = owner.borrow_mut()}
+        \\    var source = Handle{target = Ref.from(owner.borrow())}
         \\    const values = Array(Handle, 2).filled(source)
-        \\    return inspect(owner.borrow()[].borrow(), values.copy())
+        \\    return inspect(Ref.from(owner.borrow().borrow()), values.copy())
         \\if const result = run() -> exit(result) else exit(90)
-    , .borrow_outlives_source);
+    , .reference_not_writable);
 }
 
 test "Array static nested values publish into runtime storage" {
@@ -673,8 +698,8 @@ test "Array static nested values publish into runtime storage" {
         \\static matrix = Array(Array(int, 2), 2).filled(row)
         \\func run() int
         \\    const values = matrix
-        \\    if const selected = values.get(1)
-        \\        if const value = selected[].get(0) -> return value[] + row.len() + 20
+        \\    if ref selected = values.get(1)
+        \\        if ref value = selected.get(0) -> return value + row.len() + 20
         \\    return 90
         \\exit(run())
     , 42);
@@ -698,24 +723,27 @@ test "Array embedded storage supports checked mutable access" {
         \\    copy = fieldwise
         \\func run() int
         \\    var holder = Holder{values = Array(int, 3).filled(20)}
-        \\    if const selected = holder.values.get_mut(1) -> selected.replace(22)
+        \\    if ref selected = holder.values.get(1) -> selected = 22
         \\    else return 90
         \\    const copied = holder.copy()
-        \\    if const selected = copied.values.get(1) -> return selected[] + 20
+        \\    if ref selected = copied.values.get(1) -> return selected + 20
         \\    return 91
     , 42);
 }
 
 test "Array boxed inline storage retains mutable element references" {
-    try Fixture.expectSourceExit(
-        \\fallible run() int
+    try Fixture.expectParity(
+        \\import std.memory
+        \\fallible calculate() int
         \\    var owner = Box.new?(Array(int, 3).filled(20))
-        \\    borrow mut values = owner.borrow_mut()[]
-        \\    if const selected = values.get_mut(1) -> selected.replace(22)
+        \\    var values = Ref.from(owner.borrow())
+        \\    if ref selected = values.value.get(1) -> selected = 22
         \\    else return 90
-        \\    if const selected = values.get(1) -> return selected[] + 20
+        \\    if ref selected = values.value.get(1) -> return selected + 20
         \\    return 91
-        \\if const answer = run() -> exit(answer) else exit(92)
+        \\func run() int
+        \\    if const answer = calculate() -> return answer
+        \\    return 92
     , 42);
 }
 
@@ -730,7 +758,7 @@ test "Array variant payload copies immovable nested elements in place" {
         \\    const values = Array(Item, 2).filled(Item{value = 39})
         \\    const possible = widen(values)
         \\    if const selected = possible as Array(Item, 2)
-        \\        if const element = selected.get(1) -> return element[].value
+        \\        if ref element = selected.get(1) -> return element.value
         \\    return 90
     , 42);
 }
@@ -750,81 +778,83 @@ test "Array zero-sized logical elements retain custom destruction" {
 
 test "Array whole copies retain contained reference origins" {
     try Fixture.expectParity(
-        \\import std.memory.{borrow_local}
-        \\func duplicate(imm values: Array(Ref(int, false), 2)) Array(Ref(int, false), 2)
+        \\import std.memory.{Ref}
+        \\func duplicate(imm values: Array(Ref(int), 2)) Array(Ref(int), 2)
         \\    return values.copy()
         \\func run() int
         \\    const source = 42
-        \\    const original = Array(Ref(int, false), 2).filled(borrow_local(int, source))
+        \\    const original = Array(Ref(int), 2).filled(Ref.from(source))
         \\    const values = duplicate(original)
-        \\    if const selected = values.get(1) -> return selected[][]
+        \\    if ref selected = values.get(1) -> return selected.value
         \\    return 90
     , 42);
     try Fixture.expectAnySourceDiagnostic(
-        \\import std.memory.{borrow_local}
-        \\func bad() Array(Ref(int, false), 2)
+        \\import std.memory.{Ref}
+        \\func bad() Array(Ref(int), 2)
         \\    const source = 42
-        \\    const values = Array(Ref(int, false), 2).filled(borrow_local(int, source))
+        \\    const values = Array(Ref(int), 2).filled(Ref.from(source))
         \\    return values.copy()
         \\const values = bad()
         \\exit(values.len())
     , .borrow_outlives_source);
 }
 
-test "Array element references are invalidated by whole storage replacement" {
-    try Fixture.expectAnySourceDiagnostic(
+test "Array element references observe whole storage replacement" {
+    try Fixture.expectParity(
         \\func run() int
         \\    var values = Array(int, 2).filled(42)
-        \\    if const selected = values.get(1)
+        \\    if ref selected = values.get(1)
         \\        values = Array(int, 2).filled(17)
-        \\        return selected[]
+        \\        return selected
         \\    return 90
         \\exit(run())
-    , .borrow_outlives_source);
+    , 17);
 }
 
-test "Array fill invokes exactly N ordinary element copies" {
-    try Fixture.expectSourceExit(
+test "Array fill invokes an ordinary copy for each initialized element" {
+    try Fixture.expectParity(
         \\struct Item
-        \\    counter: Ref(int, true)
-        \\    copy = func(imm self: Item) Item
-        \\        self.counter.replace(self.counter[] + 1)
-        \\        return Item{counter = self.counter}
-        \\fallible run() int
-        \\    var counter = Box.new?(37)
-        \\    const source = Item{counter = counter.borrow_mut()}
-        \\    const values = Array(Item, 5).filled(source)
-        \\    if values.len() <> 5 -> return 90
-        \\    return counter.borrow()[]
-        \\if const answer = run() -> exit(answer) else exit(91)
+        \\    value: int
+        \\    copy = func(imm self: Item) Item -> Item{value = self.value + 1}
+        \\fallible calculate() int
+        \\    const source = Item{value = 20}
+        \\    const values = Array(Item, 2).filled(source)
+        \\    ref first = values.get?(0)
+        \\    ref second = values.get?(1)
+        \\    return first.value + second.value
+        \\func run() int
+        \\    if const result = calculate() -> return result
+        \\    return 90
     , 42);
 }
 
 test "mutable alias call arguments write direct values back to their referents" {
     try Fixture.expectParity(
+        \\import std.memory
         \\func advance(mut value: int)
         \\    value += 2
         \\func run() int
         \\    var source = 40
-        \\    borrow mut selected = source
-        \\    advance(selected)
+        \\    var selected = Ref.from(source)
+        \\    advance(selected.value)
         \\    return source
     , 42);
 }
 
 test "Array mutable alias calls retain newly stored reference origins" {
     try Fixture.expectAnySourceDiagnostic(
-        \\import std.memory.{borrow_local}
-        \\func overwrite(mut values: Array(Ref(int, false), 1), imm reference: Ref(int, false))
-        \\    values = Array(Ref(int, false), 1).filled(reference)
+        \\import std.memory
+        \\import std.memory.{Ref}
+        \\func overwrite(mut values: Array(Ref(int), 1), imm reference: Ref(int))
+        \\    values = Array(Ref(int), 1).filled(reference)
         \\func run() int
         \\    const original = 42
-        \\    var values = Array(Ref(int, false), 1).filled(borrow_local(int, original))
+        \\    var values = Array(Ref(int), 1).filled(Ref.from(original))
         \\    if 1 == 1
         \\        const temporary = 17
-        \\        borrow mut selected = values
-        \\        overwrite(selected, borrow_local(int, temporary))
-        \\    if const selected = values.get(0) -> return selected[][]
+        \\        ref selected = values
+        \\        overwrite(selected, Ref.from(temporary))
+        \\    if ref selected = values.get(0) -> return selected.value
         \\    return 90
         \\exit(run())
     , .borrow_outlives_source);
@@ -832,18 +862,19 @@ test "Array mutable alias calls retain newly stored reference origins" {
 
 test "Array dereferenced mutable aliases cannot retain short-lived references" {
     try Fixture.expectAnySourceDiagnostic(
-        \\import std.memory.{borrow_local}
-        \\func overwrite(mut values: Array(Ref(int, false), 1), imm reference: Ref(int, false))
-        \\    values = Array(Ref(int, false), 1).filled(reference)
+        \\import std.memory
+        \\import std.memory.{Ref}
+        \\func overwrite(mut values: Array(Ref(int), 1), imm reference: Ref(int))
+        \\    values = Array(Ref(int), 1).filled(reference)
         \\fallible run() int
         \\    const original = 42
-        \\    var owner = Box.new?(Array(Ref(int, false), 1).filled(borrow_local(int, original)))
+        \\    var owner = Box.new?(Array(Ref(int), 1).filled(Ref.from(original)))
         \\    if 1 == 1
         \\        const temporary = 17
-        \\        borrow mut selected = owner.borrow_mut()[]
-        \\        overwrite(selected, borrow_local(int, temporary))
-        \\    borrow selected = owner.borrow()[]
-        \\    if const element = selected.get(0) -> return element[][]
+        \\        var selected = Ref.from(owner.borrow())
+        \\        overwrite(selected.value, Ref.from(temporary))
+        \\    var selected = Ref.from(owner.borrow())
+        \\    if ref element = selected.value.get(0) -> return element.value
         \\    return 90
         \\if const answer = run() -> exit(answer) else exit(91)
     , .borrow_outlives_source);
@@ -851,59 +882,61 @@ test "Array dereferenced mutable aliases cannot retain short-lived references" {
 
 test "Array boxed mutable aliases retain long-lived reference origins" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_local}
-        \\func overwrite(mut values: Array(Ref(int, false), 1), imm reference: Ref(int, false))
-        \\    values = Array(Ref(int, false), 1).filled(reference)
+        \\import std.memory
+        \\import std.memory.{Ref}
+        \\func overwrite(mut values: Array(Ref(int), 1), imm reference: Ref(int))
+        \\    values = Array(Ref(int), 1).filled(reference)
         \\fallible run() int
         \\    const original = 17
         \\    const replacement = 42
-        \\    var owner = Box.new?(Array(Ref(int, false), 1).filled(borrow_local(int, original)))
+        \\    var owner = Box.new?(Array(Ref(int), 1).filled(Ref.from(original)))
         \\    if 1 == 1
-        \\        borrow mut selected = owner.borrow_mut()[]
-        \\        overwrite(selected, borrow_local(int, replacement))
-        \\    borrow selected = owner.borrow()[]
-        \\    if const element = selected.get(0) -> return element[][]
+        \\        var selected = Ref.from(owner.borrow())
+        \\        overwrite(selected.value, Ref.from(replacement))
+        \\    var selected = Ref.from(owner.borrow())
+        \\    if ref element = selected.value.get(0) -> return element.value
         \\    return 90
         \\if const answer = run() -> exit(answer) else exit(91)
     , 42);
 }
 
-test "Array mutable aliases reject reference writes without a tracked owner" {
-    try Fixture.expectAnySourceDiagnostic(
-        \\import std.memory.{borrow_local}
-        \\func overwrite(mut values: Array(Ref(int, false), 1), imm reference: Ref(int, false))
-        \\    values = Array(Ref(int, false), 1).filled(reference)
-        \\func change(imm target: Ref(Array(Ref(int, false), 1), true), imm replacement: Ref(int, false))
-        \\    borrow mut selected = target[]
-        \\    overwrite(selected, replacement)
+test "Array reference parameters retain caller origins when storing other inputs" {
+    try Fixture.expectSourceExit(
+        \\import std.memory
+        \\import std.memory.{Ref}
+        \\func overwrite(mut values: Array(Ref(int), 1), imm reference: Ref(int))
+        \\    values = Array(Ref(int), 1).filled(reference)
+        \\func change(var target: Ref(Array(Ref(int), 1)), replacement: Ref(int))
+        \\    var selected = Ref.from(target.value)
+        \\    overwrite(selected.value, replacement)
         \\fallible run() int
         \\    const original = 42
-        \\    var owner = Box.new?(Array(Ref(int, false), 1).filled(borrow_local(int, original)))
-        \\    change(owner.borrow_mut(), borrow_local(int, original))
+        \\    var owner = Box.new?(Array(Ref(int), 1).filled(Ref.from(original)))
+        \\    change(Ref.from(owner.borrow()), Ref.from(original))
         \\    return 42
         \\if const answer = run() -> exit(answer) else exit(91)
-    , .borrow_write_cannot_store_borrow);
+    , 42);
 }
 
 test "compile-time direct scalar arguments copy caller storage before mutation" {
     try Fixture.expectParity(
-        \\func observe(imm captured: int, imm target: Ref(int, true)) int
-        \\    target.replace(22)
+        \\func observe(imm captured: int, var target: Ref(int)) int
+        \\    target.value = 22
         \\    return captured + 22
         \\func run() int
         \\    var values = Array(int, 1).filled(20)
-        \\    if const target = values.get_mut(0) -> return observe(target[], target)
+        \\    if ref target = values.get(0) -> return observe(target, Ref.from(target))
         \\    return 90
     , 42);
 }
 
 test "compile-time variant coercion preserves returned reference payloads" {
     try Fixture.expectParity(
-        \\func choose(imm reference: Ref(int, false)) Ref(int, false) | none -> reference
+        \\func choose(imm reference: Ref(int)) Ref(int) | none -> reference
         \\func run() int
         \\    const values = Array(int, 1).filled(42)
-        \\    if const reference = values.get(0)
-        \\        if const selected = choose(reference) as Ref(int, false) -> return selected[]
+        \\    if ref reference = values.get(0)
+        \\        if const selected = choose(Ref.from(reference)) as Ref(int) -> return selected.value
         \\    return 90
     , 42);
 }
@@ -912,7 +945,7 @@ test "Array immutable arguments permit widening address-passed movable values" {
     try Fixture.expectParity(
         \\func inspect(imm possible: Array(int, 2) | none) int
         \\    if const values = possible as Array(int, 2)
-        \\        if const selected = values.get(1) -> return selected[]
+        \\        if ref selected = values.get(1) -> return selected
         \\    return 90
         \\func run() int
         \\    const values = Array(int, 2).filled(42)
@@ -922,29 +955,29 @@ test "Array immutable arguments permit widening address-passed movable values" {
 
 test "compile-time direct reference arguments copy handles without copying referents" {
     try Fixture.expectParity(
-        \\import std.memory.{borrow_local}
-        \\func retarget(mut reference: Ref(int, false), imm replacement: Ref(int, false))
+        \\import std.memory.{Ref}
+        \\func retarget(mut reference: Ref(int), imm replacement: Ref(int))
         \\    reference = replacement
         \\func run() int
         \\    const original = 20
         \\    const replacement = 22
-        \\    var reference = borrow_local(int, original)
+        \\    var reference = Ref.from(original)
         \\    const captured = reference
-        \\    retarget(reference, borrow_local(int, replacement))
-        \\    return captured[] + reference[]
+        \\    retarget(reference, Ref.from(replacement))
+        \\    return captured.value + reference.value
     , 42);
 }
 
 test "compile-time reference variants support widening and conditional results" {
     try Fixture.expectParity(
-        \\func choose(imm reference: Ref(int, false)) Ref(int, false) | none
+        \\func choose(imm reference: Ref(int)) Ref(int) | none
         \\    return if 1 == 1 -> reference else none
-        \\func widen(imm possible: Ref(int, false) | none) Ref(int, false) | none | bool -> possible
+        \\func widen(imm possible: Ref(int) | none) Ref(int) | none | bool -> possible
         \\func run() int
         \\    const values = Array(int, 1).filled(42)
-        \\    if const reference = values.get(0)
-        \\        const possible = choose(reference)
-        \\        if const selected = widen(possible) as Ref(int, false) -> return selected[]
+        \\    if ref reference = values.get(0)
+        \\        const possible = choose(Ref.from(reference))
+        \\        if const selected = widen(possible) as Ref(int) -> return selected.value
         \\    return 90
     , 42);
 }

@@ -7,6 +7,8 @@ All commands below run from the repository root.
 
 Install Zig 0.17 and make `zig` available on `PATH`.
 
+Comparisons and logical operators use success and failure uniformly. Store an outcome with `bool(value < limit)` and query stored data with `enabled?`. A parameter such as `value: int | none` eagerly receives a successful integer or `none` when argument preparation fails; `if const found = value as int` extracts the payload. The same rule applies to expected variants containing `none` at typed bindings, assignments, field initialization, and returns. Ownership modes and the function's declared fallibility retain their ordinary meanings. See [syntax&semantics.txt](../syntax&semantics.txt) for argument order, ownership, and failure-boundary rules.
+
 ## Run
 
 ```sh
@@ -56,21 +58,40 @@ be passed between nested calls but cannot escape into published values, static
 arguments, or runtime storage; copied or extracted ordinary data can leave evaluation.
 
 `List(T).new`, `reserve`, and `append` provide fallible dynamic growth. Array and
-List expose `span()` and `span_mut()` over their initialized elements.
-`Span(T, writable)` provides checked slicing, copied indexing, and borrowed
-`get`/`get_mut` access; `as_imm()` attenuates permission. Spans own no storage and
+List expose `span()` over their initialized elements.
+`Span(T)` provides checked slicing and borrowed `get`/index access with permission
+captured from the receiver; owned bindings copy elements, and `as_imm()` attenuates
+permission. Copies and mutable bindings cannot upgrade readonly backing. Spans own no storage and
 cannot escape local backing or survive owner transfer. Readonly spans do not
 freeze their owners; conflicting writes invalidate content-dependent views.
 
 UTF-8 literals default to the prelude `String`. Literal-backed strings allocate
 nothing; mutation grows unique owned storage, and `clone` is explicitly fallible.
 `StringView` and `BytesView` are read-only views with byte counts; BytesView wraps
-`Span(byte, false)`, while StringView additionally guarantees UTF-8. `byte_int` is the
+`Span(byte)` with readonly backing, while StringView additionally guarantees UTF-8.
+BytesView `get`/index results are readonly `ref byte`; owned bindings copy the byte.
+`byte_int` is the
 named widening operation. `BytesView.validate_utf8` validates arbitrary byte
 input, and text slices check codepoint boundaries. String-to-view converters
 borrow their source; literal-to-view converters refer to permanent static bytes.
 `String` and `StringView` support `==` and `<>` with exact byte equality,
-including embedded NUL bytes. Integer `%` is truncating remainder (`-7 % 3`
+including embedded NUL bytes and either order of owned strings, views, and
+literals. `ref item = items[index]` aliases a checked borrowed element with the
+receiver's permission; `const item = items[index]` copies it. Box.borrow and
+collection get/index access return ref T. Box.take consumes its owner and extracts
+the value; raw Allocation methods match the allocate/deallocate and unsafe
+initialize/borrow/take/destroy free functions. Explicit handles use Ref.from(place)
+and expose a reference field, value. Ref(T) owns only its handle; Box(T) owns T.
+Readonly access is transitive, and copying a readonly handle into a var cannot
+upgrade it. `if ref part = value as Part` borrows a variant payload without
+copying. Borrowed function results are declared with ref T, including in callable
+types. `ref` and `mut` parameters preserve caller storage identity; `mut` requires
+writable access. Owned getters remain owned and cannot initialize a ref binding.
+`if const item = source^ as T` consumes a variant on both paths; success owns the
+payload and failure cleans the unmatched temporary. Fresh variant results extract
+by ownership as well. Type arguments accept unions and callable types directly,
+such as Array(int | none, 2).
+Integer `%` is truncating remainder (`-7 % 3`
 is `-1`), and `%=` uses the same operation. Delimited calls, arrays, struct
 initializers, imports, and parameter lists accept multiline continuation layout.
 
@@ -78,14 +99,16 @@ initializers, imports, and parameter lists accept multiline continuation layout.
 fallible output()
     var text = "hello"
     text.append?(" 🌍")
-    print?(text)
+    print(text)
 if output() -> exit(0)
 exit(1)
 ```
 
-`std.io` exports `stdin`, `stdout`, `stderr`, `read_bytes`, `write_once`,
-`write_all`, and `write_text`; `print` is also a prelude export. Reads append to
-`List(byte)` and expose only the initialized prefix through `bytes()`. Short
+`std.io` exports `stdin`, `stdout`, and `stderr`, plus fallible `read_bytes`,
+`write_once`, `write_all`, and `write_text`. `print` is an infallible prelude
+export that writes text and a newline, terminating with panic status 134 on
+output failure. Reads append to `List(byte)` and expose only the initialized
+prefix through `bytes()`. Short
 counts are successful progress; a nonempty read returning zero indicates EOF.
 Failures keep existing initialized contents and earlier I/O effects. Programs
 using output ignore SIGPIPE so a broken pipe becomes ordinary write failure.
@@ -170,10 +193,11 @@ zig build test --seed=0 -Doptimize=safe -Dtest-source=tests/comptime_interpreter
 ```
 
 These entrypoints supply required module imports. Both suite modes run inline
-tests once through `test_sources.zig` and eight standalone suites (nine default
+tests once through `test_sources.zig` and nine standalone suites (ten default
 roots total): `tests/array_test.zig`, `tests/converter_test.zig`, `tests/codegen_test.zig`,
 `tests/comptime_interpreter_test.zig`, `tests/modules_test.zig`,
-`tests/query_disk_cache_test.zig`, `tests/query_test.zig`, and `tests/text_test.zig`.
+`tests/query_disk_cache_test.zig`, `tests/query_test.zig`, `tests/reference_test.zig`,
+and `tests/text_test.zig`.
 Each runs in its own binary's directory.
 Private disk-cache tests remain inline in
 `src/query_disk_cache.zig`; its snapshot integration suite lives in
@@ -189,7 +213,7 @@ caches compilation but reruns tests. The `safe` mode speeds up allocation checks
 with a slower first compile.
 
 For quick test iteration, omit `-Doptimize=safe` and select the affected
-suite with `-Dtest-source`. The full suite builds nine separate test binaries;
+suite with `-Dtest-source`. The full suite builds ten separate test binaries;
 its compilation cost is different from building the CLI once.
 
 Use focused checks during edits; run the routine suite once for changes spanning
@@ -226,8 +250,8 @@ represent a demanding case rather than a promise that sparse storage would help.
 
 Snapshot measurements count retained contiguous value slots or page-pointer
 arrays, each unique shared value page once (including its reference-count
-header), local and field availability, initializer state, and definite
-consumption completion. Trailing unbound value slots are omitted. Lifetime
+header), local and field availability, and initializer state. Trailing unbound
+value slots are omitted. Lifetime
 measurements count dense solver tables, not dirty-block flags or other scratch.
 Neither measurement is process RSS or an allocation-traffic counter. Value-page
 sharing reduces copying but does not remove the remaining snapshot-by-slot

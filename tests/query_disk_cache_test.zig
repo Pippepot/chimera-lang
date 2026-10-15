@@ -108,14 +108,15 @@ const Fixture = struct {
 
 test "cursor snapshots restore literal and empty spans and recompute source edits" {
     const source =
-        \\static empty = Span(int, true).empty().as_imm()
+        \\static empty = Span(int).empty().as_imm()
         \\static bytes: BytesView = "\u{e9}"
         \\func run() int
         \\    const values = [19, 23]
         \\    const view = values.span()
-        \\    if const first = view.get(0)
-        \\        if const second = view.get(1)
-        \\            return first[] + second[] + empty.len() + bytes.byte_length() - 2
+        \\    if ref first = view.get(0)
+        \\        if ref second = view.get(1)
+        \\            if ref literal = bytes.get(0)
+        \\                return first + second + empty.len() + bytes.byte_length() - 2 + byte_int(literal) - 195
         \\    return 90
         \\static answer = run()
         \\exit(run() + answer - 42)
@@ -129,12 +130,88 @@ test "cursor snapshots restore literal and empty spans and recompute source edit
     try fixture.expectExit(44);
 }
 
+test "raw borrow snapshots recompute source and registered signature edits" {
+    const source =
+        \\import std.memory.{Allocation}
+        \\fallible calculate() int
+        \\    var storage = Allocation(int).allocate?(1)
+        \\    if storage.unsafe_initialize(0, 20) -> unit
+        \\    else
+        \\        storage^.deallocate()
+        \\        fail
+        \\    ref item = storage.unsafe_borrow(0)
+        \\    item += 22
+        \\    const result = item
+        \\    storage.unsafe_destroy(0)
+        \\    storage^.deallocate()
+        \\    return result
+        \\func run() int
+        \\    if const result = calculate() -> return result
+        \\    return 90
+        \\exit(run())
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const edited = try std.mem.replaceOwned(u8, std.testing.allocator, source, "(0, 20)", "(0, 21)");
+    defer std.testing.allocator.free(edited);
+    try fixture.db.setInput(queries.SourceText, 0, edited);
+    try fixture.expectExit(43);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    const memory_module = try fixture.db.intern(queries.ModulePaths, .{ .path = "std.memory" });
+    const declarations = (try fixture.db.get(queries.ModuleDeclarations, memory_module)).*.?;
+    const resolved = (try fixture.db.get(queries.ResolveItem, declarations.resolveFunction("unsafe_borrow").?)).*.?;
+    const library_source = standard_library.source("memory/allocation.chi");
+    const invalid = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        library_source,
+        "pub extern func unsafe_borrow(static T: type, ref allocation: Allocation(T), index: int) ref T",
+        "pub extern func unsafe_borrow(static T: type, imm allocation: Allocation(T), index: int) ref T",
+    );
+    defer std.testing.allocator.free(invalid);
+    try fixture.db.setInput(queries.SourceText, resolved.file_id, invalid);
+    try std.testing.expect((try fixture.db.get(queries.BuildExecutable, 0)).* == null);
+    const diagnostics = try fixture.db.transitiveAccumulatorValues(queries.BuildExecutable, 0, structures.Diagnostic, std.testing.allocator);
+    defer std.testing.allocator.free(diagnostics);
+    var invalid_signature = false;
+    for (diagnostics) |diagnostic| {
+        if (diagnostic.kind == .invalid_external_signature) invalid_signature = true;
+    }
+    try std.testing.expect(invalid_signature);
+    try fixture.db.setInput(queries.SourceText, resolved.file_id, library_source);
+    try fixture.expectExit(42);
+}
+
+test "span snapshots retain capabilities and recompute attenuation edits" {
+    const source =
+        \\func capture(ref owner: Array(int, 1)) Span(int) -> owner.span()
+        \\func run() int
+        \\    var owner = [12]
+        \\    var view = capture(owner)
+        \\    if ref item = view.get(0)
+        \\        item += 30
+        \\        return item
+        \\    return 90
+        \\exit(run())
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const edited = try std.mem.replaceOwned(u8, std.testing.allocator, source, "-> owner.span()", "-> owner.span().as_imm()");
+    defer std.testing.allocator.free(edited);
+    try fixture.db.setInput(queries.SourceText, 0, edited);
+    try fixture.expectDiagnostic(.reference_not_writable);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(42);
+}
+
 test "returned text borrows reject conflicting writes after snapshot restoration" {
     const source =
-        \\fallible validate(imm view: Span(byte, true)) StringView -> BytesView.from_span(view.as_imm()).validate_utf8?()
+        \\fallible validate(imm view: Span(byte)) StringView -> BytesView.from_span(view.as_imm()).validate_utf8?()
         \\fallible inspect() int
         \\    var bytes: Array(byte, 1) = [65]
-        \\    const writable = bytes.span_mut()
+        \\    var writable = bytes.span()
         \\    const text = validate?(writable)
         \\    return text.byte_length() + 41
         \\func run() int
@@ -196,17 +273,17 @@ test "evaluation heap snapshots restore scalar results and recompute callee elem
     const source =
         \\struct Item
         \\    move = none
-        \\    trace: Ref(int, true)
+        \\    trace: Ref(int)
         \\    value: int
-        \\    drop = func(deinit self: Item) -> self.trace.replace(self.trace[] + self.value)
+        \\    drop = func(deinit self: Item) -> self.trace.value = self.trace.value + self.value
         \\func element() int -> 2
-        \\fallible calculate(imm trace: Ref(int, true)) int
+        \\fallible calculate(var trace: Ref(int)) int
         \\    const owner = Box(Item).new?(Item{trace = trace, value = element()})
-        \\    return owner.borrow()[].value + 38
+        \\    return owner.borrow().value + 38
         \\func run() int
         \\    var trace = Array(int, 1).filled(0)
-        \\    if const target = trace.get_mut(0)
-        \\        if const value = calculate(target) -> return value + target[]
+        \\    if ref target = trace.get(0)
+        \\        if const value = calculate(Ref.from(target)) -> return value + target
         \\    return 90
         \\static answer = run()
         \\exit(answer)
@@ -218,7 +295,7 @@ test "evaluation heap snapshots restore scalar results and recompute callee elem
     defer std.testing.allocator.free(callee);
     try fixture.db.setInput(queries.SourceText, 0, callee);
     try fixture.expectExit(44);
-    const cleanup = try std.mem.replaceOwned(u8, std.testing.allocator, source, "self.trace[] + self.value)", "self.trace[] + self.value + 1)");
+    const cleanup = try std.mem.replaceOwned(u8, std.testing.allocator, source, "self.trace.value + self.value", "self.trace.value + self.value + 1");
     defer std.testing.allocator.free(cleanup);
     try fixture.db.setInput(queries.SourceText, 0, cleanup);
     try fixture.expectExit(43);
@@ -238,9 +315,9 @@ test "collection snapshots restore pending carriers heap destinations and initia
         \\func run() int
         \\    const fixed: Array(int, 1) = [element()]
         \\    const values: List(int) = [23]
-        \\    if const first = fixed.get(0)
-        \\        if const second = values.get(0)
-        \\            return first[] + second[]
+        \\    if ref first = fixed.get(0)
+        \\        if ref second = values.get(0)
+        \\            return first + second
         \\    return 90
         \\exit(run())
     ;
@@ -677,7 +754,7 @@ test "allocating initializer snapshots retain named return hooks and invalidate 
         \\    const callback: fallible(init Item) Box(Item) = own
         \\    const first = callback?(copied())
         \\    const second = callback?(moved())
-        \\    return first.borrow()[].value + second.borrow()[].value
+        \\    return first.borrow().value + second.borrow().value
         \\if const value = run() -> exit(value) else exit(99)
     ;
     const fixture = try Fixture.restore(source);
@@ -736,11 +813,11 @@ test "allocating initializer snapshots retain partial cleanup and consumption on
         errdefer std.debug.print("allocating completion: {s}\n", .{completion});
         const source = try std.testing.allocator.print(
             \\struct Leaf
-            \\    count: Ref(int, true)
+            \\    count: Ref(int)
             \\    move = fieldwise
             \\    copy = none
             \\    drop = func(deinit self: Leaf)
-            \\        self.count[] = self.count[] + 1
+            \\        self.count.value = self.count.value + 1
             \\struct Item
             \\    move = none
             \\    first: Leaf
@@ -751,9 +828,9 @@ test "allocating initializer snapshots retain partial cleanup and consumption on
             \\fallible run() int
             \\    var count = Box.new?(40)
             \\    const callback: fallible(init Item) Box(Item) = Box(Item).new
-            \\    const leaf = Leaf{{count = count.borrow_mut()}}
+            \\    var leaf = Leaf{{count = Ref.from(count.borrow())}}
             \\    if callback(Item{{first = leaf^, second = if true == true -> {s} else 0}}) -> return 99
-            \\    return count.borrow()[] + 1
+            \\    return count.borrow() + 1
             \\if const result = run() -> exit(result) else exit(98)
         , .{completion});
         defer std.testing.allocator.free(source);
@@ -775,7 +852,7 @@ test "raw slot initializer snapshots retain immovable destruction and recompute 
         \\    value: int
         \\    drop = func(deinit self: Item) -> exit(self.value)
         \\func make(value: int) Item -> Item{value = value}
-        \\fallible initialize(mut storage: Allocation(Item), init item: Item) -> storage.unsafe_init?(1, item)
+        \\fallible initialize(mut storage: Allocation(Item), init item: Item) -> storage.unsafe_initialize?(1, item)
         \\fallible run()
         \\    var storage = allocate?(Item, 2)
         \\    const callback: fallible(mut Allocation(Item), init Item) unit = initialize
@@ -783,7 +860,7 @@ test "raw slot initializer snapshots retain immovable destruction and recompute 
         \\    else
         \\        deallocate(Item, storage)
         \\        fail
-        \\    storage.unsafe_drop(1)
+        \\    storage.unsafe_destroy(1)
         \\    deallocate(Item, storage)
         \\if run() -> exit(99) else exit(98)
     ;
@@ -809,14 +886,14 @@ test "array snapshots restore native and comptime fill reads writes and bounds" 
         \\import std.array.{Array}
         \\func run() int
         \\    var values = Array(int, 3).filled(20)
-        \\    if const middle = values.get_mut(1) -> middle.replace(22)
+        \\    if ref middle = values.get(1) -> middle = 22
         \\    else return 90
         \\    if values.get(-1) -> return 91
         \\    if values.get(3) -> return 92
-        \\    if values.get_mut(-1) -> return 93
-        \\    if values.get_mut(3) -> return 94
-        \\    if const first = values.get(0)
-        \\        if const middle = values.get(1) -> return first[] + middle[]
+        \\    if values.get(-1) -> return 93
+        \\    if values.get(3) -> return 94
+        \\    if ref first = values.get(0)
+        \\        if ref middle = values.get(1) -> return first + middle
         \\    return 95
     ;
     for ([_][]const u8{ "exit(run())", "static answer = run()\nexit(answer)", "static answer = run()\nexit(run() + answer - 42)" }) |entry| {
@@ -835,8 +912,8 @@ test "array snapshots restore empty and nested runtime tuple shapes" {
             \\func run() int
             \\    const row = Array(int, {d}).filled(40)
             \\    const matrix = Array(Array(int, {d}), 2).filled(row)
-            \\    if const selected = matrix.get(1)
-            \\        if const cell = selected[].get(0) -> return cell[] + selected[].len()
+            \\    if ref selected = matrix.get(1)
+            \\        if ref cell = selected.get(0) -> return cell + selected.len()
             \\        return 42
             \\    return 90
             \\static answer = run()
@@ -857,11 +934,11 @@ test "array snapshots recompute element types and counts and retain canonical in
         \\static Count = 2
         \\static Shape = Array(Element, Count)
         \\func number(value: int | none) int
-        \\    if const selected = value as int -> return selected
+        \\    if ref selected = value as int -> return selected
         \\    return 90
         \\func run() int
         \\    const values = Shape.filled(40)
-        \\    if const selected = values.get(1) -> return number(selected[]) + values.len()
+        \\    if ref selected = values.get(1) -> return number(selected) + values.len()
         \\    return 91
         \\static answer = run()
         \\exit(run() + answer - 42)
@@ -904,7 +981,7 @@ test "array snapshots invalidate element copy hook bodies and capabilities" {
         \\    const original = Item{value = 40}
         \\    const values = Array(Item, 2).filled(original)
         \\    const copied = values.copy()
-        \\    if const selected = copied.get(1) -> return selected[].value
+        \\    if ref selected = copied.get(1) -> return selected.value
         \\    return 90
         \\static answer = run()
         \\exit(run() + answer - 42)
@@ -930,7 +1007,7 @@ test "array snapshots invalidate source indices and standard bounds checks" {
         \\import std.array.{Array}
         \\func run() int
         \\    const values = Array(int, 2).filled(42)
-        \\    if const selected = values.get(1) -> return selected[]
+        \\    if ref selected = values.get(1) -> return selected
         \\    return 89
         \\static answer = run()
         \\exit(run() + answer - 42)
@@ -1000,8 +1077,8 @@ test "array snapshots publish static nested values into runtime storage" {
         \\static matrix = Array(Array(int, 2), 2).filled(row)
         \\func run() int
         \\    const values = matrix
-        \\    if const selected = values.get(1)
-        \\        if const value = selected[].get(0) -> return value[] + row.len() + 20
+        \\    if ref selected = values.get(1)
+        \\        if ref value = selected.get(0) -> return value + row.len() + 20
         \\    return 90
         \\exit(run())
     );
@@ -1047,5 +1124,56 @@ test "text snapshots restore owned string cleanup and standard stream artifacts"
     ;
     const fixture = try Fixture.restore(source);
     defer fixture.db.deinit();
+    try fixture.expectExit(42);
+}
+
+test "optional argument snapshots restore variant values and converters" {
+    const fixture = try Fixture.restore(
+        \\fallible missing() int -> fail
+        \\func value_or(value: int | none) int
+        \\    if const found = value as int -> return found
+        \\    return 42
+        \\func run() int
+        \\    const good = bool(value_or(missing?()) == 42)
+        \\    if good? -> return 42
+        \\    return 7
+        \\exit(run())
+    );
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+}
+
+test "captured owner cleanup survives snapshots and source edits" {
+    const source =
+        \\struct Item
+        \\    value: int
+        \\    trace: Ref(int)
+        \\    copy = none
+        \\    drop = func(deinit self: Item)
+        \\        self.trace.value = self.trace.value + self.value
+        \\fallible make(var trace: Ref(int), value: int, enabled: bool) Item
+        \\    if not enabled? -> fail
+        \\    return Item{value = value, trace = trace}
+        \\fallible missing() int -> fail
+        \\func consume(var first: Item | none, var second: Item | none, var third: Item | none, final: int) -> ()
+        \\fallible work(var trace: Ref(int))
+        \\    consume(make?(trace, 10, false), make?(trace, 11, false), make?(trace, 42, true), missing?())
+        \\func run() int
+        \\    var trace = [0]
+        \\    if ref handle = trace.get(0)
+        \\        if work(Ref.from(handle)) -> return 91
+        \\        return handle
+        \\    return 92
+        \\static answer = run()
+        \\exit(answer + run() - 42)
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const edited = try std.mem.replaceOwned(u8, std.testing.allocator, source, "make?(trace, 42, true)", "make?(trace, 43, true)");
+    defer std.testing.allocator.free(edited);
+    try fixture.db.setInput(queries.SourceText, 0, edited);
+    try fixture.expectExit(44);
+    try fixture.db.setInput(queries.SourceText, 0, source);
     try fixture.expectExit(42);
 }

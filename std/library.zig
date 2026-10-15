@@ -48,15 +48,8 @@ pub const External = enum {
     unsafe_initialize,
     unsafe_take,
     unsafe_destroy,
-    unsafe_borrow_initialized,
-    borrow_box,
-    borrow_mut_box,
-    borrow_local,
-    unsafe_borrow_element,
-    unsafe_borrow_mut_element,
-    read,
-    write,
-    attenuate_ref,
+    unsafe_borrow,
+    borrow,
     unsafe_own_box,
     unsafe_take_box,
     unsafe_destroy_box,
@@ -66,15 +59,12 @@ pub const External = enum {
     array_filled,
     array_from,
     array_borrow,
-    array_borrow_mut,
     literal_byte,
     initialize_collection,
     empty_cursor,
     static_cursor,
     array_cursor,
-    array_cursor_mut,
     allocation_cursor,
-    allocation_cursor_mut,
     cursor_offset,
     cursor_element,
     cursor_attenuate,
@@ -93,15 +83,29 @@ pub const External = enum {
             .io_read => .memory_allocation,
             .io_write => .text,
             .copy_value, .move_value => .ownership,
-            .array_filled, .array_from, .array_borrow, .array_borrow_mut => .array,
+            .array_filled, .array_from, .array_borrow => .array,
             .allocate_host_storage, .deallocate_host_storage => .memory_host,
-            .empty_cursor, .static_cursor, .array_cursor, .array_cursor_mut, .allocation_cursor, .allocation_cursor_mut, .cursor_offset, .cursor_element, .cursor_attenuate => .memory_allocation,
-            .allocate, .deallocate, .allocation_count, .unsafe_initialize, .unsafe_take, .unsafe_destroy, .unsafe_borrow_initialized, .borrow_box, .borrow_mut_box, .borrow_local, .unsafe_borrow_element, .unsafe_borrow_mut_element, .read, .write, .attenuate_ref, .unsafe_own_box, .unsafe_take_box, .unsafe_destroy_box, .deallocate_box, .initialize_collection => .memory_allocation,
+            .empty_cursor, .static_cursor, .array_cursor, .allocation_cursor, .cursor_offset, .cursor_element, .cursor_attenuate => .memory_allocation,
+            .allocate, .deallocate, .allocation_count, .unsafe_initialize, .unsafe_take, .unsafe_destroy, .unsafe_borrow, .borrow, .unsafe_own_box, .unsafe_take_box, .unsafe_destroy_box, .deallocate_box, .initialize_collection => .memory_allocation,
         };
     }
 };
 
-pub const Structure = enum { HostStorage, Allocation, Box, Ref, StorageCursor, Span, Array, collection_literal, List };
+pub const Structure = enum {
+    HostStorage,
+    Allocation,
+    Box,
+    Ref,
+    StorageCursor,
+    Span,
+    Array,
+    collection_literal,
+    List,
+
+    pub fn declarationName(self: Structure) []const u8 {
+        return @tagName(self);
+    }
+};
 
 pub fn standardModulePath(comptime file_path: []const u8) []const u8 {
     const name = comptime (std.fs.path.dirname(file_path) orelse std.fs.path.stem(file_path));

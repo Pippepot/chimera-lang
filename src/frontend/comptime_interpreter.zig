@@ -314,7 +314,7 @@ pub fn execute(
 pub fn publish(result: Result, arguments: []Value, modes: []const structures.ParameterMode, executor: anytype, gpa: std.mem.Allocator) !Result {
     if (result != .returned and result != .failure) return result;
     for (arguments, modes) |*argument, mode| {
-        if (mode != .mut or argument.* != .place) continue;
+        if ((mode != .mut and mode != .ref) or argument.* != .place) continue;
         if (containsReference(argument.place)) return executionError(.escaping_storage, null);
         const runtime = (try materialize(argument.place, executor, gpa)) orelse return executionError(.unsupported_operation, null);
         argument.* = .{ .runtime = runtime };
@@ -349,6 +349,11 @@ pub fn executeInStorage(
     std.debug.assert(entry.argument_start == 0);
     std.debug.assert(entry.argument_end == arguments.len);
     @memcpy(slots[entry.argument_start..entry.argument_end], arguments);
+    for (body.block_arguments[entry.argument_start..entry.argument_end], arguments, 0..) |parameter, *argument, index| {
+        if (parameter.representation != .storage or argument.* != .runtime) continue;
+        const cell = try storageCell(body, slots, @fromBackingInt(@intCast(index)), storage);
+        argument.* = .{ .place = cell };
+    }
     while (true) {
         const block = body.blocks[@backingInt(block_id)];
         for (block.instruction_start..block.instruction_end) |instruction_index| {
@@ -473,18 +478,14 @@ pub fn executeInStorage(
                     .returned => |value| slots[destination] = value,
                     else => |result| return atSpan(result, instructionSpan(body, instruction_index)),
                 },
-                .mut_parameter_write => |operation| {
+                .initializer_capture_write => |operation| {
+                    std.debug.assert(body.is_initializer_region);
                     std.debug.assert(operation.parameter_index < arguments.len);
                     const updated = (try readSlot(slots, operation.value, executor, gpa)) orelse return .unavailable;
                     if (arguments[operation.parameter_index] == .place) {
                         try assignCell(arguments[operation.parameter_index].place, updated, executor);
                     } else arguments[operation.parameter_index] = updated;
                     slots[destination] = .{ .runtime = .unit };
-                },
-                .call_mut_argument => |operation| {
-                    const index = operation.arguments.start + operation.argument_index;
-                    std.debug.assert(index < operation.arguments.end);
-                    try store(slots, destination, operation.destination, call_scratch[index], executor);
                 },
             }
         }
@@ -600,12 +601,12 @@ fn executeCall(
     const interpreted = scratch[call.arguments.start..call.arguments.end];
     for (arguments, interpreted) |argument, *destination| {
         if (argument == .initializer) {
-            destination.* = slots[@backingInt(argument.initializer)];
+            destination.* = slots[@backingInt(argument.valueId())];
             std.debug.assert(destination.* == .initializer);
             continue;
         }
         const use = argument.valueUse();
-        if (use.coerce_to == null and try executor.argumentPassing(body.valueType(use.value)) == .indirect) {
+        if (argument == .borrowed or argument == .deinit or (use.coerce_to == null and try executor.argumentPassing(body.valueType(use.value)) == .indirect)) {
             destination.* = .{ .place = try storageCell(body, slots, use.value, storage) };
             continue;
         }
@@ -802,7 +803,8 @@ pub fn assignCell(destination: *Cell, source: Value, executor: anytype) anyerror
                         copied.* = .{ .type_id = payload.type_id, .storage = destination.storage, .contents = .uninitialized };
                         destination.contents = .{ .variant_payload = copied };
                     }
-                    destination.contents.variant_payload.type_id = payload.type_id;
+                    if (destination.contents.variant_payload.type_id != payload.type_id)
+                        destination.contents.variant_payload.* = .{ .type_id = payload.type_id, .storage = destination.storage, .contents = .uninitialized };
                     try assignCell(destination.contents.variant_payload, .{ .place = payload }, executor);
                 },
             }
@@ -826,7 +828,8 @@ fn assignRuntime(destination: *Cell, runtime: structures.CompileTimeValue.Runtim
     if (destination.contents == .variant_payload and runtime == .variant) {
         const payload = destination.contents.variant_payload;
         const value = (try executor.lookupRuntime(runtime.variant.payload)) orelse return error.Unavailable;
-        payload.type_id = value.type_id;
+        if (payload.type_id != value.type_id)
+            payload.* = .{ .type_id = value.type_id, .storage = destination.storage, .contents = .uninitialized };
         try assignRuntime(payload, value.value, executor);
         return;
     }
@@ -874,6 +877,15 @@ fn projectArray(body: *const structures.FunctionBodyAnalysis, slots: []Value, op
 }
 
 fn borrowAddress(body: *const structures.FunctionBodyAnalysis, slots: []Value, operation: structures.BorrowAddressOperation, executor: anytype, storage: std.mem.Allocator) !Result {
+    if (operation.base_is_reference and operation.fields.start == operation.fields.end) {
+        if (try readSlot(slots, operation.source, executor, storage)) |source| {
+            if (source == .runtime and source.runtime == .storage_cursor) {
+                var cursor = source.runtime.storage_cursor;
+                cursor.type_id = operation.type_id;
+                return .{ .returned = .{ .runtime = .{ .storage_cursor = cursor } } };
+            }
+        }
+    }
     var target = if (operation.base_is_reference)
         referenceTarget(slots[@backingInt(operation.source)]) orelse return executionError(.unsupported_operation, null)
     else
@@ -1166,7 +1178,7 @@ fn branchTarget(
             continue;
         }
         switch (try valueUse(body, slots, argument, executor, gpa)) {
-            .returned => |value| temporary.* = value,
+            .returned => |value| temporary.* = try copyStoredValue(value, parameter.type_id, executor, storage),
             else => |result| return .{ .result = result },
         }
     }

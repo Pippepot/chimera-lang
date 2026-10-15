@@ -257,15 +257,10 @@ fn renderInstruction(
             @backingInt(operation.operand),
             operation.field_index,
         }),
-        .mut_parameter_write => |operation| try writer.print("    mut_parameter_write {d}, %{d}\n", .{
+        .initializer_capture_write => |operation| try writer.print("    initializer_capture_write {d}, %{d}\n", .{
             operation.parameter_index,
             @backingInt(operation.value),
         }),
-        .call_mut_argument => |operation| {
-            try writer.print("    %{d} = call_mut_argument {d}", .{ result, operation.argument_index });
-            if (operation.destination) |storage| try writer.print(" into %{d}", .{@backingInt(storage)});
-            try writer.writeByte('\n');
-        },
         .call => |call| {
             try writer.print("    %{d} = call ", .{result});
             try renderCallTarget(db, call.target, writer);

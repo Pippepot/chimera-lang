@@ -58,10 +58,10 @@ pub const UnresolvedBody = struct {
         runtime_reference: ?structures.SourceSpan,
     };
     pub const ConditionBinding = struct {
-        borrow_mode: ?bool = null,
         local: LocalId,
         annotation_type: ?structures.TypeId,
         span: structures.SourceSpan,
+        reference: bool = false,
     };
     pub const StatementRange = struct { start: u32, end: u32 };
     pub const Block = struct {
@@ -78,12 +78,12 @@ pub const UnresolvedBody = struct {
             value: ValueId,
             span: structures.SourceSpan,
             mutable: bool,
+            reference: bool = false,
         },
-        bind_borrow: struct { local: LocalId, source: ValueId, span: structures.SourceSpan, writable: bool },
         break_loop: ValueId,
         continue_loop: structures.SourceSpan,
         return_nothing: structures.SourceSpan,
-        return_value: ValueUse,
+        return_value: struct { value: ValueUse, implicit: bool },
         failure: structures.SourceSpan,
     };
     pub const PredicateOperation = enum { lt, gt, le, ge, eq, ne };
@@ -107,8 +107,8 @@ pub const UnresolvedBody = struct {
         name: []const u8,
     };
     pub const Condition = union(enum) {
-        boolean: ValueUse,
-        operation_not: ValueUse,
+        query: ValueUse,
+
         comparison: struct {
             span: structures.SourceSpan,
             operation: PredicateOperation,
@@ -126,7 +126,7 @@ pub const UnresolvedBody = struct {
         conjunction: struct { lhs: ConditionId, rhs: ConditionId, temporary: ?LocalId = null },
         disjunction: struct { lhs: ConditionId, rhs: ConditionId },
         negation: ConditionId,
-        call: struct { target: Call, binding: ?ConditionBinding = null, allow_infallible: bool = false },
+        call: struct { target: Call, binding: ?ConditionBinding = null },
         initialization: struct { value: ValueUse, binding: ?ConditionBinding = null },
     };
     pub const StructInitTarget = union(enum) { concrete: structures.TypeId, inferred: structures.InstanceId };
@@ -171,15 +171,12 @@ pub const UnresolvedBody = struct {
                 value: ValueUse,
                 replaces: bool,
             },
-            borrow_assignment: struct {
-                target: LocalId,
-                target_span: structures.SourceSpan,
-                fields: structures.FunctionValueRange,
-                value: ValueUse,
-            },
-            reference_assignment: struct { reference: ValueUse, value: ValueUse },
+            reference_assignment: struct { reference: ValueUse, fields: structures.FunctionValueRange, value: ValueUse },
+            discard: ValueUse,
             sequence: BinaryOperands,
             call: Call,
+            predicate: ConditionId,
+            extraction: struct { condition: ConditionId, local: LocalId },
             if_else: struct {
                 condition: ConditionId,
                 then_block: BlockId,
@@ -285,7 +282,6 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 id: UnresolvedBody.LocalId,
                 mutable: bool,
             },
-            borrow: struct { id: UnresolvedBody.LocalId, writable: bool },
         };
 
         ast: *const structures.Ast,
@@ -406,7 +402,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 try self.parameter_spans.append(self.gpa, span);
                 const local: Local = switch (runtime_parameter.mode) {
                     .imm, .init => .{ .value = @fromBackingInt(@intCast(parameter_value_index)) },
-                    .mut, .@"var", .deinit => blk: {
+                    .ref, .mut, .@"var", .deinit => blk: {
                         const id: UnresolvedBody.LocalId = @fromBackingInt(@intCast(self.local_count));
                         self.local_count += 1;
                         break :blk .{ .place = .{ .id = id, .mutable = true } };
@@ -441,8 +437,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             const node = self.ast.nodes[index.index()];
             const span = tokenSpan(self.ast, node.token_index);
             return switch (node.tag) {
-                .const_binding, .var_binding => try self.buildBinding(index),
-                .borrow_binding, .borrow_mut_binding => try self.buildBorrowBinding(index),
+                .const_binding, .var_binding, .ref_binding => try self.buildBinding(index),
                 .@"pub" => return self.reject(index, .misplaced_pub),
                 .import, .selective_import => return self.reject(index, .import_outside_top_level),
                 .return_nothing => if (!self.can_return)
@@ -452,7 +447,10 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 .return_expr => if (!self.can_return)
                     self.reject(index, .top_level_return)
                 else
-                    .{ .return_value = try self.appendUse(node.data.node, self.returns_type) },
+                    .{ .return_value = .{
+                        .value = try self.appendUse(node.data.node, self.returns_type),
+                        .implicit = self.ast.tokens[node.token_index].tag != .keyword_return,
+                    } },
                 .fail_expr => .{ .failure = span },
                 .break_nothing, .break_expr => try self.buildBreak(index, result_is_type),
                 .continue_expr => try self.buildContinue(index),
@@ -512,7 +510,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             self.local_count += 1;
             try self.locals.put(self.gpa, name, .{ .place = .{
                 .id = local,
-                .mutable = node.tag == .var_binding,
+                .mutable = node.tag == .var_binding or node.tag == .ref_binding,
             } });
             try self.local_names.append(self.gpa, name);
             return .{ .bind_local = .{
@@ -520,25 +518,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 .value = value,
                 .span = nodeFocusSpan(self.ast, node.data.node_node.b),
                 .mutable = node.tag == .var_binding,
-            } };
-        }
-
-        fn buildBorrowBinding(self: *Self, index: structures.Node.Index) !UnresolvedBody.Statement {
-            const node = self.ast.nodes[index.index()];
-            const span = tokenSpan(self.ast, node.token_index);
-            const name = self.source[span.start..span.end];
-            if (try self.nameIsVisible(name)) return self.reject(index, .duplicate_local_binding);
-            const source = try self.append(node.data.node_node.b, false);
-            const local: UnresolvedBody.LocalId = @fromBackingInt(@intCast(self.local_count));
-            self.local_count += 1;
-            const writable = node.tag == .borrow_mut_binding;
-            try self.locals.put(self.gpa, name, .{ .borrow = .{ .id = local, .writable = writable } });
-            try self.local_names.append(self.gpa, name);
-            return .{ .bind_borrow = .{
-                .local = local,
-                .source = source,
-                .span = nodeFocusSpan(self.ast, node.data.node_node.b),
-                .writable = writable,
+                .reference = node.tag == .ref_binding,
             } };
         }
 
@@ -688,7 +668,6 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 .struct_init => return self.appendStructInit(index),
                 .collection_literal => return self.appendCollectionLiteral(index),
                 .field_access => return self.appendFieldAccess(index),
-                .deref => return self.appendExpression(index, .{ .dereference = try self.appendUse(node.data.node, false) }),
                 .index_access => return self.appendExpression(index, .{ .call = try self.buildIndexCall(index) }),
                 .@"struct" => return self.appendExpression(index, .{ .type_value = try self.type_interner.generatedStructType(index) }),
                 .identifier => return self.appendIdentifier(index, result_is_type),
@@ -704,8 +683,9 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                     return self.appendOperationCall(index, "-", &.{try self.appendUse(node.data.node, false)});
                 },
                 .add, .sub, .mul, .div, .rem => return self.appendBinary(index),
-                .eq, .ne, .lt, .gt, .le, .ge, .not, .@"and", .@"or" => return self.appendConditionValue(index),
+                .eq, .ne, .lt, .gt, .le, .ge, .not, .@"and", .@"or", .query, .is => return self.appendConditionValue(index),
                 .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .rem_assign => return self.appendAssignment(index),
+                .as => return self.appendExtraction(index),
                 .@"if", .if_else => return self.appendIf(index, result_is_type),
                 .loop => return self.appendLoop(index, result_is_type),
                 .static_binding, .namespace_declaration => return self.reject(index, .nested_declaration_not_supported),
@@ -728,7 +708,6 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 .static_value => |value| self.appendConstant(index, value),
                 .type_value => |type_id| self.appendExpression(index, .{ .type_value = type_id }),
                 .place => |place| self.appendExpression(index, .{ .local_read = place.id }),
-                .borrow => |borrow| self.appendExpression(index, .{ .local_read = borrow.id }),
             };
             if (std.mem.eql(u8, name, "unit")) return self.appendExpression(index, if (result_is_type) .{ .type_value = .unit } else .unit);
             const reference = (try self.namedExpression(index)) orelse return self.reject(index, .unknown_value);
@@ -755,7 +734,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             const name = self.source[span.start..span.end];
             const local = self.locals.get(name) orelse return self.reject(root_index, .unknown_value);
             return switch (local) {
-                .value, .static_value, .type_value, .borrow => self.reject(index, .ownership_transfer_requires_owned_place),
+                .value, .static_value, .type_value => self.reject(index, .ownership_transfer_requires_owned_place),
                 .place => |place| self.appendExpression(index, if (field_start == self.assignment_fields.items.len)
                     .{ .local_transfer = place.id }
                 else
@@ -827,7 +806,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
 
         fn runtimeName(self: *Self, name: []const u8) bool {
             const local = self.locals.get(name) orelse return false;
-            return local == .value or local == .place or local == .borrow;
+            return local == .value or local == .place;
         }
 
         fn rejectRuntimeCapture(self: *Self, index: structures.Node.Index) !void {
@@ -957,6 +936,9 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
 
         fn appendAssignment(self: *Self, index: structures.Node.Index) !ValueId {
             const node = self.ast.nodes[index.index()];
+            if (node.tag == .assign and self.isDiscardAssignment(index)) {
+                return self.appendExpression(index, .{ .discard = try self.appendUse(node.data.node_node.b, false) });
+            }
             const target_node_value = self.ast.nodes[node.data.node_node.a.index()];
             if (target_node_value.tag == .index_access) {
                 const receiver = try self.appendUse(target_node_value.data.node_node.a, false);
@@ -986,30 +968,16 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 target_node = self.ast.nodes[target_index.index()];
             }
             std.mem.reverse(UnresolvedBody.FieldName, self.assignment_fields.items[field_start..]);
-            if (target_node.tag == .deref and field_start == self.assignment_fields.items.len) {
-                const reference = try self.appendUse(target_node.data.node, false);
-                const value = try self.assignmentOperand(index);
-                return self.appendExpression(index, .{ .reference_assignment = .{ .reference = reference, .value = value } });
-            }
-            if (target_node.tag != .identifier) return self.reject(node.data.node_node.a, .assignment_target_not_local);
+            const field_end: u32 = @intCast(self.assignment_fields.items.len);
+            if (target_node.tag != .identifier) return self.appendReferenceAssignment(index);
             const span = tokenSpan(self.ast, target_node.token_index);
             const name = self.source[span.start..span.end];
             const local = self.locals.get(name) orelse return self.reject(target_index, .unknown_value);
             const target = switch (local) {
-                .value, .static_value, .type_value => return self.reject(target_index, .assignment_to_immutable),
-                .place => |place| if (place.mutable) place.id else return self.reject(target_index, .assignment_to_immutable),
-                .borrow => |borrow| {
-                    if (!borrow.writable) return self.reject(target_index, .assignment_to_immutable);
-                    const value = try self.assignmentOperand(index);
-                    return self.appendExpression(index, .{ .borrow_assignment = .{
-                        .target = borrow.id,
-                        .target_span = span,
-                        .fields = .{ .start = field_start, .end = @intCast(self.assignment_fields.items.len) },
-                        .value = value,
-                    } });
-                },
+                .value => return if (field_end != field_start) self.appendReferenceAssignment(index) else self.reject(target_index, .assignment_to_immutable),
+                .static_value, .type_value => return self.reject(target_index, .assignment_to_immutable),
+                .place => |place| if (place.mutable) place.id else return if (field_end != field_start) self.appendReferenceAssignment(index) else self.reject(target_index, .assignment_to_immutable),
             };
-            const field_end: u32 = @intCast(self.assignment_fields.items.len);
             const value = try self.assignmentOperand(index);
             return self.appendExpression(index, .{ .assignment = .{
                 .target = target,
@@ -1017,6 +985,19 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 .fields = .{ .start = field_start, .end = field_end },
                 .value = value,
                 .replaces = node.tag == .assign,
+            } });
+        }
+
+        fn appendReferenceAssignment(self: *Self, index: structures.Node.Index) !ValueId {
+            const node = self.ast.nodes[index.index()];
+            const reference = try self.appendUse(node.data.node_node.a, false);
+            var value = try self.appendUse(node.data.node_node.b, false);
+            if (node.tag != .assign) value.value = try self.appendOperationCall(index, assignmentOperationName(node.tag), &.{ reference, value });
+            const fields: u32 = @intCast(self.assignment_fields.items.len);
+            return self.appendExpression(index, .{ .reference_assignment = .{
+                .reference = reference,
+                .fields = .{ .start = fields, .end = fields },
+                .value = value,
             } });
         }
 
@@ -1069,17 +1050,11 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
 
         fn buildIfCondition(self: *Self, index: structures.Node.Index) !UnresolvedBody.ConditionId {
             const node = self.ast.nodes[index.index()];
-            if (node.tag != .const_binding and node.tag != .var_binding and node.tag != .borrow_binding and node.tag != .borrow_mut_binding) return self.buildCondition(index);
+            if (node.tag != .const_binding and node.tag != .var_binding and node.tag != .ref_binding) return self.buildCondition(index);
             if (node.tag == .var_binding) return self.reject(index, .condition_binding_must_be_immutable);
 
             const value_index = node.data.node_node.b;
             const value_node = self.ast.nodes[value_index.index()];
-            const borrow_mode: ?bool = switch (node.tag) {
-                .borrow_binding => false,
-                .borrow_mut_binding => true,
-                else => null,
-            };
-            if (borrow_mode != null and value_node.tag != .as) return self.reject(index, .borrow_requires_place);
 
             const span = tokenSpan(self.ast, node.token_index);
             const name = self.source[span.start..span.end];
@@ -1088,10 +1063,10 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             self.local_count += 1;
             const annotation_type = if (node.data.node_node.a.unwrap()) |annotation| try self.bindingType(annotation) else null;
             const binding: UnresolvedBody.ConditionBinding = .{
-                .borrow_mode = borrow_mode,
                 .local = local,
                 .annotation_type = annotation_type,
                 .span = nodeFocusSpan(self.ast, value_index),
+                .reference = node.tag == .ref_binding,
             };
             const condition = if (value_node.tag == .as)
                 try self.buildVariantMembership(value_node, binding)
@@ -1102,20 +1077,20 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             else
                 try self.appendCondition(.{ .initialization = .{ .value = try self.appendUse(value_index, false), .binding = binding } });
 
-            try self.locals.put(self.gpa, name, if (borrow_mode) |writable| .{ .borrow = .{ .id = local, .writable = writable } } else .{ .place = .{ .id = local, .mutable = false } });
+            try self.locals.put(self.gpa, name, .{ .place = .{ .id = local, .mutable = node.tag == .ref_binding } });
             try self.local_names.append(self.gpa, name);
             return condition;
         }
 
+        fn appendExtraction(self: *Self, index: structures.Node.Index) !ValueId {
+            const local: UnresolvedBody.LocalId = @fromBackingInt(@intCast(self.local_count));
+            self.local_count += 1;
+            const condition = try self.buildVariantMembership(self.ast.nodes[index.index()], .{ .local = local, .annotation_type = null, .span = nodeFocusSpan(self.ast, index) });
+            return self.appendExpression(index, .{ .extraction = .{ .condition = condition, .local = local } });
+        }
+
         fn appendConditionValue(self: *Self, index: structures.Node.Index) !ValueId {
-            const condition = try self.buildCondition(index);
-            const then_value = try self.appendExpression(index, .{ .boolean = true });
-            const else_value = try self.appendExpression(index, .{ .boolean = false });
-            return self.appendExpression(index, .{ .if_else = .{
-                .condition = condition,
-                .then_block = try self.finishBlock(&.{}, then_value, nodeFocusSpan(self.ast, index)),
-                .else_block = try self.finishBlock(&.{}, else_value, nodeFocusSpan(self.ast, index)),
-            } });
+            return self.appendExpression(index, .{ .predicate = try self.buildCondition(index) });
         }
 
         fn buildCondition(self: *Self, index: structures.Node.Index) !UnresolvedBody.ConditionId {
@@ -1141,10 +1116,10 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 .not => self.buildNotCondition(index),
                 .call => self.appendCondition(.{ .call = .{ .target = try self.buildCall(index, true) } }),
                 .index_access => self.appendCondition(.{ .call = .{ .target = try self.buildIndexCall(index) } }),
-                .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .rem_assign => self.buildIndexedAssignmentCondition(index),
+                .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .rem_assign => if (self.ast.nodes[node.data.node_node.a.index()].tag == .index_access) self.buildIndexedAssignmentCondition(index) else self.appendCondition(.{ .initialization = .{ .value = try self.appendUse(index, false) } }),
                 .collection_literal, .struct_init => self.appendCondition(.{ .initialization = .{ .value = try self.appendUse(index, false) } }),
-                .identifier, .bool_literal, .field_access, .deref => self.appendCondition(.{ .boolean = try self.appendUse(index, false) }),
-                else => self.rejectCondition(index),
+                .query => self.appendCondition(.{ .query = try self.appendUse(node.data.node, false) }),
+                else => self.appendCondition(.{ .initialization = .{ .value = try self.appendUse(index, false) } }),
             };
         }
 
@@ -1162,7 +1137,6 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             const before = try self.appendCondition(.{ .call = .{
                 .target = getter,
                 .binding = .{ .local = local, .annotation_type = null, .span = sequence.lhs.span },
-                .allow_infallible = true,
             } });
             const after = try self.appendCondition(.{ .call = .{ .target = self.expressions.items[@backingInt(sequence.rhs.value) - self.parameters.len].operation.call } });
             return self.appendCondition(.{ .conjunction = .{ .lhs = before, .rhs = after, .temporary = local } });
@@ -1170,17 +1144,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
 
         fn buildNotCondition(self: *Self, index: structures.Node.Index) anyerror!UnresolvedBody.ConditionId {
             const operand = self.ast.nodes[index.index()].data.node;
-            return switch (self.ast.nodes[operand.index()].tag) {
-                .is, .as => self.appendCondition(.{ .negation = try self.buildCondition(operand) }),
-                .call => self.appendCondition(.{ .operation_not = .{
-                    .value = try self.appendExpression(operand, .{ .call = try self.buildCall(operand, true) }),
-                    .span = nodeFocusSpan(self.ast, index),
-                } }),
-                else => self.appendCondition(.{ .operation_not = .{
-                    .value = (try self.appendUse(operand, false)).value,
-                    .span = nodeFocusSpan(self.ast, index),
-                } }),
-            };
+            return self.appendCondition(.{ .negation = try self.buildCondition(operand) });
         }
 
         fn buildVariantMembership(self: *Self, node: structures.Node, binding: ?UnresolvedBody.ConditionBinding) !UnresolvedBody.ConditionId {
@@ -1254,13 +1218,13 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             const last = children[children.len - 1];
             const last_node = self.ast.nodes[last.index()];
             const result: ?ValueId = switch (last_node.tag) {
-                .const_binding, .var_binding, .borrow_binding, .borrow_mut_binding, .return_nothing, .return_expr, .break_nothing, .break_expr, .continue_expr, .fail_expr => blk: {
+                .const_binding, .var_binding, .return_nothing, .return_expr, .break_nothing, .break_expr, .continue_expr, .fail_expr => blk: {
                     try statements.append(self.gpa, try self.buildStatement(last, result_is_type));
                     break :blk null;
                 },
                 else => try self.append(last, result_is_type),
             };
-            if (result == null and (last_node.tag == .const_binding or last_node.tag == .var_binding or last_node.tag == .borrow_binding or last_node.tag == .borrow_mut_binding)) {
+            if (result == null and (last_node.tag == .const_binding or last_node.tag == .var_binding)) {
                 return self.finishBlock(statements.items, try self.appendExpression(index, .unit), tokenSpan(self.ast, node.token_index));
             }
             return self.finishBlock(statements.items, result, tokenSpan(self.ast, node.token_index));
@@ -1658,7 +1622,7 @@ pub fn inferStaticArguments(
         const actual_type = argument_types[runtime_index];
         runtime_index += 1;
         const annotation = parameter.data.node_node.b.unwrap().?;
-        if (!try bindInferredType(ast, source, inferred.items, annotation, actual_type, type_interner)) return .conflict;
+        if (!try bindInferredType(ast, source, inferred.items, annotation, actual_type, type_interner, gpa)) return .conflict;
     }
     std.debug.assert(runtime_index == argument_types.len);
     return finishStaticInference(inferred.items, gpa);
@@ -1682,7 +1646,7 @@ pub fn inferStructArguments(
     try appendInferredStaticParameters(ast, source, parameters, &inferred, gpa);
     for (fields, field_types) |field, actual_type| {
         const annotation = structFactoryFieldAnnotation(ast, source, declaration, field.name) orelse continue;
-        if (!try bindInferredType(ast, source, inferred.items, annotation, actual_type, type_interner)) return .conflict;
+        if (!try bindInferredType(ast, source, inferred.items, annotation, actual_type, type_interner, gpa)) return .conflict;
     }
     return finishStaticInference(inferred.items, gpa);
 }
@@ -1742,6 +1706,12 @@ fn annotationInfersParameter(ast: *const structures.Ast, source: []const u8, ann
         const span = tokenSpan(ast, node.token_index);
         return std.mem.eql(u8, source[span.start..span.end], name);
     }
+    if (node.tag == .type_variant) {
+        for (ast.nodeList(annotation)) |member| {
+            if (annotationInfersParameter(ast, source, member, name)) return true;
+        }
+        return false;
+    }
     if (node.tag != .call) return false;
     for (ast.nodeList(node.data.node_node.b)) |argument| {
         if (annotationInfersParameter(ast, source, argument, name)) return true;
@@ -1773,7 +1743,7 @@ pub fn inferConverterArguments(
         value_count += 1;
         const annotation = parameter.data.node_node.b.unwrap().?;
         if (source_type) |actual_type| {
-            if (!try bindInferredType(ast, source, inferred.items, annotation, actual_type, type_interner)) return .conflict;
+            if (!try bindInferredType(ast, source, inferred.items, annotation, actual_type, type_interner, gpa)) return .conflict;
         } else if (parameterMode(ast, parameter).? == .init and ast.nodes[annotation.index()].tag == .call) {
             const arguments = ast.nodeList(ast.nodes[annotation.index()].data.node_node.b);
             if (arguments.len == 2) if (inferredParameter(ast, source, inferred.items, arguments[1], false)) |count| {
@@ -1783,7 +1753,7 @@ pub fn inferConverterArguments(
         }
     }
     const target = signature.data.signature.return_type.unwrap() orelse return .missing;
-    if (!try bindInferredType(ast, source, inferred.items, target, target_type, type_interner)) return .conflict;
+    if (!try bindInferredType(ast, source, inferred.items, target, target_type, type_interner, gpa)) return .conflict;
     if (value_count == 0) {
         const value = source_value orelse return .missing;
         var source_parameter: ?*InferredParameter = null;
@@ -1798,7 +1768,7 @@ pub fn inferConverterArguments(
             for (inferred.items) |*parameter| {
                 if (std.mem.eql(u8, source[span.start..span.end], parameter.name)) source_parameter = parameter;
             }
-            if (!try bindInferredType(ast, source, inferred.items, annotation, source_type.?, type_interner)) return .conflict;
+            if (!try bindInferredType(ast, source, inferred.items, annotation, source_type.?, type_interner, gpa)) return .conflict;
         }
         const parameter = source_parameter orelse return .missing;
         if (!parameter.bind(value)) return .conflict;
@@ -1837,7 +1807,7 @@ fn structFactoryFieldAnnotation(ast: *const structures.Ast, source: []const u8, 
         const member = if (item.tag == .@"pub") ast.nodes[item.data.node.index()] else item;
         if (member.tag != .struct_field) continue;
         const span = tokenSpan(ast, member.token_index);
-        if (std.mem.eql(u8, name, source[span.start..span.end])) return member.data.node;
+        if (std.mem.eql(u8, name, source[span.start..span.end])) return member.data.field.type_annotation;
     }
     return null;
 }
@@ -1854,12 +1824,13 @@ fn appendInferredStaticParameters(ast: *const structures.Ast, source: []const u8
     }
 }
 
-fn bindInferredType(ast: *const structures.Ast, source: []const u8, inferred: []InferredParameter, annotation: structures.Node.Index, actual_type: structures.TypeId, type_interner: anytype) !bool {
+fn bindInferredType(ast: *const structures.Ast, source: []const u8, inferred: []InferredParameter, annotation: structures.Node.Index, actual_type: structures.TypeId, type_interner: anytype, gpa: std.mem.Allocator) anyerror!bool {
     const annotated = ast.nodes[annotation.index()];
     if (inferredParameter(ast, source, inferred, annotation, true)) |target| {
         const value = try type_interner.internCompileTimeValue(.{ .type = actual_type });
         return target.bind(value);
     }
+    if (annotated.tag == .type_variant) return bindInferredVariant(ast, source, inferred, annotation, actual_type, type_interner, gpa);
     if (annotated.tag != .call) return true;
     const factory = (try resolveNamedExpression(ast, source, annotated.data.node_node.a, type_interner)) orelse return true;
     if (factory != .declaration) return true;
@@ -1871,6 +1842,53 @@ fn bindInferredType(ast: *const structures.Ast, source: []const u8, inferred: []
         if (!target.bind(value)) return false;
     }
     return true;
+}
+
+fn annotationReferencesInferred(ast: *const structures.Ast, source: []const u8, inferred: []InferredParameter, annotation: structures.Node.Index) bool {
+    if (inferredParameter(ast, source, inferred, annotation, false) != null) return true;
+    var children = ast.nodes[annotation.index()].children(ast.node_refs);
+    for (children.slice()) |child| {
+        if (child.unwrap()) |index| if (annotationReferencesInferred(ast, source, inferred, index)) return true;
+    }
+    return false;
+}
+
+fn bindInferredVariant(ast: *const structures.Ast, source: []const u8, inferred: []InferredParameter, annotation: structures.Node.Index, actual_type: structures.TypeId, type_interner: anytype, gpa: std.mem.Allocator) !bool {
+    // Only one dependent arm can receive the unmatched members. With two,
+    // partitioning the source would require guessing between type parameters.
+    var dependent: ?structures.Node.Index = null;
+    for (ast.nodeList(annotation)) |member| {
+        if (!annotationReferencesInferred(ast, source, inferred, member)) continue;
+        if (dependent != null) return true;
+        dependent = member;
+    }
+    const target = dependent orelse return true;
+    const source_members = (try type_interner.facts().variantMembers(actual_type)) orelse &.{actual_type};
+    var remaining: std.ArrayList(structures.TypeId) = .empty;
+    defer remaining.deinit(gpa);
+    try remaining.appendSlice(gpa, source_members);
+    for (ast.nodeList(annotation)) |member| {
+        if (member == target) continue;
+        const fixed_type = switch (try analyzeType(ast, source, member, type_interner, gpa, .parameter_type_not_supported)) {
+            .success => |type_id| type_id,
+            .unsupported => return true,
+        };
+        const fixed_members = (try type_interner.facts().variantMembers(fixed_type)) orelse &.{fixed_type};
+        var index = remaining.items.len;
+        while (index > 0) {
+            index -= 1;
+            if (std.mem.indexOfScalar(structures.TypeId, fixed_members, remaining.items[index]) != null)
+                _ = remaining.orderedRemove(index);
+        }
+    }
+    // A source entirely covered by fixed arms, including bare none, supplies
+    // no evidence for the dependent arm. Never likewise supplies no payload.
+    if (remaining.items.len == 0 or actual_type == .never) return true;
+    const payload_type = if (remaining.items.len == 1) remaining.items[0] else switch (try type_interner.facts().internVariant(remaining.items)) {
+        .type_id => |type_id| type_id,
+        .duplicate => unreachable,
+    };
+    return bindInferredType(ast, source, inferred, target, payload_type, type_interner, gpa);
 }
 
 fn finishStaticInference(inferred: []const InferredParameter, gpa: std.mem.Allocator) !StaticInference {
@@ -2040,6 +2058,10 @@ pub fn analyzeFunctionInstanceSignature(
         }
     else
         .unit;
+    const result_mode: structures.ResultMode = if (return_annotation.unwrap()) |index|
+        if (ast.nodes[index.index()].tag == .reference_result) .reference else .owned
+    else
+        .owned;
 
     const function = ast.nodes[parts.function.index()];
     const is_fallible = declaredFallibility(ast, function);
@@ -2052,6 +2074,7 @@ pub fn analyzeFunctionInstanceSignature(
         const actual = try type_interner.facts().internCallable(.{
             .parameters = parameters.items,
             .return_type = return_type,
+            .result_mode = result_mode,
             .is_fallible = is_fallible,
         });
         if (expected != actual) return .{ .unsupported = .{
@@ -2067,6 +2090,7 @@ pub fn analyzeFunctionInstanceSignature(
     return .{ .success = .{
         .parameters = owned_parameters,
         .return_type = return_type,
+        .result_mode = result_mode,
         .is_fallible = is_fallible,
     } };
 }
@@ -2086,8 +2110,10 @@ pub fn callSyntaxIssue(fallible_syntax: bool, is_fallible: bool, requires_fallib
 fn parameterMode(ast: *const structures.Ast, parameter: structures.Node) ?structures.ParameterMode {
     const access = parameter.data.node_node.a.unwrap() orelse return .imm;
     if (ast.nodes[access.index()].tag == .implicit_static) return .static;
-    return switch (ast.tokens[ast.nodes[access.index()].token_index].tag) {
+    const token_index = ast.nodes[access.index()].token_index;
+    return switch (ast.tokens[token_index].tag) {
         .keyword_imm => .imm,
+        .keyword_ref => .ref,
         .keyword_static => .static,
         .keyword_mut => .mut,
         .keyword_var => .@"var",
@@ -2099,7 +2125,7 @@ fn parameterMode(ast: *const structures.Ast, parameter: structures.Node) ?struct
 
 fn isFallibleExpression(tag: structures.Node.Tag) bool {
     return switch (tag) {
-        .lt, .gt, .le, .ge, .eq, .ne, .is, .as, .@"and", .@"or", .not => true,
+        .lt, .gt, .le, .ge, .eq, .ne, .is, .as, .@"and", .@"or", .not, .query => true,
         else => false,
     };
 }
@@ -2177,7 +2203,10 @@ fn analyzeType(
     unsupported_kind: structures.Diagnostic.Kind,
 ) anyerror!SemanticResult(structures.TypeId) {
     const node = ast.nodes[node_index.index()];
+    if (node.tag == .reference_result) return analyzeType(ast, source, node.data.node, type_interner, gpa, unsupported_kind);
     if (node.tag == .implicit_type) return .{ .success = .type };
+    if (node.tag == .unit_literal) return .{ .success = .unit };
+    if (node.tag == .none_literal) return .{ .success = .none };
     if (node.tag == .call) {
         const value_id = type_interner.executeComptime(node_index) catch |err| switch (err) {
             error.QueryCycle => return .{ .unsupported = issueAt(ast, node_index.index(), .declaration_cycle) },
@@ -2241,6 +2270,7 @@ fn analyzeType(
         return .{ .success = try type_interner.facts().internCallable(.{
             .parameters = parameters.items,
             .return_type = return_type,
+            .result_mode = if (ast.nodes[node.data.node_node.b.index()].tag == .reference_result) .reference else .owned,
             .is_fallible = ast.tokens[node.token_index].tag == .keyword_fallible,
         }) };
     }
@@ -2407,6 +2437,7 @@ fn analyzeStructMembers(
                 const actual_type = try type_interner.facts().internCallable(.{
                     .parameters = actual.parameters,
                     .return_type = actual.return_type,
+                    .result_mode = actual.result_mode,
                     .is_fallible = actual.is_fallible,
                 });
                 if (actual_type != expected_type) return .{ .unsupported = .{
@@ -2467,19 +2498,18 @@ fn analyzeStructMembers(
         const name = source[name_span.start..name_span.end];
         var field_interner = type_interner;
         field_interner.public_annotation = item.tag == .@"pub";
-        const field_type = switch (try analyzeType(ast, source, member.data.node, field_interner, gpa, .struct_field_type_not_supported)) {
+        const field_type = switch (try analyzeType(ast, source, member.data.field.type_annotation, field_interner, gpa, .struct_field_type_not_supported)) {
             .success => |type_id| type_id,
             .unsupported => |issue| return .{ .unsupported = issue },
         };
-        if (field_type == .type) return .{ .unsupported = issueAt(ast, member.data.node.index(), .struct_field_type_not_supported) };
-        if (item.tag == .@"pub") {
-            if (!try type_interner.isPublicType(field_type))
-                return .{ .unsupported = issueAt(ast, member.data.node.index(), .public_field_private_type) };
-        }
+        if (field_type == .type) return .{ .unsupported = issueAt(ast, member.data.field.type_annotation.index(), .struct_field_type_not_supported) };
+        if (item.tag == .@"pub" and !try type_interner.isPublicFieldType(field_type))
+            return .{ .unsupported = issueAt(ast, member.data.field.type_annotation.index(), .public_field_private_type) };
         try fields.ensureUnusedCapacity(gpa, 1);
         const owned_name = try gpa.dupe(u8, name);
         fields.appendAssumeCapacity(.{
             .name = owned_name,
+            .kind = member.data.field.kind,
             .type_id = field_type,
             .span = name_span,
             .is_public = item.tag == .@"pub",
@@ -2583,6 +2613,7 @@ fn canWidenMember(type_interner: anytype, actual: structures.TypeId, expected: s
     const expected_callable = try type_interner.facts().callable(expected) orelse return false;
     const actual_callable = try type_interner.facts().callable(actual) orelse return false;
     return actual_callable.return_type == expected_callable.return_type and
+        actual_callable.result_mode == expected_callable.result_mode and
         actual_callable.parametersEql(expected_callable) and
         (!actual_callable.is_fallible or expected_callable.is_fallible);
 }
@@ -3104,6 +3135,19 @@ fn testUnresolvedFunctionBodyAllocations(gpa: std.mem.Allocator) !void {
 }
 
 const TestTypeInterner = struct {
+    pub fn allocator(_: @This()) std.mem.Allocator {
+        return std.testing.allocator;
+    }
+    pub fn isReferenceFactory(_: @This(), _: structures.InstanceId) !bool {
+        return false;
+    }
+    pub fn referenceType(_: @This(), _: structures.TypeId, _: bool) !?structures.TypeId {
+        unreachable;
+    }
+    pub fn borrowAccess(_: @This(), _: structures.TypeId) !?struct { element_type: structures.TypeId, writable: bool } {
+        return null;
+    }
+
     pub fn internByteString(_: @This(), _: []const u8) !structures.ByteStringId {
         unreachable;
     }
@@ -3210,7 +3254,7 @@ const TestTypeInterner = struct {
     pub fn isPublicAnnotationReference(_: @This(), _: structures.NameReference) !bool {
         return true;
     }
-    pub fn isPublicType(_: @This(), type_id: structures.TypeId) !bool {
+    pub fn isPublicFieldType(_: @This(), type_id: structures.TypeId) !bool {
         return type_id.isPrimitive();
     }
     pub fn resolveMember(_: @This(), _: structures.NameReference, _: []const u8, _: structures.SourceSpan) !?structures.NameReference {

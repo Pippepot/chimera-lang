@@ -56,25 +56,25 @@ test "evaluation heap immovable partial failure reverse destruction and extracti
         \\struct Item
         \\    move = none
         \\    copy = none
-        \\    trace: Ref(int, true)
+        \\    trace: Ref(int)
         \\    value: int
-        \\    drop = func(deinit self: Item) -> self.trace.replace(self.trace[] * 10 + self.value)
+        \\    drop = func(deinit self: Item) -> self.trace.value = self.trace.value * 10 + self.value
         \\fallible missing() Item -> fail
         \\func forbidden() Item -> exit(90)
         \\func run() int
         \\    var trace = Array(int, 1).filled(0)
-        \\    if const target = trace.get_mut(0)
-        \\        if const items: List(Item) = [Item{trace = target, value = 2}, Item{trace = target, value = 4}, missing?(), forbidden()]
+        \\    if ref target = trace.get(0)
+        \\        if const items: List(Item) = [Item{trace = Ref.from(target), value = 2}, Item{trace = Ref.from(target), value = 4}, missing?(), forbidden()]
         \\            return 91
-        \\        if target[] <> 42 -> return 92
-        \\        if const owner = Box(int).new(target[]) -> return owner.into_value()
+        \\        if target <> 42 -> return 92
+        \\        if const owner = Box(int).new(target) -> return owner.take()
         \\    return 93
     , 42);
     try test_sources.SourceFixture.expectParity(
         \\struct Leaf
         \\    move = none
-        \\    trace: Ref(int, true)
-        \\    drop = func(deinit self: Leaf) -> self.trace.replace(42)
+        \\    trace: Ref(int)
+        \\    drop = func(deinit self: Leaf) -> self.trace.value = 42
         \\struct Item
         \\    move = none
         \\    first: Leaf
@@ -83,9 +83,9 @@ test "evaluation heap immovable partial failure reverse destruction and extracti
         \\fallible missing() int -> fail
         \\func run() int
         \\    var trace = Array(int, 1).filled(0)
-        \\    if const target = trace.get_mut(0)
-        \\        if const owner = Box(Item).new(Item{first = Leaf{trace = target}, second = missing?()}) -> return 91
-        \\        return target[]
+        \\    if ref target = trace.get(0)
+        \\        if const owner = Box(Item).new(Item{first = Leaf{trace = Ref.from(target)}, second = missing?()}) -> return 91
+        \\        return target
         \\    return 92
     , 42);
 }
@@ -131,7 +131,7 @@ test "evaluation heap allocator edits skip deferred construction and recompute s
     const fixture = try test_sources.SourceFixture.init(
         \\func forbidden() int -> exit(90)
         \\func run() int
-        \\    if const owner = Box(int).new(forbidden()) -> return owner.into_value()
+        \\    if const owner = Box(int).new(forbidden()) -> return owner.take()
         \\    return 42
         \\exit(comptime -> run())
     );
@@ -171,7 +171,7 @@ test "evaluation heap compiler allocation failure is retryable without publishin
     defer db.deinit();
     try modules.registerSources(db, failing.allocator(),
         \\func compute() int
-        \\    if const owner = Box(int).new(42) -> return owner.into_value()
+        \\    if const owner = Box(int).new(42) -> return owner.take()
         \\    return 90
     , &.{}, &.{});
     const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;
@@ -228,13 +228,13 @@ test "evaluation heap independent workers share no storage and recursive snapsho
         \\func factory(seed: int) Box(int)
         \\    if const owner = Box(int).new(seed) -> return owner^
         \\    exit(90)
-        \\func advance(imm reference: Ref(int, true)) int
-        \\    if reference[] == 0 -> return 42
-        \\    reference.replace(reference[] - 1)
+        \\func advance(ref reference: int) int
+        \\    if reference == 0 -> return 42
+        \\    reference = reference - 1
         \\    return advance(reference)
         \\func compute(seed: int) int
         \\    var owner = factory(seed)
-        \\    return advance(owner.borrow_mut())
+        \\    return advance(owner.borrow())
     ;
     try modules.registerSources(db, allocator, source, &.{}, &.{});
     const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;
@@ -267,25 +267,25 @@ test "evaluation heap executes independent factories nested aliases and ordinary
         \\func factory() Box(int)
         \\    if const owner = Box(int).new(19) -> return owner^
         \\    exit(90)
-        \\func update(imm target: Ref(int, true)) -> target.replace(target[] + 4)
-        \\func forward(imm target: Ref(int, true)) -> update(target)
+        \\func update(var target: Ref(int)) -> target.value = target.value + 4
+        \\func forward(var target: Ref(int)) -> update(target)
         \\fallible compute() int
         \\    var first = factory()
         \\    const second = factory()
-        \\    forward(first.borrow_mut())
-        \\    if first.borrow()[] <> 23 -> return 91
-        \\    if second.borrow()[] <> 19 -> return 92
+        \\    forward(Ref.from(first.borrow()))
+        \\    if first.borrow() <> 23 -> return 91
+        \\    if second.borrow() <> 19 -> return 92
         \\    var buffer = List(int).new?(0)
         \\    buffer.append?(19)
         \\    buffer.append?(23)
         \\    buffer.reserve?(8)
         \\    const view = buffer.view?(0, 2)
-        \\    const left = view.get?(0)
-        \\    const right = view.get?(1)
-        \\    const values: List(int) = [left[], right[]]
-        \\    const first_value = values.get?(0)
-        \\    const second_value = values.get?(1)
-        \\    return first_value[] + second_value[]
+        \\    ref left = view.get?(0)
+        \\    ref right = view.get?(1)
+        \\    const values: List(int) = [left, right]
+        \\    ref first_value = values.get?(0)
+        \\    ref second_value = values.get?(1)
+        \\    return first_value + second_value
         \\func run() int
         \\    if const result = compute() -> return result
         \\    return 93
@@ -690,19 +690,19 @@ test "interpreter call cycles reject unchanged references and allow changed refe
     const db = try query.Database.init(allocator, .{ .worker_count = 1 });
     defer db.deinit();
     try modules.registerSources(db, allocator,
-        \\import std.memory.{borrow_local}
+        \\import std.memory.{Ref}
         \\import std.array.{Array}
-        \\func repeat(imm reference: Ref(int, false)) int -> repeat(reference)
+        \\func repeat(imm reference: Ref(int)) int -> repeat(reference)
         \\func unchanged() int
         \\    const value = 17
-        \\    return repeat(borrow_local(int, value))
-        \\func advance(imm reference: Ref(int, true)) int
-        \\    if reference[] == 0 -> return 42
-        \\    reference.replace(reference[] - 1)
+        \\    return repeat(Ref.from(value))
+        \\func advance(ref reference: int) int
+        \\    if reference == 0 -> return 42
+        \\    reference = reference - 1
         \\    return advance(reference)
         \\func changing() int
         \\    var values = Array(int, 1).filled(3)
-        \\    if const reference = values.get_mut(0) -> return advance(reference)
+        \\    if ref reference = values.get(0) -> return advance(reference)
         \\    return 90
     , &.{}, &.{});
     const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;
@@ -728,6 +728,51 @@ test "interpreter call cycles reject unchanged references and allow changed refe
     try std.testing.expect(changed.completed.outcome == .returned);
     const value = (try db.lookupInterned(queries.CompileTimeValues, changed.completed.outcome.returned)).*;
     try std.testing.expectEqual(@as(i32, 42), value.runtime.value.int);
+}
+
+test "interpreter direct branch values snapshot descriptors while storage aliases them" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const storage = arena.allocator();
+    var executor: ArrayTestExecutor = .{ .allocator = std.testing.allocator };
+    defer executor.deinit();
+    const reference_type: structures.TypeId = @fromBackingInt(@as(u32, 104));
+    var first: Cell = .{ .type_id = .int, .storage = storage, .contents = .{ .value = .{ .int = 42 } } };
+    var second: Cell = .{ .type_id = .int, .storage = storage, .contents = .{ .value = .{ .int = 7 } } };
+    for ([_]structures.ValueRepresentation{ .value, .storage }) |representation| {
+        var arguments = [_]Value{
+            try referenceValue(reference_type, &first, storage),
+            try referenceValue(reference_type, &second, storage),
+        };
+        var modes = [_]structures.ParameterMode{ .mut, .imm };
+        var block_arguments = [_]structures.FunctionBlockArgument{
+            .{ .type_id = reference_type, .representation = .storage },
+            .{ .type_id = reference_type },
+            .{ .type_id = reference_type, .representation = representation },
+        };
+        var branch_arguments = [_]structures.FunctionValueUse{.{ .value = @fromBackingInt(@as(u32, 0)) }};
+        var instructions = [_]structures.FunctionInstruction{
+            .{ .value_copy = .{ .source = @fromBackingInt(@as(u32, 1)), .destination = @fromBackingInt(@as(u32, 0)), .type_id = reference_type } },
+            .{ .borrow_read = .{ .source = @fromBackingInt(@as(u32, 2)), .type_id = .int } },
+        };
+        var blocks = [_]structures.FunctionBlock{
+            .{ .argument_end = 2, .instruction_start = 0, .instruction_end = 0, .terminator = .{ .branch = .{ .target = @fromBackingInt(@as(u32, 1)), .arguments = .{ .start = 0, .end = 1 } } } },
+            .{ .argument_start = 2, .argument_end = 3, .instruction_start = 0, .instruction_end = 2, .terminator = .{ .return_value = .{ .value = @fromBackingInt(@as(u32, 4)) } } },
+        };
+        const body: structures.FunctionBodyAnalysis = .{
+            .return_type = .int,
+            .parameter_modes = &modes,
+            .block_arguments = &block_arguments,
+            .branch_arguments = &branch_arguments,
+            .call_arguments = &.{},
+            .instructions = &instructions,
+            .blocks = &blocks,
+            .entry = @fromBackingInt(@as(u32, 0)),
+        };
+        const result = try executeInStorage(&body, &arguments, &executor, std.testing.allocator, storage);
+        try std.testing.expect(result == .returned);
+        try std.testing.expectEqual(@as(i32, if (representation == .value) 42 else 7), result.returned.runtime.int);
+    }
 }
 
 test "interpreter arrays fill through counted CFG and publish aggregate tuples" {

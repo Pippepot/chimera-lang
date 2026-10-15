@@ -119,14 +119,10 @@ fn branchStorageEnd(ssa: *const structures.FunctionBodyAnalysis, types: anytype,
     return end;
 }
 
-const MutableCallResult = struct { type_id: structures.TypeId, location: ValueLocation };
-
 const CallLayout = struct {
     result: ValueLocation,
     arguments: []ValueLocation,
     storage_end: u32,
-    mut_results: []?MutableCallResult = &.{},
-    return_register: ?u32 = null,
 
     fn init(types: anytype, return_type: structures.TypeId, parameters: []const structures.TypeId, representations: []const structures.ValueRepresentation, gpa: std.mem.Allocator) !CallLayout {
         std.debug.assert(parameters.len == representations.len);
@@ -146,7 +142,6 @@ const CallLayout = struct {
 
     fn deinit(self: *CallLayout, gpa: std.mem.Allocator) void {
         gpa.free(self.arguments);
-        gpa.free(self.mut_results);
         self.* = undefined;
     }
 };
@@ -180,14 +175,12 @@ fn planCallStorage(
         parameter.* = use.coerce_to orelse value_types[@backingInt(use.value)];
         representation.* = switch (argument) {
             .prepared => .value,
-            .deinit => .storage,
+            .deinit, .borrowed => .storage,
             .initializer => .initializer,
         };
     }
     var layout = try CallLayout.init(types, call.return_type, parameters, representations, gpa);
     errdefer layout.deinit(gpa);
-    layout.mut_results = try gpa.alloc(?MutableCallResult, parameters.len);
-    @memset(layout.mut_results, null);
     try layouts.put(gpa, key, layout);
     return layout.storage_end;
 }
@@ -222,7 +215,7 @@ const LocationPlan = struct {
         for (ssa.call_arguments[call.arguments.start..call.arguments.end]) |argument| {
             const index = @backingInt(argument.valueId());
             needed[index] = .used;
-            if (argument == .deinit) addressable[index] = true;
+            if (argument == .deinit or argument == .borrowed) addressable[index] = true;
         }
     }
 
@@ -275,7 +268,7 @@ const LocationPlan = struct {
                     }
                 },
                 .local_storage => addressable[value_index] = true,
-                .mut_parameter_write => |operation| if (ssa.is_initializer_region) {
+                .initializer_capture_write => |operation| if (ssa.is_initializer_region) {
                     needed[operation.parameter_index] = .used;
                 },
                 .storage_projection => |operation| if (operation.projection != .box_element) {
@@ -360,7 +353,7 @@ const LocationPlan = struct {
                     locations[argument_index] = .{ .indirect = try reserveStack(&local_end, indirect_layout) };
                     continue;
                 }
-                const layout = try valueSlotLayout(types, value_types[argument_index]);
+                const layout = try blockArgumentLayout(types, ssa.block_arguments[argument_index]);
                 if (layout.byte_size == 0 and !addressable[argument_index]) continue;
                 locations[argument_index] = .{ .stack = try reserveStack(&local_end, if (layout.byte_size == 0) zero_sized_address_layout else layout) };
             }
@@ -413,17 +406,6 @@ const LocationPlan = struct {
             for (entry.argument_start..entry.argument_end) |index| {
                 if (needed[index] != .unused) locations[index] = .{ .indirect = try reserveStack(&local_end, indirect_layout) };
             }
-        }
-        for (ssa.instructions) |instruction| {
-            if (instruction != .call_mut_argument) continue;
-            const operation = instruction.call_mut_argument;
-            const call = calls.getPtr(.{ .arguments = operation.arguments, .return_type = operation.return_type }).?;
-            if (call.mut_results[operation.argument_index] != null) continue;
-            const by_address = call.arguments[operation.argument_index] == .indirect;
-            const offset = try reserveStack(&local_end, if (by_address) indirect_layout else try types.layout(operation.type_id));
-            call.mut_results[operation.argument_index] = .{ .type_id = operation.type_id, .location = if (by_address) .{ .indirect = offset } else .{ .stack = offset } };
-            if (call.result == .eax and call.return_register == null)
-                call.return_register = try reserveStack(&local_end, .{ .byte_size = 4, .byte_alignment = 4 });
         }
         const stack_size = local_end;
         if (stack_size > std.math.maxInt(i32)) return error.FunctionTooLarge;
@@ -693,8 +675,7 @@ fn FunctionEmitter(comptime Types: type) type {
                     .borrow_write => |operation| try self.emitBorrowWrite(operation),
                     .value_copy => |operation| try self.copyValue(operation.type_id, self.locations[@backingInt(operation.source)], if (operation.destination) |storage| self.locations[@backingInt(storage)] else destination),
                     .field_access => |operation| try self.emitFieldAccess(operation, destination),
-                    .mut_parameter_write => |operation| try self.emitMutParameterWrite(ssa, operation),
-                    .call_mut_argument => |operation| try self.emitCallMutArgument(operation, destination),
+                    .initializer_capture_write => |operation| try self.emitInitializerCaptureWrite(ssa, operation),
                     .call => |call| try self.emitCall(call, destination),
                     .negi => |operand| {
                         try self.loadValue(self.locations[@backingInt(operand)]);
@@ -766,7 +747,9 @@ fn FunctionEmitter(comptime Types: type) type {
                 if (destination == .indirect) {
                     try self.loadArgumentAddress(arguments[0]);
                     try self.encoder.offset(.mov_rsp_rax, destination.indirect);
-                } else if (destination != .discarded) try self.emitUse(arguments[0], type_id, destination);
+                } else if (destination != .discarded) {
+                    try self.emitUse(arguments[0], type_id, destination);
+                }
                 return;
             }
             var scratch_end = self.edge_scratch_offset;
@@ -776,7 +759,9 @@ fn FunctionEmitter(comptime Types: type) type {
                 if (destination == .indirect) {
                     try self.loadArgumentAddress(argument);
                     try self.encoder.offset(.mov_rsp_rax, scratch_offset);
-                } else if (destination != .discarded) try self.emitUseToMemory(argument, scratch_offset);
+                } else if (destination != .discarded) {
+                    try self.emitUseToMemory(argument, scratch_offset);
+                }
             }
             scratch_end = self.edge_scratch_offset;
             for (arguments, 0..) |_, argument_offset| {
@@ -786,7 +771,9 @@ fn FunctionEmitter(comptime Types: type) type {
                 if (destination == .indirect) {
                     try self.encoder.offset(.mov_rax_rsp, scratch_offset);
                     try self.encoder.offset(.mov_rsp_rax, destination.indirect);
-                } else if (destination != .discarded) try self.copyValue(type_id, .{ .stack = scratch_offset }, destination);
+                } else if (destination != .discarded) {
+                    try self.copyValue(type_id, .{ .stack = scratch_offset }, destination);
+                }
             }
         }
 
@@ -849,18 +836,10 @@ fn FunctionEmitter(comptime Types: type) type {
                 },
             }
             const layout = self.call_layouts.get(.{ .arguments = call.arguments, .return_type = call.return_type }).?;
-            if (layout.return_register) |offset| try self.encoder.offset(.mov_rsp_eax, offset);
-            for (layout.arguments, layout.mut_results) |argument, saved| {
-                const snapshot = saved orelse continue;
-                if (argument == .indirect) {
-                    try self.encoder.offset(.mov_rax_rsp, argument.indirect);
-                    try self.encoder.offset(.mov_rsp_rax, snapshot.location.indirect);
-                } else try self.copyValue(snapshot.type_id, argument, snapshot.location);
-            }
             switch (layout.result) {
                 .indirect => {},
                 .stack => try self.copyValue(call.return_type, layout.result, destination),
-                .eax => try self.copyValue(call.return_type, if (layout.return_register) |offset| .{ .stack = offset } else .eax, destination),
+                .eax => try self.copyValue(call.return_type, .eax, destination),
                 else => unreachable,
             }
         }
@@ -874,7 +853,7 @@ fn FunctionEmitter(comptime Types: type) type {
             for (self.call_arguments[call.arguments.start..call.arguments.end], layout.arguments) |argument, location| {
                 if (argument == .initializer) {
                     std.debug.assert(location == .stack);
-                    try self.copyRange(self.locations[@backingInt(argument.initializer)], 0, .{ .value = location }, 0, initializer_layout.byte_size);
+                    try self.copyRange(self.locations[@backingInt(argument.valueId())], 0, .{ .value = location }, 0, initializer_layout.byte_size);
                     continue;
                 }
                 if (location == .indirect) {
@@ -981,8 +960,8 @@ fn FunctionEmitter(comptime Types: type) type {
 
         fn emitCursorElement(self: *Self, operation: structures.CursorElement, destination: ValueLocation) !void {
             if (destination == .discarded) return;
-            const access = (try self.types.facts().storageAccess(operation.type_id)) orelse unreachable;
-            const layout = try self.types.layout(access.element_type);
+            const element = (try self.types.facts().borrowElement(operation.type_id)) orelse (try self.types.facts().storageCursorAccess(operation.type_id)).?;
+            const layout = try self.types.layout(element);
             if (layout.byte_size > std.math.maxInt(i32)) return error.UnsupportedElementLayout;
             if (layout.byte_size != 0) {
                 try self.loadValue(self.locations[@backingInt(operation.index)]);
@@ -1250,33 +1229,11 @@ fn FunctionEmitter(comptime Types: type) type {
             );
         }
 
-        fn emitMutParameterWrite(self: *Self, ssa: *const structures.FunctionBodyAnalysis, operation: structures.MutParameterWrite) !void {
+        fn emitInitializerCaptureWrite(self: *Self, ssa: *const structures.FunctionBodyAnalysis, operation: structures.InitializerCaptureWrite) !void {
+            std.debug.assert(ssa.is_initializer_region);
             const entry = ssa.blocks[@backingInt(ssa.entry)];
             std.debug.assert(operation.parameter_index < entry.argument_end - entry.argument_start);
-            if (ssa.is_initializer_region) {
-                try self.copyValue(operation.type_id, self.locations[@backingInt(operation.value)], self.locations[operation.parameter_index]);
-                return;
-            }
-            const parameter = self.incoming_layout.arguments[operation.parameter_index];
-            const parameter_offset = switch (parameter) {
-                .stack, .indirect => |offset| offset,
-                else => unreachable,
-            };
-            const caller_stack_offset = std.math.add(u32, self.stack_size, @sizeOf(u64)) catch return error.FunctionTooLarge;
-            const destination_offset = std.math.add(u32, caller_stack_offset, parameter_offset) catch return error.FunctionTooLarge;
-            const destination: ValueLocation = if (parameter == .indirect)
-                .{ .indirect = destination_offset }
-            else
-                .{ .incoming_argument = destination_offset };
-            try self.copyValue(operation.type_id, self.locations[@backingInt(operation.value)], destination);
-        }
-
-        fn emitCallMutArgument(self: *Self, operation: structures.CallMutArgument, destination: ValueLocation) !void {
-            const layout = self.call_layouts.get(.{ .arguments = operation.arguments, .return_type = operation.return_type }).?;
-            const source = layout.mut_results[operation.argument_index].?.location;
-            const storage = operation.destination orelse return self.copyValue(operation.type_id, source, destination);
-            if (self.call_arguments[operation.arguments.start + operation.argument_index].valueId() == storage) return;
-            try self.copyValue(operation.type_id, source, self.locations[@backingInt(storage)]);
+            try self.copyValue(operation.type_id, self.locations[@backingInt(operation.value)], self.locations[operation.parameter_index]);
         }
 
         fn copyRange(self: *Self, source: ValueLocation, source_start: u32, destination: CopyDestination, destination_start: u32, byte_size: u32) !void {
@@ -1439,16 +1396,7 @@ pub fn compileExternalExit(gpa: std.mem.Allocator) !structures.CompiledFunction 
     try encoder.emit(.mov_edi_eax);
     try encoder.immediate(.mov_eax, linux_exit_syscall);
     try encoder.emit(.syscall);
-    const code = try encoder.code.toOwnedSlice(gpa);
-    errdefer gpa.free(code);
-    const relocations = try gpa.alloc(structures.CompiledFunction.Relocation, 0);
-    errdefer gpa.free(relocations);
-    return .{
-        .code = code,
-        .required_alignment = 1,
-        .relocations = relocations,
-        .referenced_instances = try gpa.alloc(structures.InstanceId, 0),
-    };
+    return externalArtifact(&encoder, gpa);
 }
 
 pub fn compileExternalAllocateHostStorage(gpa: std.mem.Allocator) !structures.CompiledFunction {
@@ -1532,55 +1480,6 @@ pub fn compileExternalAllocationCount(gpa: std.mem.Allocator, count_offset: u32)
     var encoder = try X86Encoder.init(gpa);
     defer encoder.deinit();
     try encoder.offset(.mov_eax_rsp, count_offset + 8);
-    try encoder.immediate(.mov_edx, 1);
-    try encoder.emit(.ret);
-    return externalArtifact(&encoder, gpa);
-}
-
-pub fn compileExternalHostBoxWrap(gpa: std.mem.Allocator, layout: structures.TypeLayout) !structures.CompiledFunction {
-    var encoder = try X86Encoder.init(gpa);
-    defer encoder.deinit();
-    var argument_end: u32 = 0;
-    _ = try reserveStack(&argument_end, layout);
-    const allocation_offset = try reserveStack(&argument_end, indirect_layout);
-    try encoder.offset(.mov_rax_rsp, allocation_offset + 8);
-    try encoder.emit(.mov_rsi_rax);
-    try encoder.offset(.lea_rdi_rsp, 8);
-    try encoder.immediate(.mov_ecx, @intCast(layout.byte_size));
-    try encoder.emit(.rep_movsb);
-    try encoder.immediate(.mov_edx, 1);
-    try encoder.emit(.ret);
-    return externalArtifact(&encoder, gpa);
-}
-
-pub fn compileExternalHostSlotTake(gpa: std.mem.Allocator, allocation: structures.TypeLayout, element: structures.TypeLayout, indexed: bool) !structures.CompiledFunction {
-    if (element.byte_size > std.math.maxInt(i32)) return error.UnsupportedElementLayout;
-    var encoder = try X86Encoder.init(gpa);
-    defer encoder.deinit();
-    if (element.byte_size == 0) {
-        try encoder.immediate(.mov_edx, 1);
-        try encoder.emit(.ret);
-        return externalArtifact(&encoder, gpa);
-    }
-
-    var argument_end: u32 = 0;
-    if (usesMemoryReturn(element)) _ = try reserveStack(&argument_end, element);
-    const allocation_offset = try reserveStack(&argument_end, allocation);
-    const index_offset = if (indexed) try reserveStack(&argument_end, .{ .byte_size = 4, .byte_alignment = 4 }) else null;
-    try encoder.offset(.mov_rax_rsp, allocation_offset + 8);
-    if (index_offset) |offset| {
-        try encoder.offset(.movsxd_rcx_rsp, offset + 8);
-        try encoder.immediate(.imul_rcx, @intCast(element.byte_size));
-        try encoder.emit(.add_rax_rcx);
-    }
-    try encoder.emit(.mov_rsi_rax);
-    if (usesMemoryReturn(element)) {
-        try encoder.offset(.lea_rdi_rsp, 8);
-        try encoder.immediate(.mov_ecx, @intCast(element.byte_size));
-        try encoder.emit(.rep_movsb);
-    } else {
-        try encoder.emit(.mov_eax_rsi);
-    }
     try encoder.immediate(.mov_edx, 1);
     try encoder.emit(.ret);
     return externalArtifact(&encoder, gpa);

@@ -250,6 +250,11 @@ fn writeTypeInner(types: anytype, writer: *std.Io.Writer, type_id: structures.Ty
         try writeTypeInner(types, writer, array.element_type);
         return writer.print(", {d})", .{array.length});
     }
+    if (try types.borrowElement(type_id)) |element| {
+        try writer.writeAll("ref ");
+        try writeTypeInner(types, writer, element);
+        return;
+    }
     if (try types.structName(type_id)) |name| return writer.writeAll(name);
     if (try types.callable(type_id)) |callable| {
         try writer.writeAll(if (callable.is_fallible) "fallible(" else "func(");
@@ -259,6 +264,7 @@ fn writeTypeInner(types: anytype, writer: *std.Io.Writer, type_id: structures.Ty
             try writeTypeInner(types, writer, parameter.type_id);
         }
         try writer.writeAll(") ");
+        if (callable.result_mode == .reference) try writer.writeAll("ref ");
         return writeTypeInner(types, writer, callable.return_type);
     }
 
@@ -431,6 +437,7 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
         .recursive_struct_containment => try writeSourceLabel(writer, "struct recursively contains itself by value through field", source, span),
         .static_initializer_type_mismatch => |mismatch| try writeMismatch(types, writer, "static initializer type mismatch: ", mismatch),
         .type_value_used_as_runtime_value => try writeSourceLabel(writer, "expected a value, found a type", source, span),
+        .reference_projection_requires_member => try writer.writeAll("a reference condition must select one variant member or retain the full target type"),
         .value_used_as_type => try writeSourceLabel(writer, "expected a type, found a value", source, span),
         .type_factory_requires_call => try writeSourceLabel(writer, "call this type-producing function to obtain a type", source, span),
         .generic_struct_requires_specialization => {
@@ -485,7 +492,7 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
         .explicit_drop_field_cannot_be_implicitly_ended => try writer.writeAll("cannot implicitly end an explicit-drop field; transfer or dispose of it on every path"),
         .field_not_restored_before_mut_return => try writer.writeAll("a `mut` argument must have every transferred field restored before returning"),
         .ownership_transfer_requires_owning_context => try writer.writeAll("remove `^`: this use borrows the value instead of taking ownership"),
-        .mutable_argument_requires_place, .mutable_argument_requires_mutable_place => try writer.writeAll("argument to a `mut` parameter must be a mutable local or one of its fields"),
+        .mutable_argument_requires_place, .mutable_argument_requires_mutable_place => try writer.writeAll("argument to a `mut` parameter must be a writable place: a mutable local, borrowed result, or reference field with writable access"),
         .overlapping_mutable_arguments => try writer.writeAll("this `mut` argument accesses the same value as another argument in the call"),
         .use_after_transfer => try writer.writeAll("cannot use this value after it was transferred with `^`"),
         .possibly_transferred => try writer.writeAll("cannot use this value because it may already have been transferred with `^`"),
@@ -502,9 +509,8 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
         .invalid_converter => try writer.writeAll("converter must have one immutable runtime source or one compile-time-only static source and an infallible result"),
         .invalid_converter_owner => try writer.writeAll("converter must be declared in the defining module of its source or target type"),
         .borrow_requires_place => try writer.writeAll("borrowing a value's storage requires a named local or parameter, or one of its fields"),
-        .mutable_borrow_requires_writable_place => try writer.writeAll("`borrow mut` requires a mutable place or writable Ref"),
-        .dereference_requires_ref => |type_id| try writeTypedMessage(types, writer, "dereference requires a Ref, found ", type_id, ""),
-        .reference_not_writable => try writer.writeAll("cannot assign through a read-only Ref"),
+        .mutable_borrow_requires_writable_place => try writer.writeAll("a writable reference requires a mutable place or writable Ref"),
+        .reference_not_writable => try writer.writeAll("cannot modify a readonly reference"),
         .transferred_value_not_restored_before_loop_backedge => try writer.writeAll("transferred value must be reassigned before the next loop iteration"),
         .type_not_movable => |type_id| try writeTypedMessage(types, writer, "cannot transfer value of immovable type ", type_id, ""),
         .relocation_requires_direct_move => |type_id| try writeTypedMessage(types, writer, "a completed value of type ", type_id, " cannot move directly into another destination; construct it there, giving the result a known type if needed"),
@@ -546,7 +552,7 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
         .unknown_value => {
             try writeSourceLabel(writer, "unknown value", source, span);
         },
-        .assignment_target_not_local => try writer.writeAll("assignment target must be a mutable local or one of its fields"),
+        .assignment_target_not_local => try writer.writeAll("assignment target must be a writable place; bind an indexed element with `ref` before assigning its fields"),
         .assignment_to_immutable => {
             try writeSourceLabel(writer, "cannot assign to immutable binding", source, span);
         },
@@ -557,7 +563,8 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
         .invalid_string_utf8 => try writer.writeAll("string literal is not valid UTF-8"),
         .integer_literal_out_of_range => try writer.writeAll("integer literal is outside the supported i32 range"),
         .fallible_condition_not_supported => try writer.writeAll("this condition syntax is not supported yet"),
-        .if_condition_not_fallible => try writer.writeAll("condition must be able to fail, such as a comparison; plain values are not supported as conditions"),
+        .if_condition_not_fallible => try writer.writeAll("this expression is not supported as a condition"),
+        .query_operand_not_bool => |found| try writeTypedMessage(types, writer, "query `?` requires bool, found ", found, ""),
         .inspection_type_not_supported => try writer.writeAll("this inspection type is not supported yet"),
         .variant_inspection_operand_not_variant => |found| try writeTypedMessage(types, writer, "variant inspection requires a variant value, found ", found, ""),
         .condition_binding_must_be_immutable => try writer.writeAll("an `if` binding must use `const`, not `var`"),

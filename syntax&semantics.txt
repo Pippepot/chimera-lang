@@ -57,19 +57,20 @@
 pub extern func int.+(imm left: int, imm right: int) int
 # Only the registered prelude may extend primitive namespaces. Other modules
 # cannot extend them, just as they cannot extend an imported struct namespace.
-# Comparisons and logical expressions produce bool values. A bool value or an
-# ordinary bool-returning call may be a condition; fallible calls retain their
-# success/failure condition semantics. and/or skip the right operand when the
-# left operand determines their result.
+# Comparisons succeed with unit or fail in every expression position. Logical
+# and/or/not compose success and failure; they never produce bool. Querying a
+# stored bool with postfix ? succeeds with unit for true and fails for false.
+# and/or skip the right operand when the left outcome determines their result.
 # The complete current inventory is +, -, *, /, %, ==, <>, <, >, <=, >=, unary
-# negation and not, and read/write indexing. Unary and binary arithmetic minus
+# negation and read/write indexing. Logical not is dedicated control flow.
+# Unary and binary arithmetic minus
 # share the spelling -, distinguished only by runtime operand count. neg is an
 # ordinary identifier, with no compiler-defined meaning. Parentheses do not
 # change operator precedence.
 # For receiver type Self, the exact signatures are:
 # +, -, *, /, %: func (imm Self, imm Self) Self
-# ==, <>, <, >, <=, >=: func (imm Self, imm Self) bool
-# unary -: func (imm Self) Self; not: func (imm Self) bool
+# ==, <>, <, >, <=, >=: fallible (imm Self, imm Right) unit
+# unary -: func (imm Self) Self
 # []: func or fallible (imm Self, index: int) Result
 # []=: func or fallible (mut Self, index: int, var value: Element) unit
 # Inherited namespace static arguments and inferable static parameters use
@@ -78,8 +79,12 @@ pub extern func int.+(imm left: int, imm right: int) int
 # explicit calls and callable values: addition with three operands is invalid.
 # Operators have fixed identities by spelling and operand count, not argument
 # types. Both forms of - may be declared in the same namespace; duplicate forms
-# remain invalid. Ordinary named functions do not acquire overloads. Explicit
-# calls select by runtime operand count or total count with explicit static
+# remain invalid. Ordinary named functions do not acquire overloads.
+# Comparison declarations choose their right operand type; ordinary argument
+# conversion applies to that operand. Dispatch still uses the left operand's
+# namespace and never reverses a user operation. Arithmetic operands retain
+# their matching-Self signatures.
+# Explicit calls select by runtime operand count or total count with explicit static
 # arguments; a call matching both forms is ambiguous. A callable reference to
 # both forms requires a function-type context; its parameter count selects the
 # form, then ordinary signature and type checks apply. A sole form needs no
@@ -88,24 +93,23 @@ pub extern func int.-(imm value: int) int
 pub extern func int.-(imm left: int, imm right: int) int
 const negate: func(imm int) int = int.-
 const subtract: func(imm int, imm int) int = int.-
-# Arithmetic/comparison/unary operation functions cannot fail. Indexers may
-# fail; indexed expressions propagate ordinary failure in a fallible function
+# Arithmetic and arithmetic unary operations cannot fail. Comparison functions
+# succeed with unit or fail. Indexers may fail; indexed expressions propagate
+# ordinary failure in a fallible function
 # and can be handled by ordinary binding conditions. Writable indexing calls
 # []= rather than treating a by-value [] result as a writable place. Receiver
 # and index are evaluated once, then the replacement is eagerly prepared as an
 # owned argument before the setter checks bounds. Its effects and transfers are
 # not rolled back on bounds failure; the prepared value is cleaned up normally.
 # Compound indexing reads the old element before evaluating its RHS; failed
-# getter bounds therefore still skip that RHS. Explicit get_mut followed by a
-# reference write provides bounds-first evaluation for ordinary replacement.
-# Ref[] still means
-# dereference, not indexing. User-defined indexers own their bounds policy.
-# Standard Array, List, and Span reads return an ordinary copy of
-# the element and require its copy capability. Array, List, and writable Span writes
+# getter bounds therefore still skip that RHS. Capturing `ref item = values[i]`
+# before assignment provides bounds-first evaluation. User-defined indexers own
+# their bounds policy. Standard Array, List, and Span reads return borrowed places;
+# an owned destination requires the element's copy capability. Array, List, and writable Span writes
 # use checked reference replacement: elements must move directly, contain no
 # borrowed references, and permit automatic drop. Immovable elements still
 # construct in containers, but cannot use these copied-read/replacement APIs;
-# get/get_mut remain available for checked borrowed access. Readonly Span has no
+# get remains available for checked borrowed access. Readonly Span has no
 # writable element access.
 # Assignment remains ownership-aware replacement; compound assignments combine
 # the corresponding binary operation and assignment. and/or remain short-
@@ -115,7 +119,7 @@ const subtract: func(imm int, imm int) int = int.-
 # typed compile-time-only int_literal values remain intrinsic and preserve their
 # wide literal range. Equality of compile-time type metadata remains compiler
 # identity comparison. Tokens with no language semantics yet (such as
-# remainder, bitwise operators, and shifts) are not added
+# bitwise operators and shifts) are not added
 # by this contract. Later numeric types use the same operation signatures.
 
 
@@ -149,7 +153,10 @@ const subtract: func(imm int, imm int) int = int.-
 # storage. String has move and automatic drop, but no implicit copy; clone is
 # explicit and fallible. Allocation-backed text also executes at compile time,
 # subject to the evaluation-local storage publication boundary.
-# BytesView is a copyable wrapper of Span(byte, false). Views of arrays,
+# BytesView is a copyable wrapper of Span(byte) with readonly backing access.
+# get and [] return readonly ref byte; ref bindings alias the byte, while owned
+# bindings copy it. A borrowed byte can outlive a temporary view descriptor but
+# not its backing owner. Views of arrays,
 # allocations, Lists, and Strings retain their backing owners and storage
 # invalidation dependencies. Views of literal storage have permanent origins.
 # Empty views are valid and never dereference their base. View construction and
@@ -161,20 +168,24 @@ const subtract: func(imm int, imm int) int = int.-
 # exposes only immutable byte views. No Unicode normalization is implicit.
 # String and StringView define == and <> as infallible exact byte comparison,
 # including embedded NUL bytes. Different byte lengths imply inequality.
-# These operations follow the ordinary matching-Self signatures; a StringView
-# receiver accepts a borrowed String through its existing converter.
+# Both receiver types accept StringView on the right. String operands convert
+# to views by borrowing, and literal operands can construct permanent views.
+# String/StringView/literal comparisons therefore work in either order without
+# copying or allocating text. Each implementation compares borrowed bytes.
 # The named byte_int function widens a byte to int without failure. Numeric
 # runtime types are still not related by converters.
 # std.io supplies stdin/stdout/stderr handles, fallible read_bytes, write_once,
-# write_all, write_text, and print (text followed by a newline). Handles borrow
+# write_all, and write_text. Infallible print writes text followed by a newline
+# and terminates with panic status 134 on output failure. Handles borrow
 # the process's standard descriptors; they do not close or own them. read_bytes
 # appends at most the requested bytes to a List(byte), publishing only the
 # initialized prefix. Positive progress and short reads/writes are success;
 # zero read indicates EOF for a nonempty request. A zero-size read returns zero
 # without reading. Interrupted syscalls retry. write_all advances by completed
 # counts and fails on zero progress. Output programs ignore SIGPIPE so closed
-# pipes report ordinary write failure. Other OS failures propagate ordinary
-# failure; earlier external effects are not rolled back. Reading or allocating
+# pipes report ordinary write failure; print handles that failure by panicking.
+# Other OS failures propagate ordinary failure; earlier external effects are
+# not rolled back. Reading or allocating
 # failure preserves initialized List contents; reservation may change capacity.
 # Writes borrow initialized readonly byte spans. Reads initialize spare allocation
 # slots, not elements of a writable initialized span.
@@ -185,7 +196,7 @@ const subtract: func(imm int, imm int) int = int.-
 # Reached compile-time I/O is an unavailable execution operation, even inside a
 # fallible condition; an unexecuted branch performs no I/O and causes no error.
 # Compiler-private static_data represents immutable literal storage. Ref and Span
-# use one private StorageCursor(T, writable) substrate for typed storage access.
+# use one private StorageCursor(T) substrate for typed storage access.
 # Only registered storage primitives create/access cursors; cursor and handle
 # permissions cannot be escalated. Neither exposes numeric addresses.
 
@@ -285,6 +296,10 @@ const d = 30      # inferred annotation
 # introduces an alias, not a distinct nominal type; aliases preserve canonical
 # structural identity when used within variants.
 static Result = int | none
+# Type-valued arguments accept the same complete type expressions as annotations,
+# including unions, grouping, nested applications, and callable types.
+static OptionalNumbers = Array(int | none, 2)
+static Callbacks = Array(func(int | none) int, 2)
 static Empty: type = none # annotation disambiguates a type from the value none
 static Default = 40
 
@@ -438,7 +453,8 @@ fallible make_twenty() Box(int) -> Box.new?(20)
 fallible inspect_allocations() int
     var first = make_twenty?()
     const second = make_twenty?()
-    first.borrow_mut()[] = 22
+    ref borrowed = first.borrow()
+    borrowed = 22
     return first.borrow()[] + second.borrow()[]
 static allocated_answer = if const value = inspect_allocations() -> value else 0
 # allocated_answer is ordinary data: 42. Both Boxes are destroyed normally.
@@ -521,8 +537,12 @@ exit(0)
 # argument's type. A parameter annotated with a declared parameterized struct
 # factory applied to static parameter names (for example Container(T, N)) infers
 # those parameters from the same factory's nominal type specialization. Other
-# type-valued functions are not inverted. Multiple uses of an inferred static
-# parameter must agree on its canonical value; absent or conflicting evidence
+# type-valued functions are not inverted. A variant annotation with one dependent
+# arm, such as T | none or List(T) | none, infers from the argument members left
+# after removing the fixed arms. Thus int | none infers T = int for T | none;
+# a bare none supplies no evidence for T. Multiple dependent arms are not
+# partitioned by inference. Multiple uses of an inferred static parameter must
+# agree on its canonical value; absent or conflicting evidence
 # is an error. Inference cannot depend on an expected parameter type that itself
 # requires the missing static arguments. Type-valued call annotations are
 # checked after inference and do not provide an expected type while inferring.
@@ -707,6 +727,11 @@ take(a^) # transfer ownership; any subsequent access to 'a' is an error
 # Assigning a value to `_` is a non-consuming use that explicitly extends its
 # lifetime to that point. The expression is evaluated once, but an owning value
 # is neither copied nor transferred merely to perform the discard.
+# A discard produces unit when used as an inline body or a block's final value.
+# Its behavior does not depend on whether another statement follows it.
+# An inline function body with declared unit result evaluates its expression
+# and discards the value. Explicit return expressions still check their result
+# against the declared type.
 _ = resource
 #
 # Lexical name visibility does not determine destruction timing.
@@ -743,7 +768,10 @@ _ = resource
 # arguments, and replacements write in place.
 # Widening such a completed value would relocate it. Copying or transferring it
 # into a larger variant constructs its active member in that destination, and
-# extraction to a smaller variant copies the member. A fresh member result
+# extraction from a borrowed variant to a smaller variant copies the member.
+# Consuming extraction transfers ownership; a single payload retains its current
+# storage, while narrowing to another variant moves into that variant's storage.
+# A fresh member result
 # constructs in the larger destination's member storage, but a fresh result of
 # a narrower variant is already complete and cannot widen. The destination type
 # must be known before construction: from an annotation, an expected type, or
@@ -871,87 +899,80 @@ fallible forward_initializer(static T: type, init item: T) T
 # normally. Forwarding, aliases, and indirect calls preserve this boundary.
 # Ordinary eager argument expressions retain caller-directed exits.
 # Deferred writes and completed transfers are not rolled back on failure.
-# Reference escape, mutable copyback, and explicit-drop obligations still apply.
+# Reference escape, mutations of caller storage, and explicit-drop obligations still apply.
 
 
-# Borrowed views and host storage
-# `std.memory.Box(T)` uniquely owns one initialized T in separately managed
-# storage. `std.memory.Ref(T, writable: bool)` is a copyable, non-owning,
-# storable handle to an initialized T; `borrow item = place` creates a local,
-# read-only alias to an existing value without copying it. `borrow mut item = place`
-# requires writable access and creates a writable local alias. A borrow
-# binding is not a value, cannot be stored as a field or retargeted, and keeps
-# its original referent alive through its last use. Assignment to a writable
-# borrow binding replaces the referent, not the binding.
-# `borrow` is contextual in a binding; ordinary functions and members may
-# still be named `borrow`. It accepts an initialized named local, parameter,
-# another alias, an accessible field path rooted in one of them, or a
-# dereferenced Ref. Other temporary projections need a separate
-# lifetime-extension rule. `borrow mut` requires a mutable named root/field or
-# writable Ref; deriving a read-only alias from a writable one cannot regain
-# permission. A borrow from a Ref captures the referent, not the handle
-# variable: rebinding a var Ref does not retarget an existing alias. A derived
-# Ref borrowed through an alias also addresses the original referent. Ending,
-# moving, or replacing its referent's storage while the alias is used is
-# rejected. A borrowed return retains its possible origins;
-# A variant condition may bind one member with `if borrow name = place as T`
-# or `if borrow mut name = place as T`. The successful branch aliases the
-# payload without copying it; writable borrowing requires a writable place.
-# Field and variant projections retain the owner across loop joins. Replacing
-# the owner while the payload alias is still used is rejected. Borrowed subset
-# variants require a separate representation and are not accepted.
-# A bare borrow binding used to initialize an owned value copies T if T is
-# copyable; transferring ownership through the binding is not allowed.
+# References, places, and ownership
+# A place is initialized storage with an access permission and a lifetime.
+# `const item = expression` and `var item = expression` own their values. When
+# expression supplies a borrowed place, these bindings copy T and require T.copy.
+# `ref item = expression` instead aliases that place, preserving its permission
+# and storage identity. Reading item accesses T; assigning item replaces T at the
+# original address. A ref binding cannot be retargeted and owns no destruction.
+# Its initializer must supply an existing place; there is no implicit lifetime
+# extension for an owned temporary. Type annotations describe the logical T and
+# do not copy, coerce, or relocate the place.
 #
-# Ref(T, false) allows reads and Ref(T, true) also allows replacing an
-# initialized referent. Writable authority is part of the handle's static
-# type, independent of whether its own binding is const or var. Copying a
-# writable handle preserves that authority; copying it does not copy T or
-# acquire ownership. A var Ref binding may be assigned a different handle,
-# while assigning through a writable dereference replaces T and destroys the
-# old value. Converting a writable Ref to a read-only Ref is safe and one-way;
-# `Ref.as_imm` makes that attenuation explicit, and no safe conversion grants
-# write authority. Replacing an initialized explicit-drop referent is rejected;
-# an explicitly consumed referent is no longer initialized and cannot be
-# written through a Ref. Borrowing an immutable Box or
-# place cannot produce a writable Ref. Multiple writable handles may coexist:
-# there is no global exclusive mutable-borrow rule. Calls still reject a mut
-# argument overlapping any borrowed argument that might refer to it.
-# Mutable calls through writable aliases update the referent and conservatively
-# retain newly stored reference origins on its tracked local owners. A call
-# through a dereferenced alias cannot store borrowed handles when the referent's
-# owner is not tracked locally, such as through an external Ref parameter.
-# The pointee must remain initialized and its owner and storage valid for every
-# use, including use through copied or returned handles and aggregate fields.
-# A read-only Ref limits access through that handle; it does not freeze the
-# underlying value against other writable handles. No method returning an
-# apparent owned T may silently substitute a borrow for a copy.
+# `ref` parameters preserve the identity and permission of caller storage.
+# `mut` parameters require writable caller storage. `imm` and omitted modes keep
+# their readonly access contract; `var` owns its prepared value. Requiring writes
+# is expressed by mut, rather than assuming that a ref parameter is writable.
+# Caller permissions are preserved when a ref parameter projects or forwards a
+# place. There are no argument-site modifiers and no explicit origin annotations.
 #
-# Ref.copy copies the handle, retaining its permission and referent origins.
-# Ref.read copies the referenced T and requires T's copy capability; it never
-# substitutes a borrow. Dereference remains borrowed access to the referent.
+# Results distinguish ownership from identity: `func(...) T` returns an owned
+# value, `func(...) ref T` returns a borrowed place, and `func(...) Ref(T)` returns
+# an owned reference handle whose referent is borrowed. Callable types retain
+# this result contract. A borrowed result can initialize an owned destination by
+# copying T, initialize a ref binding by aliasing, or supply a borrowing argument.
+# Borrowed results must designate caller or permanent storage; local and copied
+# parameter frame storage cannot escape. Physical layout does not change this rule.
 #
-# Box.new uses the init contract described below. Borrowing Box yields a Ref
-# with permission no stronger than the access path; consuming extraction
-# transfers T out only when T can move directly.
-# Allocation(T) separately owns uninitialized storage and must be explicitly
-# consumed; its deallocation never destroys initialized elements. Indexed
-# initialization, access, transfer, and destruction remain unsafe unless the
-# caller proves bounds, initialization, and absence of conflicting changes.
-# List(T) owns an initialized prefix of an Allocation(T); checked access
-# fails on invalid indices. Its read-only access yields Ref(T, false), and
-# `get_mut(index)` requires a mutable List place and yields Ref(T, true).
-# Mutable List calls invalidate earlier element and view borrows even when
-# the backing allocation does not change. Growth allocates before disturbing
-# existing elements, so allocation failure preserves them. Box, Ref, and
-# Allocation methods expose the common operations alongside the low-level
-# free functions. These expressions compile in the host subset:
-#   var handle: Ref(int, true) = owner.borrow_mut()
-#   borrow item = handle[]
-#   borrow mut writable_item = handle[]
-#   handle = other.borrow_mut()  # retargets handle, not item
-#   writable_item = 42           # replaces the captured referent
-#   handle[] = 43                # replaces the handle's current referent
+# A field declared `pub ref value: T` stores a nonowning address while exposing
+# logical type T. Initialization captures a place; assignment writes its referent.
+# Copying the field copies its address and retained permission, without copying T.
+# Destruction never destroys T through a reference field. Reference fields do not
+# participate in inline containment cycles or inherit T's move/copy/drop duties.
+# Ref(T) is the ordinary generic struct with one public reference field, value.
+# `Ref.from(place)` constructs a handle. There is no Ref(mut T), permission type
+# argument, borrow binding modifier, address operator, or empty [] dereference.
+# Box(T), in contrast, owns its initialized T and destroys it before deallocation.
+#
+# Permission is inferred from the capture origin and current access path. A const
+# handle supplies readonly access, and copying it into a var cannot restore write
+# authority. A mutable binding never upgrades a readonly captured origin. Access
+# through fields is transitive. Mutable references may coexist: there is no global
+# exclusive-borrow rule. Calls retain the ordinary overlapping mut-argument checks.
+#
+# Box.borrow(ref self) returns ref T. Array, List, and Span get(ref self, index)
+# and [](ref self, index) return ref T after checking bounds. `ref item = values[i]`
+# aliases an element; `var item = values[i]` copies it. Containers of Ref(T) return
+# ref Ref(T), which borrows the handle slot rather than silently unwrapping it.
+# An owned getter remains an owned getter and cannot satisfy a ref binding.
+# Explicit handles are requested with Ref.from(values.get?(i)) or
+# Ref.from(owner.borrow()). No separate get_mut or borrow_mut accessor is needed.
+#
+# `if ref item = value as Member` selects an existing variant payload without
+# copying or consuming it. `if ref item = values.get(index)` binds on success.
+# Conditional borrows retain their owner and active-tag dependency. Projection
+# to a differently laid-out subset variant cannot create an alias.
+#
+# Lookup preserves existing element references. Destruction, relocation,
+# reallocation, owner transfer, and changes to an active variant tag invalidate
+# the affected storage references. Replacing an initialized value in stable
+# storage preserves its slot while invalidating content-dependent views of the
+# old value. Readonly references restrict access; they do not freeze their owner.
+# Validated text views additionally depend on the byte contents remaining valid.
+# Origins and attenuation survive copies, fields, branches, loops, calls,
+# function values, returns, and incremental recomputation.
+#
+#   var owner = [1, 2, 3]
+#   ref item = owner[0]
+#   item += 1
+#   var handle = Ref.from(item)
+#   handle.value += 1
+#   const readonly = handle
+#   # readonly.value = 0 would require writable access
 #
 # Host storage and low-level operations:
 # `std.memory.Box(T)` uniquely owns one initialized T in separately managed
@@ -985,9 +1006,12 @@ fallible forward_initializer(static T: type, init item: T) T
 # Box-specific expression recognition or optional optimization.
 #
 # Box.new?(owner.borrow()[]) copies a copyable pointee into a distinct allocation.
-# Box has no separate duplication API. Consuming value(T, owner) or
-# value(T, owner^) uses deinit access to the Box; extraction of T still
+# Box has no separate duplication API. Consuming take(T, owner) or
+# take(T, owner^) uses deinit access to the Box; extraction of T still
 # requires direct movement in the host API.
+# Box.borrow and Box.take are ordinary wrappers for borrow(T, owner) and
+# take(T, owner), respectively. Descriptors returned by view construction and
+# slicing are owned values, not references to newly constructed descriptors.
 # Nonnegative zero-byte host allocations (zero elements or zero-sized T)
 # succeed with a distinct, stable storage address; the provider may reserve
 # a minimal region to supply it.
@@ -1004,7 +1028,7 @@ fallible forward_initializer(static T: type, init item: T) T
 # destroy elements. fallible unsafe_initialize(T, mut allocation, index, init value)
 # consumes an initializer into an uninitialized element slot using the general
 # destination rules. Allocation and index arguments evaluate eagerly; the value
-# expression is deferred until slot initialization. Allocation(T).unsafe_init
+# expression is deferred until slot initialization. Allocation(T).unsafe_initialize
 # is also explicitly fallible. Calls obey these declared fallible signatures,
 # even when the supplied initializer is infallible; this does not make the
 # initializer itself fallible. Failed construction
@@ -1016,53 +1040,21 @@ fallible forward_initializer(static T: type, init item: T) T
 # unsafe_take(T, mut allocation, index) still requires directly movable T in
 # the host API.
 # unsafe_destroy(T, mut allocation, index) destroys an initialized element at
-# its address without moving it. unsafe_borrow_initialized(T, imm allocation,
-# index) yields an expression-only borrow of that element, usable for immediate
-# inspection or imm arguments; binding it as T copies T if allowed, not the
-# borrow. These operations require caller-proven bounds and initialization
+# its address without moving it. unsafe_borrow(T, ref allocation,
+# index) returns ref T. A ref binding aliases the slot; an owned binding copies
+# T if copying is supported. These operations require caller-proven bounds and initialization
 # state; destruction and borrowing also require the caller to prevent
 # conflicting aliases or invalidation during use. They are not safe initialized
 # access. Box, Ref, and List are in std.prelude; raw allocation requires an explicit
-# std.memory import. Ref(T, writable: bool) is a non-null, non-owning host
-# reference with a required static permission. Ref(T, false) is read-only;
-# Ref(T, true) permits writing the referent. Either handle can be copied
-# without copying T, and multiple writable handles may coexist. There is no
-# global exclusive mutable-borrow rule. The owner must remain live through
-# every use; origins are tracked through calls, returns, stored values, and
-# invalidation.
-# borrow_box(T, imm owner: Box(T)) yields Ref(T, false).
-# borrow_mut_box(T, mut owner: Box(T)) requires a mutable Box place and yields
-# Ref(T, true); it cannot borrow an immutable owner or a temporary.
-# read(T, static writable: bool, imm reference: Ref(T, writable)) yields
-# an expression-only borrowed T. write(T, imm reference: Ref(T, true),
-# var item: T) replaces the referent, destroying its old value. The old value
-# must support automatic destruction; replacing an explicit-drop value is
-# rejected. Other handles to the stable Box storage remain valid.
-# A call cannot pass a mutable place together with a borrowed argument that may
-# refer to that place, whether the borrow is expression-only or a Ref handle
-# stored in another local.
-# An owner transferred into the same call cannot also supply an immutable
-# argument or be an origin of a borrowed argument or indirect callee. When
-# disjointness cannot be proved, the call is rejected.
-# A mut argument containing Ref conservatively retains possible referent
-# origins from its call inputs on writeback. A callee-local referent cannot
-# escape through a mut argument.
-# borrow_local(T, imm item: T) borrows the storage of a named local, parameter,
-# alias, or a field path rooted in one of them; it rejects temporary projections.
-# The borrow refers to the original storage. Replacing or transferring the root
-# or any of its fields invalidates the borrow, including changes to siblings.
-# A direct-passed parameter's storage belongs to the callee and cannot escape.
-# Replacing an initialized element through a captured handle preserves its stable
-# storage identity but invalidates borrows dependent on the old contents. This
-# applies even when T has trivial drop: validated text cannot survive byte writes.
-# Nested owner replacement invalidates borrows into the replaced owned storage.
-# Contracts belong to callable type identity,
-# including callable values. A named `mut` parameter refers to the caller's
-# owner after copy-back, including a replacement made by the callee. On failure,
-# the caller still receives the updated owner but no borrowed return value.
-# unsafe_borrow_element(T, imm allocation: Allocation(T), index: int) yields a
-# Ref(T, false) of an initialized indexed element. The caller proves bounds,
-# initialization, and absence of conflicting mutation or destruction during use.
+# std.memory import. Ref(T) owns its handle, retaining the borrowed referent's
+# origins. Borrowed results and reference fields expose T directly, as described
+# above. Existing caller storage is passed by address for ref and mut parameters.
+# Mutations remain visible on failure; a failed call supplies no borrowed result.
+# Calls reject overlapping mutable and borrowed arguments and reject transferring
+# an owner that also supplies another argument or indirect callee's borrow.
+# Allocation methods use the same allocate, deallocate, unsafe_initialize,
+# unsafe_borrow, unsafe_take, and unsafe_destroy names as their free functions.
+# Their ordinary wrappers preserve initializer timing and ownership modes.
 # An uninitialized Allocation(T) has no live T origins; unsafe operations with
 # Ref-containing elements retain conservative content origins and cannot return
 # references to callee-local owners. The caller still proves per-slot
@@ -1090,55 +1082,58 @@ fallible forward_initializer(static T: type, init item: T) T
 # initialized prefix, without restoring removed elements. Supported moves are
 # infallible, so the standard move path does not actually fail initialization;
 # the conservative init contract still requires the cleanup path. `get(index)`
-# checks 0 <= index < length and returns Ref(T, false); `get_mut(index)` also
-# checks bounds and returns Ref(T, true) from a mutable List place. An empty
+# checks 0 <= index < length and returns ref T with permission inherited from
+# the receiver. An empty
 # List has no initialized element, even for an immovable T; append still
 # rejects elements that cannot move directly. view(start, size)
 # checks that its nonnegative range lies in the initialized prefix and returns
-# Span(T, false). span() borrows the complete initialized prefix; span_mut()
-# yields Span(T, true). Mutable List calls conservatively invalidate prior element
-# and view borrows, whether or not growth occurred. Moving a List handle does not
+# Span(T). span() borrows the complete initialized prefix with backing permission
+# inherited from the receiver. Lookup preserves existing element aliases. Writes preserve
+# the identity of an initialized slot and invalidate content-dependent views;
+# reallocation or destruction invalidates loans into ended element storage.
+# Dynamic indices can conservatively share an owner dependency. Moving a List handle does not
 # inherently relocate heap elements, but owner transfer invalidates prior borrows.
 #
-# Span(T, writable) is a copyable nonowning contiguous initialized range, not an
-# allocation or a container owner. Array also supplies span()/span_mut(). Span
+# Span(T) is a copyable nonowning contiguous initialized range, not an
+# allocation or a container owner. Array also supplies span(). Span
 # owns no destruction; Ref designates one initialized element and owns none either.
-# Span.len() is initialized length, never reserved capacity. get/get_mut check
-# bounds and return Ref; slice(start, size) checks nonnegative, overflow-safe bounds
+# Span.len() is initialized length, never reserved capacity. get checks bounds
+# and returns ref T; slice(start, size) checks nonnegative, overflow-safe bounds
 # and preserves permission. Empty endpoint slices are valid, including for
 # zero-sized elements. Unsafe allocation-span constructors require caller-proven
 # initialization of the complete range. No safe view exposes spare storage.
-# Permission belongs to the handle type, independently of binding mutability.
-# A writable Span's get_mut and indexed replacement work on a const handle;
-# indexed replacement borrows its descriptor immutably. Other container index
-# setters still require mutable receivers. as_imm attenuates permission.
+# from_array and unsafe_from_allocation use ref inputs and capture their backing
+# permission. Permission belongs to the captured origins, not a type argument.
+# A const Span supplies readonly access; copying it into a mutable binding cannot
+# upgrade that captured access. Copies, fields, calls, branches, and loops retain
+# attenuation. Indexed replacement requires a mutable receiver and writable
+# backing; setters remain explicit and are not synthesized from ref getters.
+# as_imm explicitly attenuates backing permission. Static storage is readonly.
 # Readonly access does not freeze the backing owner. All views retain backing-owner
 # and storage-change dependencies; readonly ranges additionally depend on contents.
-# Span(byte, false) and BytesView are arbitrary bytes, not validated UTF-8 text.
+# Span(byte) and BytesView are arbitrary bytes, not validated UTF-8 text.
 # StringView maintains that additional guarantee through validation and invalidation.
 #
-# A returned or stored Ref depends on every owner it may refer to. The
-# result of every function conservatively depends on all inputs capable of
-# supplying a borrowed origin. There is no explicit origin annotation to narrow
-# these dependencies. Without a safe borrowed origin, returning Ref is a compile
-# error. Any returned or stored borrow whose origin the compiler
-# cannot prove safe is also a compile error. Borrowed
-# access cannot outlive or overlap destruction of an owner or invalidation by
-# storage replacement. Current imm/mut call arguments alone do not establish
-# such an escaping lifetime relationship.
-# A function may return a Ref obtained from a borrowed input, including a
-# Ref, Box, or Allocation passed by immutable access, or a mutable Box whose
-# owner is copied back to the caller. A Ref
-# handle (or a value containing one) passed by value may also be returned: its
-# referent still depends on the caller, not on the lifetime of the handle. It
-# cannot return a Ref of an owned parameter's storage, a local binding, or a
-# temporary that ends with the call. A call returning a value containing Ref
-# conservatively retains the origins of every borrowed input or owned Ref
-# handle capable of supplying it
-# All possible origins must remain valid through each subsequent use. Rebinding
-# a local invalidates a borrow of its own storage even when its type has trivial
-# destruction. Moving an owner currently invalidates borrows made through that
-# binding; transferring the owner does not silently retarget existing borrows.
+# Returned borrows retain every source they can actually reference. The compiler
+# infers private return-origin and write contracts from function bodies, including
+# recursive calls. Callers substitute their places and contained references;
+# unrelated arguments do not become artificial lifetime dependencies. Callable
+# types retain result ownership. A known function value keeps its inferred
+# contract. An unknown callable retains every possible source, requires writable
+# inputs wherever its signature permits writes, and supplies readonly results.
+# No source-level origin annotations are required.
+#
+# A function may return a borrowed input's place or references stored inside a
+# prepared value. Ref(T) owns its handle, so returning that handle does not borrow
+# the callee's handle slot. Ref and mut parameters preserve caller identity.
+# Inline storage belonging to a copied imm parameter, an owned parameter, or a
+# local cannot escape the call. Heap storage behind a copied descriptor retains
+# its caller's owner; the descriptor frame does not own those allocated bytes.
+# All possible origins must remain valid through subsequent use. Owner transfer,
+# destruction, reallocation, and active variant changes invalidate affected loans.
+# A slot reference can survive replacement of its value; references into the old
+# value's owned allocations cannot. Captured access and current access paths are
+# independent of ownership. A var binding cannot upgrade a readonly capture.
 #
 # Views provide non-owning access to existing data, including collection slices.
 # They may be returned from functions and stored in other values when their
@@ -1488,7 +1483,10 @@ reassigned = int_or_float_value
 # parameter's mode follows its type: static for a compile-time-only type,
 # including static structs and int_literal, init for collection_literal, and
 # imm otherwise, so inserting a converter never consumes an existing value.
-# Ordinary value converters are infallible. A consuming init converter may
+# Ordinary value converters are infallible. A value parameter whose expected
+# variant includes none accepts failure as that member. Selection uses the
+# successful source and target types and permits builtin input widening; it does
+# not depend on whether the particular argument can fail. A consuming init converter may
 # propagate ordinary failure from its supplied initializer, with the required
 # partial-construction cleanup. This construction effect is separate from the
 # converter's own operations: the converter cannot introduce unrelated ordinary
@@ -1512,7 +1510,6 @@ struct Degrees
 struct Radians
     value: float
 pub converter(value: Degrees) Radians -> Radians{value = to_radians(value.value)}
-pub converter(static T: type, value: Ref(T, true)) Ref(T, false) -> value.as_imm()
 
 # A converter is a top-level declaration in a module that owns its source or
 # target type. A struct is owned by its defining module, a parameterized struct
@@ -1552,7 +1549,7 @@ const copied = degrees                       # Degrees; no expected type
 # of type T. T must resolve to a type value: a parameterized factory is
 # specialized first, and omitted factory arguments are not inferred.
 const explicit = Radians(degrees)
-const read_only = Ref(int, false)(handle)
+const read_only = handle
 
 
 # Inline arrays
@@ -1579,9 +1576,9 @@ const read_only = Ref(int, false)(handle)
 # Arrays containing immovable elements cannot move directly. No operation in
 # this initial API consumes individual elements or exposes uninitialized slots.
 #
-# len(imm self) returns N. get(imm self, index: int) and get_mut(mut self,
-# index: int) are fallible and succeed only for 0 <= index < N. They return
-# Ref(T, false) and Ref(T, true), respectively, originating from self. Element
+# len(imm self) returns N. get(ref self, index: int) is fallible and succeeds
+# only for 0 <= index < N. It returns ref T with the receiver's permission
+# and storage origin. Element
 # references cannot outlive, move with, or survive destruction of their array.
 # Replacing an element uses ordinary Ref replacement and cleanup rules.
 # Contained reference origins survive aggregate operations; dynamic element
@@ -1650,15 +1647,65 @@ else -> handle_failure() # ordinary element failure, not allocation panic
 
 
 # Fallibility
-# A fallible expression succeeds or fails; it does not produce bool.
-# Success may carry a value; failure carries no value.
+# A fallible expression succeeds with a value of its successful type or fails
+# without a value. Failure is a control effect, independent of the payload type.
 # Comparisons succeed with unit when true and fail otherwise.
 # Equality and inequality accept matching int or bool operands. Ordered
-# comparisons accept int operands. Bool values are not conditions by themselves.
+# comparisons accept int operands. Bool payloads carry data, not an outcome;
+# postfix query is the explicit bridge from bool data to ordinary failure.
 # 'fallible' replaces 'func' in declarations and callable types.
 static accept_small = fallible(a: int) int
     a < 2 # failure propagates out of this fallible function
     return a
+
+# Failure-to-none conversion
+# An expected variant containing none catches ordinary failure from its complete
+# expression and stores none. On success the value must satisfy the usual
+# conversion and ownership rules. An explicit none directly selects the none
+# member of such a variant, without competing with converters to other members.
+# This applies at arguments, typed bindings, assignments, field initialization,
+# and returns. A variant without none does
+# not introduce a failure boundary. none alone is an ordinary single-valued type.
+func value_or(value: int | none, fallback: int) int
+    if const found = value as int -> return found
+    return fallback
+const size = value_or(read_size?(), 0)
+const saved: int | none = read_size?()
+
+# Arguments are prepared exactly once, left to right. Captured failure includes
+# nested operands, calls, indexing, conversion, and partial construction. Clean
+# up the completed construction prefix, construct the none member, and proceed
+# to the next argument. An argument without such an expected variant still
+# requires success: its failure skips the call and later arguments. Earlier
+# writes and completed transfers are not rolled back. Panic, exit, and compiler
+# errors never become none. A nearer failure handler owns the failure first.
+
+# The callee receives an ordinary variant. Reading or forwarding it does not
+# fail; is tests its active member and as extracts it. Success with none and
+# captured failure are indistinguishable. Ownership modes keep their ordinary
+# meanings. A mut parameter needs a mutable place of the exact variant type;
+# optional references can represent an optional borrow of different storage.
+static handler: func(int | none, int) int = value_or
+
+# Ordinary infallible converters may receive a source through builtin widening
+# into their declared input type. Selection uses the successful source and
+# target types before evaluating the expression; no converter chains are inferred.
+# If the selected converter's input variant contains none, that ordinary expected
+# input type captures failure during expression preparation.
+# A never-typed expression has no successful payload. For converter selection,
+# only input variants accepting none can handle its ordinary failure; several
+# eligible converters remain ambiguous. Divergence and compiler control still
+# bypass the conversion.
+pub converter(condition: unit | none) bool
+    if condition is unit -> return true
+    return false
+const small = bool(value < limit)
+if small? -> use_small()
+const missing = bool(false?) # false
+const inverse = bool(not small?)
+# An already boolean value uses identity conversion, so bool(false) is false.
+# none remains ordinary data: reading it succeeds. Extract or inspect the active
+# member to turn absence back into control failure, e.g. saved as int.
 
 # A fallible function need not fail. Fallibility is part of its type.
 static checked_identity: fallible(int) int = fallible(a: int) int -> a
@@ -1714,14 +1761,23 @@ fallible reject()
 # A condition binding is immutable and visible only in the success body. Its
 # optional annotation follows ordinary widening rules. A fallible call can
 # bind its successful return value as an owned local (`if const item = call() -> ...`).
-# Failure enters `else` without a binding. Variant extraction does not refine
-# or alias the original value, so `as` extraction requires copy support.
+# Failure enters `else` without a binding. Extracting from an existing place
+# copies the selected payload and requires copy support; it does not refine
+# or alias the original value. `if const item = source^ as T` transfers the
+# whole variant before testing. Success gives item ownership of the selected
+# payload without copying it; failure ends the unmatched temporary normally.
+# The original source is unavailable on both paths, including when the types
+# do not overlap. A fresh variant result is owned and uses the same consuming
+# extraction without needing ^. Explicit-drop obligations still apply to every
+# ownership path. Failure cleanup checks only unmatched alternatives; matched
+# explicit-drop members create no obligation on the failure path. Casting an
+# an `if ref part = value as Member` condition borrows the payload without consuming it.
 func inspect(fi: float | int)
     if fi is float -> found_float()
     if const f = fi as float -> use_float(f)
     if fi is float | bool -> found_float_or_bool()
 
-# 'and', 'or', 'not' compose unit-success fallible expressions, short-circuiting
+# 'and', 'or', 'not' compose expression outcomes and succeed with unit, short-circuiting
 # left to right. Precedence, tightest first: comparisons, not, and, or.
 if 2 < 3 and 5 > 4 or 1 < 5 and not 9 < 2 -> run()
 # 'not 9 < 2' means 'not (9 < 2)'.
@@ -1729,9 +1785,14 @@ if 2 < 3 and 5 > 4 or 1 < 5 and not 9 < 2 -> run()
 
 # Conditionals
 # 'if' selects its body on success and 'else' on failure.
-# bool is an ordinary value; compare explicitly to use it as a condition.
+# The complete condition expression is a failure boundary: nested calls and
+# indexing failures select else, including failures before the final comparison.
+# Any successful value selects the body; its payload does not decide the branch.
+# bool is ordinary data: query it explicitly to branch on true versus false.
 const enabled: bool = true
-if enabled == true -> run()
+if enabled? -> run()
+# `if false` succeeds with false data and therefore selects its body.
+# `if false?` fails and therefore selects else.
 
 # Bodies can be indented, inline, or mixed.
 if 1 < 2

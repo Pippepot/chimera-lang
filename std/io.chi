@@ -1,5 +1,6 @@
 import std.memory.{List}
 import std.text.{BytesView, StringView}
+import std.exit.{exit}
 
 pub struct Stream
     copy = trivial
@@ -19,7 +20,7 @@ pub fallible write_all(stream: Stream, imm bytes: BytesView)
         written > 0
         offset += written
 pub fallible write_text(stream: Stream, imm text: StringView) -> write_all?(stream, text.as_bytes())
-pub fallible print(imm text: StringView)
-    write_text?(stdout, text)
-    write_text?(stdout, "\n")
+pub func print(imm text: StringView)
+    if not write_text(stdout, text) -> exit(134)
+    if not write_text(stdout, "\n") -> exit(134)
 pub fallible read_bytes(stream: Stream, mut bytes: List(byte), count: int) int -> bytes.read_bytes?(stream.descriptor, count)

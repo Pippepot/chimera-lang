@@ -68,8 +68,17 @@ returns an integer. On failure, it returns no value.
 
 `<>` means "not equal." The standalone line `denominator <> 0` is a check:
 if it succeeds, execution continues to `return`. If it fails, `divide` fails
-immediately and skips the remaining body. Comparisons produce Boolean values
-in expressions; a standalone comparison in a fallible body acts as a check.
+immediately and skips the remaining body. Comparisons always succeed with `unit`
+or fail. Store their outcome as data with `bool(value < limit)` and test a stored
+boolean with `enabled?`. Logical `and`, `or`, and `not` compose success and failure.
+
+A parameter such as `value: int | none` accepts ordinary failure from its entire
+argument expression as `none`. Evaluation is eager and happens once, from left
+to right. The function receives an ordinary variant and extracts its payload
+with `if const found = value as int`. Expected variants containing `none` apply
+the same conversion at typed bindings, assignments, field initialization, and
+returns. Ownership modes and the function's declared fallibility keep their
+ordinary meanings.
 
 The caller uses `if const` to name the successful result `quotient`. If the call
 fails, `else` runs instead. Try `divide(84, 0)` to take the failure branch.
@@ -84,8 +93,9 @@ the next statement and failure makes the enclosing function fail too. The `?`
 marks the invocation, not failure propagation; use `if` to handle failure locally.
 
 Use the bare statement `fail` to propagate failure explicitly, including after
-local cleanup. It is allowed in a `fallible` function or a deferred initializer,
-not an ordinary `func`. Consuming a deferred initializer is always potentially
+local cleanup. A `fallible` function or deferred initializer can propagate it. An ordinary
+`func` handles fallible expressions with `if` or an expected variant containing
+`none`. Consuming a deferred initializer is always potentially
 fallible, so its construction site must handle or propagate that failure.
 
 ## Compile-time code is still code
@@ -123,6 +133,25 @@ value, also written `()`. `value += 1` adds one to the existing value.
 
 Chimera also tracks which code owns a resource and how long references to it can
 be used. Owned resources are cleaned up automatically.
+
+A `ref` binding aliases existing storage and inherits its permission:
+
+```chi
+var scores = [20, 21]
+if ref item = scores.get(1)
+  item += 1
+```
+
+Array, List, Span, and BytesView indexing returns a borrowed element. Binding the result
+with `const` or `var` copies it; binding with `ref` aliases it. Functions return
+borrowed places with `ref T`. To store an explicit reference handle, use
+`Ref.from(place)` and access its `.value` field. `Ref(T)` owns the handle;
+`Box(T)` owns the referent. Readonly access cannot be upgraded by copying a
+handle into a mutable binding.
+
+Array and List `span()` return a `Span(T)` with the receiver's access permission;
+`as_imm()` attenuates it. BytesView always exposes readonly bytes. Constructing or
+slicing a view returns a new descriptor value, not a reference to that descriptor.
 
 ## Try it
 

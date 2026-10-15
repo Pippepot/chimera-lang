@@ -12,9 +12,9 @@ test "text equality compares exact UTF-8 bytes including empty strings and NUL" 
         \\    if view == "hè\0" -> return 92
         \\    if "" <> "" -> return 93
         \\    if "é" == "e\u{301}" -> return 94
-        \\    const equal = StringView.==(view, identical)
+        \\    const equal = bool(StringView.==?(view, identical))
         \\    const different = StringView.<>
-        \\    if equal and different(view, "hè\0") -> return 42
+        \\    if equal? and different(view, "hè\0") -> return 42
         \\    return 95
     , 42);
 }
@@ -84,17 +84,17 @@ test "mutable view outputs still depend on compatible inline owner storage" {
 
 test "loop alias checks reject an owner reached through a later backedge" {
     try SourceFixture.expectSourceDiagnostic(
-        \\import std.memory.{borrow_local}
-        \\func conflict(mut owner: int, imm reference: Ref(int, false)) -> return
+        \\import std.memory.{Ref}
+        \\func conflict(mut owner: int, imm reference: Ref(int)) -> return
         \\func run() int
         \\    var first = 19
         \\    var second = 23
-        \\    var reference = borrow_local(int, first)
+        \\    var reference = Ref.from(first)
         \\    var count = 0
         \\    loop
         \\        if count == 2 -> break
         \\        conflict(second, reference)
-        \\        reference = borrow_local(int, second)
+        \\        reference = Ref.from(second)
         \\        count += 1
         \\    return first + second
         \\exit(run())
@@ -126,7 +126,7 @@ test "call borrow precision recomputes when source storage types change" {
     const changed = try std.mem.replaceOwned(u8, std.testing.allocator, first, "health = 10}", "health = 10, bytes = [66]}");
     defer std.testing.allocator.free(changed);
     try fixture.db.setInput(test_sources.queries.SourceText, 0, changed);
-    try fixture.expectDiagnostic(0, .overlapping_mutable_arguments);
+    try fixture.expectExit(0, 42);
     try fixture.db.setInput(test_sources.queries.SourceText, 0, source);
     try fixture.expectExit(0, 42);
 }
@@ -156,20 +156,22 @@ test "literal views slice on UTF-8 boundaries and widen bytes explicitly" {
     , 42);
 }
 
-test "borrowed variant bindings alias payload without copying" {
+test "reference casts project variant payloads without copying" {
     try SourceFixture.expectParity(
+        \\import std.memory
         \\pub struct Payload
         \\    pub number: int
         \\func run() int
         \\    var value: Payload | none = Payload{number = 19}
-        \\    if borrow mut payload = value as Payload -> payload.number = 42
-        \\    if borrow payload = value as Payload -> return payload.number
+        \\    if ref payload = value as Payload -> payload.number = 42
+        \\    if ref payload = value as Payload -> return payload.number
         \\    return 90
     , 42);
 }
 
 test "borrowed variant payloads can be replaced by a different member shape" {
     try SourceFixture.expectParity(
+        \\import std.memory
         \\struct Small
         \\    copy = trivial
         \\    pub number: int
@@ -179,10 +181,10 @@ test "borrowed variant payloads can be replaced by a different member shape" {
         \\    pub second: int
         \\func run() int
         \\    var value: Small | Large = Small{number = 1}
-        \\    if borrow mut payload = value as Small -> payload.number = 42
+        \\    if ref payload = value as Small -> payload.number = 42
         \\    const replacement: Small | Large = Large{first = 19, second = 23}
         \\    value = replacement
-        \\    if borrow payload = value as Large -> return payload.first + payload.second
+        \\    if ref payload = value as Large -> return payload.first + payload.second
         \\    return 90
     , 42);
 }
@@ -271,7 +273,7 @@ test "text output writes exact UTF-8 NUL and newline bytes to standard streams" 
     try expectIo(
         \\import std.io.{write_text, stdout, stderr}
         \\fallible output()
-        \\    print?("é\0")
+        \\    print("é\0")
         \\    write_text?(stderr, "oops")
         \\    write_text?(stdout, "")
         \\if output() -> exit(42)
@@ -306,7 +308,7 @@ test "reached compile-time IO is rejected while untaken IO remains pure" {
     , .compile_time_unsupported_operation);
     try SourceFixture.expectParity(
         \\func run() int
-        \\    if false
+        \\    if false?
         \\        if print("hello") -> return 1
         \\    return 42
     , 42);
@@ -355,28 +357,62 @@ test "views reject escape from local owners and use after owner growth" {
         \\if const answer = run() -> exit(answer)
     , .borrow_outlives_source);
     try SourceFixture.expectSourceDiagnostic(
+        \\import std.memory
         \\pub struct Payload
         \\    pub number: int
         \\var value: Payload | none = Payload{number = 1}
-        \\if borrow payload = value as Payload
+        \\if ref payload = value as Payload
         \\    value = none
         \\    exit(payload.number)
     , .borrow_outlives_source);
 }
 
+test "byte views borrow readonly elements and copy owned bytes in both engines" {
+    try SourceFixture.expectParity(
+        \\fallible first(imm bytes: BytesView) ref byte -> bytes.get?(0)
+        \\fallible inspect() int
+        \\    var bytes: Array(byte, 2) = [20, 22]
+        \\    var view = BytesView.from_array(2, bytes)
+        \\    ref element = first?(view)
+        \\    const copied = view[1]
+        \\    ref temporary = BytesView.from_array(2, bytes).get?(1)
+        \\    return byte_int(element) + byte_int(copied) + byte_int(temporary) - 22
+        \\func run() int
+        \\    if const result = inspect() -> return result
+        \\    return 90
+    , 42);
+    try SourceFixture.expectSourceDiagnostic(
+        \\fallible run()
+        \\    var bytes: Array(byte, 1) = [42]
+        \\    var view = BytesView.from_array(1, bytes)
+        \\    var handle = Ref.from(view.get?(0))
+        \\    handle.value = 0
+        \\if run() -> exit(1) else exit(2)
+    , .reference_not_writable);
+    try SourceFixture.expectSourceDiagnostic(
+        \\fallible run()
+        \\    var bytes: Array(byte, 1) = [42]
+        \\    var view = BytesView.from_array(1, bytes)
+        \\    ref element = view[0]
+        \\    bytes[0] = 0
+        \\    exit(byte_int(element))
+        \\if run() -> exit(1) else exit(2)
+    , .borrow_outlives_source);
+}
+
 test "generic spans borrow arrays and preserve empty slicing in both engines" {
     try SourceFixture.expectParity(
-        \\import std.memory.{Span}
+        \\import std.memory.{Span, Ref}
         \\fallible inspect() int
         \\    const numbers: Array(int, 3) = [17, 23, 2]
-        \\    const view = Span(int, false).from_array(3, numbers)
+        \\    const view = Span(int).from_array(3, numbers)
         \\    const tail = view.slice?(1, 2)
         \\    const empty = tail.slice?(2, 0)
         \\    if empty.get(0) -> fail
-        \\    const first = view.get?(0)
-        \\    const second = tail.get?(0)
-        \\    const third = tail.get?(1)
-        \\    return first[] + second[] + third[] + empty.len() + Span(int, false).empty().len()
+        \\    ref first = view.get?(0)
+        \\    ref second = tail.get?(0)
+        \\    ref third = tail.get?(1)
+        \\    return first + second + third + empty.len() + Span(int).empty().len()
         \\func run() int
         \\    if const answer = inspect() -> return answer
         \\    return 90
@@ -385,13 +421,13 @@ test "generic spans borrow arrays and preserve empty slicing in both engines" {
 
 test "generic spans retain writable access and attenuate in both engines" {
     try SourceFixture.expectParity(
-        \\import std.memory.{Span}
+        \\import std.memory.{Span, Ref}
         \\fallible inspect() int
         \\    var numbers: Array(int, 2) = [17, 23]
-        \\    const writable = Span(int, true).from_array_mut(2, numbers)
+        \\    var writable = Span(int).from_array(2, numbers)
         \\    writable[0] = 18
-        \\    const element = writable.get_mut?(0)
-        \\    element[] = 19
+        \\    ref element = writable.get?(0)
+        \\    element = 19
         \\    const readonly = writable.as_imm()
         \\    return readonly[0] + readonly[1]
         \\func run() int
@@ -402,9 +438,10 @@ test "generic spans retain writable access and attenuate in both engines" {
 
 test "attenuated empty spans publish readonly cursors in both engines" {
     try SourceFixture.expectParity(
-        \\static empty = Span(int, true).empty().as_imm()
+        \\static empty = Span(int).empty().as_imm()
         \\func run() int
-        \\    if const endpoint = empty.slice(0, 0) -> return endpoint.len() + 42
+        \\    const source = empty
+        \\    if const endpoint = source.slice(0, 0) -> return endpoint.len() + 42
         \\    return 90
     , 42);
 }
@@ -413,25 +450,26 @@ test "aggregate call results cannot assume correspondence with input fields" {
     const cases = [_]struct { result_type: []const u8, construct: []const u8, select: []const u8 }{
         .{ .result_type = "Pair", .construct = "Pair{first = value.second, second = value.first}", .select = "reordered" },
         .{ .result_type = "Array(Pair, 1)", .construct = "[Pair{first = value.second, second = value.first}]", .select = "reordered[0]" },
-        .{ .result_type = "Box(Pair)", .construct = "Box(Pair).new?(Pair{first = value.second, second = value.first})", .select = "reordered.borrow()[]" },
+        .{ .result_type = "Box(Pair)", .construct = "Box(Pair).new?(Pair{first = value.second, second = value.first})", .select = "Ref.from(reordered.borrow()).value" },
     };
     for (cases) |case| {
         for ([_][]const u8{ "exit(run())", "exit(comptime -> run())" }) |entry| {
+            errdefer std.debug.print("aggregate result: {s}, entry: {s}\n", .{ case.result_type, entry });
             const source = try test_sources.renderTemplate(std.testing.allocator,
-                \\struct Pair
+                \\pub struct Pair
                 \\    copy = trivial
-                \\    pub first: Ref(byte, true)
-                \\    pub second: Ref(byte, true)
-                \\fallible swap(imm value: Pair) $result_type -> $construct
+                \\    pub first: Ref(byte)
+                \\    pub second: Ref(byte)
+                \\fallible swap(var value: Pair) $result_type -> $construct
                 \\fallible inspect() int
                 \\    var first_bytes: Array(byte, 1) = [65]
                 \\    var second_bytes: Array(byte, 1) = [66]
-                \\    const first = first_bytes.get_mut?(0)
-                \\    const second = second_bytes.get_mut?(0)
-                \\    const reordered = swap?(Pair{first = first, second = second})
-                \\    const selected = $select
+                \\    ref first = first_bytes.get?(0)
+                \\    ref second = second_bytes.get?(0)
+                \\    var reordered = swap?(Pair{first = Ref.from(first), second = Ref.from(second)})
+                \\    var selected = $select
                 \\    const text = BytesView.from_array(1, second_bytes).validate_utf8?()
-                \\    selected.first[] = 255
+                \\    selected.first.value = 255
                 \\    return byte_int(text.as_bytes().get?(0))
                 \\func run() int
                 \\    if const answer = inspect() -> return answer
@@ -449,7 +487,7 @@ test "returned readonly ranges depend on contents throughout aggregate shapes" {
         .{ .result_type = "StringView", .construct = "text", .select = "returned" },
         .{ .result_type = "Wrapped", .construct = "Wrapped{view = text}", .select = "returned.view" },
         .{ .result_type = "Array(StringView, 1)", .construct = "[text]", .select = "returned[0]" },
-        .{ .result_type = "Box(StringView)", .construct = "Box(StringView).new?(text)", .select = "returned.borrow()[]" },
+        .{ .result_type = "Box(StringView)", .construct = "Box(StringView).new?(text)", .select = "Ref.from(returned.borrow()).value" },
         .{ .result_type = "List(StringView)", .construct = "[text]", .select = "returned[0]" },
         .{ .result_type = "StringView | none", .construct = "text", .select = "if const view = returned as StringView -> view else fail" },
     };
@@ -458,12 +496,12 @@ test "returned readonly ranges depend on contents throughout aggregate shapes" {
             const source = try test_sources.renderTemplate(std.testing.allocator,
                 \\struct Wrapped
                 \\    pub view: StringView
-                \\fallible validate(imm view: Span(byte, true)) $result_type
+                \\fallible validate(imm view: Span(byte)) $result_type
                 \\    const text = BytesView.from_span(view.as_imm()).validate_utf8?()
                 \\    return $construct
                 \\fallible inspect() int
                 \\    var bytes: Array(byte, 1) = [65]
-                \\    const writable = bytes.span_mut()
+                \\    var writable = bytes.span()
                 \\    const returned = validate?(writable)
                 \\    const text = $select
                 \\    writable[0] = 255
@@ -482,14 +520,15 @@ test "returned readonly ranges depend on contents throughout aggregate shapes" {
 test "returned aggregates preserve writable handle storage dependencies" {
     try SourceFixture.expectParity(
         \\struct Views
-        \\    pub writable: Span(byte, true)
+        \\    pub writable: Span(byte)
         \\    pub readonly: StringView
-        \\fallible views(imm source: Span(byte, true)) Views
+        \\fallible views(ref source: Span(byte)) Views
         \\    return Views{writable = source, readonly = BytesView.from_span(source.as_imm()).validate_utf8?()}
         \\fallible inspect() int
         \\    var bytes: Array(byte, 1) = [65]
-        \\    const wrapped = views?(bytes.span_mut())
-        \\    const writable = wrapped.writable
+        \\    var input = bytes.span()
+        \\    var wrapped = views?(input)
+        \\    var writable = wrapped.writable
         \\    writable[0] = 41
         \\    writable[0] = 42
         \\    return byte_int(writable[0])
@@ -508,7 +547,7 @@ test "ownership hook results preserve readonly content dependencies" {
         for ([_][]const u8{ "exit(run())", "exit(comptime -> run())" }) |entry| {
             const source = try test_sources.renderTemplate(std.testing.allocator,
                 \\struct Views
-                \\    pub writable: Span(byte, true)
+                \\    pub writable: Span(byte)
                 \\    pub readonly: StringView
                 \\    $operation = func($mode self: Views) Views
                 \\        if const text = BytesView.from_span(self.writable.as_imm()).validate_utf8()
@@ -517,7 +556,7 @@ test "ownership hook results preserve readonly content dependencies" {
                 \\fallible inspect() int
                 \\    var first: Array(byte, 1) = [65]
                 \\    var second: Array(byte, 1) = [66]
-                \\    const writable = second.span_mut()
+                \\    var writable = second.span()
                 \\    const original = Views{writable = writable, readonly = BytesView.from_array(1, first).validate_utf8?()}
                 \\    const changed = original$transfer
                 \\    writable[0] = 255
@@ -533,25 +572,26 @@ test "ownership hook results preserve readonly content dependencies" {
     }
 }
 
-test "mutable outputs preserve readonly dependencies through owned and aliased storage" {
+test "mutable outputs preserve readonly dependencies through owned and referenced storage" {
     const cases = [_]struct { setup: []const u8, place: []const u8, select: []const u8 }{
         .{ .setup = "var view = View{text = original}", .place = "view", .select = "view.text" },
         .{ .setup = "var wrapped = Wrapped{view = View{text = original}}", .place = "wrapped.view", .select = "wrapped.view.text" },
-        .{ .setup = "var wrapped = Wrapped{view = View{text = original}}\n    borrow mut alias = wrapped.view", .place = "alias", .select = "wrapped.view.text" },
-        .{ .setup = "var boxed = Box(View).new?(View{text = original})\n    borrow mut alias = boxed.borrow_mut()[]", .place = "alias", .select = "boxed.borrow()[].text" },
+        .{ .setup = "var wrapped = Wrapped{view = View{text = original}}\n    var alias = Ref.from(wrapped.view)", .place = "alias.value", .select = "wrapped.view.text" },
+        .{ .setup = "var boxed = Box(View).new?(View{text = original})\n    var alias = Ref.from(boxed.borrow())", .place = "alias.value", .select = "boxed.borrow().text" },
     };
     for (cases) |case| {
         const source = try test_sources.renderTemplate(std.testing.allocator,
+            \\import std.memory
             \\pub struct View
             \\    pub text: StringView
             \\struct Wrapped
             \\    pub view: View
-            \\fallible refresh(mut value: View, imm source: Span(byte, true))
+            \\fallible refresh(mut value: View, imm source: Span(byte))
             \\    value.text = BytesView.from_span(source.as_imm()).validate_utf8?()
             \\fallible inspect() int
             \\    var first: Array(byte, 1) = [65]
             \\    var second: Array(byte, 1) = [66]
-            \\    const writable = second.span_mut()
+            \\    var writable = second.span()
             \\    const original = BytesView.from_array(1, first).validate_utf8?()
             \\    $setup
             \\    refresh?($place, writable)
@@ -575,17 +615,17 @@ test "mutable outputs preserve readonly dependencies through owned and aliased s
 test "mutable outputs preserve writable handle storage dependencies" {
     try SourceFixture.expectParity(
         \\struct Views
-        \\    pub writable: Span(byte, true)
+        \\    pub writable: Span(byte)
         \\    pub readonly: StringView
-        \\fallible refresh(mut value: Views, imm source: Span(byte, true))
+        \\fallible refresh(mut value: Views, ref source: Span(byte))
         \\    value = Views{writable = source, readonly = BytesView.from_span(source.as_imm()).validate_utf8?()}
         \\fallible inspect() int
         \\    var first: Array(byte, 1) = [65]
         \\    var second: Array(byte, 1) = [66]
-        \\    const writable = second.span_mut()
+        \\    var writable = second.span()
         \\    var views = Views{writable = writable, readonly = BytesView.from_array(1, first).validate_utf8?()}
         \\    refresh?(views, writable)
-        \\    const changed = views.writable
+        \\    var changed = views.writable
         \\    changed[0] = 41
         \\    changed[0] = 42
         \\    return byte_int(changed[0])
@@ -596,19 +636,20 @@ test "mutable outputs preserve writable handle storage dependencies" {
 }
 
 test "mutable field outputs preserve untouched readonly siblings" {
-    for ([_][]const u8{ "", "    borrow mut alias = views.changed\n" }) |alias| {
+    for ([_][]const u8{ "", "    var alias = Ref.from(views.changed)\n" }) |alias| {
         const source = try test_sources.renderTemplate(std.testing.allocator,
+            \\import std.memory
             \\pub struct View
             \\    pub text: StringView
             \\struct Views
             \\    pub changed: View
             \\    pub untouched: StringView
-            \\fallible refresh(mut value: View, imm source: Span(byte, true))
+            \\fallible refresh(mut value: View, imm source: Span(byte))
             \\    value.text = BytesView.from_span(source.as_imm()).validate_utf8?()
             \\fallible inspect() int
             \\    var first: Array(byte, 1) = [65]
             \\    var second: Array(byte, 1) = [66]
-            \\    const writable = second.span_mut()
+            \\    var writable = second.span()
             \\    const original = BytesView.from_array(1, first).validate_utf8?()
             \\    var views = Views{changed = View{text = original}, untouched = original}
             \\$alias    refresh?($place, writable)
@@ -618,7 +659,7 @@ test "mutable field outputs preserve untouched readonly siblings" {
             \\func run() int
             \\    if const answer = inspect() -> return answer
             \\    return 90
-        , .{ .alias = alias, .place = if (alias.len == 0) "views.changed" else "alias" });
+        , .{ .alias = alias, .place = if (alias.len == 0) "views.changed" else "alias.value" });
         defer std.testing.allocator.free(source);
         try SourceFixture.expectParity(source, 42);
     }
@@ -632,8 +673,8 @@ test "generic spans borrow noncopyable elements without copying" {
         \\fallible inspect() int
         \\    const entries: Array(Entry, 2) = [Entry{score = 17}, Entry{score = 40}]
         \\    const view = entries.span()
-        \\    const element = view.get?(1)
-        \\    return element[].score + view.len()
+        \\    ref element = view.get?(1)
+        \\    return element.score + view.len()
         \\func run() int
         \\    if const answer = inspect() -> return answer
         \\    return 90
@@ -646,9 +687,10 @@ test "generic spans preserve zero-sized writable ranges" {
         \\    copy = trivial
         \\fallible inspect() int
         \\    var entries: Array(Empty, 3) = [Empty{}, Empty{}, Empty{}]
-        \\    const view = entries.span_mut().slice?(1, 2)
-        \\    const element = view.get_mut?(1)
-        \\    element[] = Empty{}
+        \\    var source = entries.span()
+        \\    var view = source.slice?(1, 2)
+        \\    ref element = view.get?(1)
+        \\    element = Empty{}
         \\    if view.get(2) -> fail
         \\    return view.len() + 40
         \\func run() int
@@ -662,20 +704,21 @@ test "generic spans cannot escalate readonly access" {
         \\fallible inspect() int
         \\    const entries = [42]
         \\    const view = entries.span()
-        \\    const element = view.get_mut?(0)
-        \\    return element[]
+        \\    ref element = view.get?(0)
+        \\    element = 17
+        \\    return element
         \\if const answer = inspect() -> exit(answer)
-    , .call_argument_type_mismatch);
+    , .reference_not_writable);
 }
 
 test "generic spans reject stale validated text through aggregate calls and loops" {
     try SourceFixture.expectAnySourceDiagnostic(
-        \\fallible replace(imm view: Span(byte, true))
-        \\    const element = view.get_mut?(0)
-        \\    element[] = 255
+        \\fallible replace(ref view: Span(byte))
+        \\    ref element = view.get?(0)
+        \\    element = 255
         \\fallible inspect() int
         \\    var entries: Array(byte, 1) = [65]
-        \\    const writable = entries.span_mut()
+        \\    var writable = entries.span()
         \\    const text = BytesView.from_span(writable.as_imm()).validate_utf8?()
         \\    var index = 0
         \\    loop
@@ -686,13 +729,14 @@ test "generic spans reject stale validated text through aggregate calls and loop
         \\if const answer = inspect() -> exit(answer)
     , .borrow_outlives_source);
     try SourceFixture.expectAnySourceDiagnostic(
+        \\import std.memory
         \\fallible inspect() int
         \\    var entries: Array(byte, 1) = [65]
-        \\    const writable = entries.span_mut()
+        \\    var writable = entries.span()
         \\    const text = BytesView.from_span(writable.as_imm()).validate_utf8?()
-        \\    borrow alias = text
+        \\    const alias = Ref.from(text)
         \\    writable[0] = 255
-        \\    return alias.byte_length()
+        \\    return alias.value.byte_length()
         \\if const answer = inspect() -> exit(answer)
     , .borrow_outlives_source);
 }
@@ -714,11 +758,11 @@ test "List growth and generic views have parity" {
 
 test "generic spans cannot escape local storage or survive owner transfer" {
     try SourceFixture.expectAnySourceDiagnostic(
-        \\func escape() Span(int, false)
+        \\func escape() Span(int)
         \\    const entries = [42]
         \\    return entries.span()
         \\const view = escape()
-        \\if const element = view.get(0) -> exit(element[])
+        \\if ref element = view.get(0) -> exit(element)
     , .borrow_outlives_source);
     try SourceFixture.expectAnySourceDiagnostic(
         \\func consume(deinit values: List(int)) int -> values.len()
@@ -736,30 +780,31 @@ test "validated text views reject content changes through byte references" {
     try SourceFixture.expectAnySourceDiagnostic(
         \\fallible inspect() int
         \\    var bytes: Array(byte, 1) = [65]
-        \\    const writable = bytes.get_mut?(0)
+        \\    ref writable = bytes.get?(0)
         \\    const view = BytesView.from_array(1, bytes).validate_utf8?()
-        \\    writable[] = 255
+        \\    writable = 255
         \\    return view.byte_length()
         \\if const answer = inspect() -> exit(answer)
     , .borrow_outlives_source);
 }
 
-test "borrowed variant aliases follow their owner through loop joins" {
+test "variant payload references follow their owner through loop joins" {
     try SourceFixture.expectParity(
+        \\import std.memory
         \\pub struct Payload
         \\    pub number: int
         \\struct Owner
         \\    pub payload: Payload | none
         \\func run() int
         \\    var owner = Owner{payload = Payload{number = 19}}
-        \\    if borrow mut value = owner.payload as Payload
+        \\    if ref value = owner.payload as Payload
         \\        var index = 0
         \\        loop
         \\            if index == 3 -> break
         \\            value.number += 1
         \\            index += 1
         \\        value.number += 20
-        \\    if borrow value = owner.payload as Payload -> return value.number
+        \\    if ref value = owner.payload as Payload -> return value.number
         \\    return 90
     , 42);
 }
@@ -785,7 +830,7 @@ test "owned strings convert to borrowed text for ordinary print callables" {
         \\    var text = "hello"
         \\    text.append?("!")
         \\    const writer = print
-        \\    writer?(text)
+        \\    writer(text)
         \\if output() -> exit(42)
         \\exit(90)
     , "", "hello!\n", "", 42);
@@ -801,7 +846,7 @@ test "from_utf8 validates before allocation and owns a copy independent of its i
         \\    text.append?("!")
         \\    const invalid: Array(byte, 1) = [128]
         \\    if String.from_utf8(BytesView.from_array(1, invalid)) -> fail
-        \\    print?(text)
+        \\    print(text)
         \\if output() -> exit(42)
         \\exit(90)
     , "", "é!\n", "", 42);
@@ -873,12 +918,13 @@ test "write_all preserves completed writes before an OS failure" {
     for (bytes) |byte| try std.testing.expectEqual(@as(u8, 42), byte);
 }
 
-test "broken output pipes propagate fallible failure instead of SIGPIPE termination" {
+test "broken output pipes propagate write failure instead of SIGPIPE termination" {
     const pipe = try nonblockingPipe();
     pipe[0].close(std.testing.io);
     defer pipe[1].close(std.testing.io);
     const term = try runWithStreams(
-        \\if print("hello") -> exit(90)
+        \\import std.io.{write_text, stdout}
+        \\if write_text(stdout, "hello") -> exit(90)
         \\exit(42)
     , .ignore, .{ .file = pipe[1] }, false);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 42 }, term);
@@ -925,18 +971,20 @@ test "temporary array backing cannot escape through a borrowed view" {
     try SourceFixture.expectAnySourceDiagnostic(
         \\func bad() BytesView -> BytesView.from_array(1, [42])
         \\const view = bad()
-    , .borrow_outlives_source);
+    , .borrow_requires_place);
 }
 
 test "borrowing a by-value variant payload cannot escape its callee frame" {
     try SourceFixture.expectAnySourceDiagnostic(
-        \\import std.memory.{Ref, borrow_local}
-        \\struct Payload
+        \\import std.memory
+        \\import std.memory.{Ref}
+        \\pub struct Payload
+        \\    copy = trivial
         \\    pub value: int
-        \\fallible bad(imm value: Payload | none) Ref(Payload, false)
-        \\    if borrow payload = value as Payload -> return borrow_local(Payload, payload)
+        \\fallible bad(imm value: Payload | none) Ref(Payload)
+        \\    if ref payload = value as Payload -> return Ref.from(payload)
         \\    fail
-        \\if const handle = bad(Payload{value = 42}) -> exit(handle[].value)
+        \\if const handle = bad(Payload{value = 42}) -> exit(handle.value.value)
     , .borrow_outlives_source);
 }
 
@@ -975,4 +1023,43 @@ test "literal canonical identity ignores escape spelling and unused literals sta
         try std.testing.expectEqual(first, value);
     }
     try fixture.expectExit(0, 42);
+}
+
+test "print is infallible and callable from an ordinary function" {
+    try expectIo(
+        \\func output()
+        \\    print("hello")
+        \\    const writer: func(imm StringView) unit = print
+        \\    writer("world")
+        \\output()
+        \\exit(42)
+    , "", "hello\nworld\n", "", 42);
+}
+
+test "print panics on a broken pipe instead of exposing catchable failure" {
+    const pipe = try nonblockingPipe();
+    pipe[0].close(std.testing.io);
+    defer pipe[1].close(std.testing.io);
+    const term = try runWithStreams(
+        \\if print("hello") -> exit(90)
+        \\exit(42)
+    , .ignore, .{ .file = pipe[1] }, false);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 134 }, term);
+}
+
+test "print panics when its newline fails and preserves completed text" {
+    const pipe = try nonblockingPipe();
+    defer std.Io.File.closeMany(std.testing.io, &pipe);
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(std.os.linux.fcntl(pipe[1].handle, std.os.linux.F.SETPIPE_SZ, 4096)));
+    const term = try runWithStreams(
+        \\const array = Array(byte, 4096).filled(65)
+        \\if const text = BytesView.from_array(4096, array).validate_utf8()
+        \\    print(text)
+        \\    exit(90)
+        \\exit(91)
+    , .ignore, .{ .file = pipe[1] }, false);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 134 }, term);
+    var bytes: [4096]u8 = undefined;
+    try std.testing.expectEqual(bytes.len, try pipe[0].readStreaming(std.testing.io, &.{&bytes}));
+    for (bytes) |byte| try std.testing.expectEqual(@as(u8, 65), byte);
 }

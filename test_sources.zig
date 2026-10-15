@@ -52,7 +52,11 @@ pub const SourceFixture = struct {
         const program = try self.executable(entry);
         try runtime.writeProgram(std.testing.io, program.bytes);
         defer std.Io.Dir.cwd().deleteFile(std.testing.io, "prog") catch {};
-        const actual_status = try runtime.runProg(std.testing.io, std.testing.allocator, &.{});
+        const actual_status = runtime.runProg(std.testing.io, std.testing.allocator, &.{}) catch |err| {
+            try self.printDiagnostics(entry);
+            std.debug.print("generated program failed: {t}\n", .{err});
+            return err;
+        };
         if (actual_status != status) try self.printDiagnostics(entry);
         try std.testing.expectEqual(status, actual_status);
     }
@@ -107,6 +111,7 @@ pub const SourceFixture = struct {
             if (std.mem.eql(u8, entry, "exit(comptime -> run())") and (try fixture.db.get(queries.BuildExecutable, 0)).* == null) {
                 const controls = try fixture.db.transitiveAccumulatorValues(queries.BuildExecutable, 0, structures.CompilerControl, std.testing.allocator);
                 defer std.testing.allocator.free(controls);
+                if (controls.len != 1) try fixture.printDiagnostics(0);
                 try std.testing.expectEqualSlices(structures.CompilerControl, &.{.{ .exit = status }}, controls);
                 const diagnostics = try fixture.db.transitiveAccumulatorValues(queries.BuildExecutable, 0, structures.Diagnostic, std.testing.allocator);
                 defer std.testing.allocator.free(diagnostics);

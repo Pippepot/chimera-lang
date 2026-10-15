@@ -6,7 +6,7 @@ const queries = @import("queries.zig");
 const structures = @import("structures.zig");
 const standard_library = @import("standard_library");
 
-const format = "CHIQRY22";
+const format = "CHIQRY34";
 const max_records = 1_000_000;
 
 pub fn save(io: std.Io, allocator: std.mem.Allocator, directory: []const u8, key: cache.Key, db: *query.Database) !void {
@@ -46,7 +46,7 @@ fn restoreIntern(comptime I: type, db: *query.Database, reader: *codec.Reader, i
     defer codec.freeValue(I.Value, reader.allocator, &value);
     if (!(try validateIds(I.Value, db, value))) return error.InvalidCache;
     if (I == queries.ByteStrings and !std.unicode.utf8ValidateSlice(value.bytes)) return error.InvalidCache;
-    if (I == queries.CompileTimeValues and !(try validArrayRuntime(db, value))) return error.InvalidCache;
+    if (I == queries.CompileTimeValues and !(try validRuntimeValue(db, value))) return error.InvalidCache;
     if (I == queries.Types) {
         switch (value) {
             .array => |array| if (!try validArrayType(db, array)) return error.InvalidCache,
@@ -124,7 +124,7 @@ fn restoreNamedInput(db: *query.Database, reader: *codec.Reader, check: bool) !?
 fn restoreNamedQueryDependency(db: *query.Database, reader: *codec.Reader, check: bool) !?query.PersistedQueryRef {
     const name = try reader.read([]const u8);
     defer reader.allocator.free(name);
-    inline for (.{ queries.BuildModuleScope, queries.ModuleDeclarations, queries.IndexModuleItems, queries.ResolveItem, queries.FunctionSignature, queries.FunctionInstanceSignature, queries.AnalyzeFunctionInstance }) |Q| {
+    inline for (.{ queries.BuildModuleScope, queries.ModuleDeclarations, queries.IndexModuleItems, queries.ResolveItem, queries.FunctionSignature, queries.FunctionInstanceSignature, queries.InferReferenceContract, queries.AnalyzeFunctionInstance }) |Q| {
         if (std.mem.eql(u8, name, @typeName(Q))) return restoreQueryDependency(Q, db, reader, check);
     }
     return error.InvalidCache;
@@ -161,7 +161,7 @@ fn validArrayElementType(db: *query.Database, type_id: structures.TypeId) anyerr
     const interned = type_id.interned() orelse return false;
     const data = (try db.lookupInternedAs(queries.Types, interned)) orelse return false;
     switch (data.*) {
-        .structure, .callable => return true,
+        .structure, .callable, .reference => return true,
         .array => |array| return validArrayType(db, array),
         .variant => |variant| {
             for (variant.members) |member| if (!try validArrayElementType(db, member)) return false;
@@ -170,21 +170,22 @@ fn validArrayElementType(db: *query.Database, type_id: structures.TypeId) anyerr
     }
 }
 
-fn validArrayRuntime(db: *query.Database, value: structures.CompileTimeValue) !bool {
+fn validRuntimeValue(db: *query.Database, value: structures.CompileTimeValue) !bool {
     if (value != .runtime) return true;
-    switch (value.runtime.value) {
-        .string_literal => if (value.runtime.type_id != .string_literal) return false,
-        .static_data => if (value.runtime.type_id != .static_data) return false,
-        .storage_cursor => |cursor| if (cursor.type_id != value.runtime.type_id) return false,
-        else => {},
-    }
-    switch (value.runtime.type_id) {
-        .string_literal, .static_data => if (value.runtime.value.scalarTypeId() != value.runtime.type_id) return false,
-        else => {},
-    }
+    if (value.runtime.value.scalarTypeId()) |type_id| {
+        if (type_id != value.runtime.type_id) return false;
+    } else if (value.runtime.type_id.isPrimitive()) return false;
     const types: queries.TypeFacts(*query.Database) = .{ .ctx = db };
-    const array = (try types.arrayType(value.runtime.type_id)) orelse return true;
-    if (value.runtime.value != .structure) return false;
+    switch (value.runtime.value) {
+        .function_ref => return try types.callable(value.runtime.type_id) != null,
+        .variant => |variant| return validVariantRuntime(db, value.runtime.type_id, variant),
+        .structure => {},
+        else => return true,
+    }
+    const array = (try types.arrayType(value.runtime.type_id)) orelse {
+        const data = (try db.lookupInternedAs(queries.Types, value.runtime.type_id.interned().?)) orelse return false;
+        return data.* == .structure;
+    };
     const tuple = (try db.lookupInternedAs(queries.CompileTimeValueTuples, value.runtime.value.structure)) orelse return false;
     if (tuple.values.len != array.length) return false;
     for (tuple.values) |element_id| {
@@ -194,23 +195,33 @@ fn validArrayRuntime(db: *query.Database, value: structures.CompileTimeValue) !b
     return true;
 }
 
-fn persistedCursorAccess(db: *query.Database, type_id: structures.TypeId) !?struct { element_type: structures.TypeId, writable: bool, reference: bool } {
+fn validVariantRuntime(db: *query.Database, type_id: structures.TypeId, variant: @FieldType(structures.CompileTimeValue.RuntimeValue, "variant")) !bool {
+    const types: queries.TypeFacts(*query.Database) = .{ .ctx = db };
+    const members = (try types.variantMembers(type_id)) orelse return false;
+    if (std.mem.indexOfScalar(structures.TypeId, members, variant.member_type) == null) return false;
+    const payload = (try db.lookupInternedAs(queries.CompileTimeValues, variant.payload)) orelse return false;
+    return switch (payload.*) {
+        .type => variant.member_type == .type,
+        .runtime => |runtime| runtime.type_id == variant.member_type,
+    };
+}
+
+fn persistedCursorAccess(db: *query.Database, type_id: structures.TypeId) !?struct { element_type: structures.TypeId, reference: bool } {
     const interned = type_id.interned() orelse return null;
     const data = (try db.lookupInternedAs(queries.Types, interned)) orelse return null;
+    if (data.* == .reference) return .{ .element_type = data.reference, .reference = true };
     if (data.* != .structure or data.structure != .generated) return null;
     const instance = data.structure.generated.owner;
     const location = (try db.lookupInternedAs(queries.ItemLocations, instance.item)) orelse return null;
     if (location.owner != null or location.origin != .module) return null;
-    const reference = std.mem.eql(u8, location.name.text(), "Ref");
-    if (!reference and !std.mem.eql(u8, location.name.text(), "StorageCursor")) return null;
+    if (!std.mem.eql(u8, location.name.text(), "StorageCursor")) return null;
     const module = (try db.lookupInternedAs(queries.ModulePaths, location.origin.module)) orelse return null;
     if (!std.mem.eql(u8, module.path, standard_library.File.memory_allocation.modulePath())) return null;
     const tuple = (try db.lookupInternedAs(queries.CompileTimeValueTuples, instance.specialization orelse return null)) orelse return null;
-    if (tuple.values.len != 2) return null;
+    if (tuple.values.len != 1) return null;
     const element = (try db.lookupInternedAs(queries.CompileTimeValues, tuple.values[0])) orelse return null;
-    const permission = (try db.lookupInternedAs(queries.CompileTimeValues, tuple.values[1])) orelse return null;
-    if (element.* != .type or permission.* != .runtime or permission.runtime.type_id != .bool or permission.runtime.value != .bool) return null;
-    return .{ .element_type = element.type, .writable = permission.runtime.value.bool, .reference = reference };
+    if (element.* != .type) return null;
+    return .{ .element_type = element.type, .reference = false };
 }
 
 fn validateIds(comptime T: type, db: *query.Database, value: T) anyerror!bool {
@@ -220,7 +231,7 @@ fn validateIds(comptime T: type, db: *query.Database, value: T) anyerror!bool {
     if (T == structures.StaticStorageCursor) {
         const access = (try persistedCursorAccess(db, value.type_id)) orelse return false;
         if (value.data) |identity| {
-            if (access.element_type != .byte or access.writable) return false;
+            if (access.element_type != .byte) return false;
             const data = (try db.lookupInternedAs(queries.ByteStrings, identity)) orelse return false;
             return if (access.reference) value.offset < data.bytes.len else value.offset <= data.bytes.len;
         }
@@ -276,32 +287,32 @@ fn validOutput(comptime Q: type, db: *query.Database, output: Q.Output) !bool {
 fn validStorageOperations(db: *query.Database, body: structures.FunctionBodyAnalysis) anyerror!bool {
     const types: queries.TypeFacts(*query.Database) = .{ .ctx = db };
     if (!try validArrayStorageType(db, types, body.return_type)) return false;
+    if (!try validReferenceContractTypes(db, types, body)) return false;
     for (body.block_arguments) |argument| if (!try validArrayStorageType(db, types, argument.type_id)) return false;
     for (body.instructions) |instruction| {
         if (!try validArrayStorageType(db, types, instruction.resultType())) return false;
         switch (instruction) {
             .static_conversion, .const_string_literal => return false,
             .const_storage_cursor => |cursor| {
-                if (try types.storageCursorAccess(cursor.type_id) == null and try types.borrowAccess(cursor.type_id) == null) return false;
+                if (try types.storageCursorAccess(cursor.type_id) == null and try types.borrowElement(cursor.type_id) == null) return false;
             },
             .storage_cursor => |operation| {
                 const cursor = (try types.storageCursorAccess(operation.type_id)) orelse return false;
                 const source_type = body.valueType(operation.source);
                 if (source_type == .static_data) {
-                    if (cursor.element_type != .byte or cursor.writable) return false;
+                    if (cursor != .byte) return false;
                 } else if (try types.arrayType(source_type)) |array| {
-                    if (cursor.element_type != array.element_type) return false;
-                } else if ((try types.allocationElement(source_type)) != cursor.element_type) return false;
+                    if (cursor != array.element_type) return false;
+                } else if ((try types.allocationElement(source_type)) != cursor) return false;
             },
             .cursor_offset, .cursor_element => |operation| {
                 if (body.valueType(operation.index) != .int) return false;
                 const source = (try types.storageCursorAccess(body.valueType(operation.cursor))) orelse return false;
-                const target = (try types.storageAccess(operation.type_id)) orelse return false;
-                if (source.element_type != target.element_type or (target.writable and !source.writable)) return false;
-                if (instruction == .cursor_offset and try types.storageCursorAccess(operation.type_id) == null) return false;
-                if (instruction == .cursor_element and try types.borrowAccess(operation.type_id) == null) return false;
+                const target = if (instruction == .cursor_element) (try types.borrowElement(operation.type_id)) orelse return false else (try types.storageCursorAccess(operation.type_id)) orelse return false;
+                if (source != target) return false;
             },
             .byte_to_int => |source| if (body.valueType(source) != .byte) return false,
+            .variant_extract => |operation| if (operation.tag_mapping == null and try types.variantMembers(operation.target_type) != null) return false,
             .initializer_ref => |reference| if (!try validInitializerResult(db, types, body, reference)) return false,
             .const_type => |type_id| if (!try validArrayStorageType(db, types, type_id)) return false,
             .borrow_address => |operation| if (!try validBorrowFields(types, body, operation)) return false,
@@ -320,6 +331,65 @@ fn validStorageOperations(db: *query.Database, body: structures.FunctionBodyAnal
         }
     }
     for (body.initializer_regions) |region| if (!try validStorageOperations(db, region)) return false;
+    return true;
+}
+
+fn referencePathElement(db: *query.Database, types: anytype, type_id: structures.TypeId) !?structures.TypeId {
+    if (try types.arrayType(type_id)) |array| return array.element_type;
+    if (try types.boxElement(type_id)) |element| return element;
+    if (try types.allocationElement(type_id)) |element| return element;
+    if (try types.storageAccess(type_id)) |element_type| return element_type;
+    const analysis: queries.AnalysisContext(*query.Database) = .{ .ctx = db };
+    if (try analysis.collectionLiteralType(type_id)) |collection| return collection.element_type;
+    return null;
+}
+
+fn validReferencePath(db: *query.Database, types: anytype, initial: structures.TypeId, path: []const structures.ReferencePathStep) anyerror!bool {
+    var type_id = initial;
+    for (path, 0..) |step, position| {
+        if (step == .field or step == .variant or step == .element)
+            while (try types.borrowElement(type_id)) |element| {
+                type_id = element;
+            };
+        switch (step) {
+            .field => |index| {
+                const definition = (try types.structDefinition(type_id)) orelse return false;
+                if (index >= definition.fields.len) return false;
+                type_id = try types.fieldStorageType(definition.fields[index]);
+            },
+            .variant => |member| {
+                const members = (try types.variantMembers(type_id)) orelse return false;
+                if (std.mem.indexOfScalar(structures.TypeId, members, member) == null) return false;
+                type_id = member;
+            },
+            .element => type_id = (try referencePathElement(db, types, type_id)) orelse return false,
+            .target, .referent => type_id = (try types.borrowElement(type_id)) orelse return false,
+            .descendants => return position + 1 == path.len,
+        }
+    }
+    return true;
+}
+
+fn validReferenceContractTypes(db: *query.Database, types: anytype, body: structures.FunctionBodyAnalysis) anyerror!bool {
+    const contract = body.reference_contract;
+    for (contract.origins) |origin| {
+        const output_type = if (origin.output_parameter) |parameter| body.block_arguments[parameter].type_id else body.return_type;
+        if (!try validReferencePath(db, types, output_type, contract.paths[origin.result_path.start..origin.result_path.end])) return false;
+        if (origin.output_parameter) |parameter| if (body.parameter_modes[parameter] != .mut and body.parameter_modes[parameter] != .ref) {
+            var through_referent = false;
+            for (contract.paths[origin.result_path.start..origin.result_path.end]) |step| {
+                if (step == .referent) through_referent = true;
+            }
+            if (!through_referent) return false;
+        };
+        if (origin.parameter) |parameter| {
+            if (!try validReferencePath(db, types, body.block_arguments[parameter].type_id, contract.paths[origin.source_path.start..origin.source_path.end])) return false;
+        } else if (origin.source_path.start != origin.source_path.end or origin.storage_depth != 0 or origin.recursive_storage or origin.after_write) return false;
+    }
+    for (contract.requirements) |requirement| {
+        if (!try validReferencePath(db, types, body.block_arguments[requirement.parameter].type_id, contract.paths[requirement.path.start..requirement.path.end])) return false;
+        if (requirement.ends_lifetime and requirement.written_type == null) return false;
+    }
     return true;
 }
 
@@ -373,7 +443,7 @@ fn validStorageProjection(types: anytype, body: structures.FunctionBodyAnalysis,
         },
         .field => |field| {
             const definition = (try types.structDefinition(type_id)) orelse return false;
-            return field < definition.fields.len and definition.fields[field].type_id == operation.type_id;
+            return field < definition.fields.len and try types.fieldStorageType(definition.fields[field]) == operation.type_id;
         },
         .variant => {
             const members = (try types.variantMembers(type_id)) orelse return false;
@@ -391,19 +461,20 @@ fn validValue(value: structures.FunctionValueId, body: structures.FunctionBodyAn
 }
 
 fn validUse(use: structures.FunctionValueUse, body: structures.FunctionBodyAnalysis) bool {
-    return validOrdinaryValue(use.value, body) and
+    return validValue(use.value, body) and valueRepresentation(body, use.value) != .initializer and
         (use.variant_tag_mapping == null or validRange(use.variant_tag_mapping.?, body.variant_coercion_tags.len));
 }
 
 fn validOrdinaryValue(value: structures.FunctionValueId, body: structures.FunctionBodyAnalysis) bool {
     if (!validValue(value, body)) return false;
-    return valueRepresentation(body, value) != .initializer;
+    const representation = valueRepresentation(body, value);
+    return representation != .initializer;
 }
 
 fn validCallArgument(argument: structures.FunctionCallArgument, body: structures.FunctionBodyAnalysis) bool {
     return switch (argument) {
         .prepared => |use| validUse(use, body),
-        .deinit => |value| validOrdinaryValue(value, body),
+        .deinit, .borrowed => |value| validOrdinaryValue(value, body),
         .initializer => |value| validValue(value, body) and valueRepresentation(body, value) == .initializer,
     };
 }
@@ -446,32 +517,16 @@ fn validVariantOperation(operation: structures.VariantOperation, body: structure
     return operation.tag_mapping == null or validRange(operation.tag_mapping.?, body.variant_coercion_tags.len);
 }
 
-fn validCallMutArgument(operation: structures.CallMutArgument, body: structures.FunctionBodyAnalysis) bool {
-    if (!validRange(operation.arguments, body.call_arguments.len) or
-        operation.argument_index >= operation.arguments.end - operation.arguments.start) return false;
-    const argument = body.call_arguments[operation.arguments.start + operation.argument_index];
-    if (argument != .prepared) return false;
-    const prepared_type = argument.prepared.coerce_to orelse body.valueType(argument.prepared.value);
-    if (operation.type_id != prepared_type) return false;
-    if (operation.destination) |destination| {
-        if (!validOrdinaryValue(destination, body) or body.valueType(destination) != operation.type_id) return false;
+fn validReferenceContract(contract: structures.ReferenceContract, parameter_count: usize) bool {
+    for (contract.origins) |origin| {
+        if (origin.output_parameter) |parameter| if (parameter >= parameter_count) return false;
+        if (origin.parameter) |parameter| if (parameter >= parameter_count) return false;
+        if (!validRange(origin.source_path, contract.paths.len) or !validRange(origin.result_path, contract.paths.len)) return false;
     }
-    var found = false;
-    for (body.instructions) |instruction| {
-        if (instruction != .call) continue;
-        const call = instruction.call;
-        if (!std.meta.eql(call.arguments, operation.arguments)) continue;
-        if (call.return_type != operation.return_type) return false;
-        found = true;
+    for (contract.requirements) |requirement| {
+        if (requirement.parameter >= parameter_count or !validRange(requirement.path, contract.paths.len)) return false;
     }
-    for (body.blocks) |block| {
-        if (block.terminator != .fallible_call) continue;
-        const call = block.terminator.fallible_call.call;
-        if (!std.meta.eql(call.arguments, operation.arguments)) continue;
-        if (call.return_type != operation.return_type) return false;
-        found = true;
-    }
-    return found;
+    return true;
 }
 
 fn validFunctionBody(body: structures.FunctionBodyAnalysis) bool {
@@ -489,8 +544,18 @@ fn validFunctionBody(body: structures.FunctionBodyAnalysis) bool {
     const entry = body.blocks[@backingInt(body.entry)];
     if (entry.argument_start != 0 or entry.argument_end > body.block_arguments.len) return false;
     if (body.parameter_modes.len != entry.argument_end - entry.argument_start) return false;
+    if (!validReferenceContract(body.reference_contract, body.parameter_modes.len)) return false;
     for (body.parameter_modes, body.block_arguments[entry.argument_start..entry.argument_end]) |mode, argument| {
         if ((mode == .init) != (argument.representation == .initializer)) return false;
+        if (!body.is_initializer_region) {
+            const expected: structures.ValueRepresentation = switch (mode) {
+                .ref, .mut, .deinit => .storage,
+                .imm, .@"var" => .value,
+                .init => .initializer,
+                .static => return false,
+            };
+            if (argument.representation != expected) return false;
+        }
         if (body.is_initializer_region and ((mode != .imm and mode != .mut and mode != .init) or
             (argument.representation != .storage and argument.representation != .initializer))) return false;
     }
@@ -503,12 +568,12 @@ fn validFunctionBody(body: structures.FunctionBodyAnalysis) bool {
         };
         const valid = switch (instruction) {
             .initializer_ref => |reference| validInitializerReference(reference, body),
-            .variant_coerce, .variant_extract, .callable_coerce => |operation| validVariantOperation(operation, body),
+            .variant_coerce => |operation| operation.tag_mapping != null and validVariantOperation(operation, body),
+            .variant_extract, .callable_coerce => |operation| validVariantOperation(operation, body),
             .result_storage => |type_id| type_id == body.return_type,
             .borrow_address => |operation| validRange(operation.fields, body.borrow_fields.len),
-            .mut_parameter_write => |operation| operation.parameter_index < body.parameter_modes.len and
-                body.parameter_modes[operation.parameter_index] == .mut,
-            .call_mut_argument => |operation| validCallMutArgument(operation, body),
+            .initializer_capture_write => |operation| body.is_initializer_region and
+                operation.parameter_index < body.parameter_modes.len and body.parameter_modes[operation.parameter_index] == .mut,
             .call => |call| validCall(call, body) and call.target != .initializer,
             else => true,
         };
@@ -530,9 +595,11 @@ fn validFunctionBody(body: structures.FunctionBodyAnalysis) bool {
             .predicate_branch => |branch| validBranch(branch.then_branch, body) and validBranch(branch.else_branch, body),
             .fallible_call => |branch| validCall(branch.call, body) and
                 validFallibleTargets(branch.call, branch.success, branch.failure, body),
-            .return_value => |use| validUse(use, body),
+            .return_value => |use| validUse(use, body) and validOrdinaryValue(use.value, body) and
+                (use.coerce_to orelse body.valueType(use.value)) == body.return_type,
             .return_failure => body.is_fallible,
-            .return_unit, .diverge => true,
+            .return_unit => body.return_type == .unit,
+            .diverge => true,
         };
         if (!valid) return false;
     }
@@ -613,6 +680,68 @@ test "restoring a malformed canonical type rejects the snapshot" {
     }
 }
 
+test "restoring scalar values rejects mismatched payload types" {
+    const allocator = std.testing.allocator;
+    const values = [_]structures.CompileTimeValue.RuntimeValue{
+        .{ .int = 42 },
+        .{ .int_literal = 2147483648 },
+        .{ .byte = 255 },
+        .{ .bool = true },
+        .unit,
+        .none,
+    };
+    for (values) |value| {
+        const db = try query.Database.init(allocator, .{ .worker_count = 1 });
+        defer db.deinit();
+        const type_id = value.scalarTypeId().?;
+        for ([_]bool{ false, true }) |matching| {
+            var writer: codec.Writer = .{ .allocator = allocator };
+            defer writer.deinit();
+            try writer.bytes.appendSlice(allocator, format);
+            try writer.write(u64, 1);
+            try writer.write([]const u8, @typeName(queries.CompileTimeValues));
+            try writer.write(structures.CompileTimeValue, .{ .runtime = .{
+                .type_id = if (matching) type_id else if (type_id == .int) .bool else .int,
+                .value = value,
+            } });
+            if (matching) {
+                try std.testing.expectEqual(writer.bytes.items.len, try restoreInterns(db, allocator, writer.bytes.items));
+            } else {
+                try std.testing.expectError(error.InvalidCache, restoreInterns(db, allocator, writer.bytes.items));
+            }
+        }
+    }
+}
+
+test "canonical values reject mismatched aggregate and callable shapes" {
+    const allocator = std.testing.allocator;
+    const db = try query.Database.init(allocator, .{ .worker_count = 1 });
+    defer db.deinit();
+    try @import("modules.zig").registerSources(db, allocator,
+        \\struct Record
+        \\  value: int
+        \\func target() int -> 42
+    , &.{}, &.{});
+    const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;
+    const target = scope.resolveFunction("target").?;
+    const record_type = structures.TypeId.fromInterned(try db.intern(queries.Types, .{ .structure = .{ .declared = scope.resolveStatic("Record").? } }));
+    const callable_type = structures.TypeId.fromInterned(try db.intern(queries.Types, .{ .callable = .{ .parameters = &.{}, .return_type = .int, .is_fallible = false } }));
+    const variant_type = structures.TypeId.fromInterned(try db.intern(queries.Types, .{ .variant = .{ .members = &.{ .int, .bool } } }));
+    const payload = try db.intern(queries.CompileTimeValues, .{ .runtime = .{ .type_id = .int, .value = .{ .int = 42 } } });
+    const fields = try db.intern(queries.CompileTimeValueTuples, .{ .values = &.{payload} });
+
+    try std.testing.expect(try validRuntimeValue(db, .{ .runtime = .{ .type_id = callable_type, .value = .{ .function_ref = .{ .target = target, .type_id = callable_type } } } }));
+    for ([_]structures.TypeId{ .int, record_type, variant_type }) |type_id|
+        try std.testing.expect(!try validRuntimeValue(db, .{ .runtime = .{ .type_id = type_id, .value = .{ .function_ref = .{ .target = target, .type_id = type_id } } } }));
+    try std.testing.expect(try validRuntimeValue(db, .{ .runtime = .{ .type_id = record_type, .value = .{ .structure = fields } } }));
+    try std.testing.expect(!try validRuntimeValue(db, .{ .runtime = .{ .type_id = callable_type, .value = .{ .structure = fields } } }));
+    try std.testing.expect(!try validRuntimeValue(db, .{ .runtime = .{ .type_id = variant_type, .value = .{ .structure = fields } } }));
+    try std.testing.expect(try validRuntimeValue(db, .{ .runtime = .{ .type_id = variant_type, .value = .{ .variant = .{ .member_type = .int, .payload = payload } } } }));
+    for ([_]structures.TypeId{ .bool, .none }) |member_type|
+        try std.testing.expect(!try validRuntimeValue(db, .{ .runtime = .{ .type_id = variant_type, .value = .{ .variant = .{ .member_type = member_type, .payload = payload } } } }));
+    try std.testing.expect(!try validRuntimeValue(db, .{ .runtime = .{ .type_id = callable_type, .value = .{ .variant = .{ .member_type = .int, .payload = payload } } } }));
+}
+
 test "query restore rejects an offset past the payload" {
     const allocator = std.testing.allocator;
     const db = try query.Database.init(allocator, .{ .worker_count = 1 });
@@ -620,12 +749,47 @@ test "query restore rejects an offset past the payload" {
     try std.testing.expectError(error.InvalidCache, restoreQueries(db, "short", 6));
 }
 
+test "cached reference contracts accept analyzed nested handles and parameter writes" {
+    const modules = @import("modules.zig");
+    const db = try query.Database.init(std.testing.allocator, .{ .worker_count = 2 });
+    defer db.deinit();
+    try modules.registerSources(db, std.testing.allocator,
+        \\pub struct Pair
+        \\    copy = trivial
+        \\    pub first: Ref(int)
+        \\    pub second: Ref(int)
+        \\func nested(imm input: Ref(Pair)) Ref(int) -> input.value.first
+        \\func selected(ref input: Pair) ref Ref(int) -> input.first
+        \\func install(var target: Ref(Ref(int)), ref source: int) -> target.value = Ref.from(source)
+    , &.{}, &.{});
+    const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;
+    for ([_][]const u8{ "nested", "selected", "install" }) |name| {
+        errdefer std.debug.print("rejected analyzed reference contract: {s}\n", .{name});
+        const body = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = scope.resolveFunction(name).? })).*.?;
+        try std.testing.expect(try validOutput(queries.AnalyzeFunctionInstance, db, body));
+        if (std.mem.eql(u8, name, "nested")) {
+            var invalid = body;
+            var origins = [_]structures.ReferenceOriginContract{body.reference_contract.origins[0]};
+            const origin = &origins[0];
+            origin.output_parameter = 0;
+            origin.result_path = .{ .start = 0, .end = 0 };
+            invalid.reference_contract.origins = &origins;
+            try std.testing.expect(!try validReferenceContractTypes(db, queries.TypeFacts(*query.Database){ .ctx = db }, invalid));
+            origin.output_parameter = null;
+            origin.source_path = .{ .start = 0, .end = 1 };
+            var paths = [_]structures.ReferencePathStep{.{ .field = std.math.maxInt(u32) }};
+            invalid.reference_contract.paths = &paths;
+            try std.testing.expect(!try validReferenceContractTypes(db, queries.TypeFacts(*query.Database){ .ctx = db }, invalid));
+        }
+    }
+}
+
 test "cached body validation rejects invalid control flow and argument indexes" {
     var block_arguments = [_]structures.FunctionBlockArgument{.{ .type_id = .int }};
     var parameter_modes = [_]structures.ParameterMode{.imm};
     var branch_arguments = [_]structures.FunctionValueUse{.{ .value = @fromBackingInt(@intCast(0)) }};
     var call_arguments: [0]structures.FunctionCallArgument = .{};
-    var instructions = [_]structures.FunctionInstruction{.{ .mut_parameter_write = .{
+    var instructions = [_]structures.FunctionInstruction{.{ .initializer_capture_write = .{
         .parameter_index = 1,
         .value = @fromBackingInt(@intCast(0)),
         .type_id = .int,
@@ -649,29 +813,38 @@ test "cached body validation rejects invalid control flow and argument indexes" 
     };
     try std.testing.expect(validFunctionBody(body));
 
+    body.return_type = .int;
+    try std.testing.expect(!validFunctionBody(body));
+    blocks[0].terminator = .{ .return_value = .{ .value = @fromBackingInt(0) } };
+    try std.testing.expect(validFunctionBody(body));
+    body.return_type = .byte;
+    try std.testing.expect(!validFunctionBody(body));
+    body.return_type = .unit;
+    try std.testing.expect(!validFunctionBody(body));
+    blocks[0].terminator = .return_unit;
+
+    block_arguments[0].representation = .value;
+    body.instructions = instructions[0..0];
+    blocks[0].instruction_end = 0;
+    instructions[0] = .{ .initializer_capture_write = .{ .parameter_index = 1, .value = @fromBackingInt(0), .type_id = .int } };
+
     blocks[0].terminator = .{ .branch = .{ .target = @fromBackingInt(@intCast(0)), .arguments = .{ .start = 0, .end = 0 } } };
     try std.testing.expect(!validFunctionBody(body));
 
     body.branch_arguments = &branch_arguments;
     blocks[0].terminator.branch.arguments.end = 1;
     block_arguments[0].representation = .storage;
+    parameter_modes[0] = .ref;
     try std.testing.expect(validFunctionBody(body));
     branch_arguments[0].coerce_to = .none;
     try std.testing.expect(!validFunctionBody(body));
     branch_arguments[0].coerce_to = null;
     block_arguments[0].representation = .value;
+    parameter_modes[0] = .imm;
 
     blocks[0].terminator = .return_unit;
     blocks[0].instruction_end = 1;
     body.instructions = &instructions;
-    try std.testing.expect(!validFunctionBody(body));
-
-    instructions[0] = .{ .call_mut_argument = .{
-        .arguments = .{ .start = 0, .end = 0 },
-        .return_type = .unit,
-        .argument_index = 0,
-        .type_id = .int,
-    } };
     try std.testing.expect(!validFunctionBody(body));
 
     blocks[0].instruction_end = 0;
@@ -699,7 +872,7 @@ test "cached body validation rejects invalid control flow and argument indexes" 
         \\import std.memory.{Allocation}
         \\struct Pair
         \\  value: int
-        \\static IntRef = Ref(int, false)
+        \\static IntRef = Ref(int)
         \\static IntBox = Box(int)
         \\static IntSlots = Allocation(int)
         \\exit(42)
@@ -764,7 +937,8 @@ test "cached body validation rejects invalid control flow and argument indexes" 
 
     const reference_item = (try db.get(queries.ModuleDeclarations, module)).*.?.resolveStatic("IntRef").?;
     const reference_value = (try db.get(queries.ResolveStatic, reference_item)).*.?;
-    const reference_type = (try db.lookupInterned(queries.CompileTimeValues, reference_value)).type;
+    _ = try db.lookupInterned(queries.CompileTimeValues, reference_value);
+    const reference_type = try (queries.TypeFacts(*query.Database){ .ctx = db }).referenceType(.int);
     var path = [_]structures.BorrowProjection{.{ .field = 0 }};
     body.borrow_fields = &path;
     block_arguments[0].type_id = pair_type;
@@ -854,18 +1028,20 @@ test "Box and Ref alias bodies restore and invalidate after a binding edit" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const initial_source =
+        \\import std.memory
         \\fallible run() int
         \\  var owner = Box.new?(17)
-        \\  borrow item = owner.borrow()[]
-        \\  return item
+        \\  var item = Ref.from(owner.borrow())
+        \\  return item.value
         \\if const result = run() -> exit(result) else exit(1)
     ;
     const edited_source =
+        \\import std.memory
         \\fallible run() int
         \\  var owner = Box.new?(17)
-        \\  borrow mut item = owner.borrow_mut()[]
-        \\  item = 42
-        \\  return item
+        \\  var item = Ref.from(owner.borrow())
+        \\  item.value = 42
+        \\  return item.value
         \\if const result = run() -> exit(result) else exit(1)
     ;
     var tmp = std.testing.tmpDir(.{});
@@ -975,11 +1151,9 @@ test "in-place bodies restore and invalidate movability edits" {
         constructed_in_place = true;
     };
     try std.testing.expect(constructed_in_place);
-    var updated_in_place = false;
-    for (restored_update.instructions) |instruction| if (instruction == .call_mut_argument) {
-        updated_in_place = instruction.call_mut_argument.destination != null;
-    };
-    try std.testing.expect(updated_in_place);
+    for (restored_update.call_arguments) |argument| {
+        if (argument == .borrowed) break;
+    } else return error.TestUnexpectedResult;
     const restored = (try second.get(queries.BuildExecutable, 0)).* orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualSlices(u8, original.bytes, restored.bytes);
     try runtime.writeProgram(io, restored.bytes);
@@ -1154,113 +1328,6 @@ test "invalid machine-code cache shapes are rejected" {
     try std.testing.expect(!validCompiledFunction(damaged));
 }
 
-test "cached mutable result requires a matching producer" {
-    var instructions = [_]structures.FunctionInstruction{
-        .{ .const_int = 42 },
-        .{ .call_mut_argument = .{
-            .arguments = .{ .start = 0, .end = 1 },
-            .argument_index = 0,
-            .return_type = .unit,
-            .type_id = .int,
-        } },
-    };
-    var call_arguments = [_]structures.FunctionCallArgument{.{ .prepared = .{ .value = @fromBackingInt(@intCast(0)) } }};
-    var blocks = [_]structures.FunctionBlock{.{
-        .argument_start = 0,
-        .argument_end = 0,
-        .instruction_start = 0,
-        .instruction_end = instructions.len,
-        .terminator = .return_unit,
-    }};
-    const body: structures.FunctionBodyAnalysis = .{
-        .return_type = .unit,
-        .parameter_modes = &.{},
-        .block_arguments = &.{},
-        .call_arguments = &call_arguments,
-        .branch_arguments = &.{},
-        .instructions = &instructions,
-        .blocks = &blocks,
-        .entry = @fromBackingInt(@intCast(0)),
-    };
-    try std.testing.expect(!validFunctionBody(body));
-}
-
-test "cached mutable result validates types and destinations across outcomes" {
-    const call: structures.FunctionCall = .{
-        .target = .{ .direct = .{ .item = @fromBackingInt(@intCast(0)) } },
-        .arguments = .{ .start = 0, .end = 1 },
-        .return_type = .unit,
-    };
-    const result: structures.CallMutArgument = .{
-        .arguments = call.arguments,
-        .argument_index = 0,
-        .return_type = .unit,
-        .type_id = .int,
-    };
-    var instructions = [_]structures.FunctionInstruction{
-        .{ .const_int = 42 },
-        .{ .const_byte = 7 },
-        .{ .call = call },
-        .{ .call_mut_argument = result },
-        .{ .call_mut_argument = result },
-    };
-    var block_arguments = [_]structures.FunctionBlockArgument{.{ .type_id = .unit }};
-    var call_arguments = [_]structures.FunctionCallArgument{.{ .prepared = .{ .value = @fromBackingInt(@intCast(1)) } }};
-    var blocks = [_]structures.FunctionBlock{
-        .{ .argument_start = 0, .argument_end = 0, .instruction_start = 0, .instruction_end = instructions.len, .terminator = .return_unit },
-        .{ .argument_start = 0, .argument_end = 1, .instruction_start = 3, .instruction_end = 4, .terminator = .return_unit },
-        .{ .argument_start = 1, .argument_end = 1, .instruction_start = 4, .instruction_end = 5, .terminator = .return_unit },
-    };
-    var body: structures.FunctionBodyAnalysis = .{
-        .return_type = .unit,
-        .is_fallible = true,
-        .parameter_modes = &.{},
-        .block_arguments = &block_arguments,
-        .call_arguments = &call_arguments,
-        .branch_arguments = &.{},
-        .instructions = &instructions,
-        .blocks = blocks[0..1],
-        .entry = @fromBackingInt(@intCast(0)),
-    };
-    try std.testing.expect(validFunctionBody(body));
-    instructions[3].call_mut_argument.return_type = .int;
-    try std.testing.expect(!validFunctionBody(body));
-    instructions[3].call_mut_argument = result;
-    instructions[2].call.arguments.end = 0;
-    try std.testing.expect(!validFunctionBody(body));
-    instructions[2].call = call;
-    instructions[3].call_mut_argument.type_id = .byte;
-    try std.testing.expect(!validFunctionBody(body));
-    instructions[3].call_mut_argument = result;
-    instructions[3].call_mut_argument.destination = @fromBackingInt(@intCast(2));
-    try std.testing.expect(!validFunctionBody(body));
-    instructions[3].call_mut_argument.destination = @fromBackingInt(@intCast(1));
-    try std.testing.expect(validFunctionBody(body));
-    instructions[3].call_mut_argument = result;
-
-    call_arguments[0].prepared = .{ .value = @fromBackingInt(@intCast(2)), .coerce_to = .int };
-    try std.testing.expect(validFunctionBody(body));
-    call_arguments[0].prepared.coerce_to = null;
-    instructions[3].call_mut_argument.type_id = .byte;
-    instructions[4].call_mut_argument.type_id = .byte;
-    try std.testing.expect(validFunctionBody(body));
-    instructions[4].call_mut_argument.type_id = .int;
-    try std.testing.expect(!validFunctionBody(body));
-    call_arguments[0].prepared = .{ .value = @fromBackingInt(@intCast(1)) };
-    instructions[3].call_mut_argument = result;
-    instructions[4].call_mut_argument = result;
-
-    instructions[2] = .const_unit;
-    blocks[0].instruction_end = 3;
-    blocks[0].terminator = .{ .fallible_call = .{ .call = call, .success = @fromBackingInt(@intCast(1)), .failure = @fromBackingInt(@intCast(2)) } };
-    body.blocks = &blocks;
-    try std.testing.expect(validFunctionBody(body));
-    blocks[0].terminator.fallible_call.call.return_type = .int;
-    try std.testing.expect(!validFunctionBody(body));
-    blocks[0].terminator.fallible_call.call = call;
-    try std.testing.expect(validFunctionBody(body));
-}
-
 test "cached initializer handles stay out of ordinary operands and mutable writes" {
     var parameter_modes = [_]structures.ParameterMode{.init};
     var block_arguments = [_]structures.FunctionBlockArgument{.{ .type_id = .int, .representation = .initializer }};
@@ -1299,17 +1366,10 @@ test "cached initializer handles stay out of ordinary operands and mutable write
 
     var arguments = [_]structures.FunctionCallArgument{.{ .initializer = @fromBackingInt(@intCast(0)) }};
     body.call_arguments = &arguments;
-    instructions[0] = .{ .call_mut_argument = .{
-        .arguments = .{ .start = 0, .end = 1 },
-        .return_type = .int,
-        .argument_index = 0,
-        .type_id = .int,
-    } };
-    try std.testing.expect(!validFunctionBody(body));
 
     var writes = [_]structures.FunctionInstruction{
         .{ .const_int = 42 },
-        .{ .mut_parameter_write = .{ .parameter_index = 0, .value = @fromBackingInt(@intCast(1)), .type_id = .int } },
+        .{ .initializer_capture_write = .{ .parameter_index = 0, .value = @fromBackingInt(@intCast(1)), .type_id = .int } },
     };
     body.instructions = &writes;
     blocks[0].instruction_end = 2;
@@ -1319,7 +1379,9 @@ test "cached initializer handles stay out of ordinary operands and mutable write
     body.call_arguments = &.{};
     parameter_modes[0] = .mut;
     block_arguments[0].representation = .value;
-    try std.testing.expect(validFunctionBody(body));
+    try std.testing.expect(!validFunctionBody(body));
+    body.is_initializer_region = true;
+    try std.testing.expect(!validFunctionBody(body));
 }
 
 test "cached initializer failures reject invalid ordinary targets and result representations" {
@@ -1476,6 +1538,48 @@ test "cached initializers reject changed regions captures and value representati
     try std.testing.expect(!validFunctionBody(body));
 }
 
+test "cached variant operations require mappings only for tagged results" {
+    const allocator = std.testing.allocator;
+    const db = try query.Database.init(allocator, .{ .worker_count = 1 });
+    defer db.deinit();
+    const variant: structures.TypeId = .fromInterned(try db.intern(queries.Types, .{ .variant = .{ .members = &.{ .int, .none } } }));
+    var modes = [_]structures.ParameterMode{.imm};
+    var arguments = [_]structures.FunctionBlockArgument{.{ .type_id = variant }};
+    var tags = [_]u32{ 0, 1 };
+    var instructions = [_]structures.FunctionInstruction{.{ .variant_coerce = .{
+        .operand = @fromBackingInt(@as(u32, 0)),
+        .target_type = variant,
+        .tag_mapping = .{ .start = 0, .end = 2 },
+    } }};
+    var blocks = [_]structures.FunctionBlock{.{ .argument_end = 1, .instruction_start = 0, .instruction_end = 1, .terminator = .return_unit }};
+    const body: structures.FunctionBodyAnalysis = .{
+        .return_type = .unit,
+        .parameter_modes = &modes,
+        .block_arguments = &arguments,
+        .variant_coercion_tags = &tags,
+        .branch_arguments = &.{},
+        .call_arguments = &.{},
+        .instructions = &instructions,
+        .blocks = &blocks,
+        .entry = @fromBackingInt(@as(u32, 0)),
+    };
+    for ([_]bool{ false, true }) |extraction| {
+        const operation: structures.VariantOperation = .{ .operand = @fromBackingInt(@as(u32, 0)), .target_type = variant, .tag_mapping = .{ .start = 0, .end = 2 } };
+        instructions[0] = if (extraction) .{ .variant_extract = operation } else .{ .variant_coerce = operation };
+        try std.testing.expect(try validOutput(queries.AnalyzeFunctionInstance, db, body));
+        const stored = if (extraction) &instructions[0].variant_extract else &instructions[0].variant_coerce;
+        stored.tag_mapping = null;
+        try std.testing.expect(!try validOutput(queries.AnalyzeFunctionInstance, db, body));
+    }
+    instructions[0] = .{ .variant_extract = .{ .operand = @fromBackingInt(@as(u32, 0)), .target_type = .int } };
+    try std.testing.expect(try validOutput(queries.AnalyzeFunctionInstance, db, body));
+    const plain: structures.TypeId = .fromInterned(try db.intern(queries.Types, .{ .callable = .{ .parameters = &.{}, .return_type = .unit, .is_fallible = false } }));
+    const fallible: structures.TypeId = .fromInterned(try db.intern(queries.Types, .{ .callable = .{ .parameters = &.{}, .return_type = .unit, .is_fallible = true } }));
+    arguments[0].type_id = plain;
+    instructions[0] = .{ .callable_coerce = .{ .operand = @fromBackingInt(@as(u32, 0)), .target_type = fallible } };
+    try std.testing.expect(try validOutput(queries.AnalyzeFunctionInstance, db, body));
+}
+
 test "cached storage joins reject mismatched types and coercion metadata" {
     var modes = [_]structures.ParameterMode{.imm};
     var arguments = [_]structures.FunctionBlockArgument{
@@ -1584,7 +1688,7 @@ test "array runtime snapshot tuples require the declared shape and runtime eleme
     const db = try query.Database.init(allocator, .{ .worker_count = 1 });
     defer db.deinit();
     const type_id: structures.TypeId = .fromInterned(try db.intern(queries.Types, .{ .array = .{ .element_type = .int, .length = 0 } }));
-    try std.testing.expect(!try validArrayRuntime(db, .{ .runtime = .{ .type_id = type_id, .value = .{ .int = 42 } } }));
+    try std.testing.expect(!try validRuntimeValue(db, .{ .runtime = .{ .type_id = type_id, .value = .{ .int = 42 } } }));
 }
 
 test "text intern restoration rejects malformed bytes IDs and payload types" {
@@ -1611,21 +1715,21 @@ test "text intern restoration rejects malformed bytes IDs and payload types" {
     }
 }
 
-test "cursor intern restoration validates nominal identity offsets and literal permissions" {
+test "cursor intern restoration validates nominal identity offsets and current type shapes" {
     const allocator = std.testing.allocator;
     for (0..10) |case_index| {
         const first = try query.Database.init(allocator, .{ .worker_count = 1 });
         defer first.deinit();
         const module = try first.intern(queries.ModulePaths, .{ .path = if (case_index == 9) "application" else standard_library.File.memory_allocation.modulePath() });
         const reference = case_index >= 6 and case_index <= 8;
-        const factory = try first.intern(queries.ItemLocations, .{ .origin = .{ .module = module }, .kind = .function, .name = .{ .identifier = if (reference) "Ref" else "StorageCursor" } });
+        const factory = try first.intern(queries.ItemLocations, .{ .origin = .{ .module = module }, .kind = .function, .name = .{ .identifier = "StorageCursor" } });
         const element = try first.intern(queries.CompileTimeValues, .{ .type = .byte });
         const permission = try first.intern(queries.CompileTimeValues, .{ .runtime = .{ .type_id = .bool, .value = .{ .bool = case_index == 3 } } });
-        const specialization = try first.intern(queries.CompileTimeValueTuples, .{ .values = &.{ element, permission } });
+        const specialization = try first.intern(queries.CompileTimeValueTuples, .{ .values = if (case_index == 3) &.{ element, permission } else &.{element} });
         const cursor_type: structures.TypeId = .fromInterned(try first.intern(queries.Types, .{ .structure = .{ .generated = .{ .owner = .{ .item = factory, .specialization = specialization }, .node_offset = 0 } } }));
         const data = try first.intern(queries.ByteStrings, .{ .bytes = "abc" });
         const cursor: structures.StaticStorageCursor = .{
-            .type_id = if (case_index == 4) .int else cursor_type,
+            .type_id = if (case_index == 4) .int else if (reference) .fromInterned(try first.intern(queries.Types, .{ .reference = .byte })) else cursor_type,
             .data = if (case_index == 5 or case_index == 6) null else if (case_index == 2) @fromBackingInt(@as(u32, 99)) else data,
             .offset = switch (case_index) {
                 1 => 4,
@@ -1656,7 +1760,7 @@ test "cached array projections validate operands shape index and result and roun
     defer db.deinit();
     const type_id: structures.TypeId = .fromInterned(try db.intern(queries.Types, .{ .array = .{ .element_type = .int, .length = 3 } }));
     var modes = [_]structures.ParameterMode{.imm};
-    var arguments = [_]structures.FunctionBlockArgument{.{ .type_id = type_id, .representation = .storage }};
+    var arguments = [_]structures.FunctionBlockArgument{.{ .type_id = type_id }};
     var instructions = [_]structures.FunctionInstruction{
         .{ .const_int = 1 },
         .{ .array_element = .{ .array = @fromBackingInt(@intCast(0)), .index = @fromBackingInt(@intCast(1)), .type_id = .int } },

@@ -16,16 +16,16 @@ const Measure = struct {
     pub const Output = Measurement;
 
     pub fn run(ctx: anytype, collect_measurements: Input) !Output {
-        const scope = (try ctx.get(queries.BuildModuleScope, 1)).* orelse return error.InvalidFixture;
+        const scope = (try ctx.get(queries.BuildModuleScope, 0)).* orelse return error.InvalidFixture;
         const item = scope.resolveFunction("probe") orelse return error.InvalidFixture;
         const signature = (try ctx.get(queries.FunctionSignature, item)).* orelse return error.InvalidFixture;
         const resolved = (try ctx.get(queries.ResolveItem, item)).* orelse return error.InvalidFixture;
-        const parsed = (try ctx.get(queries.ParseFile, 1)).* orelse return error.InvalidFixture;
-        const source = (try ctx.input(queries.SourceText, 1)).*;
+        const parsed = (try ctx.get(queries.ParseFile, resolved.file_id)).* orelse return error.InvalidFixture;
+        const source = (try ctx.input(queries.SourceText, resolved.file_id)).*;
         const instance: structures.InstanceId = .{ .item = item };
         const analysis: queries.AnalysisContext(@TypeOf(ctx)) = .{
             .ctx = ctx,
-            .file_id = 1,
+            .file_id = resolved.file_id,
             .instance = instance,
         };
         var unresolved = switch (try compiler.semantic.buildUnresolvedBody(
@@ -46,7 +46,7 @@ const Measure = struct {
         var body = (try compiler.typing.resolveAndTypeBody(
             ctx,
             instance,
-            1,
+            resolved.file_id,
             signature.parameters,
             signature.return_type,
             signature.is_fallible,
@@ -87,10 +87,7 @@ fn benchmark(init: std.process.Init, writer: *std.Io.Writer, count: u32, owning:
     for (0..(times.len + 1)) |sample_index| {
         const db = try query.Database.init(init.gpa, .{ .worker_count = 1 });
         defer db.deinit();
-        const module = try db.intern(queries.ModulePaths, .{ .path = "" });
-        try db.addInput(queries.SourceText, 1, source.items);
-        try db.addInput(queries.FileModule, 1, module);
-        try db.addInput(queries.ModuleMembers, module, &.{1});
+        try compiler.modules.registerSources(db, init.gpa, source.items, &.{}, &.{});
         const collect_measurements = sample_index == times.len;
         const result = (try db.get(Measure, collect_measurements)).*;
         if (collect_measurements) {

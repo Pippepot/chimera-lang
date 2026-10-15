@@ -102,15 +102,17 @@ const minimal_prelude =
     \\pub extern func int.*(imm left: int, imm right: int) int
     \\pub extern func int./(imm left: int, imm right: int) int
     \\pub extern func int.-(imm self: int) int
-    \\pub extern func int.==(imm left: int, imm right: int) bool
-    \\pub extern func int.<>(imm left: int, imm right: int) bool
-    \\pub extern func int.<(imm left: int, imm right: int) bool
-    \\pub extern func int.>(imm left: int, imm right: int) bool
-    \\pub extern func int.<=(imm left: int, imm right: int) bool
-    \\pub extern func int.>=(imm left: int, imm right: int) bool
-    \\pub extern func bool.==(imm left: bool, imm right: bool) bool
-    \\pub extern func bool.<>(imm left: bool, imm right: bool) bool
-    \\pub extern func bool.not(imm self: bool) bool
+    \\pub extern fallible int.==(imm left: int, imm right: int) unit
+    \\pub extern fallible int.<>(imm left: int, imm right: int) unit
+    \\pub extern fallible int.<(imm left: int, imm right: int) unit
+    \\pub extern fallible int.>(imm left: int, imm right: int) unit
+    \\pub extern fallible int.<=(imm left: int, imm right: int) unit
+    \\pub extern fallible int.>=(imm left: int, imm right: int) unit
+    \\pub extern fallible bool.==(imm left: bool, imm right: bool) unit
+    \\pub extern fallible bool.<>(imm left: bool, imm right: bool) unit
+    \\pub converter(condition: unit | none) bool
+    \\  if condition is unit -> return true
+    \\  return false
 ;
 
 fn testDatabaseWithPrelude(worker_count: usize, enable_prelude: bool) !*Database {
@@ -1810,17 +1812,24 @@ test "struct hook signature validation updates incrementally" {
     try testing.expectEqual(@as(usize, 0), diagnostics.len);
     freeDiagnostics(diagnostics);
 
-    try setSource(db, 1,
+    for ([_][]const u8{
         \\static Resource = struct
         \\  drop = func(imm self: Resource) -> return
         \\  value: int
-    );
-    item = (try db.get(queries.BuildModuleScope, 1)).*.?.resolveStatic("Resource").?;
-    try testing.expect((try db.get(queries.StructDefinition, item)).* == null);
-    diagnostics = try db.transitiveAccumulatorValues(queries.StructDefinition, item, structures.Diagnostic, testing.allocator);
-    try testing.expectEqual(@as(usize, 1), diagnostics.len);
-    try testing.expectEqual(DiagnosticKind.struct_ownership_hook_signature_mismatch, std.meta.activeTag(diagnostics[0].kind));
-    freeDiagnostics(diagnostics);
+        ,
+        \\static Resource = struct
+        \\  copy = func(imm self: Resource) ref Resource -> self
+        \\  value: int
+        ,
+    }) |invalid| {
+        try setSource(db, 1, invalid);
+        item = (try db.get(queries.BuildModuleScope, 1)).*.?.resolveStatic("Resource").?;
+        try testing.expect((try db.get(queries.StructDefinition, item)).* == null);
+        diagnostics = try db.transitiveAccumulatorValues(queries.StructDefinition, item, structures.Diagnostic, testing.allocator);
+        try testing.expectEqual(@as(usize, 1), diagnostics.len);
+        try testing.expectEqual(DiagnosticKind.struct_ownership_hook_signature_mismatch, std.meta.activeTag(diagnostics[0].kind));
+        freeDiagnostics(diagnostics);
+    }
 
     try setSource(db, 1, valid);
     item = (try db.get(queries.BuildModuleScope, 1)).*.?.resolveStatic("Resource").?;
@@ -3296,12 +3305,12 @@ test "field assignment widens to the declared field type" {
 
 test "field assignment diagnostics validate roots paths and values" {
     const cases = [_]struct { source: []const u8, expected: DiagnosticKind }{
-        .{ .source = "static Pair = struct\n  value: int\nfunc bad() int\n  const pair = Pair{value = 1}\n  pair.value = 2\n  return pair.value", .expected = .assignment_to_immutable },
-        .{ .source = "static Pair = struct\n  value: int\nfunc bad(pair: Pair) int\n  pair.value = 2\n  return pair.value", .expected = .assignment_to_immutable },
+        .{ .source = "static Pair = struct\n  value: int\nfunc bad() int\n  const pair = Pair{value = 1}\n  pair.value = 2\n  return pair.value", .expected = .reference_not_writable },
+        .{ .source = "static Pair = struct\n  value: int\nfunc bad(pair: Pair) int\n  pair.value = 2\n  return pair.value", .expected = .reference_not_writable },
         .{ .source = "func bad() int\n  var value = 1\n  value.field = 2\n  return value", .expected = .field_access_not_struct },
         .{ .source = "static Pair = struct\n  value: int\nfunc bad() int\n  var pair = Pair{value = 1}\n  pair.missing = 2\n  return pair.value", .expected = .unknown_field },
         .{ .source = "static Pair = struct\n  value: int\nfunc bad() int\n  var pair = Pair{value = 1}\n  pair.value = none\n  return pair.value", .expected = .assignment_type_mismatch },
-        .{ .source = "static Pair = struct\n  value: int\nfunc bad() int\n  Pair{value = 1}.value = 2\n  return 0", .expected = .assignment_target_not_local },
+        .{ .source = "static Pair = struct\n  value: int\nfunc bad() int\n  Pair{value = 1}.value = 2\n  return 0", .expected = .borrow_requires_place },
         .{ .source = "static Flags = struct\n  value: bool\nfunc bad() bool\n  var flags = Flags{value = true}\n  flags.value += 1\n  return flags.value", .expected = .missing_operation },
     };
     for (cases, 1..) |case, file_id| {
@@ -5758,6 +5767,13 @@ test "variant widening annotations retain equal results and recover after invali
     }
 }
 
+fn returnedSourceType(body: structures.FunctionBodyAnalysis) structures.TypeId {
+    for (body.blocks) |block| {
+        if (block.terminator == .return_value) return body.valueType(block.terminator.return_value.value);
+    }
+    unreachable;
+}
+
 test "variant branch joins inject members and preserve the selected tag" {
     const db = try testDatabase(2);
     defer db.deinit();
@@ -5768,9 +5784,7 @@ test "variant branch joins inject members and preserve the selected tag" {
     );
     const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
     const body = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = scope.resolve("choose").? })).*.?;
-    try testing.expectEqual(@as(usize, 2), body.branch_arguments.len);
-    try testing.expect(body.branch_arguments[0].coerce_to != null);
-    try testing.expect(body.branch_arguments[1].coerce_to != null);
+    try testing.expectEqual(body.return_type, returnedSourceType(body));
     try expectCompiledVariantWord(db, 1, "choose", &.{"choose"}, 0, 1);
 }
 
@@ -5801,7 +5815,7 @@ test "variant branch joins form structural unions and preserve selected values" 
                 const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
                 const body = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = scope.resolve("choose").? })).*;
                 try testing.expect(body != null);
-                const joined = body.?.block_arguments[0].type_id;
+                const joined = returnedSourceType(body.?);
                 const variant = try db.lookupInterned(queries.Types, joined.interned().?);
                 try testing.expectEqualSlices(structures.TypeId, case.members, variant.variant.members);
                 try testing.expect((try db.get(queries.BuildExecutable, 1)).* != null);
@@ -5829,7 +5843,7 @@ test "variant branch joins retain equal results and track changed member sets" {
     const instance: structures.InstanceId = .{ .item = target };
     const body = try db.get(queries.AnalyzeFunctionInstance, .{ .item = target });
     try testing.expect(body.* != null);
-    const joined = body.*.?.block_arguments[1].type_id;
+    const joined = returnedSourceType(body.*.?);
     try testing.expectEqual(body.*.?.return_type, joined);
     const compiled = try db.get(queries.CompileFunction, instance);
     try testing.expect(compiled.* != null);
@@ -5844,14 +5858,14 @@ test "variant branch joins retain equal results and track changed member sets" {
     defer testing.allocator.free(changed);
     try setSource(db, 1, changed);
     const updated = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = target })).*.?;
-    const narrower = updated.block_arguments[1].type_id;
+    const narrower = returnedSourceType(updated);
     try testing.expect(narrower != joined);
     try testing.expectEqualSlices(structures.TypeId, &.{ .int, .none }, (try db.lookupInterned(queries.Types, narrower.interned().?)).variant.members);
     try expectCompiledVariantWord(db, 1, "choose", &.{ "choose", "noop" }, 0, 2);
 
     try setSource(db, 1, source);
     const restored = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = target })).*.?;
-    try testing.expectEqual(joined, restored.block_arguments[1].type_id);
+    try testing.expectEqual(joined, returnedSourceType(restored));
     try expectCompiledVariantWord(db, 1, "choose", &.{ "choose", "noop" }, 0, 2);
 }
 
@@ -5882,10 +5896,6 @@ test "variant local annotations explicitly inject exact members" {
         \\  const value: int | none = none
         \\  return value
     );
-    const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
-    const body = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = scope.resolve("answer").? })).*.?;
-    try testing.expectEqual(@as(usize, 2), body.instructions.len);
-    try testing.expectEqual(body.return_type, body.instructions[1].variant_coerce.target_type);
     try expectCompiledVariantWord(db, 1, "answer", &.{"answer"}, 0, 1);
 }
 
@@ -6011,27 +6021,6 @@ test "declared unit functions analyze lower compile and execute as ordinary call
         \\  return done
         \\caller()
     );
-    const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
-    const leaf_id = scope.resolve("leaf").?;
-    const caller_id = scope.resolve("caller").?;
-
-    const leaf_signature = (try db.get(queries.FunctionSignature, leaf_id)).*.?;
-    try expectImmParameters(&.{.int}, leaf_signature.parameters);
-    try testing.expectEqual(structures.TypeId.unit, leaf_signature.return_type);
-    const leaf_body = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = leaf_id })).*.?;
-    try testing.expectEqualSlices(structures.FunctionBlockArgument, &.{.{ .type_id = .int }}, leaf_body.block_arguments);
-    try testing.expectEqual(structures.FunctionBodyAnalysis.Terminator.return_unit, leaf_body.blocks[0].terminator);
-
-    const caller_body = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = caller_id })).*.?;
-    try testing.expectEqual(@as(usize, 2), caller_body.instructions.len);
-    try testing.expectEqual(@as(i32, 7), caller_body.instructions[0].const_int);
-    try testing.expectEqual(leaf_id, caller_body.instructions[1].call.target.direct.item);
-    try testing.expectEqual(structures.TypeId.unit, caller_body.instructions[1].call.return_type);
-    try testing.expectEqual(structures.FunctionBodyAnalysis.Terminator.return_unit, caller_body.blocks[0].terminator);
-
-    const leaf_artifact = (try db.get(queries.CompileFunction, .{ .item = leaf_id })).*.?;
-    try testing.expectEqualSlices(u8, &.{ 0xBA, 1, 0, 0, 0, 0xC3 }, leaf_artifact.code);
-
     const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
     const io = testing.io;
     defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
@@ -6185,7 +6174,7 @@ test "function expressions analyze nested arithmetic and calls as one typed valu
     try expectCompiledFunctionResult(db, 1, "expression", &.{ "expression", "leaf" }, 15);
 }
 
-test "fallible integer if joins branch values through a block argument" {
+test "fallible integer if joins branch values" {
     const db = try testDatabase(2);
     defer db.deinit();
 
@@ -6197,22 +6186,6 @@ test "fallible integer if joins branch values through a block argument" {
         \\    22
         \\static answer = func() int -> return choose(-1) + choose(1)
     );
-    const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
-    const choose_id = scope.resolve("choose").?;
-    const body = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = choose_id })).*.?;
-
-    try testing.expectEqualSlices(structures.FunctionBlockArgument, &.{ .{ .type_id = .int }, .{ .type_id = .int } }, body.block_arguments);
-    try testing.expectEqual(@as(usize, 4), body.blocks.len);
-    try testing.expectEqual(@as(usize, 2), body.branch_arguments.len);
-    const predicate = body.blocks[0].terminator.predicate_branch;
-    try testing.expectEqual(structures.PredicateOperation.eqb, predicate.operation);
-    try expectPrimitiveCall(db, body, 1, "<", &.{ @fromBackingInt(0), @fromBackingInt(2) });
-    try testing.expectEqual(body.instructionValue(1), predicate.operands.lhs);
-    try testing.expectEqual(structures.TypeId.bool, body.valueType(predicate.operands.rhs));
-    try testing.expectEqual(@as(u32, 1), body.blocks[3].argument_start);
-    try testing.expectEqual(@as(u32, 2), body.blocks[3].argument_end);
-    try testing.expectEqual(@as(u32, 1), @backingInt(body.blocks[3].terminator.return_value.value));
-
     try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "choose" }, 42);
 }
 
@@ -6231,6 +6204,40 @@ test "fallible function signatures distinguish declarations" {
     try testing.expect(!ordinary.is_fallible);
     try testing.expect(checked.is_fallible);
     try testing.expect(!structures.FunctionSignature.eql(ordinary, checked));
+}
+
+test "optional parameter edits invalidate calls and recover failure handling" {
+    const db = try testDatabase(1);
+    defer db.deinit();
+    const optional =
+        \\fallible absent() int -> fail
+        \\func value_or(value: int | none) int
+        \\  if const found = value as int -> return found
+        \\  return 42
+        \\func answer() int -> value_or(absent?())
+    ;
+    try addSource(db, 1, optional);
+    const item = (try db.get(queries.BuildModuleScope, 1)).*.?.resolve("answer").?;
+    try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "value_or", "absent" }, 42);
+
+    try setSource(db, 1,
+        \\fallible absent() int -> fail
+        \\func value_or(value: int) int
+        \\  if const found = value as int -> return found
+        \\  return 42
+        \\func answer() int -> value_or(absent?())
+    );
+    try testing.expect((try db.get(queries.AnalyzeFunctionInstance, .{ .item = item })).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(queries.AnalyzeFunctionInstance, .{ .item = item }, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(DiagnosticKind.fallible_expression_outside_fallible_function, std.meta.activeTag(diagnostics[0].kind));
+
+    try setSource(db, 1, optional);
+    try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "value_or", "absent" }, 42);
+    const recovered = try db.transitiveAccumulatorValues(queries.AnalyzeFunctionInstance, .{ .item = item }, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(recovered);
+    try testing.expectEqual(@as(usize, 0), recovered.len);
 }
 
 test "explicit imm parameters use the default callable identity" {
@@ -6283,14 +6290,6 @@ test "callable values bind pass return and execute through indirect calls" {
         \\  return apply(selected, 41)
         \\exit(answer())
     );
-    const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
-    const apply = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = scope.resolve("apply").? })).*.?;
-    try testing.expectEqual(.call, std.meta.activeTag(apply.instructions[0]));
-    try testing.expectEqual(.indirect, std.meta.activeTag(apply.instructions[0].call.target));
-    const choose = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = scope.resolve("choose").? })).*.?;
-    try testing.expectEqual(.function_ref, std.meta.activeTag(choose.instructions[0]));
-    try testing.expectEqual(.return_value, std.meta.activeTag(choose.blocks[0].terminator));
-
     const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
     const io = testing.io;
     defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
@@ -6799,7 +6798,7 @@ test "every integer comparison selects the fallible success edge" {
     try expectCompiledFunctionResult(db, 1, "answer", &.{"answer"}, 42);
 }
 
-test "bool equality and values select branches without integer truthiness" {
+test "bool queries and equality select branches" {
     const db = try testDatabase(2);
     defer db.deinit();
 
@@ -6808,7 +6807,7 @@ test "bool equality and values select branches without integer truthiness" {
         \\  const equal = if true == true -> 20 else 0
         \\  const unequal = if true <> false -> 22 else 0
         \\  const condition = true
-        \\  const direct = if condition -> 40 else 0
+        \\  const direct = if condition? -> 40 else 0
         \\  return equal + unequal + direct - 40
     );
     try expectCompiledFunctionResult(db, 1, "answer", &.{"answer"}, 42);
@@ -6817,7 +6816,7 @@ test "bool equality and values select branches without integer truthiness" {
         .{ .file_id = 2, .source = "func bad() int -> if true < false -> 1 else 0", .kind = .missing_operation },
         .{ .file_id = 3, .source = "func bad() int -> if true == 1 -> 1 else 0", .kind = .call_argument_type_mismatch },
         .{ .file_id = 4, .source = "func bad() int -> if none == none -> 1 else 0", .kind = .equality_operand_not_supported },
-        .{ .file_id = 5, .source = "func bad() int -> if 1 -> 1 else 0", .kind = .if_condition_not_fallible },
+        .{ .file_id = 5, .source = "func bad() int -> if 1? -> 1 else 0", .kind = .query_operand_not_bool },
     };
     for (cases) |case| {
         try addSource(db, case.file_id, case.source);
@@ -6916,12 +6915,12 @@ test "logical condition edits retain equal results and recover diagnostics" {
     try setSource(db, 1, "static choose = func() int -> return if 1 < 2 and 2 < 1 -> 42 else 24");
     try expectCompiledFunctionResult(db, 1, "choose", &.{"choose"}, 24);
 
-    try setSource(db, 1, "static choose = func() int -> return if 1 < 2 and 2 -> 42 else 24");
+    try setSource(db, 1, "static choose = func() int -> return if 1 < 2 and 2? -> 42 else 24");
     try testing.expect((try db.get(queries.AnalyzeFunctionInstance, .{ .item = item })).* == null);
     const diagnostics = try db.transitiveAccumulatorValues(queries.AnalyzeFunctionInstance, .{ .item = item }, structures.Diagnostic, testing.allocator);
     defer freeDiagnostics(diagnostics);
     try testing.expectEqual(@as(usize, 1), diagnostics.len);
-    try testing.expectEqual(DiagnosticKind.if_condition_not_fallible, std.meta.activeTag(diagnostics[0].kind));
+    try testing.expectEqual(DiagnosticKind.query_operand_not_bool, std.meta.activeTag(diagnostics[0].kind));
 
     try setSource(db, 1, original);
     try testing.expect((try db.get(queries.AnalyzeFunctionInstance, .{ .item = item })).* != null);
@@ -6947,8 +6946,8 @@ test "if validates conditions and expected result types" {
     const cases = [_]struct { file_id: structures.FileId, source: []const u8, kind: DiagnosticKind }{
         .{
             .file_id = 1,
-            .source = "static bad = func() int -> return if 1 -> 1 else 2",
-            .kind = .if_condition_not_fallible,
+            .source = "static bad = func() int -> return if 1? -> 1 else 2",
+            .kind = .query_operand_not_bool,
         },
         .{
             .file_id = 2,
@@ -6962,8 +6961,8 @@ test "if validates conditions and expected result types" {
         },
         .{
             .file_id = 4,
-            .source = "func give() int -> 42\nfunc bad() int -> if const result = give() -> result else 0",
-            .kind = .if_condition_not_fallible,
+            .source = "func give() int -> 42\nfunc bad() int -> if const result: byte = give() -> result else 0",
+            .kind = .local_type_mismatch,
         },
         .{
             .file_id = 5,
@@ -6987,45 +6986,37 @@ test "if validates conditions and expected result types" {
     }
 }
 
-test "fallible call syntax removed postfix queries retain parse-only diagnostics" {
+test "postfix queries parse before rejecting non-bool operands" {
     const sources = [_][]const u8{
-        "static bad = func(v: int) int -> return if v? -> 1 else 2",
-        "static bad = func(v: int) int -> return if const x = v? -> x else 2",
+        "static bad = func(v: int) int -> return if v? -> 1 else 2\nbad(1)",
+        "static bad = func(v: int) int -> return if const x = v? -> x else 2\nbad(1)",
     };
     for (sources) |source| {
         const db = try testDatabase(2);
         defer db.deinit();
         try addSource(db, 1, source);
-        try testing.expect((try db.get(queries.ParseFile, 1)).* == null);
+        try testing.expect((try db.get(queries.ParseFile, 1)).* != null);
         try testing.expect((try db.get(queries.BuildExecutable, 1)).* == null);
-        const marker_start = std.mem.lastIndexOf(u8, source, "->").?;
-        const span: structures.SourceSpan = .{ .start = marker_start, .end = marker_start + 2 };
-        const kind: structures.Diagnostic.Kind = .{ .expected_token = .{ .expected = .l_paren, .found = .arrow } };
-        try expectSingleQueryDiagnostic(db, queries.ParseFile, 1, true, 1, span, kind);
-        try expectSingleQueryDiagnostic(db, queries.BuildExecutable, 1, false, 1, span, kind);
+        const marker_start = std.mem.lastIndexOf(u8, source, "v?").?;
+        const span: structures.SourceSpan = .{ .start = marker_start, .end = marker_start + 1 };
+        try expectSingleQueryDiagnostic(db, queries.BuildExecutable, 1, false, 1, span, .{ .query_operand_not_bool = .int });
     }
 }
 
-test "if conditions reject non-fallible forms" {
+test "if conditions select any successful payload and explicit queries test bools" {
     const db = try testDatabase(2);
     defer db.deinit();
 
-    const cases = [_]struct { file_id: structures.FileId, source: []const u8, marker: []const u8, kind: structures.Diagnostic.Kind }{
-        .{ .file_id = 4, .source = "static bad = func(v: int) int -> return if v < 1 and v -> 1 else 2", .marker = "v", .kind = .if_condition_not_fallible },
-        .{ .file_id = 5, .source = "static bad = func(v: int) int -> return if not v -> 1 else 2", .marker = "not", .kind = .if_condition_not_fallible },
-        .{ .file_id = 8, .source = "static bad = func(v: int) int -> return if const x = v -> x else 2", .marker = "v", .kind = .if_condition_not_fallible },
-    };
-    for (cases) |case| {
-        try addSource(db, case.file_id, case.source);
-        const bad_id = (try db.get(queries.BuildModuleScope, case.file_id)).*.?.resolve("bad").?;
-        try testing.expect((try db.get(queries.AnalyzeFunctionInstance, .{ .item = bad_id })).* == null);
-        const diagnostics = try db.transitiveAccumulatorValues(queries.AnalyzeFunctionInstance, .{ .item = bad_id }, structures.Diagnostic, testing.allocator);
-        defer freeDiagnostics(diagnostics);
-        try testing.expectEqual(@as(usize, 1), diagnostics.len);
-        try testing.expectEqual(case.kind, diagnostics[0].kind);
-        const marker_start = std.mem.lastIndexOf(u8, case.source, case.marker).?;
-        try testing.expectEqual(structures.SourceSpan{ .start = marker_start, .end = marker_start + case.marker.len }, diagnostics[0].span.?);
-    }
+    try addSource(db, 1,
+        \\static choose = func(v: int) int
+        \\  const a = if v -> 10 else 0
+        \\  const b = if false -> 10 else 0
+        \\  const c = if not v -> 0 else 10
+        \\  const d = if false? -> 0 else 10
+        \\  return a + b + c + d + (if const x = v -> x else 0)
+        \\static answer = func() int -> choose(2)
+    );
+    try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "choose" }, 42);
 }
 
 test "variant inspection tests active members and permits partially overlapping selectors" {
@@ -7213,8 +7204,7 @@ test "no-else if joins its body with implicit unit" {
     );
     const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
     const selected = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = scope.resolve("selected").? })).*.?;
-    try testing.expectEqual(@as(usize, 1), selected.block_arguments.len);
-    const result_type = selected.block_arguments[0].type_id;
+    const result_type = returnedSourceType(selected);
     try testing.expectEqual(selected.return_type, result_type);
     const members = (try db.lookupInterned(queries.Types, result_type.interned().?)).variant.members;
     try testing.expectEqualSlices(structures.TypeId, &.{ .int, .unit }, members);
@@ -7390,36 +7380,6 @@ test "parameters and nested call arguments form one typed value graph" {
         \\  const base = add(20, 1)
         \\  return add(twice(base), base)
     );
-    const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
-    const add_id = scope.resolve("add").?;
-    const twice_id = scope.resolve("twice").?;
-
-    const add_signature = (try db.get(queries.FunctionSignature, add_id)).*.?;
-    try expectImmParameters(&.{ .int, .int }, add_signature.parameters);
-    const add = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = add_id })).*.?;
-    try testing.expectEqualSlices(structures.FunctionBlockArgument, &.{ .{ .type_id = .int }, .{ .type_id = .int } }, add.block_arguments);
-    try testing.expectEqual(@as(u32, 0), add.blocks[0].argument_start);
-    try testing.expectEqual(@as(u32, 2), add.blocks[0].argument_end);
-    try expectPrimitiveCall(db, add, 0, "+", &.{ @fromBackingInt(0), @fromBackingInt(1) });
-    try testing.expectEqual(@as(u32, 2), @backingInt(add.blocks[0].terminator.return_value.value));
-
-    const twice = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = twice_id })).*.?;
-    try expectDirectCallArguments(&.{ @fromBackingInt(@intCast(0)), @fromBackingInt(@intCast(0)) }, twice.call_arguments);
-    try testing.expectEqual(add_id, twice.instructions[0].call.target.direct.item);
-    try testing.expectEqual(structures.FunctionValueRange{ .start = 0, .end = 2 }, twice.instructions[0].call.arguments);
-    try testing.expectEqual(@as(u32, 1), @backingInt(twice.blocks[0].terminator.return_value.value));
-
-    const answer = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = scope.resolve("answer").? })).*.?;
-    try expectDirectCallArguments(&.{
-        @fromBackingInt(@intCast(0)),
-        @fromBackingInt(@intCast(1)),
-        @fromBackingInt(@intCast(2)),
-        @fromBackingInt(@intCast(3)),
-        @fromBackingInt(@intCast(2)),
-    }, answer.call_arguments);
-    try testing.expectEqual(structures.FunctionValueRange{ .start = 0, .end = 2 }, answer.instructions[2].call.arguments);
-    try testing.expectEqual(structures.FunctionValueRange{ .start = 2, .end = 3 }, answer.instructions[3].call.arguments);
-    try testing.expectEqual(structures.FunctionValueRange{ .start = 3, .end = 5 }, answer.instructions[4].call.arguments);
     try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "twice", "add" }, 63);
 }
 
@@ -7501,7 +7461,7 @@ test "parameter arity edits invalidate callers and recovery restores them" {
     try SignatureParent.executions.expect(3);
 }
 
-test "immutable locals name typed values without adding binding instructions" {
+test "immutable locals name typed values preserve independent owned values" {
     const db = try testDatabase(2);
     defer db.deinit();
 
@@ -7516,18 +7476,6 @@ test "immutable locals name typed values without adding binding instructions" {
         \\  return alias + base
         \\locals()
     );
-    const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
-    const body = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = scope.resolve("locals").? })).*.?;
-
-    try testing.expectEqual(@as(usize, 7), body.instructions.len);
-    try testing.expectEqual(scope.resolve("leaf").?, body.instructions[0].call.target.direct.item);
-    try testing.expectEqual(scope.resolve("leaf").?, body.instructions[1].call.target.direct.item);
-    try testing.expectEqual(@as(i32, 2), body.instructions[2].const_int);
-    try testing.expectEqual(@as(i32, 1), body.instructions[3].const_int);
-    try expectPrimitiveCall(db, body, 4, "+", &.{ @fromBackingInt(2), @fromBackingInt(3) });
-    try expectPrimitiveCall(db, body, 5, "*", &.{ @fromBackingInt(0), @fromBackingInt(4) });
-    try expectPrimitiveCall(db, body, 6, "+", &.{ @fromBackingInt(5), @fromBackingInt(0) });
-    try testing.expectEqual(@as(u32, 6), @backingInt(body.blocks[0].terminator.return_value.value));
     try expectCompiledFunctionResult(db, 1, "locals", &.{ "locals", "leaf" }, 28);
 }
 
@@ -7545,7 +7493,7 @@ test "compiled immutable locals preserve reused values across a call" {
     try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "leaf" }, 42);
 }
 
-test "mutable locals and compound assignments reuse ordinary SSA values" {
+test "mutable locals and compound assignments update their storage" {
     const db = try testDatabase(2);
     defer db.deinit();
 
@@ -7560,10 +7508,6 @@ test "mutable locals and compound assignments reuse ordinary SSA values" {
         \\  const assigned = value = value
         \\  return assigned + value
     );
-    const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
-    const body = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = scope.resolve("answer").? })).*.?;
-    try testing.expectEqual(@as(usize, 11), body.instructions.len);
-    try testing.expectEqual(@as(u32, 10), @backingInt(body.blocks[0].terminator.return_value.value));
     try expectCompiledFunctionResult(db, 1, "answer", &.{"answer"}, 42);
 }
 
@@ -7577,11 +7521,6 @@ test "top-level mutable locals execute assignment right-hand sides once" {
         \\status += one()
         \\exit(status)
     );
-    const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
-    const entry_id = (try db.get(queries.SelectEntry, 1)).*.?;
-    const body = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = entry_id })).*.?;
-    try testing.expectEqual(@as(usize, 4), body.instructions.len);
-    try testing.expectEqual(scope.resolve("one").?, body.instructions[1].call.target.direct.item);
     const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
     const io = testing.io;
     defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
@@ -7609,10 +7548,6 @@ test "conditional assignments merge mutable outer locals" {
         \\  if 2 < 1 -> value = exit(1)
         \\  return value + 2
     );
-    const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
-    const selected = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = scope.resolve("selected").? })).*.?;
-    try testing.expectEqual(@as(usize, 3), selected.blocks[3].argument_end - selected.blocks[3].argument_start);
-    try testing.expectEqual(@as(usize, 6), selected.branch_arguments.len);
     try expectCompiledFunctionResult(db, 1, "selected", &.{"selected"}, 42);
     try expectCompiledFunctionResult(db, 1, "skipped", &.{"skipped"}, 42);
 }
@@ -7758,9 +7693,6 @@ test "assignment widening preserves a mutable variable's declared variant type" 
         \\  value = 42
         \\  return value
     );
-    const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
-    const body = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = scope.resolve("selected").? })).*.?;
-    try testing.expectEqual(body.return_type, body.instructions[3].variant_coerce.target_type);
     try expectCompiledVariantWord(db, 1, "selected", &.{"selected"}, 0, 0);
     try expectCompiledVariantWord(db, 1, "selected", &.{"selected"}, 4, 42);
 }
@@ -7779,7 +7711,7 @@ test "assignment diagnostics distinguish targets mutability and type" {
         .{ .file_id = 2, .source = "static bad = func(value: int) int\n  value = 2\n  return value", .marker = "value = 2", .kind = .assignment_to_immutable },
         .{ .file_id = 3, .source = "static bad = func() int\n  missing = 2\n  return 1", .marker = "missing", .kind = .unknown_value },
         .{ .file_id = 4, .source = "static bad = func() int\n  var value = 1\n  value = none\n  return value", .marker = "none", .kind = .assignment_type_mismatch },
-        .{ .file_id = 5, .source = "static bad = func() int\n  var value = 1\n  (if 1 < 2 -> value else 2) = 3\n  return value", .marker = "(if", .kind = .assignment_target_not_local },
+        .{ .file_id = 5, .source = "func make() int -> 1\nstatic bad = func() int\n  var value = 1\n  make() = 3\n  return value", .marker = "make() = 3", .kind = .borrow_requires_place },
     };
     for (cases) |case| {
         try addSource(db, case.file_id, case.source);
@@ -7928,12 +7860,12 @@ test "body edits preserve signature consumers and update body analysis" {
     try addSource(db, 1, "static f = func() int\n  const value = 7\n  return value");
     const function_id = (try db.get(queries.IndexItems, 1)).*.?.ids()[0];
     try testing.expect((try db.get(SignatureParent, function_id)).* != null);
-    try expectIntegerReturnBody((try db.get(queries.AnalyzeFunctionInstance, .{ .item = function_id })).*.?, 7);
+    try expectCompiledFunctionResult(db, 1, "f", &.{"f"}, 7);
 
     try setSource(db, 1, "static f = func() int\n  const value = 8\n  return value");
     try testing.expect((try db.get(SignatureParent, function_id)).* != null);
     try SignatureParent.executions.expect(1);
-    try expectIntegerReturnBody((try db.get(queries.AnalyzeFunctionInstance, .{ .item = function_id })).*.?, 8);
+    try expectCompiledFunctionResult(db, 1, "f", &.{"f"}, 8);
 
     try setSource(db, 1, "static f = func() foo -> return 8");
     try testing.expect((try db.get(queries.FunctionSignature, function_id)).* == null);
@@ -7972,22 +7904,19 @@ test "function signatures retain mutable borrow parameter modes" {
     try testing.expectEqual(structures.TypeId.int, signature.parameters[0].type_id);
 }
 
-test "mutable borrow parameters publish their final value" {
+test "mutable parameters write directly into caller storage" {
     const db = try testDatabase(1);
     defer db.deinit();
     try addSource(db, 1,
         \\func increment(mut value: int) int
         \\  value += 1
         \\  return value
+        \\func answer() int
+        \\  var value = 40
+        \\  const observed = increment(value)
+        \\  return observed + value - 40
     );
-
-    const function_id = (try db.get(queries.BuildModuleScope, 1)).*.?.resolveFunction("increment").?;
-    const body = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = function_id })).*.?;
-    var write_count: usize = 0;
-    for (body.instructions) |instruction| {
-        if (instruction == .mut_parameter_write) write_count += 1;
-    }
-    try testing.expectEqual(@as(usize, 1), write_count);
+    try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "increment" }, 42);
 }
 
 test "mutable borrow calls update caller places" {
@@ -8091,7 +8020,7 @@ test "mutable borrow arguments require non-overlapping mutable places" {
             .kind = .mutable_argument_requires_place,
         },
         .{
-            .source = "func update(mut changed: int, imm observed: int) -> changed += observed\nfunc bad()\n  var value = 1\n  update(value, value)",
+            .source = "struct Item\n  move = none\n  value: int\nfunc update(mut changed: Item, imm observed: Item) -> changed.value = observed.value\nfunc bad()\n  var value = Item{value = 1}\n  update(value, value)",
             .kind = .overlapping_mutable_arguments,
         },
         .{
@@ -8572,10 +8501,9 @@ test "fallible owned results originate only on success edges" {
     try testing.expectEqual(@as(u8, 42), try runtime.runProg(io, testing.allocator, &.{}));
 }
 
-test "underscore remains ordinary outside discard assignment statements" {
+test "underscore remains ordinary in compound assignments" {
     const cases = [_][]const u8{
         "func bad()\n  _ += 1",
-        "func bad() int\n  const value = _ = 1\n  return value",
     };
     for (cases, 1..) |source, file_id| {
         const db = try testDatabase(1);
@@ -8901,7 +8829,6 @@ test "movability edits switch mutable locals between rebuilt and in-place update
         const body = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = scope.resolveFunction("answer").? })).*.?;
         var rebuilt = false;
         for (body.instructions) |instruction| switch (instruction) {
-            .call_mut_argument => |argument| try testing.expectEqual(index == 1, argument.destination != null),
             .value_copy => |copy| if (copy.type_id != .int) {
                 rebuilt = true;
             },
@@ -9395,16 +9322,6 @@ test "entry const bindings name typed values and execute" {
         \\const a = status(21)
         \\exit(a)
     );
-    const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
-    const status_id = scope.resolve("status").?;
-    const entry_id = (try db.get(queries.SelectEntry, 1)).*.?;
-    const body = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = entry_id })).*.?;
-
-    try testing.expectEqual(@as(usize, 3), body.instructions.len);
-    try testing.expectEqual(@as(i32, 21), body.instructions[0].const_int);
-    try testing.expectEqual(status_id, body.instructions[1].call.target.direct.item);
-    try testing.expectEqual(structures.TypeId.never, body.instructions[2].resultType());
-
     const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
     const io = testing.io;
     defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};

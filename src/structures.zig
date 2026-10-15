@@ -92,6 +92,7 @@ pub const Token = struct {
         keyword_loop,
         keyword_match,
         keyword_mut,
+        keyword_ref,
         keyword_not,
         keyword_none,
         keyword_or,
@@ -130,6 +131,7 @@ pub const Token = struct {
         .{ "loop", .keyword_loop },
         .{ "match", .keyword_match },
         .{ "mut", .keyword_mut },
+        .{ "ref", .keyword_ref },
         .{ "not", .keyword_not },
         .{ "none", .keyword_none },
         .{ "or", .keyword_or },
@@ -206,13 +208,11 @@ pub const Node = struct {
         call_arg_list,
         const_binding,
         var_binding,
-        borrow_binding,
-        borrow_mut_binding,
+        ref_binding,
         static_binding,
         namespace_declaration,
         comptime_expr,
         field_access,
-        deref,
         index_access,
         func,
         identifier,
@@ -223,6 +223,7 @@ pub const Node = struct {
         param,
         param_list,
         move_expr,
+        query,
         break_nothing,
         break_expr,
         continue_expr,
@@ -242,6 +243,7 @@ pub const Node = struct {
         type_func,
         type_list,
         type_variant,
+        reference_result,
         import,
         selective_import,
         @"pub",
@@ -255,6 +257,10 @@ pub const Node = struct {
         node_node: struct {
             a: Index,
             b: Index,
+        },
+        field: struct {
+            type_annotation: Index,
+            kind: FieldKind,
         },
         signature: struct {
             parameters: Index,
@@ -270,8 +276,9 @@ pub const Node = struct {
     pub fn dataTag(self: Node) ?std.meta.FieldEnum(Data) {
         return switch (self.tag) {
             .break_nothing, .continue_expr, .return_nothing, .fail_expr, .access, .implicit_static, .bool_literal, .identifier, .none_literal, .number_literal, .string_literal, .unit_literal, .type, .implicit_type => .none,
-            .break_expr, .return_expr, .loop, .not, .neg, .move_expr, .comptime_expr, .sizeof_expr, .field_access, .deref, .struct_field, .struct_property, .struct_init_field, .@"pub" => .node,
-            .add, .sub, .mul, .div, .rem, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .@"and", .@"or", .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .rem_assign, .call, .index_access, .const_binding, .var_binding, .borrow_binding, .borrow_mut_binding, .static_binding, .namespace_declaration, .func, .param, .type_func, .@"if" => .node_node,
+            .break_expr, .return_expr, .loop, .not, .neg, .reference_result, .move_expr, .query, .comptime_expr, .sizeof_expr, .field_access, .struct_property, .struct_init_field, .@"pub" => .node,
+            .add, .sub, .mul, .div, .rem, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .@"and", .@"or", .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .rem_assign, .call, .index_access, .const_binding, .var_binding, .ref_binding, .static_binding, .namespace_declaration, .func, .param, .type_func, .@"if" => .node_node,
+            .struct_field => .field,
             .signature => .signature,
             .block, .call_arg_list, .param_list, .type_list, .type_variant, .where_clauses, .if_else, .@"struct", .struct_init, .collection_literal, .import, .selective_import => .ref,
             else => null,
@@ -295,6 +302,7 @@ pub const Node = struct {
             .none => .{ .list = &.{} },
             .node => .{ .fixed = .{ self.data.node, .null, .null } },
             .node_node => .{ .fixed = .{ self.data.node_node.a, self.data.node_node.b, .null } },
+            .field => .{ .fixed = .{ self.data.field.type_annotation, .null, .null } },
             .signature => .{ .fixed = .{ self.data.signature.parameters, self.data.signature.return_type, self.data.signature.where_clauses } },
             .ref => .{ .list = node_refs[self.data.ref.start..self.data.ref.end] },
         };
@@ -336,6 +344,7 @@ pub const Ast = struct {
                 .none => {},
                 .node => if (left.data.node != right.data.node) return false,
                 .node_node => if (!std.meta.eql(left.data.node_node, right.data.node_node)) return false,
+                .field => if (!std.meta.eql(left.data.field, right.data.field)) return false,
                 .signature => if (!std.meta.eql(left.data.signature, right.data.signature)) return false,
                 .ref => if (!std.meta.eql(left.data.ref, right.data.ref)) return false,
             }
@@ -415,7 +424,7 @@ pub const Operation = enum {
         return self == .@"[]" or self == .@"[]=";
     }
 
-    pub fn returnsBool(self: Operation) bool {
+    pub fn isPredicate(self: Operation) bool {
         return switch (self) {
             .@"==", .@"<>", .@"<", .@">", .@"<=", .@">=", .not => true,
             else => false,
@@ -480,6 +489,7 @@ pub const ItemKind = enum {
 
 pub const ConversionCandidate = struct {
     instance: InstanceId,
+    input_type: TypeId,
     target_type: TypeId,
     source_mode: ParameterMode,
 };
@@ -791,6 +801,7 @@ pub const VariantType = struct {
 
 pub const ParameterMode = enum {
     imm,
+    ref,
     static,
     mut,
     @"var",
@@ -803,9 +814,14 @@ pub const CallableParameter = struct {
     type_id: TypeId,
 };
 
+pub const ResultMode = enum { owned, reference };
+
+pub const FieldKind = enum { owned, reference };
+
 pub const CallableType = struct {
     parameters: []const CallableParameter,
     return_type: TypeId,
+    result_mode: ResultMode = .owned,
     is_fallible: bool,
 
     pub fn parametersEql(a: CallableType, b: CallableType) bool {
@@ -828,6 +844,8 @@ pub const StructIdentity = union(enum) {
 };
 
 pub const TypeData = union(enum) {
+    /// Nonowning address used by typed IR. Source references have logical type T.
+    reference: TypeId,
     variant: VariantType,
     callable: CallableType,
     structure: StructIdentity,
@@ -860,6 +878,7 @@ pub const VariantLayout = struct {
 
 pub const StructField = struct {
     name: []const u8,
+    kind: FieldKind = .owned,
     type_id: TypeId,
     span: SourceSpan,
     is_public: bool = false,
@@ -976,12 +995,13 @@ pub const FunctionValueUse = struct {
 pub const FunctionCallArgument = union(enum) {
     prepared: FunctionValueUse,
     deinit: FunctionValueId,
+    borrowed: FunctionValueId,
     initializer: FunctionValueId,
 
     pub fn valueUse(self: @This()) FunctionValueUse {
         return switch (self) {
             .prepared => |use| use,
-            .deinit, .initializer => |source| .{ .value = source },
+            .deinit, .borrowed, .initializer => |source| .{ .value = source },
         };
     }
 
@@ -992,7 +1012,7 @@ pub const FunctionCallArgument = union(enum) {
     pub fn operand(self: *@This()) *FunctionValueId {
         return switch (self.*) {
             .prepared => |*use| &use.value,
-            .deinit, .initializer => |*source| source,
+            .deinit, .borrowed, .initializer => |*source| source,
         };
     }
 };
@@ -1098,16 +1118,6 @@ pub const CallBehavior = enum {
     ordinary,
     box_new,
     box_value,
-    box_borrow,
-    box_borrow_mut,
-    local_borrow,
-    allocation_element_borrow,
-    reference_read,
-    reference_write,
-    reference_attenuate,
-    box_destroy,
-    allocation_destroy,
-    allocation_read,
     list_new,
     list_append,
     list_reserve,
@@ -1222,18 +1232,10 @@ pub const FieldAccessOperation = struct {
     field_type: TypeId,
 };
 
-pub const MutParameterWrite = struct {
+pub const InitializerCaptureWrite = struct {
     parameter_index: u32,
     value: FunctionValueId,
     type_id: TypeId,
-};
-
-pub const CallMutArgument = struct {
-    arguments: FunctionValueRange,
-    return_type: TypeId,
-    argument_index: u32,
-    type_id: TypeId,
-    destination: ?FunctionValueId = null,
 };
 
 pub const FunctionInstruction = union(enum) {
@@ -1268,8 +1270,7 @@ pub const FunctionInstruction = union(enum) {
     borrow_write: BorrowWriteOperation,
     value_copy: ValueCopy,
     field_access: FieldAccessOperation,
-    mut_parameter_write: MutParameterWrite,
-    call_mut_argument: CallMutArgument,
+    initializer_capture_write: InitializerCaptureWrite,
     call: FunctionCall,
     static_conversion: struct { operand: FunctionValueId, type_id: TypeId, destination: ?FunctionValueId = null },
     negi: FunctionValueId,
@@ -1291,9 +1292,8 @@ pub const FunctionInstruction = union(enum) {
             .borrow_address => |*operation| .{ &operation.source, null },
             .borrow_write => |*operation| .{ &operation.reference, &operation.value },
             .value_copy => |*operation| .{ &operation.source, if (operation.destination) |*destination| destination else null },
-            .call_mut_argument => |*operation| .{ if (operation.destination) |*destination| destination else null, null },
             .field_access => |*operation| .{ &operation.operand, null },
-            .mut_parameter_write => |*operation| .{ &operation.value, null },
+            .initializer_capture_write => |*operation| .{ &operation.value, null },
             .call => |*call| call.operands(),
             .static_conversion => |*conversion| .{ &conversion.operand, if (conversion.destination) |*destination| destination else null },
             .addi, .subi, .muli, .divsi => |*binary| .{ &binary.lhs, &binary.rhs },
@@ -1326,8 +1326,7 @@ pub const FunctionInstruction = union(enum) {
             .borrow_write => .unit,
             .value_copy => |operation| if (operation.destination == null) operation.type_id else .unit,
             .field_access => |operation| operation.field_type,
-            .mut_parameter_write => .unit,
-            .call_mut_argument => |operation| if (operation.destination == null) operation.type_id else .unit,
+            .initializer_capture_write => .unit,
             .call => |call| if (call.destination == null) call.return_type else .unit,
             .static_conversion => |conversion| if (conversion.destination == null) conversion.type_id else .unit,
         };
@@ -1337,7 +1336,100 @@ pub const FunctionInstruction = union(enum) {
 /// Owned function control-flow graph. Block arguments, branch operands, call
 /// operands, and instructions use flat arrays while each block owns its ranges
 /// and terminator. Calls retain declaration identities until code emission.
+/// Private paths describe references inside logical values, independently of
+/// the address projections consumed by code generation.
+pub const ReferencePathStep = union(enum) {
+    field: u32,
+    variant: TypeId,
+    element,
+    target,
+    referent,
+    descendants,
+};
+
+pub const ReferenceSourceKind = enum { place, contents };
+
+pub const ReferenceOriginContract = struct {
+    output_parameter: ?u32 = null,
+    parameter: ?u32,
+    kind: ReferenceSourceKind,
+    source_path: FunctionValueRange,
+    result_path: FunctionValueRange,
+    readonly: bool,
+    storage_depth: u32 = 0,
+    recursive_storage: bool = false,
+    variant_guard: bool = false,
+    stable: bool = false,
+    after_write: bool = false,
+    reads_contents: bool = false,
+};
+
+pub const ReferenceRequirement = struct {
+    parameter: u32,
+    kind: ReferenceSourceKind,
+    path: FunctionValueRange,
+    written_type: ?TypeId = null,
+    ends_lifetime: bool = false,
+    storage_depth: u32 = 0,
+    recursive_storage: bool = false,
+};
+
+pub const ReferenceContract = struct {
+    origins: []ReferenceOriginContract = &.{},
+    requirements: []ReferenceRequirement = &.{},
+    paths: []ReferencePathStep = &.{},
+
+    pub const eql = value_operations.Owned(@This()).eql;
+    pub const deinit = value_operations.Owned(@This()).deinit;
+
+    /// Inference joins sets of dependencies; their discovery order is irrelevant.
+    pub fn equivalent(left: @This(), right: @This()) bool {
+        if (left.origins.len != right.origins.len or left.requirements.len != right.requirements.len) return false;
+        for (left.origins) |a| {
+            var found = false;
+            for (right.origins) |b| {
+                if (sameOrigin(left, a, right, b)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return false;
+        }
+        for (left.requirements) |a| {
+            var found = false;
+            for (right.requirements) |b| {
+                if (sameRequirement(left, a, right, b)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return false;
+        }
+        return true;
+    }
+
+    pub fn sameOrigin(left: @This(), a: ReferenceOriginContract, right: @This(), b: ReferenceOriginContract) bool {
+        return a.output_parameter == b.output_parameter and a.parameter == b.parameter and a.kind == b.kind and a.readonly == b.readonly and
+            a.storage_depth == b.storage_depth and a.recursive_storage == b.recursive_storage and a.variant_guard == b.variant_guard and a.stable == b.stable and a.after_write == b.after_write and a.reads_contents == b.reads_contents and
+            samePath(left, a.source_path, right, b.source_path) and samePath(left, a.result_path, right, b.result_path);
+    }
+
+    pub fn sameRequirement(left: @This(), a: ReferenceRequirement, right: @This(), b: ReferenceRequirement) bool {
+        return a.parameter == b.parameter and a.kind == b.kind and a.written_type == b.written_type and
+            a.storage_depth == b.storage_depth and a.recursive_storage == b.recursive_storage and a.ends_lifetime == b.ends_lifetime and samePath(left, a.path, right, b.path);
+    }
+
+    pub fn samePath(left: @This(), a: FunctionValueRange, right: @This(), b: FunctionValueRange) bool {
+        const left_path = left.paths[a.start..a.end];
+        const right_path = right.paths[b.start..b.end];
+        if (left_path.len != right_path.len) return false;
+        for (left_path, right_path) |x, y| if (!std.meta.eql(x, y)) return false;
+        return true;
+    }
+};
+
 pub const FunctionBodyAnalysis = struct {
+    reference_contract: ReferenceContract = .{},
     return_type: TypeId,
     /// ABI failure permission; init regions and consuming converters may inherit failure.
     is_fallible: bool = false,
@@ -1549,6 +1641,7 @@ pub const Diagnostic = struct {
         invalid_converter,
         invalid_converter_owner,
         value_used_as_type,
+        reference_projection_requires_member,
         type_factory_requires_call,
         generic_struct_requires_specialization,
         function_annotation_not_supported,
@@ -1600,7 +1693,6 @@ pub const Diagnostic = struct {
         borrow_outlives_source,
         borrow_requires_place,
         mutable_borrow_requires_writable_place,
-        dereference_requires_ref: TypeId,
         reference_not_writable,
         transferred_value_not_restored_before_loop_backedge,
         type_not_movable: TypeId,
@@ -1640,6 +1732,7 @@ pub const Diagnostic = struct {
         invalid_string_utf8,
         fallible_condition_not_supported,
         if_condition_not_fallible,
+        query_operand_not_bool: TypeId,
         inspection_type_not_supported,
         variant_inspection_operand_not_variant: TypeId,
         condition_binding_must_be_immutable,

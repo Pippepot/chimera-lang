@@ -5,23 +5,21 @@ import std.exit.{exit}
 extern func literal_data(static value: string_literal) static_data
 extern func literal_size(static value: string_literal) int
 pub extern func byte_int(value: byte) int
-extern fallible io_write(descriptor: int, imm data: Span(byte, false)) int
+extern fallible io_write(descriptor: int, imm data: Span(byte)) int
 
 pub struct BytesView
     copy = trivial
-    data: Span(byte, false)
+    data: Span(byte)
 
-    pub func from_array(static N: int, imm value: Array(byte, N)) BytesView -> BytesView{data = Span(byte, false).from_array(N, value)}
-    pub fallible unsafe_from_allocation(imm value: Allocation(byte), initialized: int) BytesView
-        return BytesView{data = Span(byte, false).unsafe_from_allocation?(value, initialized)}
-    pub func from_span(imm span: Span(byte, false)) BytesView -> BytesView{data = span}
-    pub func as_span(imm self: BytesView) Span(byte, false) -> self.data
+    pub func from_array(static N: int, ref value: Array(byte, N)) BytesView -> BytesView{data = Span(byte).from_array(N, value).as_imm()}
+    pub fallible unsafe_from_allocation(ref value: Allocation(byte), initialized: int) BytesView
+        return BytesView{data = Span(byte).unsafe_from_allocation?(value, initialized).as_imm()}
+    pub func from_span(imm span: Span(byte)) BytesView -> BytesView{data = span.as_imm()}
+    pub func as_span(imm self: BytesView) Span(byte) -> self.data.as_imm()
     pub fallible write_to(imm self: BytesView, descriptor: int) int -> io_write?(descriptor, self.data)
     pub func byte_length(imm self: BytesView) int -> self.data.len()
-    pub fallible get(imm self: BytesView, index: int) byte
-        const element = self.data.get?(index)
-        return element[]
-    pub fallible [](imm self: BytesView, index: int) byte -> self.get?(index)
+    pub fallible get(imm self: BytesView, index: int) ref byte -> self.data.get?(index)
+    pub fallible [](imm self: BytesView, index: int) ref byte -> self.get?(index)
     pub fallible slice(imm self: BytesView, start: int, size: int) BytesView
         return BytesView{data = self.data.slice?(start, size)}
     pub fallible validate_utf8(imm self: BytesView) StringView
@@ -64,8 +62,8 @@ pub struct StringView
     copy = trivial
     bytes: BytesView
 
-    pub func ==(imm left: StringView, imm right: StringView) bool -> equal_bytes(left.bytes, right.bytes)
-    pub func <>(imm left: StringView, imm right: StringView) bool -> not equal_bytes(left.bytes, right.bytes)
+    pub fallible ==(imm left: StringView, imm right: StringView) unit -> equal_bytes?(left.bytes, right.bytes)
+    pub fallible <>(imm left: StringView, imm right: StringView) unit -> not equal_bytes?(left.bytes, right.bytes)
     pub func byte_length(imm self: StringView) int -> self.bytes.byte_length()
     pub func as_bytes(imm self: StringView) BytesView -> self.bytes
     pub fallible slice(imm self: StringView, start: int, size: int) StringView
@@ -94,8 +92,8 @@ pub struct String
     copy = none
     storage: LiteralBytes | OwnedBytes
 
-    pub func ==(imm left: String, imm right: String) bool -> equal_bytes(left.as_bytes(), right.as_bytes())
-    pub func <>(imm left: String, imm right: String) bool -> not equal_bytes(left.as_bytes(), right.as_bytes())
+    pub fallible ==(imm left: String, imm right: StringView) unit -> equal_bytes?(left.as_bytes(), right.as_bytes())
+    pub fallible <>(imm left: String, imm right: StringView) unit -> not equal_bytes?(left.as_bytes(), right.as_bytes())
     pub fallible from_utf8(imm bytes: BytesView) String
         const text = bytes.validate_utf8?()
         var result = String.empty()
@@ -104,15 +102,15 @@ pub struct String
     pub func empty() String -> String{storage = LiteralBytes{data = literal_data(""), size = 0}}
     pub func byte_length(imm self: String) int
         if const literal = self.storage as LiteralBytes -> return literal.size
-        if borrow owned = self.storage as OwnedBytes -> return owned.size
+        if ref owned = self.storage as OwnedBytes -> return owned.size
         exit(134)
     pub func capacity(imm self: String) int
         if const literal = self.storage as LiteralBytes -> return literal.size
-        if borrow owned = self.storage as OwnedBytes -> return owned.allocation.capacity()
+        if ref owned = self.storage as OwnedBytes -> return owned.allocation.capacity()
         exit(134)
     pub func as_bytes(imm self: String) BytesView
-        if const literal = self.storage as LiteralBytes -> return BytesView{data = Span(byte, false).unsafe_from_static(literal.data, literal.size)}
-        if borrow owned = self.storage as OwnedBytes
+        if const literal = self.storage as LiteralBytes -> return BytesView{data = Span(byte).unsafe_from_static(literal.data, literal.size)}
+        if ref owned = self.storage as OwnedBytes
             if const bytes = BytesView.unsafe_from_allocation(owned.allocation, owned.size) -> return bytes
         exit(134)
     pub func view(imm self: String) StringView -> StringView{bytes = self.as_bytes()}
@@ -127,7 +125,8 @@ pub struct String
         var index = 0
         loop
             if index == size -> break
-            unsafe_initialize?(byte, replacement.allocation, index, bytes.get?(index))
+            const item = bytes.get?(index)
+            unsafe_initialize?(byte, replacement.allocation, index, item)
             index += 1
         replacement.size = size
         self.storage = replacement^
@@ -145,11 +144,12 @@ pub struct String
             if capacity < required -> capacity = required
         self.reserve?(capacity)
         const bytes = text.as_bytes()
-        if borrow mut owned = self.storage as OwnedBytes
+        if ref owned = self.storage as OwnedBytes
             var index = 0
             loop
                 if index == count -> break
-                unsafe_initialize?(byte, owned.allocation, size + index, bytes.get?(index))
+                const item = bytes.get?(index)
+                unsafe_initialize?(byte, owned.allocation, size + index, item)
                 index += 1
             owned.size = required
             return
@@ -159,22 +159,22 @@ pub struct String
         result.append?(self.view())
         return result^
 
-func equal_bytes(imm left: BytesView, imm right: BytesView) bool
+fallible equal_bytes(imm left: BytesView, imm right: BytesView) unit
     const count = left.byte_length()
-    if count <> right.byte_length() -> return false
+    if count <> right.byte_length() -> fail
     var index = 0
     loop
-        if index == count -> return true
+        if index == count -> return
         if const first = left.get(index)
             if const second = right.get(index)
-                if byte_int(first) <> byte_int(second) -> return false
+                if byte_int(first) <> byte_int(second) -> fail
                 index += 1
                 continue
         exit(134)
 
 pub converter(static value: string_literal) String -> String{storage = LiteralBytes{data = literal_data(value), size = literal_size(value)}}
-pub converter(static value: string_literal) StringView -> StringView{bytes = BytesView{data = Span(byte, false).unsafe_from_static(literal_data(value), literal_size(value))}}
-pub converter(static value: string_literal) BytesView -> BytesView{data = Span(byte, false).unsafe_from_static(literal_data(value), literal_size(value))}
+pub converter(static value: string_literal) StringView -> StringView{bytes = BytesView{data = Span(byte).unsafe_from_static(literal_data(value), literal_size(value))}}
+pub converter(static value: string_literal) BytesView -> BytesView{data = Span(byte).unsafe_from_static(literal_data(value), literal_size(value))}
 
 pub converter(imm value: String) StringView -> value.view()
 pub converter(imm value: String) BytesView -> value.as_bytes()

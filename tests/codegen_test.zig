@@ -17,6 +17,10 @@ const TestTypes = struct {
     pub fn byteString(self: @This(), _: structures.ByteStringId) ![]const u8 {
         return self.data;
     }
+    pub fn storageCursorAccess(_: @This(), _: structures.TypeId) !?structures.TypeId {
+        return null;
+    }
+
     pub fn facts(self: @This()) @This() {
         return self;
     }
@@ -54,8 +58,8 @@ const TestTypes = struct {
         return if (type_id == byte_reference_type) structures.TypeId.byte else null;
     }
 
-    pub fn storageAccess(_: @This(), type_id: structures.TypeId) !?struct { element_type: structures.TypeId, writable: bool } {
-        return if (type_id == byte_reference_type) .{ .element_type = .byte, .writable = false } else null;
+    pub fn storageAccess(_: @This(), type_id: structures.TypeId) !?structures.TypeId {
+        return if (type_id == byte_reference_type) .byte else null;
     }
 
     pub fn argumentPassing(_: @This(), _: structures.TypeId) !structures.ArgumentPassing {
@@ -141,6 +145,10 @@ const ArrayCopyTypes = struct {
     array_length: u32 = 1024,
     field_offsets: [2]u32 = .{ 0, 4 },
 
+    pub fn storageCursorAccess(_: *@This(), _: structures.TypeId) !?structures.TypeId {
+        return null;
+    }
+
     pub fn facts(self: *@This()) *@This() {
         return self;
     }
@@ -173,9 +181,8 @@ const ArrayCopyTypes = struct {
         return null;
     }
 
-    pub fn storageAccess(self: *@This(), type_id: structures.TypeId) !?struct { element_type: structures.TypeId, writable: bool } {
-        const element = (try self.borrowElement(type_id)) orelse return null;
-        return .{ .element_type = element, .writable = true };
+    pub fn storageAccess(self: *@This(), type_id: structures.TypeId) !?structures.TypeId {
+        return self.borrowElement(type_id);
     }
 
     pub fn argumentPassing(_: *@This(), type_id: structures.TypeId) !structures.ArgumentPassing {

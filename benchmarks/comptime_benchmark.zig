@@ -61,14 +61,12 @@ fn printMeasurement(writer: *std.Io.Writer, case_name: []const u8, stage: []cons
 fn benchmarkCase(gpa: std.mem.Allocator, io: std.Io, writer: *std.Io.Writer, case: Case) !void {
     const db = try query.Database.init(gpa, .{ .worker_count = 1 });
     defer db.deinit();
-    try db.addInput(queries.SourceText, 1, case.source);
-    try db.addInput(queries.FileModule, 1, try db.intern(queries.ModulePaths, .{ .path = "" }));
-    try db.addInput(queries.ModuleMembers, try db.intern(queries.ModulePaths, .{ .path = "" }), &.{1});
+    try compiler.modules.registerSources(db, gpa, case.source, &.{}, &.{});
 
-    const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
+    const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;
     const result = scope.resolveStatic("result").?;
     const resolved = (try db.get(queries.ResolveItem, result)).*.?;
-    const parsed = (try db.get(queries.ParseFile, 1)).*.?;
+    const parsed = (try db.get(queries.ParseFile, resolved.file_id)).*.?;
     const initializer = parsed.nodes[resolved.declaration].data.node_node.b.unwrap().?;
     const site: structures.CompileTimeSite = .{ .owner = .{ .item = result }, .node = initializer };
 
@@ -98,10 +96,8 @@ fn benchmarkIncremental(gpa: std.mem.Allocator, io: std.Io, writer: *std.Io.Writ
         \\static unrelated = 0
         \\static result = increment(41)
     ;
-    try db.addInput(queries.SourceText, 1, original);
-    try db.addInput(queries.FileModule, 1, try db.intern(queries.ModulePaths, .{ .path = "" }));
-    try db.addInput(queries.ModuleMembers, try db.intern(queries.ModulePaths, .{ .path = "" }), &.{1});
-    const result = (try db.get(queries.BuildModuleScope, 1)).*.?.resolveStatic("result").?;
+    try compiler.modules.registerSources(db, gpa, original, &.{}, &.{});
+    const result = (try db.get(queries.BuildModuleScope, 0)).*.?.resolveStatic("result").?;
     _ = (try db.get(queries.ResolveStatic, result)).*.?;
 
     const edits = [_]struct { name: []const u8, source: []const u8 }{
@@ -124,7 +120,7 @@ fn benchmarkIncremental(gpa: std.mem.Allocator, io: std.Io, writer: *std.Io.Writ
     };
     for (edits) |edit| {
         const started = std.Io.Clock.awake.now(io);
-        try db.setInput(queries.SourceText, 1, edit.source);
+        try db.setInput(queries.SourceText, 0, edit.source);
         _ = (try db.get(queries.ResolveStatic, result)).*.?;
         try printMeasurement(writer, "incremental", edit.name, elapsed(started, io));
     }

@@ -677,10 +677,11 @@ test "CLI supports compile-time local borrowing" {
     const result = try compileAndRun(io, std.testing.allocator, .{
         .source_path = "borrowing.chi",
         .source =
+        \\import std.memory
         \\func compute() int
         \\  const number = 42
-        \\  borrow item = number
-        \\  return item
+        \\  const item = Ref.from(number)
+        \\  return item.value
         \\static answer = compute()
         \\exit(answer)
         ,
@@ -704,7 +705,7 @@ test "CLI supports compile-time allocation with scalar publication" {
         .source =
         \\fallible compute() int
         \\  const owner = Box.new?(42)
-        \\  return owner.borrow()[]
+        \\  return owner.borrow()
         \\static answer = compute?()
         \\exit(answer)
         ,
