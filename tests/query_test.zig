@@ -11191,3 +11191,46 @@ test "handled child failures recompute without publishing stale accumulators" {
     defer testing.allocator.free(recovered);
     try testing.expectEqualSlices(u32, &.{42}, recovered);
 }
+
+test "custom query and input keys preserve aliases collisions and incremental dependencies" {
+    const CacheKey = struct { id: u32, spelling: u32 };
+    const Setting = struct {
+        pub const Key = CacheKey;
+        pub const Value = u32;
+        pub fn hashKey(_: Key) u64 {
+            return 0;
+        }
+        pub fn eqlKey(left: Key, right: Key) bool {
+            return left.id == right.id;
+        }
+    };
+    const Read = struct {
+        pub const Input = CacheKey;
+        pub const Output = u32;
+        pub const hash = Setting.hashKey;
+        pub const eql = Setting.eqlKey;
+        var runs: Counter = .{};
+        pub fn run(ctx: *Context, key: Input) !Output {
+            runs.increment();
+            return (try ctx.input(Setting, key)).*;
+        }
+    };
+    const db = try Database.init(testing.allocator, .{ .worker_count = 2 });
+    defer db.deinit();
+    const first: CacheKey = .{ .id = 1, .spelling = 10 };
+    const alias: CacheKey = .{ .id = 1, .spelling = 20 };
+    const other: CacheKey = .{ .id = 2, .spelling = 10 };
+    try db.addInput(Setting, first, 42);
+    try db.addInput(Setting, other, 7);
+    try testing.expectError(error.DuplicateInput, db.addInput(Setting, alias, 99));
+    try testing.expectEqual(@as(u32, 42), (try db.get(Read, first)).*);
+    try testing.expectEqual(@as(u32, 42), (try db.get(Read, alias)).*);
+    try Read.runs.expect(1);
+    try testing.expectEqual(@as(u32, 7), (try db.get(Read, other)).*);
+    try Read.runs.expect(2);
+    try db.setInput(Setting, alias, 43);
+    try testing.expectEqual(@as(u32, 43), (try db.get(Read, first)).*);
+    try Read.runs.expect(3);
+    try testing.expectEqual(@as(u32, 7), (try db.get(Read, other)).*);
+    try Read.runs.expect(3);
+}

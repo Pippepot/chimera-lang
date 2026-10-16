@@ -60,7 +60,29 @@ test "owned values copy nested storage and clean up partial copies" {
     }
 }
 
+/// Plain payloads need neither traversal nor initialization during cleanup.
+/// All pointer shapes still reach the owning operation's slice validation.
+fn ownsStorage(comptime T: type) bool {
+    switch (@typeInfo(T)) {
+        .pointer => return true,
+        inline .optional, .array => |info| return ownsStorage(info.child),
+        inline .@"struct", .@"union" => |info| {
+            for (info.field_types) |Field| if (ownsStorage(Field)) return true;
+            return false;
+        },
+        else => return false,
+    }
+}
+
+test "owned buffers release uninitialized plain payloads without reading union tags" {
+    const Plain = union(enum) { integer: i32, flag: bool };
+    const Buffer = struct { values: []Plain };
+    var buffer: Buffer = .{ .values = try std.testing.allocator.alloc(Plain, 8) };
+    defer Owned(Buffer).deinit(&buffer, std.testing.allocator);
+}
+
 fn copy(comptime T: type, allocator: std.mem.Allocator, value: T) std.mem.Allocator.Error!T {
+    if (comptime !ownsStorage(T)) return value;
     switch (@typeInfo(T)) {
         .optional => |info| return if (value) |present| try copy(info.child, allocator, present) else null,
         .array => |info| {
@@ -90,10 +112,7 @@ fn copy(comptime T: type, allocator: std.mem.Allocator, value: T) std.mem.Alloca
         },
         .pointer => |info| {
             if (info.size != .slice) @compileError("owned value copying requires slices, not pointers");
-            switch (@typeInfo(info.child)) {
-                .void, .bool, .int, .float, .@"enum" => return allocator.dupe(info.child, value),
-                else => {},
-            }
+            if (comptime !ownsStorage(info.child)) return allocator.dupe(info.child, value);
             const result = try allocator.alloc(info.child, value.len);
             var initialized: usize = 0;
             errdefer {
@@ -141,6 +160,10 @@ pub fn equal(comptime T: type, a: T, b: T) bool {
 }
 
 pub fn free(comptime T: type, allocator: std.mem.Allocator, value: *T) void {
+    if (comptime !ownsStorage(T)) {
+        value.* = undefined;
+        return;
+    }
     switch (@typeInfo(T)) {
         .optional => |info| if (value.*) |*present| free(info.child, allocator, present),
         .array => |info| for (value) |*element| free(info.child, allocator, element),
@@ -152,10 +175,7 @@ pub fn free(comptime T: type, allocator: std.mem.Allocator, value: *T) void {
         },
         .pointer => |info| {
             if (info.size != .slice) @compileError("owned value cleanup requires slices, not pointers");
-            switch (@typeInfo(info.child)) {
-                .void, .bool, .int, .@"enum" => {},
-                else => for (value.*) |*element| free(info.child, allocator, @constCast(element)),
-            }
+            if (comptime ownsStorage(info.child)) for (value.*) |*element| free(info.child, allocator, @constCast(element));
             allocator.free(value.*);
         },
         else => {},

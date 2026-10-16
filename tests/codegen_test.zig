@@ -123,10 +123,6 @@ fn functionSsa(
     };
     return .{
         .return_type = return_type,
-        .parameter_modes = &.{},
-        .block_arguments = &.{},
-        .branch_arguments = &.{},
-        .call_arguments = &.{},
         .instructions = instructions,
         .blocks = blocks,
         .entry = @fromBackingInt(@intCast(0)),
@@ -512,10 +508,6 @@ test "function references relocate absolute addresses for indirect calls" {
     }};
     const ssa: structures.FunctionBodyAnalysis = .{
         .return_type = .int,
-        .parameter_modes = &.{},
-        .block_arguments = &.{},
-        .branch_arguments = &.{},
-        .call_arguments = &.{},
         .instructions = &instructions,
         .blocks = &blocks,
         .entry = @fromBackingInt(@intCast(0)),
@@ -625,14 +617,10 @@ test "typed expression values survive calls and execute every integer arithmetic
         .{ .instance = left_id, .artifact = .{
             .code = &left_code,
             .required_alignment = 1,
-            .relocations = &.{},
-            .referenced_instances = &.{},
         } },
         .{ .instance = right_id, .artifact = .{
             .code = &right_code,
             .required_alignment = 1,
-            .relocations = &.{},
-            .referenced_instances = &.{},
         } },
     };
     var executable = try codegen.buildExecutable(entry_id, &functions, std.testing.allocator);
@@ -688,7 +676,6 @@ test "cyclic CFG accepts multi-value parallel backedge copies" {
         .parameter_modes = &parameter_modes,
         .block_arguments = &block_arguments,
         .branch_arguments = &branch_arguments,
-        .call_arguments = &.{},
         .instructions = &instructions,
         .blocks = &blocks,
         .entry = @fromBackingInt(@intCast(0)),
@@ -733,8 +720,6 @@ test "variant injection copies an arbitrary-size non-variant interned payload" {
         .parameter_modes = &parameter_modes,
         .block_arguments = &block_arguments,
         .variant_coercion_tags = &.{1},
-        .branch_arguments = &.{},
-        .call_arguments = &.{},
         .instructions = &instructions,
         .blocks = &blocks,
         .entry = @fromBackingInt(@intCast(0)),
@@ -770,7 +755,6 @@ fn testCompileVariantSubsetCallAllocations(gpa: std.mem.Allocator) !void {
         .parameter_modes = &parameter_modes,
         .block_arguments = &block_arguments,
         .variant_coercion_tags = &.{ 0, 2 },
-        .branch_arguments = &.{},
         .call_arguments = &call_arguments,
         .instructions = &instructions,
         .blocks = &blocks,
@@ -844,7 +828,6 @@ test "executable builder rejects artifact metadata independently" {
         .code = &code,
         .required_alignment = 1,
         .relocations = &relocations,
-        .referenced_instances = &.{},
     };
     const invalid_functions = [_]codegen.ReachableFunction{.{ .instance = entry, .artifact = with_relocation }};
     try std.testing.expectError(error.RelocationOutOfBounds, codegen.buildExecutable(entry, &invalid_functions, failing.allocator()));
@@ -853,7 +836,6 @@ test "executable builder rejects artifact metadata independently" {
     const with_reference: structures.CompiledFunction = .{
         .code = &code,
         .required_alignment = 1,
-        .relocations = &.{},
         .referenced_instances = &references,
     };
     const missing_functions = [_]codegen.ReachableFunction{.{ .instance = entry, .artifact = with_reference }};
@@ -867,8 +849,6 @@ test "executable builder requires the entry and every referenced artifact" {
     const leaf: structures.CompiledFunction = .{
         .code = &leaf_code,
         .required_alignment = 1,
-        .relocations = &.{},
-        .referenced_instances = &.{},
     };
     const only_leaf = [_]codegen.ReachableFunction{.{ .instance = leaf_id, .artifact = leaf }};
     try std.testing.expectError(error.MissingEntryArtifact, codegen.buildExecutable(entry, &only_leaf, std.testing.allocator));
@@ -912,8 +892,6 @@ test "executable builder resolves a direct call to its callee's file offset" {
     const callee: structures.CompiledFunction = .{
         .code = &callee_code,
         .required_alignment = 16,
-        .relocations = &.{},
-        .referenced_instances = &.{},
     };
 
     const functions = [_]codegen.ReachableFunction{
@@ -965,8 +943,6 @@ test "executable builder patches multiple relocations to one shared artifact" {
     const shared: structures.CompiledFunction = .{
         .code = &shared_code,
         .required_alignment = 1,
-        .relocations = &.{},
-        .referenced_instances = &.{},
     };
     const functions = [_]codegen.ReachableFunction{
         .{ .instance = entry_id, .artifact = entry },
@@ -1033,8 +1009,6 @@ test "executable builder rejects a relocation outside entry code bounds" {
     const callee: structures.CompiledFunction = .{
         .code = &callee_code,
         .required_alignment = 1,
-        .relocations = &.{},
-        .referenced_instances = &.{},
     };
     const functions = [_]codegen.ReachableFunction{
         .{ .instance = entry_id, .artifact = entry },
@@ -1064,8 +1038,6 @@ test "executable builder rejects a reference index outside referenced_instances"
     const callee: structures.CompiledFunction = .{
         .code = &callee_code,
         .required_alignment = 1,
-        .relocations = &.{},
-        .referenced_instances = &.{},
     };
     const functions = [_]codegen.ReachableFunction{
         .{ .instance = entry_id, .artifact = entry },
@@ -1097,8 +1069,6 @@ test "executable builder rejects a displacement outside the signed 32-bit range"
     const callee: structures.CompiledFunction = .{
         .code = &callee_code,
         .required_alignment = 1,
-        .relocations = &.{},
-        .referenced_instances = &.{},
     };
     const functions = [_]codegen.ReachableFunction{
         .{ .instance = entry_id, .artifact = entry },
@@ -1138,8 +1108,6 @@ fn testBuildExecutableWithCalleeAllocations(gpa: std.mem.Allocator) !void {
     const callee: structures.CompiledFunction = .{
         .code = &callee_code,
         .required_alignment = 1,
-        .relocations = &.{},
-        .referenced_instances = &.{},
     };
     const functions = [_]codegen.ReachableFunction{
         .{ .instance = entry_id, .artifact = entry },
@@ -1155,8 +1123,6 @@ fn testBuildExecutableAllocations(gpa: std.mem.Allocator) !void {
     const artifact: structures.CompiledFunction = .{
         .code = &code,
         .required_alignment = 1,
-        .relocations = &.{},
-        .referenced_instances = &.{},
     };
     const functions = [_]codegen.ReachableFunction{.{ .instance = entry, .artifact = artifact }};
     var executable = try codegen.buildExecutable(entry, &functions, gpa);

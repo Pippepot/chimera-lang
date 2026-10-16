@@ -1,4 +1,5 @@
 const std = @import("std");
+const value_operations = @import("value.zig");
 const standard_library = @import("standard_library");
 const query = @import("query/engine.zig");
 const queries = @import("queries.zig");
@@ -47,16 +48,7 @@ pub const Catalog = struct {
     files: []DiscoveredFile,
     modules: [][]u8,
 
-    pub fn deinit(self: *Catalog, gpa: std.mem.Allocator) void {
-        for (self.files) |file| {
-            gpa.free(file.path);
-            gpa.free(file.module_path);
-        }
-        gpa.free(self.files);
-        for (self.modules) |module| gpa.free(module);
-        gpa.free(self.modules);
-        self.* = undefined;
-    }
+    pub const deinit = value_operations.Owned(@This()).deinit;
 };
 
 pub fn modulePath(gpa: std.mem.Allocator, dir_path: []const u8) ![]u8 {
@@ -137,14 +129,8 @@ pub fn collectModuleFiles(
             return std.mem.order(u8, left, right) == .lt;
         }
     }.lessThan);
-    const owned_files = try files.toOwnedSlice(gpa);
-    errdefer {
-        for (owned_files) |file| {
-            gpa.free(file.path);
-            gpa.free(file.module_path);
-        }
-        gpa.free(owned_files);
-    }
+    var owned_files = try files.toOwnedSlice(gpa);
+    errdefer value_operations.free([]DiscoveredFile, gpa, &owned_files);
     return .{ .files = owned_files, .modules = try modules.toOwnedSlice(gpa) };
 }
 

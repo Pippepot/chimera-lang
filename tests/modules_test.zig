@@ -150,7 +150,6 @@ test "missing operations and unimplemented syntax report the actual source const
         defer testing.allocator.free(rejected);
         try Fixture.expectSourceDiagnostic(rejected, .missing_operation);
     }
-    try Fixture.expectSourceDiagnostic("for item in [1, 2]\n    exit(item)", .unsupported_syntax);
     try Fixture.expectSourceDiagnostic("const result = match 1\n    _ -> 42\nexit(result)", .unsupported_syntax);
 }
 

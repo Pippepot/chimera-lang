@@ -1,4 +1,4 @@
-import std.memory.{Span}
+import std.memory.{Span, SpanIterator}
 
 pub struct collection_literal(T: type, N: int)
     move = none
@@ -8,6 +8,9 @@ pub struct Array(T: type, N: int)
     pub func filled(imm value: T) Array(T, N) where T.copy is func(imm T) T -> array_filled(T, N, value)
     pub func len(imm self: Array(T, N)) int -> N
     pub func span(ref self: Array(T, N)) Span(T) -> Span(T).from_array(N, self)
+    pub func iter(ref self: Array(T, N)) SpanIterator(T)
+        var view = self.span()
+        return view.iter()
 
     pub fallible get(ref self: Array(T, N), index: int) ref T
         index >= 0

@@ -496,8 +496,6 @@ test "storage cursor evaluation defers missing canonical elements and recovers w
         .block_arguments = &parameters,
         .instructions = &instructions,
         .blocks = &blocks,
-        .branch_arguments = &.{},
-        .call_arguments = &.{},
         .entry = @fromBackingInt(@as(u32, 0)),
     };
     try std.testing.expect(try execute(&body, &arguments, &executor, std.testing.allocator) == .unavailable);
@@ -541,8 +539,6 @@ test "borrowed variant projections retain their owner's storage" {
         .borrow_fields = &projections,
         .instructions = &instructions,
         .blocks = &blocks,
-        .branch_arguments = &.{},
-        .call_arguments = &.{},
         .entry = @fromBackingInt(@as(u32, 0)),
     };
     try std.testing.expect(try executeInStorage(&body, &arguments, &executor, std.testing.allocator, call_arena.allocator()) == .returned);
@@ -604,11 +600,6 @@ fn expectCyclicSnapshots(allocator: std.mem.Allocator) !void {
     const storage = arena.allocator();
     const body: structures.FunctionBodyAnalysis = .{
         .return_type = .unit,
-        .parameter_modes = &.{},
-        .block_arguments = &.{},
-        .branch_arguments = &.{},
-        .call_arguments = &.{},
-        .instructions = &.{},
         .blocks = &.{},
         .entry = @fromBackingInt(@intCast(0)),
     };
@@ -764,7 +755,6 @@ test "interpreter direct branch values snapshot descriptors while storage aliase
             .parameter_modes = &modes,
             .block_arguments = &block_arguments,
             .branch_arguments = &branch_arguments,
-            .call_arguments = &.{},
             .instructions = &instructions,
             .blocks = &blocks,
             .entry = @fromBackingInt(@as(u32, 0)),
@@ -803,7 +793,7 @@ test "interpreter arrays fill through counted CFG and publish aggregate tuples" 
             .{ .instruction_start = 5, .instruction_end = 8, .terminator = .{ .branch = .{ .target = @fromBackingInt(@intCast(1)), .arguments = .{ .start = 1, .end = 2 } } } },
             .{ .instruction_start = 8, .instruction_end = 8, .terminator = .{ .return_value = .{ .value = @fromBackingInt(@intCast(1)) } } },
         };
-        const body: structures.FunctionBodyAnalysis = .{ .return_type = type_id, .parameter_modes = &.{}, .block_arguments = &block_arguments, .branch_arguments = &branch_arguments, .call_arguments = &.{}, .instructions = &instructions, .blocks = &blocks, .entry = @fromBackingInt(@intCast(0)) };
+        const body: structures.FunctionBodyAnalysis = .{ .return_type = type_id, .block_arguments = &block_arguments, .branch_arguments = &branch_arguments, .instructions = &instructions, .blocks = &blocks, .entry = @fromBackingInt(@intCast(0)) };
         var arguments: [0]Value = .{};
         const result = try execute(&body, &arguments, &executor, std.testing.allocator);
         try std.testing.expect(result == .returned);
@@ -828,7 +818,7 @@ test "interpreter array references survive nested calls and cannot be published"
     var modes = [_]structures.ParameterMode{.imm};
     var block_arguments = [_]structures.FunctionBlockArgument{.{ .type_id = array_type, .representation = .storage }};
     var callee_blocks = [_]structures.FunctionBlock{.{ .argument_end = 1, .instruction_start = 0, .instruction_end = 3, .terminator = .{ .return_value = .{ .value = @fromBackingInt(@intCast(3)) } } }};
-    const callee: structures.FunctionBodyAnalysis = .{ .return_type = reference_type, .parameter_modes = &modes, .block_arguments = &block_arguments, .branch_arguments = &.{}, .call_arguments = &.{}, .instructions = &callee_instructions, .blocks = &callee_blocks, .entry = @fromBackingInt(@intCast(0)) };
+    const callee: structures.FunctionBodyAnalysis = .{ .return_type = reference_type, .parameter_modes = &modes, .block_arguments = &block_arguments, .instructions = &callee_instructions, .blocks = &callee_blocks, .entry = @fromBackingInt(@intCast(0)) };
     var instructions = [_]structures.FunctionInstruction{
         .{ .local_storage = array_type },
         .{ .const_int = 0 },
@@ -842,7 +832,7 @@ test "interpreter array references survive nested calls and cannot be published"
     };
     var call_arguments = [_]structures.FunctionCallArgument{.{ .prepared = .{ .value = @fromBackingInt(@intCast(0)) } }};
     var blocks = [_]structures.FunctionBlock{.{ .instruction_start = 0, .instruction_end = instructions.len, .terminator = .{ .return_value = .{ .value = @fromBackingInt(@intCast(8)) } } }};
-    var body: structures.FunctionBodyAnalysis = .{ .return_type = .int, .parameter_modes = &.{}, .block_arguments = &.{}, .branch_arguments = &.{}, .call_arguments = &call_arguments, .instructions = &instructions, .blocks = &blocks, .entry = @fromBackingInt(@intCast(0)) };
+    var body: structures.FunctionBodyAnalysis = .{ .return_type = .int, .call_arguments = &call_arguments, .instructions = &instructions, .blocks = &blocks, .entry = @fromBackingInt(@intCast(0)) };
     var executor: ArrayTestExecutor = .{ .allocator = std.testing.allocator, .callee = &callee };
     defer executor.deinit();
     var arguments: [0]Value = .{};
@@ -887,7 +877,7 @@ test "interpreter nested array copies retain destination cells and rehydrate tup
         .{ .value_copy = .{ .source = @fromBackingInt(@intCast(4)), .destination = @fromBackingInt(@intCast(12)), .type_id = .int } },
     };
     var blocks = [_]structures.FunctionBlock{.{ .argument_end = 1, .instruction_start = 0, .instruction_end = instructions.len, .terminator = .{ .return_value = .{ .value = @fromBackingInt(@intCast(0)) } } }};
-    var body: structures.FunctionBodyAnalysis = .{ .return_type = source.type_id, .parameter_modes = &modes, .block_arguments = &block_arguments, .branch_arguments = &.{}, .call_arguments = &.{}, .instructions = &instructions, .blocks = &blocks, .entry = @fromBackingInt(@intCast(0)) };
+    var body: structures.FunctionBodyAnalysis = .{ .return_type = source.type_id, .parameter_modes = &modes, .block_arguments = &block_arguments, .instructions = &instructions, .blocks = &blocks, .entry = @fromBackingInt(@intCast(0)) };
     const result = try executeInStorage(&body, &arguments, &executor, std.testing.allocator, storage);
     try std.testing.expect(result == .returned);
     const runtime = result.returned.runtime;
@@ -996,7 +986,7 @@ test "initializer capture cell subtrees survive the constructing region storage"
             .{ .value_copy = .{ .source = @fromBackingInt(@intCast(3)), .destination = @fromBackingInt(@intCast(2)), .type_id = .int } },
         };
         var blocks = [_]structures.FunctionBlock{.{ .argument_start = 0, .argument_end = 1, .instruction_start = 0, .instruction_end = instructions.len, .terminator = .return_unit }};
-        const body: structures.FunctionBodyAnalysis = .{ .return_type = .unit, .is_initializer_region = true, .parameter_modes = &parameters, .block_arguments = &block_arguments, .branch_arguments = &.{}, .call_arguments = &.{}, .instructions = &instructions, .blocks = &blocks, .entry = @fromBackingInt(@intCast(0)) };
+        const body: structures.FunctionBodyAnalysis = .{ .return_type = .unit, .is_initializer_region = true, .parameter_modes = &parameters, .block_arguments = &block_arguments, .instructions = &instructions, .blocks = &blocks, .entry = @fromBackingInt(@intCast(0)) };
         var region_bytes: [8192]u8 = undefined;
         var region_storage: std.heap.FixedBufferAllocator = .init(&region_bytes);
         const result = try execute(&body, &arguments, &executor, region_storage.allocator());
@@ -1058,11 +1048,6 @@ test "fallible initializer calls route ordinary failure without a value" {
         .return_type = .int,
         .is_fallible = true,
         .is_initializer_region = true,
-        .parameter_modes = &.{},
-        .block_arguments = &.{},
-        .branch_arguments = &.{},
-        .call_arguments = &.{},
-        .instructions = &.{},
         .blocks = &region_blocks,
         .entry = @fromBackingInt(@intCast(0)),
     };
@@ -1086,9 +1071,6 @@ test "fallible initializer calls route ordinary failure without a value" {
         .is_fallible = true,
         .parameter_modes = &modes,
         .block_arguments = &block_arguments,
-        .branch_arguments = &.{},
-        .call_arguments = &.{},
-        .instructions = &.{},
         .blocks = &blocks,
         .entry = @fromBackingInt(@intCast(0)),
     };

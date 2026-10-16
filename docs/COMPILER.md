@@ -65,6 +65,17 @@ permission. Copies and mutable bindings cannot upgrade readonly backing. Spans o
 cannot escape local backing or survive owner transfer. Readonly spans do not
 freeze their owners; conflicting writes invalidate content-dependent views.
 
+`for item in source` iterates ranges, Array/List/Span, and ordinary custom
+cursors. A bare item owns an owned result or aliases a borrowed result readonly;
+`for const item` and `for var item` explicitly own/copy, while `for ref item`
+preserves borrowed permission. An optional `iter` factory supplies a cursor;
+otherwise named cursor state resumes in place. Cursors expose `advance` returning
+bool and `current` returning an owned value or `ref T`. Only successful false
+means exhaustion; declared failure propagates normally. The compiler invokes
+`current` once per successful step, including `_` bindings. Ranges use `a..b` or
+`a..^b`, with ordinary `reversed()` and fallible `step_by?(positive_factor)`
+methods. Inclusive endpoints and composed steps terminate without int overflow.
+
 UTF-8 literals default to the prelude `String`. Literal-backed strings allocate
 nothing; mutation grows unique owned storage, and `clone` is explicitly fallible.
 `StringView` and `BytesView` are read-only views with byte counts; BytesView wraps
@@ -188,16 +199,17 @@ zig build test --seed=0 -Dtest-source=test_sources.zig -Dtest-filter=tokenizer
 zig build test --seed=0 -Dtest-source=tests/modules_test.zig -Dtest-filter="name fragment"
 zig build test --seed=0 -Doptimize=safe -Dtest-source=tests/query_disk_cache_test.zig -Dtest-filter="field visibility" --summary all
 zig build test --seed=0 -Doptimize=safe -Dtest-source=tests/array_test.zig --summary all
+zig build test --seed=0 -Dtest-source=tests/iteration_test.zig --summary all
 zig build test --seed=0 -Doptimize=safe -Dtest-source=tests/converter_test.zig --summary all
 zig build test --seed=0 -Doptimize=safe -Dtest-source=tests/comptime_interpreter_test.zig --summary all
 ```
 
 These entrypoints supply required module imports. Both suite modes run inline
-tests once through `test_sources.zig` and nine standalone suites (ten default
+tests once through `test_sources.zig` and ten standalone suites (eleven default
 roots total): `tests/array_test.zig`, `tests/converter_test.zig`, `tests/codegen_test.zig`,
 `tests/comptime_interpreter_test.zig`, `tests/modules_test.zig`,
 `tests/query_disk_cache_test.zig`, `tests/query_test.zig`, `tests/reference_test.zig`,
-and `tests/text_test.zig`.
+`tests/text_test.zig`, and `tests/iteration_test.zig`.
 Each runs in its own binary's directory.
 Private disk-cache tests remain inline in
 `src/query_disk_cache.zig`; its snapshot integration suite lives in
@@ -213,7 +225,7 @@ caches compilation but reruns tests. The `safe` mode speeds up allocation checks
 with a slower first compile.
 
 For quick test iteration, omit `-Doptimize=safe` and select the affected
-suite with `-Dtest-source`. The full suite builds ten separate test binaries;
+suite with `-Dtest-source`. The full suite builds eleven separate test binaries;
 its compilation cost is different from building the CLI once.
 
 Use focused checks during edits; run the routine suite once for changes spanning

@@ -31,9 +31,7 @@ const Measure = struct {
         var unresolved = switch (try compiler.semantic.buildUnresolvedBody(
             &parsed,
             source,
-            resolved.declaration,
-            .function,
-            signature.parameters,
+            .{ .function = .{ .declaration = resolved.declaration, .parameters = signature.parameters } },
             analysis,
             ctx.allocator(),
         )) {

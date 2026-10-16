@@ -9,6 +9,7 @@ pub const File = enum(u32) {
     array,
     text,
     io,
+    range,
 
     pub fn path(file: File) []const u8 {
         return switch (file) {
@@ -20,6 +21,7 @@ pub const File = enum(u32) {
             .array => "array.chi",
             .text => "text.chi",
             .io => "io.chi",
+            .range => "range.chi",
         };
     }
 

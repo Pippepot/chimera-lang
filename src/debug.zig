@@ -144,143 +144,92 @@ fn renderBranchTarget(db: *query.Database, ssa: *const structures.FunctionBodyAn
     try writer.writeByte(')');
 }
 
-fn renderInstruction(
-    db: *query.Database,
-    ssa: *const structures.FunctionBodyAnalysis,
-    instruction_index: usize,
-    writer: *std.Io.Writer,
-) !void {
-    const result = @backingInt(ssa.instructionValue(instruction_index));
-    switch (ssa.instructions[instruction_index]) {
-        .const_int => |value| try writer.print("    %{d} = const_int {d}\n", .{ result, value }),
-        .const_byte => |value| try writer.print("    %{d} = const_byte {d}\n", .{ result, value }),
-        .const_string_literal => |value| try writer.print("    %{d} = const_string_literal @{d}\n", .{ result, @backingInt(value) }),
-        .const_data => |value| try writer.print("    %{d} = const_data @{d}\n", .{ result, @backingInt(value) }),
-        .const_storage_cursor => |cursor| try writer.print("    %{d} = const_storage_cursor {any}\n", .{ result, cursor }),
-        .storage_cursor => |operation| try writer.print("    %{d} = storage_cursor %{d}\n", .{ result, @backingInt(operation.source) }),
-        .cursor_offset, .cursor_element => |operation| try writer.print("    %{d} = {s} %{d}, %{d}\n", .{ result, @tagName(ssa.instructions[instruction_index]), @backingInt(operation.cursor), @backingInt(operation.index) }),
-        .byte_to_int => |value| try writer.print("    %{d} = {s} %{d}\n", .{ result, @tagName(ssa.instructions[instruction_index]), @backingInt(value) }),
-        .const_int_literal => |value| try writer.print("    %{d} = const_int_literal {d}\n", .{ result, value }),
-        .static_conversion => |conversion| {
-            try writer.print("    %{d} = static_conversion %{d} to ", .{ result, @backingInt(conversion.operand) });
-            try renderType(db, conversion.type_id, writer);
-            try writer.writeByte('\n');
-        },
-        .const_bool => |value| try writer.print("    %{d} = const_bool {s}\n", .{ result, if (value) "true" else "false" }),
-        .const_type => |type_id| {
-            try writer.print("    %{d} = const_type ", .{result});
+fn renderInstruction(db: *query.Database, ssa: *const structures.FunctionBodyAnalysis, instruction_index: usize, writer: *std.Io.Writer) !void {
+    const instruction = ssa.instructions[instruction_index];
+    if (instruction == .initializer_capture_write)
+        try writer.writeAll("    initializer_capture_write")
+    else
+        try writer.print("    %{d} = {s}", .{ @backingInt(ssa.instructionValue(instruction_index)), @tagName(instruction) });
+    switch (instruction) {
+        inline .const_int, .const_byte, .const_int_literal => |value| try writer.print(" {d}", .{value}),
+        inline .const_string_literal, .const_data => |value| try writer.print(" @{d}", .{@backingInt(value)}),
+        .const_storage_cursor => |cursor| try writer.print(" {any}", .{cursor}),
+        .storage_cursor, .borrow_box, .borrow_read => |operation| try writer.print(" %{d}", .{@backingInt(operation.source)}),
+        .cursor_offset, .cursor_element => |operation| try writer.print(" %{d}, %{d}", .{ @backingInt(operation.cursor), @backingInt(operation.index) }),
+        .byte_to_int, .variant_tag, .negi => |value| try writer.print(" %{d}", .{@backingInt(value)}),
+        .const_bool => |value| try writer.print(" {s}", .{if (value) "true" else "false"}),
+        .const_type, .local_storage, .result_storage => |type_id| {
+            try writer.writeByte(' ');
             try renderType(db, type_id, writer);
-            try writer.writeByte('\n');
         },
-        .const_unit => try writer.print("    %{d} = const_unit\n", .{result}),
-        .const_none => try writer.print("    %{d} = const_none\n", .{result}),
-        .initializer_ref => |reference| try writer.print("    %{d} = initializer_ref region {d}, captures {d}..{d}\n", .{ result, reference.region, reference.captures.start, reference.captures.end }),
+        .const_unit, .const_none => {},
+        .static_conversion => |conversion| {
+            try writer.print(" %{d} to ", .{@backingInt(conversion.operand)});
+            try renderType(db, conversion.type_id, writer);
+        },
+        .initializer_ref => |reference| try writer.print(" region {d}, captures {d}..{d}", .{ reference.region, reference.captures.start, reference.captures.end }),
         .function_ref => |reference| {
             const target = try db.lookupInterned(queries.ItemLocations, reference.target);
-            try writer.print("    %{d} = function_ref @", .{result});
+            try writer.writeAll(" @");
             try renderName(target.name, writer);
-            try writer.writeByte('\n');
         },
-        .variant_tag => |operand| try writer.print("    %{d} = variant_tag %{d}\n", .{ result, @backingInt(operand) }),
-        .variant_coerce => |coercion| {
-            try writer.print("    %{d} = variant_coerce %{d} to ", .{ result, @backingInt(coercion.operand) });
-            try renderType(db, coercion.target_type, writer);
-            if (coercion.destination) |storage| try writer.print(" into %{d}", .{@backingInt(storage)});
-            try writer.writeByte('\n');
+        .variant_coerce, .variant_extract => |operation| {
+            try writer.print(" %{d}{s}", .{ @backingInt(operation.operand), if (instruction == .variant_coerce) " to " else " as " });
+            try renderType(db, operation.target_type, writer);
         },
-        .variant_extract => |extraction| {
-            try writer.print("    %{d} = variant_extract %{d} as ", .{ result, @backingInt(extraction.operand) });
-            try renderType(db, extraction.target_type, writer);
-            try writer.writeByte('\n');
-        },
-        .callable_coerce => |coercion| {
-            try writer.print("    %{d} = callable_coerce %{d}", .{ result, @backingInt(coercion.operand) });
-            if (coercion.destination) |storage| try writer.print(" into %{d}", .{@backingInt(storage)});
-            try writer.writeByte('\n');
-        },
-        .local_storage => |type_id| {
-            try writer.print("    %{d} = local_storage ", .{result});
-            try renderType(db, type_id, writer);
-            try writer.writeByte('\n');
-        },
-        .result_storage => |type_id| {
-            try writer.print("    %{d} = result_storage ", .{result});
-            try renderType(db, type_id, writer);
-            try writer.writeByte('\n');
-        },
-        .storage_projection => |operation| {
-            try writer.print("    %{d} = storage_projection %{d}", .{ result, @backingInt(operation.owner) });
-            switch (operation.projection) {
-                .box_element => try writer.writeAll(".element"),
-                .field => |index| try writer.print(".{d}", .{index}),
-                .variant => try writer.writeAll(".payload"),
-                .allocation_array => try writer.writeAll(".elements"),
-            }
-            try writer.writeByte('\n');
-        },
-        .allocation_element => |operation| try writer.print("    %{d} = allocation_element %{d}[%{d}]\n", .{
-            result,
-            @backingInt(operation.allocation),
-            @backingInt(operation.index),
-        }),
-        .array_element => |operation| try writer.print("    %{d} = array_element %{d}[%{d}]\n", .{
-            result,
-            @backingInt(operation.array),
-            @backingInt(operation.index),
-        }),
-        .borrow_box => |operation| try writer.print("    %{d} = borrow_box %{d}\n", .{ result, @backingInt(operation.source) }),
-        .borrow_address => |operation| {
-            try writer.print("    %{d} = borrow_address %{d}", .{ result, @backingInt(operation.source) });
-            if (operation.base_is_reference) try writer.writeAll("[]");
-            for (ssa.borrow_fields[operation.fields.start..operation.fields.end]) |projection| switch (projection) {
-                .field => |field| try writer.print(".{d}", .{field}),
-                .variant => |member| {
-                    try writer.writeAll(" as ");
-                    try renderType(db, member, writer);
-                },
-            };
-            try writer.writeByte('\n');
-        },
-        .borrow_read => |operation| try writer.print("    %{d} = borrow_read %{d}\n", .{ result, @backingInt(operation.source) }),
-        .borrow_write => |operation| try writer.print("    %{d} = borrow_write %{d}, %{d}\n", .{
-            result,
-            @backingInt(operation.reference),
-            @backingInt(operation.value),
-        }),
-        .value_copy => |operation| {
-            try writer.print("    %{d} = value_copy %{d}", .{ result, @backingInt(operation.source) });
-            if (operation.destination) |storage| try writer.print(" into %{d}", .{@backingInt(storage)});
-            try writer.writeByte('\n');
-        },
-        .field_access => |operation| try writer.print("    %{d} = field_access %{d}, {d}\n", .{
-            result,
-            @backingInt(operation.operand),
-            operation.field_index,
-        }),
-        .initializer_capture_write => |operation| try writer.print("    initializer_capture_write {d}, %{d}\n", .{
-            operation.parameter_index,
-            @backingInt(operation.value),
-        }),
-        .call => |call| {
-            try writer.print("    %{d} = call ", .{result});
-            try renderCallTarget(db, call.target, writer);
-            try writer.writeByte('(');
-            for (ssa.call_arguments[call.arguments.start..call.arguments.end], 0..) |argument, index| {
-                if (index != 0) try writer.writeAll(", ");
-                if (argument == .deinit) try writer.writeAll("deinit ");
-                try renderValueUse(db, argument.valueUse(), writer);
-            }
-            try writer.writeAll(") : ");
-            try renderType(db, call.return_type, writer);
-            if (call.destination) |storage| try writer.print(" into %{d}", .{@backingInt(storage)});
-            try writer.writeByte('\n');
-        },
-        .negi => |operand| try writer.print("    %{d} = negi %{d}\n", .{ result, @backingInt(operand) }),
-        .addi => |operands| try renderBinary(writer, result, "addi", operands),
-        .subi => |operands| try renderBinary(writer, result, "subi", operands),
-        .muli => |operands| try renderBinary(writer, result, "muli", operands),
-        .divsi => |operands| try renderBinary(writer, result, "divsi", operands),
+        .callable_coerce => |coercion| try writer.print(" %{d}", .{@backingInt(coercion.operand)}),
+        .storage_projection => |operation| try renderStorageProjection(operation, writer),
+        .allocation_element => |operation| try writer.print(" %{d}[%{d}]", .{ @backingInt(operation.allocation), @backingInt(operation.index) }),
+        .array_element => |operation| try writer.print(" %{d}[%{d}]", .{ @backingInt(operation.array), @backingInt(operation.index) }),
+        .borrow_address => |operation| try renderBorrowAddress(db, ssa, operation, writer),
+        .borrow_write => |operation| try writer.print(" %{d}, %{d}", .{ @backingInt(operation.reference), @backingInt(operation.value) }),
+        .value_copy => |operation| try writer.print(" %{d}", .{@backingInt(operation.source)}),
+        .field_access => |operation| try writer.print(" %{d}, {d}", .{ @backingInt(operation.operand), operation.field_index }),
+        .initializer_capture_write => |operation| try writer.print(" {d}, %{d}", .{ operation.parameter_index, @backingInt(operation.value) }),
+        .call => |call| try renderCall(db, ssa, call, writer),
+        .addi, .subi, .muli, .divsi => |operands| try writer.print(" %{d}, %{d}", .{ @backingInt(operands.lhs), @backingInt(operands.rhs) }),
     }
+    const destination = switch (instruction) {
+        inline .variant_coerce, .callable_coerce, .value_copy, .call => |operation| operation.destination,
+        else => null,
+    };
+    if (destination) |storage| try writer.print(" into %{d}", .{@backingInt(storage)});
+    try writer.writeByte('\n');
+}
+
+fn renderStorageProjection(operation: structures.StorageProjection, writer: *std.Io.Writer) !void {
+    try writer.print(" %{d}", .{@backingInt(operation.owner)});
+    switch (operation.projection) {
+        .box_element => try writer.writeAll(".element"),
+        .field => |index| try writer.print(".{d}", .{index}),
+        .variant => try writer.writeAll(".payload"),
+        .allocation_array => try writer.writeAll(".elements"),
+    }
+}
+
+fn renderBorrowAddress(db: *query.Database, ssa: *const structures.FunctionBodyAnalysis, operation: structures.BorrowAddressOperation, writer: *std.Io.Writer) !void {
+    try writer.print(" %{d}", .{@backingInt(operation.source)});
+    if (operation.base_is_reference) try writer.writeAll("[]");
+    for (ssa.borrow_fields[operation.fields.start..operation.fields.end]) |projection| switch (projection) {
+        .field => |field| try writer.print(".{d}", .{field}),
+        .variant => |member| {
+            try writer.writeAll(" as ");
+            try renderType(db, member, writer);
+        },
+    };
+}
+
+fn renderCall(db: *query.Database, ssa: *const structures.FunctionBodyAnalysis, call: structures.FunctionCall, writer: *std.Io.Writer) !void {
+    try writer.writeByte(' ');
+    try renderCallTarget(db, call.target, writer);
+    try writer.writeByte('(');
+    for (ssa.call_arguments[call.arguments.start..call.arguments.end], 0..) |argument, index| {
+        if (index != 0) try writer.writeAll(", ");
+        if (argument == .deinit) try writer.writeAll("deinit ");
+        try renderValueUse(db, argument.valueUse(), writer);
+    }
+    try writer.writeAll(") : ");
+    try renderType(db, call.return_type, writer);
 }
 
 fn renderCallTarget(db: *query.Database, target: @FieldType(structures.FunctionCall, "target"), writer: *std.Io.Writer) !void {
@@ -317,20 +266,6 @@ fn renderType(db: *query.Database, type_id: structures.TypeId, writer: *std.Io.W
     }
 }
 
-fn renderBinary(
-    writer: *std.Io.Writer,
-    result: usize,
-    name: []const u8,
-    operands: structures.BinaryOperands,
-) !void {
-    try writer.print("    %{d} = {s} %{d}, %{d}\n", .{
-        result,
-        name,
-        @backingInt(operands.lhs),
-        @backingInt(operands.rhs),
-    });
-}
-
 pub fn renderAssembly(
     db: *query.Database,
     file_id: structures.FileId,
@@ -365,11 +300,8 @@ test "SSA debug renders nested array types and indexed array projections" {
     };
     const body: structures.FunctionBodyAnalysis = .{
         .return_type = .unit,
-        .parameter_modes = &.{},
         .block_arguments = &arguments,
         .instructions = &instructions,
-        .call_arguments = &.{},
-        .branch_arguments = &.{},
         .blocks = &.{},
         .entry = @fromBackingInt(@intCast(0)),
     };

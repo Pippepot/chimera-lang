@@ -186,8 +186,8 @@ pub const Database = struct {
         validateInput(I);
 
         const key_copy = key;
-        const key_hash = inputKeyHash(I, key_copy);
-        const lookup_key = inputCacheKey(I, &key_copy, key_hash);
+        const key_hash = keyHash(I, "hashKey", key_copy);
+        const lookup_key = cacheKey(I, &key_copy, key_hash, "eqlKey");
 
         db.lock();
         defer db.unlock();
@@ -223,12 +223,12 @@ pub const Database = struct {
             .value_ptr = null,
             .changed_at = db.revision,
             .type_name = @typeName(I),
-            .destroy_key_fn = destroyInputKeyFn(I),
+            .destroy_key_fn = destroyBoxFn(I.Key, null),
             .destroy_value_fn = destroyInputValueFn(I),
             .write_key_fn = writeValueFn(I.Key),
             .fingerprint_fn = fingerprintInputFn(I),
         };
-        try db.inputs.put(inputCacheKey(I, key_box, key_hash), entry);
+        try db.inputs.put(cacheKey(I, key_box, key_hash, "eqlKey"), entry);
         return entry;
     }
 
@@ -236,7 +236,7 @@ pub const Database = struct {
         validateInput(I);
 
         const key_copy = key;
-        const lookup_key = inputCacheKey(I, &key_copy, inputKeyHash(I, key_copy));
+        const lookup_key = cacheKey(I, &key_copy, keyHash(I, "hashKey", key_copy), "eqlKey");
 
         db.lock();
         defer db.unlock();
@@ -272,7 +272,7 @@ pub const Database = struct {
     pub fn intern(db: *Database, comptime I: type, value: I.Value) anyerror!I.Id {
         validateInterner(I);
         const value_hash = I.hash(value);
-        const lookup_key = internCacheKey(I, &value, value_hash);
+        const lookup_key = cacheKey(I, &value, value_hash, "eql");
 
         db.lock();
         defer db.unlock();
@@ -293,10 +293,10 @@ pub const Database = struct {
         db.interned_values.appendAssumeCapacity(.{
             .type_name = @typeName(I),
             .value_ptr = @ptrCast(value_box),
-            .destroy_value_fn = destroyInternedValueFn(I),
+            .destroy_value_fn = destroyBoxFn(I.Value, I.deinit),
             .write_value_fn = writeValueFn(I.Value),
         });
-        db.interns.putAssumeCapacityNoClobber(internCacheKey(I, value_box, value_hash), index);
+        db.interns.putAssumeCapacityNoClobber(cacheKey(I, value_box, value_hash, "eql"), index);
         return internId(I, index);
     }
 
@@ -313,7 +313,7 @@ pub const Database = struct {
     pub fn matchPersistedInput(db: *Database, comptime I: type, key: I.Key, digest: [32]u8) !?PersistedInputRef {
         validateInput(I);
         const key_copy = key;
-        const lookup_key = inputCacheKey(I, &key_copy, inputKeyHash(I, key_copy));
+        const lookup_key = cacheKey(I, &key_copy, keyHash(I, "hashKey", key_copy), "eqlKey");
         db.lock();
         defer db.unlock();
         if (db.pending_queries != 0) return error.InputUpdateDuringQuery;
@@ -339,14 +339,14 @@ pub const Database = struct {
     pub fn importCompletedQuery(db: *Database, comptime Q: type, input_value: Q.Input, output_value: Q.Output, inputs: []const PersistedInputRef, queries: []const PersistedQueryRef) !void {
         validateQuery(Q);
         const input_copy = input_value;
-        const input_hash = queryInputHash(Q, input_copy);
+        const input_hash = keyHash(Q, "hash", input_copy);
         db.lock();
         defer db.unlock();
         if (db.pending_queries != 0) return error.InputUpdateDuringQuery;
-        if (db.entries.contains(queryCacheKey(Q, &input_copy, input_hash))) return error.InvalidCache;
+        if (db.entries.contains(cacheKey(Q, &input_copy, input_hash, "eql"))) return error.InvalidCache;
         const entry = try db.insertEntryLocked(Q, input_copy, input_hash);
         errdefer {
-            _ = db.entries.remove(queryCacheKey(Q, &input_copy, input_hash));
+            _ = db.entries.remove(cacheKey(Q, &input_copy, input_hash, "eql"));
             db.destroyEntry(entry);
         }
         try entry.input_deps.appendSlice(db.allocator, inputs);
@@ -511,8 +511,8 @@ pub const Database = struct {
         validateQuery(Q);
 
         const input_copy = input_value;
-        const input_hash = queryInputHash(Q, input_copy);
-        const lookup_key = queryCacheKey(Q, &input_copy, input_hash);
+        const input_hash = keyHash(Q, "hash", input_copy);
+        const lookup_key = cacheKey(Q, &input_copy, input_hash, "eql");
         const parent = if (waiter) |ctx| ctx.current else null;
 
         db.lock();
@@ -548,7 +548,7 @@ pub const Database = struct {
 
     fn getInput(db: *Database, comptime I: type, key: I.Key, parent: ?*Entry) anyerror!*const I.Value {
         const key_copy = key;
-        const lookup_key = inputCacheKey(I, &key_copy, inputKeyHash(I, key_copy));
+        const lookup_key = cacheKey(I, &key_copy, keyHash(I, "hashKey", key_copy), "eqlKey");
 
         db.lock();
         defer db.unlock();
@@ -576,8 +576,8 @@ pub const Database = struct {
             .verified_at = db.revision,
             .changed_at = db.revision,
             .compute_fn = computeFn(Q),
-            .destroy_input_fn = destroyBoxFn(Q.Input),
-            .destroy_output_fn = destroyBoxFn(Q.Output),
+            .destroy_input_fn = destroyBoxFn(Q.Input, deinitBoxValue),
+            .destroy_output_fn = destroyBoxFn(Q.Output, deinitBoxValue),
             .output_eql_fn = outputEqlFn(Q),
             .write_input_fn = writeValueFn(Q.Input),
             .fingerprint_output_fn = if (@hasDecl(Q, "disk_boundary") and Q.disk_boundary) fingerprintQueryOutputFn(Q) else null,
@@ -592,7 +592,7 @@ pub const Database = struct {
             .visit_token = 0,
         };
 
-        try db.entries.put(queryCacheKey(Q, input_box, input_hash), entry);
+        try db.entries.put(cacheKey(Q, input_box, input_hash, "eql"), entry);
         return entry;
     }
 
@@ -1277,33 +1277,28 @@ fn validateInterner(comptime I: type) void {
     }
 }
 
-fn internCacheKey(comptime I: type, value_ptr: *const I.Value, value_hash: u64) ErasedKey {
+fn cacheKey(comptime Owner: type, value_ptr: anytype, hash: u64, comptime equality: []const u8) ErasedKey {
+    const Value = @typeInfo(@TypeOf(value_ptr)).pointer.child;
     return .{
-        .type_name = @typeName(I),
-        .hash = value_hash,
+        .type_name = @typeName(Owner),
+        .hash = hash,
         .value_ptr = value_ptr,
-        .eql_fn = struct {
-            fn eql(a_opaque: *const anyopaque, b_opaque: *const anyopaque) bool {
-                const a: *const I.Value = @ptrCast(@alignCast(a_opaque));
-                const b: *const I.Value = @ptrCast(@alignCast(b_opaque));
-                return I.eql(a.*, b.*);
-            }
-        }.eql,
+        .eql_fn = erasedEqlFn(Value, if (@hasDecl(Owner, equality)) @field(Owner, equality) else std.meta.eql),
     };
+}
+
+fn erasedEqlFn(comptime T: type, comptime equal: anytype) EqlOpaqueFn {
+    return struct {
+        fn eql(a_opaque: *const anyopaque, b_opaque: *const anyopaque) bool {
+            const a: *const T = @ptrCast(@alignCast(a_opaque));
+            const b: *const T = @ptrCast(@alignCast(b_opaque));
+            return equal(a.*, b.*);
+        }
+    }.eql;
 }
 
 fn internId(comptime I: type, index: u32) I.Id {
     return @fromBackingInt(@intCast(index));
-}
-
-fn destroyInternedValueFn(comptime I: type) DestroyOpaqueFn {
-    return struct {
-        fn destroy(gpa: std.mem.Allocator, ptr: *anyopaque) void {
-            const value: *I.Value = @ptrCast(@alignCast(ptr));
-            I.deinit(gpa, value);
-            gpa.destroy(value);
-        }
-    }.destroy;
 }
 
 fn writeValueFn(comptime T: type) WriteOpaqueFn {
@@ -1350,60 +1345,11 @@ fn fingerprintInputFn(comptime I: type) FingerprintFn {
     }.fingerprint;
 }
 
-fn queryCacheKey(comptime Q: type, input_ptr: *const Q.Input, input_hash: u64) ErasedKey {
-    return .{
-        .type_name = @typeName(Q),
-        .hash = input_hash,
-        .value_ptr = input_ptr,
-        .eql_fn = queryInputEqlFn(Q),
-    };
-}
-
-fn inputCacheKey(comptime I: type, key_ptr: *const I.Key, key_hash: u64) ErasedKey {
-    return .{
-        .type_name = @typeName(I),
-        .hash = key_hash,
-        .value_ptr = key_ptr,
-        .eql_fn = inputKeyEqlFn(I),
-    };
-}
-
-fn queryInputHash(comptime Q: type, input_value: Q.Input) u64 {
-    if (@hasDecl(Q, "hash")) return Q.hash(input_value);
-
-    var hasher = std.hash.Wyhash.init(typeHash(Q));
-    std.hash.autoHash(&hasher, input_value);
+fn keyHash(comptime Owner: type, comptime hash: []const u8, value: anytype) u64 {
+    if (@hasDecl(Owner, hash)) return @field(Owner, hash)(value);
+    var hasher = std.hash.Wyhash.init(typeHash(Owner));
+    std.hash.autoHash(&hasher, value);
     return hasher.final();
-}
-
-fn queryInputEqlFn(comptime Q: type) *const fn (*const anyopaque, *const anyopaque) bool {
-    return struct {
-        fn eql(a_opaque: *const anyopaque, b_opaque: *const anyopaque) bool {
-            const a: *const Q.Input = @ptrCast(@alignCast(a_opaque));
-            const b: *const Q.Input = @ptrCast(@alignCast(b_opaque));
-            if (@hasDecl(Q, "eql")) return Q.eql(a.*, b.*);
-            return std.meta.eql(a.*, b.*);
-        }
-    }.eql;
-}
-
-fn inputKeyHash(comptime I: type, key: I.Key) u64 {
-    if (@hasDecl(I, "hashKey")) return I.hashKey(key);
-
-    var hasher = std.hash.Wyhash.init(typeHash(I));
-    std.hash.autoHash(&hasher, key);
-    return hasher.final();
-}
-
-fn inputKeyEqlFn(comptime I: type) *const fn (*const anyopaque, *const anyopaque) bool {
-    return struct {
-        fn eql(a_opaque: *const anyopaque, b_opaque: *const anyopaque) bool {
-            const a: *const I.Key = @ptrCast(@alignCast(a_opaque));
-            const b: *const I.Key = @ptrCast(@alignCast(b_opaque));
-            if (@hasDecl(I, "eqlKey")) return I.eqlKey(a.*, b.*);
-            return std.meta.eql(a.*, b.*);
-        }
-    }.eql;
 }
 
 fn typeHash(comptime T: type) u64 {
@@ -1436,37 +1382,27 @@ fn computeFn(comptime Q: type) ComputeFn {
 }
 
 fn outputEqlFn(comptime Q: type) EqlOpaqueFn {
-    return struct {
-        fn eql(a_opaque: *const anyopaque, b_opaque: *const anyopaque) bool {
-            const a: *const Q.Output = @ptrCast(@alignCast(a_opaque));
-            const b: *const Q.Output = @ptrCast(@alignCast(b_opaque));
-            if (@hasDecl(Q, "eqlOutput")) return Q.eqlOutput(a.*, b.*);
-            return valueEql(Q.Output, a.*, b.*);
-        }
-    }.eql;
+    return erasedEqlFn(Q.Output, if (@hasDecl(Q, "eqlOutput")) Q.eqlOutput else valueEql);
 }
 
-fn valueEql(comptime T: type, a: T, b: T) bool {
+fn valueEql(a: anytype, b: @TypeOf(a)) bool {
+    const T = @TypeOf(a);
     if (comptime typeHasDecl(T, "eql")) return T.eql(a, b);
     if (comptime @typeInfo(T) == .optional) {
         if (a == null or b == null) return a == null and b == null;
-        return valueEql(@typeInfo(T).optional.child, a.?, b.?);
+        return valueEql(a.?, b.?);
     }
     return std.meta.eql(a, b);
 }
 
 fn accumListEqlFn(comptime A: type) EqlOpaqueFn {
-    return struct {
-        fn eql(a_opaque: *const anyopaque, b_opaque: *const anyopaque) bool {
-            const a: *const std.ArrayList(A) = @ptrCast(@alignCast(a_opaque));
-            const b: *const std.ArrayList(A) = @ptrCast(@alignCast(b_opaque));
+    return erasedEqlFn(std.ArrayList(A), struct {
+        fn eql(a: std.ArrayList(A), b: std.ArrayList(A)) bool {
             if (a.items.len != b.items.len) return false;
-            for (a.items, b.items) |left, right| {
-                if (!valueEql(A, left, right)) return false;
-            }
+            for (a.items, b.items) |left, right| if (!valueEql(left, right)) return false;
             return true;
         }
-    }.eql;
+    }.eql);
 }
 
 fn accumBucketsEql(a_first: ?*AccumBucket, b_first: ?*AccumBucket) bool {
@@ -1506,44 +1442,35 @@ fn deinitInputValue(comptime I: type, gpa: std.mem.Allocator, value: *I.Value) v
     }
 }
 
-fn destroyInputKeyFn(comptime I: type) DestroyOpaqueFn {
-    return struct {
-        fn destroy(gpa: std.mem.Allocator, ptr: *anyopaque) void {
-            const key: *I.Key = @ptrCast(@alignCast(ptr));
-            gpa.destroy(key);
-        }
-    }.destroy;
-}
-
 fn destroyInputValueFn(comptime I: type) DestroyOpaqueFn {
-    return struct {
-        fn destroy(gpa: std.mem.Allocator, ptr: *anyopaque) void {
-            const value: *I.Value = @ptrCast(@alignCast(ptr));
+    return destroyBoxFn(I.Value, struct {
+        fn deinit(gpa: std.mem.Allocator, value: *I.Value) void {
             deinitInputValue(I, gpa, value);
-            gpa.destroy(value);
         }
-    }.destroy;
+    }.deinit);
 }
 
-fn destroyBoxFn(comptime T: type) DestroyOpaqueFn {
+fn destroyBoxFn(comptime T: type, comptime cleanup: anytype) DestroyOpaqueFn {
     return struct {
         fn destroy(gpa: std.mem.Allocator, ptr: *anyopaque) void {
             const typed: *T = @ptrCast(@alignCast(ptr));
-            deinitTypedValue(T, gpa, typed);
+            if (comptime @TypeOf(cleanup) != @TypeOf(null)) cleanup(gpa, typed);
             gpa.destroy(typed);
         }
     }.destroy;
 }
 
+fn deinitBoxValue(gpa: std.mem.Allocator, value: anytype) void {
+    deinitTypedValue(@typeInfo(@TypeOf(value)).pointer.child, gpa, value);
+}
+
 fn destroyAccumListFn(comptime A: type) DestroyOpaqueFn {
-    return struct {
-        fn destroy(gpa: std.mem.Allocator, ptr: *anyopaque) void {
-            const list: *std.ArrayList(A) = @ptrCast(@alignCast(ptr));
+    return destroyBoxFn(std.ArrayList(A), struct {
+        fn deinit(gpa: std.mem.Allocator, list: *std.ArrayList(A)) void {
             for (list.items) |*item| deinitTypedValue(A, gpa, item);
             list.deinit(gpa);
-            gpa.destroy(list);
         }
-    }.destroy;
+    }.deinit);
 }
 
 fn cloneAccumValue(comptime A: type, gpa: std.mem.Allocator, value: A) !A {

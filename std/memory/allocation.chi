@@ -49,6 +49,9 @@ pub struct List(T: type)
     pub func len(imm self: List(T)) int -> self.initialized
     pub func capacity(imm self: List(T)) int -> self.storage.capacity()
     pub func span(ref self: List(T)) Span(T) -> Span(T){data = allocation_cursor(T, self.storage), size = self.initialized}
+    pub func iter(ref self: List(T)) SpanIterator(T)
+        var view = self.span()
+        return view.iter()
     pub fallible view(ref self: List(T), start: int, size: int) Span(T)
         const range = self.span()
         return range.slice?(start, size)
@@ -156,6 +159,8 @@ pub struct Span(T: type)
         return Span(T){data = allocation_cursor(T, allocation), size = initialized}
     pub func unsafe_from_static(imm source: static_data, size: int) Span(byte) -> Span(byte){data = static_cursor(source), size = size}
     pub func len(imm self: Span(T)) int -> self.size
+    pub func iter(ref self: Span(T)) SpanIterator(T)
+        return SpanIterator(T){source = self, position = 0, active = 0, ready = false}
     pub fallible get(ref self: Span(T), index: int) ref T
         index >= 0
         index < self.size
@@ -171,6 +176,27 @@ pub struct Span(T: type)
         size <= self.size - start
         return Span(T){data = cursor_offset(T, self.data, start), size = size}
     pub func as_imm(imm self: Span(T)) Span(T) -> Span(T){data = cursor_attenuate(T, self.data), size = self.size}
+
+pub struct SpanIterator(T: type)
+    copy = trivial
+    source: Span(T)
+    position: int
+    active: int
+    ready: bool
+
+    pub func advance(mut self: SpanIterator(T)) bool
+        if self.position >= self.source.len()
+            self.ready = false
+            return false
+        self.active = self.position
+        self.position += 1
+        self.ready = true
+        return true
+
+    pub func current(ref self: SpanIterator(T)) ref T
+        if not self.ready? -> exit(134)
+        if ref item = self.source.get(self.active) -> return item
+        exit(134)
 
 extern func empty_cursor(static T: type) StorageCursor(T)
 extern func static_cursor(imm source: static_data) StorageCursor(byte)

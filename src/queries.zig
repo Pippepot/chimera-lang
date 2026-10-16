@@ -505,6 +505,10 @@ pub fn HostTypes(comptime Context: type) type {
 
 pub fn AnalysisContext(comptime Context: type) type {
     return struct {
+        pub fn rangeConstructor(self: @This(), inclusive: bool) !?structures.ItemId {
+            return standardFunction(self.ctx, .range, if (inclusive) "inclusive" else "exclusive");
+        }
+
         ctx: Context,
         file_id: ?structures.FileId = null,
         instance: ?structures.InstanceId = null,
@@ -634,12 +638,7 @@ pub fn AnalysisContext(comptime Context: type) type {
                 .copy => "copy_value",
                 .move => "move_value",
             };
-            const registered = (try standardFile(self.ctx, .ownership)) orelse return error.Unavailable;
-            const module = try self.ctx.intern(ModulePaths, .{ .path = standard_library.File.ownership.modulePath() });
-            const declarations = (try self.ctx.get(ModuleDeclarations, module)).* orelse return error.Unavailable;
-            const item = declarations.resolveFunction(name) orelse return error.Unavailable;
-            const resolved = (try self.ctx.get(ResolveItem, item)).* orelse return error.Unavailable;
-            if (resolved.file_id != registered) return error.Unavailable;
+            const item = (try standardFunction(self.ctx, .ownership, name)) orelse return error.Unavailable;
             const argument = try self.ctx.intern(CompileTimeValues, .{ .type = type_id });
             return try self.specializeFunction(.{ .item = item }, &.{argument});
         }
@@ -1125,10 +1124,7 @@ pub fn AnalysisContext(comptime Context: type) type {
         }
 
         pub fn functionSignature(self: @This(), instance: structures.InstanceId) !?structures.FunctionSignature {
-            return if (instance.specialization) |_|
-                (try self.ctx.get(FunctionInstanceSignature, instance)).*
-            else
-                (try self.ctx.get(FunctionSignature, instance.item)).*;
+            return lookupFunctionSignature(self.ctx, instance);
         }
 
         pub fn functionShape(self: @This(), item_id: structures.ItemId) !?structures.FunctionShape {
@@ -1770,55 +1766,37 @@ pub const OwnershipCapabilities = struct {
         return .{ .move = .trivial, .copy = .trivial, .drop = .trivial };
     }
 
+    fn includeOwnership(fields: *structures.OwnershipCapabilities, child: structures.OwnershipCapabilities) void {
+        inline for (.{ "move", "copy" }) |name| {
+            const aggregate = &@field(fields, name);
+            const capability = @field(child, name);
+            if (aggregate.* == .none or capability == .none) {
+                aggregate.* = .none;
+            } else if (aggregate.* != .trivial or capability != .trivial) {
+                aggregate.* = .fieldwise;
+            }
+        }
+        if (child.drop != .trivial) fields.drop = .fieldwise;
+        fields.needs_custom_move = fields.needs_custom_move or child.needs_custom_move;
+        fields.needs_custom_copy = fields.needs_custom_copy or child.needs_custom_copy;
+        fields.needs_automatic_drop = fields.needs_automatic_drop or child.needs_automatic_drop;
+        fields.requires_explicit_drop = fields.requires_explicit_drop or child.requires_explicit_drop;
+    }
+
     fn arrayOwnership(ctx: anytype, array: structures.ArrayType) !?structures.OwnershipCapabilities {
-        if (array.length == 0) return trivialOwnership();
-        const element = (try ctx.get(OwnershipCapabilities, array.element_type)).* orelse return null;
-        return .{
-            .move = switch (element.move) {
-                .trivial => .trivial,
-                .none => .none,
-                .fieldwise, .custom => .fieldwise,
-            },
-            .copy = switch (element.copy) {
-                .trivial => .trivial,
-                .none => .none,
-                .fieldwise, .custom => .fieldwise,
-            },
-            .drop = if (element.drop == .trivial) .trivial else .fieldwise,
-            .needs_custom_move = element.needs_custom_move,
-            .needs_custom_copy = element.needs_custom_copy,
-            .needs_automatic_drop = element.needs_automatic_drop,
-            .requires_explicit_drop = element.requires_explicit_drop,
-        };
+        var fields = trivialOwnership();
+        if (array.length != 0) includeOwnership(&fields, (try ctx.get(OwnershipCapabilities, array.element_type)).* orelse return null);
+        return fields;
     }
 
     fn variantOwnership(ctx: anytype, members: []const structures.TypeId) !?structures.OwnershipCapabilities {
-        var can_move = true;
-        var can_copy = true;
-        var drops_trivially = true;
-        var fields_need_custom_move = false;
-        var fields_need_custom_copy = false;
-        var needs_automatic_drop = false;
-        var requires_explicit_drop = false;
-        for (members) |member| {
-            const capabilities = (try ctx.get(OwnershipCapabilities, member)).* orelse return null;
-            can_move = can_move and capabilities.move != .none;
-            can_copy = can_copy and capabilities.copy != .none;
-            drops_trivially = drops_trivially and capabilities.drop == .trivial;
-            fields_need_custom_move = fields_need_custom_move or capabilities.needs_custom_move;
-            fields_need_custom_copy = fields_need_custom_copy or capabilities.needs_custom_copy;
-            needs_automatic_drop = needs_automatic_drop or capabilities.needs_automatic_drop;
-            requires_explicit_drop = requires_explicit_drop or capabilities.requires_explicit_drop;
-        }
-        return .{
-            .move = if (can_move) .fieldwise else .none,
-            .copy = if (can_copy) .fieldwise else .none,
-            .drop = if (drops_trivially) .trivial else .fieldwise,
-            .needs_custom_move = can_move and fields_need_custom_move,
-            .needs_custom_copy = can_copy and fields_need_custom_copy,
-            .needs_automatic_drop = needs_automatic_drop,
-            .requires_explicit_drop = requires_explicit_drop,
-        };
+        var fields = trivialOwnership();
+        for (members) |member| includeOwnership(&fields, (try ctx.get(OwnershipCapabilities, member)).* orelse return null);
+        fields.needs_custom_move = fields.move != .none and fields.needs_custom_move;
+        fields.needs_custom_copy = fields.copy != .none and fields.needs_custom_copy;
+        if (fields.move != .none) fields.move = .fieldwise;
+        if (fields.copy != .none) fields.copy = .fieldwise;
+        return fields;
     }
 
     fn structOwnership(ctx: anytype, identity: structures.StructIdentity) !?structures.OwnershipCapabilities {
@@ -1827,44 +1805,27 @@ pub const OwnershipCapabilities = struct {
         if (!try validateStructContainment(ctx, identity, &visited)) return null;
         const definition = (try getStructDefinition(ctx, identity)) orelse return null;
 
-        var can_move = true;
-        var moves_trivially = true;
-        var can_copy = true;
-        var copies_trivially = true;
-        var drops_trivially = true;
-        var fields_need_custom_move = false;
-        var fields_need_custom_copy = false;
-        var fields_need_automatic_drop = false;
-        var fields_require_explicit_drop = false;
+        var fields = trivialOwnership();
         for (definition.fields) |field| {
-            const capabilities = if (field.kind == .reference) trivialOwnership() else (try ctx.get(OwnershipCapabilities, field.type_id)).* orelse return null;
-            can_move = can_move and capabilities.move != .none;
-            moves_trivially = moves_trivially and capabilities.move == .trivial;
-            can_copy = can_copy and capabilities.copy != .none;
-            copies_trivially = copies_trivially and capabilities.copy == .trivial;
-            drops_trivially = drops_trivially and capabilities.drop == .trivial;
-            fields_need_custom_move = fields_need_custom_move or capabilities.needs_custom_move;
-            fields_need_custom_copy = fields_need_custom_copy or capabilities.needs_custom_copy;
-            fields_need_automatic_drop = fields_need_automatic_drop or capabilities.needs_automatic_drop;
-            fields_require_explicit_drop = fields_require_explicit_drop or capabilities.requires_explicit_drop;
+            if (field.kind == .owned) includeOwnership(&fields, (try ctx.get(OwnershipCapabilities, field.type_id)).* orelse return null);
         }
 
         const move: structures.MoveCapability = if (definition.ownership.move) |property| blk: {
-            if ((property.capability == .trivial and !moves_trivially) or
-                (property.capability == .fieldwise and !can_move))
+            if ((property.capability == .trivial and fields.move != .trivial) or
+                (property.capability == .fieldwise and fields.move == .none))
             {
                 try emitIncompatibleOwnershipProperty(ctx, identity, property.span, if (property.capability == .trivial) .trivial_move else .fieldwise_move);
                 return null;
             }
-            if (property.capability == .custom and !can_move) {
+            if (property.capability == .custom and fields.move == .none) {
                 try emitIncompatibleOwnershipProperty(ctx, identity, property.span, .custom_move);
                 return null;
             }
             break :blk property.capability;
-        } else if (can_move) .fieldwise else .none;
+        } else if (fields.move != .none) .fieldwise else .none;
         const copy: structures.CopyCapability = if (definition.ownership.copy) |property| blk: {
-            if ((property.capability == .trivial and !copies_trivially) or
-                (property.capability == .fieldwise and !can_copy))
+            if ((property.capability == .trivial and fields.copy != .trivial) or
+                (property.capability == .fieldwise and fields.copy == .none))
             {
                 try emitIncompatibleOwnershipProperty(ctx, identity, property.span, if (property.capability == .trivial) .trivial_copy else .fieldwise_copy);
                 return null;
@@ -1872,20 +1833,20 @@ pub const OwnershipCapabilities = struct {
             break :blk property.capability;
         } else .none;
         const drop: structures.DropCapability = if (definition.ownership.drop) |property| blk: {
-            if (property.capability == .trivial and !drops_trivially) {
+            if (property.capability == .trivial and fields.drop != .trivial) {
                 try emitIncompatibleOwnershipProperty(ctx, identity, property.span, .trivial_drop);
                 return null;
             }
             break :blk property.capability;
-        } else if (drops_trivially) .trivial else .fieldwise;
+        } else if (fields.drop == .trivial) .trivial else .fieldwise;
         return .{
             .move = move,
             .copy = copy,
             .drop = drop,
-            .needs_custom_move = move == .custom or (move == .fieldwise and fields_need_custom_move),
-            .needs_custom_copy = copy == .custom or (copy == .fieldwise and fields_need_custom_copy),
-            .needs_automatic_drop = drop == .custom or (drop == .fieldwise and fields_need_automatic_drop),
-            .requires_explicit_drop = drop == .explicit or (drop == .fieldwise and fields_require_explicit_drop),
+            .needs_custom_move = move == .custom or (move == .fieldwise and fields.needs_custom_move),
+            .needs_custom_copy = copy == .custom or (copy == .fieldwise and fields.needs_custom_copy),
+            .needs_automatic_drop = drop == .custom or (drop == .fieldwise and fields.needs_automatic_drop),
+            .requires_explicit_drop = drop == .explicit or (drop == .fieldwise and fields.requires_explicit_drop),
         };
     }
 
@@ -2636,6 +2597,13 @@ pub const FunctionSignature = struct {
     }
 };
 
+fn lookupFunctionSignature(ctx: anytype, instance: structures.InstanceId) !?structures.FunctionSignature {
+    return if (instance.specialization != null)
+        (try ctx.get(FunctionInstanceSignature, instance)).*
+    else
+        (try ctx.get(FunctionSignature, instance.item)).*;
+}
+
 fn validateDemandedSignature(
     ctx: anytype,
     instance: structures.InstanceId,
@@ -2730,7 +2698,7 @@ fn validateWhereConditions(
     type_interner: anytype,
 ) !bool {
     for (semantic.functionWhereConditions(parsed, resolved.declaration)) |condition| {
-        var unresolved = (try availableSemanticValue(ctx, resolved.file_id, semantic.buildUnresolvedWhereCondition(parsed, source, condition, type_interner, ctx.allocator()))) orelse return false;
+        var unresolved = (try availableSemanticValue(ctx, resolved.file_id, semantic.buildUnresolvedBody(parsed, source, .{ .where_condition = condition }, type_interner, ctx.allocator()))) orelse return false;
         defer unresolved.deinit(ctx.allocator());
         var body = (try typing.resolveAndTypeBody(ctx, instance, resolved.file_id, &.{}, .unit, true, .{ .publish_instruction_spans = true, .allow_type_values = true }, type_interner, unresolved)) orelse return false;
         defer body.deinit(ctx.allocator());
@@ -3166,13 +3134,7 @@ pub const AnalyzeComptimeThunk = struct {
             .instance = site.owner,
             .public_annotation = site.public_annotation,
         };
-        var unresolved = (try availableSemanticValue(ctx, item_source.resolved.file_id, semantic.buildUnresolvedComptimeThunk(
-            &item_source.parsed,
-            source,
-            site.node,
-            type_interner,
-            ctx.allocator(),
-        ))) orelse return null;
+        var unresolved = (try availableSemanticValue(ctx, item_source.resolved.file_id, semantic.buildUnresolvedBody(&item_source.parsed, source, .{ .comptime_expression = site.node }, type_interner, ctx.allocator()))) orelse return null;
         defer unresolved.deinit(ctx.allocator());
         return typing.resolveAndTypeBody(
             ctx,
@@ -3240,10 +3202,7 @@ pub const ExecuteComptimeCall = struct {
     pub const Output = ?structures.CompileTimeCallOutcome;
 
     pub fn run(ctx: anytype, key: Input) anyerror!Output {
-        const signature = if (key.instance.specialization) |_|
-            (try ctx.get(FunctionInstanceSignature, key.instance)).* orelse return null
-        else
-            (try ctx.get(FunctionSignature, key.instance.item)).* orelse return null;
+        const signature = (try lookupFunctionSignature(ctx, key.instance)) orelse return null;
         const argument_tuple = try ctx.lookupInterned(CompileTimeValueTuples, key.arguments);
         if (argument_tuple.values.len != signature.parameters.len) return null;
 
@@ -3315,10 +3274,7 @@ fn ComptimeCallExecutor(comptime Context: type) type {
                 .place, .initializer => return self.callTransient(instance, arguments, call_span, storage),
                 .runtime, .type => {},
             };
-            const signature = if (instance.specialization == null)
-                (try self.ctx.get(FunctionSignature, instance.item)).* orelse return .unavailable
-            else
-                (try self.ctx.get(FunctionInstanceSignature, instance)).* orelse return .unavailable;
+            const signature = (try lookupFunctionSignature(self.ctx, instance)) orelse return .unavailable;
             const facts: TypeFacts(Context) = .{ .ctx = self.ctx };
             if (signature.result_mode == .reference or try facts.mayContainStorage(signature.return_type)) return self.callTransient(instance, arguments, call_span, storage);
             for (signature.parameters) |parameter| {
@@ -3328,10 +3284,7 @@ fn ComptimeCallExecutor(comptime Context: type) type {
         }
 
         pub fn call(self: *@This(), instance: structures.InstanceId, arguments: []comptime_interpreter.Value, call_span: ?structures.SourceSpan) anyerror!comptime_interpreter.Result {
-            const signature = if (instance.specialization == null)
-                (try self.ctx.get(FunctionSignature, instance.item)).* orelse return .unavailable
-            else
-                (try self.ctx.get(FunctionInstanceSignature, instance)).* orelse return .unavailable;
+            const signature = (try lookupFunctionSignature(self.ctx, instance)) orelse return .unavailable;
             std.debug.assert(arguments.len == signature.parameters.len);
             var has_mut_arguments = false;
 
@@ -3420,10 +3373,7 @@ fn ComptimeCallExecutor(comptime Context: type) type {
         }
 
         fn callTransient(self: *@This(), instance: structures.InstanceId, arguments: []comptime_interpreter.Value, call_span: ?structures.SourceSpan, storage: std.mem.Allocator) anyerror!comptime_interpreter.Result {
-            const signature = if (instance.specialization == null)
-                (try self.ctx.get(FunctionSignature, instance.item)).* orelse return .unavailable
-            else
-                (try self.ctx.get(FunctionInstanceSignature, instance)).* orelse return .unavailable;
+            const signature = (try lookupFunctionSignature(self.ctx, instance)) orelse return .unavailable;
             std.debug.assert(arguments.len == signature.parameters.len);
             const external = (try self.ctx.get(ExternalSymbol, instance.item)).*;
             if (external) |symbol| {
@@ -3792,10 +3742,7 @@ fn analyzeFunctionBody(ctx: anytype, instance: structures.InstanceId, publish_in
     var is_fallible = false;
     var result_mode: structures.ResultMode = .owned;
     if (loc.kind == .function) {
-        const signature = if (instance.specialization == null)
-            (try ctx.get(FunctionSignature, instance.item)).* orelse return null
-        else
-            (try ctx.get(FunctionInstanceSignature, instance)).* orelse return null;
+        const signature = (try lookupFunctionSignature(ctx, instance)) orelse return null;
         parameters = signature.parameters;
         return_type = signature.return_type;
         result_mode = signature.result_mode;
@@ -3840,7 +3787,11 @@ fn analyzeFunctionBody(ctx: anytype, instance: structures.InstanceId, publish_in
         .instance = instance,
         .reference_inference = reference_inference,
     };
-    var unresolved = (try availableSemanticValue(ctx, resolved.file_id, semantic.buildUnresolvedBody(&parsed, source, resolved.declaration, loc.kind, parameters, type_interner, ctx.allocator()))) orelse return null;
+    var unresolved = (try availableSemanticValue(ctx, resolved.file_id, semantic.buildUnresolvedBody(&parsed, source, switch (loc.kind) {
+        .function => .{ .function = .{ .declaration = resolved.declaration, .parameters = parameters } },
+        .top_level_entry => .{ .entry = resolved.declaration },
+        .static, .structure, .primitive => unreachable,
+    }, type_interner, ctx.allocator()))) orelse return null;
     defer unresolved.deinit(ctx.allocator());
     var consuming_converter = if (builtin_body) |body| body == .array_from or body == .initialize_collection else false;
     if (loc.kind == .function and parsed.nodes[parsed.nodes[resolved.declaration].data.node_node.b.index()].is_converter) {
@@ -3885,14 +3836,10 @@ pub const CompileFunction = struct {
     pub fn run(ctx: anytype, instance_id: Input) anyerror!Output {
         if ((try ctx.get(ExternalSymbol, instance_id.item)).*) |symbol| {
             // Only publish code for a declaration with the implementation's signature.
-            _ = if (instance_id.specialization == null)
-                (try ctx.get(FunctionSignature, instance_id.item)).* orelse return null
-            else
-                (try ctx.get(FunctionInstanceSignature, instance_id)).* orelse return null;
+            const signature = (try lookupFunctionSignature(ctx, instance_id)) orelse return null;
             return switch (symbol) {
                 .primitive_operation, .copy_value, .move_value, .array_filled, .array_from, .array_borrow, .borrow, .unsafe_own_box, .unsafe_borrow, .unsafe_take, .unsafe_take_box, .unsafe_destroy, .unsafe_destroy_box, .unsafe_initialize, .literal_byte, .literal_data, .literal_size, .byte_int, .initialize_collection, .empty_cursor, .static_cursor, .array_cursor, .allocation_cursor, .cursor_offset, .cursor_element, .cursor_attenuate => try compileTypedFunction(ctx, instance_id),
                 .io_read, .io_write => blk: {
-                    const signature = (try ctx.get(FunctionSignature, instance_id.item)).* orelse return null;
                     const types: HostTypes(@TypeOf(ctx)) = .{ .ctx = ctx };
                     break :blk try codegen.compileExternalByteIo(symbol == .io_read, signature, types, ctx.allocator());
                 },
@@ -3900,7 +3847,6 @@ pub const CompileFunction = struct {
                 .allocate_host_storage => try codegen.compileExternalAllocateHostStorage(ctx.allocator()),
                 .deallocate_host_storage => try codegen.compileExternalDeallocateHostStorage(ctx.allocator()),
                 .allocate => blk: {
-                    const signature = (try ctx.get(FunctionInstanceSignature, instance_id)).* orelse return null;
                     const element_type = (try allocationElementType(ctx, signature.return_type)) orelse unreachable;
                     const resolved = (try ctx.get(ResolveItem, instance_id.item)).* orelse return null;
                     const facts: TypeFacts(@TypeOf(ctx)) = .{ .ctx = ctx };
@@ -3910,7 +3856,6 @@ pub const CompileFunction = struct {
                 },
                 .deallocate => try codegen.compileExternalDeallocateHostStorage(ctx.allocator()),
                 .allocation_count => blk: {
-                    const signature = (try ctx.get(FunctionInstanceSignature, instance_id)).* orelse return null;
                     const layout = (try ctx.get(StructLayout, signature.parameters[0].type_id)).* orelse unreachable;
                     break :blk try codegen.compileExternalAllocationCount(ctx.allocator(), layout.field_offsets[1]);
                 },

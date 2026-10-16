@@ -25,16 +25,16 @@ pub const SignatureResult = SemanticResult(structures.FunctionSignature);
 pub const UnresolvedBody = struct {
     parameter_count: u32,
     static_expression_count: u32 = 0,
-    parameter_spans: []structures.SourceSpan,
+    parameter_spans: []structures.SourceSpan = &.{},
     local_count: u32,
-    expressions: []Expression,
-    conditions: []Condition,
-    blocks: []Block,
-    statements: []Statement,
-    call_arguments: []ValueUse,
-    method_call_arguments: []MethodCallArgument,
-    struct_field_values: []StructFieldValue,
-    assignment_fields: []FieldName,
+    expressions: []Expression = &.{},
+    conditions: []Condition = &.{},
+    blocks: []Block = &.{},
+    statements: []Statement = &.{},
+    call_arguments: []ValueUse = &.{},
+    method_call_arguments: []MethodCallArgument = &.{},
+    struct_field_values: []StructFieldValue = &.{},
+    assignment_fields: []FieldName = &.{},
     root_block: BlockId,
 
     pub const ValueId = enum(u32) { _ };
@@ -64,6 +64,7 @@ pub const UnresolvedBody = struct {
         reference: bool = false,
     };
     pub const StatementRange = struct { start: u32, end: u32 };
+    pub const BindingMode = enum { owned, reference, inferred };
     pub const Block = struct {
         statements: StatementRange,
         result: ?ValueId,
@@ -78,7 +79,7 @@ pub const UnresolvedBody = struct {
             value: ValueId,
             span: structures.SourceSpan,
             mutable: bool,
-            reference: bool = false,
+            mode: BindingMode = .owned,
         },
         break_loop: ValueId,
         continue_loop: structures.SourceSpan,
@@ -92,6 +93,7 @@ pub const UnresolvedBody = struct {
         arguments: structures.FunctionValueRange,
         span: structures.SourceSpan,
         fallible_syntax: bool = false,
+        implicit_effects: bool = false,
 
         pub const Target = union(enum) {
             direct: structures.InstanceId,
@@ -183,6 +185,8 @@ pub const UnresolvedBody = struct {
                 else_block: BlockId,
             },
             loop: BlockId,
+            scope: BlockId,
+            iterator: ValueUse,
         };
     };
 
@@ -200,70 +204,31 @@ pub const UnresolvedBody = struct {
     }
 };
 
+/// Source roots carry the context each form can use. Only functions have
+/// runtime parameters and a return continuation; thunks infer their result.
+pub const BodySource = union(enum) {
+    entry: u32,
+    function: struct { declaration: u32, parameters: []const structures.CallableParameter = &.{} },
+    comptime_expression: structures.Node.Index,
+    where_condition: structures.Node.Index,
+};
+
 pub fn buildUnresolvedBody(
     ast: *const structures.Ast,
     source: []const u8,
-    declaration: u32,
-    kind: structures.ItemKind,
-    parameters: []const structures.CallableParameter,
+    root: BodySource,
     type_interner: anytype,
     gpa: std.mem.Allocator,
 ) !SemanticResult(UnresolvedBody) {
     var builder: ExpressionBuilder(@TypeOf(type_interner)) = .{
         .ast = ast,
         .source = source,
-        .parameters = parameters,
+        .parameters = if (root == .function) root.function.parameters else &.{},
         .type_interner = type_interner,
         .gpa = gpa,
     };
     defer builder.deinit();
-    builder.build(declaration, kind) catch |err| switch (err) {
-        error.SourceRejected => return .{ .unsupported = builder.issue.? },
-        else => return err,
-    };
-    return .{ .success = try builder.finish() };
-}
-
-/// Build one expression as a zero-parameter body. Its result type is inferred
-/// by typing, so this graph is suitable for demand-driven compile-time thunks.
-pub fn buildUnresolvedComptimeThunk(
-    ast: *const structures.Ast,
-    source: []const u8,
-    expression: structures.Node.Index,
-    type_interner: anytype,
-    gpa: std.mem.Allocator,
-) !SemanticResult(UnresolvedBody) {
-    var builder: ExpressionBuilder(@TypeOf(type_interner)) = .{
-        .ast = ast,
-        .source = source,
-        .parameters = &.{},
-        .type_interner = type_interner,
-        .gpa = gpa,
-    };
-    defer builder.deinit();
-    builder.buildComptimeThunk(expression) catch |err| switch (err) {
-        error.SourceRejected => return .{ .unsupported = builder.issue.? },
-        else => return err,
-    };
-    return .{ .success = try builder.finish() };
-}
-
-pub fn buildUnresolvedWhereCondition(
-    ast: *const structures.Ast,
-    source: []const u8,
-    condition: structures.Node.Index,
-    type_interner: anytype,
-    gpa: std.mem.Allocator,
-) !SemanticResult(UnresolvedBody) {
-    var builder: ExpressionBuilder(@TypeOf(type_interner)) = .{
-        .ast = ast,
-        .source = source,
-        .parameters = &.{},
-        .type_interner = type_interner,
-        .gpa = gpa,
-    };
-    defer builder.deinit();
-    builder.buildWhereCondition(condition) catch |err| switch (err) {
+    builder.build(root) catch |err| switch (err) {
         error.SourceRejected => return .{ .unsupported = builder.issue.? },
         else => return err,
     };
@@ -331,14 +296,15 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             return error.SourceRejected;
         }
 
-        fn build(self: *Self, declaration: u32, kind: structures.ItemKind) anyerror!void {
-            switch (kind) {
-                .top_level_entry => try self.buildEntry(declaration),
-                .function => {
+        fn build(self: *Self, root: BodySource) anyerror!void {
+            switch (root) {
+                .entry => |declaration| try self.buildEntry(declaration),
+                .function => |function| {
                     self.can_return = true;
-                    try self.buildFunction(declaration);
+                    try self.buildFunction(function.declaration);
                 },
-                .static, .structure, .primitive => unreachable,
+                .comptime_expression => |expression| try self.buildComptimeThunk(expression),
+                .where_condition => |condition| try self.buildWhereCondition(condition),
             }
         }
 
@@ -518,7 +484,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 .value = value,
                 .span = nodeFocusSpan(self.ast, node.data.node_node.b),
                 .mutable = node.tag == .var_binding,
-                .reference = node.tag == .ref_binding,
+                .mode = if (node.tag == .ref_binding) .reference else .owned,
             } };
         }
 
@@ -683,11 +649,13 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                     return self.appendOperationCall(index, "-", &.{try self.appendUse(node.data.node, false)});
                 },
                 .add, .sub, .mul, .div, .rem => return self.appendBinary(index),
+                .range, .range_inclusive => return self.appendRange(index),
                 .eq, .ne, .lt, .gt, .le, .ge, .not, .@"and", .@"or", .query, .is => return self.appendConditionValue(index),
                 .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .rem_assign => return self.appendAssignment(index),
                 .as => return self.appendExtraction(index),
                 .@"if", .if_else => return self.appendIf(index, result_is_type),
                 .loop => return self.appendLoop(index, result_is_type),
+                .for_loop => return self.appendFor(index, result_is_type),
                 .static_binding, .namespace_declaration => return self.reject(index, .nested_declaration_not_supported),
                 .move_expr => return self.appendTransfer(index),
                 else => return self.reject(index, .expression_not_supported),
@@ -870,6 +838,95 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             return self.appendExpression(index, .{ .loop = body });
         }
 
+        fn appendFor(self: *Self, index: structures.Node.Index, result_is_type: bool) !ValueId {
+            const parts = self.ast.nodeList(index);
+            std.debug.assert(parts.len == 3);
+            const binding = self.ast.nodes[parts[0].index()];
+            std.debug.assert(binding.tag == .param);
+            const mode = if (binding.data.node_node.a.unwrap()) |access|
+                self.ast.tokens[self.ast.nodes[access.index()].token_index].tag
+            else
+                null;
+            const name_span = tokenSpan(self.ast, binding.token_index);
+            const name = self.source[name_span.start..name_span.end];
+            if (!std.mem.eql(u8, name, "_") and try self.nameIsVisible(name)) return self.reject(parts[0], .duplicate_local_binding);
+            const scope_mark = self.local_names.items.len;
+            defer self.restoreScope(scope_mark);
+            const span = nodeFocusSpan(self.ast, index);
+            const source = try self.appendUse(parts[1], false);
+            const source_local = self.newLocal();
+            const source_read = try self.appendExpression(index, .{ .local_read = source_local });
+            const cursor = try self.appendExpression(index, .{ .iterator = .{ .value = source_read, .span = source.span } });
+            const cursor_local = self.newLocal();
+            const cursor_read = try self.appendExpression(index, .{ .local_read = cursor_local });
+            const receiver: UnresolvedBody.ValueUse = .{ .value = cursor_read, .span = source.span };
+            const advance = try self.appendProtocolCall(index, receiver, "advance");
+            const advance_local = self.newLocal();
+            const advance_read = try self.appendExpression(index, .{ .local_read = advance_local });
+            const condition = try self.appendCondition(.{ .query = .{ .value = advance_read, .span = span } });
+            var current = try self.appendProtocolCall(index, receiver, "current");
+            if (binding.data.node_node.b.unwrap()) |annotation| {
+                current = try self.appendExpression(annotation, .{ .annotation = .{
+                    .value = .{ .value = current, .span = span },
+                    .type_id = try self.bindingType(annotation),
+                } });
+            }
+            const item_local = self.newLocal();
+            if (!std.mem.eql(u8, name, "_")) {
+                try self.locals.put(self.gpa, name, .{ .place = .{
+                    .id = item_local,
+                    .mutable = mode == .keyword_var or mode == .keyword_ref,
+                } });
+                try self.local_names.append(self.gpa, name);
+            }
+            self.loop_depth += 1;
+            defer self.loop_depth -= 1;
+            const user_body = try self.buildBranch(parts[2], false);
+            self.restoreScope(scope_mark);
+            const body_value = try self.appendExpression(index, .{ .scope = user_body });
+            const success_unit = try self.appendExpression(index, .unit);
+            const success = try self.finishBlock(&.{
+                .{ .bind_local = .{
+                    .local = item_local,
+                    .value = current,
+                    .span = name_span,
+                    .mutable = mode == .keyword_var,
+                    .mode = if (mode == .keyword_ref) .reference else if (mode == null) .inferred else .owned,
+                } },
+                .{ .discard = .{ .value = body_value, .span = span } },
+            }, success_unit, span);
+            const unit = try self.appendExpression(index, .unit);
+            const exhausted = try self.finishBlock(&.{.{ .break_loop = unit }}, null, span);
+            const dispatch = try self.appendExpression(index, .{ .if_else = .{ .condition = condition, .then_block = success, .else_block = exhausted } });
+            const body_unit = try self.appendExpression(index, .unit);
+            const body = try self.finishBlock(&.{
+                .{ .bind_local = .{ .local = advance_local, .value = advance, .span = span, .mutable = false } },
+                .{ .discard = .{ .value = dispatch, .span = span } },
+            }, body_unit, span);
+            const loop_value = try self.appendExpression(index, .{ .loop = body });
+            const setup = try self.finishBlock(&.{
+                .{ .bind_local = .{ .local = source_local, .value = source.value, .span = source.span, .mutable = true, .mode = .inferred } },
+                .{ .bind_local = .{ .local = cursor_local, .value = cursor, .span = source.span, .mutable = true, .mode = .inferred } },
+            }, loop_value, span);
+            _ = result_is_type;
+            return self.appendExpression(index, .{ .scope = setup });
+        }
+
+        fn newLocal(self: *Self) UnresolvedBody.LocalId {
+            const local: UnresolvedBody.LocalId = @fromBackingInt(self.local_count);
+            self.local_count += 1;
+            return local;
+        }
+
+        fn appendProtocolCall(self: *Self, index: structures.Node.Index, receiver: UnresolvedBody.ValueUse, name: []const u8) !ValueId {
+            return self.appendExpression(index, .{ .call = .{
+                .target = .{ .member = .{ .receiver = receiver, .name = name } },
+                .arguments = .{ .start = 0, .end = 0 },
+                .span = nodeFocusSpan(self.ast, index),
+                .implicit_effects = true,
+            } });
+        }
+
         fn appendString(self: *Self, index: structures.Node.Index) !ValueId {
             const span = tokenSpan(self.ast, self.ast.nodes[index.index()].token_index);
             const decoded = try text_literal.decode(self.gpa, self.source[span.start..span.end]);
@@ -909,6 +966,20 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 else => unreachable,
             };
             return self.appendOperationCall(index, name, &.{ operands.lhs, operands.rhs });
+        }
+
+        fn appendRange(self: *Self, index: structures.Node.Index) !ValueId {
+            const node = self.ast.nodes[index.index()];
+            const constructor = (try self.type_interner.rangeConstructor(node.tag == .range_inclusive)) orelse return error.Unavailable;
+            const first = try self.appendUse(node.data.node_node.a, false);
+            const limit = try self.appendUse(node.data.node_node.b, false);
+            const start: u32 = @intCast(self.call_arguments.items.len);
+            try self.call_arguments.appendSlice(self.gpa, &.{ first, limit });
+            return self.appendExpression(index, .{ .call = .{
+                .target = .{ .direct = .{ .item = constructor } },
+                .arguments = .{ .start = start, .end = start + 2 },
+                .span = nodeFocusSpan(self.ast, index),
+            } });
         }
 
         fn appendOperationCall(self: *Self, index: structures.Node.Index, name: []const u8, operands: []const UnresolvedBody.ValueUse) !ValueId {
@@ -1450,38 +1521,23 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
         }
 
         fn finish(self: *Self) !UnresolvedBody {
-            const parameter_spans = try self.parameter_spans.toOwnedSlice(self.gpa);
-            errdefer self.gpa.free(parameter_spans);
-            const expressions = try self.expressions.toOwnedSlice(self.gpa);
-            errdefer self.gpa.free(expressions);
-            const conditions = try self.conditions.toOwnedSlice(self.gpa);
-            errdefer self.gpa.free(conditions);
-            const blocks = try self.blocks.toOwnedSlice(self.gpa);
-            errdefer self.gpa.free(blocks);
-            const statements = try self.statements.toOwnedSlice(self.gpa);
-            errdefer self.gpa.free(statements);
-            const call_arguments = try self.call_arguments.toOwnedSlice(self.gpa);
-            errdefer self.gpa.free(call_arguments);
-            const method_call_arguments = try self.method_call_arguments.toOwnedSlice(self.gpa);
-            errdefer self.gpa.free(method_call_arguments);
-            const struct_field_values = try self.struct_field_values.toOwnedSlice(self.gpa);
-            errdefer self.gpa.free(struct_field_values);
-            const assignment_fields = try self.assignment_fields.toOwnedSlice(self.gpa);
-            return .{
+            var body: UnresolvedBody = .{
                 .parameter_count = @intCast(self.parameters.len),
                 .static_expression_count = self.static_expression_count,
-                .parameter_spans = parameter_spans,
                 .local_count = self.local_count,
-                .expressions = expressions,
-                .conditions = conditions,
-                .blocks = blocks,
-                .statements = statements,
-                .call_arguments = call_arguments,
-                .method_call_arguments = method_call_arguments,
-                .struct_field_values = struct_field_values,
-                .assignment_fields = assignment_fields,
                 .root_block = self.root_block.?,
             };
+            errdefer body.deinit(self.gpa);
+            body.parameter_spans = try self.parameter_spans.toOwnedSlice(self.gpa);
+            body.expressions = try self.expressions.toOwnedSlice(self.gpa);
+            body.conditions = try self.conditions.toOwnedSlice(self.gpa);
+            body.blocks = try self.blocks.toOwnedSlice(self.gpa);
+            body.statements = try self.statements.toOwnedSlice(self.gpa);
+            body.call_arguments = try self.call_arguments.toOwnedSlice(self.gpa);
+            body.method_call_arguments = try self.method_call_arguments.toOwnedSlice(self.gpa);
+            body.struct_field_values = try self.struct_field_values.toOwnedSlice(self.gpa);
+            body.assignment_fields = try self.assignment_fields.toOwnedSlice(self.gpa);
+            return body;
         }
     };
 }
@@ -2085,10 +2141,8 @@ pub fn analyzeFunctionInstanceSignature(
             } },
         } };
     }
-    const owned_parameters = try parameters.toOwnedSlice(gpa);
-    errdefer gpa.free(owned_parameters);
     return .{ .success = .{
-        .parameters = owned_parameters,
+        .parameters = try parameters.toOwnedSlice(gpa),
         .return_type = return_type,
         .result_mode = result_mode,
         .is_fallible = is_fallible,
@@ -2956,10 +3010,10 @@ test "discard assignment has distinct unresolved statement" {
     defer report.deinit(std.testing.allocator);
     const parsed = &report.ast.?;
     const declaration = parsed.node_refs[parsed.nodes[0].data.ref.start];
-    const result = try buildUnresolvedBody(parsed, source, declaration.index(), .function, &.{.{
+    const result = try buildUnresolvedBody(parsed, source, .{ .function = .{ .declaration = declaration.index(), .parameters = &.{.{
         .mode = .imm,
         .type_id = .int,
-    }}, TestTypeInterner{}, std.testing.allocator);
+    }} } }, TestTypeInterner{}, std.testing.allocator);
     var unresolved = switch (result) {
         .success => |value| value,
         .unsupported => unreachable,
@@ -3001,7 +3055,7 @@ test "fail has terminal unresolved statements in function and branch bodies" {
         try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len);
         const parsed = &report.ast.?;
         const declaration = parsed.node_refs[parsed.nodes[0].data.ref.start];
-        const result = try buildUnresolvedBody(parsed, case.source, declaration.index(), .function, &.{}, TestTypeInterner{}, std.testing.allocator);
+        const result = try buildUnresolvedBody(parsed, case.source, .{ .function = .{ .declaration = declaration.index(), .parameters = &.{} } }, TestTypeInterner{}, std.testing.allocator);
         var unresolved = switch (result) {
             .success => |value| value,
             .unsupported => unreachable,
@@ -3120,11 +3174,11 @@ fn testUnresolvedFunctionBodyAllocations(gpa: std.mem.Allocator) !void {
     defer report.deinit(std.testing.allocator);
     const parsed = &report.ast.?;
     const declaration = parsed.node_refs[parsed.nodes[0].data.ref.start];
-    const result = try buildUnresolvedBody(parsed, source, declaration.index(), .function, &.{
+    const result = try buildUnresolvedBody(parsed, source, .{ .function = .{ .declaration = declaration.index(), .parameters = &.{
         .{ .mode = .imm, .type_id = .int },
         .{ .mode = .imm, .type_id = .int },
         .{ .mode = .imm, .type_id = .int },
-    }, TestTypeInterner{}, gpa);
+    } } }, TestTypeInterner{}, gpa);
     switch (result) {
         .success => |unresolved_value| {
             var unresolved = unresolved_value;
@@ -3135,6 +3189,10 @@ fn testUnresolvedFunctionBodyAllocations(gpa: std.mem.Allocator) !void {
 }
 
 const TestTypeInterner = struct {
+    pub fn rangeConstructor(_: @This(), _: bool) !?structures.ItemId {
+        return null;
+    }
+
     pub fn allocator(_: @This()) std.mem.Allocator {
         return std.testing.allocator;
     }

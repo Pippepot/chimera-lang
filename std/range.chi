@@ -1,0 +1,106 @@
+import std.exit.{exit}
+
+pub struct Range
+    copy = trivial
+    first: int
+    last: int
+    stride: int
+    descending: bool
+    empty: bool
+
+    pub func iter(self: Range) RangeIterator
+        return RangeIterator{
+            value = self.first,
+            last = self.last,
+            stride = self.stride,
+            descending = self.descending,
+            started = false,
+            finished = self.empty,
+        }
+
+    pub func reversed(self: Range) Range
+        return Range{
+            first = self.last,
+            last = self.first,
+            stride = self.stride,
+            descending = not_direction(self.descending),
+            empty = self.empty,
+        }
+
+    pub fallible step_by(self: Range, factor: int) Range
+        factor > 0
+        if self.empty? or factor == 1 -> return self
+        if self.stride == 0 or not has_steps(self.first, self.last, self.stride, factor)?
+            return Range{first = self.first, last = self.first, stride = 1, descending = self.descending, empty = false}
+        const stride = self.stride * factor
+        if self.stride > 2147483647 / factor
+            const last = if self.descending? -> self.first - stride else self.first + stride
+            return Range{first = self.first, last = last, stride = 0, descending = self.descending, empty = false}
+        return Range{
+            first = self.first,
+            last = aligned_last(self.first, self.last, stride, self.descending),
+            stride = stride,
+            descending = self.descending,
+            empty = false,
+        }
+
+pub struct RangeIterator
+    copy = trivial
+    value: int
+    last: int
+    stride: int
+    descending: bool
+    started: bool
+    finished: bool
+
+    pub func advance(mut self: RangeIterator) bool
+        if self.finished? -> return false
+        if self.started?
+            if self.value == self.last
+                self.finished = true
+                return false
+            if self.stride == 0 -> self.value = self.last
+            else if self.descending? -> self.value -= self.stride
+            else self.value += self.stride
+        self.started = true
+        return true
+
+    pub func current(ref self: RangeIterator) int
+        if not self.started? or self.finished? -> exit(134)
+        return self.value
+
+pub func exclusive(first: int, limit: int) Range
+    if first >= limit -> return Range{first = first, last = first, stride = 1, descending = false, empty = true}
+    return Range{first = first, last = limit - 1, stride = 1, descending = false, empty = false}
+
+pub func inclusive(first: int, limit: int) Range
+    return Range{first = first, last = limit, stride = 1, descending = false, empty = bool(first > limit)}
+
+func not_direction(value: bool) bool
+    if value? -> return false
+    return true
+
+func has_steps(first: int, last: int, stride: int, count: int) bool
+    const low = if first < last -> first else last
+    const high = if first < last -> last else first
+    if low >= 0 or high < 0 -> return bool((high - low) / stride >= count)
+    const left = -(low + 1)
+    const right = high
+    const left_steps = left / stride
+    if left_steps >= count -> return true
+    const remaining = count - left_steps
+    const right_steps = right / stride
+    if right_steps >= remaining -> return true
+    if remaining - right_steps <> 1 -> return false
+    return bool(left % stride >= stride - 1 - right % stride)
+
+func aligned_last(first: int, last: int, stride: int, descending: bool) int
+    var first_remainder = first % stride
+    if first_remainder < 0 -> first_remainder += stride
+    var last_remainder = last % stride
+    if last_remainder < 0 -> last_remainder += stride
+    const left = if descending? -> first_remainder else last_remainder
+    const right = if descending? -> last_remainder else first_remainder
+    const remainder = if left >= right -> left - right else stride - (right - left)
+    if descending? -> return last + remainder
+    return last - remainder

@@ -8,6 +8,74 @@ const query_disk_cache = test_sources.query_disk_cache;
 const structures = test_sources.structures;
 const standard_library = @import("standard_library");
 
+test "range iteration snapshots restore runtime and compile-time results and recompute endpoints" {
+    const source =
+        \\func run() int
+        \\    var total = 36
+        \\    for value in (0..^3).reversed() -> total += value
+        \\    return total
+        \\static answer = run()
+        \\exit(run() + answer - 42)
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const exclusive = try std.mem.replaceOwned(u8, std.testing.allocator, source, "0..^3", "0..3");
+    defer std.testing.allocator.free(exclusive);
+    try fixture.db.setInput(queries.SourceText, 0, exclusive);
+    try fixture.expectExit(36);
+    const longer = try std.mem.replaceOwned(u8, std.testing.allocator, source, "0..^3", "0..^4");
+    defer std.testing.allocator.free(longer);
+    try fixture.db.setInput(queries.SourceText, 0, longer);
+    try fixture.expectExit(50);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(42);
+}
+
+test "cursor iteration snapshots track method edits explicit factories and missing operations" {
+    const source =
+        \\import std.range.{RangeIterator}
+        \\struct Cursor
+        \\    next: int
+        \\    pub func advance(mut self: Cursor) bool
+        \\        if self.next >= 3 -> return false
+        \\        self.next += 1
+        \\        return true
+        \\    pub func current(ref self: Cursor) int -> self.next * 7
+        \\func run() int
+        \\    var cursor = Cursor{next = 0}
+        \\    var total = 0
+        \\    for value in cursor
+        \\        total += value
+        \\        break
+        \\    for value in cursor -> total += value
+        \\    return total
+        \\exit(run())
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const edited = try std.mem.replaceOwned(u8, std.testing.allocator, source, "self.next * 7", "self.next * 8");
+    defer std.testing.allocator.free(edited);
+    try fixture.db.setInput(queries.SourceText, 0, edited);
+    try fixture.expectExit(48);
+    const factory = try std.mem.replaceOwned(u8, std.testing.allocator, source, "    pub func advance",
+        \\    pub func iter(ref self: Cursor) RangeIterator
+        \\        const values = 0..^3
+        \\        return values.iter()
+        \\    pub func advance
+    );
+    defer std.testing.allocator.free(factory);
+    try fixture.db.setInput(queries.SourceText, 0, factory);
+    try fixture.expectExit(6);
+    const missing = try std.mem.replaceOwned(u8, std.testing.allocator, source, "pub func advance", "pub func removed");
+    defer std.testing.allocator.free(missing);
+    try fixture.db.setInput(queries.SourceText, 0, missing);
+    try fixture.expectDiagnostic(.unknown_namespace_member);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(42);
+}
+
 test "text operations remainder and precise mutable calls survive snapshots and source edits" {
     const source =
         \\struct Named

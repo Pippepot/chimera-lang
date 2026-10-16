@@ -27,28 +27,23 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Compile and run a Chi program");
     run_step.dependOn(&run.step);
 
-    const benchmark_module = b.createModule(.{
-        .root_source_file = b.path("benchmarks/comptime_benchmark.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
     const benchmark_compiler = b.createModule(.{
         .root_source_file = b.path("src/benchmark_deps.zig"),
     });
     benchmark_compiler.addImport("standard_library", standard_library);
-    benchmark_module.addImport("compiler", benchmark_compiler);
-    const benchmark = b.addExecutable(.{ .name = "comptime_benchmark", .root_module = benchmark_module });
-    const benchmark_step = b.step("benchmark", "Run the compile-time execution benchmark");
-    benchmark_step.dependOn(&b.addRunArtifact(benchmark).step);
-
-    const flow_module = b.createModule(.{
-        .root_source_file = b.path("benchmarks/flow_benchmark.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    flow_module.addImport("compiler", benchmark_compiler);
-    const flow_benchmark = b.addExecutable(.{ .name = "flow_benchmark", .root_module = flow_module });
-    b.step("flow-benchmark", "Measure typing snapshots and lifetime tables").dependOn(&b.addRunArtifact(flow_benchmark).step);
+    for ([_]struct { name: []const u8, source: []const u8, step: []const u8, description: []const u8 }{
+        .{ .name = "comptime_benchmark", .source = "benchmarks/comptime_benchmark.zig", .step = "benchmark", .description = "Run the compile-time execution benchmark" },
+        .{ .name = "flow_benchmark", .source = "benchmarks/flow_benchmark.zig", .step = "flow-benchmark", .description = "Measure typing snapshots and lifetime tables" },
+    }) |benchmark| {
+        const benchmark_module = b.createModule(.{
+            .root_source_file = b.path(benchmark.source),
+            .target = target,
+            .optimize = optimize,
+        });
+        benchmark_module.addImport("compiler", benchmark_compiler);
+        const executable = b.addExecutable(.{ .name = benchmark.name, .root_module = benchmark_module });
+        b.step(benchmark.step, benchmark.description).dependOn(&b.addRunArtifact(executable).step);
+    }
 
     const test_step = b.step("test", "Run compiler tests (allocation-failure sweeps are opt-in)");
     const test_options = b.addOptions();
@@ -70,6 +65,7 @@ pub fn build(b: *std.Build) void {
         "tests/modules_test.zig",
         "tests/query_disk_cache_test.zig",
         "tests/array_test.zig",
+        "tests/iteration_test.zig",
         "tests/reference_test.zig",
         "tests/text_test.zig",
         "tests/converter_test.zig",

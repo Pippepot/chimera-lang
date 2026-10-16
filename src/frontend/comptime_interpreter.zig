@@ -60,8 +60,7 @@ pub const Allocation = struct {
         std.debug.assert(!self.released);
         std.debug.assert(index < self.capacity);
         if (self.elements.get(index)) |cell| return cell;
-        const cell = try self.identities.create(Cell);
-        cell.* = .{ .type_id = self.element_type, .storage = self.identities, .contents = .uninitialized };
+        const cell = try Cell.create(self.identities, self.element_type, .uninitialized);
         try self.elements.put(self.backing.allocator(), index, cell);
         return cell;
     }
@@ -102,6 +101,12 @@ pub const Cell = struct {
         storage_cursor: struct { owner: *Cell, offset: u32 },
         allocation: *Allocation,
     },
+
+    fn create(storage: std.mem.Allocator, type_id: structures.TypeId, contents: @FieldType(Cell, "contents")) !*Cell {
+        const cell = try storage.create(Cell);
+        cell.* = .{ .type_id = type_id, .storage = storage, .contents = contents };
+        return cell;
+    }
 
     fn invalidate(self: *Cell) void {
         switch (self.contents) {
@@ -344,8 +349,7 @@ pub fn executeInStorage(
     const call_scratch = frame[slot_count + branch_scratch_count ..];
     @memset(slots, .{ .runtime = .unit });
 
-    var block_id = body.entry;
-    const entry = body.blocks[@backingInt(block_id)];
+    const entry = body.blocks[@backingInt(body.entry)];
     std.debug.assert(entry.argument_start == 0);
     std.debug.assert(entry.argument_end == arguments.len);
     @memcpy(slots[entry.argument_start..entry.argument_end], arguments);
@@ -354,167 +358,442 @@ pub fn executeInStorage(
         const cell = try storageCell(body, slots, @fromBackingInt(@intCast(index)), storage);
         argument.* = .{ .place = cell };
     }
-    while (true) {
-        const block = body.blocks[@backingInt(block_id)];
-        for (block.instruction_start..block.instruction_end) |instruction_index| {
-            const instruction = body.instructions[instruction_index];
-            const destination = @backingInt(body.instructionValue(instruction_index));
+    const execution: ExecutionFrame(@TypeOf(executor)) = .{
+        .body = body,
+        .arguments = arguments,
+        .slots = slots,
+        .scratch = scratch,
+        .call_scratch = call_scratch,
+        .executor = executor,
+        .gpa = gpa,
+        .storage = storage,
+    };
+    return execution.run();
+}
+
+const Step = union(enum) {
+    next: structures.FunctionBlockId,
+    result: Result,
+};
+
+/// Borrows one dense frame and its call-lived storage. Instruction evaluation
+/// produces a value or control result; this boundary owns result placement.
+fn ExecutionFrame(comptime Executor: type) type {
+    return struct {
+        const Self = @This();
+        body: *const structures.FunctionBodyAnalysis,
+        arguments: []Value,
+        slots: []Value,
+        scratch: []Value,
+        call_scratch: []Value,
+        executor: Executor,
+        gpa: std.mem.Allocator,
+        storage: std.mem.Allocator,
+
+        fn run(self: *const Self) anyerror!Result {
+            var block_id = self.body.entry;
+            while (true) {
+                const block = self.body.blocks[@backingInt(block_id)];
+                for (block.instruction_start..block.instruction_end) |index| {
+                    const instruction = self.body.instructions[index];
+                    const span = instructionSpan(self.body, index);
+                    switch (try self.instructionValue(instruction, span)) {
+                        .returned => |value| {
+                            const destination = switch (instruction) {
+                                inline .call, .value_copy, .variant_coerce, .callable_coerce, .static_conversion => |operation| operation.destination,
+                                else => null,
+                            };
+                            try self.store(@backingInt(self.body.instructionValue(index)), destination, value);
+                        },
+                        .failure => {
+                            std.debug.assert(instruction != .call);
+                            return .failure;
+                        },
+                        else => |result| return if (instruction == .static_conversion) result else atSpan(result, span),
+                    }
+                }
+                var step: Step = undefined;
+                switch (block.terminator) {
+                    .branch => |branch| step = try self.enterBranch(branch),
+                    .predicate_branch => |predicate| step = try self.enterBranch(if (predicateValue(self.slots, predicate.operation, predicate.operands)) predicate.then_branch else predicate.else_branch),
+                    .fallible_call => |fallible| step = try self.fallibleCall(fallible.call, fallible.success, fallible.failure, terminatorSpan(self.body, block_id)),
+                    .return_unit => return .{ .returned = .{ .runtime = .unit } },
+                    .return_value => |use| return self.evaluateUse(use),
+                    .return_failure => return .failure,
+                    .diverge => unreachable,
+                }
+                switch (step) {
+                    .next => |next| block_id = next,
+                    .result => |result| return result,
+                }
+            }
+        }
+
+        fn instructionValue(self: *const Self, instruction: structures.FunctionInstruction, span: ?structures.SourceSpan) anyerror!Result {
+            const slots = self.slots;
             switch (instruction) {
-                .const_int => |value| slots[destination] = .{ .runtime = .{ .int = value } },
-                .const_string_literal => |value| slots[destination] = .{ .runtime = .{ .string_literal = value } },
-                .const_data => |value| slots[destination] = .{ .runtime = .{ .static_data = value } },
-                .const_storage_cursor => |value| slots[destination] = .{ .runtime = .{ .storage_cursor = value } },
-                .storage_cursor => |operation| switch (try storageCursor(body, slots, operation, executor, storage)) {
-                    .returned => |value| slots[destination] = value,
-                    else => |result| return atSpan(result, instructionSpan(body, instruction_index)),
-                },
-                .cursor_offset => |operation| slots[destination] = try offsetStorageCursor(slots[@backingInt(operation.cursor)], operation.type_id, @intCast(integer(slots, operation.index)), storage),
-                .cursor_element => |operation| slots[destination] = try storageCursorElement(slots[@backingInt(operation.cursor)], operation.type_id, @intCast(integer(slots, operation.index)), storage),
-                .byte_to_int => |source| slots[destination] = .{ .runtime = .{ .int = scalar(slots, source).byte } },
-                .const_int_literal => |value| slots[destination] = .{ .runtime = .{ .int_literal = value } },
-                .static_conversion => |conversion| {
-                    const source = (try readSlot(slots, conversion.operand, executor, gpa)) orelse return .unavailable;
-                    if (source == .place and containsReference(source.place)) return executionError(.escaping_storage, instructionSpan(body, instruction_index));
-                    const runtime = switch (source) {
-                        .runtime => |value| value,
-                        .place => |cell| (try materialize(cell, executor, gpa)) orelse return executionError(.unsupported_operation, instructionSpan(body, instruction_index)),
-                        .type, .initializer => unreachable,
-                    };
-                    switch (try executor.convertStaticValue(body.valueType(conversion.operand), runtime, conversion.type_id, instructionSpan(body, instruction_index), storage)) {
-                        .returned => |value| try store(slots, destination, conversion.destination, value, executor),
-                        else => |result| return result,
+                .const_int => |value| return .{ .returned = .{ .runtime = .{ .int = value } } },
+                .const_int_literal => |value| return .{ .returned = .{ .runtime = .{ .int_literal = value } } },
+                .const_string_literal => |value| return .{ .returned = .{ .runtime = .{ .string_literal = value } } },
+                .const_data => |value| return .{ .returned = .{ .runtime = .{ .static_data = value } } },
+                .const_storage_cursor => |value| return .{ .returned = .{ .runtime = .{ .storage_cursor = value } } },
+                .const_byte => |value| return .{ .returned = .{ .runtime = .{ .byte = value } } },
+                .const_bool => |value| return .{ .returned = .{ .runtime = .{ .bool = value } } },
+                .const_type => |type_id| return .{ .returned = .{ .type = type_id } },
+                .const_unit => return .{ .returned = .{ .runtime = .unit } },
+                .const_none => return .{ .returned = .{ .runtime = .none } },
+                .function_ref => |reference| return .{ .returned = .{ .runtime = .{ .function_ref = reference } } },
+                .initializer_ref => |reference| return .{ .returned = try self.initializerValue(reference) },
+                .storage_cursor => |operation| return self.storageCursor(operation),
+                .cursor_offset => |operation| return .{ .returned = try offsetStorageCursor(slots[@backingInt(operation.cursor)], operation.type_id, @intCast(integer(slots, operation.index)), self.storage) },
+                .cursor_element => |operation| return .{ .returned = try storageCursorElement(slots[@backingInt(operation.cursor)], operation.type_id, @intCast(integer(slots, operation.index)), self.storage) },
+                .byte_to_int => |source| return .{ .returned = .{ .runtime = .{ .int = scalar(slots, source).byte } } },
+                .static_conversion => |conversion| return self.staticConversion(conversion, span),
+                .callable_coerce => |operation| return self.coerceCallable(operation),
+                .negi => |operand| return .{ .returned = .{ .runtime = .{ .int = -%integer(slots, operand) } } },
+                .addi => |operands| return .{ .returned = .{ .runtime = .{ .int = integer(slots, operands.lhs) +% integer(slots, operands.rhs) } } },
+                .subi => |operands| return .{ .returned = .{ .runtime = .{ .int = integer(slots, operands.lhs) -% integer(slots, operands.rhs) } } },
+                .muli => |operands| return .{ .returned = .{ .runtime = .{ .int = integer(slots, operands.lhs) *% integer(slots, operands.rhs) } } },
+                .divsi => |operands| return self.divide(operands, span),
+                .call => |call| return self.executeCall(call, span),
+                .variant_tag => |operand| return self.variantTag((try self.read(operand)) orelse return .unavailable, operand),
+                .variant_coerce, .variant_extract => |operation| return self.convertVariant((try self.read(operation.operand)) orelse return .unavailable, operation),
+                .local_storage, .result_storage => |type_id| return .{ .returned = .{ .place = try Cell.create(self.storage, type_id, .uninitialized) } },
+                .storage_projection => |operation| return self.projectStorage(operation),
+                .array_element => |operation| return self.projectArray(operation),
+                .borrow_address => |operation| return self.borrowAddress(operation),
+                .borrow_read => |operation| return self.borrowRead(operation, span),
+                .borrow_write => |operation| return self.borrowWrite(operation, span),
+                .allocation_element => |operation| return self.allocationElement(operation),
+                .borrow_box => |operation| return .{ .returned = try referenceValue(operation.type_id, try allocationRecord(slots[@backingInt(operation.source)]).element(0), self.storage) },
+                .value_copy => |operation| return self.copyValue(operation),
+                .field_access => |operation| return self.accessField(slots[@backingInt(operation.operand)], operation),
+                .initializer_capture_write => |operation| return self.writeCapture(operation),
+            }
+        }
+
+        fn initializerValue(self: *const Self, reference: @FieldType(structures.FunctionInstruction, "initializer_ref")) !Value {
+            const source = self.body.initializer_captures[reference.captures.start..reference.captures.end];
+            const captures = try self.storage.alloc(Value, source.len);
+            for (source, captures) |capture, *value| value.* = if (self.slots[@backingInt(capture)] == .initializer) self.slots[@backingInt(capture)] else .{ .place = try storageCell(self.body, self.slots, capture, self.storage) };
+            return .{ .initializer = .{ .body = &self.body.initializer_regions[reference.region], .captures = captures } };
+        }
+
+        fn projectArray(self: *const Self, operation: structures.ArrayElement) !Result {
+            const cell = try storageCell(self.body, self.slots, operation.array, self.storage);
+            const array = (try self.executor.arrayType(cell.type_id)) orelse return .unavailable;
+            std.debug.assert(array.element_type == operation.type_id);
+            const index = integer(self.slots, operation.index);
+            std.debug.assert(index >= 0);
+            std.debug.assert(@as(u32, @intCast(index)) < array.length);
+            if (cell.contents == .allocation) return .{ .returned = .{ .place = try cell.contents.allocation.element(@intCast(index)) } };
+            if (!try expandFields(cell, self.executor)) return .unavailable;
+            return .{ .returned = .{ .place = &cell.contents.fields[@intCast(index)] } };
+        }
+
+        fn borrowAddress(self: *const Self, operation: structures.BorrowAddressOperation) !Result {
+            if (operation.base_is_reference and operation.fields.start == operation.fields.end) {
+                if (try readSlot(self.slots, operation.source, self.executor, self.storage)) |source| {
+                    if (source == .runtime and source.runtime == .storage_cursor) {
+                        var cursor = source.runtime.storage_cursor;
+                        cursor.type_id = operation.type_id;
+                        return .{ .returned = .{ .runtime = .{ .storage_cursor = cursor } } };
                     }
+                }
+            }
+            var target = if (operation.base_is_reference)
+                referenceTarget(self.slots[@backingInt(operation.source)]) orelse return executionError(.unsupported_operation, null)
+            else
+                try storageCell(self.body, self.slots, operation.source, self.storage);
+            for (self.body.borrow_fields[operation.fields.start..operation.fields.end]) |projection| switch (projection) {
+                .field => |index| {
+                    if (!try expandFields(target, self.executor)) return .unavailable;
+                    const field = &target.contents.fields[index];
+                    if (field.type_id == .never) field.type_id = (try self.executor.structFieldType(target.type_id, index)) orelse return .unavailable;
+                    target = field;
                 },
-                .const_byte => |value| slots[destination] = .{ .runtime = .{ .byte = value } },
-                .const_bool => |value| slots[destination] = .{ .runtime = .{ .bool = value } },
-                .const_type => |type_id| slots[destination] = .{ .type = type_id },
-                .const_unit => slots[destination] = .{ .runtime = .unit },
-                .const_none => slots[destination] = .{ .runtime = .none },
-                .function_ref => |reference| slots[destination] = .{ .runtime = .{ .function_ref = reference } },
-                .initializer_ref => |reference| slots[destination] = try initializerValue(body, slots, reference, storage),
-                .callable_coerce => |operation| {
-                    var reference = scalar(slots, operation.operand).function_ref;
-                    reference.type_id = operation.target_type;
-                    try store(slots, destination, operation.destination, .{ .runtime = .{ .function_ref = reference } }, executor);
+                .variant => |member| target = (try borrowVariantCell(target, member, self.executor)) orelse return .unavailable,
+            };
+            return .{ .returned = try referenceValue(operation.type_id, target, self.storage) };
+        }
+
+        fn projectStorage(self: *const Self, operation: structures.StorageProjection) !Result {
+            const cell = try storageCell(self.body, self.slots, operation.owner, self.storage);
+            switch (operation.projection) {
+                .field => |index| {
+                    if (!try expandFields(cell, self.executor)) return .unavailable;
+                    const field = &cell.contents.fields[index];
+                    std.debug.assert(field.type_id == .never or field.type_id == operation.type_id);
+                    field.type_id = operation.type_id;
+                    return .{ .returned = .{ .place = field } };
                 },
-                .negi => |operand| slots[destination] = .{ .runtime = .{ .int = -%integer(slots, operand) } },
-                .addi => |operands| slots[destination] = .{ .runtime = .{ .int = integer(slots, operands.lhs) +% integer(slots, operands.rhs) } },
-                .subi => |operands| slots[destination] = .{ .runtime = .{ .int = integer(slots, operands.lhs) -% integer(slots, operands.rhs) } },
-                .muli => |operands| slots[destination] = .{ .runtime = .{ .int = integer(slots, operands.lhs) *% integer(slots, operands.rhs) } },
-                .divsi => |operands| {
-                    const lhs = integer(slots, operands.lhs);
-                    const rhs = integer(slots, operands.rhs);
-                    if (rhs == 0) return executionError(.division_by_zero, instructionSpan(body, instruction_index));
-                    if (lhs == std.math.minInt(i32) and rhs == -1) return executionError(.integer_overflow, instructionSpan(body, instruction_index));
-                    slots[destination] = .{ .runtime = .{ .int = @divTrunc(lhs, rhs) } };
-                },
-                .call => |call| if (try executeReturningCall(body, slots, call_scratch, destination, instruction_index, call, executor, gpa, storage)) |result| return result,
-                .variant_tag => |operand| switch (try variantTag(body, (try readSlot(slots, operand, executor, gpa)) orelse return .unavailable, operand, executor)) {
-                    .returned => |value| slots[destination] = value,
-                    else => |result| return atSpan(result, instructionSpan(body, instruction_index)),
-                },
-                .variant_coerce => |operation| switch (try coerceVariant(body, (try readSlot(slots, operation.operand, executor, gpa)) orelse return .unavailable, operation, executor)) {
-                    .returned => |value| try store(slots, destination, operation.destination, value, executor),
-                    else => |result| return atSpan(result, instructionSpan(body, instruction_index)),
-                },
-                .variant_extract => |operation| switch (try extractVariant(body, (try readSlot(slots, operation.operand, executor, gpa)) orelse return .unavailable, operation, executor)) {
-                    .returned => |value| slots[destination] = value,
-                    else => |result| return atSpan(result, instructionSpan(body, instruction_index)),
-                },
-                .local_storage, .result_storage => |type_id| {
-                    const cell = try storage.create(Cell);
-                    cell.* = .{ .type_id = type_id, .storage = storage, .contents = .uninitialized };
-                    slots[destination] = .{ .place = cell };
-                },
-                .storage_projection => |operation| switch (try projectStorage(body, slots, operation, executor, storage)) {
-                    .returned => |value| slots[destination] = value,
-                    else => |result| return atSpan(result, instructionSpan(body, instruction_index)),
-                },
-                .array_element => |operation| switch (try projectArray(body, slots, operation, executor, storage)) {
-                    .returned => |value| slots[destination] = value,
-                    else => |result| return atSpan(result, instructionSpan(body, instruction_index)),
-                },
-                .borrow_address => |operation| switch (try borrowAddress(body, slots, operation, executor, storage)) {
-                    .returned => |value| slots[destination] = value,
-                    else => |result| return atSpan(result, instructionSpan(body, instruction_index)),
-                },
-                .borrow_read => |operation| {
-                    if (try readStaticReference(slots[@backingInt(operation.source)], executor)) |value| {
-                        slots[destination] = value;
-                        continue;
+                .variant => {
+                    switch (cell.contents) {
+                        .uninitialized => {
+                            const payload = try Cell.create(cell.storage, operation.type_id, .uninitialized);
+                            cell.contents = .{ .variant_payload = payload };
+                        },
+                        .value => |owner| {
+                            const active = try self.activeVariant(.{ .runtime = owner }, operation.owner);
+                            const payload = try Cell.create(cell.storage, operation.type_id, .uninitialized);
+                            if (active.member_type == operation.type_id)
+                                try assignCell(payload, active.payload, self.executor);
+                            cell.contents = .{ .variant_payload = payload };
+                        },
+                        .variant_payload => |payload| if (payload.type_id != operation.type_id) {
+                            payload.* = .{ .type_id = operation.type_id, .storage = cell.storage, .contents = .uninitialized };
+                        },
+                        .fields, .reference, .storage_cursor, .allocation => unreachable,
                     }
-                    const target = referenceTarget(slots[@backingInt(operation.source)]) orelse return executionError(.unsupported_operation, instructionSpan(body, instruction_index));
-                    std.debug.assert(target.type_id == operation.type_id);
-                    slots[destination] = .{ .place = target };
+                    return .{ .returned = .{ .place = cell.contents.variant_payload } };
                 },
-                .borrow_write => |operation| {
-                    const target = referenceTarget(slots[@backingInt(operation.reference)]) orelse return executionError(.unsupported_operation, instructionSpan(body, instruction_index));
-                    std.debug.assert(target.type_id == operation.type_id);
-                    try assignCell(target, slots[@backingInt(operation.value)], executor);
-                    slots[destination] = .{ .runtime = .unit };
-                },
-                .allocation_element => |operation| {
-                    const allocation = allocationRecord(slots[@backingInt(operation.allocation)]);
-                    std.debug.assert(allocation.element_type == operation.type_id);
-                    slots[destination] = .{ .place = try allocation.element(@intCast(integer(slots, operation.index))) };
-                },
-                .borrow_box => |operation| {
-                    const allocation = allocationRecord(slots[@backingInt(operation.source)]);
-                    slots[destination] = try referenceValue(operation.type_id, try allocation.element(0), storage);
-                },
-                .value_copy => |operation| {
-                    var copied = (try readSlot(slots, operation.source, executor, gpa)) orelse return .unavailable;
-                    if (copied == .runtime and copied.runtime == .storage_cursor)
-                        copied.runtime.storage_cursor.type_id = operation.type_id;
-                    if (operation.destination == null and copied == .place) {
-                        const cell = try storage.create(Cell);
-                        cell.* = .{ .type_id = operation.type_id, .storage = storage, .contents = .uninitialized };
-                        try assignCell(cell, copied, executor);
-                        copied = .{ .place = cell };
-                    }
-                    try store(slots, destination, operation.destination, copied, executor);
-                },
-                .field_access => |operation| switch (try accessField(slots[@backingInt(operation.operand)], operation, executor, gpa, storage)) {
-                    .returned => |value| slots[destination] = value,
-                    else => |result| return atSpan(result, instructionSpan(body, instruction_index)),
-                },
-                .initializer_capture_write => |operation| {
-                    std.debug.assert(body.is_initializer_region);
-                    std.debug.assert(operation.parameter_index < arguments.len);
-                    const updated = (try readSlot(slots, operation.value, executor, gpa)) orelse return .unavailable;
-                    if (arguments[operation.parameter_index] == .place) {
-                        try assignCell(arguments[operation.parameter_index].place, updated, executor);
-                    } else arguments[operation.parameter_index] = updated;
-                    slots[destination] = .{ .runtime = .unit };
+                .box_element => return .{ .returned = .{ .place = try allocationRecord(.{ .place = cell }).element(0) } },
+                .allocation_array => {
+                    const allocation = allocationRecord(.{ .place = cell });
+                    const array = (try self.executor.arrayType(operation.type_id)) orelse return .unavailable;
+                    std.debug.assert(array.element_type == allocation.element_type);
+                    std.debug.assert(array.length <= allocation.capacity);
+                    return .{ .returned = try allocationValue(operation.type_id, allocation, self.storage) };
                 },
             }
         }
 
-        switch (block.terminator) {
-            .branch => |branch| switch (try branchTarget(body, slots, scratch, branch, executor, gpa, storage)) {
-                .next => |next| block_id = next,
-                .result => |result| return result,
-            },
-            .predicate_branch => |predicate| {
-                const branch = if (predicateValue(slots, predicate.operation, predicate.operands))
-                    predicate.then_branch
-                else
-                    predicate.else_branch;
-                switch (try branchTarget(body, slots, scratch, branch, executor, gpa, storage)) {
-                    .next => |next| block_id = next,
-                    .result => |result| return result,
-                }
-            },
-            .return_unit => return .{ .returned = .{ .runtime = .unit } },
-            .return_value => |value_use| return valueUse(body, slots, value_use, executor, gpa),
-            .return_failure => return .failure,
-            .diverge => unreachable,
-            .fallible_call => |fallible| switch (try executeFallibleCall(body, slots, call_scratch, fallible.call, fallible.success, fallible.failure, terminatorSpan(body, block_id), executor, gpa, storage)) {
-                .next => |next| block_id = next,
-                .result => |result| return result,
-            },
+        fn accessField(self: *const Self, value: Value, operation: structures.FieldAccessOperation) !Result {
+            if (value == .place and value.place.contents == .fields) {
+                const fields = value.place.contents.fields;
+                std.debug.assert(operation.field_index < fields.len);
+                const field = &fields[operation.field_index];
+                std.debug.assert(field.type_id == operation.field_type);
+                if (containsReference(field)) return .{ .returned = try copyStoredValue(.{ .place = field }, operation.field_type, self.executor, self.storage) };
+                const field_value = (try materialize(field, self.executor, self.gpa)) orelse return .unavailable;
+                return .{ .returned = .{ .runtime = field_value } };
+            }
+            const owner = if (value == .place) value.place.contents.value else value.runtime;
+            const fields = try self.executor.lookupTuple(owner.structure);
+            std.debug.assert(operation.field_index < fields.len);
+            const field = (try self.executor.lookupRuntime(fields[operation.field_index])) orelse return .unavailable;
+            std.debug.assert(field.type_id == operation.field_type);
+            return .{ .returned = .{ .runtime = field.value } };
         }
-    }
+
+        fn activeVariant(self: *const Self, value: Value, operand: structures.FunctionValueId) !ActiveVariant {
+            if (value == .place and value.place.contents == .variant_payload) {
+                const payload = value.place.contents.variant_payload;
+                return .{ .member_type = payload.type_id, .payload = .{ .place = payload } };
+            }
+            if (value == .runtime and value.runtime == .variant) {
+                const payload = (try self.executor.lookupRuntime(value.runtime.variant.payload)) orelse return error.Unavailable;
+                return .{ .member_type = value.runtime.variant.member_type, .payload = .{ .runtime = payload.value } };
+            }
+            const source_type = self.body.valueType(operand);
+            std.debug.assert(try self.executor.variantMembers(source_type) == null);
+            return .{ .member_type = source_type, .payload = value };
+        }
+
+        fn variantTag(self: *const Self, value: Value, operand: structures.FunctionValueId) !Result {
+            const active = try self.activeVariant(value, operand);
+            const members = (try self.executor.variantMembers(self.body.valueType(operand))) orelse unreachable;
+            for (members, 0..) |member, tag| if (member == active.member_type) return .{ .returned = .{ .runtime = .{ .int = @intCast(tag) } } };
+            unreachable;
+        }
+
+        fn convertVariant(self: *const Self, value: Value, operation: structures.VariantOperation) !Result {
+            const active = try self.activeVariant(value, operation.operand);
+            if (try self.executor.variantMembers(operation.target_type)) |target_members| {
+                const source_type = self.body.valueType(operation.operand);
+                const source_members = try self.executor.variantMembers(source_type);
+                const source_tag: usize = if (source_members) |members| blk: {
+                    break :blk for (members, 0..) |member, tag| {
+                        if (member == active.member_type) break tag;
+                    } else unreachable;
+                } else 0;
+                const mapping = self.body.variant_coercion_tags[operation.tag_mapping.?.start..operation.tag_mapping.?.end];
+                std.debug.assert(source_tag < mapping.len);
+                const target_tag = mapping[source_tag];
+                std.debug.assert(target_tag != structures.invalid_variant_tag);
+                std.debug.assert(target_tag < target_members.len);
+                if (value == .runtime) {
+                    const payload = if (value.runtime == .variant) value.runtime.variant.payload else try self.executor.internRuntime(source_type, value.runtime);
+                    return .{ .returned = .{ .runtime = variantValue(target_members[target_tag], payload) } };
+                }
+                return .{ .returned = try storedVariantValue(operation.target_type, target_members[target_tag], active.payload, self.executor) };
+            }
+            // Widened callable tags can retain payloads with their original type.
+            if (value == .runtime and value.runtime == .variant) {
+                const payload = (try self.executor.lookupRuntime(value.runtime.variant.payload)) orelse return .unavailable;
+                if (payload.type_id == operation.target_type) return .{ .returned = .{ .runtime = payload.value } };
+                var reference = payload.value.function_ref;
+                reference.type_id = operation.target_type;
+                return .{ .returned = .{ .runtime = .{ .function_ref = reference } } };
+            }
+            if (active.member_type == operation.target_type) return .{ .returned = active.payload };
+            var reference = active.payload.runtime.function_ref;
+            reference.type_id = operation.target_type;
+            return .{ .returned = .{ .runtime = .{ .function_ref = reference } } };
+        }
+
+        fn storageCursor(self: *const Self, operation: structures.BorrowOperation) !Result {
+            if (self.body.valueType(operation.source) == .static_data) return .{ .returned = .{ .runtime = .{ .storage_cursor = .{ .type_id = operation.type_id, .data = scalar(self.slots, operation.source).static_data } } } };
+            const owner = try storageCell(self.body, self.slots, operation.source, self.storage);
+            if (owner.contents != .allocation and !try expandFields(owner, self.executor)) return .unavailable;
+            const cell = try Cell.create(self.storage, operation.type_id, .{ .storage_cursor = .{ .owner = owner, .offset = 0 } });
+            return .{ .returned = .{ .place = cell } };
+        }
+
+        fn divide(self: *const Self, operands: structures.BinaryOperands, span: ?structures.SourceSpan) Result {
+            const lhs = integer(self.slots, operands.lhs);
+            const rhs = integer(self.slots, operands.rhs);
+            if (rhs == 0) return executionError(.division_by_zero, span);
+            if (lhs == std.math.minInt(i32) and rhs == -1) return executionError(.integer_overflow, span);
+            return .{ .returned = .{ .runtime = .{ .int = @divTrunc(lhs, rhs) } } };
+        }
+
+        fn staticConversion(self: *const Self, conversion: @FieldType(structures.FunctionInstruction, "static_conversion"), span: ?structures.SourceSpan) !Result {
+            const source = (try self.read(conversion.operand)) orelse return .unavailable;
+            if (source == .place and containsReference(source.place)) return executionError(.escaping_storage, span);
+            const runtime = switch (source) {
+                .runtime => |value| value,
+                .place => |cell| (try materialize(cell, self.executor, self.gpa)) orelse return executionError(.unsupported_operation, span),
+                .type, .initializer => unreachable,
+            };
+            return self.executor.convertStaticValue(self.body.valueType(conversion.operand), runtime, conversion.type_id, span, self.storage);
+        }
+
+        fn coerceCallable(self: *const Self, operation: structures.VariantOperation) Result {
+            var reference = scalar(self.slots, operation.operand).function_ref;
+            reference.type_id = operation.target_type;
+            return .{ .returned = .{ .runtime = .{ .function_ref = reference } } };
+        }
+
+        fn borrowRead(self: *const Self, operation: structures.BorrowOperation, span: ?structures.SourceSpan) !Result {
+            if (try readStaticReference(self.slots[@backingInt(operation.source)], self.executor)) |value| return .{ .returned = value };
+            const target = referenceTarget(self.slots[@backingInt(operation.source)]) orelse return executionError(.unsupported_operation, span);
+            std.debug.assert(target.type_id == operation.type_id);
+            return .{ .returned = .{ .place = target } };
+        }
+
+        fn borrowWrite(self: *const Self, operation: structures.BorrowWriteOperation, span: ?structures.SourceSpan) !Result {
+            const target = referenceTarget(self.slots[@backingInt(operation.reference)]) orelse return executionError(.unsupported_operation, span);
+            std.debug.assert(target.type_id == operation.type_id);
+            try assignCell(target, self.slots[@backingInt(operation.value)], self.executor);
+            return .{ .returned = .{ .runtime = .unit } };
+        }
+
+        fn allocationElement(self: *const Self, operation: structures.AllocationElement) !Result {
+            const allocation = allocationRecord(self.slots[@backingInt(operation.allocation)]);
+            std.debug.assert(allocation.element_type == operation.type_id);
+            return .{ .returned = .{ .place = try allocation.element(@intCast(integer(self.slots, operation.index))) } };
+        }
+
+        fn copyValue(self: *const Self, operation: structures.ValueCopy) !Result {
+            var copied = (try self.read(operation.source)) orelse return .unavailable;
+            if (copied == .runtime and copied.runtime == .storage_cursor) copied.runtime.storage_cursor.type_id = operation.type_id;
+            if (operation.destination == null) copied = try copyStoredValue(copied, operation.type_id, self.executor, self.storage);
+            return .{ .returned = copied };
+        }
+
+        fn writeCapture(self: *const Self, operation: structures.InitializerCaptureWrite) !Result {
+            std.debug.assert(self.body.is_initializer_region);
+            std.debug.assert(operation.parameter_index < self.arguments.len);
+            const updated = (try self.read(operation.value)) orelse return .unavailable;
+            const argument = &self.arguments[operation.parameter_index];
+            if (argument.* == .place) try assignCell(argument.place, updated, self.executor) else argument.* = updated;
+            return .{ .returned = .{ .runtime = .unit } };
+        }
+
+        fn executeCall(self: *const Self, call: structures.FunctionCall, call_span: ?structures.SourceSpan) anyerror!Result {
+            if (call.target == .initializer) {
+                const initializer = self.slots[@backingInt(call.target.initializer)].initializer;
+                return executeInStorage(initializer.body, initializer.captures, self.executor, self.gpa, self.storage);
+            }
+            const instance = switch (call.target) {
+                .direct => |instance| instance,
+                .indirect => |value| scalar(self.slots, value).function_ref.instance(),
+                .initializer => unreachable,
+            };
+            const arguments = self.body.call_arguments[call.arguments.start..call.arguments.end];
+            const interpreted = self.call_scratch[call.arguments.start..call.arguments.end];
+            for (arguments, interpreted) |argument, *destination| {
+                if (argument == .initializer) {
+                    destination.* = self.slots[@backingInt(argument.valueId())];
+                    std.debug.assert(destination.* == .initializer);
+                    continue;
+                }
+                const use = argument.valueUse();
+                if (argument == .borrowed or argument == .deinit or (use.coerce_to == null and try self.executor.argumentPassing(self.body.valueType(use.value)) == .indirect)) {
+                    destination.* = .{ .place = try storageCell(self.body, self.slots, use.value, self.storage) };
+                    continue;
+                }
+                switch (try self.evaluateUse(use)) {
+                    .returned => |value| destination.* = try copyStoredValue(value, use.coerce_to orelse self.body.valueType(use.value), self.executor, self.storage),
+                    else => |result| return result,
+                }
+            }
+            return self.executor.callInStorage(instance, interpreted, call_span, self.storage);
+        }
+
+        fn fallibleCall(self: *const Self, call: structures.FunctionCall, success_id: structures.FunctionBlockId, failure_id: ?structures.FunctionBlockId, call_span: ?structures.SourceSpan) !Step {
+            switch (try self.executeCall(call, call_span)) {
+                .returned => |value| {
+                    const success = self.body.blocks[@backingInt(success_id)];
+                    std.debug.assert(success.argument_end - success.argument_start == 1);
+                    try self.store(success.argument_start, call.destination, value);
+                    return .{ .next = success_id };
+                },
+                .failure => return .{ .next = failure_id orelse unreachable },
+                else => |result| return .{ .result = result },
+            }
+        }
+
+        fn store(self: *const Self, own: usize, destination: ?structures.FunctionValueId, value: Value) !void {
+            const target = destination orelse {
+                self.slots[own] = value;
+                return;
+            };
+            switch (self.slots[@backingInt(target)]) {
+                .place => |cell| try assignCell(cell, value, self.executor),
+                .runtime => self.slots[@backingInt(target)] = value,
+                .type, .initializer => unreachable,
+            }
+            self.slots[own] = .{ .runtime = .unit };
+        }
+
+        fn read(self: *const Self, value: structures.FunctionValueId) !?Value {
+            return readSlot(self.slots, value, self.executor, self.gpa);
+        }
+
+        fn evaluateUse(self: *const Self, use: structures.FunctionValueUse) !Result {
+            const value = (try self.read(use.value)) orelse return .unavailable;
+            const target = use.coerce_to orelse return .{ .returned = value };
+            if (use.variant_tag_mapping) |mapping| return self.convertVariant(value, .{
+                .operand = use.value,
+                .target_type = target,
+                .tag_mapping = mapping,
+            });
+            var reference = value.runtime.function_ref;
+            reference.type_id = target;
+            return .{ .returned = .{ .runtime = .{ .function_ref = reference } } };
+        }
+
+        fn enterBranch(self: *const Self, branch: structures.FunctionBranch) !Step {
+            const target = self.body.blocks[@backingInt(branch.target)];
+            const arguments = self.body.branch_arguments[branch.arguments.start..branch.arguments.end];
+            std.debug.assert(arguments.len == target.argument_end - target.argument_start);
+            for (arguments, self.scratch[0..arguments.len], self.body.block_arguments[target.argument_start..target.argument_end]) |argument, *temporary, parameter| {
+                if (parameter.representation == .storage or try self.executor.argumentPassing(parameter.type_id) == .indirect) {
+                    std.debug.assert(argument.coerce_to == null);
+                    temporary.* = .{ .place = try storageCell(self.body, self.slots, argument.value, self.storage) };
+                    continue;
+                }
+                switch (try self.evaluateUse(argument)) {
+                    .returned => |value| temporary.* = try copyStoredValue(value, parameter.type_id, self.executor, self.storage),
+                    else => |result| return .{ .result = result },
+                }
+            }
+            @memcpy(self.slots[target.argument_start..target.argument_end], self.scratch[0..arguments.len]);
+            return .{ .next = branch.target };
+        }
+    };
 }
 
 fn executionError(reason: ExecutionErrorReason, span: ?structures.SourceSpan) Result {
@@ -530,13 +809,6 @@ fn instructionSpan(body: *const structures.FunctionBodyAnalysis, instruction_ind
 
 fn terminatorSpan(body: *const structures.FunctionBodyAnalysis, block_id: structures.FunctionBlockId) ?structures.SourceSpan {
     return if (body.terminator_spans.len == body.blocks.len) body.terminator_spans[@backingInt(block_id)] else null;
-}
-
-fn initializerValue(body: *const structures.FunctionBodyAnalysis, slots: []Value, reference: @FieldType(structures.FunctionInstruction, "initializer_ref"), storage: std.mem.Allocator) !Value {
-    const source = body.initializer_captures[reference.captures.start..reference.captures.end];
-    const captures = try storage.alloc(Value, source.len);
-    for (source, captures) |capture, *value| value.* = if (slots[@backingInt(capture)] == .initializer) slots[@backingInt(capture)] else .{ .place = try storageCell(body, slots, capture, storage) };
-    return .{ .initializer = .{ .body = &body.initializer_regions[reference.region], .captures = captures } };
 }
 
 fn integer(slots: []const Value, value: structures.FunctionValueId) i32 {
@@ -578,118 +850,6 @@ fn predicateInteger(slots: []const Value, value: structures.FunctionValueId) i64
     };
 }
 
-fn executeCall(
-    body: *const structures.FunctionBodyAnalysis,
-    slots: []Value,
-    scratch: []Value,
-    call: structures.FunctionCall,
-    call_span: ?structures.SourceSpan,
-    executor: anytype,
-    gpa: std.mem.Allocator,
-    storage: std.mem.Allocator,
-) !Result {
-    if (call.target == .initializer) {
-        const initializer = slots[@backingInt(call.target.initializer)].initializer;
-        return executeInStorage(initializer.body, initializer.captures, executor, gpa, storage);
-    }
-    const instance = switch (call.target) {
-        .direct => |instance| instance,
-        .indirect => |value| scalar(slots, value).function_ref.instance(),
-        .initializer => unreachable,
-    };
-    const arguments = body.call_arguments[call.arguments.start..call.arguments.end];
-    const interpreted = scratch[call.arguments.start..call.arguments.end];
-    for (arguments, interpreted) |argument, *destination| {
-        if (argument == .initializer) {
-            destination.* = slots[@backingInt(argument.valueId())];
-            std.debug.assert(destination.* == .initializer);
-            continue;
-        }
-        const use = argument.valueUse();
-        if (argument == .borrowed or argument == .deinit or (use.coerce_to == null and try executor.argumentPassing(body.valueType(use.value)) == .indirect)) {
-            destination.* = .{ .place = try storageCell(body, slots, use.value, storage) };
-            continue;
-        }
-        switch (try valueUse(body, slots, use, executor, gpa)) {
-            .returned => |value| destination.* = try copyStoredValue(value, use.coerce_to orelse body.valueType(use.value), executor, storage),
-            else => |result| return result,
-        }
-    }
-    return executor.callInStorage(instance, interpreted, call_span, storage);
-}
-
-fn executeReturningCall(
-    body: *const structures.FunctionBodyAnalysis,
-    slots: []Value,
-    scratch: []Value,
-    destination: usize,
-    instruction_index: usize,
-    call: structures.FunctionCall,
-    executor: anytype,
-    gpa: std.mem.Allocator,
-    storage: std.mem.Allocator,
-) !?Result {
-    return switch (atSpan(
-        try executeCall(body, slots, scratch, call, instructionSpan(body, instruction_index), executor, gpa, storage),
-        instructionSpan(body, instruction_index),
-    )) {
-        .returned => |value| blk: {
-            try store(slots, destination, call.destination, value, executor);
-            break :blk null;
-        },
-        .failure => unreachable,
-        .exit => |status| .{ .exit = status },
-        .execution_error => |value| .{ .execution_error = value },
-        .reported_error => .reported_error,
-        .unavailable => .unavailable,
-    };
-}
-
-const Step = union(enum) {
-    next: structures.FunctionBlockId,
-    result: Result,
-};
-
-fn executeFallibleCall(
-    body: *const structures.FunctionBodyAnalysis,
-    slots: []Value,
-    scratch: []Value,
-    call: structures.FunctionCall,
-    success_id: structures.FunctionBlockId,
-    failure_id: ?structures.FunctionBlockId,
-    call_span: ?structures.SourceSpan,
-    executor: anytype,
-    gpa: std.mem.Allocator,
-    storage: std.mem.Allocator,
-) !Step {
-    return switch (try executeCall(body, slots, scratch, call, call_span, executor, gpa, storage)) {
-        .returned => |value| blk: {
-            const success = body.blocks[@backingInt(success_id)];
-            std.debug.assert(success.argument_end - success.argument_start == 1);
-            try store(slots, success.argument_start, call.destination, value, executor);
-            break :blk .{ .next = success_id };
-        },
-        .failure => .{ .next = failure_id orelse unreachable },
-        .exit => |status| .{ .result = .{ .exit = status } },
-        .execution_error => |value| .{ .result = .{ .execution_error = value } },
-        .reported_error => .{ .result = .reported_error },
-        .unavailable => .{ .result = .unavailable },
-    };
-}
-
-fn store(slots: []Value, own: usize, destination: ?structures.FunctionValueId, value: Value, executor: anytype) !void {
-    const storage = destination orelse {
-        slots[own] = value;
-        return;
-    };
-    switch (slots[@backingInt(storage)]) {
-        .place => |cell| try assignCell(cell, value, executor),
-        .runtime => slots[@backingInt(storage)] = value,
-        .type, .initializer => unreachable,
-    }
-    slots[own] = .{ .runtime = .unit };
-}
-
 fn readSlot(slots: []const Value, value: structures.FunctionValueId, executor: anytype, gpa: std.mem.Allocator) !?Value {
     return switch (slots[@backingInt(value)]) {
         .place => |cell| if (containsReference(cell)) .{ .place = cell } else if (try materialize(cell, executor, gpa)) |runtime| .{ .runtime = runtime } else null,
@@ -699,8 +859,7 @@ fn readSlot(slots: []const Value, value: structures.FunctionValueId, executor: a
 
 fn copyStoredValue(value: Value, type_id: structures.TypeId, executor: anytype, storage: std.mem.Allocator) !Value {
     if (value != .place) return value;
-    const copy = try storage.create(Cell);
-    copy.* = .{ .type_id = type_id, .storage = storage, .contents = .uninitialized };
+    const copy = try Cell.create(storage, type_id, .uninitialized);
     try assignCell(copy, value, executor);
     return .{ .place = copy };
 }
@@ -709,14 +868,9 @@ fn storageCell(body: *const structures.FunctionBodyAnalysis, slots: []Value, val
     const slot = &slots[@backingInt(value)];
     if (slot.* == .place) return slot.place;
     std.debug.assert(slot.* == .runtime);
-    const cell = try storage.create(Cell);
-    cell.* = .{ .type_id = body.valueType(value), .storage = storage, .contents = .{ .value = slot.runtime } };
+    const cell = try Cell.create(storage, body.valueType(value), .{ .value = slot.runtime });
     slot.* = .{ .place = cell };
     return cell;
-}
-
-fn arrayType(executor: anytype, type_id: structures.TypeId) !?structures.ArrayType {
-    return executor.arrayType(type_id);
 }
 
 pub fn containsReference(cell: *const Cell) bool {
@@ -737,15 +891,14 @@ pub fn referenceTarget(value: Value) ?*Cell {
 }
 
 pub fn referenceValue(type_id: structures.TypeId, target: *Cell, storage: std.mem.Allocator) !Value {
-    const cell = try storage.create(Cell);
-    cell.* = .{ .type_id = type_id, .storage = storage, .contents = .{ .reference = target } };
+    const cell = try Cell.create(storage, type_id, .{ .reference = target });
     return .{ .place = cell };
 }
 
 pub fn assignCell(destination: *Cell, source: Value, executor: anytype) anyerror!void {
     if (source == .place and destination == source.place) return;
     if (destination.contents == .allocation) {
-        if (try arrayType(executor, destination.type_id)) |array| {
+        if (try executor.arrayType(destination.type_id)) |array| {
             const allocation = destination.contents.allocation;
             std.debug.assert(array.element_type == allocation.element_type);
             std.debug.assert(array.length <= allocation.capacity);
@@ -775,7 +928,7 @@ pub fn assignCell(destination: *Cell, source: Value, executor: anytype) anyerror
                 .storage_cursor => |pointer| destination.contents = .{ .storage_cursor = pointer },
                 .reference => |target| destination.contents = .{ .reference = target },
                 .allocation => |allocation| {
-                    if (try arrayType(executor, cell.type_id)) |array| {
+                    if (try executor.arrayType(cell.type_id)) |array| {
                         const copied = try destination.storage.alloc(Cell, array.length);
                         for (copied, 0..) |*copy, index| {
                             copy.* = .{ .type_id = array.element_type, .storage = destination.storage, .contents = .uninitialized };
@@ -799,8 +952,7 @@ pub fn assignCell(destination: *Cell, source: Value, executor: anytype) anyerror
                 },
                 .variant_payload => |payload| {
                     if (destination.contents != .variant_payload) {
-                        const copied = try destination.storage.create(Cell);
-                        copied.* = .{ .type_id = payload.type_id, .storage = destination.storage, .contents = .uninitialized };
+                        const copied = try Cell.create(destination.storage, payload.type_id, .uninitialized);
                         destination.contents = .{ .variant_payload = copied };
                     }
                     if (destination.contents.variant_payload.type_id != payload.type_id)
@@ -839,7 +991,7 @@ fn assignRuntime(destination: *Cell, runtime: structures.CompileTimeValue.Runtim
 fn expandFields(cell: *Cell, executor: anytype) !bool {
     switch (cell.contents) {
         .uninitialized => {
-            const array = try arrayType(executor, cell.type_id);
+            const array = try executor.arrayType(cell.type_id);
             const count = if (array) |shape| shape.length else (try executor.structFieldCount(cell.type_id)) orelse return false;
             const fields = try cell.storage.alloc(Cell, count);
             for (fields) |*field| field.* = .{ .type_id = if (array) |shape| shape.element_type else .never, .storage = cell.storage, .contents = .uninitialized };
@@ -848,7 +1000,7 @@ fn expandFields(cell: *Cell, executor: anytype) !bool {
         .value => |runtime| {
             std.debug.assert(runtime == .structure);
             const values = try executor.lookupTuple(runtime.structure);
-            const array = try arrayType(executor, cell.type_id);
+            const array = try executor.arrayType(cell.type_id);
             if (array) |shape| std.debug.assert(values.len == shape.length);
             const fields = try cell.storage.alloc(Cell, values.len);
             for (values, fields) |value_id, *field| {
@@ -864,50 +1016,11 @@ fn expandFields(cell: *Cell, executor: anytype) !bool {
     return true;
 }
 
-fn projectArray(body: *const structures.FunctionBodyAnalysis, slots: []Value, operation: structures.ArrayElement, executor: anytype, storage: std.mem.Allocator) !Result {
-    const cell = try storageCell(body, slots, operation.array, storage);
-    const array = (try arrayType(executor, cell.type_id)) orelse return .unavailable;
-    std.debug.assert(array.element_type == operation.type_id);
-    const index = integer(slots, operation.index);
-    std.debug.assert(index >= 0);
-    std.debug.assert(@as(u32, @intCast(index)) < array.length);
-    if (cell.contents == .allocation) return .{ .returned = .{ .place = try cell.contents.allocation.element(@intCast(index)) } };
-    if (!try expandFields(cell, executor)) return .unavailable;
-    return .{ .returned = .{ .place = &cell.contents.fields[@intCast(index)] } };
-}
-
-fn borrowAddress(body: *const structures.FunctionBodyAnalysis, slots: []Value, operation: structures.BorrowAddressOperation, executor: anytype, storage: std.mem.Allocator) !Result {
-    if (operation.base_is_reference and operation.fields.start == operation.fields.end) {
-        if (try readSlot(slots, operation.source, executor, storage)) |source| {
-            if (source == .runtime and source.runtime == .storage_cursor) {
-                var cursor = source.runtime.storage_cursor;
-                cursor.type_id = operation.type_id;
-                return .{ .returned = .{ .runtime = .{ .storage_cursor = cursor } } };
-            }
-        }
-    }
-    var target = if (operation.base_is_reference)
-        referenceTarget(slots[@backingInt(operation.source)]) orelse return executionError(.unsupported_operation, null)
-    else
-        try storageCell(body, slots, operation.source, storage);
-    for (body.borrow_fields[operation.fields.start..operation.fields.end]) |projection| switch (projection) {
-        .field => |index| {
-            if (!try expandFields(target, executor)) return .unavailable;
-            const field = &target.contents.fields[index];
-            if (field.type_id == .never) field.type_id = (try executor.structFieldType(target.type_id, index)) orelse return .unavailable;
-            target = field;
-        },
-        .variant => |member| target = (try borrowVariantCell(target, member, executor)) orelse return .unavailable,
-    };
-    return .{ .returned = try referenceValue(operation.type_id, target, storage) };
-}
-
 fn borrowVariantCell(target: *Cell, member: structures.TypeId, executor: anytype) !?*Cell {
     if (target.contents == .value) {
         const value = (try executor.lookupRuntime(target.contents.value.variant.payload)) orelse return null;
         std.debug.assert(value.type_id == member);
-        const payload = try target.storage.create(Cell);
-        payload.* = .{ .type_id = member, .storage = target.storage, .contents = .{ .value = value.value } };
+        const payload = try Cell.create(target.storage, member, .{ .value = value.value });
         target.contents = .{ .variant_payload = payload };
     }
     std.debug.assert(target.contents == .variant_payload);
@@ -921,7 +1034,7 @@ fn materialize(cell: *const Cell, executor: anytype, gpa: std.mem.Allocator) !?s
         .reference, .storage_cursor, .allocation => return null,
         .uninitialized => {
             std.debug.assert(cell.type_id != .never);
-            if (try arrayType(executor, cell.type_id)) |array| {
+            if (try executor.arrayType(cell.type_id)) |array| {
                 if (array.length != 0) return null;
                 return .{ .structure = try executor.internTuple(&.{}) };
             }
@@ -945,114 +1058,10 @@ fn materialize(cell: *const Cell, executor: anytype, gpa: std.mem.Allocator) !?s
     }
 }
 
-fn projectStorage(
-    body: *const structures.FunctionBodyAnalysis,
-    slots: []Value,
-    operation: structures.StorageProjection,
-    executor: anytype,
-    storage: std.mem.Allocator,
-) !Result {
-    const cell = try storageCell(body, slots, operation.owner, storage);
-    switch (operation.projection) {
-        .field => |index| {
-            if (!try expandFields(cell, executor)) return .unavailable;
-            const field = &cell.contents.fields[index];
-            std.debug.assert(field.type_id == .never or field.type_id == operation.type_id);
-            field.type_id = operation.type_id;
-            return .{ .returned = .{ .place = field } };
-        },
-        .variant => {
-            switch (cell.contents) {
-                .uninitialized => {
-                    const payload = try cell.storage.create(Cell);
-                    payload.* = .{ .type_id = operation.type_id, .storage = cell.storage, .contents = .uninitialized };
-                    cell.contents = .{ .variant_payload = payload };
-                },
-                .value => |owner| {
-                    const active = try activeVariant(body, .{ .runtime = owner }, operation.owner, executor);
-                    const payload = try cell.storage.create(Cell);
-                    payload.* = .{ .type_id = operation.type_id, .storage = cell.storage, .contents = .uninitialized };
-                    if (active.member_type == operation.type_id)
-                        try assignCell(payload, active.payload, executor);
-                    cell.contents = .{ .variant_payload = payload };
-                },
-                .variant_payload => |payload| if (payload.type_id != operation.type_id) {
-                    payload.* = .{ .type_id = operation.type_id, .storage = cell.storage, .contents = .uninitialized };
-                },
-                .fields, .reference, .storage_cursor, .allocation => unreachable,
-            }
-            return .{ .returned = .{ .place = cell.contents.variant_payload } };
-        },
-        .box_element => return .{ .returned = .{ .place = try allocationRecord(.{ .place = cell }).element(0) } },
-        .allocation_array => {
-            const allocation = allocationRecord(.{ .place = cell });
-            const array = (try arrayType(executor, operation.type_id)) orelse return .unavailable;
-            std.debug.assert(array.element_type == allocation.element_type);
-            std.debug.assert(array.length <= allocation.capacity);
-            return .{ .returned = try allocationValue(operation.type_id, allocation, storage) };
-        },
-    }
-}
-
-fn accessField(
-    value: Value,
-    operation: structures.FieldAccessOperation,
-    executor: anytype,
-    gpa: std.mem.Allocator,
-    storage: std.mem.Allocator,
-) !Result {
-    if (value == .place and value.place.contents == .fields) {
-        const fields = value.place.contents.fields;
-        std.debug.assert(operation.field_index < fields.len);
-        const field = &fields[operation.field_index];
-        std.debug.assert(field.type_id == operation.field_type);
-        if (containsReference(field)) return .{ .returned = try copyStoredValue(.{ .place = field }, operation.field_type, executor, storage) };
-        const field_value = (try materialize(field, executor, gpa)) orelse return .unavailable;
-        return .{ .returned = .{ .runtime = field_value } };
-    }
-    const owner = if (value == .place) value.place.contents.value else value.runtime;
-    const fields = try executor.lookupTuple(owner.structure);
-    std.debug.assert(operation.field_index < fields.len);
-    const field = (try executor.lookupRuntime(fields[operation.field_index])) orelse return .unavailable;
-    std.debug.assert(field.type_id == operation.field_type);
-    return .{ .returned = .{ .runtime = field.value } };
-}
-
 const ActiveVariant = struct {
     member_type: structures.TypeId,
     payload: Value,
 };
-
-fn activeVariant(
-    body: *const structures.FunctionBodyAnalysis,
-    value: Value,
-    operand: structures.FunctionValueId,
-    executor: anytype,
-) !ActiveVariant {
-    if (value == .place and value.place.contents == .variant_payload) {
-        const payload = value.place.contents.variant_payload;
-        return .{ .member_type = payload.type_id, .payload = .{ .place = payload } };
-    }
-    if (value == .runtime and value.runtime == .variant) {
-        const payload = (try executor.lookupRuntime(value.runtime.variant.payload)) orelse return error.Unavailable;
-        return .{ .member_type = value.runtime.variant.member_type, .payload = .{ .runtime = payload.value } };
-    }
-    const source_type = body.valueType(operand);
-    std.debug.assert(try executor.variantMembers(source_type) == null);
-    return .{ .member_type = source_type, .payload = value };
-}
-
-fn variantTag(
-    body: *const structures.FunctionBodyAnalysis,
-    value: Value,
-    operand: structures.FunctionValueId,
-    executor: anytype,
-) !Result {
-    const active = try activeVariant(body, value, operand, executor);
-    const members = (try executor.variantMembers(body.valueType(operand))) orelse unreachable;
-    for (members, 0..) |member, tag| if (member == active.member_type) return .{ .returned = .{ .runtime = .{ .int = @intCast(tag) } } };
-    unreachable;
-}
 
 fn variantValue(member_type: structures.TypeId, payload: structures.CompileTimeValueId) structures.CompileTimeValue.RuntimeValue {
     return .{ .variant = .{ .member_type = member_type, .payload = payload } };
@@ -1062,72 +1071,10 @@ pub fn storedVariantValue(type_id: structures.TypeId, member_type: structures.Ty
     if (payload == .runtime) return .{ .runtime = variantValue(member_type, try executor.internRuntime(member_type, payload.runtime)) };
     std.debug.assert(payload == .place);
     const storage = payload.place.storage;
-    const member = try storage.create(Cell);
-    member.* = .{ .type_id = member_type, .storage = storage, .contents = .uninitialized };
+    const member = try Cell.create(storage, member_type, .uninitialized);
     try assignCell(member, payload, executor);
-    const variant = try storage.create(Cell);
-    variant.* = .{ .type_id = type_id, .storage = storage, .contents = .{ .variant_payload = member } };
+    const variant = try Cell.create(storage, type_id, .{ .variant_payload = member });
     return .{ .place = variant };
-}
-
-fn coerceVariant(
-    body: *const structures.FunctionBodyAnalysis,
-    value: Value,
-    operation: structures.VariantOperation,
-    executor: anytype,
-) !Result {
-    const mapping = body.variant_coercion_tags[operation.tag_mapping.?.start..operation.tag_mapping.?.end];
-    const source_type = body.valueType(operation.operand);
-    const source_members = try executor.variantMembers(source_type);
-    const active = try activeVariant(body, value, operation.operand, executor);
-    const source_tag: usize = if (source_members) |members| blk: {
-        break :blk for (members, 0..) |member, tag| {
-            if (member == active.member_type) break tag;
-        } else unreachable;
-    } else 0;
-    std.debug.assert(source_tag < mapping.len);
-    const target_tag = mapping[source_tag];
-    std.debug.assert(target_tag != structures.invalid_variant_tag);
-    const target_members = (try executor.variantMembers(operation.target_type)) orelse unreachable;
-    std.debug.assert(target_tag < target_members.len);
-    if (value == .runtime) {
-        const payload = if (value.runtime == .variant) value.runtime.variant.payload else try executor.internRuntime(source_type, value.runtime);
-        return .{ .returned = .{ .runtime = variantValue(target_members[target_tag], payload) } };
-    }
-    return .{ .returned = try storedVariantValue(operation.target_type, target_members[target_tag], active.payload, executor) };
-}
-
-fn extractVariant(
-    body: *const structures.FunctionBodyAnalysis,
-    value: Value,
-    operation: structures.VariantOperation,
-    executor: anytype,
-) !Result {
-    const active = try activeVariant(body, value, operation.operand, executor);
-    if (try executor.variantMembers(operation.target_type)) |target_members| {
-        const source_members = (try executor.variantMembers(body.valueType(operation.operand))).?;
-        const source_tag = for (source_members, 0..) |member, tag| {
-            if (member == active.member_type) break tag;
-        } else unreachable;
-        const mapping = body.variant_coercion_tags[operation.tag_mapping.?.start..operation.tag_mapping.?.end];
-        const target_tag = mapping[source_tag];
-        std.debug.assert(target_tag != structures.invalid_variant_tag);
-        std.debug.assert(target_tag < target_members.len);
-        if (value == .runtime and value.runtime == .variant)
-            return .{ .returned = .{ .runtime = variantValue(target_members[target_tag], value.runtime.variant.payload) } };
-        return .{ .returned = try storedVariantValue(operation.target_type, target_members[target_tag], active.payload, executor) };
-    }
-    if (value == .runtime and value.runtime == .variant) {
-        const payload = (try executor.lookupRuntime(value.runtime.variant.payload)) orelse return .unavailable;
-        if (payload.type_id == operation.target_type) return .{ .returned = .{ .runtime = payload.value } };
-        var reference = payload.value.function_ref;
-        reference.type_id = operation.target_type;
-        return .{ .returned = .{ .runtime = .{ .function_ref = reference } } };
-    }
-    if (active.member_type == operation.target_type) return .{ .returned = active.payload };
-    var reference = active.payload.runtime.function_ref;
-    reference.type_id = operation.target_type;
-    return .{ .returned = .{ .runtime = .{ .function_ref = reference } } };
 }
 
 fn atSpan(result: Result, span: ?structures.SourceSpan) Result {
@@ -1138,61 +1085,6 @@ fn atSpan(result: Result, span: ?structures.SourceSpan) Result {
             result,
         else => result,
     };
-}
-
-fn valueUse(
-    body: *const structures.FunctionBodyAnalysis,
-    slots: []const Value,
-    use: structures.FunctionValueUse,
-    executor: anytype,
-    gpa: std.mem.Allocator,
-) !Result {
-    const value = (try readSlot(slots, use.value, executor, gpa)) orelse return .unavailable;
-    const target = use.coerce_to orelse return .{ .returned = value };
-    if (use.variant_tag_mapping) |mapping| return coerceVariant(body, value, .{
-        .operand = use.value,
-        .target_type = target,
-        .tag_mapping = mapping,
-    }, executor);
-    var reference = value.runtime.function_ref;
-    reference.type_id = target;
-    return .{ .returned = .{ .runtime = .{ .function_ref = reference } } };
-}
-
-fn branchTarget(
-    body: *const structures.FunctionBodyAnalysis,
-    slots: []Value,
-    scratch: []Value,
-    branch: structures.FunctionBranch,
-    executor: anytype,
-    gpa: std.mem.Allocator,
-    storage: std.mem.Allocator,
-) !Step {
-    const target = body.blocks[@backingInt(branch.target)];
-    const arguments = body.branch_arguments[branch.arguments.start..branch.arguments.end];
-    std.debug.assert(arguments.len == target.argument_end - target.argument_start);
-    for (arguments, scratch[0..arguments.len], body.block_arguments[target.argument_start..target.argument_end]) |argument, *temporary, parameter| {
-        if (parameter.representation == .storage or try executor.argumentPassing(parameter.type_id) == .indirect) {
-            std.debug.assert(argument.coerce_to == null);
-            temporary.* = .{ .place = try storageCell(body, slots, argument.value, storage) };
-            continue;
-        }
-        switch (try valueUse(body, slots, argument, executor, gpa)) {
-            .returned => |value| temporary.* = try copyStoredValue(value, parameter.type_id, executor, storage),
-            else => |result| return .{ .result = result },
-        }
-    }
-    @memcpy(slots[target.argument_start..target.argument_end], scratch[0..arguments.len]);
-    return .{ .next = branch.target };
-}
-
-fn storageCursor(body: *const structures.FunctionBodyAnalysis, slots: []Value, operation: structures.BorrowOperation, executor: anytype, storage: std.mem.Allocator) !Result {
-    if (body.valueType(operation.source) == .static_data) return .{ .returned = .{ .runtime = .{ .storage_cursor = .{ .type_id = operation.type_id, .data = scalar(slots, operation.source).static_data } } } };
-    const owner = try storageCell(body, slots, operation.source, storage);
-    if (owner.contents != .allocation and !try expandFields(owner, executor)) return .unavailable;
-    const cell = try storage.create(Cell);
-    cell.* = .{ .type_id = operation.type_id, .storage = storage, .contents = .{ .storage_cursor = .{ .owner = owner, .offset = 0 } } };
-    return .{ .returned = .{ .place = cell } };
 }
 
 fn offsetStorageCursor(source: Value, type_id: structures.TypeId, offset: u32, storage: std.mem.Allocator) !Value {
@@ -1207,8 +1099,7 @@ fn offsetStorageCursor(source: Value, type_id: structures.TypeId, offset: u32, s
             if (cell.contents == .value) return offsetStorageCursor(.{ .runtime = cell.contents.value }, type_id, offset, storage);
             var cursor = cell.contents.storage_cursor;
             cursor.offset = std.math.add(u32, cursor.offset, offset) catch return error.TypeTooLarge;
-            const result = try storage.create(Cell);
-            result.* = .{ .type_id = type_id, .storage = storage, .contents = .{ .storage_cursor = cursor } };
+            const result = try Cell.create(storage, type_id, .{ .storage_cursor = cursor });
             return .{ .place = result };
         },
         .type, .initializer => unreachable,
@@ -1257,7 +1148,6 @@ pub fn allocationRecord(value: Value) *Allocation {
 }
 
 pub fn allocationValue(type_id: structures.TypeId, allocation: *Allocation, storage: std.mem.Allocator) !Value {
-    const cell = try storage.create(Cell);
-    cell.* = .{ .type_id = type_id, .storage = storage, .contents = .{ .allocation = allocation } };
+    const cell = try Cell.create(storage, type_id, .{ .allocation = allocation });
     return .{ .place = cell };
 }

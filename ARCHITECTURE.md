@@ -6,10 +6,10 @@ This is a high-level map of the compiler's ownership and stage boundaries. [synt
 
 - `src/main.zig` registers source inputs and requests `BuildExecutable`. Compiler queries in `src/queries.zig` coordinate parsing, semantic analysis, typing, compile-time interpretation, and code generation; the engine in `src/query/` schedules and memoizes work without depending on compiler stages. `src/structures.zig` holds shared data, and frontend and backend stages do not import query orchestration.
 - The engine records input and query dependencies, including reads of absent inputs. It can run independent queries on workers, but a result publishes only after its dependencies settle. Recomputations commit owned results, dependencies, and diagnostics together; equal observable results stop invalidation from propagating. Inputs are refreshed only while the database is idle.
-- Plain owned inputs, results, and intern values share structural copying, content equality, and recursive slice cleanup in `src/value.zig`; intern hashing follows the same fields. Types opt into these operations explicitly, so new fields participate automatically. Inputs retain distinct declaration identities; plain interners share lifecycle implementations keyed by value and ID type. AST payloads, maps, borrowed source graphs, and reference-counted snapshots retain their own representation and ownership rules.
+- Plain owned inputs, results, and intern values share structural copying, content equality, and recursive slice cleanup in `src/value.zig`; intern hashing follows the same fields. Types opt into these operations explicitly, so new fields participate automatically. Inputs retain distinct declaration identities; plain interners share lifecycle implementations keyed by value and ID type. Cleanup skips pointer-free payloads without reading union tags, so partial ASTs, typed bodies, and code artifacts use their ordinary teardown. AST equality follows syntax payload classification; maps, borrowed source graphs, and reference-counted snapshots retain explicit ownership rules.
 - A missing optional result can mean source rejection or unavailable state; source diagnostics are emitted separately. Infrastructure failures remain errors, and broken compiler invariants use assertions. `src/diagnostics.zig` owns presentation, not semantic decisions.
 - Query orchestration shares item location and AST loading without reading source text implicitly. Semantic-result helpers emit source issues and preserve infrastructure errors; each consumer chooses whether unavailable analysis propagates as an error or a missing query result.
-- AST nodes own payload classification and child enumeration. Equality, debug rendering, and semantic walkers share this syntax shape; walkers retain their own lexical and ownership boundaries.
+- AST nodes own payload classification and child enumeration. Equality, debug rendering, and semantic walkers share this syntax shape; walkers retain their own lexical and ownership boundaries. Semantic body construction shares one builder across explicit entry, function, compile-time expression, and constraint roots; only function roots permit returns.
 
 ## Sources and identity
 
@@ -49,6 +49,14 @@ This is a high-level map of the compiler's ownership and stage boundaries. [synt
 - `AnalyzeFunctionInstance(InstanceId)` owns all runtime bodies, including unspecialized declarations. `AnalysisContext` supplies source-dependent resolution, visibility, and specialization. Its `TypeFacts` view owns context-free structural and ownership lookups and is also used directly by diagnostics and cache validation. `HostTypes` adds physical layout for codegen; compile-time interpretation uses its own call executor. These adapters derive existing query facts without adding caches.
 - Typing chooses type-specific operations and explicit coercions before publication. Selected user-defined conversions use ordinary calls with ordinary destinations, reference origins, and cleanup. Joins, ownership uses, and fallible success/failure paths are represented in the graph; later stages do not rediscover their legality or build another general-purpose lowering IR. Source evaluation order is preserved.
 - Expression evaluation shares one dispatcher for access context, optional construction destination, and discarded results. Unevaluated type discovery and executed calls share member classification while retaining their separate evaluation and signature demands.
+- Ranges lower to ordinary standard-library constructor calls. Semantic `for`
+	lowering uses hidden source/cursor bindings, ordinary member calls, scopes,
+	conditionals, and loops. Typing selects an explicit `iter` factory or borrows
+	the source cursor in place; binding inference preserves owned versus borrowed
+	results. Advancement is evaluated before an exact bool query, so ordinary
+	failure is distinct from successful exhaustion. Generated protocol calls use
+	declared effects without requiring source call markers. Published IR, cleanup,
+	interpretation, and codegen need no iteration-specific representation.
 - Generic calls infer static arguments from unevaluated argument types before
 	evaluating their arguments. The specialized call prepares each argument once,
 	in source order, through the ordinary call path. Variant annotations with one
@@ -104,7 +112,16 @@ This is a high-level map of the compiler's ownership and stage boundaries. [synt
 - Calls share one operation with independent direct/indirect targets and optional result destinations. Owning initialization of an address-passed type constructs in the destination its consumer supplies: `local_storage` for locals, temporaries, and owned arguments, `result_storage` for the caller's result, and logical storage projections for fields, variant payloads, and array elements. Derived `argumentPassing` selects this representation for arrays and containing structs or variants as well as types that cannot move directly; it is not a duplicate ownership-capability field. Ordinary calls, copies, moves, and variant coercions write those destinations; conditional and loop results propagate them, and fallible results construct in storage instead of crossing the success edge. Typing never relocates a completed value that cannot move directly and rejects forms that would need it. Inferred-return compile-time thunks publish their result as a value instead. `Box.new` directly allocates one slot before forwarding its init parameter to fallible raw slot initialization. Success transfers the allocation into a Box; failure explicitly deallocates it after initializer cleanup and propagates with `fail`. No private storage guard, constructor interception, or Box-specific construction instruction is needed. Typing owns evaluation order, captures, and cleanup paths; codegen and the compile-time interpreter consume explicit destinations and operations.
 - An address-passed value is denoted by its storage independently of its direct movability. Field and array-element reads are storage projections, and a mutable local keeps one storage value across field updates, replacements, `ref`/`mut` arguments, and loops. Reference arguments pass the caller's address directly; no mutable-result copy-back operation is needed. Loops carry only the local's lifetime generation, not a block argument. Directly movable replacement prepares an owned value in separate storage, retains the target generation through preparation, and transfers into the existing storage after ending the old generation. Typing scopes local and reference targets during call preparation and retains every argument's backing owners through call completion and control-flow exits. Reference retention tracks live owners without treating it as access to an invalidated referent; ordinary access validation remains unchanged. Only ownership capabilities requiring destination construction select destructive replacement: the old value ends before constructing in the same storage, and a replaced field leaves its root's generation first, so an exit sees that field missing. Joins that select address-passed values pass addresses; codegen gives their block arguments address slots, and the compile-time interpreter passes storage cells, promoting a runtime slot before a storage projection or address-passed join creates a view. Compile-time field reads materialize only the selected field, so an unfinished sibling does not prevent access.
 - Reference contracts preserve source and result paths through direct calls, converters, and custom ownership hooks. Fieldwise ownership preserves field correspondence; only unknown callable effects need conservative result projection. Parameter writeback merges all possible loans for each written referent before updating caller state. Slot identity, content identity, and variant-tag identity are independent, so a content write does not invalidate a surviving inline address or unchanged variant tag. Contract path walking uses physical reference-field storage, crossing internal references implicitly for structural steps and explicitly for referent outputs; snapshot validation accepts the same paths as body analysis.
-- Struct construction and fieldwise copy or move use explicit storage and field projections for every ABI representation. Updating a directly passed struct copies its root once and writes the selected field into that copy, preserving earlier SSA values. Address-passed owners keep their existing storage. These operations share the array and variant storage machinery; struct construction and field replacement require no separate typed instructions or field-value table.
+- Unresolved loop reference origins defer source paths, returned-place storage
+	depth and identity, readonly attenuation, reads, and refreshes until their
+	incoming origins are known. State-dependent transformations retain the state
+	at their use, so stable cursor aliases do not erase allocated-content loans
+	or refresh a retained view across an invalidating advancement.
+	Reference-access checks have exact instruction-position checkpoints, separate
+	from the statement boundaries that collect lifetime effects. CFG validation
+	checks inferred writes from ordinary calls, fallible-call terminators, and
+	cleanup between acquisition and access, preserving field-path distinctions.
+- Struct construction and fieldwise copy or move use explicit storage and field projections for every ABI representation. Updating a directly passed struct copies its root once and writes the selected field into that copy, preserving earlier SSA values. Address-passed owners keep their existing storage. Copy and move share value-transfer dispatch and aggregate traversal while retaining separate ownership effects. Struct construction and field replacement use the array and variant storage machinery without separate typed instructions or field-value tables.
 - For a borrowed variant argument that cannot move directly, its known type follows conditional results and loop breaks. Fresh initializers construct into storage of that type; existing values of the same type retain their borrowed storage. Widening an existing narrower value still requires direct movability. Typing carries the borrow context separately from an owning destination and preserves the source's cleanup and reference origins when widening directly movable values.
 - Compile-time expressions that require evaluation, including initializers, static arguments, and expressions in type positions, are typed before interpretation; direct type aliases and declared struct identities can resolve without it. Compile-time calls are memoized by concrete instance and canonical argument values. Interpreted outcomes distinguish values, fallible failure, and compiler control; type values have no runtime representation.
 - Static array values publish as semantic `array_init` expressions, lowering
@@ -120,7 +137,9 @@ This is a high-level map of the compiler's ownership and stage boundaries. [synt
 	on failure, compiler exit, or infrastructure errors. User destruction remains
 	ordinary typed cleanup, not a heap callback.
 	The query adapter owns canonical values, call keys, and dependency tracking.
-	Nested calls and initializer regions share the heap and recursion frames.
+	Nested calls and initializer regions share the heap and recursion frames. An
+	`ExecutionFrame` borrows the body, slots, scratch space, and executor; it places
+	instruction results and propagates control outcomes centrally.
 	Calls carrying transient values, or whose resolved results or mutable parameters
 	may retain storage identities, execute transiently; argument shape alone cannot
 	make a zero-argument factory cacheable. Representable calls retain canonical
@@ -157,21 +176,16 @@ indirect callees, writable references, hooks, and implicit cleanup. Deferred rea
 conflict with every write to their referent; ordinary reference reads retain the
 checks for invalidated owned storage. Borrowed aggregate or owning parameters
 may alias other reference inputs; directly passed scalar copies have private
-storage. Writes, including mutable calls and explicit reference dereferences, update caller storage
-immediately and survive later failure. Mutability and transfer authority remain
-independent. Mutable reference writeback preserves the handle and merges conservative
-stored-reference origins into tracked local owners, including boxed referents.
-Call outputs retain incoming contained-reference origins conservatively. A
-borrow of an immutable argument's own storage adds that argument's owner only
-when the output's referent types can occur in the argument's inline or owned
-storage. Reference descriptors do not own their referents. Each mutable output
-applies this signature-based test independently; caller analysis needs no
-callee body to establish these dependencies.
+storage. Writes update caller storage immediately and survive later failure;
+mutability and transfer authority remain independent. Inferred reference contracts
+carry result and mutation effects, with conservative projection for unknown
+callables. Mutable outputs merge stored-reference origins into tracked owners,
+including boxed referents. Reference descriptors do not own their referents.
 Reference-bearing writes through aliases with untracked owners are rejected at
-argument preparation rather than silently losing dependency information.
+argument preparation.
 Symbolic capture origins retain projections until caller substitution;
-result origins and mutable effects cross forwarding without querying receiver
-bodies. Region-local references cannot escape.
+result origins and mutable effects cross forwarding through reference contracts.
+Region-local references cannot escape.
 
 Transfers use caller-owned boolean cells for roots and field paths. Moves set
 them when performed; consuming calls set them after eager argument preparation.
@@ -271,11 +285,6 @@ Remaining work and priorities are tracked in
 - Declared and generated structs publish a common definition with fields and validated ownership hooks. `OwnershipCapabilities(TypeId)` validates logical by-value containment and composes move, copy, and drop facts without requesting physical layout. Arrays compose these facts from their element type and length; empty arrays are trivial, contain no reference origins, and impose no element-hook obligations. Layout consumes validated facts before determining size, alignment, and field, variant, or array placement. Array length is a nonnegative static `int`; byte size is checked at natural element alignment, including zero-length arrays and zero-sized elements. Direct movement is derived from capabilities, not stored separately, and remains independent of derived `argumentPassing`. `HostTypeLayout(TypeId)` describes the x86-64 host representation; a non-host layout must be derived for its target's location-specific layout domain, never inferred from host layout. [syntax&semantics.txt](syntax&semantics.txt) owns the provider, location, layout, and access contracts.
 - Typed borrowed places carry field-index paths, not byte offsets. Borrowing, consuming arguments, and receiver resolution share source-place traversal and field-name and visibility validation; codegen resolves physical offsets from the trusted path. Reference origins retain independent field, variant, and owned-element projections. Slot-storage identity is separate from the current contents' identity, including at loop joins.
 - Custom copy and move hooks may rearrange reference-bearing fields, so their results conservatively retain all possible source origins rather than assuming field correspondence. Their result origins use the same shape projection as ordinary calls. Hook effects invalidate writable referents, including during in-place copies. Call arguments retain the provenance of their prepared values, and indirect callees retain borrow metadata through argument evaluation.
-- Function return dependencies conservatively include all runtime inputs capable
-	of supplying origins. This covers borrowed storage and references contained
-	in prepared values; signatures have no `from` syntax or explicit contracts
-	that narrow those dependencies. Callers substitute actual argument origins
-	without querying receiver bodies.
 - `deinit` call arguments carry exact-typed source storage; typing propagates consuming access through conditional and loop results and materializes fresh argument coercions before publishing their addresses. Storage joins preserve the selected address in codegen and the selected cell in compile-time interpretation, including directly movable and zero-sized types. Preparing an owned root retains its generation until the call or failure cleanup. Typing rejects overlapping writes to any retained source while later arguments are prepared. Move hooks receive consuming access, and nested hooks dispatch normally. Local deinit authority is separate from a generation's fields-only cleanup policy. Typing derives remaining explicit-field obligations before lifetime planning; the solver does not interpret structural ownership. Deferred `init` capture effects are checked at callable acquisition and argument preparation, with published regions and cleanup surviving query/cache reuse; the language document owns those contracts.
 - `AnalysisContext` derives `copy` and `move` member availability from validated ownership capabilities and specializes private declarations in `std/ownership.chi`. These use ordinary instance identities and canonical callable types, with capability checks also applied when their signatures are demanded. Typing builds their bodies with the existing selected ownership operations and lifetime machinery; runtime codegen and compile-time interpretation consume ordinary typed IR. No member query, recursive source wrapper, or backend ownership dispatch is added.
 - Typing tracks ownership at control-flow edges. Lifetime effects are recorded in a boundary of the block where their operation executes; block statements and results never record into an enclosing expression's boundary. A `mut` parameter root is caller-owned and carries no generation; a value assigned to the whole root passes to the caller's place. After constructing the graph, `src/frontend/lifetime.zig` produces one path-sensitive ending plan. Each generation's explicit-drop requirement determines whether its ending is an abandonment diagnostic or automatic cleanup. Typing rejects abandonment before materializing the accepted plan as ordinary typed operations; neither the solver's state nor a generic destruction operation enters published IR.
@@ -284,27 +293,20 @@ Remaining work and priorities are tracked in
   defines the selected payload's generation; the failure edge keeps whole-value
   cleanup. If matched alternatives require explicit drop, failure consumes that
   generation and drops only the unmatched automatic alternatives, using original
-  variant tags. Borrowed extraction retains copy semantics. Projections preserve
-  established reference origins rather than attaching their temporary binding
-  identity to an unrelated parameter root.
-- Source places have local, parameter, or explicit dereference roots with field
-  paths. Resolving a dereference evaluates its Ref once; it needs no anonymous
-  local or named-alias representation. Typing checks permissions and retains
-  reference origins across writes and mutable calls. Published IR uses ordinary
-  borrowed reads, addresses, and writes. Ref casts project concrete variant
-  members without copying, using the referent's tag and retaining its origins.
-  Acquiring a local address pins that local to storage; deferred captures pin
-  their local inputs as well, so loops and later references use the same slot.
-  Known local reference projections preserve field precision on mutable output.
-  Frame storage dependencies are separate from caller-owned allocated storage;
-  a reference to a copied parameter cannot escape with its frame.
-  Ordinary indexing remains the [] operation; get/get_mut return explicit Ref
-  values. Copied reads validate copy capability at the user's access boundary.
-- The registered std.memory Ref type constructor accepts one type argument,
-  optionally qualified by mut. Semantic analysis normalizes it to the private
-  RefStorage(element, writable) specialization. Recognition uses the registered
-  declaration identity, and no mutable-type runtime value is introduced. Public
-  visibility follows the referent type, not the private representation wrapper.
+  variant tags. Owned bindings copy borrowed payloads; ref bindings alias them.
+  Projections retain established reference origins across bindings.
+- Source places have local, parameter, or reference-result roots with typed field
+  paths. `ref` bindings, parameters, and results preserve storage identity and
+  access permission; reference fields expose T while storing its address. Typed
+  IR uses borrowed reads, addresses, and writes. Variant payload borrows retain
+  their origins and active-tag dependency. Acquiring a local address or capturing
+  a local pins its storage across loops and later references. Projections preserve
+  field precision on mutable output. Frame storage remains distinct from
+  caller-owned allocations, so references to copied parameters cannot escape.
+  `Ref(T)` is an ordinary struct with one public reference field, `value`;
+  `Ref.from(place)` constructs its handle. Array, List, and Span `get` and `[]`
+  return `ref T` with receiver permissions. Owned reads copy T at the access
+  boundary; ref bindings alias it.
 - Semantic return statements preserve whether the body supplied an implicit
   return. Typing evaluates and discards inline unit bodies with ordinary lifetime
   effects; explicit returns and bodies with other result types check the result.
@@ -322,18 +324,16 @@ evaluates its argument once and makes `N` ordinary copies, including custom
 hooks. It requires element copy support even at zero length, where the argument
 still evaluates but no copies run; this constructor requirement is separate
 from the empty array's trivial capabilities. Whole-array copy, move, and drop
-lower through typed loops over element operations. Fallible `get` and `get_mut`
-check bounds and return immutable or writable references tied to the array's
-checked origin. Dynamic element origins may conservatively cover the whole
+lower through typed loops over element operations. Fallible `get` checks bounds
+and returns `ref T` with the array's permission and checked origin. Dynamic element origins may conservatively cover the whole
 array without disjoint-index proofs. Collection literals construct elements in
 source order directly into final storage, including immovable elements; partial
 failure cleans the current element and completed prefix in reverse order.
 Without an expected target they construct an Array. Expected targets derive
 element types through existing converter declarations and static inference.
 Pending `collection_literal(T, N)` types have no ordinary value representation.
-Standard `[]` and `[]=` methods reuse checked `get`/`get_mut` and reference
-replacement. Reads copy elements through ordinary ownership operations; writes
-prepare owned arguments before setter bounds checks and retain automatic-drop,
+Standard `[]` and `[]=` methods reuse checked `get` and reference replacement.
+Setters prepare owned arguments before bounds checks and retain automatic-drop,
 direct-move, and reference-origin restrictions. Collection conversions, handled
 initializers, and call preparation scope pending capture restrictions through
 their synchronous construction boundary, retaining outer pending captures and
@@ -372,147 +372,24 @@ prefix. Do not introduce a thin allocation handle until retaining layout and
 location has a demonstrated material cost. Compiler storage and lifetime checks
 need not be expressible as ordinary library code.
 
-`Ref(T)`, `Ref(mut T)`, and `Span(T, writable)` share a private typed `StorageCursor`.
-Ref denotes one initialized element; Span adds initialized length and checked
-indexing/slicing. Their permission is independent of handle-binding mutability.
-Safe constructors borrow initialized arrays or List prefixes; unsafe allocation
-constructors leave initialization proof to the caller. Cursor identity and shape
-are validated at the standard-library analysis boundary, not inferred from field
-layout or exposed numeric addresses. Host layout lowers a cursor to one address,
-and a Span to that address plus an `int` length; element offsets use T's layout,
-including zero-sized elements.
+References and `Ref(T).value` store one address; `Span(T)` stores a private typed
+`StorageCursor(T)` and initialized length for checked indexing and slicing.
+Captured origins and the current access path determine permission; mutable
+bindings cannot upgrade readonly captures. Safe constructors borrow initialized
+arrays or List prefixes; unsafe allocation constructors require initialization
+proof. Cursor identity and shape are validated at the standard-library analysis
+boundary. Host layout resolves element offsets, including zero-sized elements.
 
-Ordinary call results and mutable outputs conservatively distribute every possible
-input origin over their borrowing fields, elements, and variant members; equal input and output
-types do not establish field correspondence. Returned readonly ranges depend on
-contents, including inside aggregates, while Ref and writable range handles retain
+Reference contracts preserve result and mutation dependencies through fields,
+elements, and variants; unknown callables conservatively project possible inputs.
+Returned readonly ranges depend on contents, including inside aggregates,
+while Ref and writable range handles retain
 storage dependencies. Writes invalidate contents even without automatic drop.
 Replacing an aggregate does not itself write through independent handles stored in it;
 effects through nested writable handles are tracked separately. Stable slot
 handles can observe replacement, while nested owner borrows and readonly ranges
 retain content dependencies. UTF-8 validation cannot outlive conflicting byte
 writes. Owner transfer still invalidates earlier borrows.
-
-### Future allocation interface
-
-This is a conceptual interface, not public non-host declarations. Layout
-resolution binds a target, location, type, count, and alignment before a provider
-receives the request. Keep resolved byte `AllocationLayout` separate from that
-typed request so a host layout cannot be paired with device storage, or a count
-with inconsistent bytes:
-
-```text
-fallible resolve_layout(
-		static T: type,
-		target,
-		location,
-		count,
-		alignment = natural_for(T, target, location),
-) ResolvedAllocationLayout(T)
-
-fallible allocate(
-		mut provider,
-		resolved: ResolvedAllocationLayout(T),
-) Allocation(T)
-
-func deallocate(static T: type, deinit allocation: Allocation(T))
-```
-
-Prefer `allocate` and `deallocate`; `release` is ambiguous with decrementing
-shared ownership. The allocation retains the resolved request and provider
-authority directly or through lifetime dependencies. Layout and location
-accessors remain sketches. Host low-level operations stay under `std.memory`,
-with matching `Allocation` methods; `Box` and `Ref` are prelude exports.
-`unsafe_own_box` is internal ownership transfer, not a public constructor.
-Consuming `value(T, owner)` uses deinit access without preliminary owner
-relocation; `get_value` would obscure borrowing versus copying versus transfer.
-`Ref.copy` copies only the handle; `Ref.read` requires pointee copy support.
-
-Convenience wrappers may bind location and provider without merging them:
-
-```text
-host.allocate(layout, using = allocator)
-device.allocate(layout)
-copy(source, mut destination)
-```
-
-These spellings remain conceptual. `device` is a runtime resource for one
-device, not an enum case. A kernel boundary produces an address-space-qualified
-Ref or view with a representation validated for that target; host code cannot
-dereference device-only memory. Workgroup and private storage remain explicit
-kernel declarations. Non-host layouts must be keyed by type and the target's
-location-specific layout domain. Add neither a device layout query nor a
-general provider dispatcher until a concrete target needs them; start with
-validated scalar elements. The roadmap owns remaining prerequisites and the
-deferred shared-owner design.
-
-### Mojo comparison
-
-The storage design was informed by Modular's repository at commit
-[`975baa7`](https://github.com/modular/modular/tree/975baa793c02665a36194c285496e133c9452068),
-inspected on 2026-09-17. Bracketed parameter lists and *origin* below are Mojo
-terminology, not proposed Chimera syntax.
-
-- Mojo's [allocation API](https://github.com/modular/modular/blob/975baa793c02665a36194c285496e133c9452068/Mojo/stdlib/std/memory/alloc.mojo)
-	uses `Layout[T, alignment]` with runtime element count and compile-time
-	alignment, deriving byte size. `Allocation[T]` owns storage and deallocation
-	layout; consuming it invalidates dependent origins. `ThinAllocation` retains
-	only the owning pointer and requires unsafe reattachment of the exact layout.
-	`ManagedAllocation` frees storage automatically but accepts only trivially
-	destructible elements because freeing does not run destructors. Allocation
-	failure and negative counts abort; zero-sized types use a dangling sentinel.
-	Chimera instead retains complete deallocation facts, uses ordinary fallible
-	failure, and requires distinct stable identities for successful zero-byte
-	allocations.
-- Mojo's [Pointer](https://github.com/modular/modular/blob/975baa793c02665a36194c285496e133c9452068/Mojo/stdlib/std/memory/pointer.mojo)
-	combines pointee type, mutability, origin, and address space. It is non-null;
-	arithmetic, raw-address access, initialization, and destruction are unsafe.
-	`UnsafePointer` is a deprecated alias. This supports one non-owning Chimera
-	Ref abstraction, with permission granted only by its access path.
-	[OwnedPointer](https://github.com/modular/modular/blob/975baa793c02665a36194c285496e133c9452068/Mojo/stdlib/std/memory/owned_pointer.mojo)
-	allocates a single-element layout, copies or moves its value, and destroys it
-	before deallocation; interior origins depend on the owner. Chimera's Box uses
-	the same ownership model but initially retains a complete allocation rather
-	than a thin handle with reconstructed layout.
-- Mojo's [ArcPointer](https://github.com/modular/modular/blob/975baa793c02665a36194c285496e133c9452068/Mojo/stdlib/std/memory/arc_pointer.mojo)
-	has a control block containing payload and atomic strong and weak counts.
-	This bookkeeping does not synchronize payload access. Only the control-block
-	pattern informs a future Chimera shared owner, not the Arc/WeakPointer names
-	or upgradeable weak semantics.
-- Mojo's [AddressSpace](https://github.com/modular/modular/blob/975baa793c02665a36194c285496e133c9452068/Mojo/stdlib/std/memory/address_space.mojo)
-	defines `GENERIC`, `GLOBAL`, `SHARED`, `CONSTANT`, and `LOCAL` as pointer
-	parameters; [stack_allocation](https://github.com/modular/modular/blob/975baa793c02665a36194c285496e133c9452068/Mojo/stdlib/std/memory/stack_allocation.mojo)
-	lowers GPU shared, constant, and local storage by compile-time address space.
-	Address space and dynamic allocation policy remain separate dimensions.
-- Mojo's [DeviceContext and DeviceBuffer](https://github.com/modular/modular/blob/975baa793c02665a36194c285496e133c9452068/max/mojo/max/gpu/host/device_context.mojo)
-	form a separate host-side GPU API, not a location-generalized `alloc`.
-	A device-global buffer is freed through its context and becomes a device
-	Pointer at a kernel boundary. Copies are explicit and asynchronous; pinned
-	HostBuffer is also available. DeviceBuffer accepts scalar `DType` elements,
-	not arbitrary host types, and kernel arguments use a
-	`DevicePassable.device_type` mapping with target-aware ABI checks. This
-	prevents host dereference of inaccessible memory but duplicates allocation
-	surfaces without a general location model; unlike `alloc`, buffer creation
-	is fallible. Chimera keeps location separate and initially requires
-	synchronous transfers unless a completion resource retains both allocations.
-
-## Storage design
-
-The implemented host API fixes execution target, provider, and location
-implicitly. `Allocation(T)` retains logical element count separately from
-mapped byte size; public counts are `int`, while checked byte-size arithmetic
-uses wider unsigned storage. For a zero-byte request the host provider reserves
-one byte for a distinct stable address and records the reserved size for
-deallocation without changing the logical count or layout.
-
-`Allocation` is explicit-drop and owns deallocation facts, not element
-initialization state. It needs no runtime initialization bitmap: unsafe indexed
-operations require caller-proven bounds and initialization, while containers
-track initialized ranges. `Box` retains a complete one-element allocation;
-`List` derives capacity from its allocation and tracks only its initialized
-prefix. Do not introduce a thin allocation handle until retaining layout and
-location has a demonstrated material cost. Compiler storage and lifetime checks
-need not be expressible as ordinary library code.
 
 ### Future allocation interface
 
@@ -671,7 +548,7 @@ Chimera uses unique ownership and rejects ambient compile-time I/O.
 ## Backend and execution
 
 - Codegen consumes the published graph and layout queries directly, producing owned machine code and symbolic references per function without compiling callees. Reachability starts at the designated file's synthetic top-level entry, includes referenced callable values, and supplies a deterministic order for linking an x86-64 ELF executable. A function named `main` has no special entry role.
-- Derived `argumentPassing` accounts for type structure and ownership capabilities: arrays and containing structs or variants pass by address even when directly movable, as do types that cannot move directly. One backend `CallLayout` supplies storage planning, argument emission, returns, mutable copy-back, and copy hooks. Mutable calls write their updated arguments back. The calling convention is internal to the compiler, not a platform ABI.
+- Derived `argumentPassing` accounts for type structure and ownership capabilities: arrays and containing structs or variants pass by address even when directly movable, as do types that cannot move directly. One backend `CallLayout` derives incoming and outgoing argument and return locations from type/representation pairs; incoming parameters borrow their typed block descriptors directly. The calling convention is internal to the compiler, not a platform ABI.
 - Aggregate construction uses addressable storage, including four-byte register returns. Constant field and variant projections of known stack storage fold into stack offsets without emitted pointers. Shared backend `copyRange` emits bulk byte copies for any aggregate when the selected operation permits them, not just arrays; nontrivial element operations retain typed loops and hooks. The encoder and assembly renderer share opcode bytes, operand widths, and display forms in `src/backend/x86_encoding.zig`; unknown bytes end decoding rather than permitting resynchronization inside an instruction. Divergence blocks emit an invalid-instruction trap so unexpected fallthrough cannot execute another block or outlined region.
 - Embedded standard-library declarations use ordinary lookup, signatures, and instance identities. Supported compiler-owned externs, including exit and host-memory operations, publish artifacts under those identities. Allocation and extraction use host-only emitters; slot construction uses ordinary typed init calls into host storage. Another location will require its own provider and access path. A compile-time exit instead propagates compiler control to the driver without producing an executable. `src/runtime.zig` publishes and runs successful executables.
 - Standard calls are classified by registered declaration identity at the analysis boundary; lowering retains the resolved behavior instead of rediscovering names. Box, List, and reference-write type eligibility is checked when a signature is demanded, including acquisition as a function value. These capability constraints remain compiler-owned until the language can express them. Reference-write eligibility is shared with assignment typing. `Box.new` is an ordinary fallible library init receiver with explicit allocation cleanup. The compiler-owned fallible raw slot initializer publishes a typed body that selects an allocation element and invokes its init parameter into that destination; backend calls use the general init protocol.

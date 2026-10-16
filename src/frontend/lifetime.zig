@@ -138,18 +138,18 @@ pub const Solver = struct {
     ownership_edges: []const OwnershipEdge,
     control_flow: control_flow.Index,
     entry: structures.FunctionBlockId,
-    reachable: []bool,
-    dirty_blocks: []bool,
-    available_in: []u64,
-    available_out: []u64,
-    representations_in: []?structures.FunctionValueId,
-    representations_out: []?structures.FunctionValueId,
-    live_in: []u64,
-    live_out: []u64,
-    scratch: []u64,
-    edge_scratch: []u64,
-    representation_scratch: []?structures.FunctionValueId,
-    edge_representation_scratch: []?structures.FunctionValueId,
+    reachable: []bool = &.{},
+    dirty_blocks: []bool = &.{},
+    available_in: []u64 = &.{},
+    available_out: []u64 = &.{},
+    representations_in: []?structures.FunctionValueId = &.{},
+    representations_out: []?structures.FunctionValueId = &.{},
+    live_in: []u64 = &.{},
+    live_out: []u64 = &.{},
+    scratch: []u64 = &.{},
+    edge_scratch: []u64 = &.{},
+    representation_scratch: []?structures.FunctionValueId = &.{},
+    edge_representation_scratch: []?structures.FunctionValueId = &.{},
     words_per_block: usize,
 
     pub fn init(
@@ -162,43 +162,10 @@ pub const Solver = struct {
         ownership_edges: []const OwnershipEdge,
         entry: structures.FunctionBlockId,
     ) !Solver {
-        const graph = try control_flow.Index.init(gpa, blocks.len, ownership_edges);
-        errdefer graph.deinit(gpa);
         const words_per_block = GenerationBits.wordCount(generations.len);
         const matrix_len = std.math.mul(usize, blocks.len, words_per_block) catch return error.AnalysisTooLarge;
-        const reachable = try gpa.alloc(bool, blocks.len);
-        errdefer gpa.free(reachable);
-        const dirty_blocks = try gpa.alloc(bool, blocks.len);
-        errdefer gpa.free(dirty_blocks);
-        const available_in = try gpa.alloc(u64, matrix_len);
-        errdefer gpa.free(available_in);
-        const available_out = try gpa.alloc(u64, matrix_len);
-        errdefer gpa.free(available_out);
         const representation_len = std.math.mul(usize, blocks.len, generations.len) catch return error.AnalysisTooLarge;
-        const representations_in = try gpa.alloc(?structures.FunctionValueId, representation_len);
-        errdefer gpa.free(representations_in);
-        const representations_out = try gpa.alloc(?structures.FunctionValueId, representation_len);
-        errdefer gpa.free(representations_out);
-        const live_in = try gpa.alloc(u64, matrix_len);
-        errdefer gpa.free(live_in);
-        const live_out = try gpa.alloc(u64, matrix_len);
-        errdefer gpa.free(live_out);
-        const scratch = try gpa.alloc(u64, words_per_block);
-        errdefer gpa.free(scratch);
-        const edge_scratch = try gpa.alloc(u64, words_per_block);
-        errdefer gpa.free(edge_scratch);
-        const representation_scratch = try gpa.alloc(?structures.FunctionValueId, generations.len);
-        errdefer gpa.free(representation_scratch);
-        const edge_representation_scratch = try gpa.alloc(?structures.FunctionValueId, generations.len);
-        errdefer gpa.free(edge_representation_scratch);
-        @memset(reachable, false);
-        @memset(available_in, 0);
-        @memset(available_out, 0);
-        @memset(representations_in, null);
-        @memset(representations_out, null);
-        @memset(live_in, 0);
-        @memset(live_out, 0);
-        return .{
+        var solver: Solver = .{
             .gpa = gpa,
             .generations = generations,
             .boundaries = boundaries,
@@ -206,22 +173,31 @@ pub const Solver = struct {
             .block_argument_generations = block_argument_generations,
             .ownership_forwards = ownership_forwards,
             .ownership_edges = ownership_edges,
-            .control_flow = graph,
+            .control_flow = try control_flow.Index.init(gpa, blocks.len, ownership_edges),
             .entry = entry,
-            .reachable = reachable,
-            .dirty_blocks = dirty_blocks,
-            .available_in = available_in,
-            .available_out = available_out,
-            .representations_in = representations_in,
-            .representations_out = representations_out,
-            .live_in = live_in,
-            .live_out = live_out,
-            .scratch = scratch,
-            .edge_scratch = edge_scratch,
-            .representation_scratch = representation_scratch,
-            .edge_representation_scratch = edge_representation_scratch,
             .words_per_block = words_per_block,
         };
+        errdefer solver.deinit();
+        solver.reachable = try gpa.alloc(bool, blocks.len);
+        solver.dirty_blocks = try gpa.alloc(bool, blocks.len);
+        solver.available_in = try gpa.alloc(u64, matrix_len);
+        solver.available_out = try gpa.alloc(u64, matrix_len);
+        solver.representations_in = try gpa.alloc(?structures.FunctionValueId, representation_len);
+        solver.representations_out = try gpa.alloc(?structures.FunctionValueId, representation_len);
+        solver.live_in = try gpa.alloc(u64, matrix_len);
+        solver.live_out = try gpa.alloc(u64, matrix_len);
+        solver.scratch = try gpa.alloc(u64, words_per_block);
+        solver.edge_scratch = try gpa.alloc(u64, words_per_block);
+        solver.representation_scratch = try gpa.alloc(?structures.FunctionValueId, generations.len);
+        solver.edge_representation_scratch = try gpa.alloc(?structures.FunctionValueId, generations.len);
+        @memset(solver.reachable, false);
+        @memset(solver.available_in, 0);
+        @memset(solver.available_out, 0);
+        @memset(solver.representations_in, null);
+        @memset(solver.representations_out, null);
+        @memset(solver.live_in, 0);
+        @memset(solver.live_out, 0);
+        return solver;
     }
 
     pub fn deinit(self: *Solver) void {
@@ -989,6 +965,21 @@ fn testSolverGeneration(start_order: u32, explicit: bool) Generation {
         .requires_explicit_drop = explicit,
         .cleanup_fields = false,
     };
+}
+
+test "lifetime solver releases partially initialized storage on OOM" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 6 });
+    try std.testing.expectError(error.OutOfMemory, Solver.init(
+        failing.allocator(),
+        &.{testSolverGeneration(0, false)},
+        &.{},
+        &.{.{ .argument_start = 0, .argument_end = 0, .terminator = .return_unit }},
+        &.{},
+        &.{},
+        &.{},
+        @fromBackingInt(0),
+    ));
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
 }
 
 test "lifetime solver plans straight-line last and zero uses" {

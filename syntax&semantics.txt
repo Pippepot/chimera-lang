@@ -904,6 +904,8 @@ fallible forward_initializer(static T: type, init item: T) T
 
 # References, places, and ownership
 # A place is initialized storage with an access permission and a lifetime.
+# `ref` denotes the same nonowning aliasing relationship in bindings, parameters,
+# results, and fields; it is not a general type constructor.
 # `const item = expression` and `var item = expression` own their values. When
 # expression supplies a borrowed place, these bindings copy T and require T.copy.
 # `ref item = expression` instead aliases that place, preserving its permission
@@ -928,12 +930,16 @@ fallible forward_initializer(static T: type, init item: T) T
 # Borrowed results must designate caller or permanent storage; local and copied
 # parameter frame storage cannot escape. Physical layout does not change this rule.
 #
+# Field `ref` selects borrowed instead of owned storage. Parameter access and
+# construction/destruction modes are separate concepts, not field modifiers.
 # A field declared `pub ref value: T` stores a nonowning address while exposing
 # logical type T. Initialization captures a place; assignment writes its referent.
 # Copying the field copies its address and retained permission, without copying T.
 # Destruction never destroys T through a reference field. Reference fields do not
 # participate in inline containment cycles or inherit T's move/copy/drop duties.
 # Ref(T) is the ordinary generic struct with one public reference field, value.
+# It makes that relationship an ordinary value for replacement and containers.
+# Replacing a handle does not retarget aliases already captured from its value.
 # `Ref.from(place)` constructs a handle. There is no Ref(mut T), permission type
 # argument, borrow binding modifier, address operator, or empty [] dereference.
 # Box(T), in contrast, owns its initialized T and destroys it before deallocation.
@@ -1872,15 +1878,86 @@ loop
 
 
 # Ranges and for iteration
-# a..b excludes b; a..^b includes b. These forms iterate upward; a start greater
-# than the end produces an empty range. Thus x..x is empty and x..^x contains
-# exactly x. Descending iteration requires an explicit operation whose spelling
-# remains open. Endpoint types, steps, and overflow behavior remain open.
+# a..b excludes b; a..^b includes b. Both endpoints have type int and are
+# evaluated exactly once, left to right. Arithmetic binds more tightly than a
+# range; a range binds more tightly than comparisons. The result is an ordinary
+# reusable std.range.Range value, not an active cursor or a collection of items.
+# These finite ranges initially iterate upward. A start greater than the end
+# produces an empty range; x..x is empty and x..^x contains exactly x.
 #
-# for x in iterable supports ranges, lists, other collections, and custom types
-# conforming to an iteration contract. The conformance mechanism remains open.
-# Plain iteration provides read-only access by default; modifying or consuming
-# collection elements through iteration requires explicit syntax, still TBD.
-# Item lifetime, binding representation, and loop result semantics remain open.
+# reversed() reverses the actual sequence, including a stepped sequence.
+# step_by?(positive_factor) selects the first item and then every factor-th item
+# of the receiver's sequence. It fails for a zero or negative factor, even on
+# an empty range. Repeated stepping composes sequence selection. Neither the
+# signed endpoint distance nor a composed stride must fit in a positive int.
+# Iteration checks the final item before advancing past it, so inclusive ranges
+# ending at 2147483647 terminate without wrapping. Reversal and stepping do not
+# add items outside the original sequence. Reversing an empty range is empty.
+fallible range_examples()
+    const selected = (0..10).step_by?(4) # 0, 4, 8
+    const backward = selected.reversed() # 8, 4, 0
+    const other = (0..10).reversed().step_by?(4) # 9, 5, 1
+
+# for uses ordinary methods, not a special declaration kind or generator:
+#   iter(...) Cursor          optional source-to-cursor factory
+#   advance(...) bool         required cursor operation
+#   current(...) T / ref T    required cursor operation
+# Methods retain their ordinary receiver modes, ownership, and fallibility.
+# Generic methods and callable fields follow ordinary member-call rules.
+# No trait, associated item type, iter declaration, or yield syntax is required.
+#
+# The source is evaluated once. A named source is borrowed without copying;
+# a fresh source is owned in the loop's setup scope. If an iter member exists,
+# it is invoked once to prepare the cursor. An invalid explicit iter member is
+# an error, not permission to fall back. Without iter, the source itself is the
+# cursor: named cursor state resumes in place instead of being copied or reset.
+# A factory's fresh result is owned, and a borrowed result remains borrowed.
+# Ordinary cleanup and last-use rules apply to both source and cursor.
+#
+# Each iteration calls advance once. Its successful result must be bool;
+# no conversion or truthiness is applied. Successful false means exhaustion.
+# Successful true is followed by exactly one current call and then the body.
+# A failure from source preparation, iter, advance, current, or the body is
+# ordinary failure of the complete for expression, never implicit exhaustion.
+# Surrounding conditions and expected variants may capture it normally.
+# current is never called before successful advancement or after exhaustion.
+# current may consume a buffered owned item; repeatability is not required.
+# Even an underscore binding acquires the item once and performs its cleanup.
+#
+# The bare binding preserves the result's ownership but grants read-only use:
+# an owned current result is owned, and a borrowed result is a read-only alias.
+# const and var explicitly own the item, copying a borrowed result through its
+# ordinary copy operation. var additionally permits mutation of that owned item.
+# ref explicitly aliases a borrowed result and preserves its permission; it
+# cannot bind an owned result or upgrade read-only backing. An optional : Type
+# annotation follows ordinary type checking and conversion rules.
+# The binding is local to the body, cannot shadow a visible local, and is renewed
+# for each iteration. It does not leak after the loop.
 for x in 0..20
     use(x)
+
+for const item in items -> use_copy(item)
+for var item in items -> modify_copy(item)
+for ref item in items -> modify_original(item)
+
+# Body values are discarded. Reaching its end or continue starts the next
+# advance. Break exits without advancing again; break values join with unit
+# from exhaustion, using ordinary loop result rules. Return exits the enclosing
+# function. Item, cursor, and source cleanup follow ordinary ownership on all
+# exits, including failure. There is no separate for-else clause.
+#
+# Arrays, Lists, and Spans provide iter through an ordinary SpanIterator(T).
+# It snapshots the initialized extent and borrows backing storage; current
+# returns ref T with the captured backing permission. Iteration does not freeze
+# owners. Relocation, destruction, transfer, replacement, and content-dependent
+# views follow the same invalidation rules as explicit references and calls.
+# A reference into stable backing may outlive the cursor, but not its owner.
+# A view into a cursor's reused buffer cannot survive an invalidating advance.
+#
+# Adapters are ordinary cursor structs. An adapter that inspects an owned item
+# must retain that exact item until current transfers it; calling an upstream
+# current again may repeat effects or produce a different item. Borrowed items
+# retain ordinary loan constraints. Buffering/forwarding does not permit moving
+# an immovable value or retaining a deferred init expression as a stored value.
+# Consuming traversal of collection storage is a separate library capability,
+# not an implicit effect of a bare or const for binding.

@@ -88,6 +88,7 @@ pub const Token = struct {
         keyword_func,
         keyword_for,
         keyword_if,
+        keyword_in,
         keyword_is,
         keyword_loop,
         keyword_match,
@@ -127,6 +128,7 @@ pub const Token = struct {
         .{ "func", .keyword_func },
         .{ "for", .keyword_for },
         .{ "if", .keyword_if },
+        .{ "in", .keyword_in },
         .{ "is", .keyword_is },
         .{ "loop", .keyword_loop },
         .{ "match", .keyword_match },
@@ -187,9 +189,12 @@ pub const Node = struct {
         ge,
         is,
         as,
+        range,
+        range_inclusive,
         @"if",
         if_else,
         loop,
+        for_loop,
         @"and",
         @"or",
         not,
@@ -277,10 +282,10 @@ pub const Node = struct {
         return switch (self.tag) {
             .break_nothing, .continue_expr, .return_nothing, .fail_expr, .access, .implicit_static, .bool_literal, .identifier, .none_literal, .number_literal, .string_literal, .unit_literal, .type, .implicit_type => .none,
             .break_expr, .return_expr, .loop, .not, .neg, .reference_result, .move_expr, .query, .comptime_expr, .sizeof_expr, .field_access, .struct_property, .struct_init_field, .@"pub" => .node,
-            .add, .sub, .mul, .div, .rem, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .@"and", .@"or", .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .rem_assign, .call, .index_access, .const_binding, .var_binding, .ref_binding, .static_binding, .namespace_declaration, .func, .param, .type_func, .@"if" => .node_node,
+            .add, .sub, .mul, .div, .rem, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .range, .range_inclusive, .@"and", .@"or", .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .rem_assign, .call, .index_access, .const_binding, .var_binding, .ref_binding, .static_binding, .namespace_declaration, .func, .param, .type_func, .@"if" => .node_node,
             .struct_field => .field,
             .signature => .signature,
-            .block, .call_arg_list, .param_list, .type_list, .type_variant, .where_clauses, .if_else, .@"struct", .struct_init, .collection_literal, .import, .selective_import => .ref,
+            .block, .for_loop, .call_arg_list, .param_list, .type_list, .type_variant, .where_clauses, .if_else, .@"struct", .struct_init, .collection_literal, .import, .selective_import => .ref,
             else => null,
         };
     }
@@ -311,14 +316,14 @@ pub const Node = struct {
 
 pub const Ast = struct {
     file_id: FileId,
-    tokens: []Token,
-    nodes: []Node,
-    node_refs: []Node.Index,
+    tokens: []Token = &.{},
+    nodes: []Node = &.{},
+    node_refs: []Node.Index = &.{},
 
     pub fn nodeList(self: Ast, index: Node.Index) []const Node.Index {
         const node = self.nodes[(index.unwrap() orelse return &.{}).index()];
         switch (node.tag) {
-            .param_list, .type_variant, .type_list, .call_arg_list, .where_clauses, .collection_literal => {},
+            .param_list, .type_variant, .type_list, .call_arg_list, .where_clauses, .collection_literal, .for_loop => {},
             else => unreachable,
         }
         return self.node_refs[node.data.ref.start..node.data.ref.end];
@@ -352,12 +357,7 @@ pub const Ast = struct {
         return std.mem.eql(Node.Index, a.node_refs, b.node_refs);
     }
 
-    pub fn deinit(self: *Ast, gpa: std.mem.Allocator) void {
-        gpa.free(self.tokens);
-        gpa.free(self.nodes);
-        gpa.free(self.node_refs);
-        self.* = undefined;
-    }
+    pub const deinit = value_operations.Owned(@This()).deinit;
 };
 
 pub const Executable = struct {
@@ -1437,16 +1437,16 @@ pub const FunctionBodyAnalysis = struct {
     is_initializer_region: bool = false,
     initializer_regions: []FunctionBodyAnalysis = &.{},
     initializer_captures: []FunctionValueId = &.{},
-    parameter_modes: []ParameterMode,
-    block_arguments: []FunctionBlockArgument,
+    parameter_modes: []ParameterMode = &.{},
+    block_arguments: []FunctionBlockArgument = &.{},
     variant_coercion_tags: []const u32 = &.{},
     borrow_fields: []BorrowProjection = &.{},
-    branch_arguments: []FunctionValueUse,
-    call_arguments: []FunctionCallArgument,
-    instructions: []Instruction,
+    branch_arguments: []FunctionValueUse = &.{},
+    call_arguments: []FunctionCallArgument = &.{},
+    instructions: []Instruction = &.{},
     instruction_spans: []SourceSpan = &.{},
     terminator_spans: []SourceSpan = &.{},
-    blocks: []Block,
+    blocks: []Block = &.{},
     entry: BlockId,
 
     pub const ValueId = FunctionValueId;
@@ -1532,11 +1532,11 @@ pub const ReachableInstances = struct {
 
 pub const CompiledFunction = struct {
     /// Owned, nonempty machine code implementing the callable ABI.
-    code: []const u8,
+    code: []const u8 = &.{},
     /// Nonzero power-of-two alignment required for the loaded code address.
     required_alignment: u32,
-    relocations: []const Relocation,
-    referenced_instances: []const InstanceId,
+    relocations: []const Relocation = &.{},
+    referenced_instances: []const InstanceId = &.{},
     constant_data: []const ByteString = &.{},
     requires_sigpipe_ignore: bool = false,
 
