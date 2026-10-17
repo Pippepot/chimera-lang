@@ -7,6 +7,13 @@ const linux_exit_syscall: i32 = 60;
 const linux_mmap_syscall: i32 = 9;
 const linux_munmap_syscall: i32 = 11;
 
+pub const TraceSource = struct {
+    path: []const u8,
+    source: []const u8,
+    name: []const u8,
+    fallback_span: structures.SourceSpan,
+};
+
 const Elf64Header = extern struct {
     ident: [16]u8,
     e_type: u16,
@@ -484,6 +491,8 @@ fn FunctionEmitter(comptime Types: type) type {
         relocations: std.ArrayList(structures.CompiledFunction.Relocation) = .empty,
         referenced_instances: std.ArrayList(structures.InstanceId) = .empty,
         constant_data: std.ArrayList(structures.ByteString) = .empty,
+        trace_sites: std.ArrayList(structures.CompiledFunction.TraceSite) = .empty,
+        current_span: ?structures.SourceSpan = null,
         // Scratch inverse of referenced_instances; relocations index the slice.
         reference_indices: std.AutoHashMapUnmanaged(structures.InstanceId, u32) = .empty,
         jump_patches: std.ArrayList(JumpPatch) = .empty,
@@ -538,6 +547,8 @@ fn FunctionEmitter(comptime Types: type) type {
             self.referenced_instances.deinit(self.gpa);
             for (self.constant_data.items) |data| self.gpa.free(data.bytes);
             self.constant_data.deinit(self.gpa);
+            for (self.trace_sites.items) |site| self.gpa.free(site.label);
+            self.trace_sites.deinit(self.gpa);
             self.reference_indices.deinit(self.gpa);
             self.relocations.deinit(self.gpa);
             self.encoder.deinit();
@@ -575,6 +586,7 @@ fn FunctionEmitter(comptime Types: type) type {
             std.debug.assert(block.instruction_start <= block.instruction_end);
             std.debug.assert(block.instruction_end <= ssa.instructions.len);
             for (block.instruction_start..block.instruction_end) |instruction_index| {
+                self.current_span = if (ssa.instruction_spans.len == ssa.instructions.len) ssa.instruction_spans[instruction_index] else null;
                 const instruction = ssa.instructions[instruction_index];
                 const destination = self.locations[@backingInt(ssa.instructionValue(instruction_index))];
                 switch (instruction) {
@@ -690,6 +702,7 @@ fn FunctionEmitter(comptime Types: type) type {
                     .divsi => |operands| try self.emitIntegerBinary(.divide_signed, operands, destination),
                 }
             }
+            self.current_span = if (ssa.terminator_spans.len == ssa.blocks.len) ssa.terminator_spans[block_index] else null;
             try self.emitTerminator(ssa, block.terminator);
         }
 
@@ -837,6 +850,7 @@ fn FunctionEmitter(comptime Types: type) type {
                     try self.encoder.emit(.call_rax);
                 },
             }
+            try self.recordTraceSite();
             const layout = self.call_layouts.get(.{ .arguments = call.arguments, .return_type = call.return_type }).?;
             switch (layout.result) {
                 .indirect => {},
@@ -844,6 +858,30 @@ fn FunctionEmitter(comptime Types: type) type {
                 .eax => try self.copyValue(call.return_type, .eax, destination),
                 else => unreachable,
             }
+        }
+
+        fn recordTraceSite(self: *Self) !void {
+            var label: []const u8 = &.{};
+            const TypeView = switch (@typeInfo(Types)) {
+                .pointer => |pointer| pointer.child,
+                else => Types,
+            };
+            if (@hasField(TypeView, "trace_source")) {
+                if (self.types.trace_source) |source| {
+                    const span = self.current_span orelse source.fallback_span;
+                    std.debug.assert(span.start <= source.source.len);
+                    const prefix = source.source[0..span.start];
+                    const line = std.mem.count(u8, prefix, "\n") + 1;
+                    const column = prefix.len - (if (std.mem.lastIndexOfScalar(u8, prefix, '\n')) |index| index + 1 else 0) + 1;
+                    label = try self.gpa.print("  at {s} ({s}:{d}:{d})\n", .{ source.name, source.path, line, column });
+                }
+            }
+            errdefer self.gpa.free(label);
+            try self.trace_sites.append(self.gpa, .{
+                .return_offset = std.math.cast(u32, self.encoder.code.items.len) orelse return error.FunctionTooLarge,
+                .stack_size = self.stack_size,
+                .label = label,
+            });
         }
 
         fn emitCallArguments(self: *Self, call: structures.FunctionCall, destination: ValueLocation) !void {
@@ -918,6 +956,15 @@ fn FunctionEmitter(comptime Types: type) type {
                     try self.patchJump(patch.field_offset, start);
                 };
                 try self.encoder.code.appendSlice(self.gpa, compiled.code);
+                for (compiled.trace_sites) |site| {
+                    const label = try self.gpa.dupe(u8, site.label);
+                    errdefer self.gpa.free(label);
+                    try self.trace_sites.append(self.gpa, .{
+                        .return_offset = std.math.add(u32, start, site.return_offset) catch return error.FunctionTooLarge,
+                        .stack_size = site.stack_size,
+                        .label = label,
+                    });
+                }
                 for (compiled.relocations) |relocation| {
                     var relocated = relocation;
                     relocated.offset = std.math.add(u32, start, relocation.offset) catch return error.FunctionTooLarge;
@@ -1317,6 +1364,7 @@ fn FunctionEmitter(comptime Types: type) type {
             var artifact: structures.CompiledFunction = .{ .required_alignment = 1 };
             errdefer artifact.deinit(self.gpa);
             artifact.relocations = try self.relocations.toOwnedSlice(self.gpa);
+            artifact.trace_sites = try self.trace_sites.toOwnedSlice(self.gpa);
             artifact.referenced_instances = try self.referenced_instances.toOwnedSlice(self.gpa);
             artifact.constant_data = try self.constant_data.toOwnedSlice(self.gpa);
             artifact.code = try self.encoder.code.toOwnedSlice(self.gpa);
@@ -1346,6 +1394,131 @@ pub fn compileExternalExit(gpa: std.mem.Allocator) !structures.CompiledFunction 
     try encoder.immediate(.mov_eax, linux_exit_syscall);
     try encoder.emit(.syscall);
     return externalArtifact(&encoder, gpa);
+}
+
+pub fn compileExternalPanic(signature: structures.FunctionSignature, types: anytype, gpa: std.mem.Allocator) !structures.CompiledFunction {
+    var layout = try CallLayout.init(types, .never, &.{.{ .type_id = signature.parameters[0].type_id }}, gpa);
+    defer layout.deinit(gpa);
+    var encoder = try X86Encoder.init(gpa);
+    defer encoder.deinit();
+    try emitPanicMessage(&encoder, layout.arguments[0]);
+    try encoder.emit(.test_edx);
+    const bare = try encoder.jump(.je, 0);
+    const prefix_address = try emitPanicText(&encoder, 7);
+    const ready = try encoder.jump(.jmp, 0);
+    try patchLocal(&encoder, bare, encoder.code.items.len);
+    const bare_address = try emitPanicText(&encoder, 5);
+    try patchLocal(&encoder, ready, encoder.code.items.len);
+    const prefix_write = try encoder.jump(.call_relative, 0);
+    try emitPanicMessage(&encoder, layout.arguments[0]);
+    try encoder.emit(.mov_rsi_rax);
+    const message_write = try encoder.jump(.call_relative, 0);
+    const newline_address = try emitPanicText(&encoder, 1);
+    const newline_write = try encoder.jump(.call_relative, 0);
+    const trace = try encoder.jump(.jmp, 0);
+    const writer = encoder.code.items.len;
+    try emitPanicWriter(&encoder);
+    for ([_]u32{ prefix_write, message_write, newline_write }) |call|
+        try patchLocal(&encoder, call, writer);
+    try patchLocal(&encoder, prefix_address, encoder.code.items.len);
+    try patchLocal(&encoder, bare_address, encoder.code.items.len);
+    try encoder.code.appendSlice(gpa, "panic: ");
+    try patchLocal(&encoder, newline_address, encoder.code.items.len);
+    try encoder.code.append(gpa, '\n');
+    var artifact = try externalArtifact(&encoder, gpa);
+    artifact.panic_trace_offset = trace;
+    artifact.requires_sigpipe_ignore = true;
+    return artifact;
+}
+
+fn emitPanicMessage(encoder: *X86Encoder, argument: ValueLocation) !void {
+    switch (argument) {
+        .stack => |offset| {
+            try encoder.offset(.mov_eax_rsp, 8 + offset + 8);
+            try encoder.emit(.mov_edx_eax);
+            try encoder.offset(.mov_rax_rsp, 8 + offset);
+        },
+        .indirect => |offset| {
+            try encoder.offset(.mov_rax_rsp, 8 + offset);
+            try encoder.offset(.mov_eax_rax, 8);
+            try encoder.emit(.mov_edx_eax);
+            try encoder.offset(.mov_rax_rsp, 8 + offset);
+            try encoder.emit(.mov_rax_rax);
+        },
+        else => unreachable,
+    }
+}
+
+fn emitPanicText(encoder: *X86Encoder, size: i32) !u32 {
+    const address = try encoder.jump(.lea_rax_rip, 0);
+    try encoder.emit(.mov_rsi_rax);
+    try encoder.immediate(.mov_edx, size);
+    return address;
+}
+
+/// Best-effort, allocation-free stderr output. Failed writes never panic again.
+fn emitPanicWriter(encoder: *X86Encoder) !void {
+    try encoder.emit(.test_edx);
+    const empty = try encoder.jump(.je, 0);
+    const retry = encoder.code.items.len;
+    try encoder.immediate(.mov_eax, 1);
+    try encoder.immediate(.mov_edi, 2);
+    try encoder.emit(.syscall);
+    try encoder.immediate(.cmp_eax, -4);
+    const interrupted = try encoder.jump(.je, 0);
+    try patchLocal(encoder, interrupted, retry);
+    try encoder.immediate(.cmp_eax, 0);
+    const failed = try encoder.jump(.jle, 0);
+    try encoder.emit(.add_rsi_rax);
+    try encoder.emit(.sub_rdx_rax);
+    try encoder.emit(.test_edx);
+    const remaining = try encoder.jump(.jne, 0);
+    try patchLocal(encoder, remaining, retry);
+    try patchLocal(encoder, empty, encoder.code.items.len);
+    try patchLocal(encoder, failed, encoder.code.items.len);
+    try encoder.emit(.ret);
+}
+
+fn patchLocal(encoder: *X86Encoder, field: u32, target: usize) !void {
+    try patchRelativeDisplacement(encoder.code.items, field, target, @as(u64, field) + 4, 0);
+}
+
+/// Walk only known call sites. The startup call has no record and ends the walk.
+/// Metadata describes the existing frames; successful calls execute no tracing.
+fn emitPanicTrace(encoder: *X86Encoder) !usize {
+    try encoder.emit(.mov_r12_rsp);
+    try encoder.immediate(.mov_r15d, 1024);
+    const frame = encoder.code.items.len;
+    try encoder.emit(.mov_r13_r12);
+    try encoder.emit(.add_r12_8);
+    const table_address = encoder.code.items.len + 2;
+    try encoder.absolute(.mov_r14, 0);
+    const search = encoder.code.items.len;
+    try encoder.emit(.mov_rax_r14);
+    try encoder.emit(.test_rax);
+    const unknown = try encoder.jump(.je, 0);
+    try encoder.emit(.cmp_rax_r13);
+    const found = try encoder.jump(.je, 0);
+    try encoder.emit(.add_r14_32);
+    const next = try encoder.jump(.jmp, 0);
+    try patchLocal(encoder, next, search);
+    try patchLocal(encoder, found, encoder.code.items.len);
+    try encoder.offset(.mov_rsi_r14_offset, 16);
+    try encoder.offset(.mov_edx_r14_offset, 24);
+    const write = try encoder.jump(.call_relative, 0);
+    try encoder.offset(.mov_rax_r14_offset, 8);
+    try encoder.emit(.add_r12_rax);
+    try encoder.emit(.dec_r15d);
+    const again = try encoder.jump(.jne, 0);
+    try patchLocal(encoder, again, frame);
+    try patchLocal(encoder, unknown, encoder.code.items.len);
+    try encoder.immediate(.mov_edi, 134);
+    try encoder.immediate(.mov_eax, linux_exit_syscall);
+    try encoder.emit(.syscall);
+    try encoder.emit(.ud2);
+    try patchLocal(encoder, write, encoder.code.items.len);
+    try emitPanicWriter(encoder);
+    return table_address;
 }
 
 pub fn compileExternalAllocateHostStorage(gpa: std.mem.Allocator) !structures.CompiledFunction {
@@ -1575,6 +1748,36 @@ pub fn buildExecutable(
         layout.* = .{ .address = function_address, .offset = function_offset };
     }
 
+    const needs_panic_trace = for (functions) |function| {
+        if (function.artifact.panic_trace_offset != null) break true;
+    } else false;
+    if (needs_panic_trace) {
+        const trace_address = code_virtual_address + encoder.code.items.len;
+        const table_field = try emitPanicTrace(&encoder);
+        for (functions, layouts) |function, layout| {
+            if (function.artifact.panic_trace_offset) |field| {
+                try patchRelativeDisplacement(encoder.code.items, layout.offset + field, trace_address, layout.address + field + 4, 0);
+            }
+        }
+        // Labels precede the fixed-width table; pointers are final ELF addresses.
+        var label_addresses: std.ArrayList(u64) = .empty;
+        defer label_addresses.deinit(gpa);
+        for (functions) |function| for (function.artifact.trace_sites) |site| {
+            try label_addresses.append(gpa, code_virtual_address + encoder.code.items.len);
+            try encoder.code.appendSlice(gpa, site.label);
+        };
+        try patchAbsoluteAddress(encoder.code.items, table_field, code_virtual_address + encoder.code.items.len, 0);
+        var label_index: usize = 0;
+        for (functions, layouts) |function, layout| for (function.artifact.trace_sites) |site| {
+            try appendTraceWord(&encoder, layout.address + site.return_offset);
+            try appendTraceWord(&encoder, site.stack_size);
+            try appendTraceWord(&encoder, label_addresses.items[label_index]);
+            try appendTraceWord(&encoder, site.label.len);
+            label_index += 1;
+        };
+        try appendTraceWord(&encoder, 0);
+    }
+
     // Data follows code in the read-only load segment. Intern by content across
     // functions, retaining an addressable byte even for the empty sequence.
     var data_offsets: std.StringHashMapUnmanaged(usize) = .empty;
@@ -1621,6 +1824,12 @@ pub fn buildExecutable(
     }
 
     return .{ .bytes = try buildElfExecutable(encoder.code.items, gpa) };
+}
+
+fn appendTraceWord(encoder: *X86Encoder, value: u64) !void {
+    var bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &bytes, value, .little);
+    try encoder.code.appendSlice(encoder.gpa, &bytes);
 }
 
 // A broken stream is an ordinary fallible write, including a closed pipe.

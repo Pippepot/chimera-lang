@@ -1,0 +1,2 @@
+pub struct End
+    copy = trivial

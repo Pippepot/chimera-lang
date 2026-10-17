@@ -240,7 +240,7 @@ fn writeType(types: anytype, writer: *std.Io.Writer, type_id: structures.TypeId)
     try writer.writeByte('`');
 }
 
-fn writeTypeInner(types: anytype, writer: *std.Io.Writer, type_id: structures.TypeId) !void {
+pub fn writeTypeInner(types: anytype, writer: *std.Io.Writer, type_id: structures.TypeId) anyerror!void {
     switch (type_id) {
         .int, .int_literal, .string_literal, .static_data, .byte, .bool, .unit, .none, .never, .type => return writer.writeAll(@tagName(type_id)),
         _ => {},
@@ -251,11 +251,30 @@ fn writeTypeInner(types: anytype, writer: *std.Io.Writer, type_id: structures.Ty
         return writer.print(", {d})", .{array.length});
     }
     if (try types.borrowElement(type_id)) |element| {
-        try writer.writeAll("ref ");
-        try writeTypeInner(types, writer, element);
+        try writeReferenceType(types, writer, element);
         return;
     }
-    if (try types.structName(type_id)) |name| return writer.writeAll(name);
+    if (try types.tupleMembers(type_id)) |members| {
+        try writer.writeByte('(');
+        for (members, 0..) |member, index| {
+            if (index != 0) try writer.writeAll(", ");
+            if (member.kind == .reference)
+                try writeReferenceType(types, writer, member.type_id)
+            else
+                try writeTypeInner(types, writer, member.type_id);
+        }
+        return writer.writeByte(')');
+    }
+    if (try types.structName(type_id)) |name| {
+        if (try types.structIdentity(type_id)) |identity| {
+            if (identity == .generated and identity.generated.owner.specialization != null) {
+                try writeFunctionName(types, writer, identity.generated.owner);
+                if (std.mem.eql(u8, name, "anonymous struct")) try writer.writeAll("::{anonymous struct}");
+                return;
+            }
+        }
+        return writer.writeAll(name);
+    }
     if (try types.callable(type_id)) |callable| {
         try writer.writeAll(if (callable.is_fallible) "fallible(" else "func(");
         for (callable.parameters, 0..) |parameter, index| {
@@ -264,7 +283,7 @@ fn writeTypeInner(types: anytype, writer: *std.Io.Writer, type_id: structures.Ty
             try writeTypeInner(types, writer, parameter.type_id);
         }
         try writer.writeAll(") ");
-        if (callable.result_mode == .reference) try writer.writeAll("ref ");
+        if (callable.result_mode == .reference) return writeReferenceType(types, writer, callable.return_type);
         return writeTypeInner(types, writer, callable.return_type);
     }
 
@@ -279,6 +298,107 @@ fn writeTypeInner(types: anytype, writer: *std.Io.Writer, type_id: structures.Ty
             try writeTypeInner(types, writer, member);
         }
     }
+}
+
+/// Shared source-style callable identity, including inherited and own static arguments.
+pub fn writeFunctionName(types: anytype, writer: *std.Io.Writer, instance: structures.InstanceId) anyerror!void {
+    const arguments = if (instance.specialization) |tuple| try types.staticArguments(tuple) else &.{};
+    try writeFunctionParts(types, writer, instance.item, arguments);
+}
+
+fn writeFunctionParts(types: anytype, writer: *std.Io.Writer, item: structures.ItemId, arguments: []const structures.CompileTimeValueId) anyerror!void {
+    const location = try types.itemLocation(item);
+    if (location.kind == .top_level_entry) return writer.writeAll("<entry>");
+    var inherited: usize = 0;
+    if (location.owner) |owner| {
+        // An invalid declaration may have no shape; keep its supplied arguments
+        // visible on the innermost name without trying to specialize it again.
+        if (try types.staticParameterCounts(item)) |counts| inherited = @min(counts.inherited, arguments.len);
+        try writeFunctionParts(types, writer, owner, arguments[0..inherited]);
+        try writer.writeByte('.');
+    }
+    try writer.writeAll(location.name.text());
+    if (location.name == .operation) try writer.print("/{d}", .{location.name.operation.operandCount()});
+    if (arguments.len > inherited) {
+        try writer.writeByte('(');
+        try writeStaticArguments(types, writer, arguments[inherited..]);
+        try writer.writeByte(')');
+    }
+}
+
+fn writeStaticArguments(types: anytype, writer: *std.Io.Writer, arguments: []const structures.CompileTimeValueId) anyerror!void {
+    for (arguments, 0..) |argument, index| {
+        if (index != 0) try writer.writeAll(", ");
+        try writeStaticValue(types, writer, argument);
+    }
+}
+
+fn writeStaticValue(types: anytype, writer: *std.Io.Writer, id: structures.CompileTimeValueId) anyerror!void {
+    switch (try types.staticValue(id)) {
+        .type => |type_id| try writeTypeInner(types, writer, type_id),
+        .runtime => |runtime| try writeStaticRuntime(types, writer, runtime),
+    }
+}
+
+fn writeStaticRuntime(types: anytype, writer: *std.Io.Writer, runtime: structures.CompileTimeValue.Runtime) anyerror!void {
+    switch (runtime.value) {
+        .int => |value| try writer.print("{d}", .{value}),
+        .int_literal => |value| try writer.print("{d}", .{value}),
+        .byte => |value| try writer.print("{d}", .{value}),
+        .bool => |value| try writer.writeAll(if (value) "true" else "false"),
+        .unit => try writer.writeAll("()"),
+        .none => try writer.writeAll("none"),
+        .string_literal => |value| try writer.print("\"{f}\"", .{std.zig.fmtString(try types.byteString(value))}),
+        .static_data => |value| try writer.print("bytes(\"{f}\")", .{std.zig.fmtString(try types.byteString(value))}),
+        .storage_cursor => |cursor| try writeStaticCursor(types, writer, cursor),
+        .function_ref => |reference| try writeFunctionName(types, writer, reference.instance()),
+        .structure => |tuple| try writeStaticAggregate(types, writer, runtime.type_id, try types.staticArguments(tuple)),
+        .variant => |variant| {
+            try writeStaticValue(types, writer, variant.payload);
+            try writer.writeAll(" as ");
+            try writeTypeInner(types, writer, variant.member_type);
+        },
+    }
+}
+
+fn writeStaticCursor(types: anytype, writer: *std.Io.Writer, cursor: structures.StaticStorageCursor) anyerror!void {
+    try writer.writeAll("cursor(");
+    if (cursor.data) |data|
+        try writer.print("\"{f}\"", .{std.zig.fmtString(try types.byteString(data))})
+    else
+        try writer.writeAll("none");
+    try writer.print(", {d})", .{cursor.offset});
+}
+
+fn writeStaticAggregate(types: anytype, writer: *std.Io.Writer, type_id: structures.TypeId, values: []const structures.CompileTimeValueId) anyerror!void {
+    if (try types.arrayType(type_id) != null) {
+        try writer.writeByte('[');
+        try writeStaticArguments(types, writer, values);
+        return writer.writeByte(']');
+    }
+    if (try types.tupleMembers(type_id) != null) {
+        try writer.writeByte('(');
+        try writeStaticArguments(types, writer, values);
+        return writer.writeByte(')');
+    }
+    try writeTypeInner(types, writer, type_id);
+    try writer.writeByte('{');
+    const definition = (try types.structDefinition(type_id)) orelse return error.Unavailable;
+    std.debug.assert(values.len == definition.fields.len);
+    for (definition.fields, values, 0..) |field, value, index| {
+        if (index != 0) try writer.writeAll(", ");
+        try writer.print("{s} = ", .{field.name});
+        try writeStaticValue(types, writer, value);
+    }
+    try writer.writeByte('}');
+}
+
+fn writeReferenceType(types: anytype, writer: *std.Io.Writer, type_id: structures.TypeId) anyerror!void {
+    try writer.writeAll("ref ");
+    const grouped = try types.variantMembers(type_id) != null or try types.callable(type_id) != null;
+    if (grouped) try writer.writeByte('(');
+    try writeTypeInner(types, writer, type_id);
+    if (grouped) try writer.writeByte(')');
 }
 
 fn writeTypedMessage(types: anytype, writer: *std.Io.Writer, prefix: []const u8, type_id: structures.TypeId, suffix: []const u8) !void {
@@ -404,6 +524,11 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
         .compile_time_integer_overflow => try writer.writeAll("integer overflow during compile-time execution"),
         .compile_time_unsupported_operation => try writer.writeAll("operation is not supported during compile-time execution"),
         .compile_time_escaping_storage => try writer.writeAll("evaluation-owned storage cannot escape compile-time execution"),
+        .compile_time_panic => |message| {
+            try writer.writeAll("panic during compile-time execution");
+            const bytes = try types.byteString(message);
+            if (bytes.len != 0) try writer.print(": {s}", .{bytes});
+        },
         .compile_time_call_trace => try writer.writeAll("called at compile time from here"),
         .unsupported_external_declaration => try writer.writeAll("external function has no compiler-provided implementation"),
         .invalid_external_signature => try writer.writeAll("external function signature does not match its compiler-provided implementation"),
@@ -507,7 +632,15 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
             try writeType(types, writer, mismatch.expected);
         },
         .invalid_converter => try writer.writeAll("converter must have one immutable runtime source or one compile-time-only static source and an infallible result"),
+        .ambiguous_variant_member => |mismatch| {
+            try writer.writeAll("both owned and reference alternatives accept ");
+            try writeType(types, writer, mismatch.found);
+            try writer.writeAll(" in ");
+            try writeType(types, writer, mismatch.expected);
+        },
         .invalid_converter_owner => try writer.writeAll("converter must be declared in the defining module of its source or target type"),
+        .tuple_requires_expected_type => try writer.writeAll("tuple construction requires an expected tuple type"),
+        .tuple_member_count_mismatch => |counts| try writer.print("tuple expects {d} members, found {d}", .{ counts.expected, counts.found }),
         .borrow_requires_place => try writer.writeAll("borrowing a value's storage requires a named local or parameter, or one of its fields"),
         .mutable_borrow_requires_writable_place => try writer.writeAll("a writable reference requires a mutable place or writable Ref"),
         .reference_not_writable => try writer.writeAll("cannot modify a readonly reference"),
@@ -567,6 +700,12 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
         .query_operand_not_bool => |found| try writeTypedMessage(types, writer, "query `?` requires bool, found ", found, ""),
         .inspection_type_not_supported => try writer.writeAll("this inspection type is not supported yet"),
         .variant_inspection_operand_not_variant => |found| try writeTypedMessage(types, writer, "variant inspection requires a variant value, found ", found, ""),
+        .iterator_result_requires_end => |mismatch| {
+            try writer.writeAll("next must return an item variant with owned ");
+            try writeType(types, writer, mismatch.expected);
+            try writer.writeAll(", found ");
+            try writeType(types, writer, mismatch.found);
+        },
         .condition_binding_must_be_immutable => try writer.writeAll("an `if` binding must use `const`, not `var`"),
         .value_not_callable => {
             try writeSourceLabel(writer, "value is not callable", source, span);
@@ -634,11 +773,21 @@ pub fn renderDiagnostic(
         const highlight_len = highlightLen(span, info.line_start, info.line_end);
         if (highlight_len > 1) try writer.splatByteAll('~', highlight_len - 1);
         try writer.writeByte('\n');
+        try writeFunctionContext(types, writer, diagnostic.instance);
         return;
     }
 
     try writer.print("{s} {s}: ", .{ label, source_path });
     try writeKindMessage(types, writer, source, diagnostic.span, diagnostic.kind);
+    try writer.writeByte('\n');
+    try writeFunctionContext(types, writer, diagnostic.instance);
+}
+
+fn writeFunctionContext(types: anytype, writer: *std.Io.Writer, instance: ?structures.InstanceId) !void {
+    const function = instance orelse return;
+    if ((try types.itemLocation(function.item)).kind != .function) return;
+    try writer.writeAll("  in ");
+    try writeFunctionName(types, writer, function);
     try writer.writeByte('\n');
 }
 

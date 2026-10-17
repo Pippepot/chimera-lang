@@ -14,39 +14,75 @@ Investigate these before the remaining implementation milestones, in this order.
 Ranges and slices come first because they shape indexing, iteration, collection
 APIs, and borrowing. Revisit implementation ordering when these decisions settle.
 
-1. **Ranges and slices.** Extend existing ranges and Span views with reusable
-  slice indices: `array[2..5]`, `array[..5]`, and `array[2..]`. Investigate
-  `Range[A, B]` with `Unbounded` and `FromEnd` bound types, from-end indexing
-  (potentially `array[^1]`), and mutable/immutable slice borrowing under value
-  semantics. `..^` remains inclusive; from-end slice bounds need a distinct
-  spelling.
-2. **Static comprehensions.** Fixed-size Array construction with compile-time
+1. **Range index dispatch.** Define how borrowed integer element indexing and
+  owned slice-handle results coexist in bracket syntax: `array[2..5]`,
+  `array[..5]`, and `array[2..]`. Preserve reusable typed bounds and ordinary
+  value/reference semantics without returning a union or borrowing a temporary
+  Span. Settle from-end indexing (potentially `array[^1]`) and independently
+  typed FromEnd bounds. `..^` remains inclusive, so from-end slice bounds need a
+  distinct spelling. The named slicing contract and remaining decisions are recorded
+  in [docs/RANGE_SLICING_PROPOSAL.md](docs/RANGE_SLICING_PROPOSAL.md).
+2. **Iteration composition interfaces.** Reference alternatives and typed
+  reference tuples provide the ownership-aware result model for the
+  `next() -> T | End` protocol. Settle computed member specifications, narrow
+  callable result/effect discovery, and storage-preserving variant narrowing
+  for general library adapters. These deferred proposals are not prerequisites
+  for the sole next/End protocol. Preserve lending, destination construction,
+  and the distinction between references and owned Ref handles. The approval
+  boundary and general-adapter requirements are recorded in
+  [docs/BORROWED_AGGREGATES_PROPOSAL.md](docs/BORROWED_AGGREGATES_PROPOSAL.md).
+3. **Static comprehensions.** Fixed-size Array construction with compile-time
   iteration shape and runtime element evaluation. Prefer `static if` and
   `static for` ordering; determine when filtering preserves a static count.
-3. **Collection spreading and comprehensions.** `[1, ..values, 5]` and
+4. **Collection spreading and comprehensions.** `[1, ..values, 5]` and
   `[x * 2 for x in values if x > 0]`. Preserve fixed-size Array literal
   semantics and favor List for potentially runtime-sized results; settle mixed
   static/runtime sizes, evaluation order, ownership, and partial failure cleanup.
-4. **Enum-indexed arrays.** Dense, type-safe arrays indexed directly by enum
+5. **Enum-indexed arrays.** Dense, type-safe arrays indexed directly by enum
   values; define domain coverage, storage order, and initialization.
-5. **Value-producing blocks.** Blocks and labeled `break` carrying values;
+6. **Value-producing blocks.** Blocks and labeled `break` carrying values;
   define result typing, ownership, cleanup, and interaction with failure.
 
 ## Ordered milestones
 
+### 3. Generic iteration adapters
+
+- Resolve the proposed generic composition interfaces before implementing a
+  general library entrypoint. Do not add reflection, type builders, or new
+  conditional-binding semantics without approval.
+- Build on ordinary type factories' tested exact effect selection with explicit
+  static arguments. Derive effects from callable signatures only through an
+  approved discovery interface. Cover infallible and fallible producers and
+  callbacks without making every adapter fallible; choose free functions or
+  wrapper methods.
+- Verify borrowed-place versus owned Ref items, lending from reused cursor
+  buffers, move-only filtering, and consuming extraction from the result union.
+- Verify zip's left-to-right polling and unmatched-item cleanup on exhaustion
+  and failure; reject actual invalidation and ordinary overlapping mut arguments,
+  without imposing exclusive mutable borrowing. Typed reference tuples exercise
+  composition without requiring tuple destructuring.
+- Preserve direct construction of fresh immovable sources, cursors, and items
+  through the result union. Establish which adapters support immovable items;
+  diagnose unsupported relocation rather than adding implicit copies.
+- Preserve source evaluation, binding modes, loop results, and cleanup on all
+  exits. Cover native/comptime parity and incremental changes to protocol
+  resolution, borrowing, and fallibility. Concrete fixed-type adapters alone
+  are not sufficient evidence for the generic library contract.
+
 ### 4. List mutation
 
-- Removal, append, and relocation of reference-containing elements, with
-  per-element provenance and failure cleanup. Borrowed get/index results and
-  replacement through tracked reference slots use the existing place semantics.
+- Add removal and extend existing append/reserve relocation to
+  reference-containing elements, with per-element provenance and failure cleanup.
+  Borrowed get/index results and replacement through tracked reference slots
+  use the existing place semantics.
 - Structural mutation during iteration and explicit consuming traversal, with
   stable backing references distinguished from content-dependent views.
 
 ### 5. Structural tuples
 
-- Tuple identity, type spelling, access, destructuring, layout, and elementwise
-  ownership, including `const (x, y) = point`. Resolve grouping/singletons;
-  support multiple results and Map items.
+- Extend explicitly typed multi-element tuples with unannotated inference and
+  destructuring, including `const (x, y) = point`. Resolve singleton forms and
+  independent pattern modes; support multiple results and Map items.
 
 ### 6. Match
 
@@ -65,7 +101,9 @@ APIs, and borrowing. Revisit implementation ordering when these decisions settle
   APIs.
 - Build pull-iterator utilities in the standard library: `zip`, `enumerate`,
   `pairwise`, `windows`, and `chunks`; algorithms `map`, `filter`, `find`, `any`,
-  `all`, and `sorted`; numerical helpers `min`, `max`, and `clamp`.
+  `all`, and `sorted`.
+- Generalize `min`, `max`, and `clamp` beyond integers, defining ownership and
+  comparator behavior.
 
 ### 8. Collections
 

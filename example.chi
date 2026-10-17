@@ -1,9 +1,5 @@
-fallible foo()
-  var arr = [1, 2, 3]
-  var a = arr[0] # copies
-  ref b = arr[0] # borrow, mutable as arr is mutable
-  arr[1] += 1
-  b += 1
-  exit(arr[0])
+func recurse(depth: int) never
+  if depth > 0 -> recurse(depth - 1)
+  panic "recursion complete"
 
-if foo() -> unit
+recurse(3)

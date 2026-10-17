@@ -68,6 +68,7 @@ pub fn build(b: *std.Build) void {
         "tests/iteration_test.zig",
         "tests/reference_test.zig",
         "tests/text_test.zig",
+        "tests/panic_test.zig",
         "tests/converter_test.zig",
         "tests/comptime_interpreter_test.zig",
     };

@@ -127,6 +127,7 @@ fn testDatabaseWithPrelude(worker_count: usize, enable_prelude: bool) !*Database
         const module = try db.intern(queries.ModulePaths, .{ .path = source.path });
         try db.addInput(queries.FileModule, file_id, module);
         try db.addInput(queries.SourceText, file_id, source.text);
+        try db.addInput(queries.SourcePath, file_id, source.path);
         try db.addInput(queries.ModuleMembers, module, &.{file_id});
         if (index == 0) try db.addInput(queries.StandardFile, queries.standardFileKey("exit.chi"), file_id);
         if (index == 1) try db.addInput(queries.StandardFile, queries.standardFileKey("prelude.chi"), file_id);
@@ -143,6 +144,7 @@ fn addSource(db: *Database, file_id: structures.FileId, source: []const u8) !voi
     try db.addInput(queries.SourceText, file_id, source);
     const name = try testing.allocator.print("test-module-{d}", .{file_id});
     defer testing.allocator.free(name);
+    try db.addInput(queries.SourcePath, file_id, name);
     const module = try db.intern(queries.ModulePaths, .{ .path = name });
     try db.addInput(queries.FileModule, file_id, module);
     try db.addInput(queries.ModuleMembers, module, &.{file_id});
@@ -152,6 +154,7 @@ fn addModuleFile(db: *Database, file_id: structures.FileId, module_path: []const
     const module = try db.intern(queries.ModulePaths, .{ .path = module_path });
     try db.addInput(queries.FileModule, file_id, module);
     try db.addInput(queries.SourceText, file_id, source);
+    try db.addInput(queries.SourcePath, file_id, module_path);
     return module;
 }
 
@@ -731,6 +734,26 @@ const InternVariantTriple = struct {
 
     pub fn run(ctx: *Context, members: Input) anyerror!Output {
         return queries.internVariantType(ctx, &members);
+    }
+};
+
+const InternVariantMembers = struct {
+    pub const Input = [2]structures.MemberSpec;
+    pub const Output = structures.InternVariantResult;
+
+    pub fn run(ctx: *Context, members: Input) anyerror!Output {
+        const facts: queries.TypeFacts(*Context) = .{ .ctx = ctx };
+        return facts.internVariantMembers(&members);
+    }
+};
+
+const InternTupleMembers = struct {
+    pub const Input = [2]structures.MemberSpec;
+    pub const Output = structures.TypeId;
+
+    pub fn run(ctx: *Context, members: Input) anyerror!Output {
+        const facts: queries.TypeFacts(*Context) = .{ .ctx = ctx };
+        return facts.internTuple(&members);
     }
 };
 
@@ -2469,6 +2492,8 @@ test "last-use edits move cleanup and retain equivalent restored output" {
     try setSource(db, 1, initial);
     const restored_body = try db.get(queries.AnalyzeFunctionInstance, .{ .item = answer });
     const restored_artifact = try db.get(queries.CompileFunction, instance);
+    const restored_code = try testing.allocator.dupe(u8, restored_artifact.*.?.code);
+    defer testing.allocator.free(restored_code);
     executable = (try db.get(queries.BuildExecutable, 1)).*.?;
     try runtime.writeProgram(io, executable.bytes);
     try testing.expectEqual(@as(u8, 42), try runtime.runProg(io, testing.allocator, &.{}));
@@ -2484,8 +2509,9 @@ test "last-use edits move cleanup and retain equivalent restored output" {
         \\  later()
         \\answer()
     );
-    try testing.expectEqual(restored_body, try db.get(queries.AnalyzeFunctionInstance, .{ .item = answer }));
-    try testing.expectEqual(restored_artifact, try db.get(queries.CompileFunction, instance));
+    // Source spans change even when executable operations are equivalent.
+    try testing.expect(restored_body != try db.get(queries.AnalyzeFunctionInstance, .{ .item = answer }));
+    try testing.expectEqualSlices(u8, restored_code, (try db.get(queries.CompileFunction, instance)).*.?.code);
 }
 
 test "custom drop body edits update linking without changing caller analysis" {
@@ -3986,7 +4012,8 @@ test "bool static edits invalidate consumers and retain equal results" {
         \\func answer() int -> if flag == true -> 42 else 24
     );
     try testing.expectEqual(first_flag, try db.get(queries.ResolveStatic, flag));
-    try testing.expectEqual(first_body, try db.get(queries.AnalyzeFunctionInstance, .{ .item = answer }));
+    // Source spans change even when executable operations are equivalent.
+    try testing.expect(first_body != try db.get(queries.AnalyzeFunctionInstance, .{ .item = answer }));
     try testing.expectEqual(first_artifact, try db.get(queries.CompileFunction, .{ .item = answer }));
 
     try setSource(db, 1,
@@ -5567,6 +5594,48 @@ test "concurrent BuildExecutable requests share one owned result" {
     for (handles[1..]) |handle| try testing.expectEqual(first, try handle.wait());
 }
 
+test "tuple member specifications preserve positional identity and pointer layout" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    const mixed = (try db.get(InternTupleMembers, .{ .{ .type_id = .int, .kind = .reference }, .{ .type_id = .byte } })).*;
+    const reordered = (try db.get(InternTupleMembers, .{ .{ .type_id = .byte }, .{ .type_id = .int, .kind = .reference } })).*;
+    const owned = (try db.get(InternTupleMembers, .{ .{ .type_id = .int }, .{ .type_id = .byte } })).*;
+    try testing.expect(mixed != reordered);
+    try testing.expect(mixed != owned);
+    try testing.expectEqual(@as(u32, 16), (try db.get(queries.HostTypeLayout, mixed)).byte_size);
+    try testing.expectEqual(@as(u32, 8), (try db.get(queries.HostTypeLayout, owned)).byte_size);
+    const definition = (try db.get(queries.TupleDefinition, mixed)).*.?;
+    try testing.expectEqualStrings("0", definition.fields[0].name);
+    try testing.expectEqualStrings("1", definition.fields[1].name);
+    try testing.expectEqual(structures.MemberKind.reference, definition.fields[0].kind);
+    try testing.expectEqual(structures.MemberKind.owned, definition.fields[1].kind);
+}
+
+test "variant member specifications distinguish storage kind and reference scope" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    const owned = (try db.get(InternVariantPair, .{ .int, .none })).*.type_id;
+    const borrowed = (try db.get(InternVariantMembers, .{ .{ .type_id = .int, .kind = .reference }, .{ .type_id = .none } })).*.type_id;
+    try testing.expect(owned != borrowed);
+    const borrowed_members = (try db.lookupInterned(queries.Types, borrowed.interned().?)).variant.members;
+    try testing.expectEqual(@as(usize, 2), borrowed_members.len);
+    const reference = if (borrowed_members[0] == .none) borrowed_members[1] else borrowed_members[0];
+    try testing.expectEqual(structures.TypeId.int, (try db.lookupInterned(queries.Types, reference.interned().?)).reference);
+
+    const mixed = (try db.get(InternVariantMembers, .{ .{ .type_id = .int }, .{ .type_id = .int, .kind = .reference } })).*.type_id;
+    try testing.expectEqual(@as(usize, 2), (try db.lookupInterned(queries.Types, mixed.interned().?)).variant.members.len);
+
+    const whole = (try db.get(InternVariantMembers, .{ .{ .type_id = owned, .kind = .reference }, .{ .type_id = .unit } })).*.type_id;
+    const whole_members = (try db.lookupInterned(queries.Types, whole.interned().?)).variant.members;
+    try testing.expectEqual(@as(usize, 2), whole_members.len);
+    const whole_reference = if (whole_members[0] == .unit) whole_members[1] else whole_members[0];
+    try testing.expectEqual(owned, (try db.lookupInterned(queries.Types, whole_reference.interned().?)).reference);
+    try testing.expectEqual(@as(u32, 16), (try db.get(queries.HostTypeLayout, borrowed)).byte_size);
+    try testing.expectEqual(@as(u32, 8), (try db.get(queries.HostTypeLayout, owned)).byte_size);
+}
+
 test "function signatures intern canonical variant annotations" {
     const db = try testDatabase(2);
     defer db.deinit();
@@ -5738,6 +5807,7 @@ test "variant widening annotations retain equal results and recover after invali
         const instance: structures.InstanceId = .{ .item = target };
         const body = try db.get(queries.AnalyzeFunctionInstance, .{ .item = target });
         try testing.expect(body.* != null);
+        const return_type = body.*.?.return_type;
         const compiled = try db.get(queries.CompileFunction, instance);
         try testing.expect(compiled.* != null);
         const executable = try db.get(queries.BuildExecutable, 1);
@@ -5746,7 +5816,7 @@ test "variant widening annotations retain equal results and recover after invali
         const reordered = try testing.allocator.print(boundary.source, .{"unit | none | int"});
         defer testing.allocator.free(reordered);
         try setSource(db, 1, reordered);
-        try testing.expectEqual(body, try db.get(queries.AnalyzeFunctionInstance, .{ .item = target }));
+        try testing.expectEqual(return_type, (try db.get(queries.AnalyzeFunctionInstance, .{ .item = target })).*.?.return_type);
         try testing.expectEqual(compiled, try db.get(queries.CompileFunction, instance));
         try testing.expectEqual(executable, try db.get(queries.BuildExecutable, 1));
 
@@ -5847,12 +5917,15 @@ test "variant branch joins retain equal results and track changed member sets" {
     try testing.expectEqual(body.*.?.return_type, joined);
     const compiled = try db.get(queries.CompileFunction, instance);
     try testing.expect(compiled.* != null);
+    const original_code = try testing.allocator.dupe(u8, compiled.*.?.code);
+    defer testing.allocator.free(original_code);
 
     const equivalent = try testing.allocator.print(format, .{"(noop())"});
     defer testing.allocator.free(equivalent);
     try setSource(db, 1, equivalent);
-    try testing.expectEqual(body, try db.get(queries.AnalyzeFunctionInstance, .{ .item = target }));
-    try testing.expectEqual(compiled, try db.get(queries.CompileFunction, instance));
+    // Source spans change even when executable operations are equivalent.
+    try testing.expect(body != try db.get(queries.AnalyzeFunctionInstance, .{ .item = target }));
+    try testing.expectEqualSlices(u8, original_code, (try db.get(queries.CompileFunction, instance)).*.?.code);
 
     const changed = try testing.allocator.print(format, .{"42"});
     defer testing.allocator.free(changed);
@@ -5965,7 +6038,8 @@ test "ordinary function spellings retain equivalent semantic and compiled result
     try testing.expectEqual(identity_id, updated_scope.resolve("identity").?);
     try testing.expectEqual(noop_id, updated_scope.resolve("noop").?);
     try testing.expectEqual(identity_signature, try db.get(queries.FunctionSignature, identity_id));
-    try testing.expectEqual(identity_body, try db.get(queries.AnalyzeFunctionInstance, .{ .item = identity_id }));
+    // Source spans change even when executable operations are equivalent.
+    try testing.expect(identity_body != try db.get(queries.AnalyzeFunctionInstance, .{ .item = identity_id }));
     try testing.expectEqual(identity_artifact, try db.get(queries.CompileFunction, .{ .item = identity_id }));
     try testing.expectEqual(noop_signature, try db.get(queries.FunctionSignature, noop_id));
     try testing.expectEqual(noop_artifact, try db.get(queries.CompileFunction, .{ .item = noop_id }));
@@ -6907,10 +6981,13 @@ test "logical condition edits retain equal results and recover diagnostics" {
     const instance: structures.InstanceId = .{ .item = item };
     const body = try db.get(queries.AnalyzeFunctionInstance, .{ .item = item });
     const artifact = try db.get(queries.CompileFunction, instance);
+    const original_code = try testing.allocator.dupe(u8, artifact.*.?.code);
+    defer testing.allocator.free(original_code);
 
     try setSource(db, 1, "static choose = func() int -> return if (1 < 2) or (2 < 1) -> 42 else 24");
-    try testing.expectEqual(body, try db.get(queries.AnalyzeFunctionInstance, .{ .item = item }));
-    try testing.expectEqual(artifact, try db.get(queries.CompileFunction, instance));
+    // Source spans change even when executable operations are equivalent.
+    try testing.expect(body != try db.get(queries.AnalyzeFunctionInstance, .{ .item = item }));
+    try testing.expectEqualSlices(u8, original_code, (try db.get(queries.CompileFunction, instance)).*.?.code);
 
     try setSource(db, 1, "static choose = func() int -> return if 1 < 2 and 2 < 1 -> 42 else 24");
     try expectCompiledFunctionResult(db, 1, "choose", &.{"choose"}, 24);
@@ -7143,7 +7220,8 @@ test "variant inspection edits retain equal artifacts and recover diagnostics" {
     const artifact = try db.get(queries.CompileFunction, instance);
 
     try setSource(db, 1, "static inspect = func(value: int | none) int -> return if const selected = (value) as int -> 42 else 24");
-    try testing.expectEqual(body, try db.get(queries.AnalyzeFunctionInstance, .{ .item = item }));
+    // Source spans change even when executable operations are equivalent.
+    try testing.expect(body != try db.get(queries.AnalyzeFunctionInstance, .{ .item = item }));
     try testing.expectEqual(artifact, try db.get(queries.CompileFunction, instance));
 
     try setSource(db, 1, "static inspect = func(value: int | none) int -> return if const selected = value as none -> 42 else 24");
@@ -9338,10 +9416,11 @@ test "entry const binding edits retain equal analysis and recover" {
     const initial = try db.get(queries.AnalyzeFunctionInstance, .{ .item = entry_id });
     try testing.expect(initial.* != null);
 
-    try setSource(db, 1, "const renamed = 21\nexit(renamed)");
+    // Native spans participate in equality; preserve positions while renaming.
+    try setSource(db, 1, "const other = 21\nexit(other)");
     try testing.expectEqual(initial, try db.get(queries.AnalyzeFunctionInstance, .{ .item = entry_id }));
 
-    try setSource(db, 1, "exit(renamed)");
+    try setSource(db, 1, "exit(other)");
     try testing.expect((try db.get(queries.AnalyzeFunctionInstance, .{ .item = entry_id })).* == null);
     const diagnostics = try db.transitiveAccumulatorValues(queries.AnalyzeFunctionInstance, .{ .item = entry_id }, structures.Diagnostic, testing.allocator);
     defer freeDiagnostics(diagnostics);
@@ -9566,8 +9645,8 @@ test "entry call dependencies follow spelling identity and runtime shape" {
     try testing.expectEqual(bravo_id, (try db.get(EntryCallParent, 1)).*.?);
 
     try setSource(db, 1,
-        \\static bravo = func() int -> return 20
-        \\static alpha = func() int -> return 10
+        \\static bravo = func() int -> return 3
+        \\static alpha = func() int -> return 4
         \\bravo()
     );
     try testing.expectEqual(bravo_id, (try db.get(EntryCallParent, 1)).*.?);
@@ -9591,7 +9670,7 @@ test "entry call dependencies follow spelling identity and runtime shape" {
     try testing.expectEqual(alpha_id, (try db.get(EntryCallParent, 1)).*.?);
 }
 
-test "call result types track signature changes while equal artifacts are retained" {
+test "call result type edits retain machine code and refresh trace locations" {
     const db = try testDatabase(1);
     defer db.deinit();
 
@@ -9604,6 +9683,8 @@ test "call result types track signature changes while equal artifacts are retain
     const instance: structures.InstanceId = .{ .item = entry_id };
     const initial_body = try db.get(queries.AnalyzeFunctionInstance, .{ .item = entry_id });
     const initial_artifact = try db.get(queries.CompileFunction, instance);
+    const initial_code = try testing.allocator.dupe(u8, initial_artifact.*.?.code);
+    defer testing.allocator.free(initial_code);
     try testing.expectEqual(structures.TypeId.unit, initial_body.*.?.instructions[0].call.return_type);
 
     try setSource(db, 1,
@@ -9613,7 +9694,10 @@ test "call result types track signature changes while equal artifacts are retain
     const updated_body = try db.get(queries.AnalyzeFunctionInstance, .{ .item = entry_id });
     try testing.expect(initial_body != updated_body);
     try testing.expectEqual(structures.TypeId.int, updated_body.*.?.instructions[0].call.return_type);
-    try testing.expectEqual(initial_artifact, try db.get(queries.CompileFunction, instance));
+    const updated_artifact = try db.get(queries.CompileFunction, instance);
+    try testing.expect(initial_artifact != updated_artifact);
+    try testing.expectEqualSlices(u8, initial_code, updated_artifact.*.?.code);
+    try testing.expect(std.mem.indexOf(u8, updated_artifact.*.?.trace_sites[0].label, ":2:1)") != null);
 }
 
 test "entry call diagnostics and downstream refusal update and recover" {
@@ -10298,15 +10382,15 @@ test "direct entry call SSA remains demand driven across callee edits and reorde
     // analysis dependency on it.
     try testing.expect((try db.get(queries.AnalyzeFunctionInstance, .{ .item = broken_id })).* == null);
     try setSource(db, 1,
-        \\static broken = func() int -> return false
-        \\static other = func() int -> return 20
+        \\static broken = func() int -> return none
+        \\static other = func() int -> return 3
         \\broken()
     );
     try testing.expectEqual(initial, try db.get(queries.AnalyzeFunctionInstance, .{ .item = instance.item }));
 
     try setSource(db, 1,
-        \\static other = func() int -> return 20
-        \\static broken = func() int -> return false
+        \\static other = func() int -> return 3
+        \\static broken = func() int -> return none
         \\broken()
     );
     try testing.expectEqual(initial, try db.get(queries.AnalyzeFunctionInstance, .{ .item = instance.item }));
@@ -10852,7 +10936,8 @@ test "indirect calls evaluate the callee before their arguments" {
         \\  else
         \\    0
         \\  )
-        \\exit(answer())
+        \\static compiled = comptime -> answer()
+        \\exit(answer() + compiled - 1)
     );
     const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
     const io = testing.io;
@@ -10869,7 +10954,8 @@ test "redundant variant binding annotations retain typed and compiled results" {
     const body = try db.get(queries.AnalyzeFunctionInstance, .{ .item = item });
     const artifact = try db.get(queries.CompileFunction, .{ .item = item });
     try setSource(db, 1, "static f = func(value: int | none) int | none\n  const bound: int | none = value\n  return bound");
-    try testing.expectEqual(body, try db.get(queries.AnalyzeFunctionInstance, .{ .item = item }));
+    // Source spans change even when executable operations are equivalent.
+    try testing.expect(body != try db.get(queries.AnalyzeFunctionInstance, .{ .item = item }));
     try testing.expectEqual(artifact, try db.get(queries.CompileFunction, .{ .item = item }));
 }
 

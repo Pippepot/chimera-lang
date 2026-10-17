@@ -1,6 +1,7 @@
 import std.text.{BytesView}
 import std.array.{Array, collection_literal}
-import std.exit.{exit}
+import std.iteration.{End}
+import std.range.{Range}
 import std.memory
 
 pub struct Allocation(T: type)
@@ -52,9 +53,9 @@ pub struct List(T: type)
     pub func iter(ref self: List(T)) SpanIterator(T)
         var view = self.span()
         return view.iter()
-    pub fallible view(ref self: List(T), start: int, size: int) Span(T)
-        const range = self.span()
-        return range.slice?(start, size)
+    pub fallible slice(ref self: List(T), static A: type, static B: type, bounds: Range(A, B)) Span(T)
+        var view = self.span()
+        return view.slice?(bounds)
     pub fallible bytes(imm self: List(byte)) BytesView -> BytesView.unsafe_from_allocation?(self.storage, self.initialized)
     pub fallible read_bytes(mut self: List(byte), descriptor: int, count: int) int
         count >= 0
@@ -114,7 +115,7 @@ pub struct List(T: type)
 
 func allocate_literal(static T: type, count: int) Allocation(T)
     if const storage = allocate(T, count) -> return storage^
-    exit(134)
+    panic "List literal allocation failed"
 
 extern func initialize_collection(static T: type, static N: int, mut storage: Allocation(T), init values: collection_literal(T, N))
 
@@ -160,7 +161,7 @@ pub struct Span(T: type)
     pub func unsafe_from_static(imm source: static_data, size: int) Span(byte) -> Span(byte){data = static_cursor(source), size = size}
     pub func len(imm self: Span(T)) int -> self.size
     pub func iter(ref self: Span(T)) SpanIterator(T)
-        return SpanIterator(T){source = self, position = 0, active = 0, ready = false}
+        return SpanIterator(T){source = self, position = 0}
     pub fallible get(ref self: Span(T), index: int) ref T
         index >= 0
         index < self.size
@@ -169,34 +170,22 @@ pub struct Span(T: type)
     pub fallible []=(mut self: Span(T), index: int, var item: T) unit
         ref element = self.get?(index)
         element = item^
-    pub fallible slice(ref self: Span(T), start: int, size: int) Span(T)
-        start >= 0
-        size >= 0
-        start <= self.size
-        size <= self.size - start
-        return Span(T){data = cursor_offset(T, self.data, start), size = size}
+    pub fallible slice(ref self: Span(T), static A: type, static B: type, bounds: Range(A, B)) Span(T)
+        const offsets = bounds.resolve?(self.size)
+        return Span(T){data = cursor_offset(T, self.data, offsets.0), size = offsets.1 - offsets.0}
     pub func as_imm(imm self: Span(T)) Span(T) -> Span(T){data = cursor_attenuate(T, self.data), size = self.size}
 
 pub struct SpanIterator(T: type)
     copy = trivial
     source: Span(T)
     position: int
-    active: int
-    ready: bool
 
-    pub func advance(mut self: SpanIterator(T)) bool
-        if self.position >= self.source.len()
-            self.ready = false
-            return false
-        self.active = self.position
+    pub func next(mut self: SpanIterator(T)) ref T | End
+        if self.position >= self.source.len() -> return End{}
+        const position = self.position
         self.position += 1
-        self.ready = true
-        return true
-
-    pub func current(ref self: SpanIterator(T)) ref T
-        if not self.ready? -> exit(134)
-        if ref item = self.source.get(self.active) -> return item
-        exit(134)
+        if ref item = self.source.get(position) -> return item
+        panic "invalid span iterator element"
 
 extern func empty_cursor(static T: type) StorageCursor(T)
 extern func static_cursor(imm source: static_data) StorageCursor(byte)

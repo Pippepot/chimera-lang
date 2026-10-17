@@ -1,12 +1,13 @@
 const std = @import("std");
 const structures = @import("../structures.zig");
 
-pub const ExecutionErrorReason = enum {
+pub const ExecutionErrorReason = union(enum) {
     call_cycle,
     division_by_zero,
     integer_overflow,
     unsupported_operation,
     escaping_storage,
+    panic: structures.ByteStringId,
 };
 
 pub const ExecutionError = struct {
@@ -626,7 +627,7 @@ fn ExecutionFrame(comptime Executor: type) type {
                 reference.type_id = operation.target_type;
                 return .{ .returned = .{ .runtime = .{ .function_ref = reference } } };
             }
-            if (active.member_type == operation.target_type) return .{ .returned = active.payload };
+            if (active.member_type == operation.target_type) return .{ .returned = try copyStoredValue(active.payload, operation.target_type, self.executor, self.storage) };
             var reference = active.payload.runtime.function_ref;
             reference.type_id = operation.target_type;
             return .{ .returned = .{ .runtime = .{ .function_ref = reference } } };
@@ -1111,16 +1112,49 @@ fn storageCursorElement(source: Value, type_id: structures.TypeId, offset: u32, 
         .runtime => return offsetStorageCursor(source, type_id, offset, storage),
         .place => |cell| {
             if (cell.contents == .value) return storageCursorElement(.{ .runtime = cell.contents.value }, type_id, offset, storage);
-            const cursor = cell.contents.storage_cursor;
-            const index = std.math.add(u32, cursor.offset, offset) catch return error.TypeTooLarge;
-            const element = if (cursor.owner.contents == .allocation)
-                try cursor.owner.contents.allocation.element(index)
-            else
-                &cursor.owner.contents.fields[index];
-            return referenceValue(type_id, element, storage);
+            return referenceValue(type_id, try storageCursorCell(cell, offset), storage);
         },
         .type, .initializer => unreachable,
     }
+}
+
+fn storageCursorCell(cell: *Cell, offset: u32) !*Cell {
+    const cursor = cell.contents.storage_cursor;
+    const index = std.math.add(u32, cursor.offset, offset) catch return error.TypeTooLarge;
+    return if (cursor.owner.contents == .allocation)
+        try cursor.owner.contents.allocation.element(index)
+    else
+        &cursor.owner.contents.fields[index];
+}
+
+/// Snapshot a validated StringView while its evaluation-local backing is alive.
+pub fn panicMessage(message: Value, executor: anytype, gpa: std.mem.Allocator) !structures.ByteStringId {
+    const bytes_view = try panicField(message, 0, executor);
+    const span = try panicField(bytes_view, 0, executor);
+    const cursor = try panicField(span, 0, executor);
+    const size = try panicField(span, 1, executor);
+    const count = (if (size == .place) size.place.contents.value else size.runtime).int;
+    std.debug.assert(count >= 0);
+    const bytes = try gpa.alloc(u8, @intCast(count));
+    defer gpa.free(bytes);
+    for (bytes, 0..) |*byte, index| {
+        if (cursor == .place and cursor.place.contents == .storage_cursor) {
+            byte.* = (try storageCursorCell(cursor.place, @intCast(index))).contents.value.byte;
+        } else {
+            const runtime = if (cursor == .place) cursor.place.contents.value else cursor.runtime;
+            const data = try executor.byteString(runtime.storage_cursor.data.?);
+            byte.* = data[runtime.storage_cursor.offset + index];
+        }
+    }
+    return executor.internBytes(bytes);
+}
+
+fn panicField(value: Value, index: usize, executor: anytype) !Value {
+    if (value == .place and value.place.contents == .fields)
+        return .{ .place = &value.place.contents.fields[index] };
+    const runtime = if (value == .place) value.place.contents.value else value.runtime;
+    const fields = try executor.lookupTuple(runtime.structure);
+    return .{ .runtime = (try executor.lookupRuntime(fields[index])).?.value };
 }
 
 fn readStaticReference(source: Value, executor: anytype) !?Value {

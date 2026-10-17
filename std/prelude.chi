@@ -3,6 +3,7 @@ pub import std.io.{print}
 pub import std.exit.{exit}
 pub import std.memory.{Box, Ref, Span, List}
 pub import std.array.{Array, collection_literal}
+pub import std.iteration.{End}
 
 extern func literal_byte(static value: int_literal) byte
 pub converter(static value: int_literal) byte where value >= 0 where value <= 255 -> literal_byte(value)

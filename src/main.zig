@@ -166,7 +166,7 @@ fn compileAndRun(
     var db = try query.Database.init(gpa, database_options);
     defer db.deinit();
     timings.mark(io, "database init");
-    var source_registry: modules.SourceRegistry = .{};
+    var source_registry: modules.SourceRegistry = .{ .entry_path = input.source_path };
     defer source_registry.deinit(gpa);
     var restored_offset: ?usize = null;
     if (snapshot) |bytes| {
@@ -188,7 +188,7 @@ fn compileAndRun(
             error.InvalidCache, error.InvalidInternId => {
                 const fresh = try query.Database.init(gpa, database_options);
                 source_registry.deinit(gpa);
-                source_registry = .{};
+                source_registry = .{ .entry_path = input.source_path };
                 db.deinit();
                 db = fresh;
                 try source_registry.update(db, gpa, input.source, input.source_files, input.module_paths);
@@ -632,6 +632,34 @@ test "CLI core renders source diagnostics without running" {
         "broken.chi:1:1: expected 1 call argument, found 0",
     ) != null);
     try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "timing\n") != null);
+}
+
+test "CLI renders bare and message compile-time panic without compiler-control exit" {
+    const io = std.testing.io;
+    for ([_]struct { expression: []const u8, expected: []const u8 }{
+        .{ .expression = "panic", .expected = "panic during compile-time execution\n" },
+        .{ .expression = "panic \"failed\"", .expected = "panic during compile-time execution: failed\n" },
+    }) |case| {
+        var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer output.deinit();
+        var errors: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer errors.deinit();
+        const source = try std.testing.allocator.print("func stop() int -> {s}\nstatic result = stop()\nexit(result)", .{case.expression});
+        defer std.testing.allocator.free(source);
+        const result = try compileAndRun(io, std.testing.allocator, .{
+            .source_path = "panic.chi",
+            .source = source,
+            .program_args = &.{},
+            .debug_flags = .{},
+            .started = std.Io.Clock.awake.now(io),
+        }, &output.writer, &errors.writer);
+        try std.testing.expectEqual(RunOutcome.rejected, result);
+        try std.testing.expectEqualStrings("", output.writer.buffered());
+        const rendered = errors.writer.buffered();
+        try std.testing.expect(std.mem.indexOf(u8, rendered, case.expected) != null);
+        try std.testing.expect(std.mem.indexOf(u8, rendered, "panic.chi:1:20:") != null);
+        try std.testing.expect(std.mem.indexOf(u8, rendered, "panic.chi:2:") != null);
+    }
 }
 
 test "CLI core renders compile-time call traces from the failure outward" {

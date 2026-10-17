@@ -18,6 +18,22 @@ pub const Encoding = struct {
 };
 
 const instructions = .{
+    .mov_r12_rsp = Encoding{ .prefix = &.{ 0x49, 0x89, 0xE4 }, .asm_prefix = "mov r12, rsp" },
+    .mov_r13_r12 = Encoding{ .prefix = &.{ 0x4D, 0x8B, 0x2C, 0x24 }, .asm_prefix = "mov r13, [r12]" },
+    .add_r12_8 = Encoding{ .prefix = &.{ 0x49, 0x83, 0xC4, 8 }, .asm_prefix = "add r12, 8" },
+    .mov_r14 = Encoding{ .prefix = &.{ 0x49, 0xBE }, .operand = .u64, .asm_prefix = "mov r14, " },
+    .mov_r15d = Encoding{ .prefix = &.{ 0x41, 0xBF }, .operand = .i32, .asm_prefix = "mov r15d, " },
+    .mov_rax_r14 = Encoding{ .prefix = &.{ 0x49, 0x8B, 0x06 }, .asm_prefix = "mov rax, [r14]" },
+    .cmp_rax_r13 = Encoding{ .prefix = &.{ 0x4C, 0x39, 0xE8 }, .asm_prefix = "cmp rax, r13" },
+    .add_r14_32 = Encoding{ .prefix = &.{ 0x49, 0x83, 0xC6, 32 }, .asm_prefix = "add r14, 32" },
+    .test_rax = Encoding{ .prefix = &.{ 0x48, 0x85, 0xC0 }, .asm_prefix = "test rax, rax" },
+    .mov_rax_r14_offset = Encoding{ .prefix = &.{ 0x49, 0x8B, 0x86 }, .operand = .u32, .asm_prefix = "mov rax, [r14+", .asm_suffix = "]" },
+    .mov_rsi_r14_offset = Encoding{ .prefix = &.{ 0x49, 0x8B, 0xB6 }, .operand = .u32, .asm_prefix = "mov rsi, [r14+", .asm_suffix = "]" },
+    .mov_edx_r14_offset = Encoding{ .prefix = &.{ 0x41, 0x8B, 0x96 }, .operand = .u32, .asm_prefix = "mov edx, [r14+", .asm_suffix = "]" },
+    .add_r12_rax = Encoding{ .prefix = &.{ 0x49, 0x01, 0xC4 }, .asm_prefix = "add r12, rax" },
+    .dec_r15d = Encoding{ .prefix = &.{ 0x41, 0xFF, 0xCF }, .asm_prefix = "dec r15d" },
+    .add_rsi_rax = Encoding{ .prefix = &.{ 0x48, 0x01, 0xC6 }, .asm_prefix = "add rsi, rax" },
+    .sub_rdx_rax = Encoding{ .prefix = &.{ 0x48, 0x29, 0xC2 }, .asm_prefix = "sub rdx, rax" },
     .lea_rax_rip = Encoding{ .prefix = &.{ 0x48, 0x8D, 0x05 }, .operand = .rel, .asm_prefix = "lea rax, [rip+", .asm_suffix = "]" },
     .mov_rax_rdi = Encoding{ .prefix = &.{ 0x48, 0x8B, 0x87 }, .operand = .u32, .asm_prefix = "mov rax, [rdi+", .asm_suffix = "]" },
     .ret = Encoding{ .prefix = &.{0xC3}, .asm_prefix = "ret" },

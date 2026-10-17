@@ -8,6 +8,223 @@ const query_disk_cache = test_sources.query_disk_cache;
 const structures = test_sources.structures;
 const standard_library = @import("standard_library");
 
+test "panic snapshots distinguish static arguments even when machine code is equal" {
+    const source = "func stop(static N: int) int -> panic\nfunc run() int -> stop(1)\nexit(run())";
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    const source_fixture: test_sources.SourceFixture = .{ .db = fixture.db };
+    const original = try source_fixture.runIo("");
+    defer std.testing.allocator.free(original.stdout);
+    defer std.testing.allocator.free(original.stderr);
+    try std.testing.expect(std.mem.indexOf(u8, original.stderr, "at stop(1) ") != null);
+    const edited_source = try std.mem.replaceOwned(u8, std.testing.allocator, source, "stop(1)", "stop(2)");
+    defer std.testing.allocator.free(edited_source);
+    try fixture.db.setInput(queries.SourceText, 0, edited_source);
+    const edited = try source_fixture.runIo("");
+    defer std.testing.allocator.free(edited.stdout);
+    defer std.testing.allocator.free(edited.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 134 }, edited.term);
+    try std.testing.expect(std.mem.indexOf(u8, edited.stderr, "at stop(2) ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, edited.stderr, "stop(1)") == null);
+}
+
+test "panic snapshots restore traces and refresh messages and source locations" {
+    const source = "func run() int -> panic \"original\"\nexit(run())";
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    const source_fixture: test_sources.SourceFixture = .{ .db = fixture.db };
+    const original = try source_fixture.runIo("");
+    defer std.testing.allocator.free(original.stdout);
+    defer std.testing.allocator.free(original.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 134 }, original.term);
+    try std.testing.expect(std.mem.indexOf(u8, original.stderr, "panic: original\n  at run (main.chi:1:19)") != null);
+    try fixture.db.setInput(queries.SourceText, 0, "\nfunc run() int -> panic \"edited\"\nexit(run())");
+    try fixture.db.setInput(queries.SourcePath, 0, "renamed.chi");
+    const edited = try source_fixture.runIo("");
+    defer std.testing.allocator.free(edited.stdout);
+    defer std.testing.allocator.free(edited.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 134 }, edited.term);
+    try std.testing.expect(std.mem.indexOf(u8, edited.stderr, "panic: edited\n  at run (renamed.chi:2:19)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, edited.stderr, "main.chi") == null);
+    try fixture.db.setInput(queries.SourceText, 0, "func run() int -> 42\nexit(run())");
+    try fixture.expectExit(42);
+}
+
+test "tuple snapshots restore values reference alternatives and member-kind edits" {
+    const source =
+        \\func pair() (int, int) -> (12, 30)
+        \\static answer = pair()
+        \\func capture(ref owner: int) ref int | End -> owner
+        \\func run() int
+        \\    var owner = answer.0
+        \\    var carrier: ref int | End = capture(owner)
+        \\    if ref item = carrier as int
+        \\        carrier = End{}
+        \\        item += answer.1
+        \\        return owner
+        \\    return 90
+        \\exit(run())
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const changed = try std.mem.replaceOwned(u8, std.testing.allocator, source, "(12, 30)", "(13, 30)");
+    defer std.testing.allocator.free(changed);
+    try fixture.db.setInput(queries.SourceText, 0, changed);
+    try fixture.expectExit(43);
+    const owned = try std.mem.replaceOwned(u8, std.testing.allocator, source, "ref int | End", "int | End");
+    defer std.testing.allocator.free(owned);
+    try fixture.db.setInput(queries.SourceText, 0, owned);
+    try fixture.expectDiagnostic(.borrow_outlives_source);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(42);
+}
+
+test "readonly aggregate snapshots preserve independent owned and reference permissions" {
+    const source =
+        \\struct Views
+        \\    copy = trivial
+        \\    view: Span(int)
+        \\    target: Ref(int)
+        \\func snapshot(imm source: Views) Views -> source
+        \\fallible calculate() int
+        \\    var values = [19, 23]
+        \\    var target = 41
+        \\    var owner = Box.new?(snapshot(Views{view = values.span(), target = Ref.from(target)}))
+        \\    ref copied = owner.borrow()
+        \\    copied.target.value += 1
+        \\    return copied.view[0] + copied.view[1] + target - 42
+        \\func run() int
+        \\    if const result = calculate() -> return result
+        \\    return 90
+        \\exit(run())
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const edited = try std.mem.replaceOwned(u8, std.testing.allocator, source, "copied.target.value += 1", "copied.view[0] = 1");
+    defer std.testing.allocator.free(edited);
+    try fixture.db.setInput(queries.SourceText, 0, edited);
+    try fixture.expectDiagnostic(.reference_not_writable);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(42);
+}
+
+test "temporal reference snapshots recompute aliasing and mutation effects" {
+    const source =
+        \\struct Captures(T: type)
+        \\    left: Ref(T)
+        \\    right: Ref(T)
+        \\fallible inspect(captures: Captures(String)) int
+        \\    const view = captures.left.value.view()
+        \\    captures.right.value.append?("x")
+        \\    return view.byte_length() + 39
+        \\fallible calculate() int
+        \\    var left: String = "abc"
+        \\    var right: String = ""
+        \\    const captures = Captures(String){left = Ref.from(left), right = Ref.from(right)}
+        \\    return inspect?(captures)
+        \\func run() int
+        \\    if const result = calculate() -> return result
+        \\    return 90
+        \\exit(run())
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const original = (try Fixture.functionBody(fixture.db, "inspect")).*.?;
+    try std.testing.expect(original.reference_contract.exclusions.len > 0);
+    const aliased = try std.mem.replaceOwned(u8, std.testing.allocator, source, "Ref.from(right)", "Ref.from(left)");
+    defer std.testing.allocator.free(aliased);
+    try fixture.db.setInput(queries.SourceText, 0, aliased);
+    try fixture.expectDiagnostic(.borrow_outlives_source);
+    const no_mutation = try std.mem.replaceOwned(u8, std.testing.allocator, aliased, "captures.right.value.append?(\"x\")", "_ = 0");
+    defer std.testing.allocator.free(no_mutation);
+    try fixture.db.setInput(queries.SourceText, 0, no_mutation);
+    try fixture.expectExit(42);
+    try std.testing.expectEqual(@as(usize, 0), (try Fixture.functionBody(fixture.db, "inspect")).*.?.reference_contract.exclusions.len);
+    try fixture.db.setInput(queries.SourceText, 0, aliased);
+    try fixture.expectDiagnostic(.borrow_outlives_source);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(42);
+}
+
+test "destructor snapshots recompute captured authority and mutation effects" {
+    const source =
+        \\struct Observer
+        \\    owner: Ref(String)
+        \\    trace: Ref(int)
+        \\    drop = func(deinit self: Observer)
+        \\        self.trace.value += self.owner.value.byte_length()
+        \\func discard(var observer: Observer) -> ()
+        \\fallible calculate() int
+        \\    var owner: String = "abc"
+        \\    const view = owner.view()
+        \\    var trace = 0
+        \\    discard(Observer{owner = Ref.from(owner), trace = Ref.from(trace)})
+        \\    return view.byte_length() + trace + 36
+        \\func run() int
+        \\    if const result = calculate() -> return result
+        \\    return 90
+        \\exit(run())
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const mutation = try std.mem.replaceOwned(u8, std.testing.allocator, source, "self.trace.value += self.owner.value.byte_length()", "if self.owner.value.append(\"x\") -> ()");
+    defer std.testing.allocator.free(mutation);
+    try fixture.db.setInput(queries.SourceText, 0, mutation);
+    try fixture.expectDiagnostic(.borrow_outlives_source);
+    const readonly = try std.mem.replaceOwned(u8, std.testing.allocator, source, "var owner:", "const owner:");
+    defer std.testing.allocator.free(readonly);
+    try fixture.db.setInput(queries.SourceText, 0, readonly);
+    try fixture.expectExit(42);
+    const readonly_mutation = try std.mem.replaceOwned(u8, std.testing.allocator, mutation, "var owner:", "const owner:");
+    defer std.testing.allocator.free(readonly_mutation);
+    try fixture.db.setInput(queries.SourceText, 0, readonly_mutation);
+    try fixture.expectDiagnostic(.reference_not_writable);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(42);
+}
+
+test "pull cursor snapshots recompute delivery kind effects and protocol methods" {
+    const source =
+        \\struct Cursor
+        \\    position: int
+        \\    value: int
+        \\    func next(mut self: Cursor) int | End
+        \\        if self.position >= 2 -> return End{}
+        \\        self.position += 1
+        \\        self.value += 1
+        \\        return self.value
+        \\func run() int
+        \\    var cursor = Cursor{position = 0, value = 0}
+        \\    var sum = 0
+        \\    for ref item in cursor
+        \\        item += 10
+        \\        sum += item
+        \\    return sum + cursor.value + 17
+        \\exit(run())
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const borrowed = try std.mem.replaceOwned(u8, std.testing.allocator, source, "int | End", "ref int | End");
+    defer std.testing.allocator.free(borrowed);
+    try fixture.db.setInput(queries.SourceText, 0, borrowed);
+    try fixture.expectExit(72);
+    const fallible = try std.mem.replaceOwned(u8, std.testing.allocator, source, "func next", "fallible next");
+    defer std.testing.allocator.free(fallible);
+    try fixture.db.setInput(queries.SourceText, 0, fallible);
+    try fixture.expectDiagnostic(.fallible_expression_outside_fallible_function);
+    const missing = try std.mem.replaceOwned(u8, std.testing.allocator, source, "func next", "func advance");
+    defer std.testing.allocator.free(missing);
+    try fixture.db.setInput(queries.SourceText, 0, missing);
+    try fixture.expectDiagnostic(.unknown_namespace_member);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(42);
+}
+
 test "range iteration snapshots restore runtime and compile-time results and recompute endpoints" {
     const source =
         \\func run() int
@@ -36,14 +253,13 @@ test "cursor iteration snapshots track method edits explicit factories and missi
     const source =
         \\import std.range.{RangeIterator}
         \\struct Cursor
-        \\    next: int
-        \\    pub func advance(mut self: Cursor) bool
-        \\        if self.next >= 3 -> return false
-        \\        self.next += 1
-        \\        return true
-        \\    pub func current(ref self: Cursor) int -> self.next * 7
+        \\    position: int
+        \\    pub func next(mut self: Cursor) int | End
+        \\        if self.position >= 3 -> return End{}
+        \\        self.position += 1
+        \\        return self.position * 7
         \\func run() int
-        \\    var cursor = Cursor{next = 0}
+        \\    var cursor = Cursor{position = 0}
         \\    var total = 0
         \\    for value in cursor
         \\        total += value
@@ -55,20 +271,20 @@ test "cursor iteration snapshots track method edits explicit factories and missi
     const fixture = try Fixture.restore(source);
     defer fixture.db.deinit();
     try fixture.expectExit(42);
-    const edited = try std.mem.replaceOwned(u8, std.testing.allocator, source, "self.next * 7", "self.next * 8");
+    const edited = try std.mem.replaceOwned(u8, std.testing.allocator, source, "self.position * 7", "self.position * 8");
     defer std.testing.allocator.free(edited);
     try fixture.db.setInput(queries.SourceText, 0, edited);
     try fixture.expectExit(48);
-    const factory = try std.mem.replaceOwned(u8, std.testing.allocator, source, "    pub func advance",
+    const factory = try std.mem.replaceOwned(u8, std.testing.allocator, source, "    pub func next",
         \\    pub func iter(ref self: Cursor) RangeIterator
         \\        const values = 0..^3
         \\        return values.iter()
-        \\    pub func advance
+        \\    pub func next
     );
     defer std.testing.allocator.free(factory);
     try fixture.db.setInput(queries.SourceText, 0, factory);
     try fixture.expectExit(6);
-    const missing = try std.mem.replaceOwned(u8, std.testing.allocator, source, "pub func advance", "pub func removed");
+    const missing = try std.mem.replaceOwned(u8, std.testing.allocator, source, "pub func next", "pub func removed");
     defer std.testing.allocator.free(missing);
     try fixture.db.setInput(queries.SourceText, 0, missing);
     try fixture.expectDiagnostic(.unknown_namespace_member);
@@ -196,6 +412,86 @@ test "cursor snapshots restore literal and empty spans and recompute source edit
     defer std.testing.allocator.free(edited);
     try fixture.db.setInput(queries.SourceText, 0, edited);
     try fixture.expectExit(44);
+}
+
+test "nested span snapshots recompute slice bounds extent and readonly backing" {
+    const source =
+        \\fallible select(ref source: Ref(Span(int))) Span(int) -> source.value.slice?(0..2)
+        \\fallible calculate() int
+        \\    var values = [5, 17, 23, 29, 7]
+        \\    var source = values.span()
+        \\    var middle = source.slice?(1..4)
+        \\    const carrier = Ref.from(middle)
+        \\    var nested = select?(carrier)
+        \\    nested[0] = nested[0]
+        \\    return nested[0] + nested[1] + nested.len()
+        \\func run() int
+        \\    if const result = calculate() -> return result
+        \\    return 90
+        \\static answer = run()
+        \\exit(run() + answer - 42)
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const shifted = try std.mem.replaceOwned(u8, std.testing.allocator, source, "source.slice?(1..4)", "source.slice?(2..5)");
+    defer std.testing.allocator.free(shifted);
+    try fixture.db.setInput(queries.SourceText, 0, shifted);
+    try fixture.expectExit(66);
+    const shortened = try std.mem.replaceOwned(u8, std.testing.allocator, source, "[5, 17, 23, 29, 7]", "[5, 17]");
+    defer std.testing.allocator.free(shortened);
+    try fixture.db.setInput(queries.SourceText, 0, shortened);
+    try fixture.expectExit(138);
+    const readonly = try std.mem.replaceOwned(u8, std.testing.allocator, source, "var middle =", "const middle =");
+    defer std.testing.allocator.free(readonly);
+    try fixture.db.setInput(queries.SourceText, 0, readonly);
+    try fixture.expectDiagnostic(.reference_not_writable);
+    const attenuated = try std.mem.replaceOwned(u8, std.testing.allocator, source, "var source = values.span()", "var source = values.span().as_imm()");
+    defer std.testing.allocator.free(attenuated);
+    try fixture.db.setInput(queries.SourceText, 0, attenuated);
+    try fixture.expectDiagnostic(.reference_not_writable);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(42);
+}
+
+test "range snapshots restore raw bounds and recompute omitted endpoint types" {
+    const source =
+        \\static bounds = 1..3
+        \\fallible calculate() int
+        \\    var values = [5, 17, 23, 29, 7]
+        \\    const selected = values.slice?(bounds)
+        \\    return selected[0] + selected[1] + selected.len()
+        \\func run() int
+        \\    if const result = calculate() -> return result
+        \\    return 90
+        \\static answer = run()
+        \\exit(run() + answer - 42)
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const cases = [_]struct { bounds: []const u8, status: u8 }{
+        .{ .bounds = "2..4", .status = 66 },
+        .{ .bounds = "..2", .status = 6 },
+        .{ .bounds = "1..", .status = 46 },
+        .{ .bounds = "..", .status = 12 },
+        .{ .bounds = "3..1", .status = 138 },
+        .{ .bounds = "0..^2147483647", .status = 138 },
+        .{ .bounds = "1..^none", .status = 138 },
+    };
+    for (cases) |case| {
+        const replacement = try std.fmt.allocPrint(std.testing.allocator, "static bounds = {s}", .{case.bounds});
+        defer std.testing.allocator.free(replacement);
+        const edited = try std.mem.replaceOwned(u8, std.testing.allocator, source, "static bounds = 1..3", replacement);
+        defer std.testing.allocator.free(edited);
+        try fixture.db.setInput(queries.SourceText, 0, edited);
+        try fixture.expectExit(case.status);
+        const restored = try Fixture.restore(edited);
+        defer restored.db.deinit();
+        try restored.expectExit(case.status);
+    }
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(42);
 }
 
 test "raw borrow snapshots recompute source and registered signature edits" {
@@ -918,7 +1214,7 @@ test "raw slot initializer snapshots retain immovable destruction and recompute 
         \\struct Item
         \\    move = none
         \\    value: int
-        \\    drop = func(deinit self: Item) -> exit(self.value)
+        \\    drop = func(deinit self: Item) -> exit(self.value + 0)
         \\func make(value: int) Item -> Item{value = value}
         \\fallible initialize(mut storage: Allocation(Item), init item: Item) -> storage.unsafe_initialize?(1, item)
         \\fallible run()
@@ -936,7 +1232,7 @@ test "raw slot initializer snapshots retain immovable destruction and recompute 
     defer fixture.db.deinit();
     try fixture.expectExit(42);
     const consumer_body = try Fixture.functionBody(fixture.db, "initialize");
-    const hook_edit = try std.mem.replaceOwned(u8, std.testing.allocator, source, "exit(self.value)", "exit(self.value + 1)");
+    const hook_edit = try std.mem.replaceOwned(u8, std.testing.allocator, source, "exit(self.value + 0)", "exit(self.value + 1)");
     defer std.testing.allocator.free(hook_edit);
     try fixture.db.setInput(queries.SourceText, 0, hook_edit);
     try fixture.expectExit(43);

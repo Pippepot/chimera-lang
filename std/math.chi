@@ -1,0 +1,10 @@
+pub func min(left: int, right: int) int
+    if left < right -> return left
+    return right
+
+pub func max(left: int, right: int) int
+    if left > right -> return left
+    return right
+
+pub func clamp(value: int, lower: int, upper: int) int
+    return max(min(value, upper), lower)

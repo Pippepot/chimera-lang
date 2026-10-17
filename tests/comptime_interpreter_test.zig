@@ -35,7 +35,7 @@ test "evaluation heap empty oversized and zero sized allocations preserve native
         \\    if logical_capacity <> 2147483647 -> return 92
         \\    var buffer = List(Empty).new?(0)
         \\    if buffer.get(0) -> return 93
-        \\    const empty_view = buffer.view?(0, 0)
+        \\    const empty_view = buffer.slice?(0..0)
         \\    if empty_view.get(0) -> return 94
         \\    buffer.append?(Empty{})
         \\    buffer.append?(Empty{})
@@ -279,7 +279,7 @@ test "evaluation heap executes independent factories nested aliases and ordinary
         \\    buffer.append?(19)
         \\    buffer.append?(23)
         \\    buffer.reserve?(8)
-        \\    const view = buffer.view?(0, 2)
+        \\    const view = buffer.slice?(0..2)
         \\    ref left = view.get?(0)
         \\    ref right = view.get?(1)
         \\    const values: List(int) = [left, right]

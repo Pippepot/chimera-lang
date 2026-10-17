@@ -1,4 +1,5 @@
 import std.memory.{Span, SpanIterator}
+import std.range.{Range}
 
 pub struct collection_literal(T: type, N: int)
     move = none
@@ -11,6 +12,9 @@ pub struct Array(T: type, N: int)
     pub func iter(ref self: Array(T, N)) SpanIterator(T)
         var view = self.span()
         return view.iter()
+    pub fallible slice(ref self: Array(T, N), static A: type, static B: type, bounds: Range(A, B)) Span(T)
+        var view = self.span()
+        return view.slice?(bounds)
 
     pub fallible get(ref self: Array(T, N), index: int) ref T
         index >= 0

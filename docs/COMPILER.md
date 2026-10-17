@@ -59,7 +59,13 @@ arguments, or runtime storage; copied or extracted ordinary data can leave evalu
 
 `List(T).new`, `reserve`, and `append` provide fallible dynamic growth. Array and
 List expose `span()` over their initialized elements.
-`Span(T)` provides checked slicing and borrowed `get`/index access with permission
+Array, List, and Span expose checked `slice?(bounds)`, for example
+`values.slice?(1..3)`, `values.slice?(..3)`, `values.slice?(2..)`, or
+`values.slice?(..)`. Bounds are reusable `Range(A, B)` values with independent
+integer or omitted (`none`) endpoints; equal exclusive endpoints are empty,
+reversed and out-of-bounds slices fail, and inclusive ends must name elements.
+There is no public start/size slicing alternative or range bracket dispatch.
+`Span(T)` provides borrowed `get`/index access with permission
 captured from the receiver; owned bindings copy elements, and `as_imm()` attenuates
 permission. Copies and mutable bindings cannot upgrade readonly backing. Spans own no storage and
 cannot escape local backing or survive owner transfer. Readonly spans do not
@@ -68,13 +74,16 @@ freeze their owners; conflicting writes invalidate content-dependent views.
 `for item in source` iterates ranges, Array/List/Span, and ordinary custom
 cursors. A bare item owns an owned result or aliases a borrowed result readonly;
 `for const item` and `for var item` explicitly own/copy, while `for ref item`
-preserves borrowed permission. An optional `iter` factory supplies a cursor;
-otherwise named cursor state resumes in place. Cursors expose `advance` returning
-bool and `current` returning an owned value or `ref T`. Only successful false
-means exhaustion; declared failure propagates normally. The compiler invokes
-`current` once per successful step, including `_` bindings. Ranges use `a..b` or
+aliases an available item place with its permission. An optional `iter` factory
+supplies a cursor; otherwise named cursor state resumes in place. Cursors expose
+`next`, returning an owned or borrowed item in a variant with `End`. Only `End`
+means exhaustion; declared failure propagates before item matching. The compiler
+polls once per step, including `_` bindings, and cleans up the acquired item.
+An alias into an owned poll payload cannot outlive its carrier. Ranges use `a..b` or
 `a..^b`, with ordinary `reversed()` and fallible `step_by?(positive_factor)`
 methods. Inclusive endpoints and composed steps terminate without int overflow.
+Only fully bounded integer ranges iterate. Stepping and reversal return reusable
+`RangeSequence` traversal values, which cannot be passed as contiguous slice bounds.
 
 UTF-8 literals default to the prelude `String`. Literal-backed strings allocate
 nothing; mutation grows unique owned storage, and `clone` is explicitly fallible.
@@ -83,7 +92,8 @@ nothing; mutation grows unique owned storage, and `clone` is explicitly fallible
 BytesView `get`/index results are readonly `ref byte`; owned bindings copy the byte.
 `byte_int` is the
 named widening operation. `BytesView.validate_utf8` validates arbitrary byte
-input, and text slices check codepoint boundaries. String-to-view converters
+input, and text views use the same range-based slicing API, with StringView
+additionally checking codepoint boundaries. String-to-view converters
 borrow their source; literal-to-view converters refer to permanent static bytes.
 `String` and `StringView` support `==` and `<>` with exact byte equality,
 including embedded NUL bytes and either order of owned strings, views, and
@@ -93,11 +103,32 @@ collection get/index access return ref T. Box.take consumes its owner and extrac
 the value; raw Allocation methods match the allocate/deallocate and unsafe
 initialize/borrow/take/destroy free functions. Explicit handles use Ref.from(place)
 and expose a reference field, value. Ref(T) owns only its handle; Box(T) owns T.
-Readonly access is transitive, and copying a readonly handle into a var cannot
-upgrade it. `if ref part = value as Part` borrows a variant payload without
+Readonly access restricts owned fields; a reference field preserves its captured
+authority even in a const carrier. Copying a readonly referent capture into a var
+cannot upgrade it. Owned storage views retain their readonly-backing rules.
+`if ref part = value as Part` borrows a variant payload without
 copying. Borrowed function results are declared with ref T, including in callable
 types. `ref` and `mut` parameters preserve caller storage identity; `mut` requires
 writable access. Owned getters remain owned and cannot initialize a ref binding.
+Type annotations distinguish `ref T | End`, an owned variant with a reference
+alternative, from `ref (T | End)`, a borrow of an existing whole variant. Matching
+uses logical type; reference alternatives retain their own captured authority
+and origins. Explicitly typed tuples such as `(ref A, B)` use positional `.0`
+and `.1` access and ordinary elementwise ownership. Tuple literals currently
+require an expected tuple type. Compiler lowering and standard range/span cursors
+use only `next/End`; no protocol build option or legacy fallback remains.
+The next result must contain an owned `std.iteration.End` alternative,
+independently of caller imports or shadowing. Bare bindings preserve
+the storage kinds of multiple item alternatives; owning bindings copy reference
+payloads according to ordinary ownership. Fresh immovable owned payloads can
+bind in their poll carrier without relocation. Source-level generic map, filter,
+and mixed/nested zip cases exercise explicit static type arguments and separately
+declared failure shapes; computed member specifications and one-definition exact
+generic fallibility are not yet a standard-library interface. Existing type
+factories select exact effects and delivery kinds from explicit static arguments;
+automatic discovery, builders, and new binding syntax are deferred proposals,
+not prerequisites for iteration. For focused verification, run
+`zig build test --seed=0 -Dtest-source=tests/iteration_test.zig`.
 `if const item = source^ as T` consumes a variant on both paths; success owns the
 payload and failure cleans the unmatched temporary. Fresh variant results extract
 by ownership as well. Type arguments accept unions and callable types directly,
@@ -105,6 +136,12 @@ such as Array(int | none, 2).
 Integer `%` is truncating remainder (`-7 % 3`
 is `-1`), and `%=` uses the same operation. Delimited calls, arrays, struct
 initializers, imports, and parameter lists accept multiline continuation layout.
+
+`import std.math.{min, max}` provides infallible integer minimum and maximum.
+The same module exports infallible `clamp(value, lower, upper)`, which restricts
+an integer to the inclusive bounds using `max(min(value, upper), lower)`.
+Reversed bounds return `lower`; equal bounds return that bound. All three are
+ordinary library functions and also execute at compile time.
 
 ```chi
 fallible output()
@@ -144,6 +181,23 @@ Concurrent compiler processes can share the cache and working directory; each
 runs its own executable while `./prog` is replaced atomically.
 
 Top-level code is the entry point; a function named `main` is ordinary. The CLI itself exits with 0 after a normal program exit, or 1 on invalid arguments, source-read failure, source rejection, compiler failure, or abnormal program termination. It reports the program's exit status or termination signal separately from compiler failures. A compile-time `exit(code)` is compiler control instead: it produces no executable and becomes the CLI's own process status.
+
+`panic` and `panic "message"` terminate with status 134 after reporting the
+message and source call trace to stderr. Bare panic prints just `panic`.
+The message accepts StringView and
+ordinary string conversions. Panic bypasses fallible handlers and does not
+unwind live owners. Compile-time panic reports a source error and call trace
+instead of exiting the compiler with status 134. Native traces retain read-only
+metadata and add no instructions to successful calls; traces stop at entry or
+an unknown call site, with a maximum of 1024 frames.
+
+Function names include their static arguments, for example `foo(1)` or
+`Item(int).stop(7)`. Native traces, compile-time call notes, function diagnostic
+contexts, and SSA/assembly labels use the same names and render static types
+and values rather than interner IDs.
+
+Run the focused panic suite with
+`zig build test --seed=0 -Dtest-source=tests/panic_test.zig`.
 
 ## Documentation
 
@@ -205,11 +259,11 @@ zig build test --seed=0 -Doptimize=safe -Dtest-source=tests/comptime_interpreter
 ```
 
 These entrypoints supply required module imports. Both suite modes run inline
-tests once through `test_sources.zig` and ten standalone suites (eleven default
+tests once through `test_sources.zig` and eleven standalone suites (twelve default
 roots total): `tests/array_test.zig`, `tests/converter_test.zig`, `tests/codegen_test.zig`,
 `tests/comptime_interpreter_test.zig`, `tests/modules_test.zig`,
 `tests/query_disk_cache_test.zig`, `tests/query_test.zig`, `tests/reference_test.zig`,
-`tests/text_test.zig`, and `tests/iteration_test.zig`.
+`tests/text_test.zig`, `tests/panic_test.zig`, and `tests/iteration_test.zig`.
 Each runs in its own binary's directory.
 Private disk-cache tests remain inline in
 `src/query_disk_cache.zig`; its snapshot integration suite lives in
@@ -225,7 +279,7 @@ caches compilation but reruns tests. The `safe` mode speeds up allocation checks
 with a slower first compile.
 
 For quick test iteration, omit `-Doptimize=safe` and select the affected
-suite with `-Dtest-source`. The full suite builds eleven separate test binaries;
+suite with `-Dtest-source`. The full suite builds twelve separate test binaries;
 its compilation cost is different from building the CLI once.
 
 Use focused checks during edits; run the routine suite once for changes spanning

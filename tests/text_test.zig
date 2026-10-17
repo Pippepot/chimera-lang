@@ -144,11 +144,11 @@ test "literal views slice on UTF-8 boundaries and widen bytes explicitly" {
     try SourceFixture.expectParity(
         \\fallible inspect() int
         \\    const text: StringView = "aé\0"
-        \\    const suffix = text.slice?(1, 2)
+        \\    const suffix = text.slice?(1..3)
         \\    const bytes = suffix.as_bytes()
         \\    const first = bytes.get?(0)
-        \\    if text.slice(2, 1) -> return 90
-        \\    if text.slice(-1, 1) -> return 91
+        \\    if text.slice(2..3) -> return 90
+        \\    if text.slice(-1..0) -> return 91
         \\    return byte_int(first) - 153
         \\func run() int
         \\    if const answer = inspect() -> return answer
@@ -320,7 +320,7 @@ test "byte array views validate full UTF-8 and execute through transient interpr
         \\    const bytes: Array(byte, 4) = [240, 159, 152, 128]
         \\    const view = BytesView.from_array(4, bytes)
         \\    const text = view.validate_utf8?()
-        \\    const empty = text.slice?(4, 0)
+        \\    const empty = text.slice?(4..4)
         \\    return text.byte_length() + empty.byte_length() + 38
         \\func run() int
         \\    if const answer = inspect() -> return answer
@@ -406,8 +406,8 @@ test "generic spans borrow arrays and preserve empty slicing in both engines" {
         \\fallible inspect() int
         \\    const numbers: Array(int, 3) = [17, 23, 2]
         \\    const view = Span(int).from_array(3, numbers)
-        \\    const tail = view.slice?(1, 2)
-        \\    const empty = tail.slice?(2, 0)
+        \\    const tail = view.slice?(1..3)
+        \\    const empty = tail.slice?(2..2)
         \\    if empty.get(0) -> fail
         \\    ref first = view.get?(0)
         \\    ref second = tail.get?(0)
@@ -417,6 +417,258 @@ test "generic spans borrow arrays and preserve empty slicing in both engines" {
         \\    if const answer = inspect() -> return answer
         \\    return 90
     , 42);
+}
+
+test "range slicing preserves reusable empty reversed and inclusive bounds" {
+    try SourceFixture.expectParity(
+        \\fallible inspect() int
+        \\    var values = [7, 17, 23, 11]
+        \\    var view = values.span()
+        \\    const bounds = 1..3
+        \\    const selected = view.slice?(bounds)
+        \\    const inclusive = view.slice?(1..^2)
+        \\    const empty = view.slice?(2..2)
+        \\    const endpoint = view.slice?(4..4)
+        \\    if view.slice(2..1) -> return 91
+        \\    if view.slice(4..^4) -> return 92
+        \\    if inclusive.len() <> 2 -> return 93
+        \\    if view.slice(2..^1) -> return 94
+        \\    var count = 0
+        \\    for index in bounds -> count += 1
+        \\    return selected[0] + selected[1] + count + empty.len() + endpoint.len()
+        \\func run() int
+        \\    if const result = inspect() -> return result
+        \\    return 90
+    , 42);
+}
+
+test "range slicing resolves independently omitted bounds against initialized extents" {
+    try SourceFixture.expectParity(
+        \\fallible inspect() int
+        \\    var values = [7, 17, 23, 11]
+        \\    const all = ..
+        \\    const prefix = ..3
+        \\    const suffix = 2..
+        \\    const whole = values.slice?(all)
+        \\    const head = values.slice?(prefix)
+        \\    const tail = values.slice?(suffix)
+        \\    const inclusive = values.slice?(..^2)
+        \\    const explicit_head = values.slice?(none..3)
+        \\    const explicit_tail = values.slice?(2..none)
+        \\    if whole.len() <> 4 or head.len() <> 3 or tail.len() <> 2 -> return 91
+        \\    if inclusive.len() <> 3 or explicit_head.len() <> 3 or explicit_tail.len() <> 2 -> return 92
+        \\    if values.slice(5..) -> return 93
+        \\    if values.slice(..5) -> return 94
+        \\    var empty: Array(int, 0) = []
+        \\    const absent = empty.slice?(all)
+        \\    if absent.get(0) -> return 95
+        \\    var list: List(int) = [17, 23]
+        \\    list.reserve?(8)
+        \\    if list.slice(..3) -> return 96
+        \\    var selected = list.slice?(all)
+        \\    selected[0] += 2
+        \\    return selected[0] + selected[1] + absent.len()
+        \\func run() int
+        \\    if const result = inspect() -> return result
+        \\    return 90
+    , 42);
+    try SourceFixture.expectSourceDiagnostic(
+        \\func run() int
+        \\    var cursor = (1..).iter()
+        \\    return 42
+        \\exit(run())
+    , .call_argument_type_mismatch);
+}
+
+test "range slicing preserves collection permissions and rejects sequence operands" {
+    const declarations = [_][]const u8{ "var values = [40]", "var values: List(int) = [40]" };
+    for (declarations) |declaration| {
+        const source = try test_sources.renderTemplate(std.testing.allocator,
+            \\fallible inspect() int
+            \\    $declaration
+            \\    var selected = values.slice?(..)
+            \\    selected[0] += 2
+            \\    return values[0]
+            \\func run() int
+            \\    if const result = inspect() -> return result
+            \\    return 90
+        , .{ .declaration = declaration });
+        defer std.testing.allocator.free(source);
+        try SourceFixture.expectParity(source, 42);
+        const readonly = try std.mem.replaceOwned(u8, std.testing.allocator, source, "var values", "const values");
+        defer std.testing.allocator.free(readonly);
+        const rejected = try std.fmt.allocPrint(std.testing.allocator, "{s}\nexit(run())", .{readonly});
+        defer std.testing.allocator.free(rejected);
+        try SourceFixture.expectSourceDiagnostic(rejected, .reference_not_writable);
+    }
+    const sequences = [_][]const u8{ "(0..1).reversed()", "(0..1).step_by?(1)" };
+    for (sequences) |sequence| {
+        const source = try test_sources.renderTemplate(std.testing.allocator,
+            \\fallible inspect() int
+            \\    var values = [42]
+            \\    const selected = values.slice?($sequence)
+            \\    return selected[0]
+            \\if const result = inspect() -> exit(result)
+        , .{ .sequence = sequence });
+        defer std.testing.allocator.free(source);
+        try SourceFixture.expectSourceDiagnostic(source, .static_argument_cannot_be_inferred);
+    }
+}
+
+test "span slicing matches an independent endpoint boundary matrix" {
+    try SourceFixture.expectParity(
+        \\func run() int
+        \\    const values = [2, 4, 6, 8, 10]
+        \\    const source = values.span()
+        \\    var accepted = 0
+        \\    var accepted_inclusive = 0
+        \\    for start in 0..^6
+        \\        for limit in 0..^6
+        \\            if const selected = source.slice(start..limit)
+        \\                if start > limit or limit > 5 -> return 90
+        \\                if selected.len() <> limit - start -> return 91
+        \\                var actual = 0
+        \\                for value in selected -> actual += value
+        \\                var expected = 0
+        \\                for position in start..limit -> expected += (position + 1) * 2
+        \\                if actual <> expected -> return 92
+        \\                accepted += 1
+        \\            else
+        \\                if start <= limit and limit <= 5 -> return 93
+        \\            if const included = source.slice(start..^limit)
+        \\                if start > limit or limit >= 5 -> return 95
+        \\                if included.len() <> limit - start + 1 -> return 96
+        \\                var actual = 0
+        \\                for value in included -> actual += value
+        \\                var expected = 0
+        \\                for position in start..^limit -> expected += (position + 1) * 2
+        \\                if actual <> expected -> return 97
+        \\                accepted_inclusive += 1
+        \\            else
+        \\                if start <= limit and limit < 5 -> return 98
+        \\    if accepted <> 21 -> return 94
+        \\    if accepted_inclusive <> 15 -> return 99
+        \\    return 42
+    , 42);
+}
+
+test "span slicing rejects extreme bounds before offset arithmetic" {
+    try SourceFixture.expectParity(
+        \\func run() int
+        \\    const values = [17, 23, 2]
+        \\    const source = values.span()
+        \\    if source.slice(-2147483648..0) -> return 90
+        \\    if source.slice(-1..0) -> return 91
+        \\    if source.slice(0..-2147483648) -> return 92
+        \\    if source.slice(0..-1) -> return 93
+        \\    if source.slice(2147483647..0) -> return 94
+        \\    if source.slice(0..2147483647) -> return 95
+        \\    if source.slice(1..^2147483647) -> return 96
+        \\    if source.slice(2147483647..^2147483647) -> return 97
+        \\    if source.slice(-2147483648..2147483647) -> return 98
+        \\    if const endpoint = source.slice(3..3)
+        \\        if endpoint.get(0) -> return 99
+        \\        return 42 + endpoint.len()
+        \\    return 100
+    , 42);
+}
+
+test "span slicing validates empty zero sized extents without exposing an element" {
+    try SourceFixture.expectParity(
+        \\struct Empty
+        \\    copy = trivial
+        \\func run() int
+        \\    var absent: Array(Empty, 0) = []
+        \\    var empty = absent.span()
+        \\    if empty.slice(0..1) -> return 90
+        \\    if empty.slice(1..1) -> return 91
+        \\    if const selected = empty.slice(0..0)
+        \\        if selected.get(0) -> return 92
+        \\        if selected.get(-1) -> return 93
+        \\    else
+        \\        return 94
+        \\    var values: Array(Empty, 3) = [Empty{}, Empty{}, Empty{}]
+        \\    var source = values.span()
+        \\    if const endpoint = source.slice(3..3)
+        \\        if endpoint.get(0) -> return 95
+        \\        return 42 + endpoint.len()
+        \\    return 96
+    , 42);
+}
+
+test "span slicing returns nested views with backing authority rather than carrier lifetime" {
+    const source =
+        \\fallible tail(ref values: Array(int, 4)) Span(int)
+        \\    var all = values.span()
+        \\    var selected = all.slice?(1..4)
+        \\    return selected.slice?(1..2)
+        \\fallible inspect() int
+        \\    var values = [7, 11, 40, 13]
+        \\    var view = tail?(values)
+        \\    view[0] += 2
+        \\    return values[2]
+        \\func run() int
+        \\    if const answer = inspect() -> return answer
+        \\    return 90
+    ;
+    try SourceFixture.expectParity(source, 42);
+    const readonly_cases = [_]struct { original: []const u8, replacement: []const u8 }{
+        .{ .original = "var values = [7, 11, 40, 13]", .replacement = "const values = [7, 11, 40, 13]" },
+        .{ .original = "var selected = all.slice?(1..4)", .replacement = "const selected = all.slice?(1..4)" },
+        .{ .original = "var view = tail?(values)", .replacement = "var view = tail?(values).as_imm()" },
+    };
+    for (readonly_cases) |case| {
+        const changed = try std.mem.replaceOwned(u8, std.testing.allocator, source, case.original, case.replacement);
+        defer std.testing.allocator.free(changed);
+        const rejected = try std.fmt.allocPrint(std.testing.allocator, "{s}\nexit(run())", .{changed});
+        defer std.testing.allocator.free(rejected);
+        try SourceFixture.expectSourceDiagnostic(rejected, .reference_not_writable);
+    }
+    try SourceFixture.expectSourceDiagnostic(
+        \\fallible escape() Span(int)
+        \\    var values = [7, 11, 40, 13]
+        \\    var all = values.span()
+        \\    var selected = all.slice?(1..4)
+        \\    return selected.slice?(1..2)
+        \\fallible inspect() int
+        \\    const view = escape?()
+        \\    return view[0]
+        \\if const answer = inspect() -> exit(answer)
+    , .borrow_outlives_source);
+}
+
+test "span slicing separates owned field access from captured reference authority" {
+    const source =
+        \\struct Views
+        \\    pub owned: Span(int)
+        \\    pub ref captured: Span(int)
+        \\    pub fallible owned_tail(ref self: Views) Span(int) -> self.owned.slice?(0..1)
+        \\    pub fallible captured_tail(ref self: Views) Span(int) -> self.captured.slice?(0..1)
+        \\fallible inspect() int
+        \\    var first = [7]
+        \\    var second = [40]
+        \\    var owned = first.span()
+        \\    var captured = second.span()
+        \\    const carrier = Views{owned = owned, captured = captured}
+        \\    var selected = carrier.captured_tail?()
+        \\    selected[0] += 2
+        \\    return second[0]
+        \\func run() int
+        \\    if const answer = inspect() -> return answer
+        \\    return 90
+    ;
+    try SourceFixture.expectParity(source, 42);
+    const readonly_cases = [_]struct { original: []const u8, replacement: []const u8 }{
+        .{ .original = "carrier.captured_tail?()", .replacement = "carrier.owned_tail?()" },
+        .{ .original = "var captured = second.span()", .replacement = "var captured = second.span().as_imm()" },
+    };
+    for (readonly_cases) |case| {
+        const changed = try std.mem.replaceOwned(u8, std.testing.allocator, source, case.original, case.replacement);
+        defer std.testing.allocator.free(changed);
+        const rejected = try std.fmt.allocPrint(std.testing.allocator, "{s}\nexit(run())", .{changed});
+        defer std.testing.allocator.free(rejected);
+        try SourceFixture.expectSourceDiagnostic(rejected, .reference_not_writable);
+    }
 }
 
 test "generic spans retain writable access and attenuate in both engines" {
@@ -441,7 +693,7 @@ test "attenuated empty spans publish readonly cursors in both engines" {
         \\static empty = Span(int).empty().as_imm()
         \\func run() int
         \\    const source = empty
-        \\    if const endpoint = source.slice(0, 0) -> return endpoint.len() + 42
+        \\    if const endpoint = source.slice(0..0) -> return endpoint.len() + 42
         \\    return 90
     , 42);
 }
@@ -688,7 +940,7 @@ test "generic spans preserve zero-sized writable ranges" {
         \\fallible inspect() int
         \\    var entries: Array(Empty, 3) = [Empty{}, Empty{}, Empty{}]
         \\    var source = entries.span()
-        \\    var view = source.slice?(1, 2)
+        \\    var view = source.slice?(1..3)
         \\    ref element = view.get?(1)
         \\    element = Empty{}
         \\    if view.get(2) -> fail
@@ -748,7 +1000,7 @@ test "List growth and generic views have parity" {
         \\    values.append?(17)
         \\    values.append?(23)
         \\    values.reserve?(8)
-        \\    const view = values.view?(0, 2)
+        \\    const view = values.slice?(0..2)
         \\    return view[0] + view[1] + view.len()
         \\func run() int
         \\    if const answer = inspect() -> return answer

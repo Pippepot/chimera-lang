@@ -97,6 +97,7 @@ pub const Token = struct {
         keyword_not,
         keyword_none,
         keyword_or,
+        keyword_panic,
         keyword_imm,
         keyword_return,
         keyword_sizeof,
@@ -137,6 +138,7 @@ pub const Token = struct {
         .{ "not", .keyword_not },
         .{ "none", .keyword_none },
         .{ "or", .keyword_or },
+        .{ "panic", .keyword_panic },
         .{ "imm", .keyword_imm },
         .{ "return", .keyword_return },
         .{ "sizeof", .keyword_sizeof },
@@ -235,6 +237,7 @@ pub const Node = struct {
         return_nothing,
         return_expr,
         fail_expr,
+        panic_expr,
         signature,
         where_clauses,
         sizeof_expr,
@@ -248,11 +251,13 @@ pub const Node = struct {
         type_func,
         type_list,
         type_variant,
-        reference_result,
+        type_tuple,
+        reference_type,
         import,
         selective_import,
         @"pub",
         collection_literal,
+        tuple_literal,
         _,
     };
 
@@ -265,7 +270,7 @@ pub const Node = struct {
         },
         field: struct {
             type_annotation: Index,
-            kind: FieldKind,
+            kind: MemberKind,
         },
         signature: struct {
             parameters: Index,
@@ -281,11 +286,11 @@ pub const Node = struct {
     pub fn dataTag(self: Node) ?std.meta.FieldEnum(Data) {
         return switch (self.tag) {
             .break_nothing, .continue_expr, .return_nothing, .fail_expr, .access, .implicit_static, .bool_literal, .identifier, .none_literal, .number_literal, .string_literal, .unit_literal, .type, .implicit_type => .none,
-            .break_expr, .return_expr, .loop, .not, .neg, .reference_result, .move_expr, .query, .comptime_expr, .sizeof_expr, .field_access, .struct_property, .struct_init_field, .@"pub" => .node,
+            .break_expr, .return_expr, .panic_expr, .loop, .not, .neg, .reference_type, .move_expr, .query, .comptime_expr, .sizeof_expr, .field_access, .struct_property, .struct_init_field, .@"pub" => .node,
             .add, .sub, .mul, .div, .rem, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .range, .range_inclusive, .@"and", .@"or", .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .rem_assign, .call, .index_access, .const_binding, .var_binding, .ref_binding, .static_binding, .namespace_declaration, .func, .param, .type_func, .@"if" => .node_node,
             .struct_field => .field,
             .signature => .signature,
-            .block, .for_loop, .call_arg_list, .param_list, .type_list, .type_variant, .where_clauses, .if_else, .@"struct", .struct_init, .collection_literal, .import, .selective_import => .ref,
+            .block, .for_loop, .call_arg_list, .param_list, .type_list, .type_variant, .type_tuple, .where_clauses, .if_else, .@"struct", .struct_init, .collection_literal, .tuple_literal, .import, .selective_import => .ref,
             else => null,
         };
     }
@@ -322,10 +327,7 @@ pub const Ast = struct {
 
     pub fn nodeList(self: Ast, index: Node.Index) []const Node.Index {
         const node = self.nodes[(index.unwrap() orelse return &.{}).index()];
-        switch (node.tag) {
-            .param_list, .type_variant, .type_list, .call_arg_list, .where_clauses, .collection_literal, .for_loop => {},
-            else => unreachable,
-        }
+        std.debug.assert(node.dataTag() == .ref);
         return self.node_refs[node.data.ref.start..node.data.ref.end];
     }
 
@@ -816,7 +818,12 @@ pub const CallableParameter = struct {
 
 pub const ResultMode = enum { owned, reference };
 
-pub const FieldKind = enum { owned, reference };
+pub const MemberKind = enum { owned, reference };
+
+pub const MemberSpec = struct {
+    type_id: TypeId,
+    kind: MemberKind = .owned,
+};
 
 pub const CallableType = struct {
     parameters: []const CallableParameter,
@@ -850,6 +857,11 @@ pub const TypeData = union(enum) {
     callable: CallableType,
     structure: StructIdentity,
     array: ArrayType,
+    tuple: TupleType,
+};
+
+pub const TupleType = struct {
+    members: []const MemberSpec,
 };
 
 pub const ArrayType = struct {
@@ -878,7 +890,7 @@ pub const VariantLayout = struct {
 
 pub const StructField = struct {
     name: []const u8,
-    kind: FieldKind = .owned,
+    kind: MemberKind = .owned,
     type_id: TypeId,
     span: SourceSpan,
     is_public: bool = false,
@@ -1362,6 +1374,7 @@ pub const ReferenceOriginContract = struct {
     stable: bool = false,
     after_write: bool = false,
     reads_contents: bool = false,
+    readonly_owned: ?TypeId = null,
 };
 
 pub const ReferenceRequirement = struct {
@@ -1374,9 +1387,15 @@ pub const ReferenceRequirement = struct {
     recursive_storage: bool = false,
 };
 
+pub const ReferenceExclusion = struct {
+    reference: ReferenceOriginContract,
+    invalidation: ReferenceOriginContract,
+};
+
 pub const ReferenceContract = struct {
     origins: []ReferenceOriginContract = &.{},
     requirements: []ReferenceRequirement = &.{},
+    exclusions: []ReferenceExclusion = &.{},
     paths: []ReferencePathStep = &.{},
 
     pub const eql = value_operations.Owned(@This()).eql;
@@ -1384,7 +1403,7 @@ pub const ReferenceContract = struct {
 
     /// Inference joins sets of dependencies; their discovery order is irrelevant.
     pub fn equivalent(left: @This(), right: @This()) bool {
-        if (left.origins.len != right.origins.len or left.requirements.len != right.requirements.len) return false;
+        if (left.origins.len != right.origins.len or left.requirements.len != right.requirements.len or left.exclusions.len != right.exclusions.len) return false;
         for (left.origins) |a| {
             var found = false;
             for (right.origins) |b| {
@@ -1405,11 +1424,25 @@ pub const ReferenceContract = struct {
             }
             if (!found) return false;
         }
+        for (left.exclusions) |a| {
+            var found = false;
+            for (right.exclusions) |b| {
+                if (sameExclusion(left, a, right, b)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return false;
+        }
         return true;
     }
 
+    pub fn sameExclusion(left: @This(), a: ReferenceExclusion, right: @This(), b: ReferenceExclusion) bool {
+        return sameOrigin(left, a.reference, right, b.reference) and sameOrigin(left, a.invalidation, right, b.invalidation);
+    }
+
     pub fn sameOrigin(left: @This(), a: ReferenceOriginContract, right: @This(), b: ReferenceOriginContract) bool {
-        return a.output_parameter == b.output_parameter and a.parameter == b.parameter and a.kind == b.kind and a.readonly == b.readonly and
+        return a.output_parameter == b.output_parameter and a.parameter == b.parameter and a.kind == b.kind and a.readonly == b.readonly and a.readonly_owned == b.readonly_owned and
             a.storage_depth == b.storage_depth and a.recursive_storage == b.recursive_storage and a.variant_guard == b.variant_guard and a.stable == b.stable and a.after_write == b.after_write and a.reads_contents == b.reads_contents and
             samePath(left, a.source_path, right, b.source_path) and samePath(left, a.result_path, right, b.result_path);
     }
@@ -1539,6 +1572,16 @@ pub const CompiledFunction = struct {
     referenced_instances: []const InstanceId = &.{},
     constant_data: []const ByteString = &.{},
     requires_sigpipe_ignore: bool = false,
+    /// Return addresses and caller frame sizes; consumed only on panic.
+    trace_sites: []const TraceSite = &.{},
+    /// The linker supplies the shared trace reporter to this runtime entrypoint.
+    panic_trace_offset: ?u32 = null,
+
+    pub const TraceSite = struct {
+        return_offset: u32,
+        stack_size: u32,
+        label: []const u8,
+    };
 
     pub const ReferenceId = enum(u32) { _ };
 
@@ -1570,6 +1613,7 @@ pub const Diagnostic = struct {
     file_id: FileId,
     span: ?SourceSpan,
     kind: Kind,
+    instance: ?InstanceId = null,
 
     pub const TypeMismatch = struct {
         expected: TypeId,
@@ -1619,6 +1663,7 @@ pub const Diagnostic = struct {
         compile_time_integer_overflow,
         compile_time_unsupported_operation,
         compile_time_escaping_storage,
+        compile_time_panic: ByteStringId,
         compile_time_call_trace,
         unsupported_external_declaration,
         invalid_external_signature,
@@ -1638,6 +1683,9 @@ pub const Diagnostic = struct {
         type_value_used_as_runtime_value,
         compile_time_only_type: TypeId,
         ambiguous_conversion: TypeMismatch,
+        ambiguous_variant_member: TypeMismatch,
+        tuple_requires_expected_type,
+        tuple_member_count_mismatch: struct { expected: u32, found: u32 },
         invalid_converter,
         invalid_converter_owner,
         value_used_as_type,
@@ -1735,6 +1783,7 @@ pub const Diagnostic = struct {
         query_operand_not_bool: TypeId,
         inspection_type_not_supported,
         variant_inspection_operand_not_variant: TypeId,
+        iterator_result_requires_end: TypeMismatch,
         condition_binding_must_be_immutable,
         value_not_callable,
         duplicate_variant_member_type,

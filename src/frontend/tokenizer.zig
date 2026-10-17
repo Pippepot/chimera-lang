@@ -10,6 +10,7 @@ pub const Tokenizer = struct {
     at_line_start: bool,
     indent: u32,
     indent_levels: std.ArrayList(u32),
+    previous_tag: ?Token.Tag = null,
 
     pub fn init(gpa: std.mem.Allocator, buffer: []const u8) !Tokenizer {
         if (buffer.len > std.math.maxInt(u32)) return error.SourceTooLarge;
@@ -124,6 +125,12 @@ pub const Tokenizer = struct {
     }
 
     pub fn next(self: *Tokenizer) !Token {
+        const result = try self.nextToken();
+        self.previous_tag = result.tag;
+        return result;
+    }
+
+    fn nextToken(self: *Tokenizer) !Token {
         var result: Token = .{
             .tag = undefined,
             .loc = .{ .start = self.index, .end = undefined },
@@ -434,7 +441,9 @@ pub const Tokenizer = struct {
             },
 
             .int => switch (self.current()) {
-                '.' => continue :state .int_period,
+                '.' => if (self.previous_tag != .period) {
+                    continue :state .int_period;
+                },
                 '_', 'a'...'d', 'f'...'o', 'q'...'z', 'A'...'D', 'F'...'O', 'Q'...'Z', '0'...'9' => {
                     self.index += 1;
                     continue :state .int;
@@ -782,6 +791,12 @@ test "range literals" {
     try testTokenize("0x00...0x09", &.{ .number_literal, .ellipsis3, .number_literal });
     try testTokenize("0b00...0b11", &.{ .number_literal, .ellipsis3, .number_literal });
     try testTokenize("0o00...0o11", &.{ .number_literal, .ellipsis3, .number_literal });
+}
+
+test "tuple positional projections retain member boundaries" {
+    try testTokenize("pair.0.value", &.{ .identifier, .period, .number_literal, .period, .identifier });
+    try testTokenize("pair.0.1", &.{ .identifier, .period, .number_literal, .period, .number_literal });
+    try testTokenize("0..1.5", &.{ .number_literal, .ellipsis2, .number_literal });
 }
 
 test "number literals decimal" {

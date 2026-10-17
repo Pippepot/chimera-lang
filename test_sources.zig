@@ -2,6 +2,8 @@ const std = @import("std");
 
 pub const cache = @import("src/cache.zig");
 pub const codegen = @import("src/backend/codegen.zig");
+pub const diagnostic_rendering = @import("src/diagnostics.zig");
+pub const debug = @import("src/debug.zig");
 pub const comptime_interpreter = @import("src/frontend/comptime_interpreter.zig");
 pub const modules = @import("src/modules.zig");
 pub const query = @import("src/query/engine.zig");
@@ -123,7 +125,10 @@ pub const SourceFixture = struct {
     }
 
     pub fn expectDiagnostic(self: SourceFixture, file: ?structures.FileId, kind: std.meta.Tag(structures.Diagnostic.Kind)) !void {
-        try std.testing.expect((try self.db.get(queries.BuildExecutable, 0)).* == null);
+        if ((try self.db.get(queries.BuildExecutable, 0)).* != null) {
+            try self.printDiagnostics(0);
+            return error.ExpectedDiagnostic;
+        }
         const diagnostics = try self.db.transitiveAccumulatorValues(queries.BuildExecutable, 0, structures.Diagnostic, std.testing.allocator);
         defer std.testing.allocator.free(diagnostics);
         for (diagnostics) |diagnostic| {

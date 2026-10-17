@@ -6,7 +6,7 @@ const queries = @import("queries.zig");
 const structures = @import("structures.zig");
 const standard_library = @import("standard_library");
 
-const format = "CHIQRY34";
+const format = "CHIQRY36";
 const max_records = 1_000_000;
 
 pub fn save(io: std.Io, allocator: std.mem.Allocator, directory: []const u8, key: cache.Key, db: *query.Database) !void {
@@ -50,6 +50,7 @@ fn restoreIntern(comptime I: type, db: *query.Database, reader: *codec.Reader, i
     if (I == queries.Types) {
         switch (value) {
             .array => |array| if (!try validArrayType(db, array)) return error.InvalidCache,
+            .tuple => |tuple| if (!try validTupleType(db, tuple)) return error.InvalidCache,
             .variant => |variant| {
                 if (variant.members.len < 2) return error.InvalidCache;
                 for (variant.members[1..], 1..) |member, member_index| {
@@ -115,7 +116,7 @@ fn restoreQuery(comptime Q: type, db: *query.Database, reader: *codec.Reader) !u
 fn restoreNamedInput(db: *query.Database, reader: *codec.Reader, check: bool) !?query.PersistedInputRef {
     const name = try reader.read([]const u8);
     defer reader.allocator.free(name);
-    inline for (.{ queries.SourceText, queries.FileModule, queries.ModuleMembers, queries.ModuleCatalog, queries.StandardPreludeModule, queries.StandardFile }) |I| {
+    inline for (.{ queries.SourceText, queries.SourcePath, queries.FileModule, queries.ModuleMembers, queries.ModuleCatalog, queries.StandardPreludeModule, queries.StandardFile }) |I| {
         if (std.mem.eql(u8, name, @typeName(I))) return restoreInput(I, db, reader, check);
     }
     return error.InvalidCache;
@@ -156,6 +157,12 @@ fn validArrayType(db: *query.Database, array: structures.ArrayType) !bool {
     return array.length <= std.math.maxInt(i32) and try validArrayElementType(db, array.element_type);
 }
 
+fn validTupleType(db: *query.Database, tuple: structures.TupleType) anyerror!bool {
+    if (tuple.members.len < 2) return false;
+    for (tuple.members) |member| if (!try validArrayElementType(db, member.type_id)) return false;
+    return true;
+}
+
 fn validArrayElementType(db: *query.Database, type_id: structures.TypeId) anyerror!bool {
     if (type_id.isPrimitive()) return type_id != .type;
     const interned = type_id.interned() orelse return false;
@@ -163,6 +170,7 @@ fn validArrayElementType(db: *query.Database, type_id: structures.TypeId) anyerr
     switch (data.*) {
         .structure, .callable, .reference => return true,
         .array => |array| return validArrayType(db, array),
+        .tuple => |tuple| return validTupleType(db, tuple),
         .variant => |variant| {
             for (variant.members) |member| if (!try validArrayElementType(db, member)) return false;
             return true;
@@ -181,6 +189,15 @@ fn validRuntimeValue(db: *query.Database, value: structures.CompileTimeValue) !b
         .variant => |variant| return validVariantRuntime(db, value.runtime.type_id, variant),
         .structure => {},
         else => return true,
+    }
+    if (try types.tupleMembers(value.runtime.type_id)) |members| {
+        const values = (try db.lookupInternedAs(queries.CompileTimeValueTuples, value.runtime.value.structure)) orelse return false;
+        if (values.values.len != members.len) return false;
+        for (values.values, members) |member_id, specification| {
+            const member = (try db.lookupInternedAs(queries.CompileTimeValues, member_id)) orelse return false;
+            if (member.* != .runtime or member.runtime.type_id != try types.memberStorageType(specification)) return false;
+        }
+        return true;
     }
     const array = (try types.arrayType(value.runtime.type_id)) orelse {
         const data = (try db.lookupInternedAs(queries.Types, value.runtime.type_id.interned().?)) orelse return false;
@@ -373,6 +390,10 @@ fn validReferencePath(db: *query.Database, types: anytype, initial: structures.T
 fn validReferenceContractTypes(db: *query.Database, types: anytype, body: structures.FunctionBodyAnalysis) anyerror!bool {
     const contract = body.reference_contract;
     for (contract.origins) |origin| {
+        if (origin.readonly_owned) |type_id| {
+            if (origin.readonly or type_id.isPrimitive()) return false;
+            if (try types.borrowElement(type_id) != null or try types.storageAccess(type_id) != null) return false;
+        }
         const output_type = if (origin.output_parameter) |parameter| body.block_arguments[parameter].type_id else body.return_type;
         if (!try validReferencePath(db, types, output_type, contract.paths[origin.result_path.start..origin.result_path.end])) return false;
         if (origin.output_parameter) |parameter| if (body.parameter_modes[parameter] != .mut and body.parameter_modes[parameter] != .ref) {
@@ -389,6 +410,11 @@ fn validReferenceContractTypes(db: *query.Database, types: anytype, body: struct
     for (contract.requirements) |requirement| {
         if (!try validReferencePath(db, types, body.block_arguments[requirement.parameter].type_id, contract.paths[requirement.path.start..requirement.path.end])) return false;
         if (requirement.ends_lifetime and requirement.written_type == null) return false;
+    }
+    for (contract.exclusions) |exclusion| {
+        for ([_]structures.ReferenceOriginContract{ exclusion.reference, exclusion.invalidation }) |origin| {
+            if (!try validReferencePath(db, types, body.block_arguments[origin.parameter.?].type_id, contract.paths[origin.source_path.start..origin.source_path.end])) return false;
+        }
     }
     return true;
 }
@@ -526,6 +552,14 @@ fn validReferenceContract(contract: structures.ReferenceContract, parameter_coun
     for (contract.requirements) |requirement| {
         if (requirement.parameter >= parameter_count or !validRange(requirement.path, contract.paths.len)) return false;
     }
+    for (contract.exclusions) |exclusion| {
+        for ([_]structures.ReferenceOriginContract{ exclusion.reference, exclusion.invalidation }) |origin| {
+            const parameter = origin.parameter orelse return false;
+            if (parameter >= parameter_count or origin.output_parameter != null or origin.result_path.start != origin.result_path.end) return false;
+            if (!validRange(origin.source_path, contract.paths.len) or !validRange(origin.result_path, contract.paths.len)) return false;
+            if (origin.reads_contents or origin.after_write or origin.variant_guard or origin.readonly_owned != null) return false;
+        }
+    }
     return true;
 }
 
@@ -636,6 +670,16 @@ fn validFallibleTargets(call: structures.FunctionCall, success: structures.Funct
 
 fn validCompiledFunction(artifact: structures.CompiledFunction) bool {
     if (artifact.code.len == 0 or artifact.required_alignment == 0 or !std.math.isPowerOfTwo(artifact.required_alignment)) return false;
+    var previous_return: u32 = 0;
+    for (artifact.trace_sites) |site| {
+        if (site.return_offset <= previous_return or site.return_offset >= artifact.code.len) return false;
+        if (site.stack_size > std.math.maxInt(i32) or site.label.len > std.math.maxInt(i32)) return false;
+        previous_return = site.return_offset;
+    }
+    if (artifact.panic_trace_offset) |offset| {
+        if (offset == 0 or offset > artifact.code.len or artifact.code.len - offset < 4) return false;
+        if (artifact.code[offset - 1] != 0xe9) return false;
+    }
     for (artifact.relocations) |relocation| {
         switch (relocation.reference) {
             .function => |reference| if (@backingInt(reference) >= artifact.referenced_instances.len) return false,
@@ -759,14 +803,33 @@ test "cached reference contracts accept analyzed nested handles and parameter wr
         \\    pub first: Ref(int)
         \\    pub second: Ref(int)
         \\func nested(imm input: Ref(Pair)) Ref(int) -> input.value.first
+        \\func copied(imm input: Pair) Pair -> input
         \\func selected(ref input: Pair) ref Ref(int) -> input.first
         \\func install(var target: Ref(Ref(int)), ref source: int) -> target.value = Ref.from(source)
+        \\struct Buffers
+        \\    first: Ref(String)
+        \\    second: Ref(String)
+        \\fallible retained(input: Buffers) int
+        \\    const view = input.first.value.view()
+        \\    input.second.value.append?("x")
+        \\    return view.byte_length()
     , &.{}, &.{});
     const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;
-    for ([_][]const u8{ "nested", "selected", "install" }) |name| {
+    for ([_][]const u8{ "nested", "copied", "selected", "install", "retained" }) |name| {
         errdefer std.debug.print("rejected analyzed reference contract: {s}\n", .{name});
         const body = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = scope.resolveFunction(name).? })).*.?;
         try std.testing.expect(try validOutput(queries.AnalyzeFunctionInstance, db, body));
+        if (std.mem.eql(u8, name, "copied")) {
+            var invalid = body;
+            var origins = [_]structures.ReferenceOriginContract{body.reference_contract.origins[0]};
+            try std.testing.expect(origins[0].readonly_owned != null);
+            invalid.reference_contract.origins = &origins;
+            origins[0].readonly_owned = .int;
+            try std.testing.expect(!try validOutput(queries.AnalyzeFunctionInstance, db, invalid));
+            origins[0] = body.reference_contract.origins[0];
+            origins[0].readonly = true;
+            try std.testing.expect(!try validOutput(queries.AnalyzeFunctionInstance, db, invalid));
+        }
         if (std.mem.eql(u8, name, "nested")) {
             var invalid = body;
             var origins = [_]structures.ReferenceOriginContract{body.reference_contract.origins[0]};
@@ -780,6 +843,25 @@ test "cached reference contracts accept analyzed nested handles and parameter wr
             var paths = [_]structures.ReferencePathStep{.{ .field = std.math.maxInt(u32) }};
             invalid.reference_contract.paths = &paths;
             try std.testing.expect(!try validReferenceContractTypes(db, queries.TypeFacts(*query.Database){ .ctx = db }, invalid));
+        }
+        if (std.mem.eql(u8, name, "retained")) {
+            try std.testing.expect(body.reference_contract.exclusions.len > 0);
+            var invalid = body;
+            var exclusions = [_]structures.ReferenceExclusion{body.reference_contract.exclusions[0]};
+            invalid.reference_contract.exclusions = &exclusions;
+            exclusions[0].reference.parameter = @intCast(body.parameter_modes.len);
+            try std.testing.expect(!try validOutput(queries.AnalyzeFunctionInstance, db, invalid));
+            exclusions[0] = body.reference_contract.exclusions[0];
+            exclusions[0].invalidation.source_path.end = std.math.maxInt(u32);
+            try std.testing.expect(!try validOutput(queries.AnalyzeFunctionInstance, db, invalid));
+            exclusions[0] = body.reference_contract.exclusions[0];
+            const paths = try std.testing.allocator.dupe(structures.ReferencePathStep, body.reference_contract.paths);
+            defer std.testing.allocator.free(paths);
+            const path = exclusions[0].reference.source_path;
+            try std.testing.expect(path.start < path.end);
+            paths[path.start] = .{ .field = std.math.maxInt(u32) };
+            invalid.reference_contract.paths = paths;
+            try std.testing.expect(!try validOutput(queries.AnalyzeFunctionInstance, db, invalid));
         }
     }
 }
@@ -1328,6 +1410,24 @@ test "invalid machine-code cache shapes are rejected" {
     try std.testing.expect(!validCompiledFunction(damaged));
 }
 
+test "cached panic metadata rejects out-of-range sites frames and patches" {
+    const valid: structures.CompiledFunction = .{
+        .code = &.{ 0xe9, 0, 0, 0, 0, 0xc3 },
+        .required_alignment = 1,
+        .panic_trace_offset = 1,
+        .trace_sites = &.{.{ .return_offset = 5, .stack_size = 0, .label = "frame\n" }},
+    };
+    try std.testing.expect(validCompiledFunction(valid));
+    var damaged = valid;
+    damaged.trace_sites = &.{.{ .return_offset = 6, .stack_size = 0, .label = "" }};
+    try std.testing.expect(!validCompiledFunction(damaged));
+    damaged.trace_sites = &.{.{ .return_offset = 5, .stack_size = std.math.maxInt(u32), .label = "" }};
+    try std.testing.expect(!validCompiledFunction(damaged));
+    damaged = valid;
+    damaged.panic_trace_offset = 3;
+    try std.testing.expect(!validCompiledFunction(damaged));
+}
+
 test "cached initializer handles stay out of ordinary operands and mutable writes" {
     var parameter_modes = [_]structures.ParameterMode{.init};
     var block_arguments = [_]structures.FunctionBlockArgument{.{ .type_id = .int, .representation = .initializer }};
@@ -1638,20 +1738,26 @@ test "array snapshot storage eligibility descends into variant and array element
     const nested: structures.TypeId = .fromInterned(try db.intern(queries.Types, .{ .array = .{ .element_type = variant, .length = 0 } }));
     try std.testing.expect(!try validArrayType(db, .{ .element_type = variant, .length = 0 }));
     try std.testing.expect(!try validArrayType(db, .{ .element_type = nested, .length = 2 }));
+    const tuple: structures.TypeId = .fromInterned(try db.intern(queries.Types, .{ .tuple = .{ .members = &.{ .{ .type_id = .int }, .{ .type_id = .type } } } }));
+    try std.testing.expect(!try validArrayType(db, .{ .element_type = tuple, .length = 1 }));
     try std.testing.expect(try validArrayType(db, .{ .element_type = .never, .length = 0 }));
     try std.testing.expect(try validArrayType(db, .{ .element_type = .int, .length = std.math.maxInt(i32) }));
 }
 
-test "array runtime snapshot tuples require the declared shape and runtime element type" {
+test "aggregate runtime snapshots require the declared shape and runtime member type" {
     const allocator = std.testing.allocator;
-    for (0..5) |case_index| {
+    for (0..10) |case_index| {
         const first = try query.Database.init(allocator, .{ .worker_count = 1 });
         defer first.deinit();
-        const type_id: structures.TypeId = .fromInterned(try first.intern(queries.Types, .{ .array = .{ .element_type = .int, .length = 2 } }));
+        const shape: structures.TypeData = if (case_index < 5)
+            .{ .array = .{ .element_type = .int, .length = 2 } }
+        else
+            .{ .tuple = .{ .members = &.{ .{ .type_id = .int }, .{ .type_id = .int } } } };
+        const type_id: structures.TypeId = .fromInterned(try first.intern(queries.Types, shape));
         const number = try first.intern(queries.CompileTimeValues, .{ .runtime = .{ .type_id = .int, .value = .{ .int = 42 } } });
         const wrong = try first.intern(queries.CompileTimeValues, .{ .runtime = .{ .type_id = .bool, .value = .{ .bool = true } } });
         const type_value = try first.intern(queries.CompileTimeValues, .{ .type = .int });
-        const elements: []const structures.CompileTimeValueId = switch (case_index) {
+        const elements: []const structures.CompileTimeValueId = switch (case_index % 5) {
             0 => &.{ number, number },
             1 => &.{number},
             2 => &.{ number, number, number },
@@ -1667,7 +1773,7 @@ test "array runtime snapshot tuples require the declared shape and runtime eleme
         try first.writeInternedValues(&writer);
         const second = try query.Database.init(allocator, .{ .worker_count = 1 });
         defer second.deinit();
-        if (case_index == 0) {
+        if (case_index % 5 == 0) {
             try std.testing.expectEqual(writer.bytes.items.len, try restoreInterns(second, allocator, writer.bytes.items));
         } else {
             try std.testing.expectError(error.InvalidCache, restoreInterns(second, allocator, writer.bytes.items));

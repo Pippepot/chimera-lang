@@ -203,11 +203,15 @@ const subtract: func(imm int, imm int) int = int.-
 
 # Structural tuples
 # A tuple is an ordered collection of unnamed elements, written (foo, bar).
-# Its structural type identity is determined by the ordered element types:
-# an int followed by a bool differs from a bool followed by an int. Named fields
-# belong to structs. Tuple type spelling, element access, destructuring, and
-# singleton syntax remain open; () already denotes unit.
-const pair = (1, true)
+# Its structural identity includes each element's logical type and owned/reference
+# storage kind in order. Types use (A, B), with ref selecting a reference member;
+# positions use .0, .1, and so on. Reference members capture existing places and
+# retain independent authority and origins through copies and const carriers.
+# Owned members retain their ordinary copy, move, and drop obligations.
+# Implemented tuple literals have two or more elements and require an expected
+# tuple type. Unannotated inference, destructuring, and singleton syntax remain
+# open; () already denotes unit. Named fields belong to structs.
+const pair: (int, bool) = (1, true)
 
 
 # Standard library
@@ -222,6 +226,13 @@ const pair = (1, true)
 import std.prelude.{}
 # A non-empty selective import opts into only its listed names. Other standard
 # library modules remain qualified or require explicit imports.
+# std.math exports infallible min(int, int) int and max(int, int) int.
+# They return the smaller or larger integer value, respectively, and use
+# ordinary left-to-right argument evaluation at runtime and compile time.
+# Its infallible clamp(value: int, lower: int, upper: int) int returns value
+# restricted to the inclusive interval [lower, upper], defined as
+# max(min(value, upper), lower). Reversed bounds return lower; equal bounds
+# return that bound. It uses the same ordinary call semantics.
 
 
 # Modules
@@ -455,7 +466,7 @@ fallible inspect_allocations() int
     const second = make_twenty?()
     ref borrowed = first.borrow()
     borrowed = 22
-    return first.borrow()[] + second.borrow()[]
+    return first.borrow() + second.borrow()
 static allocated_answer = if const value = inspect_allocations() -> value else 0
 # allocated_answer is ordinary data: 42. Both Boxes are destroyed normally.
 # static escaped = make_twenty?() # source error: retains evaluation-local storage
@@ -506,13 +517,38 @@ exit(apply(operation, 21))
 # maps it to its own process exit status using the host status convention.
 exit(0)
 
+# Panic is an expression keyword with successful type never, independent of
+# imports and lexical names. An optional message on the same source line is an
+# ordinary expression with expected type StringView; normal conversions borrow
+# owned strings or construct literal views. Evaluate that expression once before
+# panicking. Its ordinary failure or other control effects occur before panic.
+# Bare panic reports just "panic", with no colon or message. An empty message
+# reports the same. Delimiters and else end a bare
+# panic; a following source line does not supply its message.
+# At runtime panic reports its message and active call sites to stderr, then
+# terminates with status 134. Reporting is allocation-free and best effort;
+# output failure still terminates. Panic does not unwind or destroy live owners
+# and cannot be caught by ordinary failure handling or failure-to-none capture.
+# Existing lifetime endings during message evaluation retain their usual rules.
+# At compile time a reached panic is a source diagnostic carrying the message
+# and compile-time call trace, not compiler-control exit or ordinary failure.
+# No executable is produced. Unexecuted panic expressions have no panic effect;
+# demanded bodies retain ordinary source validation.
+# Native traces use read-only metadata and existing return addresses, adding no
+# instructions to successful calls. They stop at entry or an unknown call site
+# and report at most 1024 frames. Source paths, lines, columns, and callable names
+# are retained in the executable. Compile-time messages may borrow local storage;
+# the diagnostic snapshots their bytes before that storage is released.
+func invalid_state() never -> panic "invalid state"
+# panic
+
 
 # Parameters and transfer
 # imm: read-only access (default).
 # static: value supplied at compile time.
 # mut: mutable access to a caller-owned variable.
 # var: function-owned variable, which may be stored or returned.
-# deinit: consuming access to an existing value in its current storage.
+# deinit: consuming ownership, preserving storage when direct movement is unavailable.
 # init: pending construction into a destination supplied by the callee.
 # A runtime parameter's access mode is part of callable type identity. An
 # omitted mode is imm. Function declarations support static, imm, mut, var,
@@ -611,26 +647,30 @@ take(a)  # copy into an owned parameter, only if the type supports copy
 take(a^) # transfer ownership; any subsequent access to 'a' is an error
 # Inside the function, a var parameter is an owned mutable local. It follows the
 # same transfer, reassignment, branch, and loop availability rules as local var.
-# A deinit parameter takes ownership of the original value in its existing
-# storage, with mutable access and authority to finish its lifetime. A bare
+# A deinit parameter takes ownership with mutable access and authority to
+# finish the value's lifetime. A bare
 # owning place is consumed, not copied. An explicit '^' on that place also
-# transfers access without a preliminary move into a separate parameter object.
-# Binding the parameter invokes no copy or move hook and does not require
-# movability. A fresh argument constructs in storage valid through the call.
+# transfers consuming access. Binding the parameter invokes no copy or custom
+# move hook and does not require movability. An immovable place keeps its
+# original storage; a directly movable place is snapshotted into independent
+# owned storage before later arguments execute. Deferred init captures retain
+# caller storage until their consuming call. A fresh argument constructs in
+# storage valid through the call.
 # Borrowed aliases and Refs do not grant ownership of their referents.
 # Consuming access follows conditional results and loop break results: only
-# the selected owning place is consumed, and its original storage reaches the
-# callee. Fresh results construct in call-lived storage. An existing place must
+# the selected owning place is consumed, using the same storage-preservation
+# or direct-snapshot rule. Fresh results construct in call-lived storage. An existing place must
 # have exactly the parameter type; widening must not relocate it. A known
 # parameter type supplies the construction context for fresh selected results.
 #
-# The caller loses access when its deinit argument is prepared. The original
+# The caller loses access when its deinit argument is prepared. Argument
 # storage remains valid through the call and required cleanup. Later arguments
-# cannot overwrite that storage. Conflicting borrows are rejected; references
+# cannot overwrite retained source storage, but can reinitialize a directly
+# movable source after its value has been snapshotted. Conflicting borrows are rejected; references
 # to that parameter's own storage cannot escape its lifetime. Contained
 # references retain their independent origins.
 # After a selection, a source is available only if every incoming path retains
-# it. Later arguments cannot overwrite any source the selection may consume.
+# it. Later arguments cannot overwrite source storage retained by the selection.
 # Later argument failure does not restore ownership; prepared arguments must
 # have valid cleanup, including explicit-drop obligations.
 #
@@ -647,10 +687,12 @@ take(a^) # transfer ownership; any subsequent access to 'a' is an error
 # assignments, struct fields, var arguments, and returns require owned values:
 # a bare place is copied and must support copy, an explicitly transferred local
 # or field (`name^`, `name.field^`) is moved and must support move, and a
-# fresh result constructs directly in its destination. `imm` arguments borrow
-# through completion of the call. Explicit transfer is invalid in a borrowing
+# fresh result constructs directly in its destination. Aggregate `imm` arguments
+# borrow through completion of the call; directly passed scalar arguments snapshot
+# during preparation, before later arguments can mutate or consume their source.
+# Explicit transfer is invalid in a borrowing
 # context. Transfer into a distinct value destination requires move capability;
-# passing consuming access to deinit does not itself relocate the source.
+# passing consuming access to deinit does not require relocation capability.
 # Transferring a field leaves that field uninitialized while independent fields
 # remain accessible. Assigning a new owned value to that field reinitializes it.
 # A whole-place use requires every field to be initialized; only initialized
@@ -929,6 +971,16 @@ fallible forward_initializer(static T: type, init item: T) T
 # copying T, initialize a ref binding by aliasing, or supply a borrowing argument.
 # Borrowed results must designate caller or permanent storage; local and copied
 # parameter frame storage cannot escape. Physical layout does not change this rule.
+# In type annotations, ref binds one primary type: ref T | End is an owned variant
+# with a reference-to-T alternative, while ref (T | End) borrows an existing whole
+# variant. Parameter modes before the name remain separate from member storage.
+# Alternative identity includes logical type and storage kind, so T | ref T has
+# two alternatives. Owned nested variants flatten; references to whole variants
+# do not distribute over their alternatives. No independently owned raw-reference
+# value, address expression, or explicit dereference operator is introduced.
+# A known reference alternative captures an existing place of its logical type
+# without copying. If owned and reference alternatives can both accept that place,
+# construction is ambiguous rather than choosing from copy availability.
 #
 # Field `ref` selects borrowed instead of owned storage. Parameter access and
 # construction/destruction modes are separate concepts, not field modifiers.
@@ -944,11 +996,14 @@ fallible forward_initializer(static T: type, init item: T) T
 # argument, borrow binding modifier, address operator, or empty [] dereference.
 # Box(T), in contrast, owns its initialized T and destroys it before deallocation.
 #
-# Permission is inferred from the capture origin and current access path. A const
-# handle supplies readonly access, and copying it into a var cannot restore write
-# authority. A mutable binding never upgrades a readonly captured origin. Access
-# through fields is transitive. Mutable references may coexist: there is no global
-# exclusive-borrow rule. Calls retain the ordinary overlapping mut-argument checks.
+# Permission is inferred from the capture origin. Readonly access restricts owned
+# fields, but following a reference field preserves its captured referent authority
+# independently of carrier constness. Copying a const handle preserves that authority;
+# copying a handle captured from a readonly place never upgrades its permission.
+# Replacing the carrier requires mutable carrier storage. Mutable references may
+# coexist: there is no global exclusive-borrow rule. Calls retain the ordinary
+# overlapping mut-argument checks. Owned storage cursors retain their existing
+# readonly-backing rules; this reference-field rule does not upgrade those views.
 #
 # Box.borrow(ref self) returns ref T. Array, List, and Span get(ref self, index)
 # and [](ref self, index) return ref T after checking bounds. `ref item = values[i]`
@@ -960,8 +1015,12 @@ fallible forward_initializer(static T: type, init item: T) T
 #
 # `if ref item = value as Member` selects an existing variant payload without
 # copying or consuming it. `if ref item = values.get(index)` binds on success.
-# Conditional borrows retain their owner and active-tag dependency. Projection
-# to a differently laid-out subset variant cannot create an alias.
+# Matching uses logical type and can select owned or reference alternatives.
+# An owned payload borrow retains its carrier and active-tag dependency; selecting
+# a reference alternative follows its captured referent without also borrowing
+# the carrier. Owned bindings copy a selected referenced value under normal copy
+# rules and never consume the referent. Projection to a differently laid-out
+# subset variant cannot create an alias.
 #
 # Lookup preserves existing element references. Destruction, relocation,
 # reallocation, owner transfer, and changes to an active variant tag invalidate
@@ -969,7 +1028,7 @@ fallible forward_initializer(static T: type, init item: T) T
 # storage preserves its slot while invalidating content-dependent views of the
 # old value. Readonly references restrict access; they do not freeze their owner.
 # Validated text views additionally depend on the byte contents remaining valid.
-# Origins and attenuation survive copies, fields, branches, loops, calls,
+# Origins and captured permissions survive copies, fields, branches, loops, calls,
 # function values, returns, and incremental recomputation.
 #
 #   var owner = [1, 2, 3]
@@ -977,8 +1036,9 @@ fallible forward_initializer(static T: type, init item: T) T
 #   item += 1
 #   var handle = Ref.from(item)
 #   handle.value += 1
-#   const readonly = handle
-#   # readonly.value = 0 would require writable access
+#   const fixed_handle = handle
+#   fixed_handle.value += 1
+#   # Replacing fixed_handle is forbidden; writing its captured referent is not.
 #
 # Host storage and low-level operations:
 # `std.memory.Box(T)` uniquely owns one initialized T in separately managed
@@ -1011,7 +1071,7 @@ fallible forward_initializer(static T: type, init item: T) T
 # These guarantees use general init and storage initialization semantics, not
 # Box-specific expression recognition or optional optimization.
 #
-# Box.new?(owner.borrow()[]) copies a copyable pointee into a distinct allocation.
+# Box.new?(owner.borrow()) copies a copyable pointee into a distinct allocation.
 # Box has no separate duplication API. Consuming take(T, owner) or
 # take(T, owner^) uses deinit access to the Box; extraction of T still
 # requires direct movement in the host API.
@@ -1091,8 +1151,8 @@ fallible forward_initializer(static T: type, init item: T) T
 # checks 0 <= index < length and returns ref T with permission inherited from
 # the receiver. An empty
 # List has no initialized element, even for an immovable T; append still
-# rejects elements that cannot move directly. view(start, size)
-# checks that its nonnegative range lies in the initialized prefix and returns
+# rejects elements that cannot move directly. slice(bounds)
+# resolves a Range against the initialized prefix and returns
 # Span(T). span() borrows the complete initialized prefix with backing permission
 # inherited from the receiver. Lookup preserves existing element aliases. Writes preserve
 # the identity of an initialized slot and invalidate content-dependent views;
@@ -1104,8 +1164,10 @@ fallible forward_initializer(static T: type, init item: T) T
 # allocation or a container owner. Array also supplies span(). Span
 # owns no destruction; Ref designates one initialized element and owns none either.
 # Span.len() is initialized length, never reserved capacity. get checks bounds
-# and returns ref T; slice(start, size) checks nonnegative, overflow-safe bounds
-# and preserves permission. Empty endpoint slices are valid, including for
+# and returns ref T; slice(bounds) checks nonnegative, overflow-safe bounds
+# and preserves permission. Array and List expose the same range-based slice
+# operation. There is no separate public start/size slicing API. Empty endpoint
+# slices are valid, including for
 # zero-sized elements. Unsafe allocation-span constructors require caller-proven
 # initialization of the complete range. No safe view exposes spare storage.
 # from_array and unsafe_from_allocation use ref inputs and capture their backing
@@ -1225,6 +1287,12 @@ fallible forward_initializer(static T: type, init item: T) T
 
 
 # Structs
+# An omitted indented body defines a complete empty struct. This applies to
+# named, anonymous, parameterized, and static structs; ownership defaults are
+# unchanged. A struct's name, when present, must be on the same line as struct.
+struct Finished
+const finished = Finished{}
+
 static S = struct
     a: int
     b: float
@@ -1631,9 +1699,9 @@ const first = repeated.get?(0)
 # flow; it is not a compiler invariant violation. This policy does not change
 # explicitly fallible allocation APIs, and recoverable allocation remains an
 # opt-in operation rather than a requirement at every literal use.
-# At compile time, the standard converter's reached exit(134) follows the
-# compiler-control exit rules above; it does not become ordinary failure or
-# compiler resource exhaustion.
+# At compile time, the standard converter's reached panic reports a source
+# diagnostic and call trace; it does not become ordinary failure, compiler-
+# control exit, or compiler resource exhaustion.
 # Ordinary element failure is not a panic: clean partial construction and the
 # completed prefix, release the List allocation, and propagate that failure.
 # The allocation panic policy therefore adds no ordinary failure effect to a
@@ -1878,17 +1946,37 @@ loop
 
 
 # Ranges and for iteration
-# a..b excludes b; a..^b includes b. Both endpoints have type int and are
-# evaluated exactly once, left to right. Arithmetic binds more tightly than a
+# a..b excludes b; a..^b includes b. Endpoints are evaluated exactly once,
+# left to right. Arithmetic binds more tightly than a
 # range; a range binds more tightly than comparisons. The result is an ordinary
-# reusable std.range.Range value, not an active cursor or a collection of items.
-# These finite ranges initially iterate upward. A start greater than the end
-# produces an empty range; x..x is empty and x..^x contains exactly x.
+# reusable std.range.Range(A, B) value, not an active cursor or a collection of
+# items. Its independently inferred endpoint types initially support int and
+# none. Original endpoints and inclusivity are retained rather than normalized.
+# ..b, a.., and .. use none for omitted bounds; explicit none endpoints are
+# equivalent. A trailing .. at the end of a line omits the upper bound.
+# Inclusive syntax requires an upper endpoint. Iteration requires two int
+# endpoints; omitted bounds do not imply an unbounded iteration sequence.
+# These finite integer ranges initially iterate upward. A start greater than
+# the end produces an empty iteration; x..x is empty and x..^x contains exactly x.
+# This does not make reversed bounds valid for slicing.
+#
+# Array, List, Span, BytesView, and StringView accept slice(bounds). Omitted
+# starts resolve to zero and omitted exclusive ends to initialized length.
+# Exclusive slicing requires 0 <= start <= limit <= length. Inclusive slicing
+# requires 0 <= start <= limit < length and includes limit; it checks bounds
+# before incrementing the limit. An inclusive none upper endpoint fails.
+# Equal exclusive endpoints are empty, including at length. Negative, reversed,
+# and out-of-bounds inputs fail rather than clamp. Slices own only a view handle,
+# preserve backing permissions and lifetimes, and expose no spare capacity.
+# Text slice positions are byte offsets; StringView also checks UTF-8 boundaries.
+# Brackets still accept integer element indices, not ranges.
 #
 # reversed() reverses the actual sequence, including a stepped sequence.
 # step_by?(positive_factor) selects the first item and then every factor-th item
 # of the receiver's sequence. It fails for a zero or negative factor, even on
-# an empty range. Repeated stepping composes sequence selection. Neither the
+# an empty range. Both return std.range.RangeSequence values, distinct from raw
+# Range bounds; a RangeSequence is not a contiguous slice argument. Repeated
+# stepping composes sequence selection. Neither the
 # signed endpoint distance nor a composed stride must fit in a positive int.
 # Iteration checks the final item before advancing past it, so inclusive ranges
 # ending at 2147483647 terminate without wrapping. Reversal and stepping do not
@@ -1898,10 +1986,50 @@ fallible range_examples()
     const backward = selected.reversed() # 8, 4, 0
     const other = (0..10).reversed().step_by?(4) # 9, 5, 1
 
+# Iteration protocol
+# Iterators are ordinary structs specialized through static parameters, with no
+# required traits, dynamic dispatch, yield, coroutine, or push protocol.
+# Reference aggregate members provide the owned-carrier result model:
+#   func next(mut self: Iterator) T | End
+#   func next(mut self: Iterator) ref T | End
+#   func next(mut self: Iterator) (ref A, ref B) | End
+# A ref (T | End) result instead borrows an existing complete variant. Preserve
+# the distinction between a reference member and an owned Ref(T) value; for must
+# not implicitly unwrap Ref handles. Standard range and span cursors expose next
+# and std.iteration.End, also exported by the prelude. next is the sole cursor
+# protocol; there is no build flag, advance/current compatibility, or automatic
+# fallback. General computed-member composition and automatic callable
+# result/effect discovery remain separate, deferred interface decisions.
+# Ref has one type parameter; writable authority follows ordinary provenance,
+# not a boolean type argument or a factory name that upgrades readonly access.
+#
+# End denotes normal exhaustion, independently of ordinary fallible failure.
+# Loop lowering requires an owned std.iteration.End alternative in
+# the poll result, independent of caller imports or shadowing. A reference-to-End
+# alternative is not the exhaustion representation.
+# With this union encoding, T must not be End or have End as a direct variant
+# member. Containing an End field inside a struct is not ambiguous and is legal.
+# Preserve the binding modes, source evaluation, and loop result rules below;
+# default collection iteration remains a readonly borrow without element copies.
+# An explicit consuming traversal is a separate collection capability.
+#
+# zip polls left to right and stops when either input ends. It may acquire one
+# unmatched left item before the right input ends. It retains that item while
+# polling the right and must discharge its ownership on exhaustion or failure.
+# A queue or coroutine is not required; ordinary item storage and loan tracking
+# still are. Mutable inputs follow ordinary overlap and invalidation rules.
+#
+# Borrowed aggregate results and fresh immovable destination construction through
+# the result union are implemented. Type factories can select exact static
+# fallibility and owned/reference delivery from explicit static arguments.
+# Broader generic adapter interfaces require approval before implementation;
+# they are not prerequisites for this protocol. Buffering does not permit later
+# relocation. ROADMAP.md owns remaining library priorities and validation gates.
+#
 # for uses ordinary methods, not a special declaration kind or generator:
 #   iter(...) Cursor          optional source-to-cursor factory
-#   advance(...) bool         required cursor operation
-#   current(...) T / ref T    required cursor operation
+#   next(...) T | End         owned-item cursor operation
+#   next(...) ref T | End     borrowed-item cursor operation
 # Methods retain their ordinary receiver modes, ownership, and fallibility.
 # Generic methods and callable fields follow ordinary member-call rules.
 # No trait, associated item type, iter declaration, or yield syntax is required.
@@ -1914,22 +2042,23 @@ fallible range_examples()
 # A factory's fresh result is owned, and a borrowed result remains borrowed.
 # Ordinary cleanup and last-use rules apply to both source and cursor.
 #
-# Each iteration calls advance once. Its successful result must be bool;
-# no conversion or truthiness is applied. Successful false means exhaustion.
-# Successful true is followed by exactly one current call and then the body.
-# A failure from source preparation, iter, advance, current, or the body is
+# Each iteration calls next once and retains its result carrier. End means
+# successful exhaustion; otherwise the item is extracted and the body runs.
+# A failure from source preparation, iter, next, or the body is
 # ordinary failure of the complete for expression, never implicit exhaustion.
 # Surrounding conditions and expected variants may capture it normally.
-# current is never called before successful advancement or after exhaustion.
-# current may consume a buffered owned item; repeatability is not required.
+# Producer failure propagates before item matching. No subsequent poll is made
+# after exhaustion, and a buffered item is never reacquired from the producer.
 # Even an underscore binding acquires the item once and performs its cleanup.
 #
 # The bare binding preserves the result's ownership but grants read-only use:
-# an owned current result is owned, and a borrowed result is a read-only alias.
+# an owned poll payload is owned, and a borrowed result is a read-only alias.
 # const and var explicitly own the item, copying a borrowed result through its
 # ordinary copy operation. var additionally permits mutation of that owned item.
-# ref explicitly aliases a borrowed result and preserves its permission; it
-# cannot bind an owned result or upgrade read-only backing. An optional : Type
+# ref aliases an available place: a captured referent or an owned poll payload.
+# It preserves available permission without upgrading read-only backing. An
+# alias into the poll carrier cannot escape that carrier's lifetime; an alias
+# following a reference member depends on its referent instead. An optional : Type
 # annotation follows ordinary type checking and conversion rules.
 # The binding is local to the body, cannot shadow a visible local, and is renewed
 # for each iteration. It does not leak after the loop.
@@ -1941,22 +2070,22 @@ for var item in items -> modify_copy(item)
 for ref item in items -> modify_original(item)
 
 # Body values are discarded. Reaching its end or continue starts the next
-# advance. Break exits without advancing again; break values join with unit
+# poll. Break exits without polling again; break values join with unit
 # from exhaustion, using ordinary loop result rules. Return exits the enclosing
 # function. Item, cursor, and source cleanup follow ordinary ownership on all
 # exits, including failure. There is no separate for-else clause.
 #
 # Arrays, Lists, and Spans provide iter through an ordinary SpanIterator(T).
-# It snapshots the initialized extent and borrows backing storage; current
-# returns ref T with the captured backing permission. Iteration does not freeze
+# It snapshots the initialized extent and borrows backing storage; next
+# returns ref T | End with the captured backing permission. Iteration does not freeze
 # owners. Relocation, destruction, transfer, replacement, and content-dependent
 # views follow the same invalidation rules as explicit references and calls.
 # A reference into stable backing may outlive the cursor, but not its owner.
-# A view into a cursor's reused buffer cannot survive an invalidating advance.
+# A view into a cursor's reused buffer cannot survive an invalidating poll.
 #
 # Adapters are ordinary cursor structs. An adapter that inspects an owned item
-# must retain that exact item until current transfers it; calling an upstream
-# current again may repeat effects or produce a different item. Borrowed items
+# must retain that exact item until returning it; polling upstream again is a
+# different operation that may repeat effects or produce a different item. Borrowed items
 # retain ordinary loan constraints. Buffering/forwarding does not permit moving
 # an immovable value or retaining a deferred init expression as a stored value.
 # Consuming traversal of collection storage is a separate library capability,

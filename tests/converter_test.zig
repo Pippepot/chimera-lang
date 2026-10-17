@@ -4,8 +4,8 @@ const testing = std.testing;
 
 const Fixture = sources.SourceFixture;
 
-test "converter parameter writes retain newly installed loans" {
-    const declarations =
+test "converter inputs preserve captured authority and results retain borrowed origins" {
+    const install =
         \\struct Install
         \\    target: Ref(Ref(int))
         \\    source: Ref(int)
@@ -15,11 +15,44 @@ test "converter parameter writes retain newly installed loans" {
         \\    input.target.value = input.source
         \\    return Done{marker = 0}
     ;
+    try Fixture.expectParity(install ++ "\n" ++
+        \\func run() int
+        \\    var initial = 17
+        \\    var result = Ref.from(initial)
+        \\    var source = 42
+        \\    _ = Done(Install{target = Ref.from(result), source = Ref.from(source)})
+        \\    return result.value
+    , 42);
+    try Fixture.expectAnySourceDiagnostic(install ++ "\n" ++
+        \\var initial = 17
+        \\const result = Ref.from(initial)
+        \\var source = 42
+        \\_ = Done(Install{target = Ref.from(result), source = Ref.from(source)})
+        \\exit(0)
+    , .reference_not_writable);
+    try Fixture.expectAnySourceDiagnostic(
+        \\struct Input
+        \\    value: int
+        \\struct Done
+        \\    marker: int
+        \\converter(imm input: Input) Done
+        \\    input.value = 42
+        \\    return Done{marker = input.value}
+        \\_ = Done(Input{value = 17})
+    , .reference_not_writable);
+    const declarations =
+        \\struct Install
+        \\    source: Ref(int)
+        \\struct Done
+        \\    source: Ref(int)
+        \\converter(imm input: Install) Done
+        \\    return Done{source = input.source}
+    ;
     try Fixture.expectAnySourceDiagnostic(declarations ++ "\n" ++
         \\func selected(ref initial: int) Ref(int)
         \\    var result = Ref.from(initial)
         \\    var local = 42
-        \\    _ = Done(Install{target = Ref.from(result), source = Ref.from(local)})
+        \\    result = Done(Install{source = Ref.from(local)}).source
         \\    return result
         \\var initial = 17
         \\exit(selected(initial).value)
@@ -27,13 +60,75 @@ test "converter parameter writes retain newly installed loans" {
     try Fixture.expectParity(declarations ++ "\n" ++
         \\func selected(ref initial: int, ref source: int) Ref(int)
         \\    var result = Ref.from(initial)
-        \\    _ = Done(Install{target = Ref.from(result), source = Ref.from(source)})
+        \\    result = Done(Install{source = Ref.from(source)}).source
         \\    return result
         \\func run() int
         \\    var initial = 17
         \\    var source = 42
         \\    return selected(initial, source).value
     , 42);
+}
+
+test "converters preserve temporal conflicts between captured referents" {
+    const declarations =
+        \\struct Input
+        \\    left: Ref(String)
+        \\    right: Ref(String)
+        \\struct Done
+        \\    value: int
+        \\converter(imm input: Input) Done
+        \\    const view = input.left.value.view()
+        \\    if input.right.value.append("x") -> ()
+        \\    return Done{value = view.byte_length() + 39}
+        \\func run() int
+        \\    if const result = calculate() -> return result
+        \\    return 90
+    ;
+    try Fixture.expectParity(declarations ++ "\n" ++
+        \\fallible calculate() int
+        \\    var left: String = "abc"
+        \\    var right: String = ""
+        \\    const result: Done = Input{left = Ref.from(left), right = Ref.from(right)}
+        \\    return result.value
+    , 42);
+    try Fixture.expectAnySourceDiagnostic(declarations ++ "\n" ++
+        \\fallible calculate() int
+        \\    var buffer: String = "abc"
+        \\    const result: Done = Input{left = Ref.from(buffer), right = Ref.from(buffer)}
+        \\    return result.value
+        \\_ = run()
+    , .borrow_outlives_source);
+}
+
+test "converter mutations invalidate caller retained reads precisely" {
+    const declarations =
+        \\struct Input
+        \\    target: Ref(String)
+        \\struct Done
+        \\    value: int
+        \\converter(imm input: Input) Done
+        \\    if input.target.value.append("x") -> ()
+        \\    return Done{value = 0}
+        \\fallible inspect(ref left: String, ref right: String) int
+        \\    const view = left.view()
+        \\    const result: Done = Input{target = Ref.from(right)}
+        \\    return view.byte_length() + result.value + 39
+        \\func run() int
+        \\    if const result = calculate() -> return result
+        \\    return 90
+    ;
+    try Fixture.expectParity(declarations ++ "\n" ++
+        \\fallible calculate() int
+        \\    var left: String = "abc"
+        \\    var right: String = ""
+        \\    return inspect?(left, right)
+    , 42);
+    try Fixture.expectAnySourceDiagnostic(declarations ++ "\n" ++
+        \\fallible calculate() int
+        \\    var buffer: String = "abc"
+        \\    return inspect?(buffer, buffer)
+        \\_ = run()
+    , .borrow_outlives_source);
 }
 
 test "optional generic inference uses payload evidence and captures failure" {
@@ -1208,8 +1303,8 @@ test "optional arguments use ordinary mutable variant places and optional refere
         \\func change(mut value: int | none)
         \\    if const found = value as int -> value = found + 1
         \\func forward(mut value: int | none) -> change(value)
-        \\func update(reference: Ref(int) | none)
-        \\    if const found = reference as Ref(int) -> found.value += 1
+        \\func update(var reference: Ref(int) | none)
+        \\    if ref found = reference as Ref(int) -> found.value += 1
         \\fallible missing() Ref(int) -> fail
         \\func run() int
         \\    var value: int | none = 40

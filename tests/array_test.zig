@@ -223,7 +223,7 @@ test "operation indexing List and views use the same operator contract" {
         \\    values.append?(19)
         \\    values.append?(23)
         \\    values[0] += 1
-        \\    const view = values.view?(0, 2)
+        \\    const view = values.slice?(0..2)
         \\    return view[0] + view[1] - 1
         \\func run() int
         \\    if const calculated = calculate() -> return calculated
@@ -673,7 +673,7 @@ test "Array get_mut requires mutable source storage" {
     );
 }
 
-test "Array copy hooks preserve transitive readonly access" {
+test "Array copy hooks cannot invalidate pending borrows" {
     try Fixture.expectAnySourceDiagnostic(
         \\import std.array.{Array}
         \\import std.memory.{Ref}
@@ -689,7 +689,7 @@ test "Array copy hooks preserve transitive readonly access" {
         \\    const values = Array(Handle, 2).filled(source)
         \\    return inspect(Ref.from(owner.borrow().borrow()), values.copy())
         \\if const result = run() -> exit(result) else exit(90)
-    , .reference_not_writable);
+    , .borrow_outlives_source);
 }
 
 test "Array static nested values publish into runtime storage" {

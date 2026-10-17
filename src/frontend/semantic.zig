@@ -125,6 +125,7 @@ pub const UnresolvedBody = struct {
             target_type: structures.TypeId,
             binding: ?ConditionBinding = null,
         },
+        iterator_membership: struct { operand: ValueUse, end_type: structures.TypeId },
         conjunction: struct { lhs: ConditionId, rhs: ConditionId, temporary: ?LocalId = null },
         disjunction: struct { lhs: ConditionId, rhs: ConditionId },
         negation: ConditionId,
@@ -163,6 +164,7 @@ pub const UnresolvedBody = struct {
             },
             array_init: struct { type_id: structures.TypeId, elements: structures.FunctionValueRange },
             collection_literal: structures.FunctionValueRange,
+            tuple_literal: structures.FunctionValueRange,
             field_access: struct { operand: ValueUse, name: []const u8 },
             dereference: ValueUse,
             index_snapshot: ValueUse,
@@ -187,6 +189,13 @@ pub const UnresolvedBody = struct {
             loop: BlockId,
             scope: BlockId,
             iterator: ValueUse,
+            iterator_item: struct {
+                carrier: LocalId,
+                operand: ValueUse,
+                end_type: structures.TypeId,
+                binding: ConditionBinding,
+                mode: BindingMode,
+            },
         };
     };
 
@@ -603,7 +612,8 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             for (self.ast.nodeList(index)) |element| try elements.append(self.gpa, try self.appendUse(element, false));
             const start: u32 = @intCast(self.call_arguments.items.len);
             try self.call_arguments.appendSlice(self.gpa, elements.items);
-            return self.appendExpression(index, .{ .collection_literal = .{ .start = start, .end = @intCast(self.call_arguments.items.len) } });
+            const elements_range: structures.FunctionValueRange = .{ .start = start, .end = @intCast(self.call_arguments.items.len) };
+            return self.appendExpression(index, if (self.ast.nodes[index.index()].tag == .tuple_literal) .{ .tuple_literal = elements_range } else .{ .collection_literal = elements_range });
         }
 
         fn append(self: *Self, index: structures.Node.Index, result_is_type: bool) anyerror!ValueId {
@@ -614,7 +624,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 .bool_literal => return self.appendExpression(index, .{ .boolean = self.ast.tokens[node.token_index].tag == .keyword_true }),
                 .unit_literal => return self.appendExpression(index, if (result_is_type) .{ .type_value = .unit } else .unit),
                 .none_literal => return self.appendExpression(index, if (result_is_type) .{ .type_value = .none } else .none),
-                .type, .implicit_type, .type_func, .type_variant => return self.appendTypeValue(index),
+                .type, .implicit_type, .type_func, .type_variant, .type_tuple => return self.appendTypeValue(index),
                 .comptime_expr => {
                     try self.rejectRuntimeCapture(index);
                     const value_id = self.type_interner.executeComptime(index) catch |err| switch (err) {
@@ -631,8 +641,9 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                     };
                 },
                 .call => return self.appendCall(index),
+                .panic_expr => return self.appendPanic(index),
                 .struct_init => return self.appendStructInit(index),
-                .collection_literal => return self.appendCollectionLiteral(index),
+                .collection_literal, .tuple_literal => return self.appendCollectionLiteral(index),
                 .field_access => return self.appendFieldAccess(index),
                 .index_access => return self.appendExpression(index, .{ .call = try self.buildIndexCall(index) }),
                 .@"struct" => return self.appendExpression(index, .{ .type_value = try self.type_interner.generatedStructType(index) }),
@@ -860,18 +871,27 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             const cursor_local = self.newLocal();
             const cursor_read = try self.appendExpression(index, .{ .local_read = cursor_local });
             const receiver: UnresolvedBody.ValueUse = .{ .value = cursor_read, .span = source.span };
-            const advance = try self.appendProtocolCall(index, receiver, "advance");
-            const advance_local = self.newLocal();
-            const advance_read = try self.appendExpression(index, .{ .local_read = advance_local });
-            const condition = try self.appendCondition(.{ .query = .{ .value = advance_read, .span = span } });
-            var current = try self.appendProtocolCall(index, receiver, "current");
+            const end_type = try self.type_interner.iterationEndType();
+            const next = try self.appendProtocolCall(index, receiver, "next");
+            const next_local = self.newLocal();
+            const next_read = try self.appendExpression(index, .{ .local_read = next_local });
+            const poll: UnresolvedBody.ValueUse = .{ .value = next_read, .span = span };
+            const condition = try self.appendCondition(.{ .iterator_membership = .{ .operand = poll, .end_type = end_type } });
+            const item_local = self.newLocal();
+            const item_mode: UnresolvedBody.BindingMode = if (mode == .keyword_ref) .reference else if (mode == null) .inferred else .owned;
+            var item = try self.appendExpression(index, .{ .iterator_item = .{
+                .carrier = next_local,
+                .operand = poll,
+                .end_type = end_type,
+                .binding = .{ .local = item_local, .annotation_type = null, .span = name_span, .reference = mode == .keyword_ref },
+                .mode = item_mode,
+            } });
             if (binding.data.node_node.b.unwrap()) |annotation| {
-                current = try self.appendExpression(annotation, .{ .annotation = .{
-                    .value = .{ .value = current, .span = span },
+                item = try self.appendExpression(annotation, .{ .annotation = .{
+                    .value = .{ .value = item, .span = span },
                     .type_id = try self.bindingType(annotation),
                 } });
             }
-            const item_local = self.newLocal();
             if (!std.mem.eql(u8, name, "_")) {
                 try self.locals.put(self.gpa, name, .{ .place = .{
                     .id = item_local,
@@ -888,10 +908,10 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             const success = try self.finishBlock(&.{
                 .{ .bind_local = .{
                     .local = item_local,
-                    .value = current,
+                    .value = item,
                     .span = name_span,
                     .mutable = mode == .keyword_var,
-                    .mode = if (mode == .keyword_ref) .reference else if (mode == null) .inferred else .owned,
+                    .mode = item_mode,
                 } },
                 .{ .discard = .{ .value = body_value, .span = span } },
             }, success_unit, span);
@@ -900,7 +920,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             const dispatch = try self.appendExpression(index, .{ .if_else = .{ .condition = condition, .then_block = success, .else_block = exhausted } });
             const body_unit = try self.appendExpression(index, .unit);
             const body = try self.finishBlock(&.{
-                .{ .bind_local = .{ .local = advance_local, .value = advance, .span = span, .mutable = false } },
+                .{ .bind_local = .{ .local = next_local, .value = next, .span = span, .mutable = true, .mode = .inferred } },
                 .{ .discard = .{ .value = dispatch, .span = span } },
             }, body_unit, span);
             const loop_value = try self.appendExpression(index, .{ .loop = body });
@@ -976,8 +996,24 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             const start: u32 = @intCast(self.call_arguments.items.len);
             try self.call_arguments.appendSlice(self.gpa, &.{ first, limit });
             return self.appendExpression(index, .{ .call = .{
-                .target = .{ .direct = .{ .item = constructor } },
+                .target = .{ .inferred = .{ .item = constructor } },
                 .arguments = .{ .start = start, .end = start + 2 },
+                .span = nodeFocusSpan(self.ast, index),
+            } });
+        }
+
+        fn appendPanic(self: *Self, index: structures.Node.Index) !ValueId {
+            const message_node = self.ast.nodes[index.index()].data.node;
+            const message = if (message_node != .null)
+                try self.appendUse(message_node, false)
+            else
+                UnresolvedBody.ValueUse{ .value = try self.appendExpression(index, .{ .string_literal = try self.type_interner.internByteString("") }), .span = nodeFocusSpan(self.ast, index) };
+            const target = (try self.type_interner.panicFunction()) orelse return error.Unavailable;
+            const start: u32 = @intCast(self.call_arguments.items.len);
+            try self.call_arguments.append(self.gpa, message);
+            return self.appendExpression(index, .{ .call = .{
+                .target = .{ .direct = .{ .item = target } },
+                .arguments = .{ .start = start, .end = start + 1 },
                 .span = nodeFocusSpan(self.ast, index),
             } });
         }
@@ -1762,7 +1798,8 @@ fn annotationInfersParameter(ast: *const structures.Ast, source: []const u8, ann
         const span = tokenSpan(ast, node.token_index);
         return std.mem.eql(u8, source[span.start..span.end], name);
     }
-    if (node.tag == .type_variant) {
+    if (node.tag == .reference_type) return annotationInfersParameter(ast, source, node.data.node, name);
+    if (node.tag == .type_variant or node.tag == .type_tuple) {
         for (ast.nodeList(annotation)) |member| {
             if (annotationInfersParameter(ast, source, member, name)) return true;
         }
@@ -1886,6 +1923,19 @@ fn bindInferredType(ast: *const structures.Ast, source: []const u8, inferred: []
         const value = try type_interner.internCompileTimeValue(.{ .type = actual_type });
         return target.bind(value);
     }
+    if (annotated.tag == .reference_type)
+        return bindInferredType(ast, source, inferred, annotated.data.node, (try type_interner.facts().borrowElement(actual_type)) orelse actual_type, type_interner, gpa);
+    if (annotated.tag == .type_tuple) {
+        const actual_members = (try type_interner.facts().tupleMembers(actual_type)) orelse return true;
+        const patterns = ast.nodeList(annotation);
+        if (patterns.len != actual_members.len) return true;
+        for (patterns, actual_members) |pattern, actual| {
+            const expected_kind: structures.MemberKind = if (ast.nodes[pattern.index()].tag == .reference_type) .reference else .owned;
+            if (expected_kind != actual.kind) return false;
+            if (!try bindInferredType(ast, source, inferred, logicalTypeNode(ast, pattern), actual.type_id, type_interner, gpa)) return false;
+        }
+        return true;
+    }
     if (annotated.tag == .type_variant) return bindInferredVariant(ast, source, inferred, annotation, actual_type, type_interner, gpa);
     if (annotated.tag != .call) return true;
     const factory = (try resolveNamedExpression(ast, source, annotated.data.node_node.a, type_interner)) orelse return true;
@@ -1925,10 +1975,11 @@ fn bindInferredVariant(ast: *const structures.Ast, source: []const u8, inferred:
     try remaining.appendSlice(gpa, source_members);
     for (ast.nodeList(annotation)) |member| {
         if (member == target) continue;
-        const fixed_type = switch (try analyzeType(ast, source, member, type_interner, gpa, .parameter_type_not_supported)) {
+        const fixed_logical_type = switch (try analyzeType(ast, source, logicalTypeNode(ast, member), type_interner, gpa, .parameter_type_not_supported)) {
             .success => |type_id| type_id,
             .unsupported => return true,
         };
+        const fixed_type = try type_interner.facts().memberStorageType(.{ .type_id = fixed_logical_type, .kind = if (ast.nodes[member.index()].tag == .reference_type) .reference else .owned });
         const fixed_members = (try type_interner.facts().variantMembers(fixed_type)) orelse &.{fixed_type};
         var index = remaining.items.len;
         while (index > 0) {
@@ -2108,14 +2159,14 @@ pub fn analyzeFunctionInstanceSignature(
     if (runtimeReference(ast, source, return_annotation, runtime_parameters)) |reference|
         return .{ .unsupported = issueAt(ast, reference.index(), .value_used_as_type) };
     const return_type = if (return_annotation.unwrap()) |return_type_index|
-        switch (try analyzeType(ast, source, return_type_index, type_interner, gpa, .return_type_not_supported)) {
+        switch (try analyzeType(ast, source, logicalTypeNode(ast, return_type_index), type_interner, gpa, .return_type_not_supported)) {
             .success => |type_id| type_id,
             .unsupported => |issue| return .{ .unsupported = issue },
         }
     else
         .unit;
     const result_mode: structures.ResultMode = if (return_annotation.unwrap()) |index|
-        if (ast.nodes[index.index()].tag == .reference_result) .reference else .owned
+        if (ast.nodes[index.index()].tag == .reference_type) .reference else .owned
     else
         .owned;
 
@@ -2248,6 +2299,11 @@ fn annotationReference(reference: ?structures.NameReference, type_interner: anyt
     return reference;
 }
 
+fn logicalTypeNode(ast: *const structures.Ast, node_index: structures.Node.Index) structures.Node.Index {
+    const node = ast.nodes[node_index.index()];
+    return if (node.tag == .reference_type) node.data.node else node_index;
+}
+
 fn analyzeType(
     ast: *const structures.Ast,
     source: []const u8,
@@ -2257,7 +2313,7 @@ fn analyzeType(
     unsupported_kind: structures.Diagnostic.Kind,
 ) anyerror!SemanticResult(structures.TypeId) {
     const node = ast.nodes[node_index.index()];
-    if (node.tag == .reference_result) return analyzeType(ast, source, node.data.node, type_interner, gpa, unsupported_kind);
+    if (node.tag == .reference_type) return .{ .unsupported = issueAt(ast, node_index.index(), unsupported_kind) };
     if (node.tag == .implicit_type) return .{ .success = .type };
     if (node.tag == .unit_literal) return .{ .success = .unit };
     if (node.tag == .none_literal) return .{ .success = .none };
@@ -2317,38 +2373,42 @@ fn analyzeType(
             if (parameter_type == .type) return .{ .unsupported = issueAt(ast, parameter_index.index(), unsupported_kind) };
             try parameters.append(gpa, .{ .mode = if (explicit_mode) parameterMode(ast, parameter).? else .imm, .type_id = parameter_type });
         }
-        const return_type = switch (try analyzeType(ast, source, node.data.node_node.b, type_interner, gpa, unsupported_kind)) {
+        const return_type = switch (try analyzeType(ast, source, logicalTypeNode(ast, node.data.node_node.b), type_interner, gpa, unsupported_kind)) {
             .success => |type_id| type_id,
             .unsupported => |issue| return .{ .unsupported = issue },
         };
         return .{ .success = try type_interner.facts().internCallable(.{
             .parameters = parameters.items,
             .return_type = return_type,
-            .result_mode = if (ast.nodes[node.data.node_node.b.index()].tag == .reference_result) .reference else .owned,
+            .result_mode = if (ast.nodes[node.data.node_node.b.index()].tag == .reference_type) .reference else .owned,
             .is_fallible = ast.tokens[node.token_index].tag == .keyword_fallible,
         }) };
     }
-    if (node.tag != .type_variant) return .{ .unsupported = issueAt(ast, node_index.index(), unsupported_kind) };
+    if (node.tag != .type_variant and node.tag != .type_tuple) return .{ .unsupported = issueAt(ast, node_index.index(), unsupported_kind) };
 
-    var member_types: std.ArrayList(structures.TypeId) = .empty;
-    defer member_types.deinit(gpa);
+    var members: std.ArrayList(structures.MemberSpec) = .empty;
+    defer members.deinit(gpa);
     for (ast.nodeList(node_index)) |member_index| {
-        const member_type = switch (try analyzeType(ast, source, member_index, type_interner, gpa, unsupported_kind)) {
+        const member_node = ast.nodes[member_index.index()];
+        const member_type = switch (try analyzeType(ast, source, logicalTypeNode(ast, member_index), type_interner, gpa, unsupported_kind)) {
             .success => |type_id| type_id,
             .unsupported => |issue| return .{ .unsupported = issue },
         };
         if (member_type == .type) return .{ .unsupported = issueAt(ast, member_index.index(), unsupported_kind) };
-        try member_types.append(gpa, member_type);
+        try members.append(gpa, .{
+            .type_id = member_type,
+            .kind = if (member_node.tag == .reference_type) .reference else .owned,
+        });
     }
-    std.debug.assert(member_types.items.len >= 2);
+    std.debug.assert(members.items.len >= 2);
+    if (node.tag == .type_tuple) return .{ .success = try type_interner.facts().internTuple(members.items) };
 
-    return switch (try type_interner.facts().internVariant(member_types.items)) {
+    return switch (try type_interner.facts().internVariantMembers(members.items)) {
         .type_id => |type_id| .{ .success = type_id },
         .duplicate => |duplicate| blk: {
             var seen = false;
-            for (ast.nodeList(node_index), 0..) |duplicate_member, member_index| {
-                std.debug.assert(member_index < member_types.items.len);
-                if (member_types.items[member_index] != duplicate) continue;
+            for (ast.nodeList(node_index), members.items) |duplicate_member, member| {
+                if (try type_interner.facts().memberStorageType(member) != duplicate) continue;
                 if (seen) break :blk .{ .unsupported = issueAt(ast, duplicate_member.index(), .duplicate_variant_member_type) };
                 seen = true;
             }
@@ -3189,6 +3249,14 @@ fn testUnresolvedFunctionBodyAllocations(gpa: std.mem.Allocator) !void {
 }
 
 const TestTypeInterner = struct {
+    pub fn panicFunction(_: @This()) !?structures.ItemId {
+        unreachable;
+    }
+
+    pub fn iterationEndType(_: @This()) !structures.TypeId {
+        unreachable;
+    }
+
     pub fn rangeConstructor(_: @This(), _: bool) !?structures.ItemId {
         return null;
     }
@@ -3216,6 +3284,27 @@ const TestTypeInterner = struct {
 
     pub fn internVariant(_: @This(), _: []const structures.TypeId) !structures.InternVariantResult {
         unreachable;
+    }
+
+    pub fn memberStorageType(_: @This(), member: structures.MemberSpec) !structures.TypeId {
+        if (member.kind == .owned) return member.type_id;
+        unreachable;
+    }
+
+    pub fn internVariantMembers(_: @This(), _: []const structures.MemberSpec) !structures.InternVariantResult {
+        unreachable;
+    }
+
+    pub fn internTuple(_: @This(), _: []const structures.MemberSpec) !structures.TypeId {
+        unreachable;
+    }
+
+    pub fn tupleMembers(_: @This(), _: structures.TypeId) !?[]const structures.MemberSpec {
+        return null;
+    }
+
+    pub fn borrowElement(_: @This(), _: structures.TypeId) !?structures.TypeId {
+        return null;
     }
 
     pub fn internCallable(_: @This(), _: structures.CallableType) !structures.TypeId {

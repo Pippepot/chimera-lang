@@ -1,11 +1,12 @@
 import std.memory.{Allocation, Span, allocate, deallocate, unsafe_initialize}
 import std.array.{Array}
-import std.exit.{exit}
+import std.range.{Range}
 
 extern func literal_data(static value: string_literal) static_data
 extern func literal_size(static value: string_literal) int
 pub extern func byte_int(value: byte) int
 extern fallible io_write(descriptor: int, imm data: Span(byte)) int
+extern func panic_message(imm message: StringView) never
 
 pub struct BytesView
     copy = trivial
@@ -20,8 +21,8 @@ pub struct BytesView
     pub func byte_length(imm self: BytesView) int -> self.data.len()
     pub fallible get(imm self: BytesView, index: int) ref byte -> self.data.get?(index)
     pub fallible [](imm self: BytesView, index: int) ref byte -> self.get?(index)
-    pub fallible slice(imm self: BytesView, start: int, size: int) BytesView
-        return BytesView{data = self.data.slice?(start, size)}
+    pub fallible slice(imm self: BytesView, static A: type, static B: type, bounds: Range(A, B)) BytesView
+        return BytesView{data = self.data.slice?(bounds)}
     pub fallible validate_utf8(imm self: BytesView) StringView
         var index = 0
         loop
@@ -66,16 +67,17 @@ pub struct StringView
     pub fallible <>(imm left: StringView, imm right: StringView) unit -> not equal_bytes?(left.bytes, right.bytes)
     pub func byte_length(imm self: StringView) int -> self.bytes.byte_length()
     pub func as_bytes(imm self: StringView) BytesView -> self.bytes
-    pub fallible slice(imm self: StringView, start: int, size: int) StringView
-        const bytes = self.bytes.slice?(start, size)
+    pub fallible slice(imm self: StringView, static A: type, static B: type, bounds: Range(A, B)) StringView
+        const offsets = bounds.resolve?(self.byte_length())
+        const start = offsets.0
+        const end = offsets.1
         if start < self.byte_length()
             const first = byte_int(self.bytes.get?(start))
             if first >= 128 and first < 192 -> fail
-        const end = start + size
         if end < self.byte_length()
             const last = byte_int(self.bytes.get?(end))
             if last >= 128 and last < 192 -> fail
-        return StringView{bytes = bytes}
+        return StringView{bytes = self.bytes.slice?(bounds)}
 
 struct LiteralBytes
     copy = trivial
@@ -103,16 +105,16 @@ pub struct String
     pub func byte_length(imm self: String) int
         if const literal = self.storage as LiteralBytes -> return literal.size
         if ref owned = self.storage as OwnedBytes -> return owned.size
-        exit(134)
+        panic "invalid String storage"
     pub func capacity(imm self: String) int
         if const literal = self.storage as LiteralBytes -> return literal.size
         if ref owned = self.storage as OwnedBytes -> return owned.allocation.capacity()
-        exit(134)
+        panic "invalid String storage"
     pub func as_bytes(imm self: String) BytesView
         if const literal = self.storage as LiteralBytes -> return BytesView{data = Span(byte).unsafe_from_static(literal.data, literal.size)}
         if ref owned = self.storage as OwnedBytes
             if const bytes = BytesView.unsafe_from_allocation(owned.allocation, owned.size) -> return bytes
-        exit(134)
+        panic "invalid String byte view"
     pub func view(imm self: String) StringView -> StringView{bytes = self.as_bytes()}
     pub fallible reserve(mut self: String, minimum_capacity: int)
         minimum_capacity >= 0
@@ -153,7 +155,7 @@ pub struct String
                 index += 1
             owned.size = required
             return
-        exit(134)
+        panic "invalid String storage during append"
     pub fallible clone(imm self: String) String
         var result = String.empty()
         result.append?(self.view())
@@ -170,7 +172,7 @@ fallible equal_bytes(imm left: BytesView, imm right: BytesView) unit
                 if byte_int(first) <> byte_int(second) -> fail
                 index += 1
                 continue
-        exit(134)
+        panic "invalid text equality byte access"
 
 pub converter(static value: string_literal) String -> String{storage = LiteralBytes{data = literal_data(value), size = literal_size(value)}}
 pub converter(static value: string_literal) StringView -> StringView{bytes = BytesView{data = Span(byte).unsafe_from_static(literal_data(value), literal_size(value))}}

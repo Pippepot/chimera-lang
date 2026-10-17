@@ -2,6 +2,182 @@ const std = @import("std");
 const test_sources = @import("test_sources");
 const Fixture = test_sources.SourceFixture;
 
+test "references custom drops preserve temporal conflicts between captures" {
+    const declarations =
+        \\struct Captures
+        \\    left: Ref(String)
+        \\    right: Ref(String)
+        \\    trace: Ref(int)
+        \\    drop = func(deinit self: Captures)
+        \\        const view = self.left.value.view()
+        \\        if self.right.value.append("x") -> ()
+        \\        self.trace.value = view.byte_length() + 39
+        \\func discard(var item: Captures) -> ()
+        \\func run() int
+        \\    if const result = calculate() -> return result
+        \\    return 90
+    ;
+    try Fixture.expectParity(declarations ++ "\n" ++
+        \\fallible calculate() int
+        \\    var left: String = "abc"
+        \\    var right: String = ""
+        \\    var trace = 0
+        \\    discard(Captures{left = Ref.from(left), right = Ref.from(right), trace = Ref.from(trace)})
+        \\    return trace
+    , 42);
+    try Fixture.expectAnySourceDiagnostic(declarations ++ "\n" ++
+        \\fallible calculate() int
+        \\    var buffer: String = "abc"
+        \\    var trace = 0
+        \\    discard(Captures{left = Ref.from(buffer), right = Ref.from(buffer), trace = Ref.from(trace)})
+        \\    return trace
+        \\_ = run()
+    , .borrow_outlives_source);
+    try Fixture.expectAnySourceDiagnostic(declarations ++ "\n" ++
+        \\fallible calculate() int
+        \\    var left: String = "abc"
+        \\    var right: String = ""
+        \\    const view = right.view()
+        \\    var trace = 0
+        \\    discard(Captures{left = Ref.from(left), right = Ref.from(right), trace = Ref.from(trace)})
+        \\    return view.byte_length() + 39
+        \\_ = run()
+    , .borrow_outlives_source);
+}
+
+test "references custom drops enforce projected write authority and effects" {
+    try Fixture.expectParity(
+        \\struct Observer
+        \\    owner: Ref(String)
+        \\    trace: Ref(int)
+        \\    drop = func(deinit self: Observer)
+        \\        self.trace.value += self.owner.value.byte_length()
+        \\func discard(var observer: Observer) -> ()
+        \\fallible calculate() int
+        \\    var owner: String = "abc"
+        \\    const view = owner.view()
+        \\    var trace = 0
+        \\    discard(Observer{owner = Ref.from(owner), trace = Ref.from(trace)})
+        \\    return view.byte_length() + trace + 36
+        \\func run() int
+        \\    if const result = calculate() -> return result
+        \\    return 90
+    , 42);
+    try Fixture.expectAnySourceDiagnostic(
+        \\struct Writer
+        \\    target: Ref(int)
+        \\    drop = func(deinit self: Writer) -> self.target.value += 1
+        \\func discard(var writer: Writer) -> ()
+        \\const target = 41
+        \\discard(Writer{target = Ref.from(target)})
+    , .reference_not_writable);
+    inline for (.{
+        .{ .clear = "hook.target = none", .clear_value = "true", .safe = true },
+        .{ .clear = "_ = 0", .clear_value = "true", .safe = false },
+        .{ .clear = "if clear?\n        hook.target = none\n    else\n        hook.target = none", .clear_value = "true", .safe = true },
+        .{ .clear = "if clear?\n        hook.target = none\n    else\n        hook.target = none", .clear_value = "false", .safe = true },
+        .{ .clear = "if clear? -> hook.target = none", .clear_value = "false", .safe = false },
+        .{ .clear = "if clear?\n        _ = hook\n        return view.byte_length() + 39\n    hook.target = none", .clear_value = "true", .safe = false },
+        .{ .clear = "loop\n        if not clear? -> break\n        hook.target = none\n        clear = false", .clear_value = "false", .safe = false },
+    }) |capture| {
+        const source = try test_sources.renderTemplate(std.testing.allocator,
+            \\struct Hook
+            \\    move = none
+            \\    target: Ref(String) | none
+            \\    drop = func(deinit self: Hook)
+            \\        if const target = self.target as Ref(String)
+            \\            if target.value.append("x") -> ()
+            \\fallible inspect(ref owner: String, ref clear: bool) int
+            \\    const view = owner.view()
+            \\    var hook = Hook{target = Ref.from(owner)}
+            \\    $clear
+            \\    _ = hook
+            \\    return view.byte_length() + 39
+            \\fallible calculate() int
+            \\    var owner: String = "abc"
+            \\    var clear = $clear_value
+            \\    return inspect?(owner, clear)
+            \\func run() int
+            \\    if const result = calculate() -> return result
+            \\    return 90
+        , .{ .clear = capture.clear, .clear_value = capture.clear_value });
+        defer std.testing.allocator.free(source);
+        if (capture.safe) {
+            try Fixture.expectParity(source, 42);
+        } else {
+            const executed = try std.mem.concat(std.testing.allocator, u8, &.{ source, "\n_ = run()" });
+            defer std.testing.allocator.free(executed);
+            try Fixture.expectAnySourceDiagnostic(executed, .borrow_outlives_source);
+        }
+    }
+}
+
+test "references ownership hooks export temporal writes at their call sites" {
+    inline for (.{
+        .{ .member = "copy", .mode = "imm", .transfer = "", .container = "Hook", .construct = "Hook{target = Ref.from(right)}" },
+        .{ .member = "move", .mode = "deinit", .transfer = "^", .container = "Hook", .construct = "Hook{target = Ref.from(right)}" },
+        .{ .member = "copy", .mode = "imm", .transfer = "", .container = "Wrapper", .construct = "Wrapper{value = Hook{target = Ref.from(right)}}" },
+        .{ .member = "move", .mode = "deinit", .transfer = "^", .container = "Wrapper", .construct = "Wrapper{value = Hook{target = Ref.from(right)}}" },
+        .{ .member = "copy", .mode = "imm", .transfer = "", .container = "(Hook, int)", .construct = "(Hook{target = Ref.from(right)}, 0)" },
+        .{ .member = "move", .mode = "deinit", .transfer = "^", .container = "(Hook, int)", .construct = "(Hook{target = Ref.from(right)}, 0)" },
+        .{ .member = "copy", .mode = "imm", .transfer = "", .container = "Array(Hook, 1)", .construct = "[Hook{target = Ref.from(right)}]" },
+        .{ .member = "move", .mode = "deinit", .transfer = "^", .container = "Array(Hook, 1)", .construct = "[Hook{target = Ref.from(right)}]" },
+        .{ .member = "copy", .mode = "imm", .transfer = "", .container = "Hook | none", .construct = "Hook{target = Ref.from(right)}" },
+        .{ .member = "move", .mode = "deinit", .transfer = "^", .container = "Hook | none", .construct = "Hook{target = Ref.from(right)}" },
+    }) |hook| {
+        const declarations = try test_sources.renderTemplate(std.testing.allocator,
+            \\struct Hook
+            \\    target: Ref(String)
+            \\    $member = func($mode self: Hook) Hook
+            \\        if self.target.value.append("x") -> ()
+            \\        return Hook{target = self.target}
+            \\struct Wrapper
+            \\    $member = fieldwise
+            \\    value: Hook
+            \\func consume(var hook: $container) -> ()
+            \\fallible inspect(ref left: String, ref right: String) int
+            \\    const view = left.view()
+            \\    const hook: $container = $construct
+            \\    consume(hook$transfer)
+            \\    return view.byte_length() + 39
+            \\func run() int
+            \\    if const result = calculate() -> return result
+            \\    return 90
+        , hook);
+        defer std.testing.allocator.free(declarations);
+        const unrelated = try std.mem.concat(std.testing.allocator, u8, &.{
+            declarations, "\n",
+            \\fallible calculate() int
+            \\    var left: String = "abc"
+            \\    var right: String = ""
+            \\    return inspect?(left, right)
+        });
+        defer std.testing.allocator.free(unrelated);
+        try Fixture.expectParity(unrelated, 42);
+        const aliased = try std.mem.concat(std.testing.allocator, u8, &.{
+            declarations, "\n",
+            \\fallible calculate() int
+            \\    var buffer: String = "abc"
+            \\    return inspect?(buffer, buffer)
+            \\_ = run()
+        });
+        defer std.testing.allocator.free(aliased);
+        try Fixture.expectAnySourceDiagnostic(aliased, .borrow_outlives_source);
+    }
+}
+
+test "reference result mode borrows the complete variant" {
+    try Fixture.expectParity(
+        \\func select(ref owner: int | none) ref (int | none) -> owner
+        \\func run() int
+        \\    var owner: int | none = 12
+        \\    ref selected = select(owner)
+        \\    if ref item = selected as int -> item += 30
+        \\    if const result = owner as int -> return result
+        \\    return 90
+    , 42);
+}
+
 test "callable widening preserves reference result contracts" {
     for ([_][]const u8{
         \\func source(ref value: int) int -> value
@@ -157,6 +333,527 @@ test "references borrowed fallible results bind conditionally without copying" {
     , 42);
 }
 
+test "references variant alternatives capture existing places" {
+    try Fixture.expectParity(
+        \\struct End
+        \\    copy = trivial
+        \\func capture(ref value: int) ref int | End -> value
+        \\func run() int
+        \\    var owner = 17
+        \\    const result = capture(owner)
+        \\    if ref selected = result as int -> selected += 25
+        \\    else return 90
+        \\    return owner
+    , 42);
+}
+
+test "references variant captures retain independent referent lifetime" {
+    try Fixture.expectParity(
+        \\struct End
+        \\    copy = trivial
+        \\func capture(ref value: int) ref int | End -> value
+        \\func selected(ref value: int) ref int
+        \\    const carrier = capture(value)
+        \\    if ref result = carrier as int -> return result
+        \\    return value
+        \\func run() int
+        \\    var owner = 17
+        \\    ref result = selected(owner)
+        \\    result += 25
+        \\    return owner
+    , 42);
+    try Fixture.expectAnySourceDiagnostic(
+        \\struct End
+        \\    copy = trivial
+        \\func invalid() ref int | End
+        \\    var local = 42
+        \\    return local
+        \\_ = invalid()
+    , .borrow_outlives_source);
+    try Fixture.expectAnySourceDiagnostic(
+        \\struct End
+        \\    copy = trivial
+        \\func capture(ref value: int) ref int | End -> value
+        \\const owner = 17
+        \\const carrier = capture(owner)
+        \\if ref result = carrier as int -> result += 25
+    , .reference_not_writable);
+}
+
+test "references variant construction rejects ambiguous storage selection" {
+    try Fixture.expectAnySourceDiagnostic(
+        \\func invalid(ref value: int) int | ref int -> value
+        \\var owner = 42
+        \\_ = invalid(owner)
+    , .ambiguous_variant_member);
+    try Fixture.expectParity(
+        \\func owned() int | ref int -> 42
+        \\func run() int
+        \\    const carrier = owned()
+        \\    if ref result = carrier as int -> return result
+        \\    return 90
+    , 42);
+}
+
+test "references variant logical matching aliases either storage kind" {
+    try Fixture.expectParity(
+        \\struct End
+        \\    copy = trivial
+        \\func capture(ref value: int) ref int | End -> value
+        \\func choose(ref value: int, borrowed: bool) int | ref int | End
+        \\    if borrowed? -> return capture(value)
+        \\    return 17
+        \\func update(ref value: int, borrowed: bool) int
+        \\    var carrier = choose(value, borrowed)
+        \\    if ref selected = carrier as int
+        \\        selected += 25
+        \\        return selected
+        \\    return 90
+        \\func run() int
+        \\    var owner = 17
+        \\    if update(owner, true) <> 42 -> return 91
+        \\    if update(owner, false) <> 42 -> return 92
+        \\    return owner
+    , 42);
+}
+
+test "references variant owning matches copy reference referents" {
+    try Fixture.expectParity(
+        \\struct End
+        \\    copy = trivial
+        \\func capture(ref value: int) ref int | End -> value
+        \\func run() int
+        \\    var owner = 17
+        \\    if const selected = capture(owner) as int
+        \\        var copied = selected
+        \\        copied += 25
+        \\        if owner <> 17 -> return 90
+        \\        return copied
+        \\    return 91
+    , 42);
+}
+
+test "references variant union matches copy logical reference payloads" {
+    try Fixture.expectParity(
+        \\func capture(ref value: int, present: bool) ref int | none
+        \\    if present? -> return value
+        \\    return none
+        \\func inspect(ref owner: int, present: bool) int
+        \\    const carrier = capture(owner, present)
+        \\    if const selected = carrier as (int | none)
+        \\        if const value = selected as int -> return value + 25
+        \\        return 42
+        \\    return 90
+        \\func run() int
+        \\    var owner = 17
+        \\    if inspect(owner, true) <> 42 -> return 91
+        \\    return inspect(owner, false)
+    , 42);
+    try Fixture.expectParity(
+        \\func produce(first: bool) none | Array(int, 3) | int
+        \\    if first? -> return [10, 11, 21]
+        \\    return 42
+        \\func inspect(first: bool) int
+        \\    if const selected = produce(first) as (Array(int, 3) | int)
+        \\        if const number = selected as int -> return number
+        \\        if ref values = selected as Array(int, 3)
+        \\            if const last = values.get(2) -> return last + 21
+        \\    return 90
+        \\func run() int
+        \\    if inspect(true) <> 42 -> return 91
+        \\    return inspect(false)
+    , 42);
+}
+
+test "references typed tuples preserve member storage and authority" {
+    try Fixture.expectParity(
+        \\func run() int
+        \\    var owner = 17
+        \\    const other = 5
+        \\    const pair: (ref int, int) = (owner, other)
+        \\    pair.0 += 25
+        \\    return owner
+    , 42);
+}
+
+test "references contextual tuple construction permits unrelated reference alternatives" {
+    try Fixture.expectParity(
+        \\func run() int
+        \\    const pair: (int, int) | ref bool = (19, 23)
+        \\    if const selected = pair as (int, int) -> return selected.0 + selected.1
+        \\    return 90
+    , 42);
+}
+
+test "references readonly recursive owners preserve captured authority when forwarded" {
+    try Fixture.expectParity(
+        \\struct Node
+        \\    next: Box(Node) | none
+        \\    target: Ref(int)
+        \\func update(ref node: Node) -> node.target.value += 1
+        \\func forward(imm node: Node) -> update(node)
+        \\func run() int
+        \\    var target = 41
+        \\    const node = Node{next = none, target = Ref.from(target)}
+        \\    forward(node)
+        \\    return target
+    , 42);
+}
+
+test "references readonly recursive owners cannot upgrade owned views" {
+    try Fixture.expectAnySourceDiagnostic(
+        \\struct Node
+        \\    next: Box(Node) | none
+        \\    view: Span(int) | none
+        \\func selected(ref node: Node) Span(int)
+        \\    if ref next = node.next as Box(Node) -> return selected(next.borrow())
+        \\    if const view = node.view as Span(int) -> return view
+        \\    panic
+        \\func forward(imm node: Node) Span(int) -> selected(node)
+        \\fallible calculate()
+        \\    var values = [41]
+        \\    var leaf = Box.new?(Node{next = none, view = values.span()})
+        \\    const root = Node{next = leaf^, view = none}
+        \\    var view = forward(root)
+        \\    view[0] = 42
+        \\if calculate() -> ()
+    , .reference_not_writable);
+}
+
+test "references readonly recursive owners return writable captured handles" {
+    try Fixture.expectParity(
+        \\struct Node
+        \\    next: Box(Node) | none
+        \\    target: Ref(int)
+        \\func selected(ref node: Node) Ref(int)
+        \\    if ref next = node.next as Box(Node) -> return selected(next.borrow())
+        \\    return node.target
+        \\func forward(imm node: Node) Ref(int) -> selected(node)
+        \\fallible calculate() int
+        \\    var target = 41
+        \\    var leaf = Box.new?(Node{next = none, target = Ref.from(target)})
+        \\    const root = Node{next = leaf^, target = Ref.from(target)}
+        \\    const handle = forward(root)
+        \\    handle.value += 1
+        \\    return target
+        \\func run() int
+        \\    if const result = calculate() -> return result
+        \\    return 90
+    , 42);
+}
+
+test "references recursive parameter outputs retain replacement authority and lifetime" {
+    const source =
+        \\struct Node
+        \\    next: Box(Node) | none
+        \\    target: Ref(int)
+        \\func replace(ref node: Node, ref source: int)
+        \\    if ref next = node.next as Box(Node) -> replace(next.borrow(), source)
+        \\    else
+        \\        node.target = Ref.from(source)
+        \\func selected(ref node: Node) Ref(int)
+        \\    if ref next = node.next as Box(Node) -> return selected(next.borrow())
+        \\    return node.target
+        \\fallible calculate() int
+        \\    var original = 0
+        \\    var replacement = 41
+        \\    var leaf = Box.new?(Node{next = none, target = Ref.from(original)})
+        \\    var root = Node{next = leaf^, target = Ref.from(original)}
+        \\    replace(root, replacement)
+        \\    const handle = selected(root)
+        \\    handle.value += 1
+        \\    return replacement
+        \\func run() int
+        \\    if const result = calculate() -> return result
+        \\    return 90
+    ;
+    try Fixture.expectParity(source, 42);
+    const readonly = try std.mem.replaceOwned(u8, std.testing.allocator, source ++ "\nexit(run())", "var replacement", "const replacement");
+    defer std.testing.allocator.free(readonly);
+    try Fixture.expectAnySourceDiagnostic(readonly, .reference_not_writable);
+    const expired = try std.mem.replaceOwned(u8, std.testing.allocator, source ++ "\nexit(run())", "replace(root, replacement)",
+        \\if 1 == 1
+        \\        var temporary = 41
+        \\        replace(root, temporary)
+    );
+    defer std.testing.allocator.free(expired);
+    try Fixture.expectAnySourceDiagnostic(expired, .borrow_outlives_source);
+}
+
+test "references generic borrowed zip preserves independent tuple captures" {
+    const declarations =
+        \\struct End
+        \\    copy = trivial
+        \\struct Left
+        \\    copy = none
+        \\    pub value: int
+        \\struct Right
+        \\    copy = none
+        \\    pub value: int
+        \\struct Cursor(T: type)
+        \\    source: Ref(T)
+        \\    ready: bool
+        \\    func next(mut self: Cursor(T)) ref T | End
+        \\        if not self.ready? -> return End{}
+        \\        self.ready = false
+        \\        return self.source.value
+        \\struct Zip(L: type, R: type, A: type, B: type)
+        \\    left: L
+        \\    right: R
+        \\    func next(mut self: Zip(L, R, A, B)) (ref A, ref B) | End
+        \\        const left_result = self.left.next()
+        \\        if ref left_item = left_result as A
+        \\            const right_result = self.right.next()
+        \\            if ref right_item = right_result as B
+        \\                var pair: (ref A, ref B) = (left_item, right_item)
+        \\                return pair^
+        \\        return End{}
+    ;
+    try Fixture.expectParity(declarations ++ "\n" ++
+        \\func run() int
+        \\    var left = Left{value = 12}
+        \\    const right = Right{value = 7}
+        \\    var zipped = Zip(Cursor(Left), Cursor(Right), Left, Right){left = Cursor(Left){source = Ref.from(left), ready = true}, right = Cursor(Right){source = Ref.from(right), ready = true}}
+        \\    const result = zipped.next()
+        \\    if ref pair = result as (ref Left, ref Right)
+        \\        pair.0.value += 30
+        \\        if pair.1.value <> 7 -> return 90
+        \\        if zipped.next() is End -> return left.value
+        \\    return 91
+    , 42);
+    try Fixture.expectAnySourceDiagnostic(declarations ++ "\n" ++
+        \\var left = Left{value = 12}
+        \\const right = Right{value = 7}
+        \\var zipped = Zip(Cursor(Left), Cursor(Right), Left, Right){left = Cursor(Left){source = Ref.from(left), ready = true}, right = Cursor(Right){source = Ref.from(right), ready = true}}
+        \\const result = zipped.next()
+        \\if ref pair = result as (ref Left, ref Right) -> pair.1.value += 1
+    , .reference_not_writable);
+    try Fixture.expectParity(declarations ++ "\n" ++
+        \\func first(ref left: Left) ref Left
+        \\    const right = Right{value = 7}
+        \\    var zipped = Zip(Cursor(Left), Cursor(Right), Left, Right){left = Cursor(Left){source = Ref.from(left), ready = true}, right = Cursor(Right){source = Ref.from(right), ready = true}}
+        \\    const result = zipped.next()
+        \\    if const pair = result as (ref Left, ref Right) -> return pair.0
+        \\    exit(90)
+        \\func run() int
+        \\    var left = Left{value = 12}
+        \\    ref selected = first(left)
+        \\    selected.value += 30
+        \\    return left.value
+    , 42);
+    try Fixture.expectParity(declarations ++ "\n" ++
+        \\func run() int
+        \\    const left = Left{value = 7}
+        \\    var right = Right{value = 12}
+        \\    var zipped = Zip(Cursor(Left), Cursor(Right), Left, Right){left = Cursor(Left){source = Ref.from(left), ready = true}, right = Cursor(Right){source = Ref.from(right), ready = true}}
+        \\    const result = zipped.next()
+        \\    if const pair = result as (ref Left, ref Right)
+        \\        if pair.0.value <> 7 -> return 90
+        \\        pair.1.value += 30
+        \\        return right.value
+        \\    return 91
+    , 42);
+    try Fixture.expectAnySourceDiagnostic(declarations ++ "\n" ++
+        \\const left = Left{value = 7}
+        \\var right = Right{value = 12}
+        \\var zipped = Zip(Cursor(Left), Cursor(Right), Left, Right){left = Cursor(Left){source = Ref.from(left), ready = true}, right = Cursor(Right){source = Ref.from(right), ready = true}}
+        \\const result = zipped.next()
+        \\if const pair = result as (ref Left, ref Right) -> pair.0.value += 1
+    , .reference_not_writable);
+}
+
+test "references tuples own cleanup only for owned members" {
+    try Fixture.expectParity(
+        \\struct Tracked
+        \\    value: int
+        \\    effects: Ref(int)
+        \\    copy = func(imm self: Tracked) Tracked
+        \\        self.effects.value += 1
+        \\        return Tracked{value = self.value, effects = self.effects}
+        \\    drop = func(deinit self: Tracked) -> self.effects.value += 10
+        \\func exercise(ref owner: Tracked)
+        \\    const pair: (ref Tracked, Tracked) = (owner, owner)
+        \\    const copied = pair
+        \\    _ = copied.0.value
+        \\    _ = copied.1.value
+        \\func run() int
+        \\    var effects = 0
+        \\    var owner = Tracked{value = 17, effects = Ref.from(effects)}
+        \\    exercise(owner)
+        \\    const result = effects + 20
+        \\    _ = owner.value
+        \\    return result
+    , 42);
+    try Fixture.expectAnySourceDiagnostic(
+        \\struct Item
+        \\    copy = none
+        \\    value: int
+        \\struct End
+        \\    copy = trivial
+        \\func capture(ref value: Item) ref Item | End -> value
+        \\var owner = Item{value = 42}
+        \\if const copied = capture(owner) as Item -> exit(copied.value)
+    , .type_not_copyable);
+}
+
+test "references separate union alternatives do not become a whole union borrow" {
+    try Fixture.expectAnySourceDiagnostic(
+        \\struct End
+        \\    copy = trivial
+        \\func choose(ref number: int, ref flag: bool, first: bool) ref int | ref bool | End
+        \\    if first -> return number
+        \\    return flag
+        \\func run() int
+        \\    var number = 42
+        \\    var flag = false
+        \\    if ref item = choose(number, flag, true) as int | bool -> return 1
+        \\    return 0
+        \\_ = run()
+    , .reference_projection_requires_member);
+    try Fixture.expectParity(
+        \\struct End
+        \\    copy = trivial
+        \\func capture(ref owner: int | bool) ref (int | bool) | End -> owner
+        \\func run() int
+        \\    var owner: int | bool = true
+        \\    const carrier = capture(owner)
+        \\    if ref item = carrier as int | bool -> item = 42
+        \\    if const item = owner as int -> return item
+        \\    return 90
+    , 42);
+}
+
+test "references logical payload borrows do not retain temporary carriers" {
+    const declarations =
+        \\func capture(ref owner: int) ref int | End -> owner
+    ;
+    try Fixture.expectParity(declarations ++ "\n" ++
+        \\func selected(ref owner: int) ref int
+        \\    if ref item = capture(owner) as int -> return item
+        \\    exit(90)
+        \\func run() int
+        \\    var owner = 12
+        \\    ref item = selected(owner)
+        \\    item += 30
+        \\    return owner
+    , 42);
+    try Fixture.expectParity(declarations ++ "\n" ++
+        \\func selected(ref owner: int) ref int
+        \\    var carrier: ref int | End = owner
+        \\    if ref item = carrier as int
+        \\        carrier = End{}
+        \\        return item
+        \\    exit(90)
+        \\func run() int
+        \\    var owner = 12
+        \\    ref item = selected(owner)
+        \\    item += 30
+        \\    return owner
+    , 42);
+    try Fixture.expectAnySourceDiagnostic(declarations ++ "\n" ++
+        \\const owner = 12
+        \\if ref item = capture(owner) as int -> item += 30
+    , .reference_not_writable);
+    try Fixture.expectAnySourceDiagnostic(declarations ++ "\n" ++
+        \\func invalid() ref int
+        \\    var owner = 12
+        \\    if ref item = capture(owner) as int -> return item
+        \\    exit(90)
+        \\_ = invalid()
+    , .borrow_outlives_source);
+    try Fixture.expectAnySourceDiagnostic(
+        \\var carrier: int | End = 12
+        \\if ref item = carrier as int
+        \\    carrier = End{}
+        \\    exit(item)
+    , .borrow_outlives_source);
+}
+
+test "references tuples keep readonly captures through copies" {
+    try Fixture.expectAnySourceDiagnostic(
+        \\const owner = 17
+        \\const pair: (ref int, int) = (owner, 5)
+        \\var copied = pair
+        \\copied.0 += 25
+    , .reference_not_writable);
+    try Fixture.expectAnySourceDiagnostic(
+        \\var owner = 17
+        \\const pair: (ref int, int) = (owner, 5)
+        \\pair.1 += 25
+    , .reference_not_writable);
+    try Fixture.expectAnySourceDiagnostic(
+        \\func invalid() (ref int, int)
+        \\    var local = 42
+        \\    return (local, 7)
+        \\_ = invalid()
+    , .borrow_outlives_source);
+}
+
+test "references const carriers preserve captured referent authority" {
+    try Fixture.expectParity(
+        \\func update(ref handle: Ref(int)) -> handle.value += 10
+        \\func forward(ref handle: Ref(int)) Ref(int) -> handle
+        \\func run() int
+        \\    var owner = 12
+        \\    const first = Ref.from(owner)
+        \\    first.value += 10
+        \\    const second = first
+        \\    update(second)
+        \\    const third = forward(second)
+        \\    third.value += 10
+        \\    return owner
+    , 42);
+}
+
+test "references const aggregate copies preserve independent reference and storage permissions" {
+    try Fixture.expectParity(
+        \\struct Mixed
+        \\    copy = trivial
+        \\    pub target: Ref(int)
+        \\    pub view: Span(int)
+        \\func run() int
+        \\    var owner = 12
+        \\    var values = [1]
+        \\    const original = Mixed{target = Ref.from(owner), view = values.span()}
+        \\    var copied = original
+        \\    copied.target.value += 30
+        \\    return owner
+    , 42);
+    try Fixture.expectSourceDiagnostic(
+        \\struct Mixed
+        \\    copy = trivial
+        \\    pub target: Ref(int)
+        \\    pub view: Span(int)
+        \\fallible invalid()
+        \\    var owner = 12
+        \\    var values = [1]
+        \\    const original = Mixed{target = Ref.from(owner), view = values.span()}
+        \\    var copied = original
+        \\    ref item = copied.view.get?(0)
+        \\    item = 42
+        \\if invalid() -> unit
+    , .reference_not_writable);
+}
+
+test "references const aggregate copies preserve array and variant captures" {
+    try Fixture.expectParity(
+        \\func run() int
+        \\    var owner = 12
+        \\    const original = [Ref.from(owner)]
+        \\    var copied = original
+        \\    if ref handle = copied.get(0) -> handle.value += 30
+        \\    return owner
+    , 42);
+    try Fixture.expectParity(
+        \\func run() int
+        \\    var owner = 12
+        \\    const original: Ref(int) | none = Ref.from(owner)
+        \\    var copied = original
+        \\    if ref handle = copied as Ref(int) -> handle.value += 30
+        \\    return owner
+    , 42);
+}
+
 test "references readonly source cannot acquire writable access through a mutable handle" {
     try Fixture.expectSourceDiagnostic(
         \\import std.memory.{Ref}
@@ -166,14 +863,36 @@ test "references readonly source cannot acquire writable access through a mutabl
     , .reference_not_writable);
 }
 
-test "references copying a readonly handle keeps readonly authority" {
+test "references copying a handle captured from a readonly source keeps readonly authority" {
     try Fixture.expectSourceDiagnostic(
         \\import std.memory.{Ref}
-        \\var source = 12
+        \\const source = 12
         \\const first = Ref.from(source)
         \\var second = first
         \\second.value = 42
     , .reference_not_writable);
+}
+
+test "references readonly handle fields preserve permission in conditional borrows" {
+    try Fixture.expectSourceDiagnostic(
+        \\const source: int | none = 42
+        \\const handle = Ref.from(source)
+        \\if ref item = handle.value as int -> item += 1
+    , .reference_not_writable);
+    try Fixture.expectSourceDiagnostic(
+        \\const source: int | none = 42
+        \\const readonly = Ref.from(source)
+        \\var handle = readonly
+        \\if ref item = handle.value as int -> item += 1
+    , .reference_not_writable);
+    try Fixture.expectParity(
+        \\func run() int
+        \\    var source: int | none = 41
+        \\    const handle = Ref.from(source)
+        \\    if ref item = handle.value as int -> item += 1
+        \\    if ref item = source as int -> return item
+        \\    return 90
+    , 42);
 }
 
 test "references local storage cannot escape as a borrowed result or reference field" {
@@ -245,7 +964,7 @@ test "references readonly attenuation through a helper is preserved at its call 
         \\func readonly(ref value: int) Ref(int)
         \\    const captured = Ref.from(value)
         \\    return captured
-        \\var source = 12
+        \\const source = 12
         \\var result = readonly(source)
         \\result.value = 42
     , .reference_not_writable);
@@ -405,7 +1124,7 @@ test "references recursive borrowed returns preserve the referent and readonly a
         \\        const result = Ref.from(source)
         \\        return result
         \\    return select(source, count - 1)
-        \\var source = 12
+        \\const source = 12
         \\var result = select(source, 5)
         \\result.value = 42
     , .reference_not_writable);
@@ -441,7 +1160,7 @@ test "references list views keep allocation storage through copied descriptor fr
     try Fixture.expectParity(
         \\fallible calculate() int
         \\    var values: List(int) = [19, 23]
-        \\    const view = values.view?(0, 2)
+        \\    const view = values.slice?(0..2)
         \\    return view[0] + view[1]
         \\func run() int
         \\    if const result = calculate() -> return result
@@ -641,7 +1360,7 @@ test "references slicing a writable span preserves captured permission" {
         \\fallible calculate() int
         \\    var source = [12, 0]
         \\    var complete = source.span()
-        \\    var slice = complete.slice?(0, 1)
+        \\    var slice = complete.slice?(0..1)
         \\    ref item = slice[0]
         \\    item += 30
         \\    return source[0]
@@ -750,15 +1469,15 @@ test "references ownership hook writes retain newly installed loans" {
         \\struct Install
         \\    target: Ref(Ref(int))
         \\    source: Ref(int)
-        \\    copy = func(imm self: Install) Install
+        \\    move = func(deinit self: Install) Install
         \\        self.target.value = self.source
         \\        return Install{target = self.target, source = self.source}
         \\func selected(ref initial: int) Ref(int)
         \\    var result = Ref.from(initial)
         \\    var local = 42
         \\    const source = Install{target = Ref.from(result), source = Ref.from(local)}
-        \\    const copied = source
-        \\    _ = copied
+        \\    const moved = source^
+        \\    _ = moved
         \\    return result
         \\var initial = 17
         \\exit(selected(initial).value)

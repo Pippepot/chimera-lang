@@ -32,6 +32,7 @@ test "standard file paths derive nested module identities" {
 /// They are embedded so compilation does not depend on the process working
 /// directory or an adjacent source checkout.
 pub const standard_sources = blk: {
+    @setEvalBranchQuota(1000 * standard_library.paths.len);
     var sources: [standard_library.paths.len]StandardSource = undefined;
     for (standard_library.paths, 0..) |path, index| {
         sources[index] = .{
@@ -161,6 +162,7 @@ pub fn readSources(
 /// File IDs survive enumeration-order changes. Removed inputs remain unreachable;
 /// membership and the catalog are the authorities for current existence.
 pub const SourceRegistry = struct {
+    entry_path: []const u8 = "main.chi",
     paths: std.StringHashMapUnmanaged(structures.FileId) = .empty,
     known_modules: std.AutoHashMapUnmanaged(structures.ModuleId, void) = .empty,
 
@@ -181,6 +183,7 @@ pub const SourceRegistry = struct {
     pub fn update(self: *SourceRegistry, db: *query.Database, gpa: std.mem.Allocator, entry_source: []const u8, files: []const SourceFile, module_paths: []const []const u8) !void {
         const entry_module = try db.intern(queries.ModulePaths, .{ .path = "" });
         try putInput(db, queries.SourceText, 0, entry_source);
+        try putInput(db, queries.SourcePath, 0, self.entry_path);
         try putInput(db, queries.FileModule, 0, entry_module);
         var current: std.AutoArrayHashMapUnmanaged(structures.ModuleId, std.ArrayList(structures.FileId)) = .empty;
         defer {
@@ -243,6 +246,7 @@ pub const SourceRegistry = struct {
         };
         const module = try db.intern(queries.ModulePaths, .{ .path = file.module_path });
         try putInput(db, queries.SourceText, id, file.source);
+        try putInput(db, queries.SourcePath, id, file.path);
         try putInput(db, queries.FileModule, id, module);
         const slot = try current.getOrPut(gpa, module);
         if (!slot.found_existing) slot.value_ptr.* = .empty;

@@ -10,6 +10,8 @@ pub const File = enum(u32) {
     text,
     io,
     range,
+    iteration,
+    math,
 
     pub fn path(file: File) []const u8 {
         return switch (file) {
@@ -22,6 +24,8 @@ pub const File = enum(u32) {
             .text => "text.chi",
             .io => "io.chi",
             .range => "range.chi",
+            .iteration => "iteration.chi",
+            .math => "math.chi",
         };
     }
 
@@ -42,6 +46,7 @@ pub const root_module = "std";
 
 pub const External = enum {
     exit,
+    panic_message,
     allocate_host_storage,
     deallocate_host_storage,
     allocate,
@@ -81,7 +86,7 @@ pub const External = enum {
         return switch (symbol) {
             .exit => .exit,
             .literal_byte, .primitive_operation => .prelude,
-            .literal_data, .literal_size, .byte_int => .text,
+            .literal_data, .literal_size, .byte_int, .panic_message => .text,
             .io_read => .memory_allocation,
             .io_write => .text,
             .copy_value, .move_value => .ownership,

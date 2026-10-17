@@ -11,6 +11,102 @@ const allocation_failure_allocator = test_sources.allocation_failure_allocator;
 
 const Fixture = test_sources.SourceFixture;
 
+test "integer min max select ordered equal negative and extreme values in both engines" {
+    try Fixture.expectParity(
+        \\import std.math.{min, max}
+        \\fallible check()
+        \\    min(19, 23) == 19
+        \\    min(23, 19) == 19
+        \\    max(19, 23) == 23
+        \\    max(23, 19) == 23
+        \\    min(0, 0) == 0
+        \\    max(0, 0) == 0
+        \\    min(-19, -23) == -23
+        \\    min(-23, -19) == -23
+        \\    max(-19, -23) == -19
+        \\    max(-23, -19) == -19
+        \\    min(-2147483648, 2147483647) == -2147483648
+        \\    min(2147483647, -2147483648) == -2147483648
+        \\    max(-2147483648, 2147483647) == 2147483647
+        \\    max(2147483647, -2147483648) == 2147483647
+        \\    min(-2147483648, -2147483648) == -2147483648
+        \\    max(-2147483648, -2147483648) == -2147483648
+        \\    min(2147483647, 2147483647) == 2147483647
+        \\    max(2147483647, 2147483647) == 2147483647
+        \\func run() int
+        \\    if check() -> return 42
+        \\    return 90
+    , 42);
+}
+
+test "integer min max callable values evaluate arguments once from left to right" {
+    try Fixture.expectParity(
+        \\import std.math
+        \\func argument(mut trace: int, value: int) int
+        \\    trace = trace * 10 + value
+        \\    return value
+        \\func run() int
+        \\    const lower = std.math.min
+        \\    const upper = std.math.max
+        \\    var trace = 0
+        \\    if lower(argument(trace, 3), argument(trace, 1)) <> 1 -> return 90
+        \\    if trace <> 31 -> return 91
+        \\    if upper(argument(trace, 2), argument(trace, 4)) <> 4 -> return 92
+        \\    if trace <> 3124 -> return 93
+        \\    return 42
+    , 42);
+}
+
+test "integer min max recompute static results after argument and callable edits" {
+    const fixture = try Fixture.init(
+        \\import std.math.{min, max}
+        \\static selected = min(19, 23)
+        \\exit(selected)
+    );
+    defer fixture.deinit();
+    try fixture.expectExit(0, 19);
+    try fixture.db.setInput(queries.SourceText, 0,
+        \\import std.math.{min, max}
+        \\static selected = min(42, 23)
+        \\exit(selected)
+    );
+    try fixture.expectExit(0, 23);
+    try fixture.db.setInput(queries.SourceText, 0,
+        \\import std.math.{min, max}
+        \\static selected = max(42, 23)
+        \\exit(selected)
+    );
+    try fixture.expectExit(0, 42);
+}
+
+test "integer clamp handles inclusive equal reversed and extreme bounds in both engines" {
+    try Fixture.expectParity(
+        \\import std.math.{clamp}
+        \\fallible check()
+        \\    clamp(-1, 0, 10) == 0
+        \\    clamp(0, 0, 10) == 0
+        \\    clamp(5, 0, 10) == 5
+        \\    clamp(10, 0, 10) == 10
+        \\    clamp(11, 0, 10) == 10
+        \\    clamp(-30, -20, -10) == -20
+        \\    clamp(-15, -20, -10) == -15
+        \\    clamp(0, -20, -10) == -10
+        \\    clamp(-9, 3, 3) == 3
+        \\    clamp(9, 3, 3) == 3
+        \\    clamp(-2147483648, -2147483648, 2147483647) == -2147483648
+        \\    clamp(2147483647, -2147483648, 2147483647) == 2147483647
+        \\    clamp(2147483647, -2147483648, -2147483648) == -2147483648
+        \\    clamp(-2147483648, 2147483647, 2147483647) == 2147483647
+        \\    clamp(-1, 10, 0) == 10
+        \\    clamp(5, 10, 0) == 10
+        \\    clamp(11, 10, 0) == 10
+        \\    clamp(0, 2147483647, -2147483648) == 2147483647
+        \\func run() int
+        \\    if check() -> return clamp(42, 0, 100)
+        \\    return 90
+    , 42);
+}
+
 test "remainder signs boundary values precedence and callable syntax agree in both engines" {
     try Fixture.expectParity(
         \\func run() int
@@ -627,16 +723,16 @@ test "field visibility rejects foreign initialization projections borrows and tr
         "const value = Value{}\nexit(value.visible)",
         "const value = make()\nexit(value.secret)",
         "var value = make()\nvalue.secret = 42\nexit(value.visible)",
-        "const value = make()\nconst field = borrow_local(int, value.secret)\nexit(field[])",
-        "var value = make()\nconst field = borrow_mut_local(value.secret)\nfield[] = 42\nexit(value.visible)",
+        "const value = make()\nconst field = Ref.from(value.secret)\nexit(field.value)",
+        "var value = make()\nconst field = Ref.from(value.secret)\nfield.value = 42\nexit(value.visible)",
         "var value = make()\nconst moved = value.secret^\nexit(moved)",
         "func consume(deinit item: int) int -> item\nvar value = make()\nexit(consume(value.secret))",
-        "const value = make()\nconst reference = borrow_local(Value, value)\nexit(reference[].secret)",
+        "const value = make()\nconst reference = Ref.from(value)\nexit(reference.value.secret)",
         "static answer = make().secret\nexit(answer)",
         "const answer = comptime -> make().secret\nexit(answer)",
     };
     for (operations) |operation| {
-        const source = try testing.allocator.print("import lib.{{Value, make}}\nimport std.memory.{{borrow_local, borrow_mut_local}}\n{s}", .{operation});
+        const source = try testing.allocator.print("import lib.{{Value, make}}\n{s}", .{operation});
         defer testing.allocator.free(source);
         const fixture = try Fixture.initFiles(source, &.{library});
         defer fixture.deinit();
@@ -666,13 +762,12 @@ test "field visibility permits public initialization reads writes borrows and mo
     const fixture = try Fixture.initFiles(
         \\import std.memory
         \\import lib.{Value}
-        \\import std.memory.{borrow_local}
         \\var value = Value{first = 20, second = 21}
         \\value.first = 20
-        \\const field = std.memory.borrow_mut_local(value.first)
-        \\field[] = 21
-        \\const reference = borrow_local(int, value.first)
-        \\const observed = reference[]
+        \\var field = Ref.from(value.first)
+        \\field.value = 21
+        \\const reference = Ref.from(value.first)
+        \\const observed = reference.value
         \\const moved = value.second^
         \\exit(observed + moved)
     , &.{.{ .path = "lib/value.chi", .module_path = "lib", .source =
@@ -698,12 +793,11 @@ test "field visibility belongs to the module across files and foreign specializa
         },
         .{ .path = "lib/read.chi", .module_path = "lib", .source =
         \\import std.memory
-        \\import std.memory.{borrow_local}
         \\pub func read(mut value: Value) int
-        \\    const field = std.memory.borrow_mut_local(value.secret)
-        \\    field[] = 22
-        \\    const reference = borrow_local(int, value.secret)
-        \\    return reference[]
+        \\    var field = Ref.from(value.secret)
+        \\    field.value = 22
+        \\    const reference = Ref.from(value.secret)
+        \\    return reference.value
         \\pub func take(static T: type, var value: Cell(T)) T -> value.secret^
         },
     };
@@ -804,10 +898,27 @@ test "field visibility allows automatic fieldwise cleanup and custom drop across
     try fixture.expectExit(0, 42);
 }
 
+test "empty struct bodies support construction and passing in both engines" {
+    try Fixture.expectParity(
+        \\struct Empty
+        \\struct Generic(T: type)
+        \\static Anonymous = struct
+        \\func Generated() type -> struct
+        \\static struct StaticEmpty
+        \\static struct StaticGeneric(T: type)
+        \\func static_score(imm first: StaticEmpty, imm second: StaticGeneric(int)) int -> 40
+        \\func score(imm first: Empty, imm second: Generic(int), imm third: Anonymous, imm fourth: Generated()) int -> 2
+        \\func run() int
+        \\    const value = Empty{}
+        \\    const moved = value^
+        \\    const base = comptime -> static_score(StaticEmpty{}, StaticGeneric(int){})
+        \\    return base + score(moved, Generic(int){}, Anonymous{}, Generated(){})
+    , 42);
+}
+
 test "field visibility permits empty structs and validates callable field access" {
     const library = modules.SourceFile{ .path = "lib/value.chi", .module_path = "lib", .source =
         \\pub struct Empty
-        \\    pub static answer = 42
         \\pub struct Callbacks
         \\    operation: func() int
         \\    pub visible: func() int
@@ -1169,7 +1280,7 @@ test "uninitialized allocation of Ref needs no referent" {
 
 test "typed allocation borrows an initialized element without copying it" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{allocate, deallocate, unsafe_initialize, unsafe_destroy, unsafe_borrow_initialized}
+        \\import std.memory.{allocate, deallocate, unsafe_initialize, unsafe_destroy, unsafe_borrow}
         \\struct Tracked
         \\  copy = none
         \\  value: int
@@ -1180,7 +1291,7 @@ test "typed allocation borrows an initialized element without copying it" {
         \\  else
         \\    deallocate(Tracked, allocation^)
         \\    fail
-        \\  const observed = inspect(unsafe_borrow_initialized(Tracked, allocation, 1))
+        \\  const observed = inspect(unsafe_borrow(Tracked, allocation, 1))
         \\  unsafe_destroy(Tracked, allocation, 1)
         \\  deallocate(Tracked, allocation^)
         \\  observed == 42
@@ -1190,16 +1301,16 @@ test "typed allocation borrows an initialized element without copying it" {
 
 test "indexed scalar borrowing works in arithmetic and comparisons" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{allocate, deallocate, unsafe_initialize, unsafe_destroy, unsafe_borrow_initialized}
+        \\import std.memory.{allocate, deallocate, unsafe_initialize, unsafe_destroy, unsafe_borrow}
         \\fallible run() unit
         \\  var allocation = allocate?(int, 2)
         \\  if unsafe_initialize(int, allocation, 1, 40) -> ()
         \\  else
         \\    deallocate(int, allocation^)
         \\    fail
-        \\  const result = 1 + unsafe_borrow_initialized(int, allocation, 1) + 1
+        \\  const result = 1 + unsafe_borrow(int, allocation, 1) + 1
         \\  var equal = 0
-        \\  if 40 == unsafe_borrow_initialized(int, allocation, 1) -> equal = 1
+        \\  if 40 == unsafe_borrow(int, allocation, 1) -> equal = 1
         \\  unsafe_destroy(int, allocation, 1)
         \\  deallocate(int, allocation^)
         \\  result == 42
@@ -1210,7 +1321,7 @@ test "indexed scalar borrowing works in arithmetic and comparisons" {
 
 test "indexed boolean borrowing reads only the selected element" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{allocate, deallocate, unsafe_initialize, unsafe_destroy, unsafe_borrow_initialized}
+        \\import std.memory.{allocate, deallocate, unsafe_initialize, unsafe_destroy, unsafe_borrow}
         \\fallible run() unit
         \\  var allocation = allocate?(bool, 2)
         \\  if unsafe_initialize(bool, allocation, 0, true) -> ()
@@ -1223,8 +1334,8 @@ test "indexed boolean borrowing reads only the selected element" {
         \\    deallocate(bool, allocation^)
         \\    fail
         \\  var observed = 0
-        \\  if unsafe_borrow_initialized(bool, allocation, 0) == true -> observed += 21
-        \\  if true == unsafe_borrow_initialized(bool, allocation, 0) -> observed += 21
+        \\  if unsafe_borrow(bool, allocation, 0) == true -> observed += 21
+        \\  if true == unsafe_borrow(bool, allocation, 0) -> observed += 21
         \\  unsafe_destroy(bool, allocation, 1)
         \\  unsafe_destroy(bool, allocation, 0)
         \\  deallocate(bool, allocation^)
@@ -1235,7 +1346,7 @@ test "indexed boolean borrowing reads only the selected element" {
 
 test "indexed borrowed noncopyable value cannot become an owned local" {
     try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{allocate, deallocate, unsafe_initialize, unsafe_borrow_initialized}
+        \\import std.memory.{allocate, deallocate, unsafe_initialize, unsafe_borrow}
         \\struct Tracked
         \\  copy = none
         \\  value: int
@@ -1245,7 +1356,7 @@ test "indexed borrowed noncopyable value cannot become an owned local" {
         \\  else
         \\    deallocate(Tracked, allocation^)
         \\    fail
-        \\  const invalid = unsafe_borrow_initialized(Tracked, allocation, 0)
+        \\  const invalid = unsafe_borrow(Tracked, allocation, 0)
         \\  _ = invalid
         \\  deallocate(Tracked, allocation^)
         \\if run() -> exit(1) else exit(2)
@@ -1254,14 +1365,14 @@ test "indexed borrowed noncopyable value cannot become an owned local" {
 
 test "copying an indexed borrowed scalar snapshots it before destruction" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{allocate, deallocate, unsafe_initialize, unsafe_destroy, unsafe_borrow_initialized}
+        \\import std.memory.{allocate, deallocate, unsafe_initialize, unsafe_destroy, unsafe_borrow}
         \\fallible run() int
         \\  var allocation = allocate?(int, 1)
         \\  if unsafe_initialize(int, allocation, 0, 42) -> ()
         \\  else
         \\    deallocate(int, allocation^)
         \\    fail
-        \\  const snapshot = unsafe_borrow_initialized(int, allocation, 0)
+        \\  const snapshot = unsafe_borrow(int, allocation, 0)
         \\  unsafe_destroy(int, allocation, 0)
         \\  deallocate(int, allocation^)
         \\  return snapshot
@@ -1271,15 +1382,15 @@ test "copying an indexed borrowed scalar snapshots it before destruction" {
 
 test "an indexed allocation element yields a storable Ref" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{allocate, deallocate, unsafe_initialize, unsafe_destroy, unsafe_borrow_element, read}
+        \\import std.memory.{allocate, deallocate, unsafe_initialize, unsafe_destroy, unsafe_borrow}
         \\fallible run() int
         \\  var allocation = allocate?(int, 2)
         \\  if unsafe_initialize(int, allocation, 1, 42) -> ()
         \\  else
         \\    deallocate(int, allocation^)
         \\    fail
-        \\  const reference: Ref(int) = unsafe_borrow_element(int, allocation, 1)
-        \\  const observed = read(int, false, reference)
+        \\  const reference: Ref(int) = Ref.from(unsafe_borrow(int, allocation, 1))
+        \\  const observed = (reference).value
         \\  unsafe_destroy(int, allocation, 1)
         \\  deallocate(int, allocation^)
         \\  return observed
@@ -1308,16 +1419,16 @@ test "typed allocation destroys a nonzero indexed element in place" {
 
 test "destroying an allocation element invalidates a Ref of it" {
     try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{allocate, deallocate, unsafe_initialize, unsafe_destroy, unsafe_borrow_element, read}
+        \\import std.memory.{allocate, deallocate, unsafe_initialize, unsafe_destroy, unsafe_borrow}
         \\fallible run() int
         \\  var allocation = allocate?(int, 1)
         \\  if unsafe_initialize(int, allocation, 0, 42) -> ()
         \\  else
         \\    deallocate(int, allocation^)
         \\    fail
-        \\  const reference = unsafe_borrow_element(int, allocation, 0)
+        \\  const reference = Ref.from(unsafe_borrow(int, allocation, 0))
         \\  unsafe_destroy(int, allocation, 0)
-        \\  const observed = read(int, false, reference)
+        \\  const observed = (reference).value
         \\  deallocate(int, allocation^)
         \\  return observed
         \\if const result = run() -> exit(result) else exit(1)
@@ -1344,81 +1455,75 @@ test "typed allocation destroys a zero-sized initialized element" {
 
 test "a Box-backed borrow can be stored and read without moving its owner" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_box, read}
         \\fallible run() int
         \\  const owner = Box.new?(42)
-        \\  const reference: Ref(int) = borrow_box(int, owner)
-        \\  return read(int, false, reference)
+        \\  const reference: Ref(int) = Ref.from(owner.borrow())
+        \\  return reference.value
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
 
 test "Box owner and Ref handle use their target type names" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{read}
         \\fallible run() int
         \\  const owner: Box(int) = Box.new?(42)
-        \\  const reference: Ref(int) = owner.borrow()
-        \\  return read(int, false, reference)
+        \\  const reference: Ref(int) = Ref.from(owner.borrow())
+        \\  return (reference).value
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
 
-test "a const writable Ref changes its Box referent" {
+test "a mutable Ref changes its Box referent" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{read, write}
         \\fallible run() int
         \\  var owner = Box.new?(17)
-        \\  const reference: Ref(mut int) = owner.borrow_mut()
-        \\  write(int, reference, 42)
-        \\  return read(int, true, reference)
+        \\  var reference: Ref(int) = Ref.from(owner.borrow())
+        \\  reference.value = 42
+        \\  return reference.value
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
 
-test "Ref.as_imm preserves the origin and removes write permission" {
+test "a const Ref preserves the origin and captured permission" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{read}
         \\fallible run() int
         \\  var owner = Box.new?(42)
-        \\  const writable = owner.borrow_mut()
-        \\  const immutable: Ref(int) = writable.as_imm()
-        \\  return read(int, false, immutable)
+        \\  var writable = Ref.from(owner.borrow())
+        \\  const immutable: Ref(int) = writable
+        \\  return immutable.value
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
 
-test "Ref.as_imm cannot write through its attenuated handle" {
+test "a Ref captured from a const owner cannot write its referent" {
     try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{write}
         \\fallible run() unit
-        \\  var owner = Box.new?(17)
-        \\  const immutable = owner.borrow_mut().as_imm()
-        \\  write(int, immutable, 42)
+        \\  const owner = Box.new?(17)
+        \\  const immutable = Ref.from(owner.borrow())
+        \\  immutable.value = 42
         \\if run() -> exit(1) else exit(2)
-    , .call_argument_type_mismatch);
+    , .reference_not_writable);
 }
 
-test "Ref.as_imm cannot outlive the owner" {
+test "a const Ref cannot outlive the owner" {
     try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{read}
         \\fallible run() int
         \\  var owner = Box.new?(42)
-        \\  const immutable = owner.borrow_mut().as_imm()
+        \\  const immutable = Ref.from(owner.borrow())
         \\  const moved = owner^
         \\  _ = moved
-        \\  return read(int, false, immutable)
+        \\  return immutable.value
         \\if const result = run() -> exit(result) else exit(1)
     , .use_after_transfer);
 }
 
-test "dereferencing a const writable Ref replaces its pointee" {
+test "writing through a mutable Ref replaces its pointee" {
     try Fixture.expectSourceExit(
         \\fallible run() int
         \\  var owner = Box.new?(17)
-        \\  const reference = owner.borrow_mut()
-        \\  reference[] = 42
-        \\  return reference[]
+        \\  var reference = Ref.from(owner.borrow())
+        \\  reference.value = 42
+        \\  return reference.value
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
@@ -1427,7 +1532,7 @@ test "dereference assignment rejects read-only Ref" {
     try Fixture.expectSourceDiagnostic(
         \\fallible run() unit
         \\  const owner = Box.new?(17)
-        \\  owner.borrow()[] = 42
+        \\  Ref.from(owner.borrow()).value = 42
         \\if run() -> exit(1) else exit(2)
     , .reference_not_writable);
 }
@@ -1437,12 +1542,12 @@ test "reassigning a var Ref retargets the handle, not its previous copy" {
         \\fallible run() int
         \\  var first = Box.new?(17)
         \\  var second = Box.new?(7)
-        \\  var reference = first.borrow_mut()
-        \\  const previous = reference
-        \\  reference = second.borrow_mut()
-        \\  previous[] = 42
-        \\  reference[] = 8
-        \\  return previous[] + reference[] - 8
+        \\  var reference = Ref.from(first.borrow())
+        \\  var previous = reference
+        \\  reference = Ref.from(second.borrow())
+        \\  previous.value = 42
+        \\  reference.value = 8
+        \\  return previous.value + reference.value - 8
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
@@ -1455,7 +1560,7 @@ test "dereferencing a Ref reads a noncopyable pointee without moving it" {
         \\  value: int
         \\fallible run() int
         \\  const owner = Box(Pinned).new?(Pinned{value = 42})
-        \\  return owner.borrow()[].value
+        \\  return Ref.from(owner.borrow()).value.value
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
@@ -1464,10 +1569,10 @@ test "dereferencing a Ref after transferring its Box is rejected" {
     try Fixture.expectSourceDiagnostic(
         \\fallible run() int
         \\  const owner = Box.new?(42)
-        \\  const reference = owner.borrow()
+        \\  const reference = Ref.from(owner.borrow())
         \\  const moved = owner^
         \\  _ = moved
-        \\  return reference[]
+        \\  return reference.value
         \\if const result = run() -> exit(result) else exit(1)
     , .use_after_transfer);
 }
@@ -1485,9 +1590,9 @@ test "Box pointee copying uses distinct storage and consuming extraction" {
     try Fixture.expectSourceExit(
         \\fallible run() int
         \\  const original = Box.new?(21)
-        \\  var duplicate = Box.new?(original.borrow()[])
-        \\  duplicate.borrow_mut()[] = 42
-        \\  return original.borrow()[] + duplicate^.into_value() - 21
+        \\  var duplicate = Box.new?(Ref.from(original.borrow()).value)
+        \\  Ref.from(duplicate.borrow()).value = 42
+        \\  return Ref.from(original.borrow()).value + duplicate^.take() - 21
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
@@ -1500,19 +1605,20 @@ test "Box.new preserves in-place copying of immovable values" {
         \\  value: int
         \\fallible run() int
         \\  const original = Box(CopyOnly).new?(CopyOnly{value = 41})
-        \\  const copy = Box.new?(original.borrow()[])
-        \\  return copy.borrow()[].value
+        \\  const copy = Box.new?(Ref.from(original.borrow()).value)
+        \\  return Ref.from(copy.borrow()).value.value
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
 
-test "Ref read and replacement methods distinguish copying from borrowing" {
+test "Ref field access distinguishes copying from borrowing" {
     try Fixture.expectSourceExit(
         \\fallible run() int
         \\  var owner = Box.new?(17)
-        \\  const reference = owner.borrow_mut()
-        \\  reference.replace(42)
-        \\  return reference.read()
+        \\  var reference = Ref.from(owner.borrow())
+        \\  reference.value = 42
+        \\  const copied = reference.value
+        \\  return copied
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
@@ -1521,14 +1627,14 @@ test "Allocation methods keep raw storage explicitly managed" {
     try Fixture.expectSourceExit(
         \\import std.memory.{Allocation}
         \\fallible run() int
-        \\  var storage = Allocation(int).allocate_raw?(1)
-        \\  if storage.unsafe_init(0, 42) -> ()
+        \\  var storage = Allocation(int).allocate?(1)
+        \\  if storage.unsafe_initialize(0, 42) -> ()
         \\  else
-        \\    storage^.release()
+        \\    storage^.deallocate()
         \\    fail
-        \\  const observed = storage.unsafe_ref(0)[]
-        \\  const removed = storage.unsafe_remove(0)
-        \\  storage^.release()
+        \\  const observed = Ref.from(storage.unsafe_borrow(0)).value
+        \\  const removed = storage.unsafe_take(0)
+        \\  storage^.deallocate()
         \\  return observed + removed - 42
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
@@ -1543,8 +1649,8 @@ test "a scoped borrow of a named local does not copy its pointee" {
         \\  value: int
         \\func run() int
         \\  const pinned = Pinned{value = 42}
-        \\  const item = std.memory.borrow_local(pinned)
-        \\  return item[].value
+        \\  const item = Ref.from(pinned)
+        \\  return item.value.value
         \\exit(run())
     , 42);
 }
@@ -1555,11 +1661,11 @@ test "explicit references load reference handles and callable values indirectly"
         \\func answer() int -> 42
         \\fallible run() int
         \\  const owner = Box.new?(42)
-        \\  const handle = owner.borrow()
-        \\  const reference = std.memory.borrow_local(handle)
+        \\  const handle = Ref.from(owner.borrow())
+        \\  const reference = Ref.from(handle)
         \\  const function = answer
-        \\  const callable = std.memory.borrow_local(function)
-        \\  return reference[][] + callable[]() - 42
+        \\  const callable = Ref.from(function)
+        \\  return reference.value.value + callable.value() - 42
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
@@ -1570,11 +1676,11 @@ test "a writable reference retains its referent after handle rebinding" {
         \\fallible run() int
         \\  var first = Box.new?(17)
         \\  var second = Box.new?(7)
-        \\  var handle = first.borrow_mut()
-        \\  const item = std.memory.borrow_mut_local(handle[])
-        \\  handle = second.borrow_mut()
-        \\  item[] = 42
-        \\  return first.borrow()[] + handle[] - 7
+        \\  var handle = Ref.from(first.borrow())
+        \\  var item = Ref.from(handle.value)
+        \\  handle = Ref.from(second.borrow())
+        \\  item.value = 42
+        \\  return Ref.from(first.borrow()).value + handle.value - 7
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
@@ -1584,8 +1690,8 @@ test "a writable reference updates its named local" {
         \\import std.memory
         \\func run() int
         \\  var counter = 17
-        \\  const item = std.memory.borrow_mut_local(counter)
-        \\  item[] = 42
+        \\  var item = Ref.from(counter)
+        \\  item.value = 42
         \\  return counter
         \\exit(run())
     , 42);
@@ -1599,8 +1705,8 @@ test "a writable reference updates a named field" {
         \\  second: int
         \\func run() int
         \\  var pair = Pair{first = 17, second = 7}
-        \\  const item = std.memory.borrow_mut_local(pair.first)
-        \\  item[] = 42
+        \\  var item = Ref.from(pair.first)
+        \\  item.value = 42
         \\  return pair.first + pair.second - 7
         \\exit(run())
     , 42);
@@ -1614,8 +1720,8 @@ test "a writable reference permits field replacement" {
         \\  second: int
         \\func run() int
         \\  var pair = Pair{first = 17, second = 7}
-        \\  const item = std.memory.borrow_mut_local(pair)
-        \\  item[].first = 42
+        \\  var item = Ref.from(pair)
+        \\  item.value.first = 42
         \\  return pair.first + pair.second - 7
         \\exit(run())
     , 42);
@@ -1628,10 +1734,10 @@ test "replacing an owned field through an alias invalidates its old Ref" {
         \\  owner: Box(int)
         \\fallible run() int
         \\  var holder = Holder{owner = Box.new?(17)}
-        \\  const old = holder.owner.borrow()
-        \\  const field = std.memory.borrow_mut_local(holder.owner)
-        \\  field[] = Box.new?(42)
-        \\  return old[]
+        \\  const old = Ref.from(holder.owner.borrow())
+        \\  var field = Ref.from(holder.owner)
+        \\  field.value = Box.new?(42)
+        \\  return old.value
         \\if const result = run() -> exit(result) else exit(1)
     , .borrow_outlives_source);
 }
@@ -1641,10 +1747,10 @@ test "replacing a whole Box through an alias invalidates its old Ref" {
         \\import std.memory
         \\fallible run() int
         \\  var owner = Box.new?(17)
-        \\  const old = owner.borrow()
-        \\  const item = std.memory.borrow_mut_local(owner)
-        \\  item[] = Box.new?(42)
-        \\  return old[]
+        \\  const old = Ref.from(owner.borrow())
+        \\  var item = Ref.from(owner)
+        \\  item.value = Box.new?(42)
+        \\  return old.value
         \\if const result = run() -> exit(result) else exit(1)
     , .borrow_outlives_source);
 }
@@ -1655,11 +1761,11 @@ test "replacing an inner Box through a captured Ref invalidates its old Ref" {
         \\fallible run() int
         \\  var inner = Box.new?(17)
         \\  var outer = Box(Box(int)).new?(inner^)
-        \\  const handle = outer.borrow_mut()
-        \\  const item = std.memory.borrow_mut_local(handle[])
-        \\  const old = item[].borrow()
-        \\  item[] = Box.new?(42)
-        \\  return old[]
+        \\  var handle = Ref.from(outer.borrow())
+        \\  var item = Ref.from(handle.value)
+        \\  const old = Ref.from(item.value.borrow())
+        \\  item.value = Box.new?(42)
+        \\  return old.value
         \\if const result = run() -> exit(result) else exit(1)
     , .borrow_outlives_source);
 }
@@ -1670,10 +1776,10 @@ test "an inner Box borrowed through an outer Ref stays valid without replacement
         \\fallible run() int
         \\  var inner = Box.new?(17)
         \\  var outer = Box(Box(int)).new?(inner^)
-        \\  const handle = outer.borrow_mut()
-        \\  const item = std.memory.borrow_mut_local(handle[])
-        \\  const old = item[].borrow()
-        \\  return old[]
+        \\  var handle = Ref.from(outer.borrow())
+        \\  var item = Ref.from(handle.value)
+        \\  const old = Ref.from(item.value.borrow())
+        \\  return old.value
         \\if const result = run() -> exit(result) else exit(1)
     , 17);
 }
@@ -1684,10 +1790,10 @@ test "a captured Ref and alias still access an owned pointee after replacement" 
         \\fallible run() int
         \\  var inner = Box.new?(17)
         \\  var outer = Box(Box(int)).new?(inner^)
-        \\  const handle = outer.borrow_mut()
-        \\  const item = std.memory.borrow_mut_local(handle[])
-        \\  item[] = Box.new?(42)
-        \\  return item[].borrow()[] + handle[].borrow()[] - 42
+        \\  var handle = Ref.from(outer.borrow())
+        \\  var item = Ref.from(handle.value)
+        \\  item.value = Box.new?(42)
+        \\  return Ref.from(item.value.borrow()).value + Ref.from(handle.value.borrow()).value - 42
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
@@ -1698,26 +1804,26 @@ test "dereference replacement of an inner Box invalidates its old Ref" {
         \\fallible run() int
         \\  var inner = Box.new?(17)
         \\  var outer = Box(Box(int)).new?(inner^)
-        \\  const handle = outer.borrow_mut()
-        \\  const item = std.memory.borrow_local(handle[])
-        \\  const old = item[].borrow()
-        \\  handle[] = Box.new?(42)
-        \\  return old[]
+        \\  var handle = Ref.from(outer.borrow())
+        \\  const item = Ref.from(handle.value)
+        \\  const old = Ref.from(item.value.borrow())
+        \\  handle.value = Box.new?(42)
+        \\  return old.value
         \\if const result = run() -> exit(result) else exit(1)
     , .borrow_outlives_source);
 }
 
-test "Ref.replace of an inner Box invalidates its old Ref" {
+test "replacement through a captured Ref invalidates its old inner Box" {
     try Fixture.expectSourceDiagnostic(
         \\import std.memory
         \\fallible run() int
         \\  var inner = Box.new?(17)
         \\  var outer = Box(Box(int)).new?(inner^)
-        \\  const handle = outer.borrow_mut()
-        \\  const item = std.memory.borrow_local(handle[])
-        \\  const old = item[].borrow()
-        \\  handle.replace(Box.new?(42))
-        \\  return old[]
+        \\  var handle = Ref.from(outer.borrow())
+        \\  var item = Ref.from(handle.value)
+        \\  const old = Ref.from(item.value.borrow())
+        \\  item.value = Box.new?(42)
+        \\  return old.value
         \\if const result = run() -> exit(result) else exit(1)
     , .borrow_outlives_source);
 }
@@ -1727,10 +1833,10 @@ test "a copied Ref still addresses the outer slot after replacing its inner Box"
         \\fallible run() int
         \\  var inner = Box.new?(17)
         \\  var outer = Box(Box(int)).new?(inner^)
-        \\  const handle = outer.borrow_mut()
+        \\  var handle = Ref.from(outer.borrow())
         \\  const copied = handle
-        \\  handle[] = Box.new?(42)
-        \\  return copied[].borrow()[]
+        \\  handle.value = Box.new?(42)
+        \\  return Ref.from(copied.value.borrow()).value
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
@@ -1738,16 +1844,16 @@ test "a copied Ref still addresses the outer slot after replacing its inner Box"
 test "a writable Ref replacement through a call invalidates its old Box" {
     try Fixture.expectSourceDiagnostic(
         \\import std.memory
-        \\fallible replace(imm handle: Ref(mut Box(int)))
-        \\  handle[] = Box.new?(42)
+        \\fallible replace(var handle: Ref(Box(int)))
+        \\  handle.value = Box.new?(42)
         \\fallible run() int
         \\  var inner = Box.new?(17)
         \\  var outer = Box(Box(int)).new?(inner^)
-        \\  const handle = outer.borrow_mut()
-        \\  const item = std.memory.borrow_local(handle[])
-        \\  const old = item[].borrow()
+        \\  var handle = Ref.from(outer.borrow())
+        \\  const item = Ref.from(handle.value)
+        \\  const old = Ref.from(item.value.borrow())
         \\  replace?(handle)
-        \\  return old[]
+        \\  return old.value
         \\if const result = run() -> exit(result) else exit(1)
     , .borrow_outlives_source);
 }
@@ -1755,17 +1861,18 @@ test "a writable Ref replacement through a call invalidates its old Box" {
 test "nested aggregate writable references invalidate replaced contents" {
     try Fixture.expectSourceDiagnostic(
         \\struct Handles
-        \\  handle: Ref(mut Box(int))
+        \\  handle: Ref(Box(int))
         \\struct Wrapper
         \\  handles: Handles
-        \\fallible replace(imm wrapper: Wrapper)
-        \\  wrapper.handles.handle[] = Box.new?(42)
+        \\fallible replace(mut wrapper: Wrapper)
+        \\  wrapper.handles.handle.value = Box.new?(42)
         \\fallible run() int
         \\  var outer = Box.new?(Box.new?(17))
-        \\  const handle = outer.borrow_mut()
-        \\  const old = handle[].borrow()
-        \\  replace?(Wrapper{handles = Handles{handle = handle}})
-        \\  return old[]
+        \\  var handle = Ref.from(outer.borrow())
+        \\  const old = Ref.from(handle.value.borrow())
+        \\  var wrapper = Wrapper{handles = Handles{handle = handle}}
+        \\  replace?(wrapper)
+        \\  return old.value
         \\if const result = run() -> exit(result) else exit(1)
     , .borrow_outlives_source);
 }
@@ -1773,17 +1880,17 @@ test "nested aggregate writable references invalidate replaced contents" {
 test "aggregate writable effects preserve disjoint read-only origins" {
     try Fixture.expectSourceExit(
         \\struct Handles
-        \\  writable: Ref(mut Box(int))
+        \\  writable: Ref(Box(int))
         \\  readonly: Ref(Box(int))
-        \\fallible replace(imm handles: Handles)
-        \\  handles.writable[] = Box.new?(17)
+        \\fallible replace(mut handles: Handles)
+        \\  handles.writable.value = Box.new?(17)
         \\fallible run() int
         \\  var changed = Box.new?(Box.new?(1))
         \\  const unchanged = Box.new?(Box.new?(42))
-        \\  const handles = Handles{writable = changed.borrow_mut(), readonly = unchanged.borrow()}
-        \\  const old = handles.readonly[].borrow()
+        \\  var handles = Handles{writable = Ref.from(changed.borrow()), readonly = Ref.from(unchanged.borrow())}
+        \\  const old = Ref.from(handles.readonly.value.borrow())
         \\  replace?(handles)
-        \\  return old[]
+        \\  return old.value
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
@@ -1791,19 +1898,19 @@ test "aggregate writable effects preserve disjoint read-only origins" {
 test "failing indirect aggregate calls invalidate replaced contents" {
     try Fixture.expectSourceDiagnostic(
         \\struct Handles
-        \\  handle: Ref(mut Box(int))
-        \\fallible replace(imm handles: Handles)
-        \\  handles.handle[] = Box.new?(42)
+        \\  handle: Ref(Box(int))
+        \\fallible replace(mut handles: Handles)
+        \\  handles.handle.value = Box.new?(42)
         \\  0 == 1
         \\fallible run() int
         \\  var outer = Box.new?(Box.new?(17))
-        \\  const handles = Handles{handle = outer.borrow_mut()}
-        \\  const old = handles.handle[].borrow()
+        \\  var handles = Handles{handle = Ref.from(outer.borrow())}
+        \\  const old = Ref.from(handles.handle.value.borrow())
         \\  const operation = replace
         \\  if operation(handles)
         \\    return 0
         \\  else
-        \\    return old[]
+        \\    return old.value
         \\if const result = run() -> exit(result) else exit(1)
     , .borrow_outlives_source);
 }
@@ -1811,16 +1918,16 @@ test "failing indirect aggregate calls invalidate replaced contents" {
 test "writable references inside boxed aggregates invalidate replaced contents" {
     const source =
         \\struct Handles
-        \\  handle: Ref(mut Box(int))
-        \\fallible replace(imm handles: Box(Handles))
-        \\  handles.borrow()[].handle[] = Box.new?(42)
+        \\  handle: Ref(Box(int))
+        \\fallible replace(ref handles: Box(Handles))
+        \\  Ref.from(handles.borrow()).value.handle.value = Box.new?(42)
         \\fallible run() int
         \\  var outer = Box.new?(Box.new?(17))
-        \\  const handle = outer.borrow_mut()
-        \\  const old = handle[].borrow()
-        \\  const handles = Box.new?(Handles{handle = handle})
+        \\  var handle = Ref.from(outer.borrow())
+        \\  const old = Ref.from(handle.value.borrow())
+        \\  var handles = Box.new?(Handles{handle = handle})
         \\  replace?(handles)
-        \\  return old[]
+        \\  return old.value
         \\if const result = run() -> exit(result) else exit(1)
     ;
     const fixture = try Fixture.initFiles(source, &.{});
@@ -1830,7 +1937,7 @@ test "writable references inside boxed aggregates invalidate replaced contents" 
     defer testing.allocator.free(without_write);
     try fixture.db.setInput(queries.SourceText, 0, without_write);
     try fixture.expectExit(0, 17);
-    const repaired = try std.mem.replaceOwned(u8, testing.allocator, source, "return old[]", "return outer.borrow()[].borrow()[]");
+    const repaired = try std.mem.replaceOwned(u8, testing.allocator, source, "return old.value", "return Ref.from(Ref.from(outer.borrow()).value.borrow()).value");
     defer testing.allocator.free(repaired);
     try fixture.db.setInput(queries.SourceText, 0, repaired);
     try fixture.expectExit(0, 42);
@@ -1839,56 +1946,56 @@ test "writable references inside boxed aggregates invalidate replaced contents" 
 test "variant aggregate writable references invalidate replaced contents" {
     try Fixture.expectSourceDiagnostic(
         \\struct Handles
-        \\  handle: Ref(mut Box(int))
-        \\fallible replace(imm candidate: Handles | int)
-        \\  if const handles = candidate as Handles
-        \\    handles.handle[] = Box.new?(42)
+        \\  handle: Ref(Box(int))
+        \\fallible replace(mut candidate: Handles | int)
+        \\  if ref handles = candidate as Handles
+        \\    handles.handle.value = Box.new?(42)
         \\fallible run() int
         \\  var outer = Box.new?(Box.new?(17))
-        \\  const handle = outer.borrow_mut()
-        \\  const candidate: Handles | int = Handles{handle = handle}
-        \\  const old = handle[].borrow()
+        \\  var handle = Ref.from(outer.borrow())
+        \\  var candidate: Handles | int = Handles{handle = handle}
+        \\  const old = Ref.from(handle.value.borrow())
         \\  replace?(candidate)
-        \\  return old[]
+        \\  return old.value
         \\if const result = run() -> exit(result) else exit(1)
     , .borrow_outlives_source);
 }
 
-test "read-only references to aggregates retain nested writable effects" {
+test "read-only references to aggregates attenuate nested writable effects" {
     try Fixture.expectSourceDiagnostic(
         \\struct Handles
-        \\  handle: Ref(mut Box(int))
+        \\  handle: Ref(Box(int))
         \\fallible replace(imm handles: Ref(Handles))
-        \\  handles[].handle[] = Box.new?(42)
+        \\  handles.value.handle.value = Box.new?(42)
         \\fallible run() int
         \\  var outer = Box.new?(Box.new?(17))
-        \\  const handle = outer.borrow_mut()
+        \\  var handle = Ref.from(outer.borrow())
         \\  const handles = Box.new?(Handles{handle = handle})
-        \\  const old = handle[].borrow()
-        \\  replace?(handles.borrow())
-        \\  return old[]
+        \\  const old = Ref.from(handle.value.borrow())
+        \\  replace?(Ref.from(handles.borrow()))
+        \\  return old.value
         \\if const result = run() -> exit(result) else exit(1)
-    , .borrow_outlives_source);
+    , .reference_not_writable);
 }
 
 test "aggregate effects in loops preserve disjoint read-only origins" {
     try Fixture.expectSourceExit(
         \\struct Handles
-        \\  writable: Ref(mut Box(int))
+        \\  writable: Ref(Box(int))
         \\  readonly: Ref(Box(int))
-        \\fallible replace(imm handles: Handles)
-        \\  handles.writable[] = Box.new?(17)
+        \\fallible replace(mut handles: Handles)
+        \\  handles.writable.value = Box.new?(17)
         \\fallible run() int
         \\  var changed = Box.new?(Box.new?(1))
         \\  const unchanged = Box.new?(Box.new?(42))
-        \\  var handles = Handles{writable = changed.borrow_mut(), readonly = unchanged.borrow()}
-        \\  const old = handles.readonly[].borrow()
+        \\  var handles = Handles{writable = Ref.from(changed.borrow()), readonly = Ref.from(unchanged.borrow())}
+        \\  const old = Ref.from(handles.readonly.value.borrow())
         \\  var count = 0
         \\  loop
         \\    if count == 2 -> break
         \\    replace?(handles)
         \\    count += 1
-        \\  return old[]
+        \\  return old.value
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
@@ -1897,8 +2004,8 @@ test "boxed borrowed contents cannot outlive their original owner" {
     try Fixture.expectSourceDiagnostic(
         \\fallible invalid() Box(Ref(int))
         \\  const source = Box.new?(42)
-        \\  return Box.new?(source.borrow())
-        \\if const boxed = invalid() -> exit(boxed.borrow()[][]) else exit(1)
+        \\  return Box.new?(Ref.from(source.borrow()))
+        \\if const boxed = invalid() -> exit(Ref.from(boxed.borrow()).value.value) else exit(1)
     , .borrow_outlives_source);
 }
 
@@ -1909,12 +2016,12 @@ test "loop field replacement removes overwritten reference origins" {
         \\fallible run() int
         \\  var original = Box.new?(1)
         \\  const replacement = Box.new?(42)
-        \\  var handle = Handle{value = original.borrow()}
+        \\  var handle = Handle{value = Ref.from(original.borrow())}
         \\  loop
-        \\    handle.value = replacement.borrow()
+        \\    handle.value = Ref.from(replacement.borrow())
         \\    break
         \\  original = Box.new?(2)
-        \\  return handle.value[]
+        \\  return handle.value.value
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
@@ -1925,7 +2032,7 @@ test "initialized raw allocation contents cannot outlive their owner" {
         \\fallible leak() Allocation(Ref(int))
         \\  const owner = Box.new?(42)
         \\  var slots = allocate?(Ref(int), 1)
-        \\  if unsafe_initialize(Ref(int), slots, 0, owner.borrow()) -> ()
+        \\  if unsafe_initialize(Ref(int), slots, 0, Ref.from(owner.borrow())) -> ()
         \\  else
         \\    deallocate(Ref(int), slots^)
         \\    fail
@@ -1964,8 +2071,8 @@ test "Box preserves the origins of initialized borrowed contents" {
     try Fixture.expectSourceExit(
         \\fallible run() int
         \\  const source = Box.new?(42)
-        \\  const boxed = Box.new?(source.borrow())
-        \\  return boxed.borrow()[][]
+        \\  const boxed = Box.new?(Ref.from(source.borrow()))
+        \\  return Ref.from(boxed.borrow()).value.value
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
@@ -1975,16 +2082,16 @@ test "an in-place producer invalidates references into replaced owned values" {
         \\struct Pinned
         \\  move = none
         \\  value: int
-        \\func produce(imm handle: Ref(mut Box(int)), var replacement: Box(int)) Pinned
-        \\  handle[] = replacement^
+        \\func produce(var handle: Ref(Box(int)), var replacement: Box(int)) Pinned
+        \\  handle.value = replacement^
         \\  return Pinned{value = 0}
         \\fallible run() int
         \\  var inner = Box.new?(17)
         \\  var outer = Box(Box(int)).new?(inner^)
-        \\  const handle = outer.borrow_mut()
-        \\  const old = handle[].borrow()
+        \\  var handle = Ref.from(outer.borrow())
+        \\  const old = Ref.from(handle.value.borrow())
         \\  const produced = Box.new?(produce(handle, Box.new?(42)))
-        \\  return old[] + produced.borrow()[].value
+        \\  return old.value + Ref.from(produced.borrow()).value.value
         \\if const result = run() -> exit(result) else exit(1)
     , .borrow_outlives_source);
 }
@@ -1994,82 +2101,82 @@ test "a failing indirect in-place producer invalidates replaced references" {
         \\struct Pinned
         \\  move = none
         \\  value: int
-        \\fallible produce(imm handle: Ref(mut Box(int))) Pinned
-        \\  handle[] = Box.new?(42)
+        \\fallible produce(var handle: Ref(Box(int))) Pinned
+        \\  handle.value = Box.new?(42)
         \\  0 == 1
         \\  return Pinned{value = 0}
         \\fallible run() int
         \\  var inner = Box.new?(17)
         \\  var outer = Box(Box(int)).new?(inner^)
-        \\  const handle = outer.borrow_mut()
-        \\  const old = handle[].borrow()
+        \\  var handle = Ref.from(outer.borrow())
+        \\  const old = Ref.from(handle.value.borrow())
         \\  const producer = produce
         \\  if const produced = Box.new(producer?(handle))
-        \\    return produced.borrow()[].value
+        \\    return Ref.from(produced.borrow()).value.value
         \\  else
-        \\    return old[]
+        \\    return old.value
         \\if const result = run() -> exit(result) else exit(1)
     , .borrow_outlives_source);
 }
 
 test "a replacing call cannot return an unrelated Ref into its old pointee" {
     try Fixture.expectSourceDiagnostic(
-        \\fallible replace(imm handle: Ref(mut Box(int)), imm old: Ref(int)) Ref(int)
-        \\  handle[] = Box.new?(42)
+        \\fallible replace(var handle: Ref(Box(int)), imm old: Ref(int)) Ref(int)
+        \\  handle.value = Box.new?(42)
         \\  return old
         \\fallible run() int
         \\  var inner = Box.new?(17)
         \\  var outer = Box(Box(int)).new?(inner^)
-        \\  const handle = outer.borrow_mut()
-        \\  const old = handle[].borrow()
+        \\  var handle = Ref.from(outer.borrow())
+        \\  const old = Ref.from(handle.value.borrow())
         \\  const returned = replace?(handle, old)
-        \\  return returned[]
+        \\  return returned.value
         \\if const result = run() -> exit(result) else exit(1)
     , .borrow_outlives_source);
 }
 
 test "a copied writable Ref still addresses the slot after a replacing call" {
     try Fixture.expectSourceExit(
-        \\fallible replace(imm handle: Ref(mut Box(int)))
-        \\  handle[] = Box.new?(42)
+        \\fallible replace(var handle: Ref(Box(int)))
+        \\  handle.value = Box.new?(42)
         \\fallible run() int
         \\  var inner = Box.new?(17)
         \\  var outer = Box(Box(int)).new?(inner^)
-        \\  const handle = outer.borrow_mut()
+        \\  var handle = Ref.from(outer.borrow())
         \\  const copied = handle
         \\  replace?(handle)
-        \\  return copied[].borrow()[]
+        \\  return Ref.from(copied.value.borrow()).value
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
 
 test "another writable Ref stays valid after an owned-pointee replacement call" {
     try Fixture.expectSourceExit(
-        \\fallible replace(imm handle: Ref(mut Box(int)))
-        \\  handle[] = Box.new?(42)
+        \\fallible replace(var handle: Ref(Box(int)))
+        \\  handle.value = Box.new?(42)
         \\fallible run() int
         \\  var inner = Box.new?(17)
         \\  var outer = Box(Box(int)).new?(inner^)
-        \\  const first = outer.borrow_mut()
-        \\  const second = outer.borrow_mut()
+        \\  var first = Ref.from(outer.borrow())
+        \\  var second = Ref.from(outer.borrow())
         \\  replace?(first)
-        \\  return second[].borrow()[]
+        \\  return Ref.from(second.value.borrow()).value
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
 
 test "replacing an inner Box does not revive a handle to an old outer Box" {
     try Fixture.expectSourceDiagnostic(
-        \\fallible replace(imm handle: Ref(mut Box(int)))
-        \\  handle[] = Box.new?(42)
+        \\fallible replace(var handle: Ref(Box(int)))
+        \\  handle.value = Box.new?(42)
         \\fallible run() int
         \\  var inner = Box.new?(17)
         \\  var outer = Box(Box(int)).new?(inner^)
-        \\  const stale = outer.borrow_mut()
+        \\  var stale = Ref.from(outer.borrow())
         \\  outer = Box(Box(int)).new?(Box.new?(23))
-        \\  const fresh = outer.borrow_mut()
+        \\  var fresh = Ref.from(outer.borrow())
         \\  replace?(fresh)
-        \\  return stale[].borrow()[]
+        \\  return Ref.from(stale.value.borrow()).value
         \\if const result = run() -> exit(result) else exit(1)
     , .borrow_outlives_source);
 }
@@ -2077,16 +2184,16 @@ test "replacing an inner Box does not revive a handle to an old outer Box" {
 test "a Box borrowed through an explicit reference keeps its stable slot" {
     try Fixture.expectSourceExit(
         \\import std.memory
-        \\fallible replace(imm handle: Ref(mut Box(int)))
-        \\  handle[] = Box.new?(42)
+        \\fallible replace(var handle: Ref(Box(int)))
+        \\  handle.value = Box.new?(42)
         \\fallible run() int
         \\  var inner = Box.new?(17)
         \\  var outer = Box(Box(int)).new?(inner^)
-        \\  const item = std.memory.borrow_mut_local(outer)
-        \\  const from_alias = item[].borrow_mut()
-        \\  const from_owner = outer.borrow_mut()
+        \\  var item = Ref.from(outer)
+        \\  var from_alias = Ref.from(item.value.borrow())
+        \\  var from_owner = Ref.from(outer.borrow())
         \\  replace?(from_owner)
-        \\  return from_alias[].borrow()[]
+        \\  return Ref.from(from_alias.value.borrow()).value
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
@@ -2095,11 +2202,11 @@ test "a read-only Box alias cannot create a writable Ref" {
     try Fixture.expectSourceDiagnostic(
         \\import std.memory
         \\fallible run() unit
-        \\  var owner = Box.new?(17)
-        \\  const item = std.memory.borrow_local(owner)
-        \\  _ = item[].borrow_mut()
+        \\  const owner = Box.new?(17)
+        \\  const item = Ref.from(owner)
+        \\  Ref.from(item.value.borrow()).value = 42
         \\if run() -> exit(1) else exit(2)
-    , .mutable_argument_requires_mutable_place);
+    , .reference_not_writable);
 }
 
 test "borrowing through an inner Box alias does not preserve its old pointee" {
@@ -2108,133 +2215,133 @@ test "borrowing through an inner Box alias does not preserve its old pointee" {
         \\fallible run() int
         \\  var inner = Box.new?(17)
         \\  var outer = Box(Box(int)).new?(inner^)
-        \\  const handle = outer.borrow_mut()
-        \\  const item = std.memory.borrow_mut_local(handle[])
-        \\  const old = item[].borrow_mut()
-        \\  handle[] = Box.new?(42)
-        \\  return old[]
+        \\  var handle = Ref.from(outer.borrow())
+        \\  var item = Ref.from(handle.value)
+        \\  var old = Ref.from(item.value.borrow())
+        \\  handle.value = Box.new?(42)
+        \\  return old.value
         \\if const result = run() -> exit(result) else exit(1)
     , .borrow_outlives_source);
 }
 
 test "an attenuated Ref stays valid after an owned-pointee replacement call" {
     try Fixture.expectSourceExit(
-        \\fallible replace(imm handle: Ref(mut Box(int)))
-        \\  handle[] = Box.new?(42)
+        \\fallible replace(var handle: Ref(Box(int)))
+        \\  handle.value = Box.new?(42)
         \\fallible run() int
         \\  var inner = Box.new?(17)
         \\  var outer = Box(Box(int)).new?(inner^)
-        \\  const writable = outer.borrow_mut()
-        \\  const read_only = writable.as_imm()
+        \\  var writable = Ref.from(outer.borrow())
+        \\  const read_only = writable
         \\  replace?(writable)
-        \\  return read_only[].borrow()[]
+        \\  return Ref.from(read_only.value.borrow()).value
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
 
 test "a selected Box-slot Ref stays valid after another handle replaces its pointee" {
     try Fixture.expectSourceExit(
-        \\fallible replace(imm handle: Ref(mut Box(int)))
-        \\  handle[] = Box.new?(42)
+        \\fallible replace(var handle: Ref(Box(int)))
+        \\  handle.value = Box.new?(42)
         \\fallible run(flag: bool) int
         \\  var inner = Box.new?(17)
         \\  var outer = Box(Box(int)).new?(inner^)
-        \\  const selected = if flag == true -> outer.borrow_mut() else outer.borrow_mut()
-        \\  const other = outer.borrow_mut()
+        \\  var selected = if flag == true -> Ref.from(outer.borrow()) else Ref.from(outer.borrow())
+        \\  var other = Ref.from(outer.borrow())
         \\  replace?(other)
-        \\  return selected[].borrow()[]
+        \\  return Ref.from(selected.value.borrow()).value
         \\if const result = run(true) -> if result == 42 -> if const other = run(false) -> exit(other) else exit(1) else exit(2) else exit(3)
     , 42);
 }
 
 test "a rebound Box-slot Ref stays valid across a branch" {
     try Fixture.expectSourceExit(
-        \\fallible replace(imm handle: Ref(mut Box(int)))
-        \\  handle[] = Box.new?(42)
+        \\fallible replace(var handle: Ref(Box(int)))
+        \\  handle.value = Box.new?(42)
         \\fallible run(flag: bool) int
         \\  var inner = Box.new?(17)
         \\  var outer = Box(Box(int)).new?(inner^)
-        \\  var selected = outer.borrow_mut()
-        \\  if flag == true -> selected = outer.borrow_mut()
-        \\  const other = outer.borrow_mut()
+        \\  var selected = Ref.from(outer.borrow())
+        \\  if flag == true -> selected = Ref.from(outer.borrow())
+        \\  var other = Ref.from(outer.borrow())
         \\  replace?(other)
-        \\  return selected[].borrow()[]
+        \\  return Ref.from(selected.value.borrow()).value
         \\if const result = run(true) -> if result == 42 -> if const other = run(false) -> exit(other) else exit(1) else exit(2) else exit(3)
     , 42);
 }
 
 test "a loop-break Box-slot Ref stays valid after another handle replaces its pointee" {
     try Fixture.expectSourceExit(
-        \\fallible replace(imm handle: Ref(mut Box(int)))
-        \\  handle[] = Box.new?(42)
+        \\fallible replace(var handle: Ref(Box(int)))
+        \\  handle.value = Box.new?(42)
         \\fallible run() int
         \\  var inner = Box.new?(17)
         \\  var outer = Box(Box(int)).new?(inner^)
-        \\  const selected = loop -> break outer.borrow_mut()
-        \\  const other = outer.borrow_mut()
+        \\  var selected = loop -> break Ref.from(outer.borrow())
+        \\  var other = Ref.from(outer.borrow())
         \\  replace?(other)
-        \\  return selected[].borrow()[]
+        \\  return Ref.from(selected.value.borrow()).value
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
 
 test "replacing through a loop-carried Ref invalidates an old inner Ref" {
     try Fixture.expectSourceDiagnostic(
-        \\fallible replace(imm handle: Ref(mut Box(int)))
-        \\  handle[] = Box.new?(42)
+        \\fallible replace(var handle: Ref(Box(int)))
+        \\  handle.value = Box.new?(42)
         \\fallible run() int
         \\  var inner = Box.new?(17)
         \\  var outer = Box(Box(int)).new?(inner^)
-        \\  var selected = outer.borrow_mut()
-        \\  const old = selected[].borrow()
+        \\  var selected = Ref.from(outer.borrow())
+        \\  const old = Ref.from(selected.value.borrow())
         \\  var pass = 0
         \\  loop
         \\    if pass == 0
-        \\      selected = outer.borrow_mut()
+        \\      selected = Ref.from(outer.borrow())
         \\      pass = 1
         \\      continue
         \\    replace?(selected)
         \\    break
-        \\  return old[]
+        \\  return old.value
         \\if const result = run() -> exit(result) else exit(1)
     , .borrow_outlives_source);
 }
 
 test "a loop-carried Ref still addresses its slot after replacing its pointee" {
     try Fixture.expectSourceExit(
-        \\fallible replace(imm handle: Ref(mut Box(int)))
-        \\  handle[] = Box.new?(42)
+        \\fallible replace(var handle: Ref(Box(int)))
+        \\  handle.value = Box.new?(42)
         \\fallible run() int
         \\  var inner = Box.new?(17)
         \\  var outer = Box(Box(int)).new?(inner^)
-        \\  var selected = outer.borrow_mut()
+        \\  var selected = Ref.from(outer.borrow())
         \\  var pass = 0
         \\  loop
         \\    if pass == 0
-        \\      selected = outer.borrow_mut()
+        \\      selected = Ref.from(outer.borrow())
         \\      pass = 1
         \\      continue
         \\    replace?(selected)
         \\    break
-        \\  return selected[].borrow()[]
+        \\  return Ref.from(selected.value.borrow()).value
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
 
 test "a loop-carried Ref with another possible owner cannot replace an owned pointee" {
     try Fixture.expectSourceDiagnostic(
-        \\fallible replace(imm handle: Ref(mut Box(int)))
-        \\  handle[] = Box.new?(42)
+        \\fallible replace(var handle: Ref(Box(int)))
+        \\  handle.value = Box.new?(42)
         \\fallible run() int
         \\  var first_inner = Box.new?(17)
         \\  var second_inner = Box.new?(23)
         \\  var first = Box(Box(int)).new?(first_inner^)
         \\  var second = Box(Box(int)).new?(second_inner^)
-        \\  var selected = first.borrow_mut()
+        \\  var selected = Ref.from(first.borrow())
         \\  var pass = 0
         \\  loop
         \\    if pass == 0
-        \\      selected = second.borrow_mut()
+        \\      selected = Ref.from(second.borrow())
         \\      pass = 1
         \\      continue
         \\    replace?(selected)
@@ -2249,9 +2356,9 @@ test "independent Box handles stay valid before replacement" {
         \\fallible run() int
         \\  var inner = Box.new?(17)
         \\  var outer = Box(Box(int)).new?(inner^)
-        \\  const first = outer.borrow_mut()
-        \\  const second = outer.borrow_mut()
-        \\  return first[].borrow()[] + second[].borrow()[]
+        \\  var first = Ref.from(outer.borrow())
+        \\  var second = Ref.from(outer.borrow())
+        \\  return Ref.from(first.value.borrow()).value + Ref.from(second.value.borrow()).value
         \\if const result = run() -> exit(result) else exit(1)
     , 34);
 }
@@ -2261,9 +2368,9 @@ test "a writable reference keeps a mutable local current across a join" {
         \\import std.memory
         \\func run(flag: bool) int
         \\  var counter = 0
-        \\  const item = std.memory.borrow_mut_local(counter)
-        \\  if flag == true -> item[] = 20 else item[] = 1
-        \\  return counter + item[]
+        \\  var item = Ref.from(counter)
+        \\  if flag == true -> item.value = 20 else item.value = 1
+        \\  return counter + item.value
         \\exit(run(true) + run(false))
     , 42);
 }
@@ -2271,14 +2378,13 @@ test "a writable reference keeps a mutable local current across a join" {
 test "a stored Ref and explicit reference observe the same local across a join" {
     try Fixture.expectSourceExit(
         \\import std.memory
-        \\import std.memory.{borrow_local}
         \\func run(flag: bool) int
         \\  var counter = 0
-        \\  const reference = borrow_local(int, counter)
-        \\  const item = std.memory.borrow_mut_local(counter)
-        \\  if flag == true -> item[] = 15 else item[] = 4
-        \\  item[] = item[] + 1
-        \\  return reference[] + counter
+        \\  const reference = Ref.from(counter)
+        \\  var item = Ref.from(counter)
+        \\  if flag == true -> item.value = 15 else item.value = 4
+        \\  item.value = item.value + 1
+        \\  return reference.value + counter
         \\exit(run(true) + run(false))
     , 42);
 }
@@ -2287,8 +2393,8 @@ test "an explicit reference rejects temporary sources" {
     try Fixture.expectSourceDiagnostic(
         \\import std.memory
         \\func run() int
-        \\  const item = std.memory.borrow_local(40 + 2)
-        \\  return item[]
+        \\  const item = Ref.from(40 + 2)
+        \\  return item.value
         \\exit(run())
     , .borrow_requires_place);
 }
@@ -2298,19 +2404,20 @@ test "a writable reference needs writable access" {
         \\import std.memory
         \\fallible run() int
         \\  const owner = Box.new?(42)
-        \\  const item = std.memory.borrow_mut_local(owner.borrow()[])
-        \\  return item[]
+        \\  var item = Ref.from(Ref.from(owner.borrow()).value)
+        \\  item.value = 17
+        \\  return item.value
         \\if const result = run() -> exit(result) else exit(1)
-    , .mutable_argument_requires_mutable_place);
+    , .reference_not_writable);
 }
 
 test "a readonly reference cannot replace its referent" {
     try Fixture.expectSourceDiagnostic(
         \\import std.memory
         \\func run() int
-        \\  var counter = 17
-        \\  const item = std.memory.borrow_local(counter)
-        \\  item[] = 42
+        \\  const counter = 17
+        \\  const item = Ref.from(counter)
+        \\  item.value = 42
         \\  return counter
         \\exit(run())
     , .reference_not_writable);
@@ -2321,11 +2428,11 @@ test "a writable reference needs a mutable named place" {
         \\import std.memory
         \\func run() int
         \\  const counter = 17
-        \\  const item = std.memory.borrow_mut_local(counter)
-        \\  item[] = 42
+        \\  var item = Ref.from(counter)
+        \\  item.value = 42
         \\  return counter
         \\exit(run())
-    , .mutable_argument_requires_mutable_place);
+    , .reference_not_writable);
 }
 
 test "an explicit reference rejects a moved owner when used" {
@@ -2333,10 +2440,10 @@ test "an explicit reference rejects a moved owner when used" {
         \\import std.memory
         \\fallible run() int
         \\  const owner = Box.new?(42)
-        \\  const item = std.memory.borrow_local(owner.borrow()[])
+        \\  const item = Ref.from(Ref.from(owner.borrow()).value)
         \\  const moved = owner^
         \\  _ = moved
-        \\  return item[]
+        \\  return item.value
         \\if const result = run() -> exit(result) else exit(1)
     , .use_after_transfer);
 }
@@ -2346,10 +2453,10 @@ test "an explicit reference can borrow another writable reference" {
         \\import std.memory
         \\func run() int
         \\  var counter = 17
-        \\  const first = std.memory.borrow_mut_local(counter)
-        \\  const second = std.memory.borrow_mut_local(first[])
-        \\  second[] = 21
-        \\  return counter + first[]
+        \\  var first = Ref.from(counter)
+        \\  var second = Ref.from(first.value)
+        \\  second.value = 21
+        \\  return counter + first.value
         \\exit(run())
     , 42);
 }
@@ -2358,14 +2465,14 @@ test "a readonly reference cannot grant writable access" {
     try Fixture.expectSourceDiagnostic(
         \\import std.memory
         \\func run() int
-        \\  var counter = 17
-        \\  const first = std.memory.borrow_mut_local(counter)
-        \\  const read_only = std.memory.borrow_local(first[])
-        \\  const second = std.memory.borrow_mut_local(read_only[])
-        \\  second[] = 42
+        \\  const counter = 17
+        \\  var first = Ref.from(counter)
+        \\  const read_only = Ref.from(first.value)
+        \\  var second = Ref.from(read_only.value)
+        \\  second.value = 42
         \\  return counter
         \\exit(run())
-    , .mutable_argument_requires_mutable_place);
+    , .reference_not_writable);
 }
 
 test "an explicit reference can borrow a field of another reference" {
@@ -2376,10 +2483,10 @@ test "an explicit reference can borrow a field of another reference" {
         \\  second: int
         \\func run() int
         \\  var pair = Pair{first = 17, second = 7}
-        \\  const whole = std.memory.borrow_mut_local(pair)
-        \\  const field = std.memory.borrow_mut_local(whole[].first)
-        \\  field[] = 42
-        \\  return pair.first + whole[].second - 7
+        \\  var whole = Ref.from(pair)
+        \\  var field = Ref.from(whole.value.first)
+        \\  field.value = 42
+        \\  return pair.first + whole.value.second - 7
         \\exit(run())
     , 42);
 }
@@ -2387,12 +2494,11 @@ test "an explicit reference can borrow a field of another reference" {
 test "borrowing through an explicit reference addresses its referent" {
     try Fixture.expectSourceExit(
         \\import std.memory
-        \\import std.memory.{borrow_local}
         \\func run() int
         \\  var counter = 42
-        \\  const item = std.memory.borrow_local(counter)
-        \\  const reference = borrow_local(int, item[])
-        \\  return reference[]
+        \\  const item = Ref.from(counter)
+        \\  const reference = Ref.from(item.value)
+        \\  return reference.value
         \\exit(run())
     , 42);
 }
@@ -2407,8 +2513,8 @@ test "an explicit reference passes a noncopyable value to an imm call" {
         \\func inspect(imm item: Pinned) int -> item.value
         \\func run() int
         \\  const pinned = Pinned{value = 42}
-        \\  const item = std.memory.borrow_local(pinned)
-        \\  return inspect(item[])
+        \\  const item = Ref.from(pinned)
+        \\  return inspect(item.value)
         \\exit(run())
     , 42);
 }
@@ -2420,8 +2526,8 @@ test "an explicit reference can read an immutable parameter field" {
         \\  first: int
         \\  second: int
         \\func inspect(imm pair: Pair) int
-        \\  const item = std.memory.borrow_local(pair.first)
-        \\  return item[] + pair.second
+        \\  const item = Ref.from(pair.first)
+        \\  return item.value + pair.second
         \\exit(inspect(Pair{first = 21, second = 21}))
     , 42);
 }
@@ -2430,8 +2536,8 @@ test "a writable reference to a mut parameter copies back" {
     try Fixture.expectSourceExit(
         \\import std.memory
         \\func update(mut number: int)
-        \\  const item = std.memory.borrow_mut_local(number)
-        \\  item[] = 42
+        \\  var item = Ref.from(number)
+        \\  item.value = 42
         \\func run() int
         \\  var number = 17
         \\  update(number)
@@ -2444,8 +2550,8 @@ test "a referenced mut parameter copies back after failure" {
     try Fixture.expectSourceExit(
         \\import std.memory
         \\fallible update(mut number: int)
-        \\  const item = std.memory.borrow_mut_local(number)
-        \\  item[] = 42
+        \\  var item = Ref.from(number)
+        \\  item.value = 42
         \\  0 > 1
         \\fallible run() int
         \\  var number = 17
@@ -2461,9 +2567,9 @@ test "an explicit reference is invalid after a call replaces its owner" {
         \\fallible replace(mut owner: Box(int)) -> owner = Box.new?(17)
         \\fallible run() int
         \\  var owner = Box.new?(42)
-        \\  const item = std.memory.borrow_local(owner.borrow()[])
+        \\  const item = Ref.from(Ref.from(owner.borrow()).value)
         \\  replace?(owner)
-        \\  return item[]
+        \\  return item.value
         \\if const result = run() -> exit(result) else exit(1)
     , .borrow_outlives_source);
 }
@@ -2473,10 +2579,10 @@ test "an explicit reference releases its owner after its last use" {
         \\import std.memory
         \\fallible run() int
         \\  const owner = Box.new?(21)
-        \\  const item = std.memory.borrow_local(owner.borrow()[])
-        \\  const snapshot = item[]
+        \\  const item = Ref.from(Ref.from(owner.borrow()).value)
+        \\  const snapshot = item.value
         \\  const moved = owner^
-        \\  return snapshot + moved^.into_value()
+        \\  return snapshot + moved^.take()
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
@@ -2486,8 +2592,8 @@ test "Box and Ref alias analysis recomputes after source edits" {
         \\import std.memory
         \\fallible run() int
         \\  var owner = Box.new?(17)
-        \\  const item = std.memory.borrow_local(owner.borrow()[])
-        \\  return item[]
+        \\  const item = Ref.from(Ref.from(owner.borrow()).value)
+        \\  return item.value
         \\if const result = run() -> exit(result) else exit(1)
     , &.{});
     defer fixture.deinit();
@@ -2499,9 +2605,9 @@ test "Box and Ref alias analysis recomputes after source edits" {
         \\import std.memory
         \\fallible run() int
         \\  var owner = Box.new?(17)
-        \\  const item = std.memory.borrow_mut_local(owner.borrow_mut()[])
-        \\  item[] = 42
-        \\  return item[]
+        \\  var item = Ref.from(Ref.from(owner.borrow()).value)
+        \\  item.value = 42
+        \\  return item.value
         \\if const result = run() -> exit(result) else exit(1)
     );
     const second = try fixture.db.get(queries.AnalyzeFunctionInstance, .{ .item = run });
@@ -2512,10 +2618,10 @@ test "Box and Ref alias analysis recomputes after source edits" {
         \\import std.memory
         \\fallible run() int
         \\  var owner = Box.new?(17)
-        \\  const item = std.memory.borrow_local(owner.borrow()[])
+        \\  const item = Ref.from(Ref.from(owner.borrow()).value)
         \\  const moved = owner^
         \\  _ = moved
-        \\  return item[]
+        \\  return item.value
         \\if const result = run() -> exit(result) else exit(1)
     );
     try fixture.expectDiagnostic(0, .use_after_transfer);
@@ -2524,8 +2630,8 @@ test "Box and Ref alias analysis recomputes after source edits" {
         \\import std.memory
         \\fallible run() int
         \\  var owner = Box.new?(42)
-        \\  const item = std.memory.borrow_local(owner.borrow()[])
-        \\  return item[]
+        \\  const item = Ref.from(Ref.from(owner.borrow()).value)
+        \\  return item.value
         \\if const result = run() -> exit(result) else exit(1)
     );
     try fixture.expectExit(0, 42);
@@ -2533,32 +2639,29 @@ test "Box and Ref alias analysis recomputes after source edits" {
 
 test "an immutable Ref parameter can be read by its callee" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_box, read}
-        \\func inspect(imm reference: Ref(int)) int -> return read(int, false, reference)
+        \\func inspect(imm reference: Ref(int)) int -> return reference.value
         \\fallible run() int
         \\  const owner = Box.new?(42)
-        \\  return inspect(borrow_box(int, owner))
+        \\  return inspect(Ref.from(owner.borrow()))
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
 
 test "a local field Ref reads its field rather than a copy" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_local, read}
         \\struct Pair
         \\  offset: int
         \\  value: int
         \\func run() int
         \\  const pair = Pair{offset = 2, value = 40}
-        \\  const reference = borrow_local(int, pair.value)
-        \\  return read(int, false, reference) + pair.offset
+        \\  const reference = Ref.from(pair.value)
+        \\  return (reference).value + pair.offset
         \\exit(run())
     , 42);
 }
 
 test "a nested local field Ref reaches the leaf" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_local, read}
         \\struct Inner
         \\  first: int
         \\  second: int
@@ -2567,19 +2670,18 @@ test "a nested local field Ref reaches the leaf" {
         \\  inner: Inner
         \\func run() int
         \\  const outer = Outer{prefix = 2, inner = Inner{first = 17, second = 40}}
-        \\  const reference = borrow_local(int, outer.inner.second)
-        \\  return read(int, false, reference) + outer.prefix
+        \\  const reference = Ref.from(outer.inner.second)
+        \\  return (reference).value + outer.prefix
         \\exit(run())
     , 42);
 }
 
-test "borrow_local addresses a borrowed parameter field" {
+test "Ref.from addresses a borrowed parameter field" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_local, read}
         \\struct Pair
         \\  prefix: int
         \\  value: int
-        \\func inspect(imm pair: Pair) int -> read(int, false, borrow_local(int, pair.value))
+        \\func inspect(imm pair: Pair) int -> (Ref.from(pair.value)).value
         \\func run() int
         \\  const pair = Pair{prefix = 2, value = 40}
         \\  return inspect(pair) + pair.prefix - 2
@@ -2589,42 +2691,39 @@ test "borrow_local addresses a borrowed parameter field" {
 
 test "moving a field invalidates its Ref" {
     try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{borrow_local, read}
         \\struct Pair
         \\  value: int
         \\  sibling: int
         \\func run() int
         \\  var pair = Pair{value = 42, sibling = 0}
-        \\  const reference = borrow_local(int, pair.value)
+        \\  const reference = Ref.from(pair.value)
         \\  const moved = pair.value^
         \\  _ = moved
-        \\  return read(int, false, reference)
+        \\  return (reference).value
         \\exit(run())
     , .borrow_outlives_source);
 }
 
-test "replacing a sibling invalidates a local field Ref" {
-    try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{borrow_local, read}
+test "replacing a sibling preserves a local field Ref" {
+    try Fixture.expectSourceExit(
         \\struct Pair
         \\  value: int
         \\  offset: int
         \\func run() int
         \\  var pair = Pair{value = 40, offset = 1}
-        \\  const reference = borrow_local(int, pair.value)
+        \\  const reference = Ref.from(pair.value)
         \\  pair.offset = 2
-        \\  return read(int, false, reference)
+        \\  return (reference).value
         \\exit(run())
-    , .borrow_outlives_source);
+    , 40);
 }
 
 test "a mut owner cannot overlap a Ref argument through another local" {
     try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{borrow_box, read}
-        \\func inspect(mut owner: Box(int), imm reference: Ref(int)) int -> read(int, false, reference)
+        \\func inspect(mut owner: Box(int), imm reference: Ref(int)) int -> (reference).value
         \\fallible run() int
         \\  var owner = Box.new?(42)
-        \\  const reference = borrow_box(int, owner)
+        \\  const reference = Ref.from(owner.borrow())
         \\  return inspect(owner, reference)
         \\if const result = run() -> exit(result) else exit(1)
     , .overlapping_mutable_arguments);
@@ -2632,7 +2731,6 @@ test "a mut owner cannot overlap a Ref argument through another local" {
 
 test "a mut place cannot overlap an expression-only borrow argument" {
     try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{borrow_local, read}
         \\struct Immovable
         \\  move = none
         \\  value: int
@@ -2641,14 +2739,13 @@ test "a mut place cannot overlap an expression-only borrow argument" {
         \\  return snapshot.value
         \\func run() int
         \\  var owner = Immovable{value = 42}
-        \\  return inspect(owner, read(Immovable, false, borrow_local(Immovable, owner)))
+        \\  return inspect(owner, (Ref.from(owner)).value)
         \\exit(run())
     , .overlapping_mutable_arguments);
 }
 
 test "a mut place can coexist with an expression-only borrow of another local" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_local, read}
         \\struct Immovable
         \\  move = none
         \\  value: int
@@ -2658,32 +2755,31 @@ test "a mut place can coexist with an expression-only borrow of another local" {
         \\func run() int
         \\  var owner = Immovable{value = 17}
         \\  const other = Immovable{value = 42}
-        \\  return inspect(owner, read(Immovable, false, borrow_local(Immovable, other)))
+        \\  return inspect(owner, (Ref.from(other)).value)
         \\exit(run())
     , 42);
 }
 
 test "a mut owner and a Ref of a different owner can coexist" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_box, read}
-        \\func inspect(mut owner: Box(int), imm reference: Ref(int)) int -> read(int, false, reference)
+        \\func inspect(mut owner: Box(int), imm reference: Ref(int)) int -> (reference).value
         \\fallible run() int
         \\  var first = Box.new?(17)
         \\  const second = Box.new?(42)
-        \\  return inspect(first, borrow_box(int, second))
+        \\  return inspect(first, Ref.from(second.borrow()))
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
 
 test "an owned argument cannot consume the owner of a Ref argument" {
     try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{borrow_box, read, value}
+        \\import std.memory.{take}
         \\func inspect(imm reference: Ref(int), deinit owner: Box(int)) int
-        \\  const removed = value(int, owner^)
-        \\  return read(int, false, reference)
+        \\  const removed = take(int, owner^)
+        \\  return (reference).value
         \\fallible run() int
         \\  const owner = Box.new?(42)
-        \\  const reference = borrow_box(int, owner)
+        \\  const reference = Ref.from(owner.borrow())
         \\  return inspect(reference, owner^)
         \\if const result = run() -> exit(result) else exit(1)
     , .use_after_transfer);
@@ -2691,19 +2787,19 @@ test "an owned argument cannot consume the owner of a Ref argument" {
 
 test "an argument cannot consume a previously prepared Ref origin inside a nested call" {
     try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{borrow_box, read, value}
-        \\func dispose(deinit owner: Box(int)) int -> value(int, owner^)
-        \\func inspect(imm reference: Ref(int), imm removed: int) int -> read(int, false, reference)
+        \\import std.memory.{take}
+        \\func dispose(deinit owner: Box(int)) int -> take(int, owner^)
+        \\func inspect(imm reference: Ref(int), imm removed: int) int -> (reference).value
         \\fallible run() int
         \\  const owner = Box.new?(42)
-        \\  return inspect(borrow_box(int, owner), dispose(owner^))
+        \\  return inspect(Ref.from(owner.borrow()), dispose(owner^))
         \\if const result = run() -> exit(result) else exit(1)
     , .use_after_transfer);
 }
 
-test "an indexed borrow argument cannot outlive a nested allocation transfer" {
-    try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{Allocation, allocate, deallocate, unsafe_initialize, unsafe_borrow_initialized}
+test "an indexed scalar argument snapshots before a nested allocation transfer" {
+    try Fixture.expectSourceExit(
+        \\import std.memory.{Allocation, allocate, deallocate, unsafe_initialize, unsafe_borrow}
         \\func dispose(deinit allocation: Allocation(int)) int
         \\  deallocate(int, allocation^)
         \\  return 0
@@ -2714,14 +2810,14 @@ test "an indexed borrow argument cannot outlive a nested allocation transfer" {
         \\  else
         \\    deallocate(int, allocation^)
         \\    fail
-        \\  return inspect(unsafe_borrow_initialized(int, allocation, 0), dispose(allocation^))
+        \\  return inspect(unsafe_borrow(int, allocation, 0), dispose(allocation^))
         \\if const result = run() -> exit(result) else exit(1)
-    , .use_after_transfer);
+    , 42);
 }
 
-test "an indexed arithmetic operand cannot outlive a nested allocation transfer" {
-    try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{Allocation, allocate, deallocate, unsafe_initialize, unsafe_borrow_initialized}
+test "an indexed arithmetic operand snapshots before a nested allocation transfer" {
+    try Fixture.expectSourceExit(
+        \\import std.memory.{Allocation, allocate, deallocate, unsafe_initialize, unsafe_borrow}
         \\func dispose(deinit allocation: Allocation(int)) int
         \\  deallocate(int, allocation^)
         \\  return 0
@@ -2731,14 +2827,14 @@ test "an indexed arithmetic operand cannot outlive a nested allocation transfer"
         \\  else
         \\    deallocate(int, allocation^)
         \\    fail
-        \\  return unsafe_borrow_initialized(int, allocation, 0) + dispose(allocation^)
+        \\  return unsafe_borrow(int, allocation, 0) + dispose(allocation^)
         \\if const result = run() -> exit(result) else exit(1)
-    , .use_after_transfer);
+    , 42);
 }
 
-test "an indexed comparison operand cannot outlive a nested allocation transfer" {
-    try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{Allocation, allocate, deallocate, unsafe_initialize, unsafe_borrow_initialized}
+test "an indexed comparison operand snapshots before a nested allocation transfer" {
+    try Fixture.expectSourceExit(
+        \\import std.memory.{Allocation, allocate, deallocate, unsafe_initialize, unsafe_borrow}
         \\func dispose(deinit allocation: Allocation(int)) int
         \\  deallocate(int, allocation^)
         \\  return 42
@@ -2748,10 +2844,10 @@ test "an indexed comparison operand cannot outlive a nested allocation transfer"
         \\  else
         \\    deallocate(int, allocation^)
         \\    fail
-        \\  if unsafe_borrow_initialized(int, allocation, 0) == dispose(allocation^) -> return 1
+        \\  if unsafe_borrow(int, allocation, 0) == dispose(allocation^) -> return 42
         \\  return 0
         \\if const result = run() -> exit(result) else exit(1)
-    , .use_after_transfer);
+    , 42);
 }
 
 test "a callable field cannot outlive an argument transferring its owner" {
@@ -2762,14 +2858,14 @@ test "a callable field cannot outlive an argument transferring its owner" {
         \\func dispose(deinit owner: Box(Handler)) int -> 0
         \\fallible run() int
         \\  const owner = Box.new?(Handler{callback = answer})
-        \\  return owner.borrow()[].callback(dispose(owner^))
+        \\  return Ref.from(owner.borrow()).value.callback(dispose(owner^))
         \\if const result = run() -> exit(result) else exit(1)
     , .use_after_transfer);
 }
 
 test "an indexed callable cannot outlive a nested allocation transfer" {
     try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{Allocation, allocate, deallocate, unsafe_initialize, unsafe_borrow_initialized}
+        \\import std.memory.{Allocation, allocate, deallocate, unsafe_initialize, unsafe_borrow}
         \\static Callback: type = func(int) int
         \\func answer(value: int) int -> 42
         \\func dispose(deinit allocation: Allocation(Callback)) int
@@ -2781,17 +2877,17 @@ test "an indexed callable cannot outlive a nested allocation transfer" {
         \\  else
         \\    deallocate(Callback, allocation^)
         \\    fail
-        \\  return unsafe_borrow_initialized(Callback, allocation, 0)(dispose(allocation^))
+        \\  return unsafe_borrow(Callback, allocation, 0)(dispose(allocation^))
         \\if const result = run() -> exit(result) else exit(1)
     , .use_after_transfer);
 }
 
 test "an owned argument cannot consume an immutable argument" {
     try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{read, value}
+        \\import std.memory.{take}
         \\func inspect(imm owner: Box(int), deinit consumed: Box(int)) int
-        \\  const removed = value(int, consumed^)
-        \\  return read(int, false, borrow_box(int, owner))
+        \\  const removed = take(int, consumed^)
+        \\  return (Ref.from(owner.borrow())).value
         \\fallible run() int
         \\  const owner = Box.new?(42)
         \\  return inspect(owner, owner^)
@@ -2801,14 +2897,14 @@ test "an owned argument cannot consume an immutable argument" {
 
 test "an owned argument may consume a different owner than a Ref argument" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_box, read, value}
+        \\import std.memory.{take}
         \\func inspect(imm reference: Ref(int), deinit owner: Box(int)) int
-        \\  const removed = value(int, owner^)
-        \\  return read(int, false, reference)
+        \\  const removed = take(int, owner^)
+        \\  return (reference).value
         \\fallible run() int
         \\  const first = Box.new?(42)
         \\  const second = Box.new?(17)
-        \\  return inspect(borrow_box(int, first), second^)
+        \\  return inspect(Ref.from(first.borrow()), second^)
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
@@ -2921,29 +3017,27 @@ test "a transferred field must be restored before a loop backedge" {
 
 test "transferring an owned field moves its cleanup obligation" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_box, read}
         \\struct Container
         \\  owner: Box(int)
         \\  offset: int
         \\fallible run() int
         \\  var box = Container{owner = Box.new?(40), offset = 2}
         \\  const owner = box.owner^
-        \\  return read(int, false, borrow_box(int, owner)) + box.offset
+        \\  return (Ref.from(owner.borrow())).value + box.offset
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
 
 test "moving an owner field invalidates a Ref through that field" {
     try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{borrow_box, read}
         \\struct Container
         \\  owner: Box(int)
         \\  offset: int
         \\fallible run() int
         \\  var box = Container{owner = Box.new?(40), offset = 2}
-        \\  const reference = borrow_box(int, box.owner)
+        \\  const reference = Ref.from(box.owner.borrow())
         \\  const owner = box.owner^
-        \\  return read(int, false, reference)
+        \\  return (reference).value
         \\if const result = run() -> exit(result) else exit(1)
     , .borrow_outlives_source);
 }
@@ -3001,7 +3095,7 @@ test "replacing a parent with a moved trivial field still destroys its owned sib
 
 test "a drop hook can consume an allocation field" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{Allocation, allocate, deallocate, unsafe_initialize, unsafe_destroy, unsafe_borrow_element, read}
+        \\import std.memory.{Allocation, allocate, deallocate, unsafe_initialize, unsafe_destroy, unsafe_borrow}
         \\struct List
         \\  allocation: Allocation(int)
         \\  length: int
@@ -3015,14 +3109,13 @@ test "a drop hook can consume an allocation field" {
         \\    deallocate(int, allocation^)
         \\    fail
         \\  const buffer = List{allocation = allocation^, length = 1}
-        \\  return read(int, false, unsafe_borrow_element(int, buffer.allocation, 0)) + buffer.length
+        \\  return (Ref.from(unsafe_borrow(int, buffer.allocation, 0))).value + buffer.length
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
 
 test "transferring one owned field still destroys its owned sibling" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_box, read}
         \\struct Tracked
         \\  value: int
         \\  drop = func(deinit self: Tracked) -> exit(self.value)
@@ -3032,7 +3125,7 @@ test "transferring one owned field still destroys its owned sibling" {
         \\fallible run() int
         \\  var pair = Pair{moved = Box.new?(17), remaining = Box.new?(Tracked{value = 42})}
         \\  const moved = pair.moved^
-        \\  return read(int, false, borrow_box(int, moved))
+        \\  return (Ref.from(moved.borrow())).value
         \\if const result = run() -> exit(1) else exit(2)
     , 42);
 }
@@ -3057,7 +3150,6 @@ test "restoring an owned field rejoins its sibling cleanup" {
 
 test "two moved fields can be restored one at a time" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_box, read}
         \\struct Trio
         \\  first: Box(int)
         \\  second: Box(int)
@@ -3068,14 +3160,13 @@ test "two moved fields can be restored one at a time" {
         \\  const second = trio.second^
         \\  trio.first = Box.new?(4)
         \\  trio.second = Box.new?(5)
-        \\  return read(int, false, borrow_box(int, trio.first)) + read(int, false, borrow_box(int, trio.second)) + read(int, false, borrow_box(int, trio.stable)) + read(int, false, borrow_box(int, first)) + read(int, false, borrow_box(int, second))
+        \\  return (Ref.from(trio.first.borrow())).value + (Ref.from(trio.second.borrow())).value + (Ref.from(trio.stable.borrow())).value + (Ref.from(first.borrow())).value + (Ref.from(second.borrow())).value
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
 
 test "restoring an ownerless aggregate recovers its partial cleanup" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_box, read}
         \\struct Pair
         \\  first: Box(int)
         \\  second: Box(int)
@@ -3085,14 +3176,13 @@ test "restoring an ownerless aggregate recovers its partial cleanup" {
         \\  const second = pair.second^
         \\  pair.first = Box.new?(4)
         \\  pair.second = Box.new?(11)
-        \\  return read(int, false, borrow_box(int, pair.first)) + read(int, false, borrow_box(int, pair.second)) + read(int, false, borrow_box(int, first)) + read(int, false, borrow_box(int, second))
+        \\  return (Ref.from(pair.first.borrow())).value + (Ref.from(pair.second.borrow())).value + (Ref.from(first.borrow())).value + (Ref.from(second.borrow())).value
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
 
 test "nested missing owners are restored separately" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_box, read}
         \\struct Inner
         \\  first: Box(int)
         \\  second: Box(int)
@@ -3105,7 +3195,7 @@ test "nested missing owners are restored separately" {
         \\  const second = outer.inner.second^
         \\  outer.inner.first = Box.new?(4)
         \\  outer.inner.second = Box.new?(9)
-        \\  return read(int, false, borrow_box(int, outer.inner.first)) + read(int, false, borrow_box(int, outer.inner.second)) + read(int, false, borrow_box(int, first)) + read(int, false, borrow_box(int, second)) + outer.marker
+        \\  return (Ref.from(outer.inner.first.borrow())).value + (Ref.from(outer.inner.second.borrow())).value + (Ref.from(first.borrow())).value + (Ref.from(second.borrow())).value + outer.marker
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
@@ -3134,7 +3224,6 @@ test "restored owners are destroyed in reverse field order" {
 
 test "consecutive owned field transfers leave no aggregate cleanup" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_box, read}
         \\struct Tracked
         \\  value: int
         \\  drop = func(deinit self: Tracked) -> exit(self.value)
@@ -3145,7 +3234,7 @@ test "consecutive owned field transfers leave no aggregate cleanup" {
         \\  var pair = Pair{first = Box.new?(Tracked{value = 17}), second = Box.new?(Tracked{value = 42})}
         \\  const first = pair.first^
         \\  const second = pair.second^
-        \\  _ = read(Tracked, false, borrow_box(Tracked, second)).value
+        \\  _ = (Ref.from(second.borrow())).value.value
         \\  return first^
         \\if const owner = run() -> exit(1) else exit(2)
     , 42);
@@ -3153,7 +3242,6 @@ test "consecutive owned field transfers leave no aggregate cleanup" {
 
 test "replacing a partly moved parent destroys its remaining owned children" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_box, read}
         \\struct Tracked
         \\  value: int
         \\  drop = func(deinit self: Tracked)
@@ -3168,7 +3256,7 @@ test "replacing a partly moved parent destroys its remaining owned children" {
         \\  var outer = Outer{inner = Inner{moved = Box.new?(17), remaining = Box.new?(Tracked{value = 42})}, flag = 1}
         \\  const moved = outer.inner.moved^
         \\  outer.inner = Inner{moved = Box.new?(19), remaining = Box.new?(Tracked{value = 31})}
-        \\  return read(int, false, borrow_box(int, moved))
+        \\  return (Ref.from(moved.borrow())).value
         \\if const result = run() -> exit(1) else exit(2)
     , 42);
 }
@@ -3239,7 +3327,6 @@ test "a conditional owned field transfer ends the other branch before joining" {
 
 test "an owned sibling can be borrowed after a partial transfer join" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_box, read}
         \\struct Pair
         \\  stable: Box(int)
         \\  movable: Box(int)
@@ -3247,7 +3334,7 @@ test "an owned sibling can be borrowed after a partial transfer join" {
         \\  var pair = Pair{stable = Box.new?(41), movable = Box.new?(1)}
         \\  var chosen = Box.new?(0)
         \\  if flag == 1 -> chosen = pair.movable^
-        \\  return read(int, false, borrow_box(int, pair.stable)) + read(int, false, borrow_box(int, chosen))
+        \\  return (Ref.from(pair.stable.borrow())).value + (Ref.from(chosen.borrow())).value
         \\if const result = run(1) -> exit(result) else exit(2)
     , 42);
 }
@@ -3378,7 +3465,6 @@ test "a restoring backedge cannot revive a field moved before the loop" {
 
 test "a restored field is ended before the next loop iteration" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_box, read}
         \\struct Tracked
         \\  value: int
         \\  drop = func(deinit self: Tracked) -> exit(self.value)
@@ -3390,7 +3476,7 @@ test "a restored field is ended before the next loop iteration" {
         \\  const moved = pair.moved^
         \\  var pass = 0
         \\  loop
-        \\    if pass == 1 -> exit(read(Tracked, false, borrow_box(Tracked, moved)).value + 74)
+        \\    if pass == 1 -> exit((Ref.from(moved.borrow())).value.value + 74)
         \\    pair.moved = Box.new?(Tracked{value = 31})
         \\    pass = 1
         \\    continue
@@ -3400,7 +3486,6 @@ test "a restored field is ended before the next loop iteration" {
 
 test "three loop exits can join distinct owned results" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_box, read}
         \\fallible run(flag: int) Box(int)
         \\  var first = Box.new?(40)
         \\  var second = Box.new?(42)
@@ -3409,13 +3494,12 @@ test "three loop exits can join distinct owned results" {
         \\    if flag == 1 -> break first^
         \\    if flag == 2 -> break second^
         \\    break third^
-        \\if const owner = run(2) -> exit(read(int, false, borrow_box(int, owner))) else exit(1)
+        \\if const owner = run(2) -> exit((Ref.from(owner.borrow())).value) else exit(1)
     , 42);
 }
 
 test "a mut parameter can replace its owned field before returning" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_box, read}
         \\struct Container
         \\  owner: Box(int)
         \\  count: int
@@ -3425,7 +3509,7 @@ test "a mut parameter can replace its owned field before returning" {
         \\fallible run() int
         \\  var box = Container{owner = Box.new?(17), count = 2}
         \\  replace(box, Box.new?(40))
-        \\  return read(int, false, borrow_box(int, box.owner)) + box.count
+        \\  return (Ref.from(box.owner.borrow())).value + box.count
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
@@ -3624,12 +3708,12 @@ test "list growth moves elements and drops the initialized prefix in reverse" {
 
 test "list get checks bounds and borrows an initialized element" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{List, read}
+        \\import std.memory.{List}
         \\fallible run() int
         \\  var buffer = List(int).new?(1)
         \\  buffer.append?(42)
-        \\  const element: Ref(int) = buffer.get?(0)
-        \\  const observed = read(int, false, element)
+        \\  const element: Ref(int) = Ref.from(buffer.get?(0))
+        \\  const observed = (element).value
         \\  if buffer.get(-1) -> exit(1)
         \\  if buffer.get(1) -> exit(2)
         \\  return observed
@@ -3637,46 +3721,46 @@ test "list get checks bounds and borrows an initialized element" {
     , 42);
 }
 
-test "list get_mut checks bounds and replaces an initialized element" {
+test "list get checks bounds and replaces a writable initialized element" {
     try Fixture.expectSourceExit(
         \\import std.memory.{List}
         \\fallible run() int
         \\  var buffer = List(int).new?(0)
-        \\  if buffer.get_mut(0) -> return 1
+        \\  if buffer.get(0) -> return 1
         \\  buffer.append?(17)
-        \\  if buffer.get_mut(-1) -> return 2
-        \\  if buffer.get_mut(1) -> return 3
-        \\  const writable: Ref(mut int) = buffer.get_mut?(0)
-        \\  writable[] = 42
-        \\  return buffer.get?(0)[]
+        \\  if buffer.get(-1) -> return 2
+        \\  if buffer.get(1) -> return 3
+        \\  var writable: Ref(int) = Ref.from(buffer.get?(0))
+        \\  writable.value = 42
+        \\  return Ref.from(buffer.get?(0)).value
         \\if const result = run() -> exit(result) else exit(4)
     , 42);
 }
 
-test "list get_mut invalidates earlier element and view borrows" {
+test "list element replacement preserves earlier slot and view borrows" {
     const sources = .{
         \\import std.memory.{List}
         \\fallible run() int
         \\  var buffer = List(int).new?(2)
         \\  buffer.append?(17)
-        \\  const previous = buffer.get?(0)
-        \\  const writable = buffer.get_mut?(0)
-        \\  writable[] = 42
-        \\  return previous[]
+        \\  const previous = Ref.from(buffer.get?(0))
+        \\  var writable = Ref.from(buffer.get?(0))
+        \\  writable.value = 42
+        \\  return previous.value
         \\if const result = run() -> exit(result) else exit(1)
         ,
         \\import std.memory.{List}
         \\fallible run() int
         \\  var buffer = List(int).new?(2)
         \\  buffer.append?(17)
-        \\  const view = buffer.view?(0, 1)
-        \\  const writable = buffer.get_mut?(0)
-        \\  writable[] = 42
-        \\  return view.get?(0)[]
+        \\  const view = buffer.slice?(0..1)
+        \\  var writable = Ref.from(buffer.get?(0))
+        \\  writable.value = 42
+        \\  return Ref.from(view.get?(0)).value
         \\if const result = run() -> exit(result) else exit(1)
     };
     inline for (sources) |source| {
-        try Fixture.expectSourceDiagnostic(source, .borrow_outlives_source);
+        try Fixture.expectSourceExit(source, 42);
     }
 }
 
@@ -3686,22 +3770,23 @@ test "list append invalidates a writable element Ref without growth" {
         \\fallible run() int
         \\  var buffer = List(int).new?(2)
         \\  buffer.append?(17)
-        \\  const writable = buffer.get_mut?(0)
+        \\  var writable = Ref.from(buffer.get?(0))
         \\  buffer.append?(7)
-        \\  writable[] = 42
-        \\  return buffer.get?(0)[]
+        \\  writable.value = 42
+        \\  return Ref.from(buffer.get?(0)).value
         \\if const result = run() -> exit(result) else exit(1)
     , .borrow_outlives_source);
 }
 
-test "buffer get_mut needs a mutable list place" {
+test "writing through list get needs a mutable list place" {
     try Fixture.expectSourceDiagnostic(
         \\import std.memory.{List}
         \\fallible run() int
         \\  const buffer = List(int).new?(1)
-        \\  return buffer.get_mut?(0)[]
+        \\  Ref.from(buffer.get?(0)).value = 42
+        \\  return 0
         \\if const result = run() -> exit(result) else exit(1)
-    , .mutable_argument_requires_mutable_place);
+    , .reference_not_writable);
 }
 
 test "an explicit reference writes through checked List element access" {
@@ -3711,9 +3796,9 @@ test "an explicit reference writes through checked List element access" {
         \\fallible run() int
         \\  var buffer = List(int).new?(1)
         \\  buffer.append?(17)
-        \\  const item = std.memory.borrow_mut_local(buffer.get_mut?(0)[])
-        \\  item[] = 42
-        \\  return buffer.get?(0)[]
+        \\  var item = Ref.from(Ref.from(buffer.get?(0)).value)
+        \\  item.value = 42
+        \\  return Ref.from(buffer.get?(0)).value
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
@@ -3726,7 +3811,7 @@ test "an empty immovable List has no writable initialized element" {
         \\  value: int
         \\fallible run() int
         \\  var buffer = List(Pinned).new?(0)
-        \\  if buffer.get_mut(0) -> return 1
+        \\  if buffer.get(0) -> return 1
         \\  return buffer.len() + 42
         \\if const result = run() -> exit(result) else exit(2)
     , 42);
@@ -3734,27 +3819,27 @@ test "an empty immovable List has no writable initialized element" {
 
 test "appending without growth invalidates an earlier list element Ref" {
     try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{List, read}
+        \\import std.memory.{List}
         \\fallible run() int
         \\  var buffer = List(int).new?(2)
         \\  buffer.append?(17)
-        \\  const element = buffer.get?(0)
+        \\  const element = Ref.from(buffer.get?(0))
         \\  buffer.append?(42)
-        \\  return read(int, false, element)
+        \\  return (element).value
         \\if const result = run() -> exit(result) else exit(1)
     , .borrow_outlives_source);
 }
 
 test "list reserve preserves initialized elements on allocation failure" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{List, read}
+        \\import std.memory.{List}
         \\fallible run() int
         \\  var buffer = List(int).new?(1)
         \\  buffer.append?(42)
         \\  if buffer.reserve(-1) -> exit(1)
         \\  if buffer.reserve(2147483647) -> exit(2)
         \\  buffer.reserve?(3)
-        \\  return read(int, false, buffer.get?(0)) - buffer.len() - buffer.capacity() + 4
+        \\  return (Ref.from(buffer.get?(0))).value - buffer.len() - buffer.capacity() + 4
         \\if const result = run() -> exit(result) else exit(3)
     , 42);
 }
@@ -3807,16 +3892,16 @@ test "list reserve rejects elements with custom move" {
 
 test "a list view borrows a checked subrange" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{List, read}
+        \\import std.memory.{List}
         \\fallible run() int
         \\  var buffer = List(int).new?(2)
         \\  buffer.append?(17)
         \\  buffer.append?(42)
-        \\  const view = buffer.view?(1, 1)
+        \\  const view = buffer.slice?(1..2)
         \\  if view.get(1) -> exit(1)
-        \\  if buffer.view(-1, 1) -> exit(2)
-        \\  if buffer.view(1, 2) -> exit(3)
-        \\  return read(int, false, view.get?(0)) + view.len() - 1
+        \\  if buffer.slice(-1..0) -> exit(2)
+        \\  if buffer.slice(1..3) -> exit(3)
+        \\  return (Ref.from(view.get?(0))).value + view.len() - 1
         \\if const result = run() -> exit(result) else exit(4)
     , 42);
 }
@@ -3826,7 +3911,7 @@ test "list view range metadata is opaque outside std.memory" {
         \\import std.memory.{List}
         \\fallible run() unit
         \\  var buffer = List(int).new?(0)
-        \\  var view = buffer.view?(0, 0)
+        \\  var view = buffer.slice?(0..0)
         \\  view.size = 1
         \\if run() -> exit(1) else exit(2)
     , .private_struct_field);
@@ -3838,7 +3923,7 @@ test "list view construction retains its range length" {
         \\fallible run() int
         \\  var buffer = List(int).new?(1)
         \\  buffer.append?(42)
-        \\  const view = buffer.view?(0, 1)
+        \\  const view = buffer.slice?(0..1)
         \\  return 41 + view.len()
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
@@ -3846,44 +3931,44 @@ test "list view construction retains its range length" {
 
 test "list view reads an initialized element" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{List, read}
+        \\import std.memory.{List}
         \\fallible run() int
         \\  var buffer = List(int).new?(1)
         \\  buffer.append?(42)
-        \\  const view = buffer.view?(0, 1)
-        \\  return read(int, false, view.get?(0))
+        \\  const view = buffer.slice?(0..1)
+        \\  return (Ref.from(view.get?(0))).value
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
 
 test "a list view returned through an immutable parameter keeps its backing owner" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{List, Span, read}
-        \\fallible tail(imm buffer: List(int)) Span(int, false)
-        \\  return buffer.view?(1, buffer.len() - 1)
+        \\import std.memory.{List, Span}
+        \\fallible tail(imm buffer: List(int)) Span(int)
+        \\  return buffer.slice?(1..)
         \\fallible run() int
         \\  var buffer = List(int).new?(2)
         \\  buffer.append?(17)
         \\  buffer.append?(42)
         \\  const view = tail?(buffer)
-        \\  return read(int, false, view.get?(0))
+        \\  return (Ref.from(view.get?(0))).value
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
 
 test "a byte list view can be returned and stored without copying its backing data" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{List, Span, read}
+        \\import std.memory.{List, Span}
         \\struct ByteSlice
-        \\  view: Span(byte, false)
+        \\  view: Span(byte)
         \\fallible slice(imm buffer: List(byte)) ByteSlice
-        \\  return ByteSlice{view = buffer.view?(1, 1)}
+        \\  return ByteSlice{view = buffer.slice?(1..2)}
         \\fallible run() int
         \\  var bytes = List(byte).new?(2)
         \\  bytes.append?(17)
         \\  bytes.append?(42)
         \\  const stored = slice?(bytes)
-        \\  const element: byte = read(byte, false, stored.view.get?(0))
+        \\  const element: byte = (Ref.from(stored.view.get?(0))).value
         \\  _ = element
         \\  return stored.view.len() + bytes.len() + 39
         \\if const result = run() -> exit(result) else exit(1)
@@ -3892,17 +3977,17 @@ test "a byte list view can be returned and stored without copying its backing da
 
 test "a stored byte list view is invalid after backing storage changes" {
     try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{List, Span, read}
+        \\import std.memory.{List, Span}
         \\struct ByteSlice
-        \\  view: Span(byte, false)
+        \\  view: Span(byte)
         \\fallible slice(imm buffer: List(byte)) ByteSlice
-        \\  return ByteSlice{view = buffer.view?(0, 1)}
+        \\  return ByteSlice{view = buffer.slice?(0..1)}
         \\fallible run() unit
         \\  var bytes = List(byte).new?(1)
         \\  bytes.append?(42)
         \\  const stored = slice?(bytes)
         \\  bytes.append?(17)
-        \\  const element: byte = read(byte, false, stored.view.get?(0))
+        \\  const element: byte = (Ref.from(stored.view.get?(0))).value
         \\  _ = element
         \\if run() -> exit(1) else exit(2)
     , .borrow_outlives_source);
@@ -3911,36 +3996,35 @@ test "a stored byte list view is invalid after backing storage changes" {
 test "a byte buffer view cannot escape its local backing list" {
     try Fixture.expectSourceDiagnostic(
         \\import std.memory.{List, Span}
-        \\fallible escape() Span(byte, false)
+        \\fallible escape() Span(byte)
         \\  var bytes = List(byte).new?(1)
         \\  bytes.append?(42)
-        \\  return bytes.view?(0, 1)
+        \\  return bytes.slice?(0..1)
         \\if const view = escape() -> exit(view.len()) else exit(1)
     , .borrow_outlives_source);
 }
 
 test "mutating a list invalidates a previously borrowed view" {
     try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{List, read}
+        \\import std.memory.{List}
         \\fallible run() int
         \\  var buffer = List(int).new?(2)
         \\  buffer.append?(17)
-        \\  const view = buffer.view?(0, 1)
+        \\  const view = buffer.slice?(0..1)
         \\  buffer.append?(42)
-        \\  return read(int, false, view.get?(0))
+        \\  return (Ref.from(view.get?(0))).value
         \\if const result = run() -> exit(result) else exit(1)
     , .borrow_outlives_source);
 }
 
 test "a named unit call result can be borrowed" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_local, read}
         \\func produce() unit
         \\  const ignored = 1
         \\func run() int
         \\  const result = produce()
-        \\  const reference = borrow_local(unit, result)
-        \\  _ = read(unit, false, reference)
+        \\  const reference = Ref.from(result)
+        \\  _ = (reference).value
         \\  return 42
         \\exit(run())
     , 42);
@@ -3948,13 +4032,12 @@ test "a named unit call result can be borrowed" {
 
 test "a named unit branch result can be borrowed" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_local, read}
         \\func produce() unit
         \\  const ignored = 1
         \\func run() int
         \\  const result = if 1 == 1 -> produce() else produce()
-        \\  const reference = borrow_local(unit, result)
-        \\  _ = read(unit, false, reference)
+        \\  const reference = Ref.from(result)
+        \\  _ = (reference).value
         \\  return 42
         \\exit(run())
     , 42);
@@ -3962,11 +4045,10 @@ test "a named unit branch result can be borrowed" {
 
 test "a unit parameter can be borrowed during its call" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_local, read}
         \\func produce() unit
         \\  const ignored = 1
         \\func inspect(imm item: unit) int
-        \\  _ = read(unit, false, borrow_local(unit, item))
+        \\  _ = (Ref.from(item)).value
         \\  return 42
         \\exit(inspect(produce()))
     , 42);
@@ -3974,16 +4056,14 @@ test "a unit parameter can be borrowed during its call" {
 
 test "a direct-passed immutable parameter can be borrowed during its call" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_local, read}
-        \\func inspect(imm item: int) int -> read(int, false, borrow_local(int, item))
+        \\func inspect(imm item: int) int -> (Ref.from(item)).value
         \\exit(inspect(42))
     , 42);
 }
 
 test "a Ref of a direct-passed parameter cannot escape its call" {
     try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{borrow_local}
-        \\func escape(imm item: int) Ref(int) -> borrow_local(int, item)
+        \\func escape(imm item: int) Ref(int) -> Ref.from(item)
         \\const item = 42
         \\const reference = escape(item)
         \\exit(42)
@@ -3992,95 +4072,88 @@ test "a Ref of a direct-passed parameter cannot escape its call" {
 
 test "a function can return a Ref derived from an immutable owner" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_box, read}
-        \\func view(imm owner: Box(int)) Ref(int) -> return borrow_box(int, owner)
+        \\func view(imm owner: Box(int)) Ref(int) -> return Ref.from(owner.borrow())
         \\func forward(imm reference: Ref(int)) Ref(int) -> return reference
         \\fallible run() int
         \\  const owner = Box.new?(42)
         \\  const reference = forward(view(owner))
-        \\  return read(int, false, reference)
+        \\  return (reference).value
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
 
 test "copied writable Ref handles update stable Box storage" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_mut_box, borrow_box, read, write}
         \\fallible run() int
         \\  var owner = Box.new?(17)
-        \\  const writable: Ref(mut int) = borrow_mut_box(int, owner)
-        \\  const copied = writable
-        \\  const shared: Ref(int) = borrow_box(int, owner)
-        \\  write(int, copied, 42)
-        \\  return read(int, false, shared)
+        \\  var writable: Ref(int) = Ref.from(owner.borrow())
+        \\  var copied = writable
+        \\  const shared: Ref(int) = Ref.from(owner.borrow())
+        \\  copied.value = 42
+        \\  return (shared).value
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
 
 test "a writable Ref can be returned through its runtime handle input" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_mut_box, read, write}
-        \\func forward(imm reference: Ref(mut int)) Ref(mut int) -> reference
+        \\func forward(var reference: Ref(int)) Ref(int) -> reference
         \\fallible run() int
         \\  var owner = Box.new?(17)
-        \\  const reference = forward(borrow_mut_box(int, owner))
-        \\  write(int, reference, 42)
-        \\  return read(int, true, reference)
+        \\  var reference = forward(Ref.from(owner.borrow()))
+        \\  reference.value = 42
+        \\  return (reference).value
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
 
 test "a writable Ref returned from a mut Box follows its copied-back owner" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_mut_box, borrow_box, read, write}
-        \\func view(mut owner: Box(int)) Ref(mut int) -> borrow_mut_box(int, owner)
+        \\func view(mut owner: Box(int)) Ref(int) -> Ref.from(owner.borrow())
         \\fallible run() int
         \\  var owner = Box.new?(17)
-        \\  const reference = view(owner)
-        \\  write(int, reference, 42)
-        \\  return read(int, false, borrow_box(int, owner))
+        \\  var reference = view(owner)
+        \\  reference.value = 42
+        \\  return (Ref.from(owner.borrow())).value
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
 
 test "a fallible returned writable Ref follows the replacement mut owner" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_mut_box, borrow_box, read}
-        \\fallible view(mut owner: Box(int)) Ref(mut int)
+        \\fallible view(mut owner: Box(int)) Ref(int)
         \\  owner = Box.new?(42)
-        \\  return borrow_mut_box(int, owner)
+        \\  return Ref.from(owner.borrow())
         \\fallible run() int
         \\  var owner = Box.new?(17)
         \\  const reference = view?(owner)
-        \\  return read(int, true, reference) + read(int, false, borrow_box(int, owner)) - 42
+        \\  return (reference).value + (Ref.from(owner.borrow())).value - 42
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
 
 test "a replaced mut Box is copied back after a later failure" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_box, read}
         \\fallible fail_after_replace(mut owner: Box(int)) unit
         \\  owner = Box.new?(42)
         \\  0 > 1
         \\fallible run() int
         \\  var owner = Box.new?(17)
         \\  if fail_after_replace(owner) -> return 1
-        \\  return read(int, false, borrow_box(int, owner))
+        \\  return (Ref.from(owner.borrow())).value
         \\if const result = run() -> exit(result) else exit(2)
     , 42);
 }
 
 test "replacing a mut Box twice drops each outgoing owner once" {
     const fixture = try Fixture.initFiles(
-        \\import std.memory.{borrow_box, read}
         \\fallible replace_twice(mut owner: Box(int)) unit
         \\  owner = Box.new?(23)
         \\  owner = Box.new?(42)
         \\fallible run() int
         \\  var owner = Box.new?(17)
         \\  replace_twice?(owner)
-        \\  return read(int, false, borrow_box(int, owner))
+        \\  return (Ref.from(owner.borrow())).value
         \\if const result = run() -> exit(result) else exit(1)
     , &.{});
     defer fixture.deinit();
@@ -4096,54 +4169,51 @@ test "replacing a mut Box twice drops each outgoing owner once" {
 
 test "a read-only Ref cannot be used to write" {
     try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{borrow_box, write}
         \\fallible run() unit
-        \\  var owner = Box.new?(17)
-        \\  var reference = borrow_box(int, owner)
-        \\  write(int, reference, 42)
+        \\  const owner = Box.new?(17)
+        \\  const reference = Ref.from(owner.borrow())
+        \\  reference.value = 42
         \\if run() -> exit(1) else exit(2)
-    , .call_argument_type_mismatch);
+    , .reference_not_writable);
 }
 
 test "an immutable Box owner cannot create a writable Ref" {
     try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{borrow_mut_box}
         \\fallible run() unit
         \\  const owner = Box.new?(17)
-        \\  _ = borrow_mut_box(int, owner)
+        \\  Ref.from(owner.borrow()).value = 42
         \\if run() -> exit(1) else exit(2)
-    , .mutable_argument_requires_mutable_place);
+    , .reference_not_writable);
 }
 
-test "an immutable Box cannot call borrow_mut" {
+test "an immutable Box borrowed place remains read-only" {
     try Fixture.expectSourceDiagnostic(
         \\fallible run() unit
         \\  const owner = Box.new?(17)
-        \\  _ = owner.borrow_mut()
+        \\  ref item = owner.borrow()
+        \\  item = 42
         \\if run() -> exit(1) else exit(2)
-    , .mutable_argument_requires_mutable_place);
+    , .reference_not_writable);
 }
 
 test "transferring a Box owner invalidates its writable Ref" {
     try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{borrow_mut_box, write}
         \\fallible run() unit
         \\  var owner = Box.new?(17)
-        \\  const reference = borrow_mut_box(int, owner)
+        \\  var reference = Ref.from(owner.borrow())
         \\  const moved = owner^
         \\  _ = moved
-        \\  write(int, reference, 42)
+        \\  reference.value = 42
         \\if run() -> exit(1) else exit(2)
     , .use_after_transfer);
 }
 
 test "a mut owner argument cannot overlap a writable Ref argument" {
     try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{borrow_mut_box}
-        \\func conflict(mut owner: Box(int), imm reference: Ref(mut int)) -> return
+        \\func conflict(mut owner: Box(int), var reference: Ref(int)) -> return
         \\fallible run() unit
         \\  var owner = Box.new?(17)
-        \\  const reference = borrow_mut_box(int, owner)
+        \\  var reference = Ref.from(owner.borrow())
         \\  conflict(owner, reference)
         \\if run() -> exit(1) else exit(2)
     , .overlapping_mutable_arguments);
@@ -4151,52 +4221,52 @@ test "a mut owner argument cannot overlap a writable Ref argument" {
 
 test "writing a custom-drop pointee destroys the previous value" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_mut_box, write}
         \\struct Tracked
         \\  value: int
         \\  drop = func(deinit self: Tracked) -> exit(self.value)
         \\fallible run() unit
         \\  var owner = Box.new?(Tracked{value = 42})
-        \\  write(Tracked, borrow_mut_box(Tracked, owner), Tracked{value = 17})
+        \\  Ref.from(owner.borrow()).value = Tracked{value = 17}
         \\if run() -> exit(1) else exit(2)
     , 42);
 }
 
-test "a direct returned Ref conservatively depends on every runtime input" {
+test "a direct returned Ref depends only on its inferred runtime inputs" {
     const source =
-        \\import std.memory.{borrow_box, read}
         \\func select(imm first: Ref(int), imm second: Ref(int)) Ref(int) -> first
         \\fallible run() int
         \\  var first = Box.new?(42)
         \\  var second = Box.new?(17)
-        \\  const selected = select(borrow_box(int, first), borrow_box(int, second))
+        \\  const selected = select(Ref.from(first.borrow()), Ref.from(second.borrow()))
         \\  $invalidate
-        \\  return read(int, false, selected)
+        \\  return (selected).value
         \\if const result = run() -> exit(result) else exit(1)
     ;
-    for ([_]struct { invalidate: []const u8, diagnostic: std.meta.Tag(structures.Diagnostic.Kind) }{
+    for ([_]struct { invalidate: []const u8, diagnostic: ?std.meta.Tag(structures.Diagnostic.Kind) }{
         .{ .invalidate = "const moved = first^\n  _ = moved", .diagnostic = .use_after_transfer },
-        .{ .invalidate = "const moved = second^\n  _ = moved", .diagnostic = .use_after_transfer },
+        .{ .invalidate = "const moved = second^\n  _ = moved", .diagnostic = null },
         .{ .invalidate = "first = Box.new?(23)", .diagnostic = .borrow_outlives_source },
-        .{ .invalidate = "second = Box.new?(23)", .diagnostic = .borrow_outlives_source },
+        .{ .invalidate = "second = Box.new?(23)", .diagnostic = null },
     }) |case| {
         const entry = try test_sources.renderTemplate(testing.allocator, source, .{ .invalidate = case.invalidate });
         defer testing.allocator.free(entry);
-        try Fixture.expectSourceDiagnostic(entry, case.diagnostic);
+        if (case.diagnostic) |diagnostic|
+            try Fixture.expectSourceDiagnostic(entry, diagnostic)
+        else
+            try Fixture.expectSourceExit(entry, 42);
     }
 }
 
 test "an indirect returned Ref conservatively depends on every runtime input" {
     const source =
-        \\import std.memory.{borrow_box, read}
         \\func select(imm first: Ref(int), imm second: Ref(int)) Ref(int) -> first
         \\fallible run() int
         \\  var first = Box.new?(42)
         \\  var second = Box.new?(17)
-        \\  const function = select
-        \\  const selected = function(borrow_box(int, first), borrow_box(int, second))
+        \\  var function = select
+        \\  const selected = function(Ref.from(first.borrow()), Ref.from(second.borrow()))
         \\  $invalidate
-        \\  return read(int, false, selected)
+        \\  return (selected).value
         \\if const result = run() -> exit(result) else exit(1)
     ;
     for ([_]struct { invalidate: []const u8, diagnostic: std.meta.Tag(structures.Diagnostic.Kind) }{
@@ -4211,9 +4281,8 @@ test "an indirect returned Ref conservatively depends on every runtime input" {
     }
 }
 
-test "a returned Ref conservatively depends on mut Ref writeback inputs" {
+test "a returned Ref distinguishes its origins from mut Ref writeback inputs" {
     const source =
-        \\import std.memory.{borrow_box, read}
         \\func select(imm first: Ref(int), mut output: Ref(int), imm second: Ref(int)) Ref(int)
         \\  output = second
         \\  return first
@@ -4221,20 +4290,22 @@ test "a returned Ref conservatively depends on mut Ref writeback inputs" {
         \\  var first = Box.new?(42)
         \\  var second = Box.new?(17)
         \\  var other = Box.new?(1)
-        \\  var output = borrow_box(int, other)
-        \\  const selected = select(borrow_box(int, first), output, borrow_box(int, second))
+        \\  var output = Ref.from(other.borrow())
+        \\  const selected = select(Ref.from(first.borrow()), output, Ref.from(second.borrow()))
         \\  $invalidate
-        \\  return read(int, false, selected)
+        \\  return (selected).value
         \\if const result = run() -> exit(result) else exit(1)
     ;
     for ([_]struct { invalidate: []const u8, diagnostic: ?std.meta.Tag(structures.Diagnostic.Kind) }{
-        .{ .invalidate = "_ = read(int, false, output)", .diagnostic = null },
+        .{ .invalidate = "_ = (output).value", .diagnostic = null },
         .{ .invalidate = "const moved = first^\n  _ = moved", .diagnostic = .use_after_transfer },
-        .{ .invalidate = "const moved = second^\n  _ = moved", .diagnostic = .use_after_transfer },
-        .{ .invalidate = "const moved = other^\n  _ = moved", .diagnostic = .use_after_transfer },
+        .{ .invalidate = "const moved = second^\n  _ = moved", .diagnostic = null },
+        .{ .invalidate = "const moved = other^\n  _ = moved", .diagnostic = null },
+        .{ .invalidate = "const moved = second^\n  _ = output.value", .diagnostic = .use_after_transfer },
         .{ .invalidate = "first = Box.new?(23)", .diagnostic = .borrow_outlives_source },
-        .{ .invalidate = "second = Box.new?(23)", .diagnostic = .borrow_outlives_source },
-        .{ .invalidate = "other = Box.new?(23)", .diagnostic = .borrow_outlives_source },
+        .{ .invalidate = "second = Box.new?(23)", .diagnostic = null },
+        .{ .invalidate = "other = Box.new?(23)", .diagnostic = null },
+        .{ .invalidate = "second = Box.new?(23)\n  _ = output.value", .diagnostic = .borrow_outlives_source },
     }) |case| {
         const entry = try test_sources.renderTemplate(testing.allocator, source, .{ .invalidate = case.invalidate });
         defer testing.allocator.free(entry);
@@ -4248,23 +4319,22 @@ test "a returned Ref conservatively depends on mut Ref writeback inputs" {
     }
 }
 
-test "a returned Ref conservatively depends on unchanged mut Ref inputs" {
+test "returned Ref origins distinguish inferred contracts from indirect calls" {
     const source =
-        \\import std.memory.{borrow_box, read}
         \\func select(imm first: Ref(int), mut output: Ref(int)) Ref(int) -> first
         \\fallible run() int
         \\  const first = Box.new?(42)
         \\  var other = Box.new?(17)
-        \\  var output = borrow_box(int, other)
-        \\  const function = select
-        \\  const selected = $callee(borrow_box(int, first), output)
+        \\  var output = Ref.from(other.borrow())
+        \\  var function = select
+        \\  const selected = $callee(Ref.from(first.borrow()), output)
         \\  $invalidate
-        \\  return read(int, false, selected)
+        \\  return selected.value
         \\if const result = run() -> exit(result) else exit(1)
     ;
     for ([_][]const u8{ "select", "function" }) |callee| {
         for ([_]struct { invalidate: []const u8, diagnostic: ?std.meta.Tag(structures.Diagnostic.Kind) }{
-            .{ .invalidate = "_ = read(int, false, output)", .diagnostic = null },
+            .{ .invalidate = "_ = output.value", .diagnostic = null },
             .{ .invalidate = "const moved = other^\n  _ = moved", .diagnostic = .use_after_transfer },
             .{ .invalidate = "other = Box.new?(23)", .diagnostic = .borrow_outlives_source },
         }) |case| {
@@ -4272,7 +4342,8 @@ test "a returned Ref conservatively depends on unchanged mut Ref inputs" {
             defer testing.allocator.free(entry);
             const fixture = try Fixture.initFiles(entry, &.{});
             defer fixture.deinit();
-            if (case.diagnostic) |diagnostic| {
+            if (case.diagnostic != null and std.mem.eql(u8, callee, "function")) {
+                const diagnostic = case.diagnostic.?;
                 try fixture.expectDiagnostic(0, diagnostic);
             } else {
                 try fixture.expectExit(0, 42);
@@ -4283,13 +4354,12 @@ test "a returned Ref conservatively depends on unchanged mut Ref inputs" {
 
 test "a returned Ref may select either runtime input while both owners live" {
     const source =
-        \\import std.memory.{borrow_box, read}
         \\func select(imm first: Ref(int), imm second: Ref(int)) Ref(int) -> $selected
         \\fallible run() int
         \\  const first = Box.new?(17)
         \\  const second = Box.new?(42)
         \\  const function = select
-        \\  return read(int, false, $callee(borrow_box(int, first), borrow_box(int, second)))
+        \\  return ($callee(Ref.from(first.borrow()), Ref.from(second.borrow()))).value
         \\if const result = run() -> exit(result) else exit(1)
     ;
     for ([_][]const u8{ "select", "function" }) |callee| {
@@ -4328,67 +4398,62 @@ test "removed from return origin syntax produces a parse diagnostic" {
 
 test "a returned Ref can depend on an immutable owner aggregate" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_box, read}
         \\struct Storage
         \\  owner: Box(int)
-        \\func view(imm storage: Storage) Ref(int) -> borrow_box(int, storage.owner)
+        \\func view(imm storage: Storage) Ref(int) -> Ref.from(storage.owner.borrow())
         \\fallible run() int
         \\  const storage = Storage{owner = Box.new?(42)}
-        \\  return read(int, false, view(storage))
+        \\  return (view(storage)).value
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
 
 test "an owned Ref parameter may transfer its borrowed handle back" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_box, read}
         \\func forward(var reference: Ref(int)) Ref(int) -> return reference^
         \\fallible run() int
         \\  const owner = Box.new?(42)
-        \\  const reference = forward(borrow_box(int, owner))
-        \\  return read(int, false, reference)
+        \\  const reference = forward(Ref.from(owner.borrow()))
+        \\  return (reference).value
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
 
 test "transferring a Ref handle does not invalidate its copy" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_box, read}
         \\func forward(imm reference: Ref(int)) Ref(int) -> reference
         \\fallible run() int
         \\  const owner = Box.new?(42)
-        \\  const original = borrow_box(int, owner)
+        \\  const original = Ref.from(owner.borrow())
         \\  const copy = forward(original)
         \\  const moved = original^
-        \\  return read(int, false, copy)
+        \\  return (copy).value
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
 
 test "a conditional Ref result retains either possible owner" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_box, read}
         \\func choose(imm first: Ref(int), imm second: Ref(int), pick_first: int) Ref(int)
         \\  return if pick_first == 1 -> first else second
         \\fallible run() int
         \\  const first = Box.new?(20)
         \\  const second = Box.new?(42)
-        \\  const chosen = choose(borrow_box(int, first), borrow_box(int, second), 0)
-        \\  return read(int, false, chosen)
+        \\  const chosen = choose(Ref.from(first.borrow()), Ref.from(second.borrow()), 0)
+        \\  return (chosen).value
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
 
 test "reading a multi-owner Ref copies before the youngest owner ends" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_box, read}
         \\func choose(imm first: Box(int), imm second: Box(int), pick_first: int) Ref(int)
-        \\  return if pick_first == 1 -> borrow_box(int, first) else borrow_box(int, second)
+        \\  return if pick_first == 1 -> Ref.from(first.borrow()) else Ref.from(second.borrow())
         \\fallible run() int
         \\  const outer = Box.new?(17)
         \\  const copied = if 1 == 1
         \\    const inner = Box.new?(42)
-        \\    read(int, false, choose(inner, outer, 1))
+        \\    choose(inner, outer, 1).value
         \\  else
         \\    0
         \\  return copied
@@ -4398,269 +4463,250 @@ test "reading a multi-owner Ref copies before the youngest owner ends" {
 
 test "a returned Ref cannot outlive either possible owner" {
     try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{borrow_box, read}
         \\func choose(imm first: Ref(int), imm second: Ref(int), pick_first: int) Ref(int)
         \\  return if pick_first == 1 -> first else second
         \\fallible run() int
         \\  const first = Box.new?(20)
         \\  const second = Box.new?(42)
-        \\  const chosen = choose(borrow_box(int, first), borrow_box(int, second), 0)
+        \\  const chosen = choose(Ref.from(first.borrow()), Ref.from(second.borrow()), 0)
         \\  const moved = first^
-        \\  return read(int, false, chosen)
+        \\  return (chosen).value
         \\if const result = run() -> exit(result) else exit(1)
     , .use_after_transfer);
 }
 
 test "a mutable Ref binding retains origins across branch assignments" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_box, read}
         \\fallible run(pick_second: int) int
         \\  const first = Box.new?(20)
         \\  const second = Box.new?(42)
-        \\  var selected = borrow_box(int, first)
-        \\  if pick_second == 1 -> selected = borrow_box(int, second)
-        \\  return read(int, false, selected)
+        \\  var selected = Ref.from(first.borrow())
+        \\  if pick_second == 1 -> selected = Ref.from(second.borrow())
+        \\  return (selected).value
         \\if const result = run(1) -> exit(result) else exit(1)
     , 42);
 }
 
 test "a loop break retains its Ref origin" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_box, read}
         \\fallible run() int
         \\  const owner = Box.new?(42)
-        \\  const reference = loop -> break borrow_box(int, owner)
-        \\  return read(int, false, reference)
+        \\  const reference = loop -> break Ref.from(owner.borrow())
+        \\  return (reference).value
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
 
 test "a mutable Ref binding retains its origin through a loop exit" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_box, read}
         \\fallible run() int
         \\  const first = Box.new?(17)
         \\  const second = Box.new?(42)
-        \\  var selected = borrow_box(int, first)
+        \\  var selected = Ref.from(first.borrow())
         \\  loop
-        \\    selected = borrow_box(int, second)
+        \\    selected = Ref.from(second.borrow())
         \\    break
-        \\  return read(int, false, selected)
+        \\  return (selected).value
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
 
 test "a mutable Ref binding retains backedge origins" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_box, read}
         \\fallible run() int
         \\  const first = Box.new?(17)
         \\  const second = Box.new?(42)
-        \\  var selected = borrow_box(int, first)
+        \\  var selected = Ref.from(first.borrow())
         \\  var phase = 0
         \\  const reference = loop
         \\    if phase == 0
-        \\      selected = borrow_box(int, second)
+        \\      selected = Ref.from(second.borrow())
         \\      phase = 1
         \\      continue
         \\    break selected
-        \\  return read(int, false, reference)
+        \\  return (reference).value
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
 
 test "a loop-carried Ref is invalid when a possible owner transfers" {
     try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{borrow_box, read}
         \\fallible run() int
         \\  const first = Box.new?(17)
         \\  const second = Box.new?(42)
-        \\  var selected = borrow_box(int, first)
+        \\  var selected = Ref.from(first.borrow())
         \\  var phase = 0
         \\  loop
         \\    if phase == 0
-        \\      selected = borrow_box(int, second)
+        \\      selected = Ref.from(second.borrow())
         \\      phase = 1
         \\      continue
         \\    break
         \\  const moved = second^
-        \\  return read(int, false, selected)
+        \\  return (selected).value
         \\if const result = run() -> exit(result) else exit(1)
     , .use_after_transfer);
 }
 
 test "a Ref read inside a loop keeps backedge owners live" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_box, read}
         \\fallible run() int
         \\  const first = Box.new?(17)
         \\  const second = Box.new?(42)
-        \\  var selected = borrow_box(int, first)
+        \\  var selected = Ref.from(first.borrow())
         \\  var phase = 0
         \\  loop
         \\    if phase == 0
-        \\      selected = borrow_box(int, second)
+        \\      selected = Ref.from(second.borrow())
         \\      phase = 1
         \\      continue
-        \\    return read(int, false, selected)
+        \\    return selected.value
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
 
 test "a Ref of an unchanged mutable owner survives a loop header" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_box, read}
         \\fallible run() int
         \\  var owner = Box.new?(42)
-        \\  const reference = borrow_box(int, owner)
-        \\  return loop -> break read(int, false, reference)
+        \\  const reference = Ref.from(owner.borrow())
+        \\  return loop -> break (reference).value
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
 
 test "a Ref of a replaced loop owner cannot be read" {
     try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{borrow_box, read}
         \\fallible run() int
         \\  var owner = Box.new?(17)
-        \\  const reference = borrow_box(int, owner)
+        \\  const reference = Ref.from(owner.borrow())
         \\  loop
         \\    owner = Box.new?(42)
         \\    break
-        \\  return read(int, false, reference)
+        \\  return reference.value
         \\if const result = run() -> exit(result) else exit(1)
     , .borrow_outlives_source);
 }
 
 test "a Ref of a directly replaced owner cannot be read" {
     try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{borrow_box, read}
         \\fallible run() int
         \\  var owner = Box.new?(17)
-        \\  const reference = borrow_box(int, owner)
+        \\  const reference = Ref.from(owner.borrow())
         \\  owner = Box.new?(42)
-        \\  return read(int, false, reference)
+        \\  return reference.value
         \\if const result = run() -> exit(result) else exit(1)
     , .borrow_outlives_source);
 }
 
 test "a Ref of an owned field cannot outlive its parent replacement" {
     try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{borrow_box, read}
         \\struct Holder
         \\  box: Box(int)
         \\fallible run() int
         \\  var holder = Holder{box = Box.new?(17)}
-        \\  const reference = borrow_box(int, holder.box)
+        \\  const reference = Ref.from(holder.box.borrow())
         \\  holder = Holder{box = Box.new?(42)}
-        \\  return read(int, false, reference)
+        \\  return (reference).value
         \\if const result = run() -> exit(result) else exit(1)
     , .borrow_outlives_source);
 }
 
 test "nested loops retain their separate Ref origin sets" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_box, read}
         \\fallible run() int
         \\  const first = Box.new?(17)
         \\  const second = Box.new?(42)
-        \\  var selected = borrow_box(int, first)
+        \\  var selected = Ref.from(first.borrow())
         \\  var count = 0
         \\  loop
         \\    loop
-        \\      selected = borrow_box(int, second)
+        \\      selected = Ref.from(second.borrow())
         \\      break
         \\    if count == 0
         \\      count = 1
         \\      continue
         \\    break
-        \\  return read(int, false, selected)
+        \\  return (selected).value
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
 
 test "a struct containing a Ref cannot escape its local owner" {
     try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{borrow_box}
         \\struct View
         \\  reference: Ref(int)
         \\fallible escape() View
         \\  const owner = Box.new?(42)
-        \\  return View{reference = borrow_box(int, owner)}
+        \\  return View{reference = Ref.from(owner.borrow())}
         \\if const view = escape() -> exit(42) else exit(1)
     , .borrow_outlives_source);
 }
 
 test "a Ref keeps its origin through variant widening and extraction" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_box, read}
         \\fallible run() int
         \\  const owner = Box.new?(42)
-        \\  const selected: Ref(int) | none = borrow_box(int, owner)
-        \\  return if const reference = selected as Ref(int) -> read(int, false, reference) else 0
+        \\  const selected: Ref(int) | none = Ref.from(owner.borrow())
+        \\  return if const reference = selected as Ref(int) -> (reference).value else 0
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
 
 test "variant extraction rejects a Ref after its owner transfers" {
     try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{borrow_box, read}
         \\fallible run() int
         \\  const owner = Box.new?(42)
-        \\  const selected: Ref(int) | none = borrow_box(int, owner)
+        \\  const selected: Ref(int) | none = Ref.from(owner.borrow())
         \\  const moved = owner^
-        \\  return if const reference = selected as Ref(int) -> read(int, false, reference) else 0
+        \\  return if const reference = selected as Ref(int) -> (reference).value else 0
         \\if const result = run() -> exit(result) else exit(1)
     , .use_after_transfer);
 }
 
 test "a struct containing a Ref may return with its borrowed input" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_box, read}
         \\struct View
         \\  reference: Ref(int)
-        \\func view(imm owner: Box(int)) View -> return View{reference = borrow_box(int, owner)}
+        \\func view(imm owner: Box(int)) View -> return View{reference = Ref.from(owner.borrow())}
         \\fallible run() int
         \\  const owner = Box.new?(42)
-        \\  return read(int, false, view(owner).reference)
+        \\  return (view(owner).reference).value
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
 
 test "an in-place Box containing a Ref retains its referent" {
     try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{borrow_box, read}
         \\struct View
         \\  move = none
         \\  reference: Ref(int)
         \\fallible run() int
         \\  const owner = Box.new?(42)
-        \\  const stored = Box(View).new?(View{reference = borrow_box(int, owner)})
+        \\  const stored = Box(View).new?(View{reference = Ref.from(owner.borrow())})
         \\  const moved = owner^
-        \\  return read(int, false, read(View, false, borrow_box(View, stored)).reference)
+        \\  return ((Ref.from(stored.borrow())).value.reference).value
         \\if const result = run() -> exit(result) else exit(1)
     , .use_after_transfer);
 }
 
 test "replacing a Ref field retains the new referent dependency" {
     try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{borrow_box, read}
         \\struct View
         \\  reference: Ref(int)
         \\fallible run() int
         \\  const first = Box.new?(17)
         \\  const second = Box.new?(42)
-        \\  var view = View{reference = borrow_box(int, first)}
-        \\  view.reference = borrow_box(int, second)
+        \\  var view = View{reference = Ref.from(first.borrow())}
+        \\  view.reference = Ref.from(second.borrow())
         \\  const moved = second^
-        \\  return read(int, false, view.reference)
+        \\  return (view.reference).value
         \\if const result = run() -> exit(result) else exit(1)
     , .use_after_transfer);
 }
 
 test "mut writeback retains origins of a Ref argument" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_box, read}
         \\struct View
         \\  reference: Ref(int)
         \\func replace(mut view: View, imm reference: Ref(int))
@@ -4668,41 +4714,39 @@ test "mut writeback retains origins of a Ref argument" {
         \\fallible run() int
         \\  const first = Box.new?(17)
         \\  const second = Box.new?(42)
-        \\  var view = View{reference = borrow_box(int, first)}
-        \\  replace(view, borrow_box(int, second))
-        \\  return read(int, false, view.reference)
+        \\  var view = View{reference = Ref.from(first.borrow())}
+        \\  replace(view, Ref.from(second.borrow()))
+        \\  return (view.reference).value
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
 
 test "mut writeback retains an immutable owner's origin" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_box, read}
         \\struct View
         \\  reference: Ref(int)
         \\func replace(mut view: View, imm owner: Box(int))
-        \\  view.reference = borrow_box(int, owner)
+        \\  view.reference = Ref.from(owner.borrow())
         \\fallible run() int
         \\  const first = Box.new?(17)
         \\  const second = Box.new?(42)
-        \\  var view = View{reference = borrow_box(int, first)}
+        \\  var view = View{reference = Ref.from(first.borrow())}
         \\  replace(view, second)
-        \\  return read(int, false, view.reference)
+        \\  return (view.reference).value
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
 
 test "mut output cannot borrow a callee local" {
     try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{borrow_local, borrow_box}
         \\struct View
         \\  reference: Ref(int)
         \\func replace(mut view: View)
         \\  const local = 42
-        \\  view.reference = borrow_local(int, local)
+        \\  view.reference = Ref.from(local)
         \\fallible run() unit
         \\  const owner = Box.new?(17)
-        \\  var view = View{reference = borrow_box(int, owner)}
+        \\  var view = View{reference = Ref.from(owner.borrow())}
         \\  replace(view)
         \\if run() -> exit(1) else exit(2)
     , .borrow_outlives_source);
@@ -4710,30 +4754,28 @@ test "mut output cannot borrow a callee local" {
 
 test "mut writeback cannot outlive its caller-side referent" {
     try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{borrow_box, read}
         \\struct View
         \\  reference: Ref(int)
         \\func replace(mut view: View, imm reference: Ref(int))
         \\  view.reference = reference
         \\fallible run() int
         \\  const outer = Box.new?(17)
-        \\  var view = View{reference = borrow_box(int, outer)}
+        \\  var view = View{reference = Ref.from(outer.borrow())}
         \\  if 1 == 1
         \\    const inner = Box.new?(42)
-        \\    replace(view, borrow_box(int, inner))
-        \\  return read(int, false, view.reference)
+        \\    replace(view, Ref.from(inner.borrow()))
+        \\  return (view.reference).value
         \\if const result = run() -> exit(result) else exit(1)
     , .borrow_outlives_source);
 }
 
 test "fallible calls retain returned Ref origins" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_box, read}
         \\fallible forward(imm reference: Ref(int)) Ref(int)
         \\  return reference
         \\fallible run() int
         \\  const owner = Box.new?(42)
-        \\  if const returned = forward(borrow_box(int, owner)) -> return read(int, false, returned)
+        \\  if const returned = forward(Ref.from(owner.borrow())) -> return (returned).value
         \\  else return 1
         \\if const result = run() -> exit(result) else exit(2)
     , 42);
@@ -4741,13 +4783,12 @@ test "fallible calls retain returned Ref origins" {
 
 test "indirect fallible calls retain returned Ref origins" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_box, read}
         \\fallible forward(imm reference: Ref(int)) Ref(int)
         \\  return reference
         \\fallible run() int
         \\  const owner = Box.new?(42)
         \\  const function = forward
-        \\  if const returned = function(borrow_box(int, owner)) -> return read(int, false, returned)
+        \\  if const returned = function(Ref.from(owner.borrow())) -> return (returned).value
         \\  else return 1
         \\if const result = run() -> exit(result) else exit(2)
     , 42);
@@ -4755,63 +4796,58 @@ test "indirect fallible calls retain returned Ref origins" {
 
 test "copying a Ref of a noncopyable immovable value copies only its address" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_box, read}
         \\struct Immovable
         \\  move = none
         \\  copy = none
         \\  value: int
         \\fallible run() int
         \\  const owner = Box(Immovable).new?(Immovable{value = 42})
-        \\  const first = borrow_box(Immovable, owner)
+        \\  const first = Ref.from(owner.borrow())
         \\  const second = first
-        \\  return read(Immovable, false, second).value
+        \\  return (second).value.value
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
 
 test "a local immovable value can be borrowed without copying it" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_local, read}
         \\struct Immovable
         \\  move = none
         \\  copy = none
         \\  value: int
         \\func run() int
         \\  const local = Immovable{value = 42}
-        \\  const reference: Ref(Immovable) = borrow_local(Immovable, local)
-        \\  return read(Immovable, false, reference).value
+        \\  const reference: Ref(Immovable) = Ref.from(local)
+        \\  return (reference).value.value
         \\exit(run())
     , 42);
 }
 
-test "replacing a borrowed scalar local invalidates its address" {
-    try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{borrow_local, read}
+test "replacing a borrowed scalar local preserves its address" {
+    try Fixture.expectSourceExit(
         \\var number = 42
-        \\const reference = borrow_local(int, number)
+        \\const reference = Ref.from(number)
         \\number = 7
-        \\exit(read(int, false, reference))
-    , .borrow_outlives_source);
+        \\exit((reference).value)
+    , 7);
 }
 
 test "a borrow of a local Box cannot escape its owner" {
     try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{borrow_box}
         \\fallible escape() Ref(int)
         \\  const owner = Box.new?(42)
-        \\  return borrow_box(int, owner)
+        \\  return Ref.from(owner.borrow())
         \\if escape() -> exit(1) else exit(2)
     , .borrow_outlives_source);
 }
 
 test "a borrow cannot be read after its Box owner is transferred" {
     try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{borrow_box, read}
         \\fallible run() int
         \\  const owner = Box.new?(42)
-        \\  const reference = borrow_box(int, owner)
+        \\  const reference = Ref.from(owner.borrow())
         \\  const moved = owner^
-        \\  return read(int, false, reference)
+        \\  return reference.value
         \\if const result = run() -> exit(result) else exit(1)
     , .use_after_transfer);
 }
@@ -4848,7 +4884,7 @@ test "Box destination construction covers nested producers and loop results" {
             \\fallible run(flag: int) int
             \\  const producer = leaf
             \\  const owner = Box(Item).new?({s})
-            \\  return owner.borrow()[].leaf.value
+            \\  return Ref.from(owner.borrow()).value.leaf.value
             \\if const result = run(1) -> exit(result) else exit(1)
         , .{initializer});
         defer testing.allocator.free(source);
@@ -4870,7 +4906,7 @@ test "Box destination construction copies immovable places and moves once" {
             \\fallible run() int
             \\  const original = Item{{value = 41}}
             \\  const owner = Box.new?({s})
-            \\  return owner.borrow()[].value
+            \\  return Ref.from(owner.borrow()).value.value
             \\if const result = run() -> exit(result) else exit(1)
         , .{ case.movement, case.copy, case.initializer });
         defer testing.allocator.free(source);
@@ -4888,7 +4924,7 @@ test "Box destination construction widens fresh immovable variants" {
         \\fallible run(flag: int) int
         \\  const producer = make
         \\  const owner = Box(MaybeItem).new?(if flag == 1 -> producer() else none)
-        \\  if owner.borrow()[] is Item -> return 41
+        \\  if Ref.from(owner.borrow()).value is Item -> return 41
         \\  return 1
         \\fallible answer() int -> run?(1) + run?(0)
         \\if const result = answer() -> exit(result) else exit(1)
@@ -4924,7 +4960,7 @@ test "unevaluated initializer inference preserves lookup diagnostics" {
 }
 
 test "unevaluated result inference preserves divergence before lookup" {
-    for ([_][]const u8{ "stop().field", "stop().method()", "stop()[]", "stop()()" }) |expression| {
+    for ([_][]const u8{ "stop().field", "stop().method()", "stop().value", "stop()()" }) |expression| {
         const source = try testing.allocator.print(
             \\struct Pinned
             \\  move = none
@@ -4963,7 +4999,7 @@ test "Box infers member call results without evaluating their receivers or argum
             \\  const factory = Factory{{create = make}}
             \\  const original = Item{{value = 42}}
             \\  const owner = Box.new?({s})
-            \\  return owner.borrow()[].value
+            \\  return Ref.from(owner.borrow()).value.value
             \\if const result = run() -> exit(result) else exit(1)
         , .{initializer});
         defer testing.allocator.free(source);
@@ -5055,19 +5091,19 @@ test "allocating init consumers construct immovable raw slots through aliases an
     const cases = .{
         .{ .setup = "", .call = "unsafe_initialize?(Item, storage, 1, make(41))" },
         .{ .setup = "", .call = "initialize_alias?(storage, 1, make(41))" },
-        .{ .setup = "const initialize: fallible(mut Allocation(Item), int, init Item) unit = Allocation(Item).unsafe_init", .call = "initialize?(storage, 1, make(41))" },
-        .{ .setup = "", .call = "storage.unsafe_init?(1, make(41))" },
+        .{ .setup = "const initialize: fallible(mut Allocation(Item), int, init Item) unit = Allocation(Item).unsafe_initialize", .call = "initialize?(storage, 1, make(41))" },
+        .{ .setup = "", .call = "storage.unsafe_initialize?(1, make(41))" },
     };
     inline for (cases) |case| {
         const source = try testing.allocator.print(
-            \\import std.memory.{{Allocation, allocate, deallocate, unsafe_initialize, unsafe_destroy, unsafe_borrow_initialized}}
+            \\import std.memory.{{Allocation, allocate, deallocate, unsafe_initialize, unsafe_destroy, unsafe_borrow}}
             \\struct Item
             \\  move = none
             \\  value: int
             \\  drop = func(deinit self: Item) -> exit(self.value)
             \\func make(value: int) Item -> Item{{value = value + 1}}
             \\static Slots = Allocation(Item)
-            \\static initialize_alias = Slots.unsafe_init
+            \\static initialize_alias = Slots.unsafe_initialize
             \\fallible run()
             \\  var storage = allocate?(Item, 2)
             \\  {s}
@@ -5075,7 +5111,7 @@ test "allocating init consumers construct immovable raw slots through aliases an
             \\  else
             \\    deallocate(Item, storage)
             \\    fail
-            \\  const value = unsafe_borrow_initialized(Item, storage, 1).value
+            \\  const value = unsafe_borrow(Item, storage, 1).value
             \\  if value == 42
             \\    unsafe_destroy(Item, storage, 1)
             \\  else
@@ -5143,7 +5179,7 @@ test "Box destination construction recomputes after copy capability and allocato
         \\fallible run() int
         \\  const original = Item{value = 41}
         \\  const owner = Box.new?(original)
-        \\  return owner.borrow()[].value
+        \\  return Ref.from(owner.borrow()).value.value
         \\if const result = run() -> exit(result) else exit(43)
     ;
     const fixture = try Fixture.initFiles(source, &.{});
@@ -5313,17 +5349,17 @@ test "deinit rejects borrowed fields aliases and referents" {
         ,
         \\import std.memory
         \\const item = Item{value = 42}
-        \\const alias = std.memory.borrow_local(item)
-        \\exit(consume(alias[]))
+        \\const alias = Ref.from(item)
+        \\exit(consume(alias.value))
         ,
         \\import std.memory
         \\const holder = Holder{item = Item{value = 42}}
-        \\const alias = std.memory.borrow_local(holder)
-        \\exit(consume(alias[].item))
+        \\const alias = Ref.from(holder)
+        \\exit(consume(alias.value.item))
         ,
         \\fallible run() int
         \\  const owner = Box.new?(Item{value = 42})
-        \\  return consume(owner.borrow()[])
+        \\  return consume(Ref.from(owner.borrow()).value)
         \\if const result = run() -> exit(result) else exit(1)
         ,
         \\func run(mut item: Item) int -> consume(item)
@@ -5504,18 +5540,18 @@ test "ownership members preserve reference origins" {
     for ([_][]const u8{ "copy", "move" }) |name| {
         const source = try testing.allocator.print(
             \\fallible run() int
-            \\  const owner = Box.new?(42)
-            \\  const original = owner.borrow()
+            \\  var owner = Box.new?(42)
+            \\  var original = Ref.from(owner.borrow())
             \\  const callback = Ref(int).{s}
             \\  const handle = callback(original)
-            \\  return handle[]
+            \\  return handle.value
             \\if const result = run() -> exit(result) else exit(1)
         , .{name});
         defer testing.allocator.free(source);
         const fixture = try Fixture.initFiles(source, &.{});
         defer fixture.deinit();
         try fixture.expectExit(0, 42);
-        const invalid = try std.mem.replaceOwned(u8, testing.allocator, source, "return handle[]", "const consumed = owner^\n  return handle[]");
+        const invalid = try std.mem.replaceOwned(u8, testing.allocator, source, "return handle.value", "const consumed = owner^\n  return handle.value");
         defer testing.allocator.free(invalid);
         try fixture.db.setInput(queries.SourceText, 0, invalid);
         try fixture.expectDiagnostic(0, .use_after_transfer);
@@ -5686,8 +5722,8 @@ test "consuming selections retain sources and reject borrowed authority" {
         \\import std.memory
         \\func run(flag: int) int
         \\  const item = make(41)
-        \\  const alias = std.memory.borrow_local(item)
-        \\  return consume(if flag == 1 -> alias[] else make(1), 0)
+        \\  const alias = Ref.from(item)
+        \\  return consume(if flag == 1 -> alias.value else make(1), 0)
         \\exit(run(1))
         , .kind = .ownership_transfer_requires_owned_place },
         .{ .body =
@@ -5698,7 +5734,7 @@ test "consuming selections retain sources and reject borrowed authority" {
         .{ .body =
         \\fallible run() int
         \\  const owner = Box.new?(make(42))
-        \\  return consume(owner.borrow()[], 0)
+        \\  return consume(Ref.from(owner.borrow()).value, 0)
         \\if const result = run() -> exit(result) else exit(1)
         , .kind = .ownership_transfer_requires_owned_place },
         .{ .body =
@@ -5745,14 +5781,14 @@ test "consuming selection cleanup distinguishes successful calls from later fail
         \\struct Item
         \\  move = none
         \\  value: int
-        \\  counter: Ref(mut int)
+        \\  counter: Ref(int)
         \\  drop = func(deinit self: Item)
-        \\    self.counter[] = self.counter[] + self.value
+        \\    self.counter.value = self.counter.value + self.value
         \\func consume(deinit item: Item, marker: int) -> ()
         \\fallible fail_value() int
         \\  1 == 0
         \\  return 0
-        \\fallible prepare(imm counter: Ref(mut int), named: int, fails: int) unit
+        \\fallible prepare(var counter: Ref(int), named: int, fails: int) unit
         \\  const item = Item{value = 20, counter = counter}
         \\  if fails == 1
         \\    consume(if named == 1 -> item else Item{value = 22, counter = counter}, fail_value?())
@@ -5760,8 +5796,8 @@ test "consuming selection cleanup distinguishes successful calls from later fail
         \\    consume(if named == 1 -> item else Item{value = 22, counter = counter}, 0)
         \\fallible probe(named: int, fails: int) int
         \\  var counter = Box.new?(0)
-        \\  if prepare(counter.borrow_mut(), named, fails) -> ()
-        \\  return counter.borrow()[]
+        \\  if prepare(Ref.from(counter.borrow()), named, fails) -> ()
+        \\  return Ref.from(counter.borrow()).value
         \\fallible run() int -> probe?(1, 0) + probe?(0, 0) + probe?(1, 1) + probe?(0, 1) - 40
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
@@ -5801,22 +5837,21 @@ test "consuming selections preserve contained reference origins" {
         \\fallible run(flag: int) int
         \\  const first_owner = Box.new?(20)
         \\  const second_owner = Box.new?(22)
-        \\  const first = Item{handle = first_owner.borrow()}
-        \\  const second = Item{handle = second_owner.borrow()}
+        \\  const first = Item{handle = Ref.from(first_owner.borrow())}
+        \\  const second = Item{handle = Ref.from(second_owner.borrow())}
         \\  const handle = take(if flag == 1 -> first else second)
-        \\  return handle[]
+        \\  return handle.value
         \\fallible answer() int -> run?(1) + run?(0)
         \\if const result = answer() -> exit(result) else exit(1)
     , 42);
 
     const rejected = try Fixture.initFiles(
-        \\import std.memory.{borrow_local}
         \\struct Item
         \\  move = none
         \\  value: int
-        \\func invalid(deinit item: Item) Ref(Item) -> borrow_local(Item, item)
+        \\func invalid(deinit item: Item) Ref(Item) -> Ref.from(item)
         \\const handle = invalid(Item{value = 42})
-        \\exit(handle[].value)
+        \\exit(handle.value.value)
     , &.{});
     defer rejected.deinit();
     try rejected.expectDiagnostic(0, .borrow_outlives_source);
@@ -5897,7 +5932,7 @@ test "deinit member call consumes an owned field" {
         \\struct Holder
         \\  storage: Allocation(int)
         \\func dispose(deinit holder: Holder)
-        \\  holder.storage.release()
+        \\  holder.storage.deallocate()
         \\fallible run() unit
         \\  const holder = Holder{storage = allocate?(int, 1)}
         \\  dispose(holder)
@@ -5921,14 +5956,14 @@ test "deinit field consumption invalidates later field reads" {
 }
 
 test "pending deinit arguments retain their storage during argument evaluation" {
-    const cases = [_]struct { call: []const u8, source: []const u8, replacement: []const u8 }{
+    const cases = [_]struct { call: []const u8, source: []const u8, replacement: []const u8, expected: ?u8 = null }{
         .{ .call = "take", .source = "item", .replacement = "item = Pinned{value = 7}" },
         .{ .call = "take", .source = "item^", .replacement = "item = Pinned{value = 7}" },
         .{ .call = "callee", .source = "item", .replacement = "item = Pinned{value = 7}" },
         .{ .call = "generic", .source = "item", .replacement = "item = Pinned{value = 7}" },
         .{ .call = "take", .source = "holder.item", .replacement = "holder.item = Pinned{value = 7}" },
         .{ .call = "take", .source = "holder.item", .replacement = "holder = Holder{item = Pinned{value = 7}, count = 0}" },
-        .{ .call = "take_int", .source = "holder.count", .replacement = "holder.count = 7" },
+        .{ .call = "take_int", .source = "holder.count", .replacement = "holder.count = 7", .expected = 0 },
         .{ .call = "take", .source = "item", .replacement = "take_int(holder.count, if 1 == 1\n      item = Pinned{value = 7}\n      0\n    else 0)" },
     };
     for (cases) |case| {
@@ -5953,7 +5988,10 @@ test "pending deinit arguments retain their storage during argument evaluation" 
             \\exit(run())
         , .{ case.call, case.source, case.replacement });
         defer testing.allocator.free(source);
-        try Fixture.expectSourceDiagnostic(source, .consumed_storage_in_use);
+        if (case.expected) |expected|
+            try Fixture.expectSourceExit(source, expected)
+        else
+            try Fixture.expectSourceDiagnostic(source, .consumed_storage_in_use);
     }
 }
 
@@ -6198,7 +6236,7 @@ test "results that cannot move directly select, widen, or reject without relocat
         .{ .body = "const pinned = if 1 < 2 -> Pinned{value = 42} else none\nif pinned is Pinned -> exit(42) else exit(1)", .kind = null },
         .{ .body = "const pinned = if 1 < 2\n  const value = 40\n  make(value + 2)\nelse Pinned{value = 1}\nexit(pinned.value)", .kind = null },
         .{ .body = "var index = 0\nconst pinned = loop\n  index += 1\n  if index == 42 -> break make(index)\nexit(pinned.value)", .kind = null },
-        .{ .body = "var index = 0\nconst pinned = loop\n  index += 1\n  if index == 1 -> break none\n  break make(index)\nexit(1)", .kind = .relocation_requires_direct_move },
+        .{ .body = "var index = 0\nconst pinned = loop\n  index += 1\n  if index == 1 -> break none\n  break make(index)\nif pinned is none -> exit(42) else exit(1)", .kind = null },
         .{ .body = "const pinned: Pinned = if 1 < 2 -> Pinned{value = 42} else Pinned{value = 1}\nexit(pinned.value)", .kind = null },
         .{ .body = "if 1 < 2\n  Pinned{value = 1}\nexit(42)", .kind = null },
         .{ .body = "func look(imm value: Pinned | none) int -> 42\nconst pinned = Pinned{value = 1}\nexit(look(pinned))", .kind = .relocation_requires_direct_move },
@@ -6525,7 +6563,7 @@ test "a right-hand side that leaves early leaves the replaced place ended once" 
         .{ .body = "func reset(mut tracked: Tracked, c: int)\n  tracked = if c == 1 -> make(2) else return\nvar tracked = make(1)\nreset(tracked, 0)\nexit(1)", .kind = .replaced_value_used },
         .{ .body = "func reset(mut tracked: Tracked, c: int)\n  var index = 0\n  loop\n    index += 1\n    tracked = if index == c -> break else make(index)\n    if index == 3 -> break\nvar tracked = make(1)\nreset(tracked, 1)\nexit(1)", .kind = .possibly_transferred },
         .{ .body = "func run(c: int) int\n  var tracked = make(1)\n  var index = 0\n  loop\n    index += 1\n    tracked = if index == c -> break else make(index)\n    if index == 5 -> break\n  return tracked.value\nexit(run(1))", .kind = .possibly_transferred },
-        .{ .body = "import std.memory\nfunc run() int\n  var pair = Pair{first = make(20), count = 1}\n  const first = std.memory.borrow_local(pair.first)\n  pair.first = make(first[].value + 22)\n  return pair.first.value\nexit(run())", .kind = .borrow_outlives_source },
+        .{ .body = "import std.memory\nfunc run() int\n  var pair = Pair{first = make(20), count = 1}\n  const first = Ref.from(pair.first)\n  pair.first = make(first.value.value + 22)\n  return pair.first.value\nexit(run())", .kind = .borrow_outlives_source },
     };
     for (cases) |case| {
         const source = try std.mem.concat(testing.allocator, u8, &.{
@@ -6554,7 +6592,7 @@ test "a right-hand side that leaves early leaves the replaced place ended once" 
 }
 
 test "joins place copies of existing values without early cleanup" {
-    try Fixture.expectSourceExit(
+    const declarations =
         \\struct Tracked
         \\  move = none
         \\  copy = trivial
@@ -6587,9 +6625,23 @@ test "joins place copies of existing values without early cleanup" {
         \\  const a = make(1)
         \\  return look(if c == 1 -> a else make(2)) * 10 + a.value
         \\func total() int -> bind(1) + bind(0) + select(2) + select(7) + early(1).value + early(0).value + borrowed(1) + borrowed(0)
-        \\static compiled = comptime -> total()
-        \\exit(total() + compiled - 188)
-    , 42);
+    ;
+    const cases = [_]struct { expression: []const u8, expected: u8 }{
+        .{ .expression = "bind(1)", .expected = 11 },
+        .{ .expression = "bind(0)", .expected = 21 },
+        .{ .expression = "select(2)", .expected = 11 },
+        .{ .expression = "select(7)", .expected = 31 },
+        .{ .expression = "early(1).value", .expected = 4 },
+        .{ .expression = "early(0).value", .expected = 5 },
+        .{ .expression = "borrowed(1)", .expected = 11 },
+        .{ .expression = "borrowed(0)", .expected = 21 },
+        .{ .expression = "total()", .expected = 115 },
+    };
+    for (cases) |case| {
+        const source = try std.mem.concat(testing.allocator, u8, &.{ declarations, "\nfunc run() int -> ", case.expression });
+        defer testing.allocator.free(source);
+        try Fixture.expectParity(source, case.expected);
+    }
 }
 
 test "variant copies and transfers construct member by member" {
@@ -6696,14 +6748,13 @@ test "fields end in place when a join transfers them on another path" {
 
 test "borrowed standard results copy into a destination" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{read}
         \\struct Pinned
         \\  move = none
         \\  copy = trivial
         \\  value: int
         \\fallible run() int
         \\  const owner = Box(Pinned).new?(Pinned{value = 42})
-        \\  const copied: Pinned = read(Pinned, false, owner.borrow())
+        \\  const copied: Pinned = (Ref.from(owner.borrow())).value
         \\  return copied.value
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
@@ -7332,13 +7383,13 @@ test "Box rejects noncopyable places and explicit-drop elements" {
         \\if Box.new(Explicit{value = 42}) -> exit(1) else exit(2)
         , .diagnostic = .box_requires_automatic_drop },
         .{ .source =
-        \\import std.memory.{value}
+        \\import std.memory.{take}
         \\struct Immovable
         \\  move = none
         \\  value: int
         \\fallible run() unit
         \\  const owner = Box(Immovable).new?(Immovable{value = 42})
-        \\  const extracted = value(Immovable, owner^)
+        \\  const extracted = take(Immovable, owner^)
         \\  _ = extracted
         \\if run() -> exit(1) else exit(2)
         , .diagnostic = .box_extraction_requires_direct_move },
@@ -7355,10 +7406,10 @@ test "Box rejects noncopyable places and explicit-drop elements" {
 
 test "Box transfers its value and releases its allocation" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{value}
+        \\import std.memory
         \\fallible take() unit
         \\  const owner = Box(int).new?(42)
-        \\  const number = value(int, owner^)
+        \\  const number = std.memory.take(int, owner^)
         \\  number == 42
         \\if take() -> exit(42) else exit(1)
     , 42);
@@ -7366,23 +7417,23 @@ test "Box transfers its value and releases its allocation" {
 
 test "zero-sized Box supports consuming extraction" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{value}
+        \\import std.memory
         \\fallible take() unit
         \\  const owner = Box.new?(())
-        \\  _ = value(unit, owner^)
+        \\  _ = std.memory.take(unit, owner^)
         \\if take() -> exit(42) else exit(1)
     , 42);
 }
 
 test "Box transfers an aggregate value" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{value}
+        \\import std.memory
         \\struct Pair
         \\  first: int
         \\  second: byte
         \\fallible take() unit
         \\  const owner = Box.new?(Pair{first = 42, second = 7})
-        \\  const pair = value(Pair, owner^)
+        \\  const pair = std.memory.take(Pair, owner^)
         \\  pair.first == 42
         \\if take() -> exit(42) else exit(1)
     , 42);
@@ -7390,12 +7441,12 @@ test "Box transfers an aggregate value" {
 
 test "Box can own and transfer another Box" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{value}
+        \\import std.memory
         \\fallible take() unit
         \\  const inner = Box.new?(42)
         \\  const outer = Box(Box(int)).new?(inner^)
-        \\  const moved = value(Box(int), outer^)
-        \\  const number = value(int, moved^)
+        \\  const moved = std.memory.take(Box(int), outer^)
+        \\  const number = std.memory.take(int, moved^)
         \\  number == 42
         \\if take() -> exit(42) else exit(1)
     , 42);
@@ -7416,10 +7467,10 @@ test "zero-sized Box destroys its initialized value on last use" {
 
 test "prelude exports Box and its constructor without exporting raw allocation" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{value}
+        \\import std.memory
         \\fallible take() unit
         \\  const owner: Box(int) = Box.new?(42)
-        \\  const number = value(int, owner^)
+        \\  const number = std.memory.take(int, owner^)
         \\  number == 42
         \\if take() -> exit(42) else exit(1)
     , 42);
@@ -7461,8 +7512,8 @@ test "fallible condition binding initializes an inferred struct field" {
 
 test "fallible condition binding owns its Box on success" {
     const success = try Fixture.initFiles(
-        \\import std.memory.{value}
-        \\if const owner: Box(int) = Box.new(42) -> exit(value(int, owner^)) else exit(1)
+        \\import std.memory.{take}
+        \\if const owner: Box(int) = Box.new(42) -> exit(take(int, owner^)) else exit(1)
     , &.{});
     defer success.deinit();
     try success.expectExit(0, 42);
@@ -7485,20 +7536,20 @@ test "custom copies and moves retain all possible field origins" {
         \\  value: int
         \\  drop = func(deinit self: Item) -> ()
         \\struct Pair
-        \\  first: Ref(mut Item)
-        \\  second: Ref(mut Item)
+        \\  first: Ref(Item)
+        \\  second: Ref(Item)
         \\  $hook
         \\    return Pair{first = self.second, second = self.first}
         \\fallible run() int
         \\  var first_owner = Box.new?(Item{value = 17})
         \\  var second_owner = Box.new?(Item{value = 23})
-        \\  const first = first_owner.borrow_mut()
-        \\  const second = second_owner.borrow_mut()
+        \\  var first = Ref.from(first_owner.borrow())
+        \\  var second = Ref.from(second_owner.borrow())
         \\  const source = Pair{first = first, second = second}
         \\  const copied = $operand
         \\  const handle = copied.first
         \\  $replacement
-        \\  return handle[].value
+        \\  return handle.value.value
         \\if const result = run() -> exit(result) else exit(1)
     ;
     inline for (.{
@@ -7558,15 +7609,15 @@ test "four byte aggregates return through direct and indirect calls" {
 }
 
 test "conditional reference copies preserve live origins and reject replaced owners" {
-    for ([_][]const u8{ "reference", "owner.borrow()" }) |first| {
+    for ([_][]const u8{ "reference", "Ref.from(owner.borrow())" }) |first| {
         for ([_]bool{ false, true }) |replace_owner| {
             const source = try testing.allocator.print(
                 \\fallible run() int
                 \\  var owner = Box.new?(42)
-                \\  const reference = owner.borrow()
+                \\  const reference = Ref.from(owner.borrow())
                 \\  const selected = if 1 == 1 -> {s} else reference
                 \\  {s}
-                \\  return selected[]
+                \\  return selected.value
                 \\if const result = run() -> exit(result) else exit(1)
             , .{ first, if (replace_owner) "owner = Box.new?(17)" else "_ = reference" });
             defer testing.allocator.free(source);
@@ -7587,10 +7638,10 @@ test "partial variant copies retain reference origins" {
         const source = try testing.allocator.print(
             \\fallible run() int
             \\  var owner = Box.new?(42)
-            \\  const reference = owner.borrow()
+            \\  const reference = Ref.from(owner.borrow())
             \\  const selected = if {s} -> reference else Box.new?(17)
             \\  {s}
-            \\  return if const handle = selected as Ref(int) -> handle[] else 0
+            \\  return if const handle = selected as Ref(int) -> handle.value else 0
             \\if const result = run() -> exit(result) else exit(1)
         , .{ case.condition, case.replace });
         defer testing.allocator.free(source);
@@ -7606,24 +7657,24 @@ test "implicit drop effects retain reference parameter identities" {
         \\  value: int
         \\  drop = func(deinit self: Item) -> ()
         \\struct Guard
-        \\  target: Ref(mut Item)
+        \\  target: Ref(Item)
         \\  drop = func(deinit self: Guard)
-        \\    self.target[] = Item{value = 42}
+        \\    self.target.value = Item{value = 42}
         \\func observe(imm previous: Item, marker: int) int -> previous.value
-        \\func inspect(imm reference: Ref(mut Item)) int
-        \\  return observe(reference[], if 1 == 1
+        \\func inspect(var reference: Ref(Item)) int
+        \\  return observe(reference.value, if 1 == 1
         \\    const guard = Guard{target = reference}
         \\    0
         \\  else 0)
         \\fallible run() int
         \\  var owner = Box.new?(Item{value = 17})
-        \\  return inspect(owner.borrow_mut())
+        \\  return inspect(Ref.from(owner.borrow()))
         \\if const result = run() -> exit(result) else exit(1)
     ;
     const fixture = try Fixture.initFiles(source, &.{});
     defer fixture.deinit();
     try fixture.expectDiagnostic(0, .borrow_outlives_source);
-    const repaired = try std.mem.replaceOwned(u8, testing.allocator, source, "observe(reference[],", "observe(Item{value = 17},");
+    const repaired = try std.mem.replaceOwned(u8, testing.allocator, source, "observe(reference.value,", "observe(Item{value = 17},");
     defer testing.allocator.free(repaired);
     try fixture.db.setInput(queries.SourceText, 0, repaired);
     try fixture.expectExit(0, 17);
@@ -7635,20 +7686,20 @@ test "implicit drop effects invalidate pending expression borrows" {
         \\  value: int
         \\  drop = func(deinit self: Item) -> ()
         \\struct Replacer
-        \\  target: Ref(mut Item)
+        \\  target: Ref(Item)
         \\  drop = func(deinit self: Replacer)
-        \\    self.target[] = Item{value = 42}
+        \\    self.target.value = Item{value = 42}
         \\struct Wrapper
         \\  guard: Replacer
         \\func observe(imm previous: Item, marker: int) int -> previous.value
         \\fallible run() int
         \\  var owner = Box.new?(Item{value = 17})
-        \\  const reference = owner.borrow_mut()
+        \\  var reference = Ref.from(owner.borrow())
     ;
     const cases = [_]struct { before: []const u8, after: []const u8, expected: ?u8 }{
-        .{ .before = "  return observe(reference[], if 1 == 1\n", .after = "    0\n  else 0)\n", .expected = null },
-        .{ .before = "  const marker = if 1 == 1\n", .after = "    0\n  else 0\n  return observe(reference[], marker)\n", .expected = 42 },
-        .{ .before = "  return if 1 == 1 -> observe(reference[], 0) else\n", .after = "    0\n", .expected = 17 },
+        .{ .before = "  return observe(reference.value, if 1 == 1\n", .after = "    0\n  else 0)\n", .expected = null },
+        .{ .before = "  const marker = if 1 == 1\n", .after = "    0\n  else 0\n  return observe(reference.value, marker)\n", .expected = 42 },
+        .{ .before = "  return if 1 == 1 -> observe(reference.value, 0) else\n", .after = "    0\n", .expected = 17 },
     };
     for ([_][]const u8{
         "Replacer{target = reference}",
@@ -7668,24 +7719,26 @@ test "implicit drop effects invalidate pending expression borrows" {
     }
 }
 
-test "custom copy and move effects invalidate pending borrows" {
+test "custom copy permissions and move effects protect pending borrows" {
     const cases = .{
-        .{ .movement = "", .hook = "copy = func(imm", .parameter = "Copier", .argument = "source", .access = "copied.target[].value" },
-        .{ .movement = "", .hook = "copy = func(imm", .parameter = "Box(Copier)", .argument = "Box(Copier).new?(source)", .access = "copied.borrow()[].target[].value" },
-        .{ .movement = "  move = none\n", .hook = "copy = func(imm", .parameter = "Box(Copier)", .argument = "Box(Copier).new?(source)", .access = "copied.borrow()[].target[].value" },
-        .{ .movement = "", .hook = "move = func(deinit", .parameter = "Copier", .argument = "source^", .access = "copied.target[].value" },
+        .{ .movement = "", .hook = "copy = func(imm", .parameter = "Copier", .argument = "source", .access = "copied.target.value.value" },
+        .{ .movement = "", .hook = "copy = func(imm", .parameter = "Box(Copier)", .argument = "Box(Copier).new?(source)", .access = "Ref.from(copied.borrow()).value.target.value.value" },
+        .{ .movement = "  move = none\n", .hook = "copy = func(imm", .parameter = "Box(Copier)", .argument = "Box(Copier).new?(source)", .access = "Ref.from(copied.borrow()).value.target.value.value" },
+        .{ .movement = "", .hook = "move = func(deinit", .parameter = "Copier", .argument = "source^", .access = "copied.target.value.value" },
     };
     inline for (cases) |case| {
+        const is_copy = std.mem.startsWith(u8, case.hook, "copy");
         const source = try std.mem.concat(testing.allocator, u8, &.{
             "struct Item\n  value: int\n  drop = func(deinit self: Item) -> ()\nstruct Copier\n",
             case.movement,
-            "  target: Ref(mut Item)\n  ",
+            "  target: Ref(Item)\n  ",
             case.hook,
-            " self: Copier) Copier\n    self.target[] = Item{value = 42}\n    return Copier{target = self.target}\nfunc observe(imm previous: Item, var copied: ",
+            " self: Copier) Copier\n    self.target.value = Item{value = 42}\n    return Copier{target = self.target}\nfunc observe(imm previous: Item, var copied: ",
             case.parameter,
             ") int -> previous.value + ",
             case.access,
-            " - 42\nfallible run() int\n  var owner = Box.new?(Item{value = 17})\n  const reference = owner.borrow_mut()\n  const source = Copier{target = reference}\n  return observe(reference[], ",
+            if (is_copy) " - 17" else " - 42",
+            "\nfallible run() int\n  var owner = Box.new?(Item{value = 17})\n  var reference = Ref.from(owner.borrow())\n  var source = Copier{target = reference}\n  return observe(reference.value, ",
             case.argument,
             ")\nif const result = run() -> exit(result) else exit(1)",
         });
@@ -7693,7 +7746,10 @@ test "custom copy and move effects invalidate pending borrows" {
         const fixture = try Fixture.initFiles(source, &.{});
         defer fixture.deinit();
         try fixture.expectDiagnostic(0, .borrow_outlives_source);
-        const repaired = try std.mem.replaceOwned(u8, testing.allocator, source, "observe(reference[], ", "observe(Item{value = 17}, ");
+        const repaired = if (is_copy)
+            try std.mem.replaceOwned(u8, testing.allocator, source, "self.target.value = Item{value = 42}", "_ = self.target.value")
+        else
+            try std.mem.replaceOwned(u8, testing.allocator, source, "observe(reference.value, ", "observe(Item{value = 17}, ");
         defer testing.allocator.free(repaired);
         try fixture.db.setInput(queries.SourceText, 0, repaired);
         try fixture.expectExit(0, 17);
@@ -7702,14 +7758,14 @@ test "custom copy and move effects invalidate pending borrows" {
 
 test "Box.new copies into a new Box without consuming its source" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{value}
+        \\import std.memory.{take}
         \\struct Copyable
         \\  copy = func(imm self: Copyable) Copyable -> Copyable{value = self.value + 1}
         \\  value: int
         \\fallible run() int
         \\  const source = Copyable{value = 41}
         \\  const owner = Box(Copyable).new?(source)
-        \\  const copied = value(Copyable, owner^)
+        \\  const copied = take(Copyable, owner^)
         \\  return copied.value + source.value - 41
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
@@ -7831,17 +7887,28 @@ test "Box.new rejects explicitly droppable values" {
     try fixture.expectLibraryDiagnostic(.box_requires_automatic_drop);
 }
 
-test "reference replacement eligibility is checked for function values" {
-    const fixture = try Fixture.initFiles(
-        \\fallible run() unit
+test "reference field assignment through function values retains stored origins" {
+    const source =
+        \\func replace(ref target: Ref(int), imm source: Ref(int)) -> target = source
+        \\fallible run() int
+        \\  const previous = Box.new?(7)
         \\  const owner = Box.new?(42)
-        \\  var holder = Box.new?(owner.borrow())
-        \\  const replace = Ref(mut Ref(int)).replace
-        \\  replace(holder.borrow_mut(), owner.borrow())
-        \\if run() -> exit(1) else exit(2)
-    , &.{});
+        \\  var holder = Box.new?(Ref.from(previous.borrow()))
+        \\  const callback = replace
+        \\  callback(holder.borrow(), Ref.from(owner.borrow()))
+        \\  return holder.borrow().value
+        \\if const result = run() -> exit(result) else exit(1)
+    ;
+    const fixture = try Fixture.initFiles(
+        source,
+        &.{},
+    );
     defer fixture.deinit();
-    try fixture.expectLibraryDiagnostic(.borrow_write_cannot_store_borrow);
+    try fixture.expectExit(0, 42);
+    const invalid = try std.mem.replaceOwned(u8, testing.allocator, source, "return holder.borrow().value", "const moved = owner^\n  _ = moved\n  return holder.borrow().value");
+    defer testing.allocator.free(invalid);
+    try fixture.db.setInput(queries.SourceText, 0, invalid);
+    try fixture.expectDiagnostic(0, .use_after_transfer);
 }
 
 test "library eligibility is checked for function values" {
@@ -7899,11 +7966,11 @@ test "Box cannot be implicitly copied or used after transfer" {
         \\if copy_owner() -> exit(1) else exit(2)
         , .diagnostic = .type_not_copyable },
         .{ .source =
-        \\import std.memory.{Box, value}
+        \\import std.memory.{Box, take}
         \\fallible take_twice() unit
         \\  const owner = Box.new?(42)
-        \\  const first = value(int, owner^)
-        \\  const second = value(int, owner^)
+        \\  const first = take(int, owner^)
+        \\  const second = take(int, owner^)
         \\  _ = first
         \\  _ = second
         \\if take_twice() -> exit(1) else exit(2)
@@ -8459,11 +8526,10 @@ test "where clauses can repeat on one signature line" {
 
 test "where clauses follow borrowed return types without origin annotations" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_mut_box, read}
-        \\func forward(static T: type, imm reference: Ref(mut T)) Ref(mut T) where T is int -> reference
+        \\func forward(static T: type, var reference: Ref(T)) Ref(T) where T is int -> reference
         \\fallible run() int
         \\  var owner = Box.new?(42)
-        \\  return read(int, true, forward(int, borrow_mut_box(int, owner)))
+        \\  return (forward(int, Ref.from(owner.borrow()))).value
         \\if const result = run() -> exit(result) else exit(1)
     , 42);
 }
@@ -8991,12 +9057,12 @@ fn checkCleanupEffectAllocations(gpa: std.mem.Allocator) !void {
         \\  value: int
         \\  drop = func(deinit self: Item) -> ()
         \\struct Guard
-        \\  target: Ref(mut Item)
+        \\  target: Ref(Item)
         \\  drop = func(deinit self: Guard)
-        \\    self.target[] = Item{value = 42}
+        \\    self.target.value = Item{value = 42}
         \\func observe(imm previous: Item, marker: int) int -> previous.value
-        \\func inspect(imm reference: Ref(mut Item)) int
-        \\  return observe(reference[], if 1 == 1
+        \\func inspect(var reference: Ref(Item)) int
+        \\  return observe(reference.value, if 1 == 1
         \\    const guard = Guard{target = reference}
         \\    0
         \\  else 0)
@@ -9292,15 +9358,14 @@ test "init capture mutable calls update caller storage through forwarding" {
 
 test "init capture checked references survive generic indirect forwarding" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_local}
         \\fallible materialize(static T: type, init item: T) T -> return item
         \\fallible forward(init item: Ref(int)) Ref(int) -> return materialize?(item)
         \\fallible indirect(imm callback: fallible(init Ref(int)) Ref(int), init item: Ref(int)) Ref(int) -> return callback?(item)
         \\fallible run() int
         \\    var value = 42
-        \\    const reference = borrow_local(int, value)
+        \\    const reference = Ref.from(value)
         \\    const result = indirect?(forward, reference)
-        \\    return result[]
+        \\    return result.value
         \\if const status = run() -> exit(status) else exit(97)
     , 42);
 }
@@ -9354,9 +9419,29 @@ test "init capture field transfers clean partial region failure and residual fie
 }
 
 test "init capture deferred effects reject overlapping eager inputs and callee" {
+    try Fixture.expectSourceExit(
+        \\fallible materialize(init item: int) int -> return item
+        \\fallible receive(imm eager: int, init item: int) int
+        \\    const materialized = materialize?(item)
+        \\    return eager + materialized
+        \\fallible run() int
+        \\    var value = 42
+        \\    return receive?(value, if true == true
+        \\        value = 7
+        \\        0
+        \\    else 0)
+        \\if const status = run() -> exit(status) else exit(97)
+    , 42);
+    try Fixture.expectSourceExit(
+        \\fallible receive(init item: int, imm eager: int) int -> return item
+        \\fallible run() int
+        \\    var value = 1
+        \\    return receive?(value^, value)
+        \\if const status = run() -> exit(status) else exit(97)
+    , 1);
     const sources = [_][]const u8{
-        "fallible receive(imm eager: int, init item: int) int -> return item\nfallible run() int\n    var value = 1\n    return receive?(value, if true == true\n        value = 42\n        0\n    else 0)\nif const status = run() -> exit(status) else exit(97)",
-        "fallible receive(init item: int, imm eager: int) int -> return item\nfallible run() int\n    var value = 1\n    return receive?(value^, value)\nif const status = run() -> exit(status) else exit(97)",
+        "struct Item\n    copy = none\n    value: int\nfallible receive(imm eager: Item, init item: int) int -> return item\nfallible run() int\n    var value = Item{value = 1}\n    return receive?(value, if true == true\n        value = Item{value = 42}\n        0\n    else 0)\nif const status = run() -> exit(status) else exit(97)",
+        "struct Item\n    copy = none\n    value: int\nfallible receive(init item: Item, imm eager: Item) Item -> return item\nfallible run() Item\n    var value = Item{value = 1}\n    return receive?(value^, value)\nif const status = run() -> exit(status.value) else exit(97)",
         "fallible receive(init item: int) int -> return item\nfallible other(init item: int) int -> return item\nfallible run() int\n    var callback: fallible(init int) int = receive\n    return callback?(if true == true\n        callback = other\n        42\n    else 0)\nif const status = run() -> exit(status) else exit(97)",
     };
     for (sources) |source| {
@@ -9407,8 +9492,8 @@ test "init capture writes survive failure after deferred mutable calls" {
 
 test "init capture reference writes execute only during construction" {
     try Fixture.expectSourceExit(
-        \\func change(imm reference: Ref(mut int)) int
-        \\    reference[] = 42
+        \\func change(var reference: Ref(int)) int
+        \\    reference.value = 42
         \\    return 0
         \\fallible materialize(init item: int) int -> return item
         \\fallible skip(init item: int) int
@@ -9416,10 +9501,10 @@ test "init capture reference writes execute only during construction" {
         \\    return item
         \\fallible run() int
         \\    var owner = Box.new?(1)
-        \\    const reference = owner.borrow_mut()
+        \\    var reference = Ref.from(owner.borrow())
         \\    if const unused = skip(change(reference)) -> return 99
-        \\    if reference[] == 1 -> materialize?(change(reference)) else return 98
-        \\    return reference[]
+        \\    if reference.value == 1 -> materialize?(change(reference)) else return 98
+        \\    return reference.value
         \\if const answer = run() -> exit(answer) else exit(97)
     , 42);
 }
@@ -9464,18 +9549,18 @@ test "init capture loop consuming places preserve selected completion state" {
 test "init capture transfer hooks run exactly once across skipped and failed construction" {
     try Fixture.expectSourceExit(
         \\struct Item
-        \\    counter: Ref(mut int)
+        \\    counter: Ref(int)
         \\    copy = none
         \\    move = func(deinit self: Item) Item
-        \\        self.counter[] = self.counter[] + 1
+        \\        self.counter.value = self.counter.value + 1
         \\        return Item{counter = self.counter}
         \\    drop = func(deinit self: Item)
-        \\        self.counter[] = self.counter[] + 10
+        \\        self.counter.value = self.counter.value + 10
         \\struct Pair
         \\    move = none
         \\    first: Item
         \\    second: Item
-        \\fallible fail_value(imm counter: Ref(mut int)) Item
+        \\fallible fail_value(var counter: Ref(int)) Item
         \\    1 == 0
         \\    return Item{counter = counter}
         \\fallible receive(init item: Item, imm construct: bool) int
@@ -9486,14 +9571,14 @@ test "init capture transfer hooks run exactly once across skipped and failed con
         \\fallible materialize(init item: Pair) Pair -> return item
         \\fallible root(imm construct: bool) int
         \\    var counter = Box.new?(0)
-        \\    const source = Item{counter = counter.borrow_mut()}
+        \\    var source = Item{counter = Ref.from(counter.borrow())}
         \\    if const unused = receive(source^, construct) -> return 99
-        \\    return counter.borrow()[]
+        \\    return Ref.from(counter.borrow()).value
         \\fallible field() int
         \\    var counter = Box.new?(0)
-        \\    const source = Pair{first = Item{counter = counter.borrow_mut()}, second = Item{counter = counter.borrow_mut()}}
-        \\    if const unused = materialize(Pair{first = source.first^, second = fail_value?(counter.borrow_mut())}) -> return 99
-        \\    return counter.borrow()[]
+        \\    var source = Pair{first = Item{counter = Ref.from(counter.borrow())}, second = Item{counter = Ref.from(counter.borrow())}}
+        \\    if const unused = materialize(Pair{first = source.first^, second = fail_value?(Ref.from(counter.borrow()))}) -> return 99
+        \\    return Ref.from(counter.borrow()).value
         \\fallible run() int
         \\    const skipped = root?(false)
         \\    if skipped == 10 -> () else return 100 + skipped
@@ -9561,17 +9646,16 @@ test "init capture repeated writes retain their original storage parameter" {
 test "init capture writes refresh returned references to caller storage" {
     try Fixture.expectSourceExit(
         \\import std.memory
-        \\import std.memory.{borrow_local}
         \\fallible materialize(init item: Ref(int)) Ref(int) -> return item
         \\fallible run() int
         \\    var value = 1
         \\    const reference = materialize?(if true == true
         \\        value = 42
-        \\        borrow_local(int, value)
-        \\    else borrow_local(int, value))
-        \\    const alias = std.memory.borrow_mut_local(value)
-        \\    alias[] = 7
-        \\    return reference[] + 35
+        \\        Ref.from(value)
+        \\    else Ref.from(value))
+        \\    var alias = Ref.from(value)
+        \\    alias.value = 7
+        \\    return reference.value + 35
         \\if const status = run() -> exit(status) else exit(97)
     , 42);
 }
@@ -9609,21 +9693,21 @@ test "init capture writes do not remove caller transfer authority" {
 test "init capture owned replacements survive later region failure" {
     try Fixture.expectSourceExit(
         \\struct Item
-        \\    counter: Ref(mut int)
+        \\    counter: Ref(int)
         \\    drop = func(deinit self: Item)
-        \\        self.counter[] = self.counter[] + 10
+        \\        self.counter.value = self.counter.value + 10
         \\fallible fail_value() int
         \\    1 == 0
         \\    return 0
         \\fallible materialize(init item: int) int -> return item
         \\fallible run() int
         \\    var counter = Box.new?(0)
-        \\    var source = Item{counter = counter.borrow_mut()}
+        \\    var source = Item{counter = Ref.from(counter.borrow())}
         \\    if const unused = materialize(if true == true
-        \\        source = Item{counter = counter.borrow_mut()}
+        \\        source = Item{counter = Ref.from(counter.borrow())}
         \\        fail_value?()
         \\    else 0) -> return 99
-        \\    return counter.borrow()[] + 22
+        \\    return Ref.from(counter.borrow()).value + 22
         \\if const answer = run() -> exit(answer) else exit(98)
     , 42);
 }
@@ -9633,22 +9717,22 @@ test "init captured replacement does not revive stale references" {
         \\fallible materialize(init item: Ref(int)) Ref(int) -> return item
         \\fallible run() int
         \\    var owner = Box.new?(1)
-        \\    const reference = owner.borrow()
-        \\    const observed = reference[]
+        \\    const reference = Ref.from(owner.borrow())
+        \\    const observed = reference.value
         \\    const result = materialize?(if observed == 1
         \\        owner = Box.new?(2)
         \\        reference
         \\    else reference)
-        \\    return result[]
+        \\    return result.value
         \\if const result = run() -> exit(result) else exit(97)
     ;
     const unchanged_source = try std.mem.replaceOwned(u8, testing.allocator, source, "owner = Box.new?(2)", "const replacement = Box.new?(2)");
     defer testing.allocator.free(unchanged_source);
     try Fixture.expectSourceExit(unchanged_source, 1);
 
-    const fresh_branch = try std.mem.replaceOwned(u8, testing.allocator, source, "        reference", "        owner.borrow()");
+    const fresh_branch = try std.mem.replaceOwned(u8, testing.allocator, source, "        reference", "        Ref.from(owner.borrow())");
     defer testing.allocator.free(fresh_branch);
-    const fresh_source = try std.mem.replaceOwned(u8, testing.allocator, fresh_branch, "else reference", "else owner.borrow()");
+    const fresh_source = try std.mem.replaceOwned(u8, testing.allocator, fresh_branch, "else reference", "else Ref.from(owner.borrow())");
     defer testing.allocator.free(fresh_source);
     try Fixture.expectSourceExit(fresh_source, 2);
 
@@ -9657,11 +9741,11 @@ test "init captured replacement does not revive stale references" {
         \\fallible run() int
         \\    var owner = Box.new?(1)
         \\    const result = materialize?(if 1 == 1
-        \\        const reference = owner.borrow()
+        \\        const reference = Ref.from(owner.borrow())
         \\        owner = Box.new?(2)
         \\        reference
-        \\    else owner.borrow())
-        \\    return result[]
+        \\    else Ref.from(owner.borrow()))
+        \\    return result.value
         \\if const result = run() -> exit(result) else exit(97)
     , .borrow_outlives_source);
 
@@ -9684,10 +9768,10 @@ test "init captured replacement does not revive stale references" {
 test "init capture restoration after transfer restores caller cleanup" {
     try Fixture.expectSourceExit(
         \\struct Item
-        \\    counter: Ref(mut int)
+        \\    counter: Ref(int)
         \\    weight: int
         \\    drop = func(deinit self: Item)
-        \\        self.counter[] = self.counter[] + self.weight
+        \\        self.counter.value = self.counter.value + self.weight
         \\func take(var item: Item) int -> return 0
         \\fallible fail_value() int
         \\    1 == 0
@@ -9695,13 +9779,13 @@ test "init capture restoration after transfer restores caller cleanup" {
         \\fallible materialize(init item: int) int -> return item
         \\fallible run() int
         \\    var counter = Box.new?(0)
-        \\    var source = Item{counter = counter.borrow_mut(), weight = 10}
+        \\    var source = Item{counter = Ref.from(counter.borrow()), weight = 10}
         \\    if const unused = materialize(if true == true
         \\        take(source^)
-        \\        source = Item{counter = counter.borrow_mut(), weight = 32}
+        \\        source = Item{counter = Ref.from(counter.borrow()), weight = 32}
         \\        fail_value?()
         \\    else 0) -> return 99
-        \\    return counter.borrow()[]
+        \\    return Ref.from(counter.borrow()).value
         \\if const answer = run() -> exit(answer) else exit(98)
     , 42);
 }
@@ -9732,10 +9816,10 @@ test "init capture restored sources support successive receiving calls" {
 test "init capture restored fields keep caller cleanup on later failure" {
     try Fixture.expectSourceExit(
         \\struct Item
-        \\    counter: Ref(mut int)
+        \\    counter: Ref(int)
         \\    weight: int
         \\    drop = func(deinit self: Item)
-        \\        self.counter[] = self.counter[] + self.weight
+        \\        self.counter.value = self.counter.value + self.weight
         \\struct Pair
         \\    first: Item
         \\    second: int
@@ -9746,13 +9830,13 @@ test "init capture restored fields keep caller cleanup on later failure" {
         \\fallible materialize(init item: int) int -> return item
         \\fallible run() int
         \\    var counter = Box.new?(0)
-        \\    var source = Pair{first = Item{counter = counter.borrow_mut(), weight = 10}, second = 0}
+        \\    var source = Pair{first = Item{counter = Ref.from(counter.borrow()), weight = 10}, second = 0}
         \\    if const unused = materialize(if true == true
         \\        take(source.first^)
-        \\        source.first = Item{counter = counter.borrow_mut(), weight = 32}
+        \\        source.first = Item{counter = Ref.from(counter.borrow()), weight = 32}
         \\        fail_value?()
         \\    else 0) -> return 99
-        \\    return counter.borrow()[]
+        \\    return Ref.from(counter.borrow()).value
         \\if const answer = run() -> exit(answer) else exit(98)
     , 42);
 }
@@ -9760,9 +9844,9 @@ test "init capture restored fields keep caller cleanup on later failure" {
 test "init capture root and field alternatives share failure cleanup" {
     try Fixture.expectSourceExit(
         \\struct Item
-        \\    counter: Ref(mut int)
+        \\    counter: Ref(int)
         \\    drop = func(deinit self: Item)
-        \\        self.counter[] = self.counter[] + 10
+        \\        self.counter.value = self.counter.value + 10
         \\struct Pair
         \\    first: Item
         \\    second: Item
@@ -9774,9 +9858,9 @@ test "init capture root and field alternatives share failure cleanup" {
         \\fallible materialize(init item: int) int -> return item
         \\fallible run(imm whole: bool) int
         \\    var counter = Box.new?(0)
-        \\    const source = Pair{first = Item{counter = counter.borrow_mut()}, second = Item{counter = counter.borrow_mut()}}
+        \\    var source = Pair{first = Item{counter = Ref.from(counter.borrow())}, second = Item{counter = Ref.from(counter.borrow())}}
         \\    if const unused = materialize(if whole == true -> consume_pair(source^) + fail_value?() else consume_item(source.first^) + fail_value?()) -> return 99
-        \\    return counter.borrow()[] + 1
+        \\    return Ref.from(counter.borrow()).value + 1
         \\fallible calculate() int
         \\    const whole = run?(true)
         \\    if whole == 21 -> () else return 100 + whole
@@ -9788,9 +9872,9 @@ test "init capture root and field alternatives share failure cleanup" {
 test "init capture ancestor and nested field alternatives share failure cleanup" {
     try Fixture.expectSourceExit(
         \\struct Item
-        \\    counter: Ref(mut int)
+        \\    counter: Ref(int)
         \\    drop = func(deinit self: Item)
-        \\        self.counter[] = self.counter[] + 10
+        \\        self.counter.value = self.counter.value + 10
         \\struct Pair
         \\    first: Item
         \\    second: Item
@@ -9804,9 +9888,9 @@ test "init capture ancestor and nested field alternatives share failure cleanup"
         \\fallible materialize(init item: int) int -> return item
         \\fallible run(imm whole: bool) int
         \\    var counter = Box.new?(0)
-        \\    const source = Outer{pair = Pair{first = Item{counter = counter.borrow_mut()}, second = Item{counter = counter.borrow_mut()}}}
+        \\    var source = Outer{pair = Pair{first = Item{counter = Ref.from(counter.borrow())}, second = Item{counter = Ref.from(counter.borrow())}}}
         \\    if const unused = materialize(if whole == true -> take_pair(source.pair^) + fail_value?() else take_item(source.pair.first^) + fail_value?()) -> return 99
-        \\    return counter.borrow()[] + 1
+        \\    return Ref.from(counter.borrow()).value + 1
         \\fallible calculate() int -> return run?(true) + run?(false)
         \\if const answer = calculate() -> exit(answer) else exit(98)
     , 42);
@@ -9818,10 +9902,10 @@ test "init capture explicit references preserve deferred place access" {
         \\fallible materialize(init item: int) int -> return item
         \\fallible run() int
         \\    var value = 1
-        \\    const alias = std.memory.borrow_mut_local(value)
+        \\    var alias = Ref.from(value)
         \\    const result = materialize?(if true == true
-        \\        alias[] = 42
-        \\        alias[]
+        \\        alias.value = 42
+        \\        alias.value
         \\    else 0)
         \\    return value + result - 42
         \\if const status = run() -> exit(status) else exit(97)
@@ -9830,7 +9914,6 @@ test "init capture explicit references preserve deferred place access" {
 
 test "init capture nested reference projections survive selection and wrapping" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_local}
         \\struct Inner
         \\    reference: Ref(int)
         \\    copy = trivial
@@ -9840,29 +9923,27 @@ test "init capture nested reference projections survive selection and wrapping" 
         \\fallible forward(static T: type, init item: T) T -> return materialize?(T, item)
         \\fallible run() int
         \\    var value = 42
-        \\    const source = Outer{inner = Inner{reference = borrow_local(int, value)}}
+        \\    const source = Outer{inner = Inner{reference = Ref.from(value)}}
         \\    const selected = forward?(Ref(int), source.inner.reference)
         \\    const wrapped = forward?(Outer, Outer{inner = source.inner})
-        \\    return selected[] + wrapped.inner.reference[] - 42
+        \\    return selected.value + wrapped.inner.reference.value - 42
         \\if const status = run() -> exit(status) else exit(97)
     , 42);
     const selected = try Fixture.initFiles(
-        \\import std.memory.{borrow_local}
         \\struct References
         \\    external: Ref(int)
         \\    local: Ref(int)
         \\fallible materialize(init item: Ref(int)) Ref(int) -> return item
         \\fallible select(imm external: Ref(int)) Ref(int)
         \\    var local = 1
-        \\    const source = References{external = external, local = borrow_local(int, local)}
+        \\    const source = References{external = external, local = Ref.from(local)}
         \\    return materialize?(source.external)
         \\var value = 42
-        \\if const status = select(borrow_local(int, value)) -> exit(status[]) else exit(97)
+        \\if const status = select(Ref.from(value)) -> exit(status.value) else exit(97)
     , &.{});
     defer selected.deinit();
     try selected.expectExit(0, 42);
     try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{borrow_local}
         \\struct Inner
         \\    reference: Ref(int)
         \\    copy = trivial
@@ -9871,18 +9952,18 @@ test "init capture nested reference projections survive selection and wrapping" 
         \\fallible materialize(init item: Outer) Outer -> return item
         \\fallible escape() Ref(int)
         \\    var value = 42
-        \\    const source = Inner{reference = borrow_local(int, value)}
+        \\    const source = Inner{reference = Ref.from(value)}
         \\    return materialize?(Outer{inner = source}).inner.reference
-        \\if const status = escape() -> exit(status[]) else exit(97)
+        \\if const status = escape() -> exit(status.value) else exit(97)
     , .borrow_outlives_source);
 }
 
 test "init capture multiple receiving calls share exact failure cleanup" {
     try Fixture.expectSourceExit(
         \\struct Item
-        \\    counter: Ref(mut int)
+        \\    counter: Ref(int)
         \\    drop = func(deinit self: Item)
-        \\        self.counter[] = self.counter[] + 21
+        \\        self.counter.value = self.counter.value + 21
         \\fallible receive(init item: Item, imm construct: bool) int
         \\    construct == true
         \\    const value = item
@@ -9890,13 +9971,13 @@ test "init capture multiple receiving calls share exact failure cleanup" {
         \\    return 0
         \\fallible run(imm first_path: bool, imm construct: bool) int
         \\    var counter = Box.new?(0)
-        \\    const first = Item{counter = counter.borrow_mut()}
-        \\    const second = Item{counter = counter.borrow_mut()}
+        \\    var first = Item{counter = Ref.from(counter.borrow())}
+        \\    var second = Item{counter = Ref.from(counter.borrow())}
         \\    if first_path == true
         \\        if const unused = receive(first^, construct) -> return 99
         \\    else
         \\        if const unused = receive(second^, construct) -> return 99
-        \\    return counter.borrow()[]
+        \\    return Ref.from(counter.borrow()).value
         \\fallible calculate() int
         \\    return (run?(true, true) + run?(true, false) + run?(false, true) + run?(false, false)) / 4
         \\if const answer = calculate() -> exit(answer) else exit(98)
@@ -9905,7 +9986,6 @@ test "init capture multiple receiving calls share exact failure cleanup" {
 
 test "init capture receiving mutable reference outputs preserve initializer origins" {
     try Fixture.expectSourceExit(
-        \\import std.memory.{borrow_local}
         \\fallible install(init input: Ref(int), mut output: Ref(int))
         \\    output = input
         \\fallible forward(init input: Ref(int), mut output: Ref(int))
@@ -9913,32 +9993,31 @@ test "init capture receiving mutable reference outputs preserve initializer orig
         \\fallible run() int
         \\    var old = 1
         \\    var value = 42
-        \\    var output = borrow_local(int, old)
+        \\    var output = Ref.from(old)
         \\    const callback: fallible(init Ref(int), mut Ref(int)) unit = forward
-        \\    callback?(borrow_local(int, value), output)
-        \\    return output[]
+        \\    callback?(Ref.from(value), output)
+        \\    return output.value
         \\if const status = run() -> exit(status) else exit(97)
     , 42);
     try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{borrow_local}
         \\fallible install(init input: Ref(int), mut output: Ref(int))
         \\    output = input
         \\fallible escape(imm previous: Ref(int)) Ref(int)
         \\    var local = 42
         \\    var output = previous
-        \\    install?(borrow_local(int, local), output)
+        \\    install?(Ref.from(local), output)
         \\    return output
         \\var value = 1
-        \\if const status = escape(borrow_local(int, value)) -> exit(status[]) else exit(97)
+        \\if const status = escape(Ref.from(value)) -> exit(status.value) else exit(97)
     , .borrow_outlives_source);
 }
 
 test "init capture consuming joins keep mixed captured and local owners separate" {
     try Fixture.expectSourceExit(
         \\struct Item
-        \\    counter: Ref(mut int)
+        \\    counter: Ref(int)
         \\    drop = func(deinit self: Item)
-        \\        self.counter[] = self.counter[] + 10
+        \\        self.counter.value = self.counter.value + 10
         \\func consume(deinit item: Item, imm eager: int) int -> return 0
         \\fallible fail_value() int
         \\    1 == 0
@@ -9946,9 +10025,9 @@ test "init capture consuming joins keep mixed captured and local owners separate
         \\fallible materialize(init item: int) int -> return item
         \\fallible run(imm captured: bool) int
         \\    var counter = Box.new?(0)
-        \\    const source = Item{counter = counter.borrow_mut()}
-        \\    if const unused = materialize(consume(if captured == true -> source else Item{counter = counter.borrow_mut()}, fail_value?())) -> return 99
-        \\    return counter.borrow()[]
+        \\    var source = Item{counter = Ref.from(counter.borrow())}
+        \\    if const unused = materialize(consume(if captured == true -> source else Item{counter = Ref.from(counter.borrow())}, fail_value?())) -> return 99
+        \\    return Ref.from(counter.borrow()).value
         \\fallible calculate() int
         \\    const captured = run?(true)
         \\    if captured == 10 -> () else return 100 + captured
@@ -9957,9 +10036,9 @@ test "init capture consuming joins keep mixed captured and local owners separate
     , 42);
     const loop = try Fixture.initFiles(
         \\struct Item
-        \\    counter: Ref(mut int)
+        \\    counter: Ref(int)
         \\    drop = func(deinit self: Item)
-        \\        self.counter[] = self.counter[] + 10
+        \\        self.counter.value = self.counter.value + 10
         \\func consume(deinit item: Item, imm eager: int) int -> return 0
         \\fallible fail_value() int
         \\    1 == 0
@@ -9967,9 +10046,9 @@ test "init capture consuming joins keep mixed captured and local owners separate
         \\fallible materialize(init item: int) int -> return item
         \\fallible run(imm captured: bool) int
         \\    var counter = Box.new?(0)
-        \\    const source = Item{counter = counter.borrow_mut()}
-        \\    if const unused = materialize(consume(loop -> break if captured == true -> source else Item{counter = counter.borrow_mut()}, fail_value?())) -> return 99
-        \\    return counter.borrow()[]
+        \\    var source = Item{counter = Ref.from(counter.borrow())}
+        \\    if const unused = materialize(consume(loop -> break if captured == true -> source else Item{counter = Ref.from(counter.borrow())}, fail_value?())) -> return 99
+        \\    return Ref.from(counter.borrow()).value
         \\fallible calculate() int
         \\    const captured = run?(true)
         \\    if captured == 10 -> () else return 100 + captured
@@ -10109,25 +10188,25 @@ test "init lexical pending consumption preserves roots and fields across joins" 
     const expressions = [_][]const u8{
         \\loop
         \\        if captured == true -> break selected
-        \\        break Source{counter = counter.borrow_mut(), weight = 10}
+        \\        break Source{counter = Ref.from(counter.borrow()), weight = 10}
         \\    , eager?(succeeds)
         ,
         \\if captured == true -> loop
         \\        if 1 == 1 -> break selected
-        \\        break Source{counter = counter.borrow_mut(), weight = 99}
-        \\    else Source{counter = counter.borrow_mut(), weight = 10}, eager?(succeeds)
+        \\        break Source{counter = Ref.from(counter.borrow()), weight = 99}
+        \\    else Source{counter = Ref.from(counter.borrow()), weight = 10}, eager?(succeeds)
         ,
         \\loop
         \\        break loop
         \\            if captured == true -> break selected
-        \\            break Source{counter = counter.borrow_mut(), weight = 10}
+        \\            break Source{counter = Ref.from(counter.borrow()), weight = 10}
         \\    , eager?(succeeds)
         ,
     };
     const places = [_]struct { declaration: []const u8, payload: []const u8, captured_count: u32, fresh_count: u32, adjustment: []const u8 }{
         .{
             .declaration =
-            \\    const source = Source{counter = counter.borrow_mut(), weight = 1}
+            \\    var source = Source{counter = Ref.from(counter.borrow()), weight = 1}
             \\    return
             ,
             .payload = "source",
@@ -10137,7 +10216,7 @@ test "init lexical pending consumption preserves roots and fields across joins" 
         },
         .{
             .declaration =
-            \\    const pair = Pair{selected = Source{counter = counter.borrow_mut(), weight = 1}, sibling = Source{counter = counter.borrow_mut(), weight = 100}}
+            \\    var pair = Pair{selected = Source{counter = Ref.from(counter.borrow()), weight = 1}, sibling = Source{counter = Ref.from(counter.borrow()), weight = 100}}
             \\    return
             ,
             .payload = "pair.selected",
@@ -10149,14 +10228,14 @@ test "init lexical pending consumption preserves roots and fields across joins" 
     for (places) |place| {
         const outcomes = try testing.allocator.print(
             \\    if const unused = attempt(counter, true, true) -> ()
-            \\    if counter.borrow()[] == {d} -> () else exit(91)
+            \\    if Ref.from(counter.borrow()).value == {d} -> () else exit(91)
             \\    if const unused = attempt(counter, false, true) -> ()
-            \\    if counter.borrow()[] == {d} -> () else exit(92)
+            \\    if Ref.from(counter.borrow()).value == {d} -> () else exit(92)
             \\    if const unused = attempt(counter, true, false) -> ()
-            \\    if counter.borrow()[] == {d} -> () else exit(93)
+            \\    if Ref.from(counter.borrow()).value == {d} -> () else exit(93)
             \\    if const unused = attempt(counter, false, false) -> ()
-            \\    if counter.borrow()[] == {d} -> () else exit(94)
-            \\    return counter.borrow()[]
+            \\    if Ref.from(counter.borrow()).value == {d} -> () else exit(94)
+            \\    return Ref.from(counter.borrow()).value
         , .{ place.captured_count, place.captured_count + place.fresh_count, 2 * place.captured_count + place.fresh_count, 2 * (place.captured_count + place.fresh_count) });
         defer testing.allocator.free(outcomes);
         for (expressions) |expression| {
@@ -10166,10 +10245,10 @@ test "init lexical pending consumption preserves roots and fields across joins" 
                 errdefer std.debug.print("consuming join: payload={s}, deferred={}, expression={s}\n", .{ place.payload, deferred, expression });
                 const source = try std.mem.concat(testing.allocator, u8, &.{
                     \\struct Source
-                    \\    counter: Ref(mut int)
+                    \\    counter: Ref(int)
                     \\    weight: int
                     \\    drop = func(deinit self: Source)
-                    \\        self.counter[] = self.counter[] + self.weight
+                    \\        self.counter.value = self.counter.value + self.weight
                     \\struct Pair
                     \\    selected: Source
                     \\    sibling: Source
@@ -10200,11 +10279,7 @@ test "init lexical pending consumption preserves roots and fields across joins" 
                     \\if const answer = run() -> exit(answer) else exit(98)
                 });
                 defer testing.allocator.free(source);
-                if (!deferred and std.mem.eql(u8, place.payload, "pair.selected") and std.mem.startsWith(u8, expression, "if captured")) {
-                    try Fixture.expectSourceDiagnostic(source, .partial_field_transfer_not_supported);
-                } else {
-                    try Fixture.expectSourceExit(source, 42);
-                }
+                try Fixture.expectSourceExit(source, 42);
             }
         }
     }
@@ -10509,10 +10584,10 @@ test "init lexical early consumer failure does not authorize a forbidden deferre
 test "init lexical rejects caller return during partial aggregate construction" {
     try Fixture.expectSourceDiagnostic(
         \\struct Marker
-        \\    counter: Ref(mut int)
+        \\    counter: Ref(int)
         \\    step: int
         \\    drop = func(deinit self: Marker)
-        \\        self.counter[] = self.counter[] * 10 + self.step
+        \\        self.counter.value = self.counter.value * 10 + self.step
         \\struct Pending
         \\    first: Marker
         \\    last: int
@@ -10521,14 +10596,14 @@ test "init lexical rejects caller return during partial aggregate construction" 
         \\    const held = marker
         \\    const value = item
         \\    return value.last + held.step
-        \\fallible run(imm trace: Ref(mut int)) int
+        \\fallible run(var trace: Ref(int)) int
         \\    const caller = Marker{counter = trace, step = 3}
         \\    const unused = receive?(Marker{counter = trace, step = 2}, Pending{first = Marker{counter = trace, step = 1}, last = if 1 == 1 -> return 42 else 0})
         \\    return unused + caller.step
         \\fallible calculate() int
         \\    var counter = Box.new?(0)
-        \\    const answer = run?(counter.borrow_mut())
-        \\    if counter.borrow()[] == 123 -> return answer
+        \\    var answer = run?(Ref.from(counter.borrow()))
+        \\    if Ref.from(counter.borrow()).value == 123 -> return answer
         \\    return 99
         \\if const answer = calculate() -> exit(answer) else exit(97)
     , .initializer_exit_outside_boundary);
@@ -10613,20 +10688,19 @@ test "init lexical rejects caller returns within recursive callers" {
 
 test "init lexical rejects caller returns of checked references" {
     try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{borrow_local}
         \\fallible materialize(init item: int) int -> return item
         \\fallible select(imm reference: Ref(int)) Ref(int)
         \\    const unused = materialize?(if 1 == 1 -> return reference else 0)
         \\    return reference
         \\var value = 42
-        \\if const status = select(borrow_local(int, value)) -> exit(status[]) else exit(97)
+        \\if const status = select(Ref.from(value)) -> exit(status.value) else exit(97)
     , .initializer_exit_outside_boundary);
 }
 
 test "init lexical rejects checked reference caller returns in blocks and multi reference callers" {
     const sources = [_][]const u8{
-        "import std.memory.{borrow_local}\nfallible materialize(init item: int) int -> return item\nfallible run(imm reference: Ref(int)) Ref(int)\n    const unused = materialize?(if 1 == 1\n        return reference\n    else 0)\n    exit(99)\nvar value = 42\nif run(borrow_local(int, value)) -> ()",
-        "import std.memory.{borrow_local}\nfallible materialize(init item: int) int -> return item\nfallible select(imm allowed: Ref(int), imm other: Ref(int)) Ref(int)\n    const unused = materialize?(if 1 == 1 -> return allowed else 0)\n    return allowed\nvar value = 42\nif select(borrow_local(int, value), borrow_local(int, value)) -> ()",
+        "import std.memory.{}\nfallible materialize(init item: int) int -> return item\nfallible run(imm reference: Ref(int)) Ref(int)\n    const unused = materialize?(if 1 == 1\n        return reference\n    else 0)\n    exit(99)\nvar value = 42\nif run(Ref.from(value)) -> ()",
+        "import std.memory.{}\nfallible materialize(init item: int) int -> return item\nfallible select(imm allowed: Ref(int), imm other: Ref(int)) Ref(int)\n    const unused = materialize?(if 1 == 1 -> return allowed else 0)\n    return allowed\nvar value = 42\nif select(Ref.from(value), Ref.from(value)) -> ()",
     };
     for (sources) |source| {
         try Fixture.expectSourceDiagnostic(source, .initializer_exit_outside_boundary);
@@ -10693,23 +10767,23 @@ test "init lexical rejects caller consuming breaks with fresh immovable storage"
 test "init capture completed root and field transfers retain exact native cleanup" {
     try Fixture.expectSourceExit(
         \\struct Item
-        \\    counter: Ref(mut int)
+        \\    counter: Ref(int)
         \\    weight: int
         \\    drop = func(deinit self: Item)
-        \\        self.counter[] = self.counter[] + self.weight
+        \\        self.counter.value = self.counter.value + self.weight
         \\struct Pair
         \\    first: Item
         \\    second: Item
         \\func take(var item: Item) -> ()
         \\fallible materialize(init item: int) int -> return item
-        \\fallible run(imm counter: Ref(mut int)) int
+        \\fallible run(var counter: Ref(int)) int
         \\    const source = Pair{first = Item{counter = counter, weight = 10}, second = Item{counter = counter, weight = 20}}
         \\    const unused = materialize?(if 1 == 1
         \\        take(source.first^)
         \\        42
         \\    else 0)
         \\    return unused
-        \\fallible run_root(imm counter: Ref(mut int)) int
+        \\fallible run_root(var counter: Ref(int)) int
         \\    const source = Item{counter = counter, weight = 12}
         \\    const unused = materialize?(if 1 == 1
         \\        take(source^)
@@ -10718,9 +10792,9 @@ test "init capture completed root and field transfers retain exact native cleanu
         \\    return unused
         \\fallible calculate() int
         \\    var counter = Box.new?(0)
-        \\    run?(counter.borrow_mut())
-        \\    run_root?(counter.borrow_mut())
-        \\    return counter.borrow()[]
+        \\    run?(Ref.from(counter.borrow()))
+        \\    run_root?(Ref.from(counter.borrow()))
+        \\    return Ref.from(counter.borrow()).value
         \\if const answer = calculate() -> exit(answer) else exit(99)
     , 42);
 }
@@ -10728,10 +10802,10 @@ test "init capture completed root and field transfers retain exact native cleanu
 test "init lexical rejects caller loop exits during partial aggregate construction" {
     try Fixture.expectSourceDiagnostic(
         \\struct Marker
-        \\    counter: Ref(mut int)
+        \\    counter: Ref(int)
         \\    step: int
         \\    drop = func(deinit self: Marker)
-        \\        self.counter[] = self.counter[] * 10 + self.step
+        \\        self.counter.value = self.counter.value * 10 + self.step
         \\struct Pending
         \\    first: Marker
         \\    last: int
@@ -10740,7 +10814,7 @@ test "init lexical rejects caller loop exits during partial aggregate constructi
         \\    const held = marker
         \\    const value = item
         \\    return value.last + held.step
-        \\fallible run(imm trace: Ref(mut int)) int
+        \\fallible run(var trace: Ref(int)) int
         \\    var pass = 0
         \\    return loop
         \\        pass = pass + 1
@@ -10749,8 +10823,8 @@ test "init lexical rejects caller loop exits during partial aggregate constructi
         \\        break unused + caller.step
         \\fallible calculate() int
         \\    var counter = Box.new?(0)
-        \\    const result = run?(counter.borrow_mut())
-        \\    if counter.borrow()[] == 123123 -> return result
+        \\    var result = run?(Ref.from(counter.borrow()))
+        \\    if Ref.from(counter.borrow()).value == 123123 -> return result
         \\    return 99
         \\if const result = calculate() -> exit(result) else exit(97)
     , .initializer_exit_outside_boundary);
@@ -10759,16 +10833,16 @@ test "init lexical rejects caller loop exits during partial aggregate constructi
 test "init capture restored roots and fields clean once after nested construction" {
     try Fixture.expectSourceExit(
         \\struct Item
-        \\    counter: Ref(mut int)
+        \\    counter: Ref(int)
         \\    weight: int
         \\    drop = func(deinit self: Item)
-        \\        self.counter[] = self.counter[] + self.weight
+        \\        self.counter.value = self.counter.value + self.weight
         \\struct Pair
         \\    first: Item
         \\    second: Item
         \\func take(var item: Item) -> ()
         \\fallible materialize(init item: int) int -> return item
-        \\fallible run(imm counter: Ref(mut int)) int
+        \\fallible run(var counter: Ref(int)) int
         \\    var source = Pair{first = Item{counter = counter, weight = 10}, second = Item{counter = counter, weight = 15}}
         \\    const unused = materialize?(materialize?(if 1 == 1
         \\        take(source.first^)
@@ -10776,7 +10850,7 @@ test "init capture restored roots and fields clean once after nested constructio
         \\        42
         \\    else 0))
         \\    return unused
-        \\fallible run_root(imm counter: Ref(mut int)) int
+        \\fallible run_root(var counter: Ref(int)) int
         \\    var source = Item{counter = counter, weight = 10}
         \\    const unused = materialize?(materialize?(if 1 == 1
         \\        take(source^)
@@ -10786,9 +10860,9 @@ test "init capture restored roots and fields clean once after nested constructio
         \\    return unused
         \\fallible calculate() int
         \\    var counter = Box.new?(0)
-        \\    run?(counter.borrow_mut())
-        \\    run_root?(counter.borrow_mut())
-        \\    return counter.borrow()[]
+        \\    run?(Ref.from(counter.borrow()))
+        \\    run_root?(Ref.from(counter.borrow()))
+        \\    return Ref.from(counter.borrow()).value
         \\if const result = calculate() -> exit(result) else exit(99)
     , 42);
 }
@@ -11077,7 +11151,7 @@ test "init regions release every failed allocation when materializing borrowed s
         \\fallible materialize(static T: type, init item: T) T -> return item
         \\fallible run_box() int
         \\    const owner = Box.new?(42)
-        \\    return materialize?(owner.borrow()[])
+        \\    return materialize?(Ref.from(owner.borrow()).value)
         \\if const boxed = run_box() -> exit(boxed) else exit(1)
     });
 }
@@ -11232,37 +11306,36 @@ test "init failure edits recompute the caller while retaining the consumer" {
 
 test "init captures reject reference writes and implicit cleanup across eager arguments" {
     const expressions = [_][]const u8{
-        "if 1 == 1\n        reference[] = 7\n        0\n    else 0",
+        "if 1 == 1\n        reference.value = 7\n        0\n    else 0",
         "change(reference)",
         "if 1 == 1\n        const guard = Guard{target = reference}\n        0\n    else 0",
-        "copy_effect(Hook{target = reference})",
-        "if 1 == 1\n        const hook = Hook{target = reference}\n        copy_effect(hook)\n    else 0",
+        "change_hook(Hook{target = reference})",
+        "if 1 == 1\n        var hook = Hook{target = reference}\n        change_hook(hook^)\n    else 0",
         "if 1 == 1\n        const hook = Hook{target = reference}\n        move_effect(hook^)\n    else 0",
     };
     for (expressions) |expression| {
         const source = try test_sources.renderTemplate(testing.allocator,
             \\struct Guard
-            \\    target: Ref(mut int)
+            \\    target: Ref(int)
             \\    drop = func(deinit self: Guard)
-            \\        self.target[] = 7
+            \\        self.target.value = 7
             \\struct Hook
-            \\    target: Ref(mut int)
-            \\    copy = func(imm self: Hook) Hook
-            \\        self.target[] = 7
-            \\        return Hook{target = self.target}
+            \\    target: Ref(int)
             \\    move = func(deinit self: Hook) Hook
-            \\        self.target[] = 7
+            \\        self.target.value = 7
             \\        return Hook{target = self.target}
-            \\func copy_effect(var hook: Hook) int -> return 0
+            \\func change_hook(var hook: Hook) int
+            \\    hook.target.value = 7
+            \\    return 0
             \\func move_effect(var hook: Hook) int -> return 0
-            \\func change(imm reference: Ref(mut int)) int
-            \\    reference[] = 7
+            \\func change(var reference: Ref(int)) int
+            \\    reference.value = 7
             \\    return 0
             \\fallible receive(init item: int, imm eager: int) int -> return item
             \\fallible run() int
             \\    var owner = Box.new?(42)
-            \\    const reference = owner.borrow_mut()
-            \\    return receive?(owner.borrow()[], $expression)
+            \\    var reference = Ref.from(owner.borrow())
+            \\    return receive?(Ref.from(owner.borrow()).value, $expression)
             \\if const value = run() -> exit(value) else exit(1)
         , .{ .expression = expression });
         defer testing.allocator.free(source);
@@ -11273,10 +11346,10 @@ test "init captures reject reference writes and implicit cleanup across eager ar
 test "init captures read owned storage through checked internal references" {
     try Fixture.expectSourceExit(
         \\fallible receive(init item: int) int -> return item
-        \\fallible read_parameter(imm owner: Box(int)) int -> return receive?(owner.borrow()[])
+        \\fallible read_parameter(imm owner: Box(int)) int -> return receive?(Ref.from(owner.borrow()).value)
         \\fallible run() int
         \\    const owner = Box.new?(42)
-        \\    return receive?(owner.borrow()[]) + read_parameter?(owner) - 42
+        \\    return receive?(Ref.from(owner.borrow()).value) + read_parameter?(owner) - 42
         \\if const value = run() -> exit(value) else exit(1)
     , 42);
 }
@@ -11310,21 +11383,21 @@ test "init failure handles unit and never outcomes" {
 test "init captures allow unrelated reference effects and writes after construction" {
     try Fixture.expectSourceExit(
         \\struct Guard
-        \\    target: Ref(mut int)
+        \\    target: Ref(int)
         \\    drop = func(deinit self: Guard)
-        \\        self.target[] = 7
+        \\        self.target.value = 7
         \\fallible receive(init item: int, imm eager: int) int -> return item
         \\fallible run() int
         \\    var owner = Box.new?(42)
         \\    var other = Box.new?(0)
-        \\    const reference = owner.borrow_mut()
-        \\    const changed = other.borrow_mut()
-        \\    const result = receive?(owner.borrow()[], if 1 == 1
+        \\    var reference = Ref.from(owner.borrow())
+        \\    var changed = Ref.from(other.borrow())
+        \\    const result = receive?(Ref.from(owner.borrow()).value, if 1 == 1
         \\        const guard = Guard{target = changed}
         \\        0
         \\    else 0)
-        \\    reference[] = 99
-        \\    return result + other.borrow()[] - 7
+        \\    reference.value = 99
+        \\    return result + Ref.from(other.borrow()).value - 7
         \\if const value = run() -> exit(value) else exit(1)
     , 42);
 }
@@ -11418,15 +11491,15 @@ test "init inference supports deeply nested generic immovable construction" {
 
 test "init captures reject possibly aliased borrowed parameters" {
     try Fixture.expectSourceDiagnostic(
-        \\func change(imm reference: Ref(mut int)) int
-        \\    reference[] = 7
+        \\func change(var reference: Ref(int)) int
+        \\    reference.value = 7
         \\    return 0
         \\fallible receive(init item: int, imm eager: int) int -> return item
-        \\fallible relay(imm owner: Box(int), imm reference: Ref(mut int)) int
-        \\    return receive?(owner.borrow()[], change(reference))
+        \\fallible relay(imm owner: Box(int), var reference: Ref(int)) int
+        \\    return receive?(Ref.from(owner.borrow()).value, change(reference))
         \\fallible run() int
         \\    var owner = Box.new?(42)
-        \\    const reference = owner.borrow_mut()
+        \\    var reference = Ref.from(owner.borrow())
         \\    return relay?(owner, reference)
         \\if const value = run() -> exit(value) else exit(1)
     , .initializer_capture_conflict);
@@ -11435,18 +11508,18 @@ test "init captures reject possibly aliased borrowed parameters" {
 test "init captures reject cleanup through possibly aliased borrowed parameters" {
     try Fixture.expectSourceDiagnostic(
         \\struct Guard
-        \\    target: Ref(mut int)
+        \\    target: Ref(int)
         \\    drop = func(deinit self: Guard)
-        \\        self.target[] = 7
+        \\        self.target.value = 7
         \\fallible receive(init item: int, imm eager: int) int -> return item
-        \\fallible relay(imm owner: Box(int), imm reference: Ref(mut int)) int
-        \\    return receive?(owner.borrow()[], if 1 == 1
+        \\fallible relay(imm owner: Box(int), var reference: Ref(int)) int
+        \\    return receive?(Ref.from(owner.borrow()).value, if 1 == 1
         \\        const guard = Guard{target = reference}
         \\        0
         \\    else 0)
         \\fallible run() int
         \\    var owner = Box.new?(42)
-        \\    const reference = owner.borrow_mut()
+        \\    var reference = Ref.from(owner.borrow())
         \\    return relay?(owner, reference)
         \\if const value = run() -> exit(value) else exit(1)
     , .initializer_capture_conflict);
@@ -11454,16 +11527,16 @@ test "init captures reject cleanup through possibly aliased borrowed parameters"
 
 test "init captures permit scalar parameter copies beside reference writes" {
     try Fixture.expectSourceExit(
-        \\func change(imm reference: Ref(mut int)) int
-        \\    reference[] = 7
+        \\func change(var reference: Ref(int)) int
+        \\    reference.value = 7
         \\    return 0
         \\fallible receive(init item: int, imm eager: int) int -> return item
-        \\fallible relay(imm value: int, imm reference: Ref(mut int)) int
+        \\fallible relay(imm value: int, var reference: Ref(int)) int
         \\    return receive?(value, change(reference))
         \\fallible run() int
         \\    var owner = Box.new?(42)
-        \\    const reference = owner.borrow_mut()
-        \\    return relay?(owner.borrow()[], reference)
+        \\    var reference = Ref.from(owner.borrow())
+        \\    return relay?(Ref.from(owner.borrow()).value, reference)
         \\if const value = run() -> exit(value) else exit(1)
     , 42);
 }
@@ -11489,17 +11562,17 @@ test "init captures preserve booleans callables and aggregate storage" {
 test "init handled failure preserves guarded root and field cleanup on receiver success" {
     const Case = struct { type_name: []const u8, initializer: []const u8, transfer: []const u8, expected: u8 };
     const cases = [_]Case{
-        .{ .type_name = "Item", .initializer = "Item{counter = counter.borrow_mut(), weight = 10}", .transfer = "source^", .expected = 10 },
-        .{ .type_name = "Pair", .initializer = "Pair{first = Item{counter = counter.borrow_mut(), weight = 10}, second = Item{counter = counter.borrow_mut(), weight = 32}}", .transfer = "source.first^", .expected = 42 },
+        .{ .type_name = "Item", .initializer = "Item{counter = Ref.from(counter.borrow()), weight = 10}", .transfer = "source^", .expected = 10 },
+        .{ .type_name = "Pair", .initializer = "Pair{first = Item{counter = Ref.from(counter.borrow()), weight = 10}, second = Item{counter = Ref.from(counter.borrow()), weight = 32}}", .transfer = "source.first^", .expected = 42 },
     };
     for (cases) |case| {
         const source = try test_sources.renderTemplate(testing.allocator,
             \\struct Item
-            \\    counter: Ref(mut int)
+            \\    counter: Ref(int)
             \\    weight: int
             \\    copy = none
             \\    drop = func(deinit self: Item)
-            \\        self.counter[] = self.counter[] + self.weight
+            \\        self.counter.value = self.counter.value + self.weight
             \\struct Pair
             \\    first: Item
             \\    second: Item
@@ -11519,7 +11592,7 @@ test "init handled failure preserves guarded root and field cleanup on receiver 
             \\        fail_value?()
             \\        0
             \\    else 0) -> () else return 99
-            \\    return counter.borrow()[]
+            \\    return Ref.from(counter.borrow()).value
             \\fallible calculate() int
             \\    const transferred = run?(true)
             \\    const retained = run?(false)
@@ -11625,10 +11698,10 @@ test "init comptime cycle checks diagnose cycles through aggregate captures" {
 test "init handled forwarding failure retains skipped capture cleanup on receiver success" {
     try Fixture.expectSourceExit(
         \\struct Item
-        \\    counter: Ref(mut int)
+        \\    counter: Ref(int)
         \\    copy = none
         \\    drop = func(deinit self: Item)
-        \\        self.counter[] = self.counter[] + 10
+        \\        self.counter.value = self.counter.value + 10
         \\fallible forward(init item: Item, imm construct: bool) int
         \\    construct == true
         \\    const value = item
@@ -11637,9 +11710,9 @@ test "init handled forwarding failure retains skipped capture cleanup on receive
         \\    if const result = forward(item, construct) -> return result else return 0
         \\fallible run(imm construct: bool) int
         \\    var counter = Box.new?(0)
-        \\    const source = Item{counter = counter.borrow_mut()}
+        \\    var source = Item{counter = Ref.from(counter.borrow())}
         \\    const result = receive?(source^, construct)
-        \\    return counter.borrow()[] + result
+        \\    return Ref.from(counter.borrow()).value + result
         \\fallible calculate() int
         \\    const constructed = run?(true)
         \\    const skipped = run?(false)
@@ -11780,11 +11853,11 @@ test "init milestone1 pending root and field consumption cleans exactly once on 
     for (cases) |case| {
         const source = try test_sources.renderTemplate(testing.allocator,
             \\struct Item
-            \\    counter: Ref(mut int)
+            \\    counter: Ref(int)
             \\    weight: int
             \\    copy = none
             \\    drop = func(deinit self: Item)
-            \\        self.counter[] = self.counter[] + self.weight
+            \\        self.counter.value = self.counter.value + self.weight
             \\struct Pair
             \\    first: Item
             \\    second: Item
@@ -11798,14 +11871,14 @@ test "init milestone1 pending root and field consumption cleans exactly once on 
             \\fallible receive(init item: int) int
             \\    const value = forward?(item)
             \\    fail
-            \\func attempt(imm trace: Ref(mut int), imm complete: bool)
+            \\func attempt(var trace: Ref(int), imm complete: bool)
             \\    $binding
             \\    const callback: fallible(init int) int = receive
             \\    if const unused = callback(consume($place, if complete == true -> 0 else fail_value?())) -> exit(99)
             \\fallible run(imm complete: bool) int
             \\    var counter = Box.new?(0)
-            \\    attempt(counter.borrow_mut(), complete)
-            \\    return counter.borrow()[]
+            \\    attempt(Ref.from(counter.borrow()), complete)
+            \\    return Ref.from(counter.borrow()).value
             \\if const first = run(false)
             \\    if first == 42
             \\        if const second = run(true) -> exit(second) else exit(98)
@@ -11821,14 +11894,14 @@ test "init milestone1 raw allocation failure destroys completed elements and rel
     try Fixture.expectSourceExit(
         \\import std.memory.{allocate, deallocate, unsafe_initialize, unsafe_destroy}
         \\struct Item
-        \\    counter: Ref(mut int)
+        \\    counter: Ref(int)
         \\    weight: int
         \\    move = none
         \\    copy = none
         \\    drop = func(deinit self: Item)
-        \\        self.counter[] = self.counter[] + self.weight
+        \\        self.counter.value = self.counter.value + self.weight
         \\fallible fail_value() int -> fail
-        \\fallible attempt(imm trace: Ref(mut int))
+        \\fallible attempt(var trace: Ref(int))
         \\    var separate = Box.new?(0)
         \\    var first = allocate?(Item, 2)
         \\    var second = if const storage = allocate(Item, 1) -> storage^
@@ -11846,7 +11919,7 @@ test "init milestone1 raw allocation failure destroys completed elements and rel
         \\        deallocate(Item, second^)
         \\        deallocate(Item, first^)
         \\        fail
-        \\    if unsafe_initialize(Item, first, 1, Item{counter = separate.borrow_mut(), weight = fail_value?()})
+        \\    if unsafe_initialize(Item, first, 1, Item{counter = Ref.from(separate.borrow()), weight = fail_value?()})
         \\        unsafe_destroy(Item, first, 1)
         \\        unsafe_destroy(Item, second, 0)
         \\        unsafe_destroy(Item, first, 0)
@@ -11862,8 +11935,8 @@ test "init milestone1 raw allocation failure destroys completed elements and rel
         \\    fail
         \\fallible run() int
         \\    var counter = Box.new?(0)
-        \\    if attempt(counter.borrow_mut()) -> return 98
-        \\    return counter.borrow()[] + 12
+        \\    if attempt(Ref.from(counter.borrow())) -> return 98
+        \\    return Ref.from(counter.borrow()).value + 12
         \\if const result = run() -> exit(result) else exit(97)
     , 42);
 }
@@ -11957,28 +12030,29 @@ test "movable replacement reads its target independently of storage representati
 
 test "movable replacement completes its RHS before dropping the old generation" {
     for ([_][]const u8{
-        "var items = [Item{trace = handle, value = 1}, Item{trace = handle, value = 2}]\n        items = produce?(handle)\n        if handle[] <> 321 -> return 90\n        _ = items",
-        "var pair = Pair{items = [Item{trace = handle, value = 1}, Item{trace = handle, value = 2}]}\n        pair.items = produce?(handle)\n        if handle[] <> 321 -> return 90\n        _ = pair",
-        "var items = [Item{trace = handle, value = 1}, Item{trace = handle, value = 2}]\n        reset?(items, handle)\n        if handle[] <> 321 -> return 90\n        _ = items",
+        "var items = [Item{trace = handle, value = 1}, Item{trace = handle, value = 2}]\n        items = produce?(handle)\n        if handle.value <> 321 -> return 90\n        _ = items",
+        "var pair = Pair{items = [Item{trace = handle, value = 1}, Item{trace = handle, value = 2}]}\n        pair.items = produce?(handle)\n        if handle.value <> 321 -> return 90\n        _ = pair",
+        "var items = [Item{trace = handle, value = 1}, Item{trace = handle, value = 2}]\n        reset?(items, handle)\n        if handle.value <> 321 -> return 90\n        _ = items",
     }) |body| {
         const source = try test_sources.renderTemplate(testing.allocator,
             \\struct Item
-            \\    trace: Ref(mut int)
+            \\    trace: Ref(int)
             \\    value: int
             \\    drop = func(deinit self: Item)
-            \\        self.trace.replace(self.trace[] * 10 + self.value)
+            \\        self.trace.value = self.trace.value * 10 + self.value
             \\struct Pair
             \\    items: Array(Item, 2)
-            \\fallible produce(imm trace: Ref(mut int)) Array(Item, 2)
-            \\    trace.replace(trace[] * 10 + 3)
+            \\fallible produce(var trace: Ref(int)) Array(Item, 2)
+            \\    trace.value = trace.value * 10 + 3
             \\    return [Item{trace = trace, value = 4}, Item{trace = trace, value = 5}]
-            \\fallible reset(mut items: Array(Item, 2), imm trace: Ref(mut int))
+            \\fallible reset(mut items: Array(Item, 2), var trace: Ref(int))
             \\    items = produce?(trace)
             \\fallible calculate() int
             \\    var trace = [0]
-            \\    if const handle = trace.get_mut(0)
+            \\    if ref slot = trace.get(0)
+            \\        var handle = Ref.from(slot)
             \\        $body
-            \\        if handle[] == 32154 -> return 42
+            \\        if handle.value == 32154 -> return 42
             \\    return 91
             \\func run() int
             \\    if const result = calculate() -> return result
@@ -12092,10 +12166,10 @@ test "replacement retains its old generation through a divergent RHS" {
 
 test "reference and indexed replacement keep their owners alive through divergent preparation" {
     for ([_]struct { binding: []const u8, replacement: []const u8 }{
-        .{ .binding = "var owner = Box.new?(Item{value = 90})", .replacement = "const target = owner.borrow_mut()\n    target[] = exit(42)" },
+        .{ .binding = "var owner = Box.new?(Item{value = 90})", .replacement = "var target = Ref.from(owner.borrow())\n    target.value = exit(42)" },
         .{ .binding = "var values: List(Item) = [Item{value = 90}]", .replacement = "values[0] = exit(42)" },
         .{ .binding = "var values = [Item{value = 90}]", .replacement = "values[0] = exit(42)" },
-        .{ .binding = "var values = [Item{value = 90}]", .replacement = "const span = values.span_mut()\n    span[0] = exit(42)" },
+        .{ .binding = "var values = [Item{value = 90}]", .replacement = "var span = values.span()\n    span[0] = exit(42)" },
     }) |case| {
         const source = try test_sources.renderTemplate(testing.allocator,
             \\struct Item
@@ -12119,8 +12193,8 @@ test "failed reference replacement does not roll back explicit RHS ownership tra
         \\fallible consume(var owner: Box(int)) int -> fail
         \\fallible calculate() int
         \\    var owner = Box.new?(20)
-        \\    const target = owner.borrow_mut()
-        \\    target[] = if true
+        \\    var target = Ref.from(owner.borrow())
+        \\    target.value = if true
         \\        _ = consume?(owner^)
         \\        fail
         \\    else 0
@@ -12149,8 +12223,8 @@ test "review fixes mutable variant borrow preserves parameter provenance" {
     try Fixture.expectParity(
         \\import std.memory
         \\func inspect(mut value: Box(int) | none) int
-        \\    if const box = std.memory.borrow_local(value) as Ref(Box(int))
-        \\        return box[].borrow()[]
+        \\    if ref box = value as Box(int)
+        \\        return box.borrow()
         \\    return 1
         \\fallible calculate() int
         \\    var value: Box(int) | none = Box.new?(42)
@@ -12213,7 +12287,7 @@ test "review fixes consuming variant extraction transfers noncopyable payloads" 
         \\    var source: Box(int) | none = Box.new?(42)
         \\    if const payload = source^ as Box(int)
         \\        const moved = payload^
-        \\        return moved.borrow()[]
+        \\        return Ref.from(moved.borrow()).value
         \\    return 90
         \\func run() int
         \\    if const result = calculate() -> return result
@@ -12222,7 +12296,7 @@ test "review fixes consuming variant extraction transfers noncopyable payloads" 
     try Fixture.expectParity(
         \\fallible create() Box(int) | none -> Box.new?(42)
         \\fallible calculate() int
-        \\    if const payload = create?() as Box(int) -> return payload.borrow()[]
+        \\    if const payload = create?() as Box(int) -> return Ref.from(payload.borrow()).value
         \\    return 90
         \\func run() int
         \\    if const result = calculate() -> return result
@@ -12234,10 +12308,10 @@ test "review fixes consuming variant extraction drops each active payload once" 
     try Fixture.expectParity(
         \\import std.memory
         \\struct Tracked
-        \\    pub counter: Ref(mut int)
+        \\    pub counter: Ref(int)
         \\    copy = none
         \\    drop = func(deinit self: Tracked)
-        \\        self.counter[] += 1
+        \\        self.counter.value += 1
         \\func inspect(var source: Tracked | int | none) int
         \\    if const payload = source^ as Tracked -> return 10
         \\    return 20
@@ -12246,14 +12320,14 @@ test "review fixes consuming variant extraction drops each active payload once" 
         \\    return 0
         \\func subset(var source: Tracked | int | none) int
         \\    if const payload = source^ as Tracked | none
-        \\        if const tracked = std.memory.borrow_local(payload) as Ref(Tracked) -> return 0
+        \\        if ref tracked = payload as Tracked -> return 0
         \\    return 90
         \\fallible calculate() int
         \\    var drops = Box.new?(0)
-        \\    const first = inspect(Tracked{counter = drops.borrow_mut()})
-        \\    const second = miss(Tracked{counter = drops.borrow_mut()})
-        \\    const third = subset(Tracked{counter = drops.borrow_mut()})
-        \\    return first + second + third + drops.borrow()[] + 29
+        \\    var first = inspect(Tracked{counter = Ref.from(drops.borrow())})
+        \\    var second = miss(Tracked{counter = Ref.from(drops.borrow())})
+        \\    var third = subset(Tracked{counter = Ref.from(drops.borrow())})
+        \\    return first + second + third + Ref.from(drops.borrow()).value + 29
         \\func run() int
         \\    if const result = calculate() -> return result
         \\    return 91
@@ -12277,10 +12351,10 @@ test "review fixes reference dereferences and projections are mutable argument p
         \\    value += 1
         \\fallible calculate() int
         \\    var owner = Box.new?(Point{x = 19, y = 20})
-        \\    const handle = owner.borrow_mut()
-        \\    increment(handle[].x)
-        \\    handle[].y += 2
-        \\    return handle[].x + handle[].y
+        \\    var handle = Ref.from(owner.borrow())
+        \\    increment(handle.value.x)
+        \\    handle.value.y += 2
+        \\    return handle.value.x + handle.value.y
         \\func run() int
         \\    if const result = calculate() -> return result
         \\    return 90
@@ -12290,8 +12364,8 @@ test "review fixes reference dereferences and projections are mutable argument p
         \\    value += 1
         \\fallible calculate() int
         \\    var value = Box.new?(41)
-        \\    increment(value.borrow_mut()[])
-        \\    return value.borrow()[]
+        \\    increment(Ref.from(value.borrow()).value)
+        \\    return Ref.from(value.borrow()).value
         \\func run() int
         \\    if const result = calculate() -> return result
         \\    return 91
@@ -12302,14 +12376,14 @@ test "review fixes reference field assignments evaluate the handle once" {
     try Fixture.expectParity(
         \\struct Point
         \\    pub x: int
-        \\func handle(mut point: Box(Point), mut calls: int) Ref(mut Point)
+        \\func handle(mut point: Box(Point), mut calls: int) Ref(Point)
         \\    calls += 1
-        \\    return point.borrow_mut()
+        \\    return Ref.from(point.borrow())
         \\fallible calculate() int
         \\    var point = Box.new?(Point{x = 40})
         \\    var calls = 0
-        \\    handle(point, calls)[].x += 1
-        \\    return point.borrow()[].x + calls
+        \\    handle(point, calls).value.x += 1
+        \\    return Ref.from(point.borrow()).value.x + calls
         \\func run() int
         \\    if const result = calculate() -> return result
         \\    return 91
@@ -12323,12 +12397,12 @@ test "review fixes indexed explicit borrows avoid noncopyable element copies" {
         \\    pub score: int
         \\fallible calculate() int
         \\    var rows = [Row{score = 20}, Row{score = 21}]
-        \\    const row = rows.get?(0)
-        \\    const first = row[].score
-        \\    const second = rows.get_mut?(1)
-        \\    second[].score += 1
-        \\    const total = first + second[].score
-        \\    rows.get_mut?(0)[].score += 1
+        \\    const row = Ref.from(rows.get?(0))
+        \\    const first = row.value.score
+        \\    var second = Ref.from(rows.get?(1))
+        \\    second.value.score += 1
+        \\    const total = first + second.value.score
+        \\    Ref.from(rows.get?(0)).value.score += 1
         \\    return total
         \\func run() int
         \\    if const result = calculate() -> return result
@@ -12354,13 +12428,13 @@ test "review fixes explicit indexed borrows compose fields nesting and handled b
         \\    pub score: int
         \\fallible calculate() int
         \\    var rows = [[Row{score = 20}, Row{score = 21}]]
-        \\    const score = std.memory.borrow_mut_local(rows.get_mut?(0)[].get_mut?(0)[].score)
-        \\    score[] += 1
-        \\    if const invalid = rows.get?(1) -> return 90
-        \\    if const row = rows.get_mut?(0)[].get_mut?(1)
-        \\        row[].score += 0
-        \\        const first = rows.get?(0)[].get?(0)
-        \\        return first[].score + row[].score
+        \\    var score = Ref.from(Ref.from(Ref.from(rows.get?(0)).value.get?(0)).value.score)
+        \\    score.value += 1
+        \\    if ref invalid = rows.get(1) -> return 90
+        \\    if ref row = rows.get?(0).get(1)
+        \\        row.score += 0
+        \\        const first = Ref.from(Ref.from(rows.get?(0)).value.get?(0))
+        \\        return first.value.score + row.score
         \\    return 91
         \\func run() int
         \\    if const result = calculate() -> return result
@@ -12374,7 +12448,7 @@ test "review fixes readonly reference places cannot become mutable" {
         \\    value += 1
         \\fallible calculate() int
         \\    const value = Box.new?(41)
-        \\    increment(value.borrow()[])
+        \\    increment(Ref.from(value.borrow()).value)
         \\    return 42
         \\if const result = calculate() -> exit(result)
     , .mutable_argument_requires_mutable_place);
@@ -12383,22 +12457,22 @@ test "review fixes readonly reference places cannot become mutable" {
         \\    pub x: int
         \\fallible calculate() int
         \\    const point = Box.new?(Point{x = 41})
-        \\    point.borrow()[].x = 42
+        \\    Ref.from(point.borrow()).value.x = 42
         \\    return 42
         \\if const result = calculate() -> exit(result)
     , .reference_not_writable);
 }
 
 test "review fixes overlapping explicit reference arguments are rejected" {
-    for ([_][]const u8{ "handle[]", "value.borrow()[]" }) |other| {
+    for ([_][]const u8{ "handle.value", "Ref.from(value.borrow()).value" }) |other| {
         const source = try test_sources.renderTemplate(testing.allocator,
-            \\func observe(mut left: int, imm right: int) int
+            \\func observe(mut left: int, ref right: int) int
             \\    left += 1
             \\    return right
             \\fallible calculate() int
             \\    var value = Box.new?(41)
-            \\    const handle = value.borrow_mut()
-            \\    return observe(handle[], $other)
+            \\    var handle = Ref.from(value.borrow())
+            \\    return observe(handle.value, $other)
             \\if const result = calculate() -> exit(result)
         , .{ .other = other });
         defer testing.allocator.free(source);
@@ -12416,9 +12490,9 @@ test "review fixes disjoint fields through one explicit reference can be mutable
         \\    right += 1
         \\fallible calculate() int
         \\    var pair = Box.new?(Pair{first = 19, second = 21})
-        \\    const handle = pair.borrow_mut()
-        \\    increment(handle[].first, handle[].second)
-        \\    return pair.borrow()[].first + pair.borrow()[].second
+        \\    var handle = Ref.from(pair.borrow())
+        \\    increment(handle.value.first, handle.value.second)
+        \\    return Ref.from(pair.borrow()).value.first + Ref.from(pair.borrow()).value.second
         \\func run() int
         \\    if const result = calculate() -> return result
         \\    return 91
@@ -12429,10 +12503,10 @@ test "review fixes mutable variant projection still rejects owner invalidation" 
     try Fixture.expectSourceDiagnostic(
         \\import std.memory
         \\func inspect(mut value: Box(int) | none) int
-        \\    if const box = std.memory.borrow_local(value) as Ref(Box(int))
-        \\        const handle = box[].borrow()
+        \\    if ref box = value as Box(int)
+        \\        const handle = Ref.from(box.borrow())
         \\        value = none
-        \\        return handle[]
+        \\        return handle.value
         \\    return 1
         \\fallible calculate() int
         \\    var value: Box(int) | none = Box.new?(42)
@@ -12492,9 +12566,9 @@ test "review fixes consuming extraction narrows explicit drop obligations on fai
         \\    pub number: int
         \\struct Tracked
         \\    copy = none
-        \\    pub counter: Ref(mut int)
+        \\    pub counter: Ref(int)
         \\    drop = func(deinit self: Tracked)
-        \\        self.counter[] += 1
+        \\        self.counter.value += 1
         \\func dispose(deinit token: Token) -> ()
         \\func inspect(var source: Token | Tracked | none) int
         \\    if const token = source^ as Token
@@ -12505,9 +12579,9 @@ test "review fixes consuming extraction narrows explicit drop obligations on fai
         \\fallible calculate() int
         \\    var drops = Box.new?(0)
         \\    const success = inspect(Token{number = 41})
-        \\    const failure = inspect(Tracked{counter = drops.borrow_mut()})
+        \\    var failure = inspect(Tracked{counter = Ref.from(drops.borrow())})
         \\    const empty = inspect(none)
-        \\    return success + failure + empty + drops.borrow()[]
+        \\    return success + failure + empty + Ref.from(drops.borrow()).value
         \\func run() int
         \\    if const result = calculate() -> return result
         \\    return 91
@@ -12550,12 +12624,12 @@ test "disjunction joins consumed recursive owners without retaining ended bindin
         \\    fail
         \\fallible evaluate() int
         \\    var tree = Box.new?(Expr{term = Pair{left = Box.new?(Expr{term = Constant{value = 1}}), right = Box.new?(Expr{term = Constant{value = 2}})}})
-        \\    var owned = tree.into_value()
+        \\    var owned = tree.take()
         \\    if owned.term is Pair
         \\        const pair = owned.term^ as Pair
         \\        const left = pair.left^
         \\        const right = pair.right^
-        \\        if literal?(left.borrow()[]) == 0 or literal?(right.borrow()[]) == 0 -> return 1
+        \\        if literal?(Ref.from(left.borrow()).value) == 0 or literal?(Ref.from(right.borrow()).value) == 0 -> return 1
         \\        return 42
         \\    return 4
         \\func run() int
@@ -12576,26 +12650,26 @@ test "disjunction joins consumed recursive owners preserve cleanup and short cir
         \\    right: Box(Expr)
         \\struct Expr
         \\    term: Constant | Pair
-        \\fallible literal(imm node: Expr, calls: Ref(mut int)) int
-        \\    calls[] += 1
-        \\    if const constant = std.memory.borrow_local(node.term) as Ref(Constant)
-        \\        constant[].value >= 0
-        \\        return constant[].value
+        \\fallible literal(imm node: Expr, var calls: Ref(int)) int
+        \\    calls.value += 1
+        \\    if ref constant = node.term as Constant
+        \\        constant.value >= 0
+        \\        return constant.value
         \\    fail
-        \\fallible inspect(var tree: Box(Expr), calls: Ref(mut int)) int
-        \\    var owned = tree.into_value()
+        \\fallible inspect(var tree: Box(Expr), var calls: Ref(int)) int
+        \\    var owned = tree.take()
         \\    if owned.term is Pair
         \\        const pair = owned.term^ as Pair
         \\        const left = pair.left^
         \\        const right = pair.right^
-        \\        if literal?(left.borrow()[], calls) == 0 or literal?(right.borrow()[], calls) == 0 -> return 1
+        \\        if literal?(Ref.from(left.borrow()).value, calls) == 0 or literal?(Ref.from(right.borrow()).value, calls) == 0 -> return 1
         \\        return 0
         \\    return 90
         \\fallible check(left: int, right: int, expected: int, expected_calls: int)
         \\    var calls = Box.new?(0)
         \\    const tree = Box.new?(Expr{term = Pair{left = Box.new?(Expr{term = Constant{value = left}}), right = Box.new?(Expr{term = Constant{value = right}})}})
-        \\    inspect?(tree^, calls.borrow_mut()) == expected
-        \\    calls.borrow()[] == expected_calls
+        \\    inspect?(tree^, Ref.from(calls.borrow())) == expected
+        \\    Ref.from(calls.borrow()).value == expected_calls
         \\func run() int
         \\    if not check(0, 1, 1, 1) -> return 91
         \\    if not check(1, 0, 1, 2) -> return 92
@@ -12616,26 +12690,24 @@ test "disjunction joins consumed recursive owners preserve cleanup and short cir
 
 test "explicit references infer readonly and writable referent types" {
     try Fixture.expectParity(
-        \\import std.memory.{borrow_local, borrow_mut_local}
-        \\func copy_value(static T: type, reference: Ref(T)) T -> reference[]
-        \\func replace_value(static T: type, reference: Ref(mut T), value: T)
-        \\    reference[] = value
+        \\func copy_value(static T: type, reference: Ref(T)) T -> reference.value
+        \\func replace_value(static T: type, var reference: Ref(T), value: T)
+        \\    reference.value = value
         \\func increment(value: int) int -> value + 1
         \\func invoke(Ref: func(int) int) int -> Ref(41)
         \\func run() int
         \\    var value = 17
-        \\    const writable: Ref(mut int) = borrow_mut_local(value)
+        \\    var writable: Ref(int) = Ref.from(value)
         \\    replace_value(writable, invoke(increment))
-        \\    return copy_value(borrow_local(value))
+        \\    return copy_value(Ref.from(value))
     , 42);
     try Fixture.expectParity(
-        \\import std.memory.{borrow_mut_local}
         \\func first(value: int) int -> value + 1
         \\func second(value: int) int -> value + 2
         \\func run() int
         \\    var callback: func(int) int = first
-        \\    const reference: Ref(mut func(int) int) = borrow_mut_local(callback)
-        \\    reference[] = second
+        \\    var reference: Ref(func(int) int) = Ref.from(callback)
+        \\    reference.value = second
         \\    return callback(40)
     , 42);
 }
@@ -12647,44 +12719,127 @@ test "explicit reference syntax rejects removed forms and permission upgrades" {
         \\exit(value)
     , .expected_token);
     try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{borrow_local}
         \\const value = 42
-        \\const item: Ref(int, false) = borrow_local(value)
-        \\exit(item[])
+        \\const item: Ref(int, false) = Ref.from(value)
+        \\exit(item.value)
     , .call_argument_count_mismatch);
     try Fixture.expectSourceDiagnostic(
         \\func inspect(value: mut int) int -> value
         \\exit(inspect(42))
     , .invalid_expression);
     try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{borrow_local}
-        \\var value: int | none = 42
-        \\if const part = borrow_local(value) as Ref(mut int) -> exit(part[])
+        \\const value: int | none = 42
+        \\const reference = Ref.from(value)
+        \\if ref part = reference.value as int -> part += 1
     , .reference_not_writable);
+}
+
+test "const reference carriers preserve field-sensitive generic contracts incrementally" {
+    const source =
+        \\struct Left
+        \\    copy = none
+        \\    pub value: int
+        \\struct Right
+        \\    copy = none
+        \\    pub value: int
+        \\struct Pair(A: type, B: type)
+        \\    copy = trivial
+        \\    pub first: Ref(A)
+        \\    pub second: Ref(B)
+        \\func update(static A: type, static B: type, ref pair: Pair(A, B))
+        \\    pair.first.value.value += 30
+        \\func first(static A: type, static B: type, ref pair: Pair(A, B)) ref A
+        \\    return pair.first.value
+        \\func selected(ref left: Left) ref Left
+        \\    const right = Right{value = 7}
+        \\    const pair = Pair(Left, Right){first = Ref.from(left), second = Ref.from(right)}
+        \\    update(pair)
+        \\    return first(pair)
+        \\func run() int
+        \\    var owner = Left{value = 12}
+        \\    ref result = selected(owner)
+        \\    return result.value
+        \\exit(run())
+    ;
+    const fixture = try Fixture.init(source);
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+
+    const readonly = try std.mem.replaceOwned(u8, testing.allocator, source, "var owner =", "const owner =");
+    defer testing.allocator.free(readonly);
+    try fixture.db.setInput(queries.SourceText, 0, readonly);
+    try fixture.expectDiagnostic(0, .reference_not_writable);
+
+    const reading = try std.mem.replaceOwned(u8, testing.allocator, readonly, "pair.first.value.value += 30", "_ = pair.first.value.value");
+    defer testing.allocator.free(reading);
+    try fixture.db.setInput(queries.SourceText, 0, reading);
+    try fixture.expectExit(0, 12);
+
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(0, 42);
+}
+
+test "reference tuple generic contracts recompute permissions and origins" {
+    const source =
+        \\struct Left
+        \\    copy = none
+        \\    pub value: int
+        \\struct Right
+        \\    copy = none
+        \\    pub value: int
+        \\func update(static A: type, static B: type, ref pair: (ref A, ref B))
+        \\    pair.0.value += 30
+        \\func first(static A: type, static B: type, ref pair: (ref A, ref B)) ref A
+        \\    return pair.0
+        \\func selected(ref left: Left) ref Left
+        \\    const right = Right{value = 7}
+        \\    const pair: (ref Left, ref Right) = (left, right)
+        \\    update(pair)
+        \\    return first(pair)
+        \\func run() int
+        \\    var owner = Left{value = 12}
+        \\    ref result = selected(owner)
+        \\    return result.value
+        \\exit(run())
+    ;
+    const fixture = try Fixture.init(source);
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+
+    const readonly = try std.mem.replaceOwned(u8, testing.allocator, source, "var owner =", "const owner =");
+    defer testing.allocator.free(readonly);
+    try fixture.db.setInput(queries.SourceText, 0, readonly);
+    try fixture.expectDiagnostic(0, .reference_not_writable);
+
+    const reading = try std.mem.replaceOwned(u8, testing.allocator, readonly, "pair.0.value += 30", "_ = pair.0.value");
+    defer testing.allocator.free(reading);
+    try fixture.db.setInput(queries.SourceText, 0, reading);
+    try fixture.expectExit(0, 12);
+
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(0, 42);
 }
 
 test "reference projections retain allocated parameter storage without exposing parameter copies" {
     try Fixture.expectParity(
-        \\import std.memory.{borrow_local}
         \\func selected(value: Box(int) | none) Ref(int) | none
-        \\    if const box = borrow_local(value) as Ref(Box(int)) -> return box[].borrow()
+        \\    if ref box = value as Box(int) -> return Ref.from(box.borrow())
         \\    return none
         \\fallible calculate() int
         \\    const owner = Box.new?(42)
-        \\    if const reference = selected(owner) as Ref(int) -> return reference[]
+        \\    if const reference = selected(owner) as Ref(int) -> return reference.value
         \\    return 90
         \\func run() int
         \\    if const result = calculate() -> return result
         \\    return 91
     , 42);
     try Fixture.expectSourceDiagnostic(
-        \\import std.memory.{borrow_local}
         \\struct Pair
         \\    copy = trivial
         \\    value: int
-        \\func escape(pair: Pair) Ref(int) -> borrow_local(pair.value)
+        \\func escape(pair: Pair) Ref(int) -> Ref.from(pair.value)
         \\const reference = escape(Pair{value = 42})
-        \\exit(reference[])
+        \\exit(reference.value)
     , .borrow_outlives_source);
 }
 
@@ -12692,10 +12847,10 @@ test "replacing a variant through a reference invalidates its projected payload"
     try Fixture.expectSourceDiagnostic(
         \\fallible calculate() int
         \\    var owner = Box(int | none).new?(42)
-        \\    const reference = owner.borrow_mut()
-        \\    if const part = reference as Ref(mut int)
-        \\        reference[] = none
-        \\        return part[]
+        \\    ref reference = owner.borrow()
+        \\    if ref part = reference as int
+        \\        reference = none
+        \\        return part
         \\    return 90
         \\if const result = calculate() -> exit(result)
     , .borrow_outlives_source);
@@ -12703,19 +12858,18 @@ test "replacing a variant through a reference invalidates its projected payload"
 
 test "reference permission edits recompute projected access" {
     const source =
-        \\import std.memory.{borrow_mut_local}
         \\func run() int
         \\    var value: int | none = 41
-        \\    if const part = borrow_mut_local(value) as Ref(mut int)
-        \\        part[] += 1
-        \\        return part[]
+        \\    if ref part = value as int
+        \\        part += 1
+        \\        return part
         \\    return 90
         \\exit(run())
     ;
     const fixture = try Fixture.init(source);
     defer fixture.deinit();
     try fixture.expectExit(0, 42);
-    const readonly = try std.mem.replaceOwned(u8, testing.allocator, source, "as Ref(mut int)", "as Ref(int)");
+    const readonly = try std.mem.replaceOwned(u8, testing.allocator, source, "var value:", "const value:");
     defer testing.allocator.free(readonly);
     try fixture.db.setInput(queries.SourceText, 0, readonly);
     try fixture.expectDiagnostic(0, .reference_not_writable);

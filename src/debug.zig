@@ -40,29 +40,16 @@ fn renderFunctionSource(db: *query.Database, instance: structures.InstanceId, so
     for (sources) |source| {
         if (source.file_id != resolved.file_id) continue;
         try writer.print("source {s} :: ", .{source.path});
-        try renderItemName(db, instance.item, writer);
-        if (instance.specialization) |specialization| try writer.print("[{d}]", .{@backingInt(specialization)});
+        const location = try db.lookupInterned(queries.ItemLocations, instance.item);
+        if (location.origin == .module) {
+            const module = try db.lookupInterned(queries.ModulePaths, location.origin.module);
+            try writer.print("{s}.", .{if (module.path.len == 0) "$entry" else module.path});
+        }
+        try diagnostics.writeFunctionName(queries.TypeFacts(*query.Database){ .ctx = db }, writer, instance);
         try writer.writeByte('\n');
         return;
     }
     unreachable; // The driver supplies every registered source.
-}
-
-fn renderItemName(db: *query.Database, item: structures.ItemId, writer: *std.Io.Writer) anyerror!void {
-    const loc = try db.lookupInterned(queries.ItemLocations, item);
-    if (loc.owner) |owner| {
-        try renderItemName(db, owner, writer);
-        try writer.writeByte('.');
-    } else if (loc.origin == .module) {
-        const module = try db.lookupInterned(queries.ModulePaths, loc.origin.module);
-        try writer.print("{s}.", .{if (module.path.len == 0) "$entry" else module.path});
-    }
-    try renderName(loc.name, writer);
-}
-
-fn renderName(name: structures.Name, writer: *std.Io.Writer) !void {
-    try writer.writeAll(name.text());
-    if (name == .operation) try writer.print("/{d}", .{name.operation.operandCount()});
 }
 
 fn renderSsaFunction(
@@ -71,10 +58,8 @@ fn renderSsaFunction(
     ssa: *const structures.FunctionBodyAnalysis,
     writer: *std.Io.Writer,
 ) !void {
-    const location = try db.lookupInterned(queries.ItemLocations, instance.item);
     try writer.writeAll("fn ");
-    try renderName(location.name, writer);
-    if (instance.specialization) |specialization| try writer.print("[{d}]", .{@backingInt(specialization)});
+    try diagnostics.writeFunctionName(queries.TypeFacts(*query.Database){ .ctx = db }, writer, instance);
     try writer.writeByte('\n');
     for (ssa.blocks, 0..) |block, block_index| {
         try writer.print("  b{d}(", .{block_index});
@@ -169,9 +154,8 @@ fn renderInstruction(db: *query.Database, ssa: *const structures.FunctionBodyAna
         },
         .initializer_ref => |reference| try writer.print(" region {d}, captures {d}..{d}", .{ reference.region, reference.captures.start, reference.captures.end }),
         .function_ref => |reference| {
-            const target = try db.lookupInterned(queries.ItemLocations, reference.target);
             try writer.writeAll(" @");
-            try renderName(target.name, writer);
+            try diagnostics.writeFunctionName(queries.TypeFacts(*query.Database){ .ctx = db }, writer, reference.instance());
         },
         .variant_coerce, .variant_extract => |operation| {
             try writer.print(" %{d}{s}", .{ @backingInt(operation.operand), if (instruction == .variant_coerce) " to " else " as " });
@@ -235,9 +219,8 @@ fn renderCall(db: *query.Database, ssa: *const structures.FunctionBodyAnalysis, 
 fn renderCallTarget(db: *query.Database, target: @FieldType(structures.FunctionCall, "target"), writer: *std.Io.Writer) !void {
     switch (target) {
         .direct => |instance| {
-            const location = try db.lookupInterned(queries.ItemLocations, instance.item);
             try writer.writeByte('@');
-            try renderName(location.name, writer);
+            try diagnostics.writeFunctionName(queries.TypeFacts(*query.Database){ .ctx = db }, writer, instance);
         },
         .indirect => |value| try writer.print("%{d}", .{@backingInt(value)}),
         .initializer => |value| try writer.print("init %{d}", .{@backingInt(value)}),
@@ -253,17 +236,7 @@ fn renderValueUse(db: *query.Database, value_use: structures.FunctionValueUse, w
 }
 
 fn renderType(db: *query.Database, type_id: structures.TypeId, writer: *std.Io.Writer) anyerror!void {
-    const types: queries.TypeFacts(*query.Database) = .{ .ctx = db };
-    if (try types.arrayType(type_id)) |array| {
-        try writer.writeAll("Array(");
-        try renderType(db, array.element_type, writer);
-        return writer.print(", {d})", .{array.length});
-    }
-    if (type_id.interned()) |interned_id| {
-        try writer.print("type#{d}", .{@backingInt(interned_id)});
-    } else {
-        try writer.writeAll(@tagName(type_id));
-    }
+    try diagnostics.writeTypeInner(queries.TypeFacts(*query.Database){ .ctx = db }, writer, type_id);
 }
 
 pub fn renderAssembly(
