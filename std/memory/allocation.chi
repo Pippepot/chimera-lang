@@ -107,7 +107,7 @@ pub struct List(T: type)
         index < self.initialized
         return unsafe_borrow(T, self.storage, index)
 
-    pub fallible [](ref self: List(T), index: int) ref T -> self.get?(index)
+    pub overload [](get, slice)
 
     pub fallible []=(mut self: List(T), index: int, var item: T) unit
         ref element = self.get?(index)
@@ -166,7 +166,7 @@ pub struct Span(T: type)
         index >= 0
         index < self.size
         return cursor_element(T, self.data, index)
-    pub fallible [](ref self: Span(T), index: int) ref T -> self.get?(index)
+    pub overload [](get, slice)
     pub fallible []=(mut self: Span(T), index: int, var item: T) unit
         ref element = self.get?(index)
         element = item^

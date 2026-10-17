@@ -97,6 +97,7 @@ pub const Token = struct {
         keyword_not,
         keyword_none,
         keyword_or,
+        keyword_overload,
         keyword_panic,
         keyword_imm,
         keyword_return,
@@ -138,6 +139,7 @@ pub const Token = struct {
         .{ "not", .keyword_not },
         .{ "none", .keyword_none },
         .{ "or", .keyword_or },
+        .{ "overload", .keyword_overload },
         .{ "panic", .keyword_panic },
         .{ "imm", .keyword_imm },
         .{ "return", .keyword_return },
@@ -222,6 +224,7 @@ pub const Node = struct {
         field_access,
         index_access,
         func,
+        overload,
         identifier,
         none_literal,
         number_literal,
@@ -290,7 +293,7 @@ pub const Node = struct {
             .add, .sub, .mul, .div, .rem, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .range, .range_inclusive, .@"and", .@"or", .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .rem_assign, .call, .index_access, .const_binding, .var_binding, .ref_binding, .static_binding, .namespace_declaration, .func, .param, .type_func, .@"if" => .node_node,
             .struct_field => .field,
             .signature => .signature,
-            .block, .for_loop, .call_arg_list, .param_list, .type_list, .type_variant, .type_tuple, .where_clauses, .if_else, .@"struct", .struct_init, .collection_literal, .tuple_literal, .import, .selective_import => .ref,
+            .block, .for_loop, .call_arg_list, .param_list, .type_list, .type_variant, .type_tuple, .where_clauses, .if_else, .@"struct", .struct_init, .collection_literal, .tuple_literal, .import, .selective_import, .overload => .ref,
             else => null,
         };
     }
@@ -483,6 +486,7 @@ pub const Name = union(enum) {
 
 pub const ItemKind = enum {
     function,
+    overload,
     structure,
     static,
     top_level_entry,
@@ -648,8 +652,18 @@ pub const NamespaceBinding = struct { module: ModuleId, members_visible: bool = 
 pub const NameReference = union(enum) {
     namespace: NamespaceBinding,
     declaration: InstanceId,
-    overloaded_function: [2]InstanceId,
+    overloaded_function: FunctionOverloadId,
     constant: CompileTimeValueId,
+};
+
+pub const FunctionOverloadId = enum(u32) { _ };
+
+pub const FunctionOverloadSet = struct {
+    candidates: []const InstanceId,
+    declaration: ?InstanceId = null,
+
+    pub const eql = value_operations.Owned(@This()).eql;
+    pub const deinit = value_operations.Owned(@This()).deinit;
 };
 
 pub const ImportTarget = union(enum) {
@@ -1669,6 +1683,12 @@ pub const Diagnostic = struct {
         invalid_external_signature,
         invalid_operation_signature,
         ambiguous_operation_reference,
+        empty_overload,
+        invalid_overload_candidate,
+        duplicate_overload_candidate,
+        no_matching_overload: ?TypeId,
+        ambiguous_overload,
+        overload_requires_callable_context,
         struct_member_not_supported,
         duplicate_struct_member,
         reserved_ownership_member,

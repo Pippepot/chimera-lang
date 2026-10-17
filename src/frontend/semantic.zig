@@ -98,6 +98,7 @@ pub const UnresolvedBody = struct {
         pub const Target = union(enum) {
             direct: structures.InstanceId,
             inferred: structures.InstanceId,
+            overloaded: structures.FunctionOverloadId,
             operation: []const u8,
             unknown_function,
             value: ValueUse,
@@ -151,7 +152,7 @@ pub const UnresolvedBody = struct {
             unit,
             none,
             function_ref: structures.FunctionReference,
-            overloaded_function: [2]structures.InstanceId,
+            overloaded_function: structures.FunctionOverloadId,
             local_read: LocalId,
             local_transfer: LocalId,
             field_transfer: struct { target: LocalId, fields: structures.FunctionValueRange },
@@ -1413,11 +1414,14 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             };
             const PendingTarget = union(enum) {
                 direct: DirectTarget,
+                overloaded: structures.FunctionOverloadId,
                 unknown_function,
                 value: UnresolvedBody.ValueUse,
             };
             const pending_target: PendingTarget = target: {
                 if (try self.namedExpressionWithOperands(callee_index, self.ast.nodeList(node.data.node_node.b).len)) |reference| {
+                    if (reference == .overloaded_function)
+                        break :target .{ .overloaded = reference.overloaded_function };
                     if (reference == .declaration) {
                         if (try self.type_interner.functionShape(reference.declaration.item)) |shape|
                             break :target .{ .direct = .{ .instance = reference.declaration, .shape = shape } };
@@ -1430,6 +1434,8 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                     break :target .unknown_function;
                 break :target .{ .value = try self.appendUse(callee_index, false) };
             };
+            if (pending_target == .overloaded)
+                return self.buildOverloadedCall(node, span, fallible_syntax, pending_target.overloaded);
             if (pending_target == .direct) {
                 if (callSyntaxIssue(fallible_syntax, pending_target.direct.shape.is_fallible, requires_fallible)) |kind|
                     return self.reject(callee_index, kind);
@@ -1438,6 +1444,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             const parameter_shapes: ?[]const structures.FunctionParameterShape = switch (pending_target) {
                 .direct => |direct| direct.shape.parameters,
                 .unknown_function, .value => null,
+                .overloaded => unreachable,
             };
             var infer_static = if (pending_target == .direct)
                 try self.type_interner.needsInheritedInference(pending_target.direct.instance)
@@ -1508,6 +1515,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             const target: UnresolvedBody.Call.Target = switch (pending_target) {
                 .unknown_function => .unknown_function,
                 .value => |value| .{ .value = value },
+                .overloaded => unreachable,
                 .direct => |direct| if (infer_static)
                     .{ .inferred = direct.instance }
                 else
@@ -1521,9 +1529,32 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             };
         }
 
+        fn buildOverloadedCall(self: *Self, call: structures.Node, span: structures.SourceSpan, fallible_syntax: bool, overload: structures.FunctionOverloadId) !UnresolvedBody.Call {
+            const arguments = try self.buildMethodArguments(self.ast.nodeList(call.data.node_node.b));
+            return .{
+                .target = .{ .overloaded = overload },
+                .arguments = arguments,
+                .span = span,
+                .fallible_syntax = fallible_syntax,
+            };
+        }
+
         fn buildMemberCall(self: *Self, call: structures.Node, callee: structures.Node) !UnresolvedBody.Call {
             const receiver = try self.appendUse(callee.data.node, false);
-            const argument_nodes = self.ast.nodeList(call.data.node_node.b);
+            const arguments = try self.buildMethodArguments(self.ast.nodeList(call.data.node_node.b));
+            const name_span = tokenSpan(self.ast, callee.token_index);
+            return .{
+                .target = .{ .member = .{
+                    .receiver = receiver,
+                    .name = self.source[name_span.start..name_span.end],
+                } },
+                .arguments = arguments,
+                .span = name_span,
+                .fallible_syntax = self.ast.tokens[call.token_index].tag == .question_mark,
+            };
+        }
+
+        fn buildMethodArguments(self: *Self, argument_nodes: []const structures.Node.Index) !structures.FunctionValueRange {
             var arguments: std.ArrayList(UnresolvedBody.MethodCallArgument) = .empty;
             defer arguments.deinit(self.gpa);
             for (argument_nodes) |argument| {
@@ -1538,16 +1569,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             }
             const start: u32 = @intCast(self.method_call_arguments.items.len);
             try self.method_call_arguments.appendSlice(self.gpa, arguments.items);
-            const name_span = tokenSpan(self.ast, callee.token_index);
-            return .{
-                .target = .{ .member = .{
-                    .receiver = receiver,
-                    .name = self.source[name_span.start..name_span.end],
-                } },
-                .arguments = .{ .start = start, .end = @intCast(self.method_call_arguments.items.len) },
-                .span = name_span,
-                .fallible_syntax = self.ast.tokens[call.token_index].tag == .question_mark,
-            };
+            return .{ .start = start, .end = @intCast(self.method_call_arguments.items.len) };
         }
 
         fn appendExpression(self: *Self, index: structures.Node.Index, operation: UnresolvedBody.Expression.Operation) !ValueId {
@@ -2281,9 +2303,13 @@ fn resolveNamedExpressionWithOperands(ast: *const structures.Ast, source: []cons
         },
         .call => {
             const callee = (try resolveNamedExpressionWithOperands(ast, source, node.data.node_node.a, type_interner, ast.nodeList(node.data.node_node.b).len)) orelse return null;
-            if (callee != .declaration) return null;
-            const shape = (try type_interner.functionShape(callee.declaration.item)) orelse return null;
-            if (!shape.returns_type) return null;
+            if (callee == .overloaded_function) {
+                if (!try type_interner.overloadCallReturnsType(callee.overloaded_function, index)) return null;
+            } else {
+                if (callee != .declaration) return null;
+                const shape = (try type_interner.functionShape(callee.declaration.item)) orelse return null;
+                if (!shape.returns_type) return null;
+            }
             const value = (try type_interner.executeComptime(index)) orelse return error.Unavailable;
             return .{ .constant = value };
         },
@@ -2892,6 +2918,7 @@ pub fn discoverItems(gpa: std.mem.Allocator, ast: *const structures.Ast, source:
         const value = target_node.data.node_node.b.unwrap() orelse unreachable;
         const kind: structures.ItemKind = switch (ast.nodes[value.index()].tag) {
             .func => .function,
+            .overload => .overload,
             .@"struct" => .structure,
             else => .static,
         };
@@ -2989,6 +3016,7 @@ fn discoverStructItems(
             const value = member.data.node_node.b;
             const kind: structures.ItemKind = switch (ast.nodes[value.index()].tag) {
                 .func => .function,
+                .overload => .overload,
                 .@"struct" => .structure,
                 else => .static,
             };
@@ -3004,6 +3032,8 @@ fn discoverStructItems(
 
 fn declarationName(ast: *const structures.Ast, name: []const u8, declaration: u32) structures.Name {
     const node = ast.nodes[declaration];
+    if (node.tag == .static_binding and ast.nodes[node.data.node_node.b.index()].tag == .overload)
+        return .fromText(name, null);
     if (node.tag != .static_binding or ast.nodes[node.data.node_node.b.index()].tag != .func)
         return .{ .identifier = name };
     const parts = functionParts(ast, declaration);
@@ -3352,6 +3382,10 @@ const TestTypeInterner = struct {
     }
 
     pub fn functionShape(_: @This(), _: structures.ItemId) !?structures.FunctionShape {
+        unreachable;
+    }
+
+    pub fn overloadCallReturnsType(_: @This(), _: structures.FunctionOverloadId, _: structures.Node.Index) !bool {
         unreachable;
     }
 

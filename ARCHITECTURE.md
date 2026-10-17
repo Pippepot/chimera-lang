@@ -39,9 +39,17 @@ This is a high-level map of the compiler's ownership and stage boundaries. [synt
 - Declaration names distinguish ordinary identifiers from `Operation` identities.
 	The same operator identity owns spelling, operand count, signature shape, and
 	primitive support. Unary and binary `-` are distinct interned declarations;
-	namespace collection, duplicate checks, and ordering preserve both. Calls select
-	by shape, never argument types. Ambiguous callable references remain unresolved
-	until typing receives a function-type context and selects its operand count.
+	namespace collection, duplicate checks, and ordering preserve both. These
+	unmarked forms retain shape-only selection. Explicit overload declarations own
+	their complete name and reference separately identified implementations.
+	`ResolveOverloads` publishes interned candidate sets with stable instance
+	identities, not pointers into query-owned scopes. Direct calls, methods,
+	operations, callable contexts, and unevaluated discovery share type-based
+	selection for explicit sets; imports do not merge membership.
+	`FunctionCandidateSignature` owns callable headers and declared operation
+	validation without evaluating `where` clauses. Selected signatures validate
+	constraints and capabilities normally. Candidate mismatches remain distinct
+	from source errors and unavailable state; bodies are never trial-executed.
 
 ## Analysis and compile time
 
@@ -54,7 +62,10 @@ This is a high-level map of the compiler's ownership and stage boundaries. [synt
 	bounds and inclusivity; only traversal constructs normalized RangeSequence
 	state. Library range resolution checks initialized extents before offset or
 	inclusive-end arithmetic. Array/List/Span and text views use one range-based
-	slice API without a compiler slicing instruction or range index overload.
+	slice API. Explicit library index overloads select borrowed element getters
+	or owned slicing functions, without a compiler slicing instruction or
+	Range-specific dispatch. Index snapshots freeze direct primitive arguments
+	while preserving ordinary borrowing and overlap checks for aggregate keys.
 	Semantic `for`
 	lowering uses hidden source/cursor bindings, ordinary member calls, scopes,
 	conditionals, and loops. Typing selects an explicit `iter` factory or borrows

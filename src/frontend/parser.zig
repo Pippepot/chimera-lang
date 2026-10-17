@@ -310,6 +310,7 @@ fn parseExpression(parser: *ParserState) ParseError!Node.Index {
         .keyword_import => try parseImport(parser),
         .keyword_func, .keyword_fallible, .keyword_extern => try parseFunction(parser),
         .keyword_converter => try parseConverter(parser),
+        .keyword_overload => try parseOverload(parser),
         .keyword_return, .keyword_break => try parseReturnOrBreak(parser),
         .keyword_panic => try parsePanic(parser),
         .keyword_fail => try parseTokenNode(parser, .keyword_fail, .fail_expr),
@@ -498,6 +499,7 @@ fn parsePublic(parser: *ParserState) !Node.Index {
         .keyword_const, .keyword_var, .keyword_ref, .keyword_static => try parseBinding(parser),
         .keyword_func, .keyword_fallible, .keyword_extern => try parseFunction(parser),
         .keyword_converter => try parseConverter(parser),
+        .keyword_overload => try parseOverload(parser),
         .keyword_struct => try parseStruct(parser),
         .keyword_import => try parseImport(parser),
         else => {
@@ -598,6 +600,20 @@ fn parseFunction(parser: *ParserState) !Node.Index {
     const declared_name = name orelse return value;
     const declaration = try finishNamedDeclaration(parser, declared_name.token_index, value);
     return finishQualifiedDeclaration(parser, declared_name, declaration);
+}
+
+fn parseOverload(parser: *ParserState) !Node.Index {
+    const token_index = parser.index;
+    _ = try parser.expect(.keyword_overload);
+    const name = try parseDeclarationName(parser, true);
+    const candidates = try parseDelimitedList(parser, .l_paren, .r_paren, &.{}, parseExpressionPrecedence, .{@as(u8, 0)});
+    if (candidates.ref.start == candidates.ref.end) {
+        try parser.addError(.empty_overload);
+        return error.ParseError;
+    }
+    const value = try parser.addNode(.{ .tag = .overload, .token_index = token_index, .data = candidates });
+    const declaration = try finishNamedDeclaration(parser, name.token_index, value);
+    return finishQualifiedDeclaration(parser, name, declaration);
 }
 
 fn parseConverter(parser: *ParserState) !Node.Index {
@@ -1038,7 +1054,7 @@ fn parseStructItem(parser: *ParserState) ParseError!Node.Index {
         return parser.addNode(.{ .tag = .@"pub", .token_index = token_index, .data = .{ .node = field } });
     }
     if (parser.current().tag == .keyword_pub) return parsePublic(parser);
-    if (parser.current().tag == .keyword_func or parser.current().tag == .keyword_fallible or parser.current().tag == .keyword_struct) {
+    if (parser.current().tag == .keyword_func or parser.current().tag == .keyword_fallible or parser.current().tag == .keyword_struct or parser.current().tag == .keyword_overload) {
         return parseExpression(parser);
     }
     return switch (parser.tokens[parser.index + 1].tag) {
@@ -1243,6 +1259,21 @@ test "parse named function declaration and implicit inline return" {
         \\    └─mul
         \\      ├─identifier : x
         \\      └─number_literal : 2
+    );
+}
+
+test "parse explicit multiline overload declarations with trailing commas" {
+    try testParsing(
+        \\pub overload [](
+        \\    get,
+        \\    slice,
+        \\)
+    ,
+        \\pub
+        \\└─static_binding
+        \\  └─overload
+        \\    ├─identifier : get
+        \\    └─identifier : slice
     );
 }
 

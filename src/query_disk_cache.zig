@@ -6,7 +6,7 @@ const queries = @import("queries.zig");
 const structures = @import("structures.zig");
 const standard_library = @import("standard_library");
 
-const format = "CHIQRY36";
+const format = "CHIQRY38";
 const max_records = 1_000_000;
 
 pub fn save(io: std.Io, allocator: std.mem.Allocator, directory: []const u8, key: cache.Key, db: *query.Database) !void {
@@ -35,7 +35,7 @@ pub fn restoreInterns(db: *query.Database, allocator: std.mem.Allocator, payload
 }
 
 fn restoreNamedIntern(name: []const u8, db: *query.Database, reader: *codec.Reader, index: usize) !void {
-    inline for (.{ queries.ModulePaths, queries.ItemLocations, queries.Types, queries.ByteStrings, queries.CompileTimeValues, queries.CompileTimeValueTuples }) |I| {
+    inline for (.{ queries.ModulePaths, queries.ItemLocations, queries.FunctionOverloads, queries.Types, queries.ByteStrings, queries.CompileTimeValues, queries.CompileTimeValueTuples }) |I| {
         if (std.mem.eql(u8, name, @typeName(I))) return restoreIntern(I, db, reader, index);
     }
     return error.InvalidCache;
@@ -47,6 +47,18 @@ fn restoreIntern(comptime I: type, db: *query.Database, reader: *codec.Reader, i
     if (!(try validateIds(I.Value, db, value))) return error.InvalidCache;
     if (I == queries.ByteStrings and !std.unicode.utf8ValidateSlice(value.bytes)) return error.InvalidCache;
     if (I == queries.CompileTimeValues and !(try validRuntimeValue(db, value))) return error.InvalidCache;
+    if (I == queries.FunctionOverloads) {
+        if (value.candidates.len == 0) return error.InvalidCache;
+        if (value.declaration) |declaration| {
+            if ((try db.lookupInternedAs(queries.ItemLocations, declaration.item)).?.kind != .overload) return error.InvalidCache;
+        }
+        var seen: std.AutoHashMapUnmanaged(structures.InstanceId, void) = .empty;
+        defer seen.deinit(reader.allocator);
+        for (value.candidates) |candidate| {
+            if ((try db.lookupInternedAs(queries.ItemLocations, candidate.item)).?.kind != .function) return error.InvalidCache;
+            if ((try seen.getOrPut(reader.allocator, candidate)).found_existing) return error.InvalidCache;
+        }
+    }
     if (I == queries.Types) {
         switch (value) {
             .array => |array| if (!try validArrayType(db, array)) return error.InvalidCache,
@@ -245,6 +257,7 @@ fn validateIds(comptime T: type, db: *query.Database, value: T) anyerror!bool {
     if (T == u8) return true;
     if (T == structures.ModuleId) return (try db.lookupInternedAs(queries.ModulePaths, value)) != null;
     if (T == structures.ItemId) return (try db.lookupInternedAs(queries.ItemLocations, value)) != null;
+    if (T == structures.FunctionOverloadId) return (try db.lookupInternedAs(queries.FunctionOverloads, value)) != null;
     if (T == structures.StaticStorageCursor) {
         const access = (try persistedCursorAccess(db, value.type_id)) orelse return false;
         if (value.data) |identity| {

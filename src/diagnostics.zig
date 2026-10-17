@@ -534,6 +534,17 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
         .invalid_external_signature => try writer.writeAll("external function signature does not match its compiler-provided implementation"),
         .invalid_operation_signature => try writer.writeAll("operation function must match its exact compiler-specified signature"),
         .ambiguous_operation_reference => try writer.writeAll("operator reference requires an unambiguous operand count or a function-type annotation"),
+        .empty_overload => try writer.writeAll("an overload declaration requires at least one function"),
+        .invalid_overload_candidate => try writer.writeAll("overload alternatives must name function declarations"),
+        .duplicate_overload_candidate => try writer.writeAll("function is already included in this overload set"),
+        .no_matching_overload => |expected| {
+            if (expected) |type_id| {
+                try writer.writeAll("no overload matches the required function type ");
+                try writeType(types, writer, type_id);
+            } else try writer.writeAll("no overload matches the argument types and count");
+        },
+        .ambiguous_overload => try writer.writeAll("multiple overloads match; name an implementation explicitly"),
+        .overload_requires_callable_context => try writer.writeAll("an overload reference requires a function-type annotation"),
         .struct_member_not_supported => try writer.writeAll("struct bodies support fields, namespace declarations, and `move`, `copy`, or `drop` properties"),
         .duplicate_struct_member => try writeSourceLabel(writer, "struct member is already declared", source, span),
         .reserved_ownership_member => try writeSourceLabel(writer, "`copy` and `move` are reserved for ownership capabilities", source, span),
@@ -819,6 +830,11 @@ test "diagnostic types display array elements lengths and nested variants" {
     const element: structures.TypeId = .fromInterned(try db.intern(queries.Types, .{ .variant = .{ .members = &.{ .int, .none } } }));
     const row: structures.TypeId = .fromInterned(try db.intern(queries.Types, .{ .array = .{ .element_type = element, .length = 2 } }));
     const matrix: structures.TypeId = .fromInterned(try db.intern(queries.Types, .{ .array = .{ .element_type = row, .length = 0 } }));
+    const callable: structures.TypeId = .fromInterned(try db.intern(queries.Types, .{ .callable = .{
+        .parameters = &.{.{ .mode = .imm, .type_id = .int }},
+        .return_type = .int,
+        .is_fallible = false,
+    } }));
     const types: queries.TypeFacts(*query.Database) = .{ .ctx = db };
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
@@ -831,6 +847,10 @@ test "diagnostic types display array elements lengths and nested variants" {
         .{ .kind = .{ .return_type_mismatch = .{ .expected = matrix, .found = .int } }, .message = "return type mismatch: expected `Array(Array(int | none, 2), 0)`, found `int`" },
         .{ .kind = .{ .type_not_copyable = .{ .type_id = matrix, .is_movable = true } }, .message = "cannot implicitly copy value of non-copyable type `Array(Array(int | none, 2), 0)`; use `^` to transfer ownership" },
         .{ .kind = .{ .type_not_copyable = .{ .type_id = matrix, .is_movable = false } }, .message = "cannot implicitly copy value of non-copyable type `Array(Array(int | none, 2), 0)`" },
+        .{ .kind = .overload_requires_callable_context, .message = "an overload reference requires a function-type annotation" },
+        .{ .kind = .{ .no_matching_overload = null }, .message = "no overload matches the argument types and count" },
+        .{ .kind = .{ .no_matching_overload = callable }, .message = "no overload matches the required function type `func(int) int`" },
+        .{ .kind = .ambiguous_overload, .message = "multiple overloads match; name an implementation explicitly" },
     };
     for (cases) |case| {
         output.clearRetainingCapacity();

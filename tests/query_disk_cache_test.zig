@@ -8,6 +8,55 @@ const query_disk_cache = test_sources.query_disk_cache;
 const structures = test_sources.structures;
 const standard_library = @import("standard_library");
 
+test "overload snapshots restore selection and refresh membership and signatures" {
+    const prefix =
+        \\func first(value: int) int -> value
+        \\func second(value: int) int -> value + 1
+        \\func boolean(value: bool) int -> 0
+    ;
+    const body = "\nfunc run() int -> choose(42)\nexit(run())";
+    const source = prefix ++ "\noverload choose(first, boolean)" ++ body;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    try fixture.db.setInput(queries.SourceText, 0, prefix ++ "\noverload choose(second, boolean)" ++ body);
+    try fixture.expectExit(43);
+    try fixture.db.setInput(queries.SourceText, 0, prefix ++ "\noverload choose(first, second)" ++ body);
+    try fixture.expectDiagnostic(.ambiguous_overload);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(42);
+    const changed = try std.mem.replaceOwned(u8, std.testing.allocator, source, "value: bool", "value: int");
+    defer std.testing.allocator.free(changed);
+    try fixture.db.setInput(queries.SourceText, 0, changed);
+    try fixture.expectDiagnostic(.ambiguous_overload);
+}
+
+test "overload range snapshots retain backing and refresh reusable bounds" {
+    const source =
+        \\fallible calculate() int
+        \\    var values = [12, 20, 30]
+        \\    const bounds = 1..
+        \\    var selected = values[bounds]
+        \\    selected[0] = 28
+        \\    return values[0] + values[1] + selected.len()
+        \\func run() int
+        \\    if const result = calculate() -> return result
+        \\    return 90
+        \\exit(run())
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const changed = try std.mem.replaceOwned(u8, std.testing.allocator, source, "1..", "2..");
+    defer std.testing.allocator.free(changed);
+    try fixture.db.setInput(queries.SourceText, 0, changed);
+    try fixture.expectExit(33);
+    const shortened = try std.mem.replaceOwned(u8, std.testing.allocator, changed, "[12, 20, 30]", "[12, 20]");
+    defer std.testing.allocator.free(shortened);
+    try fixture.db.setInput(queries.SourceText, 0, shortened);
+    try fixture.expectExit(90);
+}
+
 test "panic snapshots distinguish static arguments even when machine code is equal" {
     const source = "func stop(static N: int) int -> panic\nfunc run() int -> stop(1)\nexit(run())";
     const fixture = try Fixture.restore(source);

@@ -1,7 +1,8 @@
 # Range Slicing Contract
 
-Status: range-based named slicing is implemented. Bracket dispatch, from-end
-indices, and strided views remain deferred decisions. Language rules live in
+Status: range-based named and bracket slicing are implemented through explicit
+overload sets. From-end indices and strided views remain deferred decisions.
+Language rules live in
 [syntax&semantics.txt](../syntax&semantics.txt).
 
 ## Verified Starting Point
@@ -18,9 +19,10 @@ indices, and strided views remain deferred decisions. Language rules live in
   reserved capacity. Safe slicing must not expose uninitialized storage.
 - Standard integer indexing returns `ref T`; binding intent selects borrowing
   or copying. Slicing returns an owned Span handle, not ownership of elements.
-- Index operation declarations currently require an integer index. Operation
-  identity uses spelling and runtime operand count, not argument types.
-  Adding another same-arity index declaration is not an available overload.
+- Explicit declarations such as `pub overload [](get, slice)` select ordinary
+  functions by argument types and existing static inference. Index parameters
+  are not restricted to integers; user-defined index types use the same mechanism.
+  Duplicate ordinary declarations do not implicitly form overloads.
 - Fully bounded integer ranges create normalized traversal state only when
   iterated, reversed, or stepped. Reversal and stepping return RangeSequence,
   not raw Range bounds; these sequence values are not contiguous slice arguments.
@@ -42,23 +44,31 @@ Partial ranges require a collection extent for slicing and do not implicitly
 introduce infinite iteration. A contiguous Span cannot represent a reversed or
 strided sequence; keeping RangeSequence separate prevents silent reinterpretation.
 
+## Index Dispatch Contract
+
+Array, List, Span, and BytesView expose explicit getter/slicing overload sets.
+StringView exposes range slicing through an explicit single-alternative set.
+Bracket operands are reusable ordinary values, not syntax recognized specially
+by the compiler. Each implementation retains its own result ownership and
+effects: integer getters return borrowed elements, while slicing functions return
+owned view handles.
+
+Selected functions use ordinary bounds, conversion, ownership, and lifetime
+checks. Matching uses logical argument types and existing generic inference,
+not implicit converters, expected result types, mutable authority, or call
+fallibility. Direct bracket syntax propagates the selected function's ordinary
+failure; named fallible calls retain their usual markers. Source operands
+execute once, left to right. Standard setters remain integer element replacement;
+bulk range assignment is not defined.
+
 ## Decisions Still Requiring Approval
 
-### Index Dispatch And Result Ownership
-
-Decide how integer and range indexing coexist without inventing implicit
-argument-type overloading. A generic index declaration would also need to
-express the difference between `ref T` element results and owned Span results.
-Returning a union of both shapes would change existing integer-index consumers;
-returning a reference to a temporary Span is not an equivalent solution.
-
-The implemented named slicing method does not change operator semantics or
-implement `span[a..b]`. From-end spelling and strided-view representation also
-remain open; independently typed bounds leave room for a future FromEnd type.
+From-end spelling and strided-view representation remain open; independently
+typed bounds leave room for a future FromEnd type. `..^` remains inclusive.
 
 ## Checked Bounded Slice Cases
 
-For a source of length 5, these are named slicing outcomes, not bracket behavior:
+For a source of length 5, these are both named and bracket slicing outcomes:
 
 | Bounds | Outcome |
 | --- | --- |
@@ -124,8 +134,11 @@ snapshot test in [query_disk_cache_test.zig](../tests/query_disk_cache_test.zig)
 restoration and recomputation after edits to slice bounds, source length,
 intermediate constness, and backing permission.
 
-## Recommended Next Step
+The [overload suite](../tests/overload_test.zig) covers bracket selection and
+ownership. Snapshot tests also refresh overload membership and signatures.
 
-Approve an index-dispatch contract that preserves both borrowed integer results
-and owned slice handles before extending bracket syntax. Keep generic reflection,
-type builders, and new conditional-binding semantics outside that change.
+## Remaining Design Work
+
+Settle from-end indices and independently typed bounds before implementing them.
+Keep generic reflection, type builders, new conditional-binding semantics, and
+bulk range assignment outside the approved bracket-dispatch change.

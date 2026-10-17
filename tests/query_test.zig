@@ -5696,7 +5696,7 @@ test "variant annotation diagnostics belong to their semantic boundary" {
         const target_id = (try db.get(queries.IndexItems, case.file_id)).*.?.ids()[0];
         const diagnostics = if (case.query_signature) blk: {
             try testing.expect((try db.get(queries.FunctionSignature, target_id)).* == null);
-            break :blk try db.directAccumulatorValues(queries.FunctionSignature, target_id, structures.Diagnostic);
+            break :blk try db.directAccumulatorValues(queries.FunctionCandidateSignature, .{ .item = target_id }, structures.Diagnostic);
         } else blk: {
             try testing.expect((try db.get(queries.FunctionSignature, target_id)).* != null);
             try testing.expect((try db.get(queries.AnalyzeFunctionInstance, .{ .item = target_id })).* == null);
@@ -7892,7 +7892,7 @@ test "declarations cannot shadow visible module names" {
     const parameter = (try db.get(queries.BuildModuleScope, 2)).*.?.resolve("bad").?;
     try testing.expect((try db.get(queries.FunctionSignature, parameter)).* == null);
     const parameter_start = std.mem.indexOf(u8, parameter_source, "bad(visible").? + "bad(".len;
-    try expectSingleQueryDiagnostic(db, queries.FunctionSignature, parameter, true, 2, .{
+    try expectSingleQueryDiagnostic(db, queries.FunctionCandidateSignature, .{ .item = parameter }, true, 2, .{
         .start = parameter_start,
         .end = parameter_start + "visible".len,
     }, .duplicate_parameter);

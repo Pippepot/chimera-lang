@@ -14,13 +14,11 @@ Investigate these before the remaining implementation milestones, in this order.
 Ranges and slices come first because they shape indexing, iteration, collection
 APIs, and borrowing. Revisit implementation ordering when these decisions settle.
 
-1. **Range index dispatch.** Define how borrowed integer element indexing and
-  owned slice-handle results coexist in bracket syntax: `array[2..5]`,
-  `array[..5]`, and `array[2..]`. Preserve reusable typed bounds and ordinary
-  value/reference semantics without returning a union or borrowing a temporary
-  Span. Settle from-end indexing (potentially `array[^1]`) and independently
-  typed FromEnd bounds. `..^` remains inclusive, so from-end slice bounds need a
-  distinct spelling. The named slicing contract and remaining decisions are recorded
+1. **From-end indexing and bounds.** Settle from-end indexing (potentially
+  `array[^1]`) and independently typed FromEnd bounds. `..^` remains inclusive,
+  so from-end slice bounds need a distinct spelling. Define strided-view
+  representation separately from contiguous slicing. The slicing contract
+  and remaining decisions are recorded
   in [docs/RANGE_SLICING_PROPOSAL.md](docs/RANGE_SLICING_PROPOSAL.md).
 2. **Iteration composition interfaces.** Reference alternatives and typed
   reference tuples provide the ownership-aware result model for the
@@ -150,7 +148,7 @@ not gate collections or basic algorithms.
 - Temporary-projection borrowing and lifetime extension.
 - Shared ownership: atomic reference counts, access synchronization guarantees,
   and cycle policy. No upgradeable weak-reference API is proposed.
-- General overloading, function literals/closures, `sizeof`, and return inference.
+- Function literals/closures, `sizeof`, and return inference.
 - Additional targets only for concrete use cases: target/location-specific
   layouts, allocation, access, and zero-byte behavior. Start with scalar device
   buffers; defer raw addresses and foreign memory.

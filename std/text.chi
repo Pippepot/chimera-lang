@@ -20,7 +20,7 @@ pub struct BytesView
     pub fallible write_to(imm self: BytesView, descriptor: int) int -> io_write?(descriptor, self.data)
     pub func byte_length(imm self: BytesView) int -> self.data.len()
     pub fallible get(imm self: BytesView, index: int) ref byte -> self.data.get?(index)
-    pub fallible [](imm self: BytesView, index: int) ref byte -> self.get?(index)
+    pub overload [](get, slice)
     pub fallible slice(imm self: BytesView, static A: type, static B: type, bounds: Range(A, B)) BytesView
         return BytesView{data = self.data.slice?(bounds)}
     pub fallible validate_utf8(imm self: BytesView) StringView
@@ -67,6 +67,7 @@ pub struct StringView
     pub fallible <>(imm left: StringView, imm right: StringView) unit -> not equal_bytes?(left.bytes, right.bytes)
     pub func byte_length(imm self: StringView) int -> self.bytes.byte_length()
     pub func as_bytes(imm self: StringView) BytesView -> self.bytes
+    pub overload [](slice)
     pub fallible slice(imm self: StringView, static A: type, static B: type, bounds: Range(A, B)) StringView
         const offsets = bounds.resolve?(self.byte_length())
         const start = offsets.0

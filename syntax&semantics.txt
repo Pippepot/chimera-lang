@@ -49,8 +49,9 @@
 # An operation function is a type-namespace member with a compiler-specified
 # signature. Namespace visibility and ordinary call/specialization rules apply;
 # lookup uses the left operand's defining namespace, independently of imports.
-# No fallback to the right operand, conversion, or general function overloading
-# participates in selection. Operands evaluate once, left to right.
+# No fallback to the right operand or implicit merging of same-named declarations
+# participates in selection. Explicit overload sets use the rules below.
+# Operands evaluate once, left to right.
 # Primitive type namespaces belong to the registered standard prelude. Their
 # operations are qualified extern declarations, with compiler-provided bodies;
 # operator syntax, explicit calls, and callable values use the same declarations.
@@ -71,15 +72,17 @@ pub extern func int.+(imm left: int, imm right: int) int
 # +, -, *, /, %: func (imm Self, imm Self) Self
 # ==, <>, <, >, <=, >=: fallible (imm Self, imm Right) unit
 # unary -: func (imm Self) Self
-# []: func or fallible (imm Self, index: int) Result
-# []=: func or fallible (mut Self, index: int, var value: Element) unit
+# []: func or fallible (imm Self, index: Index) Result; ref Self is also allowed
+# []=: func or fallible (mut Self, index: Index, var value: Element) unit
 # Inherited namespace static arguments and inferable static parameters use
 # ordinary specialization; they do not count as runtime operands or permit
 # extra runtime operands. Signature validation rejects mismatches even for
 # explicit calls and callable values: addition with three operands is invalid.
 # Operators have fixed identities by spelling and operand count, not argument
 # types. Both forms of - may be declared in the same namespace; duplicate forms
-# remain invalid. Ordinary named functions do not acquire overloads.
+# remain invalid. Ordinary named functions do not acquire implicit overloads.
+# An explicit operator overload set owns its complete spelling and cannot coexist
+# with another declaration of that spelling, including another form of minus.
 # Comparison declarations choose their right operand type; ordinary argument
 # conversion applies to that operand. Dispatch still uses the left operand's
 # namespace and never reverses a user operation. Arithmetic operands retain
@@ -93,6 +96,7 @@ pub extern func int.-(imm value: int) int
 pub extern func int.-(imm left: int, imm right: int) int
 const negate: func(imm int) int = int.-
 const subtract: func(imm int, imm int) int = int.-
+# Explicitly declared sets instead select by argument types as specified below.
 # Arithmetic and arithmetic unary operations cannot fail. Comparison functions
 # succeed with unit or fail. Indexers may fail; indexed expressions propagate
 # ordinary failure in a fallible function
@@ -500,6 +504,43 @@ func choose() func(int) int -> double
 func apply(operation: func(int) int, value: int) int -> operation(value)
 const operation = choose()
 exit(apply(operation, 21))
+
+# Explicit overload sets
+# An overload declaration binds a module or type-namespace name to a nonempty
+# list of named functions. Multiline lists and trailing commas are allowed.
+func identity_int(value: int) int -> value
+func identity_bool(value: bool) bool -> value
+pub overload identity(identity_int, identity_bool)
+# Declarations and alternatives may be qualified. Alternatives must resolve to
+# distinct function declarations, not callable values or other overload sets.
+# Functions may be generic and have different result types, ownership, or effects.
+# A public set may expose private implementations without exporting their names.
+# Imports and reexports preserve set identity and never merge membership.
+#
+# Calls require one match by argument count and logical types, using ordinary
+# static inference and explicit static arguments. Context-free literals use
+# their ordinary defaults. Builtin widening participates, but implicit converters
+# do not. There is no declaration-order, conversion, or generic-specificity ranking.
+# Direct selection ignores expected result type, access authority, result
+# ownership, and fallible call spelling. Selected where clauses validate that
+# implementation; failure does not try another alternative.
+# After selection, ordinary ownership, overlap, conversion, destination, and
+# effect checks apply. Arguments execute once, left to right; explicit static
+# arguments retain ordinary compile-time execution. Rejected bodies are not run.
+# Callable and tuple arguments may receive an independent candidate parameter
+# context, without changing literal defaults or inferring statics from results.
+#
+# A reference to a set requires a callable type context. It selects one function
+# by the full signature, including parameter modes, result ownership, and ordinary
+# infallible-to-fallible widening.
+const selected: func(int) int = identity
+# Operator syntax, qualified calls, methods, and callable references share
+# explicit sets. Each alternative must satisfy the operation's signature contract.
+# For example, inside Array, List, Span, and BytesView:
+#   pub overload [](get, slice)
+# StringView exposes range indexing through pub overload [](slice).
+# Range and user-defined index types use this same mechanism. Slice results own
+# only the view handle and retain backing permission and lifetime.
 
 # A named `extern func` has a signature but no source body. It is a compiler-
 # provided declaration, not a general foreign-function interface. The compiler
@@ -1969,7 +2010,9 @@ loop
 # and out-of-bounds inputs fail rather than clamp. Slices own only a view handle,
 # preserve backing permissions and lifetimes, and expose no spare capacity.
 # Text slice positions are byte offsets; StringView also checks UTF-8 boundaries.
-# Brackets still accept integer element indices, not ranges.
+# Brackets select integer element indexing or range slicing through explicit
+# standard-library overload sets. StringView supports range slicing, not integer
+# element indexing. No standard range setter or bulk slice assignment is defined.
 #
 # reversed() reverses the actual sequence, including a stepped sequence.
 # step_by?(positive_factor) selects the first item and then every factor-th item

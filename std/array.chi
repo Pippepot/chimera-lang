@@ -21,7 +21,7 @@ pub struct Array(T: type, N: int)
         index < N
         return array_borrow(T, N, self, index)
 
-    pub fallible [](ref self: Array(T, N), index: int) ref T -> self.get?(index)
+    pub overload [](get, slice)
 
     pub fallible []=(mut self: Array(T, N), index: int, var value: T) unit
         ref element = self.get?(index)

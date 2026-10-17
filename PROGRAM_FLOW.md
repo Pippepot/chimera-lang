@@ -44,6 +44,15 @@ flowchart TD
     RS --> SD
     RI --> FH["FunctionShape(ItemId) → ?FunctionShape"]
     FH --> SA["SpecializationArity"]
+    FH --> CH["FunctionCandidateSignature(InstanceId)"]
+    SA --> CH
+    CH --> FS
+    CH --> AB
+    RI --> OS["ResolveOverloads(InstanceId)"]
+    MS --> OS
+    NS --> OS
+    OS --> AB
+    OS --> AT
     SA --> FS
     FH --> FS["FunctionInstanceSignature(InstanceId) → ?FunctionSignature"]
     RS --> FS
@@ -79,7 +88,7 @@ flowchart TD
 
 1. `ParseFile` and `DiscoverItems` identify declarations and the synthetic entry. `IndexItems` interns identities; `ModuleDeclarations` checks names across current member files, and `IndexModuleItems` publishes source locations. Building effective file scope does not demand signatures or bodies. Duplicate declarations fail even when unused.
 2. Static resolution demands referenced declarations recursively. Direct type aliases and declared struct identities can resolve without interpretation. Other initializers, explicit `comptime` expressions, static arguments, and calls in type positions use `AnalyzeComptimeThunk` then `ExecuteComptimeThunk`; the site key includes specialization and optional expected type. `ExecuteComptimeCall` keys concrete calls by instance and canonical arguments, obtaining typed bodies from `AnalyzeComptimeFunctionBody`. Mutable calls also return canonical copy-back arguments. Repeated instance-and-argument recursion is diagnosed; changing-argument recursion and loops have no step limit. Execution failures retain instruction spans and call-site notes.
-3. `AnalyzeFunctionInstance` demands its signature, effective scope, definitions, and ownership capabilities, then builds typed SSA. After deferred reference uses resolve, lifetime analysis plans cleanup, typing diagnoses explicit abandonment, and cleanup is materialized. A final reference check accounts for mutating destructors at their actual lowered positions before the body is published. All runtime instances use this same query, including unspecialized declarations; the synthetic entry supplies its own unit signature.
+3. `AnalyzeFunctionInstance` demands its signature, effective scope, definitions, and ownership capabilities, then builds typed SSA. Overload membership and candidate headers are separate cached facts; only the selected signature validates constraints. After deferred reference uses resolve, lifetime analysis plans cleanup, typing diagnoses explicit abandonment, and cleanup is materialized. A final reference check accounts for mutating destructors at their actual lowered positions before the body is published. All runtime instances use this same query, including unspecialized declarations; the synthetic entry supplies its own unit signature.
 4. `CompileFunction` demands the typed body and validates runtime eligibility, including initializer regions, before requesting host layouts; it does not compile callees. Layout consumes logical ownership validation. Codegen publishes machine code with symbolic instance references and call-site trace metadata derived from source paths and retained spans. Source or path edits refresh trace labels. Emission and assembly rendering use the same instruction descriptions.
 5. `ValidateModuleGraph` first validates imports, public exports, and converter declaration placement, ownership, and parameter shape throughout the dependency graph without compiling or evaluating any entry body. Reachability starts only at the designated entry and compiles each referenced instance once in breadth-first order, including recursive graphs. The linker consumes that order, lays out artifacts, and patches relocations. When panic is reachable, it also resolves trace metadata and links the shared panic reporter. Unreachable function bodies stay unanalyzed.
 6. The CLI handles a transitive compile-time `exit` control outcome without producing an executable, otherwise renders transitive diagnostics or optional AST/SSA/assembly/timing views, writes the executable through `src/runtime.zig`, and runs it through a private hard link to the published inode (or a private copy on filesystems without hard links). SSA debug output uses the same reachable set. The CLI registers the entry directory tree plus the embedded `std` sources and uses two workers by default where available. Module validation prefetches independent file queries, and reachability prefetches referenced function compilation.

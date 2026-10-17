@@ -37,6 +37,12 @@ not optimization of the generated Chimera program.
 `-h` and `--help` print usage and exit successfully when given before the source
 path. Options after the source path are passed to the generated program instead.
 
+Explicit overload declarations use `pub overload name(first, second)`, including
+operator names such as `pub overload [](get, slice)`. Alternatives are separately
+named ordinary or generic functions. Calls select one signature; function-type
+annotations select callable values. See [syntax&semantics.txt](../syntax&semantics.txt)
+for the selection rules.
+
 The CLI loads the entry directory tree except its root `std/` directory, which
 is reserved for embedded standard-library modules. It shares declarations
 within each module, compiles the designated entry file, writes `./prog`, runs
@@ -64,7 +70,11 @@ Array, List, and Span expose checked `slice?(bounds)`, for example
 `values.slice?(..)`. Bounds are reusable `Range(A, B)` values with independent
 integer or omitted (`none`) endpoints; equal exclusive endpoints are empty,
 reversed and out-of-bounds slices fail, and inclusive ends must name elements.
-There is no public start/size slicing alternative or range bracket dispatch.
+The same bounds work in brackets: `values[1..3]`, `values[..3]`,
+`values[2..]`, and `values[..]`. Explicit standard-library index overloads select
+the integer getter or slicing function; no range-specific compiler dispatch is
+involved. There is no public start/size slicing alternative, from-end index
+syntax, or bulk range assignment.
 `Span(T)` provides borrowed `get`/index access with permission
 captured from the receiver; owned bindings copy elements, and `as_imm()` attenuates
 permission. Copies and mutable bindings cannot upgrade readonly backing. Spans own no storage and
@@ -258,10 +268,13 @@ zig build test --seed=0 -Doptimize=safe -Dtest-source=tests/converter_test.zig -
 zig build test --seed=0 -Doptimize=safe -Dtest-source=tests/comptime_interpreter_test.zig --summary all
 ```
 
+Run the focused overload suite with
+`zig build test --seed=0 -Dtest-source=tests/overload_test.zig`.
+
 These entrypoints supply required module imports. Both suite modes run inline
-tests once through `test_sources.zig` and eleven standalone suites (twelve default
+tests once through `test_sources.zig` and twelve standalone suites (thirteen default
 roots total): `tests/array_test.zig`, `tests/converter_test.zig`, `tests/codegen_test.zig`,
-`tests/comptime_interpreter_test.zig`, `tests/modules_test.zig`,
+`tests/comptime_interpreter_test.zig`, `tests/modules_test.zig`, `tests/overload_test.zig`,
 `tests/query_disk_cache_test.zig`, `tests/query_test.zig`, `tests/reference_test.zig`,
 `tests/text_test.zig`, `tests/panic_test.zig`, and `tests/iteration_test.zig`.
 Each runs in its own binary's directory.
@@ -279,7 +292,7 @@ caches compilation but reruns tests. The `safe` mode speeds up allocation checks
 with a slower first compile.
 
 For quick test iteration, omit `-Doptimize=safe` and select the affected
-suite with `-Dtest-source`. The full suite builds twelve separate test binaries;
+suite with `-Dtest-source`. The full suite builds thirteen separate test binaries;
 its compilation cost is different from building the CLI once.
 
 Use focused checks during edits; run the routine suite once for changes spanning

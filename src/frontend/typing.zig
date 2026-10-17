@@ -1928,12 +1928,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 .tuple_literal => |elements| try self.constructTuple(expression, elements, context),
                 .field_access => try self.fieldAccess(expression),
                 .dereference => |reference| try self.dereference(reference),
-                .index_snapshot => |source| blk: {
-                    const index_value = try self.borrowValue(try self.valueWithType(source.value, .int), source.span);
-                    if (index_value.type_id == .never) break :blk index_value;
-                    if (index_value.type_id != .int) return self.reject(source.span, .{ .call_argument_type_mismatch = self.typeMismatch(.int, index_value.type_id) });
-                    break :blk try self.appendInstruction(.{ .value_copy = .{ .source = index_value.id, .type_id = .int } });
-                },
+                .index_snapshot => |source| try self.snapshotIndex(source, expected_type),
                 .assignment => try self.assignment(expression),
                 .reference_assignment => |assignment_ref| try self.referenceAssignment(assignment_ref),
                 .discard => |discarded| try self.discardResult(try self.discardedValue(discarded.value), discarded.span),
@@ -4536,7 +4531,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                         return self.reject(reference.span, .borrow_requires_place);
                     break :blk element;
                 },
-                .index_snapshot => .int,
+                .index_snapshot => |source| try self.unevaluatedType(source.value, expected_type),
                 .discard, .predicate => .unit,
                 .extraction => |extraction| blk: {
                     const membership = self.unresolved.conditions[@backingInt(extraction.condition)].variant_membership;
@@ -4566,7 +4561,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 },
                 .assignment, .reference_assignment => .unit,
                 .loop, .scope, .iterator, .iterator_item => try self.inferArgumentType(.{ .value = id, .span = self.valueSpan(id) }),
-                .type_value => null,
+                .type_value => .type,
             };
         }
 
@@ -4614,6 +4609,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         const MemberTarget = union(enum) {
             field: structures.TypeId,
             function: MemberFunction,
+            overloaded: structures.FunctionOverloadId,
             static_callable: structures.CompileTimeValue.Runtime,
         };
 
@@ -4628,13 +4624,16 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     return .{ .field = (try self.resolvePlaceField(receiver_type, member.name, member.receiver.span, span)).type_id };
             } else if (!receiver_type.isPrimitive() and try self.type_interner.facts().arrayType(receiver_type) == null)
                 return self.reject(member.receiver.span, .{ .field_access_not_struct = receiver_type });
-            const instance = (try self.type_interner.typeNamespaceCallMember(operand_type, member.name, operands, span)) orelse {
+            const reference = (try self.type_interner.typeNamespaceCallMember(operand_type, member.name, operands, span)) orelse {
                 const kind: structures.Diagnostic.Kind = if (structures.Operation.fromName(member.name, operands)) |operation|
                     .{ .missing_operation = .{ .receiver = operand_type, .operation = operation } }
                 else
                     .unknown_namespace_member;
                 return self.reject(span, kind);
             };
+            if (reference == .overloaded_function) return .{ .overloaded = reference.overloaded_function };
+            std.debug.assert(reference == .declaration);
+            const instance = reference.declaration;
             if (try self.type_interner.functionShape(instance.item)) |shape| return .{ .function = .{ .instance = instance, .shape = shape } };
             const value_id = (try self.type_interner.staticItem(instance)) orelse return error.Unavailable;
             const callee = try self.type_interner.lookupCompileTimeValue(value_id);
@@ -4658,17 +4657,220 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             return self.readReference(reference, reference.id, source_type, span);
         }
 
-        fn overloadedFunction(self: *Self, choices: [2]structures.InstanceId, expected_type: ?structures.TypeId, span: structures.SourceSpan) !structures.FunctionReference {
-            const expected = expected_type orelse return self.reject(span, .ambiguous_operation_reference);
-            const signature = (try self.type_interner.facts().callable(expected)) orelse return self.reject(span, .ambiguous_operation_reference);
-            return (try self.type_interner.selectFunctionOverload(choices, signature.parameters.len, span)) orelse return self.reject(span, .static_parameter_requires_specialization);
+        fn overloadedFunction(self: *Self, overload: structures.FunctionOverloadId, expected_type: ?structures.TypeId, span: structures.SourceSpan) !structures.FunctionReference {
+            const set = try self.type_interner.functionOverloads(overload);
+            const missing_context: structures.Diagnostic.Kind = if (set.declaration == null) .ambiguous_operation_reference else .overload_requires_callable_context;
+            const expected = expected_type orelse return self.reject(span, missing_context);
+            const signature = (try self.type_interner.facts().callable(expected)) orelse return self.reject(span, missing_context);
+            switch (try self.matchFunctionOverload(overload, signature, span)) {
+                .none => return self.reject(span, .{ .no_matching_overload = expected }),
+                .ambiguous => return self.reject(span, .ambiguous_overload),
+                .unique => |instance| return (try self.type_interner.functionItemReference(instance)) orelse return self.reject(span, .static_parameter_requires_specialization),
+            }
         }
 
-        fn operationTarget(self: *Self, receiver_type: structures.TypeId, name: []const u8, operands: usize, span: structures.SourceSpan) !CallTarget {
+        const FunctionOverloadMatch = union(enum) { none, unique: structures.InstanceId, ambiguous };
+
+        fn matchFunctionOverload(self: *Self, overload: structures.FunctionOverloadId, signature: structures.CallableType, span: structures.SourceSpan) !FunctionOverloadMatch {
+            const set = try self.type_interner.functionOverloads(overload);
+            var argument_types: std.ArrayList(structures.TypeId) = .empty;
+            defer argument_types.deinit(self.ctx.allocator());
+            for (signature.parameters) |parameter| try argument_types.append(self.ctx.allocator(), parameter.type_id);
+            var selected: ?structures.InstanceId = null;
+            for (set.candidates) |candidate| {
+                const instance = (try self.overloadInstance(candidate, argument_types.items)) orelse continue;
+                const header = (try self.type_interner.candidateSignature(instance)) orelse return error.Unavailable;
+                try self.type_interner.validateOverloadHeader(overload, instance, header, span);
+                if (!header.parametersEql(signature) or header.return_type != signature.return_type or
+                    header.result_mode != signature.result_mode or (header.is_fallible and !signature.is_fallible)) continue;
+                if (selected != null) return .ambiguous;
+                selected = instance;
+            }
+            return if (selected) |instance| .{ .unique = instance } else .none;
+        }
+
+        fn snapshotIndex(self: *Self, source: semantic.UnresolvedBody.ValueUse, expected_type: ?structures.TypeId) !Value {
+            var operand = try self.borrowValue(try self.valueWithType(source.value, expected_type), source.span);
+            if (operand.type_id == .never) return operand;
+            if (operand.type_id.isPrimitive() and try self.type_interner.facts().argumentPassing(operand.type_id) == .direct) {
+                operand.materialize_on_copy = true;
+                operand = try self.ownValue(operand, source.span);
+                if (!try self.type_interner.canStoreBorrow(operand.type_id)) operand.reference_origins = null;
+            }
+            return operand;
+        }
+
+        fn overloadInstance(self: *Self, candidate: structures.InstanceId, argument_types: []const structures.TypeId) !?structures.InstanceId {
+            const shape = (try self.type_interner.functionShape(candidate.item)) orelse return error.Unavailable;
+            var runtime_count: usize = 0;
+            var needs_inference = try self.type_interner.needsInheritedInference(candidate);
+            for (shape.parameters) |parameter| {
+                if (parameter.mode == .static) {
+                    needs_inference = true;
+                } else runtime_count += 1;
+            }
+            if (runtime_count != argument_types.len) return null;
+            if (!needs_inference) return candidate;
+            const inferred = switch (try self.type_interner.inferStaticArguments(candidate, argument_types)) {
+                .arguments => |arguments| arguments,
+                .missing, .conflict => return null,
+            };
+            defer self.ctx.allocator().free(inferred);
+            return try self.type_interner.specializeFunction(candidate, inferred);
+        }
+
+        fn overloadArgumentType(self: *Self, argument: semantic.UnresolvedBody.ValueUse, expected_type: ?structures.TypeId) anyerror!?structures.TypeId {
+            const index = @backingInt(argument.value);
+            if (index >= self.unresolved.parameter_count) {
+                const operation = self.unresolved.expressions[index - self.unresolved.parameter_count].operation;
+                if (operation == .overloaded_function) {
+                    const expected = expected_type orelse return null;
+                    const callable = (try self.type_interner.facts().callable(expected)) orelse return null;
+                    if (try self.matchFunctionOverload(operation.overloaded_function, callable, argument.span) == .none) return null;
+                    return expected;
+                }
+                if (operation == .tuple_literal) {
+                    const expected = expected_type orelse return null;
+                    const members = (try self.type_interner.facts().tupleMembers(expected)) orelse return null;
+                    const elements = self.unresolved.call_arguments[operation.tuple_literal.start..operation.tuple_literal.end];
+                    if (members.len != elements.len) return null;
+                    for (members, elements) |member, element| {
+                        const actual = (try self.overloadArgumentType(element, member.type_id)) orelse return null;
+                        if (!try semantic.canWidenTo(self.type_interner, actual, member.type_id)) return null;
+                    }
+                    return expected;
+                }
+            }
+            return (try self.unevaluatedType(argument.value, null)) orelse try self.inferArgumentType(argument);
+        }
+
+        fn resolveOverload(
+            self: *Self,
+            overload: structures.FunctionOverloadId,
+            provided: []const semantic.UnresolvedBody.MethodCallArgument,
+            span: structures.SourceSpan,
+            arguments: *std.ArrayList(semantic.UnresolvedBody.ValueUse),
+        ) !structures.InstanceId {
+            const set = try self.type_interner.functionOverloads(overload);
+            const operation = try self.type_interner.overloadOperation(overload);
+            var candidate_arguments: std.ArrayList(semantic.UnresolvedBody.ValueUse) = .empty;
+            defer candidate_arguments.deinit(self.ctx.allocator());
+            var argument_types: std.ArrayList(structures.TypeId) = .empty;
+            defer argument_types.deinit(self.ctx.allocator());
+            var static_arguments: std.ArrayList(structures.CompileTimeValueId) = .empty;
+            defer static_arguments.deinit(self.ctx.allocator());
+            var selected: ?structures.InstanceId = null;
+            const start = arguments.items.len;
+            for (set.candidates) |candidate| {
+                const shape = (try self.type_interner.functionShape(candidate.item)) orelse return error.Unavailable;
+                var runtime_count: usize = 0;
+                for (shape.parameters) |parameter| if (parameter.mode != .static) {
+                    runtime_count += 1;
+                };
+                if (provided.len != runtime_count and provided.len != shape.parameters.len) continue;
+                candidate_arguments.clearRetainingCapacity();
+                argument_types.clearRetainingCapacity();
+                static_arguments.clearRetainingCapacity();
+                var instance = candidate;
+                if (provided.len == runtime_count) {
+                    var applicable = true;
+                    for (provided, 0..) |argument, runtime_index| {
+                        const expected = try self.type_interner.independentParameterType(candidate, runtime_index);
+                        const actual = (try self.overloadArgumentType(argument.value, expected)) orelse {
+                            applicable = false;
+                            break;
+                        };
+                        try candidate_arguments.append(self.ctx.allocator(), argument.value);
+                        try argument_types.append(self.ctx.allocator(), if (operation != null and actual == .int_literal) .int else actual);
+                    }
+                    if (!applicable) continue;
+                    instance = (try self.overloadInstance(candidate, argument_types.items)) orelse continue;
+                } else {
+                    if (try self.type_interner.needsInheritedInference(candidate)) continue;
+                    var applicable = true;
+                    for (provided, shape.parameters, 0..) |argument, parameter, parameter_index| {
+                        if (parameter.mode != .static) {
+                            try candidate_arguments.append(self.ctx.allocator(), argument.value);
+                            continue;
+                        }
+                        if (argument.node == .null or argument.runtime_reference != null) {
+                            applicable = false;
+                            break;
+                        }
+                        const expected = if (parameter.is_meta_type) null else try self.type_interner.staticParameterType(candidate, parameter_index, static_arguments.items);
+                        const actual = (try self.overloadArgumentType(argument.value, expected)) orelse {
+                            applicable = false;
+                            break;
+                        };
+                        if (!try semantic.canWidenTo(self.type_interner, actual, expected orelse .type)) {
+                            applicable = false;
+                            break;
+                        }
+                        const static_value = (try self.type_interner.staticCallArgument(argument.node, parameter.is_meta_type, expected)) orelse return error.Unavailable;
+                        try static_arguments.append(self.ctx.allocator(), static_value);
+                    }
+                    if (!applicable) continue;
+                    instance = try self.type_interner.specializeFunction(candidate, static_arguments.items);
+                }
+                const header = (try self.type_interner.candidateSignature(instance)) orelse return error.Unavailable;
+                try self.type_interner.validateOverloadHeader(overload, instance, header, span);
+                if (provided.len != runtime_count) {
+                    var applicable = true;
+                    for (candidate_arguments.items, header.parameters) |argument, parameter| {
+                        const actual = (try self.overloadArgumentType(argument, parameter.type_id)) orelse {
+                            applicable = false;
+                            break;
+                        };
+                        try argument_types.append(self.ctx.allocator(), if (operation != null and actual == .int_literal) .int else actual);
+                    }
+                    if (!applicable) continue;
+                }
+                std.debug.assert(header.parameters.len == argument_types.items.len);
+                var applicable = true;
+                for (header.parameters, argument_types.items) |parameter, actual| {
+                    if (!try semantic.canWidenTo(self.type_interner, actual, parameter.type_id)) {
+                        applicable = false;
+                        break;
+                    }
+                }
+                if (!applicable) continue;
+                if (selected != null) return self.reject(span, if (set.declaration == null) .ambiguous_operation_reference else .ambiguous_overload);
+                selected = instance;
+                arguments.shrinkRetainingCapacity(start);
+                try arguments.appendSlice(self.ctx.allocator(), candidate_arguments.items);
+            }
+            const instance = selected orelse return self.reject(span, .{ .no_matching_overload = null });
+            _ = (try self.type_interner.functionSignature(instance)) orelse return error.Unavailable; // Validate only the selected specialization's constraints.
+            return instance;
+        }
+
+        fn resolveValueOverload(self: *Self, overload: structures.FunctionOverloadId, provided: []const semantic.UnresolvedBody.ValueUse, span: structures.SourceSpan, arguments: *std.ArrayList(semantic.UnresolvedBody.ValueUse)) !structures.InstanceId {
+            var sources: std.ArrayList(semantic.UnresolvedBody.MethodCallArgument) = .empty;
+            defer sources.deinit(self.ctx.allocator());
+            for (provided) |argument| try sources.append(self.ctx.allocator(), .{ .node = .null, .value = argument, .runtime_reference = null });
+            return self.resolveOverload(overload, sources.items, span, arguments);
+        }
+
+        fn resolveMemberOverload(self: *Self, overload: structures.FunctionOverloadId, call: semantic.UnresolvedBody.Call, receiver: semantic.UnresolvedBody.ValueUse, arguments: *std.ArrayList(semantic.UnresolvedBody.ValueUse)) !structures.InstanceId {
+            var sources: std.ArrayList(semantic.UnresolvedBody.MethodCallArgument) = .empty;
+            defer sources.deinit(self.ctx.allocator());
+            try sources.append(self.ctx.allocator(), .{ .node = .null, .value = receiver, .runtime_reference = null });
+            try sources.appendSlice(self.ctx.allocator(), self.unresolved.method_call_arguments[call.arguments.start..call.arguments.end]);
+            return self.resolveOverload(overload, sources.items, call.span, arguments);
+        }
+
+        fn operationTarget(self: *Self, receiver_type: structures.TypeId, name: []const u8, arguments: []const semantic.UnresolvedBody.ValueUse, span: structures.SourceSpan) !CallTarget {
             const operand_type = if (receiver_type == .int_literal) structures.TypeId.int else receiver_type;
-            const operation = structures.Operation.fromName(name, operands).?;
-            const instance = (try self.type_interner.namedTypeNamespaceMember(operand_type, .{ .operation = operation }, span)) orelse
+            const operation = structures.Operation.fromName(name, arguments.len).?;
+            const reference = (try self.type_interner.typeNamespaceCallMember(operand_type, name, arguments.len, span)) orelse
                 return self.reject(span, .{ .missing_operation = .{ .receiver = operand_type, .operation = operation } });
+            if (reference == .overloaded_function) {
+                var resolved: std.ArrayList(semantic.UnresolvedBody.ValueUse) = .empty;
+                defer resolved.deinit(self.ctx.allocator());
+                return .{ .direct = try self.resolveValueOverload(reference.overloaded_function, arguments, span, &resolved) };
+            }
+            std.debug.assert(reference == .declaration);
+            const instance = reference.declaration;
             const shape = (try self.type_interner.functionShape(instance.item)) orelse return error.Unavailable;
             if (try self.type_interner.needsInheritedInference(instance)) return .{ .inferred = instance };
             for (shape.parameters) |parameter| if (parameter.mode == .static) return .{ .inferred = instance };
@@ -4692,14 +4894,20 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
         }
 
         fn unevaluatedCallType(self: *Self, call: semantic.UnresolvedBody.Call) !?structures.TypeId {
-            const arguments = if (call.target == .member) &.{} else self.unresolved.call_arguments[call.arguments.start..call.arguments.end];
+            const arguments = if (call.target == .member or call.target == .overloaded) &.{} else self.unresolved.call_arguments[call.arguments.start..call.arguments.end];
             const target: CallTarget = switch (call.target) {
                 .direct => |instance| .{ .direct = instance },
                 .inferred => |generic| .{ .inferred = generic },
+                .overloaded => |overload| blk: {
+                    var resolved: std.ArrayList(semantic.UnresolvedBody.ValueUse) = .empty;
+                    defer resolved.deinit(self.ctx.allocator());
+                    const instance = try self.resolveOverload(overload, self.unresolved.method_call_arguments[call.arguments.start..call.arguments.end], call.span, &resolved);
+                    break :blk .{ .direct = instance };
+                },
                 .operation => |name| blk: {
                     const receiver_type = (try self.unevaluatedType(arguments[0].value, null)) orelse return null;
                     if (receiver_type == .never) return .never;
-                    break :blk try self.operationTarget(receiver_type, name, arguments.len, call.span);
+                    break :blk try self.operationTarget(receiver_type, name, arguments, call.span);
                 },
                 .value => |callee| {
                     const callee_type = (try self.unevaluatedType(callee.value, null)) orelse return null;
@@ -4718,6 +4926,12 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
             switch (try self.memberTarget(receiver_type, member, call.arguments.end - call.arguments.start + 1, call.span)) {
                 .field => |type_id| return (try self.callableSignature(type_id, call.span)).return_type,
                 .static_callable => |callee| return (try self.callableSignature(callee.type_id, call.span)).return_type,
+                .overloaded => |overload| {
+                    var arguments: std.ArrayList(semantic.UnresolvedBody.ValueUse) = .empty;
+                    defer arguments.deinit(self.ctx.allocator());
+                    const instance = try self.resolveMemberOverload(overload, call, member.receiver, &arguments);
+                    return self.unevaluatedTargetType(.{ .direct = instance }, arguments.items);
+                },
                 .function => |function| {
                     if (function.ownership) return self.unevaluatedTargetType(.{ .direct = function.instance }, &.{});
                     var arguments: std.ArrayList(semantic.UnresolvedBody.ValueUse) = .empty;
@@ -5898,6 +6112,10 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     self.appendSourcePlaceFields(annotation.value.value, fields)
                 else
                     null,
+                .index_snapshot => |source| if (try self.unevaluatedType(source.value, null)) |type_id|
+                    if (type_id.isPrimitive()) null else self.appendSourcePlaceFields(source.value, fields)
+                else
+                    null,
                 .call => .{ .reference = .{ .value = value_id, .span = expression.span } },
                 .field_transfer => |transfer| blk: {
                     try fields.appendSlice(self.ctx.allocator(), self.unresolved.assignment_fields[transfer.fields.start..transfer.fields.end]);
@@ -6005,7 +6223,7 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                         if (receiver.type_id == .never) return .{ .diverged = receiver };
                         break :blk receiver.type_id;
                     };
-                    target = try self.operationTarget(receiver_type, name, raw_arguments.len, span);
+                    target = try self.operationTarget(receiver_type, name, raw_arguments, span);
                     if (target == .direct) signature = (try self.type_interner.functionSignature(target.direct)) orelse return error.Unavailable;
                 },
                 .direct => |instance| {
@@ -6018,6 +6236,12 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                 .inferred => |instance| {
                     raw_arguments = self.unresolved.call_arguments[call.arguments.start..call.arguments.end];
                     target = .{ .inferred = instance };
+                },
+                .overloaded => |overload| {
+                    const instance = try self.resolveOverload(overload, self.unresolved.method_call_arguments[call.arguments.start..call.arguments.end], span, &argument_storage);
+                    raw_arguments = argument_storage.items;
+                    target = .{ .direct = instance };
+                    signature = (try self.type_interner.functionSignature(instance)) orelse return error.Unavailable;
                 },
                 .value => |target_use| {
                     raw_arguments = self.unresolved.call_arguments[call.arguments.start..call.arguments.end];
@@ -6483,6 +6707,12 @@ fn BodyBuilder(comptime Context: type, comptime TypeInterner: type) type {
                     target.* = if (function.ownership) .{ .direct = function.instance } else try self.resolveMethodArguments(function.instance, function.shape, method_arguments, call.span, arguments);
                     if (target.* == .direct) signature.* = (try self.type_interner.functionSignature(target.direct)) orelse return error.Unavailable;
                     if (!function.ownership) return null;
+                },
+                .overloaded => |overload| {
+                    const instance = try self.resolveMemberOverload(overload, call, member.receiver, arguments);
+                    target.* = .{ .direct = instance };
+                    signature.* = (try self.type_interner.functionSignature(instance)) orelse return error.Unavailable;
+                    return null;
                 },
             }
             for (method_arguments) |argument| try arguments.append(self.ctx.allocator(), argument.value);

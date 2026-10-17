@@ -700,7 +700,7 @@ test "operation functions reject comparison unary and indexer signature mismatch
         .{ .name = "==", .declaration = "func ==(imm left: Value, imm right: Value) Value -> left" },
         .{ .name = "-", .declaration = "func -(mut self: Value) Value -> self" },
         .{ .name = "not", .declaration = "func not(imm self: Value) Value -> self" },
-        .{ .name = "[]", .declaration = "fallible [](imm self: Value, index: bool) int -> 42" },
+        .{ .name = "[]", .declaration = "fallible [](imm self: Value, mut index: bool) int -> 42" },
         .{ .name = "[]=", .declaration = "fallible []=(imm self: Value, index: int, var replacement: int) unit -> fail" },
         .{ .name = "[]=", .declaration = "fallible []=(mut self: Value, index: int, init replacement: int) unit -> fail" },
     }) |case| {
